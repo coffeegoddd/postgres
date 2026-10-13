@@ -1,18 +1,19 @@
-# CI for the prolly storage fork: every push builds and runs the tests that
-# must pass before a branch is merged into master.  (Upstream's pg-ci.yml is
-# left as it is; it only runs when the PG_CI_ENABLED variable is set.)
+# CI for the prolly storage fork: every pull request into master builds and
+# runs the tests that must pass before it is merged.  (Upstream's pg-ci.yml
+# is left as it is; it only runs when the PG_CI_ENABLED variable is set.)
 
 name: prolly
 
 on:
-  push:
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: prolly-${{ github.ref }}
+  group: prolly-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
