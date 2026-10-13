@@ -9,8 +9,9 @@ CREATE EXTENSION test_prolly;
 SELECT interface, name, impl_id, format_version
 FROM prolly_implementations();
 
--- Conformance suites against every built-in implementation.  Until real
--- implementations exist, everything but "identity" is "not implemented".
+-- Conformance suites against every built-in implementation.  Interfaces
+-- that only have stubs report "not implemented" for everything but
+-- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
 
 -- Filters, and the suite passing and failing on the test-only hashes

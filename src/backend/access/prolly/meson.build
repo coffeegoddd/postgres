@@ -2,6 +2,7 @@
 
 backend_sources += files(
   'alloc_stub.c',
+  'chunker_keyhash.c',
   'chunker_stub.c',
   'commit_stub.c',
   'coord_k1.c',
@@ -12,10 +13,13 @@ backend_sources += files(
   'engine_d3a.c',
   'engine_d3b.c',
   'engine_d4.c',
+  'hash_sha256.c',
   'hash_stub.c',
+  'keyenc_ordered.c',
   'keyenc_stub.c',
   'log_stub.c',
   'merge_stub.c',
+  'nodeformat_basic.c',
   'nodeformat_stub.c',
   'nodestore_stub.c',
   'prolly_config.c',
@@ -27,5 +31,6 @@ backend_sources += files(
   'refs_stub.c',
   'rowid_stub.c',
   'transfer_stub.c',
+  'valenc_heaptuple.c',
   'valenc_stub.c',
 )

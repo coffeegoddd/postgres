@@ -17,12 +17,17 @@ FROM prolly_implementations();
  coordination    | k1          |       1 |              0
  coordination    | k2          |       2 |              0
  coordination    | k3          |       3 |              0
+ node_format     | basic       |       1 |              1
  node_format     | stub        |       0 |              0
+ chunker         | keyhash     |       1 |              1
  chunker         | stub        |       0 |              0
+ content_hash    | sha256      |       1 |              1
  content_hash    | stub        |       0 |              0
  content_hash    | test_fnv    |    9001 |              0
  content_hash    | test_broken |    9002 |              0
+ key_encoder     | ordered     |       1 |              1
  key_encoder     | stub        |       0 |              0
+ value_encoder   | heaptuple   |       1 |              1
  value_encoder   | stub        |       0 |              0
  node_store      | stub        |       0 |              0
  allocator       | stub        |       0 |              0
@@ -33,10 +38,11 @@ FROM prolly_implementations();
  refs            | stub        |       0 |              0
  transfer        | stub        |       0 |              0
  diff_merge      | stub        |       0 |              0
-(24 rows)
+(29 rows)
 
--- Conformance suites against every built-in implementation.  Until real
--- implementations exist, everything but "identity" is "not implemented".
+-- Conformance suites against every built-in implementation.  Interfaces
+-- that only have stubs report "not implemented" for everything but
+-- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
     interface    | implementation |                  test                   |                                                   result                                                    
 -----------------+----------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------
@@ -114,27 +120,52 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  coordination    | k3             | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
  coordination    | k3             | predicate_locks                         | not implemented (missing predicate_lock_range)
  coordination    | k3             | complete                                | not implemented (11 of 11 callbacks missing)
+ node_format     | basic          | identity                                | pass
+ node_format     | basic          | items_round_trip                        | pass
+ node_format     | basic          | level_round_trip                        | pass
+ node_format     | basic          | space_accounting                        | pass
+ node_format     | basic          | canonical_bytes_depend_only_on_items    | pass
+ node_format     | basic          | page_check_detects_corruption           | pass
+ node_format     | basic          | complete                                | pass
  node_format     | stub           | identity                                | pass
  node_format     | stub           | items_round_trip                        | not implemented (missing page_init, item_append, item_count, item_get)
- node_format     | stub           | level_round_trip                        | not implemented (missing page_init, page_level)
+ node_format     | stub           | level_round_trip                        | not implemented (missing page_init, page_level, item_count)
  node_format     | stub           | space_accounting                        | not implemented (missing page_init, item_space, free_space, item_append)
  node_format     | stub           | canonical_bytes_depend_only_on_items    | not implemented (missing page_init, item_append, canonical_bytes, special_space)
- node_format     | stub           | page_check_detects_corruption           | not implemented (missing page_check)
+ node_format     | stub           | page_check_detects_corruption           | not implemented (missing page_init, item_append, page_check)
  node_format     | stub           | complete                                | not implemented (10 of 10 callbacks missing)
+ chunker         | keyhash        | identity                                | pass
+ chunker         | keyhash        | deterministic                           | pass
+ chunker         | keyhash        | forced_split_respects_capacity          | pass
+ chunker         | keyhash        | reset_equals_begin                      | pass
+ chunker         | keyhash        | complete                                | pass
  chunker         | stub           | identity                                | pass
  chunker         | stub           | deterministic                           | not implemented (missing begin, add, end)
  chunker         | stub           | forced_split_respects_capacity          | not implemented (missing begin, add, end)
  chunker         | stub           | reset_equals_begin                      | not implemented (missing begin, add, reset, end)
  chunker         | stub           | complete                                | not implemented (4 of 4 callbacks missing)
+ content_hash    | sha256         | identity                                | pass
+ content_hash    | sha256         | deterministic                           | pass
+ content_hash    | sha256         | incremental_equals_one_shot             | pass
+ content_hash    | sha256         | complete                                | pass
  content_hash    | stub           | identity                                | pass
  content_hash    | stub           | deterministic                           | not implemented (missing begin, update, finish)
  content_hash    | stub           | incremental_equals_one_shot             | not implemented (missing begin, update, finish)
  content_hash    | stub           | complete                                | not implemented (3 of 3 callbacks missing)
+ key_encoder     | ordered        | identity                                | pass
+ key_encoder     | ordered        | order_matches_opclass                   | pass
+ key_encoder     | ordered        | desc_and_nulls_ordering                 | pass
+ key_encoder     | ordered        | decode_round_trip                       | pass
+ key_encoder     | ordered        | complete                                | pass
  key_encoder     | stub           | identity                                | pass
  key_encoder     | stub           | order_matches_opclass                   | not implemented (missing supports, begin, encode, compare, end)
- key_encoder     | stub           | desc_and_nulls_ordering                 | not implemented (missing begin, encode, compare, end)
+ key_encoder     | stub           | desc_and_nulls_ordering                 | not implemented (missing supports, begin, encode, compare, end)
  key_encoder     | stub           | decode_round_trip                       | not implemented (missing begin, encode, decode, end)
  key_encoder     | stub           | complete                                | not implemented (6 of 6 callbacks missing)
+ value_encoder   | heaptuple      | identity                                | pass
+ value_encoder   | heaptuple      | round_trip                              | pass
+ value_encoder   | heaptuple      | platform_independent                    | pass
+ value_encoder   | heaptuple      | complete                                | pass
  value_encoder   | stub           | identity                                | pass
  value_encoder   | stub           | round_trip                              | not implemented (missing begin, encode, decode, end)
  value_encoder   | stub           | platform_independent                    | not implemented (missing begin, encode, end)
@@ -176,7 +207,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge      | stub           | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub           | merge                                   | not implemented (missing merge)
  diff_merge      | stub           | complete                                | not implemented (2 of 2 callbacks missing)
-(136 rows)
+(161 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -198,6 +229,10 @@ SELECT * FROM prolly_conformance('engine', 'd1');
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        
 --------------+----------------+-----------------------------+------------------------------------------------------
+ content_hash | sha256         | identity                    | pass
+ content_hash | sha256         | deterministic               | pass
+ content_hash | sha256         | incremental_equals_one_shot | pass
+ content_hash | sha256         | complete                    | pass
  content_hash | stub           | identity                    | pass
  content_hash | stub           | deterministic               | not implemented (missing begin, update, finish)
  content_hash | stub           | incremental_equals_one_shot | not implemented (missing begin, update, finish)
@@ -210,7 +245,7 @@ SELECT * FROM prolly_conformance('content_hash');
  content_hash | test_broken    | deterministic               | pass
  content_hash | test_broken    | incremental_equals_one_shot | fail: hashing in pieces differs from hashing at once
  content_hash | test_broken    | complete                    | pass
-(12 rows)
+(16 rows)
 
 SELECT * FROM prolly_conformance('no_such_interface');
 ERROR:  unknown prolly interface "no_such_interface"

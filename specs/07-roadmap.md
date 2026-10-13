@@ -120,8 +120,9 @@ in the same mode and configuration as the engine.
   immutable copy-on-write on Postgres pages, with a separate lock table. It's
   the simplest engine and the reference point for the others.
 - Decided for this engine: synthetic TIDs with a map (question 2), Postgres
-  tuple format for values (question 12), schema versioned per branch
-  (question 5; the mechanism is still to be designed).
+  tuple format for values (question 12), schema versioned per branch by
+  making the database's catalogs prolly tables (question 5; sub-questions
+  21–26).
 - Starting choices (questions 1, 3, 4): nodes in the table's main fork through
   the buffer manager; key-only chunk boundaries with a forced split; our own
   format with SHA-256.
@@ -129,8 +130,15 @@ in the same mode and configuration as the engine.
   format, chunker; (4b) node store and WAL; (4c) D1 tree operations; (4d)
   table and index AM wiring, single writer per table; (4e) concurrency: K1,
   commit pipeline, root-carrying snapshots (B1, B2); (4f) checkpoint,
-  recovery, reclamation; (4g) V1–V3 and the versioned schema; (4h) S and V
+  recovery, reclamation; (4g) V1–V3 and versioned catalogs; (4h) S and V
   suites and correctness gates.
+
+**Status (2026-10-13): 4a built.** Implementations `sha256` (content hash),
+`basic` (node format), `keyhash` (chunker), `ordered` (key encoder) and
+`heaptuple` (value encoder) pass their conformance suites in
+`src/test/modules/test_prolly`; deliberately broken versions of the key
+encoder and chunker were checked to fail them. Chunk size targets are
+starting values (`chunker_keyhash.c`), to be set by measurement.
 - Includes the shared foundation it needs (`04-candidate-designs.md`): node
   page format, chunker, content hashing, key and value encoding, canonical
   export, WAL resource manager, commit publish (B1, B2).

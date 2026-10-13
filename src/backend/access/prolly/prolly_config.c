@@ -4,8 +4,9 @@
  *	  Choosing which implementation of each interface a tree uses.
  *
  * Each prolly table AM has a default profile: an implementation name per
- * interface.  The pairings follow specs/04-candidate-designs.md.  Foundation
- * interfaces have only stubs so far.
+ * interface.  The pairings follow specs/04-candidate-designs.md.  The
+ * foundation implementations are shared by every engine; interfaces without
+ * one yet use their stubs.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_config.c
@@ -27,12 +28,12 @@ typedef struct ProllyProfile
 	const char *impls[PROLLY_IFACE_LAST + 1];
 } ProllyProfile;
 
-#define FOUNDATION_STUBS \
-	[PROLLY_IFACE_NODE_FORMAT] = "stub", \
-	[PROLLY_IFACE_CHUNKER] = "stub", \
-	[PROLLY_IFACE_CONTENT_HASH] = "stub", \
-	[PROLLY_IFACE_KEY_ENCODER] = "stub", \
-	[PROLLY_IFACE_VALUE_ENCODER] = "stub", \
+#define FOUNDATION \
+	[PROLLY_IFACE_NODE_FORMAT] = "basic", \
+	[PROLLY_IFACE_CHUNKER] = "keyhash", \
+	[PROLLY_IFACE_CONTENT_HASH] = "sha256", \
+	[PROLLY_IFACE_KEY_ENCODER] = "ordered", \
+	[PROLLY_IFACE_VALUE_ENCODER] = "heaptuple", \
 	[PROLLY_IFACE_NODE_STORE] = "stub", \
 	[PROLLY_IFACE_ALLOCATOR] = "stub", \
 	[PROLLY_IFACE_RECLAMATION] = "stub", \
@@ -42,15 +43,15 @@ typedef struct ProllyProfile
 
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
-	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION_STUBS}},
+	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
-	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION_STUBS}},
+	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION}},
 	{"prolly_d3a", {[PROLLY_IFACE_ENGINE] = "d3a",
-	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION_STUBS}},
+	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION}},
 	{"prolly_d3b", {[PROLLY_IFACE_ENGINE] = "d3b",
-	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION_STUBS}},
+	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION}},
 	{"prolly_d4", {[PROLLY_IFACE_ENGINE] = "d4",
-	[PROLLY_IFACE_COORDINATION] = "k3", FOUNDATION_STUBS}},
+	[PROLLY_IFACE_COORDINATION] = "k3", FOUNDATION}},
 };
 
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {

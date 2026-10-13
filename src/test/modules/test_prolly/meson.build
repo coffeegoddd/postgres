@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'foundation_checks.c',
   'test_prolly.c',
 )
 

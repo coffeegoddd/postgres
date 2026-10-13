@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	alloc_stub.o \
+	chunker_keyhash.o \
 	chunker_stub.o \
 	commit_stub.o \
 	coord_k1.o \
@@ -24,10 +25,13 @@ OBJS = \
 	engine_d3a.o \
 	engine_d3b.o \
 	engine_d4.o \
+	hash_sha256.o \
 	hash_stub.o \
+	keyenc_ordered.o \
 	keyenc_stub.o \
 	log_stub.o \
 	merge_stub.o \
+	nodeformat_basic.o \
 	nodeformat_stub.o \
 	nodestore_stub.o \
 	prolly_config.o \
@@ -39,6 +43,7 @@ OBJS = \
 	refs_stub.o \
 	rowid_stub.o \
 	transfer_stub.o \
+	valenc_heaptuple.o \
 	valenc_stub.o
 
 include $(top_srcdir)/src/backend/common.mk

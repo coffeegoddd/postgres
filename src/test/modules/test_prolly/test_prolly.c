@@ -30,7 +30,6 @@
  */
 #include "postgres.h"
 
-#include "access/prolly_config.h"
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -39,6 +38,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/tuplestore.h"
+#include "test_prolly.h"
 
 PG_MODULE_MAGIC;
 
@@ -95,18 +95,22 @@ static const ConformanceCase cases[] = {
 
 	/* node format */
 	{PROLLY_IFACE_NODE_FORMAT, "items_round_trip",
-	"page_init item_append item_count item_get", NULL},
-	{PROLLY_IFACE_NODE_FORMAT, "level_round_trip", "page_init page_level", NULL},
+	"page_init item_append item_count item_get", nodeformat_items_round_trip},
+	{PROLLY_IFACE_NODE_FORMAT, "level_round_trip", "page_init page_level item_count", nodeformat_level_round_trip},
 	{PROLLY_IFACE_NODE_FORMAT, "space_accounting",
-	"page_init item_space free_space item_append", NULL},
+	"page_init item_space free_space item_append", nodeformat_space_accounting},
 	{PROLLY_IFACE_NODE_FORMAT, "canonical_bytes_depend_only_on_items",
-	"page_init item_append canonical_bytes special_space", NULL},
-	{PROLLY_IFACE_NODE_FORMAT, "page_check_detects_corruption", "page_check", NULL},
+	"page_init item_append canonical_bytes special_space",
+	nodeformat_canonical_bytes},
+	{PROLLY_IFACE_NODE_FORMAT, "page_check_detects_corruption",
+	"page_init item_append page_check", nodeformat_page_check},
 
 	/* chunker */
-	{PROLLY_IFACE_CHUNKER, "deterministic", "begin add end", NULL},
-	{PROLLY_IFACE_CHUNKER, "forced_split_respects_capacity", "begin add end", NULL},
-	{PROLLY_IFACE_CHUNKER, "reset_equals_begin", "begin add reset end", NULL},
+	{PROLLY_IFACE_CHUNKER, "deterministic", "begin add end", chunker_deterministic},
+	{PROLLY_IFACE_CHUNKER, "forced_split_respects_capacity", "begin add end",
+	chunker_forced_split},
+	{PROLLY_IFACE_CHUNKER, "reset_equals_begin", "begin add reset end",
+	chunker_reset_equals_begin},
 
 	/* content hash */
 	{PROLLY_IFACE_CONTENT_HASH, "deterministic", "begin update finish",
@@ -116,14 +120,17 @@ static const ConformanceCase cases[] = {
 
 	/* key encoder */
 	{PROLLY_IFACE_KEY_ENCODER, "order_matches_opclass",
-	"supports begin encode compare end", NULL},
+	"supports begin encode compare end", keyenc_order_matches_opclass},
 	{PROLLY_IFACE_KEY_ENCODER, "desc_and_nulls_ordering",
-	"begin encode compare end", NULL},
-	{PROLLY_IFACE_KEY_ENCODER, "decode_round_trip", "begin encode decode end", NULL},
+	"supports begin encode compare end", keyenc_desc_and_nulls},
+	{PROLLY_IFACE_KEY_ENCODER, "decode_round_trip", "begin encode decode end",
+	keyenc_decode_round_trip},
 
 	/* value encoder */
-	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end", NULL},
-	{PROLLY_IFACE_VALUE_ENCODER, "platform_independent", "begin encode end", NULL},
+	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end",
+	valenc_round_trip},
+	{PROLLY_IFACE_VALUE_ENCODER, "platform_independent", "begin encode end",
+	valenc_platform_independent},
 
 	/* node store */
 	{PROLLY_IFACE_NODE_STORE, "new_publish_read",

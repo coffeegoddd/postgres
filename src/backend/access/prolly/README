@@ -9,8 +9,10 @@ can be branched, diffed, merged, cloned, pushed and pulled.  The design and
 the plan are in specs/ at the top of the tree; start with
 specs/README.md and specs/00-architecture-principles.md.
 
-Status: roadmap step 1.  Every interface exists; every implementation is a
-stub.  Nothing stores data yet.
+Status: roadmap step 4a.  Every interface exists.  The foundation
+interfaces that don't touch storage (node format, chunker, content hash, key
+and value encoders) have real implementations that pass their conformance
+suites; everything else is a stub.  Nothing stores data yet.
 
 
 Interfaces and implementations
@@ -22,11 +24,11 @@ design choice can be changed later by writing a new implementation:
 	Interface         Header                  Implementations so far
 	engine            prolly_engine.h         d1 d2 d3a d3b d4 (stubs)
 	coordination      prolly_coord.h          k1 k2 k3 (stubs)
-	node_format       prolly_nodeformat.h     stub
-	chunker           prolly_chunker.h        stub
-	content_hash      prolly_hash.h           stub
-	key_encoder       prolly_keyenc.h         stub
-	value_encoder     prolly_valenc.h         stub
+	node_format       prolly_nodeformat.h     basic, stub
+	chunker           prolly_chunker.h        keyhash, stub
+	content_hash      prolly_hash.h           sha256, stub
+	key_encoder       prolly_keyenc.h         ordered, stub
+	value_encoder     prolly_valenc.h         heaptuple, stub
 	node_store        prolly_nodestore.h      stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
@@ -58,12 +60,16 @@ register more with prolly_register_impl().
 Which implementation a tree uses comes from configuration (prolly_config.c),
 never from code.  Today that is a default profile per table AM:
 
-	Table AM      Engine   Coordination   Foundation
-	prolly_d1     d1       k1             stubs
-	prolly_d2     d2       k1             stubs
-	prolly_d3a    d3a      k2             stubs
-	prolly_d3b    d3b      k2             stubs
-	prolly_d4     d4       k3             stubs
+	Table AM      Engine   Coordination
+	prolly_d1     d1       k1
+	prolly_d2     d2       k1
+	prolly_d3a    d3a      k2
+	prolly_d3b    d3b      k2
+	prolly_d4     d4       k3
+
+All five share the same foundation: node format basic, chunker keyhash,
+content hash sha256, key encoder ordered, value encoder heaptuple, and stubs
+for the interfaces without an implementation yet.
 
 Database-wide components (refs, transfer, diff_merge) come from a database
 profile.  Once a tree can be created, its components will be recorded in the

@@ -10,6 +10,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Candidate set (D1–D5, K1–K3, pairings) | Proposed 2026-10-13; agreed as the working plan, not as final designs |
 | Engine per storage type | Open; hypotheses in `05-storage-targets.md` |
 | First engine, its VC scope, row identity, value encoding, versioned schema (2, 5, 12, 13, 14) | Decided by the user 2026-10-13 for step 4; see each question |
+| Versioned schema mechanism (5, 21) | Decided by the user 2026-10-13: per-database catalogs are prolly tables, shared catalogs stay heap; 22–26 open, leaning to per-branch caches (23) |
 | Node I/O, chunk boundaries, canonical format (1, 3, 4) | Starting choices for step 4 (user, 2026-10-13); can change |
 
 ## Questions
@@ -42,10 +43,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 5. **Catalogs.** Are system catalogs versioned per branch? Large and separate.
    **Decided 2026-10-13 (user):** the schema is versioned per branch, from the
    first engine on: a branch, commit, diff and merge carry table definitions
-   as well as rows. Still open: how. For example, a schema tree in each
-   branch's root set that the catalogs are materialized from on checkout,
-   or per-branch catalog entries (B9). Which catalogs count as schema (tables,
-   columns, indexes, constraints; functions? roles?) is also open.
+   as well as rows.
+   **Decided 2026-10-13 (user): versioned catalogs.** The database's system
+   catalogs are themselves prolly tables, so every catalog read goes through
+   the session's branch root, and DDL writes into the branch. A branch's
+   root set holds its catalog trees beside its user-table trees, which is
+   Dolt's "schema in the root value", in Postgres's catalog form. Rejected
+   alternatives: materializing a schema stored in the tree into heap
+   catalogs on checkout, and an overlay on heap catalogs. Sub-questions are
+   21–26 below.
 6. **Reference counting (D3b).** Can decrements be propagated lazily without
    unbounded backlog after a branch delete? What bounds the background work?
 7. **Cross-branch coordination (axis 4b).** Is per-chunk latching across
@@ -110,4 +116,33 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     stay on the btrfs `/home` with the data directory copy-on-write-free;
     device bytes are reported with this caveat, and WAL bytes per
     transaction are the cleaner measure of write volume.
-
+21. **Which catalogs are versioned.** Shared catalogs (`pg_database`,
+    `pg_authid`, `pg_tablespace`, `pg_shdepend`, …) are cluster-wide and
+    presumably stay heap. Which per-database catalogs are versioned: all of
+    them, or schema only (`pg_class`, `pg_attribute`, `pg_type`, `pg_index`,
+    `pg_constraint`, `pg_attrdef`, `pg_namespace`, `pg_depend`, `pg_proc`,
+    …) with `pg_statistic` and the like left per database?
+    **Decided 2026-10-13 (user):** cluster-wide (shared) catalogs stay heap;
+    every per-database catalog is versioned.
+22. **Heap-specific catalog code.** Catalog writes go through
+    `CatalogTupleInsert`/`Update`/`Delete` (`simple_heap_*`), in-place updates
+    (`heap_inplace_update` for `relfrozenxid`, `relhasindex`, statistics),
+    the relation mapper for mapped catalogs, and bootstrap mode in initdb.
+    Each needs a table-AM path or a patch. The full list has to be found
+    before estimating the work.
+23. **Caches per branch.** The syscache, relcache, catcache and plan cache
+    must not serve one branch's definitions to a session on another.
+    Per-branch caches, or invalidation on checkout and on root change?
+    **Leaning (user, 2026-10-13):** per-branch caches. Not final until the
+    cache design is worked out.
+24. **Code that reads catalog tuples' xmin/ctid.** Some code reads system
+    columns of catalog tuples (for example to detect changed functions or
+    for in-place updates). Those must work with synthetic TIDs and
+    emulated xmin, or change.
+25. **Heap user tables in a versioned database.** A heap table's definition
+    would change with the branch while its data doesn't. Forbid heap tables
+    in a versioned database, or treat their catalog rows as unversioned?
+26. **Schema merge validity.** Merging catalog rows row by row can produce an
+    inconsistent schema (a column added on one branch to a table dropped on
+    the other; a dependency on a removed object). What checks run after a
+    catalog merge, and how are conflicts reported?

@@ -28,6 +28,13 @@ PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k1)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k2)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k3)
 
+/* foundation implementations (roadmap step 4a) */
+PG_PROLLY_IMPL(ProllyHashRoutine, prolly_hash_sha256)
+PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_basic)
+PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_keyhash)
+PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
+PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
+
 /* stubs of the foundation and version-control interfaces */
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_stub)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_stub)

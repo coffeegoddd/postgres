@@ -3,6 +3,7 @@
 MODULE_big = test_prolly
 OBJS = \
 	$(WIN32RES) \
+	foundation_checks.o \
 	test_prolly.o
 PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 
