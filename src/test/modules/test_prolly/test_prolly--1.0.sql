@@ -38,3 +38,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION prolly_store_verify(store text, seed int8, n int4)
 RETURNS int4
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The canonical bytes of a value (prolly_datum.h), and the value decoded
+-- back from them.
+CREATE FUNCTION prolly_canonical_value(anyelement)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION prolly_canonical_round_trip(anyelement)
+RETURNS anyelement
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

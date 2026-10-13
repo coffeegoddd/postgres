@@ -1,0 +1,8 @@
+# Concurrency: must match stock Postgres (expected output comes from heap)
+test: iso_row_locks
+test: iso_unique_wait
+test: iso_rr_conflict
+test: iso_serializable
+test: iso_fk_key_share
+test: iso_read_committed
+test: iso_deadlock

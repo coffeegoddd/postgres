@@ -45,6 +45,7 @@ control; this project's premise is that we should not have to.
 | [06-benchmarking.md](06-benchmarking.md) | The S (storage) and V (version-control) suites: workloads, metrics, environment, procedure, correctness gates, reporting |
 | [07-roadmap.md](07-roadmap.md) | The six-step build order (stubs, harnesses, baseline, first engine, measurement, discussion) and exit criteria |
 | [08-open-questions.md](08-open-questions.md) | Questions that are still open, and who or what decides them; decisions made so far |
+| `src/test/prolly/README` | The requirements suite: what an engine must pass, and how to run it |
 | [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
 
 ## Related local repositories
@@ -77,7 +78,7 @@ detail.
 | **Root** | The hash (or pointer) of a tree's top node. A root identifies an entire table state |
 | **Branch head / working set** | The current mutable root set of a branch: Postgres-native (local OIDs, catalog rows as Postgres stores them) |
 | **Version-control commit** | A commit made with `prolly_commit` (Dolt's `dolt commit`), as distinct from a SQL `COMMIT`. Its hash covers the canonical form only |
-| **Canonical form** | The OID-free, portable, history-independent form of schema and data that commit hashes cover and clone/push transfer |
+| **Canonical form** | The OID-free, portable, history-independent form of schema and data that commits' root hashes cover and clone/push transfer. A commit's own id also covers its parents and message, as in Dolt |
 | **Content plane** | The hashed, persisted part of a node |
 | **Coordination plane** | Unhashed state attached to a node: row locks, insert intents, commit markers |
 | **Canonical chunk** | The exact byte form of a node that the hash covers and that push/pull exchange |
@@ -103,3 +104,11 @@ detail.
   above, both are Apache-2.0, while Postgres is under the PostgreSQL License.
 - Keep Postgres-semantics preservation as the yardstick. A proposal that
   drops a Postgres behaviour needs to say so explicitly.
+- **Every bug gets a test** (user, 2026-10-13). Each bug found or hit in this
+  code base comes with at least one new test that fails without the fix:
+  in `src/test/prolly` if it is a requirement-level behaviour, in
+  `src/test/modules/test_prolly` for an interface or implementation, or in
+  the harness's unit tests (`src/tools/prolly_bench/tests`).
+- **Requirements are tests.** Decided requirements for engines are encoded
+  in `src/test/prolly`; when a decision adds or changes a requirement, add
+  or change its test there in the same change.

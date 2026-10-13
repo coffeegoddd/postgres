@@ -1,0 +1,29 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s2_begin s1_check s2_check s1_leave s2_leave s1_commit s2_commit s3_show
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_check: SELECT count(*) FROM oncall WHERE on_call;
+count
+-----
+    2
+(1 row)
+
+step s2_check: SELECT count(*) FROM oncall WHERE on_call;
+count
+-----
+    2
+(1 row)
+
+step s1_leave: UPDATE oncall SET on_call = false WHERE doctor = 'alice';
+step s2_leave: UPDATE oncall SET on_call = false WHERE doctor = 'bob';
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s3_show: SELECT * FROM oncall ORDER BY doctor;
+doctor|on_call
+------+-------
+alice |f      
+bob   |t      
+(2 rows)
+

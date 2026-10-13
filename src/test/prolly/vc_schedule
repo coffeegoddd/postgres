@@ -1,0 +1,6 @@
+# Version control and canonical form: prolly engines only
+test: vc_branches
+test: vc_schema
+test: vc_diff_merge
+test: vc_history
+test: vc_canonical

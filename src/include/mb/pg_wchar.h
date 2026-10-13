@@ -575,6 +575,7 @@ extern int	pg_do_encoding_conversion_buf(Oid proc,
 										  unsigned char *dest, int destlen,
 										  bool noError);
 
+extern int	SetClientEncodingOverride(int encoding);
 extern char *pg_client_to_server(const char *s, int len);
 extern char *pg_server_to_client(const char *s, int len);
 extern char *pg_any_to_server(const char *s, int len, int encoding);

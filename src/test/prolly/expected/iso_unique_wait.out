@@ -1,0 +1,41 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_insert s2_insert s1_commit s2_select
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO uniq VALUES (1, 's1');
+step s2_insert: INSERT INTO uniq VALUES (1, 's2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_insert: <... completed>
+ERROR:  duplicate key value violates unique constraint "uniq_pkey"
+step s2_select: SELECT * FROM uniq;
+id|v 
+--+--
+ 1|s1
+(1 row)
+
+
+starting permutation: s1_begin s1_insert s2_insert s1_rollback s2_select
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO uniq VALUES (1, 's1');
+step s2_insert: INSERT INTO uniq VALUES (1, 's2'); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_insert: <... completed>
+step s2_select: SELECT * FROM uniq;
+id|v 
+--+--
+ 1|s2
+(1 row)
+
+
+starting permutation: s1_begin s1_insert s2_upsert s1_commit s2_select
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO uniq VALUES (1, 's1');
+step s2_upsert: INSERT INTO uniq VALUES (1, 's2') ON CONFLICT (id) DO UPDATE SET v = uniq.v || '+s2'; <waiting ...>
+step s1_commit: COMMIT;
+step s2_upsert: <... completed>
+step s2_select: SELECT * FROM uniq;
+id|v    
+--+-----
+ 1|s1+s2
+(1 row)
+

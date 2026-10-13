@@ -82,6 +82,36 @@ prolly_commit(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_to_text(&commit_id));
 }
 
+/*
+ * prolly_root_hash(ref text) returns text
+ *
+ * The canonical root hash of the commit ref names (a branch or a commit
+ * id).  It depends only on the logical content (schema and data) of that
+ * commit, never on how it was produced (specs/09-versioned-catalogs.md), so
+ * comparing it is how history independence is tested.
+ */
+Datum
+prolly_root_hash(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents components;
+	const ProllyRefsRoutine *refs;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ProllyHash	commit_id = {0};
+	ProllyCommitInfo info;
+
+	prolly_database_components(&components);
+	refs = components.refs;
+	if (!PROLLY_CALL(refs, resolve, ref, &commit_id))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	if (!PROLLY_CALL(refs, commit_get, &commit_id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly commit for ref \"%s\" does not exist", ref)));
+	PG_RETURN_TEXT_P(hash_to_text(&info.root.hash));
+}
+
 /* Collects diff rows into a tuplestore. */
 typedef struct DiffCollector
 {

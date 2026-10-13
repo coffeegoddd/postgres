@@ -1,0 +1,106 @@
+--
+-- Semantics: DDL on tables that hold data.  Added columns, defaults,
+-- dropped columns, type changes and renames behave exactly as on heap.
+--
+CREATE TABLE evolve (id int PRIMARY KEY, a text);
+INSERT INTO evolve SELECT g, 'a' || g FROM generate_series(1, 5) g;
+-- A nullable column, then one with a default (old rows get the default).
+ALTER TABLE evolve ADD COLUMN b int;
+ALTER TABLE evolve ADD COLUMN c int DEFAULT 7;
+ALTER TABLE evolve ADD COLUMN d timestamptz DEFAULT '2026-01-01 00:00:00+00';
+INSERT INTO evolve (id, a, b) VALUES (6, 'a6', 60);
+INSERT INTO evolve (id, a, b, c) VALUES (7, 'a7', 70, NULL);
+SELECT id, a, b, c, d IS NOT NULL AS has_d FROM evolve ORDER BY id;
+ id | a  | b  | c | has_d 
+----+----+----+---+-------
+  1 | a1 |    | 7 | t
+  2 | a2 |    | 7 | t
+  3 | a3 |    | 7 | t
+  4 | a4 |    | 7 | t
+  5 | a5 |    | 7 | t
+  6 | a6 | 60 | 7 | t
+  7 | a7 | 70 |   | t
+(7 rows)
+
+-- Dropping a column hides it; its values don't come back.
+ALTER TABLE evolve DROP COLUMN a;
+SELECT * FROM evolve ORDER BY id LIMIT 3;
+ id | b | c |              d               
+----+---+---+------------------------------
+  1 |   | 7 | Wed Dec 31 16:00:00 2025 PST
+  2 |   | 7 | Wed Dec 31 16:00:00 2025 PST
+  3 |   | 7 | Wed Dec 31 16:00:00 2025 PST
+(3 rows)
+
+ALTER TABLE evolve ADD COLUMN a text;
+SELECT id, a FROM evolve ORDER BY id LIMIT 3;
+ id | a 
+----+---
+  1 | 
+  2 | 
+  3 | 
+(3 rows)
+
+-- Type change rewrites the table.
+ALTER TABLE evolve ALTER COLUMN b TYPE bigint USING coalesce(b, -1) * 10;
+SELECT id, b, pg_typeof(b) FROM evolve ORDER BY id;
+ id |  b  | pg_typeof 
+----+-----+-----------
+  1 | -10 | bigint
+  2 | -10 | bigint
+  3 | -10 | bigint
+  4 | -10 | bigint
+  5 | -10 | bigint
+  6 | 600 | bigint
+  7 | 700 | bigint
+(7 rows)
+
+-- Renames.
+ALTER TABLE evolve RENAME COLUMN c TO c2;
+ALTER TABLE evolve RENAME TO evolved;
+SELECT id, c2 FROM evolved ORDER BY id;
+ id | c2 
+----+----
+  1 |  7
+  2 |  7
+  3 |  7
+  4 |  7
+  5 |  7
+  6 |  7
+  7 |   
+(7 rows)
+
+-- NOT NULL added on existing data.
+ALTER TABLE evolved ALTER COLUMN c2 SET NOT NULL;
+ERROR:  column "c2" of relation "evolved" contains null values
+UPDATE evolved SET c2 = 0 WHERE c2 IS NULL;
+ALTER TABLE evolved ALTER COLUMN c2 SET NOT NULL;
+INSERT INTO evolved (id, c2) VALUES (8, NULL);
+ERROR:  null value in column "c2" of relation "evolved" violates not-null constraint
+DETAIL:  Failing row contains (8, null, null, Wed Dec 31 16:00:00 2025 PST, null).
+-- Generated columns.
+CREATE TABLE gen (a int, b int GENERATED ALWAYS AS (a * 2) STORED,
+				  c int GENERATED ALWAYS AS (a * 3) VIRTUAL);
+INSERT INTO gen (a) VALUES (1), (2), (NULL);
+UPDATE gen SET a = 10 WHERE a = 2;
+SELECT * FROM gen ORDER BY a NULLS LAST;
+ a  | b  | c  
+----+----+----
+  1 |  2 |  3
+ 10 | 20 | 30
+    |    |   
+(3 rows)
+
+-- CREATE TABLE AS, SELECT INTO, and a table copied with LIKE.
+CREATE TABLE ctas AS SELECT id, c2 FROM evolved WHERE id <= 3;
+SELECT * INTO selinto FROM ctas WHERE id = 2;
+CREATE TABLE liked (LIKE evolved INCLUDING ALL);
+INSERT INTO liked SELECT * FROM evolved;
+SELECT (SELECT count(*) FROM ctas), (SELECT count(*) FROM selinto),
+	   (SELECT count(*) FROM liked);
+ count | count | count 
+-------+-------+-------
+     3 |     1 |     7
+(1 row)
+
+DROP TABLE evolved, gen, ctas, selinto, liked;

@@ -124,7 +124,7 @@ in the same mode and configuration as the engine.
   export, WAL resource managers, commit publish (B1, B2).
 - Includes version-control operations V1–V3 (decided 2026-10-13, open
   question 14); clone, fetch and push stay stubs.
-- Schema is versioned with data and commit hashes don't depend on history
+- Schema is versioned with data and commits' root hashes don't depend on history
   (decided 2026-10-13, `09-versioned-catalogs.md` part 1): every catalog is a
   prolly table; the working set is Postgres-native; version-control commits
   are canonical (identity by name, canonical schema derived from the
@@ -154,9 +154,19 @@ Order of work within the step:
 `heaptuple` (value encoder) pass their conformance suites in
 `src/test/modules/test_prolly`; deliberately broken versions of the key
 encoder and chunker were checked to fail them. Chunk size targets are
-starting values (`chunker_keyhash.c`), to be set by measurement. Still to do
-for 4a after the canonical-form decision: the canonical value encoder, and
-OID-free key encoding for arrays and composites of user-defined types.
+starting values (`chunker_keyhash.c`), to be set by measurement.
+
+**Status (2026-10-13): 4a revisited for canonical form.** Value encoder
+`canonical` is the default: live columns only, trailing NULLs omitted,
+values in a canonical encoding shared with the key encoder
+(`prolly_datum.c`: send formats under a UTF-8 client encoding, OID-free
+arrays and composites). The key encoder stores text as UTF-8 and encodes
+other types canonically. New conformance checks (independence from DDL
+history and from `client_encoding`, columns added with a default, arrays
+and composites) pass; `heaptuple` fails the platform and history checks, as
+expected. A SQL test shows enum arrays and composites encode identically
+after their types are dropped and recreated with new OIDs. A deliberately
+disabled encoding override was checked to fail the session check.
 
 **Status (2026-10-13): 4b built.** One cluster-wide node store (`global`:
 linear-hashing hash → block map, per-child block hints in internal nodes),
@@ -166,8 +176,15 @@ nodes across many map splits; a TAP test replays the store on a standby and
 through crash recovery with `wal_consistency_checking`, and a deliberately
 broken redo was checked to fail it. Not yet: reuse of released blocks (4f).
 
-**Exit criteria:** the S and V suites run against D1+K1, and the correctness
-gates in `06-benchmarking.md` are run, with their status recorded.
+**Status (2026-10-13): requirements suite added.** `src/test/prolly` encodes
+the decided engine requirements as tests (semantics, concurrency,
+durability, version control, canonical form). Its Postgres-semantics groups
+pass against heap; against `prolly_d1` every test fails with "not
+implemented", which is the work of 4c–4h.
+
+**Exit criteria:** the S and V suites run against D1+K1, the requirements
+suite (`src/test/prolly`) passes against it, and the correctness gates in
+`06-benchmarking.md` are run, with their status recorded.
 
 ## 5. Measure the first engine
 

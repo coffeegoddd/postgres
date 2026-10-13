@@ -19,7 +19,10 @@
 
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "access/tupdesc_details.h"
+#include "access/prolly_datum.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_index.h"
 #include "catalog/namespace.h"
@@ -32,7 +35,9 @@
 #include "nodes/value.h"
 #include "test_prolly.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 
 /* ------------------------------------------------------------------------
  * Node format
@@ -483,7 +488,8 @@ key_case_init(KeyCase *kc)
 		kc->opfamilies[i] = opfamily;
 		kc->collations[i] = spec->collation;
 		kc->options[i] = spec->options;
-		fmgr_info(get_opfamily_proc(opfamily, spec->type, spec->type, BTORDER_PROC),
+		fmgr_info(get_opfamily_proc(opfamily, get_opclass_input_type(opclass),
+									get_opclass_input_type(opclass), BTORDER_PROC),
 				  &kc->cmp[i]);
 	}
 	kc->desc.nkeys = kc->ncols;
@@ -518,6 +524,17 @@ reference_compare(KeyCase *kc, const KeyRow *a, const KeyRow *b)
 	return 0;
 }
 
+/* A value of type from its text form, through the type's input function. */
+static Datum
+typed_value(Oid type, const char *s)
+{
+	Oid			input;
+	Oid			ioparam;
+
+	getTypeInputInfo(type, &input, &ioparam);
+	return OidInputFunctionCall(input, unconstify(char *, s), ioparam, -1);
+}
+
 static Datum
 numeric_datum(const char *s)
 {
@@ -535,6 +552,8 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 	"B", "a b", "a-b", "ab ", "10", "9", "zz", "Z", "~", "abc", "abd"};
 	static const char *const numerics[] = {"-1e10", "-1", "-0.5", "0", "0.0001",
 	"1", "1.0", "1.5", "2", "1e20", "NaN", "Infinity", "-Infinity"};
+	static const char *const arrays[] = {"{}", "{1}", "{1,2}", "{2}", "{1,NULL}",
+	"{NULL}", "{{1,2},{3,4}}", "[0:1]={1,2}", "{-5,7}"};
 	int			n = 0;
 
 	switch (type)
@@ -565,6 +584,10 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 		case NUMERICOID:
 			for (int i = 0; i < lengthof(numerics); i++)
 				values[n++] = numeric_datum(numerics[i]);
+			break;
+		case INT4ARRAYOID:
+			for (int i = 0; i < lengthof(arrays); i++)
+				values[n++] = typed_value(INT4ARRAYOID, arrays[i]);
 			break;
 		default:
 			elog(ERROR, "no test values for type %u", type);
@@ -750,6 +773,8 @@ keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 		{2, {{INT4OID}, {TEXTOID, C_COLLATION_OID}}},
 		{2, {{TEXTOID, non_c_collation()}, {INT8OID}}},
 		{2, {{NUMERICOID}, {BOOLOID}}},
+		{1, {{INT4ARRAYOID}}},
+		{2, {{INT4ARRAYOID}, {TEXTOID, C_COLLATION_OID}}},
 	};
 
 	for (int i = 0; i < lengthof(cases); i++)
@@ -794,6 +819,7 @@ keyenc_decode_round_trip(const ProllyImplInfo *impl)
 		{1, {{TEXTOID, non_c_collation()}}},
 		{1, {{NUMERICOID, InvalidOid, INDOPTION_DESC}}},
 		{2, {{INT4OID}, {TEXTOID, C_COLLATION_OID}}},
+		{1, {{INT4ARRAYOID, InvalidOid, INDOPTION_DESC}}},
 	};
 
 	for (int i = 0; i < lengthof(cases); i++)
@@ -805,41 +831,164 @@ keyenc_decode_round_trip(const ProllyImplInfo *impl)
  * ------------------------------------------------------------------------
  */
 
-#define VAL_COLS 5
+typedef enum ColKind
+{
+	COL_I4,
+	COL_TEXT,
+	COL_I8,
+	COL_BOOL,
+	COL_NUMERIC,
+	COL_I4_ARRAY,
+	COL_JSON,
+	COL_COMPOSITE,				/* pg_am's row type */
+} ColKind;
+
+typedef struct ColSpec
+{
+	ColKind		kind;
+	bool		dropped;
+	bool		has_missing;	/* added with DEFAULT 5 (COL_I4 only) */
+} ColSpec;
+
+static Oid
+col_type(ColKind kind)
+{
+	switch (kind)
+	{
+		case COL_I4:
+			return INT4OID;
+		case COL_TEXT:
+			return TEXTOID;
+		case COL_I8:
+			return INT8OID;
+		case COL_BOOL:
+			return BOOLOID;
+		case COL_NUMERIC:
+			return NUMERICOID;
+		case COL_I4_ARRAY:
+			return INT4ARRAYOID;
+		case COL_JSON:
+			return JSONOID;
+		case COL_COMPOSITE:
+			return get_rel_type_id(AccessMethodRelationId);
+	}
+	return InvalidOid;
+}
 
 static TupleDesc
-value_tupdesc(void)
+make_desc(const ColSpec *cols, int n)
 {
-	TupleDesc	desc = CreateTemplateTupleDesc(VAL_COLS);
+	TupleDesc	desc = CreateTemplateTupleDesc(n);
 
-	TupleDescInitEntry(desc, 1, "i4", INT4OID, -1, 0);
-	TupleDescInitEntry(desc, 2, "t", TEXTOID, -1, 0);
-	TupleDescInitEntry(desc, 3, "i8", INT8OID, -1, 0);
-	TupleDescInitEntry(desc, 4, "b", BOOLOID, -1, 0);
-	TupleDescInitEntry(desc, 5, "n", NUMERICOID, -1, 0);
+	for (int i = 0; i < n; i++)
+	{
+		TupleDescInitEntry(desc, i + 1, psprintf("c%d", i + 1),
+						   col_type(cols[i].kind), -1, 0);
+		TupleDescAttr(desc, i)->attisdropped = cols[i].dropped;
+		if (cols[i].has_missing)
+		{
+			if (desc->constr == NULL)
+			{
+				desc->constr = palloc0(sizeof(TupleConstr));
+				desc->constr->missing = palloc0(sizeof(AttrMissing) * n);
+			}
+			TupleDescAttr(desc, i)->atthasmissing = true;
+			desc->constr->missing[i].am_present = true;
+			desc->constr->missing[i].am_value = Int32GetDatum(5);
+		}
+		populate_compact_attribute(desc, i);
+	}
 	TupleDescFinalize(desc);
 	return desc;
 }
 
-static void
-store_row(TupleTableSlot *slot, int i)
+static Datum
+composite_value(int i, const char *name)
 {
-	char	   *longtext = palloc(501);
+	TupleDesc	desc = lookup_rowtype_tupdesc_copy(col_type(COL_COMPOSITE), -1);
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, i % 4 == 3};
 
-	memset(longtext, 'x', 500);
-	longtext[500] = '\0';
+	Assert(desc->natts == 4);
+	values[0] = ObjectIdGetDatum(1000 + i);
+	values[1] = DirectFunctionCall1(namein, CStringGetDatum(name));
+	values[2] = ObjectIdGetDatum(0);
+	values[3] = CharGetDatum('t');
+	return heap_copy_tuple_as_datum(heap_form_tuple(desc, values, nulls), desc);
+}
 
+/* Row i's value for a column of kind; text-like values contain text. */
+static Datum
+col_value(ColKind kind, int i, const char *text)
+{
+	switch (kind)
+	{
+		case COL_I4:
+			return Int32GetDatum(i * 1000 - 7);
+		case COL_TEXT:
+			return CStringGetTextDatum(i % 3 == 0 ? "" : text);
+		case COL_I8:
+			return Int64GetDatum((int64) i << 40);
+		case COL_BOOL:
+			return BoolGetDatum(i % 2 == 0);
+		case COL_NUMERIC:
+			return numeric_datum(i % 2 ? "3.14159" : "-1e30");
+		case COL_I4_ARRAY:
+			return typed_value(INT4ARRAYOID,
+							   i % 2 ? "[0:1][2:3]={{1,2},{NULL,4}}" : "{5,6,7}");
+		case COL_JSON:
+			return typed_value(JSONOID,
+							   psprintf("{\"k\": \"%s\", \"n\": %d}", text, i));
+		case COL_COMPOSITE:
+			return composite_value(i, text);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * Fill slot (laid out as cols) with row i.  Columns whose bit is set in
+ * nullmask are NULL, as are dropped columns.
+ */
+static void
+store_row(TupleTableSlot *slot, const ColSpec *cols, int i, uint32 nullmask,
+		  const char *text)
+{
 	ExecClearTuple(slot);
-	slot->tts_values[0] = Int32GetDatum(i * 1000 - 7);
-	slot->tts_values[1] = CStringGetTextDatum(i % 3 == 0 ? "" : i % 3 == 1 ? "abc" : longtext);
-	slot->tts_values[2] = Int64GetDatum((int64) i << 40);
-	slot->tts_values[3] = BoolGetDatum(i % 2 == 0);
-	slot->tts_values[4] = numeric_datum(i % 2 ? "3.14159" : "-1e30");
-	for (int c = 0; c < VAL_COLS; c++)
-		slot->tts_isnull[c] = (i >> c) & 1 && i >= 8;
+	for (int c = 0; c < slot->tts_tupleDescriptor->natts; c++)
+	{
+		slot->tts_isnull[c] = cols[c].dropped || ((nullmask >> c) & 1);
+		slot->tts_values[c] = slot->tts_isnull[c] ? (Datum) 0 :
+			col_value(cols[c].kind, i, text);
+	}
 	ExecStoreVirtualTuple(slot);
 }
 
+static void
+encode_row(const ProllyValueEncoderRoutine *ve, ProllyValueEncoder *enc,
+		   TupleTableSlot *slot, StringInfo out)
+{
+	resetStringInfo(out);
+	PROLLY_CALL(ve, encode, enc, slot, out);
+}
+
+static bool
+same_bytes(StringInfo a, StringInfo b)
+{
+	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+static char *
+hex(StringInfo s)
+{
+	StringInfoData h;
+
+	initStringInfo(&h);
+	for (int i = 0; i < s->len; i++)
+		appendStringInfo(&h, "%02x", (uint8) s->data[i]);
+	return h.data;
+}
+
+/* Every live column of want and got (both laid out as desc) prints alike. */
 static void
 check_same_row(TupleTableSlot *want, TupleTableSlot *got, int row)
 {
@@ -854,6 +1003,8 @@ check_same_row(TupleTableSlot *want, TupleTableSlot *got, int row)
 		char	   *a;
 		char	   *b;
 
+		if (TupleDescAttr(desc, c)->attisdropped)
+			continue;
 		if (want->tts_isnull[c] != got->tts_isnull[c])
 			elog(ERROR, "row %d column %d: NULL did not round-trip", row, c + 1);
 		if (want->tts_isnull[c])
@@ -867,25 +1018,31 @@ check_same_row(TupleTableSlot *want, TupleTableSlot *got, int row)
 	}
 }
 
+static const ColSpec all_cols[] = {
+	{COL_I4}, {COL_TEXT}, {COL_I8}, {COL_BOOL}, {COL_NUMERIC},
+	{COL_I4_ARRAY}, {COL_JSON}, {COL_COMPOSITE},
+};
+
 void
 valenc_round_trip(const ProllyImplInfo *impl)
 {
 	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
-	TupleDesc	desc = value_tupdesc();
+	TupleDesc	desc = make_desc(all_cols, lengthof(all_cols));
 	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
 	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	const TupleTableSlotOps *const kinds[] = {
 		&TTSOpsVirtual, &TTSOpsMinimalTuple, &TTSOpsHeapTuple,
 	};
+	StringInfoData buf;
 
-	for (int i = 0; i < 32; i++)
+	initStringInfo(&buf);
+	for (int i = 0; i < 64; i++)
 	{
-		StringInfoData buf;
 		ProllyValue value;
 
-		store_row(src, i);
-		initStringInfo(&buf);
-		PROLLY_CALL(ve, encode, enc, src, &buf);
+		/* rows 0..7 have no NULLs; later rows NULL a varying set */
+		store_row(src, all_cols, i, i < 8 ? 0 : (uint32) (i * 37), "abc");
+		encode_row(ve, enc, src, &buf);
 		value.data = (const uint8 *) buf.data;
 		value.len = buf.len;
 
@@ -903,15 +1060,13 @@ valenc_round_trip(const ProllyImplInfo *impl)
 }
 
 /*
- * Reference encoding of row 1 (see store_row), and of row 9 (with NULLs).
- * These bytes are the canonical format: an implementation whose encoding
- * differs between platforms fails here on all but one of them.  The
- * expected bytes were recorded on x86-64 Linux, the platform of the first
- * implementation ("heaptuple", which is platform-dependent by decision;
- * open question 12).
+ * Reference encodings of rows 1 and 9 of a table (int4, text, int8, bool,
+ * numeric); row 9 has NULLs.  These bytes are the canonical format, so they
+ * are the same on every platform.  An implementation whose bytes depend on
+ * the platform fails here on all but one.
  */
-#define REFERENCE_ROW1_HEX "2a000000000000000000050002001800e103000009616263000000000001000000138082030087052823"
-#define REFERENCE_ROW9_HEX "2900000000000000000005000300181603000000000000000000000000090000138082030087052823"
+#define REFERENCE_ROW1_HEX "050004000003e10361626308000001000000000001000e0003000000000005000305872328"
+#define REFERENCE_ROW9_HEX "0509000800000900000000000e0003000000000005000305872328"
 
 static const char *const reference_hex[] = {
 	REFERENCE_ROW1_HEX,
@@ -922,37 +1077,195 @@ void
 valenc_platform_independent(const ProllyImplInfo *impl)
 {
 	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
-	TupleDesc	desc = value_tupdesc();
+	TupleDesc	desc = make_desc(all_cols, 5);
 	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
 	TupleTableSlot *virt = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	TupleTableSlot *heap = MakeSingleTupleTableSlot(desc, &TTSOpsHeapTuple);
 	static const int rows[] = {1, 9};
+	static const uint32 nullmasks[] = {0, 0x9};
+	StringInfoData a,
+				b;
 
+	initStringInfo(&a);
+	initStringInfo(&b);
 	for (int r = 0; r < lengthof(rows); r++)
 	{
-		StringInfoData a,
-					b,
-					hex;
-
 		/* The same row from two kinds of slot must encode identically. */
-		store_row(virt, rows[r]);
+		store_row(virt, all_cols, rows[r], nullmasks[r], "abc");
 		ExecCopySlot(heap, virt);
-		initStringInfo(&a);
-		initStringInfo(&b);
-		PROLLY_CALL(ve, encode, enc, virt, &a);
-		PROLLY_CALL(ve, encode, enc, heap, &b);
-		if (a.len != b.len || memcmp(a.data, b.data, a.len) != 0)
+		encode_row(ve, enc, virt, &a);
+		encode_row(ve, enc, heap, &b);
+		if (!same_bytes(&a, &b))
 			elog(ERROR, "row %d encodes differently from a heap tuple slot",
 				 rows[r]);
-
-		initStringInfo(&hex);
-		for (int i = 0; i < a.len; i++)
-			appendStringInfo(&hex, "%02x", (uint8) a.data[i]);
-		if (strcmp(hex.data, reference_hex[r]) != 0)
+		if (strcmp(hex(&a), reference_hex[r]) != 0)
 			elog(ERROR, "row %d encodes as %s, the reference encoding is %s",
-				 rows[r], hex.data, reference_hex[r]);
+				 rows[r], hex(&a), reference_hex[r]);
 	}
 	ExecDropSingleTupleTableSlot(virt);
 	ExecDropSingleTupleTableSlot(heap);
 	PROLLY_CALL(ve, end, enc);
+}
+
+/*
+ * A table that dropped a column, or added nullable columns that are NULL,
+ * encodes rows exactly as one that never had those columns.
+ */
+void
+valenc_independent_of_history(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec plain[] = {{COL_I4}, {COL_TEXT}, {COL_NUMERIC}};
+	static const ColSpec history[] = {
+		{COL_I4}, {COL_I8, true}, {COL_TEXT}, {COL_COMPOSITE, true},
+		{COL_NUMERIC}, {COL_JSON}, {COL_I4_ARRAY},
+	};
+	TupleDesc	pdesc = make_desc(plain, lengthof(plain));
+	TupleDesc	hdesc = make_desc(history, lengthof(history));
+	ProllyValueEncoder *penc = PROLLY_CALL(ve, begin, pdesc, CurrentMemoryContext);
+	ProllyValueEncoder *henc = PROLLY_CALL(ve, begin, hdesc, CurrentMemoryContext);
+	TupleTableSlot *pslot = MakeSingleTupleTableSlot(pdesc, &TTSOpsVirtual);
+	TupleTableSlot *hslot = MakeSingleTupleTableSlot(hdesc, &TTSOpsHeapTuple);
+	StringInfoData a,
+				b;
+
+	initStringInfo(&a);
+	initStringInfo(&b);
+	for (int i = 0; i < 16; i++)
+	{
+		uint32		pnulls = (i >= 8) ? (uint32) (i & 0x7) : 0;
+		/* the same live columns NULL; added columns 5, 6 NULL */
+		uint32		hnulls = (pnulls & 0x1) | ((pnulls & 0x2) << 1) |
+			((pnulls & 0x4) << 2) | 0x60;
+
+		store_row(pslot, plain, i, pnulls, "abc");
+		store_row(hslot, history, i, hnulls, "abc");
+		encode_row(ve, penc, pslot, &a);
+		encode_row(ve, henc, hslot, &b);
+		if (!same_bytes(&a, &b))
+			elog(ERROR, "row %d: %s without the table's history, %s with it",
+				 i, hex(&a), hex(&b));
+	}
+
+	/* An added column that is not NULL must change the bytes. */
+	store_row(hslot, history, 1, 0x20, "abc");
+	encode_row(ve, henc, hslot, &b);
+	store_row(pslot, plain, 1, 0, "abc");
+	encode_row(ve, penc, pslot, &a);
+	if (same_bytes(&a, &b))
+		elog(ERROR, "a non-NULL added column did not change the encoding");
+}
+
+/* The session's client_encoding must not change the bytes. */
+void
+valenc_independent_of_session(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {{COL_TEXT}, {COL_JSON}, {COL_COMPOSITE}};
+	TupleDesc	desc = make_desc(cols, lengthof(cols));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	const char *text = "caf\xc3\xa9";	/* "café" in UTF-8 */
+	char	   *old_encoding = pstrdup(GetConfigOption("client_encoding", false, false));
+	StringInfoData utf8,
+				latin1;
+
+	if (GetDatabaseEncoding() != PG_UTF8)
+		return;					/* the test text needs a UTF-8 database */
+
+	initStringInfo(&utf8);
+	initStringInfo(&latin1);
+	store_row(slot, cols, 1, 0, text);
+	PG_TRY();
+	{
+		SetConfigOption("client_encoding", "UTF8", PGC_USERSET, PGC_S_SESSION);
+		encode_row(ve, enc, slot, &utf8);
+		SetConfigOption("client_encoding", "LATIN1", PGC_USERSET, PGC_S_SESSION);
+		encode_row(ve, enc, slot, &latin1);
+	}
+	PG_FINALLY();
+	{
+		SetConfigOption("client_encoding", old_encoding, PGC_USERSET, PGC_S_SESSION);
+	}
+	PG_END_TRY();
+
+	if (!same_bytes(&utf8, &latin1))
+		elog(ERROR, "client_encoding changed the encoding: %s under UTF8, %s under LATIN1",
+			 hex(&utf8), hex(&latin1));
+}
+
+/*
+ * A column added with a default: rows from before it decode to the default,
+ * and rows written since keep their own values, NULL included.
+ */
+void
+valenc_missing_values(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec before[] = {{COL_I4}, {COL_TEXT}};
+	static const ColSpec after[] = {{COL_I4}, {COL_TEXT}, {COL_I4, false, true}};
+	TupleDesc	bdesc = make_desc(before, lengthof(before));
+	TupleDesc	adesc = make_desc(after, lengthof(after));
+	ProllyValueEncoder *benc = PROLLY_CALL(ve, begin, bdesc, CurrentMemoryContext);
+	ProllyValueEncoder *aenc = PROLLY_CALL(ve, begin, adesc, CurrentMemoryContext);
+	TupleTableSlot *bslot = MakeSingleTupleTableSlot(bdesc, &TTSOpsVirtual);
+	TupleTableSlot *aslot = MakeSingleTupleTableSlot(adesc, &TTSOpsVirtual);
+	TupleTableSlot *out = MakeSingleTupleTableSlot(adesc, &TTSOpsVirtual);
+	StringInfoData buf;
+	ProllyValue value;
+
+	initStringInfo(&buf);
+
+	/* A row from before the column: the default. */
+	store_row(bslot, before, 2, 0, "old");
+	encode_row(ve, benc, bslot, &buf);
+	value.data = (const uint8 *) buf.data;
+	value.len = buf.len;
+	PROLLY_CALL(ve, decode, aenc, &value, out);
+	slot_getallattrs(out);
+	if (out->tts_isnull[2] || DatumGetInt32(out->tts_values[2]) != 5)
+		elog(ERROR, "a row from before the column did not get its default");
+
+	/* Rows written since: their own value, and NULL stays NULL. */
+	for (int nullit = 0; nullit < 2; nullit++)
+	{
+		store_row(aslot, after, 3, nullit ? 0x4 : 0, "new");
+		encode_row(ve, aenc, aslot, &buf);
+		value.data = (const uint8 *) buf.data;
+		value.len = buf.len;
+		PROLLY_CALL(ve, decode, aenc, &value, out);
+		check_same_row(aslot, out, 3);
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * SQL-callable: canonical bytes of a value, and their round trip
+ * ------------------------------------------------------------------------
+ */
+
+PG_FUNCTION_INFO_V1(prolly_canonical_value);
+PG_FUNCTION_INFO_V1(prolly_canonical_round_trip);
+
+Datum
+prolly_canonical_value(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	ProllyDatumCodec *codec = prolly_datum_codec(type, -1, CurrentMemoryContext);
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	prolly_datum_encode(codec, PG_GETARG_DATUM(0), &buf);
+	PG_RETURN_BYTEA_P(cstring_to_text_with_len(buf.data, buf.len));
+}
+
+Datum
+prolly_canonical_round_trip(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	ProllyDatumCodec *codec = prolly_datum_codec(type, -1, CurrentMemoryContext);
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	prolly_datum_encode(codec, PG_GETARG_DATUM(0), &buf);
+	PG_RETURN_DATUM(prolly_datum_decode(codec, buf.data, buf.len));
 }

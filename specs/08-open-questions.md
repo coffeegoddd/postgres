@@ -70,7 +70,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    **Decided 2026-10-13 (user): how the Dolt promise is kept.** Catalogs hold
    Postgres-native rows (local OIDs); a canonical schema, identified by name
    and free of OIDs, is derived from them at version-control commit, diff,
-   merge and transfer, and is what commit hashes cover. Details in
+   merge and transfer, and is what commits' root hashes cover. Details in
    `09-versioned-catalogs.md` part 1.
 6. **Reference counting (D3b).** Can decrements be propagated lazily without
    unbounded backlog after a branch delete? What bounds the background work?
@@ -92,7 +92,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     an implementation of the value_encoder interface; a portable encoding can
     replace it when clone/push between architectures matters.
     **Changed the same day (user):** a canonical, portable row encoding
-    replaces it as the default, because commit hashes must not depend on
+    replaces it as the default, because root hashes must not depend on
     history or platform: heap tuples keep dropped columns, rely on catalog
     defaults for added columns, and embed local OIDs in enum, array and
     composite values. Live columns only, logical order, trailing NULLs
@@ -100,7 +100,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     no padding; decoded into Postgres's tuple layout with
     `TupleConversionMap`. Rows untouched since a DROP COLUMN or a defaulted
     ADD COLUMN are rewritten at the next version-control commit. The
-    `heaptuple` implementation stays registered, for comparison.
+    `heaptuple` implementation stays registered, for comparison. Built
+    2026-10-13 (`valenc_canonical.c`, `prolly_datum.c`).
 13. **First engine.** D1+K1 is proposed for roadmap step 4 because it is the
     simplest and the reference point for the others. Confirm before starting.
     **Decided 2026-10-13:** D1+K1.

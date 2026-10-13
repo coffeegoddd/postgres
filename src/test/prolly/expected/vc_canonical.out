@@ -1,0 +1,18 @@
+--
+-- Canonical form: the session's client_encoding doesn't affect what is
+-- stored, and two databases holding the same content have the same root
+-- hash although their objects have different OIDs (identity by name,
+-- specs/09-versioned-catalogs.md).
+--
+\set ECHO none
+commit start|t
+branch latin1|t
+branch utf8|t
+checkout latin1|t
+commit latin1|t
+checkout utf8|t
+commit utf8|t
+same root across client encodings|t
+back to main|t
+different oids|t
+same root across databases|t

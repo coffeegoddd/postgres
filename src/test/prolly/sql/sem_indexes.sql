@@ -1,0 +1,95 @@
+--
+-- Semantics: every index access method works on engine tables (row
+-- identity: open question 2), and index scans, bitmap scans and
+-- index-only scans give the same rows as a sequential scan.
+--
+CREATE TABLE idx (
+	id int PRIMARY KEY,
+	k int,
+	t text,
+	jb jsonb,
+	tags text[],
+	pt point,
+	r int4range
+);
+INSERT INTO idx
+	SELECT g, g % 50, 'text ' || (g % 200),
+		   jsonb_build_object('g', g, 'even', g % 2 = 0),
+		   ARRAY['t' || (g % 5), 't' || (g % 7)],
+		   point(g % 100, g % 37),
+		   int4range(g, g + (g % 10) + 1)
+	FROM generate_series(1, 5000) g;
+
+CREATE INDEX idx_k ON idx (k);
+CREATE INDEX idx_kt ON idx (k, t);
+CREATE INDEX idx_expr ON idx (lower(t));
+CREATE INDEX idx_partial ON idx (id) WHERE k = 7;
+CREATE UNIQUE INDEX idx_t_id ON idx (t, id);
+CREATE INDEX idx_jb ON idx USING gin (jb);
+CREATE INDEX idx_tags ON idx USING gin (tags);
+CREATE INDEX idx_pt ON idx USING gist (pt);
+CREATE INDEX idx_r ON idx USING spgist (r);
+CREATE INDEX idx_brin ON idx USING brin (id);
+CREATE INDEX idx_hash ON idx USING hash (t);
+
+-- The same questions, answered by scans of each kind.
+CREATE FUNCTION idx_answers() RETURNS TABLE (q text, answer bigint)
+LANGUAGE sql AS $$
+	SELECT 'k = 7', count(*) FROM idx WHERE k = 7
+	UNION ALL SELECT 'k, t', count(*) FROM idx WHERE k = 3 AND t = 'text 103'
+	UNION ALL SELECT 'lower(t)', count(*) FROM idx WHERE lower(t) = 'text 42'
+	UNION ALL SELECT 'partial', sum(id) FROM idx WHERE k = 7 AND id > 100
+	UNION ALL SELECT 'jsonb @>', count(*) FROM idx WHERE jb @> '{"even": true}'
+	UNION ALL SELECT 'array &&', count(*) FROM idx WHERE tags && '{t3}'
+	UNION ALL SELECT 'point <@', count(*) FROM idx WHERE pt <@ box '((0,0),(10,10))'
+	UNION ALL SELECT 'range &&', count(*) FROM idx WHERE r && int4range(100, 110)
+	UNION ALL SELECT 'brin', count(*) FROM idx WHERE id BETWEEN 1000 AND 1999
+	UNION ALL SELECT 'hash', count(*) FROM idx WHERE t = 'text 5'
+	UNION ALL SELECT 'index only', count(k) FROM idx WHERE k BETWEEN 10 AND 20
+	UNION ALL SELECT 'order by', sum(id) FROM (SELECT id FROM idx ORDER BY k, t LIMIT 50) s
+$$;
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+CREATE TABLE seq_answers AS SELECT * FROM idx_answers();
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET enable_indexonlyscan;
+SET enable_seqscan = off;
+SELECT q, s.answer, i.answer = s.answer AS indexes_agree
+FROM seq_answers s JOIN idx_answers() i USING (q) ORDER BY q;
+
+-- After updates and deletes, indexes still agree.
+UPDATE idx SET k = 7, t = 'moved' WHERE id % 13 = 0;
+DELETE FROM idx WHERE id % 17 = 0;
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+DROP TABLE seq_answers;
+CREATE TABLE seq_answers AS SELECT * FROM idx_answers();
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET enable_indexonlyscan;
+SET enable_seqscan = off;
+SELECT q, s.answer, i.answer = s.answer AS indexes_agree
+FROM seq_answers s JOIN idx_answers() i USING (q) ORDER BY q;
+RESET enable_seqscan;
+
+-- Unique and primary key violations.
+INSERT INTO idx (id, k, t) VALUES (1, 0, 'dup');
+INSERT INTO idx (id, k, t) VALUES (100000, 0, 'text 1'), (100000, 0, 'text 2');
+INSERT INTO idx (id, k, t) VALUES (100000, 0, 'text 1'), (100001, 0, 'text 1');
+SELECT count(*) FROM idx WHERE id >= 100000;
+
+-- REINDEX and CREATE INDEX CONCURRENTLY.
+REINDEX TABLE idx;
+CREATE INDEX CONCURRENTLY idx_conc ON idx (k, id);
+SET enable_seqscan = off;
+SELECT count(*) FROM idx WHERE k = 7;
+RESET enable_seqscan;
+DROP INDEX CONCURRENTLY idx_conc;
+
+DROP FUNCTION idx_answers();
+DROP TABLE idx, seq_answers;

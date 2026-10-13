@@ -67,7 +67,7 @@ provisional.
 | **Chunker / boundary rule** | Where node boundaries fall; forced splits | Key-only (**keyhash**), key + bytes |
 | **Content hash** | Hashing the canonical region | SHA-256 (**sha256**), others if measured |
 | **Key encoder** | memcmp-comparable keys from btree opclasses and collations; no local OIDs | Per opclass, plus a comparator fallback (**ordered**) |
-| **Value encoder** | Row encoding and deforming into slots | Canonical portable format (the default, decided 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
+| **Value encoder** | Row encoding and deforming into slots | Canonical portable format (**canonical**, the default since 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
 | **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Cluster-wide hash-addressed (**global**), location-addressed |
 | **Allocator** | Space management for in-place engines | Fixed-size blocks; variable-size |
 | **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |

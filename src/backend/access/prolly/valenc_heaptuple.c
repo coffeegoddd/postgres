@@ -5,13 +5,14 @@
  *
  * A row is stored as the bytes of a MinimalTuple (header, null bitmap and
  * attributes in Postgres's on-disk tuple layout), so decoding is Postgres's
- * own tuple deforming (open question 12: decided for the first engine).
+ * own tuple deforming.
  *
- * The bytes depend only on the row's values: heap_form_minimal_tuple zeroes
- * the tuple, so padding is zero.  They are not portable between platforms
- * of different endianness or alignment rules; a portable encoding can
- * replace this implementation when clone/push between architectures
- * matters.
+ * Not the default: kept for comparison with "canonical" (open question 12,
+ * changed 2026-10-13).  Its bytes depend on the platform (byte order,
+ * alignment) and on the table's history (dropped columns stay in tuples,
+ * added columns' defaults live in the catalog), and enum, array and
+ * composite values carry local OIDs, so it fails the value encoder's
+ * platform and history conformance checks.
  *
  * Values must arrive detoasted (prolly_valenc.h); an external TOAST pointer
  * is an error.  Compressed inline values are stored as they are.

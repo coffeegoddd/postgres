@@ -15,7 +15,15 @@ harnesses, because Postgres's existing engines can't do version control:
 ## Correctness gates
 
 Results are only trustworthy for an engine that behaves correctly, so every
-results set records which of these pass:
+results set records which of these pass.
+
+**The requirements suite** (`src/test/prolly`, added 2026-10-13) encodes the
+decided requirements as tests: Postgres semantics, concurrency and
+durability (expected output generated from heap, so the suite also runs
+against heap to validate itself), and version control and canonical form,
+including gate 6. Run it with `make -C src/test/prolly check PROLLY_AM=<am>`;
+stock Postgres's `make check` doesn't run it. Gates 1 and 2 are its
+`check-upstream-regress` and `check-upstream-isolation` targets.
 
 1. `make check` (regress) with `default_table_access_method` set to the prolly
    AM, with known, documented exceptions (e.g. tests that print `ctid`).
@@ -29,7 +37,8 @@ results set records which of these pass:
 6. **History independence** (`09-versioned-catalogs.md` part 1): the same
    logical state (schema and data) reached through different histories
    (different DDL orders, insert/delete churn, different clusters) gives
-   identical version-control commit hashes.
+   identical canonical root hashes for their version-control commits (the
+   commit ids differ: they also cover parents and message, as in Dolt).
 
 A failing gate is reported next to the numbers it affects.
 

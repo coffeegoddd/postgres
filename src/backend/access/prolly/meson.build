@@ -25,6 +25,7 @@ backend_sources += files(
   'nodestore_global.c',
   'nodestore_stub.c',
   'prolly_config.c',
+  'prolly_datum.c',
   'prolly_indexam.c',
   'prolly_registry.c',
   'prolly_rmgr.c',
@@ -34,6 +35,7 @@ backend_sources += files(
   'refs_stub.c',
   'rowid_stub.c',
   'transfer_stub.c',
+  'valenc_canonical.c',
   'valenc_heaptuple.c',
   'valenc_stub.c',
 )

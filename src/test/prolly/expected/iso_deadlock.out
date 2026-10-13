@@ -1,0 +1,14 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_a s2_b s2_a s1_b s1_commit s2_commit
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_a: UPDATE dl SET v = v + 1 WHERE id = 1;
+step s2_b: UPDATE dl SET v = v + 10 WHERE id = 2;
+step s2_a: UPDATE dl SET v = v + 10 WHERE id = 1; <waiting ...>
+step s1_b: UPDATE dl SET v = v + 1 WHERE id = 2; <waiting ...>
+step s1_b: <... completed>
+ERROR:  deadlock detected
+step s2_a: <... completed>
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;

@@ -37,6 +37,7 @@ OBJS = \
 	nodestore_global.o \
 	nodestore_stub.o \
 	prolly_config.o \
+	prolly_datum.o \
 	prolly_indexam.o \
 	prolly_registry.o \
 	prolly_rmgr.o \
@@ -46,6 +47,7 @@ OBJS = \
 	refs_stub.o \
 	rowid_stub.o \
 	transfer_stub.o \
+	valenc_canonical.o \
 	valenc_heaptuple.o \
 	valenc_stub.o
 

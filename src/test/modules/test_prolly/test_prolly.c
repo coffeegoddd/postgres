@@ -132,6 +132,12 @@ static const ConformanceCase cases[] = {
 	valenc_round_trip},
 	{PROLLY_IFACE_VALUE_ENCODER, "platform_independent", "begin encode end",
 	valenc_platform_independent},
+	{PROLLY_IFACE_VALUE_ENCODER, "independent_of_history", "begin encode end",
+	valenc_independent_of_history},
+	{PROLLY_IFACE_VALUE_ENCODER, "independent_of_session", "begin encode end",
+	valenc_independent_of_session},
+	{PROLLY_IFACE_VALUE_ENCODER, "missing_values", "begin encode decode end",
+	valenc_missing_values},
 
 	/* node store */
 	{PROLLY_IFACE_NODE_STORE, "new_publish_read",

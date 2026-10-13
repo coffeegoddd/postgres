@@ -9,7 +9,7 @@ can be branched, diffed, merged, cloned, pushed and pulled.  The design and
 the plan are in specs/ at the top of the tree; start with
 specs/README.md and specs/00-architecture-principles.md.
 
-Status: roadmap step 4b.  Every interface exists.  The foundation
+Status: roadmap step 4b, plus the canonical encoders (4a revisited).  Every interface exists.  The foundation
 interfaces (node format, chunker, content hash, key and value encoders), the
 cluster-wide node store and D1's WAL form have real implementations that
 pass their conformance suites; everything else is a stub.  No table stores
@@ -29,7 +29,7 @@ design choice can be changed later by writing a new implementation:
 	chunker           prolly_chunker.h        keyhash, stub
 	content_hash      prolly_hash.h           sha256, stub
 	key_encoder       prolly_keyenc.h         ordered, stub
-	value_encoder     prolly_valenc.h         heaptuple, stub
+	value_encoder     prolly_valenc.h         canonical, heaptuple, stub
 	node_store        prolly_nodestore.h      global, stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
@@ -69,9 +69,23 @@ never from code.  Today that is a default profile per table AM:
 	prolly_d4     d4       k3
 
 All five share the same foundation: node format basic, chunker keyhash,
-content hash sha256, key encoder ordered, value encoder heaptuple, and stubs
+content hash sha256, key encoder ordered, value encoder canonical, and stubs
 for the interfaces without an implementation yet.  prolly_d1 uses the node
 store global and the log chunks; prolly_d2 the node store global.
+
+
+Canonical values
+----------------
+
+Rows and keys are stored in canonical form: the same bytes on every
+platform, in every cluster and session, whatever the table's DDL history,
+with no local OIDs (specs/09-versioned-catalogs.md).  prolly_datum.c holds
+the canonical encoding of single values, shared by the key and value
+encoders as a fixed part of the format: send formats produced with the
+client encoding fixed to UTF-8 (SetClientEncodingOverride in mbutils.c),
+and OID-free encodings of arrays and composites.  valenc_canonical.c stores
+live columns only, without trailing NULLs.  heaptuple stays registered for
+comparison and fails the platform and history checks by design.
 
 
 Storage and WAL

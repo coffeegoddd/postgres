@@ -12840,5 +12840,10 @@
   proname => 'prolly_push', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => 'text text',
   proargnames => '{remote_url,branch}', prosrc => 'prolly_push' },
+{ oid => '9396',
+  descr => 'prolly: canonical root hash of a commit (stub)',
+  proname => 'prolly_root_hash', provolatile => 'v', proparallel => 'u',
+  prorettype => 'text', proargtypes => 'text', proargnames => '{ref}',
+  prosrc => 'prolly_root_hash' },
 
 ]

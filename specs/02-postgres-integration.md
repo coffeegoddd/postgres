@@ -101,6 +101,7 @@ in each record (`src/include/access/prolly_xlog.h`).
 | B8 | Parallel workers see the leader's writes | `InitializeParallelDSM` / `EnterParallelMode` | The private mutation map must be in DSA, or flushed to a private root, before workers start |
 | B9 | Branches | `namespace.c` (schema lookup and search path), `InitPostgres` | `public@branch` schema names, `dbname=db/branch` connection strings (one option; not decided) |
 | B10 | Versioned catalogs | `catalog/indexing.c` (`CatalogTuple*` through the table AM), in-place updates (`genam.c`), `heap_getnext` catalog loops, bootstrap (`bootparse.y`, `bootstrap.c`), `relcache.c` (`formrdesc`, nailed relations, init files), relation mapper, cache reset on checkout | Every catalog is a prolly table (decided 2026-10-13). Inventory and proposals in `09-versioned-catalogs.md` |
+| B11 | Client encoding override | `src/backend/utils/mb/mbutils.c` (`SetClientEncodingOverride`) | Built 2026-10-13. Binary send/receive of text-like types converts through the client encoding; canonical values must not depend on a session setting, so prolly storage runs them with the encoding fixed to UTF-8 |
 
 ## C. Sketch of the tree's internal API
 
@@ -160,7 +161,7 @@ void        pt_export_chunks(PtRootSet *rs, PtTree t, PtChunkSink *sink);
 6. Table and index trees always come from the same root set.
 7. **All engines produce identical canonical chunks and root hashes for the
    same logical data** (see `05-storage-targets.md`).
-8. **History independence:** a version-control commit's hash depends only on
+8. **History independence:** a version-control commit's root hash depends only on
    the logical content (schema and data) it holds, never on the operations
    that produced it, on the cluster, or on the platform
    (`09-versioned-catalogs.md`).

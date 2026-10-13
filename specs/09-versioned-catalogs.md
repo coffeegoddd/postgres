@@ -1,7 +1,7 @@
 # 09. Versioned schema and canonical form
 
 **Goal (user, 2026-10-13):** be true to Postgres and true to Dolt. Schema is
-versioned with data, a commit's hash is determined by its logical content
+versioned with data, a commit's root hash is determined by its logical content
 alone (not by the operations that produced it), and clone and push work
 between clusters without identifier collisions.
 
@@ -90,7 +90,9 @@ This file has three parts:
   depend on history.
 - **History-independence gate** (`06-benchmarking.md`, gate 6): the same
   logical state reached through different histories (different DDL orders,
-  insert/delete churn, different clusters) must give identical commit hashes.
+  insert/delete churn, different clusters) must give identical root hashes.
+  A commit's own id also covers its parents and message, as in Dolt, so
+  commit ids differ; `prolly_root_hash(ref)` returns the root hash.
 
 ### Not hashed
 

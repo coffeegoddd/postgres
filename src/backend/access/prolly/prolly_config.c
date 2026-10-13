@@ -38,7 +38,7 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_CHUNKER] = "keyhash", \
 	[PROLLY_IFACE_CONTENT_HASH] = "sha256", \
 	[PROLLY_IFACE_KEY_ENCODER] = "ordered", \
-	[PROLLY_IFACE_VALUE_ENCODER] = "heaptuple", \
+	[PROLLY_IFACE_VALUE_ENCODER] = "canonical", \
 	[PROLLY_IFACE_ALLOCATOR] = "stub", \
 	[PROLLY_IFACE_RECLAMATION] = "stub", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "stub", \

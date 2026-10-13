@@ -663,6 +663,37 @@ pg_encoding_max_length_sql(PG_FUNCTION_ARGS)
 }
 
 /*
+ * An encoding that, while set, replaces the client encoding in
+ * pg_client_to_server() and pg_server_to_client(), and so in the binary
+ * send and receive functions of text-like types (which convert through
+ * pq_sendtext() and pq_getmsgtext()).  Prolly storage sets it to UTF-8
+ * while it encodes or decodes values with those functions, so that stored
+ * bytes don't depend on the session's client_encoding.  -1 means unset.
+ */
+static int	client_encoding_override = -1;
+
+/*
+ * Set the override (-1 to clear) and return the previous value, which the
+ * caller restores, also on error.
+ */
+int
+SetClientEncodingOverride(int encoding)
+{
+	int			old = client_encoding_override;
+
+	Assert(encoding == -1 || PG_VALID_ENCODING(encoding));
+	client_encoding_override = encoding;
+	return old;
+}
+
+static inline int
+client_encoding_for_conversion(void)
+{
+	return client_encoding_override >= 0 ? client_encoding_override :
+		ClientEncoding->encoding;
+}
+
+/*
  * Convert client encoding to server encoding.
  *
  * See the notes about string conversion functions at the top of this file.
@@ -670,7 +701,7 @@ pg_encoding_max_length_sql(PG_FUNCTION_ARGS)
 char *
 pg_client_to_server(const char *s, int len)
 {
-	return pg_any_to_server(s, len, ClientEncoding->encoding);
+	return pg_any_to_server(s, len, client_encoding_for_conversion());
 }
 
 /*
@@ -748,7 +779,7 @@ pg_any_to_server(const char *s, int len, int encoding)
 char *
 pg_server_to_client(const char *s, int len)
 {
-	return pg_server_to_any(s, len, ClientEncoding->encoding);
+	return pg_server_to_any(s, len, client_encoding_for_conversion());
 }
 
 /*

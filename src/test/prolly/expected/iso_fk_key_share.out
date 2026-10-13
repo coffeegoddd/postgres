@@ -1,0 +1,26 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_note s2_child s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_note: UPDATE fk_parent SET note = 'changed' WHERE id = 1;
+step s2_child: INSERT INTO fk_child VALUES (10, 1);
+step s1_commit: COMMIT;
+step s2_show: SELECT * FROM fk_child;
+id|parent_id
+--+---------
+10|        1
+(1 row)
+
+
+starting permutation: s1_begin s1_key s2_child s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_key: UPDATE fk_parent SET id = 2 WHERE id = 1;
+step s2_child: INSERT INTO fk_child VALUES (10, 1); <waiting ...>
+step s1_commit: COMMIT;
+step s2_child: <... completed>
+ERROR:  insert or update on table "fk_child" violates foreign key constraint "fk_child_parent_id_fkey"
+step s2_show: SELECT * FROM fk_child;
+id|parent_id
+--+---------
+(0 rows)
+

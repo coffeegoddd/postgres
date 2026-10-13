@@ -1,0 +1,71 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_begin s2_read s1_begin s1_incr s2_read s1_commit s2_read s2_commit
+step s2_begin: BEGIN;
+step s2_read: SELECT * FROM rc ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|20
+(2 rows)
+
+step s1_begin: BEGIN;
+step s1_incr: UPDATE rc SET v = v + 1 WHERE id = 1;
+step s2_read: SELECT * FROM rc ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|20
+(2 rows)
+
+step s1_commit: COMMIT;
+step s2_read: SELECT * FROM rc ORDER BY id;
+id| v
+--+--
+ 1|11
+ 2|20
+(2 rows)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s1_incr s2_begin s2_incr s1_commit s2_commit s2_read
+step s1_begin: BEGIN;
+step s1_incr: UPDATE rc SET v = v + 1 WHERE id = 1;
+step s2_begin: BEGIN;
+step s2_incr: UPDATE rc SET v = v + 1 WHERE id = 1 RETURNING v; <waiting ...>
+step s1_commit: COMMIT;
+step s2_incr: <... completed>
+ v
+--
+12
+(1 row)
+
+step s2_commit: COMMIT;
+step s2_read: SELECT * FROM rc ORDER BY id;
+id| v
+--+--
+ 1|12
+ 2|20
+(2 rows)
+
+
+starting permutation: s1_begin s1_move s2_begin s2_cond s1_commit s2_commit s2_read
+step s1_begin: BEGIN;
+step s1_move: UPDATE rc SET v = 100 WHERE id = 2;
+step s2_begin: BEGIN;
+step s2_cond: UPDATE rc SET v = v + 1 WHERE v < 50 RETURNING id, v; <waiting ...>
+step s1_commit: COMMIT;
+step s2_cond: <... completed>
+id| v
+--+--
+ 1|11
+(1 row)
+
+step s2_commit: COMMIT;
+step s2_read: SELECT * FROM rc ORDER BY id;
+id|  v
+--+---
+ 1| 11
+ 2|100
+(2 rows)
+

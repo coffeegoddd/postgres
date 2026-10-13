@@ -13,16 +13,17 @@
  *
  *	btint2cmp, btint4cmp, btint8cmp	big-endian, sign bit flipped
  *	btboolcmp						one byte, 0 or 1
- *	bttextcmp, bttext_pattern_cmp	the text's bytes, then a 0x00 terminator
- *									(text never contains NUL)
+ *	bttextcmp, bttext_pattern_cmp	the text in UTF-8, then a 0x00
+ *									terminator (text never contains NUL)
  *	anything else					4-byte big-endian length, then the
- *									type's binary send format
+ *									value's canonical bytes (prolly_datum.h)
  *
  * For DESC columns, the bytes of the first three kinds are inverted
  * (marker excluded), which reverses their order.
  *
- * The integer, bool and pattern-text encodings, and text under a C
- * collation, sort with memcmp, so when every column is one of those,
+ * The integer and bool encodings, and in a UTF-8 database the pattern-text
+ * encoding and text under a C collation, sort with memcmp (UTF-8 byte order
+ * is code point order), so when every column is one of those,
  * compare() is a single memcmp.  Otherwise compare() walks the columns,
  * comparing memcmp-ordered columns by their bytes and decoding the others to
  * call their comparison function with the column's collation.  That
@@ -30,8 +31,9 @@
  * usable (B6).
  *
  * Every encoding is reversible, so decode() always succeeds.  The encodings
- * use fixed byte order and binary send formats, so they are the same on
- * every platform.
+ * use fixed byte order, UTF-8 text and canonical value bytes, so they are
+ * the same on every platform, in every cluster and in every session, and
+ * hold no local OIDs (specs/09-versioned-catalogs.md).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/keyenc_ordered.c
@@ -42,8 +44,10 @@
 
 #include "access/nbtree.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_datum.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
+#include "mb/pg_wchar.h"
 #include "port/pg_bswap.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -74,10 +78,8 @@ typedef struct KeyColumn
 	bool		nulls_first;
 	bool		byval;			/* decoded values are not palloc'd */
 	Oid			collation;
-	Oid			typioparam;		/* KIND_SEND */
 	FmgrInfo	cmp;			/* if !memcmp_ordered */
-	FmgrInfo	send;			/* KIND_SEND */
-	FmgrInfo	recv;			/* KIND_SEND */
+	ProllyDatumCodec *codec;	/* KIND_SEND */
 } KeyColumn;
 
 struct ProllyKeyEncoder
@@ -99,12 +101,47 @@ typedef struct Segment
  * The kind of column for (opfamily, type, collation), and whether its bytes
  * sort with memcmp.  Returns false if the column can't be encoded.
  */
+/*
+ * The opfamily's comparison function for type.  Families for arrays, enums,
+ * ranges, multiranges and composites register theirs for the polymorphic
+ * type, not for each concrete one.
+ */
+static Oid
+comparison_proc(Oid opfamily, Oid base)
+{
+	Oid			proc = get_opfamily_proc(opfamily, base, base, BTORDER_PROC);
+	Oid			poly = InvalidOid;
+
+	if (OidIsValid(proc))
+		return proc;
+	if (OidIsValid(get_element_type(base)))
+		poly = ANYARRAYOID;
+	else
+		switch (get_typtype(base))
+		{
+			case TYPTYPE_ENUM:
+				poly = ANYENUMOID;
+				break;
+			case TYPTYPE_RANGE:
+				poly = ANYRANGEOID;
+				break;
+			case TYPTYPE_MULTIRANGE:
+				poly = ANYMULTIRANGEOID;
+				break;
+			case TYPTYPE_COMPOSITE:
+				poly = RECORDOID;
+				break;
+		}
+	return OidIsValid(poly) ?
+		get_opfamily_proc(opfamily, poly, poly, BTORDER_PROC) : InvalidOid;
+}
+
 static bool
 classify(Oid opfamily, Oid type, Oid collation, ColumnKind *kind,
 		 bool *memcmp_ordered, Oid *cmpproc)
 {
 	Oid			base = getBaseType(type);
-	Oid			proc = get_opfamily_proc(opfamily, base, base, BTORDER_PROC);
+	Oid			proc = comparison_proc(opfamily, base);
 
 	if (!OidIsValid(proc))
 		return false;
@@ -120,13 +157,17 @@ classify(Oid opfamily, Oid type, Oid collation, ColumnKind *kind,
 	else if (proc == F_BTBOOLCMP && base == BOOLOID)
 		*kind = KIND_BOOL;
 	else if (proc == F_BTTEXT_PATTERN_CMP && (base == TEXTOID || base == VARCHAROID))
+	{
 		*kind = KIND_TEXT;
+		*memcmp_ordered = GetDatabaseEncoding() == PG_UTF8;
+	}
 	else if (proc == F_BTTEXTCMP && (base == TEXTOID || base == VARCHAROID))
 	{
 		if (!OidIsValid(collation))
 			return false;
 		*kind = KIND_TEXT;
-		*memcmp_ordered = pg_newlocale_from_collation(collation)->collate_is_c;
+		*memcmp_ordered = GetDatabaseEncoding() == PG_UTF8 &&
+			pg_newlocale_from_collation(collation)->collate_is_c;
 	}
 	else
 	{
@@ -190,16 +231,7 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 			fmgr_info_cxt(cmpproc, &col->cmp, mcxt);
 		}
 		if (col->kind == KIND_SEND)
-		{
-			Oid			send;
-			Oid			recv;
-			bool		varlena;
-
-			getTypeBinaryOutputInfo(base, &send, &varlena);
-			getTypeBinaryInputInfo(base, &recv, &col->typioparam);
-			fmgr_info_cxt(send, &col->send, mcxt);
-			fmgr_info_cxt(recv, &col->recv, mcxt);
-		}
+			col->codec = prolly_datum_codec(desc->types[i], -1, mcxt);
 	}
 	return enc;
 }
@@ -263,8 +295,12 @@ ordered_encode(ProllyKeyEncoder *enc, const Datum *values, const bool *isnull,
 			case KIND_TEXT:
 				{
 					text	   *t = DatumGetTextPP(values[i]);
+					int			len = VARSIZE_ANY_EXHDR(t);
+					char	   *utf8 = pg_server_to_any(VARDATA_ANY(t), len, PG_UTF8);
 
-					appendBinaryStringInfo(out, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+					if (utf8 != VARDATA_ANY(t))
+						len = strlen(utf8);
+					appendBinaryStringInfo(out, utf8, len);
 					appendStringInfoChar(out, '\0');
 					if ((Pointer) t != DatumGetPointer(values[i]))
 						pfree(t);
@@ -272,11 +308,13 @@ ordered_encode(ProllyKeyEncoder *enc, const Datum *values, const bool *isnull,
 				}
 			case KIND_SEND:
 				{
-					bytea	   *b = SendFunctionCall(&col->send, values[i]);
+					StringInfoData b;
 
-					append_be(out, VARSIZE(b) - VARHDRSZ, 4);
-					appendBinaryStringInfo(out, VARDATA(b), VARSIZE(b) - VARHDRSZ);
-					pfree(b);
+					initStringInfo(&b);
+					prolly_datum_encode(col->codec, values[i], &b);
+					append_be(out, b.len, 4);
+					appendBinaryStringInfo(out, b.data, b.len);
+					pfree(b.data);
 					break;
 				}
 		}
@@ -377,22 +415,23 @@ segment_value(const KeyColumn *col, const Segment *seg)
 		case KIND_TEXT:
 			{
 				uint32		n = seg->len - 1;	/* without terminator */
-				text	   *t = palloc(VARHDRSZ + n);
+				char	   *utf8 = palloc(n + 1);
+				char	   *server;
+				Datum		d;
 
-				SET_VARSIZE(t, VARHDRSZ + n);
 				for (uint32 i = 0; i < n; i++)
-					((uint8 *) VARDATA(t))[i] = col->desc ? ~seg->data[i] : seg->data[i];
-				return PointerGetDatum(t);
+					utf8[i] = col->desc ? ~seg->data[i] : seg->data[i];
+				utf8[n] = '\0';
+				server = pg_any_to_server(utf8, n, PG_UTF8);
+				d = PointerGetDatum(cstring_to_text_with_len(server,
+															 server == utf8 ? n : strlen(server)));
+				pfree(utf8);
+				return d;
 			}
 		case KIND_SEND:
 			{
-				StringInfoData si;
-				Datum		d;
-
-				initReadOnlyStringInfo(&si, (char *) seg->data + 4, seg->len - 4);
-				d = ReceiveFunctionCall(unconstify(FmgrInfo *, &col->recv), &si,
-										col->typioparam, -1);
-				return d;
+				return prolly_datum_decode(col->codec, (const char *) seg->data + 4,
+										   seg->len - 4);
 			}
 	}
 	elog(ERROR, "unrecognized prolly key column kind %d", col->kind);
@@ -491,7 +530,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 		.format_version = 1,
 		.name = "ordered",
 		.description = "memcmp-ordered integers, bools and C-collation text; "
-		"other types by binary send format and their comparison function",
+		"other types by canonical bytes and their comparison function",
 	},
 	.supports = ordered_supports,
 	.begin = ordered_begin,

@@ -1,0 +1,99 @@
+src/test/prolly/README
+
+Requirements suite for prolly storage engines
+=============================================
+
+These tests encode what a prolly engine must do, as decided in specs/
+(true to Postgres and true to Dolt: specs/09-versioned-catalogs.md).  An
+engine meets its requirements when this suite passes against it.  The suite
+is not part of "make check" or "make check-world"; stock Postgres doesn't
+run it.
+
+Running
+-------
+
+	make -C src/test/prolly check PROLLY_AM=prolly_d1
+
+PROLLY_AM is the table access method under test (default prolly_d1); every
+instance the suite starts uses it as default_table_access_method, so every
+table the tests create is stored by the engine.  Individual groups:
+
+	check-semantics       SQL behaves exactly as on heap
+	check-isolation       concurrency behaves exactly as on heap
+	check-tap-durability  crash recovery, standby replay, prepared xacts
+	check-vc              branches, versioned schema, diff, merge,
+	                      history independence (prolly engines only)
+	check-vc-isolation    sessions on different branches at once
+	check-tap-vc          history independence across clusters
+
+The TAP groups need a build configured with --enable-tap-tests.
+
+Correctness gates 1 and 2 (specs/06-benchmarking.md), Postgres's own
+regression and isolation suites run with the engine as the default table
+AM, are separate targets, not part of "check":
+
+	check-upstream-regress
+	check-upstream-isolation
+
+Some upstream tests print heap-specific details (ctid values, page counts);
+those exceptions are still to be documented.
+
+Validating the tests themselves
+-------------------------------
+
+The semantics, isolation and durability groups describe Postgres
+behaviour, so their expected output is what heap produces, and they must
+pass against heap:
+
+	make -C src/test/prolly check-heap
+
+Run this whenever those tests change.  Their expected files are generated
+from heap and then reviewed; never edit them to match an engine.
+
+The version-control groups have hand-written expected output: each check
+prints one "label|value" line.  They can't run against heap.
+
+What is and isn't covered
+-------------------------
+
+Covered: requirements that are decided (specs/08-open-questions.md).
+
+	Semantics       types, large values, COPY, TRUNCATE, DDL on data
+	                (sem_basic, sem_ddl); every index AM on engine tables
+	                (sem_indexes); savepoints, Halloween protection, ON
+	                CONFLICT, cursors, ctid, xmin as a change token, 2PC
+	                (sem_transactions); constraints and triggers
+	                (sem_constraints); VACUUM, ANALYZE, CLUSTER,
+	                partitioning, inheritance, materialized views
+	                (sem_maintenance)
+	Concurrency     row locks, unique waits, REPEATABLE READ conflicts,
+	                SERIALIZABLE write skew, FK key-share locks, READ
+	                COMMITTED re-checks, deadlocks (iso_*)
+	Durability      crash recovery and prepared transactions (101),
+	                standby replay and promotion (102), all under
+	                wal_consistency_checking
+	Version control branches isolate data (vc_branches); schema is
+	                versioned, including cached plans and functions
+	                (vc_schema); diff and non-conflicting merge
+	                (vc_diff_merge); sessions on different branches
+	                (vc_branch_sessions)
+	Canonical form  history independence within a database (vc_history),
+	                across client encodings and databases (vc_canonical)
+	                and across clusters (201)
+
+Not covered until decided: temporary and unlogged tables (open question
+28), tablespaces (29), logical decoding (31, deferred), clone/push/fetch
+(V4, out of scope for the first engine), the staging API, how merge
+conflicts are reported, merges that change schema, and branch scope of
+cluster-wide catalogs (27).
+
+The version-control tests assume the default branch is named "main" and
+that an unknown branch is reported as
+	prolly branch "NAME" does not exist
+
+Bugs
+----
+
+Every bug found in prolly storage gets at least one test that fails without
+the fix: here if it is a requirement-level behaviour, otherwise in
+src/test/modules/test_prolly (specs/README.md, ground rules).

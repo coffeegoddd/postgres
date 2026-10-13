@@ -1,0 +1,24 @@
+--
+-- Version control: schema is versioned with data (open question 5).  DDL on
+-- a branch is invisible on other branches, including to cached plans and
+-- functions, and checking out a branch shows its schema.
+--
+\set ECHO none
+commit|t
+branch|t
+checkout feature|t
+feature row|(1,one,7)
+feature function|(1,one,7)
+1|one|7
+feature table|42
+checkout main|t
+main row|(1,one)
+main function|(1,one)
+1|one
+main has no feature table|t
+main has no feature index|t
+main columns|id,v
+checkout feature again|t
+feature dropped vs|t
+checkout main again|t
+main still has vs|(1,one)

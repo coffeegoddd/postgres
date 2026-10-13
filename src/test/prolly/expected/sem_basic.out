@@ -1,0 +1,188 @@
+--
+-- Semantics: basic storage.  Rows of every common type, large values, COPY,
+-- updates, deletes and TRUNCATE behave exactly as on heap.  The expected
+-- output is heap's.
+--
+SET timezone = 'UTC';
+SET extra_float_digits = 0;
+-- Tables are created by the engine under test.
+CREATE TABLE basic (id int);
+SELECT a.amname = current_setting('default_table_access_method') AS uses_engine
+FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = 'basic';
+ uses_engine 
+-------------
+ t
+(1 row)
+
+DROP TABLE basic;
+CREATE TYPE basic_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE basic_pair AS (x int4, y text);
+CREATE DOMAIN basic_pos AS int4 CHECK (VALUE > 0);
+CREATE TABLE types (
+	id int4,
+	i2 int2, i8 int8, num numeric(12, 3), f8 float8, b bool,
+	t text, vc varchar(10), ch char(3),
+	d date, ts timestamptz, iv interval, u uuid, by bytea,
+	js json, jb jsonb, ia int4[], ta text[],
+	mood basic_mood, pair basic_pair, pos basic_pos,
+	ip inet, pt point
+);
+INSERT INTO types VALUES
+	(1, 1, 10000000000, 123.456, 1.5, true,
+	 'one', 'v1', 'c1',
+	 '2026-01-02', '2026-01-02 03:04:05+00', '1 day 2 hours', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\x0001ff',
+	 '{"k": [1, 2]}', '{"k": [1, 2]}', '{1,2,3}', '{a,NULL,c}',
+	 'happy', ROW(1, 'x'), 5,
+	 '192.168.0.1/24', '(1,2)'),
+	(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+	(3, -32768, -9223372036854775808, -0.001, 'NaN', false,
+	 '', '', '', '-infinity', 'infinity', '-1 mon', '00000000-0000-0000-0000-000000000000', '\x',
+	 '[]', '[]', '{}', '{}',
+	 'sad', ROW(NULL, NULL), 1,
+	 '::1', '(0,0)');
+SELECT * FROM types ORDER BY id;
+ id |   i2   |          i8          |   num   | f8  | b |  t  | vc | ch  |     d      |              ts              |       iv        |                  u                   |    by    |      js       |      jb       |   ia    |     ta     | mood  | pair  | pos |       ip       |  pt   
+----+--------+----------------------+---------+-----+---+-----+----+-----+------------+------------------------------+-----------------+--------------------------------------+----------+---------------+---------------+---------+------------+-------+-------+-----+----------------+-------
+  1 |      1 |          10000000000 | 123.456 | 1.5 | t | one | v1 | c1  | 01-02-2026 | Fri Jan 02 03:04:05 2026 UTC | @ 1 day 2 hours | a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 | \x0001ff | {"k": [1, 2]} | {"k": [1, 2]} | {1,2,3} | {a,NULL,c} | happy | (1,x) |   5 | 192.168.0.1/24 | (1,2)
+  2 |        |                      |         |     |   |     |    |     |            |                              |                 |                                      |          |               |               |         |            |       |       |     |                | 
+  3 | -32768 | -9223372036854775808 |  -0.001 | NaN | f |     |    |     | -infinity  | infinity                     | @ 1 mon ago     | 00000000-0000-0000-0000-000000000000 | \x       | []            | []            | {}      | {}         | sad   | (,)   |   1 | ::1            | (0,0)
+(3 rows)
+
+-- Domain constraints are still enforced.
+INSERT INTO types (id, pos) VALUES (4, 0);
+ERROR:  value for domain basic_pos violates check constraint "basic_pos_check"
+-- Large values (out-of-line storage).
+CREATE TABLE big (id int, payload text, blob bytea);
+INSERT INTO big
+	SELECT g, repeat(md5(g::text), 40000), decode(repeat(md5(g::text), 1000), 'hex')
+	FROM generate_series(1, 5) g;
+SELECT id, length(payload), md5(payload), length(blob), md5(blob)
+FROM big ORDER BY id;
+ id | length  |               md5                | length |               md5                
+----+---------+----------------------------------+--------+----------------------------------
+  1 | 1280000 | e9c4c75e116bcaca6c4ff468479488da |  16000 | f8ae5f96ded3bccddc197ac5a504a7d4
+  2 | 1280000 | d3eb25459b4b8e560dceaded2d90f617 |  16000 | ebe2c357f9a1db4e2feaacf340de3132
+  3 | 1280000 | 8704b4af9cbe66164a1e9130cfce7e86 |  16000 | fddc63a419cf5f901d9844ad40131b00
+  4 | 1280000 | 2351a2e61135f3e4981a41884eb714b8 |  16000 | 8a1444b09266ab745e934390060469f4
+  5 | 1280000 | 49ab95b0a03683744e0ee01b0e063492 |  16000 | 7bbf4beb8c01ed1b616f4753654fc72b
+(5 rows)
+
+UPDATE big SET payload = payload || 'x' WHERE id = 3;
+SELECT id, length(payload), md5(payload) FROM big WHERE id = 3;
+ id | length  |               md5                
+----+---------+----------------------------------
+  3 | 1280001 | b0ee8c70edcfc5431b6578a1d34a43c8
+(1 row)
+
+-- Many rows; updates and deletes with RETURNING.
+CREATE TABLE many (id int, v int, note text);
+INSERT INTO many SELECT g, g % 97, 'row ' || g FROM generate_series(1, 20000) g;
+SELECT count(*), sum(id), sum(v), count(DISTINCT note) FROM many;
+ count |    sum    |  sum   | count 
+-------+-----------+--------+-------
+ 20000 | 200010000 | 959307 | 20000
+(1 row)
+
+WITH u AS (UPDATE many SET v = v + 1000 WHERE id % 10 = 0 RETURNING id, v)
+SELECT * FROM u ORDER BY id LIMIT 3;
+ id |  v   
+----+------
+ 10 | 1010
+ 20 | 1020
+ 30 | 1030
+(3 rows)
+
+WITH u AS (UPDATE many SET v = -1 WHERE id BETWEEN 100 AND 105 RETURNING *)
+SELECT * FROM u ORDER BY id;
+ id  | v  |  note   
+-----+----+---------
+ 100 | -1 | row 100
+ 101 | -1 | row 101
+ 102 | -1 | row 102
+ 103 | -1 | row 103
+ 104 | -1 | row 104
+ 105 | -1 | row 105
+(6 rows)
+
+WITH d AS (DELETE FROM many WHERE id % 3 = 0 RETURNING id)
+SELECT count(*), sum(id) FROM d;
+ count |   sum    
+-------+----------
+  6666 | 66663333
+(1 row)
+
+SELECT count(*), sum(id), sum(v) FROM many;
+ count |    sum    |   sum   
+-------+-----------+---------
+ 13334 | 133346667 | 1972488
+(1 row)
+
+-- An update that changes nothing still succeeds.
+UPDATE many SET v = v WHERE id = 1;
+SELECT * FROM many WHERE id = 1;
+ id | v | note  
+----+---+-------
+  1 | 1 | row 1
+(1 row)
+
+-- COPY in and out.
+CREATE TABLE copied (id int, t text, n numeric);
+COPY copied FROM stdin;
+COPY (SELECT * FROM copied ORDER BY id) TO stdout;
+1	one	1.5
+2	\N	2.5
+3	three	\N
+COPY (SELECT * FROM copied ORDER BY id DESC) TO stdout WITH (FORMAT csv, HEADER);
+id,t,n
+3,three,
+2,,2.5
+1,one,1.5
+-- TRUNCATE, then the table is usable again.
+TRUNCATE many;
+SELECT count(*) FROM many;
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO many VALUES (1, 1, 'again');
+SELECT * FROM many;
+ id | v | note  
+----+---+-------
+  1 | 1 | again
+(1 row)
+
+-- Rollback leaves nothing behind.
+BEGIN;
+INSERT INTO copied VALUES (99, 'gone', 0);
+ROLLBACK;
+SELECT count(*) FROM copied WHERE id = 99;
+ count 
+-------
+     0
+(1 row)
+
+-- Table without columns; table with many columns.
+CREATE TABLE nocols ();
+INSERT INTO nocols DEFAULT VALUES;
+INSERT INTO nocols DEFAULT VALUES;
+SELECT count(*) FROM nocols;
+ count 
+-------
+     2
+(1 row)
+
+SELECT format('CREATE TABLE wide (%s)',
+			  string_agg(format('c%s int', g), ', ')) FROM generate_series(1, 300) g \gexec
+CREATE TABLE wide (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18 int, c19 int, c20 int, c21 int, c22 int, c23 int, c24 int, c25 int, c26 int, c27 int, c28 int, c29 int, c30 int, c31 int, c32 int, c33 int, c34 int, c35 int, c36 int, c37 int, c38 int, c39 int, c40 int, c41 int, c42 int, c43 int, c44 int, c45 int, c46 int, c47 int, c48 int, c49 int, c50 int, c51 int, c52 int, c53 int, c54 int, c55 int, c56 int, c57 int, c58 int, c59 int, c60 int, c61 int, c62 int, c63 int, c64 int, c65 int, c66 int, c67 int, c68 int, c69 int, c70 int, c71 int, c72 int, c73 int, c74 int, c75 int, c76 int, c77 int, c78 int, c79 int, c80 int, c81 int, c82 int, c83 int, c84 int, c85 int, c86 int, c87 int, c88 int, c89 int, c90 int, c91 int, c92 int, c93 int, c94 int, c95 int, c96 int, c97 int, c98 int, c99 int, c100 int, c101 int, c102 int, c103 int, c104 int, c105 int, c106 int, c107 int, c108 int, c109 int, c110 int, c111 int, c112 int, c113 int, c114 int, c115 int, c116 int, c117 int, c118 int, c119 int, c120 int, c121 int, c122 int, c123 int, c124 int, c125 int, c126 int, c127 int, c128 int, c129 int, c130 int, c131 int, c132 int, c133 int, c134 int, c135 int, c136 int, c137 int, c138 int, c139 int, c140 int, c141 int, c142 int, c143 int, c144 int, c145 int, c146 int, c147 int, c148 int, c149 int, c150 int, c151 int, c152 int, c153 int, c154 int, c155 int, c156 int, c157 int, c158 int, c159 int, c160 int, c161 int, c162 int, c163 int, c164 int, c165 int, c166 int, c167 int, c168 int, c169 int, c170 int, c171 int, c172 int, c173 int, c174 int, c175 int, c176 int, c177 int, c178 int, c179 int, c180 int, c181 int, c182 int, c183 int, c184 int, c185 int, c186 int, c187 int, c188 int, c189 int, c190 int, c191 int, c192 int, c193 int, c194 int, c195 int, c196 int, c197 int, c198 int, c199 int, c200 int, c201 int, c202 int, c203 int, c204 int, c205 int, c206 int, c207 int, c208 int, c209 int, c210 int, c211 int, c212 int, c213 int, c214 int, c215 int, c216 int, c217 int, c218 int, c219 int, c220 int, c221 int, c222 int, c223 int, c224 int, c225 int, c226 int, c227 int, c228 int, c229 int, c230 int, c231 int, c232 int, c233 int, c234 int, c235 int, c236 int, c237 int, c238 int, c239 int, c240 int, c241 int, c242 int, c243 int, c244 int, c245 int, c246 int, c247 int, c248 int, c249 int, c250 int, c251 int, c252 int, c253 int, c254 int, c255 int, c256 int, c257 int, c258 int, c259 int, c260 int, c261 int, c262 int, c263 int, c264 int, c265 int, c266 int, c267 int, c268 int, c269 int, c270 int, c271 int, c272 int, c273 int, c274 int, c275 int, c276 int, c277 int, c278 int, c279 int, c280 int, c281 int, c282 int, c283 int, c284 int, c285 int, c286 int, c287 int, c288 int, c289 int, c290 int, c291 int, c292 int, c293 int, c294 int, c295 int, c296 int, c297 int, c298 int, c299 int, c300 int)
+INSERT INTO wide (c1, c150, c300) VALUES (1, 150, 300);
+SELECT c1, c2, c150, c300 FROM wide;
+ c1 | c2 | c150 | c300 
+----+----+------+------
+  1 |    |  150 |  300
+(1 row)
+
+DROP TABLE types, big, many, copied, nocols, wide;
+DROP TYPE basic_pair, basic_mood;
+DROP DOMAIN basic_pos;

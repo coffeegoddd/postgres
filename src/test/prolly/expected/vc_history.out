@@ -1,0 +1,23 @@
+--
+-- Canonical form: a commit's root hash depends only on its logical content
+-- (schema and data), never on how it was produced
+-- (specs/09-versioned-catalogs.md).  Two branches reach the same tables by
+-- different histories: different statement orders, rows inserted and
+-- deleted, columns added and dropped, a column added with a default, and
+-- objects created and dropped first so that OIDs differ.
+--
+\set ECHO none
+commit start|t
+branch a|t
+branch b|t
+branch c|t
+checkout a|t
+checkout b|t
+checkout c|t
+a and b: same content|t
+a and b: same root|t
+a and b: different commits|t
+c: different root|t
+root by commit id|t
+stable|t
+back to main|t

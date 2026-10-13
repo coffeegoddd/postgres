@@ -28,6 +28,7 @@ FROM prolly_implementations();
  key_encoder     | ordered     |       1 |              1
  key_encoder     | stub        |       0 |              0
  value_encoder   | heaptuple   |       1 |              1
+ value_encoder   | canonical   |       2 |              1
  value_encoder   | stub        |       0 |              0
  node_store      | global      |       1 |              1
  node_store      | stub        |       0 |              0
@@ -40,14 +41,14 @@ FROM prolly_implementations();
  refs            | stub        |       0 |              0
  transfer        | stub        |       0 |              0
  diff_merge      | stub        |       0 |              0
-(31 rows)
+(32 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
-    interface    | implementation |                  test                   |                                                   result                                                    
------------------+----------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------
+    interface    | implementation |                  test                   |                                                                                                      result                                                                                                       
+-----------------+----------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  engine          | d1             | identity                                | pass
  engine          | d1             | create_and_truncate                     | not implemented (missing tree_create, tree_truncate)
  engine          | d1             | read_empty_tree                         | not implemented (missing roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close)
@@ -166,11 +167,24 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  key_encoder     | stub           | complete                                | not implemented (6 of 6 callbacks missing)
  value_encoder   | heaptuple      | identity                                | pass
  value_encoder   | heaptuple      | round_trip                              | pass
- value_encoder   | heaptuple      | platform_independent                    | pass
+ value_encoder   | heaptuple      | platform_independent                    | fail: row 1 encodes as 2a000000000000000000050002001800e103000009616263000000000001000000138082030087052823, the reference encoding is 050004000003e10361626308000001000000000001000e0003000000000005000305872328
+ value_encoder   | heaptuple      | independent_of_history                  | fail: row 0: 1a000000000000000000030002001800f9ffffff030b07a06400 without the table's history, 1a000000000000000000070003001815f9ffffff030b07a06400 with it
+ value_encoder   | heaptuple      | independent_of_session                  | pass
+ value_encoder   | heaptuple      | missing_values                          | pass
  value_encoder   | heaptuple      | complete                                | pass
+ value_encoder   | canonical      | identity                                | pass
+ value_encoder   | canonical      | round_trip                              | pass
+ value_encoder   | canonical      | platform_independent                    | pass
+ value_encoder   | canonical      | independent_of_history                  | pass
+ value_encoder   | canonical      | independent_of_session                  | pass
+ value_encoder   | canonical      | missing_values                          | pass
+ value_encoder   | canonical      | complete                                | pass
  value_encoder   | stub           | identity                                | pass
  value_encoder   | stub           | round_trip                              | not implemented (missing begin, encode, decode, end)
  value_encoder   | stub           | platform_independent                    | not implemented (missing begin, encode, end)
+ value_encoder   | stub           | independent_of_history                  | not implemented (missing begin, encode, end)
+ value_encoder   | stub           | independent_of_session                  | not implemented (missing begin, encode, end)
+ value_encoder   | stub           | missing_values                          | not implemented (missing begin, encode, decode, end)
  value_encoder   | stub           | complete                                | not implemented (4 of 4 callbacks missing)
  node_store      | global         | identity                                | pass
  node_store      | global         | new_publish_read                        | pass
@@ -220,7 +234,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge      | stub           | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub           | merge                                   | not implemented (missing merge)
  diff_merge      | stub           | complete                                | not implemented (2 of 2 callbacks missing)
-(172 rows)
+(185 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -345,3 +359,49 @@ SELECT prolly_fetch('file:///nowhere', 'main');
 ERROR:  transfer implementation "stub" does not implement fetch
 SELECT prolly_push('file:///nowhere', 'main');
 ERROR:  transfer implementation "stub" does not implement push
+--
+-- Canonical value bytes carry no local OIDs and no DDL history: the same
+-- values of user-defined types encode identically after the types are
+-- dropped and recreated (with new OIDs), and a composite type that dropped
+-- an attribute encodes like one that never had it.
+--
+CREATE TYPE prolly_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE prolly_pair AS (m prolly_mood, n int4, tags text[]);
+SELECT prolly_canonical_value(ARRAY['happy', NULL, 'sad']::prolly_mood[]) AS enum_array,
+       prolly_canonical_value(ROW('ok', 3, '{a,b}')::prolly_pair) AS composite
+\gset
+SELECT prolly_canonical_round_trip(ARRAY['happy', NULL, 'sad']::prolly_mood[]),
+       prolly_canonical_round_trip(ROW('ok', 3, '{a,b}')::prolly_pair),
+       prolly_canonical_round_trip('[2:3]={1.5,NULL}'::numeric[]),
+       prolly_canonical_round_trip('{"a": [1, 2]}'::jsonb);
+ prolly_canonical_round_trip | prolly_canonical_round_trip | prolly_canonical_round_trip | prolly_canonical_round_trip 
+-----------------------------+-----------------------------+-----------------------------+-----------------------------
+ {happy,NULL,sad}            | (ok,3,"{a,b}")              | [2:3]={1.5,NULL}            | {"a": [1, 2]}
+(1 row)
+
+SELECT 'prolly_mood'::regtype::oid AS old_oid \gset
+DROP TYPE prolly_pair;
+DROP TYPE prolly_mood;
+CREATE TYPE prolly_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE prolly_pair AS (m prolly_mood, n int4, tags text[]);
+SELECT 'prolly_mood'::regtype::oid <> :old_oid AS new_oid,
+       prolly_canonical_value(ARRAY['happy', NULL, 'sad']::prolly_mood[]) = :'enum_array'
+         AS same_enum_array,
+       prolly_canonical_value(ROW('ok', 3, '{a,b}')::prolly_pair) = :'composite'
+         AS same_composite;
+ new_oid | same_enum_array | same_composite 
+---------+-----------------+----------------
+ t       | t               | t
+(1 row)
+
+CREATE TYPE prolly_dropped AS (a int4, b int8, c text);
+ALTER TYPE prolly_dropped DROP ATTRIBUTE b;
+CREATE TYPE prolly_never AS (a int4, c text);
+SELECT prolly_canonical_value(ROW(1, 'x')::prolly_dropped) =
+       prolly_canonical_value(ROW(1, 'x')::prolly_never) AS same_after_drop;
+ same_after_drop 
+-----------------
+ t
+(1 row)
+
+DROP TYPE prolly_pair, prolly_mood, prolly_dropped, prolly_never;

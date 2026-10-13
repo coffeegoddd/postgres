@@ -3,16 +3,18 @@
  * prolly_valenc.h
  *	  Value encoder interface: turning rows into bytes and back.
  *
- * Whether rows use Postgres's tuple format (so executor deforming works
- * unchanged) or a portable canonical encoding is open question 12.  Canonical
- * chunks must be identical across platforms either way.
+ * Rows are stored in canonical form (open question 12, decided 2026-10-13;
+ * specs/09-versioned-catalogs.md).
  *
  * Contract:
  * - decode(encode(row)) gives back the same attribute values.
- * - Encodings that appear in canonical chunks are identical on every
- *   platform.
- * - Values arrive detoasted; storing large values out of line is the
- *   engine's job.
+ * - The bytes depend only on the row's logical content: not on the
+ *   platform, the cluster, the session (client_encoding) or the table's
+ *   DDL history (dropped columns, nullable columns added later), and they
+ *   hold no local OIDs.  The one allowed exception: rows of a table with a
+ *   column added with a default (atthasmissing) until the table is
+ *   rewritten.
+ * - Storing large values out of line is the engine's job.
  *
  * Provisional (v0).
  *

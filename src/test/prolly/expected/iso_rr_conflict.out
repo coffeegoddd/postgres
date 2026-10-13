@@ -1,0 +1,43 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_read s2_update s2_insert s1_read s1_update s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_read: SELECT * FROM rr ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|20
+(2 rows)
+
+step s2_update: UPDATE rr SET v = v * 100 WHERE id = 1;
+step s2_insert: INSERT INTO rr VALUES (3, 30);
+step s1_read: SELECT * FROM rr ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|20
+(2 rows)
+
+step s1_update: UPDATE rr SET v = v + 1 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s1_commit: COMMIT;
+
+starting permutation: s1_begin s1_read s2_update s1_update2 s1_read s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_read: SELECT * FROM rr ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|20
+(2 rows)
+
+step s2_update: UPDATE rr SET v = v * 100 WHERE id = 1;
+step s1_update2: UPDATE rr SET v = v + 1 WHERE id = 2;
+step s1_read: SELECT * FROM rr ORDER BY id;
+id| v
+--+--
+ 1|10
+ 2|21
+(2 rows)
+
+step s1_commit: COMMIT;

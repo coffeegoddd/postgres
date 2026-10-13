@@ -1,0 +1,52 @@
+--
+-- Semantics: DDL on tables that hold data.  Added columns, defaults,
+-- dropped columns, type changes and renames behave exactly as on heap.
+--
+CREATE TABLE evolve (id int PRIMARY KEY, a text);
+INSERT INTO evolve SELECT g, 'a' || g FROM generate_series(1, 5) g;
+
+-- A nullable column, then one with a default (old rows get the default).
+ALTER TABLE evolve ADD COLUMN b int;
+ALTER TABLE evolve ADD COLUMN c int DEFAULT 7;
+ALTER TABLE evolve ADD COLUMN d timestamptz DEFAULT '2026-01-01 00:00:00+00';
+INSERT INTO evolve (id, a, b) VALUES (6, 'a6', 60);
+INSERT INTO evolve (id, a, b, c) VALUES (7, 'a7', 70, NULL);
+SELECT id, a, b, c, d IS NOT NULL AS has_d FROM evolve ORDER BY id;
+
+-- Dropping a column hides it; its values don't come back.
+ALTER TABLE evolve DROP COLUMN a;
+SELECT * FROM evolve ORDER BY id LIMIT 3;
+ALTER TABLE evolve ADD COLUMN a text;
+SELECT id, a FROM evolve ORDER BY id LIMIT 3;
+
+-- Type change rewrites the table.
+ALTER TABLE evolve ALTER COLUMN b TYPE bigint USING coalesce(b, -1) * 10;
+SELECT id, b, pg_typeof(b) FROM evolve ORDER BY id;
+
+-- Renames.
+ALTER TABLE evolve RENAME COLUMN c TO c2;
+ALTER TABLE evolve RENAME TO evolved;
+SELECT id, c2 FROM evolved ORDER BY id;
+
+-- NOT NULL added on existing data.
+ALTER TABLE evolved ALTER COLUMN c2 SET NOT NULL;
+UPDATE evolved SET c2 = 0 WHERE c2 IS NULL;
+ALTER TABLE evolved ALTER COLUMN c2 SET NOT NULL;
+INSERT INTO evolved (id, c2) VALUES (8, NULL);
+
+-- Generated columns.
+CREATE TABLE gen (a int, b int GENERATED ALWAYS AS (a * 2) STORED,
+				  c int GENERATED ALWAYS AS (a * 3) VIRTUAL);
+INSERT INTO gen (a) VALUES (1), (2), (NULL);
+UPDATE gen SET a = 10 WHERE a = 2;
+SELECT * FROM gen ORDER BY a NULLS LAST;
+
+-- CREATE TABLE AS, SELECT INTO, and a table copied with LIKE.
+CREATE TABLE ctas AS SELECT id, c2 FROM evolved WHERE id <= 3;
+SELECT * INTO selinto FROM ctas WHERE id = 2;
+CREATE TABLE liked (LIKE evolved INCLUDING ALL);
+INSERT INTO liked SELECT * FROM evolved;
+SELECT (SELECT count(*) FROM ctas), (SELECT count(*) FROM selinto),
+	   (SELECT count(*) FROM liked);
+
+DROP TABLE evolved, gen, ctas, selinto, liked;

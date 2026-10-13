@@ -1,0 +1,7 @@
+# Semantics: must match stock Postgres (expected output comes from heap)
+test: sem_basic
+test: sem_ddl
+test: sem_indexes
+test: sem_transactions
+test: sem_constraints
+test: sem_maintenance
