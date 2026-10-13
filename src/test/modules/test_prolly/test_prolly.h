@@ -57,6 +57,7 @@ extern void rootlayout_apply_matches_reference(const ProllyImplInfo *impl);
 extern void rootlayout_history_independent(const ProllyImplInfo *impl);
 extern void rootlayout_subroots_independent(const ProllyImplInfo *impl);
 extern void rootlayout_diff_reports_changes(const ProllyImplInfo *impl);
+extern void rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl);
 extern void rootlayout_walk_reaches_trees(const ProllyImplInfo *impl);
 
 #endif							/* TEST_PROLLY_H */

@@ -221,6 +221,8 @@ static const ConformanceCase cases[] = {
 	"empty apply subroot", rootlayout_subroots_independent},
 	{PROLLY_IFACE_ROOT_LAYOUT, "diff_reports_changes",
 	"empty apply diff", rootlayout_diff_reports_changes},
+	{PROLLY_IFACE_ROOT_LAYOUT, "apply_rejects_invalid_refs",
+	"empty apply lookup", rootlayout_apply_rejects_invalid_refs},
 	{PROLLY_IFACE_ROOT_LAYOUT, "walk_reaches_trees",
 	"empty apply subroot walk", rootlayout_walk_reaches_trees},
 };

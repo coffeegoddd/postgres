@@ -99,9 +99,21 @@ key_relid(const ProllyKey *key)
 		((Oid) key->data[2] << 8) | (Oid) key->data[3];
 }
 
+/* A reference must carry a hash that decode_ref() will accept. */
+static void
+check_ref(const ProllyNodeRef *ref)
+{
+	if (ref->hash.len == 0 || ref->hash.len > PROLLY_HASH_MAX_LEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prolly root layout reference has an invalid hash length %u",
+						(unsigned) ref->hash.len)));
+}
+
 static void
 encode_ref(StringInfo out, const ProllyNodeRef *ref)
 {
+	check_ref(ref);
 	appendStringInfoChar(out, (char) ref->hash.len);
 	appendBinaryStringInfo(out, ref->hash.bytes, ref->hash.len);
 }
@@ -237,9 +249,12 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
 	bool		changed = false;
 	int			i = 0;
 
+	/* Validate everything first, so a bad edit never reaches a tree. */
 	for (int k = 0; k < nedits; k++)
 	{
 		check_sub(edits[k].sub);
+		if (!edits[k].is_remove)
+			check_ref(&edits[k].tree);
 		if (k > 0 &&
 			(edits[k - 1].sub > edits[k].sub ||
 			 (edits[k - 1].sub == edits[k].sub &&
