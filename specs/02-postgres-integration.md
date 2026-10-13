@@ -1,0 +1,190 @@
+# 02. Integrating with Postgres
+
+Every engine in `04-candidate-designs.md` must satisfy these interfaces. They
+are written in terms of the coordination-in-the-tree candidate (option 8 in
+`01-context.md`), but most apply to all candidates. Line numbers were checked
+against this checkout when written; re-verify before relying on them.
+
+The tree meets Postgres at three levels:
+
+- **A.** Pluggable APIs that already exist and suffice.
+- **B.** Places with no hook, where the fork must patch core.
+- **C.** The tree's own internal API, which A and B call.
+
+## A. Existing pluggable APIs
+
+### A1. Table AM (`TableAmRoutine`, `src/include/access/tableam.h`)
+
+| Callbacks | What the tree must provide |
+|---|---|
+| `slot_callbacks`, `scan_begin/getnextslot/rescan/end` | Cursor over (snapshot root ⊕ own mutation map); a slot that decodes lazily from node bytes |
+| `parallelscan_*` | Range splitting by leaf ordinal |
+| `index_scan_*` (which install `xs_getnext_slot`), `tuple_fetch_row_version`, `tuple_tid_valid`, `tuple_satisfies_snapshot`, `tuple_get_latest_tid` | TID ↔ key resolution (B7). On this master the table AM decides index-only visibility itself (the visibility map is only consulted inside heap's index-scan code), so exact index-only scans need no core patch |
+| `tuple_insert`, `multi_insert` | Writes go to the private mutation map, tagged with the command id (Halloween protection, `TM_SelfModified`) |
+| `tuple_insert_speculative` / `tuple_complete_speculative` | Insert intent carrying the speculative token, so `ON CONFLICT` waiters use `SpeculativeInsertionWait` |
+| `tuple_update`, `tuple_delete`, `tuple_lock` → `TM_Result` + `TM_FailureData{ctid, xmax, cmax, traversed}` | Lock entries hold xid or multixact, cid and mode. `TUPLE_LOCK_FLAG_FIND_LAST_VERSION` re-reads from the latest head |
+| Lock modes KEY SHARE / SHARE / NO KEY UPDATE / UPDATE | The full conflict matrix, including detecting whether an update changes key columns |
+| Wait policies Block / Skip / Error | `XactLockTableWait`, `ConditionalXactLockTableWait`, or error |
+| `relation_set_new_filelocator` | New empty root; return invalid freeze xid / multixact (no xids in content, no wraparound vacuum) |
+| `relation_nontransactional_truncate`, `relation_copy_data`, `relation_copy_for_cluster` | Root reset or copy, O(1) for content-addressed data |
+| `relation_vacuum` | Engine-specific: reclaim roots/nodes (D1–D3), or prune in-page versions (D4) |
+| ANALYZE / TABLESAMPLE / size estimate callbacks | Leaf ordinals as pseudo-blocks; row counts from subtree counts |
+| `index_build_range_scan`, `index_validate_scan` | Full snapshot scan to feed index builds |
+| `relation_needs_toast_table` → false | Large values stored out of line by the tree (blob subtrees) |
+
+### A2. Index AM (`IndexAmRoutine`, `src/include/access/amapi.h`)
+
+A prolly-native index is a second tree per index, from the **same root set** as
+its table.
+
+- `ambuild`: bulk build from a sorted stream via the chunker.
+- `aminsert` with `UNIQUE_CHECK_YES` (insert intent + wait), and
+  `UNIQUE_CHECK_PARTIAL` / `UNIQUE_CHECK_EXISTING` for deferred unique
+  constraints (recheck at commit).
+- Scans, mark/restore, parallel scans by ordinal range.
+- `amcanreturn` true: index-only scans are exact.
+- Key encoding must be memcmp-comparable **and** agree with every btree
+  opclass and collation (B6).
+
+### A3. Custom WAL resource manager (`RegisterCustomRmgr`, `src/include/access/xlog_internal.h`)
+
+- `rm_redo`: replay the engine's WAL records (logical mutations, deltas or page
+  images depending on the engine), plus root installs (reset, fast-forward,
+  checkout).
+- `rm_desc`, `rm_identify`: `pg_waldump`.
+- `rm_startup`, `rm_cleanup`: rebuild redo-time branch heads.
+- `rm_mask`: only if nodes are buffer-manager pages.
+- `rm_decode`: logical decoding from row-level records, giving pgoutput and
+  logical replication natively. Engines whose WAL is not row-level (D1, D3,
+  D4) must also emit row-level information for decoding when
+  `wal_level=logical`.
+
+### A4. Locking, waiting, SSI
+
+- Row waits via `XactLockTableWait` / `ConditionalXactLockTableWait`
+  (`src/backend/storage/lmgr/lmgr.c`). The coordination state only records
+  *which* xid to wait on, so deadlock detection is unchanged.
+- Multiple lockers via multixacts, as heap's `xmax` does.
+- SSI (`src/backend/storage/lmgr/predicate.c`): map tree ranges onto
+  predicate.c's vocabulary. Leaves get stable synthetic block numbers (keyed
+  by key range, not node identity) → `PredicateLockPage`; keys →
+  `PredicateLockTID`; splits/merges → `PredicateLockPageSplit/Combine`; writes
+  → `CheckForSerializableConflictIn`; reads that skip an invisible newer
+  version → `CheckForSerializableConflictOut`.
+
+### A5. Shared memory and lifecycle
+
+- `shmem_request_hook` / `shmem_startup_hook`, LWLock tranches, DSA / dshash,
+  condition variables.
+- `RegisterXactCallback` / `RegisterSubXactCallback`: drop a transaction's
+  locks and mutation map on abort; on subtransaction abort drop only entries
+  tagged with that subxid.
+- ResourceOwner: pins on roots and nodes are released on error.
+
+## B. Core patches the fork owns
+
+| # | Gap | Patch point | Why |
+|---|---|---|---|
+| B1 | Atomic commit publish | `CommitTransaction` between `RecordTransactionCommit` and `ProcArrayEndTransaction` (`src/backend/access/transam/xact.c`), and the prepared path | Branch roots must change at the instant the xid becomes visible |
+| B2 | Snapshots carry a root epoch | `SnapshotData`, `GetSnapshotData` (`procarray.c`), snapmgr copy/serialize, exported and parallel snapshots | A snapshot must map to exactly one root set, consistent with heap tables in the same transaction |
+| B3 | Standby visibility | `xact_redo_commit` | On a hot standby, roots become visible exactly when the commit record replays |
+| B4 | Checkpoint and node I/O | Add an `smgrsw[]` entry (`src/backend/storage/smgr/smgr.c`, static today) so nodes are buffer-manager pages, **or** add a hook in `CheckPointGuts` | No checkpoint hook exists for extensions. The smgr route makes nodes Postgres pages (≤ `BLCKSZ`), which is the starting assumption of the Postgres-native foundation (`04-candidate-designs.md`). **Biggest single decision in B** |
+| B5 | 2PC | New `TWOPHASE_RM_*` id (fixed list in `twophase_rmgr.h`) | PREPARE persists the mutation map and locks; recovery re-acquires locks |
+| B6 | Key encoding | New opclass → encoder registry | memcmp keys for every btree opclass and collation, with a comparator fallback |
+| B7 | Row identity | None (synthetic TID + map in the tree), or variable-width row ids in `ItemPointer` users | TIDs flow through index scans, triggers, EPQ, `CURRENT OF`, `ctid` |
+| B8 | Parallel workers see the leader's writes | `InitializeParallelDSM` / `EnterParallelMode` | The private mutation map must be in DSA, or flushed to a private root, before workers start |
+| B9 | Branches | `namespace.c` (schema lookup and search path), `InitPostgres` | `public@branch` schema names, `dbname=db/branch` connection strings |
+
+## C. Sketch of the tree's internal API
+
+All engines implement this so the A/B adapters, the tests and the benchmark
+harness are shared. Names are provisional.
+
+```c
+/* roots & snapshots */
+PtRootSet  *pt_snapshot_roots(Snapshot snap);
+PtCursor   *pt_seek(PtRootSet *rs, PtTxn *txn, PtTree t, PtKey k, CommandId cid);
+bool        pt_next(PtCursor *c, PtKey *k, PtValue *v);
+uint64      pt_count_range(PtRoot r, PtKey lo, PtKey hi);
+
+/* private writes */
+void        pt_put(PtTxn *txn, PtTree t, PtKey k, PtValue v, CommandId cid);
+void        pt_delete(PtTxn *txn, PtTree t, PtKey k, CommandId cid);
+void        pt_subxact_rollback(PtTxn *txn, SubTransactionId sub);
+
+/* coordination (implemented by K1/K2/K3, see 04) */
+PtLockResult pt_lock(PtTxn *txn, PtTree t, PtKey k, LockTupleMode m,
+                     LockWaitPolicy w, PtLockFailure *out);
+PtLockResult pt_intent_insert(PtTxn *txn, PtTree t, PtKey k, uint32 spec_token,
+                              PtLockFailure *out);
+void         pt_range_lock(PtTxn *txn, PtTree t, PtKey lo, PtKey hi);
+void         pt_release_all(PtTxn *txn);
+
+/* commit path */
+void        pt_precommit(PtTxn *txn);
+void        pt_publish(PtTxn *txn);
+XLogRecPtr  pt_log(PtTxn *txn);
+void        pt_prepare(PtTxn *txn);
+
+/* durability & housekeeping */
+void        pt_checkpoint(void);
+void        pt_redo(XLogReaderState *rec);
+void        pt_install_roots(PtBranch b, PtRootSet *rs);
+void        pt_gc_roots(void (*cb)(PtHash, void *), void *arg);
+
+/* canonical form (required of every engine, see 05) */
+PtHash      pt_canonical_root(PtRootSet *rs, PtTree t);
+void        pt_export_chunks(PtRootSet *rs, PtTree t, PtChunkSink *sink);
+```
+
+## Invariants
+
+1. Hashes cover canonical content only. Nothing transactional (locks, xids,
+   markers, physical locations) is ever part of a hashed chunk.
+2. A snapshot sees exactly one root set (or, in D4, one visibility cut), and it
+   agrees with procarray visibility for every xid.
+3. A lock entry never outlives its transaction or subtransaction, except for
+   prepared transactions and the commit markers below.
+4. Commit publish never fails on conflicts: anything that could conflict was
+   locked earlier, so the rebase at commit is mechanical.
+5. Node rewrites (splits, merges, boundary shifts) preserve lock entries by
+   key and notify SSI.
+6. Table and index trees always come from the same root set.
+7. **All engines produce identical canonical chunks and root hashes for the
+   same logical data** (see `05-storage-targets.md`).
+
+## Three design changes found necessary for option 8
+
+These came out of checking option 8 against the interfaces above. They apply
+to any copy-on-write engine (D1–D3) that uses K2.
+
+1. **Ordered commit pipeline.** Rebasing under `ProcArrayLock` would stall every
+   snapshot cluster-wide. Instead:
+   1. rebase under a per-branch commit lock, write the WAL record, enqueue the
+      new root in branch commit order, release the lock **before** fsync;
+   2. flush with normal group commit;
+   3. publish roots in queue order in `ProcArrayEndTransaction` (an O(1) pointer
+      swap once every predecessor is visible).
+
+   Abort after rebase is impossible short of PANIC, so the queue has no gaps.
+   This is the most performance-critical code in the system.
+2. **Commit markers kept until the xmin horizon.** REPEATABLE READ's "could not
+   serialize access due to concurrent update" and SSI's conflict-out checks
+   need to know a key was written by a transaction that committed after the
+   reader's snapshot. On commit, lock entries become
+   `COMMITTED_WRITE(key, xid)` markers, kept (unhashed, unpersisted) until the
+   xmin horizon passes them.
+3. **Per-version TIDs derived from content.** Non-prolly index AMs (GiST, GIN,
+   BRIN, pgvector, bloom) assume one TID names one row version.
+   `TID = hash48(pk ‖ hash(row content))`, plus a TID → (key, content hash) map
+   with collision probing (≈ one expected collision at 16M rows). Dead TIDs for
+   `ambulkdelete` = diff(root at last vacuum, current root). Long-term fix:
+   wide row identifiers (B7).
+
+## What can only be emulated
+
+| Feature | Treatment |
+|---|---|
+| `xmin` / `xmax` / `cmin` / `cmax` columns | Synthetic. A content-derived `xmin` that changes only when the row changes keeps ORMs that use it as an optimistic-concurrency token working; `age(xmin)` is meaningless. D4 may be able to expose real values |
+| `ctid` as a physical location | Synthetic |
+| `pageinspect`, `pg_visibility`, heap amcheck, `pg_surgery`, `pg_repack` | Need prolly equivalents |
