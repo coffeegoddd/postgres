@@ -15,7 +15,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); sizes still to be measured |
 | Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
 | Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
-| Root layout, caches, refs, schema merge, shared catalogs (23, 26, 27, 32–34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
+| Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root |
+| Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
 ## Questions
@@ -217,6 +218,11 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 33. **Root layout.** One flat map from relation identity to trees, or a
     catalog sub-root beside a user-data sub-root (so "schema changed?" is one
     hash comparison)? Needed for step 4c.
+    **Decided 2026-10-13 (user):** two sub-roots. A branch's root points to
+    a catalog sub-root (every catalog's trees) and a user-data sub-root (user
+    tables' data and index trees). Schema changes are one hash comparison,
+    diff can skip whichever side didn't change, and the canonical schema is
+    derived from the catalog sub-root alone.
 34. **Keyless catalogs.** `pg_depend` and `pg_shdepend` have no unique key.
     Key their trees by row content hash with a count (Dolt's keyless tables),
     or by a synthetic row id?

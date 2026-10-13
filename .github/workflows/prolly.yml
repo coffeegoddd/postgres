@@ -1,0 +1,62 @@
+# CI for the prolly storage fork: every push builds and runs the tests that
+# must pass before a branch is merged into master.  (Upstream's pg-ci.yml is
+# left as it is; it only runs when the PG_CI_ENABLED variable is set.)
+
+name: prolly
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prolly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libipc-run-perl libreadline-dev libssl-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          ./configure --enable-cassert --enable-debug --enable-tap-tests --with-openssl
+          make -s -j4
+          make -s -j4 -C contrib
+
+      - name: Postgres regression tests
+        run: make check
+
+      - name: Prolly interface conformance and recovery (test_prolly)
+        run: make -C src/test/modules/test_prolly check
+
+      - name: pg_waldump (prolly resource managers)
+        run: make -C src/bin/pg_waldump check
+
+      - name: Requirements suite, validated against heap
+        run: make -C src/test/prolly check-heap
+
+      - name: Benchmark harness unit tests
+        working-directory: src/tools/prolly_bench
+        run: python3 -m unittest discover -s tests
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            **/regression.diffs
+            **/tmp_check/log/*
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore

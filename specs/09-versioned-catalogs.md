@@ -101,10 +101,10 @@ hints, node locations).
 
 ## 2. Proposals (direction agreed 2026-10-13; open until built)
 
-- **Root layout.** A branch's working-set root maps relation identity to the
-  relation's trees (data tree, index trees). Catalogs are entries like any
-  relation. Flat map or a catalog sub-root beside a data sub-root is open
-  (question 33).
+- **Root layout** (decided 2026-10-13, question 33). A branch's root points
+  to two sub-roots: a **catalog sub-root**, mapping each catalog to its
+  trees, and a **user-data sub-root**, mapping each user relation to its
+  data and index trees. "Did the schema change?" is one hash comparison.
 - **Catalog indexes are prolly index trees** in the same root (required:
   a heap btree index isn't versioned, so it would point at rows that don't
   exist on the branch). Each catalog's primary tree is keyed by its unique
