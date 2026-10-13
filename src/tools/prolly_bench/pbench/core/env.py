@@ -104,6 +104,9 @@ def warnings(env: dict[str, Any]) -> list[str]:
     try:
         fs = env["filesystem"]["filesystems"][0]
         if fs["fstype"] == "btrfs":
+            w.append("data directory is on btrfs: device bytes include a large "
+                     "per-fsync filesystem cost (open question 20); compare WAL "
+                     "bytes for write volume")
             if "C" not in env["data_root_attributes"].split()[0]:
                 w.append("data directory is on btrfs with copy-on-write on")
             elif "compress" in fs.get("options", ""):

@@ -80,4 +80,8 @@ Nothing below is decided. Update this file when something is.
     to show. Options for step 3: run the data directory on a dedicated
     ext4/XFS partition or device, or report device bytes with this caveat.
     Not yet confirmed with a filesystem-level trace.
+    **Decided for now (2026-10-13):** no separate partition or device. Runs
+    stay on the btrfs `/home` with the data directory copy-on-write-free;
+    device bytes are reported with this caveat, and WAL bytes per
+    transaction are the cleaner measure of write volume.
 
