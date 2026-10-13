@@ -18,9 +18,12 @@
 #include "postgres.h"
 
 #include "catalog/pg_class.h"
+#include "access/xact.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "test_prolly.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #define NREL		200			/* relids per sub-root */
 #define NTREES		12			/* distinct relation trees */
@@ -402,6 +405,100 @@ rootlayout_subroots_independent(const ProllyImplInfo *impl)
 	}
 }
 
+/*
+ * apply() of one edit, in its own subtransaction: the error message if it
+ * failed, or NULL if it succeeded.
+ */
+static char *
+apply_error(Fixture *f, const ProllyNodeRef *root, const ProllyRootEdit *e)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	char	   *message = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		ProllyNodeRef newroot;
+
+		PROLLY_CALL(f->rl, apply, &f->env, root, e, 1, &newroot);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		message = edata->message;
+	}
+	PG_END_TRY();
+	return message;
+}
+
+/*
+ * A reference whose hash length is 0 or too long is refused, so a root
+ * never holds one that lookup() can't read back.
+ */
+void
+rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl)
+{
+	Fixture		f;
+	ProllyNodeRef root;
+	static const int bad_lengths[] = {0, PROLLY_HASH_MAX_LEN + 1, 255};
+
+	make_fixture(impl, &f);
+	PROLLY_CALL(f.rl, empty, &f.env, &root);
+
+	for (int sub = 0; sub < PROLLY_NUM_SUBROOTS; sub++)
+	{
+		for (int b = 0; b < lengthof(bad_lengths); b++)
+		{
+			ProllyRootEdit e;
+			char	   *message;
+
+			/* A real tree's reference, with its block hint, but a bad hash. */
+			memset(&e, 0, sizeof(e));
+			e.sub = (ProllySubRoot) sub;
+			e.relid = relid_of(sub, 1);
+			e.tree = f.trees[3];
+			e.tree.hash.len = (uint8) bad_lengths[b];
+			e.is_remove = false;
+
+			message = apply_error(&f, &root, &e);
+			if (message == NULL)
+				elog(ERROR, "apply accepted a reference with hash length %d in sub-root %d",
+					 bad_lengths[b], sub);
+			if (strstr(message, "invalid hash length") == NULL)
+				elog(ERROR, "apply refused hash length %d for the wrong reason: %s",
+					 bad_lengths[b], message);
+		}
+	}
+
+	/* The root is still usable, and a valid reference is accepted. */
+	{
+		ProllyRootEdit e;
+		ProllyNodeRef newroot;
+		ProllyNodeRef got;
+
+		memset(&e, 0, sizeof(e));
+		e.sub = PROLLY_SUBROOT_USER_DATA;
+		e.relid = relid_of(PROLLY_SUBROOT_USER_DATA, 1);
+		e.tree = f.trees[3];
+		PROLLY_CALL(f.rl, apply, &f.env, &root, &e, 1, &newroot);
+		if (!PROLLY_CALL(f.rl, lookup, &f.env, &newroot, e.sub, e.relid, &got) ||
+			!same_hash(&got, &f.trees[3]))
+			elog(ERROR, "a valid reference was not stored after rejected ones");
+	}
+}
+
 typedef struct DiffSeen
 {
 	const Fixture *f;
@@ -551,43 +648,54 @@ in_set(const HashSet *s, const ProllyHash *h)
 	return false;
 }
 
+/*
+ * Every node a root depends on is visited: the branch root, every node of
+ * both sub-root trees (not just their top nodes), and every node of every
+ * relation tree.  This is what reclamation must keep.
+ */
 void
 rootlayout_walk_reaches_trees(const ProllyImplInfo *impl)
 {
 	Fixture		f;
 	Ref			ref;
+	Ref			full;
 	ProllyNodeRef root;
 	HashSet		all = {0};
-	pg_prng_state rng;
 
 	make_fixture(impl, &f);
-	pg_prng_seed(&rng, 5);
+
+	/* Every slot full, so each sub-root tree spans several nodes. */
 	ref_clear(&ref);
+	for (int s = 0; s < NSLOTS; s++)
+		full.tree[s] = s % NTREES;
 	PROLLY_CALL(f.rl, empty, &f.env, &root);
-	random_batch(&f, &rng, 300, &ref, &root);
+	apply_to(&f, &ref, &full, &root);
 	PROLLY_CALL(f.rl, walk, &f.env, &root, collect_node, &all);
 
 	if (!in_set(&all, &root.hash))
 		elog(ERROR, "walk did not visit the branch root");
+
+	/* The layout's own trees; walking them needs no key order. */
 	for (int sub = 0; sub < PROLLY_NUM_SUBROOTS; sub++)
 	{
 		ProllyNodeRef s;
+		HashSet		nodes = {0};
 
 		PROLLY_CALL(f.rl, subroot, &f.env, &root, (ProllySubRoot) sub, &s);
-		if (!in_set(&all, &s.hash))
-			elog(ERROR, "walk did not visit sub-root %d", sub);
+		PROLLY_CALL(f.env.tree, walk, &f.tenv, &s, collect_node, &nodes);
+		if (nodes.n < 2)
+			elog(ERROR, "sub-root %d has only %d node; the test needs a multi-node mapping tree",
+				 sub, nodes.n);
+		for (int i = 0; i < nodes.n; i++)
+			if (!in_set(&all, &nodes.hashes[i]))
+				elog(ERROR, "walk missed node %d of %d of sub-root %d", i, nodes.n, sub);
 	}
 
 	/* Every node of every relation tree present. */
 	for (int j = 0; j < NTREES; j++)
 	{
-		bool		present = false;
 		HashSet		nodes = {0};
 
-		for (int s = 0; s < NSLOTS && !present; s++)
-			present = ref.tree[s] == j;
-		if (!present)
-			continue;
 		PROLLY_CALL(f.env.tree, walk, &f.tenv, &f.trees[j], collect_node, &nodes);
 		for (int i = 0; i < nodes.n; i++)
 			if (!in_set(&all, &nodes.hashes[i]))

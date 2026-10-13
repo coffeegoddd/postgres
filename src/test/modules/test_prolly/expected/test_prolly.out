@@ -264,6 +264,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  root_layout     | subroots       | history_independent                     | pass
  root_layout     | subroots       | subroots_independent                    | pass
  root_layout     | subroots       | diff_reports_changes                    | pass
+ root_layout     | subroots       | apply_rejects_invalid_refs              | pass
  root_layout     | subroots       | walk_reaches_trees                      | pass
  root_layout     | subroots       | complete                                | pass
  root_layout     | stub           | identity                                | pass
@@ -272,9 +273,10 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  root_layout     | stub           | history_independent                     | not implemented (missing empty, apply, lookup, scan)
  root_layout     | stub           | subroots_independent                    | not implemented (missing empty, apply, subroot)
  root_layout     | stub           | diff_reports_changes                    | not implemented (missing empty, apply, diff)
+ root_layout     | stub           | apply_rejects_invalid_refs              | not implemented (missing empty, apply, lookup)
  root_layout     | stub           | walk_reaches_trees                      | not implemented (missing empty, apply, subroot, walk)
  root_layout     | stub           | complete                                | not implemented (7 of 7 callbacks missing)
-(221 rows)
+(223 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

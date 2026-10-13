@@ -33,7 +33,9 @@
  *   Setting a relation that is present replaces its tree; removing one that
  *   is absent does nothing.
  * - A relation's tree is referenced by hash only (no block hint), so the
- *   layout stays free of physical locations.
+ *   layout stays free of physical locations.  apply() rejects a reference
+ *   whose hash length is 0 or above PROLLY_HASH_MAX_LEN, before changing
+ *   anything, so a root never holds a reference that can't be read back.
  * - Errors are raised with ereport().
  *
  * Provisional (v0).
