@@ -11,8 +11,15 @@ databases. So these are **fixed for the whole format** and never vary by device
 or engine:
 
 - chunk boundaries: the chunker algorithm, its parameters and target size;
-- node encoding and key encoding;
-- the hash function.
+- node encoding, key encoding and row (value) encoding;
+- the hash function;
+- the canonical schema and object identity (by name, never by OID).
+
+The same rule holds across **history**, not only across engines and
+devices: a table's canonical form depends only on its current logical
+content, never on the DDL or DML that produced it
+(`09-versioned-catalogs.md` part 1). Local, physical details (OIDs,
+dropped-column slots, statistics, block locations) never enter it.
 
 If a table on NVMe and its clone on cloud storage chunked differently, their
 roots would differ and every diff would show the whole table changed.
@@ -27,7 +34,8 @@ canonical chunks either way.
 
 **Required test (write it first):** load the same logical data through every
 engine, with different write orders and update histories, and assert identical
-root hashes and identical exported chunk sets.
+root hashes and identical exported chunk sets. Its history half is
+correctness gate 6 in `06-benchmarking.md`.
 
 ## Granularity of the choice
 

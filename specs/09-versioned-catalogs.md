@@ -1,14 +1,159 @@
-# 09. Versioned catalogs
+# 09. Versioned schema and canonical form
 
-**Decided (user, 2026-10-13):** every system catalog, per-database and
-cluster-wide, is a prolly table, so schema is versioned with data
-(`08-open-questions.md`, questions 5 and 21). Catalog reads go through the
-session's branch root; DDL writes into the branch. This file records what
-Postgres assumes about catalogs being heap, from a survey of the source on
-2026-10-13, and what each assumption means for the design. The mechanism for
-each item is **not decided** unless it says so.
+**Goal (user, 2026-10-13):** be true to Postgres and true to Dolt. Schema is
+versioned with data, a commit's hash is determined by its logical content
+alone (not by the operations that produced it), and clone and push work
+between clusters without identifier collisions.
 
-## Summary
+This file has three parts:
+
+1. **The design** that meets that goal: decided 2026-10-13.
+2. **Proposals** for the remaining mechanisms: the user agreed with the
+   direction on 2026-10-13, but each is open until built and confirmed.
+3. **The survey** of what Postgres assumes about catalogs being heap tables
+   (2026-10-13), and what each assumption implies.
+
+## 1. The design (decided 2026-10-13)
+
+### Two layers: Postgres-native working set, canonical commits
+
+- **The working set is Postgres-native.** Every system catalog, per-database
+  and cluster-wide, is a prolly table on the branch (questions 5 and 21), with
+  ordinary rows carrying local OIDs. syscache, relcache, the planner and DDL
+  code work unchanged, and DDL keeps Postgres's speed: `ADD COLUMN … DEFAULT`
+  stays instant.
+- **Version-control operations work on canonical form:** version-control
+  commit, diff, merge, clone, push and fetch. Canonical form has no OIDs, no
+  physical layout, no history; it is portable between platforms and clusters.
+  The hash promise is a promise about **commits**, as in Dolt.
+- **Working set, staged, commit, as in Dolt.** A SQL `COMMIT` publishes a new
+  working-set root for the branch; a version-control commit (`prolly_commit`)
+  produces a commit with a canonical root. Staging follows Dolt's model.
+
+### Identity by name
+
+- Objects are identified in canonical form by name: a relation by qualified
+  name, a function by qualified name and argument types, a type by qualified
+  name, a role by name. This is what Dolt does for tables; random identifiers
+  were rejected because two branches that independently create the same table
+  must hash the same.
+- A rename is a removal and an addition with identical content; diff reports
+  it as a rename by matching content hashes (as git detects renames).
+- OIDs are local to a cluster. Each cluster maps canonical identity to local
+  OIDs; clone, fetch and merge assign local OIDs. When two branches each
+  create `public.t`, merge treats them as the same table, as Dolt does.
+
+### Canonical schema, derived from the catalogs
+
+- Catalog trees hold Postgres-native rows (option "b"; storing canonical rows
+  and translating on every catalog read was rejected).
+- A **canonicalizer**, behind its own interface, derives the canonical schema
+  from catalog rows:
+  - drops local-only columns (the row's `oid`, `relfilenode`, statistics,
+    `relfrozenxid`, …);
+  - replaces OID references with canonical names, using the `BKI_LOOKUP`
+    annotations Postgres already keeps on catalog columns (the metadata
+    `genbki.pl` uses to turn names into OIDs at initdb);
+  - stores expressions held as node trees (defaults, index expressions,
+    constraints, views, policies) as SQL from Postgres's deparser
+    (`ruleutils.c`).
+- It runs at version-control commit, diff, merge and transfer, incrementally
+  over changed catalog rows, not at every SQL commit.
+- A commit records two roots: the **canonical root**, which is hashed and
+  transferred, and the **local root** (catalog trees with local OIDs), which
+  stays on the cluster so checking out an old commit is immediate. Clone and
+  fetch rebuild local catalogs from the canonical form.
+
+### Canonical rows
+
+- Data trees are hashed as they are written (D1), so rows are stored in
+  canonical form from the start. A canonical value encoding replaces the
+  `heaptuple` encoding as the default (question 12, changed): live columns
+  only, in logical order, trailing NULLs omitted, enums by label, user types
+  inside arrays and composites by canonical name, fixed byte order, no
+  padding. Rows are decoded into Postgres's tuple layout with the mapping
+  Postgres already uses for dropped columns (`TupleConversionMap`).
+- Key encodings follow the same rule: no local OIDs in key bytes.
+- Rows written or updated are always canonical: the encoder skips dropped
+  columns and fills in missing defaults. Rows untouched since a DROP COLUMN
+  or an ADD COLUMN with a default are canonicalized at the next
+  version-control commit, by rewriting the affected tables, so DDL stays
+  instant and the cost is paid once, at commit, on tables whose layout
+  changed.
+
+### Scope and a correctness gate
+
+- Canonicalizer coverage grows by object kind: tables, columns, types,
+  constraints, indexes, defaults and sequences first; then views, functions,
+  policies and the rest. A version-control commit touching an object kind not
+  yet covered fails with a clear error; it never produces a hash that might
+  depend on history.
+- **History-independence gate** (`06-benchmarking.md`, gate 6): the same
+  logical state reached through different histories (different DDL orders,
+  insert/delete churn, different clusters) must give identical commit hashes.
+
+### Not hashed
+
+Statistics, `relfrozenxid`, relfilenodes, OIDs, and physical layout (block
+hints, node locations).
+
+## 2. Proposals (direction agreed 2026-10-13; open until built)
+
+- **Root layout.** A branch's working-set root maps relation identity to the
+  relation's trees (data tree, index trees). Catalogs are entries like any
+  relation. Flat map or a catalog sub-root beside a data sub-root is open
+  (question 33).
+- **Catalog indexes are prolly index trees** in the same root (required:
+  a heap btree index isn't versioned, so it would point at rows that don't
+  exist on the branch). Each catalog's primary tree is keyed by its unique
+  key; `pg_depend` and `pg_shdepend` have none, and are keyed by row
+  content hash with a count, or by a synthetic row id (question 34).
+- **Catalog snapshot** = the latest committed working-set root of the
+  session's branch, refreshed when Postgres refreshes it today (on
+  invalidation). A transaction's own catalog changes come from its private,
+  command-id-tagged writes, the same mechanism as user tables (4e).
+- **Caches:** checking out a branch resets the backend's caches, as a
+  shared-invalidation overflow does today. Invalidation messages stay
+  broadcast to every backend whatever its branch (extra invalidation is
+  always safe). Relcache init files are keyed by the catalog root's hash.
+  Per-branch cache sets (switching without a reset) are an optimization for
+  later, if measured to matter (question 23).
+- **DDL locks** stay global by OID (DDL on one branch blocks use of the table
+  on another): safe and unchanged. Branch-qualified lock tags are a later
+  option.
+- **In-place updates** (statistics, `relfrozenxid`, survey §2) become
+  unversioned side records, not catalog changes, so they never appear in
+  diffs. Dolt doesn't version statistics either.
+- **relfilenode** no longer locates data (the root does); it stays as a
+  counter that changes on TRUNCATE and rewrites, for code that expects that.
+- **Refs and bootstrap.** Branch heads can't live in a versioned catalog.
+  A small refs file per database (branch names and root hashes), WAL-logged
+  and replaced atomically like the relation mapper's `pg_filenode.map`, is
+  read at startup to find the default branch's catalog trees. It replaces
+  the nailed relations, `formrdesc` and the relation mapper as the way in
+  (question 32).
+- **Cluster-wide catalogs** (question 27): either cluster-level branches for
+  shared catalogs, separate from per-database branches, or versioned history
+  without branching. Carrying shared catalogs inside each database's branch
+  conflicts with Postgres's startup order (`pg_database` is read before a
+  database is chosen).
+- **Schema merge:** three-way merge of catalog rows, then checks: catalog
+  unique keys catch name collisions (two branches creating `public.foo`
+  differently), `pg_depend` catches dependencies on removed objects, and
+  rebuilding the relcache for every changed relation lets Postgres validate
+  the merged definitions (question 26).
+- **ADD and DROP COLUMN in merges:** Postgres's tuple layout tolerates
+  schema evolution, so a branch that added a column merges with a branch
+  that inserted rows without migrating rows. Changes that rewrite a table
+  (`ALTER COLUMN TYPE`) against concurrent row changes are real conflicts, as
+  in Dolt.
+
+## 3. Survey: what Postgres assumes about heap catalogs
+
+From a survey of the source on 2026-10-13. The mechanism for each item is
+**not decided** unless it says so.
+
+### Summary
 
 Catalog **reads** are mostly table-AM neutral already: `systable_*` uses
 slots, the catcache sits on `systable_*`, and `table_beginscan_catalog` is
@@ -29,9 +174,9 @@ catalogs can be opened before catalogs are readable.
 | 8 | CLUSTER/VACUUM FULL/REINDEX on catalogs, catalog TOAST, pg_upgrade, amcheck | About 15 sites | Medium |
 | 9 | Shared catalogs read before a database is chosen | About 25 sites | Medium |
 
-## Details and what they imply
+### Details and what they imply
 
-### 1. Writes
+#### 1. Writes
 
 - `CatalogTupleInsert`/`Update`/`Delete`, `CatalogTupleInsertWithInfo`,
   `CatalogTupleUpdateWithInfo` and `CatalogTuplesMultiInsertWithInfo`
@@ -49,7 +194,7 @@ catalogs can be opened before catalogs are readable.
 - Also direct: bootstrap's `InsertOneTuple` (`bootstrap.c`), how initdb loads
   every catalog row; and catalog TOAST writes (`toast_internals.c`).
 
-### 2. In-place updates
+#### 2. In-place updates
 
 - `systable_inplace_update_begin/finish/cancel` (`genam.c`) assume a buffer
   heap tuple slot and call `heap_inplace_lock`, `heap_inplace_update_and_unlock`
@@ -68,9 +213,10 @@ catalogs can be opened before catalogs are readable.
   table-AM in-place callback that the prolly AM implements as a
   non-versioned side record; or making these ordinary transactional updates,
   which changes their semantics (and, with versioning, means statistics and
-  frozen-xid values would differ by branch and show up in diffs).
+  frozen-xid values would differ by branch and show up in diffs). Proposed:
+  unversioned side records (part 2).
 
-### 3. Reads that bypass the AM
+#### 3. Reads that bypass the AM
 
 - `heap_getnext` raises an error for any non-heap AM; 34 catalog scan loops
   use it and must become `table_scan_getnextslot`.
@@ -85,7 +231,7 @@ catalogs can be opened before catalogs are readable.
   database from a template can be a copy of the template's root set, with no
   file copying.
 
-### 4. `xmin` and `ctid` of catalog tuples
+#### 4. `xmin` and `ctid` of catalog tuples
 
 - Function caches decide whether a cached function is current by `pg_proc`
   `xmin` and TID: `funccache.c` (PL/pgSQL, SQL functions), `fmgr.c` (C
@@ -98,9 +244,9 @@ catalogs can be opened before catalogs are readable.
 - **Implication:** the AM must supply a per-version identity that changes
   whenever a row version changes (an emulated `xmin`, or a version token
   derived from the content hash), or these sites move to invalidation
-  callbacks.
+  callbacks (question 24).
 
-### 5–6. Bootstrap, nailed catalogs, relation mapper
+#### 5–6. Bootstrap, nailed catalogs, relation mapper
 
 - Heap is hardcoded: `bootparse.y` (every catalog created with
   `HEAP_TABLE_AM_OID`), `pg_class.h` (`relam` default), `formrdesc` and
@@ -114,7 +260,7 @@ catalogs can be opened before catalogs are readable.
   its relfilenumber; the mapper would still name catalogs, but VACUUM FULL
   and CLUSTER on catalogs would publish a new root rather than swap files.
 
-### 7. Horizons, freezing, logical decoding
+#### 7. Horizons, freezing, logical decoding
 
 - Catalog row versions must be kept until `catalog_xmin` of replication
   slots (procarray horizons), or logical decoding and standby catalog reads
@@ -145,7 +291,7 @@ catalogs can be opened before catalogs are readable.
   - Separately, decoding prolly table data needs row-level change records
     under `wal_level = logical`, since D1 logs whole nodes.
 
-### 8. Other
+#### 8. Other
 
 - CLUSTER/VACUUM FULL/REPACK and REINDEX on catalogs have catalog-specific
   paths (`repack.c`, `heapam_handler.c`), including tolerating in-progress
@@ -154,7 +300,7 @@ catalogs can be opened before catalogs are readable.
 - pg_upgrade copies some catalog files physically and freezes catalogs;
   amcheck, pageinspect, pgstattuple and pg_visibility are heap-only.
 
-### 9. Shared catalogs before a database is chosen
+#### 9. Shared catalogs before a database is chosen
 
 - Connection start (`postinit.c`) reads `pg_database` and authentication
   reads `pg_authid`/`pg_auth_members`/`pg_db_role_setting` before
@@ -167,13 +313,14 @@ catalogs can be opened before catalogs are readable.
 - **Implication:** the AM must work with no database selected, and reads of
   shared catalogs need a branch to read from before a session has chosen one
   (question 27). A cluster-wide node store (question 1) fits this; the branch
-  question does not have an answer yet.
+  question is open (part 2).
 
-## Consequences already taken into account
+### Consequences already taken into account
 
 - One cluster-wide node store (question 1): shared catalogs need storage
   reachable without a database, and `CREATE DATABASE` becomes a root-set
   copy.
-- Per-branch caches (question 23, leaning).
+- Caches reflect the session's branch (question 23; part 2).
 - Order: versioned catalogs need a complete engine (concurrency, WAL,
-  recovery), so they come in step 4g.
+  recovery), so they come in step 4g, with the canonicalizer and the
+  working-set/commit model.

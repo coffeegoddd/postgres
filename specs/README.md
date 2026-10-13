@@ -19,8 +19,13 @@ control; this project's premise is that we should not have to.
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
 - **Where the work is:** roadmap step 4, building the first engine (D1+K1).
-  Step 4a (hash, node format, chunker, key and value encoders) is built; see
-  the status notes in `07-roadmap.md`. Code lives in
+  Steps 4a (hash, node format, chunker, key and value encoders) and 4b
+  (cluster-wide node store, WAL resource managers) are built; 4a gets a
+  canonical value encoder next. See the status notes in `07-roadmap.md`.
+- **The product goal:** true to Postgres and true to Dolt. Postgres-native
+  working sets; canonical, history-independent version-control commits;
+  schema versioned with data (`09-versioned-catalogs.md`).
+- Code lives in
   `src/backend/access/prolly/` and `src/include/access/prolly_*.h`; the
   benchmark harness in `src/tools/prolly_bench/`.
 - The plan is to **build several candidate designs, benchmark them against
@@ -40,7 +45,7 @@ control; this project's premise is that we should not have to.
 | [06-benchmarking.md](06-benchmarking.md) | The S (storage) and V (version-control) suites: workloads, metrics, environment, procedure, correctness gates, reporting |
 | [07-roadmap.md](07-roadmap.md) | The six-step build order (stubs, harnesses, baseline, first engine, measurement, discussion) and exit criteria |
 | [08-open-questions.md](08-open-questions.md) | Questions that are still open, and who or what decides them; decisions made so far |
-| [09-versioned-catalogs.md](09-versioned-catalogs.md) | Making every system catalog a prolly table: what Postgres assumes about heap catalogs, and what each assumption implies |
+| [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
 
 ## Related local repositories
 
@@ -70,7 +75,9 @@ detail.
 | **Prolly tree** | A B-tree-like search tree whose node boundaries are chosen by a rolling hash over the content, so the same data always produces the same tree. Nodes are content-addressed chunks |
 | **Chunk** | A serialized tree node, identified by the hash of its bytes |
 | **Root** | The hash (or pointer) of a tree's top node. A root identifies an entire table state |
-| **Branch head / working set** | The current mutable root set of a branch |
+| **Branch head / working set** | The current mutable root set of a branch: Postgres-native (local OIDs, catalog rows as Postgres stores them) |
+| **Version-control commit** | A commit made with `prolly_commit` (Dolt's `dolt commit`), as distinct from a SQL `COMMIT`. Its hash covers the canonical form only |
+| **Canonical form** | The OID-free, portable, history-independent form of schema and data that commit hashes cover and clone/push transfer |
 | **Content plane** | The hashed, persisted part of a node |
 | **Coordination plane** | Unhashed state attached to a node: row locks, insert intents, commit markers |
 | **Canonical chunk** | The exact byte form of a node that the hash covers and that push/pull exchange |

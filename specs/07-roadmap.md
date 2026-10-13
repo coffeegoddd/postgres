@@ -119,41 +119,52 @@ in the same mode and configuration as the engine.
 - The first pairing is **D1+K1** (decided 2026-10-13, open question 13):
   immutable copy-on-write on Postgres pages, with a separate lock table. It's
   the simplest engine and the reference point for the others.
-- Decided for this engine: synthetic TIDs with a map (question 2), Postgres
-  tuple format for values (question 12), schema versioned per branch by
-  making all catalogs, shared ones included, prolly tables (question 5;
-  sub-questions 21–27).
-- Starting choices (questions 1, 3, 4): nodes in the table's main fork through
-  the buffer manager; key-only chunk boundaries with a forced split; our own
-  format with SHA-256.
-- Order of work within the step: (4a) hash, key and value encoders, node
-  format, chunker; (4b) node store and WAL; (4c) D1 tree operations; (4d)
-  table and index AM wiring, single writer per table; (4e) concurrency: K1,
-  commit pipeline, root-carrying snapshots (B1, B2); (4f) checkpoint,
-  recovery, reclamation; (4g) V1–V3 and versioned catalogs; (4h) S and V
-  suites and correctness gates.
+- Includes the shared foundation it needs (`04-candidate-designs.md`): node
+  page format, chunker, content hashing, key and value encoding, canonical
+  export, WAL resource managers, commit publish (B1, B2).
+- Includes version-control operations V1–V3 (decided 2026-10-13, open
+  question 14); clone, fetch and push stay stubs.
+- Schema is versioned with data and commit hashes don't depend on history
+  (decided 2026-10-13, `09-versioned-catalogs.md` part 1): every catalog is a
+  prolly table; the working set is Postgres-native; version-control commits
+  are canonical (identity by name, canonical schema derived from the
+  catalogs, canonical portable row encoding).
+- Decided for this engine: synthetic TIDs with a map (question 2); one
+  cluster-wide node store with a hash → block map and per-child block hints
+  (question 1); key-only chunk boundaries with a forced split, and SHA-256,
+  in our own format (questions 3, 4, starting choices).
+- Every piece is an implementation of an interface from step 1; D1 and K1
+  must pass their interfaces' conformance suites.
+
+Order of work within the step:
+
+| | Work |
+|---|---|
+| 4a | Content hash, node format, chunker, key and value encoders. Revisited: a canonical, portable value encoder replaces `heaptuple` as the default, and the key encoder's fallback stops carrying local OIDs (question 12 changed) |
+| 4b | Node store and WAL |
+| 4c | D1 tree operations |
+| 4d | Table and index AM wiring, single writer per table |
+| 4e | Concurrency: K1, commit pipeline, root-carrying snapshots (B1, B2) |
+| 4f | Checkpoint, recovery, reclamation |
+| 4g | V1–V3 and versioned catalogs: catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap |
+| 4h | S and V suites and correctness gates, including the history-independence gate |
 
 **Status (2026-10-13): 4a built.** Implementations `sha256` (content hash),
 `basic` (node format), `keyhash` (chunker), `ordered` (key encoder) and
 `heaptuple` (value encoder) pass their conformance suites in
 `src/test/modules/test_prolly`; deliberately broken versions of the key
 encoder and chunker were checked to fail them. Chunk size targets are
-starting values (`chunker_keyhash.c`), to be set by measurement.
+starting values (`chunker_keyhash.c`), to be set by measurement. Still to do
+for 4a after the canonical-form decision: the canonical value encoder, and
+OID-free key encoding for arrays and composites of user-defined types.
 
 **Status (2026-10-13): 4b built.** One cluster-wide node store (`global`:
 linear-hashing hash → block map, per-child block hints in internal nodes),
-D1's log (`chunks`: full node images), and two WAL resource managers
-(`Prolly`, `ProllyStore`). Conformance checks pass, including 5,000 nodes
-across many map splits; a TAP test replays the store on a standby and
+D1's log (`chunks`: full node images), and two built-in WAL resource
+managers (`Prolly`, `ProllyStore`). Conformance checks pass, including 5,000
+nodes across many map splits; a TAP test replays the store on a standby and
 through crash recovery with `wal_consistency_checking`, and a deliberately
 broken redo was checked to fail it. Not yet: reuse of released blocks (4f).
-- Includes the shared foundation it needs (`04-candidate-designs.md`): node
-  page format, chunker, content hashing, key and value encoding, canonical
-  export, WAL resource manager, commit publish (B1, B2).
-- Includes version-control operations V1–V3 (decided 2026-10-13, open
-  question 14); clone, fetch and push stay stubs.
-- Every piece is an implementation of an interface from step 1; D1 and K1
-  must pass their interfaces' conformance suites.
 
 **Exit criteria:** the S and V suites run against D1+K1, and the correctness
 gates in `06-benchmarking.md` are run, with their status recorded.

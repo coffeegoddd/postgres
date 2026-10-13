@@ -46,18 +46,24 @@ its table.
 - Key encoding must be memcmp-comparable **and** agree with every btree
   opclass and collation (B6).
 
-### A3. Custom WAL resource manager (`RegisterCustomRmgr`, `src/include/access/xlog_internal.h`)
+### A3. WAL resource managers (`RmgrData`, `src/include/access/rmgrlist.h`)
+
+The storage is in core, so its resource managers are built in (listed in
+`rmgrlist.h`) rather than registered with `RegisterCustomRmgr`. Built in step
+4b: `Prolly` for records from the log interface and `ProllyStore` for the
+node store's own structures, with redo dispatched to the implementation named
+in each record (`src/include/access/prolly_xlog.h`).
 
 - `rm_redo`: replay the engine's WAL records (logical mutations, deltas or page
   images depending on the engine), plus root installs (reset, fast-forward,
   checkout).
-- `rm_desc`, `rm_identify`: `pg_waldump`.
+- `rm_desc`, `rm_identify`: `pg_waldump` (generic for now; open question 16).
 - `rm_startup`, `rm_cleanup`: rebuild redo-time branch heads.
 - `rm_mask`: only if nodes are buffer-manager pages.
 - `rm_decode`: logical decoding from row-level records, giving pgoutput and
   logical replication natively. Engines whose WAL is not row-level (D1, D3,
   D4) must also emit row-level information for decoding when
-  `wal_level=logical`.
+  `wal_level=logical`. Deferred past the first engine (open question 31).
 
 ### A4. Locking, waiting, SSI
 
@@ -88,12 +94,13 @@ its table.
 | B1 | Atomic commit publish | `CommitTransaction` between `RecordTransactionCommit` and `ProcArrayEndTransaction` (`src/backend/access/transam/xact.c`), and the prepared path | Branch roots must change at the instant the xid becomes visible |
 | B2 | Snapshots carry a root epoch | `SnapshotData`, `GetSnapshotData` (`procarray.c`), snapmgr copy/serialize, exported and parallel snapshots | A snapshot must map to exactly one root set, consistent with heap tables in the same transaction |
 | B3 | Standby visibility | `xact_redo_commit` | On a hot standby, roots become visible exactly when the commit record replays |
-| B4 | Checkpoint and node I/O | Add an `smgrsw[]` entry (`src/backend/storage/smgr/smgr.c`, static today) so nodes are buffer-manager pages, **or** add a hook in `CheckPointGuts` | No checkpoint hook exists for extensions. The smgr route makes nodes Postgres pages (≤ `BLCKSZ`), which is the starting assumption of the Postgres-native foundation (`04-candidate-designs.md`). **Biggest single decision in B** |
+| B4 | Checkpoint and node I/O | Was: an `smgrsw[]` entry or a `CheckPointGuts` hook. **Decided 2026-10-13: neither.** Nodes are pages of a cluster-wide node store at fixed relation file numbers in the global tablespace, read through the existing smgr (md) and buffer manager, so checkpoints, checksums and full-page writes need no patch (open question 1; built in step 4b) | No checkpoint hook exists for extensions; being in core with ordinary relation files avoids needing one |
 | B5 | 2PC | New `TWOPHASE_RM_*` id (fixed list in `twophase_rmgr.h`) | PREPARE persists the mutation map and locks; recovery re-acquires locks |
 | B6 | Key encoding | New opclass → encoder registry | memcmp keys for every btree opclass and collation, with a comparator fallback |
 | B7 | Row identity | None (synthetic TID + map in the tree), or variable-width row ids in `ItemPointer` users | TIDs flow through index scans, triggers, EPQ, `CURRENT OF`, `ctid` |
 | B8 | Parallel workers see the leader's writes | `InitializeParallelDSM` / `EnterParallelMode` | The private mutation map must be in DSA, or flushed to a private root, before workers start |
-| B9 | Branches | `namespace.c` (schema lookup and search path), `InitPostgres` | `public@branch` schema names, `dbname=db/branch` connection strings |
+| B9 | Branches | `namespace.c` (schema lookup and search path), `InitPostgres` | `public@branch` schema names, `dbname=db/branch` connection strings (one option; not decided) |
+| B10 | Versioned catalogs | `catalog/indexing.c` (`CatalogTuple*` through the table AM), in-place updates (`genam.c`), `heap_getnext` catalog loops, bootstrap (`bootparse.y`, `bootstrap.c`), `relcache.c` (`formrdesc`, nailed relations, init files), relation mapper, cache reset on checkout | Every catalog is a prolly table (decided 2026-10-13). Inventory and proposals in `09-versioned-catalogs.md` |
 
 ## C. Sketch of the tree's internal API
 
@@ -140,7 +147,8 @@ void        pt_export_chunks(PtRootSet *rs, PtTree t, PtChunkSink *sink);
 ## Invariants
 
 1. Hashes cover canonical content only. Nothing transactional (locks, xids,
-   markers, physical locations) is ever part of a hashed chunk.
+   markers, physical locations) and nothing local to a cluster (OIDs,
+   statistics) is ever part of a hashed chunk.
 2. A snapshot sees exactly one root set (or, in D4, one visibility cut), and it
    agrees with procarray visibility for every xid.
 3. A lock entry never outlives its transaction or subtransaction, except for
@@ -152,6 +160,10 @@ void        pt_export_chunks(PtRootSet *rs, PtTree t, PtChunkSink *sink);
 6. Table and index trees always come from the same root set.
 7. **All engines produce identical canonical chunks and root hashes for the
    same logical data** (see `05-storage-targets.md`).
+8. **History independence:** a version-control commit's hash depends only on
+   the logical content (schema and data) it holds, never on the operations
+   that produced it, on the cluster, or on the platform
+   (`09-versioned-catalogs.md`).
 
 ## Three design changes found necessary for option 8
 
@@ -185,6 +197,6 @@ to any copy-on-write engine (D1–D3) that uses K2.
 
 | Feature | Treatment |
 |---|---|
-| `xmin` / `xmax` / `cmin` / `cmax` columns | Synthetic. A content-derived `xmin` that changes only when the row changes keeps ORMs that use it as an optimistic-concurrency token working; `age(xmin)` is meaningless. D4 may be able to expose real values |
+| `xmin` / `xmax` / `cmin` / `cmax` columns | Synthetic (open question 24 for catalog rows). A content-derived `xmin` that changes only when the row changes keeps ORMs that use it as an optimistic-concurrency token working; `age(xmin)` is meaningless. D4 may be able to expose real values |
 | `ctid` as a physical location | Synthetic |
 | `pageinspect`, `pg_visibility`, heap amcheck, `pg_surgery`, `pg_repack` | Need prolly equivalents |

@@ -57,8 +57,10 @@ challenged, but a challenge should say what Postgres facility it gives up.
 - Boundary rule decided deliberately: whether it depends on keys only (stable
   boundaries under value updates, which keeps lock entries and SSI page
   mappings stable) or on bytes too (tighter size control). Open question 3.
-- The boundary hash should be cheap; candidates include Postgres's own
-  `hash_bytes` (`src/common/hashfn.c`) or a rolling hash written for this.
+- The boundary hash should be cheap and identical on every platform.
+  Built (step 4a, `chunker_keyhash.c`): 64-bit FNV-1a over the key, seeded by
+  level, with a splitmix64 finalizer, written out rather than taken from
+  `hash_bytes`, whose output isn't specified across platforms.
 
 ### Content hashing
 
@@ -72,25 +74,35 @@ challenged, but a challenge should say what Postgres facility it gives up.
 - Keys: memcmp-comparable encodings generated from **btree opclasses and
   collations** (B6), so ordering matches what Postgres's planner and
   constraints already assume.
-- Values: the row encoding should reuse Postgres's tuple deforming
-  (`TupleTableSlot`, `slot_deform`) where possible, so existing executor code
-  reads rows without a translation layer. But Postgres's on-disk tuple format is
-  platform-dependent (alignment, endianness), and canonical chunks must be
-  portable between machines for clone/push/pull. Reconciling those is open
-  question 12.
+- Keys carry no local OIDs: encodings of arrays and composites of
+  user-defined types name the type canonically (`09-versioned-catalogs.md`).
+- Values: a canonical, portable row encoding (decided 2026-10-13, question 12
+  changed): live columns only, in logical order, trailing NULLs omitted, enums
+  by label, user types by canonical name, fixed byte order, no padding. Rows
+  are decoded into Postgres's tuple layout with `TupleConversionMap`, so
+  executor code still sees ordinary tuples. Postgres's on-disk tuple format
+  was the first choice but depends on platform and history (dropped columns,
+  catalog-supplied defaults, local OIDs inside values); `heaptuple` remains
+  as an implementation for comparison.
 - Large values: an out-of-line value tree within the same root, replacing
   TOAST for prolly tables, reusing Postgres's compression methods (pglz, lz4).
 
 ### Everything else through Postgres subsystems
 
-- WAL: a resource manager per engine (A3), written in Postgres's WAL style
+- WAL: built-in resource managers (A3), written in Postgres's WAL style
   (`XLogBeginInsert` / `XLogRegisterBuffer` / `XLogInsert`), using
-  full-page images for page-based engines exactly as heap does.
+  full-page images for page-based engines exactly as heap does. Built in
+  step 4b: `Prolly` (records from the log interface) and `ProllyStore`
+  (the node store's own structures); each record names the implementation
+  that wrote it.
 - Locks: `XactLockTableWait`, multixacts, predicate.c (A4).
 - Visibility: snapshots, procarray and commit publish (B1, B2).
-- Branches, refs and the commit graph: stored in Postgres catalogs or system
-  tables, exposed through SQL functions and procedures. How they relate to
-  versioned catalogs is open question 5.
+- Schema: every catalog is a prolly table, versioned with the data; the
+  working set is Postgres-native and version-control commits are canonical
+  (`09-versioned-catalogs.md`).
+- Branches, refs and the commit graph: exposed through SQL functions and
+  procedures. Branch heads can't live in a versioned catalog; where they live
+  is open question 32 (proposed: a WAL-logged refs file per database).
 
 ### Shared pieces every engine uses
 
@@ -99,6 +111,8 @@ challenged, but a challenge should say what Postgres facility it gives up.
 - Content-derived TIDs.
 - **Canonical chunk export** and the cross-engine hash-equivalence test (see
   `05-storage-targets.md`).
+- The schema canonicalizer, the working-set/staged/commit model, and the
+  history-independence test (`09-versioned-catalogs.md`).
 - The benchmark harness (`06-benchmarking.md`).
 
 ## Baseline

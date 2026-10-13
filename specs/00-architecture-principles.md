@@ -59,24 +59,25 @@ AMs (`IndexAmRoutine`), storage managers (`smgrsw`) and WAL resource managers
 Each of these is an interface with the implementations listed. Names are
 provisional.
 
-| Interface | Responsibility | Implementations planned |
+| Interface | Responsibility | Implementations planned (built so far in bold) |
 |---|---|---|
 | **Engine** | The tree as a whole: cursors, private writes, commit, checkpoint, redo, reclamation (`02-postgres-integration.md` section C) | D1, D2, D3a, D3b, D4, (D5), stub |
 | **Coordination** | Row locks, insert intents, range locks, commit markers, SSI mapping | K1, K2, K3, stub |
-| **Node page format** | Layout of a node in a page: canonical region, unhashed special space, item access | One per engine family |
-| **Chunker / boundary rule** | Where node boundaries fall; forced splits | Key-only, key + bytes |
-| **Content hash** | Hashing the canonical region | SHA-256, others if measured |
-| **Key encoder** | memcmp-comparable keys from btree opclasses and collations | Per opclass, plus a comparator fallback |
-| **Value encoder** | Row encoding and deforming into slots | Postgres tuple format, portable canonical format |
-| **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Hash-addressed, location-addressed |
+| **Node page format** | Layout of a node in a page: canonical region, unhashed special space, item access, per-child block hints | One per engine family (**basic**) |
+| **Chunker / boundary rule** | Where node boundaries fall; forced splits | Key-only (**keyhash**), key + bytes |
+| **Content hash** | Hashing the canonical region | SHA-256 (**sha256**), others if measured |
+| **Key encoder** | memcmp-comparable keys from btree opclasses and collations; no local OIDs | Per opclass, plus a comparator fallback (**ordered**) |
+| **Value encoder** | Row encoding and deforming into slots | Canonical portable format (the default, decided 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
+| **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Cluster-wide hash-addressed (**global**), location-addressed |
 | **Allocator** | Space management for in-place engines | Fixed-size blocks; variable-size |
 | **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |
-| **Log** | What the WAL records contain and how they are replayed | Full chunk, delta, logical |
+| **Log** | What the WAL records contain and how they are replayed | Full chunk (**chunks**), delta, logical |
 | **Commit pipeline** | Ordering and publishing roots at commit | Single lock, ordered pipeline |
 | **Row identity** | TIDs ↔ keys | Content-derived TID map, wide row ids |
-| **Refs and commit graph** | Branches, commits, history storage | Catalog tables, others |
+| **Refs and commit graph** | Branches, commits, history storage | A refs file per database (proposed; catalogs can't hold refs now that they are versioned), others |
 | **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |
 | **Diff / merge** | Row diff and three-way merge between refs, over canonical trees | Structural diff (added in step 1; see below) |
+| **Schema canonicalizer** | Deriving the canonical, OID-free schema from catalog rows, and rebuilding local catalogs from it | Catalog-driven, using `BKI_LOOKUP` metadata and the deparser (decided 2026-10-13, `09-versioned-catalogs.md`; to be defined in step 4g) |
 | **Benchmark workload** | One S or V workload | S1–S9, V1–V4 |
 | **Metric collector** | One metric source | WAL, diskstats, `pg_stat_io`, perf, engine counters |
 | **Result sink** | Where results go | Files under `specs/results/`, others |
@@ -88,12 +89,13 @@ the Engine interface (`canonical_root`, `export_chunks`); the transfer
 interface covers clone, fetch and push.
 
 The C interfaces (everything above the benchmark rows) were defined in step 1:
-headers `src/include/access/prolly_*.h`. The benchmark workload, metric
+headers `src/include/access/prolly_*.h`, except the schema canonicalizer,
+added to the design on 2026-10-13 and to be defined when step 4g needs it. The benchmark workload, metric
 collector and result sink interfaces belong to the harness and are defined in
 step 2.
 
 The Postgres-facing adapters (the table AM and index AM handlers, the WAL
-resource manager and the core-patch hooks) are thin: they translate Postgres
+resource managers and the core-patch hooks) are thin: they translate Postgres
 calls into calls on these interfaces and contain no engine logic.
 
 ## Performance

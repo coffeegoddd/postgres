@@ -74,8 +74,9 @@ OrioleDB did):
 4. **Durability is the WAL.** Crash recovery, streaming replication, hot
    standby, PITR, `pg_basebackup`, `pg_rewind`, logical decoding and 2PC are
    all built on WAL records.
-5. **Catalogs.** Whether system catalogs are versioned per branch is a separate,
-   large decision.
+5. **Catalogs.** Whether system catalogs are versioned per branch was a
+   separate, large decision. **Decided 2026-10-13:** every catalog is a prolly
+   table, and commits are canonical; see `09-versioned-catalogs.md`.
 
 ## Concurrency options considered so far
 

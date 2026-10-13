@@ -26,6 +26,10 @@ results set records which of these pass:
 4. The cross-engine **hash-equivalence test** (`05-storage-targets.md`), once
    more than one engine exists.
 5. An amcheck-style consistency checker for the engine's on-disk structure.
+6. **History independence** (`09-versioned-catalogs.md` part 1): the same
+   logical state (schema and data) reached through different histories
+   (different DDL orders, insert/delete churn, different clusters) gives
+   identical version-control commit hashes.
 
 A failing gate is reported next to the numbers it affects.
 

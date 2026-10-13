@@ -9,10 +9,14 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Overall concurrency design | Open. Option 8 (coordination in the tree) was the user's stated favorite on 2026-10-12; the current plan is to measure candidates instead of choosing up front |
 | Candidate set (D1–D5, K1–K3, pairings) | Proposed 2026-10-13; agreed as the working plan, not as final designs |
 | Engine per storage type | Open; hypotheses in `05-storage-targets.md` |
-| First engine, its VC scope, row identity, value encoding, versioned schema (2, 5, 12, 13, 14) | Decided by the user 2026-10-13 for step 4; see each question |
-| Node store (1) | Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints; 28–30 open |
-| Versioned schema mechanism (5, 21) | Decided by the user 2026-10-13: all catalogs, shared included, are prolly tables; 22–27 open, leaning to per-branch caches (23) |
-| Node I/O, chunk boundaries, canonical format (1, 3, 4) | Starting choices for step 4 (user, 2026-10-13); can change |
+| First engine and its version-control scope (13, 14) | Decided by the user 2026-10-13: D1+K1, V1–V3 |
+| Row identity (2) | Decided for the first engine 2026-10-13: synthetic TIDs with a map |
+| Node store (1) | Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints. Built (step 4b). 28–30 open |
+| Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); sizes still to be measured |
+| Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
+| Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
+| Root layout, caches, refs, schema merge, shared catalogs (23, 26, 27, 32–34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
+| Logical decoding (31) | Deferred by the user 2026-10-13 |
 
 ## Questions
 
@@ -48,7 +52,9 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    interop? Dolt compatibility would constrain nearly every foundation choice,
    so the default is our own format.
    **Starting choice for the first engine (user, 2026-10-13):** our own format,
-   with SHA-256 through `src/common/cryptohash.c`.
+   with SHA-256 through `src/common/cryptohash.c`. The canonical format also
+   covers schema, identity and row encoding: `09-versioned-catalogs.md`
+   part 1.
 5. **Catalogs.** Are system catalogs versioned per branch? Large and separate.
    **Decided 2026-10-13 (user):** the schema is versioned per branch, from the
    first engine on: a branch, commit, diff and merge carry table definitions
@@ -60,7 +66,12 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    Dolt's "schema in the root value", in Postgres's catalog form. Rejected
    alternatives: materializing a schema stored in the tree into heap
    catalogs on checkout, and an overlay on heap catalogs. Sub-questions are
-   21–26 below.
+   21–27 and 32–35 below.
+   **Decided 2026-10-13 (user): how the Dolt promise is kept.** Catalogs hold
+   Postgres-native rows (local OIDs); a canonical schema, identified by name
+   and free of OIDs, is derived from them at version-control commit, diff,
+   merge and transfer, and is what commit hashes cover. Details in
+   `09-versioned-catalogs.md` part 1.
 6. **Reference counting (D3b).** Can decrements be propagated lazily without
    unbounded backlog after a branch delete? What bounds the background work?
 7. **Cross-branch coordination (axis 4b).** Is per-chunk latching across
@@ -80,6 +91,16 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     **Decided 2026-10-13 for the first engine:** Postgres's tuple format. It's
     an implementation of the value_encoder interface; a portable encoding can
     replace it when clone/push between architectures matters.
+    **Changed the same day (user):** a canonical, portable row encoding
+    replaces it as the default, because commit hashes must not depend on
+    history or platform: heap tuples keep dropped columns, rely on catalog
+    defaults for added columns, and embed local OIDs in enum, array and
+    composite values. Live columns only, logical order, trailing NULLs
+    omitted, enums by label, user types by canonical name, fixed byte order,
+    no padding; decoded into Postgres's tuple layout with
+    `TupleConversionMap`. Rows untouched since a DROP COLUMN or a defaulted
+    ADD COLUMN are rewritten at the next version-control commit. The
+    `heaptuple` implementation stays registered, for comparison.
 13. **First engine.** D1+K1 is proposed for roadmap step 4 because it is the
     simplest and the reference point for the others. Confirm before starting.
     **Decided 2026-10-13:** D1+K1.
@@ -96,7 +117,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     wrote it). Needed before D2+K2 is built.
 16. **WAL description in `pg_waldump`.** The log interface's `desc` and
     `identify` must also run in `pg_waldump`, which is a frontend program
-    without the registry.
+    without the registry. For now (step 4b) the `Prolly` and `ProllyStore`
+    resource managers have generic `desc`/`identify` in
+    `rmgrdesc/prollydesc.c`: the implementation id and record type number,
+    not the payload.
 17. **Index trees on non-prolly tables.** `CREATE INDEX … USING prolly` on a
     heap table is accepted up to `ambuild` today. Should prolly indexes be
     refused on heap tables, or supported?
@@ -126,22 +150,14 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     device bytes are reported with this caveat, and WAL bytes per
     transaction are the cleaner measure of write volume.
 21. **Which catalogs are versioned.** Shared catalogs (`pg_database`,
-    `pg_authid`, `pg_tablespace`, `pg_shdepend`, …) are cluster-wide and
-    presumably stay heap. Which per-database catalogs are versioned: all of
+    `pg_authid`, `pg_tablespace`, `pg_shdepend`, …) are cluster-wide. Do
+    they stay heap, and which per-database catalogs are versioned: all of
     them, or schema only (`pg_class`, `pg_attribute`, `pg_type`, `pg_index`,
     `pg_constraint`, `pg_attrdef`, `pg_namespace`, `pg_depend`, `pg_proc`,
     …) with `pg_statistic` and the like left per database?
     **Decided 2026-10-13 (user):** every catalog is versioned, per-database
     and cluster-wide (shared) alike. (Earlier the same day: shared catalogs
     stay heap; changed by the user.)
-27. **Branch scope of shared catalogs.** Shared catalogs (`pg_database`,
-    `pg_authid`, `pg_tablespace`, `pg_auth_members`, `pg_shdepend`,
-    `pg_db_role_setting`, …) are read before a session has picked a
-    database or branch: authentication reads `pg_authid`, and connection
-    start reads `pg_database`. What branch do those reads see, and are
-    shared catalogs branched per cluster, or per database alongside that
-    database's catalogs? `pg_shdepend` links shared and per-database objects
-    across those scopes.
 22. **Heap-specific catalog code.** Catalog writes go through
     `CatalogTupleInsert`/`Update`/`Delete` (`simple_heap_*`), in-place updates
     (`heap_inplace_update` for `relfrozenxid`, `relhasindex`, statistics),
@@ -152,18 +168,32 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     must not serve one branch's definitions to a session on another.
     Per-branch caches, or invalidation on checkout and on root change?
     **Leaning (user, 2026-10-13):** per-branch caches. Not final until the
-    cache design is worked out.
+    cache design is worked out. Proposal (direction agreed 2026-10-13): a
+    backend's caches reflect its branch by resetting on checkout;
+    invalidation stays broadcast; separate cache sets per branch later if
+    measured to matter (`09-versioned-catalogs.md` part 2).
 24. **Code that reads catalog tuples' xmin/ctid.** Some code reads system
     columns of catalog tuples (for example to detect changed functions or
     for in-place updates). Those must work with synthetic TIDs and
-    emulated xmin, or change.
+    emulated xmin, or change. In-place updates themselves: proposed as
+    unversioned side records (`09-versioned-catalogs.md` part 2).
 25. **Heap user tables in a versioned database.** A heap table's definition
     would change with the branch while its data doesn't. Forbid heap tables
     in a versioned database, or treat their catalog rows as unversioned?
 26. **Schema merge validity.** Merging catalog rows row by row can produce an
     inconsistent schema (a column added on one branch to a table dropped on
     the other; a dependency on a removed object). What checks run after a
-    catalog merge, and how are conflicts reported?
+    catalog merge, and how are conflicts reported? Proposal:
+    `09-versioned-catalogs.md` part 2.
+27. **Branch scope of shared catalogs.** Shared catalogs (`pg_database`,
+    `pg_authid`, `pg_tablespace`, `pg_auth_members`, `pg_shdepend`,
+    `pg_db_role_setting`, …) are read before a session has picked a
+    database or branch: authentication reads `pg_authid`, and connection
+    start reads `pg_database`. What branch do those reads see, and are
+    shared catalogs branched per cluster, or per database alongside that
+    database's catalogs? `pg_shdepend` links shared and per-database objects
+    across those scopes.
+    Options and proposal: `09-versioned-catalogs.md` part 2.
 28. **Temporary and unlogged prolly tables.** The cluster-wide store is
     WAL-logged and in shared buffers. Temporary tables use backend-local
     buffers, and unlogged tables are reset after a crash. Do they get their
@@ -177,4 +207,24 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     measure in step 5.
 31. **Logical decoding of prolly databases.** **Deferred (user,
     2026-10-13)** past the first engine. Approach notes in
-    `09-versioned-catalogs.md` §7.
+    `09-versioned-catalogs.md` part 3, §7.
+32. **Refs and bootstrap.** Branch heads can't be stored in a versioned
+    catalog. Where are they, and how does startup find a branch's catalog
+    trees before any catalog is readable? Proposal: a WAL-logged refs file
+    per database, replaced atomically like `pg_filenode.map`
+    (`09-versioned-catalogs.md` part 2).
+33. **Root layout.** One flat map from relation identity to trees, or a
+    catalog sub-root beside a user-data sub-root (so "schema changed?" is one
+    hash comparison)? Needed for step 4c.
+34. **Keyless catalogs.** `pg_depend` and `pg_shdepend` have no unique key.
+    Key their trees by row content hash with a count (Dolt's keyless tables),
+    or by a synthetic row id?
+35. **Canonicalizer details.**
+    - Expressions are stored as deparsed SQL, but `ruleutils.c` output can
+      change between Postgres versions, which would change hashes on upgrade.
+      Pin a canonical deparse format, or version it with the format stamp?
+    - User data that holds OIDs (`oid` and `reg*` columns, large object
+      references) is local by nature. Translate where the type says what it
+      refers to (`regclass` → name), and refuse or pass through the rest?
+    - Rename detection in diff: by matching content hashes, with what
+      threshold for "same table, changed"?
