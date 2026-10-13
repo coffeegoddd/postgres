@@ -76,6 +76,22 @@ Both suites:
 results for heap; the V suite runs against the stubs and reports every
 workload as not implemented.
 
+**Status (2026-10-13): built, not yet reviewed.** Harness in
+`src/tools/prolly_bench/` (usage in its README; reading notes in
+`06-benchmarking.md`, Harness).
+
+| Exit criterion | Result |
+|---|---|
+| Both suites run end to end | Yes. The quick check (`configs/smoke.toml`) takes about 2.5 minutes for S and 20 seconds for V |
+| S suite complete for heap | 70/70 cells OK, S1–S10, every collector except perf (run with an earlier, larger smoke config) |
+| V suite reports not implemented on the stubs | 8/8 cells `not_implemented` against `prolly_d1`. The V operations past setup (timed statements, background pgbench) were checked separately against a scratch cluster |
+
+Result sets are kept locally under `specs/results/` and not committed.
+
+Not yet exercised: the perf collector (needs `system/system_prepare.sh`),
+and the larger-than-RAM size (open question 18). S10 (sysbench) was added
+during step 2 at the user's request.
+
 ## 3. Demonstrate the harness and record a local baseline
 
 - Run the S suite against stock heap (B0) on the local machine, at the

@@ -42,6 +42,7 @@ A failing gate is reported next to the numbers it affects.
 | S7 | Secondary-index heavy | Tables with several btree indexes, plus one GiST | Index trees from the same root, content-derived TIDs for foreign AMs |
 | S8 | Large transactions | Updates touching 1–10% of a table | Lock memory, mutation-map size, rebase cost |
 | S9 | Mixed OLTP | BenchBase TPC-C (`~/cursor_src/benchbase` exists locally) | Overall realism |
+| S10 | sysbench OLTP | sysbench 1.0 Lua tests, one variant each: `oltp_read_write`, `oltp_read_only`, `oltp_write_only`, `oltp_point_select`, `oltp_update_index`, `oltp_update_non_index`, `oltp_insert`, `select_random_ranges`, `bulk_insert` | Standard OLTP mixes; the tool Dolt and Doltgres publish latency comparisons with, so results can be set beside theirs (for orientation only) |
 
 Scale each workload at two sizes: fits in `shared_buffers`, and several times
 larger than RAM.
@@ -113,3 +114,44 @@ each other.
   confirms or refutes.
 - Store results under `specs/results/<date>-<suite>-<pairing>/` with a short
   README per run.
+
+## Harness
+
+The harness is `src/tools/prolly_bench/` (its README has usage). Choices that
+affect how results are read:
+
+- **Fresh cluster per cell.** Every (workload, size, variant, clients,
+  repetition) cell runs initdb, load, `CHECKPOINT`, warm-up, measurement. That
+  is affordable for sizes that fit in memory; for the larger-than-RAM size,
+  loading per cell is not (open question 18).
+- **Table AM under test** reaches every table through
+  `default_table_access_method`, including tables pgbench and BenchBase
+  create. Indexes, including primary keys, are created with their default AM
+  (btree); see open question 19.
+- **CPU** is measured system-wide (`/proc/stat`) minus the CPU of the client
+  programs (pgbench, BenchBase), which run on the same machine.
+- **Device bytes** come from `/proc/diskstats` for the device holding the data
+  directory, so they include anything else writing to that device. The data
+  directory is made copy-on-write-free on btrfs (`chattr +C`), which also
+  turns off compression for it.
+- **Intermediate output stays off the measured device.** Per-transaction
+  latency logs, BenchBase samples and perf data are written to a per-cell
+  tmpfs directory; only a latency histogram and small summaries are kept with
+  the results. `latency_sampling_rate` (0.1 in the standard config) bounds
+  how much pgbench logs in long, fast windows.
+- **Recovery time** is measured after every cell's window: crash with
+  `pg_ctl -m immediate`, restart, time to accepting connections. The WAL
+  volume replayed (since the last redo point) is recorded with it rather than
+  fixed in advance.
+- **Space amplification** is `pg_total_relation_size` of the workload's tables
+  over the sum of `pg_column_size` of their rows.
+- **V workloads** take a "background" variant (`none` or `S1`); with `S1` the
+  client count is the number of background pgbench clients.
+- **Statuses.** `not_implemented` (SQLSTATE 0A000 from the engine, read from
+  psql or the server log), `unavailable` (a tool is missing),
+  `not_applicable`, `error`. Each says why.
+- **System settings** for a run (governor, boost, perf permissions) are applied
+  and reverted with `system/system_prepare.sh` and `system/system_restore.sh`;
+  every result set records them, and the harness warns when they're not in
+  benchmark mode.
+

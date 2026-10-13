@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Benchmark harness for prolly storage; see README.md.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -B -m pbench "$@"

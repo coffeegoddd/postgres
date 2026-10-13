@@ -1,0 +1,51 @@
+# A quick end-to-end check of the harness (a few minutes): tiny data, one
+# repetition, one client count, short windows, and a subset of variants.
+# Results from it say nothing about performance.
+
+[run]
+repetitions = 1
+clients = [4]
+warmup_seconds = 1
+measure_seconds = 5
+sizes = ["tiny"]
+fio_baseline = true
+fio_seconds = 2
+
+[postgres]
+shared_buffers = "1GB"
+max_wal_size = "4GB"
+checkpoint_timeout = "5min"
+synchronous_commit = "on"
+fsync = "on"
+full_page_writes = "on"
+
+[sizes.tiny]
+pgbench_scale = 5
+s4_rows = 200000
+s7_rows = 50000
+tpcc_warehouses = 1
+v_rows = 10000
+sysbench_tables = 4
+sysbench_table_size = 10000
+
+[workloads.S3]
+ranges = [100]
+
+[workloads.S8]
+percents = [1]
+
+[workloads.S10]
+tests = ["oltp_read_write", "oltp_point_select", "bulk_insert"]
+
+[workloads.V2]
+changes = [100]
+iterations = 3
+
+[workloads.V3]
+changes = [100]
+locality = ["clustered"]
+
+[tools]
+benchbase = "build-bench/benchbase/benchbase-postgres"
+benchbase_source = "~/cursor_src/benchbase"
+benchbase_build_commit_file = "build-bench/benchbase/BUILD_COMMIT"

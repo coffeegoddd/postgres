@@ -59,4 +59,25 @@ Nothing below is decided. Update this file when something is.
 17. **Index trees on non-prolly tables.** `CREATE INDEX … USING prolly` on a
     heap table is accepted up to `ambuild` today. Should prolly indexes be
     refused on heap tables, or supported?
+18. **Loading the larger-than-RAM size.** A fresh ~300 GB load per cell is
+    impractical (5 repetitions x 5 client counts x 9 workloads). Options: load
+    once per workload and size and reuse it across cells (results then depend
+    on cell order), or keep a loaded copy and restore it per cell (a 300 GB
+    copy each time, since the data directory is copy-on-write-free). Needed
+    before step 3 runs that size.
+19. **Indexes on prolly tables in the S suite.** pgbench and BenchBase create
+    their primary keys and indexes as btree. On a prolly table that means a
+    btree index over a prolly table, not a prolly index tree. Should the S
+    suite make prolly the default index AM for prolly runs (no such setting
+    exists in Postgres; it would need a small core change or rewriting the
+    workloads' DDL)?
+20. **Device bytes on this machine are dominated by btrfs fsync.** In the
+    step 2 smoke run every write workload wrote 45-77 KB to the device per
+    transaction, whatever its WAL volume (S5: 127 bytes of WAL, 46 KB on the
+    device; read-only workloads: ~0). That is a fixed cost per commit fsync
+    from the filesystem (most likely btrfs's fsync log tree), not from
+    Postgres, and it would swamp the engine differences the metric is meant
+    to show. Options for step 3: run the data directory on a dedicated
+    ext4/XFS partition or device, or report device bytes with this caveat.
+    Not yet confirmed with a filesystem-level trace.
 
