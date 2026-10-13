@@ -10,9 +10,8 @@
  *
  * Where a callback maps directly onto an engine callback it calls through
  * the engine interface already.  The rest need translation that isn't
- * designed yet (specs/02-postgres-integration.md, A1) and raise
- * ERRCODE_FEATURE_NOT_SUPPORTED naming the table AM, the engine and the
- * callback.
+ * designed yet and raise ERRCODE_FEATURE_NOT_SUPPORTED naming the table
+ * AM, the engine and the callback.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_tableam.c
@@ -258,7 +257,7 @@ prolly_relation_set_new_filelocator(Relation rel,
 	ProllyComponents components;
 	const ProllyEngineRoutine *engine;
 
-	/* Rows carry no xids, so there is nothing to freeze (A1). */
+	/* Rows carry no xids, so there is nothing to freeze. */
 	*freezeXid = InvalidTransactionId;
 	*minmulti = InvalidMultiXactId;
 

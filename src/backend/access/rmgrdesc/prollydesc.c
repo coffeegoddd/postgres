@@ -5,7 +5,7 @@
  *
  * These are generic: they name the implementation that wrote a record and
  * its record type, but can't decode the payload, because pg_waldump has no
- * registry of implementations (open question 16).
+ * registry of implementations.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

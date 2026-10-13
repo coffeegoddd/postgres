@@ -5,8 +5,7 @@
  *	  only on their logical content.
  *
  * A row's bytes must not depend on platform, cluster, session or the DDL
- * history of its table (specs/09-versioned-catalogs.md, open question 12).
- * A row is encoded as
+ * history of its table.  A row is encoded as
  *
  *	varint n		number of live (not dropped) columns stored
  *	null bitmap		n bits, 1 = NULL
@@ -23,8 +22,8 @@
  * is absent from a row (the row predates the column) decodes to its missing
  * value; so rows written while the column has one store an explicit NULL
  * for it rather than leaving it off.  Such rows are not yet canonical; the
- * version-control commit rewrites the table and clears the missing values
- * (roadmap step 4g), after which they are.
+ * version-control commit will rewrite the table and clear the missing
+ * values, after which they are.
  *
  * Decoding fills a slot in the relation's own layout, with NULLs for dropped
  * columns, as Postgres's tuple conversion would.

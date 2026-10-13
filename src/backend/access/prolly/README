@@ -5,15 +5,13 @@ Prolly tree storage
 
 This directory holds prolly-tree storage for Postgres: table and index
 access methods whose data lives in content-addressed trees, so that tables
-can be branched, diffed, merged, cloned, pushed and pulled.  The design and
-the plan are in specs/ at the top of the tree; start with
-specs/README.md and specs/00-architecture-principles.md.
+can be branched, diffed, merged, cloned, pushed and pulled.
 
-Status: roadmap step 4b, plus the canonical encoders (4a revisited).  Every interface exists.  The foundation
-interfaces (node format, chunker, content hash, key and value encoders), the
-cluster-wide node store and D1's WAL form have real implementations that
-pass their conformance suites; everything else is a stub.  No table stores
-data yet.
+Status: every interface exists.  The foundation interfaces (node format,
+chunker, content hash, canonical key and value encoders), the cluster-wide
+node store, D1's WAL form and copy-on-write trees have real implementations
+that pass their conformance suites; everything else is a stub.  No table
+stores data yet.
 
 
 Interfaces and implementations
@@ -31,6 +29,8 @@ design choice can be changed later by writing a new implementation:
 	key_encoder       prolly_keyenc.h         ordered, stub
 	value_encoder     prolly_valenc.h         canonical, heaptuple, stub
 	node_store        prolly_nodestore.h      global, stub
+	tree              prolly_tree.h           cow, stub
+	root_layout       prolly_rootlayout.h     subroots, stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
 	log               prolly_log.h            chunks, stub
@@ -80,7 +80,7 @@ Canonical values
 
 Rows and keys are stored in canonical form: the same bytes on every
 platform, in every cluster and session, whatever the table's DDL history,
-with no local OIDs (specs/09-versioned-catalogs.md).  prolly_datum.c holds
+with no local OIDs.  prolly_datum.c holds
 the canonical encoding of single values, shared by the key and value
 encoders as a fixed part of the format: send formats produced with the
 client encoding fixed to UTF-8 (SetClientEncodingOverride in mbutils.c),

@@ -1,6 +1,5 @@
-"""The S suite: storage workloads that run on any table AM
-(specs/06-benchmarking.md).  Every table is created with the table AM under
-test through default_table_access_method."""
+"""The S suite: storage workloads that run on any table AM.  Every table is
+created with the table AM under test through default_table_access_method."""
 
 from __future__ import annotations
 

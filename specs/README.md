@@ -21,8 +21,11 @@ control; this project's premise is that we should not have to.
 - **Where the work is:** roadmap step 4, building the first engine (D1+K1).
   Steps 4a (hash, node format, chunker, canonical key and value encoders),
   4b (cluster-wide node store, WAL resource managers) and 4c (copy-on-write
-  tree operations) are built; the root layout (question 33) comes next, then
-  4d. See the status notes in `07-roadmap.md`.
+  tree operations) are built, and so is the root layout (question 33); 4d
+  comes next. See the status notes in `07-roadmap.md`.
+- **Code never refers to these specs** (user rule, 2026-10-13): no paths,
+  question numbers, step numbers or shorthand such as "B2" in code or
+  comments. Specs may point at code.
 - **The product goal:** true to Postgres and true to Dolt. Postgres-native
   working sets; canonical, history-independent version-control commits;
   schema versioned with data (`09-versioned-catalogs.md`).

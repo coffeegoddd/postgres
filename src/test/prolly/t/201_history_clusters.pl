@@ -3,7 +3,7 @@
 # Canonical form across clusters: two separate clusters build the same
 # schema and data by different histories, with OIDs that differ (one
 # cluster creates and drops objects first), and their commits have the same
-# root hash (specs/09-versioned-catalogs.md).
+# root hash.
 
 use strict;
 use warnings FATAL => 'all';

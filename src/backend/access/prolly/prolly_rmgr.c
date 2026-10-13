@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_rmgr.c
- *	  WAL resource-manager adapters for prolly storage (A3).
+ *	  WAL resource-manager adapters for prolly storage.
  *
  * Redo for the Prolly and ProllyStore resource managers is dispatched to the
  * implementation named in the record's xl_prolly_header: a log

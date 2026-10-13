@@ -28,12 +28,12 @@
  * comparing memcmp-ordered columns by their bytes and decoding the others to
  * call their comparison function with the column's collation.  That
  * fallback is slower; it is what keeps every btree opclass and collation
- * usable (B6).
+ * usable as a prolly key, ordered exactly as btree orders it.
  *
  * Every encoding is reversible, so decode() always succeeds.  The encodings
  * use fixed byte order, UTF-8 text and canonical value bytes, so they are
  * the same on every platform, in every cluster and in every session, and
- * hold no local OIDs (specs/09-versioned-catalogs.md).
+ * hold no local OIDs.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/keyenc_ordered.c

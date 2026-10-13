@@ -5,7 +5,7 @@
  *
  * Hash-addressed stores (D1, D2) find nodes by content hash through a
  * hash -> block map; location-addressed stores (D3, D4) by extent.  Nodes
- * are buffer-manager pages reached through smgr (B4, open question 1).
+ * are buffer-manager pages reached through smgr.
  *
  * Contract:
  * - read() and new_node() return a pinned buffer; the caller locks and

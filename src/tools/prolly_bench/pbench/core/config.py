@@ -31,7 +31,7 @@ RUN_DEFAULTS: dict[str, Any] = {
     "fio_seconds": 20,
 }
 
-# Settings the procedure requires (specs/06-benchmarking.md, Environment).
+# Settings every run requires: results are only comparable when durable.
 REQUIRED_SETTINGS = {"fsync": "on", "synchronous_commit": "on"}
 
 # Settings the harness itself needs, under the config's settings.

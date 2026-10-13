@@ -3,9 +3,9 @@
  * coord_k1.c
  *	  K1 implementation of the coordination interface.
  *
- * K1: separate lock table on the Postgres lock manager.  See
- * specs/04-candidate-designs.md.  Not implemented yet: every callback is
- * NULL, so each call raises "not implemented" (prolly_impl.h).
+ * K1: separate lock table on the Postgres lock manager.  Not implemented
+ * yet: every callback is NULL, so each call raises "not implemented"
+ * (prolly_impl.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/coord_k1.c

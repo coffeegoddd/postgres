@@ -6,6 +6,7 @@ OBJS = \
 	foundation_checks.o \
 	storage_checks.o \
 	tree_checks.o \
+	rootlayout_checks.o \
 	test_prolly.o
 PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 

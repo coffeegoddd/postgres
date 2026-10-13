@@ -1,4 +1,4 @@
-# The procedure of specs/06-benchmarking.md: 5 repetitions, clients swept
+# The standard procedure: 5 repetitions, clients swept
 # 1-256, a measured window long enough to span several checkpoints.
 
 [run]

@@ -16,7 +16,7 @@
 
 /* there is deliberately not an #ifndef PROLLY_IMPLLIST_H here */
 
-/* engines (specs/04-candidate-designs.md); all stubs so far */
+/* engines; all stubs so far */
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d1)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d2)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d3a)
@@ -28,7 +28,7 @@ PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k1)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k2)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k3)
 
-/* foundation implementations (roadmap step 4a) */
+/* foundation implementations */
 PG_PROLLY_IMPL(ProllyHashRoutine, prolly_hash_sha256)
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_basic)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_keyhash)
@@ -36,12 +36,15 @@ PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_canonical)
 
-/* node storage (roadmap step 4b) */
+/* node storage */
 PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
 PG_PROLLY_IMPL(ProllyLogRoutine, prolly_log_chunks)
 
-/* trees (roadmap step 4c) */
+/* trees */
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_cow)
+
+/* root layouts */
+PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_subroots)
 
 /* stubs of the foundation and version-control interfaces */
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_stub)
@@ -59,3 +62,4 @@ PG_PROLLY_IMPL(ProllyRefsRoutine, prolly_refs_stub)
 PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_stub)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_stub)
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_stub)
+PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_stub)

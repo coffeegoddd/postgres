@@ -9,7 +9,7 @@
  * cluster don't collide with earlier runs' nodes.
  *
  * A node store may be cluster-wide, so what these checks write stays in it
- * (until reclamation exists, roadmap step 4f).
+ * (until reclamation exists).
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *

@@ -202,6 +202,21 @@ large for a node (an error for now), freeing replaced nodes (4f), and the
 root layout of question 33, which comes next as its own change, built on
 trees, before 4d.
 
+**Status (2026-10-13): root layout built.** A new interface, Root layout
+(`prolly_rootlayout.h`), says how a branch's root finds every relation's
+tree. Its implementation `subroots` (D1, D2) makes the working-set root a
+small tree of two sub-roots, catalog and user data, each a tree mapping
+relation OIDs to relation-tree hashes (one entry per relation; which
+sub-root is the caller's choice). Operations: empty, lookup, apply, subroot
+(for one-comparison "did the schema change?"), scan, walk (into every
+relation's tree, for reclamation in 4f) and diff (skipping an unchanged
+sub-root). Its conformance suite checks lookups and scans against a
+reference, history independence, sub-root independence, diff and walk; five
+deliberately broken versions were checked to fail it. The canonical root,
+keyed by name, comes with the canonicalizer in 4g. Code comments no longer
+refer to these specs (user rule, 2026-10-13): specs may point at code, not
+the reverse.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

@@ -3,8 +3,7 @@
 Everything the driver works with is one of these abstract classes, found by
 name through a registry (registry.py).  Adding a workload, collector, sink or
 cluster provider means writing a new implementation module; the driver does
-not change.  See specs/00-architecture-principles.md and
-specs/06-benchmarking.md.
+not change.
 """
 
 from __future__ import annotations
@@ -202,7 +201,7 @@ class Window(abc.ABC):
 # ---------------------------------------------------------------------------
 
 class Workload(abc.ABC):
-    """One S or V workload (specs/06-benchmarking.md)."""
+    """One S or V workload."""
 
     id: ClassVar[str]               # "S1", "V3", ...
     suite: ClassVar[str]            # "S" or "V"
@@ -241,7 +240,7 @@ class Workload(abc.ABC):
 # ---------------------------------------------------------------------------
 
 class Collector(abc.ABC):
-    """One metric source (specs/06-benchmarking.md, Metrics).
+    """One metric source.
 
     A new instance is made for every cell.  start and stop bracket the
     measured window and should only take snapshots; results then turns the

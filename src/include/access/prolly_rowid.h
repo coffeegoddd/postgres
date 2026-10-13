@@ -5,8 +5,8 @@
  *
  * Postgres passes rows around by ItemPointer (index scans, triggers, EPQ,
  * CURRENT OF, ctid).  Prolly rows are identified by key.  Implementations:
- * content-derived TIDs with a map (design change 3), or wide row ids (B7,
- * open question 2).
+ * content-derived TIDs with a map (so one TID names one row version, as
+ * non-prolly index AMs assume), or wide row ids.
  *
  * Contract:
  * - One TID names one row version: the same (key, content) always gets the

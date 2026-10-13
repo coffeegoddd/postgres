@@ -5,11 +5,10 @@
  *
  * Every interface (src/include/access/prolly_*.h) has a suite of named
  * cases here, and every registered implementation of that interface is run
- * against it (rule 4, specs/00-architecture-principles.md).  A case lists
- * the callbacks it needs; if the implementation lacks any, the result is
- * "not implemented".  A case whose checks aren't written yet reports
- * "no checks yet" once its callbacks exist.  Cases get their checks as the
- * first real implementations are built (roadmap step 4).
+ * against it.  A case lists the callbacks it needs; if the implementation
+ * lacks any, the result is "not implemented".  A case whose checks aren't
+ * written yet reports "no checks yet" once its callbacks exist.  Cases get
+ * their checks as the first real implementations are built.
  *
  * Every interface also gets two generic cases: "identity" (the
  * implementation's ProllyImplInfo is sane and the registry finds it) and
@@ -61,7 +60,7 @@ static void hash_incremental(const ProllyImplInfo *impl);
 
 /*
  * The suites.  Case names describe the contract they will check, taken from
- * the interface headers' contracts and specs/02-postgres-integration.md.
+ * the interface headers' contracts.
  */
 static const ConformanceCase cases[] = {
 	/* engine */
@@ -210,6 +209,20 @@ static const ConformanceCase cases[] = {
 	"build_begin build_add build_finish apply diff", tree_diff_reports_changes},
 	{PROLLY_IFACE_TREE, "nodes_are_valid",
 	"build_begin build_add build_finish walk", tree_nodes_are_valid},
+
+	/* root layout */
+	{PROLLY_IFACE_ROOT_LAYOUT, "empty", "empty subroot lookup scan apply",
+	rootlayout_empty},
+	{PROLLY_IFACE_ROOT_LAYOUT, "apply_matches_reference",
+	"empty apply lookup scan", rootlayout_apply_matches_reference},
+	{PROLLY_IFACE_ROOT_LAYOUT, "history_independent",
+	"empty apply lookup scan", rootlayout_history_independent},
+	{PROLLY_IFACE_ROOT_LAYOUT, "subroots_independent",
+	"empty apply subroot", rootlayout_subroots_independent},
+	{PROLLY_IFACE_ROOT_LAYOUT, "diff_reports_changes",
+	"empty apply diff", rootlayout_diff_reports_changes},
+	{PROLLY_IFACE_ROOT_LAYOUT, "walk_reaches_trees",
+	"empty apply subroot walk", rootlayout_walk_reaches_trees},
 };
 
 /* ------------------------------------------------------------------------

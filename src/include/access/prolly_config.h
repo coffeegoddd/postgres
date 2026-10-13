@@ -4,7 +4,7 @@
  *	  Choosing which implementation of each interface to use.
  *
  * A tree's components (engine, coordination and foundation) are chosen by
- * configuration, never by code (rule: specs/00-architecture-principles.md).
+ * configuration, never by code.
  * Today the only source is a default profile per prolly table AM.  Later
  * sources (tablespace options, settings) plug in here without changing
  * callers.  Once a tree exists, its components come from the format stamps
@@ -32,6 +32,7 @@
 #include "access/prolly_nodestore.h"
 #include "access/prolly_reclaim.h"
 #include "access/prolly_refs.h"
+#include "access/prolly_rootlayout.h"
 #include "access/prolly_rowid.h"
 #include "access/prolly_transfer.h"
 #include "access/prolly_tree.h"
@@ -54,6 +55,7 @@ typedef struct ProllyComponents
 	const ProllyCommitRoutine *commit;
 	const ProllyRowIdRoutine *row_identity;
 	const ProllyTreeRoutine *tree;
+	const ProllyRootLayoutRoutine *root_layout;
 } ProllyComponents;
 
 /* Database-wide components: version control. */

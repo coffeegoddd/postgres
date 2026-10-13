@@ -3,10 +3,10 @@
  * prolly_indexam.c
  *	  Index access method adapter for prolly index trees.
  *
- * A prolly index is a second tree from the same root set as its table
- * (specs/02-postgres-integration.md, A2).  Its operator classes follow the
- * btree operator class contract exactly, since key encodings must agree
- * with btree ordering (B6); so validation reuses btvalidate().
+ * A prolly index is a second tree from the same root set as its table.
+ * Its operator classes follow the btree operator class contract exactly,
+ * since key encodings must agree with btree ordering; so validation reuses
+ * btvalidate().
  *
  * The scan and maintenance callbacks need translation that isn't designed
  * yet and raise ERRCODE_FEATURE_NOT_SUPPORTED naming the callback.

@@ -2,11 +2,11 @@
  *
  * nodestore_global.c
  *	  Node store implementation "global": one cluster-wide, hash-addressed
- *	  store (open question 1).
+ *	  store.
  *
  * Every relation's nodes, in every database and on every branch, live in
  * one store, so a tree is found from its branch's root, never from a
- * catalog entry (catalogs are themselves versioned; specs/09).  The store
+ * catalog entry (catalogs are themselves versioned).  The store
  * is three relation files in the global tablespace, read through smgr and
  * the buffer manager like any shared catalog, so checksums, checkpoints,
  * full-page writes and pg_stat_io apply unchanged:
@@ -37,9 +37,9 @@
  * contents is the log interface's job (prolly_log.h), not the store's.
  *
  * Limitations for now: release() removes a node from the map, but its
- * block is not reused (reclamation and space reuse are roadmap step 4f).
- * Overflow pages freed by splits are reused only by later splits.  Only
- * permanent relations are supported (open question 28).
+ * block is not reused (reclamation and space reuse come later).  Overflow
+ * pages freed by splits are reused only by later splits.  Only permanent
+ * relations are supported; temporary and unlogged ones are not decided yet.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/nodestore_global.c

@@ -5,16 +5,17 @@
  *	  commit markers for prolly trees.
  *
  * Implementations: K1 (separate lock table), K2 (coordination plane on live
- * nodes), K3 (locks in the page).  See specs/04-candidate-designs.md.
+ * nodes), K3 (locks in the page).
  *
  * Contract:
  * - Operations act for the current (sub)transaction.
- * - Waiting is done with XactLockTableWait() and friends (A4), so deadlock
+ * - Waiting is done with XactLockTableWait() and friends, so deadlock
  *   detection is Postgres's.  Results use the table AM's TM_Result and
  *   TM_FailureData so the adapter can return them unchanged.
  * - Lock state never outlives its transaction or subtransaction, except for
- *   prepared transactions and commit markers (invariant 3).
- * - Nothing here is ever part of a hashed chunk (invariant 1).
+ *   prepared transactions and commit markers.
+ * - Nothing here is ever part of a hashed chunk: hashes cover canonical
+ *   content only, never transactional state.
  *
  * Provisional (v0).
  *
@@ -62,7 +63,8 @@ typedef struct ProllyCoordRoutine
 
 	/*
 	 * True if key was written by a transaction that committed after snapshot
-	 * was taken (commit markers, design change 2); sets *writer.
+	 * was taken (from commit markers, kept until the xmin horizon passes
+	 * them); sets *writer.
 	 */
 	bool		(*written_since) (Relation tree, const ProllyKey *key,
 								  Snapshot snapshot, TransactionId *writer);

@@ -4,7 +4,7 @@
  *	  Content hash interface: hashing a node's canonical region.
  *
  * The hash function and its digest length are part of the canonical format
- * (specs/05-storage-targets.md, open question 4).  Candidates include
+ * (the choice is still to be measured).  Candidates include
  * SHA-256 through src/common/cryptohash.c.  The chunker's boundary hash is a
  * separate concern of the chunker.
  *

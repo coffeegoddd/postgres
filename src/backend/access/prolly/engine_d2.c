@@ -3,9 +3,9 @@
  * engine_d2.c
  *	  D2 implementation of the engine interface.
  *
- * D2: copy-on-write with logical WAL and deferred hashing.  See
- * specs/04-candidate-designs.md.  Not implemented yet: every callback is
- * NULL, so each call raises "not implemented" (prolly_impl.h).
+ * D2: copy-on-write with logical WAL and deferred hashing.  Not
+ * implemented yet: every callback is NULL, so each call raises "not
+ * implemented" (prolly_impl.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d2.c

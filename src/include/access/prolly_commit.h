@@ -4,8 +4,9 @@
  *	  Commit pipeline interface: ordering and publishing branch roots.
  *
  * At commit, a transaction's new root must become a branch's head at the
- * instant its xid becomes visible (B1).  Implementations: a single lock, or
- * the ordered pipeline of specs/02-postgres-integration.md (design change 1).
+ * instant its xid becomes visible.  Implementations: a single lock, or an
+ * ordered pipeline that rebases under a per-branch lock, enqueues the new
+ * root and releases the lock before the WAL flush.
  *
  * Usage, per branch a transaction changes:
  *		branch_lock(b);  (engine rebases onto head(b))

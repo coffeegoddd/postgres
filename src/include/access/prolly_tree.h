@@ -16,8 +16,8 @@
  * - History independence: the root hash depends only on the tree's items
  *   (keys and values) and on the components' formats, never on how the tree
  *   was produced (which builds and applies, in what order and batch sizes).
- *   This is the lowest layer of the canonical-form rule
- *   (specs/09-versioned-catalogs.md).
+ *   This is the lowest layer of canonical form: a commit's root hash
+ *   depends only on its logical content.
  * - The empty tree is a tree (a leaf with no items) and has a root hash.
  * - Keys are unique and ordered by env->compare.  build_add() takes keys in
  *   strictly increasing order; apply() takes edits sorted by key with no

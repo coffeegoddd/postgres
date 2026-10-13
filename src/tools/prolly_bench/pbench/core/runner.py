@@ -1,9 +1,8 @@
 """The driver: runs one suite's grid of cells and hands results to sinks.
 
 A cell is (workload, size, variant, client count, repetition).  Every cell
-gets a fresh cluster (specs/06-benchmarking.md, Procedure): initdb, load,
-CHECKPOINT, warm-up, measured window with collectors, post-measurement
-collectors.  The driver knows only the interfaces in interfaces.py.
+gets a fresh cluster: initdb, load, CHECKPOINT, warm-up, measured window
+with collectors, post-measurement collectors.  The driver knows only the interfaces in interfaces.py.
 """
 
 from __future__ import annotations

@@ -9,8 +9,8 @@
  * free space between pd_lower and pd_upper.  Redo restores the image.
  *
  * Row-level records (log_mutation) are not written: D1 has no logical WAL,
- * and logical decoding is deferred (open question 31).  The commit record
- * (log_commit) comes with the commit pipeline in roadmap step 4e.
+ * and logical decoding is deferred.  The commit record (log_commit) comes
+ * with the commit pipeline.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/log_chunks.c

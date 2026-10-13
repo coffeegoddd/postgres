@@ -7,8 +7,7 @@
  * attributes in Postgres's on-disk tuple layout), so decoding is Postgres's
  * own tuple deforming.
  *
- * Not the default: kept for comparison with "canonical" (open question 12,
- * changed 2026-10-13).  Its bytes depend on the platform (byte order,
+ * Not the default: kept for comparison with "canonical".  Its bytes depend on the platform (byte order,
  * alignment) and on the table's history (dropped columns stay in tuples,
  * added columns' defaults live in the catalog), and enum, array and
  * composite values carry local OIDs, so it fails the value encoder's

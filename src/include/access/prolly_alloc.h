@@ -4,7 +4,7 @@
  *	  Allocator interface: space management inside a relation's storage.
  *
  * Used by in-place engines (D3, D4): fixed-size runs (e.g. 512 bytes) or
- * variable-size allocation (specs/03-design-space.md, axis 5).
+ * variable-size allocation.
  *
  * Contract:
  * - allocate() returns an extent of at least size bytes that no other live

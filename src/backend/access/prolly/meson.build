@@ -33,6 +33,8 @@ backend_sources += files(
   'prolly_vcs.c',
   'reclaim_stub.c',
   'refs_stub.c',
+  'rootlayout_stub.c',
+  'rootlayout_subroots.c',
   'rowid_stub.c',
   'transfer_stub.c',
   'tree_cow.c',
