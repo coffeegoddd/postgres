@@ -5,9 +5,8 @@
  *
  * An engine stores the trees of prolly tables and indexes and answers
  * reads, private writes, commit, checkpoint and canonical export.  Engines
- * D1-D4 (specs/04-candidate-designs.md) are implementations.  The table AM and
- * index AM adapters translate Postgres calls into calls on this interface
- * (specs/02-postgres-integration.md, section C).
+ * D1-D4 are implementations.  The table AM and index AM adapters translate
+ * Postgres calls into calls on this interface.
  *
  * An engine builds on the foundation interfaces (node format, chunker, hash,
  * encoders, node store, allocator, reclamation, log, commit pipeline,
@@ -18,14 +17,14 @@
  * - Operations act for the current transaction (GetCurrentTransactionId()
  *   and friends) unless a parameter says otherwise, as heap does.
  * - "tree" is the table or index relation whose tree is meant.  A table and
- *   its indexes always come from the same root set (invariant 6).
+ *   its indexes always come from the same root set.
  * - Returned keys and values stay valid until the next call on the same
  *   cursor, or until the cursor is closed.
  * - Errors are raised with ereport(); callbacks never return error codes.
  *
  * Provisional (v0).  Open questions that may reshape this interface: root
- * sets spanning tables of different engines; row identity (B7); where redo
- * of logical records rebuilds nodes.
+ * sets spanning tables of different engines; row identity (how TIDs map to
+ * rows); where redo of logical records rebuilds nodes.
  *
  * src/include/access/prolly_engine.h
  *
@@ -48,7 +47,7 @@ typedef struct ProllyEngineRoutine
 {
 	ProllyImplInfo info;
 
-	/* Shared memory needed, and its initialization (A5). */
+	/* Shared memory needed, and its initialization. */
 	Size		(*shmem_size) (void);
 	void		(*shmem_init) (void);
 
@@ -66,8 +65,8 @@ typedef struct ProllyEngineRoutine
 	void		(*tree_copy) (Relation rel, const RelFileLocator *newrlocator);
 
 	/*
-	 * The root set visible to snapshot (B2): exactly one, consistent with
-	 * procarray visibility (invariant 2).  Pinned until released.
+	 * The root set visible to snapshot: exactly one, consistent with
+	 * procarray visibility for every xid.  Pinned until released.
 	 */
 	ProllyRootSet *(*roots_acquire) (Snapshot snapshot);
 	void		(*roots_release) (ProllyRootSet *roots);
@@ -103,16 +102,17 @@ typedef struct ProllyEngineRoutine
 	void		(*xact_abort) (void);
 
 	/*
-	 * Before commit (B1): rebase the private writes onto the current branch
+	 * Before commit: rebase the private writes onto the current branch
 	 * heads, write them durably through the log, and hand the new roots to
-	 * the commit pipeline.  Must not fail on conflicts (invariant 4).
+	 * the commit pipeline.  Must not fail on conflicts: anything that could
+	 * conflict was locked earlier, so the rebase is mechanical.
 	 */
 	void		(*xact_precommit) (void);
 
-	/* PREPARE TRANSACTION (B5): persist private writes for later commit. */
+	/* PREPARE TRANSACTION: persist private writes for later commit. */
 	void		(*xact_prepare) (void);
 
-	/* Checkpoint (B4): make everything up to the redo point durable. */
+	/* Checkpoint: make everything up to the redo point durable. */
 	void		(*checkpoint) (int flags);
 
 	/* Make root the head of branch (checkout, reset, fast-forward). */
@@ -123,9 +123,9 @@ typedef struct ProllyEngineRoutine
 						   BufferAccessStrategy bstrategy);
 
 	/*
-	 * Canonical form (specs/05-storage-targets.md): the root hash of tree in
-	 * roots, and every canonical chunk reachable from it.  Identical across
-	 * all engines for the same logical data (invariant 7).
+	 * Canonical form: the root hash of tree in roots, and every canonical
+	 * chunk reachable from it.  Identical across all engines for the same
+	 * logical data.
 	 */
 	void		(*canonical_root) (ProllyRootSet *roots, Relation tree,
 								   ProllyHash *root);

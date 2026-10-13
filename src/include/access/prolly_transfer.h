@@ -5,11 +5,10 @@
  *
  * Transfer moves canonical chunks (engine export_chunks) and refs between
  * this database and a remote.  Implementations differ in transport: a local
- * copy between two instances, or a network protocol (open question 14).
+ * copy between two instances, or a network protocol.
  *
  * Contract:
- * - Only canonical chunks cross, so the remote may use any engine
- *   (specs/05-storage-targets.md).
+ * - Only canonical chunks cross, so the remote may use any engine.
  * - Chunks the other side already has are not sent.
  * - A failed transfer leaves refs unchanged on both sides.
  *

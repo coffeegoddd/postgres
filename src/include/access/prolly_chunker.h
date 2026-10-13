@@ -6,8 +6,7 @@
  * The chunker sees the items of one tree level in key order and decides
  * where each node ends.  Its algorithm and parameters are part of the
  * canonical format: the same items must give the same boundaries in every
- * engine, on every machine (specs/05-storage-targets.md).  Which rule to use
- * is open question 3.
+ * engine, on every machine.  Which rule is best is still to be measured.
  *
  * Contract:
  * - Decisions depend only on the items fed since begin/reset (and level),

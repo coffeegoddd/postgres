@@ -1,7 +1,7 @@
 --
 -- Canonical form: a commit's root hash depends only on its logical content
--- (schema and data), never on how it was produced
--- (specs/09-versioned-catalogs.md).  Two branches reach the same tables by
+-- (schema and data), never on how it was produced.  Two branches reach the
+-- same tables by
 -- different histories: different statement orders, rows inserted and
 -- deleted, columns added and dropped, a column added with a default, and
 -- objects created and dropped first so that OIDs differ.

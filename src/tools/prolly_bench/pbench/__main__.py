@@ -1,4 +1,4 @@
-"""prolly_bench: benchmark harness for prolly storage (specs/06-benchmarking.md).
+"""prolly_bench: benchmark harness for prolly storage.
 
   prolly_bench run S --am heap                  S suite against stock heap (B0)
   prolly_bench run V --am prolly_d1             V suite against an engine

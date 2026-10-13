@@ -2,8 +2,7 @@
 
 Medians and spread (min-max) over repetitions, per (workload, size, variant,
 clients).  S results are compared with B0 by normalizing each median to the
-baseline's (B0 = 1.0); V results are reported as they are
-(specs/06-benchmarking.md, Reporting).
+baseline's (B0 = 1.0); V results are reported as they are.
 """
 
 from __future__ import annotations

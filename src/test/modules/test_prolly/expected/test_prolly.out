@@ -43,7 +43,9 @@ FROM prolly_implementations();
  diff_merge      | stub        |       0 |              0
  tree            | cow         |       1 |              1
  tree            | stub        |       0 |              0
-(34 rows)
+ root_layout     | subroots    |       1 |              1
+ root_layout     | stub        |       0 |              0
+(36 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -256,7 +258,23 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree            | stub           | diff_reports_changes                    | not implemented (missing build_begin, build_add, build_finish, apply, diff)
  tree            | stub           | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
  tree            | stub           | complete                                | not implemented (12 of 12 callbacks missing)
-(205 rows)
+ root_layout     | subroots       | identity                                | pass
+ root_layout     | subroots       | empty                                   | pass
+ root_layout     | subroots       | apply_matches_reference                 | pass
+ root_layout     | subroots       | history_independent                     | pass
+ root_layout     | subroots       | subroots_independent                    | pass
+ root_layout     | subroots       | diff_reports_changes                    | pass
+ root_layout     | subroots       | walk_reaches_trees                      | pass
+ root_layout     | subroots       | complete                                | pass
+ root_layout     | stub           | identity                                | pass
+ root_layout     | stub           | empty                                   | not implemented (missing empty, subroot, lookup, scan, apply)
+ root_layout     | stub           | apply_matches_reference                 | not implemented (missing empty, apply, lookup, scan)
+ root_layout     | stub           | history_independent                     | not implemented (missing empty, apply, lookup, scan)
+ root_layout     | stub           | subroots_independent                    | not implemented (missing empty, apply, subroot)
+ root_layout     | stub           | diff_reports_changes                    | not implemented (missing empty, apply, diff)
+ root_layout     | stub           | walk_reaches_trees                      | not implemented (missing empty, apply, subroot, walk)
+ root_layout     | stub           | complete                                | not implemented (7 of 7 callbacks missing)
+(221 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

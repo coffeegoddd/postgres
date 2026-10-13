@@ -6,8 +6,8 @@
  * A node ends after an item whose key hashes below a threshold.  The
  * decision depends on that key's bytes and the tree level only, so updating
  * a value never moves a boundary, and inserting or deleting a key moves at
- * most the boundaries next to it (open question 3: starting choice for the
- * first engine).
+ * most the boundaries next to it.  This is the starting choice for the
+ * first engine.
  *
  * Because a node must fit in a page, an item that would overflow the
  * current node starts a new one (PROLLY_CHUNK_SPLIT_BEFORE).  That depends
@@ -19,8 +19,8 @@
  * splitmix64 finalizer.  It is written out here rather than taken from
  * hashfn.c, so it is the same on every platform by construction.
  *
- * Target node sizes are starting values, to be set by measurement in
- * roadmap step 4 and then frozen as part of the canonical format.  A
+ * Target node sizes are starting values, to be set by measurement and then
+ * frozen as part of the canonical format.  A
  * key-only rule targets a number of items, not bytes; the targets assume an
  * average item of LEAF_ITEM_BYTES in leaves and INTERNAL_ITEM_BYTES in
  * internal nodes.

@@ -2,7 +2,7 @@
 
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
 compared with stock heap) and the V suite (version control, prolly engines
-only).  What it measures and why is in `specs/06-benchmarking.md`.
+only).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
 (S9), sysbench (S10), `fio` and `perf`.

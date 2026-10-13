@@ -1,7 +1,6 @@
-"""Recording the environment of a run (specs/06-benchmarking.md,
-Environment): machine, kernel, CPU settings, filesystem, device, build, and
-an fio baseline of the device.  Also produces warnings for conditions that
-make results less trustworthy."""
+"""Recording the environment of a run: machine, kernel, CPU settings,
+filesystem, device, build, and an fio baseline of the device.  Also produces
+warnings for conditions that make results less trustworthy."""
 
 from __future__ import annotations
 
@@ -105,7 +104,7 @@ def warnings(env: dict[str, Any]) -> list[str]:
         fs = env["filesystem"]["filesystems"][0]
         if fs["fstype"] == "btrfs":
             w.append("data directory is on btrfs: device bytes include a large "
-                     "per-fsync filesystem cost (open question 20); compare WAL "
+                     "per-fsync filesystem cost; compare WAL "
                      "bytes for write volume")
             if "C" not in env["data_root_attributes"].split()[0]:
                 w.append("data directory is on btrfs with copy-on-write on")

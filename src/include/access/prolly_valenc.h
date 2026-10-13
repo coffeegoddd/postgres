@@ -3,8 +3,7 @@
  * prolly_valenc.h
  *	  Value encoder interface: turning rows into bytes and back.
  *
- * Rows are stored in canonical form (open question 12, decided 2026-10-13;
- * specs/09-versioned-catalogs.md).
+ * Rows are stored in canonical form.
  *
  * Contract:
  * - decode(encode(row)) gives back the same attribute values.

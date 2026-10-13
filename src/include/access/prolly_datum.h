@@ -4,10 +4,10 @@
  *	  Canonical encoding of single values (part of the canonical format).
  *
  * The bytes a value is stored as in canonical form: the same on every
- * platform, in every cluster and in every session, and free of local OIDs
- * (specs/09-versioned-catalogs.md).  Key and value encoder implementations
- * use this; it is a fixed part of the canonical format, like the content
- * hash's digest, not a component with alternatives.
+ * platform, in every cluster and in every session, and free of local OIDs.
+ * Key and value encoder implementations use this; it is a fixed part of the
+ * canonical format, like the content hash's digest, not a component with
+ * alternatives.
  *
  * The encoding of a value of type T:
  *
@@ -33,7 +33,8 @@
  * send functions would, without the function call.
  *
  * Values of OID types (oid, regclass, …) are local by nature and are stored
- * as their send format for now (open question 35).
+ * as their send format for now; how canonical form should treat them is not
+ * settled.
  *
  * src/include/access/prolly_datum.h
  *

@@ -4,7 +4,7 @@
  *	  Choosing which implementation of each interface a tree uses.
  *
  * Each prolly table AM has a default profile: an implementation name per
- * interface.  The pairings follow specs/04-candidate-designs.md.  The
+ * interface, pairing each engine with a coordination module.  The
  * foundation implementations are shared by every engine; interfaces without
  * one yet use their stubs.
  *
@@ -29,9 +29,10 @@ typedef struct ProllyProfile
 } ProllyProfile;
 
 /*
- * Shared by every engine.  Node store, tree and log differ by engine: D1
- * and D2 are hash-addressed (the "global" store, copy-on-write trees); D3
- * and D4 are location-addressed and have neither yet.
+ * Shared by every engine.  Node store, tree, root layout and log differ by
+ * engine: D1 and D2 are hash-addressed (the "global" store, copy-on-write
+ * trees, sub-root layout); D3 and D4 are location-addressed and have none
+ * of these yet.
  */
 #define FOUNDATION \
 	[PROLLY_IFACE_NODE_FORMAT] = "basic", \
@@ -47,23 +48,23 @@ typedef struct ProllyProfile
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
 	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
-	[PROLLY_IFACE_TREE] = "cow",
+	[PROLLY_IFACE_TREE] = "cow", [PROLLY_IFACE_ROOT_LAYOUT] = "subroots",
 	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
 	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
-	[PROLLY_IFACE_TREE] = "cow",
+	[PROLLY_IFACE_TREE] = "cow", [PROLLY_IFACE_ROOT_LAYOUT] = "subroots",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3a", {[PROLLY_IFACE_ENGINE] = "d3a",
 	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3b", {[PROLLY_IFACE_ENGINE] = "d3b",
 	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d4", {[PROLLY_IFACE_ENGINE] = "d4",
 	[PROLLY_IFACE_COORDINATION] = "k3", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 };
 
@@ -129,6 +130,8 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 		profile_impl(impls, PROLLY_IFACE_ROW_IDENTITY);
 	components->tree = (const ProllyTreeRoutine *)
 		profile_impl(impls, PROLLY_IFACE_TREE);
+	components->root_layout = (const ProllyRootLayoutRoutine *)
+		profile_impl(impls, PROLLY_IFACE_ROOT_LAYOUT);
 }
 
 void
@@ -136,7 +139,10 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 {
 	Oid			amoid;
 
-	/* An index's tree belongs to its table's engine (invariant 6). */
+	/*
+	 * An index's tree belongs to its table's engine, so a table and its
+	 * indexes always come from the same root set.
+	 */
 	if (rel->rd_rel->relkind == RELKIND_INDEX ||
 		rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
 		amoid = get_rel_relam(rel->rd_index->indrelid);

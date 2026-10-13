@@ -3,9 +3,9 @@
  * engine_d3a.c
  *	  D3a implementation of the engine interface.
  *
- * D3a: location-addressed, in place when unpinned (birth epoch).  See
- * specs/04-candidate-designs.md.  Not implemented yet: every callback is
- * NULL, so each call raises "not implemented" (prolly_impl.h).
+ * D3a: location-addressed, in place when unpinned (birth epoch).  Not
+ * implemented yet: every callback is NULL, so each call raises "not
+ * implemented" (prolly_impl.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d3a.c

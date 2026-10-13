@@ -6,8 +6,7 @@
  * A node is a Postgres page with a standard PageHeaderData.  It has a
  * canonical region, whose bytes are hashed, and an unhashed special space
  * for physical metadata (read hints, cached hash, flags, and for D4 version
- * and lock data).  See specs/04-candidate-designs.md, "Nodes are Postgres
- * pages".
+ * and lock data).
  *
  * Contract:
  * - Items in a node are (key, value) pairs in key order.  In internal nodes
@@ -16,7 +15,7 @@
  *   the child was stored when the node was written.  Hints are outside the
  *   canonical region, so they never affect the hash.  Leaves have none.
  * - The canonical region depends only on the node's items and level, never
- *   on how or in what order they were written (invariant 7).
+ *   on how or in what order they were written.
  * - Callbacks don't lock or pin; the caller holds the buffer appropriately.
  *
  * Provisional (v0).
@@ -71,7 +70,7 @@ typedef struct ProllyNodeFormatRoutine
 	/* The unhashed special space. */
 	char	   *(*special_space) (Page page, Size *len);
 
-	/* Structural check for amcheck-style verification (gate 5). */
+	/* Structural check for amcheck-style verification. */
 	bool		(*page_check) (Page page, char **detail);
 } ProllyNodeFormatRoutine;
 

@@ -3,9 +3,10 @@ src/test/prolly/README
 Requirements suite for prolly storage engines
 =============================================
 
-These tests encode what a prolly engine must do, as decided in specs/
-(true to Postgres and true to Dolt: specs/09-versioned-catalogs.md).  An
-engine meets its requirements when this suite passes against it.  The suite
+These tests encode what a prolly engine must do: be true to Postgres (SQL,
+concurrency and durability behave exactly as on heap) and true to Dolt
+(branches, versioned schema, diff, merge, and commits whose root hash
+depends only on their content).  An engine meets its requirements when this suite passes against it.  The suite
 is not part of "make check" or "make check-world"; stock Postgres doesn't
 run it.
 
@@ -28,9 +29,8 @@ table the tests create is stored by the engine.  Individual groups:
 
 The TAP groups need a build configured with --enable-tap-tests.
 
-Correctness gates 1 and 2 (specs/06-benchmarking.md), Postgres's own
-regression and isolation suites run with the engine as the default table
-AM, are separate targets, not part of "check":
+Postgres's own regression and isolation suites, run with the engine as
+the default table AM, are separate targets, not part of "check":
 
 	check-upstream-regress
 	check-upstream-isolation
@@ -56,7 +56,7 @@ prints one "label|value" line.  They can't run against heap.
 What is and isn't covered
 -------------------------
 
-Covered: requirements that are decided (specs/08-open-questions.md).
+Covered: requirements that are decided.
 
 	Semantics       types, large values, COPY, TRUNCATE, DDL on data
 	                (sem_basic, sem_ddl); every index AM on engine tables
@@ -81,11 +81,10 @@ Covered: requirements that are decided (specs/08-open-questions.md).
 	                across client encodings and databases (vc_canonical)
 	                and across clusters (201)
 
-Not covered until decided: temporary and unlogged tables (open question
-28), tablespaces (29), logical decoding (31, deferred), clone/push/fetch
-(V4, out of scope for the first engine), the staging API, how merge
-conflicts are reported, merges that change schema, and branch scope of
-cluster-wide catalogs (27).
+Not covered until decided: temporary and unlogged tables, tablespaces,
+logical decoding (deferred), clone/push/fetch (V4, out of scope for the
+first engine), the staging API, how merge conflicts are reported, merges
+that change schema, and branch scope of cluster-wide catalogs.
 
 The version-control tests assume the default branch is named "main" and
 that an unknown branch is reported as
@@ -96,4 +95,4 @@ Bugs
 
 Every bug found in prolly storage gets at least one test that fails without
 the fix: here if it is a requirement-level behaviour, otherwise in
-src/test/modules/test_prolly (specs/README.md, ground rules).
+src/test/modules/test_prolly.

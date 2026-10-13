@@ -1,5 +1,5 @@
-"""The V suite: version-control workloads, for prolly engines only
-(specs/06-benchmarking.md).  They call the prolly_* SQL functions.
+"""The V suite: version-control workloads, for prolly engines only.  They
+call the prolly_* SQL functions.
 
 Every V workload has a "background" variant dimension: "none", or "S1" to
 run pgbench TPC-B alongside the version-control operations, measuring how

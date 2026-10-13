@@ -5,7 +5,7 @@
  *
  * Each function is a thin adapter onto one call of the refs, diff/merge or
  * transfer interface (prolly_config.h).  Names and signatures are
- * provisional: they are what the V suite (specs/06-benchmarking.md) calls.
+ * provisional: they are what the version-control benchmarks call.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_vcs.c
@@ -87,8 +87,8 @@ prolly_commit(PG_FUNCTION_ARGS)
  *
  * The canonical root hash of the commit ref names (a branch or a commit
  * id).  It depends only on the logical content (schema and data) of that
- * commit, never on how it was produced (specs/09-versioned-catalogs.md), so
- * comparing it is how history independence is tested.
+ * commit, never on how it was produced, so comparing it is how history
+ * independence is tested.
  */
 Datum
 prolly_root_hash(PG_FUNCTION_ARGS)

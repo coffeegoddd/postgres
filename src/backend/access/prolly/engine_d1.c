@@ -3,9 +3,9 @@
  * engine_d1.c
  *	  D1 implementation of the engine interface.
  *
- * D1: immutable copy-on-write: hash-addressed nodes, full-chunk WAL.  See
- * specs/04-candidate-designs.md.  Not implemented yet: every callback is
- * NULL, so each call raises "not implemented" (prolly_impl.h).
+ * D1: immutable copy-on-write: hash-addressed nodes, full-chunk WAL.  Not
+ * implemented yet: every callback is NULL, so each call raises "not
+ * implemented" (prolly_impl.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d1.c

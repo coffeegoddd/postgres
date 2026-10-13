@@ -4,7 +4,7 @@
  *	  Data types shared by the prolly storage interfaces.
  *
  * Everything here is plain data passed between interfaces.  Nothing here
- * belongs to any one implementation.  See specs/00-architecture-principles.md.
+ * belongs to any one implementation.
  *
  * src/include/access/prolly_types.h
  *
@@ -50,7 +50,7 @@ typedef struct ProllyValue
 
 /*
  * A physical location inside a relation's storage: a whole block, or a run
- * of bytes within one (prolly_alloc.h, axis 5).
+ * of bytes within one (prolly_alloc.h).
  */
 typedef struct ProllyExtent
 {
@@ -62,8 +62,8 @@ typedef struct ProllyExtent
 /*
  * A reference to a node.  Hash-addressed stores identify nodes by hash;
  * location-addressed stores by extent, with the hash computed on demand
- * (axis 2-ii).  Either may be absent; at least one must be present.  The
- * location may also be a read hint for a hash-addressed store (axis 3b).
+ * (lazy hashing).  Either may be absent; at least one must be present.  The
+ * location may also be a read hint for a hash-addressed store.
  */
 typedef struct ProllyNodeRef
 {

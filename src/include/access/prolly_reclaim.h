@@ -4,14 +4,13 @@
  *	  Reclamation interface: deciding what is garbage and freeing it.
  *
  * Implementations: root-reachability GC (D1, D2), birth epoch (D3a), lazy
- * reference counts (D3b), in-page vacuum (D4).  See
- * specs/03-design-space.md, axis 1.
+ * reference counts (D3b), in-page vacuum (D4).
  *
  * Contract:
  * - Nothing reachable from a root that a branch, a snapshot or a prepared
  *   transaction can still use is ever freed.
  * - may_modify_in_place() is true only if no root other than the caller's
- *   private one reaches node (the in-place constraint in axis 1).
+ *   private one reaches node, so changing it in place is invisible to others.
  * - node_created/node_dropped/root_retired are notifications; an
  *   implementation that doesn't need one leaves it as a no-op, not NULL.
  *

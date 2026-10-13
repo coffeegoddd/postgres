@@ -45,6 +45,8 @@ OBJS = \
 	prolly_vcs.o \
 	reclaim_stub.o \
 	refs_stub.o \
+	rootlayout_stub.o \
+	rootlayout_subroots.o \
 	rowid_stub.o \
 	transfer_stub.o \
 	tree_cow.o \

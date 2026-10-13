@@ -51,4 +51,12 @@ extern void tree_edits_share_nodes(const ProllyImplInfo *impl);
 extern void tree_diff_reports_changes(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 
+/* rootlayout_checks.c */
+extern void rootlayout_empty(const ProllyImplInfo *impl);
+extern void rootlayout_apply_matches_reference(const ProllyImplInfo *impl);
+extern void rootlayout_history_independent(const ProllyImplInfo *impl);
+extern void rootlayout_subroots_independent(const ProllyImplInfo *impl);
+extern void rootlayout_diff_reports_changes(const ProllyImplInfo *impl);
+extern void rootlayout_walk_reaches_trees(const ProllyImplInfo *impl);
+
 #endif							/* TEST_PROLLY_H */

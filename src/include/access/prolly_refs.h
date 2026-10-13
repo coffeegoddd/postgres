@@ -5,8 +5,7 @@
  *
  * A commit records a root, its parents and metadata.  Branches name commits
  * (or working roots).  Where this lives (catalog tables or elsewhere) and how
- * it relates to versioned catalogs (open question 5) is the implementation's
- * business.
+ * it relates to versioned catalogs is the implementation's business.
  *
  * Contract:
  * - Branch and commit changes are transactional with the calling

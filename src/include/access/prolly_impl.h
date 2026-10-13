@@ -16,8 +16,6 @@
  * up one callback at a time.  The conformance suite
  * (src/test/modules/test_prolly) reports which callbacks are missing.
  *
- * See specs/00-architecture-principles.md for the rules.
- *
  * src/include/access/prolly_impl.h
  *
  *-------------------------------------------------------------------------
@@ -26,7 +24,7 @@
 #define PROLLY_IMPL_H
 
 /*
- * The interfaces.  These numbers are persisted in format stamps (rule 5), so
+ * The interfaces.  These numbers are persisted in format stamps, so
  * never renumber or reuse one; add new interfaces at the end.
  */
 typedef enum ProllyInterface
@@ -48,10 +46,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_TRANSFER = 15,
 	PROLLY_IFACE_DIFF_MERGE = 16,
 	PROLLY_IFACE_TREE = 17,
+	PROLLY_IFACE_ROOT_LAYOUT = 18,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_ENGINE
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_TREE
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_ROOT_LAYOUT
 
 /*
  * Identity of an implementation.  The first member of every routine struct.
@@ -73,8 +72,10 @@ typedef struct ProllyImplInfo
 #define PROLLY_STUB_IMPL_ID		0
 
 /*
- * What persisted data records about the implementation that wrote it
- * (rule 5).  Serialize field by field; don't write the struct's bytes.
+ * What persisted data records about the implementation that wrote it, so
+ * data written by one implementation can be recognized and refused, migrated
+ * or read by another.  Serialize field by field; don't write the struct's
+ * bytes.
  */
 typedef struct ProllyFormatStamp
 {

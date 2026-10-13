@@ -3,10 +3,10 @@
  * prolly_log.h
  *	  Log interface: what prolly WAL records contain and how they replay.
  *
- * Implementations differ in WAL form (specs/03-design-space.md, axis 2):
+ * Implementations differ in WAL form:
  * full chunks, deltas, or logical row changes.  The engine reports events;
  * the log implementation decides what, if anything, each event writes.  A
- * resource-manager adapter (A3) dispatches redo/desc/identify/mask here.
+ * resource-manager adapter dispatches redo/desc/identify/mask here.
  *
  * Contract:
  * - After crash recovery, every tree is as of its last committed root.

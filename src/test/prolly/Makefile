@@ -60,7 +60,7 @@ check-tap-vc: PROVE_TESTS = t/2*.pl
 check-tap-vc: temp-install
 	$(prove_check)
 
-# Correctness gates 1 and 2 (specs/06-benchmarking.md): Postgres's own
+# Upstream correctness checks: Postgres's own
 # regression and isolation suites with the engine as the default table AM.
 # Not part of "check": some upstream tests print heap-specific details
 # (ctid values, page counts), and those exceptions aren't documented yet.

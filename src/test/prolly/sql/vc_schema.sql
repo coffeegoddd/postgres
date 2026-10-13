@@ -1,5 +1,6 @@
 --
--- Version control: schema is versioned with data (open question 5).  DDL on
+-- Version control: schema is versioned with data (the catalogs are prolly
+-- tables on the branch).  DDL on
 -- a branch is invisible on other branches, including to cached plans and
 -- functions, and checking out a branch shows its schema.
 --

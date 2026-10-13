@@ -69,6 +69,7 @@ provisional.
 | **Key encoder** | memcmp-comparable keys from btree opclasses and collations; no local OIDs | Per opclass, plus a comparator fallback (**ordered**) |
 | **Value encoder** | Row encoding and deforming into slots | Canonical portable format (**canonical**, the default since 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
 | **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Cluster-wide hash-addressed (**global**), location-addressed |
+| **Root layout** | How a branch's root finds every relation's tree: catalog and user-data sub-roots | Sub-roots keyed by relation OID for the working set (**subroots**); by name for canonical roots (4g) |
 | **Tree** | Persistent prolly-tree operations over the foundation: build, get, cursors, batched apply, count, walk, diff | Copy-on-write in a hash-addressed store (**cow**); location-addressed engines (D3, D4) to be decided when they are built |
 | **Allocator** | Space management for in-place engines | Fixed-size blocks; variable-size |
 | **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |
@@ -94,6 +95,11 @@ from trees, and two engines that share a node store (D1, D2) share tree
 code, so the tree operations are their own interface rather than part of
 each engine. A tree is an immutable map identified by its root; the
 foundation components it uses come from the engine (`prolly_tree.h`).
+
+**Root layout** was added after step 4c (question 33): the two-sub-root
+shape of a branch's root is the same for every engine that keeps
+hash-addressed trees, and the canonical root will reuse it, so it is an
+interface over Tree rather than part of an engine (`prolly_rootlayout.h`).
 
 The C interfaces (everything above the benchmark rows) were defined in step 1:
 headers `src/include/access/prolly_*.h`, except the schema canonicalizer,

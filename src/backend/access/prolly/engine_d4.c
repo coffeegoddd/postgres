@@ -3,9 +3,9 @@
  * engine_d4.c
  *	  D4 implementation of the engine interface.
  *
- * D4: location-addressed, row versions in the page.  See
- * specs/04-candidate-designs.md.  Not implemented yet: every callback is
- * NULL, so each call raises "not implemented" (prolly_impl.h).
+ * D4: location-addressed, row versions in the page.  Not implemented yet:
+ * every callback is NULL, so each call raises "not implemented"
+ * (prolly_impl.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d4.c

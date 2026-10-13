@@ -1,8 +1,8 @@
 --
 -- Canonical form: the session's client_encoding doesn't affect what is
 -- stored, and two databases holding the same content have the same root
--- hash although their objects have different OIDs (identity by name,
--- specs/09-versioned-catalogs.md).
+-- hash although their objects have different OIDs (objects are identified
+-- by name in canonical form, never by OID).
 --
 \set ECHO none
 commit start|t

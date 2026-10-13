@@ -16,7 +16,7 @@
  * bits of the record's info byte are the implementation's own record type.
  *
  * desc and identify here are generic, because they also run in pg_waldump,
- * which has no registry (open question 16).
+ * which has no registry.
  *
  * This header is included by frontend code (pg_waldump).
  *
