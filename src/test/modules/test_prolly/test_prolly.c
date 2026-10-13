@@ -95,7 +95,8 @@ static const ConformanceCase cases[] = {
 
 	/* node format */
 	{PROLLY_IFACE_NODE_FORMAT, "items_round_trip",
-	"page_init item_append item_count item_get", nodeformat_items_round_trip},
+	"page_init item_append item_hint item_count item_get",
+	nodeformat_items_round_trip},
 	{PROLLY_IFACE_NODE_FORMAT, "level_round_trip", "page_init page_level item_count", nodeformat_level_round_trip},
 	{PROLLY_IFACE_NODE_FORMAT, "space_accounting",
 	"page_init item_space free_space item_append", nodeformat_space_accounting},
@@ -134,8 +135,13 @@ static const ConformanceCase cases[] = {
 
 	/* node store */
 	{PROLLY_IFACE_NODE_STORE, "new_publish_read",
-	"create open new_node publish read contains close", NULL},
-	{PROLLY_IFACE_NODE_STORE, "release_frees", "open release contains close", NULL},
+	"create open new_node publish read contains close",
+	nodestore_new_publish_read},
+	{PROLLY_IFACE_NODE_STORE, "many_nodes_findable",
+	"create open new_node publish read contains close", nodestore_many_nodes},
+	{PROLLY_IFACE_NODE_STORE, "release_frees",
+	"create open new_node publish release contains close",
+	nodestore_release_frees},
 
 	/* allocator */
 	{PROLLY_IFACE_ALLOCATOR, "no_overlapping_extents",

@@ -2,6 +2,7 @@
 
 test_prolly_sources = files(
   'foundation_checks.c',
+  'storage_checks.c',
   'test_prolly.c',
 )
 
@@ -29,6 +30,11 @@ tests += {
   'regress': {
     'sql': [
       'test_prolly',
+    ],
+  },
+  'tap': {
+    'tests': [
+      't/001_store_recovery.pl',
     ],
   },
 }

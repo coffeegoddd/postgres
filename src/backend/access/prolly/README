@@ -9,10 +9,11 @@ can be branched, diffed, merged, cloned, pushed and pulled.  The design and
 the plan are in specs/ at the top of the tree; start with
 specs/README.md and specs/00-architecture-principles.md.
 
-Status: roadmap step 4a.  Every interface exists.  The foundation
-interfaces that don't touch storage (node format, chunker, content hash, key
-and value encoders) have real implementations that pass their conformance
-suites; everything else is a stub.  Nothing stores data yet.
+Status: roadmap step 4b.  Every interface exists.  The foundation
+interfaces (node format, chunker, content hash, key and value encoders), the
+cluster-wide node store and D1's WAL form have real implementations that
+pass their conformance suites; everything else is a stub.  No table stores
+data yet.
 
 
 Interfaces and implementations
@@ -29,10 +30,10 @@ design choice can be changed later by writing a new implementation:
 	content_hash      prolly_hash.h           sha256, stub
 	key_encoder       prolly_keyenc.h         ordered, stub
 	value_encoder     prolly_valenc.h         heaptuple, stub
-	node_store        prolly_nodestore.h      stub
+	node_store        prolly_nodestore.h      global, stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
-	log               prolly_log.h            stub
+	log               prolly_log.h            chunks, stub
 	commit_pipeline   prolly_commit.h         stub
 	row_identity      prolly_rowid.h          stub
 	refs              prolly_refs.h           stub
@@ -69,7 +70,25 @@ never from code.  Today that is a default profile per table AM:
 
 All five share the same foundation: node format basic, chunker keyhash,
 content hash sha256, key encoder ordered, value encoder heaptuple, and stubs
-for the interfaces without an implementation yet.
+for the interfaces without an implementation yet.  prolly_d1 uses the node
+store global and the log chunks; prolly_d2 the node store global.
+
+
+Storage and WAL
+---------------
+
+All nodes, of every relation in every database on every branch, live in one
+cluster-wide store (nodestore_global.c): relation files 9393 (nodes), 9394
+(hash -> block map) and 9395 (map overflow) in the global tablespace,
+through smgr and the buffer manager.  Internal nodes carry an unhashed
+block hint per child, so reads usually skip the map.
+
+Two WAL resource managers carry prolly records (prolly_xlog.h,
+prolly_rmgr.c): Prolly for the log interface (D1's "chunks" logs each new
+node as a full page image) and ProllyStore for the node store's own map.
+Each record names the implementation that wrote it, and redo dispatches to
+it.  test_prolly's TAP test replays both on a streaming standby and through
+crash recovery under wal_consistency_checking.
 
 Database-wide components (refs, transfer, diff_merge) come from a database
 profile.  Once a tree can be created, its components will be recorded in the

@@ -35,6 +35,10 @@ PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_keyhash)
 PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
 
+/* node storage (roadmap step 4b) */
+PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
+PG_PROLLY_IMPL(ProllyLogRoutine, prolly_log_chunks)
+
 /* stubs of the foundation and version-control interfaces */
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_stub)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_stub)

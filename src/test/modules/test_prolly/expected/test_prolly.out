@@ -29,16 +29,18 @@ FROM prolly_implementations();
  key_encoder     | stub        |       0 |              0
  value_encoder   | heaptuple   |       1 |              1
  value_encoder   | stub        |       0 |              0
+ node_store      | global      |       1 |              1
  node_store      | stub        |       0 |              0
  allocator       | stub        |       0 |              0
  reclamation     | stub        |       0 |              0
+ log             | chunks      |       1 |              1
  log             | stub        |       0 |              0
  commit_pipeline | stub        |       0 |              0
  row_identity    | stub        |       0 |              0
  refs            | stub        |       0 |              0
  transfer        | stub        |       0 |              0
  diff_merge      | stub        |       0 |              0
-(29 rows)
+(31 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -128,12 +130,12 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  node_format     | basic          | page_check_detects_corruption           | pass
  node_format     | basic          | complete                                | pass
  node_format     | stub           | identity                                | pass
- node_format     | stub           | items_round_trip                        | not implemented (missing page_init, item_append, item_count, item_get)
+ node_format     | stub           | items_round_trip                        | not implemented (missing page_init, item_append, item_hint, item_count, item_get)
  node_format     | stub           | level_round_trip                        | not implemented (missing page_init, page_level, item_count)
  node_format     | stub           | space_accounting                        | not implemented (missing page_init, item_space, free_space, item_append)
  node_format     | stub           | canonical_bytes_depend_only_on_items    | not implemented (missing page_init, item_append, canonical_bytes, special_space)
  node_format     | stub           | page_check_detects_corruption           | not implemented (missing page_init, item_append, page_check)
- node_format     | stub           | complete                                | not implemented (10 of 10 callbacks missing)
+ node_format     | stub           | complete                                | not implemented (11 of 11 callbacks missing)
  chunker         | keyhash        | identity                                | pass
  chunker         | keyhash        | deterministic                           | pass
  chunker         | keyhash        | forced_split_respects_capacity          | pass
@@ -170,10 +172,16 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder   | stub           | round_trip                              | not implemented (missing begin, encode, decode, end)
  value_encoder   | stub           | platform_independent                    | not implemented (missing begin, encode, end)
  value_encoder   | stub           | complete                                | not implemented (4 of 4 callbacks missing)
+ node_store      | global         | identity                                | pass
+ node_store      | global         | new_publish_read                        | pass
+ node_store      | global         | many_nodes_findable                     | pass
+ node_store      | global         | release_frees                           | pass
+ node_store      | global         | complete                                | pass
  node_store      | stub           | identity                                | pass
  node_store      | stub           | new_publish_read                        | not implemented (missing create, open, new_node, publish, read, contains, close)
- node_store      | stub           | release_frees                           | not implemented (missing open, release, contains, close)
- node_store      | stub           | complete                                | not implemented (8 of 8 callbacks missing)
+ node_store      | stub           | many_nodes_findable                     | not implemented (missing create, open, new_node, publish, read, contains, close)
+ node_store      | stub           | release_frees                           | not implemented (missing create, open, new_node, publish, release, contains, close)
+ node_store      | stub           | complete                                | not implemented (9 of 9 callbacks missing)
  allocator       | stub           | identity                                | pass
  allocator       | stub           | no_overlapping_extents                  | not implemented (missing open, allocate, free, close)
  allocator       | stub           | complete                                | not implemented (4 of 4 callbacks missing)
@@ -181,6 +189,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  reclamation     | stub           | reachable_never_freed                   | not implemented (missing node_created, node_dropped, root_retired, run)
  reclamation     | stub           | in_place_only_when_private              | not implemented (missing may_modify_in_place)
  reclamation     | stub           | complete                                | not implemented (5 of 5 callbacks missing)
+ log             | chunks         | identity                                | pass
+ log             | chunks         | commit_record                           | not implemented (missing log_commit)
+ log             | chunks         | redo_restores_committed_root            | not implemented (missing log_commit, startup, cleanup)
+ log             | chunks         | describes_records                       | not implemented (missing desc, identify)
+ log             | chunks         | complete                                | not implemented (6 of 9 callbacks missing)
  log             | stub           | identity                                | pass
  log             | stub           | commit_record                           | not implemented (missing log_commit)
  log             | stub           | redo_restores_committed_root            | not implemented (missing log_node, log_mutation, log_commit, redo, startup, cleanup)
@@ -207,7 +220,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge      | stub           | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub           | merge                                   | not implemented (missing merge)
  diff_merge      | stub           | complete                                | not implemented (2 of 2 callbacks missing)
-(161 rows)
+(172 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

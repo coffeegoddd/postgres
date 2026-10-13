@@ -33,4 +33,9 @@ extern void keyenc_decode_round_trip(const ProllyImplInfo *impl);
 extern void valenc_round_trip(const ProllyImplInfo *impl);
 extern void valenc_platform_independent(const ProllyImplInfo *impl);
 
+/* storage_checks.c */
+extern void nodestore_new_publish_read(const ProllyImplInfo *impl);
+extern void nodestore_many_nodes(const ProllyImplInfo *impl);
+extern void nodestore_release_frees(const ProllyImplInfo *impl);
+
 #endif							/* TEST_PROLLY_H */

@@ -121,8 +121,8 @@ in the same mode and configuration as the engine.
   the simplest engine and the reference point for the others.
 - Decided for this engine: synthetic TIDs with a map (question 2), Postgres
   tuple format for values (question 12), schema versioned per branch by
-  making the database's catalogs prolly tables (question 5; sub-questions
-  21–26).
+  making all catalogs, shared ones included, prolly tables (question 5;
+  sub-questions 21–27).
 - Starting choices (questions 1, 3, 4): nodes in the table's main fork through
   the buffer manager; key-only chunk boundaries with a forced split; our own
   format with SHA-256.
@@ -139,6 +139,14 @@ in the same mode and configuration as the engine.
 `src/test/modules/test_prolly`; deliberately broken versions of the key
 encoder and chunker were checked to fail them. Chunk size targets are
 starting values (`chunker_keyhash.c`), to be set by measurement.
+
+**Status (2026-10-13): 4b built.** One cluster-wide node store (`global`:
+linear-hashing hash → block map, per-child block hints in internal nodes),
+D1's log (`chunks`: full node images), and two WAL resource managers
+(`Prolly`, `ProllyStore`). Conformance checks pass, including 5,000 nodes
+across many map splits; a TAP test replays the store on a standby and
+through crash recovery with `wal_consistency_checking`, and a deliberately
+broken redo was checked to fail it. Not yet: reuse of released blocks (4f).
 - Includes the shared foundation it needs (`04-candidate-designs.md`): node
   page format, chunker, content hashing, key and value encoding, canonical
   export, WAL resource manager, commit publish (B1, B2).

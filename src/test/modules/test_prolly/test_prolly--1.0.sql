@@ -24,3 +24,17 @@ CREATE FUNCTION prolly_conformance(
 	OUT result text)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Write n nodes to a node store implementation, with hashes and contents
+-- derived from seed, so prolly_store_verify can find them later (for
+-- example after crash recovery).  Returns the number written.
+CREATE FUNCTION prolly_store_write(store text, seed int8, n int4)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Check that the n nodes written by prolly_store_write(store, seed, n) are
+-- all found by hash and have the right contents.  Returns n, or raises an
+-- error.
+CREATE FUNCTION prolly_store_verify(store text, seed int8, n int4)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

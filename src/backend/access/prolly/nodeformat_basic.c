@@ -21,9 +21,11 @@
  * same on every platform.  It is contiguous, from the end of the page header
  * to pd_lower.
  *
- * Item offsets (uint16, native byte order) grow down from the special space,
- * item 0 nearest it, for random access by index.  They are derived from the
- * canonical region and are not hashed.  The special space is
+ * Item entries grow down from the special space, item 0 nearest it, for
+ * random access by index.  An entry is the item's offset (uint16, native
+ * byte order), and in internal nodes also the child's block hint (uint32,
+ * native byte order, unaligned).  Entries are derived from the canonical
+ * region or are hints, so they are not hashed.  The special space is
  * PROLLY_BASIC_SPECIAL_SIZE bytes, zeroed at page_init; this format doesn't
  * interpret it.
  *
@@ -47,6 +49,9 @@
 #define NODE_HEADER_SIZE	(2 * sizeof(uint16))
 /* key and value lengths */
 #define ITEM_HEADER_SIZE	(2 * sizeof(uint16))
+/* item entries: offset, plus block hint in internal nodes */
+#define LEAF_ENTRY_SIZE		sizeof(uint16)
+#define INTERNAL_ENTRY_SIZE	(sizeof(uint16) + sizeof(BlockNumber))
 
 #define CANONICAL_START		SizeOfPageHeaderData
 
@@ -66,17 +71,34 @@ put_be16(char *p, uint16 v)
 	memcpy(p, &v, sizeof(v));
 }
 
-static inline uint16 *
-offsets_base(Page page)
+static inline Size
+entry_size(uint16 level)
 {
-	/* offset of item i is at index -(i + 1) */
-	return (uint16 *) PageGetSpecialPointer(page);
+	return level == 0 ? LEAF_ENTRY_SIZE : INTERNAL_ENTRY_SIZE;
 }
+
+/* Item index's entry: offset, then (internal nodes) hint. */
+static inline char *
+item_entry(Page page, int index, Size entsize)
+{
+	return PageGetSpecialPointer(page) - entsize * (index + 1);
+}
+
+static inline uint16
+item_offset_sized(Page page, int index, Size entsize)
+{
+	uint16		off;
+
+	memcpy(&off, item_entry(page, index, entsize), sizeof(off));
+	return off;
+}
+
+static uint16 basic_page_level(Page page);
 
 static inline uint16
 item_offset(Page page, int index)
 {
-	return offsets_base(page)[-(index + 1)];
+	return item_offset_sized(page, index, entry_size(basic_page_level(page)));
 }
 
 static void
@@ -121,9 +143,9 @@ basic_item_get(Page page, int index, ProllyKey *key, ProllyValue *value)
 }
 
 static Size
-basic_item_space(const ProllyKey *key, const ProllyValue *value)
+basic_item_space(uint16 level, const ProllyKey *key, const ProllyValue *value)
 {
-	return ITEM_HEADER_SIZE + key->len + value->len + sizeof(uint16);
+	return ITEM_HEADER_SIZE + key->len + value->len + entry_size(level);
 }
 
 static Size
@@ -135,15 +157,20 @@ basic_free_space(Page page)
 }
 
 static bool
-basic_item_append(Page page, const ProllyKey *key, const ProllyValue *value)
+basic_item_append(Page page, const ProllyKey *key, const ProllyValue *value,
+				  BlockNumber hint)
 {
 	PageHeader	phdr = (PageHeader) page;
+	uint16		level = basic_page_level(page);
+	Size		entsize = entry_size(level);
 	char	   *count_ptr = (char *) page + CANONICAL_START + sizeof(uint16);
 	int			count = get_be16(count_ptr);
 	char	   *item;
+	char	   *entry;
+	uint16		off = phdr->pd_lower;
 
 	if (key->len > PG_UINT16_MAX || value->len > PG_UINT16_MAX ||
-		basic_item_space(key, value) > basic_free_space(page) ||
+		basic_item_space(level, key, value) > basic_free_space(page) ||
 		count == PG_UINT16_MAX)
 		return false;
 
@@ -153,11 +180,27 @@ basic_item_append(Page page, const ProllyKey *key, const ProllyValue *value)
 	memcpy(item + ITEM_HEADER_SIZE, key->data, key->len);
 	memcpy(item + ITEM_HEADER_SIZE + key->len, value->data, value->len);
 
-	offsets_base(page)[-(count + 1)] = phdr->pd_lower;
-	phdr->pd_upper -= sizeof(uint16);
+	entry = item_entry(page, count, entsize);
+	memcpy(entry, &off, sizeof(off));
+	if (level > 0)
+		memcpy(entry + sizeof(uint16), &hint, sizeof(hint));
+	phdr->pd_upper -= entsize;
 	phdr->pd_lower += ITEM_HEADER_SIZE + key->len + value->len;
 	put_be16(count_ptr, (uint16) (count + 1));
 	return true;
+}
+
+static BlockNumber
+basic_item_hint(Page page, int index)
+{
+	BlockNumber hint;
+
+	Assert(index >= 0 && index < basic_item_count(page));
+	if (basic_page_level(page) == 0)
+		return InvalidBlockNumber;
+	memcpy(&hint, item_entry(page, index, INTERNAL_ENTRY_SIZE) + sizeof(uint16),
+		   sizeof(hint));
+	return hint;
 }
 
 static void
@@ -198,9 +241,10 @@ basic_page_check(Page page, char **detail)
 	}
 
 	count = basic_item_count(page);
-	if (phdr->pd_special - phdr->pd_upper != count * sizeof(uint16))
+	if (phdr->pd_special - phdr->pd_upper !=
+		count * entry_size(basic_page_level(page)))
 	{
-		*detail = psprintf("item count %d does not match %u bytes of offsets",
+		*detail = psprintf("item count %d does not match %u bytes of item entries",
 						   count, phdr->pd_special - phdr->pd_upper);
 		return false;
 	}
@@ -244,13 +288,14 @@ const ProllyNodeFormatRoutine prolly_nodeformat_basic = {
 		.format_version = 1,
 		.name = "basic",
 		.description = "items packed in key order after the page header; "
-		"big-endian lengths; unhashed offsets and special space",
+		"big-endian lengths; unhashed offsets, child hints and special space",
 	},
 	.page_init = basic_page_init,
 	.page_level = basic_page_level,
 	.item_count = basic_item_count,
 	.item_get = basic_item_get,
 	.item_append = basic_item_append,
+	.item_hint = basic_item_hint,
 	.item_space = basic_item_space,
 	.free_space = basic_free_space,
 	.canonical_bytes = basic_canonical_bytes,

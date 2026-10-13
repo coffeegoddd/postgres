@@ -29,14 +29,17 @@ OBJS = \
 	hash_stub.o \
 	keyenc_ordered.o \
 	keyenc_stub.o \
+	log_chunks.o \
 	log_stub.o \
 	merge_stub.o \
 	nodeformat_basic.o \
 	nodeformat_stub.o \
+	nodestore_global.o \
 	nodestore_stub.o \
 	prolly_config.o \
 	prolly_indexam.o \
 	prolly_registry.o \
+	prolly_rmgr.o \
 	prolly_tableam.o \
 	prolly_vcs.o \
 	reclaim_stub.o \

@@ -12,6 +12,9 @@
  * Contract:
  * - Items in a node are (key, value) pairs in key order.  In internal nodes
  *   the value is an encoded child reference.
+ * - Each item in an internal node (level > 0) also has a block hint: where
+ *   the child was stored when the node was written.  Hints are outside the
+ *   canonical region, so they never affect the hash.  Leaves have none.
  * - The canonical region depends only on the node's items and level, never
  *   on how or in what order they were written (invariant 7).
  * - Callbacks don't lock or pin; the caller holds the buffer appropriately.
@@ -43,15 +46,23 @@ typedef struct ProllyNodeFormatRoutine
 	void		(*item_get) (Page page, int index, ProllyKey *key,
 							 ProllyValue *value);
 
-	/* Append an item after the last one; false if it doesn't fit. */
+	/*
+	 * Append an item after the last one; false if it doesn't fit.  hint is
+	 * the child's block in an internal node (InvalidBlockNumber if unknown),
+	 * and is ignored in a leaf.
+	 */
 	bool		(*item_append) (Page page, const ProllyKey *key,
-								const ProllyValue *value);
+								const ProllyValue *value, BlockNumber hint);
+
+	/* The item's block hint; InvalidBlockNumber in a leaf or if unknown. */
+	BlockNumber (*item_hint) (Page page, int index);
 
 	/*
-	 * Space an item would take in a node, and the free space left in page.
-	 * The chunker uses these for its deterministic forced split.
+	 * Space an item would take in a node at level, and the free space left
+	 * in page.  The chunker uses these for its deterministic forced split.
 	 */
-	Size		(*item_space) (const ProllyKey *key, const ProllyValue *value);
+	Size		(*item_space) (uint16 level, const ProllyKey *key,
+							   const ProllyValue *value);
 	Size		(*free_space) (Page page);
 
 	/* The bytes to hash: the canonical region. */
@@ -66,8 +77,8 @@ typedef struct ProllyNodeFormatRoutine
 
 #define PROLLY_NODEFORMAT_CALLBACK_NAMES \
 	"page_init", "page_level", "item_count", "item_get", "item_append", \
-	"item_space", "free_space", "canonical_bytes", "special_space", \
-	"page_check"
+	"item_hint", "item_space", "free_space", "canonical_bytes", \
+	"special_space", "page_check"
 #define PROLLY_NODEFORMAT_FIRST_CALLBACK page_init
 
 static inline const ProllyNodeFormatRoutine *

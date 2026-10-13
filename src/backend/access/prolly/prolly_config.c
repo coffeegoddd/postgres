@@ -28,30 +28,38 @@ typedef struct ProllyProfile
 	const char *impls[PROLLY_IFACE_LAST + 1];
 } ProllyProfile;
 
+/*
+ * Shared by every engine.  Node store and log differ by engine: D1 and D2
+ * are hash-addressed (the "global" store); D3 and D4 are location-addressed
+ * and have no store yet.
+ */
 #define FOUNDATION \
 	[PROLLY_IFACE_NODE_FORMAT] = "basic", \
 	[PROLLY_IFACE_CHUNKER] = "keyhash", \
 	[PROLLY_IFACE_CONTENT_HASH] = "sha256", \
 	[PROLLY_IFACE_KEY_ENCODER] = "ordered", \
 	[PROLLY_IFACE_VALUE_ENCODER] = "heaptuple", \
-	[PROLLY_IFACE_NODE_STORE] = "stub", \
 	[PROLLY_IFACE_ALLOCATOR] = "stub", \
 	[PROLLY_IFACE_RECLAMATION] = "stub", \
-	[PROLLY_IFACE_LOG] = "stub", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "stub", \
 	[PROLLY_IFACE_ROW_IDENTITY] = "stub"
 
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
-	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
+	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
-	[PROLLY_IFACE_COORDINATION] = "k1", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
+	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3a", {[PROLLY_IFACE_ENGINE] = "d3a",
-	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3b", {[PROLLY_IFACE_ENGINE] = "d3b",
-	[PROLLY_IFACE_COORDINATION] = "k2", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d4", {[PROLLY_IFACE_ENGINE] = "d4",
-	[PROLLY_IFACE_COORDINATION] = "k3", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k3", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 };
 
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {

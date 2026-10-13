@@ -10,7 +10,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Candidate set (D1–D5, K1–K3, pairings) | Proposed 2026-10-13; agreed as the working plan, not as final designs |
 | Engine per storage type | Open; hypotheses in `05-storage-targets.md` |
 | First engine, its VC scope, row identity, value encoding, versioned schema (2, 5, 12, 13, 14) | Decided by the user 2026-10-13 for step 4; see each question |
-| Versioned schema mechanism (5, 21) | Decided by the user 2026-10-13: per-database catalogs are prolly tables, shared catalogs stay heap; 22–26 open, leaning to per-branch caches (23) |
+| Node store (1) | Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints; 28–30 open |
+| Versioned schema mechanism (5, 21) | Decided by the user 2026-10-13: all catalogs, shared included, are prolly tables; 22–27 open, leaning to per-branch caches (23) |
 | Node I/O, chunk boundaries, canonical format (1, 3, 4) | Starting choices for step 4 (user, 2026-10-13); can change |
 
 ## Questions
@@ -22,6 +23,14 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    **Starting choice for the first engine (user, 2026-10-13):** nodes are
    pages in the table's main fork through the buffer manager, so no smgr
    patch. Still to be confirmed by measurement.
+   **Superseded the same day (user):** versioned catalogs mean a relation's
+   storage can't be found through, or die with, its catalog entry. Nodes
+   live in **one cluster-wide node store**: every relation, database and
+   branch, as buffer-manager pages of fixed relation file numbers in the
+   global tablespace (no smgr patch). Branches point at roots in it;
+   reclamation frees unreachable nodes. Children are found through a
+   persistent **hash → block map**, plus an **unhashed per-child block
+   hint** in internal nodes so most reads skip the map (user, 2026-10-13).
 2. **Row identity (B7).** Synthetic content-derived TIDs with a map, or patch
    core for wide row identifiers?
    **Decided 2026-10-13 for the first engine:** synthetic TIDs with a map, no
@@ -44,8 +53,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    **Decided 2026-10-13 (user):** the schema is versioned per branch, from the
    first engine on: a branch, commit, diff and merge carry table definitions
    as well as rows.
-   **Decided 2026-10-13 (user): versioned catalogs.** The database's system
-   catalogs are themselves prolly tables, so every catalog read goes through
+   **Decided 2026-10-13 (user): versioned catalogs.** All system catalogs,
+   per-database and cluster-wide, are themselves prolly tables, so every catalog read goes through
    the session's branch root, and DDL writes into the branch. A branch's
    root set holds its catalog trees beside its user-table trees, which is
    Dolt's "schema in the root value", in Postgres's catalog form. Rejected
@@ -122,14 +131,23 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     them, or schema only (`pg_class`, `pg_attribute`, `pg_type`, `pg_index`,
     `pg_constraint`, `pg_attrdef`, `pg_namespace`, `pg_depend`, `pg_proc`,
     …) with `pg_statistic` and the like left per database?
-    **Decided 2026-10-13 (user):** cluster-wide (shared) catalogs stay heap;
-    every per-database catalog is versioned.
+    **Decided 2026-10-13 (user):** every catalog is versioned, per-database
+    and cluster-wide (shared) alike. (Earlier the same day: shared catalogs
+    stay heap; changed by the user.)
+27. **Branch scope of shared catalogs.** Shared catalogs (`pg_database`,
+    `pg_authid`, `pg_tablespace`, `pg_auth_members`, `pg_shdepend`,
+    `pg_db_role_setting`, …) are read before a session has picked a
+    database or branch: authentication reads `pg_authid`, and connection
+    start reads `pg_database`. What branch do those reads see, and are
+    shared catalogs branched per cluster, or per database alongside that
+    database's catalogs? `pg_shdepend` links shared and per-database objects
+    across those scopes.
 22. **Heap-specific catalog code.** Catalog writes go through
     `CatalogTupleInsert`/`Update`/`Delete` (`simple_heap_*`), in-place updates
     (`heap_inplace_update` for `relfrozenxid`, `relhasindex`, statistics),
     the relation mapper for mapped catalogs, and bootstrap mode in initdb.
-    Each needs a table-AM path or a patch. The full list has to be found
-    before estimating the work.
+    Each needs a table-AM path or a patch. Surveyed 2026-10-13: see
+    `09-versioned-catalogs.md`.
 23. **Caches per branch.** The syscache, relcache, catcache and plan cache
     must not serve one branch's definitions to a session on another.
     Per-branch caches, or invalidation on checkout and on root change?
@@ -146,3 +164,17 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     inconsistent schema (a column added on one branch to a table dropped on
     the other; a dependency on a removed object). What checks run after a
     catalog merge, and how are conflicts reported?
+28. **Temporary and unlogged prolly tables.** The cluster-wide store is
+    WAL-logged and in shared buffers. Temporary tables use backend-local
+    buffers, and unlogged tables are reset after a crash. Do they get their
+    own stores, stay heap, or aren't they supported?
+29. **Tablespaces.** With one store, `CREATE TABLE … TABLESPACE` can't place a
+    prolly table's data. One store per tablespace, or tablespaces ignored for
+    prolly tables?
+30. **One store under concurrency.** Every writer in the cluster extends the
+    same relation files, so the relation extension lock and the map are
+    shared hot spots. Bulk extension and map partitioning may be needed;
+    measure in step 5.
+31. **Logical decoding of prolly databases.** **Deferred (user,
+    2026-10-13)** past the first engine. Approach notes in
+    `09-versioned-catalogs.md` §7.

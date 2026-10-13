@@ -35,8 +35,13 @@ challenged, but a challenge should say what Postgres facility it gives up.
   checksums, the buffer manager (pinning, eviction, the bgwriter, the
   checkpointer), smgr, AIO and read streams, `full_page_writes` and
   `pg_stat_io` all apply unchanged.
-- Nodes are stored in relation forks reached through smgr (B4). For hash-addressed
-  engines (D1, D2), a hash → block map in its own fork locates nodes.
+- Nodes are stored in **one cluster-wide node store** (decided 2026-10-13,
+  open question 1): fixed relation file numbers in the global tablespace,
+  read through smgr and the buffer manager, holding every relation's nodes on
+  every branch. A relation's data is found from its branch's root, never from
+  its catalog entry, which is itself versioned. For hash-addressed engines
+  (D1, D2), a persistent hash → block map locates nodes, and internal nodes
+  carry an unhashed block hint per child so most reads skip the map.
 - The page has two regions: the **canonical region**, whose bytes are hashed,
   and an **unhashed special space** (like nbtree's `BTPageOpaqueData`) for
   physical metadata: read hints, the cached hash, engine flags, and for D4 the

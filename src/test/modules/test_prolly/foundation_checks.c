@@ -65,6 +65,13 @@ test_item(int i, uint8 *keybuf, uint8 *valbuf, ProllyKey *key, ProllyValue *valu
 	value->len = vlen;
 }
 
+/* Block hint stored with item i in internal nodes. */
+static BlockNumber
+test_hint(int i)
+{
+	return (BlockNumber) (i * 2654435761u) % MaxBlockNumber;
+}
+
 static void
 fill_page(const ProllyNodeFormatRoutine *nf, Page page, uint16 level,
 		  int first, int n)
@@ -78,7 +85,7 @@ fill_page(const ProllyNodeFormatRoutine *nf, Page page, uint16 level,
 	for (int i = first; i < first + n; i++)
 	{
 		test_item(i, keybuf, valbuf, &key, &value);
-		if (!PROLLY_CALL(nf, item_append, page, &key, &value))
+		if (!PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i)))
 			elog(ERROR, "item %d did not fit in an empty-enough page", i);
 	}
 }
@@ -90,27 +97,34 @@ nodeformat_items_round_trip(const ProllyImplInfo *impl)
 	Page		page = new_page();
 	const int	n = 40;
 
-	fill_page(nf, page, 0, 0, n);
-	if (PROLLY_CALL(nf, item_count, page) != n)
-		elog(ERROR, "item_count is %d, expected %d",
-			 PROLLY_CALL(nf, item_count, page), n);
-
-	for (int i = n - 1; i >= 0; i--)
+	for (uint16 level = 0; level < 2; level++)
 	{
-		uint8		keybuf[4];
-		uint8		valbuf[128];
-		ProllyKey	want_key,
-					key;
-		ProllyValue want_value,
-					value;
+		fill_page(nf, page, level, 0, n);
+		if (PROLLY_CALL(nf, item_count, page) != n)
+			elog(ERROR, "item_count is %d, expected %d",
+				 PROLLY_CALL(nf, item_count, page), n);
 
-		test_item(i, keybuf, valbuf, &want_key, &want_value);
-		PROLLY_CALL(nf, item_get, page, i, &key, &value);
-		if (key.len != want_key.len || memcmp(key.data, want_key.data, key.len) != 0)
-			elog(ERROR, "item %d has the wrong key", i);
-		if (value.len != want_value.len ||
-			memcmp(value.data, want_value.data, value.len) != 0)
-			elog(ERROR, "item %d has the wrong value", i);
+		for (int i = n - 1; i >= 0; i--)
+		{
+			uint8		keybuf[4];
+			uint8		valbuf[128];
+			ProllyKey	want_key,
+						key;
+			ProllyValue want_value,
+						value;
+			BlockNumber hint = PROLLY_CALL(nf, item_hint, page, i);
+
+			test_item(i, keybuf, valbuf, &want_key, &want_value);
+			PROLLY_CALL(nf, item_get, page, i, &key, &value);
+			if (key.len != want_key.len ||
+				memcmp(key.data, want_key.data, key.len) != 0)
+				elog(ERROR, "level %u item %d has the wrong key", level, i);
+			if (value.len != want_value.len ||
+				memcmp(value.data, want_value.data, value.len) != 0)
+				elog(ERROR, "level %u item %d has the wrong value", level, i);
+			if (hint != (level == 0 ? InvalidBlockNumber : test_hint(i)))
+				elog(ERROR, "level %u item %d has block hint %u", level, i, hint);
+		}
 	}
 }
 
@@ -139,7 +153,7 @@ nodeformat_space_accounting(const ProllyImplInfo *impl)
 	Page		page = new_page();
 	bool		filled = false;
 
-	PROLLY_CALL(nf, page_init, page, TEST_PAGE_SIZE, 0);
+	PROLLY_CALL(nf, page_init, page, TEST_PAGE_SIZE, 1);
 	for (int i = 0; i < TEST_PAGE_SIZE; i++)
 	{
 		uint8		keybuf[4];
@@ -151,9 +165,9 @@ nodeformat_space_accounting(const ProllyImplInfo *impl)
 		bool		ok;
 
 		test_item(i, keybuf, valbuf, &key, &value);
-		need = PROLLY_CALL(nf, item_space, &key, &value);
+		need = PROLLY_CALL(nf, item_space, 1, &key, &value);
 		before = PROLLY_CALL(nf, free_space, page);
-		ok = PROLLY_CALL(nf, item_append, page, &key, &value);
+		ok = PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i));
 
 		if (ok != (need <= before))
 			elog(ERROR, "item %d of %zu bytes %s with %zu bytes free",
@@ -209,6 +223,26 @@ nodeformat_canonical_bytes(const ProllyImplInfo *impl)
 	canonical_copy(nf, b, &cb);
 	if (ca.len != cb.len || memcmp(ca.data, cb.data, ca.len) != 0)
 		elog(ERROR, "same items gave different canonical bytes");
+
+	/* Block hints are not canonical: different hints, same bytes. */
+	fill_page(nf, a, 1, 0, 30);
+	canonical_copy(nf, a, &ca);
+	PROLLY_CALL(nf, page_init, b, TEST_PAGE_SIZE, 1);
+	for (int i = 0; i < 30; i++)
+	{
+		uint8		keybuf[4];
+		uint8		valbuf[128];
+		ProllyKey	key;
+		ProllyValue value;
+
+		test_item(i, keybuf, valbuf, &key, &value);
+		PROLLY_CALL(nf, item_append, b, &key, &value, InvalidBlockNumber);
+	}
+	canonical_copy(nf, b, &cb);
+	if (ca.len != cb.len || memcmp(ca.data, cb.data, ca.len) != 0)
+		elog(ERROR, "block hints changed the canonical bytes");
+	fill_page(nf, a, 0, 0, 30);
+	canonical_copy(nf, a, &ca);
 
 	/* A different item, or a different level, must change them. */
 	fill_page(nf, b, 0, 1, 30);
