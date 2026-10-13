@@ -70,8 +70,10 @@ check-upstream-regress: prolly_am.conf
 check-upstream-isolation: prolly_am.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
-# What stock Postgres must pass: proves the tests are right.
-check-heap:
+# What stock Postgres must pass: proves the tests are right.  The temporary
+# installation (with EXTRA_INSTALL) is made here: temp-install does nothing
+# in the recursive make below.
+check-heap: temp-install
 	$(MAKE) check-semantics check-isolation check-tap-durability PROLLY_AM=heap
 
 clean distclean:
