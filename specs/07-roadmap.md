@@ -104,16 +104,38 @@ during step 2 at the user's request.
 **Exit criteria:** a reproducible local B0 baseline for S1–S9, with its spread
 and environment recorded.
 
+**Status (2026-10-13): repeatability shown; full baseline deferred by the
+user.** In benchmark mode (`system/system_prepare.sh`), 5 repetitions of S1
+and S2 (scale 5, 4 clients, 60 s) had throughput CV 1.2% and range 3.2%, under
+the 5% target; latency p50–p99.9 CV 1.1–3.4%. Outside benchmark mode, CPU
+boost gave S2 an outlier run (range 8.4%), so benchmark mode is required.
+Remaining noise: S1's post-run VACUUM time had one repetition at 4 ms against
+44 ms (probably a collision with autovacuum), and device bytes carry the btrfs
+fsync cost (open question 20). The full B0 baseline will be run in step 5,
+in the same mode and configuration as the engine.
+
 ## 4. Implement the first engine
 
-- The first pairing is **D1+K1** (proposed; confirm before starting, open
-  question 13): immutable copy-on-write on Postgres pages, with a separate lock
-  table. It's the simplest engine and the reference point for the others.
+- The first pairing is **D1+K1** (decided 2026-10-13, open question 13):
+  immutable copy-on-write on Postgres pages, with a separate lock table. It's
+  the simplest engine and the reference point for the others.
+- Decided for this engine: synthetic TIDs with a map (question 2), Postgres
+  tuple format for values (question 12), schema versioned per branch
+  (question 5; the mechanism is still to be designed).
+- Starting choices (questions 1, 3, 4): nodes in the table's main fork through
+  the buffer manager; key-only chunk boundaries with a forced split; our own
+  format with SHA-256.
+- Order of work within the step: (4a) hash, key and value encoders, node
+  format, chunker; (4b) node store and WAL; (4c) D1 tree operations; (4d)
+  table and index AM wiring, single writer per table; (4e) concurrency: K1,
+  commit pipeline, root-carrying snapshots (B1, B2); (4f) checkpoint,
+  recovery, reclamation; (4g) V1–V3 and the versioned schema; (4h) S and V
+  suites and correctness gates.
 - Includes the shared foundation it needs (`04-candidate-designs.md`): node
   page format, chunker, content hashing, key and value encoding, canonical
   export, WAL resource manager, commit publish (B1, B2).
-- Includes the version-control operations the V suite measures, to the scope
-  agreed in open question 14.
+- Includes version-control operations V1–V3 (decided 2026-10-13, open
+  question 14); clone, fetch and push stay stubs.
 - Every piece is an implementation of an interface from step 1; D1 and K1
   must pass their interfaces' conformance suites.
 
@@ -122,8 +144,8 @@ gates in `06-benchmarking.md` are run, with their status recorded.
 
 ## 5. Measure the first engine
 
-- Run both suites against D1+K1 on the same machine and configuration as the
-  step 3 baseline.
+- Run the full B0 baseline (deferred from step 3) and both suites against
+  D1+K1, on the same machine, in benchmark mode, with the same configuration.
 - Collect profiles (`perf`) for the workloads where D1+K1 differs most from B0.
 
 **Exit criteria:** S results side by side with B0 (normalized to B0 = 1.0), V

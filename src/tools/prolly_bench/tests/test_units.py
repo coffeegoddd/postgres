@@ -221,3 +221,12 @@ class TableTest(unittest.TestCase):
             page = table.to_html(sets, "S")
             self.assertIn("class='num bad'", page)   # 0.80x throughput is worse
             self.assertIn("not impl.", page)
+
+    def test_write_metrics_na_when_read_only(self):
+        from pbench import table
+        rs = [{"status": "ok", "read_only": True,
+               "metrics": {"wal_bytes_per_txn": 0.01, "tps": 5.0}}]
+        self.assertEqual(table._cell(rs, "wal_bytes_per_txn", None).text, "n/a")
+        self.assertEqual(table._cell(rs, "throughput", None).text, "5.00")
+        rs[0]["read_only"] = False
+        self.assertEqual(table._cell(rs, "wal_bytes_per_txn", None).text, "0.01")

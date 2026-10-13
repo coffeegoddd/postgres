@@ -230,6 +230,7 @@ class Runner:
             result.metrics.update(outcome.metrics)
             result.metrics["window_seconds"] = window.seconds
             result.notes += outcome.notes
+            result.read_only = outcome.read_only
             if outcome.unit != "transaction":
                 result.notes.append(f"per-txn metrics are per {outcome.unit}")
 

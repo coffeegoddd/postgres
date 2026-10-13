@@ -27,6 +27,10 @@ DEFAULT_TESTS = [
     "select_random_ranges", "bulk_insert",
 ]
 
+# Tests that only read.
+_READ_ONLY = {"oltp_read_only", "oltp_point_select", "select_random_points",
+              "select_random_ranges"}
+
 # Tests whose scripts only support a single table.
 _ONE_TABLE = {"select_random_points", "select_random_ranges"}
 
@@ -137,7 +141,8 @@ class S10(Workload):
                    "latency_p999_ms": ms(hist.percentile(99.9)),
                    "latency_max_ms": ms(hist.max_us or None)}
         return Outcome(metrics=metrics, transactions=parsed["transactions"],
-                       client_cpu_seconds=client_cpu)
+                       client_cpu_seconds=client_cpu,
+                       read_only=ctx.params["test"] in _READ_ONLY)
 
     def tables(self, ctx: Context) -> list[str]:
         return [f"sbtest{i}" for i in range(1, self._tables(ctx) + 1)]

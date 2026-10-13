@@ -49,6 +49,8 @@ V_TABLES = [
     ("background_tps", "Background S1 throughput", "tps"),
 ]
 _HIGHER = HIGHER_IS_BETTER | {"throughput"}
+# Metrics that measure write volume; not applicable to read-only cells.
+_WRITE_METRICS = {"wal_bytes_per_txn", "device_write_bytes_per_txn"}
 _STATUS_TEXT = {"not_implemented": "not impl.", "unavailable": "unavail.",
                 "error": "error", "not_applicable": "n/a"}
 
@@ -114,6 +116,9 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
         status = rs[0]["status"]
         return Cell(_STATUS_TEXT.get(status, status), ok=False,
                     detail=rs[0].get("message", ""))
+    if metric in _WRITE_METRICS and all(r.get("read_only") for r in ok):
+        return Cell(_STATUS_TEXT["not_applicable"], ok=False,
+                    detail="read-only workload")
     s = summarize(_metric(r, metric) for r in ok)
     if s["median"] is None:
         return Cell("-", ok=False)

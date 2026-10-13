@@ -1,6 +1,6 @@
 # 08. Open questions
 
-Nothing below is decided. Update this file when something is.
+Nothing below is decided unless its entry says so. Update this file when something is.
 
 ## Status
 
@@ -9,6 +9,8 @@ Nothing below is decided. Update this file when something is.
 | Overall concurrency design | Open. Option 8 (coordination in the tree) was the user's stated favorite on 2026-10-12; the current plan is to measure candidates instead of choosing up front |
 | Candidate set (D1–D5, K1–K3, pairings) | Proposed 2026-10-13; agreed as the working plan, not as final designs |
 | Engine per storage type | Open; hypotheses in `05-storage-targets.md` |
+| First engine, its VC scope, row identity, value encoding, versioned schema (2, 5, 12, 13, 14) | Decided by the user 2026-10-13 for step 4; see each question |
+| Node I/O, chunk boundaries, canonical format (1, 3, 4) | Starting choices for step 4 (user, 2026-10-13); can change |
 
 ## Questions
 
@@ -16,17 +18,34 @@ Nothing below is decided. Update this file when something is.
    pages reached through smgr. Still to confirm: whether the forced split at a
    full page costs too much sharing, and whether D1/D2's hash → block map
    performs well enough, or a separate store with a checkpoint hook is needed.
+   **Starting choice for the first engine (user, 2026-10-13):** nodes are
+   pages in the table's main fork through the buffer manager, so no smgr
+   patch. Still to be confirmed by measurement.
 2. **Row identity (B7).** Synthetic content-derived TIDs with a map, or patch
    core for wide row identifiers?
+   **Decided 2026-10-13 for the first engine:** synthetic TIDs with a map, no
+   core patch. It's an implementation of the row_identity interface, so it can
+   be replaced.
 3. **Chunker boundary rule.** Boundaries that depend on keys only stay put when
    values change, so K2's lock entries and SSI page mappings stay stable. Rules
    that also count bytes control node size better. Page-bounded nodes need a
    forced split either way. Which rule, and what size targets?
+   **Starting choice for the first engine (user, 2026-10-13):** boundaries
+   depend on keys only, plus a forced split when the page is full. Size
+   targets are set by measurement in step 4.
 4. **Canonical format.** Our own Postgres-native format (node layout, key and
    value encoding, content hash), or Dolt byte compatibility for DoltHub
    interop? Dolt compatibility would constrain nearly every foundation choice,
    so the default is our own format.
+   **Starting choice for the first engine (user, 2026-10-13):** our own format,
+   with SHA-256 through `src/common/cryptohash.c`.
 5. **Catalogs.** Are system catalogs versioned per branch? Large and separate.
+   **Decided 2026-10-13 (user):** the schema is versioned per branch, from the
+   first engine on: a branch, commit, diff and merge carry table definitions
+   as well as rows. Still open: how. For example, a schema tree in each
+   branch's root set that the catalogs are materialized from on checkout,
+   or per-branch catalog entries (B9). Which catalogs count as schema (tables,
+   columns, indexes, constraints; functions? roles?) is also open.
 6. **Reference counting (D3b).** Can decrements be propagated lazily without
    unbounded backlog after a branch delete? What bounds the background work?
 7. **Cross-branch coordination (axis 4b).** Is per-chunk latching across
@@ -43,11 +62,18 @@ Nothing below is decided. Update this file when something is.
     works unchanged, or define a portable canonical row encoding (fixed
     endianness, no alignment padding) and deform from it? Canonical chunks must
     be identical across platforms for clone/push/pull.
+    **Decided 2026-10-13 for the first engine:** Postgres's tuple format. It's
+    an implementation of the value_encoder interface; a portable encoding can
+    replace it when clone/push between architectures matters.
 13. **First engine.** D1+K1 is proposed for roadmap step 4 because it is the
     simplest and the reference point for the others. Confirm before starting.
+    **Decided 2026-10-13:** D1+K1.
 14. **Version-control scope for the first engine.** Which of V1–V4 must D1+K1
     support in step 4? Clone/push/fetch (V4) needs a transfer protocol, which
     may be more than the first engine needs.
+    **Decided 2026-10-13:** V1–V3 (branch, checkout, commit, diff, merge on one
+    cluster). V4 (clone, fetch, push) stays a stub that reports not
+    implemented.
 15. **Choosing a pairing per table.** Today the table AM name picks a fixed
     profile (`prolly_d2` → D2+K1). D2+K2 needs another way to pick K2: another
     AM name, or a setting read only at table creation and recorded in the

@@ -177,6 +177,9 @@ class Outcome:
     unit: str = "transaction"
     # CPU used by client programs during the window, to separate server CPU.
     client_cpu_seconds: Optional[float] = None
+    # True when the measured work writes nothing, so write-volume metrics
+    # (WAL and device bytes per transaction) do not apply.
+    read_only: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -281,6 +284,7 @@ class CellResult:
     collector_status: dict[str, tuple[str, str]] = field(default_factory=dict)
     seconds: float = 0.0
     raw_dir: str = ""
+    read_only: bool = False
     notes: list[str] = field(default_factory=list)
 
 

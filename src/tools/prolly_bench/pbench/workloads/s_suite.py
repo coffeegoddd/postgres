@@ -14,9 +14,9 @@ from pbench.workloads._common import (PgbenchResult, check_client_error,
                                       pgbench_init, run_pgbench)
 
 
-def _outcome(res: PgbenchResult) -> Outcome:
+def _outcome(res: PgbenchResult, read_only: bool = False) -> Outcome:
     return Outcome(metrics=res.metrics(), transactions=res.transactions,
-                   client_cpu_seconds=res.client_cpu_seconds)
+                   client_cpu_seconds=res.client_cpu_seconds, read_only=read_only)
 
 
 class PgbenchWorkload(Workload):
@@ -24,6 +24,7 @@ class PgbenchWorkload(Workload):
 
     builtin: str | None = None
     scripts: list[tuple[str, int]] = []
+    read_only = False
 
     def scale(self, ctx: Context) -> int:
         return int(ctx.size_params["pgbench_scale"])
@@ -46,7 +47,7 @@ class PgbenchWorkload(Workload):
     def measure(self, ctx: Context, window: Window) -> Outcome:
         with window:
             res = self._run(ctx, ctx.measure_seconds, "measure")
-        return _outcome(res)
+        return _outcome(res, self.read_only)
 
     def tables(self, ctx: Context) -> list[str]:
         return ["pgbench_accounts", "pgbench_branches", "pgbench_tellers",
@@ -63,12 +64,14 @@ class S1(PgbenchWorkload):
 class S2(PgbenchWorkload):
     id, suite, title = "S2", "S", "Read-only point lookups (pgbench -S)"
     builtin = "select-only"
+    read_only = True
 
 
 @registry.workloads.register("S3")
 class S3(PgbenchWorkload):
     id, suite, title = "S3", "S", "Range scans"
     scripts = [("s3_range.sql", 1)]
+    read_only = True
 
     def variants(self, params):
         return [(f"range{r}", {"range": int(r)}) for r in params.get("ranges", [100])]
