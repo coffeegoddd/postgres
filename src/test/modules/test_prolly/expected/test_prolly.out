@@ -41,7 +41,9 @@ FROM prolly_implementations();
  refs            | stub        |       0 |              0
  transfer        | stub        |       0 |              0
  diff_merge      | stub        |       0 |              0
-(32 rows)
+ tree            | cow         |       1 |              1
+ tree            | stub        |       0 |              0
+(34 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -234,7 +236,27 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge      | stub           | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub           | merge                                   | not implemented (missing merge)
  diff_merge      | stub           | complete                                | not implemented (2 of 2 callbacks missing)
-(185 rows)
+ tree            | cow            | identity                                | pass
+ tree            | cow            | build_and_get                           | pass
+ tree            | cow            | cursor_scans                            | pass
+ tree            | cow            | apply_matches_reference                 | pass
+ tree            | cow            | apply_past_the_end                      | pass
+ tree            | cow            | history_independent                     | pass
+ tree            | cow            | edits_share_nodes                       | pass
+ tree            | cow            | diff_reports_changes                    | pass
+ tree            | cow            | nodes_are_valid                         | pass
+ tree            | cow            | complete                                | pass
+ tree            | stub           | identity                                | pass
+ tree            | stub           | build_and_get                           | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub           | cursor_scans                            | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub           | apply_matches_reference                 | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub           | apply_past_the_end                      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub           | history_independent                     | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub           | edits_share_nodes                       | not implemented (missing build_begin, build_add, build_finish, apply, walk)
+ tree            | stub           | diff_reports_changes                    | not implemented (missing build_begin, build_add, build_finish, apply, diff)
+ tree            | stub           | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree            | stub           | complete                                | not implemented (12 of 12 callbacks missing)
+(205 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

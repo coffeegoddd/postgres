@@ -3,6 +3,7 @@
 test_prolly_sources = files(
   'foundation_checks.c',
   'storage_checks.c',
+  'tree_checks.c',
   'test_prolly.c',
 )
 

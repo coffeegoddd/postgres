@@ -182,6 +182,26 @@ durability, version control, canonical form). Its Postgres-semantics groups
 pass against heap; against `prolly_d1` every test fails with "not
 implemented", which is the work of 4c–4h.
 
+**Status (2026-10-13): 4c built.** A new interface, Tree (`prolly_tree.h`),
+holds persistent prolly-tree operations: build, get, cursors in both
+directions, batched apply, count, walk and diff. Its implementation `cow`
+(D1 and D2) writes copy-on-write trees into the global node store; apply
+re-chunks a window around each edit until the new chunking meets an old
+node boundary, one level at a time, so an edit rewrites one path plus the
+nodes next to it. The conformance suite checks get and scans against a
+reference map, random batches of edits, history independence (the same
+items give the same root hash whatever the order and batching of builds
+and applies, and emptying a tree gives the empty tree's hash), node
+sharing after an edit, diff, and page validity. A regression check covers
+edits past the last key when the last leaf ends on a chunk boundary, which
+once made apply loop forever; apply now also raises an error if a window
+makes no progress. Deliberately broken versions (the old loop, no root
+collapse, an off-by-one backward seek, a diff that drops modifications,
+wrong subtree counts) were checked to fail the suite. Not yet: values too
+large for a node (an error for now), freeing replaced nodes (4f), and the
+root layout of question 33, which comes next as its own change, built on
+trees, before 4d.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

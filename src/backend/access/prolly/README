@@ -71,7 +71,8 @@ never from code.  Today that is a default profile per table AM:
 All five share the same foundation: node format basic, chunker keyhash,
 content hash sha256, key encoder ordered, value encoder canonical, and stubs
 for the interfaces without an implementation yet.  prolly_d1 uses the node
-store global and the log chunks; prolly_d2 the node store global.
+store global, the tree cow and the log chunks; prolly_d2 the node store
+global and the tree cow.
 
 
 Canonical values
@@ -108,6 +109,21 @@ Database-wide components (refs, transfer, diff_merge) come from a database
 profile.  Once a tree can be created, its components will be recorded in the
 tree with their format stamps and read back from there, so changing
 configuration never changes how existing data is read.
+
+
+Trees
+-----
+
+A tree is an immutable sorted map identified by its root node, made of the
+foundation components an engine passes in (prolly_tree.h).  tree_cow.c
+builds trees bottom up, cutting each level into nodes with the chunker; the
+root is the first level with one node, so the shape and every hash depend
+on the items alone.  apply() takes a sorted batch of edits and re-chunks a
+window around each one, a level at a time, until the new boundaries meet an
+old one; everything after that point is shared with the old tree.  Internal
+items carry the child's hash, its item count and (as the node format's
+unhashed hint) its block, and every node caches its own hash in its special
+space, so a stale hint falls back to the hash -> block map.
 
 
 Adapters

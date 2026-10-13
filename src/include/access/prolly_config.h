@@ -34,6 +34,7 @@
 #include "access/prolly_refs.h"
 #include "access/prolly_rowid.h"
 #include "access/prolly_transfer.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_valenc.h"
 
 /* The components of one tree. */
@@ -52,6 +53,7 @@ typedef struct ProllyComponents
 	const ProllyLogRoutine *log;
 	const ProllyCommitRoutine *commit;
 	const ProllyRowIdRoutine *row_identity;
+	const ProllyTreeRoutine *tree;
 } ProllyComponents;
 
 /* Database-wide components: version control. */
