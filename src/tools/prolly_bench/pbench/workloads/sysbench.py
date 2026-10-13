@@ -53,7 +53,7 @@ def parse_sysbench_output(text: str, hist: LatencyHistogram) -> dict[str, Option
 
 @registry.workloads.register("S10")
 class S10(Workload):
-    id, suite, title = "S10", "S", "sysbench OLTP (one variant per sysbench test)"
+    id, suite, title = "S10", "S", "sysbench OLTP"
 
     def variants(self, params):
         return [(t, {"test": t}) for t in params.get("tests", DEFAULT_TESTS)]

@@ -189,3 +189,35 @@ class ReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TableTest(unittest.TestCase):
+    def _set(self, root, label, am, tps, status="ok"):
+        d = root / label
+        d.mkdir()
+        (d / "run.json").write_text(json.dumps(
+            {"suite": "S", "label": label, "table_am": am, "started": "2026-10-13T00:00:00"}))
+        with open(d / "results.jsonl", "w") as f:
+            for rep in (1, 2):
+                f.write(json.dumps({
+                    "key": {"suite": "S", "workload": "S1", "size": "tiny", "variant": "",
+                            "clients": 4, "rep": rep},
+                    "status": status, "message": "engine does not implement x",
+                    "metrics": {"tps": tps, "latency_p99_ms": 2.0}}) + "\n")
+        return d
+
+    def test_engines_side_by_side(self):
+        from pbench import table
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._set(root, "B0", "heap", 1000.0)
+            self._set(root, "prolly_d1", "prolly_d1", 800.0)
+            self._set(root, "prolly_d2", "prolly_d2", None, "not_implemented")
+            sets = table.discover(root, "S")
+            md = table.to_markdown(sets, "S")
+            self.assertIn("| B0 (heap) | prolly_d1 | prolly_d2 |", md)
+            self.assertIn("| 1,000 | 800 (0.80x) | not impl. |", md)
+            self.assertIn("| 2.00 | 2.00 (1.00x) | not impl. |", md)
+            page = table.to_html(sets, "S")
+            self.assertIn("class='num bad'", page)   # 0.80x throughput is worse
+            self.assertIn("not impl.", page)

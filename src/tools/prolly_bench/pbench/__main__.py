@@ -5,6 +5,7 @@
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
+  prolly_bench table [DIR ...]                  engines side by side, per metric
 """
 
 from __future__ import annotations
@@ -98,6 +99,28 @@ def _compare(args) -> int:
     return 0
 
 
+def _table(args) -> int:
+    from pbench import table
+    if args.dirs:
+        sets = [table.load_set(d) for d in args.dirs]
+        suites = {s.suite for s in sets}
+        if len(suites) != 1:
+            raise SystemExit("give result sets of one suite")
+        suite = suites.pop()
+    else:
+        suite = args.suite
+        sets = table.discover(args.results, suite)
+    if not sets:
+        raise SystemExit(f"no {suite} result sets under {args.results}")
+    md = table.to_markdown(sets, suite)
+    out = args.output or args.results / f"summary-{suite}"
+    out.with_suffix(".md").write_text(md)
+    out.with_suffix(".html").write_text(table.to_html(sets, suite))
+    print(md)
+    print(f"written: {out.with_suffix('.md')}\n         {out.with_suffix('.html')}")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="prolly_bench", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,6 +161,15 @@ def main(argv=None) -> int:
     c.add_argument("dir", type=Path)
     c.add_argument("-o", "--output", type=Path)
     c.set_defaults(fn=_compare)
+
+    t = sub.add_parser("table", help="engines side by side: a table per metric")
+    t.add_argument("dirs", type=Path, nargs="*",
+                   help="result sets (default: the latest per label)")
+    t.add_argument("--suite", choices=["S", "V"], default="S")
+    t.add_argument("--results", type=Path, default=REPO / "specs" / "results")
+    t.add_argument("-o", "--output", type=Path,
+                   help="output path without extension (default RESULTS/summary-SUITE)")
+    t.set_defaults(fn=_table)
 
     args = p.parse_args(argv)
     return args.fn(args)

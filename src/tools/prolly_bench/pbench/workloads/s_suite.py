@@ -217,7 +217,7 @@ class S7(PgbenchWorkload):
 
 @registry.workloads.register("S8")
 class S8(PgbenchWorkload):
-    id, suite, title = "S8", "S", "Large transactions (update 1-10% of a table)"
+    id, suite, title = "S8", "S", "Large transactions"
     scripts = [("s8_large.sql", 1)]
 
     def variants(self, params):

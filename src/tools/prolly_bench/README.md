@@ -29,8 +29,18 @@ src/tools/prolly_bench/prolly_bench run V --am prolly_d1
 # after: put the machine back
 src/tools/prolly_bench/system/system_restore.sh
 
-src/tools/prolly_bench/prolly_bench compare specs/results/<B0 dir> specs/results/<other dir>
+# every engine side by side: a table per metric, a column per engine
+src/tools/prolly_bench/prolly_bench table            # S suite; --suite V for V
 ```
+
+`table` takes the most recent result set per label under `specs/results/`
+(or the result sets you name), prints Markdown tables (throughput, latency
+percentiles, WAL and device bytes per transaction, CPU, hit ratio, space,
+VACUUM, recovery) with each S number's ratio to B0, and writes
+`specs/results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
+better than B0 are green and worse are red (beyond 5%), and hovering a cell
+shows its spread.  `compare BASELINE_DIR DIR` gives one result set's ratios
+to a baseline in a single wide table.
 
 A quick check that everything works (tiny data, 10-second windows):
 
