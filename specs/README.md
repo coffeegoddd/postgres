@@ -19,9 +19,10 @@ control; this project's premise is that we should not have to.
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
 - **Where the work is:** roadmap step 4, building the first engine (D1+K1).
-  Steps 4a (hash, node format, chunker, key and value encoders) and 4b
-  (cluster-wide node store, WAL resource managers) are built; 4a gets a
-  canonical value encoder next. See the status notes in `07-roadmap.md`.
+  Steps 4a (hash, node format, chunker, canonical key and value encoders),
+  4b (cluster-wide node store, WAL resource managers) and 4c (copy-on-write
+  tree operations) are built; the root layout (question 33) comes next, then
+  4d. See the status notes in `07-roadmap.md`.
 - **The product goal:** true to Postgres and true to Dolt. Postgres-native
   working sets; canonical, history-independent version-control commits;
   schema versioned with data (`09-versioned-catalogs.md`).

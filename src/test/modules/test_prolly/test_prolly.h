@@ -41,4 +41,14 @@ extern void nodestore_new_publish_read(const ProllyImplInfo *impl);
 extern void nodestore_many_nodes(const ProllyImplInfo *impl);
 extern void nodestore_release_frees(const ProllyImplInfo *impl);
 
+/* tree_checks.c */
+extern void tree_build_and_get(const ProllyImplInfo *impl);
+extern void tree_cursor_scans(const ProllyImplInfo *impl);
+extern void tree_apply_matches_reference(const ProllyImplInfo *impl);
+extern void tree_apply_past_the_end(const ProllyImplInfo *impl);
+extern void tree_history_independent(const ProllyImplInfo *impl);
+extern void tree_edits_share_nodes(const ProllyImplInfo *impl);
+extern void tree_diff_reports_changes(const ProllyImplInfo *impl);
+extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
+
 #endif							/* TEST_PROLLY_H */

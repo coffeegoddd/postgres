@@ -47,10 +47,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_REFS = 14,
 	PROLLY_IFACE_TRANSFER = 15,
 	PROLLY_IFACE_DIFF_MERGE = 16,
+	PROLLY_IFACE_TREE = 17,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_ENGINE
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_DIFF_MERGE
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_TREE
 
 /*
  * Identity of an implementation.  The first member of every routine struct.

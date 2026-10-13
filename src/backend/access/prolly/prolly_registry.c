@@ -62,6 +62,7 @@ static const char *const rowid_callbacks[] = {PROLLY_ROWID_CALLBACK_NAMES};
 static const char *const refs_callbacks[] = {PROLLY_REFS_CALLBACK_NAMES};
 static const char *const transfer_callbacks[] = {PROLLY_TRANSFER_CALLBACK_NAMES};
 static const char *const merge_callbacks[] = {PROLLY_MERGE_CALLBACK_NAMES};
+static const char *const tree_callbacks[] = {PROLLY_TREE_CALLBACK_NAMES};
 
 #define CHECK_ROUTINE(type, first, names) \
 	static_assert(offsetof(type, info) == 0 && \
@@ -85,6 +86,7 @@ CHECK_ROUTINE(ProllyRowIdRoutine, PROLLY_ROWID_FIRST_CALLBACK, rowid_callbacks);
 CHECK_ROUTINE(ProllyRefsRoutine, PROLLY_REFS_FIRST_CALLBACK, refs_callbacks);
 CHECK_ROUTINE(ProllyTransferRoutine, PROLLY_TRANSFER_FIRST_CALLBACK, transfer_callbacks);
 CHECK_ROUTINE(ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, merge_callbacks);
+CHECK_ROUTINE(ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, tree_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -122,6 +124,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("transfer", ProllyTransferRoutine, PROLLY_TRANSFER_FIRST_CALLBACK, transfer_callbacks),
 	[PROLLY_IFACE_DIFF_MERGE] =
 	IFACE("diff_merge", ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, merge_callbacks),
+	[PROLLY_IFACE_TREE] =
+	IFACE("tree", ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, tree_callbacks),
 };
 
 static const ProllyInterfaceDesc *

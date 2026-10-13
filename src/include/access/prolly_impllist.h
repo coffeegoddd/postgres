@@ -40,6 +40,9 @@ PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_canonical)
 PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
 PG_PROLLY_IMPL(ProllyLogRoutine, prolly_log_chunks)
 
+/* trees (roadmap step 4c) */
+PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_cow)
+
 /* stubs of the foundation and version-control interfaces */
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_stub)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_stub)
@@ -55,3 +58,4 @@ PG_PROLLY_IMPL(ProllyRowIdRoutine, prolly_rowid_stub)
 PG_PROLLY_IMPL(ProllyRefsRoutine, prolly_refs_stub)
 PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_stub)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_stub)
+PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_stub)

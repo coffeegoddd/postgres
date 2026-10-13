@@ -29,9 +29,9 @@ typedef struct ProllyProfile
 } ProllyProfile;
 
 /*
- * Shared by every engine.  Node store and log differ by engine: D1 and D2
- * are hash-addressed (the "global" store); D3 and D4 are location-addressed
- * and have no store yet.
+ * Shared by every engine.  Node store, tree and log differ by engine: D1
+ * and D2 are hash-addressed (the "global" store, copy-on-write trees); D3
+ * and D4 are location-addressed and have neither yet.
  */
 #define FOUNDATION \
 	[PROLLY_IFACE_NODE_FORMAT] = "basic", \
@@ -47,18 +47,23 @@ typedef struct ProllyProfile
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
 	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
+	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
 	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
+	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3a", {[PROLLY_IFACE_ENGINE] = "d3a",
 	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3b", {[PROLLY_IFACE_ENGINE] = "d3b",
 	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d4", {[PROLLY_IFACE_ENGINE] = "d4",
 	[PROLLY_IFACE_COORDINATION] = "k3", [PROLLY_IFACE_NODE_STORE] = "stub",
+	[PROLLY_IFACE_TREE] = "stub",
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 };
 
@@ -122,6 +127,8 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 		profile_impl(impls, PROLLY_IFACE_COMMIT_PIPELINE);
 	components->row_identity = (const ProllyRowIdRoutine *)
 		profile_impl(impls, PROLLY_IFACE_ROW_IDENTITY);
+	components->tree = (const ProllyTreeRoutine *)
+		profile_impl(impls, PROLLY_IFACE_TREE);
 }
 
 void

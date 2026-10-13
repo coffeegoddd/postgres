@@ -187,6 +187,29 @@ static const ConformanceCase cases[] = {
 	/* diff and merge */
 	{PROLLY_IFACE_DIFF_MERGE, "diff_reports_each_change_once", "diff", NULL},
 	{PROLLY_IFACE_DIFF_MERGE, "merge", "merge", NULL},
+
+	/* tree */
+	{PROLLY_IFACE_TREE, "build_and_get",
+	"build_begin build_add build_finish get cursor_open cursor_seek cursor_next cursor_close count",
+	tree_build_and_get},
+	{PROLLY_IFACE_TREE, "cursor_scans",
+	"build_begin build_add build_finish cursor_open cursor_seek cursor_next cursor_close count",
+	tree_cursor_scans},
+	{PROLLY_IFACE_TREE, "apply_matches_reference",
+	"build_begin build_add build_finish apply cursor_open cursor_seek cursor_next cursor_close count",
+	tree_apply_matches_reference},
+	{PROLLY_IFACE_TREE, "apply_past_the_end",
+	"build_begin build_add build_finish apply cursor_open cursor_seek cursor_next cursor_close count",
+	tree_apply_past_the_end},
+	{PROLLY_IFACE_TREE, "history_independent",
+	"build_begin build_add build_finish apply cursor_open cursor_seek cursor_next cursor_close count",
+	tree_history_independent},
+	{PROLLY_IFACE_TREE, "edits_share_nodes",
+	"build_begin build_add build_finish apply walk", tree_edits_share_nodes},
+	{PROLLY_IFACE_TREE, "diff_reports_changes",
+	"build_begin build_add build_finish apply diff", tree_diff_reports_changes},
+	{PROLLY_IFACE_TREE, "nodes_are_valid",
+	"build_begin build_add build_finish walk", tree_nodes_are_valid},
 };
 
 /* ------------------------------------------------------------------------

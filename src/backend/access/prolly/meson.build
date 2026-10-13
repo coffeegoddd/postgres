@@ -35,6 +35,8 @@ backend_sources += files(
   'refs_stub.c',
   'rowid_stub.c',
   'transfer_stub.c',
+  'tree_cow.c',
+  'tree_stub.c',
   'valenc_canonical.c',
   'valenc_heaptuple.c',
   'valenc_stub.c',
