@@ -34,4 +34,23 @@
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
 
+# prolly storage (src/backend/access/prolly); one table AM per engine
+{ oid => '9370', descr => 'prolly engine D1 table access method (stub)',
+  amname => 'prolly_d1', amhandler => 'prolly_d1_tableam_handler',
+  amtype => 't' },
+{ oid => '9371', descr => 'prolly engine D2 table access method (stub)',
+  amname => 'prolly_d2', amhandler => 'prolly_d2_tableam_handler',
+  amtype => 't' },
+{ oid => '9372', descr => 'prolly engine D3a table access method (stub)',
+  amname => 'prolly_d3a', amhandler => 'prolly_d3a_tableam_handler',
+  amtype => 't' },
+{ oid => '9373', descr => 'prolly engine D3b table access method (stub)',
+  amname => 'prolly_d3b', amhandler => 'prolly_d3b_tableam_handler',
+  amtype => 't' },
+{ oid => '9374', descr => 'prolly engine D4 table access method (stub)',
+  amname => 'prolly_d4', amhandler => 'prolly_d4_tableam_handler',
+  amtype => 't' },
+{ oid => '9375', descr => 'prolly tree index access method (stub)',
+  amname => 'prolly', amhandler => 'prolly_indexam_handler', amtype => 'i' },
+
 ]

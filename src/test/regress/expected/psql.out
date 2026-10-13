@@ -5203,31 +5203,43 @@ Indexes:
 -- check printing info about access methods
 \dA
 List of access methods
-  Name  | Type  
---------+-------
- brin   | Index
- btree  | Index
- gin    | Index
- gist   | Index
- hash   | Index
- heap   | Table
- heap2  | Table
- spgist | Index
-(8 rows)
+    Name    | Type  
+------------+-------
+ brin       | Index
+ btree      | Index
+ gin        | Index
+ gist       | Index
+ hash       | Index
+ heap       | Table
+ heap2      | Table
+ prolly     | Index
+ prolly_d1  | Table
+ prolly_d2  | Table
+ prolly_d3a | Table
+ prolly_d3b | Table
+ prolly_d4  | Table
+ spgist     | Index
+(14 rows)
 
 \dA *
 List of access methods
-  Name  | Type  
---------+-------
- brin   | Index
- btree  | Index
- gin    | Index
- gist   | Index
- hash   | Index
- heap   | Table
- heap2  | Table
- spgist | Index
-(8 rows)
+    Name    | Type  
+------------+-------
+ brin       | Index
+ btree      | Index
+ gin        | Index
+ gist       | Index
+ hash       | Index
+ heap       | Table
+ heap2      | Table
+ prolly     | Index
+ prolly_d1  | Table
+ prolly_d2  | Table
+ prolly_d3a | Table
+ prolly_d3b | Table
+ prolly_d4  | Table
+ spgist     | Index
+(14 rows)
 
 \dA h*
 List of access methods
@@ -5252,32 +5264,44 @@ List of access methods
 
 \dA: extra argument "bar" ignored
 \dA+
-                             List of access methods
-  Name  | Type  |       Handler        |              Description               
---------+-------+----------------------+----------------------------------------
- brin   | Index | brinhandler          | block range index (BRIN) access method
- btree  | Index | bthandler            | b-tree index access method
- gin    | Index | ginhandler           | GIN index access method
- gist   | Index | gisthandler          | GiST index access method
- hash   | Index | hashhandler          | hash index access method
- heap   | Table | heap_tableam_handler | heap table access method
- heap2  | Table | heap_tableam_handler | 
- spgist | Index | spghandler           | SP-GiST index access method
-(8 rows)
+                                     List of access methods
+    Name    | Type  |          Handler           |                 Description                  
+------------+-------+----------------------------+----------------------------------------------
+ brin       | Index | brinhandler                | block range index (BRIN) access method
+ btree      | Index | bthandler                  | b-tree index access method
+ gin        | Index | ginhandler                 | GIN index access method
+ gist       | Index | gisthandler                | GiST index access method
+ hash       | Index | hashhandler                | hash index access method
+ heap       | Table | heap_tableam_handler       | heap table access method
+ heap2      | Table | heap_tableam_handler       | 
+ prolly     | Index | prolly_indexam_handler     | prolly tree index access method (stub)
+ prolly_d1  | Table | prolly_d1_tableam_handler  | prolly engine D1 table access method (stub)
+ prolly_d2  | Table | prolly_d2_tableam_handler  | prolly engine D2 table access method (stub)
+ prolly_d3a | Table | prolly_d3a_tableam_handler | prolly engine D3a table access method (stub)
+ prolly_d3b | Table | prolly_d3b_tableam_handler | prolly engine D3b table access method (stub)
+ prolly_d4  | Table | prolly_d4_tableam_handler  | prolly engine D4 table access method (stub)
+ spgist     | Index | spghandler                 | SP-GiST index access method
+(14 rows)
 
 \dA+ *
-                             List of access methods
-  Name  | Type  |       Handler        |              Description               
---------+-------+----------------------+----------------------------------------
- brin   | Index | brinhandler          | block range index (BRIN) access method
- btree  | Index | bthandler            | b-tree index access method
- gin    | Index | ginhandler           | GIN index access method
- gist   | Index | gisthandler          | GiST index access method
- hash   | Index | hashhandler          | hash index access method
- heap   | Table | heap_tableam_handler | heap table access method
- heap2  | Table | heap_tableam_handler | 
- spgist | Index | spghandler           | SP-GiST index access method
-(8 rows)
+                                     List of access methods
+    Name    | Type  |          Handler           |                 Description                  
+------------+-------+----------------------------+----------------------------------------------
+ brin       | Index | brinhandler                | block range index (BRIN) access method
+ btree      | Index | bthandler                  | b-tree index access method
+ gin        | Index | ginhandler                 | GIN index access method
+ gist       | Index | gisthandler                | GiST index access method
+ hash       | Index | hashhandler                | hash index access method
+ heap       | Table | heap_tableam_handler       | heap table access method
+ heap2      | Table | heap_tableam_handler       | 
+ prolly     | Index | prolly_indexam_handler     | prolly tree index access method (stub)
+ prolly_d1  | Table | prolly_d1_tableam_handler  | prolly engine D1 table access method (stub)
+ prolly_d2  | Table | prolly_d2_tableam_handler  | prolly engine D2 table access method (stub)
+ prolly_d3a | Table | prolly_d3a_tableam_handler | prolly engine D3a table access method (stub)
+ prolly_d3b | Table | prolly_d3b_tableam_handler | prolly engine D3b table access method (stub)
+ prolly_d4  | Table | prolly_d4_tableam_handler  | prolly engine D4 table access method (stub)
+ spgist     | Index | spghandler                 | SP-GiST index access method
+(14 rows)
 
 \dA+ h*
                      List of access methods

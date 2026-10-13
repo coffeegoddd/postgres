@@ -31,11 +31,18 @@ AMs (`IndexAmRoutine`), storage managers (`smgrsw`) and WAL resource managers
 ## Rules
 
 1. No code outside an implementation includes that implementation's headers or
-   calls its functions directly.
+   calls its functions directly. The one exception is the list of built-in
+   implementations (`src/include/access/prolly_impllist.h`, like
+   `rmgrlist.h`), which the registry reads.
 2. No implementation depends on another implementation of the same or a
    different interface. Implementations depend only on interfaces.
 3. Every interface gets a **stub implementation first** that raises
    `ERRCODE_FEATURE_NOT_SUPPORTED`. Stubs are how roadmap step 1 is built.
+   Concretely, a NULL callback means "not implemented": callers dispatch
+   through `PROLLY_CALL(routine, callback, ...)` (`prolly_impl.h`), which
+   raises the error naming the interface, implementation and callback. A stub
+   is a routine with every callback NULL, and a real implementation can be
+   filled in one callback at a time.
 4. Every interface gets a **conformance test suite** that runs against every
    implementation. A new implementation is done when it passes the suite.
 5. Anything persisted (pages, WAL records, catalog rows, canonical chunks)
@@ -69,9 +76,21 @@ provisional.
 | **Row identity** | TIDs ↔ keys | Content-derived TID map, wide row ids |
 | **Refs and commit graph** | Branches, commits, history storage | Catalog tables, others |
 | **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |
+| **Diff / merge** | Row diff and three-way merge between refs, over canonical trees | Structural diff (added in step 1; see below) |
 | **Benchmark workload** | One S or V workload | S1–S9, V1–V4 |
 | **Metric collector** | One metric source | WAL, diskstats, `pg_stat_io`, perf, engine counters |
 | **Result sink** | Where results go | Files under `specs/results/`, others |
+
+**Diff / merge** was added while building step 1: the `prolly_diff` and
+`prolly_merge` SQL functions needed an interface to call, and diff and merge
+work on canonical trees independently of the engine. Canonical export lives on
+the Engine interface (`canonical_root`, `export_chunks`); the transfer
+interface covers clone, fetch and push.
+
+The C interfaces (everything above the benchmark rows) were defined in step 1:
+headers `src/include/access/prolly_*.h`. The benchmark workload, metric
+collector and result sink interfaces belong to the harness and are defined in
+step 2.
 
 The Postgres-facing adapters (the table AM and index AM handlers, the WAL
 resource manager and the core-patch hooks) are thin: they translate Postgres

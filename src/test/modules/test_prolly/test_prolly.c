@@ -1,0 +1,531 @@
+/*--------------------------------------------------------------------------
+ *
+ * test_prolly.c
+ *		Conformance suites for the prolly storage interfaces.
+ *
+ * Every interface (src/include/access/prolly_*.h) has a suite of named
+ * cases here, and every registered implementation of that interface is run
+ * against it (rule 4, specs/00-architecture-principles.md).  A case lists
+ * the callbacks it needs; if the implementation lacks any, the result is
+ * "not implemented".  A case whose checks aren't written yet reports
+ * "no checks yet" once its callbacks exist.  Cases get their checks as the
+ * first real implementations are built (roadmap step 4).
+ *
+ * Every interface also gets two generic cases: "identity" (the
+ * implementation's ProllyImplInfo is sane and the registry finds it) and
+ * "complete" (every callback is provided).
+ *
+ * To show that the suites can pass and fail, _PG_init registers two
+ * content-hash implementations of its own: test_fnv, which is correct, and
+ * test_broken, which ignores all but the first update() call.  (Real
+ * implementations register from shared_preload_libraries; registering at
+ * CREATE EXTENSION affects only this backend, which is all a test needs.)
+ *
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *		src/test/modules/test_prolly/test_prolly.c
+ *
+ * -------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/prolly_config.h"
+#include "access/xact.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "lib/stringinfo.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "utils/tuplestore.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(prolly_implementations);
+PG_FUNCTION_INFO_V1(prolly_conformance);
+
+typedef void (*ConformanceBody) (const ProllyImplInfo *impl);
+
+typedef struct ConformanceCase
+{
+	ProllyInterface iface;
+	const char *name;
+	const char *requires;		/* space-separated callback names */
+	ConformanceBody body;		/* NULL: checks not written yet */
+} ConformanceCase;
+
+static void check_identity(const ProllyImplInfo *impl);
+static void hash_deterministic(const ProllyImplInfo *impl);
+static void hash_incremental(const ProllyImplInfo *impl);
+
+/*
+ * The suites.  Case names describe the contract they will check, taken from
+ * the interface headers' contracts and specs/02-postgres-integration.md.
+ */
+static const ConformanceCase cases[] = {
+	/* engine */
+	{PROLLY_IFACE_ENGINE, "create_and_truncate",
+	"tree_create tree_truncate", NULL},
+	{PROLLY_IFACE_ENGINE, "read_empty_tree",
+	"roots_acquire roots_release cursor_open cursor_seek cursor_next cursor_close", NULL},
+	{PROLLY_IFACE_ENGINE, "read_own_writes",
+	"put remove cursor_open cursor_seek cursor_next cursor_close", NULL},
+	{PROLLY_IFACE_ENGINE, "subxact_abort_discards_writes",
+	"put subxact_abort xact_abort", NULL},
+	{PROLLY_IFACE_ENGINE, "commit_publishes_roots",
+	"put xact_precommit roots_acquire", NULL},
+	{PROLLY_IFACE_ENGINE, "count_range_matches_scan",
+	"count_range cursor_next", NULL},
+	{PROLLY_IFACE_ENGINE, "canonical_root_independent_of_history",
+	"put remove xact_precommit canonical_root", NULL},
+	{PROLLY_IFACE_ENGINE, "export_chunks_closed_under_reachability",
+	"canonical_root export_chunks", NULL},
+
+	/* coordination */
+	{PROLLY_IFACE_COORDINATION, "lock_conflict_matrix", "lock_row", NULL},
+	{PROLLY_IFACE_COORDINATION, "wait_policies", "lock_row", NULL},
+	{PROLLY_IFACE_COORDINATION, "speculative_insertion",
+	"insert_intent insert_intent_complete", NULL},
+	{PROLLY_IFACE_COORDINATION, "commit_markers_until_horizon",
+	"lock_row xact_commit written_since prune_markers", NULL},
+	{PROLLY_IFACE_COORDINATION, "abort_releases_locks",
+	"lock_row xact_abort subxact_abort", NULL},
+	{PROLLY_IFACE_COORDINATION, "predicate_locks", "predicate_lock_range", NULL},
+
+	/* node format */
+	{PROLLY_IFACE_NODE_FORMAT, "items_round_trip",
+	"page_init item_append item_count item_get", NULL},
+	{PROLLY_IFACE_NODE_FORMAT, "level_round_trip", "page_init page_level", NULL},
+	{PROLLY_IFACE_NODE_FORMAT, "space_accounting",
+	"page_init item_space free_space item_append", NULL},
+	{PROLLY_IFACE_NODE_FORMAT, "canonical_bytes_depend_only_on_items",
+	"page_init item_append canonical_bytes special_space", NULL},
+	{PROLLY_IFACE_NODE_FORMAT, "page_check_detects_corruption", "page_check", NULL},
+
+	/* chunker */
+	{PROLLY_IFACE_CHUNKER, "deterministic", "begin add end", NULL},
+	{PROLLY_IFACE_CHUNKER, "forced_split_respects_capacity", "begin add end", NULL},
+	{PROLLY_IFACE_CHUNKER, "reset_equals_begin", "begin add reset end", NULL},
+
+	/* content hash */
+	{PROLLY_IFACE_CONTENT_HASH, "deterministic", "begin update finish",
+	hash_deterministic},
+	{PROLLY_IFACE_CONTENT_HASH, "incremental_equals_one_shot",
+	"begin update finish", hash_incremental},
+
+	/* key encoder */
+	{PROLLY_IFACE_KEY_ENCODER, "order_matches_opclass",
+	"supports begin encode compare end", NULL},
+	{PROLLY_IFACE_KEY_ENCODER, "desc_and_nulls_ordering",
+	"begin encode compare end", NULL},
+	{PROLLY_IFACE_KEY_ENCODER, "decode_round_trip", "begin encode decode end", NULL},
+
+	/* value encoder */
+	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end", NULL},
+	{PROLLY_IFACE_VALUE_ENCODER, "platform_independent", "begin encode end", NULL},
+
+	/* node store */
+	{PROLLY_IFACE_NODE_STORE, "new_publish_read",
+	"create open new_node publish read contains close", NULL},
+	{PROLLY_IFACE_NODE_STORE, "release_frees", "open release contains close", NULL},
+
+	/* allocator */
+	{PROLLY_IFACE_ALLOCATOR, "no_overlapping_extents",
+	"open allocate free close", NULL},
+
+	/* reclamation */
+	{PROLLY_IFACE_RECLAMATION, "reachable_never_freed",
+	"node_created node_dropped root_retired run", NULL},
+	{PROLLY_IFACE_RECLAMATION, "in_place_only_when_private",
+	"may_modify_in_place", NULL},
+
+	/* log */
+	{PROLLY_IFACE_LOG, "commit_record", "log_commit", NULL},
+	{PROLLY_IFACE_LOG, "redo_restores_committed_root",
+	"log_node log_mutation log_commit redo startup cleanup", NULL},
+	{PROLLY_IFACE_LOG, "describes_records", "desc identify", NULL},
+
+	/* commit pipeline */
+	{PROLLY_IFACE_COMMIT_PIPELINE, "publishes_in_enqueue_order",
+	"branch_lock enqueue branch_unlock publish head", NULL},
+
+	/* row identity */
+	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve", "tid_assign tid_resolve", NULL},
+	{PROLLY_IFACE_ROW_IDENTITY, "same_version_same_tid", "tid_assign", NULL},
+	{PROLLY_IFACE_ROW_IDENTITY, "forget", "tid_assign tid_resolve tid_forget", NULL},
+
+	/* refs */
+	{PROLLY_IFACE_REFS, "branch_lifecycle",
+	"branch_create branch_lookup branch_delete", NULL},
+	{PROLLY_IFACE_REFS, "commit_then_resolve", "commit resolve commit_get", NULL},
+	{PROLLY_IFACE_REFS, "merge_base", "commit merge_base", NULL},
+
+	/* transfer */
+	{PROLLY_IFACE_TRANSFER, "clone", "clone", NULL},
+	{PROLLY_IFACE_TRANSFER, "fetch_then_push", "fetch push", NULL},
+
+	/* diff and merge */
+	{PROLLY_IFACE_DIFF_MERGE, "diff_reports_each_change_once", "diff", NULL},
+	{PROLLY_IFACE_DIFF_MERGE, "merge", "merge", NULL},
+};
+
+/* ------------------------------------------------------------------------
+ * Checks
+ * ------------------------------------------------------------------------
+ */
+
+static void
+check_identity(const ProllyImplInfo *impl)
+{
+	if (impl->name == NULL || impl->name[0] == '\0')
+		elog(ERROR, "implementation has no name");
+	if (impl->description == NULL)
+		elog(ERROR, "implementation \"%s\" has no description", impl->name);
+	if (prolly_lookup_impl(impl->iface, impl->name) != impl)
+		elog(ERROR, "registry does not find \"%s\" by name", impl->name);
+	if (prolly_lookup_impl_id(impl->iface, impl->impl_id) != impl)
+		elog(ERROR, "registry does not find \"%s\" by impl_id %u",
+			 impl->name, (unsigned) impl->impl_id);
+}
+
+static void
+hash_once(const ProllyHashRoutine *hash, const uint8 *data, Size len,
+		  Size piece, ProllyHash *out)
+{
+	ProllyHashCtx *ctx = PROLLY_CALL(hash, begin, CurrentMemoryContext);
+
+	for (Size off = 0; off < len; off += piece)
+		PROLLY_CALL(hash, update, ctx, data + off, Min(piece, len - off));
+	PROLLY_CALL(hash, finish, ctx, out);
+
+	if (out->len == 0 || out->len > PROLLY_HASH_MAX_LEN)
+		elog(ERROR, "digest length %d is out of range", out->len);
+}
+
+static bool
+hash_equal(const ProllyHash *a, const ProllyHash *b)
+{
+	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+static void
+hash_deterministic(const ProllyImplInfo *impl)
+{
+	const ProllyHashRoutine *hash = (const ProllyHashRoutine *) impl;
+	static const uint8 data[] = "prolly conformance";
+	ProllyHash	a;
+	ProllyHash	b;
+	ProllyHash	c;
+
+	hash_once(hash, data, sizeof(data), sizeof(data), &a);
+	hash_once(hash, data, sizeof(data), sizeof(data), &b);
+	if (!hash_equal(&a, &b))
+		elog(ERROR, "same input gave different digests");
+
+	hash_once(hash, data, sizeof(data) - 1, sizeof(data), &c);
+	if (hash_equal(&a, &c))
+		elog(ERROR, "different inputs gave the same digest");
+	if (a.len != c.len)
+		elog(ERROR, "digest length varies with input");
+}
+
+static void
+hash_incremental(const ProllyImplInfo *impl)
+{
+	const ProllyHashRoutine *hash = (const ProllyHashRoutine *) impl;
+	uint8		data[1000];
+	ProllyHash	whole;
+	ProllyHash	pieces;
+
+	for (int i = 0; i < lengthof(data); i++)
+		data[i] = (uint8) (i * 31 + 7);
+
+	hash_once(hash, data, sizeof(data), sizeof(data), &whole);
+	hash_once(hash, data, sizeof(data), 7, &pieces);
+	if (!hash_equal(&whole, &pieces))
+		elog(ERROR, "hashing in pieces differs from hashing at once");
+}
+
+/* ------------------------------------------------------------------------
+ * Test-only content hashes: 64-bit FNV-1a, correct and broken
+ * ------------------------------------------------------------------------
+ */
+
+struct ProllyHashCtx
+{
+	uint64		state;
+	int			nupdates;
+	bool		broken;
+};
+
+static ProllyHashCtx *
+fnv_begin(MemoryContext mcxt)
+{
+	ProllyHashCtx *ctx = MemoryContextAllocZero(mcxt, sizeof(ProllyHashCtx));
+
+	ctx->state = UINT64CONST(0xcbf29ce484222325);
+	return ctx;
+}
+
+static ProllyHashCtx *
+broken_begin(MemoryContext mcxt)
+{
+	ProllyHashCtx *ctx = fnv_begin(mcxt);
+
+	ctx->broken = true;
+	return ctx;
+}
+
+static void
+fnv_update(ProllyHashCtx *ctx, const uint8 *data, Size len)
+{
+	if (ctx->broken && ctx->nupdates++ > 0)
+		return;
+	for (Size i = 0; i < len; i++)
+	{
+		ctx->state ^= data[i];
+		ctx->state *= UINT64CONST(0x100000001b3);
+	}
+}
+
+static void
+fnv_finish(ProllyHashCtx *ctx, ProllyHash *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->len = sizeof(uint64);
+	for (int i = 0; i < sizeof(uint64); i++)
+		out->bytes[i] = (uint8) (ctx->state >> (8 * i));
+	pfree(ctx);
+}
+
+static const ProllyHashRoutine test_fnv_hash = {
+	.info = {
+		.iface = PROLLY_IFACE_CONTENT_HASH,
+		.impl_id = 9001,
+		.name = "test_fnv",
+		.description = "test only: 64-bit FNV-1a",
+	},
+	.begin = fnv_begin,
+	.update = fnv_update,
+	.finish = fnv_finish,
+};
+
+static const ProllyHashRoutine test_broken_hash = {
+	.info = {
+		.iface = PROLLY_IFACE_CONTENT_HASH,
+		.impl_id = 9002,
+		.name = "test_broken",
+		.description = "test only: ignores all but the first update",
+	},
+	.begin = broken_begin,
+	.update = fnv_update,
+	.finish = fnv_finish,
+};
+
+void
+_PG_init(void)
+{
+	prolly_register_impl(&test_fnv_hash.info);
+	prolly_register_impl(&test_broken_hash.info);
+}
+
+/* ------------------------------------------------------------------------
+ * Running cases
+ * ------------------------------------------------------------------------
+ */
+
+static int
+callback_number(ProllyInterface iface, const char *name)
+{
+	for (int i = 0; i < prolly_interface_ncallbacks(iface); i++)
+	{
+		if (strcmp(prolly_interface_callback_name(iface, i), name) == 0)
+			return i;
+	}
+	elog(ERROR, "conformance case names unknown %s callback \"%s\"",
+		 prolly_interface_name(iface), name);
+	return -1;					/* keep compiler quiet */
+}
+
+/* Missing callbacks among those listed in requires, or "" if none. */
+static char *
+missing_callbacks(const ProllyImplInfo *impl, const char *requires)
+{
+	StringInfoData missing;
+	char	   *list = pstrdup(requires);
+	char	   *saveptr;
+
+	initStringInfo(&missing);
+	for (char *tok = strtok_r(list, " ", &saveptr); tok != NULL;
+		 tok = strtok_r(NULL, " ", &saveptr))
+	{
+		if (!prolly_impl_has_callback(impl, callback_number(impl->iface, tok)))
+			appendStringInfo(&missing, "%s%s", missing.len > 0 ? ", " : "", tok);
+	}
+	return missing.data;
+}
+
+/*
+ * Run body against impl in a subtransaction, so that a failing check (or a
+ * "not implemented" error) is reported as a result instead of aborting the
+ * suite.
+ */
+static char *
+run_body(ConformanceBody body, const ProllyImplInfo *impl)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	char	   *result;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+
+	PG_TRY();
+	{
+		body(impl);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		result = pstrdup("pass");
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+
+		if (edata->sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED)
+			result = psprintf("not implemented (%s)", edata->message);
+		else
+			result = psprintf("fail: %s", edata->message);
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+static void
+emit(ReturnSetInfo *rsinfo, const ProllyImplInfo *impl, const char *test,
+	 const char *result)
+{
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	values[0] = CStringGetTextDatum(prolly_interface_name(impl->iface));
+	values[1] = CStringGetTextDatum(impl->name);
+	values[2] = CStringGetTextDatum(test);
+	values[3] = CStringGetTextDatum(result);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+static void
+run_suite(ReturnSetInfo *rsinfo, const ProllyImplInfo *impl)
+{
+	int			ncallbacks = prolly_interface_ncallbacks(impl->iface);
+	int			nmissing = 0;
+
+	emit(rsinfo, impl, "identity", run_body(check_identity, impl));
+
+	for (int i = 0; i < lengthof(cases); i++)
+	{
+		const ConformanceCase *c = &cases[i];
+		char	   *missing;
+
+		if (c->iface != impl->iface)
+			continue;
+
+		missing = missing_callbacks(impl, c->requires);
+		if (missing[0] != '\0')
+			emit(rsinfo, impl, c->name,
+				 psprintf("not implemented (missing %s)", missing));
+		else if (c->body == NULL)
+			emit(rsinfo, impl, c->name, "no checks yet");
+		else
+			emit(rsinfo, impl, c->name, run_body(c->body, impl));
+	}
+
+	for (int i = 0; i < ncallbacks; i++)
+	{
+		if (!prolly_impl_has_callback(impl, i))
+			nmissing++;
+	}
+	emit(rsinfo, impl, "complete",
+		 nmissing == 0 ? "pass" :
+		 psprintf("not implemented (%d of %d callbacks missing)",
+				  nmissing, ncallbacks));
+}
+
+/* ------------------------------------------------------------------------
+ * SQL functions
+ * ------------------------------------------------------------------------
+ */
+
+Datum
+prolly_implementations(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (int iface = PROLLY_IFACE_FIRST; iface <= PROLLY_IFACE_LAST; iface++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, prolly_list_impls((ProllyInterface) iface))
+		{
+			const ProllyImplInfo *impl = lfirst(lc);
+			Datum		values[5];
+			bool		nulls[5] = {0};
+
+			values[0] = CStringGetTextDatum(prolly_interface_name(impl->iface));
+			values[1] = CStringGetTextDatum(impl->name);
+			values[2] = Int32GetDatum(impl->impl_id);
+			values[3] = Int32GetDatum(impl->format_version);
+			values[4] = CStringGetTextDatum(impl->description);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
+	}
+	return (Datum) 0;
+}
+
+Datum
+prolly_conformance(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *only_iface = PG_ARGISNULL(0) ? NULL :
+		text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *only_impl = PG_ARGISNULL(1) ? NULL :
+		text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ProllyInterface wanted = 0;
+
+	if (only_iface != NULL && !prolly_interface_from_name(only_iface, &wanted))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unknown prolly interface \"%s\"", only_iface)));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (int iface = PROLLY_IFACE_FIRST; iface <= PROLLY_IFACE_LAST; iface++)
+	{
+		ListCell   *lc;
+
+		if (only_iface != NULL && iface != wanted)
+			continue;
+
+		foreach(lc, prolly_list_impls((ProllyInterface) iface))
+		{
+			const ProllyImplInfo *impl = lfirst(lc);
+
+			if (only_impl == NULL || strcmp(only_impl, impl->name) == 0)
+				run_suite(rsinfo, impl);
+		}
+	}
+	return (Datum) 0;
+}

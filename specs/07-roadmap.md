@@ -9,8 +9,9 @@ and don't start a step until a human asks for it.
 Make every planned interface exist and fail cleanly, before any of it works.
 
 - Register table AMs for engines D1–D4 (`04-candidate-designs.md`) in the
-  catalog (`pg_am`, handler functions in `pg_proc`), e.g. `prolly_d1` …
-  `prolly_d4`. D5 is not stubbed: it waits on the storage-target question.
+  catalog (`pg_am`, handler functions in `pg_proc`): `prolly_d1`,
+  `prolly_d2`, `prolly_d3a`, `prolly_d3b`, `prolly_d4`. D5 is not stubbed: it
+  waits on the storage-target question.
 - Each `TableAmRoutine` callback, and the prolly index AM's `IndexAmRoutine`
   callbacks, raise
   `ereport(ERROR, errcode(ERRCODE_FEATURE_NOT_SUPPORTED), …)` with a message
@@ -32,6 +33,19 @@ unchanged for heap; each stub raises its "not implemented" error when called
 through SQL; every interface in `00-architecture-principles.md` has a header,
 a stub and a conformance-test skeleton; the Postgres-facing adapters call only
 interfaces.
+
+**Status (2026-10-13): built, not yet reviewed.**
+
+| Exit criterion | Result |
+|---|---|
+| Builds with no new warnings | Yes (autoconf build, gcc, `--enable-cassert`). The meson build files were written but not tried: meson isn't installed locally |
+| `make check` passes unchanged for heap | 239/239. Four expected outputs gained rows for the new AMs and opclasses (`amutils`, `create_am`, `opr_sanity`, `psql`); no heap behaviour changed |
+| Each stub raises "not implemented" through SQL | Yes for creating a table with each prolly AM (reaches the engine's `tree_create`), `SET ACCESS METHOD`, `CREATE INDEX … USING prolly`, and every version-control function. Table AM callbacks other than the storage ones can't be reached from SQL until a table can be created |
+| Every C interface has a header, a stub and a conformance skeleton | Yes: 16 interfaces (the 15 planned plus diff/merge), `src/test/modules/test_prolly`. The suite also runs two test-only hash implementations to show it passes and fails correctly |
+| Adapters call only interfaces | Yes: `prolly_tableam.c`, `prolly_indexam.c` and `prolly_vcs.c` go through `prolly_config.h` and `PROLLY_CALL` |
+
+The benchmark workload, metric collector and result sink interfaces are part
+of step 2.
 
 ## 2. Build the benchmark harnesses
 

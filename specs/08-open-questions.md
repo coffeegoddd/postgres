@@ -48,3 +48,15 @@ Nothing below is decided. Update this file when something is.
 14. **Version-control scope for the first engine.** Which of V1–V4 must D1+K1
     support in step 4? Clone/push/fetch (V4) needs a transfer protocol, which
     may be more than the first engine needs.
+15. **Choosing a pairing per table.** Today the table AM name picks a fixed
+    profile (`prolly_d2` → D2+K1). D2+K2 needs another way to pick K2: another
+    AM name, or a setting read only at table creation and recorded in the
+    tree (so a session can never read a table with different components than
+    wrote it). Needed before D2+K2 is built.
+16. **WAL description in `pg_waldump`.** The log interface's `desc` and
+    `identify` must also run in `pg_waldump`, which is a frontend program
+    without the registry.
+17. **Index trees on non-prolly tables.** `CREATE INDEX … USING prolly` on a
+    heap table is accepted up to `ambuild` today. Should prolly indexes be
+    refused on heap tables, or supported?
+

@@ -1,0 +1,101 @@
+src/backend/access/prolly/README
+
+Prolly tree storage
+===================
+
+This directory holds prolly-tree storage for Postgres: table and index
+access methods whose data lives in content-addressed trees, so that tables
+can be branched, diffed, merged, cloned, pushed and pulled.  The design and
+the plan are in specs/ at the top of the tree; start with
+specs/README.md and specs/00-architecture-principles.md.
+
+Status: roadmap step 1.  Every interface exists; every implementation is a
+stub.  Nothing stores data yet.
+
+
+Interfaces and implementations
+------------------------------
+
+Every component is an interface with implementations behind it, so that any
+design choice can be changed later by writing a new implementation:
+
+	Interface         Header                  Implementations so far
+	engine            prolly_engine.h         d1 d2 d3a d3b d4 (stubs)
+	coordination      prolly_coord.h          k1 k2 k3 (stubs)
+	node_format       prolly_nodeformat.h     stub
+	chunker           prolly_chunker.h        stub
+	content_hash      prolly_hash.h           stub
+	key_encoder       prolly_keyenc.h         stub
+	value_encoder     prolly_valenc.h         stub
+	node_store        prolly_nodestore.h      stub
+	allocator         prolly_alloc.h          stub
+	reclamation       prolly_reclaim.h        stub
+	log               prolly_log.h            stub
+	commit_pipeline   prolly_commit.h         stub
+	row_identity      prolly_rowid.h          stub
+	refs              prolly_refs.h           stub
+	transfer          prolly_transfer.h       stub
+	diff_merge        prolly_merge.h          stub
+
+An interface header declares a routine struct: a ProllyImplInfo (interface,
+name, impl_id, format_version) followed only by callback pointers, with the
+contract written as comments.  An implementation is one or more source files
+here, named <interface>_<implementation>.c, that define a const routine
+struct.  Nothing else includes an implementation's private headers or calls
+its functions.
+
+Callers go through PROLLY_CALL(routine, callback, args...) (prolly_impl.h).
+A NULL callback means "not implemented", and PROLLY_CALL raises
+ERRCODE_FEATURE_NOT_SUPPORTED naming the interface, implementation and
+callback.  So a stub is a routine with every callback NULL, and a real
+implementation can be filled in one callback at a time.
+
+Built-in implementations are listed in src/include/access/prolly_impllist.h,
+the one place that names them, and found by interface and name through the
+registry (prolly_registry.c).  Libraries in shared_preload_libraries can
+register more with prolly_register_impl().
+
+Which implementation a tree uses comes from configuration (prolly_config.c),
+never from code.  Today that is a default profile per table AM:
+
+	Table AM      Engine   Coordination   Foundation
+	prolly_d1     d1       k1             stubs
+	prolly_d2     d2       k1             stubs
+	prolly_d3a    d3a      k2             stubs
+	prolly_d3b    d3b      k2             stubs
+	prolly_d4     d4       k3             stubs
+
+Database-wide components (refs, transfer, diff_merge) come from a database
+profile.  Once a tree can be created, its components will be recorded in the
+tree with their format stamps and read back from there, so changing
+configuration never changes how existing data is read.
+
+
+Adapters
+--------
+
+The Postgres-facing code is thin and holds no engine logic:
+
+	prolly_tableam.c   one TableAmRoutine for all prolly table AMs
+	prolly_indexam.c   the "prolly" index AM; its opclasses follow the btree
+	                   contract, so validation is btvalidate()
+	prolly_vcs.c       SQL functions prolly_branch_create, prolly_checkout,
+	                   prolly_commit, prolly_diff, prolly_merge, prolly_clone,
+	                   prolly_fetch, prolly_push
+
+Table AM callbacks that map directly onto an engine callback (storage
+creation, truncation, copy, vacuum) already call through the engine
+interface.  The rest raise "does not implement ... yet" until their
+translation is designed.
+
+The catalog entries (pg_am, pg_proc, pg_opfamily, pg_opclass, pg_amop,
+pg_amproc) use OIDs 9370-9392.
+
+
+Tests
+-----
+
+src/test/modules/test_prolly runs each interface's conformance suite
+against every registered implementation, and reaches each stub from SQL:
+
+	make -C src/test/modules/test_prolly check
