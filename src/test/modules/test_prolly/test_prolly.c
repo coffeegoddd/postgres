@@ -29,10 +29,13 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/prolly_commit.h"
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -178,7 +181,7 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_COMMIT_PIPELINE, "survives_crash_and_replays",
 	"enqueue publish checkpoint redo", NULL},
 	{PROLLY_IFACE_COMMIT_PIPELINE, "copies_and_drops_databases",
-	"copy_database drop_database head checkpoint redo", NULL},
+	"copy_database drop_database usage head checkpoint redo", NULL},
 
 	/* row identity */
 	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve",
@@ -612,4 +615,67 @@ prolly_conformance(PG_FUNCTION_ARGS)
 		}
 	}
 	return (Datum) 0;
+}
+
+/*
+ * prolly_commit_usage(implementation): how many heads and pending roots a
+ * commit pipeline holds.
+ */
+PG_FUNCTION_INFO_V1(prolly_commit_usage);
+
+Datum
+prolly_commit_usage(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyCommitRoutine *r = prolly_commit_lookup(name);
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+	int			nheads;
+	int			npending;
+
+	if (r == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("no commit pipeline implementation \"%s\"", name)));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(r, usage, &nheads, &npending);
+	values[0] = Int32GetDatum(nheads);
+	values[1] = Int32GetDatum(npending);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * prolly_fail_next_commit(): the backend's next transaction (not the one
+ * calling this) raises an error just before it commits, for tests of what
+ * an aborted statement that can't run in a transaction block leaves behind.
+ */
+PG_FUNCTION_INFO_V1(prolly_fail_next_commit);
+
+static LocalTransactionId fail_after_lxid = InvalidLocalTransactionId;
+static bool fail_callback_registered = false;
+
+static void
+fail_commit_callback(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_PRE_COMMIT ||
+		fail_after_lxid == InvalidLocalTransactionId ||
+		MyProc->vxid.lxid == fail_after_lxid)
+		return;
+	fail_after_lxid = InvalidLocalTransactionId;
+	ereport(ERROR,
+			(errmsg("commit failed by prolly_fail_next_commit()")));
+}
+
+Datum
+prolly_fail_next_commit(PG_FUNCTION_ARGS)
+{
+	if (!fail_callback_registered)
+	{
+		RegisterXactCallback(fail_commit_callback, NULL);
+		fail_callback_registered = true;
+	}
+	fail_after_lxid = MyProc->vxid.lxid;
+	PG_RETURN_VOID();
 }

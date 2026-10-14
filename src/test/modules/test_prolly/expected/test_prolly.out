@@ -232,8 +232,8 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  commit_pipeline | stub           | identity                                | pass
  commit_pipeline | stub           | publishes_in_enqueue_order              | not implemented (missing branch_lock, tip, enqueue, branch_unlock, publish, abandon, head)
  commit_pipeline | stub           | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
- commit_pipeline | stub           | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, head, checkpoint, redo)
- commit_pipeline | stub           | complete                                | not implemented (13 of 13 callbacks missing)
+ commit_pipeline | stub           | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, usage, head, checkpoint, redo)
+ commit_pipeline | stub           | complete                                | not implemented (14 of 14 callbacks missing)
  row_identity    | hashed         | identity                                | pass
  row_identity    | hashed         | assign_then_resolve                     | pass
  row_identity    | hashed         | same_version_same_tid                   | pass

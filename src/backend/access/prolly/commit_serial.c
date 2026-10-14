@@ -27,8 +27,20 @@
  *
  * CREATE DATABASE copies the template's heads as pending entries of the
  * new database under the creating transaction's xid, logged like any
- * enqueue, so they are settled the same way.  DROP DATABASE removes the
- * database's heads and pending entries and logs that.
+ * enqueue; the creating backend publishes them when its transaction
+ * commits and drops them when it aborts, and after a crash or on a
+ * standby they are settled through the commit log like any other.  DROP
+ * DATABASE removes the database's heads and pending entries and logs that.
+ *
+ * Settling lazily leaves entries behind that nobody reads again: those of
+ * a database nobody opens after a crash, or of transactions that ended in
+ * a crash.  Their xids are invisible to the commit log's truncation and
+ * to xid wraparound, so a checkpoint on a primary settles every entry
+ * whose transaction has finished.  Restartpoints and the end-of-recovery
+ * checkpoint don't: during recovery a transaction whose commit hasn't been
+ * replayed yet may look finished.  The sweep never raises an error; an
+ * entry it can't settle (its status already truncated from the commit
+ * log, or no room for a new head) is left, with a log message.
  *
  * Checkpoints write heads and pending entries to global/prolly_heads
  * (written to a temporary file, then durably renamed), which shmem_init
@@ -51,6 +63,7 @@
 #include "access/prolly_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -126,6 +139,14 @@ typedef struct xl_serial_drop_database
 } xl_serial_drop_database;
 
 static SerialShared *shared = NULL;
+
+/*
+ * Pending entries this backend's transaction added by copying a database,
+ * published or dropped when it ends.
+ */
+static uint64 copied_seqs[MAX_HEADS];
+static int	ncopied = 0;
+static bool copy_callback_registered = false;
 
 static SerialShared *
 get_shared(void)
@@ -233,15 +254,43 @@ branch_has_pending(SerialShared *s, Oid dboid, ProllyBranchId branch)
 }
 
 /*
+ * For the checkpoint's sweep: can p be settled without raising an error?
+ * Its xid's status must still be in the commit log, and if it committed
+ * there must be room for its head.  Caller holds XactTruncationLock.
+ */
+static bool
+can_sweep(SerialShared *s, PendingEntry *p)
+{
+	if (TransactionIdPrecedes(p->xid, TransamVariables->oldestClogXid))
+	{
+		ereport(LOG,
+				(errmsg("prolly commit of transaction %u to database %u can't be settled: its status is no longer in the commit log",
+						p->xid, p->dboid)));
+		return false;
+	}
+	if (s->nheads >= MAX_HEADS && find_head(s, p->dboid, p->branch) == NULL &&
+		TransactionIdDidCommit(p->xid))
+	{
+		ereport(LOG,
+				(errmsg("prolly commit of transaction %u to database %u can't be settled: too many prolly branch heads (limit %d)",
+						p->xid, p->dboid, MAX_HEADS)));
+		return false;
+	}
+	return true;
+}
+
+/*
  * Settle the branch's pending entries whose transactions are known to have
  * finished, oldest first: a committed one's root becomes the head, others
  * are dropped.  With check_running, stops at the first transaction still
  * running; redo passes false, because there every entry below below_seq
- * has finished (commits to a branch are serialized).
+ * has finished (commits to a branch are serialized).  With sweeping (and
+ * XactTruncationLock held), also stops at the first entry can_sweep()
+ * refuses.
  */
 static void
 settle_pending(SerialShared *s, Oid dboid, ProllyBranchId branch,
-			   bool check_running, uint64 below_seq)
+			   bool check_running, uint64 below_seq, bool sweeping)
 {
 	int			i = 0;
 
@@ -254,6 +303,8 @@ settle_pending(SerialShared *s, Oid dboid, ProllyBranchId branch,
 			i++;
 			continue;
 		}
+		if (sweeping && !can_sweep(s, p))
+			break;
 		if (TransactionIdDidCommit(p->xid))
 			set_head(s, dboid, branch, &p->root);
 		else if (check_running && TransactionIdIsInProgress(p->xid))
@@ -275,8 +326,35 @@ settle_database(SerialShared *s, Oid dboid)
 			branches[n++] = s->pending[i].branch;
 	}
 	for (int i = 0; i < n; i++)
-		settle_pending(s, dboid, branches[i], true, PG_UINT64_MAX);
+		settle_pending(s, dboid, branches[i], true, PG_UINT64_MAX, false);
 	pfree(branches);
+}
+
+/* Settle every branch's finished entries, without raising errors. */
+static void
+sweep_pending(SerialShared *s)
+{
+	PendingEntry *keys = palloc(sizeof(PendingEntry) * MAX_PENDING);
+	int			n = 0;
+
+	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	for (int i = 0; i < s->npending; i++)
+	{
+		bool		seen = false;
+
+		for (int j = 0; j < n && !seen; j++)
+			seen = (keys[j].dboid == s->pending[i].dboid &&
+					keys[j].branch == s->pending[i].branch);
+		if (!seen)
+			keys[n++] = s->pending[i];
+	}
+	for (int i = 0; i < n; i++)
+		settle_pending(s, keys[i].dboid, keys[i].branch, true, PG_UINT64_MAX,
+					   true);
+	LWLockRelease(XactTruncationLock);
+	LWLockRelease(ProllyHeadsLock);
+	pfree(keys);
 }
 
 /* Shared or exclusive lock. */
@@ -394,6 +472,13 @@ serial_checkpoint(int flags)
 	pg_crc32c	crc;
 	int			fd;
 
+	/*
+	 * On a primary only: during recovery, a transaction whose commit
+	 * record is still to be replayed can look finished.
+	 */
+	if (!RecoveryInProgress() && !(flags & CHECKPOINT_END_OF_RECOVERY))
+		sweep_pending(s);
+
 	heads = palloc(sizeof(HeadEntry) * MAX_HEADS);
 	pending = palloc(sizeof(PendingEntry) * MAX_PENDING);
 
@@ -480,7 +565,7 @@ serial_tip(ProllyBranchId branch, ProllyNodeRef *root)
 	bool		found = false;
 
 	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
-	settle_pending(s, MyDatabaseId, branch, true, PG_UINT64_MAX);
+	settle_pending(s, MyDatabaseId, branch, true, PG_UINT64_MAX, false);
 	for (int i = s->npending - 1; i >= 0; i--)
 	{
 		PendingEntry *p = &s->pending[i];
@@ -595,7 +680,7 @@ serial_head(ProllyBranchId branch, ProllyNodeRef *root)
 		/* Settle anything left by recovery or by a commit in flight. */
 		LWLockRelease(ProllyHeadsLock);
 		LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
-		settle_pending(s, MyDatabaseId, branch, true, PG_UINT64_MAX);
+		settle_pending(s, MyDatabaseId, branch, true, PG_UINT64_MAX, false);
 	}
 	h = find_head(s, MyDatabaseId, branch);
 	if (h != NULL)
@@ -605,6 +690,28 @@ serial_head(ProllyBranchId branch, ProllyNodeRef *root)
 	}
 	LWLockRelease(ProllyHeadsLock);
 	return found;
+}
+
+static void finish_ticket(ProllyCommitTicket ticket, bool committed);
+
+static void
+copy_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+			for (int i = 0; i < ncopied; i++)
+				finish_ticket(copied_seqs[i], event == XACT_EVENT_COMMIT);
+			ncopied = 0;
+			break;
+		case XACT_EVENT_PREPARE:
+			/* Left to be settled through the commit log. */
+			ncopied = 0;
+			break;
+		default:
+			break;
+	}
 }
 
 static void
@@ -655,8 +762,19 @@ serial_copy_database(Oid src_dboid, Oid dst_dboid)
 				 errmsg("too many prolly commits in progress (limit %d)",
 						MAX_PENDING)));
 	}
+	if (ncopied + n > MAX_HEADS)
+	{
+		LWLockRelease(ProllyHeadsLock);
+		elog(ERROR, "too many prolly branch heads copied in one transaction");
+	}
+	if (!copy_callback_registered)
+	{
+		RegisterXactCallback(copy_xact_callback, NULL);
+		copy_callback_registered = true;
+	}
 	for (int i = 0; i < n; i++)
-		(void) add_pending(s, dst_dboid, heads[i].branch, xid, &heads[i].root);
+		copied_seqs[ncopied++] = add_pending(s, dst_dboid, heads[i].branch,
+											 xid, &heads[i].root);
 	LWLockRelease(ProllyHeadsLock);
 
 	for (int i = 0; i < n; i++)
@@ -681,6 +799,17 @@ serial_drop_database(Oid dboid)
 	XLogRegisterData(&hdr, SizeOfProllyHeader);
 	XLogRegisterData(&rec, sizeof(rec));
 	(void) XLogInsert(RM_PROLLY_COMMIT_ID, XLOG_PROLLY_COMMIT_DROP_DATABASE);
+}
+
+static void
+serial_usage(int *nheads, int *npending)
+{
+	SerialShared *s = get_shared();
+
+	LWLockAcquire(ProllyHeadsLock, LW_SHARED);
+	*nheads = s->nheads;
+	*npending = s->npending;
+	LWLockRelease(ProllyHeadsLock);
 }
 
 static void
@@ -716,7 +845,7 @@ serial_redo(XLogReaderState *record)
 				 * Commits to a branch are serialized, so every earlier
 				 * transaction on it has finished by now.
 				 */
-				settle_pending(s, rec.dboid, rec.branch, false, seq);
+				settle_pending(s, rec.dboid, rec.branch, false, seq, false);
 				LWLockRelease(ProllyHeadsLock);
 				break;
 			}
@@ -759,6 +888,7 @@ const ProllyCommitRoutine prolly_commit_serial = {
 	.head = serial_head,
 	.copy_database = serial_copy_database,
 	.drop_database = serial_drop_database,
+	.usage = serial_usage,
 	.checkpoint = serial_checkpoint,
 	.redo = serial_redo,
 };
