@@ -77,6 +77,7 @@ provisional.
 | **Commit pipeline** | Branch heads; ordering and publishing roots at commit; their WAL and checkpoint | One committer per branch (**serial**), ordered pipeline |
 | **Row identity** | TIDs ↔ row versions | TIDs from a per-table counter with a map both ways (**counter**, since 4d.2; replaced content-derived **hashed**, question 37), wide row ids |
 | **Table keying** | How a table's rows become tree items: key, value layout, content hash | Primary key, else row content with a count (**pk_or_content**) |
+| **Index keying** | How a prolly index's entries are made: index columns, then the row's key and ordinal; bounds for seeking | **columns_then_row** (4d.3) |
 | **Refs and commit graph** | Branches, commits, history storage | A refs file per database (proposed; catalogs can't hold refs now that they are versioned), others |
 | **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |
 | **Diff / merge** | Row diff and three-way merge between refs, over canonical trees | Structural diff (added in step 1; see below) |
@@ -105,6 +106,10 @@ interface over Tree rather than part of an engine (`prolly_rootlayout.h`).
 **Table keying** was added in step 4d.1 (question 36): how rows become
 tree items is independent of the engine, and other rules (always by
 content, by a synthetic id) stay possible (`prolly_keying.h`).
+
+**Index keying** was added in step 4d.3 (question 42): a prolly index's
+entries hold the row's key, never a TID, and how they are laid out is its
+own interface (`prolly_ixkeying.h`).
 
 The C interfaces (everything above the benchmark rows) were defined in step 1:
 headers `src/include/access/prolly_*.h`, except the schema canonicalizer,

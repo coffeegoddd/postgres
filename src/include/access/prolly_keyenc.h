@@ -15,6 +15,10 @@
  *   platform, in every cluster and in every session, with no local OIDs.
  * - decode() returns false if the encoding can't be reversed (e.g. collation
  *   sort keys); callers then read the column from the row.
+ * - Encodings are self-delimiting: an encoded key followed by other bytes
+ *   can be split again, and prefix_length() says how many bytes the first
+ *   ncols columns of an encoded key take (a key of fewer columns, encoded
+ *   by an encoder begun for those columns, compares with that prefix).
  *
  * Provisional (v0).
  *
@@ -58,11 +62,15 @@ typedef struct ProllyKeyEncoderRoutine
 	int			(*compare) (ProllyKeyEncoder *enc, const ProllyKey *a,
 							const ProllyKey *b);
 
+	uint32		(*prefix_length) (ProllyKeyEncoder *enc, const ProllyKey *key,
+								  int ncols);
+
 	void		(*end) (ProllyKeyEncoder *enc);
 } ProllyKeyEncoderRoutine;
 
 #define PROLLY_KEYENC_CALLBACK_NAMES \
-	"supports", "begin", "encode", "decode", "compare", "end"
+	"supports", "begin", "encode", "decode", "compare", "prefix_length", \
+	"end"
 #define PROLLY_KEYENC_FIRST_CALLBACK supports
 
 static inline const ProllyKeyEncoderRoutine *

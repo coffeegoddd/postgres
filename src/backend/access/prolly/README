@@ -36,6 +36,7 @@ design choice can be changed later by writing a new implementation:
 	tree              prolly_tree.h           cow, stub
 	root_layout       prolly_rootlayout.h     subroots, stub
 	table_keying      prolly_keying.h         pk_or_content, stub
+	index_keying      prolly_ixkeying.h       columns_then_row, stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
 	log               prolly_log.h            chunks, stub
@@ -75,7 +76,7 @@ never from code.  Today that is a default profile per table AM:
 
 All five share the same foundation: node format basic, chunker keyhash,
 content hash sha256, key encoder ordered, value encoder canonical, table
-keying pk_or_content, and stubs for the interfaces without an
+keying pk_or_content, index keying columns_then_row, and stubs for the interfaces without an
 implementation yet.  prolly_d1 and prolly_d2 use the node store global,
 the tree cow, the root layout subroots, the commit pipeline serial and
 the row identity counter; prolly_d1 also the log chunks, and the
@@ -243,6 +244,23 @@ virtual slots that look up xmin, and whether the row is the current
 transaction's, through the map.  Uniqueness checks find TIDs in indexes
 that no map knows (another writer's private rows) and wait for the right
 to write the table before looking again.
+
+
+Prolly indexes
+--------------
+
+A prolly index (prolly_indexam.c, index AM "prolly", btree-compatible
+operator classes) is a tree from its table's root set, found by the
+index's relfilenumber, with one entry per row: the index columns, then
+the row's key and ordinal (index keying columns_then_row).  No TIDs, so
+the tree depends only on the table's rows.  Postgres calls aminsert; the
+table AM removes a row version's entries when it deletes or updates it
+(computing expressions and partial predicates), and rebuilds its prolly
+indexes when it re-keys the table.  Unique checks look for another entry
+with the same columns (writers are one per table).  Scans seek from a
+bound made of leading equality keys and a range key, stop at the bound
+past them, check every key on the decoded entry, and find the TID through
+row identity.  Only on prolly tables; no bitmap scans or INCLUDE yet.
 
 
 Core hooks

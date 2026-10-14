@@ -34,6 +34,7 @@ tests += {
     'sql': [
       'test_prolly',
       'd1_tables',
+      'd1_index',
     ],
   },
   'tap': {
@@ -46,6 +47,7 @@ tests += {
       't/006_d1_head_limit.pl',
       't/007_d1_commit_capacity.pl',
       't/008_d1_writers.pl',
+      't/009_d1_index.pl',
     ],
   },
 }

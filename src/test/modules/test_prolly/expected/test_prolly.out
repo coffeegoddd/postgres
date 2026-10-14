@@ -7,325 +7,335 @@ CREATE EXTENSION test_prolly;
 -- Every implementation of every interface.
 SELECT interface, name, impl_id, format_version
 FROM prolly_implementations();
-    interface    |     name      | impl_id | format_version 
------------------+---------------+---------+----------------
- engine          | d1            |       1 |              1
- engine          | d2            |       2 |              0
- engine          | d3a           |       3 |              0
- engine          | d3b           |       4 |              0
- engine          | d4            |       5 |              0
- coordination    | k1            |       1 |              0
- coordination    | k2            |       2 |              0
- coordination    | k3            |       3 |              0
- coordination    | single_writer |       4 |              1
- node_format     | basic         |       1 |              1
- node_format     | stub          |       0 |              0
- chunker         | keyhash       |       1 |              1
- chunker         | stub          |       0 |              0
- content_hash    | sha256        |       1 |              1
- content_hash    | stub          |       0 |              0
- content_hash    | test_fnv      |    9001 |              0
- content_hash    | test_broken   |    9002 |              0
- key_encoder     | ordered       |       1 |              1
- key_encoder     | stub          |       0 |              0
- value_encoder   | heaptuple     |       1 |              1
- value_encoder   | canonical     |       2 |              1
- value_encoder   | stub          |       0 |              0
- node_store      | global        |       1 |              1
- node_store      | stub          |       0 |              0
- allocator       | stub          |       0 |              0
- reclamation     | stub          |       0 |              0
- log             | chunks        |       1 |              1
- log             | stub          |       0 |              0
- commit_pipeline | serial        |       1 |              1
- commit_pipeline | stub          |       0 |              0
- row_identity    | counter       |       2 |              1
- row_identity    | stub          |       0 |              0
- refs            | stub          |       0 |              0
- transfer        | stub          |       0 |              0
- diff_merge      | stub          |       0 |              0
- tree            | cow           |       1 |              1
- tree            | stub          |       0 |              0
- root_layout     | subroots      |       1 |              2
- root_layout     | stub          |       0 |              0
- table_keying    | pk_or_content |       1 |              2
- table_keying    | stub          |       0 |              0
-(41 rows)
+    interface    |       name       | impl_id | format_version 
+-----------------+------------------+---------+----------------
+ engine          | d1               |       1 |              1
+ engine          | d2               |       2 |              0
+ engine          | d3a              |       3 |              0
+ engine          | d3b              |       4 |              0
+ engine          | d4               |       5 |              0
+ coordination    | k1               |       1 |              0
+ coordination    | k2               |       2 |              0
+ coordination    | k3               |       3 |              0
+ coordination    | single_writer    |       4 |              1
+ node_format     | basic            |       1 |              1
+ node_format     | stub             |       0 |              0
+ chunker         | keyhash          |       1 |              1
+ chunker         | stub             |       0 |              0
+ content_hash    | sha256           |       1 |              1
+ content_hash    | stub             |       0 |              0
+ content_hash    | test_fnv         |    9001 |              0
+ content_hash    | test_broken      |    9002 |              0
+ key_encoder     | ordered          |       1 |              1
+ key_encoder     | stub             |       0 |              0
+ value_encoder   | heaptuple        |       1 |              1
+ value_encoder   | canonical        |       2 |              1
+ value_encoder   | stub             |       0 |              0
+ node_store      | global           |       1 |              1
+ node_store      | stub             |       0 |              0
+ allocator       | stub             |       0 |              0
+ reclamation     | stub             |       0 |              0
+ log             | chunks           |       1 |              1
+ log             | stub             |       0 |              0
+ commit_pipeline | serial           |       1 |              1
+ commit_pipeline | stub             |       0 |              0
+ row_identity    | counter          |       2 |              1
+ row_identity    | stub             |       0 |              0
+ refs            | stub             |       0 |              0
+ transfer        | stub             |       0 |              0
+ diff_merge      | stub             |       0 |              0
+ tree            | cow              |       1 |              1
+ tree            | stub             |       0 |              0
+ root_layout     | subroots         |       1 |              2
+ root_layout     | stub             |       0 |              0
+ table_keying    | pk_or_content    |       1 |              2
+ table_keying    | stub             |       0 |              0
+ index_keying    | columns_then_row |       1 |              1
+ index_keying    | stub             |       0 |              0
+(43 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
 NOTICE:  drop cascades to column m of table conf_kt
-    interface    | implementation |                  test                   |                                                                                                      result                                                                                                       
------------------+----------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- engine          | d1             | identity                                | pass
- engine          | d1             | create_and_truncate                     | pass
- engine          | d1             | read_empty_tree                         | pass
- engine          | d1             | read_own_writes                         | pass
- engine          | d1             | subxact_abort_discards_writes           | pass
- engine          | d1             | commit_publishes_roots                  | no checks yet
- engine          | d1             | count_range_matches_scan                | pass
- engine          | d1             | canonical_root_independent_of_history   | not implemented (missing canonical_root)
- engine          | d1             | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d1             | complete                                | not implemented (6 of 26 callbacks missing)
- engine          | d2             | identity                                | pass
- engine          | d2             | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d2             | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
- engine          | d2             | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d2             | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
- engine          | d2             | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
- engine          | d2             | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
- engine          | d2             | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
- engine          | d2             | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d2             | complete                                | not implemented (26 of 26 callbacks missing)
- engine          | d3a            | identity                                | pass
- engine          | d3a            | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d3a            | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
- engine          | d3a            | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d3a            | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
- engine          | d3a            | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
- engine          | d3a            | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
- engine          | d3a            | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
- engine          | d3a            | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d3a            | complete                                | not implemented (26 of 26 callbacks missing)
- engine          | d3b            | identity                                | pass
- engine          | d3b            | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d3b            | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
- engine          | d3b            | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d3b            | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
- engine          | d3b            | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
- engine          | d3b            | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
- engine          | d3b            | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
- engine          | d3b            | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d3b            | complete                                | not implemented (26 of 26 callbacks missing)
- engine          | d4             | identity                                | pass
- engine          | d4             | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d4             | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
- engine          | d4             | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
- engine          | d4             | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
- engine          | d4             | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
- engine          | d4             | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
- engine          | d4             | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
- engine          | d4             | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d4             | complete                                | not implemented (26 of 26 callbacks missing)
- coordination    | k1             | identity                                | pass
- coordination    | k1             | lock_conflict_matrix                    | not implemented (missing lock_row)
- coordination    | k1             | wait_policies                           | not implemented (missing lock_row)
- coordination    | k1             | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
- coordination    | k1             | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
- coordination    | k1             | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
- coordination    | k1             | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k1             | complete                                | not implemented (11 of 11 callbacks missing)
- coordination    | k2             | identity                                | pass
- coordination    | k2             | lock_conflict_matrix                    | not implemented (missing lock_row)
- coordination    | k2             | wait_policies                           | not implemented (missing lock_row)
- coordination    | k2             | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
- coordination    | k2             | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
- coordination    | k2             | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
- coordination    | k2             | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k2             | complete                                | not implemented (11 of 11 callbacks missing)
- coordination    | k3             | identity                                | pass
- coordination    | k3             | lock_conflict_matrix                    | not implemented (missing lock_row)
- coordination    | k3             | wait_policies                           | not implemented (missing lock_row)
- coordination    | k3             | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
- coordination    | k3             | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
- coordination    | k3             | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
- coordination    | k3             | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k3             | complete                                | not implemented (11 of 11 callbacks missing)
- coordination    | single_writer  | identity                                | pass
- coordination    | single_writer  | lock_conflict_matrix                    | no checks yet
- coordination    | single_writer  | wait_policies                           | no checks yet
- coordination    | single_writer  | speculative_insertion                   | no checks yet
- coordination    | single_writer  | commit_markers_until_horizon            | not implemented (missing xact_commit, written_since, prune_markers)
- coordination    | single_writer  | abort_releases_locks                    | not implemented (missing xact_abort, subxact_abort)
- coordination    | single_writer  | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | single_writer  | complete                                | not implemented (8 of 11 callbacks missing)
- node_format     | basic          | identity                                | pass
- node_format     | basic          | items_round_trip                        | pass
- node_format     | basic          | level_round_trip                        | pass
- node_format     | basic          | space_accounting                        | pass
- node_format     | basic          | canonical_bytes_depend_only_on_items    | pass
- node_format     | basic          | page_check_detects_corruption           | pass
- node_format     | basic          | complete                                | pass
- node_format     | stub           | identity                                | pass
- node_format     | stub           | items_round_trip                        | not implemented (missing page_init, item_append, item_hint, item_count, item_get)
- node_format     | stub           | level_round_trip                        | not implemented (missing page_init, page_level, item_count)
- node_format     | stub           | space_accounting                        | not implemented (missing page_init, item_space, free_space, item_append)
- node_format     | stub           | canonical_bytes_depend_only_on_items    | not implemented (missing page_init, item_append, canonical_bytes, special_space)
- node_format     | stub           | page_check_detects_corruption           | not implemented (missing page_init, item_append, page_check)
- node_format     | stub           | complete                                | not implemented (11 of 11 callbacks missing)
- chunker         | keyhash        | identity                                | pass
- chunker         | keyhash        | deterministic                           | pass
- chunker         | keyhash        | forced_split_respects_capacity          | pass
- chunker         | keyhash        | reset_equals_begin                      | pass
- chunker         | keyhash        | complete                                | pass
- chunker         | stub           | identity                                | pass
- chunker         | stub           | deterministic                           | not implemented (missing begin, add, end)
- chunker         | stub           | forced_split_respects_capacity          | not implemented (missing begin, add, end)
- chunker         | stub           | reset_equals_begin                      | not implemented (missing begin, add, reset, end)
- chunker         | stub           | complete                                | not implemented (4 of 4 callbacks missing)
- content_hash    | sha256         | identity                                | pass
- content_hash    | sha256         | deterministic                           | pass
- content_hash    | sha256         | incremental_equals_one_shot             | pass
- content_hash    | sha256         | complete                                | pass
- content_hash    | stub           | identity                                | pass
- content_hash    | stub           | deterministic                           | not implemented (missing begin, update, finish)
- content_hash    | stub           | incremental_equals_one_shot             | not implemented (missing begin, update, finish)
- content_hash    | stub           | complete                                | not implemented (3 of 3 callbacks missing)
- key_encoder     | ordered        | identity                                | pass
- key_encoder     | ordered        | order_matches_opclass                   | pass
- key_encoder     | ordered        | desc_and_nulls_ordering                 | pass
- key_encoder     | ordered        | decode_round_trip                       | pass
- key_encoder     | ordered        | complete                                | pass
- key_encoder     | stub           | identity                                | pass
- key_encoder     | stub           | order_matches_opclass                   | not implemented (missing supports, begin, encode, compare, end)
- key_encoder     | stub           | desc_and_nulls_ordering                 | not implemented (missing supports, begin, encode, compare, end)
- key_encoder     | stub           | decode_round_trip                       | not implemented (missing begin, encode, decode, end)
- key_encoder     | stub           | complete                                | not implemented (6 of 6 callbacks missing)
- value_encoder   | heaptuple      | identity                                | pass
- value_encoder   | heaptuple      | round_trip                              | pass
- value_encoder   | heaptuple      | platform_independent                    | fail: row 1 encodes as 2a000000000000000000050002001800e103000009616263000000000001000000138082030087052823, the reference encoding is 050004000003e10361626308000001000000000001000e0003000000000005000305872328
- value_encoder   | heaptuple      | independent_of_history                  | fail: row 0: 1a000000000000000000030002001800f9ffffff030b07a06400 without the table's history, 1a000000000000000000070003001815f9ffffff030b07a06400 with it
- value_encoder   | heaptuple      | independent_of_session                  | pass
- value_encoder   | heaptuple      | missing_values                          | pass
- value_encoder   | heaptuple      | decodes_earlier_layouts                 | pass
- value_encoder   | heaptuple      | complete                                | pass
- value_encoder   | canonical      | identity                                | pass
- value_encoder   | canonical      | round_trip                              | pass
- value_encoder   | canonical      | platform_independent                    | pass
- value_encoder   | canonical      | independent_of_history                  | pass
- value_encoder   | canonical      | independent_of_session                  | pass
- value_encoder   | canonical      | missing_values                          | pass
- value_encoder   | canonical      | decodes_earlier_layouts                 | pass
- value_encoder   | canonical      | complete                                | pass
- value_encoder   | stub           | identity                                | pass
- value_encoder   | stub           | round_trip                              | not implemented (missing begin, encode, decode, end)
- value_encoder   | stub           | platform_independent                    | not implemented (missing begin, encode, end)
- value_encoder   | stub           | independent_of_history                  | not implemented (missing begin, encode, end)
- value_encoder   | stub           | independent_of_session                  | not implemented (missing begin, encode, end)
- value_encoder   | stub           | missing_values                          | not implemented (missing begin, encode, decode, end)
- value_encoder   | stub           | decodes_earlier_layouts                 | not implemented (missing begin, layout, begin_layout, reads_layout, encode, decode, end)
- value_encoder   | stub           | complete                                | not implemented (7 of 7 callbacks missing)
- node_store      | global         | identity                                | pass
- node_store      | global         | new_publish_read                        | pass
- node_store      | global         | many_nodes_findable                     | pass
- node_store      | global         | release_frees                           | pass
- node_store      | global         | complete                                | pass
- node_store      | stub           | identity                                | pass
- node_store      | stub           | new_publish_read                        | not implemented (missing create, open, new_node, publish, read, contains, close)
- node_store      | stub           | many_nodes_findable                     | not implemented (missing create, open, new_node, publish, read, contains, close)
- node_store      | stub           | release_frees                           | not implemented (missing create, open, new_node, publish, release, contains, close)
- node_store      | stub           | complete                                | not implemented (9 of 9 callbacks missing)
- allocator       | stub           | identity                                | pass
- allocator       | stub           | no_overlapping_extents                  | not implemented (missing open, allocate, free, close)
- allocator       | stub           | complete                                | not implemented (4 of 4 callbacks missing)
- reclamation     | stub           | identity                                | pass
- reclamation     | stub           | reachable_never_freed                   | not implemented (missing node_created, node_dropped, root_retired, run)
- reclamation     | stub           | in_place_only_when_private              | not implemented (missing may_modify_in_place)
- reclamation     | stub           | complete                                | not implemented (5 of 5 callbacks missing)
- log             | chunks         | identity                                | pass
- log             | chunks         | commit_record                           | not implemented (missing log_commit)
- log             | chunks         | redo_restores_committed_root            | not implemented (missing log_commit, startup, cleanup)
- log             | chunks         | describes_records                       | not implemented (missing desc, identify)
- log             | chunks         | complete                                | not implemented (6 of 9 callbacks missing)
- log             | stub           | identity                                | pass
- log             | stub           | commit_record                           | not implemented (missing log_commit)
- log             | stub           | redo_restores_committed_root            | not implemented (missing log_node, log_mutation, log_commit, redo, startup, cleanup)
- log             | stub           | describes_records                       | not implemented (missing desc, identify)
- log             | stub           | complete                                | not implemented (9 of 9 callbacks missing)
- commit_pipeline | serial         | identity                                | pass
- commit_pipeline | serial         | publishes_in_enqueue_order              | pass
- commit_pipeline | serial         | survives_crash_and_replays              | no checks yet
- commit_pipeline | serial         | copies_and_drops_databases              | no checks yet
- commit_pipeline | serial         | complete                                | pass
- commit_pipeline | stub           | identity                                | pass
- commit_pipeline | stub           | publishes_in_enqueue_order              | not implemented (missing branch_lock, tip, enqueue, branch_unlock, publish, abandon, head)
- commit_pipeline | stub           | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
- commit_pipeline | stub           | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, usage, head, checkpoint, redo)
- commit_pipeline | stub           | complete                                | not implemented (14 of 14 callbacks missing)
- row_identity    | counter        | identity                                | pass
- row_identity    | counter        | assign_then_resolve                     | pass
- row_identity    | counter        | rename_keeps_tid                        | pass
- row_identity    | counter        | renew_makes_new_version                 | pass
- row_identity    | counter        | never_reused                            | pass
- row_identity    | counter        | forget                                  | not implemented (missing tid_forget)
- row_identity    | counter        | complete                                | not implemented (1 of 9 callbacks missing)
- row_identity    | stub           | identity                                | pass
- row_identity    | stub           | assign_then_resolve                     | not implemented (missing tid_assign, scan_begin, tid_find, scan_end, tid_resolve)
- row_identity    | stub           | rename_keeps_tid                        | not implemented (missing tid_assign, tid_rename, tid_resolve, scan_begin, tid_find, scan_end)
- row_identity    | stub           | renew_makes_new_version                 | not implemented (missing tid_assign, tid_renew, tid_resolve, scan_begin, tid_find, scan_end)
- row_identity    | stub           | never_reused                            | not implemented (missing tid_assign, tid_retire, tid_resolve, scan_begin, tid_find, scan_end)
- row_identity    | stub           | forget                                  | not implemented (missing tid_assign, tid_resolve, tid_forget)
- row_identity    | stub           | complete                                | not implemented (9 of 9 callbacks missing)
- refs            | stub           | identity                                | pass
- refs            | stub           | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
- refs            | stub           | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
- refs            | stub           | merge_base                              | not implemented (missing commit, merge_base)
- refs            | stub           | complete                                | not implemented (8 of 8 callbacks missing)
- transfer        | stub           | identity                                | pass
- transfer        | stub           | clone                                   | not implemented (missing clone)
- transfer        | stub           | fetch_then_push                         | not implemented (missing fetch, push)
- transfer        | stub           | complete                                | not implemented (3 of 3 callbacks missing)
- diff_merge      | stub           | identity                                | pass
- diff_merge      | stub           | diff_reports_each_change_once           | not implemented (missing diff)
- diff_merge      | stub           | merge                                   | not implemented (missing merge)
- diff_merge      | stub           | complete                                | not implemented (2 of 2 callbacks missing)
- tree            | cow            | identity                                | pass
- tree            | cow            | build_and_get                           | pass
- tree            | cow            | cursor_scans                            | pass
- tree            | cow            | apply_matches_reference                 | pass
- tree            | cow            | apply_past_the_end                      | pass
- tree            | cow            | history_independent                     | pass
- tree            | cow            | edits_share_nodes                       | pass
- tree            | cow            | diff_reports_changes                    | pass
- tree            | cow            | nodes_are_valid                         | pass
- tree            | cow            | complete                                | pass
- tree            | stub           | identity                                | pass
- tree            | stub           | build_and_get                           | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree            | stub           | cursor_scans                            | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree            | stub           | apply_matches_reference                 | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree            | stub           | apply_past_the_end                      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree            | stub           | history_independent                     | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree            | stub           | edits_share_nodes                       | not implemented (missing build_begin, build_add, build_finish, apply, walk)
- tree            | stub           | diff_reports_changes                    | not implemented (missing build_begin, build_add, build_finish, apply, diff)
- tree            | stub           | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
- tree            | stub           | complete                                | not implemented (12 of 12 callbacks missing)
- root_layout     | subroots       | identity                                | pass
- root_layout     | subroots       | empty                                   | pass
- root_layout     | subroots       | apply_matches_reference                 | pass
- root_layout     | subroots       | history_independent                     | pass
- root_layout     | subroots       | subroots_independent                    | pass
- root_layout     | subroots       | diff_reports_changes                    | pass
- root_layout     | subroots       | apply_rejects_invalid_refs              | pass
- root_layout     | subroots       | walk_reaches_trees                      | pass
- root_layout     | subroots       | complete                                | pass
- root_layout     | stub           | identity                                | pass
- root_layout     | stub           | empty                                   | not implemented (missing empty, subroot, lookup, scan, apply)
- root_layout     | stub           | apply_matches_reference                 | not implemented (missing empty, apply, lookup, scan)
- root_layout     | stub           | history_independent                     | not implemented (missing empty, apply, lookup, scan)
- root_layout     | stub           | subroots_independent                    | not implemented (missing empty, apply, subroot)
- root_layout     | stub           | diff_reports_changes                    | not implemented (missing empty, apply, diff)
- root_layout     | stub           | apply_rejects_invalid_refs              | not implemented (missing empty, apply, lookup)
- root_layout     | stub           | walk_reaches_trees                      | not implemented (missing empty, apply, subroot, walk)
- root_layout     | stub           | complete                                | not implemented (7 of 7 callbacks missing)
- table_keying    | pk_or_content  | identity                                | pass
- table_keying    | pk_or_content  | round_trip                              | pass
- table_keying    | pk_or_content  | keys_and_content                        | pass
- table_keying    | pk_or_content  | description_reopens                     | pass
- table_keying    | pk_or_content  | reads_after_key_column_dropped          | pass
- table_keying    | pk_or_content  | owns_its_memory                         | pass
- table_keying    | pk_or_content  | cannot_compare_after_key_type_dropped   | pass
- table_keying    | pk_or_content  | complete                                | pass
- table_keying    | stub           | identity                                | pass
- table_keying    | stub           | round_trip                              | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
- table_keying    | stub           | keys_and_content                        | not implemented (missing open, encode_row, content_hash, compare, close)
- table_keying    | stub           | description_reopens                     | not implemented (missing open, describe, keyless, encode_row, close)
- table_keying    | stub           | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
- table_keying    | stub           | owns_its_memory                         | not implemented (missing open, encode_row, decode_row, close)
- table_keying    | stub           | cannot_compare_after_key_type_dropped   | not implemented (missing open, describe, can_compare, close)
- table_keying    | stub           | complete                                | not implemented (12 of 12 callbacks missing)
-(266 rows)
+    interface    |  implementation  |                  test                   |                                                                                                      result                                                                                                       
+-----------------+------------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ engine          | d1               | identity                                | pass
+ engine          | d1               | create_and_truncate                     | pass
+ engine          | d1               | read_empty_tree                         | pass
+ engine          | d1               | read_own_writes                         | pass
+ engine          | d1               | subxact_abort_discards_writes           | pass
+ engine          | d1               | commit_publishes_roots                  | no checks yet
+ engine          | d1               | count_range_matches_scan                | pass
+ engine          | d1               | canonical_root_independent_of_history   | not implemented (missing canonical_root)
+ engine          | d1               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
+ engine          | d1               | complete                                | not implemented (6 of 26 callbacks missing)
+ engine          | d2               | identity                                | pass
+ engine          | d2               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d2               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
+ engine          | d2               | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d2               | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
+ engine          | d2               | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
+ engine          | d2               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
+ engine          | d2               | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
+ engine          | d2               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
+ engine          | d2               | complete                                | not implemented (26 of 26 callbacks missing)
+ engine          | d3a              | identity                                | pass
+ engine          | d3a              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3a              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
+ engine          | d3a              | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3a              | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
+ engine          | d3a              | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
+ engine          | d3a              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
+ engine          | d3a              | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
+ engine          | d3a              | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
+ engine          | d3a              | complete                                | not implemented (26 of 26 callbacks missing)
+ engine          | d3b              | identity                                | pass
+ engine          | d3b              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3b              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
+ engine          | d3b              | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3b              | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
+ engine          | d3b              | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
+ engine          | d3b              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
+ engine          | d3b              | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
+ engine          | d3b              | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
+ engine          | d3b              | complete                                | not implemented (26 of 26 callbacks missing)
+ engine          | d4               | identity                                | pass
+ engine          | d4               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d4               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
+ engine          | d4               | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d4               | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
+ engine          | d4               | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
+ engine          | d4               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
+ engine          | d4               | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
+ engine          | d4               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
+ engine          | d4               | complete                                | not implemented (26 of 26 callbacks missing)
+ coordination    | k1               | identity                                | pass
+ coordination    | k1               | lock_conflict_matrix                    | not implemented (missing lock_row)
+ coordination    | k1               | wait_policies                           | not implemented (missing lock_row)
+ coordination    | k1               | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
+ coordination    | k1               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
+ coordination    | k1               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
+ coordination    | k1               | predicate_locks                         | not implemented (missing predicate_lock_range)
+ coordination    | k1               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | k2               | identity                                | pass
+ coordination    | k2               | lock_conflict_matrix                    | not implemented (missing lock_row)
+ coordination    | k2               | wait_policies                           | not implemented (missing lock_row)
+ coordination    | k2               | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
+ coordination    | k2               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
+ coordination    | k2               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
+ coordination    | k2               | predicate_locks                         | not implemented (missing predicate_lock_range)
+ coordination    | k2               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | k3               | identity                                | pass
+ coordination    | k3               | lock_conflict_matrix                    | not implemented (missing lock_row)
+ coordination    | k3               | wait_policies                           | not implemented (missing lock_row)
+ coordination    | k3               | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
+ coordination    | k3               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
+ coordination    | k3               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
+ coordination    | k3               | predicate_locks                         | not implemented (missing predicate_lock_range)
+ coordination    | k3               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | single_writer    | identity                                | pass
+ coordination    | single_writer    | lock_conflict_matrix                    | no checks yet
+ coordination    | single_writer    | wait_policies                           | no checks yet
+ coordination    | single_writer    | speculative_insertion                   | no checks yet
+ coordination    | single_writer    | commit_markers_until_horizon            | not implemented (missing xact_commit, written_since, prune_markers)
+ coordination    | single_writer    | abort_releases_locks                    | not implemented (missing xact_abort, subxact_abort)
+ coordination    | single_writer    | predicate_locks                         | not implemented (missing predicate_lock_range)
+ coordination    | single_writer    | complete                                | not implemented (8 of 11 callbacks missing)
+ node_format     | basic            | identity                                | pass
+ node_format     | basic            | items_round_trip                        | pass
+ node_format     | basic            | level_round_trip                        | pass
+ node_format     | basic            | space_accounting                        | pass
+ node_format     | basic            | canonical_bytes_depend_only_on_items    | pass
+ node_format     | basic            | page_check_detects_corruption           | pass
+ node_format     | basic            | complete                                | pass
+ node_format     | stub             | identity                                | pass
+ node_format     | stub             | items_round_trip                        | not implemented (missing page_init, item_append, item_hint, item_count, item_get)
+ node_format     | stub             | level_round_trip                        | not implemented (missing page_init, page_level, item_count)
+ node_format     | stub             | space_accounting                        | not implemented (missing page_init, item_space, free_space, item_append)
+ node_format     | stub             | canonical_bytes_depend_only_on_items    | not implemented (missing page_init, item_append, canonical_bytes, special_space)
+ node_format     | stub             | page_check_detects_corruption           | not implemented (missing page_init, item_append, page_check)
+ node_format     | stub             | complete                                | not implemented (11 of 11 callbacks missing)
+ chunker         | keyhash          | identity                                | pass
+ chunker         | keyhash          | deterministic                           | pass
+ chunker         | keyhash          | forced_split_respects_capacity          | pass
+ chunker         | keyhash          | reset_equals_begin                      | pass
+ chunker         | keyhash          | complete                                | pass
+ chunker         | stub             | identity                                | pass
+ chunker         | stub             | deterministic                           | not implemented (missing begin, add, end)
+ chunker         | stub             | forced_split_respects_capacity          | not implemented (missing begin, add, end)
+ chunker         | stub             | reset_equals_begin                      | not implemented (missing begin, add, reset, end)
+ chunker         | stub             | complete                                | not implemented (4 of 4 callbacks missing)
+ content_hash    | sha256           | identity                                | pass
+ content_hash    | sha256           | deterministic                           | pass
+ content_hash    | sha256           | incremental_equals_one_shot             | pass
+ content_hash    | sha256           | complete                                | pass
+ content_hash    | stub             | identity                                | pass
+ content_hash    | stub             | deterministic                           | not implemented (missing begin, update, finish)
+ content_hash    | stub             | incremental_equals_one_shot             | not implemented (missing begin, update, finish)
+ content_hash    | stub             | complete                                | not implemented (3 of 3 callbacks missing)
+ key_encoder     | ordered          | identity                                | pass
+ key_encoder     | ordered          | order_matches_opclass                   | pass
+ key_encoder     | ordered          | desc_and_nulls_ordering                 | pass
+ key_encoder     | ordered          | decode_round_trip                       | pass
+ key_encoder     | ordered          | self_delimiting_prefixes                | pass
+ key_encoder     | ordered          | complete                                | pass
+ key_encoder     | stub             | identity                                | pass
+ key_encoder     | stub             | order_matches_opclass                   | not implemented (missing supports, begin, encode, compare, end)
+ key_encoder     | stub             | desc_and_nulls_ordering                 | not implemented (missing supports, begin, encode, compare, end)
+ key_encoder     | stub             | decode_round_trip                       | not implemented (missing begin, encode, decode, end)
+ key_encoder     | stub             | self_delimiting_prefixes                | not implemented (missing begin, encode, prefix_length, end)
+ key_encoder     | stub             | complete                                | not implemented (7 of 7 callbacks missing)
+ value_encoder   | heaptuple        | identity                                | pass
+ value_encoder   | heaptuple        | round_trip                              | pass
+ value_encoder   | heaptuple        | platform_independent                    | fail: row 1 encodes as 2a000000000000000000050002001800e103000009616263000000000001000000138082030087052823, the reference encoding is 050004000003e10361626308000001000000000001000e0003000000000005000305872328
+ value_encoder   | heaptuple        | independent_of_history                  | fail: row 0: 1a000000000000000000030002001800f9ffffff030b07a06400 without the table's history, 1a000000000000000000070003001815f9ffffff030b07a06400 with it
+ value_encoder   | heaptuple        | independent_of_session                  | pass
+ value_encoder   | heaptuple        | missing_values                          | pass
+ value_encoder   | heaptuple        | decodes_earlier_layouts                 | pass
+ value_encoder   | heaptuple        | complete                                | pass
+ value_encoder   | canonical        | identity                                | pass
+ value_encoder   | canonical        | round_trip                              | pass
+ value_encoder   | canonical        | platform_independent                    | pass
+ value_encoder   | canonical        | independent_of_history                  | pass
+ value_encoder   | canonical        | independent_of_session                  | pass
+ value_encoder   | canonical        | missing_values                          | pass
+ value_encoder   | canonical        | decodes_earlier_layouts                 | pass
+ value_encoder   | canonical        | complete                                | pass
+ value_encoder   | stub             | identity                                | pass
+ value_encoder   | stub             | round_trip                              | not implemented (missing begin, encode, decode, end)
+ value_encoder   | stub             | platform_independent                    | not implemented (missing begin, encode, end)
+ value_encoder   | stub             | independent_of_history                  | not implemented (missing begin, encode, end)
+ value_encoder   | stub             | independent_of_session                  | not implemented (missing begin, encode, end)
+ value_encoder   | stub             | missing_values                          | not implemented (missing begin, encode, decode, end)
+ value_encoder   | stub             | decodes_earlier_layouts                 | not implemented (missing begin, layout, begin_layout, reads_layout, encode, decode, end)
+ value_encoder   | stub             | complete                                | not implemented (7 of 7 callbacks missing)
+ node_store      | global           | identity                                | pass
+ node_store      | global           | new_publish_read                        | pass
+ node_store      | global           | many_nodes_findable                     | pass
+ node_store      | global           | release_frees                           | pass
+ node_store      | global           | complete                                | pass
+ node_store      | stub             | identity                                | pass
+ node_store      | stub             | new_publish_read                        | not implemented (missing create, open, new_node, publish, read, contains, close)
+ node_store      | stub             | many_nodes_findable                     | not implemented (missing create, open, new_node, publish, read, contains, close)
+ node_store      | stub             | release_frees                           | not implemented (missing create, open, new_node, publish, release, contains, close)
+ node_store      | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ allocator       | stub             | identity                                | pass
+ allocator       | stub             | no_overlapping_extents                  | not implemented (missing open, allocate, free, close)
+ allocator       | stub             | complete                                | not implemented (4 of 4 callbacks missing)
+ reclamation     | stub             | identity                                | pass
+ reclamation     | stub             | reachable_never_freed                   | not implemented (missing node_created, node_dropped, root_retired, run)
+ reclamation     | stub             | in_place_only_when_private              | not implemented (missing may_modify_in_place)
+ reclamation     | stub             | complete                                | not implemented (5 of 5 callbacks missing)
+ log             | chunks           | identity                                | pass
+ log             | chunks           | commit_record                           | not implemented (missing log_commit)
+ log             | chunks           | redo_restores_committed_root            | not implemented (missing log_commit, startup, cleanup)
+ log             | chunks           | describes_records                       | not implemented (missing desc, identify)
+ log             | chunks           | complete                                | not implemented (6 of 9 callbacks missing)
+ log             | stub             | identity                                | pass
+ log             | stub             | commit_record                           | not implemented (missing log_commit)
+ log             | stub             | redo_restores_committed_root            | not implemented (missing log_node, log_mutation, log_commit, redo, startup, cleanup)
+ log             | stub             | describes_records                       | not implemented (missing desc, identify)
+ log             | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ commit_pipeline | serial           | identity                                | pass
+ commit_pipeline | serial           | publishes_in_enqueue_order              | pass
+ commit_pipeline | serial           | survives_crash_and_replays              | no checks yet
+ commit_pipeline | serial           | copies_and_drops_databases              | no checks yet
+ commit_pipeline | serial           | complete                                | pass
+ commit_pipeline | stub             | identity                                | pass
+ commit_pipeline | stub             | publishes_in_enqueue_order              | not implemented (missing branch_lock, tip, enqueue, branch_unlock, publish, abandon, head)
+ commit_pipeline | stub             | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
+ commit_pipeline | stub             | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, usage, head, checkpoint, redo)
+ commit_pipeline | stub             | complete                                | not implemented (14 of 14 callbacks missing)
+ row_identity    | counter          | identity                                | pass
+ row_identity    | counter          | assign_then_resolve                     | pass
+ row_identity    | counter          | rename_keeps_tid                        | pass
+ row_identity    | counter          | renew_makes_new_version                 | pass
+ row_identity    | counter          | never_reused                            | pass
+ row_identity    | counter          | forget                                  | not implemented (missing tid_forget)
+ row_identity    | counter          | complete                                | not implemented (1 of 9 callbacks missing)
+ row_identity    | stub             | identity                                | pass
+ row_identity    | stub             | assign_then_resolve                     | not implemented (missing tid_assign, scan_begin, tid_find, scan_end, tid_resolve)
+ row_identity    | stub             | rename_keeps_tid                        | not implemented (missing tid_assign, tid_rename, tid_resolve, scan_begin, tid_find, scan_end)
+ row_identity    | stub             | renew_makes_new_version                 | not implemented (missing tid_assign, tid_renew, tid_resolve, scan_begin, tid_find, scan_end)
+ row_identity    | stub             | never_reused                            | not implemented (missing tid_assign, tid_retire, tid_resolve, scan_begin, tid_find, scan_end)
+ row_identity    | stub             | forget                                  | not implemented (missing tid_assign, tid_resolve, tid_forget)
+ row_identity    | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ refs            | stub             | identity                                | pass
+ refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
+ refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
+ refs            | stub             | merge_base                              | not implemented (missing commit, merge_base)
+ refs            | stub             | complete                                | not implemented (8 of 8 callbacks missing)
+ transfer        | stub             | identity                                | pass
+ transfer        | stub             | clone                                   | not implemented (missing clone)
+ transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
+ transfer        | stub             | complete                                | not implemented (3 of 3 callbacks missing)
+ diff_merge      | stub             | identity                                | pass
+ diff_merge      | stub             | diff_reports_each_change_once           | not implemented (missing diff)
+ diff_merge      | stub             | merge                                   | not implemented (missing merge)
+ diff_merge      | stub             | complete                                | not implemented (2 of 2 callbacks missing)
+ tree            | cow              | identity                                | pass
+ tree            | cow              | build_and_get                           | pass
+ tree            | cow              | cursor_scans                            | pass
+ tree            | cow              | apply_matches_reference                 | pass
+ tree            | cow              | apply_past_the_end                      | pass
+ tree            | cow              | history_independent                     | pass
+ tree            | cow              | edits_share_nodes                       | pass
+ tree            | cow              | diff_reports_changes                    | pass
+ tree            | cow              | nodes_are_valid                         | pass
+ tree            | cow              | complete                                | pass
+ tree            | stub             | identity                                | pass
+ tree            | stub             | build_and_get                           | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | cursor_scans                            | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | apply_matches_reference                 | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | apply_past_the_end                      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | history_independent                     | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | edits_share_nodes                       | not implemented (missing build_begin, build_add, build_finish, apply, walk)
+ tree            | stub             | diff_reports_changes                    | not implemented (missing build_begin, build_add, build_finish, apply, diff)
+ tree            | stub             | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree            | stub             | complete                                | not implemented (12 of 12 callbacks missing)
+ root_layout     | subroots         | identity                                | pass
+ root_layout     | subroots         | empty                                   | pass
+ root_layout     | subroots         | apply_matches_reference                 | pass
+ root_layout     | subroots         | history_independent                     | pass
+ root_layout     | subroots         | subroots_independent                    | pass
+ root_layout     | subroots         | diff_reports_changes                    | pass
+ root_layout     | subroots         | apply_rejects_invalid_refs              | pass
+ root_layout     | subroots         | walk_reaches_trees                      | pass
+ root_layout     | subroots         | complete                                | pass
+ root_layout     | stub             | identity                                | pass
+ root_layout     | stub             | empty                                   | not implemented (missing empty, subroot, lookup, scan, apply)
+ root_layout     | stub             | apply_matches_reference                 | not implemented (missing empty, apply, lookup, scan)
+ root_layout     | stub             | history_independent                     | not implemented (missing empty, apply, lookup, scan)
+ root_layout     | stub             | subroots_independent                    | not implemented (missing empty, apply, subroot)
+ root_layout     | stub             | diff_reports_changes                    | not implemented (missing empty, apply, diff)
+ root_layout     | stub             | apply_rejects_invalid_refs              | not implemented (missing empty, apply, lookup)
+ root_layout     | stub             | walk_reaches_trees                      | not implemented (missing empty, apply, subroot, walk)
+ root_layout     | stub             | complete                                | not implemented (7 of 7 callbacks missing)
+ table_keying    | pk_or_content    | identity                                | pass
+ table_keying    | pk_or_content    | round_trip                              | pass
+ table_keying    | pk_or_content    | keys_and_content                        | pass
+ table_keying    | pk_or_content    | description_reopens                     | pass
+ table_keying    | pk_or_content    | reads_after_key_column_dropped          | pass
+ table_keying    | pk_or_content    | owns_its_memory                         | pass
+ table_keying    | pk_or_content    | cannot_compare_after_key_type_dropped   | pass
+ table_keying    | pk_or_content    | complete                                | pass
+ table_keying    | stub             | identity                                | pass
+ table_keying    | stub             | round_trip                              | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
+ table_keying    | stub             | keys_and_content                        | not implemented (missing open, encode_row, content_hash, compare, close)
+ table_keying    | stub             | description_reopens                     | not implemented (missing open, describe, keyless, encode_row, close)
+ table_keying    | stub             | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
+ table_keying    | stub             | owns_its_memory                         | not implemented (missing open, encode_row, decode_row, close)
+ table_keying    | stub             | cannot_compare_after_key_type_dropped   | not implemented (missing open, describe, can_compare, close)
+ table_keying    | stub             | complete                                | not implemented (12 of 12 callbacks missing)
+ index_keying    | columns_then_row | identity                                | pass
+ index_keying    | columns_then_row | entries_and_bounds                      | pass
+ index_keying    | columns_then_row | complete                                | pass
+ index_keying    | stub             | identity                                | pass
+ index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
+ index_keying    | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+(274 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -419,13 +429,13 @@ WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly');
 (3 rows)
 
 CREATE INDEX ON prolly_heap USING prolly (a);
-ERROR:  index access method "prolly" does not implement ambuild yet
+ERROR:  prolly indexes exist only on prolly tables
 CREATE INDEX ON prolly_heap USING prolly (b);
-ERROR:  index access method "prolly" does not implement ambuild yet
+ERROR:  prolly indexes exist only on prolly tables
 CREATE INDEX ON prolly_heap USING prolly (c);
-ERROR:  index access method "prolly" does not implement ambuild yet
+ERROR:  prolly indexes exist only on prolly tables
 CREATE INDEX ON prolly_heap USING prolly (a, c);
-ERROR:  index access method "prolly" does not implement ambuild yet
+ERROR:  prolly indexes exist only on prolly tables
 DROP TABLE prolly_heap;
 --
 -- Version-control functions dispatch to the refs, diff/merge and transfer

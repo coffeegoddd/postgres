@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -934,6 +935,188 @@ keying_compare_after_type_dropped_body(const ProllyImplInfo *impl)
 		elog(ERROR, "a keying claims to compare keys of a dropped type");
 	PROLLY_CALL(kr, close, k);
 	table_close(rel, AccessShareLock);
+}
+
+/* ------------------------------------------------------------------------
+ * Index keying
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct IxCase
+{
+	int			a;				/* -1: NULL */
+	const char *b;				/* NULL: NULL */
+	const char *rowkey;
+	uint64		ordinal;
+	StringInfoData entry;
+} IxCase;
+
+/* The order of an index on (a, b DESC): NULLs last; then row key, ordinal. */
+static int
+ix_reference(const IxCase *x, const IxCase *y)
+{
+	int			r;
+
+	if ((x->a < 0) != (y->a < 0))
+		return x->a < 0 ? 1 : -1;
+	if (x->a != y->a)
+		return x->a < y->a ? -1 : 1;
+	if ((x->b == NULL) != (y->b == NULL))
+		return x->b == NULL ? -1 : 1;	/* DESC: NULLS FIRST */
+	if (x->b && (r = strcmp(x->b, y->b)) != 0)
+		return r > 0 ? -1 : 1;
+	if ((r = strcmp(x->rowkey, y->rowkey)) != 0)
+		return r < 0 ? -1 : 1;
+	return (x->ordinal > y->ordinal) - (x->ordinal < y->ordinal);
+}
+
+static void
+ix_values(const IxCase *x, Datum *values, bool *isnull)
+{
+	isnull[0] = x->a < 0;
+	values[0] = Int32GetDatum(x->a);
+	isnull[1] = x->b == NULL;
+	values[1] = x->b ? CStringGetTextDatum(x->b) : (Datum) 0;
+}
+
+/*
+ * Entries round-trip and sort as their index orders them, then by row key
+ * and ordinal; bounds sort before (lower) or after (upper) exactly the
+ * entries whose first columns equal theirs; a reopened keying is the same.
+ */
+static void
+ixkeying_entries_body(const ProllyImplInfo *impl)
+{
+	const ProllyIndexKeyingRoutine *kr = (const ProllyIndexKeyingRoutine *) impl;
+	const char *engine = engine_for_impl(impl);
+	Relation	heap;
+	Relation	index;
+	ProllyIndexKeying *k;
+	ProllyIndexKeying *k2;
+	StringInfoData desc;
+	ProllyValue d;
+	IxCase		cases[64];
+	int			n = 0;
+	int			as[] = {-1, 1, 2};
+	const char *bs[] = {NULL, "x", "y"};
+	const char *rks[] = {"r1", "r2"};
+
+	run_sql(psprintf("CREATE TABLE conf_ix (a int, b text COLLATE \"C\") USING prolly_%s",
+					 engine));
+	run_sql("CREATE INDEX conf_ix_ab ON conf_ix USING prolly (a, b DESC)");
+	heap = table_open(RelnameGetRelid("conf_ix"), AccessShareLock);
+	index = index_open(RelnameGetRelid("conf_ix_ab"), AccessShareLock);
+	k = PROLLY_CALL(kr, open, index, NULL, CurrentMemoryContext);
+	if (PROLLY_CALL(kr, nkeys, k) != 2)
+		elog(ERROR, "an index keying on two columns has %d", PROLLY_CALL(kr, nkeys, k));
+	initStringInfo(&desc);
+	PROLLY_CALL(kr, describe, k, &desc);
+	d.data = (const uint8 *) desc.data;
+	d.len = desc.len;
+	k2 = PROLLY_CALL(kr, open, index, &d, CurrentMemoryContext);
+
+	for (int i = 0; i < lengthof(as); i++)
+		for (int j = 0; j < lengthof(bs); j++)
+			for (int r = 0; r < lengthof(rks); r++)
+				for (uint64 o = 0; o < 2; o++)
+				{
+					IxCase	   *x = &cases[n++];
+					Datum		values[2];
+					bool		isnull[2];
+					ProllyKey	rk = {(const uint8 *) rks[r], 2};
+
+					x->a = as[i];
+					x->b = bs[j];
+					x->rowkey = rks[r];
+					x->ordinal = o;
+					initStringInfo(&x->entry);
+					ix_values(x, values, isnull);
+					PROLLY_CALL(kr, encode_entry, k, values, isnull, &rk, o, &x->entry);
+				}
+
+	for (int i = 0; i < n; i++)
+	{
+		ProllyKey	ei = {(const uint8 *) cases[i].entry.data, cases[i].entry.len};
+		Datum		values[2];
+		bool		isnull[2];
+		ProllyKey	rk;
+		uint64		ord;
+		Datum		bv[2];
+		bool		bn[2];
+
+		/* Round trip. */
+		PROLLY_CALL(kr, decode_entry, k, &ei, values, isnull, &rk, &ord);
+		if (isnull[0] != (cases[i].a < 0) ||
+			(!isnull[0] && DatumGetInt32(values[0]) != cases[i].a) ||
+			isnull[1] != (cases[i].b == NULL) ||
+			(!isnull[1] && strcmp(TextDatumGetCString(values[1]), cases[i].b) != 0) ||
+			rk.len != 2 || memcmp(rk.data, cases[i].rowkey, 2) != 0 ||
+			ord != cases[i].ordinal)
+			elog(ERROR, "an index entry did not decode to what it was made from");
+
+		for (int j = 0; j < n; j++)
+		{
+			ProllyKey	ej = {(const uint8 *) cases[j].entry.data, cases[j].entry.len};
+			int			got = PROLLY_CALL(kr, compare, k, &ei, &ej);
+			int			got2 = PROLLY_CALL(kr, compare, k2, &ei, &ej);
+			int			want = ix_reference(&cases[i], &cases[j]);
+			bool		eq1 = (cases[i].a == cases[j].a);
+			bool		eq2 = eq1 && ((cases[i].b == NULL && cases[j].b == NULL) ||
+									  (cases[i].b && cases[j].b &&
+									   strcmp(cases[i].b, cases[j].b) == 0));
+
+			got = got < 0 ? -1 : (got > 0 ? 1 : 0);
+			got2 = got2 < 0 ? -1 : (got2 > 0 ? 1 : 0);
+			if (got != want || got2 != want)
+				elog(ERROR, "index entries %d and %d compare %d (reopened %d), should be %d",
+					 i, j, got, got2, want);
+			if (PROLLY_CALL(kr, columns_equal, k, &ei, &ej, 1) != eq1 ||
+				PROLLY_CALL(kr, columns_equal, k, &ei, &ej, 2) != eq2)
+				elog(ERROR, "columns_equal is wrong for index entries %d and %d", i, j);
+		}
+
+		/* Bounds on the first column, and on both. */
+		ix_values(&cases[i], bv, bn);
+		for (int nk = 1; nk <= 2; nk++)
+		{
+			StringInfoData lo;
+			StringInfoData hi;
+			ProllyKey	l;
+			ProllyKey	h;
+
+			initStringInfo(&lo);
+			initStringInfo(&hi);
+			PROLLY_CALL(kr, encode_bound, k, nk, bv, bn, false, &lo);
+			PROLLY_CALL(kr, encode_bound, k, nk, bv, bn, true, &hi);
+			l.data = (const uint8 *) lo.data;
+			l.len = lo.len;
+			h.data = (const uint8 *) hi.data;
+			h.len = hi.len;
+			for (int j = 0; j < n; j++)
+			{
+				ProllyKey	ej = {(const uint8 *) cases[j].entry.data, cases[j].entry.len};
+				bool		same = PROLLY_CALL(kr, columns_equal, k, &ei, &ej, nk);
+				int			cl = PROLLY_CALL(kr, compare, k, &l, &ej);
+				int			ch = PROLLY_CALL(kr, compare, k, &h, &ej);
+				int			want = ix_reference(&cases[i], &cases[j]);
+
+				if (same ? !(cl < 0 && ch > 0) :
+					(want < 0 ? !(cl < 0 && ch < 0) : !(cl > 0 && ch > 0)))
+					elog(ERROR, "bounds on %d columns of entry %d misplace entry %d",
+						 nk, i, j);
+			}
+		}
+	}
+	PROLLY_CALL(kr, close, k);
+	PROLLY_CALL(kr, close, k2);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+}
+
+void
+ixkeying_entries(const ProllyImplInfo *impl)
+{
+	rolled_back(ixkeying_entries_body, impl);
 }
 
 /* ------------------------------------------------------------------------

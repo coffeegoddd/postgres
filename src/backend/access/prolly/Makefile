@@ -29,6 +29,8 @@ OBJS = \
 	engine_d4.o \
 	hash_sha256.o \
 	hash_stub.o \
+	ixkeying_columns.o \
+	ixkeying_stub.o \
 	keyenc_ordered.o \
 	keyenc_stub.o \
 	keying_pkcontent.o \

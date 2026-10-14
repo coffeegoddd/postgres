@@ -37,6 +37,7 @@ PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_canonical)
 PG_PROLLY_IMPL(ProllyKeyingRoutine, prolly_keying_pk_or_content)
+PG_PROLLY_IMPL(ProllyIndexKeyingRoutine, prolly_ixkeying_columns_then_row)
 
 /* node storage */
 PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
@@ -70,3 +71,4 @@ PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_stub)
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_stub)
 PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_stub)
 PG_PROLLY_IMPL(ProllyKeyingRoutine, prolly_keying_stub)
+PG_PROLLY_IMPL(ProllyIndexKeyingRoutine, prolly_ixkeying_stub)

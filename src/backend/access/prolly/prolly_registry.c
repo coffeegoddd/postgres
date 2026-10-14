@@ -65,6 +65,7 @@ static const char *const merge_callbacks[] = {PROLLY_MERGE_CALLBACK_NAMES};
 static const char *const tree_callbacks[] = {PROLLY_TREE_CALLBACK_NAMES};
 static const char *const rootlayout_callbacks[] = {PROLLY_ROOTLAYOUT_CALLBACK_NAMES};
 static const char *const keying_callbacks[] = {PROLLY_KEYING_CALLBACK_NAMES};
+static const char *const ixkeying_callbacks[] = {PROLLY_IXKEYING_CALLBACK_NAMES};
 
 #define CHECK_ROUTINE(type, first, names) \
 	static_assert(offsetof(type, info) == 0 && \
@@ -91,6 +92,7 @@ CHECK_ROUTINE(ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, merge_callbacks);
 CHECK_ROUTINE(ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, tree_callbacks);
 CHECK_ROUTINE(ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, rootlayout_callbacks);
 CHECK_ROUTINE(ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, keying_callbacks);
+CHECK_ROUTINE(ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, ixkeying_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -134,6 +136,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("root_layout", ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, rootlayout_callbacks),
 	[PROLLY_IFACE_TABLE_KEYING] =
 	IFACE("table_keying", ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, keying_callbacks),
+	[PROLLY_IFACE_INDEX_KEYING] =
+	IFACE("index_keying", ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, ixkeying_callbacks),
 };
 
 static const ProllyInterfaceDesc *
