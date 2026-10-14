@@ -166,6 +166,13 @@ publish() makes it the head.  After a crash or on a standby, pending
 entries are settled through the commit log.  Checkpoints write heads and
 pending entries to global/prolly_heads, read back at startup.
 
+Heads are kept per database.  CREATE DATABASE copies the template's
+heads to the new database as pending entries of the creating
+transaction, and DROP DATABASE forgets the database's heads (both
+WAL-logged), through prolly_database.c.  Every prolly relation also has
+an empty main fork, so the copy strategies, ALTER TABLE SET TABLESPACE
+and the size functions find the file they expect.
+
 
 Rows, keys and TIDs
 -------------------
@@ -175,7 +182,10 @@ by row content hash with a count of identical rows.  Each data tree
 records the keying description it was written with (META kind); scans
 read with it, and the first write in a (sub)transaction after the keying
 changed (primary key added or dropped, or a rewrite through a table
-without one) rebuilds the tree.
+without one) rebuilds the tree.  The description records the key
+columns' types, so rows keyed by a column dropped since (or by a type
+dropped with it) are still read; the key encoder starts only when keys
+are compared or encoded.
 
 Row identity (rowid_hashed.c) names a row version by (content hash,
 ordinal among identical rows) and derives its TID from them, probing
@@ -189,7 +199,9 @@ Core hooks
 
 prolly_shmem.c is a shared-memory subsystem (subsystemlist.h) reserving
 an area per engine, coordination and commit pipeline implementation that
-asks for one, and CheckPointProlly() runs in CheckPointGuts().  A table
+asks for one, and CheckPointProlly() runs in CheckPointGuts().
+createdb() and dropdb() call ProllyCopyDatabase() and
+ProllyDropDatabase() (prolly_database.c).  A table
 AM may leave the parallel-scan callbacks NULL; the planner then keeps
 scans of its tables in the leader (AMFLAG_NO_PARALLEL_SCAN), as for
 temporary tables, because workers couldn't see the leader's private

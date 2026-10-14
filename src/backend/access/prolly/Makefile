@@ -40,6 +40,7 @@ OBJS = \
 	nodestore_global.o \
 	nodestore_stub.o \
 	prolly_config.o \
+	prolly_database.o \
 	prolly_datum.o \
 	prolly_indexam.o \
 	prolly_registry.o \

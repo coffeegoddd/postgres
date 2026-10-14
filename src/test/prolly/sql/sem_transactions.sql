@@ -104,6 +104,17 @@ COMMIT PREPARED 'p1';
 ROLLBACK PREPARED 'p2';
 SELECT id FROM tx WHERE id IN (40, 41);
 
+-- Preparing a transaction whose writes were all rolled back to a
+-- savepoint, then writing again on the same connection.
+BEGIN;
+SAVEPOINT s;
+INSERT INTO tx VALUES (42, 42);
+ROLLBACK TO s;
+PREPARE TRANSACTION 'p3';
+COMMIT PREPARED 'p3';
+INSERT INTO tx VALUES (43, 43);
+SELECT id FROM tx WHERE id IN (42, 43);
+
 -- Explicit row locks in one session.
 BEGIN;
 SELECT id FROM tx WHERE id = 1 FOR UPDATE;

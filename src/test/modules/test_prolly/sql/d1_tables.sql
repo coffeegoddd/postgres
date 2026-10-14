@@ -126,6 +126,24 @@ SELECT id, count(*), count(DISTINCT ctid) FROM d1_twins GROUP BY id ORDER BY id;
 SELECT count(*) AS same_tid FROM d1_twins WHERE ctid IN (SELECT tid FROM d1_twin_tids);
 DROP TABLE d1_cols, d1_twins;
 
+-- Dropping the primary key's column: the old rows were keyed by a column
+-- the relation no longer describes, and are still read and rebuilt.
+CREATE TABLE d1_dropkey (id int PRIMARY KEY, v text);
+INSERT INTO d1_dropkey VALUES (1, 'kept'), (2, 'also kept');
+ALTER TABLE d1_dropkey DROP COLUMN id CASCADE;
+SELECT * FROM d1_dropkey ORDER BY v;
+INSERT INTO d1_dropkey VALUES ('next');
+SELECT * FROM d1_dropkey ORDER BY v;
+-- Even when the key's type is gone too.
+CREATE TYPE d1_mood AS ENUM ('sad', 'happy');
+CREATE TABLE d1_dropkeytype (m d1_mood PRIMARY KEY, v text);
+INSERT INTO d1_dropkeytype VALUES ('sad', 'one'), ('happy', 'two');
+DROP TYPE d1_mood CASCADE;
+SELECT * FROM d1_dropkeytype ORDER BY v;
+INSERT INTO d1_dropkeytype VALUES ('three');
+SELECT * FROM d1_dropkeytype ORDER BY v;
+DROP TABLE d1_dropkey, d1_dropkeytype;
+
 -- A table created and filled in one transaction.
 BEGIN;
 CREATE TABLE d1_new (n int);

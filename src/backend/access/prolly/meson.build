@@ -28,6 +28,7 @@ backend_sources += files(
   'nodestore_global.c',
   'nodestore_stub.c',
   'prolly_config.c',
+  'prolly_database.c',
   'prolly_datum.c',
   'prolly_indexam.c',
   'prolly_registry.c',

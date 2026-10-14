@@ -761,6 +761,63 @@ keying_description_reopens_body(const ProllyImplInfo *impl)
 	table_close(none, AccessShareLock);
 }
 
+/*
+ * A keying reopened from its description after its key column was
+ * dropped still orders the old keys and decodes the old rows.
+ */
+static void
+keying_reads_dropped_key_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	const char *engine = engine_for_impl(impl);
+	Relation	rel = make_table_for_engine(engine, "conf_kdrop",
+											"id int PRIMARY KEY, t text, n int");
+	Oid			relid = RelationGetRelid(rel);
+	ProllyKeying *k = PROLLY_CALL(kr, open, rel, NULL, CurrentMemoryContext);
+	StringInfoData desc;
+	ProllyValue d;
+	EncodedRow	a;
+	EncodedRow	b;
+	ProllyKey	ka;
+	ProllyKey	kb;
+	ProllyValue row;
+	TupleTableSlot *slot;
+
+	initStringInfo(&desc);
+	PROLLY_CALL(kr, describe, k, &desc);
+	d.data = (const uint8 *) desc.data;
+	d.len = desc.len;
+	encode(kr, k, rel, 1, "one", 1, &a);
+	encode(kr, k, rel, 2, "two", 2, &b);
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+
+	run_sql("ALTER TABLE conf_kdrop DROP COLUMN id CASCADE");
+	rel = table_open(relid, AccessShareLock);
+	k = PROLLY_CALL(kr, open, rel, &d, CurrentMemoryContext);
+	ka.data = (const uint8 *) a.key.data;
+	ka.len = a.key.len;
+	kb.data = (const uint8 *) b.key.data;
+	kb.len = b.key.len;
+	if (PROLLY_CALL(kr, compare, k, &ka, &kb) >= 0 ||
+		PROLLY_CALL(kr, compare, k, &kb, &ka) <= 0 ||
+		PROLLY_CALL(kr, compare, k, &ka, &ka) != 0)
+		elog(ERROR, "a keying reopened after its key column was dropped misorders keys");
+
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	row.data = (const uint8 *) b.row.data;
+	row.len = b.row.len;
+	PROLLY_CALL(kr, decode_row, k, &row, slot);
+	slot_getallattrs(slot);
+	if (slot->tts_isnull[1] || slot->tts_isnull[2] ||
+		strcmp(TextDatumGetCString(slot->tts_values[1]), "two") != 0 ||
+		DatumGetInt32(slot->tts_values[2]) != 2)
+		elog(ERROR, "a keying reopened after its key column was dropped misreads rows");
+	ExecDropSingleTupleTableSlot(slot);
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+}
+
 /* ------------------------------------------------------------------------
  * Row identity
  * ------------------------------------------------------------------------
@@ -1141,6 +1198,12 @@ void
 keying_description_reopens(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_description_reopens_body, impl);
+}
+
+void
+keying_reads_dropped_key(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_reads_dropped_key_body, impl);
 }
 
 void

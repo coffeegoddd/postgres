@@ -47,7 +47,7 @@ FROM prolly_implementations();
  tree            | stub          |       0 |              0
  root_layout     | subroots      |       1 |              2
  root_layout     | stub          |       0 |              0
- table_keying    | pk_or_content |       1 |              1
+ table_keying    | pk_or_content |       1 |              2
  table_keying    | stub          |       0 |              0
 (40 rows)
 
@@ -227,11 +227,13 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  commit_pipeline | serial         | identity                                | pass
  commit_pipeline | serial         | publishes_in_enqueue_order              | pass
  commit_pipeline | serial         | survives_crash_and_replays              | no checks yet
+ commit_pipeline | serial         | copies_and_drops_databases              | no checks yet
  commit_pipeline | serial         | complete                                | pass
  commit_pipeline | stub           | identity                                | pass
  commit_pipeline | stub           | publishes_in_enqueue_order              | not implemented (missing branch_lock, tip, enqueue, branch_unlock, publish, abandon, head)
  commit_pipeline | stub           | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
- commit_pipeline | stub           | complete                                | not implemented (11 of 11 callbacks missing)
+ commit_pipeline | stub           | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, head, checkpoint, redo)
+ commit_pipeline | stub           | complete                                | not implemented (13 of 13 callbacks missing)
  row_identity    | hashed         | identity                                | pass
  row_identity    | hashed         | assign_then_resolve                     | pass
  row_identity    | hashed         | same_version_same_tid                   | pass
@@ -299,13 +301,15 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying    | pk_or_content  | round_trip                              | pass
  table_keying    | pk_or_content  | keys_and_content                        | pass
  table_keying    | pk_or_content  | description_reopens                     | pass
+ table_keying    | pk_or_content  | reads_after_key_column_dropped          | pass
  table_keying    | pk_or_content  | complete                                | pass
  table_keying    | stub           | identity                                | pass
  table_keying    | stub           | round_trip                              | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying    | stub           | keys_and_content                        | not implemented (missing open, encode_row, content_hash, compare, close)
  table_keying    | stub           | description_reopens                     | not implemented (missing open, describe, keyless, encode_row, close)
+ table_keying    | stub           | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
  table_keying    | stub           | complete                                | not implemented (11 of 11 callbacks missing)
-(248 rows)
+(252 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

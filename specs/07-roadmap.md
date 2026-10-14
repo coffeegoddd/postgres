@@ -259,6 +259,16 @@ index builds; TID fetches, updates, deletes, row locks and index scans are
 (`d1_tables`), and a TAP test of heads across crashes, checkpoints,
 restarts, standby replay and promotion (`002_d1_heads.pl`).
 
+Review fixes (2026-10-14): heads are copied by CREATE DATABASE (both
+strategies) and forgotten by DROP DATABASE, through two new commit
+pipeline callbacks, `copy_database` and `drop_database`, and every prolly
+relation gets an empty main fork; keying descriptions record key column
+types, so a dropped primary-key column's rows stay readable; D1 cleans
+up its transaction state after a PREPARE and after a lock error on a
+table's first write. Each has tests in both suites (`003_d1_cleanup.pl`,
+`004_d1_databases.pl`, `103_database_copy.pl`, `sem_ddl`,
+`sem_transactions`).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

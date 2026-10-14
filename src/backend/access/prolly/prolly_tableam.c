@@ -40,6 +40,7 @@
 #include "access/skey.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
+#include "catalog/storage.h"
 #include "commands/defrem.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -386,6 +387,8 @@ insert_keying(Relation rel, const ProllyComponents *c)
 	Oid			relid = RelationGetRelid(rel);
 	InsertKeying *ik;
 	bool		found;
+	MemoryContext mcxt;
+	ProllyKeying *keying;
 
 	if (insert_keyings == NULL)
 	{
@@ -398,18 +401,29 @@ insert_keying(Relation rel, const ProllyComponents *c)
 									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		CacheRegisterRelcacheCallback(insert_keying_invalidate, (Datum) 0);
 	}
-	ik = hash_search(insert_keyings, &relid, HASH_ENTER, &found);
+	ik = hash_search(insert_keyings, &relid, HASH_FIND, &found);
 	if (found && ik->valid && ik->relnumber == rel->rd_locator.relNumber)
 		return ik;
+
+	/*
+	 * Open the new keying before touching the entry, so an error leaves
+	 * either the old entry or none; its memory moves under the cache only
+	 * once it's complete.
+	 */
+	mcxt = AllocSetContextCreate(CurrentMemoryContext, "prolly insert keying",
+								 ALLOCSET_SMALL_SIZES);
+	keying = PROLLY_CALL(c->keying, open, rel, NULL, mcxt);
+	MemoryContextSetParent(mcxt, CacheMemoryContext);
 	if (found)
 	{
 		PROLLY_CALL(ik->routine, close, ik->keying);
 		MemoryContextDelete(ik->mcxt);
 	}
-	ik->mcxt = AllocSetContextCreate(CacheMemoryContext, "prolly insert keying",
-									 ALLOCSET_SMALL_SIZES);
+	else
+		ik = hash_search(insert_keyings, &relid, HASH_ENTER, NULL);
+	ik->mcxt = mcxt;
 	ik->routine = c->keying;
-	ik->keying = PROLLY_CALL(c->keying, open, rel, NULL, ik->mcxt);
+	ik->keying = keying;
 	ik->relnumber = rel->rd_locator.relNumber;
 	ik->valid = true;
 	ik->checked_lxid = InvalidLocalTransactionId;
@@ -694,6 +708,10 @@ prolly_finish_bulk_insert(Relation rel, uint32 options)
 
 /* ------------------------------------------------------------------------
  * Relation storage: these map directly onto the engine interface.
+ *
+ * Rows live in the engine's store, but every relation also gets an empty
+ * main fork, as Postgres expects of a relation with storage: CREATE
+ * DATABASE, ALTER TABLE SET TABLESPACE and the size functions open it.
  * ------------------------------------------------------------------------
  */
 
@@ -714,6 +732,7 @@ prolly_relation_set_new_filelocator(Relation rel,
 	prolly_components_for_relation(rel, &components);
 	engine = components.engine;
 	PROLLY_CALL(engine, tree_create, rel, newrlocator, persistence);
+	smgrclose(RelationCreateStorage(*newrlocator, persistence, true));
 }
 
 static void
@@ -736,6 +755,8 @@ prolly_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	prolly_components_for_relation(rel, &components);
 	engine = components.engine;
 	PROLLY_CALL(engine, tree_copy, rel, newrlocator);
+	smgrclose(RelationCreateStorage(*newrlocator, rel->rd_rel->relpersistence,
+									true));
 }
 
 static void
