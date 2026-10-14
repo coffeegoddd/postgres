@@ -42,6 +42,13 @@
  * entry it can't settle (its status already truncated from the commit
  * log, or no room for a new head) is left, with a log message.
  *
+ * The heads table has room for MAX_HEADS (database, branch) pairs across
+ * the cluster (debug_prolly_max_branch_heads lowers that, for tests).  A
+ * root for a pair with no head yet takes a slot when it is enqueued, so a
+ * full table makes the transaction fail before it commits; publishing,
+ * and replaying commits the primary accepted, never need a slot that
+ * isn't there.
+ *
  * Checkpoints write heads and pending entries to global/prolly_heads
  * (written to a temporary file, then durably renamed), which shmem_init
  * reads back.  Entries are added to shared memory before their WAL
@@ -140,6 +147,8 @@ typedef struct xl_serial_drop_database
 
 static SerialShared *shared = NULL;
 
+int			debug_prolly_max_branch_heads = 0;
+
 /*
  * Pending entries this backend's transaction added by copying a database,
  * published or dropped when it ends.
@@ -202,6 +211,7 @@ set_head(SerialShared *s, Oid dboid, ProllyBranchId branch,
 
 	if (h == NULL)
 	{
+		/* Slots are reserved before commit; see reserve_slots(). */
 		if (s->nheads >= MAX_HEADS)
 			ereport(PANIC,
 					(errmsg("too many prolly branch heads (limit %d)", MAX_HEADS)));
@@ -330,15 +340,16 @@ settle_database(SerialShared *s, Oid dboid)
 	pfree(branches);
 }
 
-/* Settle every branch's finished entries, without raising errors. */
+/*
+ * Settle every branch's finished entries; with sweeping (and
+ * XactTruncationLock held), without raising errors.
+ */
 static void
-sweep_pending(SerialShared *s)
+settle_all(SerialShared *s, bool sweeping)
 {
 	PendingEntry *keys = palloc(sizeof(PendingEntry) * MAX_PENDING);
 	int			n = 0;
 
-	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
-	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	for (int i = 0; i < s->npending; i++)
 	{
 		bool		seen = false;
@@ -351,10 +362,72 @@ sweep_pending(SerialShared *s)
 	}
 	for (int i = 0; i < n; i++)
 		settle_pending(s, keys[i].dboid, keys[i].branch, true, PG_UINT64_MAX,
-					   true);
+					   sweeping);
+	pfree(keys);
+}
+
+static void
+sweep_pending(SerialShared *s)
+{
+	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	settle_all(s, true);
 	LWLockRelease(XactTruncationLock);
 	LWLockRelease(ProllyHeadsLock);
-	pfree(keys);
+}
+
+static int
+head_limit(void)
+{
+	if (debug_prolly_max_branch_heads > 0 &&
+		debug_prolly_max_branch_heads < MAX_HEADS)
+		return debug_prolly_max_branch_heads;
+	return MAX_HEADS;
+}
+
+/* Heads, plus the pairs with pending roots that will need one. */
+static int
+slots_in_use(SerialShared *s)
+{
+	int			n = s->nheads;
+
+	for (int i = 0; i < s->npending; i++)
+	{
+		PendingEntry *p = &s->pending[i];
+		bool		counted = false;
+
+		if (find_head(s, p->dboid, p->branch) != NULL)
+			continue;
+		for (int j = 0; j < i && !counted; j++)
+			counted = (s->pending[j].dboid == p->dboid &&
+					   s->pending[j].branch == p->branch);
+		if (!counted)
+			n++;
+	}
+	return n;
+}
+
+/*
+ * Make sure n more pairs can get a head, or raise an error (releasing
+ * ProllyHeadsLock, which the caller holds exclusively).
+ */
+static void
+reserve_slots(SerialShared *s, int n)
+{
+	if (slots_in_use(s) + n <= head_limit())
+		return;
+
+	/* Entries of transactions that have finished may be holding slots. */
+	settle_all(s, false);
+	if (slots_in_use(s) + n <= head_limit())
+		return;
+	LWLockRelease(ProllyHeadsLock);
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("too many prolly branch heads"),
+			 errdetail("The cluster's databases can have at most %d branches with prolly data between them.",
+					   head_limit()),
+			 errhint("Drop databases that are no longer needed.")));
 }
 
 /* Shared or exclusive lock. */
@@ -622,6 +695,9 @@ serial_enqueue(ProllyBranchId branch, const ProllyNodeRef *new_root)
 
 	/* Into shared memory first, so a checkpoint can't miss it. */
 	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	if (find_head(s, MyDatabaseId, branch) == NULL &&
+		!branch_has_pending(s, MyDatabaseId, branch))
+		reserve_slots(s, 1);
 	seq = add_pending(s, MyDatabaseId, branch, xid, &new_root->hash);
 	LWLockRelease(ProllyHeadsLock);
 
@@ -762,6 +838,7 @@ serial_copy_database(Oid src_dboid, Oid dst_dboid)
 				 errmsg("too many prolly commits in progress (limit %d)",
 						MAX_PENDING)));
 	}
+	reserve_slots(s, n);
 	if (ncopied + n > MAX_HEADS)
 	{
 		LWLockRelease(ProllyHeadsLock);

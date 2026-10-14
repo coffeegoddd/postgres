@@ -100,6 +100,9 @@ typedef struct ProllyCommitRoutine
 	"drop_database", "usage", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
 
+/* For tests: if positive, fewer branch heads than an implementation's limit. */
+extern PGDLLIMPORT int debug_prolly_max_branch_heads;
+
 static inline const ProllyCommitRoutine *
 prolly_commit_lookup(const char *name)
 {
