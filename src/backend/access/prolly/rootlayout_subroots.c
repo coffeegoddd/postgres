@@ -1,19 +1,19 @@
 /*-------------------------------------------------------------------------
  *
  * rootlayout_subroots.c
- *	  Root layout implementation "subroots": a branch root of two sub-root
- *	  trees, each mapping relation OIDs to relation trees.
+ *	  Root layout implementation "subroots": a branch root of sub-root
+ *	  trees, each mapping relfilenumbers to relation trees.
  *
  * Layout.  The branch root is a tree with one item per sub-root, always
- * both, an empty sub-root being the empty tree:
+ * all of them, an empty sub-root being the empty tree:
  *
  *	key: uint8 sub-root number		value: uint8 hash length, hash
  *
  * Each sub-root is a tree with one item per relation:
  *
- *	key: uint32 relid, big-endian	value: uint8 hash length, hash
+ *	key: uint32 relfilenumber, big-endian	value: uint8 hash length, hash
  *
- * Big-endian keys sort by memcmp in relid order.  Values hold hashes only,
+ * Big-endian keys sort by memcmp in relnumber order.  Values hold hashes only,
  * never block hints: trees' items are hashed, and physical locations must
  * never be part of a hash.  So reading through
  * a reference costs a hash -> block map lookup; a hint in an unhashed side
@@ -75,21 +75,21 @@ sub_key(ProllySubRoot sub, uint8 *byte)
 }
 
 static ProllyKey
-rel_key(Oid relid, RelKey *buf)
+rel_key(RelFileNumber relnumber, RelKey *buf)
 {
 	ProllyKey	key;
 
-	buf->bytes[0] = (uint8) (relid >> 24);
-	buf->bytes[1] = (uint8) (relid >> 16);
-	buf->bytes[2] = (uint8) (relid >> 8);
-	buf->bytes[3] = (uint8) relid;
+	buf->bytes[0] = (uint8) (relnumber >> 24);
+	buf->bytes[1] = (uint8) (relnumber >> 16);
+	buf->bytes[2] = (uint8) (relnumber >> 8);
+	buf->bytes[3] = (uint8) relnumber;
 	key.data = buf->bytes;
 	key.len = 4;
 	return key;
 }
 
-static Oid
-key_relid(const ProllyKey *key)
+static RelFileNumber
+key_relnumber(const ProllyKey *key)
 {
 	if (key->len != 4)
 		ereport(ERROR,
@@ -221,12 +221,12 @@ subroots_empty(const ProllyRootEnv *env, ProllyNodeRef *root)
 
 static bool
 subroots_lookup(const ProllyRootEnv *env, const ProllyNodeRef *root,
-				ProllySubRoot sub, Oid relid, ProllyNodeRef *tree)
+				ProllySubRoot sub, RelFileNumber relnumber, ProllyNodeRef *tree)
 {
 	ProllyTreeEnv tenv;
 	ProllyNodeRef subroot;
 	RelKey		kb;
-	ProllyKey	key = rel_key(relid, &kb);
+	ProllyKey	key = rel_key(relnumber, &kb);
 	StringInfoData v;
 	bool		found;
 
@@ -258,8 +258,8 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
 		if (k > 0 &&
 			(edits[k - 1].sub > edits[k].sub ||
 			 (edits[k - 1].sub == edits[k].sub &&
-			  edits[k - 1].relid >= edits[k].relid)))
-			elog(ERROR, "prolly root layout edits are not in strictly increasing (sub-root, relid) order");
+			  edits[k - 1].relnumber >= edits[k].relnumber)))
+			elog(ERROR, "prolly root layout edits are not in strictly increasing (sub-root, relnumber) order");
 	}
 
 	layout_env(env, &tenv);
@@ -286,7 +286,7 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
 		{
 			const ProllyRootEdit *e = &edits[start + k];
 
-			tedits[k].key = rel_key(e->relid, &kbs[k]);
+			tedits[k].key = rel_key(e->relnumber, &kbs[k]);
 			tedits[k].is_delete = e->is_remove;
 			initStringInfo(&vbufs[k]);
 			if (!e->is_remove)
@@ -316,7 +316,7 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
  * ------------------------------------------------------------------------
  */
 
-/* Visit each (relid, tree) item of a sub-root tree. */
+/* Visit each (relnumber, tree) item of a sub-root tree. */
 static void
 scan_subroot(const ProllyRootEnv *env, const ProllyNodeRef *subroot,
 			 ProllySubRoot sub, ProllyRootVisitRel visit, void *arg)
@@ -332,11 +332,11 @@ scan_subroot(const ProllyRootEnv *env, const ProllyNodeRef *subroot,
 	while (PROLLY_CALL(env->tree, cursor_next, c, &key, &value))
 	{
 		ProllyNodeRef tree;
-		Oid			relid = key_relid(&key);
+		RelFileNumber			relnumber = key_relnumber(&key);
 
 		CHECK_FOR_INTERRUPTS();
 		decode_ref(value.data, value.len, &tree);
-		visit(sub, relid, &tree, arg);
+		visit(sub, relnumber, &tree, arg);
 	}
 	PROLLY_CALL(env->tree, cursor_close, c);
 }
@@ -360,7 +360,7 @@ typedef struct WalkTrees
 } WalkTrees;
 
 static void
-collect_tree(ProllySubRoot sub, Oid relid, const ProllyNodeRef *tree, void *arg)
+collect_tree(ProllySubRoot sub, RelFileNumber relnumber, const ProllyNodeRef *tree, void *arg)
 {
 	WalkTrees  *w = arg;
 
@@ -425,7 +425,7 @@ diff_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 		decode_ref(before->data, before->len, &b);
 	if (after)
 		decode_ref(after->data, after->len, &a);
-	d->visit(kind, d->sub, key_relid(key), before ? &b : NULL,
+	d->visit(kind, d->sub, key_relnumber(key), before ? &b : NULL,
 			 after ? &a : NULL, d->arg);
 }
 
@@ -456,9 +456,9 @@ const ProllyRootLayoutRoutine prolly_rootlayout_subroots = {
 	.info = {
 		.iface = PROLLY_IFACE_ROOT_LAYOUT,
 		.impl_id = SUBROOTS_IMPL_ID,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "subroots",
-		.description = "catalog and user-data sub-roots, each a tree of relation OIDs",
+		.description = "catalog, user-data and local sub-roots, each a tree of relfilenumbers",
 	},
 	.empty = subroots_empty,
 	.lookup = subroots_lookup,

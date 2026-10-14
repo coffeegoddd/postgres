@@ -971,6 +971,8 @@ typedef struct PartitionSchemeData *PartitionScheme;
 
 /* Bitmask of flags supported by table AMs */
 #define AMFLAG_HAS_TID_RANGE (1 << 0)
+/* The table AM can't be scanned by parallel workers at all */
+#define AMFLAG_NO_PARALLEL_SCAN (1 << 1)
 
 typedef enum RelOptKind
 {

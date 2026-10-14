@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'engine_checks.c',
   'foundation_checks.c',
   'storage_checks.c',
   'tree_checks.c',
@@ -32,11 +33,13 @@ tests += {
   'regress': {
     'sql': [
       'test_prolly',
+      'd1_tables',
     ],
   },
   'tap': {
     'tests': [
       't/001_store_recovery.pl',
+      't/002_d1_heads.pl',
     ],
   },
 }

@@ -29,10 +29,11 @@ typedef struct ProllyProfile
 } ProllyProfile;
 
 /*
- * Shared by every engine.  Node store, tree, root layout and log differ by
- * engine: D1 and D2 are hash-addressed (the "global" store, copy-on-write
- * trees, sub-root layout); D3 and D4 are location-addressed and have none
- * of these yet.
+ * Shared by every engine.  Node store, tree, root layout, log, commit
+ * pipeline and row identity differ by engine: D1 and D2 are hash-addressed
+ * (the "global" store, copy-on-write trees, sub-root layout, serial
+ * commits, hashed TIDs); D3 and D4 are location-addressed and have none of
+ * these yet.
  */
 #define FOUNDATION \
 	[PROLLY_IFACE_NODE_FORMAT] = "basic", \
@@ -40,32 +41,38 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_CONTENT_HASH] = "sha256", \
 	[PROLLY_IFACE_KEY_ENCODER] = "ordered", \
 	[PROLLY_IFACE_VALUE_ENCODER] = "canonical", \
+	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_content", \
 	[PROLLY_IFACE_ALLOCATOR] = "stub", \
-	[PROLLY_IFACE_RECLAMATION] = "stub", \
+	[PROLLY_IFACE_RECLAMATION] = "stub"
+
+#define HASH_ADDRESSED \
+	[PROLLY_IFACE_NODE_STORE] = "global", \
+	[PROLLY_IFACE_TREE] = "cow", \
+	[PROLLY_IFACE_ROOT_LAYOUT] = "subroots", \
+	[PROLLY_IFACE_COMMIT_PIPELINE] = "serial", \
+	[PROLLY_IFACE_ROW_IDENTITY] = "hashed"
+
+#define NOT_YET \
+	[PROLLY_IFACE_NODE_STORE] = "stub", \
+	[PROLLY_IFACE_TREE] = "stub", \
+	[PROLLY_IFACE_ROOT_LAYOUT] = "stub", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "stub", \
-	[PROLLY_IFACE_ROW_IDENTITY] = "stub"
+	[PROLLY_IFACE_ROW_IDENTITY] = "stub", \
+	[PROLLY_IFACE_LOG] = "stub"
 
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
-	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
-	[PROLLY_IFACE_TREE] = "cow", [PROLLY_IFACE_ROOT_LAYOUT] = "subroots",
+	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,
 	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
-	[PROLLY_IFACE_COORDINATION] = "k1", [PROLLY_IFACE_NODE_STORE] = "global",
-	[PROLLY_IFACE_TREE] = "cow", [PROLLY_IFACE_ROOT_LAYOUT] = "subroots",
+	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,
 	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
 	{"prolly_d3a", {[PROLLY_IFACE_ENGINE] = "d3a",
-	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
-	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k2", NOT_YET, FOUNDATION}},
 	{"prolly_d3b", {[PROLLY_IFACE_ENGINE] = "d3b",
-	[PROLLY_IFACE_COORDINATION] = "k2", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
-	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k2", NOT_YET, FOUNDATION}},
 	{"prolly_d4", {[PROLLY_IFACE_ENGINE] = "d4",
-	[PROLLY_IFACE_COORDINATION] = "k3", [PROLLY_IFACE_NODE_STORE] = "stub",
-	[PROLLY_IFACE_TREE] = "stub", [PROLLY_IFACE_ROOT_LAYOUT] = "stub",
-	[PROLLY_IFACE_LOG] = "stub", FOUNDATION}},
+	[PROLLY_IFACE_COORDINATION] = "k3", NOT_YET, FOUNDATION}},
 };
 
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
@@ -132,6 +139,8 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 		profile_impl(impls, PROLLY_IFACE_TREE);
 	components->root_layout = (const ProllyRootLayoutRoutine *)
 		profile_impl(impls, PROLLY_IFACE_ROOT_LAYOUT);
+	components->keying = (const ProllyKeyingRoutine *)
+		profile_impl(impls, PROLLY_IFACE_TABLE_KEYING);
 }
 
 void
@@ -150,6 +159,23 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 		amoid = rel->rd_rel->relam;
 
 	prolly_components_for_am(get_am_name(amoid), components);
+}
+
+void
+prolly_components_for_engine(const ProllyImplInfo *engine,
+							 ProllyComponents *components)
+{
+	for (int i = 0; i < lengthof(profiles); i++)
+	{
+		const char *name = profiles[i].impls[PROLLY_IFACE_ENGINE];
+
+		if (name != NULL && strcmp(name, engine->name) == 0)
+		{
+			prolly_components_for_am(profiles[i].amname, components);
+			return;
+		}
+	}
+	elog(ERROR, "no prolly profile uses engine \"%s\"", engine->name);
 }
 
 void

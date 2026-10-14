@@ -65,17 +65,21 @@ static void hash_incremental(const ProllyImplInfo *impl);
 static const ConformanceCase cases[] = {
 	/* engine */
 	{PROLLY_IFACE_ENGINE, "create_and_truncate",
-	"tree_create tree_truncate", NULL},
+	"tree_create tree_truncate put cursor_open cursor_seek cursor_next cursor_close",
+	engine_create_and_truncate},
 	{PROLLY_IFACE_ENGINE, "read_empty_tree",
-	"roots_acquire roots_release cursor_open cursor_seek cursor_next cursor_close", NULL},
+	"tree_create roots_acquire roots_release cursor_open cursor_seek cursor_next cursor_close get",
+	engine_read_empty_tree},
 	{PROLLY_IFACE_ENGINE, "read_own_writes",
-	"put remove cursor_open cursor_seek cursor_next cursor_close", NULL},
+	"tree_create put remove get cursor_open cursor_seek cursor_next cursor_close",
+	engine_read_own_writes},
 	{PROLLY_IFACE_ENGINE, "subxact_abort_discards_writes",
-	"put subxact_abort xact_abort", NULL},
+	"tree_create put remove subxact_abort xact_abort cursor_open cursor_next",
+	engine_subxact_abort_discards_writes},
 	{PROLLY_IFACE_ENGINE, "commit_publishes_roots",
-	"put xact_precommit roots_acquire", NULL},
+	"put xact_precommit xact_commit roots_acquire", NULL},
 	{PROLLY_IFACE_ENGINE, "count_range_matches_scan",
-	"count_range cursor_next", NULL},
+	"tree_create put count_range cursor_next", engine_count_range_matches_scan},
 	{PROLLY_IFACE_ENGINE, "canonical_root_independent_of_history",
 	"put remove xact_precommit canonical_root", NULL},
 	{PROLLY_IFACE_ENGINE, "export_chunks_closed_under_reachability",
@@ -137,6 +141,9 @@ static const ConformanceCase cases[] = {
 	valenc_independent_of_session},
 	{PROLLY_IFACE_VALUE_ENCODER, "missing_values", "begin encode decode end",
 	valenc_missing_values},
+	{PROLLY_IFACE_VALUE_ENCODER, "decodes_earlier_layouts",
+	"begin layout begin_layout reads_layout encode decode end",
+	valenc_decodes_earlier_layouts},
 
 	/* node store */
 	{PROLLY_IFACE_NODE_STORE, "new_publish_read",
@@ -166,12 +173,28 @@ static const ConformanceCase cases[] = {
 
 	/* commit pipeline */
 	{PROLLY_IFACE_COMMIT_PIPELINE, "publishes_in_enqueue_order",
-	"branch_lock enqueue branch_unlock publish head", NULL},
+	"branch_lock tip enqueue branch_unlock publish abandon head",
+	commit_publishes_in_enqueue_order},
+	{PROLLY_IFACE_COMMIT_PIPELINE, "survives_crash_and_replays",
+	"enqueue publish checkpoint redo", NULL},
 
 	/* row identity */
-	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve", "tid_assign tid_resolve", NULL},
-	{PROLLY_IFACE_ROW_IDENTITY, "same_version_same_tid", "tid_assign", NULL},
+	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve",
+	"tid_assign scan_begin tid_find scan_end tid_resolve", rowid_assign_then_resolve},
+	{PROLLY_IFACE_ROW_IDENTITY, "same_version_same_tid", "tid_assign tid_resolve",
+	rowid_same_version_same_tid},
+	{PROLLY_IFACE_ROW_IDENTITY, "displaced_version_keeps_tid",
+	"tid_assign scan_begin tid_find scan_end", rowid_hashed_displaced_version},
 	{PROLLY_IFACE_ROW_IDENTITY, "forget", "tid_assign tid_resolve tid_forget", NULL},
+
+	/* table keying */
+	{PROLLY_IFACE_TABLE_KEYING, "round_trip",
+	"open keyless encode_row make_value parse_value decode_row close",
+	keying_round_trip},
+	{PROLLY_IFACE_TABLE_KEYING, "keys_and_content",
+	"open encode_row content_hash compare close", keying_keys_and_content},
+	{PROLLY_IFACE_TABLE_KEYING, "description_reopens",
+	"open describe keyless encode_row close", keying_description_reopens},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",

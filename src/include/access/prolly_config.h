@@ -26,6 +26,7 @@
 #include "access/prolly_engine.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_keyenc.h"
+#include "access/prolly_keying.h"
 #include "access/prolly_log.h"
 #include "access/prolly_merge.h"
 #include "access/prolly_nodeformat.h"
@@ -56,6 +57,7 @@ typedef struct ProllyComponents
 	const ProllyRowIdRoutine *row_identity;
 	const ProllyTreeRoutine *tree;
 	const ProllyRootLayoutRoutine *root_layout;
+	const ProllyKeyingRoutine *keying;
 } ProllyComponents;
 
 /* Database-wide components: version control. */
@@ -78,6 +80,13 @@ extern void prolly_components_for_am(const char *amname,
  */
 extern void prolly_components_for_relation(Relation rel,
 										   ProllyComponents *components);
+
+/*
+ * Components of the first profile that uses engine (for an engine's own
+ * work that isn't about one relation, such as finding branch heads).
+ */
+extern void prolly_components_for_engine(const ProllyImplInfo *engine,
+										 ProllyComponents *components);
 
 extern void prolly_database_components(ProllyDatabaseComponents *components);
 

@@ -6,7 +6,7 @@
  * Layouts are built from the prolly_d1 profile's tree implementation and
  * foundation components, over a set of real relation trees, and compared
  * against an in-memory reference: for each sub-root and each of NREL
- * relids, which relation tree it holds, or none.
+ * relnumbers, which relation tree it holds, or none.
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -25,14 +25,14 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
-#define NREL		200			/* relids per sub-root */
+#define NREL		200			/* relnumbers per sub-root */
 #define NTREES		12			/* distinct relation trees */
 #define ABSENT		(-1)
 #define NSLOTS		(PROLLY_NUM_SUBROOTS * NREL)
 
 /* Relids: catalog OIDs below FirstNormalObjectId, user ones above. */
-static Oid
-relid_of(int sub, int i)
+static RelFileNumber
+relnum_of(int sub, int i)
 {
 	return sub == PROLLY_SUBROOT_CATALOG ? 1000 + 3 * i : 16384 + 7 * i;
 }
@@ -138,7 +138,7 @@ apply_to(Fixture *f, Ref *ref, const Ref *target, ProllyNodeRef *root)
 		if (ref->tree[s] == target->tree[s])
 			continue;
 		edits[n].sub = (ProllySubRoot) (s / NREL);
-		edits[n].relid = relid_of(s / NREL, s % NREL);
+		edits[n].relnumber = relnum_of(s / NREL, s % NREL);
 		edits[n].is_remove = target->tree[s] == ABSENT;
 		if (!edits[n].is_remove)
 			edits[n].tree = f->trees[target->tree[s]];
@@ -177,7 +177,7 @@ typedef struct ScanSeen
 } ScanSeen;
 
 static void
-check_scanned(ProllySubRoot sub, Oid relid, const ProllyNodeRef *tree, void *arg)
+check_scanned(ProllySubRoot sub, RelFileNumber relnumber, const ProllyNodeRef *tree, void *arg)
 {
 	ScanSeen   *s = arg;
 
@@ -185,11 +185,11 @@ check_scanned(ProllySubRoot sub, Oid relid, const ProllyNodeRef *tree, void *arg
 		elog(ERROR, "scan of sub-root %d visited sub-root %d", s->sub, (int) sub);
 	while (s->next < NREL && s->ref->tree[s->sub * NREL + s->next] == ABSENT)
 		s->next++;
-	if (s->next >= NREL || relid_of(s->sub, s->next) != relid)
-		elog(ERROR, "scan of sub-root %d returned relid %u out of order or absent",
-			 s->sub, relid);
+	if (s->next >= NREL || relnum_of(s->sub, s->next) != relnumber)
+		elog(ERROR, "scan of sub-root %d returned relnumber %u out of order or absent",
+			 s->sub, relnumber);
 	if (!same_hash(tree, &s->f->trees[s->ref->tree[s->sub * NREL + s->next]]))
-		elog(ERROR, "scan returned the wrong tree for relid %u", relid);
+		elog(ERROR, "scan returned the wrong tree for relnumber %u", relnumber);
 	s->next++;
 	s->n++;
 }
@@ -208,14 +208,14 @@ check_matches(Fixture *f, const ProllyNodeRef *root, const Ref *ref, const char 
 			int			t = ref->tree[sub * NREL + i];
 			ProllyNodeRef got;
 			bool		found = PROLLY_CALL(f->rl, lookup, &f->env, root,
-											(ProllySubRoot) sub, relid_of(sub, i), &got);
+											(ProllySubRoot) sub, relnum_of(sub, i), &got);
 
 			if (found != (t != ABSENT))
-				elog(ERROR, "%s: lookup of relid %u in sub-root %d %s", when,
-					 relid_of(sub, i), sub, found ? "found an absent relation" : "missed a relation");
+				elog(ERROR, "%s: lookup of relnumber %u in sub-root %d %s", when,
+					 relnum_of(sub, i), sub, found ? "found an absent relation" : "missed a relation");
 			if (found && !same_hash(&got, &f->trees[t]))
-				elog(ERROR, "%s: lookup of relid %u returned the wrong tree", when,
-					 relid_of(sub, i));
+				elog(ERROR, "%s: lookup of relnumber %u returned the wrong tree", when,
+					 relnum_of(sub, i));
 			if (t != ABSENT)
 				want++;
 		}
@@ -256,7 +256,7 @@ rootlayout_empty(const ProllyImplInfo *impl)
 
 		memset(&e, 0, sizeof(e));
 		e.sub = PROLLY_SUBROOT_USER_DATA;
-		e.relid = relid_of(PROLLY_SUBROOT_USER_DATA, 0);
+		e.relnumber = relnum_of(PROLLY_SUBROOT_USER_DATA, 0);
 		e.is_remove = true;
 		PROLLY_CALL(f.rl, apply, &f.env, &a, NULL, 0, &b);
 		if (!same_hash(&a, &b))
@@ -366,7 +366,6 @@ rootlayout_subroots_independent(const ProllyImplInfo *impl)
 
 	for (int sub = 0; sub < PROLLY_NUM_SUBROOTS; sub++)
 	{
-		int			other = 1 - sub;
 		ProllyNodeRef before[PROLLY_NUM_SUBROOTS];
 		ProllyNodeRef after[PROLLY_NUM_SUBROOTS];
 		ProllyNodeRef old = root;
@@ -384,8 +383,10 @@ rootlayout_subroots_independent(const ProllyImplInfo *impl)
 
 		if (same_hash(&before[sub], &after[sub]))
 			elog(ERROR, "changing a relation in sub-root %d left it unchanged", sub);
-		if (!same_hash(&before[other], &after[other]))
-			elog(ERROR, "changing a relation in sub-root %d changed sub-root %d", sub, other);
+		for (int other = 0; other < PROLLY_NUM_SUBROOTS; other++)
+			if (other != sub && !same_hash(&before[other], &after[other]))
+				elog(ERROR, "changing a relation in sub-root %d changed sub-root %d",
+					 sub, other);
 		if (same_hash(&old, &root))
 			elog(ERROR, "changing a relation left the branch root unchanged");
 
@@ -395,7 +396,7 @@ rootlayout_subroots_independent(const ProllyImplInfo *impl)
 			ProllyNodeRef again;
 
 			e.sub = (ProllySubRoot) sub;
-			e.relid = relid_of(sub, 5);
+			e.relnumber = relnum_of(sub, 5);
 			e.tree = f.trees[ref.tree[slot]];
 			e.is_remove = false;
 			PROLLY_CALL(f.rl, apply, &f.env, &root, &e, 1, &again);
@@ -467,7 +468,7 @@ rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl)
 			/* A real tree's reference, with its block hint, but a bad hash. */
 			memset(&e, 0, sizeof(e));
 			e.sub = (ProllySubRoot) sub;
-			e.relid = relid_of(sub, 1);
+			e.relnumber = relnum_of(sub, 1);
 			e.tree = f.trees[3];
 			e.tree.hash.len = (uint8) bad_lengths[b];
 			e.is_remove = false;
@@ -490,10 +491,10 @@ rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl)
 
 		memset(&e, 0, sizeof(e));
 		e.sub = PROLLY_SUBROOT_USER_DATA;
-		e.relid = relid_of(PROLLY_SUBROOT_USER_DATA, 1);
+		e.relnumber = relnum_of(PROLLY_SUBROOT_USER_DATA, 1);
 		e.tree = f.trees[3];
 		PROLLY_CALL(f.rl, apply, &f.env, &root, &e, 1, &newroot);
-		if (!PROLLY_CALL(f.rl, lookup, &f.env, &newroot, e.sub, e.relid, &got) ||
+		if (!PROLLY_CALL(f.rl, lookup, &f.env, &newroot, e.sub, e.relnumber, &got) ||
 			!same_hash(&got, &f.trees[3]))
 			elog(ERROR, "a valid reference was not stored after rejected ones");
 	}
@@ -509,26 +510,26 @@ typedef struct DiffSeen
 } DiffSeen;
 
 static int
-slot_of(ProllySubRoot sub, Oid relid)
+slot_of(ProllySubRoot sub, RelFileNumber relnumber)
 {
 	for (int i = 0; i < NREL; i++)
-		if (relid_of(sub, i) == relid)
+		if (relnum_of(sub, i) == relnumber)
 			return sub * NREL + i;
-	elog(ERROR, "diff reported unknown relid %u", relid);
+	elog(ERROR, "diff reported unknown relnumber %u", relnumber);
 	return -1;					/* keep compiler quiet */
 }
 
 static void
-check_change(ProllyDiffKind kind, ProllySubRoot sub, Oid relid,
+check_change(ProllyDiffKind kind, ProllySubRoot sub, RelFileNumber relnumber,
 			 const ProllyNodeRef *before, const ProllyNodeRef *after, void *arg)
 {
 	DiffSeen   *d = arg;
-	int			s = slot_of(sub, relid);
+	int			s = slot_of(sub, relnumber);
 	int			ft = d->from->tree[s];
 	int			tt = d->to->tree[s];
 
 	if (s <= d->last)
-		elog(ERROR, "diff reported relid %u out of (sub-root, relid) order", relid);
+		elog(ERROR, "diff reported relnumber %u out of (sub-root, relnumber) order", relnumber);
 	d->last = s;
 	d->n++;
 	switch (kind)
@@ -536,19 +537,19 @@ check_change(ProllyDiffKind kind, ProllySubRoot sub, Oid relid,
 		case PROLLY_DIFF_ADDED:
 			if (ft != ABSENT || tt == ABSENT || before != NULL ||
 				!same_hash(after, &d->f->trees[tt]))
-				elog(ERROR, "diff: relid %u wrongly reported added", relid);
+				elog(ERROR, "diff: relnumber %u wrongly reported added", relnumber);
 			break;
 		case PROLLY_DIFF_REMOVED:
 			if (ft == ABSENT || tt != ABSENT || after != NULL ||
 				!same_hash(before, &d->f->trees[ft]))
-				elog(ERROR, "diff: relid %u wrongly reported removed", relid);
+				elog(ERROR, "diff: relnumber %u wrongly reported removed", relnumber);
 			break;
 		case PROLLY_DIFF_MODIFIED:
 			if (ft == ABSENT || tt == ABSENT ||
 				same_hash(&d->f->trees[ft], &d->f->trees[tt]) ||
 				!same_hash(before, &d->f->trees[ft]) ||
 				!same_hash(after, &d->f->trees[tt]))
-				elog(ERROR, "diff: relid %u wrongly reported modified", relid);
+				elog(ERROR, "diff: relnumber %u wrongly reported modified", relnumber);
 			break;
 	}
 }

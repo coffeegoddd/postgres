@@ -16,6 +16,7 @@ OBJS = \
 	alloc_stub.o \
 	chunker_keyhash.o \
 	chunker_stub.o \
+	commit_serial.o \
 	commit_stub.o \
 	coord_k1.o \
 	coord_k2.o \
@@ -29,6 +30,8 @@ OBJS = \
 	hash_stub.o \
 	keyenc_ordered.o \
 	keyenc_stub.o \
+	keying_pkcontent.o \
+	keying_stub.o \
 	log_chunks.o \
 	log_stub.o \
 	merge_stub.o \
@@ -41,12 +44,15 @@ OBJS = \
 	prolly_indexam.o \
 	prolly_registry.o \
 	prolly_rmgr.o \
+	prolly_shmem.o \
 	prolly_tableam.o \
 	prolly_vcs.o \
+	prolly_xact.o \
 	reclaim_stub.o \
 	refs_stub.o \
 	rootlayout_stub.o \
 	rootlayout_subroots.o \
+	rowid_hashed.o \
 	rowid_stub.o \
 	transfer_stub.o \
 	tree_cow.o \

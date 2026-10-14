@@ -3,6 +3,7 @@
 MODULE_big = test_prolly
 OBJS = \
 	$(WIN32RES) \
+	engine_checks.o \
 	foundation_checks.o \
 	storage_checks.o \
 	tree_checks.o \
@@ -13,7 +14,7 @@ PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
-REGRESS = test_prolly
+REGRESS = test_prolly d1_tables
 TAP_TESTS = 1
 
 ifdef USE_PGXS

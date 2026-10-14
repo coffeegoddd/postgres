@@ -36,7 +36,7 @@ typedef struct ProllyCoordRoutine
 	ProllyImplInfo info;
 
 	Size		(*shmem_size) (void);
-	void		(*shmem_init) (void);
+	void		(*shmem_init) (void *area);
 
 	/*
 	 * Lock key in tree in mode, waiting per wait_policy.  On anything but

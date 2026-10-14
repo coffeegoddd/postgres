@@ -1,25 +1,44 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_commit.h
- *	  Commit pipeline interface: ordering and publishing branch roots.
+ *	  Commit pipeline interface: branch heads, and publishing new ones.
  *
- * At commit, a transaction's new root must become a branch's head at the
- * instant its xid becomes visible.  Implementations: a single lock, or an
- * ordered pipeline that rebases under a per-branch lock, enqueues the new
- * root and releases the lock before the WAL flush.
+ * Every branch of a database has a head: the working-set root its readers
+ * see.  A transaction that changed a branch makes a new root, which must
+ * become the head when, and only when, the transaction commits, and must
+ * survive a crash exactly when the commit does.  Implementations: "serial"
+ * (one committer per branch at a time, until its transaction ends), or an
+ * ordered pipeline that rebases under a short per-branch lock and
+ * publishes roots in queue order.
  *
- * Usage, per branch a transaction changes:
- *		branch_lock(b);  (engine rebases onto head(b))
- *		ticket = enqueue(b, new_root, commit_lsn);
- *		branch_unlock(b);  (before the WAL flush)
- *		... RecordTransactionCommit() flushes ...
- *		publish(ticket);  (in ProcArrayEndTransaction)
+ * Usage at commit, for each branch the transaction changed:
+ *		branch_lock(b);
+ *		tip(b, &base);		(the engine rebases its writes onto base)
+ *		ticket = enqueue(b, &new_root);
+ *		branch_unlock(b);
+ *		... the commit record is written and flushed ...
+ *		publish(ticket);	(or abandon(ticket) if the transaction aborts)
  *
  * Contract:
+ * - Branches are those of the current database (MyDatabaseId), numbered
+ *   by the database's refs.
+ * - tip() and enqueue() need the branch lock.  tip() returns the root the
+ *   next commit must build on: the newest root enqueued for the branch, or
+ *   its head; false if the branch has never had a root.
+ * - enqueue() WAL-logs the new root with the current transaction's xid
+ *   (assigning one if needed).  After a crash, and on a standby, a
+ *   branch's head is the root of the last enqueued transaction that
+ *   committed.
  * - Roots are published in enqueue order per branch; publish() returns once
- *   ticket's root and every earlier one is the head.
- * - Nothing after enqueue() can fail short of PANIC, so the queue never has
- *   gaps.
+ *   ticket's root and every earlier one is the head.  If the transaction
+ *   aborts after enqueue(), abandon() is called instead; its root never
+ *   becomes the head, and the implementation makes sure no other commit
+ *   was built on it.
+ * - head() returns the published head, without the branch lock; false if
+ *   the branch has never had a root.
+ * - checkpoint() makes every branch's state as of the checkpoint's redo
+ *   point durable; redo() replays the implementation's own ProllyCommit
+ *   records (prolly_xlog.h).
  *
  * Provisional (v0).
  *
@@ -32,7 +51,7 @@
 
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
-#include "access/xlogdefs.h"
+#include "access/xlogreader.h"
 
 typedef uint64 ProllyCommitTicket;
 
@@ -41,22 +60,26 @@ typedef struct ProllyCommitRoutine
 	ProllyImplInfo info;
 
 	Size		(*shmem_size) (void);
-	void		(*shmem_init) (void);
+	void		(*shmem_init) (void *area);
 
 	void		(*branch_lock) (ProllyBranchId branch);
+	bool		(*tip) (ProllyBranchId branch, ProllyNodeRef *root);
 	ProllyCommitTicket (*enqueue) (ProllyBranchId branch,
-								   const ProllyNodeRef *new_root,
-								   XLogRecPtr commit_lsn);
+								   const ProllyNodeRef *new_root);
 	void		(*branch_unlock) (ProllyBranchId branch);
 	void		(*publish) (ProllyCommitTicket ticket);
+	void		(*abandon) (ProllyCommitTicket ticket);
 
 	/* The branch's current published head. */
-	void		(*head) (ProllyBranchId branch, ProllyNodeRef *root);
+	bool		(*head) (ProllyBranchId branch, ProllyNodeRef *root);
+
+	void		(*checkpoint) (int flags);
+	void		(*redo) (XLogReaderState *record);
 } ProllyCommitRoutine;
 
 #define PROLLY_COMMIT_CALLBACK_NAMES \
-	"shmem_size", "shmem_init", "branch_lock", "enqueue", "branch_unlock", \
-	"publish", "head"
+	"shmem_size", "shmem_init", "branch_lock", "tip", "enqueue", \
+	"branch_unlock", "publish", "abandon", "head", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
 
 static inline const ProllyCommitRoutine *

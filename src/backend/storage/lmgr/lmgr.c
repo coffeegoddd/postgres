@@ -1221,6 +1221,22 @@ LockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
 }
 
 /*
+ *		LockProllyBranch
+ *
+ * Obtain the right to commit to a prolly branch of the current database.
+ * Held until the end of the transaction.
+ */
+void
+LockProllyBranch(uint32 branch, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_PROLLY_BRANCH(tag, MyDatabaseId, branch);
+
+	(void) LockAcquire(&tag, lockmode, false, false);
+}
+
+/*
  *		UnlockApplyTransactionForSession
  */
 void
@@ -1326,6 +1342,12 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 			appendStringInfo(buf,
 							 _("remote transaction %u of subscription %u of database %u"),
 							 tag->locktag_field3,
+							 tag->locktag_field2,
+							 tag->locktag_field1);
+			break;
+		case LOCKTAG_PROLLY_BRANCH:
+			appendStringInfo(buf,
+							 _("prolly branch %u of database %u"),
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;

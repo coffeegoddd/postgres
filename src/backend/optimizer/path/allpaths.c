@@ -680,6 +680,13 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 				return;
 
 			/*
+			 * Likewise for a table AM that can't be scanned in parallel: it
+			 * may keep the leader's changes where workers can't see them.
+			 */
+			if (rel->amflags & AMFLAG_NO_PARALLEL_SCAN)
+				return;
+
+			/*
 			 * Table sampling can be pushed down to workers if the sample
 			 * function and its arguments are safe.
 			 */

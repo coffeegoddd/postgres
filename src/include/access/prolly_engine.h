@@ -16,15 +16,23 @@
  * General contract:
  * - Operations act for the current transaction (GetCurrentTransactionId()
  *   and friends) unless a parameter says otherwise, as heap does.
- * - "tree" is the table or index relation whose tree is meant.  A table and
- *   its indexes always come from the same root set.
+ * - "tree" is the table or index relation whose tree is meant, and "kind"
+ *   which of its trees: its data, or local metadata such as its row
+ *   identity map (prolly_types.h).  A table and its indexes always come
+ *   from the same root set.  A relation's trees are found by its storage
+ *   (rd_locator.relNumber), so new storage (TRUNCATE, rewrites) starts a
+ *   new tree and the old one stays readable until the transaction ends.
+ * - Keys of a table's data tree are ordered by the table keying
+ *   (prolly_keying.h); keys of local metadata trees by memcmp.
+ * - A command sees the writes of earlier commands of its transaction, not
+ *   its own (cid), as heap does.
  * - Returned keys and values stay valid until the next call on the same
  *   cursor, or until the cursor is closed.
  * - Errors are raised with ereport(); callbacks never return error codes.
  *
  * Provisional (v0).  Open questions that may reshape this interface: root
- * sets spanning tables of different engines; row identity (how TIDs map to
- * rows); where redo of logical records rebuilds nodes.
+ * sets spanning tables of different engines; where redo of logical records
+ * rebuilds nodes.
  *
  * src/include/access/prolly_engine.h
  *
@@ -36,6 +44,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "access/sdir.h"
+#include "lib/stringinfo.h"
 #include "storage/buf.h"
 #include "storage/relfilelocator.h"
 #include "utils/relcache.h"
@@ -49,7 +58,7 @@ typedef struct ProllyEngineRoutine
 
 	/* Shared memory needed, and its initialization. */
 	Size		(*shmem_size) (void);
-	void		(*shmem_init) (void);
+	void		(*shmem_init) (void *area);
 
 	/*
 	 * Create an empty tree for rel in new storage at newrlocator (CREATE
@@ -60,6 +69,12 @@ typedef struct ProllyEngineRoutine
 
 	/* Make rel's tree empty in place, non-transactionally. */
 	void		(*tree_truncate) (Relation rel);
+
+	/*
+	 * Empty one of rel's trees as a private write of the current
+	 * transaction (to rebuild it).
+	 */
+	void		(*tree_reset) (Relation rel, ProllyTreeKind kind);
 
 	/* Copy rel's tree into new storage at newrlocator (SET TABLESPACE). */
 	void		(*tree_copy) (Relation rel, const RelFileLocator *newrlocator);
@@ -73,29 +88,39 @@ typedef struct ProllyEngineRoutine
 
 	/*
 	 * Cursors over tree in roots, overlaid with the current transaction's own
-	 * writes made before command cid.  cursor_seek positions before the first
-	 * key >= key (forward) or after the last key <= key (backward); a NULL
-	 * key means the start or end.  cursor_next returns false at the end.
+	 * writes made before command cid (InvalidCommandId: all of them).
+	 * cursor_seek positions before the first key >= key (forward) or after
+	 * the last key <= key (backward); a NULL key means the start or end.
+	 * cursor_next returns false at the end.
 	 */
 	ProllyCursor *(*cursor_open) (ProllyRootSet *roots, Relation tree,
-								  CommandId cid);
+								  ProllyTreeKind kind, CommandId cid);
 	void		(*cursor_seek) (ProllyCursor *cursor, const ProllyKey *key,
 								ScanDirection direction);
 	bool		(*cursor_next) (ProllyCursor *cursor, ProllyKey *key,
 								ProllyValue *value);
 	void		(*cursor_close) (ProllyCursor *cursor);
 
-	/* Number of keys in [lo, hi] (NULL = unbounded), from subtree counts. */
+	/* Look up key as a cursor would see it; on success append its value. */
+	bool		(*get) (ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
+						const ProllyKey *key, CommandId cid, StringInfo value);
+
+	/*
+	 * Number of keys in [lo, hi] (NULL = unbounded), from subtree counts;
+	 * an estimate while the transaction has private writes to tree.
+	 */
 	uint64		(*count_range) (ProllyRootSet *roots, Relation tree,
-								const ProllyKey *lo, const ProllyKey *hi);
+								ProllyTreeKind kind, const ProllyKey *lo,
+								const ProllyKey *hi);
 
 	/*
 	 * Private writes of the current transaction, tagged with cid.  Locking
 	 * is the coordination module's job and has happened before these calls.
 	 */
-	void		(*put) (Relation tree, const ProllyKey *key,
+	void		(*put) (Relation tree, ProllyTreeKind kind, const ProllyKey *key,
 						const ProllyValue *value, CommandId cid);
-	void		(*remove) (Relation tree, const ProllyKey *key, CommandId cid);
+	void		(*remove) (Relation tree, ProllyTreeKind kind,
+						   const ProllyKey *key, CommandId cid);
 
 	/* Discard writes of subxid and its children, or of the transaction. */
 	void		(*subxact_abort) (SubTransactionId subxid);
@@ -108,6 +133,9 @@ typedef struct ProllyEngineRoutine
 	 * conflict was locked earlier, so the rebase is mechanical.
 	 */
 	void		(*xact_precommit) (void);
+
+	/* After the commit record: publish what xact_precommit enqueued. */
+	void		(*xact_commit) (void);
 
 	/* PREPARE TRANSACTION: persist private writes for later commit. */
 	void		(*xact_prepare) (void);
@@ -134,11 +162,13 @@ typedef struct ProllyEngineRoutine
 } ProllyEngineRoutine;
 
 #define PROLLY_ENGINE_CALLBACK_NAMES \
-	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_copy", \
+	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
+	"tree_copy", \
 	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
-	"cursor_next", "cursor_close", "count_range", "put", "remove", \
-	"subxact_abort", "xact_abort", "xact_precommit", "xact_prepare", \
-	"checkpoint", "install_root", "vacuum", "canonical_root", "export_chunks"
+	"cursor_next", "cursor_close", "get", "count_range", "put", "remove", \
+	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
+	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \
+	"export_chunks"
 #define PROLLY_ENGINE_FIRST_CALLBACK shmem_size
 
 static inline const ProllyEngineRoutine *

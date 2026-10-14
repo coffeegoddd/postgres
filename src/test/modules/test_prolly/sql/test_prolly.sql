@@ -21,8 +21,9 @@ SELECT * FROM prolly_conformance('content_hash');
 SELECT * FROM prolly_conformance('no_such_interface');
 
 --
--- Table access methods: creating storage dispatches to the engine interface,
--- which the stub engines don't implement.
+-- Table access methods: creating storage dispatches to the engine interface.
+-- Engine d1 creates its trees (its tables are tested in d1_tables); the
+-- others are stubs.
 --
 CREATE TABLE prolly_t1 (a int) USING prolly_d1;
 CREATE TABLE prolly_t2 (a int) USING prolly_d2;

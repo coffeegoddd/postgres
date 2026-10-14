@@ -98,7 +98,8 @@ Generic
 LogicalMessage
 XLOG2
 Prolly
-ProllyStore$/,
+ProllyStore
+ProllyCommit$/,
 	'rmgr list');
 
 

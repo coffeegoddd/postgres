@@ -16,7 +16,7 @@
 
 /* there is deliberately not an #ifndef PROLLY_IMPLLIST_H here */
 
-/* engines; all stubs so far */
+/* engines; d1 is built, the others are stubs */
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d1)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d2)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d3a)
@@ -35,6 +35,7 @@ PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_keyhash)
 PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_canonical)
+PG_PROLLY_IMPL(ProllyKeyingRoutine, prolly_keying_pk_or_content)
 
 /* node storage */
 PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
@@ -42,6 +43,10 @@ PG_PROLLY_IMPL(ProllyLogRoutine, prolly_log_chunks)
 
 /* trees */
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_cow)
+
+/* commit pipelines and row identity */
+PG_PROLLY_IMPL(ProllyCommitRoutine, prolly_commit_serial)
+PG_PROLLY_IMPL(ProllyRowIdRoutine, prolly_rowid_hashed)
 
 /* root layouts */
 PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_subroots)
@@ -63,3 +68,4 @@ PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_stub)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_stub)
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_stub)
 PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_stub)
+PG_PROLLY_IMPL(ProllyKeyingRoutine, prolly_keying_stub)

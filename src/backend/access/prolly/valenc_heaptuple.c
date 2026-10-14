@@ -43,6 +43,46 @@ heaptuple_begin(TupleDesc desc, MemoryContext mcxt)
 	return enc;
 }
 
+/* Heap tuples keep dropped columns: the layout is the attribute count. */
+static void
+heaptuple_layout(ProllyValueEncoder *enc, StringInfo out)
+{
+	int16		natts = (int16) enc->desc->natts;
+
+	appendBinaryStringInfo(out, (const char *) &natts, sizeof(natts));
+}
+
+static int16
+layout_natts(const ProllyValue *layout)
+{
+	int16		natts;
+
+	if (layout->len != sizeof(int16))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid prolly heaptuple layout")));
+	memcpy(&natts, layout->data, sizeof(natts));
+	return natts;
+}
+
+/* Fewer attributes decode as missing or NULL, as for heap. */
+static bool
+heaptuple_reads_layout(ProllyValueEncoder *enc, const ProllyValue *layout)
+{
+	return layout_natts(layout) <= enc->desc->natts;
+}
+
+static ProllyValueEncoder *
+heaptuple_begin_layout(TupleDesc desc, const ProllyValue *layout,
+					   MemoryContext mcxt)
+{
+	if (layout_natts(layout) > desc->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly rows have more attributes than their table")));
+	return heaptuple_begin(desc, mcxt);
+}
+
 static void
 heaptuple_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 {
@@ -98,6 +138,9 @@ const ProllyValueEncoderRoutine prolly_valenc_heaptuple = {
 		.description = "rows as MinimalTuple bytes (platform-dependent)",
 	},
 	.begin = heaptuple_begin,
+	.layout = heaptuple_layout,
+	.begin_layout = heaptuple_begin_layout,
+	.reads_layout = heaptuple_reads_layout,
 	.encode = heaptuple_encode,
 	.decode = heaptuple_decode,
 	.end = heaptuple_end,

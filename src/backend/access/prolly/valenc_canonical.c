@@ -28,6 +28,14 @@
  * Decoding fills a slot in the relation's own layout, with NULLs for dropped
  * columns, as Postgres's tuple conversion would.
  *
+ * A layout is the list of attribute numbers rows are encoded over (int16
+ * each, native byte order: layouts are local).  DROP COLUMN doesn't
+ * rewrite the table, so rows encoded before it still hold the column;
+ * begin_layout() decodes them, skipping values of columns dropped since
+ * and filling columns added since with their missing value or NULL.  Rows
+ * encoded under a layout decode correctly with the current encoder while
+ * that layout is a prefix of the current one (columns were only added).
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/valenc_canonical.c
  *
@@ -46,37 +54,145 @@ struct ProllyValueEncoder
 	MemoryContext tmpcxt;		/* reset after each row */
 	ProllyDatumCodec **codecs;	/* per attribute; NULL if dropped */
 	int			nlive;
-	int		   *live_attno;		/* 0-based attribute index of live column j */
-	bool	   *has_missing;	/* per live column */
+	int		   *live_attno;		/* 0-based attribute index of encoded column j */
+	bool	   *has_missing;	/* per encoded column */
 	bool	   *nulls;			/* scratch, nlive entries */
+
+	/* Decoding an earlier layout: live columns it doesn't hold. */
+	bool		decode_only;
+	int			nextra;
+	int		   *extra_attno;
 };
 
+/*
+ * An encoder over the given 0-based attribute indexes (NULL: the live
+ * columns); indexes of columns dropped since get no codec and are skipped.
+ */
 static ProllyValueEncoder *
-canonical_begin(TupleDesc desc, MemoryContext mcxt)
+begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt)
 {
 	ProllyValueEncoder *enc = MemoryContextAllocZero(mcxt, sizeof(ProllyValueEncoder));
 	int			natts = desc->natts;
+	int			ncols = attnos ? nattnos : natts;
+	bool	   *covered = palloc0(sizeof(bool) * Max(natts, 1));
 
 	enc->desc = desc;
 	enc->tmpcxt = AllocSetContextCreate(mcxt, "prolly canonical rows",
 										ALLOCSET_DEFAULT_SIZES);
-	enc->codecs = MemoryContextAllocZero(mcxt, sizeof(ProllyDatumCodec *) * natts);
-	enc->live_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(natts, 1));
-	enc->has_missing = MemoryContextAlloc(mcxt, sizeof(bool) * Max(natts, 1));
-	enc->nulls = MemoryContextAlloc(mcxt, sizeof(bool) * Max(natts, 1));
+	enc->codecs = MemoryContextAllocZero(mcxt, sizeof(ProllyDatumCodec *) * Max(natts, 1));
+	enc->live_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(ncols, 1));
+	enc->has_missing = MemoryContextAlloc(mcxt, sizeof(bool) * Max(ncols, 1));
+	enc->nulls = MemoryContextAlloc(mcxt, sizeof(bool) * Max(ncols, 1));
+	enc->extra_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(natts, 1));
+	enc->decode_only = (attnos != NULL);
 
-	for (int i = 0; i < natts; i++)
+	for (int j = 0; j < ncols; j++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
+		int			i = attnos ? attnos[j] : j;
+		Form_pg_attribute att;
 
+		if (i < 0 || i >= natts || (attnos && j > 0 && i <= attnos[j - 1]))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid canonical prolly row layout")));
+		att = TupleDescAttr(desc, i);
 		if (att->attisdropped)
+		{
+			if (!attnos)
+				continue;
+			/* Dropped since the rows were encoded: skipped on decode. */
+			enc->live_attno[enc->nlive] = i;
+			enc->has_missing[enc->nlive] = false;
+			enc->nlive++;
 			continue;
+		}
 		enc->codecs[i] = prolly_datum_codec(att->atttypid, att->atttypmod, mcxt);
 		enc->live_attno[enc->nlive] = i;
 		enc->has_missing[enc->nlive] = att->atthasmissing;
 		enc->nlive++;
+		covered[i] = true;
+	}
+	for (int i = 0; attnos && i < natts; i++)
+	{
+		if (!covered[i] && !TupleDescAttr(desc, i)->attisdropped)
+			enc->extra_attno[enc->nextra++] = i;
+	}
+	pfree(covered);
+
+	/* A layout that is the current one encodes like begin() would. */
+	if (attnos && enc->nextra == 0)
+	{
+		bool		current = true;
+
+		for (int j = 0; j < enc->nlive; j++)
+			if (enc->codecs[enc->live_attno[j]] == NULL)
+				current = false;
+		enc->decode_only = !current;
 	}
 	return enc;
+}
+
+static ProllyValueEncoder *
+canonical_begin(TupleDesc desc, MemoryContext mcxt)
+{
+	return begin_columns(desc, NULL, 0, mcxt);
+}
+
+static void
+canonical_layout(ProllyValueEncoder *enc, StringInfo out)
+{
+	for (int j = 0; j < enc->nlive; j++)
+	{
+		int16		attno = (int16) enc->live_attno[j];
+
+		appendBinaryStringInfo(out, (const char *) &attno, sizeof(attno));
+	}
+}
+
+static int *
+parse_layout(const ProllyValue *layout, int *n)
+{
+	int		   *attnos;
+
+	if (layout->len % sizeof(int16) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row layout")));
+	*n = layout->len / sizeof(int16);
+	attnos = palloc(sizeof(int) * Max(*n, 1));
+	for (int j = 0; j < *n; j++)
+	{
+		int16		a;
+
+		memcpy(&a, layout->data + j * sizeof(int16), sizeof(a));
+		attnos[j] = a;
+	}
+	return attnos;
+}
+
+static ProllyValueEncoder *
+canonical_begin_layout(TupleDesc desc, const ProllyValue *layout,
+					   MemoryContext mcxt)
+{
+	int			n;
+	int		   *attnos = parse_layout(layout, &n);
+	ProllyValueEncoder *enc = begin_columns(desc, attnos, n, mcxt);
+
+	pfree(attnos);
+	return enc;
+}
+
+static bool
+canonical_reads_layout(ProllyValueEncoder *enc, const ProllyValue *layout)
+{
+	int			n;
+	int		   *attnos = parse_layout(layout, &n);
+	bool		ok = (n <= enc->nlive);
+
+	for (int j = 0; ok && j < n; j++)
+		ok = (attnos[j] == enc->live_attno[j]);
+	pfree(attnos);
+	return ok;
 }
 
 static void
@@ -85,6 +201,8 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	MemoryContext old;
 	int			n = 0;
 
+	if (enc->decode_only)
+		elog(ERROR, "a prolly encoder for an earlier row layout can only decode");
 	slot_getallattrs(slot);
 
 	/* Columns up to the last that is non-NULL or has a missing value. */
@@ -171,10 +289,24 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("invalid canonical prolly row: value runs past the end")));
-			slot->tts_values[i] = prolly_datum_decode(enc->codecs[i], p, (int) len);
-			slot->tts_isnull[i] = false;
+
+			/* No codec: the column was dropped after the row was encoded. */
+			if (enc->codecs[i] != NULL)
+			{
+				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i], p, (int) len);
+				slot->tts_isnull[i] = false;
+			}
 			p += len;
 		}
+	}
+
+	/* Columns added after the rows' layout. */
+	for (int x = 0; x < enc->nextra; x++)
+	{
+		int			i = enc->extra_attno[x];
+
+		if (TupleDescAttr(desc, i)->atthasmissing)
+			slot->tts_values[i] = getmissingattr(desc, i + 1, &slot->tts_isnull[i]);
 	}
 	if (p != end)
 		ereport(ERROR,
@@ -196,6 +328,7 @@ canonical_end(ProllyValueEncoder *enc)
 	pfree(enc->live_attno);
 	pfree(enc->has_missing);
 	pfree(enc->nulls);
+	pfree(enc->extra_attno);
 	pfree(enc);
 }
 
@@ -209,6 +342,9 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 		"no local OIDs",
 	},
 	.begin = canonical_begin,
+	.layout = canonical_layout,
+	.begin_layout = canonical_begin_layout,
+	.reads_layout = canonical_reads_layout,
 	.encode = canonical_encode,
 	.decode = canonical_decode,
 	.end = canonical_end,
