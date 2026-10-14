@@ -5,3 +5,4 @@ test: sem_indexes
 test: sem_transactions
 test: sem_constraints
 test: sem_maintenance
+test: sem_sampling

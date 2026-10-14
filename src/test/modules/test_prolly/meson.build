@@ -35,6 +35,7 @@ tests += {
       'test_prolly',
       'd1_tables',
       'd1_index',
+      'd1_maintenance',
     ],
   },
   'tap': {
@@ -48,6 +49,7 @@ tests += {
       't/007_d1_commit_capacity.pl',
       't/008_d1_writers.pl',
       't/009_d1_index.pl',
+      't/010_d1_maintenance.pl',
     ],
   },
 }

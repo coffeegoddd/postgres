@@ -38,6 +38,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_indexam.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
@@ -46,6 +47,7 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "executor/executor.h"
+#include "nodes/tidbitmap.h"
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -593,6 +595,7 @@ typedef struct ProllyIndexScanOpaque
 	int			nkeys;
 	CommandId	cid;
 	ProllyCursor *cursor;
+	Relation	table;			/* opened here for a bitmap scan, else NULL */
 	ProllyRowIdScan *rowid;
 	Datum	   *values;
 	bool	   *isnull;
@@ -786,8 +789,12 @@ prolly_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->roots = PROLLY_CALL(so->c.engine, roots_acquire, scan->xs_snapshot);
 	so->cursor = PROLLY_CALL(so->c.engine, cursor_open, so->roots,
 							 scan->indexRelation, PROLLY_TREE_DATA, so->cid);
+	/* A bitmap scan isn't given the table; the executor has it locked. */
+	if (scan->heapRelation == NULL && so->table == NULL)
+		so->table = table_open(scan->indexRelation->rd_index->indrelid, NoLock);
 	so->rowid = PROLLY_CALL(so->c.row_identity, scan_begin, so->roots,
-							scan->heapRelation, so->cid);
+							scan->heapRelation ? scan->heapRelation : so->table,
+							so->cid);
 	MemoryContextSwitchTo(old);
 	so->positioned = false;
 	so->exhausted = false;
@@ -934,12 +941,28 @@ prolly_amgettuple(IndexScanDesc scan, ScanDirection direction)
 	}
 }
 
+/* Every matching entry's TID, into tbm; entries are exact, so no recheck. */
+static int64
+prolly_amgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+{
+	int64		ntids = 0;
+
+	while (prolly_amgettuple(scan, ForwardScanDirection))
+	{
+		tbm_add_tuples(tbm, &scan->xs_heaptid, 1, false);
+		ntids++;
+	}
+	return ntids;
+}
+
 static void
 prolly_amendscan(IndexScanDesc scan)
 {
 	ProllyIndexScanOpaque *so = (ProllyIndexScanOpaque *) scan->opaque;
 
 	close_cursor(so);
+	if (so->table)
+		table_close(so->table, NoLock);
 	MemoryContextDelete(so->mcxt);
 	pfree(so);
 }
@@ -1110,7 +1133,7 @@ prolly_indexam_handler(PG_FUNCTION_ARGS)
 		.ambeginscan = prolly_ambeginscan,
 		.amrescan = prolly_amrescan,
 		.amgettuple = prolly_amgettuple,
-		.amgetbitmap = NULL,
+		.amgetbitmap = prolly_amgetbitmap,
 		.amendscan = prolly_amendscan,
 		.ammarkpos = prolly_ammarkpos,
 		.amrestrpos = prolly_amrestrpos,

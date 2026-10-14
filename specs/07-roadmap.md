@@ -342,11 +342,47 @@ TRUNCATE, crash recovery and standby replay. Prolly indexes on heap tables
 are refused. Tests: conformance checks for index keying and key prefixes,
 `d1_index` (every index agrees with sequential scans, and its tree equals a
 freshly built index's after updates, deletes, rollbacks, keyless deletes and
-re-keying), `009_d1_index.pl`. Not yet: bitmap scans, INCLUDE columns,
+re-keying), `009_d1_index.pl`. Not yet: bitmap scans (built in 4d.4), INCLUDE columns,
 parallel scans and builds, predicate locks; deferrable unique constraints
 can't use prolly indexes (Postgres requires btree for constraint indexes).
 Scan bounds only narrow the scan (every key is checked on each entry), so
 their stop condition has no test that fails without it.
+
+**Status (2026-10-14): 4d.4 built.** The remaining table AM callbacks
+(decision: question 44).
+- ANALYZE: a new optional table AM callback, `relation_acquire_sample_rows`
+  (`tableam.h`, used by `analyze.c` for tables and inheritance children;
+  heap leaves it NULL). The tree interface gained `key_at` (the key at a
+  position, from subtree counts) and the engine interface `key_at` over a
+  table's committed data tree. The prolly sampler picks distinct positions
+  (selection when the table is under twice the sample, else random draws
+  redrawn for repeats), reads only those items, keeps a reservoir over the
+  rows of keyless items (identical rows), returns the sample in key order,
+  and skips an item reached twice after the transaction's own deletes.
+- TABLESAMPLE: pseudo-blocks of 64 items in key order, found by position, so
+  SYSTEM reads only the blocks it picks; each block runs to the next block's
+  first key as the transaction sees the table (its own writes are sampled
+  once), and a block with more rows than a page has offsets is shown to the
+  method a page at a time.
+- Bitmap scans: the table AM looks up each TID of the bitmap (all of a lossy
+  page's, rechecked); the prolly index AM has `amgetbitmap`.
+- CLUSTER and VACUUM FULL: the new storage takes the table's trees and TID
+  counter as they are (O(1); rows are in key order already), so trees,
+  digests and TIDs are unchanged; the row count reported sums identical rows.
+- Size estimates: pages from the item count and the columns' type widths
+  (stable across ANALYZE); rows from the rows per page ANALYZE recorded, as
+  heap estimates, so keyless tables with identical rows are planned by rows.
+Bugs found and fixed, each with a test that fails without the fix: the
+planner counted a keyless table's items, not its rows, and VACUUM FULL
+recorded that count; a bitmap index scan, which isn't given the table,
+crashed. Tests: `key_at` in the tree conformance checks, `sem_sampling` in
+the requirements suite (statistics, TABLESAMPLE, bitmap scans with lossy
+pages, CLUSTER and VACUUM FULL, against heap's output), `d1_maintenance`,
+`010_d1_maintenance.pl` (what ANALYZE reads; CLUSTER and VACUUM FULL across
+a crash and on a standby). Requirements suite against prolly_d1: the
+semantics group fails only on values larger than a node, PREPARE after
+prolly writes and temporary tables (`REFRESH MATERIALIZED VIEW
+CONCURRENTLY`).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

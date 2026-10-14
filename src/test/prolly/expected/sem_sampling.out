@@ -1,0 +1,295 @@
+--
+-- Semantics: statistics, sampling and bitmap scans.  Results only: these
+-- tables are small enough that ANALYZE samples every row, so statistics
+-- are exact; correlation and sizes are the engine's own.
+--
+CREATE TABLE st (id int PRIMARY KEY, k int, t text, n int);
+INSERT INTO st SELECT g, g % 10, 'v' || (g % 37), CASE WHEN g % 4 = 0 THEN NULL ELSE g % 100 END
+FROM generate_series(1, 20000) g;
+ANALYZE st;
+SELECT reltuples FROM pg_class WHERE relname = 'st';
+ reltuples 
+-----------
+     20000
+(1 row)
+
+SELECT attname, null_frac, n_distinct, most_common_vals::text, histogram_bounds::text
+FROM pg_stats WHERE tablename = 'st' AND attname IN ('k', 'n') ORDER BY attname;
+ attname | null_frac | n_distinct |                                                                                                      most_common_vals                                                                                                       | histogram_bounds 
+---------+-----------+------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------------
+ k       |         0 |         10 | {0,1,2,3,4,5,6,7,8,9}                                                                                                                                                                                                       | 
+ n       |      0.25 |         75 | {1,2,3,5,6,7,9,10,11,13,14,15,17,18,19,21,22,23,25,26,27,29,30,31,33,34,35,37,38,39,41,42,43,45,46,47,49,50,51,53,54,55,57,58,59,61,62,63,65,66,67,69,70,71,73,74,75,77,78,79,81,82,83,85,86,87,89,90,91,93,94,95,97,98,99} | 
+(2 rows)
+
+SELECT attname, null_frac, n_distinct, array_length(histogram_bounds, 1) AS bounds
+FROM pg_stats WHERE tablename = 'st' AND attname IN ('id', 't') ORDER BY attname;
+ attname | null_frac | n_distinct | bounds 
+---------+-----------+------------+--------
+ id      |         0 |         -1 |    101
+ t       |         0 |         37 |       
+(2 rows)
+
+-- After deletes and updates, ANALYZE sees only what's live.
+DELETE FROM st WHERE id > 15000;
+UPDATE st SET k = 99 WHERE id <= 1000;
+ANALYZE st;
+SELECT reltuples FROM pg_class WHERE relname = 'st';
+ reltuples 
+-----------
+     15000
+(1 row)
+
+SELECT n_distinct, most_common_vals::text FROM pg_stats
+WHERE tablename = 'st' AND attname = 'k';
+ n_distinct |     most_common_vals     
+------------+--------------------------
+         11 | {0,1,2,3,4,5,6,7,8,9,99}
+(1 row)
+
+-- No primary key, and identical rows: every copy counts.
+CREATE TABLE dup (a int, b text);
+INSERT INTO dup SELECT g % 50, 'same' FROM generate_series(1, 6000) g;
+ANALYZE dup;
+SELECT reltuples FROM pg_class WHERE relname = 'dup';
+ reltuples 
+-----------
+      6000
+(1 row)
+
+SELECT attname, n_distinct, most_common_freqs[1] AS top_freq FROM pg_stats
+WHERE tablename = 'dup' ORDER BY attname;
+ attname | n_distinct | top_freq 
+---------+------------+----------
+ a       |         50 |     0.02
+ b       |          1 |        1
+(2 rows)
+
+-- An inheritance tree is sampled as a whole and child by child.
+CREATE TABLE sparent (id int, v int);
+CREATE TABLE schild (extra int) INHERITS (sparent);
+INSERT INTO sparent SELECT g, g % 3 FROM generate_series(1, 300) g;
+INSERT INTO schild SELECT g, g % 7, 0 FROM generate_series(1, 700) g;
+ANALYZE sparent;
+SELECT inherited, n_distinct FROM pg_stats
+WHERE tablename = 'sparent' AND attname = 'v' ORDER BY inherited;
+ inherited | n_distinct 
+-----------+------------
+ f         |          3
+ t         |          7
+(2 rows)
+
+-- A column list, and VACUUM ANALYZE.
+CREATE TABLE cols (a int, b int);
+INSERT INTO cols SELECT g, g % 5 FROM generate_series(1, 1000) g;
+ANALYZE cols (b);
+SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'cols' ORDER BY attname;
+ attname | n_distinct 
+---------+------------
+ b       |          5
+(1 row)
+
+VACUUM ANALYZE cols;
+SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'cols' ORDER BY attname;
+ attname | n_distinct 
+---------+------------
+ a       |         -1
+ b       |          5
+(2 rows)
+
+-- TABLESAMPLE: all or nothing gives every row or none; a percentage gives
+-- some; the transaction's own writes are sampled like any rows.
+SELECT count(*), sum(id) FROM st TABLESAMPLE SYSTEM (100);
+ count |    sum    
+-------+-----------
+ 15000 | 112507500
+(1 row)
+
+SELECT count(*), sum(id) FROM st TABLESAMPLE BERNOULLI (100);
+ count |    sum    
+-------+-----------
+ 15000 | 112507500
+(1 row)
+
+SELECT count(*) FROM st TABLESAMPLE SYSTEM (0);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM st TABLESAMPLE BERNOULLI (0);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) BETWEEN 1000 AND 5000 AS some FROM st TABLESAMPLE BERNOULLI (20) REPEATABLE (3);
+ some 
+------
+ t
+(1 row)
+
+SELECT count(*) < 15000 AS fewer FROM st TABLESAMPLE SYSTEM (20) REPEATABLE (3);
+ fewer 
+-------
+ t
+(1 row)
+
+SELECT count(*) FROM dup TABLESAMPLE SYSTEM (100);
+ count 
+-------
+  6000
+(1 row)
+
+BEGIN;
+DELETE FROM st WHERE id % 3 = 0;
+INSERT INTO st SELECT g, 1, 'new', 1 FROM generate_series(15001, 25000) g;
+UPDATE st SET t = 'upd' WHERE id % 7 = 0;
+SELECT count(*), count(DISTINCT id), sum(id) FROM st TABLESAMPLE SYSTEM (100);
+ count | count |    sum    
+-------+-------+-----------
+ 20000 | 20000 | 275005000
+(1 row)
+
+SELECT count(*), count(DISTINCT id), sum(id) FROM st TABLESAMPLE BERNOULLI (100);
+ count | count |    sum    
+-------+-------+-----------
+ 20000 | 20000 | 275005000
+(1 row)
+
+SELECT count(*) FROM st TABLESAMPLE SYSTEM (100) WHERE t = 'upd';
+ count 
+-------
+  2857
+(1 row)
+
+ROLLBACK;
+BEGIN;
+CREATE TABLE fresh (id int PRIMARY KEY);
+INSERT INTO fresh SELECT generate_series(1, 5000);
+SELECT count(*), sum(id) FROM fresh TABLESAMPLE SYSTEM (100);
+ count |   sum    
+-------+----------
+  5000 | 12502500
+(1 row)
+
+ROLLBACK;
+-- Bitmap scans: OR and AND of indexes, rows changed by the transaction,
+-- and lossy pages (a small work_mem and a large bitmap) that must be
+-- rechecked.
+CREATE TABLE bm (id int PRIMARY KEY, g int, s text);
+INSERT INTO bm SELECT i, i % 50, 'x' || (i % 7) FROM generate_series(1, 50000) i;
+CREATE INDEX bm_g ON bm (g);
+CREATE INDEX bm_s ON bm (s);
+ANALYZE bm;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SELECT count(*), sum(id) FROM bm WHERE g = 3 OR s = 'x2';
+ count |    sum    
+-------+-----------
+  8001 | 199998981
+(1 row)
+
+SELECT count(*), sum(id) FROM bm WHERE g = 3 AND s = 'x2';
+ count |   sum   
+-------+---------
+   142 | 3546876
+(1 row)
+
+SELECT count(*), sum(id) FROM bm WHERE g IN (1, 2, 3) AND id < 20000;
+ count |   sum    
+-------+----------
+  1200 | 11972400
+(1 row)
+
+BEGIN;
+DELETE FROM bm WHERE id % 2 = 0;
+UPDATE bm SET s = 'x2' WHERE id % 3 = 0;
+INSERT INTO bm VALUES (60000, 3, 'x0');
+SELECT count(*), sum(id) FROM bm WHERE g = 3 OR s = 'x2';
+ count |    sum    
+-------+-----------
+ 11286 | 282161703
+(1 row)
+
+SELECT count(*), sum(id) FROM bm WHERE g = 3 AND s = 'x2';
+ count |   sum    
+-------+----------
+   428 | 10690584
+(1 row)
+
+ROLLBACK;
+CREATE TABLE wide (id int PRIMARY KEY, g int);
+INSERT INTO wide SELECT i, i % 3 FROM generate_series(1, 400000) i;
+CREATE INDEX wide_g ON wide (g);
+ANALYZE wide;
+SET work_mem = '64kB';
+SELECT count(*), sum(id) FROM bm WHERE g < 25 OR s = 'x2';
+ count |    sum    
+-------+-----------
+ 28572 | 714096461
+(1 row)
+
+SELECT count(*), sum(id) FROM bm WHERE g < 25 AND s <> 'x2';
+ count |    sum    
+-------+-----------
+ 21429 | 535528604
+(1 row)
+
+SELECT count(*), sum(id) FROM wide WHERE g = 1;
+ count  |     sum     
+--------+-------------
+ 133334 | 26666866667
+(1 row)
+
+SELECT count(*), sum(id) FROM wide WHERE g = 1 AND id % 2 = 0;
+ count |     sum     
+-------+-------------
+ 66667 | 13333533334
+(1 row)
+
+RESET work_mem;
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+-- CLUSTER and VACUUM FULL keep rows and indexes, including tables without
+-- a primary key.
+CLUSTER bm USING bm_g;
+SET enable_seqscan = off;
+SELECT count(*), sum(id) FROM bm WHERE g = 3;
+ count |   sum    
+-------+----------
+  1000 | 24978000
+(1 row)
+
+RESET enable_seqscan;
+VACUUM FULL dup;
+SELECT count(*), count(DISTINCT a) FROM dup;
+ count | count 
+-------+-------
+  6000 |    50
+(1 row)
+
+SELECT reltuples FROM pg_class WHERE relname = 'dup';
+ reltuples 
+-----------
+      6000
+(1 row)
+
+CREATE INDEX dup_a ON dup (a);
+CLUSTER dup USING dup_a;
+SELECT count(*), count(DISTINCT a) FROM dup;
+ count | count 
+-------+-------
+  6000 |    50
+(1 row)
+
+SELECT a, count(*) FROM dup WHERE a < 3 GROUP BY a ORDER BY a;
+ a | count 
+---+-------
+ 0 |   120
+ 1 |   120
+ 2 |   120
+(3 rows)
+
+DROP TABLE st, dup, sparent, schild, cols, bm, wide;

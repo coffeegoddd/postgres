@@ -1173,6 +1173,21 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	return found;
 }
 
+static bool
+d1_key_at(ProllyRootSet *roots, Relation tree, uint64 ordinal, StringInfo key)
+{
+	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
+	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	ProllyNodeRef base;
+
+	backend_init();
+	read_base(roots, sub, relnumber, find_writeset(sub, relnumber), &base);
+	if (base.hash.len == 0)
+		return false;
+	return PROLLY_CALL(backend.c.tree, key_at, &backend.memcmp_env, &base,
+					   ordinal, key);
+}
+
 static uint64
 d1_count_range(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 			   const ProllyKey *lo, const ProllyKey *hi)
@@ -1676,6 +1691,7 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.cursor_next = d1_cursor_next,
 	.cursor_close = d1_cursor_close,
 	.get = d1_get,
+	.key_at = d1_key_at,
 	.count_range = d1_count_range,
 	.put = d1_put,
 	.remove = d1_remove,
