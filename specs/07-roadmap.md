@@ -145,7 +145,7 @@ Order of work within the step:
 | 4b | Node store and WAL |
 | 4c | D1 tree operations |
 | 4d | Table and index AM wiring, single writer per table |
-| 4e | Concurrency: root-carrying snapshots first (B1, B2: every scan of a snapshot reads the same root set); K1 row-level locks replacing single_writer, so writers to different rows of one table run concurrently, as on heap; a commit pipeline that materializes changed trees before taking the branch's commit lock and, under it, replays the transaction's write set onto a newer head (row locks keep concurrent writers off each other's rows, so replay needs no merge); bounded transaction memory: write sets flushed to intermediate trees, with savepoint roots, their edits recovered at replay by tree diff (question 47); tree diff that skips unchanged internal subtrees, not only leaves (needed by replay; also status, diff, merge and transfer); TID counter ranges per backend already, per node if nodes share storage (question 37) |
+| 4e | Concurrency: root-carrying snapshots first (B1, B2: every scan of a snapshot reads the same root set); K1 row-level locks replacing single_writer, so writers to different rows of one table run concurrently, as on heap; a commit pipeline that materializes changed trees before taking the branch's commit lock and, under it, replays the transaction's write set onto a newer head (row locks keep concurrent writers off each other's rows, so replay needs no merge); bounded transaction memory: write sets flushed to intermediate trees, with savepoint roots, their edits recovered at replay by tree diff (question 47); tree diff that skips unchanged internal subtrees, not only leaves (needed by replay; also status, diff, merge and transfer); engine counters of nodes read and written, so tests can check complexity bounds (gate 7); TID counter ranges per backend already, per node if nodes share storage (question 37) |
 | 4f | Checkpoint, recovery, reclamation, and large values: out-of-line value trees whose references the node format exposes to walk, reclamation and transfer (question 48); reclamation from the full set of live roots (question 49), including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
 | 4g | V1–V3 and versioned catalogs: first, the canonical format freeze (a chunk rule independent of `BLCKSZ` with size targets set by measurement, question 45; portable codecs or refusal for `reg*` and extension types, question 35; collation versions, question 46); then catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap, and three-way merge that reuses unchanged subtrees |
 | 4h | S and V suites and correctness gates, including the history-independence gate |
@@ -417,6 +417,14 @@ failed with a duplicate-key error, and D1's write set kept the old key
 bytes, so an index-only scan returned the old spelling and the trees
 differed from ones written with the new value directly (the tree's diff now
 reports such a key as modified).
+
+**Complexity requirement (user, 2026-10-14).** Every version-control
+operation must at worst match Dolt's time and space bounds, ideally beat
+them (`10-complexity-requirements.md`). Two are not met today and are fixed
+in 4e: row diff (leaf walk, O(N / leaf size), instead of O((Δ + 1) log N))
+and pending-write memory (unbounded). The rest are met by design and
+checked when built (4g, V4); engines expose node read and write counters so
+tests can assert the bounds (gate 7).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

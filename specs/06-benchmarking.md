@@ -39,6 +39,11 @@ stock Postgres's `make check` doesn't run it. Gates 1 and 2 are its
    (different DDL orders, insert/delete churn, different clusters) gives
    identical canonical root hashes for their version-control commits (the
    commit ids differ: they also cover parents and message, as in Dolt).
+7. **Complexity** (`10-complexity-requirements.md`, user requirement
+   2026-10-14): every version-control operation is at worst as cheap as
+   Dolt's, in time and space. The V suite sweeps N with Δ fixed and Δ with N
+   fixed, and engine counters of nodes read and written are checked against
+   each operation's bound, with timing reported beside them.
 
 A failing gate is reported next to the numbers it affects.
 
