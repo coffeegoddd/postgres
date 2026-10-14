@@ -18,9 +18,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
 | Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
-| Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2 |
+| Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2. The writer lock is a stopgap: K1's row-level locks replace it in 4e |
 | Prolly indexes (17, 42, 43) | Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. Built in 4d.3 |
-| ANALYZE sampling (44) | Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts. Built in 4d.4 |
+| ANALYZE sampling (44) | Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts; keyless tables and tables the transaction wrote are read whole. Built in 4d.4 |
+| Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
@@ -53,6 +54,13 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    **Starting choice for the first engine (user, 2026-10-13):** boundaries
    depend on keys only, plus a forced split when the page is full. Size
    targets are set by measurement in step 4.
+   **Review (2026-10-14):** the starting targets aim at an item count
+   (about 31 leaf items per node, assuming 256-byte items), so a node of
+   narrow rows can hold about 1 KiB in an 8 KiB page; Dolt and DoltLite
+   split by accumulated bytes (a Weibull rule around 4 KiB, none below
+   512 bytes, forced at 16 KiB). The forced split at a full page also
+   makes boundaries depend on `BLCKSZ` (question 45). Measure occupancy
+   first; the rule and targets are settled with the format freeze (4g).
 4. **Canonical format.** Our own Postgres-native format (node layout, key and
    value encoding, content hash), or Dolt byte compatibility for DoltHub
    interop? Dolt compatibility would constrain nearly every foundation choice,
@@ -256,6 +264,18 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     - User data that holds OIDs (`oid` and `reg*` columns, large object
       references) is local by nature. Translate where the type says what it
       refers to (`regclass` → name), and refuse or pass through the rest?
+      **Recommended (2026-10-14):** this is a hole in the "no local OIDs"
+      promise today (the canonical encoder's fallback uses a type's send
+      function, and `regclasssend` sends the OID). Portable codecs for the
+      `reg*` types (by qualified name, as their output functions print
+      them); a version-control commit refuses a column of a type with no
+      known OID-free encoding (`oid` itself, unknown extension types), with
+      a clear error, rather than hashing a local identifier.
+    - Column identity across renames: Dolt keeps column tags across
+      renames, so a rename on one branch and an edit on another merge;
+      identity here is by name. Rows are encoded by column position, so a
+      rename leaves data trees untouched; the merge rules for a column
+      renamed on one branch and changed on the other are still to decide.
     - Rename detection in diff: by matching content hashes, with what
       threshold for "same table, changed"?
 36. **Keying user tables.** Postgres tables need not have a primary key,
@@ -374,3 +394,53 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     Tables of other AMs are untouched. Rejected: reading every row and
     letting reservoir sampling pick (O(N) for every ANALYZE, autovacuum's
     included).
+    **Changed 2026-10-14 (user), after review:** keyless tables are read
+    whole, into a reservoir over rows: an item holds identical rows, so
+    picking items gives every row the same chance but with huge variance
+    (a value that is most of the table, in one item, is usually missed).
+    Rejected: subtree counts weighted by rows (a format change through the
+    tree, engine and keying interfaces). A table the transaction has
+    written is read whole too (positions cover only the committed tree).
+45. **Canonical chunks and `BLCKSZ`.** Boundaries depend on page capacity
+    (a forced split when the page is full), so identical content on builds
+    with different page sizes makes different trees and different hashes;
+    the canonical form must not depend on a build option.
+    **Recommended (2026-10-14):** the canonical chunk rule has its own size
+    limits, fixed by the format and independent of `BLCKSZ` (byte targets
+    from question 3, an upper bound that fits an 8 KiB page); an engine
+    whose page can't hold a canonical chunk stores it in more than one
+    block. Alternative: require `BLCKSZ` = 8192 for prolly databases. To
+    settle with the format freeze (4g).
+46. **Collation versions in canonical form.** Keys ordered by a collation
+    (the key encoder's comparator fallback) are in an order that can change
+    with the collation library's version, so two clusters can order the
+    same keys differently.
+    **Recommended (2026-10-14):** the canonical schema records each key
+    column's collation and its version; transfer and merge between
+    mismatched versions refuse, or rebuild the affected trees. To settle
+    with the format freeze (4g).
+47. **Bounded transaction memory.** D1 keeps a transaction's writes, with
+    their command and subtransaction versions, in memory until commit, with
+    no limit; Dolt flushes after about 64K pending entries, DoltLite at
+    about 64 MiB or a million entries.
+    **Recommended (2026-10-14), for 4e:** past a threshold, versions older
+    than the current command are flushed into an intermediate tree, keeping
+    a root per open savepoint (Dolt's checkpoints) so rollback still works;
+    commit replays edits recovered by diffing the intermediate tree against
+    the base, which is why subtree-skipping diff comes with it.
+48. **Large values.** Items must fit a node, and prolly tables have no
+    TOAST table.
+    **Recommended (2026-10-14), for 4f:** out-of-line value trees in the
+    same root, as Dolt's blobs, reusing Postgres's compression methods; the
+    node format records where a value refers to another tree, so walk,
+    reclamation and transfer find every reference. Without that contract a
+    value tree would be invisible to GC and to push.
+49. **What reclamation must keep.** Reachability from branch heads alone
+    isn't enough.
+    **Recommended (2026-10-14), for 4f:** the live roots are every
+    branch's working-set head, every commit's canonical and local roots,
+    every root a running transaction or snapshot holds (its start, its
+    savepoints, intermediate trees of its write sets), roots pending in the
+    commit log, and the value trees all of these refer to. Gone row
+    versions still named by a live TID map are a separate retirement,
+    under Postgres's visibility and index-lifetime rules (question 40).

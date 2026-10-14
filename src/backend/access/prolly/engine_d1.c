@@ -85,6 +85,14 @@ typedef struct D1Version
 	bool		is_delete;
 	uint8	   *value;
 	uint32		len;
+
+	/*
+	 * The key as this version wrote it, if its bytes differ from the
+	 * entry's (keys equal by the tree's order, such as 'a' and 'A' under a
+	 * case-insensitive collation); NULL: the entry's.
+	 */
+	uint8	   *key;
+	uint32		keylen;
 } D1Version;
 
 /* A key in a write set, with its versions in the order they were written. */
@@ -609,9 +617,23 @@ ws_write(D1WriteSet *ws, const ProllyKey *key, const ProllyValue *value,
 		v->cid = cid;
 		v->subxid = subxid;
 	}
-	else if (v->value)
-		pfree(v->value);	/* the same command writing the key again */
+	else
+	{
+		/* The same command writing the key again. */
+		if (v->value)
+			pfree(v->value);
+		if (v->key)
+			pfree(v->key);
+	}
 
+	v->key = NULL;
+	v->keylen = 0;
+	if (key->len != e->keylen || memcmp(key->data, e->key, key->len) != 0)
+	{
+		v->key = palloc(Max(key->len, 1));
+		memcpy(v->key, key->data, key->len);
+		v->keylen = key->len;
+	}
 	v->is_delete = (value == NULL);
 	v->value = NULL;
 	v->len = 0;
@@ -622,6 +644,17 @@ ws_write(D1WriteSet *ws, const ProllyKey *key, const ProllyValue *value,
 		v->len = value->len;
 	}
 	MemoryContextSwitchTo(old);
+}
+
+/* The key bytes version v of entry e was written with. */
+static inline ProllyKey
+version_key(const D1Entry *e, const D1Version *v)
+{
+	ProllyKey	k;
+
+	k.data = v->key ? v->key : e->key;
+	k.len = v->key ? v->keylen : e->keylen;
+	return k;
 }
 
 /*
@@ -1022,7 +1055,11 @@ next_unordered(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 		v = visible_version(e, c->cid);
 		if (v == NULL || v->is_delete)
 			continue;
-		return_key(c, e->key, e->keylen, key);
+		{
+			ProllyKey	vk = version_key(e, v);
+
+			return_key(c, vk.data, vk.len, key);
+		}
 		value->data = v->value;
 		value->len = v->len;
 		return true;
@@ -1087,7 +1124,11 @@ d1_cursor_next(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 			c->t_have = false;
 		if (v->is_delete)
 			continue;
-		return_key(c, c->o_entry->key, c->o_entry->keylen, key);
+		{
+			ProllyKey	vk = version_key(c->o_entry, v);
+
+			return_key(c, vk.data, vk.len, key);
+		}
 		value->data = v->value;
 		value->len = v->len;
 		return true;
@@ -1371,8 +1412,7 @@ materialize_unordered(D1WriteSet *ws, ProllyNodeRef *out)
 			cap *= 2;
 			rows = repalloc(rows, sizeof(D1Row) * cap);
 		}
-		rows[nrows].key.data = e->key;
-		rows[nrows].key.len = e->keylen;
+		rows[nrows].key = version_key(e, v);
 		rows[nrows].value.data = v->value;
 		rows[nrows].value.len = v->len;
 		nrows++;
@@ -1423,8 +1463,7 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 		if (e->nversions == 0)
 			continue;
 		v = &e->versions[e->nversions - 1];
-		edits[n].key.data = e->key;
-		edits[n].key.len = e->keylen;
+		edits[n].key = version_key(e, v);
 		edits[n].is_delete = v->is_delete;
 		edits[n].value.data = v->value;
 		edits[n].value.len = v->len;
@@ -1650,6 +1689,8 @@ d1_subxact_abort(SubTransactionId subxid)
 
 				if (v->value)
 					pfree(v->value);
+				if (v->key)
+					pfree(v->key);
 			}
 			if (e->nversions == 0)
 			{

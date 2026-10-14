@@ -257,6 +257,9 @@ static const ConformanceCase cases[] = {
 	"build_begin build_add build_finish apply walk", tree_edits_share_nodes},
 	{PROLLY_IFACE_TREE, "diff_reports_changes",
 	"build_begin build_add build_finish apply diff", tree_diff_reports_changes},
+	{PROLLY_IFACE_TREE, "equal_keys_take_new_bytes",
+	"build_begin build_add build_finish apply cursor_open cursor_seek cursor_next cursor_close diff",
+	tree_equal_keys_take_new_bytes},
 	{PROLLY_IFACE_TREE, "nodes_are_valid",
 	"build_begin build_add build_finish walk", tree_nodes_are_valid},
 
