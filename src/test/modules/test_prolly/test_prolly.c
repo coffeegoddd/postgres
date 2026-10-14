@@ -202,6 +202,8 @@ static const ConformanceCase cases[] = {
 	"open describe keyless encode_row close", keying_description_reopens},
 	{PROLLY_IFACE_TABLE_KEYING, "reads_after_key_column_dropped",
 	"open describe encode_row compare decode_row close", keying_reads_dropped_key},
+	{PROLLY_IFACE_TABLE_KEYING, "cannot_compare_after_key_type_dropped",
+	"open describe can_compare close", keying_compare_after_type_dropped},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",
@@ -677,5 +679,79 @@ prolly_fail_next_commit(PG_FUNCTION_ARGS)
 		fail_callback_registered = true;
 	}
 	fail_after_lxid = MyProc->vxid.lxid;
+	PG_RETURN_VOID();
+}
+
+/*
+ * prolly_commit_test_enqueue(implementation, branch): commit a made-up
+ * root to a branch of the current database through a commit pipeline, as
+ * part of the current transaction: published if it commits, abandoned if
+ * it aborts.  For filling a pipeline's tables in tests; nothing reads the
+ * branches it writes, so use branches other than the main one.
+ */
+PG_FUNCTION_INFO_V1(prolly_commit_test_enqueue);
+
+#define MAX_TEST_TICKETS 4096
+
+static const ProllyCommitRoutine *test_tickets_routine = NULL;
+static ProllyCommitTicket test_tickets[MAX_TEST_TICKETS];
+static int	ntest_tickets = 0;
+static bool test_tickets_registered = false;
+
+static void
+test_tickets_callback(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
+		return;
+	for (int i = 0; i < ntest_tickets; i++)
+	{
+		if (event == XACT_EVENT_COMMIT)
+			PROLLY_CALL(test_tickets_routine, publish, test_tickets[i]);
+		else
+			PROLLY_CALL(test_tickets_routine, abandon, test_tickets[i]);
+	}
+	ntest_tickets = 0;
+}
+
+Datum
+prolly_commit_test_enqueue(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int64		branch = PG_GETARG_INT64(1);
+	const ProllyCommitRoutine *r = prolly_commit_lookup(name);
+	ProllyNodeRef base;
+	ProllyNodeRef root;
+
+	if (r == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("no commit pipeline implementation \"%s\"", name)));
+	if (branch <= PROLLY_MAIN_BRANCH || branch > PG_UINT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("test commits go to branches after the main one")));
+	if (ntest_tickets > 0 && test_tickets_routine != r)
+		elog(ERROR, "test commits to two pipelines in one transaction");
+	if (ntest_tickets >= MAX_TEST_TICKETS)
+		elog(ERROR, "too many test commits in one transaction");
+	if (!test_tickets_registered)
+	{
+		RegisterXactCallback(test_tickets_callback, NULL);
+		test_tickets_registered = true;
+	}
+
+	memset(&root, 0, sizeof(root));
+	root.location.blkno = InvalidBlockNumber;
+	root.hash.len = 32;
+	for (int i = 0; i < 32; i++)
+		root.hash.bytes[i] = (uint8) ((branch >> ((i % 8) * 8)) ^ (i * 37) ^
+									  MyProc->vxid.lxid);
+
+	PROLLY_CALL(r, branch_lock, (ProllyBranchId) branch);
+	(void) PROLLY_CALL(r, tip, (ProllyBranchId) branch, &base);
+	test_tickets_routine = r;
+	test_tickets[ntest_tickets++] = PROLLY_CALL(r, enqueue,
+												(ProllyBranchId) branch, &root);
+	PROLLY_CALL(r, branch_unlock, (ProllyBranchId) branch);
 	PG_RETURN_VOID();
 }

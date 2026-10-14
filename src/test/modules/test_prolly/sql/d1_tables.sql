@@ -144,6 +144,34 @@ INSERT INTO d1_dropkeytype VALUES ('three');
 SELECT * FROM d1_dropkeytype ORDER BY v;
 DROP TABLE d1_dropkey, d1_dropkeytype;
 
+-- The key's type dropped while the transaction has rows of its own in
+-- the table: reads merge them with the committed rows, writes rebuild,
+-- and a commit with nothing written since stores them.
+CREATE TYPE d1_mood2 AS ENUM ('sad', 'happy', 'meh');
+CREATE TABLE d1_droptype_active (m d1_mood2 PRIMARY KEY, v text);
+INSERT INTO d1_droptype_active VALUES ('sad', 'old'), ('meh', 'older');
+BEGIN;
+INSERT INTO d1_droptype_active VALUES ('happy', 'new');
+DROP TYPE d1_mood2 CASCADE;
+SAVEPOINT after_drop;
+SELECT * FROM d1_droptype_active ORDER BY v;
+ROLLBACK TO after_drop;
+INSERT INTO d1_droptype_active VALUES ('third');
+SELECT * FROM d1_droptype_active ORDER BY v;
+ROLLBACK;
+SELECT * FROM d1_droptype_active ORDER BY v;
+CREATE TYPE d1_mood3 AS ENUM ('sad', 'happy', 'meh');
+CREATE TABLE d1_droptype_commit (m d1_mood3 PRIMARY KEY, v text);
+INSERT INTO d1_droptype_commit VALUES ('sad', 'old'), ('meh', 'older');
+BEGIN;
+INSERT INTO d1_droptype_commit VALUES ('happy', 'new');
+DROP TYPE d1_mood3 CASCADE;
+COMMIT;
+SELECT * FROM d1_droptype_commit ORDER BY v;
+INSERT INTO d1_droptype_commit VALUES ('fourth');
+SELECT * FROM d1_droptype_commit ORDER BY v;
+DROP TABLE d1_droptype_active, d1_droptype_commit;
+
 -- A table created and filled in one transaction.
 BEGIN;
 CREATE TABLE d1_new (n int);

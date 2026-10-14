@@ -22,6 +22,11 @@
  *   carries count >= 1.
  * - decode_row(encode_row(slot)) gives back the same attribute values.
  * - compare() orders keys as the data tree must be ordered.
+ * - can_compare() is false when compare() can no longer order the keys
+ *   of a keying opened from a description, because something it orders
+ *   by (a key column's type, operator family or collation) has since
+ *   been dropped.  Callers can still match keys by their bytes, which
+ *   agrees with compare() except under a nondeterministic collation.
  * - A keying is opened for one relation and is valid until the relation's
  *   relcache entry is rebuilt; callers reopen after invalidation.  It
  *   holds nothing but memory in the context it was opened in.
@@ -102,13 +107,15 @@ typedef struct ProllyKeyingRoutine
 
 	int			(*compare) (ProllyKeying *k, const ProllyKey *a,
 							const ProllyKey *b);
+	bool		(*can_compare) (ProllyKeying *k);
 
 	void		(*close) (ProllyKeying *k);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "describe", "can_read", "keyless", "encode_row", "make_value", \
-	"parse_value", "content_hash", "decode_row", "compare", "close"
+	"parse_value", "content_hash", "decode_row", "compare", "can_compare", \
+	"close"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 
 static inline const ProllyKeyingRoutine *

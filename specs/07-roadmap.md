@@ -274,7 +274,12 @@ reports a pipeline's heads and pending entries. A full heads table
 commit record, and again on every replay; a commit needing a new head now
 reserves its slot when it enqueues and fails with an ERROR instead
 (`debug_prolly_max_branch_heads` lowers the limit for tests,
-`006_d1_head_limit.pl`). Each has tests
+`006_d1_head_limit.pl`). Redo settles a branch's previous entry before
+adding the next and makes room from replayed commits and aborts, so
+recovery replays every accepted commit at the real 1024-entry capacity
+(`007_d1_commit_capacity.pl`). Keyings gained `can_compare`: after a key's
+type is dropped D1 matches keys by bytes, so a transaction's own rows
+are still read, rebuilt and committed. Each has tests
 (`003_d1_cleanup.pl`, `004_d1_databases.pl`, `005_d1_pending.pl`,
 `103_database_copy.pl`, `sem_ddl`, `sem_transactions`).
 

@@ -62,6 +62,7 @@ extern void keying_round_trip(const ProllyImplInfo *impl);
 extern void keying_keys_and_content(const ProllyImplInfo *impl);
 extern void keying_description_reopens(const ProllyImplInfo *impl);
 extern void keying_reads_dropped_key(const ProllyImplInfo *impl);
+extern void keying_compare_after_type_dropped(const ProllyImplInfo *impl);
 extern void valenc_decodes_earlier_layouts(const ProllyImplInfo *impl);
 extern void rowid_assign_then_resolve(const ProllyImplInfo *impl);
 extern void rowid_same_version_same_tid(const ProllyImplInfo *impl);

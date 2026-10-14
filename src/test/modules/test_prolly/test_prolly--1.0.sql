@@ -60,3 +60,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION prolly_fail_next_commit()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Commit a made-up root to a branch (after the main one) of the current
+-- database through a commit pipeline, as part of the current transaction.
+CREATE FUNCTION prolly_commit_test_enqueue(implementation text, branch int8)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
