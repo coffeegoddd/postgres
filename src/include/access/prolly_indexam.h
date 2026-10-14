@@ -33,4 +33,10 @@ extern void prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 /* Rebuild every prolly index of heap from its rows. */
 extern void prolly_index_rebuild_all(Relation heap);
 
+/*
+ * Rebuild index from heap's rows as every write so far sees them; the
+ * caller holds the right to write heap, so nothing changes meanwhile.
+ */
+extern void prolly_index_rebuild(Relation heap, Relation index);
+
 #endif							/* PROLLY_INDEXAM_H */

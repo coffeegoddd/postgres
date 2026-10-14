@@ -511,6 +511,7 @@ prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 		StringInfoData entry;
 		ProllyKey	e;
 
+		/* An index still being built concurrently is rebuilt when validated. */
 		if (!prolly_index_is_prolly(index))
 		{
 			index_close(index, NoLock);
@@ -548,6 +549,16 @@ prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 }
 
 void
+prolly_index_rebuild(Relation heap, Relation index)
+{
+	ProllyComponents c;
+
+	prolly_components_for_relation(index, &c);
+	PROLLY_CALL(c.engine, tree_reset, index, PROLLY_TREE_DATA);
+	(void) build_entries(&c, heap, index, BuildIndexInfo(index));
+}
+
+void
 prolly_index_rebuild_all(Relation heap)
 {
 	List	   *indexes;
@@ -559,14 +570,9 @@ prolly_index_rebuild_all(Relation heap)
 	foreach(lc, indexes)
 	{
 		Relation	index = index_open(lfirst_oid(lc), RowExclusiveLock);
-		ProllyComponents c;
 
 		if (prolly_index_is_prolly(index))
-		{
-			prolly_components_for_relation(index, &c);
-			PROLLY_CALL(c.engine, tree_reset, index, PROLLY_TREE_DATA);
-			(void) build_entries(&c, heap, index, BuildIndexInfo(index));
-		}
+			prolly_index_rebuild(heap, index);
 		index_close(index, NoLock);
 	}
 	list_free(indexes);
@@ -597,6 +603,7 @@ typedef struct ProllyIndexScanOpaque
 
 	bool		positioned;
 	ScanDirection dir;
+	bool		exhausted;		/* ran off the end in direction dir */
 	StringInfoData current;		/* the last entry returned */
 	StringInfoData mark;		/* ammarkpos's entry */
 	bool		have_mark;
@@ -783,6 +790,7 @@ prolly_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 							scan->heapRelation, so->cid);
 	MemoryContextSwitchTo(old);
 	so->positioned = false;
+	so->exhausted = false;
 	so->have_mark = false;
 	so->skipping = false;
 	resetStringInfo(&so->current);
@@ -858,11 +866,17 @@ prolly_amgettuple(IndexScanDesc scan, ScanDirection direction)
 	StringInfo	stop = forward ? &so->upper : &so->lower;
 	ProllyKey	stopkey = {(const uint8 *) stop->data, stop->len};
 
-	/* Start, or turn around at the last entry returned. */
+	/*
+	 * Start; or turn around: at the last entry returned, or, past the end,
+	 * at the scan's bound in the new direction (whose first entry is the
+	 * one returned last).
+	 */
 	if (!so->positioned)
 		position(so, direction, NULL);
 	else if (so->dir != direction)
-		position(so, direction, so->current.len > 0 ? &so->current : NULL);
+		position(so, direction,
+				 !so->exhausted && so->current.len > 0 ? &so->current : NULL);
+	so->exhausted = false;
 
 	for (;;)
 	{
@@ -874,7 +888,10 @@ prolly_amgettuple(IndexScanDesc scan, ScanDirection direction)
 
 		CHECK_FOR_INTERRUPTS();
 		if (!PROLLY_CALL(so->c.engine, cursor_next, so->cursor, &key, &value))
+		{
+			so->exhausted = true;
 			return false;
+		}
 		if (so->skipping)
 		{
 			so->skipping = false;
@@ -888,7 +905,10 @@ prolly_amgettuple(IndexScanDesc scan, ScanDirection direction)
 										&key, &stopkey);
 
 			if (forward ? r > 0 : r < 0)
+			{
+				so->exhausted = true;
 				return false;
+			}
 		}
 		MemoryContextReset(so->tuplecxt);
 		old = MemoryContextSwitchTo(so->tuplecxt);

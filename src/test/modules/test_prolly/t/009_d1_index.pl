@@ -81,4 +81,48 @@ is($primary->safe_psql('postgres', q{
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
 	SELECT id FROM t WHERE v = 'same'}), '3000', 'the first row stays');
 
+# CREATE INDEX CONCURRENTLY while another session updates or deletes a
+# row: the index is right once valid.  The build pauses on an advisory
+# lock in the indexed expression when it reaches the row with v = 10.
+$primary->safe_psql('postgres', q{
+	CREATE FUNCTION cic_key(int) RETURNS int IMMUTABLE LANGUAGE plpgsql AS $$
+	BEGIN
+		IF $1 = 10 THEN
+			PERFORM pg_advisory_lock(606);
+			PERFORM pg_advisory_unlock(606);
+		END IF;
+		RETURN $1;
+	END $$;
+});
+for my $case (['UPDATE cic SET v = 25 WHERE id = 2', '|1|2|25'],
+	['DELETE FROM cic WHERE id = 2', '|0||'])
+{
+	my ($dml, $want) = @$case;
+	$primary->safe_psql('postgres', q{
+		DROP TABLE IF EXISTS cic;
+		CREATE TABLE cic (id int PRIMARY KEY, v int);
+		INSERT INTO cic VALUES (1, 10), (2, 20);
+	});
+	my $holder = $primary->background_psql('postgres');
+	my $builder = $primary->background_psql('postgres');
+	$holder->query_safe('SELECT pg_advisory_lock(606)');
+	$builder->query_until(qr/go/,
+		"\\echo go\nCREATE INDEX CONCURRENTLY cic_i ON cic USING prolly (cic_key(v));\n");
+	$primary->poll_query_until('postgres', q{
+		SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+	}) or die 'the build did not pause';
+	$holder->query_safe($dml);
+	$holder->query_safe('SELECT pg_advisory_unlock(606)');
+	$builder->query_safe('SELECT 1');
+	$holder->quit;
+	$builder->quit;
+	is($primary->safe_psql('postgres', q{
+		SET enable_seqscan = off; SET enable_bitmapscan = off;
+		SELECT (SELECT id FROM cic WHERE cic_key(v) = 20),
+			   (SELECT count(*) FROM cic WHERE cic_key(v) = 25),
+			   (SELECT id FROM cic WHERE cic_key(v) = 25),
+			   (SELECT v FROM cic WHERE cic_key(v) = 25)}),
+		$want, "CREATE INDEX CONCURRENTLY with a concurrent '$dml'");
+}
+
 done_testing();

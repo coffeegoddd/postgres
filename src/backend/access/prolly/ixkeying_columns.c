@@ -30,7 +30,9 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "catalog/pg_type.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 #define TAG_ENTRY		0
@@ -111,7 +113,14 @@ columns_open(Relation index, const ProllyValue *description, MemoryContext mcxt)
 		k->cols = palloc0(sizeof(IxColumn) * k->nkeys);
 		for (int i = 0; i < k->nkeys; i++)
 		{
+			/*
+			 * The operator class's input type, unless that is polymorphic
+			 * (anyenum, anyarray): then the indexed column's own type.
+			 */
 			k->cols[i].type = index->rd_opcintype[i];
+			if (IsPolymorphicType(k->cols[i].type) ||
+				get_typtype(k->cols[i].type) == TYPTYPE_PSEUDO)
+				k->cols[i].type = TupleDescAttr(RelationGetDescr(index), i)->atttypid;
 			k->cols[i].opfamily = index->rd_opfamily[i];
 			k->cols[i].collation = index->rd_indcollation[i];
 			k->cols[i].option = index->rd_indoption[i];
