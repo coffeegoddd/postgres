@@ -269,7 +269,12 @@ table's first write. A copy's pending heads are published or dropped
 when its transaction ends, and checkpoints on a primary settle pending
 entries nobody else will (their xids are invisible to commit-log
 truncation and wraparound); restartpoints don't. A `usage` callback
-reports a pipeline's heads and pending entries. Each has tests
+reports a pipeline's heads and pending entries. A full heads table
+(1024 database-branch pairs across the cluster) used to PANIC after the
+commit record, and again on every replay; a commit needing a new head now
+reserves its slot when it enqueues and fails with an ERROR instead
+(`debug_prolly_max_branch_heads` lowers the limit for tests,
+`006_d1_head_limit.pl`). Each has tests
 (`003_d1_cleanup.pl`, `004_d1_databases.pl`, `005_d1_pending.pl`,
 `103_database_copy.pl`, `sem_ddl`, `sem_transactions`).
 

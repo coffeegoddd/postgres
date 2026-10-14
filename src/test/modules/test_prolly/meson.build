@@ -43,6 +43,7 @@ tests += {
       't/003_d1_cleanup.pl',
       't/004_d1_databases.pl',
       't/005_d1_pending.pl',
+      't/006_d1_head_limit.pl',
     ],
   },
 }
