@@ -45,6 +45,7 @@ tests += {
       't/005_d1_pending.pl',
       't/006_d1_head_limit.pl',
       't/007_d1_commit_capacity.pl',
+      't/008_d1_writers.pl',
     ],
   },
 }

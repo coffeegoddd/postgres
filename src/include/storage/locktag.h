@@ -48,9 +48,10 @@ typedef enum LockTagType
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
 	LOCKTAG_PROLLY_BRANCH,		/* the right to commit to a prolly branch */
+	LOCKTAG_PROLLY_TABLE,		/* the right to write a prolly table */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_BRANCH
+#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_TABLE
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -198,6 +199,19 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field3 = 0, \
 	 (locktag).locktag_field4 = 0, \
 	 (locktag).locktag_type = LOCKTAG_PROLLY_BRANCH, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
+/*
+ * ID info for the right to write a prolly table is DB OID + REL OID, as
+ * for a relation lock, but a separate lock: it conflicts only with other
+ * holders of it, never with the relation's own locks.
+ */
+#define SET_LOCKTAG_PROLLY_TABLE(locktag,dboid,reloid) \
+	((locktag).locktag_field1 = (dboid), \
+	 (locktag).locktag_field2 = (reloid), \
+	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_PROLLY_TABLE, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 #endif							/* _PG_LOCKTAG_H_ */

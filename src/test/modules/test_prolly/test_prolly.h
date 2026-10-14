@@ -65,8 +65,8 @@ extern void keying_reads_dropped_key(const ProllyImplInfo *impl);
 extern void keying_compare_after_type_dropped(const ProllyImplInfo *impl);
 extern void valenc_decodes_earlier_layouts(const ProllyImplInfo *impl);
 extern void rowid_assign_then_resolve(const ProllyImplInfo *impl);
-extern void rowid_same_version_same_tid(const ProllyImplInfo *impl);
-extern void rowid_hashed_displaced_version(const ProllyImplInfo *impl);
+extern void rowid_rename_keeps_tid(const ProllyImplInfo *impl);
+extern void rowid_never_reused(const ProllyImplInfo *impl);
 
 /* rootlayout_checks.c */
 extern void rootlayout_empty(const ProllyImplInfo *impl);

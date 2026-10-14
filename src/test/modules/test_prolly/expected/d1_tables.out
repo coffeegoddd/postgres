@@ -362,6 +362,240 @@ SELECT * FROM d1_droptype_commit ORDER BY v;
 (4 rows)
 
 DROP TABLE d1_droptype_active, d1_droptype_commit;
+-- A row inserted again after its insert rolled back: indexes hold one
+-- entry for it, and a retried batch isn't refused as a duplicate.
+CREATE TABLE d1_retry (id int PRIMARY KEY, a int, t text);
+CREATE INDEX d1_retry_a ON d1_retry (a);
+BEGIN;
+INSERT INTO d1_retry VALUES (1, 10, 'x');
+ROLLBACK;
+INSERT INTO d1_retry VALUES (1, 10, 'x');
+INSERT INTO d1_retry VALUES (2, 20, 'y'), (2, 20, 'dup');
+ERROR:  duplicate key value violates unique constraint "d1_retry_pkey"
+INSERT INTO d1_retry VALUES (2, 20, 'y'), (3, 30, 'z');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, a, t FROM d1_retry WHERE a = 10;
+ id | a  | t 
+----+----+---
+  1 | 10 | x
+(1 row)
+
+SELECT id, a, t FROM d1_retry WHERE id = 2;
+ id | a  | t 
+----+----+---
+  2 | 20 | y
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) FROM d1_retry;
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE d1_retry;
+-- A rewrite goes through a table without a primary key; the statement
+-- whose first write rebuilds the tree under the key is still scanning the
+-- old one, and finds every row's TID.
+CREATE TABLE d1_retype (id int PRIMARY KEY, b int, c int DEFAULT 7);
+INSERT INTO d1_retype VALUES (1, 1, NULL), (2, 2, 3), (3, 3, NULL);
+ALTER TABLE d1_retype ALTER COLUMN b TYPE bigint;
+UPDATE d1_retype SET c = 0 WHERE c IS NULL;
+SELECT id, b, c FROM d1_retype ORDER BY id;
+ id | b | c 
+----+---+---
+  1 | 1 | 0
+  2 | 2 | 3
+  3 | 3 | 0
+(3 rows)
+
+DROP TABLE d1_retype;
+-- Rows by TID: updates, deletes, index scans, ctid, xmin.
+CREATE TABLE d1_rows (id int PRIMARY KEY, v text);
+CREATE INDEX d1_rows_v ON d1_rows (v);
+INSERT INTO d1_rows SELECT g, 'v' || g FROM generate_series(1, 20) g;
+UPDATE d1_rows SET v = v || '!' WHERE id <= 5;
+DELETE FROM d1_rows WHERE id > 15;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, v FROM d1_rows WHERE id = 3;
+ id |  v  
+----+-----
+  3 | v3!
+(1 row)
+
+SELECT id, v FROM d1_rows WHERE v = 'v3!';
+ id |  v  
+----+-----
+  3 | v3!
+(1 row)
+
+SELECT count(*) FROM d1_rows WHERE v = 'v3';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM d1_rows WHERE id > 15;
+ count 
+-------
+     0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT ctid AS t7 FROM d1_rows WHERE id = 7 \gset
+SELECT xmin AS x7 FROM d1_rows WHERE id = 7 \gset
+SELECT xmin AS x8 FROM d1_rows WHERE id = 8 \gset
+UPDATE d1_rows SET v = 'seven' WHERE id = 7;
+SELECT count(*) AS old_tid_finds FROM d1_rows WHERE ctid = :'t7';
+ old_tid_finds 
+---------------
+             0
+(1 row)
+
+SELECT (SELECT xmin::text FROM d1_rows WHERE id = 7) <> :'x7' AS changed_row_new_xmin,
+	   (SELECT xmin::text FROM d1_rows WHERE id = 8) = :'x8' AS other_row_same_xmin;
+ changed_row_new_xmin | other_row_same_xmin 
+----------------------+---------------------
+ t                    | t
+(1 row)
+
+SELECT currtid2('d1_rows', :'t7') = (SELECT ctid FROM d1_rows WHERE id = 7)
+	AS follows_update;
+ follows_update 
+----------------
+ t
+(1 row)
+
+-- Identical rows: deleting one by ctid leaves the others' ctids alone.
+CREATE TABLE d1_same (a int);
+INSERT INTO d1_same VALUES (1), (1), (1);
+CREATE TEMP TABLE d1_same_tids USING heap AS SELECT ctid AS tid FROM d1_same;
+DELETE FROM d1_same WHERE ctid = (SELECT min(tid) FROM d1_same_tids);
+SELECT count(*) AS kept FROM d1_same
+	WHERE ctid IN (SELECT tid FROM d1_same_tids WHERE tid > (SELECT min(tid) FROM d1_same_tids));
+ kept 
+------
+    2
+(1 row)
+
+SELECT count(*) FROM d1_same;
+ count 
+-------
+     2
+(1 row)
+
+-- Foreign keys cascade, and check whether a row is the transaction's own.
+CREATE TABLE d1_parent (id int PRIMARY KEY);
+CREATE TABLE d1_child (id int PRIMARY KEY,
+	parent_id int REFERENCES d1_parent ON UPDATE CASCADE ON DELETE CASCADE);
+INSERT INTO d1_parent VALUES (1), (2);
+INSERT INTO d1_child VALUES (10, 1), (20, 2);
+UPDATE d1_parent SET id = 100 WHERE id = 1;
+DELETE FROM d1_parent WHERE id = 2;
+SELECT * FROM d1_child ORDER BY id;
+ id | parent_id 
+----+-----------
+ 10 |       100
+(1 row)
+
+INSERT INTO d1_child VALUES (30, 99);
+ERROR:  insert or update on table "d1_child" violates foreign key constraint "d1_child_parent_id_fkey"
+-- ON CONFLICT, and a deferrable primary key holding duplicates until commit.
+INSERT INTO d1_rows VALUES (1, 'upsert') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+INSERT INTO d1_rows VALUES (1, 'nothing') ON CONFLICT (id) DO NOTHING;
+SELECT v FROM d1_rows WHERE id = 1;
+   v    
+--------
+ upsert
+(1 row)
+
+CREATE TABLE d1_deferred (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v text);
+BEGIN;
+INSERT INTO d1_deferred VALUES (1, 'a'), (1, 'b');
+DELETE FROM d1_deferred WHERE v = 'a';
+COMMIT;
+SELECT * FROM d1_deferred;
+ id | v 
+----+---
+  1 | b
+(1 row)
+
+-- Indexes built concurrently.
+CREATE INDEX CONCURRENTLY d1_rows_conc ON d1_rows (v, id);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id FROM d1_rows WHERE v = 'seven';
+ id 
+----
+  7
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE d1_rows, d1_same, d1_child, d1_parent, d1_deferred;
+-- A duplicate a unique index (not the primary key) finds: the index checks
+-- the row it finds with a dirty snapshot, and must be told nobody is
+-- inserting it.
+CREATE TABLE d1_uq (id int PRIMARY KEY, b int UNIQUE);
+INSERT INTO d1_uq VALUES (1, 1);
+INSERT INTO d1_uq VALUES (2, 1);
+ERROR:  duplicate key value violates unique constraint "d1_uq_b_key"
+DO $$
+BEGIN
+	INSERT INTO d1_uq VALUES (3, 1);
+EXCEPTION WHEN unique_violation THEN
+	RAISE NOTICE 'caught duplicate';
+END $$;
+NOTICE:  caught duplicate
+SELECT * FROM d1_uq;
+ id | b 
+----+---
+  1 | 1
+(1 row)
+
+-- Updates that leave an index's key alone fill its pages with entries for
+-- one key, which btree tries to delete bottom-up.
+CREATE INDEX d1_uq_id_b ON d1_uq (id, b);
+DO $$
+BEGIN
+	FOR i IN 1..2000 LOOP
+		UPDATE d1_uq SET b = b + 0 * i, id = id WHERE id = 1;
+		UPDATE d1_uq SET b = -b WHERE id = 1;
+	END LOOP;
+END $$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT * FROM d1_uq WHERE id = 1;
+ id | b 
+----+---
+  1 | 1
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE d1_uq;
+-- A deferred foreign key on a row the transaction inserted and then
+-- updated without changing the key: the update's check runs because the
+-- row is the transaction's own.
+CREATE TABLE d1_dparent (id int PRIMARY KEY);
+CREATE TABLE d1_dchild (id int PRIMARY KEY, x int,
+	parent_id int REFERENCES d1_dparent DEFERRABLE INITIALLY DEFERRED);
+BEGIN;
+INSERT INTO d1_dchild VALUES (1, 0, 99);
+UPDATE d1_dchild SET x = 1 WHERE id = 1;
+COMMIT;
+ERROR:  insert or update on table "d1_dchild" violates foreign key constraint "d1_dchild_parent_id_fkey"
+SELECT count(*) FROM d1_dchild;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE d1_dchild, d1_dparent;
 -- A table created and filled in one transaction.
 BEGIN;
 CREATE TABLE d1_new (n int);

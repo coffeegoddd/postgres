@@ -25,7 +25,9 @@
  * - Keys of a table's data tree are ordered by the table keying
  *   (prolly_keying.h); keys of local metadata trees by memcmp.
  * - A command sees the writes of earlier commands of its transaction, not
- *   its own (cid), as heap does.
+ *   its own (cid), as heap does.  A write tagged InvalidCommandId (rows
+ *   rebuilt in another encoding, which are not new writes) is seen by
+ *   every command, its own included.
  * - Returned keys and values stay valid until the next call on the same
  *   cursor, or until the cursor is closed.
  * - Errors are raised with ereport(); callbacks never return error codes.

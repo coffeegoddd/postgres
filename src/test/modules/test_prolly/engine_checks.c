@@ -906,11 +906,11 @@ rowid_assign_then_resolve_body(const ProllyImplInfo *impl)
 	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
 	for (int i = 0; i < 200; i++)
 	{
-		ProllyHash	h = content_of(i / 2);
+		ProllyHash	h = content_of(i);
 		uint8		kb[4];
-		ProllyKey	key = int_key(i, kb);
+		ProllyKey	key = int_key(i / 2, kb);
 
-		/* Pairs of identical rows: ordinals 0 and 1. */
+		/* Pairs of identical rows at one key: ordinals 0 and 1. */
 		PROLLY_CALL(ri, tid_assign, roots, rel, &h, i % 2, &key, 1, &tids[i]);
 		check_valid_tid(&tids[i]);
 		for (int j = 0; j < i; j++)
@@ -921,148 +921,154 @@ rowid_assign_then_resolve_body(const ProllyImplInfo *impl)
 	scan = PROLLY_CALL(ri, scan_begin, roots, rel, 2);
 	for (int i = 0; i < 200; i++)
 	{
-		ProllyHash	h = content_of(i / 2);
+		ProllyHash	h = content_of(i);
+		uint8		kb[4];
+		ProllyKey	k = int_key(i / 2, kb);
 		ProllyHash	got_h;
 		uint64		got_ord;
 		ItemPointerData tid;
 		StringInfoData key;
+		ProllyTidInfo info;
 
-		if (!PROLLY_CALL(ri, tid_find, scan, &h, i % 2, &tid) ||
+		if (!PROLLY_CALL(ri, tid_find, scan, &k, i % 2, &tid) ||
 			!ItemPointerEquals(&tid, &tids[i]))
 			elog(ERROR, "tid_find disagrees with tid_assign for version %d", i);
 
 		initStringInfo(&key);
-		if (!PROLLY_CALL(ri, tid_resolve, roots, rel, &tids[i], 2, &key,
-						 &got_h, &got_ord))
+		if (PROLLY_CALL(ri, tid_resolve, roots, rel, &tids[i], 2, &key,
+						&got_h, &got_ord, &info) != PROLLY_TID_NAMED)
 			elog(ERROR, "tid_resolve does not know an assigned TID");
 		if (!same_hash(&got_h, &h) || got_ord != (uint64) (i % 2) ||
-			key.len != 4 || key_int(&(ProllyKey) {(const uint8 *) key.data, 4}) != i)
+			key.len != 4 || key_int(&(ProllyKey) {(const uint8 *) key.data, 4}) != i / 2)
 			elog(ERROR, "tid_resolve returned the wrong version for %d", i);
+		if (!TransactionIdIsCurrentTransactionId(info.xmin))
+			elog(ERROR, "a version's xmin is not the transaction that wrote it");
 	}
 	PROLLY_CALL(ri, scan_end, scan);
 	PROLLY_CALL(c.engine, roots_release, roots);
 	table_close(rel, AccessShareLock);
 }
 
+/*
+ * A version renamed (re-encoded, re-keyed) keeps its TID, which now
+ * resolves to its new key and content; assigning the version again gives
+ * the same TID.
+ */
 static void
-rowid_same_version_same_tid_body(const ProllyImplInfo *impl)
+rowid_rename_keeps_tid_body(const ProllyImplInfo *impl)
 {
 	const ProllyRowIdRoutine *ri = (const ProllyRowIdRoutine *) impl;
 	Relation	rel = make_table_for_engine(engine_for_impl(impl), "conf_rowid2", "a int");
 	ProllyComponents c;
 	ProllyRootSet *roots;
-	ProllyHash	h = content_of(9);
-	uint8		kb[4];
-	ProllyKey	k1 = int_key(1, kb);
+	ProllyHash	h1 = content_of(9);
+	ProllyHash	h2 = content_of(10);
+	uint8		kb1[4];
+	uint8		kb2[4];
+	ProllyKey	k1 = int_key(1, kb1);
+	ProllyKey	k2 = int_key(2, kb2);
 	ItemPointerData t1;
 	ItemPointerData t2;
 	StringInfoData key;
 	ProllyHash	got_h;
 	uint64		got_ord;
+	ProllyTidInfo info;
+	ProllyRowIdScan *scan;
 
 	prolly_components_for_relation(rel, &c);
 	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
-	PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k1, 1, &t1);
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h1, 0, &k1, 1, &t1);
+	PROLLY_CALL(ri, tid_rename, roots, rel, &t1, &h2, 0, &k2, 2);
 
-	/* Same version, now under another key (as after a re-keying). */
-	{
-		uint8		kb2[4];
-		ProllyKey	k2 = int_key(2, kb2);
-
-		PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k2, 2, &t2);
-	}
+	initStringInfo(&key);
+	if (PROLLY_CALL(ri, tid_resolve, roots, rel, &t1, 3, &key, &got_h, &got_ord,
+					&info) != PROLLY_TID_NAMED ||
+		key_int(&(ProllyKey) {(const uint8 *) key.data, key.len}) != 2 ||
+		!same_hash(&got_h, &h2))
+		elog(ERROR, "a renamed TID does not resolve to the new version");
+	scan = PROLLY_CALL(ri, scan_begin, roots, rel, 3);
+	if (!PROLLY_CALL(ri, tid_find, scan, &k2, 0, &t2) || !ItemPointerEquals(&t1, &t2))
+		elog(ERROR, "tid_find does not find a renamed version's TID");
+	PROLLY_CALL(ri, scan_end, scan);
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h2, 0, &k2, 3, &t2);
 	if (!ItemPointerEquals(&t1, &t2))
 		elog(ERROR, "the same version got a second TID");
-	initStringInfo(&key);
-	if (!PROLLY_CALL(ri, tid_resolve, roots, rel, &t1, 3, &key, &got_h, &got_ord) ||
-		key_int(&(ProllyKey) {(const uint8 *) key.data, key.len}) != 2)
-		elog(ERROR, "the TID does not resolve to the version's current key");
 	PROLLY_CALL(c.engine, roots_release, roots);
 	table_close(rel, AccessShareLock);
 }
 
-/* ------------------------------------------------------------------------
- * The "hashed" row identity's collision path (white box)
- * ------------------------------------------------------------------------
- */
-
-/* The hashed implementation's first-choice TID; must match rowid_hashed.c. */
-static void
-hashed_candidate(const ProllyHash *content, uint64 ordinal, int probe,
-				 ItemPointer tid)
-{
-	uint64		h = hash_bytes_extended(content->bytes, content->len,
-										hash_combine64(ordinal, (uint64) probe));
-
-	ItemPointerSet(tid, (BlockNumber) ((h >> 32) % (uint64) InvalidBlockNumber),
-				   (OffsetNumber) (1 + (uint32) h % MaxHeapTuplesPerPage));
-}
-
 /*
- * A version whose first-choice TID is taken by another version gets a
- * different TID, keeps it, and scans find it.  The collision is made by
- * writing a 'T' entry for another version at the first-choice TID.
+ * A TID is never given to a second version: not after the subtransaction
+ * that got it aborts (index entries made for it would survive the abort),
+ * and not after its version is retired.  A retired TID resolves as gone,
+ * with its successor.
  */
 static void
-rowid_hashed_displaced_version_body(const ProllyImplInfo *impl)
+rowid_never_reused_body(const ProllyImplInfo *impl)
 {
 	const ProllyRowIdRoutine *ri = (const ProllyRowIdRoutine *) impl;
-	Relation	rel;
+	Relation	rel = make_table_for_engine(engine_for_impl(impl), "conf_rowid3", "a int");
 	ProllyComponents c;
 	ProllyRootSet *roots;
-	ProllyHash	mine = content_of(1);
-	ProllyHash	other = content_of(2);
-	ItemPointerData first;
-	ItemPointerData got;
-	ItemPointerData again;
-	ProllyRowIdScan *scan;
-	uint8		tk[7];
-	StringInfoData entry;
+	ProllyHash	h = content_of(5);
+	ProllyHash	h2 = content_of(6);
 	uint8		kb[4];
-	ProllyKey	key = int_key(1, kb);
-	ProllyKey	tkey;
-	ProllyValue tval;
+	uint8		kb2[4];
+	ProllyKey	k = int_key(5, kb);
+	ProllyKey	k2 = int_key(6, kb2);
+	ItemPointerData aborted;
+	ItemPointerData t1;
+	ItemPointerData t2;
+	ItemPointerData t3;
+	StringInfoData key;
+	ProllyHash	got_h;
+	uint64		got_ord;
+	ProllyTidInfo info;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ProllyRowIdScan *scan;
 
-	if (strcmp(impl->name, "hashed") != 0)
-		return;
-	rel = make_table_for_engine("d1", "conf_rowid_hashed", "a int");
 	prolly_components_for_relation(rel, &c);
+
+	/* Assigned in a subtransaction that aborts... */
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
 	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k, 1, &aborted);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
 
-	/* Another version holds my first choice. */
-	hashed_candidate(&mine, 0, 0, &first);
-	tk[0] = 'T';
-	tk[1] = (uint8) (ItemPointerGetBlockNumber(&first) >> 24);
-	tk[2] = (uint8) (ItemPointerGetBlockNumber(&first) >> 16);
-	tk[3] = (uint8) (ItemPointerGetBlockNumber(&first) >> 8);
-	tk[4] = (uint8) ItemPointerGetBlockNumber(&first);
-	tk[5] = (uint8) (ItemPointerGetOffsetNumber(&first) >> 8);
-	tk[6] = (uint8) ItemPointerGetOffsetNumber(&first);
-	tkey.data = tk;
-	tkey.len = 7;
-	initStringInfo(&entry);
-	appendStringInfoChar(&entry, (char) other.len);
-	appendBinaryStringInfo(&entry, (const char *) other.bytes, other.len);
-	appendStringInfoChar(&entry, 0);	/* ordinal 0 */
-	appendBinaryStringInfo(&entry, (const char *) key.data, key.len);
-	tval.data = (const uint8 *) entry.data;
-	tval.len = entry.len;
-	PROLLY_CALL(c.engine, put, rel, PROLLY_TREE_ROWID, &tkey, &tval, 1);
+	/* ...the same version again gets another TID. */
+	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k, 2, &t1);
+	if (ItemPointerEquals(&t1, &aborted))
+		elog(ERROR, "a TID was given out again after its transaction aborted");
 
-	PROLLY_CALL(ri, tid_assign, roots, rel, &mine, 0, &key, 2, &got);
-	check_valid_tid(&got);
-	if (ItemPointerEquals(&got, &first))
-		elog(ERROR, "a displaced version took a TID held by another version");
+	/* Retired with a successor: gone, and followable. */
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h2, 0, &k2, 3, &t2);
+	{
+		ProllyValue row = {(const uint8 *) "old row", 7};
 
-	/* It keeps its TID, and scans find it. */
-	PROLLY_CALL(ri, tid_assign, roots, rel, &mine, 0, &key, 3, &again);
-	if (!ItemPointerEquals(&got, &again))
-		elog(ERROR, "a displaced version got a different TID the second time");
+		PROLLY_CALL(ri, tid_retire, roots, rel, &t1, &t2, &row, 3);
+	}
+	initStringInfo(&key);
+	if (PROLLY_CALL(ri, tid_resolve, roots, rel, &t1, 4, &key, &got_h, &got_ord,
+					&info) != PROLLY_TID_GONE ||
+		!ItemPointerEquals(&info.successor, &t2) || info.cid != 3)
+		elog(ERROR, "a retired TID does not resolve to its successor");
+	if (key.len != 7 || memcmp(key.data, "old row", 7) != 0)
+		elog(ERROR, "a retired TID does not keep its version's row");
 	scan = PROLLY_CALL(ri, scan_begin, roots, rel, 4);
-	if (!PROLLY_CALL(ri, tid_find, scan, &mine, 0, &again) ||
-		!ItemPointerEquals(&got, &again))
-		elog(ERROR, "a scan does not find the displaced version's TID");
+	if (PROLLY_CALL(ri, tid_find, scan, &k, 0, &t3))
+		elog(ERROR, "tid_find still finds a retired version");
 	PROLLY_CALL(ri, scan_end, scan);
+
+	/* The same version written again gets a new TID. */
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k, 4, &t3);
+	if (ItemPointerEquals(&t3, &t1) || ItemPointerEquals(&t3, &aborted))
+		elog(ERROR, "a retired TID was given out again");
 	PROLLY_CALL(c.engine, roots_release, roots);
 	table_close(rel, AccessShareLock);
 }
@@ -1230,15 +1236,15 @@ rowid_assign_then_resolve(const ProllyImplInfo *impl)
 }
 
 void
-rowid_same_version_same_tid(const ProllyImplInfo *impl)
+rowid_rename_keeps_tid(const ProllyImplInfo *impl)
 {
-	rolled_back(rowid_same_version_same_tid_body, impl);
+	rolled_back(rowid_rename_keeps_tid_body, impl);
 }
 
 void
-rowid_hashed_displaced_version(const ProllyImplInfo *impl)
+rowid_never_reused(const ProllyImplInfo *impl)
 {
-	rolled_back(rowid_hashed_displaced_version_body, impl);
+	rolled_back(rowid_never_reused_body, impl);
 }
 
 void

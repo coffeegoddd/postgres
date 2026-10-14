@@ -10,10 +10,12 @@ can be branched, diffed, merged, cloned, pushed and pulled.
 Status: every interface exists.  The foundation interfaces (node format,
 chunker, content hash, canonical key and value encoders), the cluster-wide
 node store, D1's WAL form, copy-on-write trees, the root layout, table
-keying, row identity, the serial commit pipeline and engine D1 have real
-implementations that pass their conformance suites; everything else is a
-stub.  prolly_d1 tables store data: inserts, sequential scans and index
-builds work; fetching by TID, updates, deletes and row locks come next.
+keying, row identity, the serial commit pipeline, the single_writer
+coordination and engine D1 have real implementations that pass their
+conformance suites; everything else is a stub.  prolly_d1 tables store
+data: inserts, updates, deletes, row locks, ON CONFLICT, sequential, TID
+and index scans (with btree and the other index AMs), and index builds
+work; ANALYZE, sampling, bitmap scans and CLUSTER come next.
 
 
 Interfaces and implementations
@@ -24,7 +26,7 @@ design choice can be changed later by writing a new implementation:
 
 	Interface         Header                  Implementations so far
 	engine            prolly_engine.h         d1; d2 d3a d3b d4 (stubs)
-	coordination      prolly_coord.h          k1 k2 k3 (stubs)
+	coordination      prolly_coord.h          single_writer; k1 k2 k3 (stubs)
 	node_format       prolly_nodeformat.h     basic, stub
 	chunker           prolly_chunker.h        keyhash, stub
 	content_hash      prolly_hash.h           sha256, stub
@@ -38,7 +40,7 @@ design choice can be changed later by writing a new implementation:
 	reclamation       prolly_reclaim.h        stub
 	log               prolly_log.h            chunks, stub
 	commit_pipeline   prolly_commit.h         serial, stub
-	row_identity      prolly_rowid.h          hashed, stub
+	row_identity      prolly_rowid.h          counter, stub
 	refs              prolly_refs.h           stub
 	transfer          prolly_transfer.h       stub
 	diff_merge        prolly_merge.h          stub
@@ -76,7 +78,8 @@ content hash sha256, key encoder ordered, value encoder canonical, table
 keying pk_or_content, and stubs for the interfaces without an
 implementation yet.  prolly_d1 and prolly_d2 use the node store global,
 the tree cow, the root layout subroots, the commit pipeline serial and
-the row identity hashed; prolly_d1 also the log chunks.
+the row identity counter; prolly_d1 also the log chunks, and the
+coordination single_writer instead of k1 until k1 is built.
 
 
 Canonical values
@@ -150,9 +153,24 @@ key's newest version from an earlier command.  Aborting a subtransaction
 drops its versions, write sets it created, and undoes emptyings it did.
 At commit, xact_precommit takes the branch lock, applies every write
 set's newest versions to the tip's trees, builds the new root and
-enqueues it; xact_commit publishes it.  Until coordination arrives, the
-first write to a table takes ExclusiveLock on it (one writer per table;
-readers aren't blocked), and snapshots read the newest published head.
+enqueues it; xact_commit publishes it.  Writers hold the right to write
+a table from coordination single_writer (below) from before their first
+write until they end, so a write set's base, read from the newest head
+when it's made, doesn't change under it.  Readers see the root set they
+hold with the transaction's own writes over it; snapshots read the newest
+published head.  Rows rebuilt under another encoding are written with
+InvalidCommandId and seen by every command.
+
+
+Coordination "single_writer"
+----------------------------
+
+One writer per table: a heavyweight lock of its own (LOCKTAG_PROLLY_TABLE,
+pg_locks type prollytable), separate from the relation's locks, taken in
+ExclusiveLock by writes, FOR UPDATE and FOR NO KEY UPDATE, and ShareLock by
+FOR SHARE and FOR KEY SHARE, held to the end of the (sub)transaction.
+Waiting for it means another writer may have committed, so the table AM
+reads again after it gets it.
 
 
 Commit pipeline "serial"
@@ -205,11 +223,26 @@ collation has been dropped, no keying can order its keys any more
 tree's by their bytes, which serves full scans and the rebuild, and
 stores a commit made without writing again as a tree in byte order.
 
-Row identity (rowid_hashed.c) names a row version by (content hash,
-ordinal among identical rows) and derives its TID from them, probing
-past TIDs held by other versions.  Displaced versions are recorded, so a
-scan computes nearly every TID without a lookup.  TIDs don't depend on
-keying, so rebuilding a tree leaves indexes valid.
+Row identity (rowid_counter.c) gives each row version (key, ordinal among
+identical rows) a TID from a per-table counter in block 0 of the table's
+main fork, reserved 1024 at a time with generic WAL, so a TID is never
+given out twice, even after the transaction that got it aborts (indexes
+keep entries for it) and on any branch.  The map holds TID -> version
+(content hash, ordinal, xmin, key) and (key, ordinal) -> TID.  An update
+or delete retires the old TID, recording its successor (for READ
+COMMITTED's update chains and currtid) and its row, which SnapshotAny
+returns as heap returns a dead tuple.  Rebuilding a tree renames TIDs
+rather than giving new ones, so indexes stay valid.
+
+The table AM's rows by TID: an update, delete or row lock first gets the
+right to write or lock the row, then compares the row as the command sees
+it with every write and with what others committed: live, changed by this
+transaction (TM_SelfModified), or changed by a transaction that committed
+while it waited (TM_Updated with the successor, TM_Deleted).  Slots are
+virtual slots that look up xmin, and whether the row is the current
+transaction's, through the map.  Uniqueness checks find TIDs in indexes
+that no map knows (another writer's private rows) and wait for the right
+to write the table before looking again.
 
 
 Core hooks

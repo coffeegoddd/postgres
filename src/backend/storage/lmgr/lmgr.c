@@ -1237,6 +1237,23 @@ LockProllyBranch(uint32 branch, LOCKMODE lockmode)
 }
 
 /*
+ *		LockProllyTable
+ *
+ * Obtain the right to write a prolly table of the current database.  Held
+ * until the end of the (sub)transaction.  With dontWait, returns false
+ * instead of waiting if the lock isn't free.
+ */
+bool
+LockProllyTable(Oid relid, LOCKMODE lockmode, bool dontWait)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_PROLLY_TABLE(tag, MyDatabaseId, relid);
+
+	return LockAcquire(&tag, lockmode, false, dontWait) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+/*
  *		UnlockApplyTransactionForSession
  */
 void
@@ -1348,6 +1365,12 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 		case LOCKTAG_PROLLY_BRANCH:
 			appendStringInfo(buf,
 							 _("prolly branch %u of database %u"),
+							 tag->locktag_field2,
+							 tag->locktag_field1);
+			break;
+		case LOCKTAG_PROLLY_TABLE:
+			appendStringInfo(buf,
+							 _("writing prolly table %u of database %u"),
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;

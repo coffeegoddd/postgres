@@ -31,12 +31,12 @@
  *
  * Commit.  xact_precommit locks the branch, applies every write set's
  * newest versions to the branch tip's trees, builds the new branch root
- * and enqueues it; xact_commit publishes it.  Until coordination is wired
- * in, D1 keeps one writer per table: the first write to a relation in a
- * transaction takes ExclusiveLock on it (readers are not blocked) and
- * reads its base trees from the head after getting the lock, so the
+ * and enqueues it; xact_commit publishes it.  D1 relies on its writers
+ * holding the right to write a table (coordination "single_writer") from
+ * before their first write to it until their transaction ends: a write
+ * set reads its base trees from the newest head when it's made, so the
  * rebase at commit is a plain replay.  Snapshots read the newest published
- * head; roots that follow snapshots come with coordination.
+ * head; roots that follow snapshots come with row-level coordination.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d1.c
@@ -50,7 +50,6 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "lib/rbtree.h"
-#include "storage/lmgr.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -466,11 +465,11 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	}
 
 	/*
-	 * One writer per table until coordination arrives.  The write set is
-	 * entered only once it's complete, so an error here (a lock timeout, a
-	 * cancel) leaves nothing behind for a retry to find.
+	 * The caller holds the right to write rel (coordination), so the
+	 * newest head is the base nobody else will change before this
+	 * transaction ends.  The write set is entered only once it's complete,
+	 * so an error here leaves nothing behind for a retry to find.
 	 */
-	LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
 	(void) GetCurrentTransactionId();
 
 	old = MemoryContextSwitchTo(xact->mcxt);
@@ -605,13 +604,17 @@ ws_write(D1WriteSet *ws, const ProllyKey *key, const ProllyValue *value,
 	MemoryContextSwitchTo(old);
 }
 
-/* The newest version a command cid may see; NULL if none. */
+/*
+ * The newest version a command cid may see; NULL if none.  Versions
+ * written with InvalidCommandId (rebuilt rows) are seen by every command.
+ */
 static const D1Version *
 visible_version(const D1Entry *e, CommandId cid)
 {
 	for (int i = e->nversions - 1; i >= 0; i--)
 	{
-		if (cid == InvalidCommandId || e->versions[i].cid < cid)
+		if (cid == InvalidCommandId || e->versions[i].cid < cid ||
+			e->versions[i].cid == InvalidCommandId)
 			return &e->versions[i];
 	}
 	return NULL;
@@ -708,12 +711,19 @@ d1_roots_release(ProllyRootSet *roots)
 	pfree(roots);
 }
 
-/* A tree's base for reading: its write set's, else from roots. */
+/*
+ * A tree's base for reading: from roots, so a reader sees what was
+ * committed in the root set it holds, with the transaction's own writes
+ * over it.  A write set that replaced the tree (emptied or rebuilt it) has
+ * its own base instead.  (A write set's base is the newest head when it
+ * was made; a reader may hold an older root set, taken before the
+ * transaction waited for the right to write the table.)
+ */
 static void
 read_base(ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber,
 		  D1WriteSet *ws, ProllyNodeRef *base)
 {
-	if (ws)
+	if (ws && ws->replaced)
 		*base = ws->base;
 	else
 		find_tree(roots, sub, relnumber, base);
@@ -1476,8 +1486,8 @@ d1_xact_precommit(void)
 			ProllyNodeRef current;
 
 			/*
-			 * One writer per table means nobody else changed this tree
-			 * since the write set read it.
+			 * The transaction has held the right to write this table since
+			 * the write set read it, so nobody else changed it.
 			 */
 			find_tree(&tip, ws->sub, ws->relnumber, &current);
 			if (!same_hash(&current, &ws->base))

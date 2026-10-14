@@ -187,10 +187,15 @@ to any copy-on-write engine (D1–D3) that uses K2.
    reader's snapshot. On commit, lock entries become
    `COMMITTED_WRITE(key, xid)` markers, kept (unhashed, unpersisted) until the
    xmin horizon passes them.
-3. **Per-version TIDs derived from content.** Non-prolly index AMs (GiST, GIN,
-   BRIN, pgvector, bloom) assume one TID names one row version.
-   `TID = hash48(pk ‖ hash(row content))`, plus a TID → (key, content hash) map
-   with collision probing (≈ one expected collision at 16M rows). Dead TIDs for
+3. **Per-version TIDs from a per-table counter.** Non-prolly index AMs (GiST,
+   GIN, BRIN, pgvector, bloom) assume one TID names one row version, and keep
+   entries for TIDs whose transaction aborted. So TIDs come from a per-table
+   counter that aborts don't roll back (like heap's line pointers), shared by
+   every branch of the table, with a map TID → (key, content hash, xmin) and
+   (key, ordinal) → TID (question 37, changed 2026-10-14). Content-derived
+   TIDs were tried first and dropped: a row inserted again after an abort got
+   the TID its aborted insert left in every index, and hash collisions across
+   branches can't be seen by any one branch's map. Dead TIDs for
    `ambulkdelete` = diff(root at last vacuum, current root). Long-term fix:
    wide row identifiers (B7).
 

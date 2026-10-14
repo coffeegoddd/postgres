@@ -62,7 +62,7 @@ provisional.
 | Interface | Responsibility | Implementations planned (built so far in bold) |
 |---|---|---|
 | **Engine** | The tree as a whole: cursors, private writes, commit, checkpoint, redo, reclamation (`02-postgres-integration.md` section C) | D1, D2, D3a, D3b, D4, (D5), stub |
-| **Coordination** | Row locks, insert intents, range locks, commit markers, SSI mapping | K1, K2, K3, stub |
+| **Coordination** | Row locks, insert intents, range locks, commit markers, SSI mapping | One writer per table (**single_writer**, until 4e), K1, K2, K3, stub |
 | **Node page format** | Layout of a node in a page: canonical region, unhashed special space, item access, per-child block hints | One per engine family (**basic**) |
 | **Chunker / boundary rule** | Where node boundaries fall; forced splits | Key-only (**keyhash**), key + bytes |
 | **Content hash** | Hashing the canonical region | SHA-256 (**sha256**), others if measured |
@@ -75,7 +75,7 @@ provisional.
 | **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |
 | **Log** | What the WAL records contain and how they are replayed | Full chunk (**chunks**), delta, logical |
 | **Commit pipeline** | Branch heads; ordering and publishing roots at commit; their WAL and checkpoint | One committer per branch (**serial**), ordered pipeline |
-| **Row identity** | TIDs ↔ row versions | Content-derived TIDs with a map (**hashed**), wide row ids |
+| **Row identity** | TIDs ↔ row versions | TIDs from a per-table counter with a map both ways (**counter**, since 4d.2; replaced content-derived **hashed**, question 37), wide row ids |
 | **Table keying** | How a table's rows become tree items: key, value layout, content hash | Primary key, else row content with a count (**pk_or_content**) |
 | **Refs and commit graph** | Branches, commits, history storage | A refs file per database (proposed; catalogs can't hold refs now that they are versioned), others |
 | **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |

@@ -5,7 +5,8 @@
  *	  commit markers for prolly trees.
  *
  * Implementations: K1 (separate lock table), K2 (coordination plane on live
- * nodes), K3 (locks in the page).
+ * nodes), K3 (locks in the page), and "single_writer" (one writer per
+ * table, until row-level coordination is built).
  *
  * Contract:
  * - Operations act for the current (sub)transaction.
@@ -40,7 +41,11 @@ typedef struct ProllyCoordRoutine
 
 	/*
 	 * Lock key in tree in mode, waiting per wait_policy.  On anything but
-	 * TM_Ok, tmfd says who holds or changed the row.
+	 * TM_Ok, tmfd says who holds or changed the row.  Writers lock what
+	 * they write first: the row's key in an exclusive mode, before
+	 * inserting, updating or deleting it, or a NULL key to write the whole
+	 * tree (rebuilding it); readers taking row locks lock the row's key.
+	 * The engine's private writes happen after the lock is held.
 	 */
 	TM_Result	(*lock_row) (Relation tree, const ProllyKey *key,
 							 LockTupleMode mode, LockWaitPolicy wait_policy,
