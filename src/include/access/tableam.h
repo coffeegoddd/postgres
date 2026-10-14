@@ -733,9 +733,10 @@ typedef struct TableAmRoutine
 	 * Optional: sample rows for ANALYZE, with the signature and contract of
 	 * an FDW's AcquireSampleRowsFunc (foreign/fdwapi.h).  An AM whose rows
 	 * aren't laid out in the blocks of its main fork samples them this way;
-	 * ANALYZE then takes the relation's size in pages from
-	 * relation_estimate_size.  NULL: ANALYZE samples blocks of the main fork
-	 * through scan_analyze_next_block and scan_analyze_next_tuple.
+	 * the size in pages recorded in pg_class (by ANALYZE, CLUSTER and index
+	 * builds) is then relation_estimate_size's (table_relation_stats_pages).
+	 * NULL: ANALYZE samples blocks of the main fork through
+	 * scan_analyze_next_block and scan_analyze_next_tuple.
 	 */
 	int			(*relation_acquire_sample_rows) (Relation rel, int elevel,
 												 HeapTuple *rows, int targrows,
@@ -2156,6 +2157,7 @@ extern void table_block_parallelscan_startblock_init(Relation rel,
  * ----------------------------------------------------------------------------
  */
 
+extern BlockNumber table_relation_stats_pages(Relation rel);
 extern uint64 table_block_relation_size(Relation rel, ForkNumber forkNumber);
 extern void table_block_relation_estimate_size(Relation rel,
 											   int32 *attr_widths,

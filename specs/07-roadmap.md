@@ -353,29 +353,43 @@ their stop condition has no test that fails without it.
 - ANALYZE: a new optional table AM callback, `relation_acquire_sample_rows`
   (`tableam.h`, used by `analyze.c` for tables and inheritance children;
   heap leaves it NULL). The tree interface gained `key_at` (the key at a
-  position, from subtree counts) and the engine interface `key_at` over a
-  table's committed data tree. The prolly sampler picks distinct positions
-  (selection when the table is under twice the sample, else random draws
-  redrawn for repeats), reads only those items, keeps a reservoir over the
-  rows of keyless items (identical rows), returns the sample in key order,
-  and skips an item reached twice after the transaction's own deletes.
+  position, from subtree counts), the engine interface `key_at` and
+  `has_writes`. For a table with a primary key that the transaction hasn't
+  written, the prolly sampler picks distinct positions (selection when the
+  table is under twice the sample, else random draws redrawn for repeats)
+  and reads only those items. Keyless tables (decided by the user
+  2026-10-14: an item holds identical rows, so picking items would rarely
+  see a value that is most of the table) and tables the transaction has
+  written (positions don't cover its writes) are read whole into a reservoir
+  over rows. The sample is returned in key order.
 - TABLESAMPLE: pseudo-blocks of 64 items in key order, found by position, so
-  SYSTEM reads only the blocks it picks; each block runs to the next block's
-  first key as the transaction sees the table (its own writes are sampled
-  once), and a block with more rows than a page has offsets is shown to the
-  method a page at a time.
+  SYSTEM reads only the blocks it picks; if the transaction has written the
+  table, the blocks are cut while reading it. A block with more rows than a
+  page has offsets is shown to the method a page at a time, each chunk under
+  its own block number.
 - Bitmap scans: the table AM looks up each TID of the bitmap (all of a lossy
   page's, rechecked); the prolly index AM has `amgetbitmap`.
 - CLUSTER and VACUUM FULL: the new storage takes the table's trees and TID
   counter as they are (O(1); rows are in key order already), so trees,
   digests and TIDs are unchanged; the row count reported sums identical rows.
+  If columns were added with a default, the rows are rewritten with their
+  values (Postgres clears the catalog's missing values after a rewrite),
+  through a new table keying callback, `open_rewritten`; they keep their TIDs
+  and match a table created with the column.
 - Size estimates: pages from the item count and the columns' type widths
-  (stable across ANALYZE); rows from the rows per page ANALYZE recorded, as
+  (stable across ANALYZE); rows from the rows per page last recorded, as
   heap estimates, so keyless tables with identical rows are planned by rows.
+  A new core helper, `table_relation_stats_pages`, makes ANALYZE, CLUSTER and
+  index builds record the estimate's pages for such an AM.
 Bugs found and fixed, each with a test that fails without the fix: the
 planner counted a keyless table's items, not its rows, and VACUUM FULL
 recorded that count; a bitmap index scan, which isn't given the table,
-crashed. Tests: `key_at` in the tree conformance checks, `sem_sampling` in
+crashed. Found in review: CLUSTER and VACUUM FULL lost the values of
+columns added with a default; ANALYZE of a table written in the transaction
+found no rows or miscounted them; keyless tables with a dominant value were
+sampled with huge variance; CLUSTER, VACUUM FULL and CREATE INDEX recorded
+zero pages, losing the planner's row density; chunks of a large sample
+block repeated BERNOULLI's choices. Tests: `key_at` in the tree conformance checks, `sem_sampling` in
 the requirements suite (statistics, TABLESAMPLE, bitmap scans with lossy
 pages, CLUSTER and VACUUM FULL, against heap's output), `d1_maintenance`,
 `010_d1_maintenance.pl` (what ANALYZE reads; CLUSTER and VACUUM FULL across

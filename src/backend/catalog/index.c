@@ -2991,7 +2991,8 @@ index_update_stats(Relation rel,
 	 */
 	if (update_stats)
 	{
-		relpages = RelationGetNumberOfBlocks(rel);
+		relpages = rel->rd_rel->relkind == RELKIND_INDEX ?
+			RelationGetNumberOfBlocks(rel) : table_relation_stats_pages(rel);
 
 		if (rel->rd_rel->relkind != RELKIND_INDEX)
 			visibilitymap_count(rel, &relallvisible, &relallfrozen);

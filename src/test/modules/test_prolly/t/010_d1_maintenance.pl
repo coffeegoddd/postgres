@@ -54,8 +54,8 @@ is(analyzed('near'),
 	'read 3000 of 5000 items, 3000 rows; 3000 rows in sample, 5000 estimated total rows',
 	'a sample close to the table size is still exactly the target');
 is(analyzed('triples'),
-	'read 3000 of 40000 items, 9000 rows; 3000 rows in sample, 120000 estimated total rows',
-	'identical rows are read with their item and counted');
+	'read 40000 of 40000 items, 120000 rows; 3000 rows in sample, 120000 estimated total rows',
+	'a keyless table is read whole');
 
 # CLUSTER and VACUUM FULL keep the rows' TIDs and the indexes; the copy
 # survives a crash before any checkpoint, and the standby replays it.

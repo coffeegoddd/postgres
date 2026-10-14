@@ -213,8 +213,13 @@ bad:
  * is often kept longer than its caller's memory (a cache), so nothing it
  * keeps may be in the caller's.
  */
+/*
+ * rewritten: encode with the table's columns as they are once its missing
+ * values are cleared (k->desc is a copy without them).
+ */
 static ProllyKeying *
-pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
+open_keying(Relation rel, const ProllyValue *description, bool rewritten,
+			MemoryContext mcxt)
 {
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyComponents c;
@@ -240,7 +245,9 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 
 		d.keyless = !OidIsValid(pkoid);
 		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
-		k->valenc = PROLLY_CALL(c.value_encoder, begin, RelationGetDescr(rel), mcxt);
+		k->valenc = PROLLY_CALL(c.value_encoder, begin,
+								rewritten ? k->desc : RelationGetDescr(rel),
+								mcxt);
 	}
 	k->keyless = d.keyless;
 	if (!k->keyless)
@@ -249,6 +256,18 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);
 	return k;
+}
+
+static ProllyKeying *
+pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
+{
+	return open_keying(rel, description, false, mcxt);
+}
+
+static ProllyKeying *
+pkcontent_open_rewritten(Relation rel, MemoryContext mcxt)
+{
+	return open_keying(rel, NULL, true, mcxt);
 }
 
 static void
@@ -469,6 +488,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_content = {
 	},
 	.open = pkcontent_open,
 	.describe = pkcontent_describe,
+	.open_rewritten = pkcontent_open_rewritten,
 	.can_read = pkcontent_can_read,
 	.keyless = pkcontent_keyless,
 	.encode_row = pkcontent_encode_row,
