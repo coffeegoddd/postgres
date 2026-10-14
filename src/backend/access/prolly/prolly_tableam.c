@@ -1388,8 +1388,18 @@ prolly_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		}
 		else
 		{
-			bool		same_key = key.len == now.key.len &&
-				memcmp(key.data, now.key.data, key.len) == 0;
+			ProllyKey	nk = {(const uint8 *) key.data, key.len};
+			ProllyKey	ok = {(const uint8 *) now.key.data, now.key.len};
+
+			/*
+			 * Keys equal by the key's ordering are the same key even if
+			 * their bytes differ ('a' and 'A' under a case-insensitive
+			 * collation, numeric 1.0 and 1.00): the row is replaced, and
+			 * takes the new bytes.
+			 */
+			bool		same_key = PROLLY_CALL(c.keying, can_compare, keying) ?
+				PROLLY_CALL(c.keying, compare, keying, &nk, &ok) == 0 :
+				(nk.len == ok.len && memcmp(nk.data, ok.data, nk.len) == 0);
 			ItemPointerData ntid;
 
 			/* The new version first, then the old one goes. */

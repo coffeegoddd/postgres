@@ -142,7 +142,9 @@ typedef struct ProllyTreeRoutine
 
 	/*
 	 * Report each key whose presence or value differs between from and to,
-	 * once, in key order.  Subtrees with the same hash are skipped.
+	 * once, in key order; a key equal in both by the tree's order but
+	 * written differently is modified (reported as to writes it).  Subtrees
+	 * with the same hash are skipped.
 	 */
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyTreeVisitChange visit,

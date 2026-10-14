@@ -767,6 +767,115 @@ tree_diff_reports_changes(const ProllyImplInfo *impl)
 	}
 }
 
+/*
+ * Keys of five bytes whose order ignores the last (a "spelling"), as a
+ * collation can find 'a' and 'A' equal.
+ */
+static int
+spelled_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	return memcmp(a->data, b->data, 4);
+}
+
+static ProllyKey
+spelled_key(int k, uint8 spelling, uint8 *buf)
+{
+	ProllyKey	key;
+
+	buf[0] = (uint8) (k >> 24);
+	buf[1] = (uint8) (k >> 16);
+	buf[2] = (uint8) (k >> 8);
+	buf[3] = (uint8) k;
+	buf[4] = spelling;
+	key.data = buf;
+	key.len = 5;
+	return key;
+}
+
+/* Keys 0..n-1, spelled 0 except key respelled, spelled 1. */
+static void
+build_spelled(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env, int n,
+			  int respelled, ProllyNodeRef *root)
+{
+	ProllyTreeBuilder *b = PROLLY_CALL(tr, build_begin, env, CurrentMemoryContext);
+	ProllyValue v = {(const uint8 *) "v", 1};
+
+	for (int k = 0; k < n; k++)
+	{
+		uint8		buf[5];
+		ProllyKey	key = spelled_key(k, k == respelled ? 1 : 0, buf);
+
+		PROLLY_CALL(tr, build_add, b, &key, &v);
+	}
+	PROLLY_CALL(tr, build_finish, b, root);
+}
+
+typedef struct SpelledDiff
+{
+	int			changes;
+	bool		right;
+} SpelledDiff;
+
+static void
+check_spelled_change(ProllyDiffKind kind, const ProllyKey *key,
+					 const ProllyValue *before, const ProllyValue *after,
+					 void *arg)
+{
+	SpelledDiff *s = arg;
+
+	s->changes++;
+	s->right = kind == PROLLY_DIFF_MODIFIED && key->len == 5 &&
+		key->data[3] == 77 && key->data[4] == 1;
+}
+
+/*
+ * A put of a key equal by the order to one in the tree but written
+ * differently replaces it with the new bytes: the tree is the one built
+ * with them, cursors return them, and diff reports the change.
+ */
+void
+tree_equal_keys_take_new_bytes(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyNodeRef before;
+	ProllyNodeRef after;
+	ProllyNodeRef built;
+	ProllyEdit	edit;
+	uint8		buf[5];
+	ProllyTreeCursor *c;
+	ProllyKey	key;
+	ProllyValue value;
+	SpelledDiff seen = {0, false};
+	int			n = 3000;
+
+	make_env(tr, &env);
+	env.compare = spelled_compare;
+	build_spelled(tr, &env, n, -1, &before);
+	build_spelled(tr, &env, n, 77, &built);
+
+	memset(&edit, 0, sizeof(edit));
+	edit.key = spelled_key(77, 1, buf);
+	edit.value.data = (const uint8 *) "v";
+	edit.value.len = 1;
+	PROLLY_CALL(tr, apply, &env, &before, &edit, 1, &after);
+	if (after.hash.len != built.hash.len ||
+		memcmp(after.hash.bytes, built.hash.bytes, built.hash.len) != 0)
+		elog(ERROR, "respelling a key gave a different tree from building it so");
+
+	c = PROLLY_CALL(tr, cursor_open, &env, &after, CurrentMemoryContext);
+	PROLLY_CALL(tr, cursor_seek, c, &edit.key, ForwardScanDirection);
+	if (!PROLLY_CALL(tr, cursor_next, c, &key, &value) || key.len != 5 ||
+		key.data[3] != 77 || key.data[4] != 1)
+		elog(ERROR, "a respelled key reads back as it was written before");
+	PROLLY_CALL(tr, cursor_close, c);
+
+	PROLLY_CALL(tr, diff, &env, &before, &after, check_spelled_change, &seen);
+	if (seen.changes != 1 || !seen.right)
+		elog(ERROR, "diff reported %d changes for a respelled key, %s",
+			 seen.changes, seen.right ? "as modified" : "not as a modification to it");
+}
+
 /* Every node a tree is made of passes the node format's structure check. */
 typedef struct PageCheck
 {

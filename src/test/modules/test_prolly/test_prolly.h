@@ -51,6 +51,7 @@ extern void tree_apply_past_the_end(const ProllyImplInfo *impl);
 extern void tree_history_independent(const ProllyImplInfo *impl);
 extern void tree_edits_share_nodes(const ProllyImplInfo *impl);
 extern void tree_diff_reports_changes(const ProllyImplInfo *impl);
+extern void tree_equal_keys_take_new_bytes(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 
 /* engine_checks.c */

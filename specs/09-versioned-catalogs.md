@@ -74,6 +74,14 @@ This file has three parts:
   padding. Rows are decoded into Postgres's tuple layout with the mapping
   Postgres already uses for dropped columns (`TupleConversionMap`).
 - Key encodings follow the same rule: no local OIDs in key bytes.
+- **Structural sharing between the working set and commits.** Data and
+  prolly index trees are canonical as written, so a commit's canonical root
+  refers to the working set's trees themselves; a version-control commit
+  builds only the canonical directory (by name) and the canonical schema,
+  incrementally over changed relations and catalog rows, and rewrites only
+  tables with rows not yet canonical (below). Branches and commits share
+  every unchanged chunk, as in Dolt. Local-only structures (TID maps,
+  relfilenumbers, statistics) stay out of canonical roots.
 - Rows written or updated are always canonical: the encoder skips dropped
   columns and fills in missing defaults. Rows untouched since a DROP COLUMN
   or an ADD COLUMN with a default are canonicalized at the next

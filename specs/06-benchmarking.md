@@ -56,6 +56,8 @@ A failing gate is reported next to the numbers it affects.
 | S8 | Large transactions | Updates touching 1–10% of a table | Lock memory, mutation-map size, rebase cost |
 | S9 | Mixed OLTP | BenchBase TPC-C (`~/cursor_src/benchbase` exists locally) | Overall realism |
 | S10 | sysbench OLTP | sysbench 1.0 Lua tests, one variant each: `oltp_read_write`, `oltp_read_only`, `oltp_write_only`, `oltp_point_select`, `oltp_update_index`, `oltp_update_non_index`, `oltp_insert`, `select_random_ranges`, `bulk_insert` | Standard OLTP mixes; the tool Dolt and Doltgres publish latency comparisons with, so results can be set beside theirs (for orientation only) |
+| S11 | Many tables | Many tables, small transactions touching a few | Root-layout directory cost: paths through the sub-root trees vs a flat catalog |
+| S12 | Duplicate-heavy keyless tables | Tables without a primary key, many identical rows | Item counts, ANALYZE, per-duplicate TID metadata |
 
 Scale each workload at two sizes: fits in `shared_buffers`, and several times
 larger than RAM.
@@ -68,6 +70,7 @@ larger than RAM.
 | V2 | Dolt-style commit after N row changes, N swept | Hashing cost (deferred-hashing engines D2–D4 pay here) |
 | V3 | Diff and three-way merge between two branches with controlled change sets (size, locality, conflicts) | Structural sharing; canonicalization cost for D3/D4 |
 | V4 | Clone / push / fetch between two local instances | Chunk export path |
+| V5 | Sparse diff: one changed row in a large table | Work proportional to the change (subtree skipping), not to the table |
 
 Each V workload is also run with an S workload in the background (S1 by
 default), to measure how version-control operations and ordinary traffic affect
@@ -88,6 +91,8 @@ each other.
 | Lock/coordination memory | Engine-specific counters |
 | Recovery time | Time from crash to accepting connections after a fixed WAL volume |
 | GC / vacuum cost | Time and I/O of the engine's reclamation pass |
+| Bytes by structure | Canonical bytes (data and index trees), allocated pages (node occupancy), TID-map bytes, and WAL, reported separately; tree operations measured apart from SQL execution |
+| Commit-lock hold time | Time a commit holds the branch's commit lock |
 | Version-control op latency (V suite) | V1–V4 wall time |
 
 ## Environment

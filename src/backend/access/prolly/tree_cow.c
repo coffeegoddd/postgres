@@ -1421,8 +1421,10 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		}
 		else
 		{
-			if (va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0)
-				visit(PROLLY_DIFF_MODIFIED, &ka, &va, &vb, arg);
+			/* Equal keys can be written differently; that is a change too. */
+			if (va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0 ||
+				ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0)
+				visit(PROLLY_DIFF_MODIFIED, &kb, &va, &vb, arg);
 			diff_step(&a);
 			diff_step(&b);
 		}

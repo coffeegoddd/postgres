@@ -75,3 +75,25 @@ SELECT * FROM child ORDER BY id;
 
 DROP TABLE booking, deferred, strict_child, child, parent, audit;
 DROP FUNCTION child_before(), child_after(), child_stmt();
+
+-- Keys updated to an equal value written differently (numeric scale): the
+-- update replaces the row, and the new spelling is what reads return.
+CREATE TABLE eqk (k numeric PRIMARY KEY, n numeric);
+CREATE INDEX eqk_n ON eqk (n);
+INSERT INTO eqk VALUES (1.0, 2.0), (3, 4);
+UPDATE eqk SET k = 1.00 WHERE k = 1;
+UPDATE eqk SET n = 2.000 WHERE k = 1;
+SELECT k::text, n::text FROM eqk ORDER BY k;
+SET enable_seqscan = off;
+SELECT k::text FROM eqk WHERE k = 1;
+SELECT n::text FROM eqk WHERE n = 2;
+RESET enable_seqscan;
+BEGIN;
+UPDATE eqk SET k = 3.0 WHERE k = 3;
+SAVEPOINT s;
+UPDATE eqk SET k = 3.00 WHERE k = 3;
+ROLLBACK TO s;
+SELECT k::text FROM eqk ORDER BY k;
+COMMIT;
+SELECT k::text FROM eqk ORDER BY k;
+DROP TABLE eqk;

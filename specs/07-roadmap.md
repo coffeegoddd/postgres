@@ -145,9 +145,9 @@ Order of work within the step:
 | 4b | Node store and WAL |
 | 4c | D1 tree operations |
 | 4d | Table and index AM wiring, single writer per table |
-| 4e | Concurrency: K1 (replacing single_writer), commit pipeline, root-carrying snapshots (B1, B2); TID counter ranges per backend already, per node if nodes share storage (question 37) |
-| 4f | Checkpoint, recovery, reclamation, including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
-| 4g | V1–V3 and versioned catalogs: catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap |
+| 4e | Concurrency: root-carrying snapshots first (B1, B2: every scan of a snapshot reads the same root set); K1 row-level locks replacing single_writer, so writers to different rows of one table run concurrently, as on heap; a commit pipeline that materializes changed trees before taking the branch's commit lock and, under it, replays the transaction's write set onto a newer head (row locks keep concurrent writers off each other's rows, so replay needs no merge); bounded transaction memory: write sets flushed to intermediate trees, with savepoint roots, their edits recovered at replay by tree diff (question 47); tree diff that skips unchanged internal subtrees, not only leaves (needed by replay; also status, diff, merge and transfer); TID counter ranges per backend already, per node if nodes share storage (question 37) |
+| 4f | Checkpoint, recovery, reclamation, and large values: out-of-line value trees whose references the node format exposes to walk, reclamation and transfer (question 48); reclamation from the full set of live roots (question 49), including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
+| 4g | V1–V3 and versioned catalogs: first, the canonical format freeze (a chunk rule independent of `BLCKSZ` with size targets set by measurement, question 45; portable codecs or refusal for `reg*` and extension types, question 35; collation versions, question 46); then catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap, and three-way merge that reuses unchanged subtrees |
 | 4h | S and V suites and correctness gates, including the history-independence gate |
 
 **Status (2026-10-13): 4a built.** Implementations `sha256` (content hash),
@@ -397,6 +397,26 @@ a crash and on a standby). Requirements suite against prolly_d1: the
 semantics group fails only on values larger than a node, PREPARE after
 prolly writes and temporary tables (`REFRESH MATERIALIZED VIEW
 CONCURRENTLY`).
+
+**Review against Dolt and DoltLite (2026-10-14).** Two source-level
+comparisons of this implementation with Dolt and DoltLite (kept outside this
+repository) found the same tree model in all three, with the gaps in the
+machinery around it. Taken into the plan above (user, 2026-10-14): snapshot
+roots and row-level locking first (4e); bounded transaction memory and
+subtree-skipping diff (4e); large values with a reference contract (4f);
+the full set of roots reclamation protects (4f); the canonical format freeze
+before the first canonical commit (4g); and benchmarks that separate
+canonical bytes, physical pages, TID-map bytes and WAL (`06-benchmarking.md`).
+Structural sharing between the working set and commits is by design: data
+and index trees are canonical as written, and a commit's canonical root
+refers to the same trees (`09-versioned-catalogs.md`). Bug found while
+checking one finding, fixed with tests that fail without the fix: an update
+of a key (or a prolly-indexed column) to an equal value written differently
+(numeric 1.0 to 1.00, or 'a' to 'A' under a case-insensitive collation)
+failed with a duplicate-key error, and D1's write set kept the old key
+bytes, so an index-only scan returned the old spelling and the trees
+differed from ones written with the new value directly (the tree's diff now
+reports such a key as modified).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

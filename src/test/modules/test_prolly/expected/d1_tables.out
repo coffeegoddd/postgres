@@ -685,4 +685,58 @@ SELECT sum(n) FROM d1_new;
  155
 (1 row)
 
-DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp;
+-- A key or index column updated to an equal value written differently
+-- (numeric scale) takes the new bytes in the trees: they equal the trees
+-- of a table written with them directly, and index-only scans return them.
+CREATE OPERATOR CLASS d1_numeric_ops DEFAULT FOR TYPE numeric USING prolly AS
+	OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+	FUNCTION 1 numeric_cmp(numeric, numeric);
+CREATE TABLE d1_respelled (k numeric PRIMARY KEY, n numeric) USING prolly_d1;
+CREATE INDEX d1_respelled_n ON d1_respelled USING prolly (n);
+INSERT INTO d1_respelled VALUES (1.0, 2.0), (3, 4);
+UPDATE d1_respelled SET k = 1.00 WHERE k = 1;
+UPDATE d1_respelled SET n = 2.000 WHERE k = 1;
+CREATE TABLE d1_spelled (k numeric PRIMARY KEY, n numeric) USING prolly_d1;
+CREATE INDEX d1_spelled_n ON d1_spelled USING prolly (n);
+INSERT INTO d1_spelled VALUES (1.00, 2.000), (3, 4);
+SELECT prolly_tree_digest('d1_respelled') = prolly_tree_digest('d1_spelled') AS same_table,
+	   prolly_tree_digest('d1_respelled_n') = prolly_tree_digest('d1_spelled_n') AS same_index;
+ same_table | same_index 
+------------+------------
+ t          | t
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT n::text FROM d1_respelled WHERE n = 2;
+   n   
+-------
+ 2.000
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- Within a transaction, and back to a savepoint.
+BEGIN;
+UPDATE d1_respelled SET n = 2.0 WHERE k = 1;
+SAVEPOINT s;
+UPDATE d1_respelled SET n = 2.00 WHERE k = 1;
+ROLLBACK TO s;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SELECT n::text FROM d1_respelled WHERE n = 2;
+  n  
+-----
+ 2.0
+(1 row)
+
+COMMIT;
+UPDATE d1_spelled SET n = 2.0 WHERE k = 1;
+SELECT prolly_tree_digest('d1_respelled_n') = prolly_tree_digest('d1_spelled_n') AS same_index;
+ same_index 
+------------
+ t
+(1 row)
+
+DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled;
+DROP OPERATOR CLASS d1_numeric_ops USING prolly;
