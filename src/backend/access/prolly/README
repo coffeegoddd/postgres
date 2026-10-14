@@ -168,8 +168,12 @@ pending entries to global/prolly_heads, read back at startup.
 
 Heads are kept per database.  CREATE DATABASE copies the template's
 heads to the new database as pending entries of the creating
-transaction, and DROP DATABASE forgets the database's heads (both
-WAL-logged), through prolly_database.c.  Every prolly relation also has
+transaction, published when it commits and dropped when it aborts, and
+DROP DATABASE forgets the database's heads (both WAL-logged), through
+prolly_database.c.  Entries nobody settles (a crash's, or a standby's
+that nobody read before promotion) are settled by the next checkpoint on
+a primary; never during recovery, where a transaction whose commit is
+still to be replayed can look finished.  Every prolly relation also has
 an empty main fork, so the copy strategies, ALTER TABLE SET TABLESPACE
 and the size functions find the file they expect.
 

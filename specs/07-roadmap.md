@@ -265,9 +265,13 @@ pipeline callbacks, `copy_database` and `drop_database`, and every prolly
 relation gets an empty main fork; keying descriptions record key column
 types, so a dropped primary-key column's rows stay readable; D1 cleans
 up its transaction state after a PREPARE and after a lock error on a
-table's first write. Each has tests in both suites (`003_d1_cleanup.pl`,
-`004_d1_databases.pl`, `103_database_copy.pl`, `sem_ddl`,
-`sem_transactions`).
+table's first write. A copy's pending heads are published or dropped
+when its transaction ends, and checkpoints on a primary settle pending
+entries nobody else will (their xids are invisible to commit-log
+truncation and wraparound); restartpoints don't. A `usage` callback
+reports a pipeline's heads and pending entries. Each has tests
+(`003_d1_cleanup.pl`, `004_d1_databases.pl`, `005_d1_pending.pl`,
+`103_database_copy.pl`, `sem_ddl`, `sem_transactions`).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

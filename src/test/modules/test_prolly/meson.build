@@ -42,6 +42,7 @@ tests += {
       't/002_d1_heads.pl',
       't/003_d1_cleanup.pl',
       't/004_d1_databases.pl',
+      't/005_d1_pending.pl',
     ],
   },
 }

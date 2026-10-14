@@ -48,3 +48,15 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION prolly_canonical_round_trip(anyelement)
 RETURNS anyelement
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- How many branch heads and roots waiting to be published or abandoned a
+-- commit pipeline implementation holds, across all databases.
+CREATE FUNCTION prolly_commit_usage(implementation text,
+	OUT heads int4, OUT pending int4)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Make this backend's next transaction fail just before it commits.
+CREATE FUNCTION prolly_fail_next_commit()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C;
