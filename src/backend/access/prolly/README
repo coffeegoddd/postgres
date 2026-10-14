@@ -9,9 +9,11 @@ can be branched, diffed, merged, cloned, pushed and pulled.
 
 Status: every interface exists.  The foundation interfaces (node format,
 chunker, content hash, canonical key and value encoders), the cluster-wide
-node store, D1's WAL form and copy-on-write trees have real implementations
-that pass their conformance suites; everything else is a stub.  No table
-stores data yet.
+node store, D1's WAL form, copy-on-write trees, the root layout, table
+keying, row identity, the serial commit pipeline and engine D1 have real
+implementations that pass their conformance suites; everything else is a
+stub.  prolly_d1 tables store data: inserts, sequential scans and index
+builds work; fetching by TID, updates, deletes and row locks come next.
 
 
 Interfaces and implementations
@@ -21,7 +23,7 @@ Every component is an interface with implementations behind it, so that any
 design choice can be changed later by writing a new implementation:
 
 	Interface         Header                  Implementations so far
-	engine            prolly_engine.h         d1 d2 d3a d3b d4 (stubs)
+	engine            prolly_engine.h         d1; d2 d3a d3b d4 (stubs)
 	coordination      prolly_coord.h          k1 k2 k3 (stubs)
 	node_format       prolly_nodeformat.h     basic, stub
 	chunker           prolly_chunker.h        keyhash, stub
@@ -31,11 +33,12 @@ design choice can be changed later by writing a new implementation:
 	node_store        prolly_nodestore.h      global, stub
 	tree              prolly_tree.h           cow, stub
 	root_layout       prolly_rootlayout.h     subroots, stub
+	table_keying      prolly_keying.h         pk_or_content, stub
 	allocator         prolly_alloc.h          stub
 	reclamation       prolly_reclaim.h        stub
 	log               prolly_log.h            chunks, stub
-	commit_pipeline   prolly_commit.h         stub
-	row_identity      prolly_rowid.h          stub
+	commit_pipeline   prolly_commit.h         serial, stub
+	row_identity      prolly_rowid.h          hashed, stub
 	refs              prolly_refs.h           stub
 	transfer          prolly_transfer.h       stub
 	diff_merge        prolly_merge.h          stub
@@ -69,10 +72,11 @@ never from code.  Today that is a default profile per table AM:
 	prolly_d4     d4       k3
 
 All five share the same foundation: node format basic, chunker keyhash,
-content hash sha256, key encoder ordered, value encoder canonical, and stubs
-for the interfaces without an implementation yet.  prolly_d1 uses the node
-store global, the tree cow and the log chunks; prolly_d2 the node store
-global and the tree cow.
+content hash sha256, key encoder ordered, value encoder canonical, table
+keying pk_or_content, and stubs for the interfaces without an
+implementation yet.  prolly_d1 and prolly_d2 use the node store global,
+the tree cow, the root layout subroots, the commit pipeline serial and
+the row identity hashed; prolly_d1 also the log chunks.
 
 
 Canonical values
@@ -85,7 +89,9 @@ the canonical encoding of single values, shared by the key and value
 encoders as a fixed part of the format: send formats produced with the
 client encoding fixed to UTF-8 (SetClientEncodingOverride in mbutils.c),
 and OID-free encodings of arrays and composites.  valenc_canonical.c stores
-live columns only, without trailing NULLs.  heaptuple stays registered for
+live columns only, without trailing NULLs.  DROP COLUMN doesn't rewrite a
+table, so rows from earlier layouts remain: encoders describe their row
+layout, and decode rows encoded under an earlier one.  heaptuple stays registered for
 comparison and fails the platform and history checks by design.
 
 
@@ -126,6 +132,70 @@ unhashed hint) its block, and every node caches its own hash in its special
 space, so a stale hint falls back to the hash -> block map.
 
 
+Engine D1
+---------
+
+A database's working set is one branch root (root layout subroots): a
+catalog, a user-data and a local sub-root, each mapping relfilenumbers to
+trees.  A relation's data tree is in the catalog or user-data sub-root;
+its local metadata (row identity map, recorded keying) shares one tree in
+the local sub-root, each key prefixed by its kind.  Keying by
+relfilenumber makes each new storage (TRUNCATE, rewrites, REINDEX) a new
+tree, so rollback and file swaps behave as on heap.
+
+A transaction's writes stay in memory, in a write set per tree: a
+red-black tree of keys, each with its versions tagged by command id and
+subtransaction.  Cursors merge the base tree with the write set, seeing a
+key's newest version from an earlier command.  Aborting a subtransaction
+drops its versions, write sets it created, and undoes emptyings it did.
+At commit, xact_precommit takes the branch lock, applies every write
+set's newest versions to the tip's trees, builds the new root and
+enqueues it; xact_commit publishes it.  Until coordination arrives, the
+first write to a table takes ExclusiveLock on it (one writer per table;
+readers aren't blocked), and snapshots read the newest published head.
+
+
+Commit pipeline "serial"
+------------------------
+
+Branch heads live in shared memory under ProllyHeadsLock.  The branch
+lock is a heavyweight lock (LOCKTAG_PROLLY_BRANCH) held until the
+committer's transaction ends.  enqueue() adds a pending entry and writes a
+ProllyCommit record with the root and xid, before the commit record;
+publish() makes it the head.  After a crash or on a standby, pending
+entries are settled through the commit log.  Checkpoints write heads and
+pending entries to global/prolly_heads, read back at startup.
+
+
+Rows, keys and TIDs
+-------------------
+
+Table keying (keying_pkcontent.c) keys a table by its primary key, or
+by row content hash with a count of identical rows.  Each data tree
+records the keying description it was written with (META kind); scans
+read with it, and the first write in a (sub)transaction after the keying
+changed (primary key added or dropped, or a rewrite through a table
+without one) rebuilds the tree.
+
+Row identity (rowid_hashed.c) names a row version by (content hash,
+ordinal among identical rows) and derives its TID from them, probing
+past TIDs held by other versions.  Displaced versions are recorded, so a
+scan computes nearly every TID without a lookup.  TIDs don't depend on
+keying, so rebuilding a tree leaves indexes valid.
+
+
+Core hooks
+----------
+
+prolly_shmem.c is a shared-memory subsystem (subsystemlist.h) reserving
+an area per engine, coordination and commit pipeline implementation that
+asks for one, and CheckPointProlly() runs in CheckPointGuts().  A table
+AM may leave the parallel-scan callbacks NULL; the planner then keeps
+scans of its tables in the leader (AMFLAG_NO_PARALLEL_SCAN), as for
+temporary tables, because workers couldn't see the leader's private
+writes.
+
+
 Adapters
 --------
 
@@ -138,10 +208,9 @@ The Postgres-facing code is thin and holds no engine logic:
 	                   prolly_commit, prolly_diff, prolly_merge, prolly_clone,
 	                   prolly_fetch, prolly_push
 
-Table AM callbacks that map directly onto an engine callback (storage
-creation, truncation, copy, vacuum) already call through the engine
-interface.  The rest raise "does not implement ... yet" until their
-translation is designed.
+Table AM callbacks not built yet raise "does not implement ... yet".
+prolly_xact.c delivers transaction events to engines with private
+writes.
 
 The catalog entries (pg_am, pg_proc, pg_opfamily, pg_opclass, pg_amop,
 pg_amproc) use OIDs 9370-9392.
@@ -154,3 +223,7 @@ src/test/modules/test_prolly runs each interface's conformance suite
 against every registered implementation, and reaches each stub from SQL:
 
 	make -C src/test/modules/test_prolly check
+
+which also runs d1_tables (D1 tables from SQL) and the TAP tests: node
+store replay (001) and branch heads across crashes, checkpoints, standby
+replay and promotion (002).

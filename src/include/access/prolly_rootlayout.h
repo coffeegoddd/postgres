@@ -4,17 +4,23 @@
  *	  Root layout interface: how a branch's root finds every relation's tree.
  *
  * A branch's root (its working-set root, published at SQL COMMIT) points
- * to two sub-roots: the catalog sub-root, holding every system catalog's
- * trees, and the user-data sub-root, holding user tables' and indexes'
- * trees.  Each sub-root maps a relation to the root of its tree.  "Did the
- * schema change?" is one hash comparison of catalog sub-roots, and diff
- * skips whichever sub-root didn't change.
+ * to three sub-roots: the catalog sub-root, holding every system catalog's
+ * trees; the user-data sub-root, holding user tables' and indexes' trees;
+ * and the local sub-root, holding per-relation metadata that is never part
+ * of a version-control commit (TID maps).  Each sub-root maps a relation to
+ * the root of its tree.  "Did the schema change?" is one hash comparison of
+ * catalog sub-roots, diff skips whichever sub-root didn't change, and
+ * local metadata never changes the user-data sub-root's hash.
  *
  * This is the local, Postgres-native layout: relations are identified by
- * OID, one entry per relation (a table and each of its indexes are separate
- * entries).  The canonical root of a version-control commit uses the same
- * shape with relations identified by name; it comes with the schema
- * canonicalizer, which derives those names.
+ * relfilenumber (their storage within the database), one entry per
+ * relation (a table and each of its indexes are separate entries).  A
+ * relation gets a new relfilenumber whenever Postgres gives it new storage
+ * (TRUNCATE, rewrites, REINDEX), so each new storage is a new tree and the
+ * old one stays reachable until the transaction ends, as heap's old files
+ * do.  The canonical root of a version-control commit uses the catalog
+ * and user-data shape with relations identified by name; it comes with the
+ * schema canonicalizer, which derives those names.
  *
  * A layout is built from trees (prolly_tree.h), so a root is an immutable
  * value like a tree: operations never change one, and apply() returns a
@@ -29,7 +35,7 @@
  *   gives the empty root's hash.
  * - Which sub-root a relation belongs in is the caller's decision; the
  *   layout doesn't apply Postgres's catalog rules.
- * - apply() takes edits sorted by (sub-root, relid) with no duplicates.
+ * - apply() takes edits sorted by (sub-root, relnumber) with no duplicates.
  *   Setting a relation that is present replaces its tree; removing one that
  *   is absent does nothing.
  * - A relation's tree is referenced by hash only (no block hint), so the
@@ -50,14 +56,16 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "common/relpath.h"
 
 typedef enum ProllySubRoot
 {
 	PROLLY_SUBROOT_CATALOG = 0,
 	PROLLY_SUBROOT_USER_DATA = 1,
+	PROLLY_SUBROOT_LOCAL = 2,
 } ProllySubRoot;
 
-#define PROLLY_NUM_SUBROOTS 2
+#define PROLLY_NUM_SUBROOTS 3
 
 /* What a layout is made of; filled in by the caller. */
 typedef struct ProllyRootEnv
@@ -66,22 +74,22 @@ typedef struct ProllyRootEnv
 	const ProllyTreeEnv *tree_env;
 } ProllyRootEnv;
 
-/* One change for apply(): set relid's tree in sub, or remove relid. */
+/* One change for apply(): set relnumber's tree in sub, or remove relnumber. */
 typedef struct ProllyRootEdit
 {
 	ProllySubRoot sub;
-	Oid			relid;
+	RelFileNumber relnumber;
 	ProllyNodeRef tree;			/* ignored for a remove */
 	bool		is_remove;
 } ProllyRootEdit;
 
 /* Called for each relation in a sub-root (scan). */
-typedef void (*ProllyRootVisitRel) (ProllySubRoot sub, Oid relid,
+typedef void (*ProllyRootVisitRel) (ProllySubRoot sub, RelFileNumber relnumber,
 									const ProllyNodeRef *tree, void *arg);
 
 /* Called for each relation whose tree differs between two roots (diff). */
 typedef void (*ProllyRootVisitChange) (ProllyDiffKind kind, ProllySubRoot sub,
-									   Oid relid,
+									   RelFileNumber relnumber,
 									   const ProllyNodeRef *before,	/* NULL if added */
 									   const ProllyNodeRef *after,	/* NULL if removed */
 									   void *arg);
@@ -90,14 +98,14 @@ typedef struct ProllyRootLayoutRoutine
 {
 	ProllyImplInfo info;
 
-	/* The root with no relations (both sub-roots empty). */
+	/* The root with no relations (every sub-root empty). */
 	void		(*empty) (const ProllyRootEnv *env, ProllyNodeRef *root);
 
-	/* Find relid's tree in sub; false if relid isn't there. */
+	/* Find relnumber's tree in sub; false if relnumber isn't there. */
 	bool		(*lookup) (const ProllyRootEnv *env, const ProllyNodeRef *root,
-						   ProllySubRoot sub, Oid relid, ProllyNodeRef *tree);
+						   ProllySubRoot sub, RelFileNumber relnumber, ProllyNodeRef *tree);
 
-	/* Apply edits (sorted by sub-root, then relid) to root, giving *new_root. */
+	/* Apply edits (sorted by sub-root, then relnumber) to root, giving *new_root. */
 	void		(*apply) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 						  const ProllyRootEdit *edits, int nedits,
 						  ProllyNodeRef *new_root);
@@ -106,7 +114,7 @@ typedef struct ProllyRootLayoutRoutine
 	void		(*subroot) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 							ProllySubRoot sub, ProllyNodeRef *subroot);
 
-	/* Visit each relation in sub, in relid order. */
+	/* Visit each relation in sub, in relnumber order. */
 	void		(*scan) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 						 ProllySubRoot sub, ProllyRootVisitRel visit, void *arg);
 
@@ -120,7 +128,7 @@ typedef struct ProllyRootLayoutRoutine
 
 	/*
 	 * Report each relation whose presence or tree differs between from and
-	 * to, once, in (sub-root, relid) order.  A sub-root with the same hash
+	 * to, once, in (sub-root, relnumber) order.  A sub-root with the same hash
 	 * in both is skipped.
 	 */
 	void		(*diff) (const ProllyRootEnv *env, const ProllyNodeRef *from,

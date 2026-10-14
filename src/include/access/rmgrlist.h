@@ -50,3 +50,4 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 PG_RMGR(RM_XLOG2_ID, "XLOG2", xlog2_redo, xlog2_desc, xlog2_identify, NULL, NULL, NULL, xlog2_decode)
 PG_RMGR(RM_PROLLY_ID, "Prolly", prolly_redo, prolly_desc, prolly_identify, NULL, NULL, prolly_mask, NULL)
 PG_RMGR(RM_PROLLY_STORE_ID, "ProllyStore", prolly_store_redo, prolly_store_desc, prolly_store_identify, NULL, NULL, prolly_mask, NULL)
+PG_RMGR(RM_PROLLY_COMMIT_ID, "ProllyCommit", prolly_commit_redo, prolly_commit_desc, prolly_commit_identify, NULL, NULL, NULL, NULL)

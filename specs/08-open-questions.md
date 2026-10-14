@@ -15,7 +15,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); sizes still to be measured |
 | Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
 | Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
-| Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13 (relations by OID, one entry per relation); the canonical layout by name comes with 4g |
+| Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
+| Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present, else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
@@ -228,6 +229,16 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     separately), behind its own interface (`root_layout`, implementation
     `subroots`). The canonical root uses the same shape keyed by name, with
     the canonicalizer (4g).
+    **Changed 2026-10-14 (user), for 4d:** the local root keys relations by
+    **relfilenumber**, not OID. TRUNCATE, ALTER TABLE rewrites, CLUSTER,
+    VACUUM FULL and REINDEX give a relation new storage (and rewrites swap
+    `relfilenode` between OIDs in `swap_relation_files`); keyed by storage
+    number, each new storage is a new tree, the old one stays reachable
+    until commit, so transactional truncate and rollback of a rewrite
+    behave as on heap and SET TABLESPACE is a pointer copy. And the local
+    root has a **third sub-root, local**, holding per-relation metadata that
+    is never canonical (TID maps, question 37); the canonical root keeps
+    the two-sub-root shape.
 34. **Keyless catalogs.** `pg_depend` and `pg_shdepend` have no unique key.
     Key their trees by row content hash with a count (Dolt's keyless tables),
     or by a synthetic row id?
@@ -240,3 +251,24 @@ Nothing below is decided unless its entry says so. Update this file when somethi
       refers to (`regclass` → name), and refuse or pass through the rest?
     - Rename detection in diff: by matching content hashes, with what
       threshold for "same table, changed"?
+36. **Keying user tables.** Postgres tables need not have a primary key,
+    the table AM doesn't see the key at insert, and history independence
+    rules out insertion-order row ids.
+    **Decided 2026-10-14 (user):** Dolt's model. A table with a primary key
+    is keyed by its encoded key columns; a table without one is keyed by
+    the row's content hash, with a count of identical rows as part of the
+    value. ADD or DROP PRIMARY KEY rebuilds the table's tree. Rejected:
+    always keying by content with the primary key as a separate index tree
+    (diff and cell-level merge would need a join), and synthetic row ids
+    (history-dependent).
+37. **Where the TID map lives.** Non-prolly index AMs store TIDs
+    persistently, so the synthetic TID → row map must be resolvable after
+    restart and per branch.
+    **Decided 2026-10-14 (user):** one tree per relation, TID → (key,
+    content hash, local row metadata such as the xmin change token), in the
+    local sub-root of the working-set root; TID = a hash of (key, content
+    hash) folded into a valid heap-style item pointer, with probing on
+    collision. Versioned with the working set, WAL-logged by the node store,
+    never part of a canonical root. Rejected: one unversioned cluster-wide
+    map (checkout could leave index entries pointing at TIDs the branch
+    doesn't have).

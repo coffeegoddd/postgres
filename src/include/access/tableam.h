@@ -416,6 +416,10 @@ typedef struct TableAmRoutine
 
 	/* ------------------------------------------------------------------------
 	 * Parallel table scan related functions.
+	 *
+	 * Optional: an AM that can't share a scan between processes leaves all
+	 * three NULL, and the planner then keeps every scan of its tables in
+	 * the leader (they are parallel restricted, as temporary tables are).
 	 * ------------------------------------------------------------------------
 	 */
 

@@ -118,6 +118,7 @@ extern void LockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16
 										   LOCKMODE lockmode);
 extern void UnlockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
 											 LOCKMODE lockmode);
+extern void LockProllyBranch(uint32 branch, LOCKMODE lockmode);
 
 /* Describe a locktag for error messages */
 extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);

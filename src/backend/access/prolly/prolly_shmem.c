@@ -1,0 +1,177 @@
+/*-------------------------------------------------------------------------
+ *
+ * prolly_shmem.c
+ *	  The prolly shared-memory subsystem and checkpoint hook.
+ *
+ * At postmaster startup this reserves a shared area for every registered
+ * engine, coordination and commit pipeline implementation whose
+ * shmem_size() is non-zero, named after the implementation, and calls its
+ * shmem_init() with the area once.  Every process finds the area again
+ * with prolly_shmem_area().
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/prolly/prolly_shmem.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/prolly_config.h"
+#include "access/prolly_shmem.h"
+#include "storage/shmem.h"
+#include "storage/subsystems.h"
+
+/* Interfaces whose implementations may have shared state. */
+static const ProllyInterface shmem_interfaces[] = {
+	PROLLY_IFACE_ENGINE,
+	PROLLY_IFACE_COORDINATION,
+	PROLLY_IFACE_COMMIT_PIPELINE,
+};
+
+#define MAX_AREAS 64
+#define AREA_NAME_LEN 64
+
+typedef struct ProllyShmemArea
+{
+	const ProllyImplInfo *impl;
+	char		name[AREA_NAME_LEN];
+	void	   *area;
+} ProllyShmemArea;
+
+static ProllyShmemArea areas[MAX_AREAS];
+static int	nareas = 0;
+
+static Size
+impl_shmem_size(const ProllyImplInfo *impl)
+{
+	switch (impl->iface)
+	{
+		case PROLLY_IFACE_ENGINE:
+			{
+				const ProllyEngineRoutine *r = (const ProllyEngineRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
+		case PROLLY_IFACE_COORDINATION:
+			{
+				const ProllyCoordRoutine *r = (const ProllyCoordRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
+		case PROLLY_IFACE_COMMIT_PIPELINE:
+			{
+				const ProllyCommitRoutine *r = (const ProllyCommitRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
+		default:
+			return 0;
+	}
+}
+
+static void
+impl_shmem_init(const ProllyImplInfo *impl, void *area)
+{
+	switch (impl->iface)
+	{
+		case PROLLY_IFACE_ENGINE:
+			PROLLY_CALL(((const ProllyEngineRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_COORDINATION:
+			PROLLY_CALL(((const ProllyCoordRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_COMMIT_PIPELINE:
+			PROLLY_CALL(((const ProllyCommitRoutine *) impl), shmem_init, area);
+			break;
+		default:
+			elog(ERROR, "prolly %s implementations have no shared memory",
+				 prolly_interface_name(impl->iface));
+	}
+}
+
+static void
+ProllyShmemRequest(void *arg)
+{
+	nareas = 0;
+	for (int i = 0; i < lengthof(shmem_interfaces); i++)
+	{
+		List	   *impls = prolly_list_impls(shmem_interfaces[i]);
+		ListCell   *lc;
+
+		foreach(lc, impls)
+		{
+			const ProllyImplInfo *impl = lfirst(lc);
+			Size		size = impl_shmem_size(impl);
+			ProllyShmemArea *a;
+
+			if (size == 0)
+				continue;
+			if (nareas >= MAX_AREAS)
+				elog(FATAL, "too many prolly implementations with shared memory");
+			a = &areas[nareas++];
+			a->impl = impl;
+			a->area = NULL;
+			snprintf(a->name, sizeof(a->name), "prolly %s %s",
+					 prolly_interface_name(impl->iface), impl->name);
+			ShmemRequestStruct(.name = a->name,
+							   .size = size,
+							   .ptr = &a->area,
+				);
+		}
+		list_free(impls);
+	}
+}
+
+static void
+ProllyShmemInit(void *arg)
+{
+	for (int i = 0; i < nareas; i++)
+		impl_shmem_init(areas[i].impl, areas[i].area);
+}
+
+const ShmemCallbacks ProllyShmemCallbacks = {
+	.request_fn = ProllyShmemRequest,
+	.init_fn = ProllyShmemInit,
+};
+
+void *
+prolly_shmem_area(const ProllyImplInfo *impl)
+{
+	for (int i = 0; i < nareas; i++)
+	{
+		if (areas[i].impl == impl)
+			return areas[i].area;
+	}
+	return NULL;
+}
+
+/*
+ * Called by CheckPointGuts(), after the redo point is fixed: each
+ * implementation makes its state as of that point durable.
+ */
+void
+CheckPointProlly(int flags)
+{
+	List	   *impls;
+	ListCell   *lc;
+
+	impls = prolly_list_impls(PROLLY_IFACE_COMMIT_PIPELINE);
+	foreach(lc, impls)
+	{
+		const ProllyCommitRoutine *r = lfirst(lc);
+
+		if (PROLLY_HAS(r, checkpoint))
+			r->checkpoint(flags);
+	}
+	list_free(impls);
+
+	impls = prolly_list_impls(PROLLY_IFACE_ENGINE);
+	foreach(lc, impls)
+	{
+		const ProllyEngineRoutine *r = lfirst(lc);
+
+		if (PROLLY_HAS(r, checkpoint))
+			r->checkpoint(flags);
+	}
+	list_free(impls);
+}

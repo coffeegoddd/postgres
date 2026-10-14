@@ -46,9 +46,11 @@ GetTableAmRoutine(Oid amhandler)
 	Assert(routine->scan_rescan != NULL);
 	Assert(routine->scan_getnextslot != NULL);
 
-	Assert(routine->parallelscan_estimate != NULL);
-	Assert(routine->parallelscan_initialize != NULL);
-	Assert(routine->parallelscan_reinitialize != NULL);
+	/* Parallel scans are optional, but all or none of their callbacks. */
+	Assert((routine->parallelscan_estimate == NULL) ==
+		   (routine->parallelscan_initialize == NULL));
+	Assert((routine->parallelscan_estimate == NULL) ==
+		   (routine->parallelscan_reinitialize == NULL));
 
 	Assert(routine->index_scan_begin != NULL);
 	Assert(routine->index_scan_reset != NULL);

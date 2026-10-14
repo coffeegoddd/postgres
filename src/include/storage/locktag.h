@@ -47,9 +47,10 @@ typedef enum LockTagType
 	LOCKTAG_ADVISORY,			/* advisory user locks */
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
+	LOCKTAG_PROLLY_BRANCH,		/* the right to commit to a prolly branch */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_APPLY_TRANSACTION
+#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_BRANCH
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -185,6 +186,18 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field3 = (xid), \
 	 (locktag).locktag_field4 = (objid), \
 	 (locktag).locktag_type = LOCKTAG_APPLY_TRANSACTION, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
+/*
+ * ID info for a prolly branch is DB OID + branch number (as numbered by
+ * the database's refs).
+ */
+#define SET_LOCKTAG_PROLLY_BRANCH(locktag,dboid,branch) \
+	((locktag).locktag_field1 = (dboid), \
+	 (locktag).locktag_field2 = (branch), \
+	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_PROLLY_BRANCH, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 #endif							/* _PG_LOCKTAG_H_ */

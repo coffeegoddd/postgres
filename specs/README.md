@@ -22,7 +22,7 @@ control; this project's premise is that we should not have to.
   Steps 4a (hash, node format, chunker, canonical key and value encoders),
   4b (cluster-wide node store, WAL resource managers) and 4c (copy-on-write
   tree operations) are built, and so is the root layout (question 33); 4d
-  comes next. See the status notes in `07-roadmap.md`.
+  (tables and indexes on trees) is in progress as four PRs, 4d.1 first. See the status notes in `07-roadmap.md`.
 - **Code never refers to these specs** (user rule, 2026-10-13): no paths,
   question numbers, step numbers or shorthand such as "B2" in code or
   comments. Specs may point at code.

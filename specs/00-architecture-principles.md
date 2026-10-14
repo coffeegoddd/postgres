@@ -69,13 +69,14 @@ provisional.
 | **Key encoder** | memcmp-comparable keys from btree opclasses and collations; no local OIDs | Per opclass, plus a comparator fallback (**ordered**) |
 | **Value encoder** | Row encoding and deforming into slots | Canonical portable format (**canonical**, the default since 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
 | **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Cluster-wide hash-addressed (**global**), location-addressed |
-| **Root layout** | How a branch's root finds every relation's tree: catalog and user-data sub-roots | Sub-roots keyed by relation OID for the working set (**subroots**); by name for canonical roots (4g) |
+| **Root layout** | How a branch's root finds every relation's tree: catalog, user-data and (working set only) local sub-roots | Sub-roots keyed by relfilenumber for the working set (**subroots**); by name for canonical roots (4g) |
 | **Tree** | Persistent prolly-tree operations over the foundation: build, get, cursors, batched apply, count, walk, diff | Copy-on-write in a hash-addressed store (**cow**); location-addressed engines (D3, D4) to be decided when they are built |
 | **Allocator** | Space management for in-place engines | Fixed-size blocks; variable-size |
 | **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |
 | **Log** | What the WAL records contain and how they are replayed | Full chunk (**chunks**), delta, logical |
-| **Commit pipeline** | Ordering and publishing roots at commit | Single lock, ordered pipeline |
-| **Row identity** | TIDs ↔ keys | Content-derived TID map, wide row ids |
+| **Commit pipeline** | Branch heads; ordering and publishing roots at commit; their WAL and checkpoint | One committer per branch (**serial**), ordered pipeline |
+| **Row identity** | TIDs ↔ row versions | Content-derived TIDs with a map (**hashed**), wide row ids |
+| **Table keying** | How a table's rows become tree items: key, value layout, content hash | Primary key, else row content with a count (**pk_or_content**) |
 | **Refs and commit graph** | Branches, commits, history storage | A refs file per database (proposed; catalogs can't hold refs now that they are versioned), others |
 | **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |
 | **Diff / merge** | Row diff and three-way merge between refs, over canonical trees | Structural diff (added in step 1; see below) |
@@ -100,6 +101,10 @@ foundation components it uses come from the engine (`prolly_tree.h`).
 shape of a branch's root is the same for every engine that keeps
 hash-addressed trees, and the canonical root will reuse it, so it is an
 interface over Tree rather than part of an engine (`prolly_rootlayout.h`).
+
+**Table keying** was added in step 4d.1 (question 36): how rows become
+tree items is independent of the engine, and other rules (always by
+content, by a synthetic id) stay possible (`prolly_keying.h`).
 
 The C interfaces (everything above the benchmark rows) were defined in step 1:
 headers `src/include/access/prolly_*.h`, except the schema canonicalizer,

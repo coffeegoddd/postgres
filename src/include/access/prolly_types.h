@@ -77,6 +77,25 @@ typedef uint32 ProllyBranchId;
 #define InvalidProllyBranchId	((ProllyBranchId) 0)
 
 /*
+ * Every database's default branch.  Until refs exist, it is the only one.
+ */
+#define PROLLY_MAIN_BRANCH		((ProllyBranchId) 1)
+
+/*
+ * Which of a relation's trees is meant.  DATA is the relation's own rows
+ * (or index entries); the others are local metadata, never part of a
+ * version-control commit.  These numbers are persisted; never renumber.
+ */
+typedef enum ProllyTreeKind
+{
+	PROLLY_TREE_DATA = 0,
+	PROLLY_TREE_ROWID = 1,		/* row identity: TIDs <-> rows */
+	PROLLY_TREE_META = 2,		/* facts about the data tree, such as its keying */
+} ProllyTreeKind;
+
+#define PROLLY_TREE_KIND_LAST	PROLLY_TREE_META
+
+/*
  * Opaque handles.  Each is defined privately by the implementation that
  * creates it; callers only pass them back to the same implementation.
  */

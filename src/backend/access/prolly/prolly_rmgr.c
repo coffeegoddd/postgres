@@ -3,9 +3,10 @@
  * prolly_rmgr.c
  *	  WAL resource-manager adapters for prolly storage.
  *
- * Redo for the Prolly and ProllyStore resource managers is dispatched to the
- * implementation named in the record's xl_prolly_header: a log
- * implementation for Prolly, a node store implementation for ProllyStore.
+ * Redo for the prolly resource managers is dispatched to the implementation
+ * named in the record's xl_prolly_header: a log implementation for Prolly,
+ * a node store implementation for ProllyStore, a commit pipeline
+ * implementation for ProllyCommit.
  * desc and identify are generic and live in rmgrdesc/prollydesc.c.
  *
  * Masking for wal_consistency_checking is common to both: prolly pages are
@@ -56,6 +57,15 @@ prolly_store_redo(XLogReaderState *record)
 		record_impl(record, PROLLY_IFACE_NODE_STORE);
 
 	PROLLY_CALL(store, redo, record);
+}
+
+void
+prolly_commit_redo(XLogReaderState *record)
+{
+	const ProllyCommitRoutine *commit = (const ProllyCommitRoutine *)
+		record_impl(record, PROLLY_IFACE_COMMIT_PIPELINE);
+
+	PROLLY_CALL(commit, redo, record);
 }
 
 void

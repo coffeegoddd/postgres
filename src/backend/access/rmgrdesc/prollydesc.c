@@ -68,3 +68,15 @@ prolly_store_identify(uint8 info)
 {
 	return generic_identify(info);
 }
+
+void
+prolly_commit_desc(StringInfo buf, XLogReaderState *record)
+{
+	generic_desc(buf, record);
+}
+
+const char *
+prolly_commit_identify(uint8 info)
+{
+	return generic_identify(info);
+}

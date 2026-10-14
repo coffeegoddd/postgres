@@ -217,6 +217,48 @@ keyed by name, comes with the canonicalizer in 4g. Code comments no longer
 refer to these specs (user rule, 2026-10-13): specs may point at code, not
 the reverse.
 
+**Plan (2026-10-14, user): 4d in four stacked PRs.**
+
+| | Work |
+|---|---|
+| 4d.1 | Branch head store (one working-set head per database, in shared memory, WAL-logged, saved at checkpoint); D1 private writes per transaction with command-id and savepoint overlay; insert and sequential scan; tables keyed by primary key or by content (question 36); local root by relfilenumber with a local sub-root (question 33) |
+| 4d.2 | TID maps (question 37); fetch by TID, delete, update, row locks for a single writer; btree and the other index AMs on prolly tables |
+| 4d.3 | The prolly index AM |
+| 4d.4 | Remaining table AM callbacks: ANALYZE, sampling, bitmap scans, CLUSTER, size estimates |
+
+Until 4e, every snapshot reads the latest published head (no root-carrying
+snapshots), and a table has one writer at a time. Values too large for a
+node stay an error until out-of-line storage.
+
+**Status (2026-10-14): 4d.1 built.** Engine D1 stores tables: private
+writes per transaction (command-id and savepoint visibility, Halloween
+protection), commit through a new commit pipeline implementation
+`serial` (branch heads in shared memory, a `ProllyCommit` WAL record per
+new root, `global/prolly_heads` at checkpoints, heads settled through the
+commit log after a crash or on a standby), a new interface Table keying
+(`prolly_keying.h`, implementation `pk_or_content`, question 36) and row
+identity `hashed` (question 37). The local root keys relations by
+relfilenumber and has a local sub-root (question 33 changed), so
+transactional TRUNCATE and table rewrites behave as on heap. Each data
+tree records its keying and row layout; a primary key added or dropped,
+a rewrite (which goes through a table without one) or a dropped column
+rebuilds the tree at the next write, keeping every row's TID (re-encoded
+rows are renamed in the TID map). Bug found in 4a's `canonical` value
+encoder: rows written before a DROP COLUMN (which doesn't rewrite the
+table) couldn't be decoded; value encoders now describe their row layout
+and decode rows from earlier layouts, with a conformance check and SQL
+tests. Core changes: a prolly shared-memory
+subsystem and checkpoint hook, a `prollybranch` lock tag, the
+`ProllyHeads` LWLock, the `ProllyCommit` resource manager, and optional
+parallel-scan callbacks (a table AM without them is scanned only in the
+leader, like temporary tables, because workers can't see the leader's
+private writes). Table AM: sequential scans, inserts, size estimates,
+index builds; TID fetches, updates, deletes, row locks and index scans are
+4d.2. Tests: conformance suites for engine D1, `serial`, `hashed` and
+`pk_or_content` (`src/test/modules/test_prolly`), SQL tests of D1 tables
+(`d1_tables`), and a TAP test of heads across crashes, checkpoints,
+restarts, standby replay and promotion (`002_d1_heads.pl`).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

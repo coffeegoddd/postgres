@@ -51,6 +51,21 @@ extern void tree_edits_share_nodes(const ProllyImplInfo *impl);
 extern void tree_diff_reports_changes(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 
+/* engine_checks.c */
+extern void engine_read_empty_tree(const ProllyImplInfo *impl);
+extern void engine_read_own_writes(const ProllyImplInfo *impl);
+extern void engine_subxact_abort_discards_writes(const ProllyImplInfo *impl);
+extern void engine_create_and_truncate(const ProllyImplInfo *impl);
+extern void engine_count_range_matches_scan(const ProllyImplInfo *impl);
+extern void commit_publishes_in_enqueue_order(const ProllyImplInfo *impl);
+extern void keying_round_trip(const ProllyImplInfo *impl);
+extern void keying_keys_and_content(const ProllyImplInfo *impl);
+extern void keying_description_reopens(const ProllyImplInfo *impl);
+extern void valenc_decodes_earlier_layouts(const ProllyImplInfo *impl);
+extern void rowid_assign_then_resolve(const ProllyImplInfo *impl);
+extern void rowid_same_version_same_tid(const ProllyImplInfo *impl);
+extern void rowid_hashed_displaced_version(const ProllyImplInfo *impl);
+
 /* rootlayout_checks.c */
 extern void rootlayout_empty(const ProllyImplInfo *impl);
 extern void rootlayout_apply_matches_reference(const ProllyImplInfo *impl);

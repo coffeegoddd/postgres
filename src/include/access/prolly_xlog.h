@@ -9,6 +9,8 @@
  *	ProllyStore	records written by a node store implementation
  *				(prolly_nodestore.h) for its own structures, such as a
  *				hash -> block map
+ *	ProllyCommit	records written by a commit pipeline implementation
+ *				(prolly_commit.h): new branch heads
  *
  * Every record's main data starts with xl_prolly_header, naming the
  * implementation (by impl_id within the interface) that wrote it; redo is
@@ -51,5 +53,10 @@ extern void prolly_mask(char *pagedata, BlockNumber blkno);
 extern void prolly_store_redo(XLogReaderState *record);
 extern void prolly_store_desc(StringInfo buf, XLogReaderState *record);
 extern const char *prolly_store_identify(uint8 info);
+
+/* The ProllyCommit rmgr (commit pipeline interface) */
+extern void prolly_commit_redo(XLogReaderState *record);
+extern void prolly_commit_desc(StringInfo buf, XLogReaderState *record);
+extern const char *prolly_commit_identify(uint8 info);
 
 #endif							/* PROLLY_XLOG_H */
