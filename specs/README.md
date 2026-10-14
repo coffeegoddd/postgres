@@ -28,7 +28,9 @@ control; this project's premise is that we should not have to.
   comments. Specs may point at code.
 - **The product goal:** true to Postgres and true to Dolt. Postgres-native
   working sets; canonical, history-independent version-control commits;
-  schema versioned with data (`09-versioned-catalogs.md`).
+  schema versioned with data (`09-versioned-catalogs.md`); every
+  version-control operation at worst as cheap as Dolt's, in time and space
+  (`10-complexity-requirements.md`).
 - Code lives in
   `src/backend/access/prolly/` and `src/include/access/prolly_*.h`; the
   benchmark harness in `src/tools/prolly_bench/`.
@@ -51,6 +53,7 @@ control; this project's premise is that we should not have to.
 | [08-open-questions.md](08-open-questions.md) | Questions that are still open, and who or what decides them; decisions made so far |
 | `src/test/prolly/README` | The requirements suite: what an engine must pass, and how to run it |
 | [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
+| [10-complexity-requirements.md](10-complexity-requirements.md) | **Requirement:** every version-control operation at worst matches Dolt's time and space bounds, ideally beats them; per-operation bounds, how the design meets them, and status |
 
 ## Related local repositories
 

@@ -24,6 +24,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
+| Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 
 ## Questions
 
