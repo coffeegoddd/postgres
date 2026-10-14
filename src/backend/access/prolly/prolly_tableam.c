@@ -113,8 +113,10 @@ typedef struct ProllyScanDescData
 	 * and the rows of the current one.
 	 */
 	bool		sample_started;
+	bool		sample_by_position; /* blocks found by position, else read */
 	BlockNumber sample_nblocks;
 	BlockNumber sample_block;
+	BlockNumber sample_cursor_block;	/* read: the block the cursor is at */
 	int			sample_nrows;
 	int			sample_chunk;	/* first row of the chunk offsets name */
 	int			sample_cap;
@@ -1815,12 +1817,33 @@ prolly_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	smgrclose(dstrel);
 }
 
+/* Whether a live column of rel has a missing value (added with a default). */
+static bool
+has_missing_values(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->atthasmissing)
+			return true;
+	}
+	return false;
+}
+
 /*
  * CLUSTER and VACUUM FULL: rows are kept in key order whatever the index,
  * and carry no xids to freeze, so the new storage takes the table's trees
  * as they are (the transaction's own writes included), and its TID
  * counter: the rows, their keying and their TIDs are the same.  Nothing
  * else can write the table meanwhile (it is locked exclusively).
+ *
+ * Postgres clears the missing values of added columns once the table is
+ * rewritten, so rows written before such a column was added (which don't
+ * hold it) are rewritten in the new storage with its value, as rows of a
+ * table without missing values are encoded; they keep their TIDs.
  */
 static void
 prolly_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
@@ -1842,11 +1865,27 @@ prolly_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 	RelationCopyStorage(RelationGetSmgr(OldTable), RelationGetSmgr(NewTable),
 						MAIN_FORKNUM, NewTable->rd_rel->relpersistence);
 
+	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+	if (has_missing_values(OldTable))
+	{
+		ProllyKeying *old = open_read_keying(&c, roots, OldTable,
+											 CurrentMemoryContext);
+		ProllyKeying *now = PROLLY_CALL(c.keying, open_rewritten, OldTable,
+										CurrentMemoryContext);
+
+		/*
+		 * The copied trees record the keying, which describes itself the
+		 * same rewritten or not.
+		 */
+		rekey(NewTable, &c, &roots, old, now);
+		PROLLY_CALL(c.keying, close, now);
+		PROLLY_CALL(c.keying, close, old);
+	}
+
 	/*
 	 * The row count: the item count, but in a keyless table an item holds
 	 * every copy of identical rows, so their counts are summed.
 	 */
-	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
 	keying = read_keying(OldTable, &c, roots, &owned);
 	if (PROLLY_CALL(c.keying, keyless, keying))
 	{
@@ -2166,12 +2205,71 @@ sampled_row_cmp(const void *a, const void *b)
 					  &((const SampledRow *) b)->seq);
 }
 
+/* ANALYZE's sample so far: a reservoir over the rows read, in order. */
+typedef struct SampleState
+{
+	const ProllyComponents *c;
+	Relation	rel;
+	ProllyKeying *keying;
+	ProllyRowIdScan *rowid;
+	TupleTableSlot *slot;
+	MemoryContext caller;		/* the sample's tuples live here */
+	pg_prng_state rng;
+	SampledRow *kept;
+	int			targrows;
+	int			nrows;			/* rows kept */
+	int			nitems;			/* items read */
+	uint64		nread;			/* rows read */
+} SampleState;
+
+/* Offer every row of an item to the reservoir. */
+static void
+sample_item(SampleState *st, const ProllyKey *key, const ProllyValue *value)
+{
+	ProllyValue row;
+	uint64		count;
+
+	PROLLY_CALL(st->c->keying, parse_value, st->keying, value, &row, &count);
+	PROLLY_CALL(st->c->keying, decode_row, st->keying, &row, st->slot);
+	st->nitems++;
+	for (uint64 o = 0; o < count; o++, st->nread++)
+	{
+		int			slotno;
+		MemoryContext old;
+
+		if (st->nrows < st->targrows)
+			slotno = st->nrows++;
+		else
+		{
+			uint64		j = pg_prng_uint64_range(&st->rng, 0, st->nread);
+
+			if (j >= (uint64) st->targrows)
+				continue;
+			slotno = (int) j;
+			heap_freetuple(st->kept[slotno].tuple);
+		}
+		old = MemoryContextSwitchTo(st->caller);
+		st->kept[slotno].tuple = ExecCopySlotHeapTuple(st->slot);
+		MemoryContextSwitchTo(old);
+		st->kept[slotno].seq = st->nread;
+		if (!PROLLY_CALL(st->c->row_identity, tid_find, st->rowid, key, o,
+						 &st->kept[slotno].tuple->t_self))
+			ItemPointerSetInvalid(&st->kept[slotno].tuple->t_self);
+		st->kept[slotno].tuple->t_tableOid = RelationGetRelid(st->rel);
+	}
+}
+
 /*
- * ANALYZE's sample: random items of the data tree, found by position from
- * subtree counts (so only they are read).  An item of a keyless table
- * holds identical rows; all are read, and a reservoir keeps targrows of
- * them, so every row has the same chance to be in the sample.  The sample
- * is returned in key order.
+ * ANALYZE's sample, returned in key order.
+ *
+ * A table with a primary key that the transaction hasn't written: random
+ * items of the data tree, found by position from subtree counts, so only
+ * they are read (each item is a row).
+ *
+ * A keyless table, whose items hold identical rows (a value can be most of
+ * the table in one item, so picking items would rarely see it), or one the
+ * transaction has written (positions don't cover its writes): every row,
+ * as the transaction sees the table, offered to a reservoir.
  */
 static int
 prolly_acquire_sample_rows(Relation rel, int elevel, HeapTuple *rows,
@@ -2184,138 +2282,120 @@ prolly_acquire_sample_rows(Relation rel, int elevel, HeapTuple *rows,
 											  ALLOCSET_DEFAULT_SIZES);
 	MemoryContext caller = MemoryContextSwitchTo(tmp);
 	ProllyRootSet *roots;
-	ProllyKeying *keying;
 	bool		owned;
 	ProllyCursor *cur;
-	ProllyRowIdScan *rowid;
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
-													&TTSOpsVirtual);
+	SampleState st;
+	ProllyKey	key;
+	ProllyValue value;
 	uint64		nitems;
-	uint64	   *picks;
-	int			npicks = 0;
-	int			nrows = 0;
-	int			sampled = 0;
-	uint64		nread = 0;
-	SampledRow *kept;
-	StringInfoData last;
-	pg_prng_state rng;
+	bool		positional;
 
 	prolly_components_for_relation(rel, &c);
-	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
-	keying = read_keying(rel, &c, roots, &owned);
-	nitems = PROLLY_CALL(c.engine, count_range, roots, rel, PROLLY_TREE_DATA,
-						 NULL, NULL);
+	memset(&st, 0, sizeof(st));
+	st.c = &c;
+	st.rel = rel;
+	st.caller = caller;
+	st.targrows = targrows;
+	st.kept = palloc(sizeof(SampledRow) * Max(targrows, 1));
+	st.slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	pg_prng_seed(&st.rng, pg_prng_uint64(&pg_global_prng_state));
 
-	/*
-	 * targrows positions (or all), distinct, sorted.  With fewer than twice
-	 * as many items, choose each in turn with the probability that keeps
-	 * every subset equally likely; else draw at random, and draw again for
-	 * repeats (each draw is new at least half the time).
-	 */
-	pg_prng_seed(&rng, pg_prng_uint64(&pg_global_prng_state));
-	picks = palloc(sizeof(uint64) * Max(targrows, 1));
-	if (nitems <= (uint64) targrows * 2)
+	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+	st.keying = read_keying(rel, &c, roots, &owned);
+	positional = !PROLLY_CALL(c.keying, keyless, st.keying) &&
+		!PROLLY_CALL(c.engine, has_writes, rel, PROLLY_TREE_DATA);
+	cur = PROLLY_CALL(c.engine, cursor_open, roots, rel, PROLLY_TREE_DATA,
+					  InvalidCommandId);
+	st.rowid = PROLLY_CALL(c.row_identity, scan_begin, roots, rel,
+						   InvalidCommandId);
+
+	if (positional)
 	{
-		for (uint64 i = 0; i < nitems && npicks < targrows; i++)
-			if (pg_prng_double(&rng) * (nitems - i) < (targrows - npicks))
-				picks[npicks++] = i;
+		uint64	   *picks = palloc(sizeof(uint64) * Max(targrows, 1));
+		int			npicks = 0;
+
+		nitems = PROLLY_CALL(c.engine, count_range, roots, rel,
+							 PROLLY_TREE_DATA, NULL, NULL);
+
+		/*
+		 * targrows positions (or all), distinct, sorted.  With fewer than
+		 * twice as many items, choose each in turn with the probability that
+		 * keeps every subset equally likely; else draw at random, and draw
+		 * again for repeats (each draw is new at least half the time).
+		 */
+		if (nitems <= (uint64) targrows * 2)
+		{
+			for (uint64 i = 0; i < nitems && npicks < targrows; i++)
+				if (pg_prng_double(&st.rng) * (nitems - i) < (targrows - npicks))
+					picks[npicks++] = i;
+		}
+		else
+		{
+			while (npicks < targrows)
+			{
+				int			n = npicks;
+
+				while (n < targrows)
+					picks[n++] = pg_prng_uint64_range(&st.rng, 0, nitems - 1);
+				qsort(picks, n, sizeof(uint64), uint64_cmp);
+				npicks = 0;
+				for (int i = 0; i < n; i++)
+					if (npicks == 0 || picks[npicks - 1] != picks[i])
+						picks[npicks++] = picks[i];
+			}
+		}
+
+		for (int i = 0; i < npicks; i++)
+		{
+			StringInfoData at;
+			ProllyKey	k;
+
+			vacuum_delay_point(true);
+			initStringInfo(&at);
+			if (!PROLLY_CALL(c.engine, key_at, roots, rel, picks[i], &at))
+				elog(ERROR, "prolly table \"%s\" has no item at position " UINT64_FORMAT,
+					 RelationGetRelationName(rel), picks[i]);
+			k.data = (const uint8 *) at.data;
+			k.len = at.len;
+			PROLLY_CALL(c.engine, cursor_seek, cur, &k, ForwardScanDirection);
+			if (!PROLLY_CALL(c.engine, cursor_next, cur, &key, &value))
+				elog(ERROR, "prolly table \"%s\" has no item at position " UINT64_FORMAT,
+					 RelationGetRelationName(rel), picks[i]);
+			sample_item(&st, &key, &value);
+			pfree(at.data);
+		}
 	}
 	else
 	{
-		while (npicks < targrows)
+		PROLLY_CALL(c.engine, cursor_seek, cur, NULL, ForwardScanDirection);
+		while (PROLLY_CALL(c.engine, cursor_next, cur, &key, &value))
 		{
-			int			n = npicks;
-
-			while (n < targrows)
-				picks[n++] = pg_prng_uint64_range(&rng, 0, nitems - 1);
-			qsort(picks, n, sizeof(uint64), uint64_cmp);
-			npicks = 0;
-			for (int i = 0; i < n; i++)
-				if (npicks == 0 || picks[npicks - 1] != picks[i])
-					picks[npicks++] = picks[i];
+			if ((st.nitems & 63) == 0)
+				vacuum_delay_point(true);
+			sample_item(&st, &key, &value);
 		}
+		nitems = st.nitems;
 	}
 
-	kept = palloc(sizeof(SampledRow) * Max(targrows, 1));
-	initStringInfo(&last);
-	cur = PROLLY_CALL(c.engine, cursor_open, roots, rel, PROLLY_TREE_DATA,
-					  InvalidCommandId);
-	rowid = PROLLY_CALL(c.row_identity, scan_begin, roots, rel, InvalidCommandId);
-	for (int i = 0; i < npicks; i++)
-	{
-		StringInfoData at;
-		ProllyKey	k;
-		ProllyKey	key;
-		ProllyValue value;
-		ProllyValue row;
-		uint64		count;
-
-		vacuum_delay_point(true);
-		initStringInfo(&at);
-		if (!PROLLY_CALL(c.engine, key_at, roots, rel, picks[i], &at))
-			break;
-		k.data = (const uint8 *) at.data;
-		k.len = at.len;
-		PROLLY_CALL(c.engine, cursor_seek, cur, &k, ForwardScanDirection);
-		if (!PROLLY_CALL(c.engine, cursor_next, cur, &key, &value))
-			break;
-
-		/*
-		 * Positions are in the tree without the transaction's writes, which
-		 * the cursor sees: after its deletes, two can reach the same item.
-		 */
-		if (key.len == last.len && memcmp(key.data, last.data, key.len) == 0)
-			continue;
-		resetStringInfo(&last);
-		appendBinaryStringInfo(&last, (const char *) key.data, key.len);
-		PROLLY_CALL(c.keying, parse_value, keying, &value, &row, &count);
-		PROLLY_CALL(c.keying, decode_row, keying, &row, slot);
-		sampled++;
-		for (uint64 o = 0; o < count; o++, nread++)
-		{
-			int			slotno;
-			MemoryContext old;
-
-			if (nrows < targrows)
-				slotno = nrows++;
-			else
-			{
-				uint64		j = pg_prng_uint64_range(&rng, 0, nread);
-
-				if (j >= (uint64) targrows)
-					continue;
-				slotno = (int) j;
-				heap_freetuple(kept[slotno].tuple);
-			}
-			old = MemoryContextSwitchTo(caller);
-			kept[slotno].tuple = ExecCopySlotHeapTuple(slot);
-			MemoryContextSwitchTo(old);
-			kept[slotno].seq = nread;
-			if (!PROLLY_CALL(c.row_identity, tid_find, rowid, &key, o,
-							 &kept[slotno].tuple->t_self))
-				ItemPointerSetInvalid(&kept[slotno].tuple->t_self);
-			kept[slotno].tuple->t_tableOid = RelationGetRelid(rel);
-		}
-	}
-	qsort(kept, nrows, sizeof(SampledRow), sampled_row_cmp);
-	for (int i = 0; i < nrows; i++)
-		rows[i] = kept[i].tuple;
-	PROLLY_CALL(c.row_identity, scan_end, rowid);
+	qsort(st.kept, st.nrows, sizeof(SampledRow), sampled_row_cmp);
+	for (int i = 0; i < st.nrows; i++)
+		rows[i] = st.kept[i].tuple;
+	PROLLY_CALL(c.row_identity, scan_end, st.rowid);
 	PROLLY_CALL(c.engine, cursor_close, cur);
-	ExecDropSingleTupleTableSlot(slot);
-	release_keying(&c, keying, owned);
+	ExecDropSingleTupleTableSlot(st.slot);
+	release_keying(&c, st.keying, owned);
 	PROLLY_CALL(c.engine, roots_release, roots);
 
-	/* Items times the rows per item read. */
-	*totalrows = sampled > 0 ? (double) nitems * nread / sampled : 0;
+	/* Every row, or (one row per item) the item count. */
+	*totalrows = positional ? (double) nitems : (double) st.nread;
 	*totaldeadrows = 0;
 	ereport(elevel,
 			(errmsg("\"%s\": read %d of " UINT64_FORMAT " items, " UINT64_FORMAT " rows; %d rows in sample, %.0f estimated total rows",
-					RelationGetRelationName(rel), sampled, nitems, nread,
-					nrows, *totalrows)));
+					RelationGetRelationName(rel), st.nitems, nitems, st.nread,
+					st.nrows, *totalrows)));
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(tmp);
-	return nrows;
+	return st.nrows;
 }
 
 /*
@@ -2386,59 +2466,63 @@ prolly_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot,
 #define SAMPLE_BLOCK_ITEMS	64
 
 /*
- * Read pseudo-block block's rows and TIDs: those from its first key to the
- * next block's, as the scan sees the table (blocks are cut in the tree
- * without the transaction's writes, so a block can hold more or fewer than
- * SAMPLE_BLOCK_ITEMS items, but each row is in one block).  If keys can't
- * be compared, SAMPLE_BLOCK_ITEMS items from its first key.
+ * Read pseudo-block block's rows and TIDs: SAMPLE_BLOCK_ITEMS items from the
+ * one at the block's first position, or, reading the table (it has the
+ * transaction's writes, which positions don't cover), from where the cursor
+ * is (going back to the start for an earlier block).
  */
 static void
 load_sample_block(ProllyScanDesc scan, BlockNumber block)
 {
 	Relation	rel = scan->base.rs_rd;
-	StringInfoData at;
-	StringInfoData next;
-	ProllyKey	k;
-	ProllyKey	stop = {NULL, 0};
-	bool		bounded = PROLLY_CALL(scan->c.keying, can_compare, scan->keying);
+	ProllyKey	key;
+	ProllyValue value;
 
 	scan->sample_nrows = 0;
 	scan->sample_chunk = 0;
-	initStringInfo(&at);
-	initStringInfo(&next);
-	/* The first block starts at the table's start. */
-	if (block > 0 &&
-		!PROLLY_CALL(scan->c.engine, key_at, scan->roots, rel,
-					 (uint64) block * SAMPLE_BLOCK_ITEMS, &at))
+	if (scan->sample_by_position)
 	{
+		StringInfoData at;
+		ProllyKey	k;
+		bool		found;
+
+		initStringInfo(&at);
+		found = PROLLY_CALL(scan->c.engine, key_at, scan->roots, rel,
+							(uint64) block * SAMPLE_BLOCK_ITEMS, &at);
+		k.data = (const uint8 *) at.data;
+		k.len = at.len;
+		if (found)
+			PROLLY_CALL(scan->c.engine, cursor_seek, scan->cursor, &k,
+						ForwardScanDirection);
 		pfree(at.data);
-		pfree(next.data);
-		return;
+		if (!found)
+			return;
 	}
-	k.data = (const uint8 *) at.data;
-	k.len = at.len;
-	if (bounded &&
-		PROLLY_CALL(scan->c.engine, key_at, scan->roots, rel,
-					((uint64) block + 1) * SAMPLE_BLOCK_ITEMS, &next))
+	else
 	{
-		stop.data = (const uint8 *) next.data;
-		stop.len = next.len;
+		if (!BlockNumberIsValid(scan->sample_cursor_block) ||
+			block < scan->sample_cursor_block)
+		{
+			PROLLY_CALL(scan->c.engine, cursor_seek, scan->cursor, NULL,
+						ForwardScanDirection);
+			scan->sample_cursor_block = 0;
+		}
+		for (uint64 skip = (uint64) (block - scan->sample_cursor_block) *
+			 SAMPLE_BLOCK_ITEMS; skip > 0; skip--)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (!PROLLY_CALL(scan->c.engine, cursor_next, scan->cursor, &key,
+							 &value))
+				break;
+		}
+		scan->sample_cursor_block = block + 1;
 	}
-	PROLLY_CALL(scan->c.engine, cursor_seek, scan->cursor,
-				block > 0 ? &k : NULL, ForwardScanDirection);
-	for (int i = 0;; i++)
+	for (int i = 0; i < SAMPLE_BLOCK_ITEMS; i++)
 	{
-		ProllyKey	key;
-		ProllyValue value;
 		ProllyValue row;
 		uint64		count;
 
-		if (!bounded && i >= SAMPLE_BLOCK_ITEMS)
-			break;
 		if (!PROLLY_CALL(scan->c.engine, cursor_next, scan->cursor, &key, &value))
-			break;
-		if (stop.len > 0 &&
-			PROLLY_CALL(scan->c.keying, compare, scan->keying, &key, &stop) >= 0)
 			break;
 		PROLLY_CALL(scan->c.keying, parse_value, scan->keying, &value, &row, &count);
 		for (uint64 o = 0; o < count; o++)
@@ -2466,14 +2550,14 @@ load_sample_block(ProllyScanDesc scan, BlockNumber block)
 			scan->sample_nrows++;
 		}
 	}
-	pfree(at.data);
-	pfree(next.data);
 }
 
 /*
  * TABLESAMPLE: the table's items in key order make pseudo-blocks of
  * SAMPLE_BLOCK_ITEMS, found by position, so a method that picks blocks
- * (SYSTEM) reads only those.
+ * (SYSTEM) reads only those.  If the transaction has written the table,
+ * the blocks are cut while reading it (there are at least as many as its
+ * items fill: the count may include rows its writes replaced or deleted).
  */
 static bool
 prolly_scan_sample_next_block(TableScanDesc sscan, SampleScanState *scanstate)
@@ -2488,10 +2572,13 @@ prolly_scan_sample_next_block(TableScanDesc sscan, SampleScanState *scanstate)
 		uint64		n = PROLLY_CALL(scan->c.engine, count_range, scan->roots,
 									sscan->rs_rd, PROLLY_TREE_DATA, NULL, NULL);
 
+		scan->sample_by_position = !PROLLY_CALL(scan->c.engine, has_writes,
+												sscan->rs_rd, PROLLY_TREE_DATA);
 		scan->sample_nblocks = (BlockNumber)
 			Min((n + SAMPLE_BLOCK_ITEMS - 1) / SAMPLE_BLOCK_ITEMS,
 				(uint64) MaxBlockNumber);
 		scan->sample_block = InvalidBlockNumber;
+		scan->sample_cursor_block = InvalidBlockNumber;
 		scan->sample_started = true;
 	}
 	if (scan->sample_nblocks == 0)
@@ -2526,19 +2613,25 @@ prolly_scan_sample_next_tuple(TableScanDesc sscan, SampleScanState *scanstate,
 	TsmRoutine *tsm = scanstate->tsmroutine;
 
 	/*
-	 * A block can hold more rows than a page has offsets (the transaction's
-	 * own inserts); the method is shown them a page's worth at a time.
+	 * A block can hold more rows than a page has offsets (identical rows);
+	 * the method is shown them a page's worth at a time, each as a block of
+	 * its own past the table's blocks, so that a method choosing rows by
+	 * their block and offset chooses each chunk's afresh.
 	 */
 	for (;;)
 	{
 		int			left = scan->sample_nrows - scan->sample_chunk;
 		OffsetNumber maxoff = (OffsetNumber) Min(left, MaxOffsetNumber);
+		uint64		chunkno = scan->sample_chunk / MaxOffsetNumber;
+		BlockNumber blockno = (BlockNumber)
+			((scan->sample_block + chunkno * scan->sample_nblocks) %
+			 ((uint64) MaxBlockNumber + 1));
 		OffsetNumber off;
 		int			i;
 		ProllyValue row;
 
 		CHECK_FOR_INTERRUPTS();
-		off = tsm->NextSampleTuple(scanstate, scan->sample_block, maxoff);
+		off = tsm->NextSampleTuple(scanstate, blockno, maxoff);
 		if (!OffsetNumberIsValid(off))
 		{
 			if (left > MaxOffsetNumber)

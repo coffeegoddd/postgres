@@ -1256,21 +1256,15 @@ block_sampling_read_stream_next(ReadStream *stream,
  * table_acquirefunc -- the row acquisition function for a table, and its
  * size in pages
  *
- * The table AM's own sampler if it has one (its size then comes from its
- * size estimate), else block sampling of the main fork.
+ * The table AM's own sampler if it has one, else block sampling of the
+ * main fork.
  */
 static AcquireSampleRowsFunc
 table_acquirefunc(Relation rel, BlockNumber *relpages)
 {
+	*relpages = table_relation_stats_pages(rel);
 	if (rel->rd_tableam->relation_acquire_sample_rows != NULL)
-	{
-		double		tuples;
-		double		allvisfrac;
-
-		table_relation_estimate_size(rel, NULL, relpages, &tuples, &allvisfrac);
 		return rel->rd_tableam->relation_acquire_sample_rows;
-	}
-	*relpages = RelationGetNumberOfBlocks(rel);
 	return acquire_sample_rows;
 }
 

@@ -77,6 +77,14 @@ typedef struct ProllyKeyingRoutine
 	ProllyKeying *(*open) (Relation rel, const ProllyValue *description,
 						   MemoryContext mcxt);
 
+	/*
+	 * Rows of rel as keyed now, as they are once Postgres rewrites the
+	 * table (CLUSTER, VACUUM FULL): the catalog's missing values of added
+	 * columns are cleared then, so every row carries its own.  Describes
+	 * itself as open(rel, NULL) does once they are cleared.
+	 */
+	ProllyKeying *(*open_rewritten) (Relation rel, MemoryContext mcxt);
+
 	/* Append the description of this keying. */
 	void		(*describe) (ProllyKeying *k, StringInfo out);
 
@@ -116,7 +124,7 @@ typedef struct ProllyKeyingRoutine
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
-	"open", "describe", "can_read", "keyless", "encode_row", "make_value", \
+	"open", "open_rewritten", "describe", "can_read", "keyless", "encode_row", "make_value", \
 	"parse_value", "content_hash", "decode_row", "compare", "can_compare", \
 	"close"
 #define PROLLY_KEYING_FIRST_CALLBACK open

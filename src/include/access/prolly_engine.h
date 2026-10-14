@@ -115,9 +115,15 @@ typedef struct ProllyEngineRoutine
 	 * an estimate while the transaction has private writes to tree.
 	 */
 	/*
+	 * Whether the current transaction has written tree's tree of kind (or
+	 * given it new storage), so that its reads overlay private writes.
+	 */
+	bool		(*has_writes) (Relation tree, ProllyTreeKind kind);
+
+	/*
 	 * Append the key of the item at position ordinal (from 0) of tree's
-	 * data tree in roots to key, without the transaction's private writes
-	 * (for sampling); false past the end.
+	 * data tree in roots to key; false past the end.  Positions are only
+	 * those of a tree the transaction hasn't written (has_writes false).
 	 */
 	bool		(*key_at) (ProllyRootSet *roots, Relation tree, uint64 ordinal,
 						   StringInfo key);
@@ -178,7 +184,8 @@ typedef struct ProllyEngineRoutine
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
 	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
-	"cursor_next", "cursor_close", "get", "key_at", "count_range", "put", "remove", \
+	"cursor_next", "cursor_close", "get", "has_writes", "key_at", "count_range", \
+	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
 	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \
 	"export_chunks"

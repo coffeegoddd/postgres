@@ -64,6 +64,48 @@ WHERE tablename = 'dup' ORDER BY attname;
  b       |          1 |        1
 (2 rows)
 
+-- ANALYZE in a transaction that wrote the table counts what it sees.
+BEGIN;
+DELETE FROM st WHERE id > 1000;
+ANALYZE st;
+SELECT reltuples FROM pg_class WHERE relname = 'st';
+ reltuples 
+-----------
+      1000
+(1 row)
+
+ROLLBACK;
+BEGIN;
+CREATE TABLE created (id int PRIMARY KEY);
+INSERT INTO created SELECT generate_series(1, 1000);
+ANALYZE created;
+SELECT reltuples FROM pg_class WHERE relname = 'created';
+ reltuples 
+-----------
+      1000
+(1 row)
+
+SELECT n_distinct FROM pg_stats WHERE tablename = 'created';
+ n_distinct 
+------------
+         -1
+(1 row)
+
+ROLLBACK;
+-- One value making up most of a table is its most common value.
+CREATE TABLE skewed (v int);
+ALTER TABLE skewed ALTER v SET STATISTICS 1;
+INSERT INTO skewed SELECT g FROM generate_series(1, 10000) g;
+INSERT INTO skewed SELECT 0 FROM generate_series(1, 90000);
+ANALYZE skewed;
+SELECT most_common_vals::text, most_common_freqs[1] > 0.8 AS mostly
+FROM pg_stats WHERE tablename = 'skewed';
+ most_common_vals | mostly 
+------------------+--------
+ {0}              | t
+(1 row)
+
+DROP TABLE skewed;
 -- An inheritance tree is sampled as a whole and child by child.
 CREATE TABLE sparent (id int, v int);
 CREATE TABLE schild (extra int) INHERITS (sparent);
@@ -292,4 +334,39 @@ SELECT a, count(*) FROM dup WHERE a < 3 GROUP BY a ORDER BY a;
  2 |   120
 (3 rows)
 
-DROP TABLE st, dup, sparent, schild, cols, bm, wide;
+-- A rewrite keeps the values of columns added with a default.
+CREATE TABLE added (id int PRIMARY KEY);
+INSERT INTO added VALUES (1), (2);
+ALTER TABLE added ADD COLUMN v int NOT NULL DEFAULT 42;
+INSERT INTO added VALUES (3, 7);
+VACUUM FULL added;
+SELECT * FROM added ORDER BY id;
+ id | v  
+----+----
+  1 | 42
+  2 | 42
+  3 |  7
+(3 rows)
+
+CLUSTER added USING added_pkey;
+SELECT * FROM added ORDER BY id;
+ id | v  
+----+----
+  1 | 42
+  2 | 42
+  3 |  7
+(3 rows)
+
+CREATE TABLE added_keyless (a int);
+INSERT INTO added_keyless SELECT 1 FROM generate_series(1, 3);
+ALTER TABLE added_keyless ADD COLUMN b text DEFAULT 'd';
+INSERT INTO added_keyless VALUES (1, 'd'), (3, NULL);
+VACUUM FULL added_keyless;
+SELECT a, b, count(*) FROM added_keyless GROUP BY a, b ORDER BY a;
+ a | b | count 
+---+---+-------
+ 1 | d |     4
+ 3 |   |     1
+(2 rows)
+
+DROP TABLE st, dup, sparent, schild, cols, bm, wide, added, added_keyless;

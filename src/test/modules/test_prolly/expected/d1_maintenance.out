@@ -5,6 +5,7 @@
 SET default_table_access_method = prolly_d1;
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+CREATE EXTENSION IF NOT EXISTS tsm_system_rows;
 RESET client_min_messages;
 -- ANALYZE of a table larger than its sample: the statistics of a sample,
 -- and the row count, exact (it is the tree's item count).
@@ -81,6 +82,24 @@ SELECT planned_rows('SELECT * FROM triples') BETWEEN 220000 AND 260000 AS rows_p
 (1 row)
 
 DELETE FROM triples WHERE a >= 40000;
+-- CLUSTER, VACUUM FULL and index builds keep the rows per page the
+-- planner estimates from.
+ANALYZE triples;
+VACUUM FULL triples;
+SELECT planned_rows('SELECT * FROM triples') BETWEEN 110000 AND 130000 AS rows_planned;
+ rows_planned 
+--------------
+ t
+(1 row)
+
+CREATE INDEX triples_a ON triples (a);
+SELECT planned_rows('SELECT * FROM triples') BETWEEN 110000 AND 130000 AS rows_planned;
+ rows_planned 
+--------------
+ t
+(1 row)
+
+DROP INDEX triples_a;
 -- (Taking every row of the first items read instead would see each value
 -- exactly three times, and estimate as many distinct values as it saw.)
 SELECT (histogram_bounds::text::int[])[11] > 39000 AS reaches_top,
@@ -92,15 +111,74 @@ FROM pg_stats WHERE tablename = 'triples' AND attname = 'a';
  t           | t              | t
 (1 row)
 
--- After the transaction deletes most rows, the sample still holds each
--- row once (positions come from the tree without its writes).
+-- One value can be most of a keyless table, all in one item: the sample
+-- reads every row, so it finds that value and counts the rows.
+CREATE TABLE skewed (v int);
+ALTER TABLE skewed ALTER v SET STATISTICS 1;
+INSERT INTO skewed SELECT g FROM generate_series(1, 10000) g;
+INSERT INTO skewed SELECT 0 FROM generate_series(1, 90000);
+ANALYZE skewed;
+SELECT reltuples FROM pg_class WHERE relname = 'skewed';
+ reltuples 
+-----------
+    100000
+(1 row)
+
+SELECT most_common_vals::text, most_common_freqs[1] > 0.8 AS mostly
+FROM pg_stats WHERE tablename = 'skewed';
+ most_common_vals | mostly 
+------------------+--------
+ {0}              | t
+(1 row)
+
+-- A table the transaction has written is sampled as it sees it: rows it
+-- deleted are gone, each row is in the sample once, and a table it created
+-- has its rows.
 BEGIN;
 DELETE FROM big WHERE id % 10 <> 0;
 ANALYZE big;
+SELECT reltuples FROM pg_class WHERE relname = 'big';
+ reltuples 
+-----------
+     10000
+(1 row)
+
 SELECT n_distinct FROM pg_stats WHERE tablename = 'big' AND attname = 'id';
  n_distinct 
 ------------
          -1
+(1 row)
+
+ROLLBACK;
+BEGIN;
+CREATE TABLE created (id int PRIMARY KEY);
+INSERT INTO created SELECT generate_series(1, 1000);
+ANALYZE created;
+SELECT reltuples FROM pg_class WHERE relname = 'created';
+ reltuples 
+-----------
+      1000
+(1 row)
+
+SELECT n_distinct FROM pg_stats WHERE tablename = 'created';
+ n_distinct 
+------------
+         -1
+(1 row)
+
+SELECT count(*) BETWEEN 50 AND 200 AS about_a_tenth
+FROM created TABLESAMPLE SYSTEM (10) REPEATABLE (2);
+ about_a_tenth 
+---------------
+ t
+(1 row)
+
+-- (A method that visits the blocks in any order.)
+SELECT count(*), count(DISTINCT id), sum(id)
+FROM created TABLESAMPLE SYSTEM_ROWS (1000);
+ count | count |  sum   
+-------+-------+--------
+  1000 |  1000 | 500500
 (1 row)
 
 ROLLBACK;
@@ -155,6 +233,23 @@ FROM big TABLESAMPLE BERNOULLI (10) REPEATABLE (5);
  t
 (1 row)
 
+-- An item of many identical rows is sampled a page's worth of offsets at
+-- a time, each chunk independently: of rows 2048 apart, about a quarter
+-- of the pairs are both in a 50% sample (half, if chunks repeated).
+CREATE TABLE same (v int);
+INSERT INTO same SELECT 1 FROM generate_series(1, 8192);
+WITH n AS (
+	SELECT (ctid::text::point)[0]::int * 291 + (ctid::text::point)[1]::int - 1 AS n
+	FROM same TABLESAMPLE BERNOULLI (50) REPEATABLE (3))
+SELECT (SELECT count(*) BETWEEN 3800 AND 4400 FROM n) AS half,
+	   (SELECT count(*) BETWEEN 1300 AND 1800 FROM n a JOIN n b ON b.n = a.n + 2048)
+	   AS independent;
+ half | independent 
+------+-------------
+ t    | t
+(1 row)
+
+DROP TABLE same;
 -- A sample scan started again before it ends starts from the beginning.
 SELECT x, (SELECT id FROM big TABLESAMPLE SYSTEM (100) LIMIT 1 OFFSET x),
 	   (SELECT id FROM big TABLESAMPLE BERNOULLI (100) LIMIT 1 OFFSET x)
@@ -389,4 +484,64 @@ ROLLBACK;
 DROP FUNCTION same_as_before();
 DROP FUNCTION lossy_blocks(text);
 DROP FUNCTION planned_rows(text);
-DROP TABLE big, near, triples, bm, wide, digests;
+-- Rows written before a column was added with a default get its value
+-- when the table is rewritten (Postgres then drops the default from the
+-- catalog), and are what a table created with the column holds.
+CREATE TABLE added (id int PRIMARY KEY);
+INSERT INTO added VALUES (1), (2);
+ALTER TABLE added ADD COLUMN v int NOT NULL DEFAULT 42;
+INSERT INTO added VALUES (3, 7);
+CREATE TABLE added_fresh (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO added_fresh VALUES (1, 42), (2, 42), (3, 7);
+CREATE TEMP TABLE added_tids USING heap AS SELECT id, ctid AS tid FROM added;
+VACUUM FULL added;
+SELECT * FROM added ORDER BY id;
+ id | v  
+----+----
+  1 | 42
+  2 | 42
+  3 |  7
+(3 rows)
+
+SELECT prolly_tree_digest('added') = prolly_tree_digest('added_fresh') AS same_tree,
+	   (SELECT bool_and(a.ctid = t.tid) FROM added a JOIN added_tids t USING (id)) AS same_tids;
+ same_tree | same_tids 
+-----------+-----------
+ t         | t
+(1 row)
+
+CLUSTER added USING added_pkey;
+SELECT * FROM added ORDER BY id;
+ id | v  
+----+----
+  1 | 42
+  2 | 42
+  3 |  7
+(3 rows)
+
+CREATE TABLE added_keyless (a int);
+INSERT INTO added_keyless SELECT 1 FROM generate_series(1, 3);
+INSERT INTO added_keyless VALUES (2);
+ALTER TABLE added_keyless ADD COLUMN b text DEFAULT 'd';
+INSERT INTO added_keyless VALUES (1, 'd'), (3, NULL);
+CREATE TABLE added_keyless_fresh (a int, b text);
+INSERT INTO added_keyless_fresh SELECT 1, 'd' FROM generate_series(1, 4);
+INSERT INTO added_keyless_fresh VALUES (2, 'd'), (3, NULL);
+VACUUM FULL added_keyless;
+SELECT a, b, count(*) FROM added_keyless GROUP BY a, b ORDER BY a;
+ a | b | count 
+---+---+-------
+ 1 | d |     4
+ 2 | d |     1
+ 3 |   |     1
+(3 rows)
+
+SELECT prolly_tree_digest('added_keyless') = prolly_tree_digest('added_keyless_fresh')
+	AS same_tree;
+ same_tree 
+-----------
+ t
+(1 row)
+
+DROP TABLE big, near, triples, bm, wide, digests, skewed, added, added_fresh,
+	added_tids, added_keyless, added_keyless_fresh;
