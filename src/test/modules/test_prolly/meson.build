@@ -50,6 +50,7 @@ tests += {
       't/008_d1_writers.pl',
       't/009_d1_index.pl',
       't/010_d1_maintenance.pl',
+      't/011_d1_respelled_keys.pl',
     ],
   },
 }

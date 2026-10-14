@@ -706,24 +706,30 @@ SELECT prolly_tree_digest('d1_respelled') = prolly_tree_digest('d1_spelled') AS 
  t          | t
 (1 row)
 
+-- (This file turns index scans off at its start; they are on here.)
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+SET enable_indexscan = on;
+SET enable_indexonlyscan = on;
+EXPLAIN (COSTS OFF) SELECT n FROM d1_respelled WHERE n = 2;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Index Only Scan using d1_respelled_n on d1_respelled
+   Index Cond: (n = '2'::numeric)
+(2 rows)
+
 SELECT n::text FROM d1_respelled WHERE n = 2;
    n   
 -------
  2.000
 (1 row)
 
-RESET enable_seqscan;
-RESET enable_bitmapscan;
 -- Within a transaction, and back to a savepoint.
 BEGIN;
 UPDATE d1_respelled SET n = 2.0 WHERE k = 1;
 SAVEPOINT s;
 UPDATE d1_respelled SET n = 2.00 WHERE k = 1;
 ROLLBACK TO s;
-SET LOCAL enable_seqscan = off;
-SET LOCAL enable_bitmapscan = off;
 SELECT n::text FROM d1_respelled WHERE n = 2;
   n  
 -----
@@ -731,6 +737,10 @@ SELECT n::text FROM d1_respelled WHERE n = 2;
 (1 row)
 
 COMMIT;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
 UPDATE d1_spelled SET n = 2.0 WHERE k = 1;
 SELECT prolly_tree_digest('d1_respelled_n') = prolly_tree_digest('d1_spelled_n') AS same_index;
  same_index 
