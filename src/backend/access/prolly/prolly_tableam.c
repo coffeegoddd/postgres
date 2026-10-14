@@ -1906,6 +1906,26 @@ prolly_index_validate_scan(Relation table_rel, Relation index_rel,
 	bool		ts_isnull;
 
 	/*
+	 * A prolly index's entries point at row keys, which an update keeps, so
+	 * checking that every TID is indexed can't tell a stale entry from a
+	 * right one.  Instead the index is rebuilt from the rows as they are,
+	 * holding the right to write the table so no writer commits meanwhile;
+	 * from then on, writers keep it.
+	 */
+	if (prolly_index_is_prolly(index_rel))
+	{
+		ProllyComponents c;
+		ProllyRootSet *roots;
+
+		prolly_components_for_relation(table_rel, &c);
+		roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+		lock_for_write(table_rel, &c, NULL, &roots);
+		PROLLY_CALL(c.engine, roots_release, roots);
+		prolly_index_rebuild(table_rel, index_rel);
+		return;
+	}
+
+	/*
 	 * The index's TIDs come sorted; rows come in key order, not TID order,
 	 * so the TIDs are kept for lookups rather than merged.
 	 */

@@ -68,7 +68,7 @@ BEGIN
 	SET LOCAL enable_indexonlyscan = on;
 	SET LOCAL enable_seqscan = off;
 	RETURN QUERY SELECT s.q, s.answer IS NOT DISTINCT FROM i.answer
-		FROM ix_seq s JOIN ix_answers() i USING (q) ORDER BY s.q;
+		FROM ix_seq s JOIN ix_answers() i USING (q) ORDER BY s.q COLLATE "C";
 	DROP TABLE ix_seq;
 END $$;
 
@@ -216,6 +216,47 @@ RESET enable_bitmapscan;
 RESET enable_hashjoin;
 RESET enable_nestloop;
 RESET enable_sort;
+
+-- Turning around at either end of a scan returns the row at that end.
+CREATE TABLE ends (k int, v text);
+INSERT INTO ends VALUES (1, 'a'), (2, 'b'), (3, 'c');
+CREATE INDEX ends_k ON ends USING prolly (k);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+BEGIN;
+DECLARE io SCROLL CURSOR FOR SELECT k FROM ends ORDER BY k;
+FETCH ALL FROM io;
+FETCH BACKWARD 1 FROM io;
+FETCH BACKWARD ALL FROM io;
+FETCH FORWARD 1 FROM io;
+DECLARE pl SCROLL CURSOR FOR SELECT k, v FROM ends WHERE k >= 1 ORDER BY k;
+FETCH ALL FROM pl;
+FETCH BACKWARD 1 FROM pl;
+FETCH BACKWARD ALL FROM pl;
+FETCH FORWARD 1 FROM pl;
+COMMIT;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- A polymorphic operator class indexes a column of a concrete type.
+CREATE TYPE ix_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE OPERATOR CLASS ix_mood_ops DEFAULT FOR TYPE anyenum USING prolly AS
+	OPERATOR 1 < (anyenum, anyenum), OPERATOR 2 <= (anyenum, anyenum),
+	OPERATOR 3 = (anyenum, anyenum), OPERATOR 4 >= (anyenum, anyenum),
+	OPERATOR 5 > (anyenum, anyenum), FUNCTION 1 enum_cmp(anyenum, anyenum);
+CREATE TABLE moods (id int PRIMARY KEY, m ix_mood);
+INSERT INTO moods VALUES (1, 'happy'), (2, 'sad'), (3, 'ok'), (4, 'sad');
+CREATE INDEX moods_m ON moods USING prolly (m);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT m, count(*) FROM moods WHERE m >= 'ok' GROUP BY m ORDER BY m;
+SELECT id FROM moods ORDER BY m, id;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE moods, ends;
+DROP OPERATOR CLASS ix_mood_ops USING prolly;
+DROP OPERATOR FAMILY ix_mood_ops USING prolly;
+DROP TYPE ix_mood;
 
 -- REINDEX, CREATE INDEX CONCURRENTLY, TRUNCATE.
 REINDEX INDEX mj_k;
