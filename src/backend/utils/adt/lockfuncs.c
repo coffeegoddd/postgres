@@ -38,7 +38,8 @@ const char *const LockTagTypeNames[] = {
 	"userlock",
 	"advisory",
 	"applytransaction",
-	"prollybranch"
+	"prollybranch",
+	"prollytable"
 };
 
 StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_LAST_TYPE + 1),
@@ -337,6 +338,17 @@ pg_lock_status(PG_FUNCTION_ARGS)
 				nulls[4] = true;
 				nulls[5] = true;
 				nulls[7] = true;
+				break;
+			case LOCKTAG_PROLLY_TABLE:
+				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+				values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[6] = true;
+				nulls[7] = true;
+				nulls[8] = true;
+				nulls[9] = true;
 				break;
 			case LOCKTAG_PROLLY_BRANCH:
 				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);

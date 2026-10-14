@@ -17,6 +17,7 @@ FROM prolly_implementations();
  coordination    | k1            |       1 |              0
  coordination    | k2            |       2 |              0
  coordination    | k3            |       3 |              0
+ coordination    | single_writer |       4 |              1
  node_format     | basic         |       1 |              1
  node_format     | stub          |       0 |              0
  chunker         | keyhash       |       1 |              1
@@ -38,7 +39,7 @@ FROM prolly_implementations();
  log             | stub          |       0 |              0
  commit_pipeline | serial        |       1 |              1
  commit_pipeline | stub          |       0 |              0
- row_identity    | hashed        |       1 |              1
+ row_identity    | counter       |       2 |              1
  row_identity    | stub          |       0 |              0
  refs            | stub          |       0 |              0
  transfer        | stub          |       0 |              0
@@ -49,7 +50,7 @@ FROM prolly_implementations();
  root_layout     | stub          |       0 |              0
  table_keying    | pk_or_content |       1 |              2
  table_keying    | stub          |       0 |              0
-(40 rows)
+(41 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -132,6 +133,14 @@ NOTICE:  drop cascades to column m of table conf_kt
  coordination    | k3             | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
  coordination    | k3             | predicate_locks                         | not implemented (missing predicate_lock_range)
  coordination    | k3             | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | single_writer  | identity                                | pass
+ coordination    | single_writer  | lock_conflict_matrix                    | no checks yet
+ coordination    | single_writer  | wait_policies                           | no checks yet
+ coordination    | single_writer  | speculative_insertion                   | no checks yet
+ coordination    | single_writer  | commit_markers_until_horizon            | not implemented (missing xact_commit, written_since, prune_markers)
+ coordination    | single_writer  | abort_releases_locks                    | not implemented (missing xact_abort, subxact_abort)
+ coordination    | single_writer  | predicate_locks                         | not implemented (missing predicate_lock_range)
+ coordination    | single_writer  | complete                                | not implemented (8 of 11 callbacks missing)
  node_format     | basic          | identity                                | pass
  node_format     | basic          | items_round_trip                        | pass
  node_format     | basic          | level_round_trip                        | pass
@@ -235,18 +244,18 @@ NOTICE:  drop cascades to column m of table conf_kt
  commit_pipeline | stub           | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
  commit_pipeline | stub           | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, usage, head, checkpoint, redo)
  commit_pipeline | stub           | complete                                | not implemented (14 of 14 callbacks missing)
- row_identity    | hashed         | identity                                | pass
- row_identity    | hashed         | assign_then_resolve                     | pass
- row_identity    | hashed         | same_version_same_tid                   | pass
- row_identity    | hashed         | displaced_version_keeps_tid             | pass
- row_identity    | hashed         | forget                                  | not implemented (missing tid_forget)
- row_identity    | hashed         | complete                                | not implemented (1 of 7 callbacks missing)
+ row_identity    | counter        | identity                                | pass
+ row_identity    | counter        | assign_then_resolve                     | pass
+ row_identity    | counter        | rename_keeps_tid                        | pass
+ row_identity    | counter        | never_reused                            | pass
+ row_identity    | counter        | forget                                  | not implemented (missing tid_forget)
+ row_identity    | counter        | complete                                | not implemented (1 of 8 callbacks missing)
  row_identity    | stub           | identity                                | pass
  row_identity    | stub           | assign_then_resolve                     | not implemented (missing tid_assign, scan_begin, tid_find, scan_end, tid_resolve)
- row_identity    | stub           | same_version_same_tid                   | not implemented (missing tid_assign, tid_resolve)
- row_identity    | stub           | displaced_version_keeps_tid             | not implemented (missing tid_assign, scan_begin, tid_find, scan_end)
+ row_identity    | stub           | rename_keeps_tid                        | not implemented (missing tid_assign, tid_rename, tid_resolve, scan_begin, tid_find, scan_end)
+ row_identity    | stub           | never_reused                            | not implemented (missing tid_assign, tid_retire, tid_resolve, scan_begin, tid_find, scan_end)
  row_identity    | stub           | forget                                  | not implemented (missing tid_assign, tid_resolve, tid_forget)
- row_identity    | stub           | complete                                | not implemented (7 of 7 callbacks missing)
+ row_identity    | stub           | complete                                | not implemented (8 of 8 callbacks missing)
  refs            | stub           | identity                                | pass
  refs            | stub           | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub           | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
@@ -312,7 +321,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  table_keying    | stub           | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
  table_keying    | stub           | cannot_compare_after_key_type_dropped   | not implemented (missing open, describe, can_compare, close)
  table_keying    | stub           | complete                                | not implemented (12 of 12 callbacks missing)
-(254 rows)
+(262 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

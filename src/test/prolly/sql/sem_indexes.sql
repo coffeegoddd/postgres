@@ -46,7 +46,7 @@ LANGUAGE sql AS $$
 	UNION ALL SELECT 'brin', count(*) FROM idx WHERE id BETWEEN 1000 AND 1999
 	UNION ALL SELECT 'hash', count(*) FROM idx WHERE t = 'text 5'
 	UNION ALL SELECT 'index only', count(k) FROM idx WHERE k BETWEEN 10 AND 20
-	UNION ALL SELECT 'order by', sum(id) FROM (SELECT id FROM idx ORDER BY k, t LIMIT 50) s
+	UNION ALL SELECT 'order by', sum(id) FROM (SELECT id FROM idx ORDER BY k, t, id LIMIT 50) s
 $$;
 
 SET enable_indexscan = off;
@@ -82,6 +82,25 @@ INSERT INTO idx (id, k, t) VALUES (1, 0, 'dup');
 INSERT INTO idx (id, k, t) VALUES (100000, 0, 'text 1'), (100000, 0, 'text 2');
 INSERT INTO idx (id, k, t) VALUES (100000, 0, 'text 1'), (100001, 0, 'text 1');
 SELECT count(*) FROM idx WHERE id >= 100000;
+
+-- A row inserted again after its insert rolled back: indexes hold one
+-- entry for it, and a retried batch isn't refused as a duplicate.
+CREATE TABLE retry (id int PRIMARY KEY, a int, t text);
+CREATE INDEX retry_a ON retry (a);
+BEGIN;
+INSERT INTO retry VALUES (1, 10, 'x');
+ROLLBACK;
+INSERT INTO retry VALUES (1, 10, 'x');
+INSERT INTO retry VALUES (2, 20, 'y'), (2, 20, 'dup');
+INSERT INTO retry VALUES (2, 20, 'y'), (3, 30, 'z');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, a, t FROM retry WHERE a = 10;
+SELECT id, a, t FROM retry WHERE id = 2;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) FROM retry;
+DROP TABLE retry;
 
 -- REINDEX and CREATE INDEX CONCURRENTLY.
 REINDEX TABLE idx;

@@ -22,10 +22,11 @@ $node->safe_psql('postgres', q{
 	INSERT INTO t VALUES (1);
 });
 
-# A first write that fails waiting for the table's write lock, inside a
-# savepoint, then a retry after rolling back to it.
+# A first write that fails waiting for the right to write the table
+# (another session holds a share row lock on it), inside a savepoint, then
+# a retry after rolling back to it.
 my $holder = $node->background_psql('postgres');
-$holder->query_safe('BEGIN; LOCK TABLE t IN ROW SHARE MODE;');
+$holder->query_safe('BEGIN; SELECT * FROM t FOR SHARE;');
 
 my $writer = $node->background_psql('postgres', on_error_stop => 0);
 $writer->query_safe(q{BEGIN; SAVEPOINT s; SET LOCAL lock_timeout = '100ms';});

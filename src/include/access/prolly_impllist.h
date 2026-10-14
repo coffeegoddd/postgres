@@ -23,10 +23,11 @@ PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d3a)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d3b)
 PG_PROLLY_IMPL(ProllyEngineRoutine, prolly_engine_d4)
 
-/* coordination modules; all stubs so far */
+/* coordination modules; K1-K3 are stubs so far */
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k1)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k2)
 PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_k3)
+PG_PROLLY_IMPL(ProllyCoordRoutine, prolly_coord_single_writer)
 
 /* foundation implementations */
 PG_PROLLY_IMPL(ProllyHashRoutine, prolly_hash_sha256)
@@ -46,7 +47,7 @@ PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_cow)
 
 /* commit pipelines and row identity */
 PG_PROLLY_IMPL(ProllyCommitRoutine, prolly_commit_serial)
-PG_PROLLY_IMPL(ProllyRowIdRoutine, prolly_rowid_hashed)
+PG_PROLLY_IMPL(ProllyRowIdRoutine, prolly_rowid_counter)
 
 /* root layouts */
 PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_subroots)

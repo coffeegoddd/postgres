@@ -186,10 +186,12 @@ static const ConformanceCase cases[] = {
 	/* row identity */
 	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve",
 	"tid_assign scan_begin tid_find scan_end tid_resolve", rowid_assign_then_resolve},
-	{PROLLY_IFACE_ROW_IDENTITY, "same_version_same_tid", "tid_assign tid_resolve",
-	rowid_same_version_same_tid},
-	{PROLLY_IFACE_ROW_IDENTITY, "displaced_version_keeps_tid",
-	"tid_assign scan_begin tid_find scan_end", rowid_hashed_displaced_version},
+	{PROLLY_IFACE_ROW_IDENTITY, "rename_keeps_tid",
+	"tid_assign tid_rename tid_resolve scan_begin tid_find scan_end",
+	rowid_rename_keeps_tid},
+	{PROLLY_IFACE_ROW_IDENTITY, "never_reused",
+	"tid_assign tid_retire tid_resolve scan_begin tid_find scan_end",
+	rowid_never_reused},
 	{PROLLY_IFACE_ROW_IDENTITY, "forget", "tid_assign tid_resolve tid_forget", NULL},
 
 	/* table keying */

@@ -21,6 +21,7 @@ OBJS = \
 	coord_k1.o \
 	coord_k2.o \
 	coord_k3.o \
+	coord_singlewriter.o \
 	engine_d1.o \
 	engine_d2.o \
 	engine_d3a.o \
@@ -53,7 +54,7 @@ OBJS = \
 	refs_stub.o \
 	rootlayout_stub.o \
 	rootlayout_subroots.o \
-	rowid_hashed.o \
+	rowid_counter.o \
 	rowid_stub.o \
 	transfer_stub.o \
 	tree_cow.o \

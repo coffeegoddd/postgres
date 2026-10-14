@@ -123,7 +123,8 @@ in the same mode and configuration as the engine.
   page format, chunker, content hashing, key and value encoding, canonical
   export, WAL resource managers, commit publish (B1, B2).
 - Includes version-control operations V1–V3 (decided 2026-10-13, open
-  question 14); clone, fetch and push stay stubs.
+  question 14); clone, fetch and push stay stubs (when built, clone uses
+  implicit TID maps, question 41).
 - Schema is versioned with data and commits' root hashes don't depend on history
   (decided 2026-10-13, `09-versioned-catalogs.md` part 1): every catalog is a
   prolly table; the working set is Postgres-native; version-control commits
@@ -144,8 +145,8 @@ Order of work within the step:
 | 4b | Node store and WAL |
 | 4c | D1 tree operations |
 | 4d | Table and index AM wiring, single writer per table |
-| 4e | Concurrency: K1, commit pipeline, root-carrying snapshots (B1, B2) |
-| 4f | Checkpoint, recovery, reclamation |
+| 4e | Concurrency: K1 (replacing single_writer), commit pipeline, root-carrying snapshots (B1, B2); TID counter ranges per backend already, per node if nodes share storage (question 37) |
+| 4f | Checkpoint, recovery, reclamation, including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
 | 4g | V1–V3 and versioned catalogs: catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap |
 | 4h | S and V suites and correctness gates, including the history-independence gate |
 
@@ -282,6 +283,48 @@ type is dropped D1 matches keys by bytes, so a transaction's own rows
 are still read, rebuilt and committed. Each has tests
 (`003_d1_cleanup.pl`, `004_d1_databases.pl`, `005_d1_pending.pl`,
 `103_database_copy.pl`, `sem_ddl`, `sem_transactions`).
+
+**Status (2026-10-14): 4d.2 built.** prolly_d1 tables support fetching by
+TID, UPDATE, DELETE, row locks, ON CONFLICT, TID and TID-range scans,
+plain and index-only index scans with btree and the other index AMs,
+CREATE INDEX CONCURRENTLY, and xmin. Built:
+- Coordination implementation `single_writer` (question 38): a per-table
+  write lock of its own (`prollytable` in pg_locks), exclusive for writes
+  and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE. It replaces 4d.1's
+  relation ExclusiveLock, which conflicts with the RowExclusiveLock every
+  writing statement holds, so two writers that had both started
+  deadlocked.
+- Row identity `counter` (question 37 changed, user): per-table counter
+  TIDs in the main fork, never reused after aborts, retired TIDs with
+  successors (question 39) and the gone version's row (what SnapshotAny
+  returns), xmin per version. It replaces `hashed`: a row inserted again
+  after a rollback got its aborted TID back, and indexes returned it
+  twice.
+- Table AM: update/delete/lock classify a row as live, changed by this
+  transaction, or changed by one that committed while it waited
+  (TM_Updated with the successor, followed by READ COMMITTED);
+  speculative insertion; a prolly slot type (xmin,
+  is_current_xact_tuple); `index_validate_scan`.
+- Engine contract: writes tagged InvalidCommandId (rebuilt rows) are seen
+  by every command; D1 readers see their own root set with the
+  transaction's writes over it, not the write set's newer base.
+Bugs found and fixed, each with a test that fails without the fix: the
+concurrent-writer deadlock; TID reuse after abort; a waiting writer read
+a stale root set (a committed row was overwritten by a duplicate, and an
+update was applied to an old version, losing a concurrent one); D1 cursors
+mixed root sets; upserts didn't wait for a concurrent insert of the same
+key; PK-keyed trees silently replaced a row on a duplicate key (now
+btree's error); dirty snapshots were left uninitialized; rebuilt rows were
+invisible to the command that rebuilt them; ALTER COLUMN TYPE with data
+decoded old rows with the new types (4d.1); bottom-up index deletion
+asserted. One test was made deterministic (an ORDER BY with ties in
+`sem_indexes`). Requirements suite against prolly_d1: sem_ddl,
+sem_constraints, iso_unique_wait and iso_read_committed pass; the rest
+fail only on values larger than a node, PREPARE after prolly writes,
+temporary tables, the 4d.4 callbacks (ANALYZE, bitmap scans, CLUSTER),
+REPEATABLE READ and SERIALIZABLE (newest-head snapshots, 4e), and the
+single writer's coarser blocking (4e). Not tested: index_validate_scan
+with rows written while the index is built.
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

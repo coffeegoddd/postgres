@@ -4,7 +4,8 @@
  *	  Table keying implementation "pk_or_content": keyed by the primary
  *	  key if the table has one, else by row content.
  *
- * A table with a primary key:
+ * A table with a primary key (checked immediately; a deferrable one may
+ * hold duplicates until commit, so its table is keyed like one without):
  *
  *	key		the primary key columns, through the key encoder, in the
  *			order, opfamilies, collations and options of the key's index
@@ -51,6 +52,12 @@ struct ProllyKeying
 	const ProllyHashRoutine *hash;
 	const ProllyValueEncoderRoutine *valenc_routine;
 	ProllyValueEncoder *valenc;
+	TupleDesc	desc;			/* the relation's, when opened */
+	StringInfoData layout;		/* valenc's row layout */
+
+	/* Decoding into slots whose column types differ from desc's. */
+	TupleDesc	alt_desc;
+	ProllyValueEncoder *alt_valenc;
 
 	/* Primary key, if any. */
 	bool		keyless;
@@ -212,6 +219,7 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 	k->mcxt = mcxt;
 	k->hash = c.hash;
 	k->valenc_routine = c.value_encoder;
+	k->desc = CreateTupleDescCopy(RelationGetDescr(rel));
 
 	if (description)
 	{
@@ -221,6 +229,7 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 	}
 	else
 	{
+		/* Not a deferrable one: it may hold duplicates until commit. */
 		Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 		d.keyless = !OidIsValid(pkoid);
@@ -230,6 +239,13 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 	k->keyless = d.keyless;
 	if (!k->keyless)
 		setup_key(k, rel, d.nkeys, d.cols, c.key_encoder);
+	{
+		MemoryContext old = MemoryContextSwitchTo(mcxt);
+
+		initStringInfo(&k->layout);
+		PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
+		MemoryContextSwitchTo(old);
+	}
 	return k;
 }
 
@@ -367,7 +383,32 @@ static void
 pkcontent_decode_row(ProllyKeying *k, const ProllyValue *row,
 					 TupleTableSlot *slot)
 {
-	PROLLY_CALL(k->valenc_routine, decode, k->valenc, row, slot);
+	TupleDesc	sd = slot->tts_tupleDescriptor;
+	ProllyValueEncoder *enc = k->valenc;
+	bool		same = (sd->natts == k->desc->natts);
+
+	/*
+	 * A slot may give columns the types they had when the rows were written
+	 * (a table rewrite reads the old rows that way).
+	 */
+	for (int i = 0; same && i < sd->natts; i++)
+		same = TupleDescAttr(sd, i)->atttypid == TupleDescAttr(k->desc, i)->atttypid &&
+			TupleDescAttr(sd, i)->atttypmod == TupleDescAttr(k->desc, i)->atttypmod;
+	if (!same)
+	{
+		if (k->alt_desc != sd)
+		{
+			ProllyValue layout = {(const uint8 *) k->layout.data, k->layout.len};
+
+			if (k->alt_valenc)
+				PROLLY_CALL(k->valenc_routine, end, k->alt_valenc);
+			k->alt_valenc = PROLLY_CALL(k->valenc_routine, begin_layout, sd,
+										&layout, k->mcxt);
+			k->alt_desc = sd;
+		}
+		enc = k->alt_valenc;
+	}
+	PROLLY_CALL(k->valenc_routine, decode, enc, row, slot);
 }
 
 static int
@@ -408,6 +449,8 @@ static void
 pkcontent_close(ProllyKeying *k)
 {
 	PROLLY_CALL(k->valenc_routine, end, k->valenc);
+	if (k->alt_valenc)
+		PROLLY_CALL(k->valenc_routine, end, k->alt_valenc);
 	if (k->keyenc)
 		PROLLY_CALL(k->keyenc_routine, end, k->keyenc);
 	pfree(k);

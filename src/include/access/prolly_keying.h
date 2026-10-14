@@ -21,6 +21,9 @@
  *   make_value() is only given count 1 for it; a keyless table's value
  *   carries count >= 1.
  * - decode_row(encode_row(slot)) gives back the same attribute values.
+ * - decode_row() fills the slot in the slot's own descriptor, which may
+ *   give columns other types than the relation has now: a table rewrite
+ *   reads the old rows with the types they were written with.
  * - compare() orders keys as the data tree must be ordered.
  * - can_compare() is false when compare() can no longer order the keys
  *   of a keying opened from a description, because something it orders

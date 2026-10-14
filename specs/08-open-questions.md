@@ -16,8 +16,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
 | Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
 | Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
-| Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present, else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
+| Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
+| Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2 |
+| TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
 ## Questions
@@ -261,14 +263,74 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     always keying by content with the primary key as a separate index tree
     (diff and cell-level merge would need a join), and synthetic row ids
     (history-dependent).
-37. **Where the TID map lives.** Non-prolly index AMs store TIDs
-    persistently, so the synthetic TID → row map must be resolvable after
-    restart and per branch.
-    **Decided 2026-10-14 (user):** one tree per relation, TID → (key,
-    content hash, local row metadata such as the xmin change token), in the
-    local sub-root of the working-set root; TID = a hash of (key, content
-    hash) folded into a valid heap-style item pointer, with probing on
-    collision. Versioned with the working set, WAL-logged by the node store,
-    never part of a canonical root. Rejected: one unversioned cluster-wide
-    map (checkout could leave index entries pointing at TIDs the branch
-    doesn't have).
+37. **Where the TID map lives, and where TIDs come from.** Non-prolly index
+    AMs store TIDs persistently, so the synthetic TID → row map must be
+    resolvable after restart and per branch.
+    **Decided 2026-10-14 (user):** one tree per relation, in the local
+    sub-root of the working-set root, versioned with the working set,
+    WAL-logged by the node store, never part of a canonical root. Rejected:
+    one unversioned cluster-wide map (checkout could leave index entries
+    pointing at TIDs the branch doesn't have).
+    **Changed 2026-10-14 (user), TID source:** TIDs come from a per-table
+    counter, not from a hash of the row. The counter is block 0 of the
+    table's main fork, reserved by each backend 1024 numbers at a time with
+    generic WAL (as sequences cache values); aborts and crashes skip
+    numbers, never reuse them. TID number n is item pointer
+    (n / MaxHeapTuplesPerPage, n % MaxHeapTuplesPerPage + 1), so TIDs are
+    in insertion order. The map holds TID → (content hash, ordinal, xmin,
+    key), or for a gone version (cid, xmin, successor, its row, kept like a
+    dead tuple until VACUUM), and (key, ordinal) → TID; scans find TIDs
+    through the second. Why: TIDs must never be given to a second version
+    while an index can hold them, and index entries outlive aborts (a row
+    inserted again after a rollback got the same content-hashed TID, so
+    indexes held two entries for it and returned it twice); and an index
+    serves every branch of its table, so a TID must not name different
+    versions on different branches, which per-branch collision probing
+    can't see. One counter per table storage serves every branch.
+    Rejected: hashed TIDs salted with the xid (still collide across
+    branches), and hashed TIDs plus a log of issued TIDs (the log would
+    have to be a cluster-wide allocator anyway). Consequences: TID reuse
+    after VACUUM is a requirement of step 4f (question 40), several writing
+    nodes would need per-node ranges, and clones can avoid building the map
+    (question 41).
+38. **Row locks for a single writer.** Until the concurrency design (step
+    4e), a prolly table has one writer at a time. Row locks (SELECT FOR
+    UPDATE/SHARE, and the FOR KEY SHARE locks of foreign-key checks) need
+    a rule that fits it.
+    **Decided 2026-10-14 (user):** a per-table writer lock, separate from
+    the relation lock (so it doesn't conflict with the RowExclusiveLock
+    every writing statement already holds, which made concurrent writers
+    deadlock in 4d.1). Writes, FOR UPDATE and FOR NO KEY UPDATE take it
+    exclusively; FOR SHARE and FOR KEY SHARE take it in share mode, so
+    many sessions can hold share locks while writers wait. Coarser than
+    heap (per table, not per row), with the same kinds of locks
+    conflicting. Rejected: every row lock exclusive (every foreign-key
+    check would serialize all inserts into child tables).
+39. **Finding a row's new version.** In READ COMMITTED, an UPDATE, DELETE
+    or row lock that finds its row changed by a transaction that committed
+    while it waited follows the change to the new version (heap follows
+    t_ctid).
+    **Decided 2026-10-14 (user):** forwarding entries in the TID map: an
+    update records old TID -> new TID, for primary-key and keyless tables
+    alike; currtid and WHERE CURRENT OF use them too. They stay until
+    VACUUM forgets the old TID. Rejected: following by primary key (a
+    keyless table's updated row would be treated as deleted, unlike heap).
+40. **TID reuse.** A table has about 1.25×10¹² counter TIDs; every insert
+    and update uses one. At 100k updates a second that lasts about five
+    months; table rewrites (TRUNCATE, VACUUM FULL, CLUSTER, ALTER TYPE)
+    start a new counter. **Requirement for step 4f:** VACUUM, once it has
+    removed every index entry for TIDs that no retained root's map names,
+    lets the counter hand those numbers out again (heap does the same with
+    line pointers), across every branch and retained root.
+41. **Clone without building TID maps.** TID maps are local and never
+    shipped, so a clone has to give the received rows TIDs. Plan for V4:
+    at clone, reserve a counter range [base, base + N) per table and let
+    TID base + i mean the row at position i of the cloned tree (prolly
+    trees keep subtree counts, so position ↔ row is O(log N) both ways);
+    rows written later get explicit map entries above the range, and a
+    scan finds an unchanged row's TID by walking the cloned root beside the
+    current one (O(changes)). Then a clone costs O(chunks), as Dolt's does,
+    for tables whose indexes are prolly indexes; non-prolly indexes on the
+    receiving cluster are rebuilt (O(N log N) each), as in a restore.
+    Content-derived TIDs couldn't avoid an O(N) map: a hash can't be
+    inverted. Not built until clone is.

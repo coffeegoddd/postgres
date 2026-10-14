@@ -6,3 +6,4 @@ test: iso_serializable
 test: iso_fk_key_share
 test: iso_read_committed
 test: iso_deadlock
+test: iso_concurrent_writers

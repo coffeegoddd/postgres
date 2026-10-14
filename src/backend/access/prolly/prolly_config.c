@@ -50,7 +50,7 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_TREE] = "cow", \
 	[PROLLY_IFACE_ROOT_LAYOUT] = "subroots", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "serial", \
-	[PROLLY_IFACE_ROW_IDENTITY] = "hashed"
+	[PROLLY_IFACE_ROW_IDENTITY] = "counter"
 
 #define NOT_YET \
 	[PROLLY_IFACE_NODE_STORE] = "stub", \
@@ -62,7 +62,7 @@ typedef struct ProllyProfile
 
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
-	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,
+	[PROLLY_IFACE_COORDINATION] = "single_writer", HASH_ADDRESSED,
 	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
 	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,
