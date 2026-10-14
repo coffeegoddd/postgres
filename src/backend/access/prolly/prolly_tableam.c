@@ -1402,6 +1402,16 @@ prolly_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				(nk.len == ok.len && memcmp(nk.data, ok.data, nk.len) == 0);
 			ItemPointerData ntid;
 
+			/*
+			 * A key respelled: remove it as it was written first, so the
+			 * write names the committed key by its bytes too, which is how
+			 * it is matched once the key's order is gone (its collation
+			 * dropped later in the transaction).
+			 */
+			if (same_key && !PROLLY_CALL(c.keying, keyless, keying) &&
+				(nk.len != ok.len || memcmp(nk.data, ok.data, nk.len) != 0))
+				PROLLY_CALL(c.engine, remove, rel, PROLLY_TREE_DATA, &ok, cid);
+
 			/* The new version first, then the old one goes. */
 			insert_row(rel, &c, keying, &roots, slot, 1, NULL, same_key, cid);
 			ntid = slot->tts_tid;
