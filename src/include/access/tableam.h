@@ -729,6 +729,19 @@ typedef struct TableAmRoutine
 											double *deadrows,
 											TupleTableSlot *slot);
 
+	/*
+	 * Optional: sample rows for ANALYZE, with the signature and contract of
+	 * an FDW's AcquireSampleRowsFunc (foreign/fdwapi.h).  An AM whose rows
+	 * aren't laid out in the blocks of its main fork samples them this way;
+	 * ANALYZE then takes the relation's size in pages from
+	 * relation_estimate_size.  NULL: ANALYZE samples blocks of the main fork
+	 * through scan_analyze_next_block and scan_analyze_next_tuple.
+	 */
+	int			(*relation_acquire_sample_rows) (Relation rel, int elevel,
+												 HeapTuple *rows, int targrows,
+												 double *totalrows,
+												 double *totaldeadrows);
+
 	/* see table_index_build_range_scan for reference about parameters */
 	double		(*index_build_range_scan) (Relation table_rel,
 										   Relation index_rel,

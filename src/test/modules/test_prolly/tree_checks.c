@@ -214,6 +214,9 @@ check_matches(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env,
 	int			next = 0;
 	uint64		n = 0;
 
+	StringInfoData at;
+
+	initStringInfo(&at);
 	PROLLY_CALL(tr, cursor_seek, c, NULL, ForwardScanDirection);
 	while (PROLLY_CALL(tr, cursor_next, c, &key, &value))
 	{
@@ -225,9 +228,21 @@ check_matches(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env,
 			elog(ERROR, "%s: scan returned key %d, expected %d", when, k, next);
 		if (!same_value(&value, k, ref->version[k]))
 			elog(ERROR, "%s: key %d has the wrong value", when, k);
+
+		/* The item at each position is the one the scan finds there. */
+		resetStringInfo(&at);
+		if (!PROLLY_CALL(tr, key_at, env, root, n, &at) ||
+			at.len != key.len || memcmp(at.data, key.data, key.len) != 0)
+			elog(ERROR, "%s: key_at(" UINT64_FORMAT ") is not key %d",
+				 when, n, k);
 		next++;
 		n++;
 	}
+	resetStringInfo(&at);
+	if (PROLLY_CALL(tr, key_at, env, root, n, &at) ||
+		PROLLY_CALL(tr, key_at, env, root, n + 1000, &at))
+		elog(ERROR, "%s: key_at past the last item found one", when);
+	pfree(at.data);
 	PROLLY_CALL(tr, cursor_close, c);
 	while (next < MAX_KEY && ref->version[next] == ABSENT)
 		next++;

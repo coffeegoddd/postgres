@@ -78,7 +78,10 @@ typedef struct ProllyEngineRoutine
 	 */
 	void		(*tree_reset) (Relation rel, ProllyTreeKind kind);
 
-	/* Copy rel's tree into new storage at newrlocator (SET TABLESPACE). */
+	/*
+	 * Copy rel's trees, with the current transaction's writes, into new
+	 * storage at newrlocator (SET TABLESPACE, CLUSTER, VACUUM FULL).
+	 */
 	void		(*tree_copy) (Relation rel, const RelFileLocator *newrlocator);
 
 	/*
@@ -111,6 +114,14 @@ typedef struct ProllyEngineRoutine
 	 * Number of keys in [lo, hi] (NULL = unbounded), from subtree counts;
 	 * an estimate while the transaction has private writes to tree.
 	 */
+	/*
+	 * Append the key of the item at position ordinal (from 0) of tree's
+	 * data tree in roots to key, without the transaction's private writes
+	 * (for sampling); false past the end.
+	 */
+	bool		(*key_at) (ProllyRootSet *roots, Relation tree, uint64 ordinal,
+						   StringInfo key);
+
 	uint64		(*count_range) (ProllyRootSet *roots, Relation tree,
 								ProllyTreeKind kind, const ProllyKey *lo,
 								const ProllyKey *hi);
@@ -167,7 +178,7 @@ typedef struct ProllyEngineRoutine
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
 	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
-	"cursor_next", "cursor_close", "get", "count_range", "put", "remove", \
+	"cursor_next", "cursor_close", "get", "key_at", "count_range", "put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
 	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \
 	"export_chunks"

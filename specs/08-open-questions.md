@@ -19,7 +19,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
 | Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2 |
-| Prolly indexes (17, 42, 43) | Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. For 4d.3 |
+| Prolly indexes (17, 42, 43) | Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. Built in 4d.3 |
+| ANALYZE sampling (44) | Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts. Built in 4d.4 |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
@@ -361,3 +362,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     holds exactly the table's rows, so commits stay history-independent
     and index-only scans can be exact. Rejected: leaving stale entries for
     VACUUM (the index tree would depend on when VACUUM ran).
+44. **ANALYZE and sampling of prolly tables.** Postgres samples a table by
+    physical block of its main fork; a prolly table's main fork has one
+    block (the TID counter), and table AMs have no hook for their own
+    sampler.
+    **Decided 2026-10-14 (user):** an optional table AM callback in
+    `analyze.c` lets an AM supply its row sampler, as FDWs already can;
+    the tree and engine find the key of the n-th row from subtree counts,
+    so ANALYZE reads only the sampled rows (O(sample × log N)) and
+    TABLESAMPLE SYSTEM picks groups of rows in key order the same way.
+    Tables of other AMs are untouched. Rejected: reading every row and
+    letting reservoir sampling pick (O(N) for every ANALYZE, autovacuum's
+    included).
