@@ -50,3 +50,19 @@ SELECT (SELECT count(*) FROM ctas), (SELECT count(*) FROM selinto),
 	   (SELECT count(*) FROM liked);
 
 DROP TABLE evolved, gen, ctas, selinto, liked;
+
+-- Dropping the primary key's column, and dropping the key's type with it.
+CREATE TABLE dropkey (id int PRIMARY KEY, v text);
+INSERT INTO dropkey VALUES (1, 'kept'), (2, 'also kept');
+ALTER TABLE dropkey DROP COLUMN id CASCADE;
+SELECT * FROM dropkey ORDER BY v;
+INSERT INTO dropkey VALUES ('next');
+SELECT * FROM dropkey ORDER BY v;
+CREATE TYPE mood AS ENUM ('sad', 'happy');
+CREATE TABLE dropkeytype (m mood PRIMARY KEY, v text);
+INSERT INTO dropkeytype VALUES ('sad', 'one'), ('happy', 'two');
+DROP TYPE mood CASCADE;
+SELECT * FROM dropkeytype ORDER BY v;
+INSERT INTO dropkeytype VALUES ('three');
+SELECT * FROM dropkeytype ORDER BY v;
+DROP TABLE dropkey, dropkeytype;

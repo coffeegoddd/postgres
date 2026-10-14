@@ -27,6 +27,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/prolly_database.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
@@ -1595,6 +1596,9 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
 										dst_deftablespace);
 
+		/* Prolly tables are found from branch heads outside the files. */
+		ProllyCopyDatabase(src_dboid, dboid);
+
 		/*
 		 * Close pg_database, but keep lock till commit.
 		 */
@@ -1925,6 +1929,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Remove all tablespace subdirs belonging to the database.
 	 */
 	remove_dbtablespaces(db_id);
+
+	/* And the branch heads its prolly tables are found from. */
+	ProllyDropDatabase(db_id);
 
 	/*
 	 * Close pg_database, but keep lock till commit.

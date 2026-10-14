@@ -40,6 +40,8 @@ tests += {
     'tests': [
       't/001_store_recovery.pl',
       't/002_d1_heads.pl',
+      't/003_d1_cleanup.pl',
+      't/004_d1_databases.pl',
     ],
   },
 }

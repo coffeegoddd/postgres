@@ -177,6 +177,8 @@ static const ConformanceCase cases[] = {
 	commit_publishes_in_enqueue_order},
 	{PROLLY_IFACE_COMMIT_PIPELINE, "survives_crash_and_replays",
 	"enqueue publish checkpoint redo", NULL},
+	{PROLLY_IFACE_COMMIT_PIPELINE, "copies_and_drops_databases",
+	"copy_database drop_database head checkpoint redo", NULL},
 
 	/* row identity */
 	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve",
@@ -195,6 +197,8 @@ static const ConformanceCase cases[] = {
 	"open encode_row content_hash compare close", keying_keys_and_content},
 	{PROLLY_IFACE_TABLE_KEYING, "description_reopens",
 	"open describe keyless encode_row close", keying_description_reopens},
+	{PROLLY_IFACE_TABLE_KEYING, "reads_after_key_column_dropped",
+	"open describe encode_row compare decode_row close", keying_reads_dropped_key},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",

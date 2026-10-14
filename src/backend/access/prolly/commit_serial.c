@@ -25,6 +25,11 @@
  * dropped.  So a branch's head after a crash, or on a standby, is the
  * root of the last enqueued transaction that committed.
  *
+ * CREATE DATABASE copies the template's heads as pending entries of the
+ * new database under the creating transaction's xid, logged like any
+ * enqueue, so they are settled the same way.  DROP DATABASE removes the
+ * database's heads and pending entries and logs that.
+ *
  * Checkpoints write heads and pending entries to global/prolly_heads
  * (written to a temporary file, then durably renamed), which shmem_init
  * reads back.  Entries are added to shared memory before their WAL
@@ -59,6 +64,7 @@
 
 /* ProllyCommit record types (high bits of info) */
 #define XLOG_PROLLY_COMMIT_ENQUEUE	0x10
+#define XLOG_PROLLY_COMMIT_DROP_DATABASE	0x20
 
 #define MAX_HEADS		1024
 #define MAX_PENDING		1024
@@ -113,6 +119,11 @@ typedef struct xl_serial_enqueue
 } xl_serial_enqueue;
 
 #define SizeOfSerialEnqueue	offsetof(xl_serial_enqueue, hash)
+
+typedef struct xl_serial_drop_database
+{
+	Oid			dboid;
+} xl_serial_drop_database;
 
 static SerialShared *shared = NULL;
 
@@ -248,6 +259,55 @@ settle_pending(SerialShared *s, Oid dboid, ProllyBranchId branch,
 		else if (check_running && TransactionIdIsInProgress(p->xid))
 			break;
 		remove_pending(s, i);
+	}
+}
+
+/* Settle every branch of dboid as far as finished transactions allow. */
+static void
+settle_database(SerialShared *s, Oid dboid)
+{
+	ProllyBranchId *branches = palloc(sizeof(ProllyBranchId) * MAX_PENDING);
+	int			n = 0;
+
+	for (int i = 0; i < s->npending; i++)
+	{
+		if (s->pending[i].dboid == dboid)
+			branches[n++] = s->pending[i].branch;
+	}
+	for (int i = 0; i < n; i++)
+		settle_pending(s, dboid, branches[i], true, PG_UINT64_MAX);
+	pfree(branches);
+}
+
+/* Shared or exclusive lock. */
+static bool
+database_has_pending(SerialShared *s, Oid dboid)
+{
+	for (int i = 0; i < s->npending; i++)
+	{
+		if (s->pending[i].dboid == dboid)
+			return true;
+	}
+	return false;
+}
+
+static void
+forget_database(SerialShared *s, Oid dboid)
+{
+	int			n = 0;
+
+	for (int i = 0; i < s->nheads; i++)
+	{
+		if (s->heads[i].dboid != dboid)
+			s->heads[n++] = s->heads[i];
+	}
+	s->nheads = n;
+	for (int i = 0; i < s->npending;)
+	{
+		if (s->pending[i].dboid == dboid)
+			remove_pending(s, i);
+		else
+			i++;
 	}
 }
 
@@ -446,13 +506,31 @@ serial_tip(ProllyBranchId branch, ProllyNodeRef *root)
 	return found;
 }
 
+/* Log a pending entry already added to shared memory. */
+static void
+log_enqueue(Oid dboid, ProllyBranchId branch, TransactionId xid,
+			const ProllyHash *root)
+{
+	xl_prolly_header hdr;
+	xl_serial_enqueue rec;
+
+	hdr.impl_id = SERIAL_IMPL_ID;
+	rec.dboid = dboid;
+	rec.branch = branch;
+	rec.xid = xid;
+	rec.hash_len = root->len;
+	XLogBeginInsert();
+	XLogRegisterData(&hdr, SizeOfProllyHeader);
+	XLogRegisterData(&rec, SizeOfSerialEnqueue);
+	XLogRegisterData(root->bytes, root->len);
+	(void) XLogInsert(RM_PROLLY_COMMIT_ID, XLOG_PROLLY_COMMIT_ENQUEUE);
+}
+
 static ProllyCommitTicket
 serial_enqueue(ProllyBranchId branch, const ProllyNodeRef *new_root)
 {
 	SerialShared *s = get_shared();
 	TransactionId xid = GetCurrentTransactionId();
-	xl_prolly_header hdr;
-	xl_serial_enqueue rec;
 	uint64		seq;
 
 	check_root(new_root);
@@ -462,17 +540,7 @@ serial_enqueue(ProllyBranchId branch, const ProllyNodeRef *new_root)
 	seq = add_pending(s, MyDatabaseId, branch, xid, &new_root->hash);
 	LWLockRelease(ProllyHeadsLock);
 
-	hdr.impl_id = SERIAL_IMPL_ID;
-	rec.dboid = MyDatabaseId;
-	rec.branch = branch;
-	rec.xid = xid;
-	rec.hash_len = new_root->hash.len;
-	XLogBeginInsert();
-	XLogRegisterData(&hdr, SizeOfProllyHeader);
-	XLogRegisterData(&rec, SizeOfSerialEnqueue);
-	XLogRegisterData(new_root->hash.bytes, new_root->hash.len);
-	(void) XLogInsert(RM_PROLLY_COMMIT_ID, XLOG_PROLLY_COMMIT_ENQUEUE);
-
+	log_enqueue(MyDatabaseId, branch, xid, &new_root->hash);
 	return seq;
 }
 
@@ -540,6 +608,82 @@ serial_head(ProllyBranchId branch, ProllyNodeRef *root)
 }
 
 static void
+serial_copy_database(Oid src_dboid, Oid dst_dboid)
+{
+	SerialShared *s = get_shared();
+	TransactionId xid = GetCurrentTransactionId();
+	HeadEntry  *heads;
+	int			n = 0;
+
+	heads = palloc(sizeof(HeadEntry) * MAX_HEADS);
+	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	settle_database(s, src_dboid);
+	settle_database(s, dst_dboid);
+	if (database_has_pending(s, src_dboid))
+	{
+		LWLockRelease(ProllyHeadsLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("source database %u has prolly commits in progress",
+						src_dboid)));
+	}
+	for (int i = 0; i < s->nheads; i++)
+	{
+		if (s->heads[i].dboid == dst_dboid)
+		{
+			LWLockRelease(ProllyHeadsLock);
+			elog(ERROR, "new database %u already has prolly branch heads",
+				 dst_dboid);
+		}
+	}
+	if (database_has_pending(s, dst_dboid))
+	{
+		LWLockRelease(ProllyHeadsLock);
+		elog(ERROR, "new database %u already has prolly commits in progress",
+			 dst_dboid);
+	}
+	for (int i = 0; i < s->nheads; i++)
+	{
+		if (s->heads[i].dboid == src_dboid)
+			heads[n++] = s->heads[i];
+	}
+	if (s->npending + n > MAX_PENDING)
+	{
+		LWLockRelease(ProllyHeadsLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("too many prolly commits in progress (limit %d)",
+						MAX_PENDING)));
+	}
+	for (int i = 0; i < n; i++)
+		(void) add_pending(s, dst_dboid, heads[i].branch, xid, &heads[i].root);
+	LWLockRelease(ProllyHeadsLock);
+
+	for (int i = 0; i < n; i++)
+		log_enqueue(dst_dboid, heads[i].branch, xid, &heads[i].root);
+	pfree(heads);
+}
+
+static void
+serial_drop_database(Oid dboid)
+{
+	SerialShared *s = get_shared();
+	xl_prolly_header hdr;
+	xl_serial_drop_database rec;
+
+	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	forget_database(s, dboid);
+	LWLockRelease(ProllyHeadsLock);
+
+	hdr.impl_id = SERIAL_IMPL_ID;
+	rec.dboid = dboid;
+	XLogBeginInsert();
+	XLogRegisterData(&hdr, SizeOfProllyHeader);
+	XLogRegisterData(&rec, sizeof(rec));
+	(void) XLogInsert(RM_PROLLY_COMMIT_ID, XLOG_PROLLY_COMMIT_DROP_DATABASE);
+}
+
+static void
 serial_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & PROLLY_XLOG_TYPE_MASK;
@@ -576,6 +720,19 @@ serial_redo(XLogReaderState *record)
 				LWLockRelease(ProllyHeadsLock);
 				break;
 			}
+		case XLOG_PROLLY_COMMIT_DROP_DATABASE:
+			{
+				xl_serial_drop_database rec;
+
+				if (XLogRecGetDataLen(record) != SizeOfProllyHeader + sizeof(rec))
+					elog(PANIC, "prolly drop database record has the wrong length");
+				memcpy(&rec, XLogRecGetData(record) + SizeOfProllyHeader,
+					   sizeof(rec));
+				LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+				forget_database(s, rec.dboid);
+				LWLockRelease(ProllyHeadsLock);
+				break;
+			}
 		default:
 			elog(PANIC, "prolly commit pipeline \"serial\": unknown record type 0x%02X",
 				 info);
@@ -600,6 +757,8 @@ const ProllyCommitRoutine prolly_commit_serial = {
 	.publish = serial_publish,
 	.abandon = serial_abandon,
 	.head = serial_head,
+	.copy_database = serial_copy_database,
+	.drop_database = serial_drop_database,
 	.checkpoint = serial_checkpoint,
 	.redo = serial_redo,
 };

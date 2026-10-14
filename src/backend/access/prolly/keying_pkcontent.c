@@ -22,8 +22,15 @@
  *
  * A description is 'C' for content keying or 'P' for a primary key, the
  * length and bytes of the value encoder's row layout, and for 'P' the
- * number of key columns and per column its attribute number, opfamily,
- * collation and options, in native byte order (descriptions are local).
+ * number of key columns and per column its attribute number, options,
+ * opfamily, collation and type, in native byte order (descriptions are
+ * local).  The type is recorded because a table's old rows must stay
+ * readable after their key column is dropped, when the relation no longer
+ * says what type it had.
+ *
+ * The key encoder starts the first time keys are encoded or compared: a
+ * scan of old rows needs neither, and the key's type may be gone by then
+ * (DROP TYPE ... CASCADE drops the column with it).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/keying_pkcontent.c
@@ -53,6 +60,7 @@ struct ProllyKeying
 	Oid		   *opfamilies;
 	Oid		   *collations;
 	int16	   *options;
+	Oid		   *types;
 	Datum	   *key_values;		/* scratch */
 	bool	   *key_isnull;
 };
@@ -63,6 +71,7 @@ typedef struct KeyColumn
 	int16		option;
 	Oid			opfamily;
 	Oid			collation;
+	Oid			type;
 } KeyColumn;
 
 static void
@@ -79,9 +88,6 @@ static void
 setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 		  const ProllyKeyEncoderRoutine *keyenc)
 {
-	Oid		   *types;
-	ProllyKeyDesc desc;
-
 	k->nkeys = nkeys;
 	k->key_attnos = MemoryContextAlloc(k->mcxt, sizeof(AttrNumber) * nkeys);
 	k->key_values = MemoryContextAlloc(k->mcxt, sizeof(Datum) * nkeys);
@@ -89,7 +95,7 @@ setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 	k->opfamilies = MemoryContextAlloc(k->mcxt, sizeof(Oid) * nkeys);
 	k->collations = MemoryContextAlloc(k->mcxt, sizeof(Oid) * nkeys);
 	k->options = MemoryContextAlloc(k->mcxt, sizeof(int16) * nkeys);
-	types = MemoryContextAlloc(k->mcxt, sizeof(Oid) * nkeys);
+	k->types = MemoryContextAlloc(k->mcxt, sizeof(Oid) * nkeys);
 	for (int i = 0; i < nkeys; i++)
 	{
 		/* Primary keys are plain columns, never expressions. */
@@ -100,31 +106,44 @@ setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 		k->opfamilies[i] = cols[i].opfamily;
 		k->collations[i] = cols[i].collation;
 		k->options[i] = cols[i].option;
-		types[i] = TupleDescAttr(RelationGetDescr(rel), cols[i].attno - 1)->atttypid;
+		k->types[i] = cols[i].type;
 	}
+	k->keyenc_routine = keyenc;
+}
 
-	desc.nkeys = nkeys;
-	desc.types = types;
+static ProllyKeyEncoder *
+key_encoder(ProllyKeying *k)
+{
+	ProllyKeyDesc desc;
+
+	if (k->keyenc)
+		return k->keyenc;
+	desc.nkeys = k->nkeys;
+	desc.types = k->types;
 	desc.opfamilies = k->opfamilies;
 	desc.collations = k->collations;
 	desc.options = k->options;
-	k->keyenc_routine = keyenc;
-	k->keyenc = PROLLY_CALL(keyenc, begin, &desc, k->mcxt);
+	k->keyenc = PROLLY_CALL(k->keyenc_routine, begin, &desc, k->mcxt);
+	return k->keyenc;
 }
 
 /* The key columns of rel's primary key index pkoid. */
 static int
-primary_key_columns(Oid pkoid, KeyColumn *cols)
+primary_key_columns(Relation rel, Oid pkoid, KeyColumn *cols)
 {
 	Relation	idx = index_open(pkoid, AccessShareLock);
 	int			nkeys = IndexRelationGetNumberOfKeyAttributes(idx);
 
 	for (int i = 0; i < nkeys; i++)
 	{
+		memset(&cols[i], 0, sizeof(KeyColumn));
 		cols[i].attno = idx->rd_index->indkey.values[i];
 		cols[i].opfamily = idx->rd_opfamily[i];
 		cols[i].collation = idx->rd_indcollation[i];
 		cols[i].option = idx->rd_indoption[i];
+		if (cols[i].attno > 0 && cols[i].attno <= RelationGetNumberOfAttributes(rel))
+			cols[i].type = TupleDescAttr(RelationGetDescr(rel),
+										 cols[i].attno - 1)->atttypid;
 	}
 	index_close(idx, AccessShareLock);
 	return nkeys;
@@ -204,7 +223,7 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 		Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 		d.keyless = !OidIsValid(pkoid);
-		d.nkeys = d.keyless ? 0 : primary_key_columns(pkoid, d.cols);
+		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
 		k->valenc = PROLLY_CALL(c.value_encoder, begin, RelationGetDescr(rel), mcxt);
 	}
 	k->keyless = d.keyless;
@@ -239,6 +258,7 @@ pkcontent_describe(ProllyKeying *k, StringInfo out)
 		col.option = k->options[i];
 		col.opfamily = k->opfamilies[i];
 		col.collation = k->collations[i];
+		col.type = k->types[i];
 		appendBinaryStringInfo(out, (const char *) &col, sizeof(col));
 	}
 }
@@ -260,7 +280,8 @@ pkcontent_can_read(ProllyKeying *k, const ProllyValue *description)
 		if (d.cols[i].attno != k->key_attnos[i] ||
 			d.cols[i].opfamily != k->opfamilies[i] ||
 			d.cols[i].collation != k->collations[i] ||
-			d.cols[i].option != k->options[i])
+			d.cols[i].option != k->options[i] ||
+			d.cols[i].type != k->types[i])
 			return false;
 	}
 	return PROLLY_CALL(k->valenc_routine, reads_layout, k->valenc, &d.layout);
@@ -295,7 +316,7 @@ pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 		k->key_values[i] = slot->tts_values[att];
 		k->key_isnull[i] = slot->tts_isnull[att];
 	}
-	PROLLY_CALL(k->keyenc_routine, encode, k->keyenc, k->key_values,
+	PROLLY_CALL(k->keyenc_routine, encode, key_encoder(k), k->key_values,
 				k->key_isnull, key);
 }
 
@@ -354,7 +375,7 @@ pkcontent_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 	int			r;
 
 	if (!k->keyless)
-		return PROLLY_CALL(k->keyenc_routine, compare, k->keyenc, a, b);
+		return PROLLY_CALL(k->keyenc_routine, compare, key_encoder(k), a, b);
 	r = memcmp(a->data, b->data, Min(a->len, b->len));
 	if (r != 0)
 		return r;
@@ -374,7 +395,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_content = {
 	.info = {
 		.iface = PROLLY_IFACE_TABLE_KEYING,
 		.impl_id = 1,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "pk_or_content",
 		.description = "keyed by the primary key, or by row content hash with "
 		"a count for tables without one",

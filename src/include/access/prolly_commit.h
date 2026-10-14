@@ -36,6 +36,14 @@
  *   was built on it.
  * - head() returns the published head, without the branch lock; false if
  *   the branch has never had a root.
+ * - copy_database() gives a new database dst_dboid the branches of
+ *   src_dboid, as part of the current transaction: their heads become
+ *   dst's when, and only when, the transaction commits (CREATE DATABASE
+ *   copies the template's catalogs and files, and this copies the roots
+ *   they refer to).  The caller makes sure nothing writes to src
+ *   meanwhile.  Errors if dst already has branches.
+ * - drop_database() forgets every branch of dboid, at once and durably
+ *   (DROP DATABASE removes the database's files the same way).
  * - checkpoint() makes every branch's state as of the checkpoint's redo
  *   point durable; redo() replays the implementation's own ProllyCommit
  *   records (prolly_xlog.h).
@@ -73,13 +81,18 @@ typedef struct ProllyCommitRoutine
 	/* The branch's current published head. */
 	bool		(*head) (ProllyBranchId branch, ProllyNodeRef *root);
 
+	/* Databases. */
+	void		(*copy_database) (Oid src_dboid, Oid dst_dboid);
+	void		(*drop_database) (Oid dboid);
+
 	void		(*checkpoint) (int flags);
 	void		(*redo) (XLogReaderState *record);
 } ProllyCommitRoutine;
 
 #define PROLLY_COMMIT_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "branch_lock", "tip", "enqueue", \
-	"branch_unlock", "publish", "abandon", "head", "checkpoint", "redo"
+	"branch_unlock", "publish", "abandon", "head", "copy_database", \
+	"drop_database", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
 
 static inline const ProllyCommitRoutine *

@@ -70,7 +70,8 @@ Covered: requirements that are decided.
 	                SERIALIZABLE write skew, FK key-share locks, READ
 	                COMMITTED re-checks, deadlocks (iso_*)
 	Durability      crash recovery and prepared transactions (101),
-	                standby replay and promotion (102), all under
+	                standby replay and promotion (102), databases
+	                copied from templates and dropped (103), all under
 	                wal_consistency_checking
 	Version control branches isolate data (vc_branches); schema is
 	                versioned, including cached plans and functions

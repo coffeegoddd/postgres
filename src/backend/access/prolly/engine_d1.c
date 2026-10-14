@@ -430,7 +430,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	memset(&key, 0, sizeof(key));
 	key.sub = sub;
 	key.relnumber = relnumber;
-	he = hash_search(xact->writesets, &key, HASH_ENTER, &found);
+	he = hash_search(xact->writesets, &key, HASH_FIND, &found);
 	if (found)
 	{
 		ws = he->ws;
@@ -465,7 +465,11 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 		return ws;
 	}
 
-	/* One writer per table until coordination arrives. */
+	/*
+	 * One writer per table until coordination arrives.  The write set is
+	 * entered only once it's complete, so an error here (a lock timeout, a
+	 * cancel) leaves nothing behind for a retry to find.
+	 */
 	LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
 	(void) GetCurrentTransactionId();
 
@@ -487,6 +491,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 		current_head(&head);
 		find_tree(&head, sub, relnumber, &ws->base);
 	}
+	he = hash_search(xact->writesets, &key, HASH_ENTER, NULL);
 	he->ws = ws;
 	ws->next = xact->all;
 	xact->all = ws;
@@ -1267,6 +1272,13 @@ d1_xact_prepare(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot PREPARE a transaction that has written to a prolly table")));
+
+	/*
+	 * Writes made and rolled back in subtransactions leave state but
+	 * nothing to carry into the prepared transaction.  Its memory goes
+	 * with the transaction's, and no commit or abort event follows here.
+	 */
+	xact_reset();
 }
 
 /* Forget a write set made in an aborted subtransaction. */
