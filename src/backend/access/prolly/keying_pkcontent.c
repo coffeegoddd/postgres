@@ -43,6 +43,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 struct ProllyKeying
 {
@@ -382,6 +383,27 @@ pkcontent_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 	return (a->len > b->len) - (a->len < b->len);
 }
 
+/*
+ * Keys are ordered by their columns' btree comparison functions, which
+ * need the types, operator families and collations they were recorded
+ * with.
+ */
+static bool
+pkcontent_can_compare(ProllyKeying *k)
+{
+	if (k->keyless)
+		return true;
+	for (int i = 0; i < k->nkeys; i++)
+	{
+		if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(k->types[i])) ||
+			!SearchSysCacheExists1(OPFAMILYOID, ObjectIdGetDatum(k->opfamilies[i])) ||
+			(OidIsValid(k->collations[i]) &&
+			 !SearchSysCacheExists1(COLLOID, ObjectIdGetDatum(k->collations[i]))))
+			return false;
+	}
+	return true;
+}
+
 static void
 pkcontent_close(ProllyKeying *k)
 {
@@ -410,5 +432,6 @@ const ProllyKeyingRoutine prolly_keying_pk_or_content = {
 	.content_hash = pkcontent_content_hash,
 	.decode_row = pkcontent_decode_row,
 	.compare = pkcontent_compare,
+	.can_compare = pkcontent_can_compare,
 	.close = pkcontent_close,
 };

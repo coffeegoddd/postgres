@@ -818,6 +818,53 @@ keying_reads_dropped_key_body(const ProllyImplInfo *impl)
 	table_close(rel, AccessShareLock);
 }
 
+/*
+ * can_compare() holds while the key's type exists, and fails for a keying
+ * reopened from its description after the type was dropped.
+ */
+static void
+keying_compare_after_type_dropped_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	const char *engine = engine_for_impl(impl);
+	Relation	rel;
+	Relation	none;
+	Oid			relid;
+	ProllyKeying *k;
+	StringInfoData desc;
+	ProllyValue d;
+
+	run_sql("CREATE TYPE conf_kt_mood AS ENUM ('sad', 'happy')");
+	rel = make_table_for_engine(engine, "conf_kt",
+								"m conf_kt_mood PRIMARY KEY, t text");
+	none = make_table_for_engine(engine, "conf_kt_none", "id int, t text");
+	relid = RelationGetRelid(rel);
+
+	k = PROLLY_CALL(kr, open, none, NULL, CurrentMemoryContext);
+	if (!PROLLY_CALL(kr, can_compare, k))
+		elog(ERROR, "a keying without a primary key can't compare");
+	PROLLY_CALL(kr, close, k);
+	table_close(none, AccessShareLock);
+
+	k = PROLLY_CALL(kr, open, rel, NULL, CurrentMemoryContext);
+	if (!PROLLY_CALL(kr, can_compare, k))
+		elog(ERROR, "a keying can't compare while its key's type exists");
+	initStringInfo(&desc);
+	PROLLY_CALL(kr, describe, k, &desc);
+	d.data = (const uint8 *) desc.data;
+	d.len = desc.len;
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+
+	run_sql("DROP TYPE conf_kt_mood CASCADE");
+	rel = table_open(relid, AccessShareLock);
+	k = PROLLY_CALL(kr, open, rel, &d, CurrentMemoryContext);
+	if (PROLLY_CALL(kr, can_compare, k))
+		elog(ERROR, "a keying claims to compare keys of a dropped type");
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+}
+
 /* ------------------------------------------------------------------------
  * Row identity
  * ------------------------------------------------------------------------
@@ -1198,6 +1245,12 @@ void
 keying_description_reopens(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_description_reopens_body, impl);
+}
+
+void
+keying_compare_after_type_dropped(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_compare_after_type_dropped_body, impl);
 }
 
 void

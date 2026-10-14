@@ -617,6 +617,76 @@ visible_version(const D1Entry *e, CommandId cid)
 	return NULL;
 }
 
+/*
+ * Keys that can't be ordered any more (their keying's type, operator
+ * family or collation was dropped) are matched by their bytes instead:
+ * the write set's entries, sorted by bytes, looked up by binary search.
+ */
+static bool
+order_lost(const D1Order *order)
+{
+	return order->keying != NULL &&
+		!PROLLY_CALL(order->routine, can_compare, order->keying);
+}
+
+static int
+entry_bytes_cmp(const void *a, const void *b)
+{
+	const D1Entry *ea = *(D1Entry *const *) a;
+	const D1Entry *eb = *(D1Entry *const *) b;
+	ProllyKey	ka = {ea->key, ea->keylen};
+	ProllyKey	kb = {eb->key, eb->keylen};
+
+	return memcmp_keys(&ka, &kb, NULL);
+}
+
+static D1Entry **
+entries_by_bytes(D1WriteSet *ws, int *n)
+{
+	D1Entry   **arr = palloc(sizeof(D1Entry *) * Max(ws->nentries, 1));
+	RBTreeIterator it;
+	D1Entry    *e;
+
+	*n = 0;
+	rbt_begin_iterate(ws->entries, LeftRightWalk, &it);
+	while ((e = (D1Entry *) rbt_iterate(&it)) != NULL)
+		arr[(*n)++] = e;
+	qsort(arr, *n, sizeof(D1Entry *), entry_bytes_cmp);
+	return arr;
+}
+
+static D1Entry *
+find_by_bytes(D1Entry **arr, int n, const ProllyKey *key)
+{
+	int			lo = 0;
+	int			hi = n - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		ProllyKey	k = {arr[mid]->key, arr[mid]->keylen};
+		int			r = memcmp_keys(key, &k, NULL);
+
+		if (r == 0)
+			return arr[mid];
+		if (r < 0)
+			hi = mid - 1;
+		else
+			lo = mid + 1;
+	}
+	return NULL;
+}
+
+static void
+order_lost_error(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot look up rows of this prolly table by key"),
+			 errdetail("A type, operator family or collation its rows are keyed by has been dropped."),
+			 errhint("Write to the table to rebuild it.")));
+}
+
 /* ------------------------------------------------------------------------
  * Root sets
  * ------------------------------------------------------------------------
@@ -681,6 +751,12 @@ struct ProllyCursor
 	bool		o_from_end;		/* no bound: start at the first/last key */
 
 	ScanDirection dir;
+
+	/* Keys matched by bytes: the base tree, then the write set's rest. */
+	bool		unordered;
+	D1Entry   **by_bytes;
+	int			nby_bytes;
+	int			by_bytes_pos;
 };
 
 static int
@@ -724,7 +800,8 @@ d1_cursor_open(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	}
 	else
 		open_order(tree, sub, roots, mcxt, &c->order);
-	tree_env(&c->order, &c->env);
+	c->unordered = order_lost(&c->order);
+	tree_env(c->unordered ? NULL : &c->order, &c->env);
 	read_base(roots, sub, relnumber, c->ws, &base);
 	if (base.hash.len > 0)
 		c->tc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env, &base, mcxt);
@@ -747,6 +824,28 @@ d1_cursor_seek(ProllyCursor *c, const ProllyKey *key, ScanDirection direction)
 	ProllyKey	bound;
 
 	c->dir = forward ? ForwardScanDirection : BackwardScanDirection;
+
+	if (c->unordered)
+	{
+		/* Only a forward scan of everything needs no order. */
+		if (key || !forward)
+			order_lost_error();
+		if (c->tc)
+		{
+			PROLLY_CALL(backend.c.tree, cursor_seek, c->tc, NULL, c->dir);
+			c->t_done = false;
+		}
+		c->t_have = false;
+		if (c->by_bytes)
+			pfree(c->by_bytes);
+		c->by_bytes = NULL;
+		c->nby_bytes = 0;
+		if (c->ws)
+			c->by_bytes = entries_by_bytes(c->ws, &c->nby_bytes);
+		c->by_bytes_pos = 0;
+		MemoryContextSwitchTo(old);
+		return;
+	}
 
 	/* Where the base tree starts. */
 	if (key || (is_local(c->sub) && forward))
@@ -870,9 +969,44 @@ return_key(ProllyCursor *c, const uint8 *data, uint32 len, ProllyKey *key)
 }
 
 static bool
+next_unordered(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
+{
+	for (;;)
+	{
+		D1Entry    *e;
+		const D1Version *v;
+
+		fill_tree(c);
+		if (c->t_have)
+		{
+			c->t_have = false;
+			e = find_by_bytes(c->by_bytes, c->nby_bytes, &c->t_key);
+			if (e && visible_version(e, c->cid) != NULL)
+				continue;		/* the write set's version comes later */
+			return_key(c, c->t_key.data, c->t_key.len, key);
+			*value = c->t_value;
+			return true;
+		}
+		if (c->by_bytes_pos >= c->nby_bytes)
+			return false;
+		e = c->by_bytes[c->by_bytes_pos++];
+		v = visible_version(e, c->cid);
+		if (v == NULL || v->is_delete)
+			continue;
+		return_key(c, e->key, e->keylen, key);
+		value->data = v->value;
+		value->len = v->len;
+		return true;
+	}
+}
+
+static bool
 d1_cursor_next(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 {
 	bool		forward = ScanDirectionIsForward(c->dir);
+
+	if (c->unordered)
+		return next_unordered(c, key, value);
 
 	for (;;)
 	{
@@ -961,6 +1095,13 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 		D1Entry    *e;
 
 		refresh_order(ws, tree);
+		if (!is_local(sub))
+		{
+			D1Order		o = {ws->keying_routine, ws->keying};
+
+			if (order_lost(&o))
+				order_lost_error();
+		}
 		e = ws_find(ws, fk);
 		if (e)
 		{
@@ -989,6 +1130,12 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 		}
 		else
 			open_order(tree, sub, roots, CurrentMemoryContext, &order);
+		if (order_lost(&order))
+		{
+			if (!ws)
+				close_order(&order);
+			order_lost_error();
+		}
 		tree_env(&order, &env);
 		found = PROLLY_CALL(backend.c.tree, get, &env, &base, fk, value);
 		if (!ws)
@@ -1092,6 +1239,105 @@ d1_tree_reset(Relation rel, ProllyTreeKind kind)
 	(void) get_writeset(rel, sub, rel->rd_locator.relNumber, true);
 }
 
+/*
+ * materialize() for a write set whose keys can't be ordered any more: the
+ * base tree's rows and the newest versions, matched by bytes, built into a
+ * new tree in byte order.  Readers of it can't order its keys either, so
+ * they read it the same way; the next write rebuilds it under the table's
+ * current keying.
+ */
+typedef struct D1Row
+{
+	ProllyKey	key;
+	ProllyValue value;
+} D1Row;
+
+static int
+row_bytes_cmp(const void *a, const void *b)
+{
+	return memcmp_keys(&((const D1Row *) a)->key, &((const D1Row *) b)->key,
+					   NULL);
+}
+
+static void
+materialize_unordered(D1WriteSet *ws, ProllyNodeRef *out)
+{
+	int			nentries;
+	D1Entry   **entries = entries_by_bytes(ws, &nentries);
+	D1Row	   *rows;
+	int			nrows = 0;
+	int			cap = Max(nentries, 64);
+	ProllyTreeBuilder *b;
+
+	rows = palloc(sizeof(D1Row) * cap);
+
+	/* The base's rows the write set doesn't replace or delete. */
+	if (ws->base.hash.len > 0)
+	{
+		ProllyTreeCursor *tc = PROLLY_CALL(backend.c.tree, cursor_open,
+										   &backend.memcmp_env, &ws->base,
+										   CurrentMemoryContext);
+		ProllyKey	key;
+		ProllyValue value;
+
+		PROLLY_CALL(backend.c.tree, cursor_seek, tc, NULL, ForwardScanDirection);
+		while (PROLLY_CALL(backend.c.tree, cursor_next, tc, &key, &value))
+		{
+			D1Entry    *e = find_by_bytes(entries, nentries, &key);
+			uint8	   *copy;
+
+			if (e && e->nversions > 0)
+				continue;
+			if (nrows == cap)
+			{
+				cap *= 2;
+				rows = repalloc(rows, sizeof(D1Row) * cap);
+			}
+			copy = palloc(Max(key.len + value.len, 1));
+			memcpy(copy, key.data, key.len);
+			memcpy(copy + key.len, value.data, value.len);
+			rows[nrows].key.data = copy;
+			rows[nrows].key.len = key.len;
+			rows[nrows].value.data = copy + key.len;
+			rows[nrows].value.len = value.len;
+			nrows++;
+		}
+		PROLLY_CALL(backend.c.tree, cursor_close, tc);
+	}
+
+	/* The write set's newest versions. */
+	for (int i = 0; i < nentries; i++)
+	{
+		D1Entry    *e = entries[i];
+		const D1Version *v;
+
+		if (e->nversions == 0)
+			continue;
+		v = &e->versions[e->nversions - 1];
+		if (v->is_delete)
+			continue;
+		if (nrows == cap)
+		{
+			cap *= 2;
+			rows = repalloc(rows, sizeof(D1Row) * cap);
+		}
+		rows[nrows].key.data = e->key;
+		rows[nrows].key.len = e->keylen;
+		rows[nrows].value.data = v->value;
+		rows[nrows].value.len = v->len;
+		nrows++;
+	}
+
+	qsort(rows, nrows, sizeof(D1Row), row_bytes_cmp);
+	b = PROLLY_CALL(backend.c.tree, build_begin, &backend.memcmp_env,
+					CurrentMemoryContext);
+	for (int i = 0; i < nrows; i++)
+		PROLLY_CALL(backend.c.tree, build_add, b, &rows[i].key, &rows[i].value);
+	PROLLY_CALL(backend.c.tree, build_finish, b, out);
+	pfree(rows);
+	pfree(entries);
+}
+
 /* Write ws's newest versions into a tree; returns its root in *out. */
 static void
 materialize(D1WriteSet *ws, ProllyNodeRef *out)
@@ -1104,6 +1350,11 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 	D1Order		order = {ws->keying_routine, ws->keying};
 	ProllyTreeEnv env;
 
+	if (order_lost(&order))
+	{
+		materialize_unordered(ws, out);
+		return;
+	}
 	tree_env(ws->keying ? &order : NULL, &env);
 	if (base.hash.len == 0)
 	{

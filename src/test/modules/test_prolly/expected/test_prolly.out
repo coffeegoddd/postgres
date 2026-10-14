@@ -55,6 +55,7 @@ FROM prolly_implementations();
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
+NOTICE:  drop cascades to column m of table conf_kt
     interface    | implementation |                  test                   |                                                                                                      result                                                                                                       
 -----------------+----------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  engine          | d1             | identity                                | pass
@@ -302,14 +303,16 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying    | pk_or_content  | keys_and_content                        | pass
  table_keying    | pk_or_content  | description_reopens                     | pass
  table_keying    | pk_or_content  | reads_after_key_column_dropped          | pass
+ table_keying    | pk_or_content  | cannot_compare_after_key_type_dropped   | pass
  table_keying    | pk_or_content  | complete                                | pass
  table_keying    | stub           | identity                                | pass
  table_keying    | stub           | round_trip                              | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying    | stub           | keys_and_content                        | not implemented (missing open, encode_row, content_hash, compare, close)
  table_keying    | stub           | description_reopens                     | not implemented (missing open, describe, keyless, encode_row, close)
  table_keying    | stub           | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
- table_keying    | stub           | complete                                | not implemented (11 of 11 callbacks missing)
-(252 rows)
+ table_keying    | stub           | cannot_compare_after_key_type_dropped   | not implemented (missing open, describe, can_compare, close)
+ table_keying    | stub           | complete                                | not implemented (12 of 12 callbacks missing)
+(254 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

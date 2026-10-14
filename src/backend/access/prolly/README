@@ -179,7 +179,10 @@ The heads table holds at most 1024 (database, branch) pairs across the
 cluster.  A commit that needs a new head reserves its slot when it
 enqueues its root, so a full table fails the transaction before it
 commits instead of after (which would also fail every replay of it).
-debug_prolly_max_branch_heads lowers the limit for tests.  Keeping heads
+debug_prolly_max_branch_heads lowers the limit for tests.  Redo settles
+a branch's earlier entry before adding its new one, so it holds one entry
+per branch, and when the pending table is full it settles the entries
+whose commit or abort it has replayed.  Keeping heads
 in the store, with shared memory as a cache, comes with branches.  Every prolly relation also has
 an empty main fork, so the copy strategies, ALTER TABLE SET TABLESPACE
 and the size functions find the file they expect.
@@ -196,7 +199,11 @@ changed (primary key added or dropped, or a rewrite through a table
 without one) rebuilds the tree.  The description records the key
 columns' types, so rows keyed by a column dropped since (or by a type
 dropped with it) are still read; the key encoder starts only when keys
-are compared or encoded.
+are compared or encoded.  When a key's type, operator family or
+collation has been dropped, no keying can order its keys any more
+(can_compare is false); D1 then matches the write set's keys with the
+tree's by their bytes, which serves full scans and the rebuild, and
+stores a commit made without writing again as a tree in byte order.
 
 Row identity (rowid_hashed.c) names a row version by (content hash,
 ordinal among identical rows) and derives its TID from them, probing

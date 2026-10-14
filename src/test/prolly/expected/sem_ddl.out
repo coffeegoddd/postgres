@@ -146,3 +146,58 @@ SELECT * FROM dropkeytype ORDER BY v;
 (3 rows)
 
 DROP TABLE dropkey, dropkeytype;
+-- The key's type dropped while the transaction has rows of its own.
+CREATE TYPE mood2 AS ENUM ('sad', 'happy', 'meh');
+CREATE TABLE droptype_active (m mood2 PRIMARY KEY, v text);
+INSERT INTO droptype_active VALUES ('sad', 'old'), ('meh', 'older');
+BEGIN;
+INSERT INTO droptype_active VALUES ('happy', 'new');
+DROP TYPE mood2 CASCADE;
+NOTICE:  drop cascades to column m of table droptype_active
+SAVEPOINT after_drop;
+SELECT * FROM droptype_active ORDER BY v;
+   v   
+-------
+ new
+ old
+ older
+(3 rows)
+
+ROLLBACK TO after_drop;
+INSERT INTO droptype_active VALUES ('third');
+SELECT * FROM droptype_active ORDER BY v;
+   v   
+-------
+ new
+ old
+ older
+ third
+(4 rows)
+
+COMMIT;
+SELECT * FROM droptype_active ORDER BY v;
+   v   
+-------
+ new
+ old
+ older
+ third
+(4 rows)
+
+CREATE TYPE mood3 AS ENUM ('sad', 'happy', 'meh');
+CREATE TABLE droptype_commit (m mood3 PRIMARY KEY, v text);
+INSERT INTO droptype_commit VALUES ('sad', 'old'), ('meh', 'older');
+BEGIN;
+INSERT INTO droptype_commit VALUES ('happy', 'new');
+DROP TYPE mood3 CASCADE;
+NOTICE:  drop cascades to column m of table droptype_commit
+COMMIT;
+SELECT * FROM droptype_commit ORDER BY v;
+   v   
+-------
+ new
+ old
+ older
+(3 rows)
+
+DROP TABLE droptype_active, droptype_commit;

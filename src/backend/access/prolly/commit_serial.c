@@ -376,6 +376,32 @@ sweep_pending(SerialShared *s)
 	LWLockRelease(ProllyHeadsLock);
 }
 
+/*
+ * During redo, with no room for another entry: settle the entries whose
+ * commit or abort record has been replayed.  Each branch holds at most one
+ * entry here, so this only leaves entries of transactions still open at
+ * this point of the WAL.  Exclusive lock.
+ */
+static void
+settle_replayed(SerialShared *s)
+{
+	int			i = 0;
+
+	while (i < s->npending)
+	{
+		PendingEntry *p = &s->pending[i];
+
+		if (TransactionIdDidCommit(p->xid))
+			set_head(s, p->dboid, p->branch, &p->root);
+		else if (!TransactionIdDidAbort(p->xid))
+		{
+			i++;
+			continue;
+		}
+		remove_pending(s, i);
+	}
+}
+
 static int
 head_limit(void)
 {
@@ -903,7 +929,6 @@ serial_redo(XLogReaderState *record)
 				Size		len = XLogRecGetDataLen(record) - SizeOfProllyHeader;
 				xl_serial_enqueue rec;
 				ProllyHash	root;
-				uint64		seq;
 
 				if (len < SizeOfSerialEnqueue)
 					elog(PANIC, "prolly commit record is too short");
@@ -916,13 +941,17 @@ serial_redo(XLogReaderState *record)
 				memcpy(root.bytes, data + SizeOfSerialEnqueue, rec.hash_len);
 
 				LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
-				seq = add_pending(s, rec.dboid, rec.branch, rec.xid, &root);
 
 				/*
 				 * Commits to a branch are serialized, so every earlier
-				 * transaction on it has finished by now.
+				 * transaction on it has finished by now.  Settled before
+				 * adding, so a branch never holds more than one entry here.
 				 */
-				settle_pending(s, rec.dboid, rec.branch, false, seq, false);
+				settle_pending(s, rec.dboid, rec.branch, false, PG_UINT64_MAX,
+							   false);
+				if (s->npending >= MAX_PENDING)
+					settle_replayed(s);
+				(void) add_pending(s, rec.dboid, rec.branch, rec.xid, &root);
 				LWLockRelease(ProllyHeadsLock);
 				break;
 			}
