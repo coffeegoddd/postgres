@@ -34,6 +34,11 @@
  *   is followed (like heap's t_ctid).  The TID itself stays taken, and so
  *   does the gone version's row (as the table keying encoded it), until
  *   VACUUM: like heap's dead tuples, it is what SnapshotAny returns.
+ * - tid_renew() gives the version a TID names a new TID, written by the
+ *   current transaction and command, and retires the old one with the
+ *   new one as its successor: an update that leaves the row as it was
+ *   still makes a new version, as heap does, so the command (and others
+ *   waiting for it) can tell the row was changed.
  * - tid_rename() records that the row a TID names is now another version
  *   that is the same row: its bytes were re-encoded (after DROP COLUMN),
  *   the table was re-keyed, or one of identical rows took another's
@@ -110,6 +115,10 @@ typedef struct ProllyRowIdRoutine
 							   ItemPointer tid, ItemPointer successor,
 							   const ProllyValue *row, CommandId cid);
 
+	void		(*tid_renew) (ProllyRootSet *roots, Relation rel,
+							  ItemPointer otid, const ProllyValue *row,
+							  CommandId cid, ItemPointer ntid);
+
 	void		(*tid_rename) (ProllyRootSet *roots, Relation rel,
 							   ItemPointer tid, const ProllyHash *content,
 							   uint64 ordinal, const ProllyKey *key,
@@ -120,7 +129,7 @@ typedef struct ProllyRowIdRoutine
 
 #define PROLLY_ROWID_CALLBACK_NAMES \
 	"tid_assign", "scan_begin", "tid_find", "scan_end", "tid_resolve", \
-	"tid_retire", "tid_rename", "tid_forget"
+	"tid_retire", "tid_renew", "tid_rename", "tid_forget"
 #define PROLLY_ROWID_FIRST_CALLBACK tid_assign
 
 static inline const ProllyRowIdRoutine *

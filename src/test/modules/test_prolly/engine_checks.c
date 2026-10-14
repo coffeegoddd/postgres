@@ -31,6 +31,7 @@
 #include "test_prolly.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
 
@@ -159,7 +160,24 @@ rolled_back(void (*body) (const ProllyImplInfo *), const ProllyImplInfo *impl)
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
-	body(impl);
+	PG_TRY();
+	{
+		body(impl);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/* Pass the error on, without this subtransaction. */
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
 	RollbackAndReleaseCurrentSubTransaction();
 	MemoryContextSwitchTo(cxt);
 	CurrentResourceOwner = owner;
@@ -819,6 +837,59 @@ keying_reads_dropped_key_body(const ProllyImplInfo *impl)
 }
 
 /*
+ * A keying lives in the context it was opened with, not the caller's:
+ * after the caller's context is gone, it still encodes and decodes.
+ */
+static void
+keying_owns_its_memory_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	Relation	rel = make_table_for_engine(engine_for_impl(impl), "conf_kmem",
+											"id int PRIMARY KEY, t text, n int");
+	MemoryContext owner = AllocSetContextCreate(CurrentMemoryContext,
+												"keying owner",
+												ALLOCSET_DEFAULT_SIZES);
+	MemoryContext caller = AllocSetContextCreate(CurrentMemoryContext,
+												 "keying caller",
+												 ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+	ProllyKeying *k;
+	EncodedRow	er;
+	ProllyValue row;
+	TupleTableSlot *slot;
+	MemoryContextCounters before;
+	MemoryContextCounters after;
+
+	/* Nothing the keying keeps is left in the caller's memory. */
+	memset(&before, 0, sizeof(before));
+	memset(&after, 0, sizeof(after));
+	MemoryContextMemConsumed(caller, &before);
+	old = MemoryContextSwitchTo(caller);
+	k = PROLLY_CALL(kr, open, rel, NULL, owner);
+	MemoryContextSwitchTo(old);
+	MemoryContextMemConsumed(caller, &after);
+	if (after.totalspace - after.freespace != before.totalspace - before.freespace)
+		elog(ERROR, "opening a keying left %zu bytes in the caller's memory",
+			 (after.totalspace - after.freespace) -
+			 (before.totalspace - before.freespace));
+	MemoryContextDelete(caller);
+
+	encode(kr, k, rel, 7, "seven", 7, &er);
+	row.data = (const uint8 *) er.row.data;
+	row.len = er.row.len;
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	PROLLY_CALL(kr, decode_row, k, &row, slot);
+	slot_getallattrs(slot);
+	if (slot->tts_isnull[0] || DatumGetInt32(slot->tts_values[0]) != 7 ||
+		strcmp(TextDatumGetCString(slot->tts_values[1]), "seven") != 0)
+		elog(ERROR, "a keying misreads rows once its caller's memory is gone");
+	ExecDropSingleTupleTableSlot(slot);
+	PROLLY_CALL(kr, close, k);
+	MemoryContextDelete(owner);
+	table_close(rel, AccessShareLock);
+}
+
+/*
  * can_compare() holds while the key's type exists, and fails for a keying
  * reopened from its description after the type was dropped.
  */
@@ -1241,6 +1312,60 @@ rowid_rename_keeps_tid(const ProllyImplInfo *impl)
 	rolled_back(rowid_rename_keeps_tid_body, impl);
 }
 
+/*
+ * Renewing gives the version a new TID that the version's key finds, and
+ * retires the old one with the new one as its successor, keeping the row.
+ */
+static void
+rowid_renew_body(const ProllyImplInfo *impl)
+{
+	const ProllyRowIdRoutine *ri = (const ProllyRowIdRoutine *) impl;
+	Relation	rel = make_table_for_engine(engine_for_impl(impl), "conf_rowid4", "a int");
+	ProllyComponents c;
+	ProllyRootSet *roots;
+	ProllyHash	h = content_of(3);
+	uint8		kb[4];
+	ProllyKey	k = int_key(3, kb);
+	ProllyValue row = {(const uint8 *) "row", 3};
+	ItemPointerData t1;
+	ItemPointerData t2;
+	ItemPointerData t3;
+	StringInfoData out;
+	ProllyHash	got_h;
+	uint64		got_ord;
+	ProllyTidInfo info;
+	ProllyRowIdScan *scan;
+
+	prolly_components_for_relation(rel, &c);
+	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
+	PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k, 1, &t1);
+	PROLLY_CALL(ri, tid_renew, roots, rel, &t1, &row, 2, &t2);
+	if (ItemPointerEquals(&t1, &t2))
+		elog(ERROR, "a renewed version kept its TID");
+	initStringInfo(&out);
+	if (PROLLY_CALL(ri, tid_resolve, roots, rel, &t1, 3, &out, &got_h, &got_ord,
+					&info) != PROLLY_TID_GONE ||
+		!ItemPointerEquals(&info.successor, &t2) || info.cid != 2 ||
+		out.len != 3 || memcmp(out.data, "row", 3) != 0)
+		elog(ERROR, "a renewed TID does not resolve to its successor and row");
+	resetStringInfo(&out);
+	if (PROLLY_CALL(ri, tid_resolve, roots, rel, &t2, 3, &out, &got_h, &got_ord,
+					&info) != PROLLY_TID_NAMED || !same_hash(&got_h, &h))
+		elog(ERROR, "a renewed version's new TID does not name it");
+	scan = PROLLY_CALL(ri, scan_begin, roots, rel, 3);
+	if (!PROLLY_CALL(ri, tid_find, scan, &k, 0, &t3) || !ItemPointerEquals(&t2, &t3))
+		elog(ERROR, "tid_find does not find a renewed version's new TID");
+	PROLLY_CALL(ri, scan_end, scan);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	table_close(rel, AccessShareLock);
+}
+
+void
+rowid_renew(const ProllyImplInfo *impl)
+{
+	rolled_back(rowid_renew_body, impl);
+}
+
 void
 rowid_never_reused(const ProllyImplInfo *impl)
 {
@@ -1251,6 +1376,12 @@ void
 keying_description_reopens(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_description_reopens_body, impl);
+}
+
+void
+keying_owns_its_memory(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_owns_its_memory_body, impl);
 }
 
 void

@@ -1280,10 +1280,8 @@ prolly_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 
 /*
  * An update writes the new version and retires the old TID with the new
- * one as its successor.  A version whose content doesn't change keeps its
- * TID and needs no new index entries.  (Unlike heap, such an update
- * leaves no trace, so a second update of the row by the same command
- * isn't reported as TM_SelfModified.)
+ * one as its successor.  A version whose content doesn't change gets a new
+ * TID all the same (row identity's tid_renew), as heap makes a new tuple.
  */
 static TM_Result
 prolly_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
@@ -1318,9 +1316,15 @@ prolly_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			key.len == now.key.len &&
 			memcmp(key.data, now.key.data, key.len) == 0)
 		{
-			/* Nothing changes */
-			slot->tts_tid = *otid;
+			/*
+			 * The row stays as it was, but is a new version, under a new
+			 * TID, as on heap: so this command, and writers waiting for
+			 * it, see that it changed.
+			 */
+			PROLLY_CALL(c.row_identity, tid_renew, roots, rel, otid, &now.row,
+						cid, &slot->tts_tid);
 			slot->tts_tableOid = RelationGetRelid(rel);
+			*update_indexes = TU_All;
 		}
 		else
 		{
@@ -1419,7 +1423,12 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 		else
 			tmfd->ctid = *tid;	/* deleted at the end of the chain */
 	}
-	if (fate == ROW_LIVE)
+	/*
+	 * The slot holds the row when it's live, and also when the command
+	 * can't see it because it inserted it itself: ON CONFLICT reads its
+	 * xmin to report a row affected a second time.
+	 */
+	if (fate == ROW_LIVE || (fate == ROW_INVISIBLE && now.present))
 		store_row(&c, rel, keying, &now, tid, slot);
 	row_at_free(&now);
 	release_keying(&c, keying, owned);

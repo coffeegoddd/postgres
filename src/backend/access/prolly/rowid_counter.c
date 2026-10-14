@@ -611,6 +611,29 @@ counter_tid_retire(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 }
 
 static void
+counter_tid_renew(ProllyRootSet *roots, Relation rel, ItemPointer otid,
+				  const ProllyValue *row, CommandId cid, ItemPointer ntid)
+{
+	const ProllyEngineRoutine *engine = engine_for(rel);
+	StringInfoData v;
+	StringInfoData entry;
+	Entry		e;
+
+	initStringInfo(&v);
+	named_entry(engine, roots, rel, otid, &v, &e);
+	number_tid(next_number(rel), ntid);
+	initStringInfo(&entry);
+	encode_entry(&e.content, e.ordinal, GetCurrentTransactionId(), &e.key, &entry);
+	put_entry(engine, rel, ntid, &entry, cid);
+	put_version(engine, rel, &e.key, e.ordinal, ntid, cid);
+	resetStringInfo(&entry);
+	encode_gone(ntid, cid, e.xmin, row, &entry);
+	put_entry(engine, rel, otid, &entry, cid);
+	pfree(entry.data);
+	pfree(v.data);
+}
+
+static void
 counter_tid_rename(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 				   const ProllyHash *content, uint64 ordinal,
 				   const ProllyKey *key, CommandId cid)
@@ -655,6 +678,7 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.scan_end = counter_scan_end,
 	.tid_resolve = counter_tid_resolve,
 	.tid_retire = counter_tid_retire,
+	.tid_renew = counter_tid_renew,
 	.tid_rename = counter_tid_rename,
 	/* tid_forget comes with VACUUM, which must also drop 'V' entries */
 };
