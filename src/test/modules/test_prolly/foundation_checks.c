@@ -806,6 +806,72 @@ keyenc_desc_and_nulls(const ProllyImplInfo *impl)
 	}
 }
 
+/*
+ * Encodings are self-delimiting: prefix_length() finds where the first k
+ * columns end, even with other bytes after the key, and that prefix is
+ * the encoding of the first k columns alone.
+ */
+static void
+check_key_prefixes(const ProllyKeyEncoderRoutine *ke, KeyCase *kc)
+{
+	ProllyKeyEncoder *enc;
+	KeyRow	   *rows;
+	int			nrows;
+
+	key_case_init(kc);
+	enc = PROLLY_CALL(ke, begin, &kc->desc, CurrentMemoryContext);
+	rows = key_rows(kc, true, &nrows);
+	for (int r = 0; r < nrows; r++)
+	{
+		StringInfoData full;
+		ProllyKey	key;
+		int			bare;
+
+		initStringInfo(&full);
+		PROLLY_CALL(ke, encode, enc, rows[r].values, rows[r].isnull, &full);
+		bare = full.len;
+		appendStringInfoString(&full, "trailing bytes");
+		key.data = (const uint8 *) full.data;
+		key.len = full.len;
+		if (PROLLY_CALL(ke, prefix_length, enc, &key, kc->ncols) != bare)
+			elog(ERROR, "%s: prefix_length of every column is not the key's length",
+				 describe_row(kc, &rows[r]));
+		for (int k = 1; k < kc->ncols; k++)
+		{
+			ProllyKeyDesc d = kc->desc;
+			ProllyKeyEncoder *pe;
+			StringInfoData part;
+
+			d.nkeys = k;
+			pe = PROLLY_CALL(ke, begin, &d, CurrentMemoryContext);
+			initStringInfo(&part);
+			PROLLY_CALL(ke, encode, pe, rows[r].values, rows[r].isnull, &part);
+			if (PROLLY_CALL(ke, prefix_length, enc, &key, k) != part.len ||
+				memcmp(part.data, full.data, part.len) != 0)
+				elog(ERROR, "%s: its first %d columns are not their own encoding",
+					 describe_row(kc, &rows[r]), k);
+			PROLLY_CALL(ke, end, pe);
+		}
+	}
+	PROLLY_CALL(ke, end, enc);
+}
+
+void
+keyenc_prefix_lengths(const ProllyImplInfo *impl)
+{
+	const ProllyKeyEncoderRoutine *ke = (const ProllyKeyEncoderRoutine *) impl;
+	KeyCase		cases[] = {
+		{1, {{INT4OID}}},
+		{2, {{INT4OID, InvalidOid, INDOPTION_DESC}, {TEXTOID, C_COLLATION_OID}}},
+		{2, {{TEXTOID, non_c_collation(), INDOPTION_NULLS_FIRST}, {INT8OID}}},
+		{2, {{NUMERICOID}, {BOOLOID, InvalidOid, INDOPTION_DESC}}},
+		{2, {{INT4ARRAYOID}, {TEXTOID, C_COLLATION_OID, INDOPTION_DESC}}},
+	};
+
+	for (int i = 0; i < lengthof(cases); i++)
+		check_key_prefixes(ke, &cases[i]);
+}
+
 void
 keyenc_decode_round_trip(const ProllyImplInfo *impl)
 {

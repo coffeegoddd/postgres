@@ -25,6 +25,7 @@
 #include "access/prolly_coord.h"
 #include "access/prolly_engine.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_ixkeying.h"
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
 #include "access/prolly_log.h"
@@ -58,6 +59,7 @@ typedef struct ProllyComponents
 	const ProllyTreeRoutine *tree;
 	const ProllyRootLayoutRoutine *root_layout;
 	const ProllyKeyingRoutine *keying;
+	const ProllyIndexKeyingRoutine *index_keying;
 } ProllyComponents;
 
 /* Database-wide components: version control. */
@@ -89,5 +91,8 @@ extern void prolly_components_for_engine(const ProllyImplInfo *engine,
 										 ProllyComponents *components);
 
 extern void prolly_database_components(ProllyDatabaseComponents *components);
+
+/* Is amname a prolly table access method? */
+extern bool prolly_is_table_am(const char *amname);
 
 #endif							/* PROLLY_CONFIG_H */

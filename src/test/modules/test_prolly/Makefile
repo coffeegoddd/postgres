@@ -14,7 +14,7 @@ PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
-REGRESS = test_prolly d1_tables
+REGRESS = test_prolly d1_tables d1_index
 TAP_TESTS = 1
 
 ifdef USE_PGXS

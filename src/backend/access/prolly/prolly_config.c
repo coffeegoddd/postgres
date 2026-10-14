@@ -42,6 +42,7 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_KEY_ENCODER] = "ordered", \
 	[PROLLY_IFACE_VALUE_ENCODER] = "canonical", \
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_content", \
+	[PROLLY_IFACE_INDEX_KEYING] = "columns_then_row", \
 	[PROLLY_IFACE_ALLOCATOR] = "stub", \
 	[PROLLY_IFACE_RECLAMATION] = "stub"
 
@@ -86,6 +87,17 @@ profile_impl(const char *const *impls, ProllyInterface iface)
 {
 	Assert(impls[iface] != NULL);
 	return prolly_get_impl(iface, impls[iface]);
+}
+
+bool
+prolly_is_table_am(const char *amname)
+{
+	for (int i = 0; amname != NULL && i < lengthof(profiles); i++)
+	{
+		if (strcmp(profiles[i].amname, amname) == 0)
+			return true;
+	}
+	return false;
 }
 
 void
@@ -141,6 +153,8 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 		profile_impl(impls, PROLLY_IFACE_ROOT_LAYOUT);
 	components->keying = (const ProllyKeyingRoutine *)
 		profile_impl(impls, PROLLY_IFACE_TABLE_KEYING);
+	components->index_keying = (const ProllyIndexKeyingRoutine *)
+		profile_impl(impls, PROLLY_IFACE_INDEX_KEYING);
 }
 
 void

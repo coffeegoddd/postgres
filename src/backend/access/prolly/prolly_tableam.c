@@ -40,6 +40,7 @@
 #include "access/xact.h"
 #include "access/multixact.h"
 #include "access/prolly_config.h"
+#include "access/prolly_indexam.h"
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
@@ -671,6 +672,7 @@ rekey(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 				   InvalidCommandId);
 	}
 
+
 	ExecDropSingleTupleTableSlot(slot);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(tmp);
@@ -687,6 +689,7 @@ check_keying(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 	StringInfoData recorded;
 	StringInfoData now;
 	ProllyKey	key = {(const uint8 *) PROLLY_META_KEYING, PROLLY_META_KEYING_LEN};
+	bool		rebuilt = false;
 
 	if (ik->checked_lxid == MyProc->vxid.lxid &&
 		ik->checked_subxid == GetCurrentSubTransactionId())
@@ -726,9 +729,17 @@ check_keying(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 
 			rekey(rel, c, roots, old, ik->keying);
 			PROLLY_CALL(c->keying, close, old);
+			rebuilt = true;
 		}
 		PROLLY_CALL(c->engine, put, rel, PROLLY_TREE_META, &key, &v,
 					InvalidCommandId);
+
+		/*
+		 * A rebuild changed every row key, so the prolly indexes are
+		 * rebuilt, reading the table as it is now recorded.
+		 */
+		if (rebuilt)
+			prolly_index_rebuild_all(rel);
 	}
 done:
 	pfree(recorded.data);
@@ -1189,6 +1200,23 @@ remove_version(const ProllyComponents *c, ProllyRootSet *roots, Relation rel,
 			   ItemPointer successor, bool keep_key, CommandId cid)
 {
 	ProllyKey	k = {(const uint8 *) r->key.data, r->key.len};
+
+	/*
+	 * Its prolly index entries go too: of identical rows, the one whose
+	 * ordinal no longer exists (they have the same entries otherwise).
+	 */
+	if (rel->rd_rel->relhasindex)
+	{
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+														&TTSOpsVirtual);
+
+		PROLLY_CALL(c->keying, decode_row, keying, &r->row, slot);
+		prolly_index_remove_row(rel, slot, &k,
+								PROLLY_CALL(c->keying, keyless, keying) ?
+								r->count - 1 : 0,
+								cid);
+		ExecDropSingleTupleTableSlot(slot);
+	}
 
 	if (PROLLY_CALL(c->keying, keyless, keying) && r->count > 1)
 	{

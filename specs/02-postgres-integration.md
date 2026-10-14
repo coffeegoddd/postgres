@@ -35,7 +35,12 @@ The tree meets Postgres at three levels:
 ### A2. Index AM (`IndexAmRoutine`, `src/include/access/amapi.h`)
 
 A prolly-native index is a second tree per index, from the **same root set** as
-its table.
+its table. Built in 4d.3: an entry is the index columns, then the row's key in
+its table and its ordinal among identical rows (question 42), so the tree depends
+only on the table's rows; the table AM removes a row version's entries in the
+same write (question 43), since Postgres calls an index AM only to insert.
+Prolly indexes exist only on prolly tables (question 17). Not built yet: bitmap
+scans, INCLUDE columns, parallel scans and builds, predicate locks.
 
 - `ambuild`: bulk build from a sorted stream via the chunker.
 - `aminsert` with `UNIQUE_CHECK_YES` (insert intent + wait), and

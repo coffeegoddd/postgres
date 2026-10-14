@@ -171,7 +171,7 @@ select amname, prop, pg_indexam_has_property(a.oid, prop) as p
  prolly | can_unique    | t
  prolly | can_multi_col | t
  prolly | can_exclude   | t
- prolly | can_include   | t
+ prolly | can_include   | f
  prolly | bogus         | 
  spgist | can_order     | f
  spgist | can_unique    | f

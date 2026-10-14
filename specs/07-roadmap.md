@@ -326,6 +326,28 @@ REPEATABLE READ and SERIALIZABLE (newest-head snapshots, 4e), and the
 single writer's coarser blocking (4e). Not tested: index_validate_scan
 with rows written while the index is built.
 
+**Status (2026-10-14): 4d.3 built.** The prolly index AM works on prolly
+tables (decisions: questions 17, 42, 43). A new interface, Index keying
+(`prolly_ixkeying.h`, implementation `columns_then_row`), makes an entry from
+the index columns, then the row's key and ordinal, with no value and no TID,
+and bounds for seeking; the key encoder gained `prefix_length` (encodings are
+self-delimiting). D1 orders an index's tree by its index keying. Built:
+builds (refusing duplicates for unique indexes), inserts with unique checks,
+removal of a row version's entries by the table AM in the same write (with
+expressions and partial predicates), rebuilds when the table is re-keyed,
+ordered scans in both directions bounded by leading equality keys and a range
+key (DESC columns bound the other end), index-only scans, mark and restore
+(merge joins), ON CONFLICT arbiters, REINDEX, CREATE INDEX CONCURRENTLY,
+TRUNCATE, crash recovery and standby replay. Prolly indexes on heap tables
+are refused. Tests: conformance checks for index keying and key prefixes,
+`d1_index` (every index agrees with sequential scans, and its tree equals a
+freshly built index's after updates, deletes, rollbacks, keyless deletes and
+re-keying), `009_d1_index.pl`. Not yet: bitmap scans, INCLUDE columns,
+parallel scans and builds, predicate locks; deferrable unique constraints
+can't use prolly indexes (Postgres requires btree for constraint indexes).
+Scan bounds only narrow the scan (every key is checked on each entry), so
+their stop condition has no test that fails without it.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

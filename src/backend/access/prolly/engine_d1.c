@@ -98,6 +98,24 @@ typedef struct D1Entry
 	D1Version  *versions;
 } D1Entry;
 
+/*
+ * A tree's key order: a table's data tree by its table keying, an index's
+ * tree by its index keying; neither set means memcmp (local metadata).
+ */
+typedef struct D1Order
+{
+	const ProllyKeyingRoutine *routine;
+	ProllyKeying *keying;
+	const ProllyIndexKeyingRoutine *ix_routine;
+	ProllyIndexKeying *ix;
+} D1Order;
+
+static inline bool
+order_set(const D1Order *order)
+{
+	return order->keying != NULL || order->ix != NULL;
+}
+
 /* A write set's contents before it was emptied, for subtransaction abort. */
 typedef struct D1Saved
 {
@@ -106,8 +124,7 @@ typedef struct D1Saved
 	int			nentries;
 	ProllyNodeRef base;
 	bool		replaced;
-	ProllyKeying *keying;
-	const ProllyKeyingRoutine *keying_routine;
+	D1Order		order;
 	struct D1Saved *prev;
 } D1Saved;
 
@@ -127,8 +144,7 @@ typedef struct D1WriteSet
 	RBTree	   *entries;
 	int			nentries;
 	D1Saved    *saved;			/* contents before each emptying */
-	ProllyKeying *keying;		/* data trees: the key order */
-	const ProllyKeyingRoutine *keying_routine;
+	D1Order		order;			/* data and index trees: the key order */
 	struct D1WriteSet *next;	/* all write sets, newest first */
 } D1WriteSet;
 
@@ -248,26 +264,23 @@ free_key(ProllySubRoot sub, D1KeyBuf *kb)
 		pfree(kb->buf.data);
 }
 
-/* The tree environment for a tree ordered by keying (NULL: memcmp). */
-typedef struct D1Order
-{
-	const ProllyKeyingRoutine *routine;
-	ProllyKeying *keying;
-} D1Order;
 
 static int
 keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
 	D1Order    *o = arg;
 
+	if (o->ix)
+		return PROLLY_CALL(o->ix_routine, compare, o->ix, a, b);
 	return PROLLY_CALL(o->routine, compare, o->keying, a, b);
 }
 
+/* The tree environment for a tree in order (NULL: memcmp). */
 static void
 tree_env(const D1Order *order, ProllyTreeEnv *env)
 {
 	*env = backend.memcmp_env;
-	if (order && order->keying)
+	if (order && order_set(order))
 	{
 		env->compare = keying_compare;
 		env->compare_arg = (void *) order;
@@ -278,8 +291,9 @@ static bool d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 				   const ProllyKey *key, CommandId cid, StringInfo value);
 
 /*
- * A relation's key order for its data tree: as recorded in roots (with the
- * transaction's writes) if roots is given, else its current keying.
+ * A relation's key order for its data tree (or an index's tree): as
+ * recorded in roots (with the transaction's writes) if roots is given,
+ * else its current keying.
  */
 static void
 open_order(Relation rel, ProllySubRoot sub, ProllyRootSet *roots,
@@ -294,10 +308,6 @@ open_order(Relation rel, ProllySubRoot sub, ProllyRootSet *roots,
 	memset(order, 0, sizeof(*order));
 	if (is_local(sub))
 		return;
-	if (rel->rd_rel->relkind == RELKIND_INDEX)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("prolly index trees are not implemented yet")));
 	prolly_components_for_relation(rel, &c);
 	initStringInfo(&desc);
 	if (roots)
@@ -305,8 +315,18 @@ open_order(Relation rel, ProllySubRoot sub, ProllyRootSet *roots,
 						  &desc);
 	d.data = (const uint8 *) desc.data;
 	d.len = desc.len;
-	order->routine = c.keying;
-	order->keying = PROLLY_CALL(c.keying, open, rel, recorded ? &d : NULL, mcxt);
+	if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		order->ix_routine = c.index_keying;
+		order->ix = PROLLY_CALL(c.index_keying, open, rel,
+								recorded ? &d : NULL, mcxt);
+	}
+	else
+	{
+		order->routine = c.keying;
+		order->keying = PROLLY_CALL(c.keying, open, rel, recorded ? &d : NULL,
+									mcxt);
+	}
 	pfree(desc.data);
 }
 
@@ -315,6 +335,8 @@ close_order(D1Order *order)
 {
 	if (order->keying)
 		PROLLY_CALL(order->routine, close, order->keying);
+	if (order->ix)
+		PROLLY_CALL(order->ix_routine, close, order->ix);
 }
 
 /* relnumber's tree in sub of root, or an empty reference. */
@@ -405,8 +427,7 @@ refresh_order(D1WriteSet *ws, Relation rel)
 	 * saved state may still order its entries by it.
 	 */
 	open_order(rel, ws->sub, NULL, xact->mcxt, &order);
-	ws->keying_routine = order.routine;
-	ws->keying = order.keying;
+	ws->order = order;
 }
 
 /*
@@ -448,8 +469,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 			saved->nentries = ws->nentries;
 			saved->base = ws->base;
 			saved->replaced = ws->replaced;
-			saved->keying = ws->keying;
-			saved->keying_routine = ws->keying_routine;
+			saved->order = ws->order;
 			saved->prev = ws->saved;
 			ws->saved = saved;
 			ws->entries = rbt_create(sizeof(D1Entry), entry_compare,
@@ -505,8 +525,8 @@ ws_compare(D1WriteSet *ws, const uint8 *a, uint32 alen, const uint8 *b,
 	ProllyKey	ka = {a, alen};
 	ProllyKey	kb = {b, blen};
 
-	if (ws->keying)
-		return PROLLY_CALL(ws->keying_routine, compare, ws->keying, &ka, &kb);
+	if (order_set(&ws->order))
+		return keying_compare(&ka, &kb, &ws->order);
 	return memcmp_keys(&ka, &kb, NULL);
 }
 
@@ -805,8 +825,7 @@ d1_cursor_open(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	{
 		/* The write set's key order, which it keeps owning. */
 		refresh_order(c->ws, tree);
-		c->order.routine = c->ws->keying_routine;
-		c->order.keying = c->ws->keying;
+		c->order = c->ws->order;
 	}
 	else
 		open_order(tree, sub, roots, mcxt, &c->order);
@@ -1107,7 +1126,7 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 		refresh_order(ws, tree);
 		if (!is_local(sub))
 		{
-			D1Order		o = {ws->keying_routine, ws->keying};
+			D1Order		o = ws->order;
 
 			if (order_lost(&o))
 				order_lost_error();
@@ -1135,8 +1154,7 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 
 		if (ws)
 		{
-			order.routine = ws->keying_routine;
-			order.keying = ws->keying;
+			order = ws->order;
 		}
 		else
 			open_order(tree, sub, roots, CurrentMemoryContext, &order);
@@ -1357,7 +1375,7 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 	RBTreeIterator it;
 	D1Entry    *e;
 	ProllyNodeRef base = ws->base;
-	D1Order		order = {ws->keying_routine, ws->keying};
+	D1Order		order = ws->order;
 	ProllyTreeEnv env;
 
 	if (order_lost(&order))
@@ -1365,7 +1383,7 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 		materialize_unordered(ws, out);
 		return;
 	}
-	tree_env(ws->keying ? &order : NULL, &env);
+	tree_env(&order, &env);
 	if (base.hash.len == 0)
 	{
 		ProllyTreeBuilder *b = PROLLY_CALL(backend.c.tree, build_begin, &env,
@@ -1594,8 +1612,7 @@ d1_subxact_abort(SubTransactionId subxid)
 			ws->nentries = saved->nentries;
 			ws->base = saved->base;
 			ws->replaced = saved->replaced;
-			ws->keying = saved->keying;
-			ws->keying_routine = saved->keying_routine;
+			ws->order = saved->order;
 			ws->saved = saved->prev;
 		}
 

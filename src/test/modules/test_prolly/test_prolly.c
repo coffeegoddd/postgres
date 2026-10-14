@@ -32,6 +32,10 @@
 #include "access/htup_details.h"
 #include "access/prolly_commit.h"
 #include "access/xact.h"
+#include "utils/snapmgr.h"
+#include "access/prolly_config.h"
+#include "common/hashfn.h"
+#include "access/relation.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -132,6 +136,8 @@ static const ConformanceCase cases[] = {
 	"supports begin encode compare end", keyenc_desc_and_nulls},
 	{PROLLY_IFACE_KEY_ENCODER, "decode_round_trip", "begin encode decode end",
 	keyenc_decode_round_trip},
+	{PROLLY_IFACE_KEY_ENCODER, "self_delimiting_prefixes",
+	"begin encode prefix_length end", keyenc_prefix_lengths},
 
 	/* value encoder */
 	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end",
@@ -211,6 +217,11 @@ static const ConformanceCase cases[] = {
 	"open encode_row decode_row close", keying_owns_its_memory},
 	{PROLLY_IFACE_TABLE_KEYING, "cannot_compare_after_key_type_dropped",
 	"open describe can_compare close", keying_compare_after_type_dropped},
+
+	/* index keying */
+	{PROLLY_IFACE_INDEX_KEYING, "entries_and_bounds",
+	"open describe nkeys encode_entry decode_entry encode_bound compare columns_equal close",
+	ixkeying_entries},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",
@@ -761,4 +772,42 @@ prolly_commit_test_enqueue(PG_FUNCTION_ARGS)
 												(ProllyBranchId) branch, &root);
 	PROLLY_CALL(r, branch_unlock, (ProllyBranchId) branch);
 	PG_RETURN_VOID();
+}
+
+/*
+ * prolly_tree_digest(rel): the number of items in rel's tree (a prolly
+ * table's data tree, or a prolly index's), and a digest of them, as the
+ * current transaction sees it.  Two trees with the same items have the
+ * same digest, however they were written.
+ */
+PG_FUNCTION_INFO_V1(prolly_tree_digest);
+
+Datum
+prolly_tree_digest(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel = relation_open(relid, AccessShareLock);
+	ProllyComponents c;
+	ProllyRootSet *roots;
+	ProllyCursor *cur;
+	ProllyKey	key;
+	ProllyValue value;
+	uint64		n = 0;
+	uint64		h = 0;
+
+	prolly_components_for_relation(rel, &c);
+	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
+	cur = PROLLY_CALL(c.engine, cursor_open, roots, rel, PROLLY_TREE_DATA,
+					  InvalidCommandId);
+	PROLLY_CALL(c.engine, cursor_seek, cur, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(c.engine, cursor_next, cur, &key, &value))
+	{
+		h = hash_combine64(h, hash_bytes_extended(key.data, key.len, n));
+		h = hash_combine64(h, hash_bytes_extended(value.data, value.len, n));
+		n++;
+	}
+	PROLLY_CALL(c.engine, cursor_close, cur);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(UINT64_FORMAT ":%016" PRIx64, n, h)));
 }

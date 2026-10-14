@@ -17,6 +17,8 @@ backend_sources += files(
   'engine_d4.c',
   'hash_sha256.c',
   'hash_stub.c',
+  'ixkeying_columns.c',
+  'ixkeying_stub.c',
   'keyenc_ordered.c',
   'keyenc_stub.c',
   'keying_pkcontent.c',

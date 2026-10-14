@@ -1,0 +1,429 @@
+--
+-- The prolly index AM on engine D1 tables: one entry per row, the index
+-- columns then the row's key, kept exactly in step with the table.
+--
+SET default_table_access_method = prolly_d1;
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+-- An index tree holds exactly its table's rows: the same tree as an index
+-- built afresh on the same columns, however the rows got there.
+CREATE FUNCTION ix_same_tree(idx regclass) RETURNS bool
+LANGUAGE plpgsql AS $$
+DECLARE
+	def text := pg_get_indexdef(idx);
+	fresh regclass;
+	same bool;
+BEGIN
+	EXECUTE replace(def, ' INDEX ' || quote_ident(idx::text) || ' ON ',
+					' INDEX ix_fresh ON ');
+	fresh := 'ix_fresh'::regclass;
+	same := prolly_tree_digest(idx) = prolly_tree_digest(fresh);
+	EXECUTE 'DROP INDEX ix_fresh';
+	RETURN same;
+END $$;
+-- Every index answers as a sequential scan does, and holds exactly the
+-- table's rows (an index-only scan counts them).
+CREATE TABLE ix (id int PRIMARY KEY, k int, t text, n int);
+INSERT INTO ix SELECT g, g % 10, 'text ' || (g % 37), CASE WHEN g % 7 = 0 THEN NULL ELSE g END
+	FROM generate_series(1, 2000) g;
+CREATE INDEX ix_k ON ix USING prolly (k);
+CREATE INDEX ix_kt ON ix USING prolly (k, t DESC);
+CREATE INDEX ix_n ON ix USING prolly (n NULLS FIRST);
+CREATE INDEX ix_lower ON ix USING prolly (lower(t));
+CREATE INDEX ix_part ON ix USING prolly (id) WHERE k = 7;
+CREATE UNIQUE INDEX ix_tid ON ix USING prolly (t, id);
+CREATE FUNCTION ix_answers() RETURNS TABLE (q text, answer text)
+LANGUAGE sql AS $$
+	SELECT 'k = 3', count(*)::text FROM ix WHERE k = 3
+	UNION ALL SELECT 'k range', count(*)::text FROM ix WHERE k > 2 AND k <= 5
+	UNION ALL SELECT 'k, t', count(*)::text FROM ix WHERE k = 3 AND t = 'text 3'
+	UNION ALL SELECT 'k, t range', string_agg(id::text, ',' ORDER BY id) FROM
+		(SELECT id FROM ix WHERE k = 1 AND t < 'text 2' ORDER BY id LIMIT 5) s
+	UNION ALL SELECT 'n null', count(*)::text FROM ix WHERE n IS NULL
+	UNION ALL SELECT 'n not null', count(*)::text FROM ix WHERE n IS NOT NULL
+	UNION ALL SELECT 'n order', string_agg(coalesce(n::text, 'null'), ',') FROM
+		(SELECT n FROM ix ORDER BY n NULLS FIRST LIMIT 4) s
+	UNION ALL SELECT 'lower', count(*)::text FROM ix WHERE lower(t) = 'text 5'
+	UNION ALL SELECT 'partial', sum(id)::text FROM ix WHERE k = 7 AND id > 1000
+	UNION ALL SELECT 'kt desc', string_agg(t, ',') FROM
+		(SELECT t FROM ix WHERE k = 2 ORDER BY k, t DESC LIMIT 3) s
+	UNION ALL SELECT 'backward', string_agg(id::text, ',') FROM
+		(SELECT id FROM ix WHERE k = 4 ORDER BY k DESC, t ASC, id LIMIT 3) s
+	UNION ALL SELECT 'index only', count(k)::text FROM ix WHERE k BETWEEN 1 AND 3
+$$;
+-- Compare index scans with sequential scans.
+CREATE FUNCTION ix_agree() RETURNS TABLE (q text, agree bool)
+LANGUAGE plpgsql AS $$
+BEGIN
+	SET LOCAL enable_indexscan = off;
+	SET LOCAL enable_indexonlyscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	CREATE TEMP TABLE ix_seq USING heap ON COMMIT DROP AS SELECT * FROM ix_answers();
+	SET LOCAL enable_indexscan = on;
+	SET LOCAL enable_indexonlyscan = on;
+	SET LOCAL enable_seqscan = off;
+	RETURN QUERY SELECT s.q, s.answer IS NOT DISTINCT FROM i.answer
+		FROM ix_seq s JOIN ix_answers() i USING (q) ORDER BY s.q;
+	DROP TABLE ix_seq;
+END $$;
+-- The number of entries in an index, read with an index-only scan.
+CREATE FUNCTION ix_entries(idx regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	cols text;
+	n bigint;
+BEGIN
+	SELECT string_agg(quote_ident(a.attname), ',') INTO cols
+		FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid
+			AND a.attnum = ANY (i.indkey)
+		WHERE i.indexrelid = idx;
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	EXECUTE format('SELECT count(*) FROM (SELECT %s FROM ix ORDER BY %s) s', cols, cols)
+		INTO n;
+	RETURN n;
+END $$;
+BEGIN;
+SELECT * FROM ix_agree();
+     q      | agree 
+------------+-------
+ backward   | t
+ index only | t
+ k = 3      | t
+ k range    | t
+ k, t       | t
+ kt desc    | t
+ k, t range | t
+ lower      | t
+ n not null | t
+ n null     | t
+ n order    | t
+ partial    | t
+(12 rows)
+
+COMMIT;
+SELECT ix_entries('ix_k') = (SELECT count(*) FROM ix) AS ix_k_exact,
+	   ix_entries('ix_n') = (SELECT count(*) FROM ix) AS ix_n_exact;
+ ix_k_exact | ix_n_exact 
+------------+------------
+ t          | t
+(1 row)
+
+-- Updates, deletes, inserts and rollbacks keep every index exact.
+UPDATE ix SET k = (k + 1) % 10 WHERE id % 3 = 0;
+UPDATE ix SET t = upper(t) WHERE id % 11 = 0;
+UPDATE ix SET n = n WHERE id % 5 = 0;
+DELETE FROM ix WHERE id % 13 = 0;
+INSERT INTO ix SELECT g, g % 10, 'new ' || g, g FROM generate_series(3001, 3100) g;
+BEGIN;
+DELETE FROM ix WHERE k = 1;
+SAVEPOINT s;
+UPDATE ix SET k = 99;
+ROLLBACK TO s;
+INSERT INTO ix VALUES (5000, 1, 'kept', 1);
+COMMIT;
+BEGIN;
+DELETE FROM ix;
+ROLLBACK;
+BEGIN;
+SELECT * FROM ix_agree();
+     q      | agree 
+------------+-------
+ backward   | t
+ index only | t
+ k = 3      | t
+ k range    | t
+ k, t       | t
+ kt desc    | t
+ k, t range | t
+ lower      | t
+ n not null | t
+ n null     | t
+ n order    | t
+ partial    | t
+(12 rows)
+
+COMMIT;
+SELECT ix_entries('ix_k') = (SELECT count(*) FROM ix) AS ix_k_exact,
+	   ix_entries('ix_n') = (SELECT count(*) FROM ix) AS ix_n_exact;
+ ix_k_exact | ix_n_exact 
+------------+------------
+ t          | t
+(1 row)
+
+SELECT i::text, ix_same_tree(i) FROM unnest(ARRAY['ix_k', 'ix_kt', 'ix_n',
+	'ix_lower', 'ix_part', 'ix_tid']::regclass[]) i;
+    i     | ix_same_tree 
+----------+--------------
+ ix_k     | t
+ ix_kt    | t
+ ix_n     | t
+ ix_lower | t
+ ix_part  | t
+ ix_tid   | t
+(6 rows)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM ix WHERE k = 99;
+ count 
+-------
+     0
+(1 row)
+
+SELECT id, t FROM ix WHERE id = 5000;
+  id  |  t   
+------+------
+ 5000 | kept
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- Unique prolly indexes: duplicates refused, within a statement too, and
+-- as ON CONFLICT arbiters.
+CREATE TABLE ux (id int PRIMARY KEY, u int, v text);
+CREATE UNIQUE INDEX ux_u ON ux USING prolly (u);
+INSERT INTO ux VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c'), (4, NULL, 'd');
+INSERT INTO ux VALUES (5, 10, 'dup');
+ERROR:  duplicate key value violates unique constraint "ux_u"
+DETAIL:  Key (u)=(10) already exists.
+UPDATE ux SET u = 20 WHERE id = 1;
+ERROR:  duplicate key value violates unique constraint "ux_u"
+DETAIL:  Key (u)=(20) already exists.
+INSERT INTO ux VALUES (6, 30, 'x'), (7, 30, 'y');
+ERROR:  duplicate key value violates unique constraint "ux_u"
+DETAIL:  Key (u)=(30) already exists.
+INSERT INTO ux VALUES (8, 10, 'up') ON CONFLICT (u) DO UPDATE SET v = excluded.v;
+INSERT INTO ux VALUES (9, 20, 'nothing') ON CONFLICT (u) DO NOTHING;
+SELECT * FROM ux ORDER BY id;
+ id | u  | v  
+----+----+----
+  1 | 10 | up
+  2 | 20 | b
+  3 |    | c
+  4 |    | d
+(4 rows)
+
+CREATE UNIQUE INDEX ux_v ON ux USING prolly (v);
+INSERT INTO ux VALUES (10, 100, 'a');
+CREATE TABLE ud (a int);
+INSERT INTO ud VALUES (1), (1);
+CREATE UNIQUE INDEX ud_a ON ud USING prolly (a);
+ERROR:  could not create unique index "ud_a"
+DETAIL:  Key (a)=(1) is duplicated.
+DELETE FROM ud WHERE ctid = (SELECT min(ctid) FROM ud);
+CREATE UNIQUE INDEX ud_a ON ud USING prolly (a);
+-- Keyless tables: identical rows have one entry each.
+CREATE TABLE kx (a int, b text);
+INSERT INTO kx VALUES (1, 'x'), (1, 'x'), (1, 'x'), (2, 'y');
+CREATE INDEX kx_a ON kx USING prolly (a);
+DELETE FROM kx WHERE ctid = (SELECT min(ctid) FROM kx WHERE a = 1);
+UPDATE kx SET b = 'z' WHERE ctid = (SELECT max(ctid) FROM kx WHERE a = 1);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT a, b, count(*) FROM kx WHERE a = 1 GROUP BY a, b ORDER BY b;
+ a | b | count 
+---+---+-------
+ 1 | x |     1
+ 1 | z |     1
+(2 rows)
+
+SELECT count(*) FROM (SELECT a FROM kx ORDER BY a) s;
+ count 
+-------
+     3
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT ix_same_tree('kx_a');
+ ix_same_tree 
+--------------
+ t
+(1 row)
+
+-- Re-keying the table (a primary key added or dropped, columns dropped)
+-- rebuilds its prolly indexes, whose entries hold row keys.
+ALTER TABLE kx ADD COLUMN id serial;
+ALTER TABLE kx ADD PRIMARY KEY (id);
+INSERT INTO kx (a, b) VALUES (3, 'w');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT a, b FROM kx WHERE a IN (1, 3) ORDER BY a, b;
+ a | b 
+---+---
+ 1 | x
+ 1 | z
+ 3 | w
+(3 rows)
+
+DELETE FROM kx WHERE a = 2;
+SELECT ix_same_tree('kx_a');
+ ix_same_tree 
+--------------
+ t
+(1 row)
+
+ALTER TABLE kx DROP CONSTRAINT kx_pkey;
+ALTER TABLE kx DROP COLUMN b;
+INSERT INTO kx (a) VALUES (4);
+SELECT a, count(*) FROM kx WHERE a >= 1 GROUP BY a ORDER BY a;
+ a | count 
+---+-------
+ 1 |     2
+ 3 |     1
+ 4 |     1
+(3 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT ix_same_tree('kx_a');
+ ix_same_tree 
+--------------
+ t
+(1 row)
+
+-- Range keys on a DESC column bound the other end of the index order.
+CREATE TABLE dx (k int, t text COLLATE "C");
+INSERT INTO dx SELECT g % 3, chr(97 + g % 26) FROM generate_series(1, 300) g;
+CREATE INDEX dx_kt ON dx USING prolly (k, t DESC);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM dx WHERE k = 1 AND t < 'm';
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Index Only Scan using dx_kt on dx
+         Index Cond: ((k = 1) AND (t < 'm'::text))
+(3 rows)
+
+SELECT count(*) FROM dx WHERE k = 1 AND t < 'm';
+ count 
+-------
+    48
+(1 row)
+
+SELECT count(*) FROM dx WHERE k = 1 AND t > 'm';
+ count 
+-------
+    48
+(1 row)
+
+SELECT count(*) FROM dx WHERE k = 1 AND t >= 'c' AND t <= 'e';
+ count 
+-------
+    12
+(1 row)
+
+SELECT string_agg(t, '' ORDER BY t DESC) FROM (SELECT DISTINCT t FROM dx WHERE k = 2 AND t > 'w') s;
+ string_agg 
+------------
+ zyx
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) FILTER (WHERE t < 'm'), count(*) FILTER (WHERE t > 'm'),
+	   count(*) FILTER (WHERE t BETWEEN 'c' AND 'e') FROM dx WHERE k = 1;
+ count | count | count 
+-------+-------+-------
+    48 |    48 |    12
+(1 row)
+
+-- Merge joins mark and restore positions; cursors scan backward.
+CREATE TABLE mj (k int, v int);
+INSERT INTO mj SELECT g % 5, g FROM generate_series(1, 20) g;
+CREATE INDEX mj_k ON mj USING prolly (k);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_sort = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM mj a JOIN mj b ON a.k = b.k;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (a.k = b.k)
+         ->  Index Only Scan using mj_k on mj a
+         ->  Index Only Scan using mj_k on mj b
+(5 rows)
+
+SELECT count(*) FROM mj a JOIN mj b ON a.k = b.k;
+ count 
+-------
+    80
+(1 row)
+
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT k FROM mj WHERE k >= 3 ORDER BY k;
+FETCH 3 FROM c;
+ k 
+---
+ 3
+ 3
+ 3
+(3 rows)
+
+FETCH BACKWARD 2 FROM c;
+ k 
+---
+ 3
+ 3
+(2 rows)
+
+FETCH LAST FROM c;
+ k 
+---
+ 4
+(1 row)
+
+FETCH BACKWARD 1 FROM c;
+ k 
+---
+ 4
+(1 row)
+
+COMMIT;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_hashjoin;
+RESET enable_nestloop;
+RESET enable_sort;
+-- REINDEX, CREATE INDEX CONCURRENTLY, TRUNCATE.
+REINDEX INDEX mj_k;
+CREATE INDEX CONCURRENTLY mj_v ON mj USING prolly (v);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM mj WHERE v > 10;
+ count 
+-------
+    10
+(1 row)
+
+TRUNCATE mj;
+INSERT INTO mj VALUES (1, 1);
+SELECT count(*) FROM mj WHERE k = 1;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM mj WHERE v = 1;
+ count 
+-------
+     1
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- Not supported: prolly indexes on heap tables, INCLUDE columns.
+CREATE TABLE hx (a int) USING heap;
+CREATE INDEX hx_a ON hx USING prolly (a);
+ERROR:  prolly indexes exist only on prolly tables
+DETAIL:  Table "hx" uses access method "heap".
+CREATE INDEX mj_inc ON mj USING prolly (k) INCLUDE (v);
+ERROR:  access method "prolly" does not support included columns
+DROP TABLE ix, ux, ud, kx, mj, hx, dx;
+DROP FUNCTION ix_answers(), ix_agree(), ix_entries(regclass), ix_same_tree(regclass);

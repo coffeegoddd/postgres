@@ -66,3 +66,8 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION prolly_commit_test_enqueue(implementation text, branch int8)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The number of items in a prolly relation's tree and a digest of them.
+CREATE FUNCTION prolly_tree_digest(rel regclass)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

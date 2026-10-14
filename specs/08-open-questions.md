@@ -19,6 +19,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
 | Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2 |
+| Prolly indexes (17, 42, 43) | Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. For 4d.3 |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 
@@ -129,6 +130,9 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 17. **Index trees on non-prolly tables.** `CREATE INDEX … USING prolly` on a
     heap table is accepted up to `ambuild` today. Should prolly indexes be
     refused on heap tables, or supported?
+    **Decided 2026-10-14 (user):** refused, with a clear error: a prolly
+    index lives in its table's root set and points at row keys, which heap
+    tables don't have. Can be revisited.
 18. **Loading the larger-than-RAM size.** A fresh ~300 GB load per cell is
     impractical (5 repetitions x 5 client counts x 9 workloads). Options: load
     once per workload and size and reuse it across cells (results then depend
@@ -334,3 +338,26 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     receiving cluster are rebuilt (O(N log N) each), as in a restore.
     Content-derived TIDs couldn't avoid an O(N) map: a hash can't be
     inverted. Not built until clone is.
+42. **What a prolly index entry points at.**
+    **Decided 2026-10-14 (user):** the row's key in its table (and its
+    ordinal among identical rows), never a TID. An entry is the encoded
+    index columns, then the row key, then the ordinal, with no value; the
+    tree records its own description (the index columns' types, operator
+    families, collations and options) once, as a table's tree records its
+    keying, and is found in the root under the index's own relfilenumber
+    (by name in canonical roots). So the index tree is a function of the
+    table's rows: versioned with the branch, merged and shipped with clones
+    like the data. Scans map row key -> TID through the TID map. A change
+    of the table's keying (which changes every row key) rebuilds its
+    prolly indexes with the data tree. As in Dolt, where a secondary index
+    row is the index columns then the primary key columns. Rejected:
+    entries pointing at TIDs (local, so the index couldn't be part of a
+    commit or ship with a clone).
+43. **Removing a prolly index's entries.** Postgres calls an index AM only
+    to insert; heap leaves old entries for VACUUM.
+    **Decided 2026-10-14 (user):** the table AM removes the old version's
+    entries in the same write as the delete or update, computing index
+    expressions and partial-index predicates itself. The index always
+    holds exactly the table's rows, so commits stay history-independent
+    and index-only scans can be exact. Rejected: leaving stale entries for
+    VACUUM (the index tree would depend on when VACUUM ran).

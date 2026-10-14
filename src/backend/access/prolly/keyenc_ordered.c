@@ -516,6 +516,23 @@ ordered_compare(ProllyKeyEncoder *enc, const ProllyKey *a, const ProllyKey *b)
 	return 0;
 }
 
+static uint32
+ordered_prefix_length(ProllyKeyEncoder *enc, const ProllyKey *key, int ncols)
+{
+	const uint8 *p = key->data;
+	const uint8 *end = key->data + key->len;
+
+	if (ncols < 0 || ncols > enc->ncols)
+		elog(ERROR, "prolly key prefix of %d columns out of %d", ncols, enc->ncols);
+	for (int i = 0; i < ncols; i++)
+	{
+		Segment		seg;
+
+		next_segment(&enc->cols[i], &p, end, &seg);
+	}
+	return p - key->data;
+}
+
 static void
 ordered_end(ProllyKeyEncoder *enc)
 {
@@ -537,5 +554,6 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.encode = ordered_encode,
 	.decode = ordered_decode,
 	.compare = ordered_compare,
+	.prefix_length = ordered_prefix_length,
 	.end = ordered_end,
 };
