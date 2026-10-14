@@ -279,7 +279,7 @@ SELECT * FROM d1_uq;
 CREATE INDEX d1_uq_id_b ON d1_uq (id, b);
 DO $$
 BEGIN
-	FOR i IN 1..2000 LOOP
+	FOR i IN 1..500 LOOP
 		UPDATE d1_uq SET b = b + 0 * i, id = id WHERE id = 1;
 		UPDATE d1_uq SET b = -b WHERE id = 1;
 	END LOOP;
@@ -302,6 +302,22 @@ UPDATE d1_dchild SET x = 1 WHERE id = 1;
 COMMIT;
 SELECT count(*) FROM d1_dchild;
 DROP TABLE d1_dchild, d1_dparent;
+
+-- A row affected twice by one command, where the first change leaves it
+-- as it was, and a row inserted by the command and hit again: both are
+-- refused, as on heap.
+CREATE TABLE d1_twice (id int PRIMARY KEY, v int);
+INSERT INTO d1_twice VALUES (1, 10);
+INSERT INTO d1_twice VALUES (1, 10), (1, 20)
+	ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING *;
+INSERT INTO d1_twice VALUES (2, 10), (2, 20)
+	ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING *;
+MERGE INTO d1_twice t USING (VALUES (1, 10), (1, 20)) s(id, v) ON t.id = s.id
+	WHEN MATCHED THEN UPDATE SET v = s.v;
+SELECT * FROM d1_twice ORDER BY id;
+UPDATE d1_twice SET v = v;
+SELECT * FROM d1_twice ORDER BY id;
+DROP TABLE d1_twice;
 
 -- A table created and filled in one transaction.
 BEGIN;

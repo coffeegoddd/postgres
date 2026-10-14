@@ -189,6 +189,9 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_ROW_IDENTITY, "rename_keeps_tid",
 	"tid_assign tid_rename tid_resolve scan_begin tid_find scan_end",
 	rowid_rename_keeps_tid},
+	{PROLLY_IFACE_ROW_IDENTITY, "renew_makes_new_version",
+	"tid_assign tid_renew tid_resolve scan_begin tid_find scan_end",
+	rowid_renew},
 	{PROLLY_IFACE_ROW_IDENTITY, "never_reused",
 	"tid_assign tid_retire tid_resolve scan_begin tid_find scan_end",
 	rowid_never_reused},
@@ -204,6 +207,8 @@ static const ConformanceCase cases[] = {
 	"open describe keyless encode_row close", keying_description_reopens},
 	{PROLLY_IFACE_TABLE_KEYING, "reads_after_key_column_dropped",
 	"open describe encode_row compare decode_row close", keying_reads_dropped_key},
+	{PROLLY_IFACE_TABLE_KEYING, "owns_its_memory",
+	"open encode_row decode_row close", keying_owns_its_memory},
 	{PROLLY_IFACE_TABLE_KEYING, "cannot_compare_after_key_type_dropped",
 	"open describe can_compare close", keying_compare_after_type_dropped},
 

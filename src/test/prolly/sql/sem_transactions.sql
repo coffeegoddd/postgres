@@ -115,6 +115,22 @@ COMMIT PREPARED 'p3';
 INSERT INTO tx VALUES (43, 43);
 SELECT id FROM tx WHERE id IN (42, 43);
 
+-- A row affected twice by one command, where the first change leaves it
+-- as it was, and a row inserted by the command and hit again: both are
+-- refused, as on heap.
+CREATE TABLE twice (id int PRIMARY KEY, v int);
+INSERT INTO twice VALUES (1, 10);
+INSERT INTO twice VALUES (1, 10), (1, 20)
+	ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING *;
+INSERT INTO twice VALUES (2, 10), (2, 20)
+	ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING *;
+MERGE INTO twice t USING (VALUES (1, 10), (1, 20)) s(id, v) ON t.id = s.id
+	WHEN MATCHED THEN UPDATE SET v = s.v;
+SELECT * FROM twice ORDER BY id;
+UPDATE twice SET v = v;
+SELECT * FROM twice ORDER BY id;
+DROP TABLE twice;
+
 -- Explicit row locks in one session.
 BEGIN;
 SELECT id FROM tx WHERE id = 1 FOR UPDATE;

@@ -208,11 +208,17 @@ bad:
 			 errmsg("invalid prolly table keying description")));
 }
 
+/*
+ * Everything open() allocates, temporaries included, is in mcxt: a keying
+ * is often kept longer than its caller's memory (a cache), so nothing it
+ * keeps may be in the caller's.
+ */
 static ProllyKeying *
 pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 {
+	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyComponents c;
-	ProllyKeying *k = MemoryContextAllocZero(mcxt, sizeof(ProllyKeying));
+	ProllyKeying *k = palloc0(sizeof(ProllyKeying));
 	Description d;
 
 	prolly_components_for_relation(rel, &c);
@@ -239,13 +245,9 @@ pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 	k->keyless = d.keyless;
 	if (!k->keyless)
 		setup_key(k, rel, d.nkeys, d.cols, c.key_encoder);
-	{
-		MemoryContext old = MemoryContextSwitchTo(mcxt);
-
-		initStringInfo(&k->layout);
-		PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
-		MemoryContextSwitchTo(old);
-	}
+	initStringInfo(&k->layout);
+	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
+	MemoryContextSwitchTo(old);
 	return k;
 }
 
