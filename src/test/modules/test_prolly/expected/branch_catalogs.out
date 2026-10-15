@@ -23,6 +23,8 @@ CREATE VIEW app.v AS SELECT id FROM app.t;
 CREATE FUNCTION app.f(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
 COMMENT ON TABLE app.t IS 'versioned';
 COMMENT ON TABLE plain.base IS 'shared';
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA plain GRANT SELECT ON TABLES TO PUBLIC;
 -- Rows of versioned objects are on main; shared objects' rows are on no branch.
 SELECT nspname, nspbranch = :main AS on_main FROM pg_namespace
   WHERE nspname IN ('app', 'plain') ORDER BY 1;
@@ -146,6 +148,15 @@ SELECT objoid::regclass, objbranch = :main AS on_main FROM pg_description
 ------------+---------
  plain.base | f
  app.t      | t
+(2 rows)
+
+SELECT defaclnamespace::regnamespace, defaclbranch = :main AS on_main
+  FROM pg_default_acl
+  WHERE defaclnamespace IN ('app'::regnamespace, 'plain'::regnamespace) ORDER BY 1;
+ defaclnamespace | on_main 
+-----------------+---------
+ plain           | f
+ app             | t
 (2 rows)
 
 SELECT DISTINCT classid::regclass, depbranch = :main AS on_main FROM pg_depend
