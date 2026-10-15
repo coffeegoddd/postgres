@@ -842,10 +842,43 @@ common ancestor. Tests: `022_d1_dolt_sql.pl` (authors, empty commits,
 log order and ancestry, branches and connections to them, status, diffs
 of keyed, keyless and large rows, fast-forward, merge commit and
 `--no-ff` merges, hard resets through a crash, branch copy and delete).
-Not yet: conflict tables (merges with conflicts still fail and change
-nothing), `dolt_diff_<table>` and other per-table system tables (they
+Not yet: conflict tables (the next stage), `dolt_diff_<table>` and other per-table system tables (they
 need a relation per table, which waits for versioned catalogs), schema
 changes in `dolt_status`, remotes.
+
+**Status (2026-10-15): 4g.4 built (merge conflicts).** Dolt's conflict
+model (question 55), for rows. A merge applies every change that doesn't
+conflict, keeps the current branch's row where both sides changed a key
+differently, and leaves the merge in progress without a commit: the refs
+keep it per branch (`'M'` entries: the merged head, the common ancestor,
+and the tables with unresolved conflicts), so it is transactional and
+crash-safe, and the conflicts themselves are found again from the three
+commits whenever they're listed or resolved (no copy of them is stored).
+`dolt_conflicts` lists tables and counts; `dolt_conflicts(NULL::t)` gives
+each conflict's base, our and their rows (of the table's row type, as
+Doltgres's `dolt_conflicts_<table>` columns) and how each side changed it;
+`dolt_conflicts_resolve('--ours'|'--theirs', table | '.')` resolves a
+table (taking theirs writes their rows through the executor, as the merge
+does); `dolt_status` shows conflicted tables, unstaged; `dolt_commit` then
+makes the merge commit, with both heads as parents; `dolt_merge('--abort')`
+(a hard reset) ends it. As in Dolt, a transaction can't commit with
+unresolved conflicts unless `dolt.allow_commit_conflicts` is on, so
+outside a transaction block a merge with conflicts fails and changes
+nothing. To allow that workflow (`BEGIN; dolt_merge; resolve; dolt_commit;
+COMMIT`), a commit may now be made by a transaction that has written: the
+commit records the working set the transaction will commit (later writes
+in it are changes after the commit). Interfaces: merge returns its
+conflict count and gained `conflicts` and `resolve` (with
+`PROLLY_MERGE_FAIL_ON_CONFLICT`, kept by `prolly_merge()`, for the old
+behavior); refs gained `merge_state` and `set_merge_state`, and refuse a
+transaction's commit with unresolved conflicts. Tests: `023_d1_conflicts.pl`
+(rollback outside a transaction block; listing; COMMIT and `dolt_commit`
+refused; `--theirs` and `--ours`, the merge commit's parents and the btree
+index; conflicts kept through a crash, a second merge refused, abort;
+`prolly_merge()` still failing). Not yet: schema conflicts (they need
+versioned catalogs), resolving single rows (Dolt deletes rows from
+`dolt_conflicts_<table>`; here a table is resolved whole, after fixing its
+rows by hand if need be), constraint violations (`dolt_constraint_violations`).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

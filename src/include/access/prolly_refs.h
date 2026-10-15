@@ -42,6 +42,18 @@ typedef struct ProllyCommitInfo
 	char	   *message;		/* palloc'd */
 } ProllyCommitInfo;
 
+/*
+ * A merge in progress on a branch: it stopped with conflicts in tables,
+ * which must be resolved before the merge commit is made.
+ */
+typedef struct ProllyMergeState
+{
+	ProllyHash	theirs;			/* the merged branch's head commit */
+	ProllyHash	base;			/* the common ancestor */
+	int			ntables;
+	Oid		   *tables;			/* with unresolved conflicts (palloc'd) */
+} ProllyMergeState;
+
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
@@ -58,7 +70,12 @@ typedef struct ProllyRefsRoutine
 	/* Make name the current session's branch. */
 	void		(*checkout) (const char *name);
 
-	/* Record a commit of the current branch's working root. */
+	/*
+	 * Record a commit of the current branch's working root, as the current
+	 * transaction will commit it.  With a merge in progress, it is the
+	 * merge commit (both heads its parents), and every conflict must have
+	 * been resolved.
+	 */
 	void		(*commit) (const char *message, ProllyHash *commit_id);
 
 	/*
@@ -105,6 +122,15 @@ typedef struct ProllyRefsRoutine
 	void		(*reset) (const char *ref);
 
 	/*
+	 * The session branch's merge in progress (false: none), and setting it
+	 * (NULL: none), with the current transaction.  The transaction can't
+	 * commit while its branch's merge has unresolved conflicts, unless
+	 * prolly_allow_commit_conflicts().  A reset ends a merge.
+	 */
+	bool		(*merge_state) (ProllyMergeState *state);
+	void		(*set_merge_state) (const ProllyMergeState *state);
+
+	/*
 	 * Visit every node the refs keep alive, from the root of their own
 	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
 	 */
@@ -115,7 +141,8 @@ typedef struct ProllyRefsRoutine
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
-	"commit_with", "branches", "working_set", "reset", "walk"
+	"commit_with", "branches", "working_set", "reset", "merge_state", \
+	"set_merge_state", "walk"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

@@ -1585,3 +1585,6 @@ CREATE VIEW dolt_branches AS
 
 CREATE VIEW dolt_status AS
     SELECT * FROM dolt_status();
+
+CREATE VIEW dolt_conflicts AS
+    SELECT * FROM dolt_conflicts();

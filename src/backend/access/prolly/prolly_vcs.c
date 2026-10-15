@@ -180,7 +180,8 @@ prolly_merge(PG_FUNCTION_ARGS)
 
 	prolly_database_components(&components);
 	diff_merge = components.diff_merge;
-	PROLLY_CALL(diff_merge, merge, branch, NULL, 0, &commit_id);
+	(void) PROLLY_CALL(diff_merge, merge, branch, NULL,
+					   PROLLY_MERGE_FAIL_ON_CONFLICT, &commit_id);
 	PG_RETURN_TEXT_P(hash_to_text(&commit_id));
 }
 

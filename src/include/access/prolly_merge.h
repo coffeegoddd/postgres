@@ -15,8 +15,17 @@
  *   the branch is at afterwards: the current head if branch was merged
  *   already; branch's head if the current one is its ancestor (a
  *   fast-forward, unless PROLLY_MERGE_NO_FF); else a merge commit, with
- *   message (NULL: a default one).  Conflicts raise an error and change
- *   nothing (conflict reporting is not designed yet).
+ *   message (NULL: a default one).  Rows changed differently on both
+ *   sides are conflicts: the merge applies everything else, keeps the
+ *   current branch's version of those rows, records a merge in progress
+ *   (the refs' merge state), makes no commit (commit_id's len is 0) and
+ *   returns how many conflicts there are; with PROLLY_MERGE_FAIL_ON_CONFLICT
+ *   it raises an error instead, changing nothing.
+ * - conflicts() reports a table's unresolved conflicts of the merge in
+ *   progress, in key order, each row as the common ancestor, the current
+ *   branch and the merged branch have it (NULL where it doesn't exist).
+ * - resolve() resolves them, keeping the current rows or taking the merged
+ *   branch's.
  *
  * Provisional (v0).
  *
@@ -33,6 +42,16 @@
 /* merge() flags */
 #define PROLLY_MERGE_NO_FF	0x01	/* a merge commit even if it could
 									 * fast-forward */
+#define PROLLY_MERGE_FAIL_ON_CONFLICT 0x02	/* conflicts are an error */
+
+typedef struct ProllyConflictSink ProllyConflictSink;
+struct ProllyConflictSink
+{
+	void		(*conflict) (ProllyConflictSink *self, const ProllyKey *key,
+							 const ProllyValue *base,
+							 const ProllyValue *ours,
+							 const ProllyValue *theirs);
+};
 
 typedef struct ProllyMergeRoutine
 {
@@ -41,11 +60,13 @@ typedef struct ProllyMergeRoutine
 	/* relid InvalidOid: every table. */
 	void		(*diff) (const char *from_ref, const char *to_ref, Oid relid,
 						 ProllyDiffSink *sink);
-	void		(*merge) (const char *branch, const char *message, int flags,
+	int			(*merge) (const char *branch, const char *message, int flags,
 						  ProllyHash *commit_id);
+	void		(*conflicts) (Oid relid, ProllyConflictSink *sink);
+	void		(*resolve) (Oid relid, bool theirs);
 } ProllyMergeRoutine;
 
-#define PROLLY_MERGE_CALLBACK_NAMES "diff", "merge"
+#define PROLLY_MERGE_CALLBACK_NAMES "diff", "merge", "conflicts", "resolve"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 
 static inline const ProllyMergeRoutine *
