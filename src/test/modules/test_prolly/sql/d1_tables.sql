@@ -351,16 +351,16 @@ SELECT sum(n) FROM d1_new;
 -- A key or index column updated to an equal value written differently
 -- (numeric scale) takes the new bytes in the trees: they equal the trees
 -- of a table written with them directly, and index-only scans return them.
-CREATE OPERATOR CLASS d1_numeric_ops DEFAULT FOR TYPE numeric USING prolly AS
+CREATE OPERATOR CLASS d1_numeric_ops DEFAULT FOR TYPE numeric USING prolly_d1_index AS
 	OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
 	FUNCTION 1 numeric_cmp(numeric, numeric);
 CREATE TABLE d1_respelled (k numeric PRIMARY KEY, n numeric) USING prolly_d1;
-CREATE INDEX d1_respelled_n ON d1_respelled USING prolly (n);
+CREATE INDEX d1_respelled_n ON d1_respelled USING prolly_d1_index (n);
 INSERT INTO d1_respelled VALUES (1.0, 2.0), (3, 4);
 UPDATE d1_respelled SET k = 1.00 WHERE k = 1;
 UPDATE d1_respelled SET n = 2.000 WHERE k = 1;
 CREATE TABLE d1_spelled (k numeric PRIMARY KEY, n numeric) USING prolly_d1;
-CREATE INDEX d1_spelled_n ON d1_spelled USING prolly (n);
+CREATE INDEX d1_spelled_n ON d1_spelled USING prolly_d1_index (n);
 INSERT INTO d1_spelled VALUES (1.00, 2.000), (3, 4);
 SELECT prolly_tree_digest('d1_respelled') = prolly_tree_digest('d1_spelled') AS same_table,
 	   prolly_tree_digest('d1_respelled_n') = prolly_tree_digest('d1_spelled_n') AS same_index;
@@ -435,7 +435,7 @@ SELECT count(*) FROM d1_seek;
 DROP TABLE d1_seek;
 
 DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled, d1_counted;
-DROP OPERATOR CLASS d1_numeric_ops USING prolly;
+DROP OPERATOR CLASS d1_numeric_ops USING prolly_d1_index;
 
 -- A primary key the key encoder can't order (WITHOUT OVERLAPS is kept by a
 -- GiST index, whose support function 1 isn't a comparison) doesn't key the

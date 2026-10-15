@@ -12780,6 +12780,10 @@
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
 # prolly storage (src/backend/access/prolly)
+{ oid => '9423', descr => 'prolly table access method handler',
+  proname => 'prolly_tableam_handler', provolatile => 'v',
+  prorettype => 'table_am_handler', proargtypes => 'internal',
+  prosrc => 'prolly_tableam_handler' },
 { oid => '9376', descr => 'prolly engine D1 table access method handler',
   proname => 'prolly_d1_tableam_handler', provolatile => 'v',
   prorettype => 'table_am_handler', proargtypes => 'internal',

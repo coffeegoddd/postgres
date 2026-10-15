@@ -1327,10 +1327,12 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 
 	/*
 	 * The new heap and its TOAST table are kept by the storage manager that
-	 * keeps the old heap.
+	 * keeps the old heap, unless the access method changes: then the new
+	 * one decides.
 	 */
 	save_smgr = new_relation_smgr;
-	new_relation_smgr = RelationGetSmgr(OldHeap)->smgr_which;
+	if (NewAccessMethod == OldHeap->rd_rel->relam)
+		new_relation_smgr = RelationGetSmgr(OldHeap)->smgr_which;
 	PG_TRY();
 	{
 	OIDNewHeap = heap_create_with_catalog(NewHeapName,

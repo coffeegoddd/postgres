@@ -31,6 +31,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
+#include "catalog/pg_am.h"
 #include "catalog/storage.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage_xlog.h"
@@ -486,9 +487,10 @@ tuple_lock_retry:
 
 /*
  * The storage manager for a heap relation's new storage.  Only permanent
- * relations outside the global tablespace may be block-mapped.  Storage
- * made anew for an existing relation stays where the old was, and so does
- * a rewrite's new heap (new_relation_smgr); a new relation is in md.c, or
+ * relations outside the global tablespace may be block-mapped.  A prolly
+ * table (and with it its TOAST table and indexes) is.  Storage made anew
+ * for an existing relation stays where the old was, and so does a
+ * rewrite's new heap (new_relation_smgr); a new relation is in md.c, or
  * with debug_block_mapped_heap in block-mapped storage if it is a user
  * relation.
  */
@@ -499,6 +501,8 @@ heapam_storage_manager(Relation rel, const RelFileLocator *newrlocator,
 	if (persistence != RELPERSISTENCE_PERMANENT ||
 		newrlocator->spcOid == GLOBALTABLESPACE_OID)
 		return SMGR_MD;
+	if (rel->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		return SMGR_BMAP;
 	if (rel->rd_locator.relNumber != newrlocator->relNumber)
 		return RelationGetSmgr(rel)->smgr_which;
 	if (new_relation_smgr >= 0)

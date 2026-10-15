@@ -69,7 +69,7 @@ pass('and it has heap tables');
 # Tablespaces.
 my ($ret, $out, $err) = $node->psql('v', q{
 	CREATE TABLE ts (x int) TABLESPACE pg_default;
-	CREATE INDEX ts_x ON ts USING prolly (x) TABLESPACE pg_default;
+	CREATE INDEX ts_x ON ts USING prolly_d1_index (x) TABLESPACE pg_default;
 	ALTER TABLE ts SET TABLESPACE pg_default;});
 is(() = $err =~ /NOTICE:  prolly relations ignore tablespaces; tablespace "pg_default" is not used/g, 3,
 	'prolly tables and indexes ignore tablespaces, with a NOTICE');

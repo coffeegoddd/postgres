@@ -2387,7 +2387,7 @@ prolly_drop_relation(Relation rel)
 	ProllyComponents c;
 	char	   *amname = get_am_name(rel->rd_rel->relam);
 	bool		prolly = rel->rd_rel->relkind == RELKIND_INDEX ?
-		amname != NULL && strcmp(amname, "prolly") == 0 :
+		amname != NULL && strcmp(amname, "prolly_d1_index") == 0 :
 		prolly_is_table_am(amname);
 
 	if (!prolly)

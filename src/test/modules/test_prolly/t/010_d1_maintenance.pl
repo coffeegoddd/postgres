@@ -65,7 +65,7 @@ is(analyzed('triples'),
 # CLUSTER and VACUUM FULL keep the rows' TIDs and the indexes; the copy
 # survives a crash before any checkpoint, and the standby replays it.
 $primary->safe_psql('postgres', q{
-	CREATE INDEX big_k ON big USING prolly (k);
+	CREATE INDEX big_k ON big USING prolly_d1_index (k);
 	CREATE INDEX big_kb ON big (k);
 	DELETE FROM big WHERE id % 4 = 0;
 });

@@ -36,6 +36,7 @@ tests += {
       'd1_tables',
       'd1_index',
       'd1_maintenance',
+      'prolly_tables',
     ],
   },
   'tap': {

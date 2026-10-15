@@ -3875,10 +3875,26 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	{
 		/* handle these directly, at least for now */
 		SMgrRelation srel;
+		int			smgr_which = RelationGetSmgr(relation)->smgr_which;
 
-		/* the new storage stays with the storage manager that held the old */
+		/*
+		 * An index's new storage goes to the storage manager that keeps its
+		 * table, which may have just been rewritten into another; anything
+		 * else stays with the storage manager that held the old.
+		 */
+		if (relation->rd_rel->relkind == RELKIND_INDEX)
+		{
+			Relation	heap = RelationIdGetRelation(relation->rd_index->indrelid);
+
+			if (RelationIsValid(heap))
+			{
+				if (RELKIND_HAS_STORAGE(heap->rd_rel->relkind))
+					smgr_which = RelationGetSmgr(heap)->smgr_which;
+				RelationClose(heap);
+			}
+		}
 		srel = RelationCreateStorageWith(newrlocator, persistence, true,
-										 RelationGetSmgr(relation)->smgr_which);
+										 smgr_which);
 		smgrclose(srel);
 	}
 	else

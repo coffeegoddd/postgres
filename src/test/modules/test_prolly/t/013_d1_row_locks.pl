@@ -29,7 +29,7 @@ $node->safe_psql('postgres', q{
 	CREATE UNIQUE INDEX t_u ON t USING btree (u);
 	INSERT INTO t SELECT g, 0, g FROM generate_series(1, 10) g;
 	CREATE TABLE p (id int PRIMARY KEY, w text);
-	CREATE UNIQUE INDEX p_w ON p USING prolly (w);
+	CREATE UNIQUE INDEX p_w ON p USING prolly_d1_index (w);
 	CREATE TABLE n (id numeric PRIMARY KEY, v int);
 	INSERT INTO n VALUES (1, 0), (2, 0);
 	CREATE TABLE parent (id int PRIMARY KEY, note text);

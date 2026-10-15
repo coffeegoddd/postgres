@@ -107,6 +107,9 @@ extern bool prolly_is_table_am(const char *amname);
 extern Oid	prolly_table_am_for_persistence(Oid amoid, char relpersistence,
 											bool explicit);
 
+/* Error if a prolly table is to become unlogged. */
+extern void prolly_check_unlogged(Relation rel);
+
 /*
  * Error if a permanent relation stored by amoid can't be in the current
  * database: a versioned database versions every permanent table, so they

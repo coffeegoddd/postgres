@@ -52,6 +52,7 @@ OBJS = \
 	prolly_registry.o \
 	prolly_rmgr.o \
 	prolly_shmem.o \
+	prolly_table.o \
 	prolly_tableam.o \
 	prolly_dolt.o \
 	prolly_vcs.o \
