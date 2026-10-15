@@ -147,7 +147,7 @@ Order of work within the step:
 | 4d | Table and index AM wiring, single writer per table |
 | 4e | Concurrency: root-carrying snapshots first (B1, B2: every scan of a snapshot reads the same root set); K1 row-level locks replacing single_writer, so writers to different rows of one table run concurrently, as on heap; a commit pipeline that materializes changed trees before taking the branch's commit lock and, under it, replays the transaction's write set onto a newer head (row locks keep concurrent writers off each other's rows, so replay needs no merge); bounded transaction memory: write sets flushed to intermediate trees, with savepoint roots, their edits recovered at replay by tree diff (question 47); tree diff that skips unchanged internal subtrees, not only leaves (needed by replay; also status, diff, merge and transfer); engine counters of nodes read and written, so tests can check complexity bounds (gate 7); TID counter ranges per backend already, per node if nodes share storage (question 37) |
 | 4f | Checkpoint, recovery, reclamation, and large values: out-of-line value trees whose references the node format exposes to walk, reclamation and transfer (question 48); reclamation from the full set of live roots (question 49), including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
-| 4g | V1–V3 and versioned catalogs: first, the canonical format freeze (a chunk rule independent of `BLCKSZ` with size targets set by measurement, question 45; portable codecs or refusal for `reg*` and extension types, question 35; collation versions, question 46); then catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap, and three-way merge that reuses unchanged subtrees |
+| 4g | V1–V3 and versioned catalogs: first, the canonical format freeze (provisional until every engine implementation has been evaluated: step 5 and later may still change it; a chunk rule independent of `BLCKSZ` with size targets set by measurement, question 45; portable codecs or refusal for `reg*` and extension types, question 35; collation versions, question 46); then catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap, and three-way merge that reuses unchanged subtrees |
 | 4h | S and V suites and correctness gates, including the history-independence gate |
 
 **Status (2026-10-13): 4a built.** Implementations `sha256` (content hash),
@@ -473,6 +473,35 @@ suite (`src/test/prolly`) passes against it, and the correctness gates in
 - Run the full B0 baseline (deferred from step 3) and both suites against
   D1+K1, on the same machine, in benchmark mode, with the same configuration.
 - Collect profiles (`perf`) for the workloads where D1+K1 differs most from B0.
+- Settle the chunk rule (question 3). The 4g freeze doesn't bind it yet:
+  the format stays provisional until every engine implementation has been
+  evaluated (user, 2026-10-14).
+  - **Why:** the starting chunker (`keyhash`) aims at about 31 items per
+    leaf whatever their size. In 4e.1 the node counters showed what that
+    costs: narrow items leave pages mostly empty. A 20,000-row scan of an
+    `int` key plus a 60-byte text column reads 1,334 nodes: about 650 data
+    leaves at about 3 KB each, and 655 row-identity-map leaves at about
+    800 bytes each, in 8 KB pages. Filled by bytes to about 4 KB, it would
+    read about 600.
+  - **Candidate:** a second chunker implementation, `keyhash_weibull`,
+    shaped like Dolt's default `keySplitter`. The boundary hash stays on the
+    key alone and is seeded by level. The chance of a boundary rises with
+    the bytes since the last one, following a Weibull curve (K = 4). The
+    format fixes its own minimum and maximum, independent of `BLCKSZ`
+    (question 45), with the maximum fitting an 8 KiB page.
+  - **Measure, for `keyhash` and `keyhash_weibull` at a few scales (4, 5
+    and 6 KiB):**
+    - Node fill, per tree kind (data, row-identity map, prolly indexes,
+      catalogs).
+    - Nodes read by scans, lookups and diffs.
+    - Nodes written by a value update that keeps its size, by one that
+      changes its size (byte-weighted boundaries can move for these, and
+      settle again after about a node), and by inserts and deletes.
+    - Store size and WAL volume.
+    - How often K2 lock entries and SSI page mappings move when values
+      change size (question 3's reason for key-only boundaries).
+  - **Decide:** the rule and its scale, recorded in question 3, with the
+    chunker interface keeping both implementations swappable.
 
 **Exit criteria:** S results side by side with B0 (normalized to B0 = 1.0), V
 results, gate status, profiles; stored under `specs/results/`.
