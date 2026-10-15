@@ -665,6 +665,8 @@ newest_roots(const ProllyComponents *c, ProllyRootSet **roots)
 	MemoryContextSwitchTo(old);
 }
 
+static bool has_rows(Relation rel, const ProllyComponents *c,
+					 ProllyRootSet *roots);
 static void insert_row(Relation rel, const ProllyComponents *c,
 					   ProllyKeying *keying, ProllyRootSet **roots,
 					   TupleTableSlot *slot, uint64 copies,
@@ -768,11 +770,17 @@ check_keying(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 	initStringInfo(&recorded);
 	initStringInfo(&now);
 	PROLLY_CALL(c->keying, describe, ik->keying, &now);
-	if (!recorded_keying(c, *roots, rel, &recorded) ||
-		recorded.len != now.len ||
-		memcmp(recorded.data, now.data, now.len) != 0)
+	if ((!recorded_keying(c, *roots, rel, &recorded) ||
+		 recorded.len != now.len ||
+		 memcmp(recorded.data, now.data, now.len) != 0) &&
+		has_rows(rel, c, *roots))
 	{
-		/* Writing the whole tree: lock it, and look again once locked. */
+		/*
+		 * Writing the whole tree: lock it, and look again once locked.  A
+		 * tree with no rows has nothing to rebuild, and writers that find
+		 * it so all record the same keying, so they needn't wait for each
+		 * other (a new table's first writers).
+		 */
 		lock_for_write(rel, c, NULL, roots);
 		resetStringInfo(&recorded);
 		if (recorded_keying(c, *roots, rel, &recorded) &&
@@ -791,7 +799,8 @@ check_keying(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 		 * they are; others are rebuilt.  Either way the tree is recorded as
 		 * written now.
 		 */
-		if (recorded.len > 0 && !PROLLY_CALL(c->keying, can_read, ik->keying, &r))
+		if (recorded.len > 0 && !PROLLY_CALL(c->keying, can_read, ik->keying, &r) &&
+			has_rows(rel, c, *roots))
 		{
 			ProllyValue d = {(const uint8 *) recorded.data, recorded.len};
 			ProllyKeying *old = PROLLY_CALL(c->keying, open, rel, &d,
@@ -816,6 +825,22 @@ done:
 	pfree(now.data);
 	ik->checked_lxid = MyProc->vxid.lxid;
 	ik->checked_subxid = GetCurrentSubTransactionId();
+}
+
+/* Does rel's data tree hold any row, as roots and this transaction see it? */
+static bool
+has_rows(Relation rel, const ProllyComponents *c, ProllyRootSet *roots)
+{
+	ProllyCursor *cur = PROLLY_CALL(c->engine, cursor_open, roots, rel,
+									PROLLY_TREE_DATA, InvalidCommandId);
+	ProllyKey	key;
+	ProllyValue value;
+	bool		any;
+
+	PROLLY_CALL(c->engine, cursor_seek, cur, NULL, ForwardScanDirection);
+	any = PROLLY_CALL(c->engine, cursor_next, cur, &key, &value);
+	PROLLY_CALL(c->engine, cursor_close, cur);
+	return any;
 }
 
 /*

@@ -53,6 +53,7 @@ tests += {
       't/011_d1_respelled_keys.pl',
       't/012_d1_snapshots.pl',
       't/013_d1_row_locks.pl',
+      't/014_d1_spill.pl',
     ],
   },
 }

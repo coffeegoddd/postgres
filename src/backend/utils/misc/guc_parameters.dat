@@ -2452,6 +2452,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'prolly_write_set_memory', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
+  short_desc => 'Sets the memory a transaction\'s writes to prolly tables may use before they are spilled to disk.',
+  long_desc => 'Past this much, writes made by earlier commands of the transaction are moved to intermediate trees in the node store.',
+  flags => 'GUC_UNIT_KB',
+  variable => 'prolly_write_set_memory',
+  boot_val => '65536',
+  min => '64',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',
   short_desc => 'When generating SQL fragments, quote all identifiers.',
   variable => 'quote_all_identifiers',

@@ -490,6 +490,12 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     root is kept in the two-phase state file (user, 2026-10-14, 4e.4).
     **Decided (user, 2026-10-14):** the threshold is a setting,
     `prolly.write_set_memory`, 64 MB by default.
+    **Built (4e.4):** named `prolly_write_set_memory`, as core settings
+    have no dots. The intermediate tree is a delta keyed as the write set
+    (each key's newest version, and the one the current command sees),
+    read in key order at commit, rather than a tree diffed against the
+    base; PREPARE records whole trees and COMMIT PREPARED replays them by
+    diff.
 48. **Large values.** Items must fit a node, and prolly tables have no
     TOAST table.
     **Recommended (2026-10-14), for 4f:** out-of-line value trees in the

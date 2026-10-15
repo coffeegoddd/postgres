@@ -1,7 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Engine D1's transaction state is cleaned up on every way a transaction
-# or subtransaction can end, and the same connection keeps working.
+# or subtransaction can end (prepared too), and the same connection keeps
+# working.
 
 use strict;
 use warnings FATAL => 'all';
@@ -56,17 +57,18 @@ is($node->safe_psql('postgres', q{
 	SELECT array_agg(id ORDER BY id) FROM t;
 }), '{1,3,5}', 'a connection writes again after preparing a transaction');
 
-# Preparing with writes is refused, and the connection keeps working.
-my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
+# Preparing with writes, then more writes on the same connection, then
+# committing the prepared transaction.
+is($node->safe_psql('postgres', q{
 	BEGIN;
 	INSERT INTO t VALUES (6);
 	PREPARE TRANSACTION 'q';
 	INSERT INTO t VALUES (7);
 	SELECT array_agg(id ORDER BY id) FROM t;
-}, on_error_stop => 0);
-like($stderr, qr/cannot PREPARE a transaction that has written to a prolly table/,
-	'preparing with writes is refused');
-is($stdout, '{1,3,5,7}', 'the refused transaction is rolled back');
+}), '{1,3,5,7}', 'a connection writes again after preparing writes');
+$node->safe_psql('postgres', q{COMMIT PREPARED 'q'});
+is($node->safe_psql('postgres', 'SELECT array_agg(id ORDER BY id) FROM t'),
+	'{1,3,5,6,7}', 'committing the prepared transaction brings its write');
 
 ok($node->safe_psql('postgres', 'SELECT 1') eq '1', 'the server is still up');
 
