@@ -759,7 +759,7 @@ void
 keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 {
 	const ProllyKeyEncoderRoutine *ke = (const ProllyKeyEncoderRoutine *) impl;
-	Oid			prolly_am = get_index_am_oid("prolly", false);
+	Oid			prolly_am = get_index_am_oid("prolly_d1_index", false);
 	KeyCase		cases[] = {
 		{1, {{INT2OID}}},
 		{1, {{INT4OID}}},

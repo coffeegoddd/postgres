@@ -40,6 +40,7 @@ backend_sources += files(
   'prolly_registry.c',
   'prolly_rmgr.c',
   'prolly_shmem.c',
+  'prolly_table.c',
   'prolly_tableam.c',
   'prolly_dolt.c',
   'prolly_vcs.c',

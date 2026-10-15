@@ -63,7 +63,7 @@ not_implemented(const char *callback)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("index access method \"%s\" does not implement %s yet",
-					"prolly", callback)));
+					"prolly_d1_index", callback)));
 	pg_unreachable();
 }
 

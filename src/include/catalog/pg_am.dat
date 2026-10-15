@@ -34,6 +34,11 @@
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
 
+# prolly tables: heap's pages in block-mapped storage (access/prolly/prolly_table.c)
+{ oid => '9422', oid_symbol => 'PROLLY_TABLE_AM_OID',
+  descr => 'prolly table access method: heap pages in block-mapped storage',
+  amname => 'prolly', amhandler => 'prolly_tableam_handler', amtype => 't' },
+
 # prolly storage (src/backend/access/prolly); one table AM per engine
 { oid => '9370', descr => 'prolly engine D1 table access method (stub)',
   amname => 'prolly_d1', amhandler => 'prolly_d1_tableam_handler',
@@ -50,7 +55,7 @@
 { oid => '9374', descr => 'prolly engine D4 table access method (stub)',
   amname => 'prolly_d4', amhandler => 'prolly_d4_tableam_handler',
   amtype => 't' },
-{ oid => '9375', descr => 'prolly tree index access method (stub)',
-  amname => 'prolly', amhandler => 'prolly_indexam_handler', amtype => 'i' },
+{ oid => '9375', descr => 'prolly engine D1 index access method',
+  amname => 'prolly_d1_index', amhandler => 'prolly_indexam_handler', amtype => 'i' },
 
 ]

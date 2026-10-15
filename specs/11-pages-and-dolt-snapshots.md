@@ -493,6 +493,23 @@ check-upstream-bmap`):
 first extension), a standby, promotion, block reuse, base backups,
 `pg_checksums`, rewrites, persistence changes and tablespaces.
 
+### The `prolly` table access method (2026-10-15)
+
+`prolly` returns heap's own `TableAmRoutine`, so code that recognizes heap
+by its routines treats a prolly table as heap; heap's storage creation
+puts a relation whose access method is `prolly` (and its TOAST table and
+indexes, which follow their table) in block-mapped storage. Prolly tables
+are permanent: with `prolly` as the default, temporary and unlogged tables
+get heap; `USING prolly` on one, `SET UNLOGGED` on a prolly table and
+`SET ACCESS METHOD prolly` on an unlogged one are refused. D1's index
+access method, which held the name, is now `prolly_d1_index`.
+
+With `default_table_access_method = prolly`: isolation 134 of 134;
+regression 236 of 239, the three others (`identity`, `alter_table`,
+`publication`) turning default-AM tables unlogged, which is refused; the
+recovery suite as with `debug_block_mapped_heap`, plus
+`027_stream_regress`, which runs the same regression suite.
+
 ### Step 2's remapping rule (designed now, built then)
 
 A shared page must be copied before its first change is WAL-logged, and

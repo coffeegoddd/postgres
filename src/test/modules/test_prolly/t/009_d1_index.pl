@@ -28,8 +28,8 @@ $standby->start;
 $primary->safe_psql('postgres', q{
 	CREATE TABLE t (id int PRIMARY KEY, k int, v text);
 	INSERT INTO t SELECT g, g % 10, 'v' || g FROM generate_series(1, 1000) g;
-	CREATE INDEX t_k ON t USING prolly (k);
-	CREATE UNIQUE INDEX t_v ON t USING prolly (v);
+	CREATE INDEX t_k ON t USING prolly_d1_index (k);
+	CREATE UNIQUE INDEX t_v ON t USING prolly_d1_index (v);
 	UPDATE t SET k = 42 WHERE id <= 10;
 	DELETE FROM t WHERE id > 990;
 });
@@ -107,7 +107,7 @@ for my $case (['UPDATE cic SET v = 25 WHERE id = 2', '|1|2|25'],
 	my $builder = $primary->background_psql('postgres');
 	$holder->query_safe('SELECT pg_advisory_lock(606)');
 	$builder->query_until(qr/go/,
-		"\\echo go\nCREATE INDEX CONCURRENTLY cic_i ON cic USING prolly (cic_key(v));\n");
+		"\\echo go\nCREATE INDEX CONCURRENTLY cic_i ON cic USING prolly_d1_index (cic_key(v));\n");
 	$primary->poll_query_until('postgres', q{
 		SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
 	}) or die 'the build did not pause';

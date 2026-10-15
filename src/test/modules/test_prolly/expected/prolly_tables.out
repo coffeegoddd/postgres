@@ -1,0 +1,229 @@
+-- Prolly tables: heap's pages in block-mapped storage, beside heap tables.
+-- A relation is block-mapped if it has a map fork.
+CREATE FUNCTION pg_temp.block_mapped(rel regclass) RETURNS bool
+LANGUAGE sql AS $$
+  SELECT (pg_stat_file(pg_relation_filepath(rel) || '_bmap', true)).size IS NOT NULL
+$$;
+CREATE FUNCTION pg_temp.storage(tbl regclass) RETURNS TABLE (rel text, block_mapped bool)
+LANGUAGE sql AS $$
+  SELECT 'table', pg_temp.block_mapped(tbl)
+  UNION ALL
+  SELECT 'toast', pg_temp.block_mapped(reltoastrelid)
+    FROM pg_class WHERE oid = tbl AND reltoastrelid <> 0
+  UNION ALL
+  SELECT 'index ' || indexrelid::regclass, pg_temp.block_mapped(indexrelid)
+    FROM pg_index WHERE indrelid = tbl
+  ORDER BY 1
+$$;
+CREATE TABLE p (id int PRIMARY KEY, t text) USING prolly;
+CREATE TABLE h (id int PRIMARY KEY, t text);
+SELECT amname FROM pg_am JOIN pg_class ON relam = pg_am.oid WHERE relname = 'p';
+ amname 
+--------
+ prolly
+(1 row)
+
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+SELECT * FROM pg_temp.storage('h');
+     rel      | block_mapped 
+--------------+--------------
+ index h_pkey | f
+ table        | f
+ toast        | f
+(3 rows)
+
+-- Rows, out-of-line values, an index scan.
+INSERT INTO p SELECT g, repeat(md5(g::text), 100) FROM generate_series(1, 2000) g;
+UPDATE p SET t = 'short' WHERE id % 10 = 0;
+DELETE FROM p WHERE id % 7 = 0;
+SELECT count(*), sum(length(t)) FROM p;
+ count |   sum   
+-------+---------
+  1715 | 4938460
+(1 row)
+
+SET enable_seqscan = off;
+SELECT id, length(t) FROM p WHERE id BETWEEN 9 AND 11 ORDER BY id;
+ id | length 
+----+--------
+  9 |   3200
+ 10 |      5
+ 11 |   3200
+(3 rows)
+
+RESET enable_seqscan;
+SELECT pg_relation_size('p') > 0 AS has_size;
+ has_size 
+----------
+ t
+(1 row)
+
+-- Storage made anew stays block-mapped.
+VACUUM p;
+VACUUM FULL p;
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+CLUSTER p USING p_pkey;
+REINDEX TABLE p;
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+TRUNCATE p;
+INSERT INTO p VALUES (1, 'one');
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+SELECT * FROM p;
+ id |  t  
+----+-----
+  1 | one
+(1 row)
+
+-- Changing the access method moves the storage.
+ALTER TABLE p SET ACCESS METHOD heap;
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | f
+ table        | f
+ toast        | f
+(3 rows)
+
+ALTER TABLE p SET ACCESS METHOD prolly;
+SELECT * FROM pg_temp.storage('p');
+     rel      | block_mapped 
+--------------+--------------
+ index p_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+SELECT * FROM p;
+ id |  t  
+----+-----
+  1 | one
+(1 row)
+
+ALTER TABLE h SET ACCESS METHOD prolly;
+SELECT * FROM pg_temp.storage('h');
+     rel      | block_mapped 
+--------------+--------------
+ index h_pkey | t
+ table        | t
+ toast        | t
+(3 rows)
+
+-- Prolly tables are permanent.
+CREATE UNLOGGED TABLE u (id int) USING prolly;
+ERROR:  prolly storage supports only permanent tables
+DETAIL:  Temporary and unlogged tables are never part of a commit.
+HINT:  Leave out USING, and the table is stored by heap.
+CREATE TEMPORARY TABLE tmp (id int) USING prolly;
+ERROR:  prolly storage supports only permanent tables
+DETAIL:  Temporary and unlogged tables are never part of a commit.
+HINT:  Leave out USING, and the table is stored by heap.
+ALTER TABLE p SET UNLOGGED;
+ERROR:  cannot change prolly table "p" to unlogged
+DETAIL:  Prolly tables are always permanent.
+HINT:  Use ALTER TABLE ... SET ACCESS METHOD heap first.
+CREATE UNLOGGED TABLE u (id int);
+ALTER TABLE u SET ACCESS METHOD prolly;
+ERROR:  prolly storage supports only permanent tables
+DETAIL:  Temporary and unlogged tables are never part of a commit.
+HINT:  Leave out USING, and the table is stored by heap.
+SET default_table_access_method = prolly;
+CREATE TEMPORARY TABLE tmp (id int);
+CREATE UNLOGGED TABLE u2 (id int);
+SELECT relname, amname FROM pg_class JOIN pg_am ON relam = pg_am.oid
+  WHERE relname IN ('tmp', 'u2') ORDER BY 1;
+ relname | amname 
+---------+--------
+ tmp     | heap
+ u2      | heap
+(2 rows)
+
+CREATE TABLE d (id int);
+SELECT * FROM pg_temp.storage('d');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+RESET default_table_access_method;
+-- Partitions, materialized views, CREATE TABLE AS.
+CREATE TABLE parted (id int, v text) PARTITION BY RANGE (id) USING prolly;
+CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100);
+CREATE TABLE parted_2 PARTITION OF parted FOR VALUES FROM (100) TO (200) USING heap;
+INSERT INTO parted SELECT g, 'v' FROM generate_series(0, 199) g;
+SELECT * FROM pg_temp.storage('parted_1');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+ toast | t
+(2 rows)
+
+SELECT * FROM pg_temp.storage('parted_2');
+  rel  | block_mapped 
+-------+--------------
+ table | f
+ toast | f
+(2 rows)
+
+SELECT count(*) FROM parted;
+ count 
+-------
+   200
+(1 row)
+
+CREATE MATERIALIZED VIEW mv USING prolly AS SELECT id FROM p;
+SELECT * FROM pg_temp.storage('mv');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+REFRESH MATERIALIZED VIEW mv;
+SELECT * FROM pg_temp.storage('mv');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+CREATE TABLE ctas USING prolly AS SELECT g AS id FROM generate_series(1, 100) g;
+SELECT * FROM pg_temp.storage('ctas');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+SELECT count(*) FROM ctas;
+ count 
+-------
+   100
+(1 row)
+
+DROP MATERIALIZED VIEW mv;
+DROP TABLE p, h, d, u, parted, ctas;

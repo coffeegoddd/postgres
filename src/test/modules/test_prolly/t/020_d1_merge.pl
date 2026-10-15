@@ -24,7 +24,7 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 sql(q{
 	CREATE TABLE m (id int PRIMARY KEY, v text, big text);
 	CREATE INDEX m_v ON m USING btree (v);
-	CREATE UNIQUE INDEX m_big ON m USING prolly (left(big, 20));
+	CREATE UNIQUE INDEX m_big ON m USING prolly_d1_index (left(big, 20));
 	INSERT INTO m SELECT g, 'v' || g, g || repeat('x', 3000) FROM generate_series(1, 10) g;
 	CREATE TABLE k (a int, b int);
 	INSERT INTO k VALUES (1, 1), (1, 1), (2, 2);

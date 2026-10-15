@@ -5,7 +5,7 @@
 # running, or committed after its snapshot) are found, so write skew fails
 # to serialize whichever order the reads and writes come in, while
 # transactions on different tables commit.  Temporary and unlogged tables
-# get heap when prolly is the default, an explicit USING prolly on one is
+# get heap when prolly is the default, an explicit USING prolly_d1_index on one is
 # refused, and a concurrent refresh of a prolly materialized view (which
 # diffs through a temporary table) works.  Prepared writers count.
 
@@ -115,7 +115,7 @@ is($node->safe_psql('postgres', q{
 my ($ret, $out, $err) = $node->psql('postgres',
 	'CREATE TEMP TABLE tp (id int) USING prolly_d1');
 like($err, qr/prolly storage supports only permanent tables/,
-	'an explicit USING prolly on a temporary table is refused');
+	'an explicit USING prolly_d1_index on a temporary table is refused');
 $node->safe_psql('postgres', q{
 	CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM x;
 	CREATE UNIQUE INDEX ON mv (id);

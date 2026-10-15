@@ -117,7 +117,7 @@ prolly_table_am_for_persistence(Oid amoid, char relpersistence, bool explicit)
 		return amoid;
 	}
 	amname = get_am_name(amoid);
-	prolly = prolly_is_table_am(amname);
+	prolly = prolly_is_table_am(amname) || amoid == PROLLY_TABLE_AM_OID;
 	if (amname)
 		pfree(amname);
 	if (!prolly)
@@ -129,6 +129,24 @@ prolly_table_am_for_persistence(Oid amoid, char relpersistence, bool explicit)
 				 errdetail("Temporary and unlogged tables are never part of a commit."),
 				 errhint("Leave out USING, and the table is stored by heap.")));
 	return HEAP_TABLE_AM_OID;
+}
+
+void
+prolly_check_unlogged(Relation rel)
+{
+	char	   *amname = get_am_name(rel->rd_rel->relam);
+	bool		prolly = prolly_is_table_am(amname) ||
+		rel->rd_rel->relam == PROLLY_TABLE_AM_OID;
+
+	if (amname)
+		pfree(amname);
+	if (prolly)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change prolly table \"%s\" to unlogged",
+						RelationGetRelationName(rel)),
+				 errdetail("Prolly tables are always permanent."),
+				 errhint("Use ALTER TABLE ... SET ACCESS METHOD heap first.")));
 }
 
 void
@@ -158,7 +176,7 @@ prolly_note_tablespace(Oid amoid, const char *tablespacename)
 	if (tablespacename == NULL || !OidIsValid(amoid))
 		return;
 	amname = get_am_name(amoid);
-	if (amname && (prolly_is_table_am(amname) || strcmp(amname, "prolly") == 0))
+	if (amname && (prolly_is_table_am(amname) || strcmp(amname, "prolly_d1_index") == 0))
 		ereport(NOTICE,
 				(errmsg("prolly relations ignore tablespaces; tablespace \"%s\" is not used",
 						tablespacename),

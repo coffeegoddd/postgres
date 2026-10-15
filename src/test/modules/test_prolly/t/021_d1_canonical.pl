@@ -34,7 +34,7 @@ my $schema_a = q{
 	ALTER TABLE t DROP COLUMN extra;
 	ALTER TABLE t ADD COLUMN score pos DEFAULT 5;
 	CREATE INDEX t_name ON t (name);
-	CREATE UNIQUE INDEX t_m ON t USING prolly (name, id);
+	CREATE UNIQUE INDEX t_m ON t USING prolly_d1_index (name, id);
 	CREATE TABLE k (v text);
 	INSERT INTO k VALUES ('x'), ('x'), ('y');
 	CREATE TABLE d (id int PRIMARY KEY);
@@ -51,7 +51,7 @@ my $schema_b = q{
 	CREATE DOMAIN pos AS int CHECK (VALUE > 0);
 	CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
 	CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL, m mood, p pair, score pos DEFAULT 5);
-	CREATE UNIQUE INDEX t_m ON t USING prolly (name, id);
+	CREATE UNIQUE INDEX t_m ON t USING prolly_d1_index (name, id);
 	INSERT INTO t SELECT g, 'n' || g, 'ok', ROW(g, 'y')::pair, 5 FROM generate_series(200, 1, -1) g;
 	CREATE INDEX t_name ON t (name);
 	CREATE SEQUENCE ids START 100;

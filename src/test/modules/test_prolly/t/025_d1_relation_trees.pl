@@ -25,7 +25,7 @@ sub sql { return $node->safe_psql($_[1] // 'v', $_[0]); }
 
 sql(q{
 	CREATE TABLE t (id int PRIMARY KEY, v text);
-	CREATE INDEX t_id ON t USING prolly (id);
+	CREATE INDEX t_id ON t USING prolly_d1_index (id);
 	INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 5) g;
 	SELECT dolt_commit('-m', 'base');
 	SELECT dolt_branch('b');

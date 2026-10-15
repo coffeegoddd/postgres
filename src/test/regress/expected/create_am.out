@@ -133,12 +133,13 @@ SELECT amname, amhandler, amtype FROM pg_am where amtype = 't' ORDER BY 1, 2;
 ------------+----------------------------+--------
  heap       | heap_tableam_handler       | t
  heap2      | heap_tableam_handler       | t
+ prolly     | prolly_tableam_handler     | t
  prolly_d1  | prolly_d1_tableam_handler  | t
  prolly_d2  | prolly_d2_tableam_handler  | t
  prolly_d3a | prolly_d3a_tableam_handler | t
  prolly_d3b | prolly_d3b_tableam_handler | t
  prolly_d4  | prolly_d4_tableam_handler  | t
-(7 rows)
+(8 rows)
 
 -- First create tables employing the new AM using USING
 -- plain CREATE TABLE

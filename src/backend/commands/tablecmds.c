@@ -17191,6 +17191,8 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	/* if it's a match, phase 3 doesn't need to do anything */
 	if (rel->rd_rel->relam == amoid)
 		return;
+	(void) prolly_table_am_for_persistence(amoid, rel->rd_rel->relpersistence,
+										   true);
 	prolly_check_versioned_am(amoid, rel->rd_rel->relpersistence);
 
 	/* Save info for Phase 3 to do the real work */
@@ -19555,6 +19557,7 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 			if (toLogged)
 				/* nothing to do */
 				return;
+			prolly_check_unlogged(rel);
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 			if (!toLogged)

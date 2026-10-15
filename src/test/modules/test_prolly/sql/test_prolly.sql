@@ -46,14 +46,14 @@ WHERE c.relname = 'prolly_heap';
 -- building an index reaches the stub.
 --
 SELECT opcname, opcintype::regtype
-FROM pg_opclass WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly')
+FROM pg_opclass WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly_d1_index')
 ORDER BY opcname;
 SELECT amvalidate(oid) FROM pg_opclass
-WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly');
-CREATE INDEX ON prolly_heap USING prolly (a);
-CREATE INDEX ON prolly_heap USING prolly (b);
-CREATE INDEX ON prolly_heap USING prolly (c);
-CREATE INDEX ON prolly_heap USING prolly (a, c);
+WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly_d1_index');
+CREATE INDEX ON prolly_heap USING prolly_d1_index (a);
+CREATE INDEX ON prolly_heap USING prolly_d1_index (b);
+CREATE INDEX ON prolly_heap USING prolly_d1_index (c);
+CREATE INDEX ON prolly_heap USING prolly_d1_index (a, c);
 DROP TABLE prolly_heap;
 
 --

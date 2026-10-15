@@ -14,7 +14,7 @@ PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
-REGRESS = test_prolly d1_tables d1_index d1_maintenance
+REGRESS = test_prolly d1_tables d1_index d1_maintenance prolly_tables
 TAP_TESTS = 1
 EXTRA_INSTALL = contrib/tsm_system_rows
 

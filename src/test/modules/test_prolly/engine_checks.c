@@ -1121,7 +1121,7 @@ ixkeying_entries_body(const ProllyImplInfo *impl)
 
 	run_sql(psprintf("CREATE TABLE conf_ix (a int, b text COLLATE \"C\") USING prolly_%s",
 					 engine));
-	run_sql("CREATE INDEX conf_ix_ab ON conf_ix USING prolly (a, b DESC)");
+	run_sql("CREATE INDEX conf_ix_ab ON conf_ix USING prolly_d1_index (a, b DESC)");
 	heap = table_open(RelnameGetRelid("conf_ix"), AccessShareLock);
 	index = index_open(RelnameGetRelid("conf_ix_ab"), AccessShareLock);
 	k = PROLLY_CALL(kr, open, index, NULL, CurrentMemoryContext);

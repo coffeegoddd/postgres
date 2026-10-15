@@ -137,8 +137,8 @@ SELECT (SELECT sum(id) FROM big TABLESAMPLE SYSTEM (10) REPEATABLE (5)) =
 -- Bitmap scans of prolly indexes, combined.
 CREATE TABLE bm (id int PRIMARY KEY, g int, s text);
 INSERT INTO bm SELECT i, i % 50, 'x' || (i % 7) FROM generate_series(1, 50000) i;
-CREATE INDEX bm_g ON bm USING prolly (g);
-CREATE INDEX bm_s ON bm USING prolly (s);
+CREATE INDEX bm_g ON bm USING prolly_d1_index (g);
+CREATE INDEX bm_s ON bm USING prolly_d1_index (s);
 ANALYZE bm;
 SET enable_seqscan = off;
 SET enable_indexscan = off;
@@ -154,7 +154,7 @@ ROLLBACK;
 -- Lossy pages: every row of a page is looked up, and rechecked.
 CREATE TABLE wide (id int PRIMARY KEY, g int);
 INSERT INTO wide SELECT i, i % 3 FROM generate_series(1, 400000) i;
-CREATE INDEX wide_g ON wide USING prolly (g);
+CREATE INDEX wide_g ON wide USING prolly_d1_index (g);
 ANALYZE wide;
 SET work_mem = '64kB';
 CREATE FUNCTION lossy_blocks(query text) RETURNS bool

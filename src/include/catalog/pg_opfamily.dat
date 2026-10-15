@@ -311,10 +311,10 @@
 
 # prolly index operator families follow the btree contract
 { oid => '9390',
-  opfmethod => 'prolly', opfname => 'int4_ops' },
+  opfmethod => 'prolly_d1_index', opfname => 'int4_ops' },
 { oid => '9391',
-  opfmethod => 'prolly', opfname => 'int8_ops' },
+  opfmethod => 'prolly_d1_index', opfname => 'int8_ops' },
 { oid => '9392',
-  opfmethod => 'prolly', opfname => 'text_ops' },
+  opfmethod => 'prolly_d1_index', opfname => 'text_ops' },
 
 ]
