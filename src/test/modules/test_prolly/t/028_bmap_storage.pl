@@ -175,4 +175,33 @@ is($standby->safe_psql('postgres', 'SELECT pad FROM big WHERE id = 100001'), 'pr
 
 $standby->stop;
 $primary->stop;
+
+# At wal_level minimal, a table made in its transaction syncs its pages at
+# commit instead of logging them.  Replaying an earlier table's allocation
+# zeroes that table's blocks again; if the new table had reused them after
+# the earlier one was dropped, nothing would restore its rows.  So such a
+# table never takes freed blocks.
+my $minimal = PostgreSQL::Test::Cluster->new('bmap_minimal');
+$minimal->init;
+$minimal->append_conf('postgresql.conf', qq{
+debug_block_mapped_heap = on
+wal_level = minimal
+max_wal_senders = 0
+wal_skip_threshold = 0
+autovacuum = off
+});
+$minimal->start;
+$minimal->safe_psql('postgres', 'CREATE TABLE old_t (id int)');
+$minimal->safe_psql('postgres', 'CHECKPOINT');
+$minimal->safe_psql('postgres', 'INSERT INTO old_t SELECT generate_series(1, 10000)');
+$minimal->safe_psql('postgres', 'DROP TABLE old_t');
+$minimal->safe_psql('postgres',
+	'CREATE TABLE new_t AS SELECT generate_series(20001, 30000) AS id');
+# no scan before the crash: a hint bit's full-page image would hide the loss
+$minimal->stop('immediate');
+$minimal->start;
+is($minimal->safe_psql('postgres', 'SELECT count(*) FROM new_t'), '10000',
+	'a table whose pages skipped WAL keeps them through redo of earlier allocations');
+$minimal->stop;
+
 done_testing();

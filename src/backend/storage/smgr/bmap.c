@@ -745,8 +745,14 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	new_nfree = meta->nfree;
 	new_hint = meta->hint;
 
-	/* freed blocks first */
-	if (nneed > 0 && meta->nfree > 0)
+	/*
+	 * Freed blocks first, except for a relation whose data skips WAL (made
+	 * in this transaction at wal_level minimal): its pages are synced at
+	 * commit, not logged, so nothing in redo would restore them if replaying
+	 * an earlier record of the block's previous owner zeroed them.  Blocks
+	 * above the high-water mark were never in an earlier record.
+	 */
+	if (nneed > 0 && meta->nfree > 0 && !RelFileLocatorSkippingWAL(rel))
 	{
 		for (uint32 k = 0; k < meta->nbitmap && ntaken < nneed &&
 			 nbits < BMAP_SCAN_PAGES; k++)
@@ -1165,6 +1171,17 @@ drop_blocks(SMgrRelation reln)
 					blocks[n++] = entries[i].block;
 			UnlockReleaseBuffer(buf);
 
+#ifdef USE_ASSERT_CHECKING
+			/* the relation's pages have left shared buffers (bmappredrop) */
+			for (uint32 i = 0; i < BMAP_FANOUT; i++)
+			{
+				BlockNumber blk = (mapblk - 1) * BMAP_FANOUT + i;
+				PrefetchBufferResult r = PrefetchSharedBuffer(reln, MAIN_FORKNUM, blk);
+
+				Assert(!BufferIsValid(r.recent_buffer));
+			}
+#endif
+
 			qsort(blocks, n, sizeof(BlockNumber), cmp_block);
 			free_blocks(rel, blocks, n);
 		}
@@ -1409,8 +1426,19 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 void
 bmappredrop(SMgrRelation reln, bool isRedo)
 {
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber first = 0;
+
 	if (isRedo || !mdexists(reln, BMAP_FORKNUM))
 		return;
+
+	/*
+	 * The relation's pages leave shared buffers first: once a block is free,
+	 * another relation may be given it, and a dirty page still cached here
+	 * would be written onto it through this relation's map.  The map's own
+	 * pages stay until the blocks are freed.
+	 */
+	DropRelationBuffers(reln, &fork, 1, &first);
 	drop_blocks(reln);
 }
 
