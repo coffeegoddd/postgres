@@ -417,6 +417,10 @@ CREATE TABLE d1_seek (a int) USING prolly_d1;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 SELECT prolly_seek_sees_later_writes('d1_seek');
 SELECT count(*) FROM d1_seek;
+-- With committed rows a cursor has read before the tree is emptied.
+INSERT INTO d1_seek SELECT generate_series(1, 100);
+SELECT prolly_seek_sees_later_writes('d1_seek');
+SELECT count(*) FROM d1_seek;
 DROP TABLE d1_seek;
 
 DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled, d1_counted;
