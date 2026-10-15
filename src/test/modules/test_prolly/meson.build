@@ -61,6 +61,7 @@ tests += {
       't/019_d1_branches.pl',
       't/020_d1_merge.pl',
       't/021_d1_canonical.pl',
+      't/022_d1_dolt_sql.pl',
     ],
   },
 }

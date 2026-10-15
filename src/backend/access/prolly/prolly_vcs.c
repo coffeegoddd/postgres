@@ -164,7 +164,8 @@ prolly_diff(PG_FUNCTION_ARGS)
 
 	prolly_database_components(&components);
 	diff_merge = components.diff_merge;
-	PROLLY_CALL(diff_merge, diff, from_ref, to_ref, &collector.sink);
+	PROLLY_CALL(diff_merge, diff, from_ref, to_ref, InvalidOid,
+				&collector.sink);
 	return (Datum) 0;
 }
 
@@ -179,7 +180,7 @@ prolly_merge(PG_FUNCTION_ARGS)
 
 	prolly_database_components(&components);
 	diff_merge = components.diff_merge;
-	PROLLY_CALL(diff_merge, merge, branch, &commit_id);
+	PROLLY_CALL(diff_merge, merge, branch, NULL, 0, &commit_id);
 	PG_RETURN_TEXT_P(hash_to_text(&commit_id));
 }
 

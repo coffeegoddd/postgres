@@ -21,7 +21,9 @@
  * merge then records a commit with both heads as parents, of the working
  * set this transaction will commit: it holds the branch's commit lock from
  * the start, so nothing else changes the branch meanwhile.  The branch
- * must have no changes since its head commit.
+ * must have no changes since its head commit.  When the current head is
+ * the common ancestor, the merge fast-forwards instead (unless asked not
+ * to): the refs reset the branch to the other head and its working set.
  *
  * Until catalogs are versioned, every branch has the same tables, and a
  * table created on one branch has an empty tree on the others.
@@ -46,6 +48,7 @@
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -118,6 +121,13 @@ static void
 resolve_working_set(const ProllyRefsRoutine *refs, const char *ref,
 					ProllyHash *commit, ProllyNodeRef *ws)
 {
+	/* WORKING: the session branch's working set; no commit. */
+	if (strcmp(ref, "WORKING") == 0)
+	{
+		memset(commit, 0, sizeof(*commit));
+		(void) PROLLY_CALL(refs, working_set, NULL, ws);
+		return;
+	}
 	if (!PROLLY_CALL(refs, resolve, ref, commit))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -149,7 +159,8 @@ to_sink(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 }
 
 static void
-rows_diff(const char *from_ref, const char *to_ref, ProllyDiffSink *sink)
+rows_diff(const char *from_ref, const char *to_ref, Oid relid,
+		  ProllyDiffSink *sink)
 {
 	ProllyDatabaseComponents dc;
 	ProllyComponents c;
@@ -168,7 +179,7 @@ rows_diff(const char *from_ref, const char *to_ref, ProllyDiffSink *sink)
 	resolve_working_set(dc.refs, to_ref, &to_commit, &to_ws);
 	from = PROLLY_CALL(c.engine, roots_at, &from_ws);
 	to = PROLLY_CALL(c.engine, roots_at, &to_ws);
-	tables = prolly_tables();
+	tables = OidIsValid(relid) ? list_make1_oid(relid) : prolly_tables();
 	foreach(lc, tables)
 	{
 		Relation	rel = table_open(lfirst_oid(lc), AccessShareLock);
@@ -423,7 +434,8 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 }
 
 static void
-rows_merge(const char *branch, ProllyHash *commit_id)
+rows_merge(const char *branch, const char *message, int flags,
+		   ProllyHash *commit_id)
 {
 	ProllyDatabaseComponents dc;
 	ProllyComponents c;
@@ -441,7 +453,6 @@ rows_merge(const char *branch, ProllyHash *commit_id)
 	ProllyNodeRef merged;
 	List	   *tables;
 	ListCell   *lc;
-	char	   *message;
 
 	prolly_database_components(&dc);
 	prolly_components_for_engine(&prolly_engine_d1.info, &c);
@@ -464,6 +475,10 @@ rows_merge(const char *branch, ProllyHash *commit_id)
 		*commit_id = ours_c;	/* already merged */
 		return;
 	}
+	if (strcmp(branch, "WORKING") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot merge WORKING")));
 
 	/*
 	 * Nothing else commits to the branch until this transaction ends, and
@@ -477,6 +492,18 @@ rows_merge(const char *branch, ProllyHash *commit_id)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current prolly branch has changes since its last commit"),
 				 errhint("Commit them before merging.")));
+
+	/* The current head is an ancestor of branch's: move up to it. */
+	if (same_hash(&base_c, &ours_c) && !(flags & PROLLY_MERGE_NO_FF))
+	{
+		char	   *hex = palloc(theirs_c.len * 2 + 1);
+
+		hex_encode((const char *) theirs_c.bytes, theirs_c.len, hex);
+		hex[theirs_c.len * 2] = '\0';
+		PROLLY_CALL(dc.refs, reset, hex);
+		*commit_id = theirs_c;
+		return;
+	}
 	(void) PROLLY_CALL(dc.refs, commit_working_set, &base_c, &base_ws);
 	base = PROLLY_CALL(c.engine, roots_at, &base_ws);
 	ours = PROLLY_CALL(c.engine, roots_at, &ours_ws);
@@ -521,7 +548,8 @@ rows_merge(const char *branch, ProllyHash *commit_id)
 	PROLLY_CALL(c.engine, pending_root, &merged);
 	parents[0] = ours_c;
 	parents[1] = theirs_c;
-	message = psprintf("Merge branch '%s'", branch);
+	if (message == NULL)
+		message = psprintf("Merge branch '%s'", branch);
 	PROLLY_CALL(dc.refs, commit_with, message, parents, 2, &merged, commit_id);
 	PROLLY_CALL(c.engine, roots_release, base);
 	PROLLY_CALL(c.engine, roots_release, ours);

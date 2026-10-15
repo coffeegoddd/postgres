@@ -1286,6 +1286,25 @@ drop table cchild;
 SELECT viewname, definition FROM pg_views
 WHERE schemaname = 'pg_catalog'
 ORDER BY viewname;
+dolt_branches| SELECT name,
+    hash,
+    latest_committer,
+    latest_committer_email,
+    latest_commit_date,
+    latest_commit_message,
+    dirty
+   FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty);
+dolt_log| SELECT commit_hash,
+    committer,
+    email,
+    date,
+    message,
+    commit_order
+   FROM dolt_log('HEAD'::text) dolt_log(commit_hash, committer, email, date, message, commit_order);
+dolt_status| SELECT table_name,
+    staged,
+    status
+   FROM dolt_status() dolt_status(table_name, staged, status);
 pg_aios| SELECT pid,
     io_id,
     io_generation,

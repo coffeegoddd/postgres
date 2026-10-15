@@ -25,6 +25,7 @@
 #include "access/session.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/prolly_xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/namespace.h"
@@ -726,6 +727,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 			 char *out_dbname)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
+	char	   *connect_branch = NULL;
 	bool		am_superuser;
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
@@ -1061,7 +1063,19 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		HeapTuple	tuple;
 		Form_pg_database dbform;
 
+		/*
+		 * "dbname/branch" connects to dbname with the prolly branch checked
+		 * out, as Doltgres does, unless a database has that whole name.
+		 */
 		tuple = GetDatabaseTuple(in_dbname);
+		if (!HeapTupleIsValid(tuple) && strchr(in_dbname, '/') != NULL)
+		{
+			const char *slash = strchr(in_dbname, '/');
+
+			connect_branch = pstrdup(slash + 1);
+			in_dbname = pnstrdup(in_dbname, slash - in_dbname);
+			tuple = GetDatabaseTuple(in_dbname);
+		}
 		if (!HeapTupleIsValid(tuple))
 			ereport(FATAL,
 					(errcode(ERRCODE_UNDEFINED_DATABASE),
@@ -1278,6 +1292,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	if ((flags & INIT_PG_LOAD_SESSION_LIBS) != 0)
 		process_session_preload_libraries();
+
+	/* Prolly's session state, and the branch the connection asked for. */
+	if (!bootstrap)
+		prolly_session_init(connect_branch);
 
 	/* fill in the remainder of this entry in the PgBackendStatus array */
 	if (!bootstrap)
