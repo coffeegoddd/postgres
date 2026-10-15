@@ -510,6 +510,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     fixed by the format, about 2 KB (near TOAST's threshold). Its canonical
     bytes are uncompressed, so a hash never depends on a compression
     method's version; compressing pages is a later storage choice.
+    **Built (4f.1):** in the tree layer, for every tree; chunks keyed by
+    offset for now.
 49. **What reclamation must keep.** Reachability from branch heads alone
     isn't enough.
     **Recommended (2026-10-14), for 4f:** the live roots are every

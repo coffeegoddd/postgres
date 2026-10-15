@@ -17,6 +17,9 @@
  *
  *	uint16 key length, uint16 value length (big-endian), key, value
  *
+ * The value length's top bit is the item's PROLLY_ITEM_VALUE_REF flag
+ * (values are shorter than a page, so the bit is free).
+ *
  * with no padding, so it depends only on the level and the items and is the
  * same on every platform.  It is contiguous, from the end of the page header
  * to pd_lower.
@@ -54,6 +57,10 @@
 #define INTERNAL_ENTRY_SIZE	(sizeof(uint16) + sizeof(BlockNumber))
 
 #define CANONICAL_START		SizeOfPageHeaderData
+
+/* The value length's flag bit, and its length bits. */
+#define VLEN_REF			0x8000
+#define VLEN_MASK			0x7FFF
 
 static inline uint16
 get_be16(const char *p)
@@ -126,7 +133,8 @@ basic_item_count(Page page)
 }
 
 static void
-basic_item_get(Page page, int index, ProllyKey *key, ProllyValue *value)
+basic_item_get(Page page, int index, ProllyKey *key, ProllyValue *value,
+			   uint8 *flags)
 {
 	const char *item;
 	uint16		klen;
@@ -139,7 +147,9 @@ basic_item_get(Page page, int index, ProllyKey *key, ProllyValue *value)
 	key->data = (const uint8 *) item + ITEM_HEADER_SIZE;
 	key->len = klen;
 	value->data = (const uint8 *) item + ITEM_HEADER_SIZE + klen;
-	value->len = vlen;
+	value->len = vlen & VLEN_MASK;
+	if (flags)
+		*flags = (vlen & VLEN_REF) ? PROLLY_ITEM_VALUE_REF : 0;
 }
 
 static Size
@@ -158,7 +168,7 @@ basic_free_space(Page page)
 
 static bool
 basic_item_append(Page page, const ProllyKey *key, const ProllyValue *value,
-				  BlockNumber hint)
+				  BlockNumber hint, uint8 flags)
 {
 	PageHeader	phdr = (PageHeader) page;
 	uint16		level = basic_page_level(page);
@@ -169,14 +179,15 @@ basic_item_append(Page page, const ProllyKey *key, const ProllyValue *value,
 	char	   *entry;
 	uint16		off = phdr->pd_lower;
 
-	if (key->len > PG_UINT16_MAX || value->len > PG_UINT16_MAX ||
+	if (key->len > PG_UINT16_MAX || value->len > VLEN_MASK ||
 		basic_item_space(level, key, value) > basic_free_space(page) ||
 		count == PG_UINT16_MAX)
 		return false;
 
 	item = (char *) page + phdr->pd_lower;
 	put_be16(item, (uint16) key->len);
-	put_be16(item + sizeof(uint16), (uint16) value->len);
+	put_be16(item + sizeof(uint16), (uint16) value->len |
+			 ((flags & PROLLY_ITEM_VALUE_REF) ? VLEN_REF : 0));
 	memcpy(item + ITEM_HEADER_SIZE, key->data, key->len);
 	memcpy(item + ITEM_HEADER_SIZE + key->len, value->data, value->len);
 
@@ -266,7 +277,8 @@ basic_page_check(Page page, char **detail)
 			*detail = psprintf("item %d header runs past the canonical region", i);
 			return false;
 		}
-		off += ITEM_HEADER_SIZE + get_be16(item) + get_be16(item + sizeof(uint16));
+		off += ITEM_HEADER_SIZE + get_be16(item) +
+			(get_be16(item + sizeof(uint16)) & VLEN_MASK);
 		if (off > phdr->pd_lower)
 		{
 			*detail = psprintf("item %d runs past the canonical region", i);

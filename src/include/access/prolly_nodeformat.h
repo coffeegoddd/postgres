@@ -16,6 +16,10 @@
  *   canonical region, so they never affect the hash.  Leaves have none.
  * - The canonical region depends only on the node's items and level, never
  *   on how or in what order they were written.
+ * - A leaf item's value may refer to another tree (a large value stored
+ *   out of line) instead of holding the bytes: the item's flags say so
+ *   (PROLLY_ITEM_VALUE_REF), and they are part of the canonical region, so
+ *   walks, reclamation and transfer can find every such reference.
  * - Callbacks don't lock or pin; the caller holds the buffer appropriately.
  *
  * Provisional (v0).
@@ -31,6 +35,9 @@
 #include "access/prolly_types.h"
 #include "storage/bufpage.h"
 
+/* Item flags. */
+#define PROLLY_ITEM_VALUE_REF	0x01	/* the value refers to a value tree */
+
 typedef struct ProllyNodeFormatRoutine
 {
 	ProllyImplInfo info;
@@ -41,9 +48,12 @@ typedef struct ProllyNodeFormatRoutine
 	uint16		(*page_level) (Page page);
 	int			(*item_count) (Page page);
 
-	/* Item index (0-based); key and value point into the page. */
+	/*
+	 * Item index (0-based); key and value point into the page.  Sets
+	 * *flags (PROLLY_ITEM_*) unless flags is NULL.
+	 */
 	void		(*item_get) (Page page, int index, ProllyKey *key,
-							 ProllyValue *value);
+							 ProllyValue *value, uint8 *flags);
 
 	/*
 	 * Append an item after the last one; false if it doesn't fit.  hint is
@@ -51,7 +61,8 @@ typedef struct ProllyNodeFormatRoutine
 	 * and is ignored in a leaf.
 	 */
 	bool		(*item_append) (Page page, const ProllyKey *key,
-								const ProllyValue *value, BlockNumber hint);
+								const ProllyValue *value, BlockNumber hint,
+								uint8 flags);
 
 	/* The item's block hint; InvalidBlockNumber in a leaf or if unknown. */
 	BlockNumber (*item_hint) (Page page, int index);

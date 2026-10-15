@@ -90,7 +90,7 @@ fill_page(const ProllyNodeFormatRoutine *nf, Page page, uint16 level,
 	for (int i = first; i < first + n; i++)
 	{
 		test_item(i, keybuf, valbuf, &key, &value);
-		if (!PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i)))
+		if (!PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i), 0))
 			elog(ERROR, "item %d did not fit in an empty-enough page", i);
 	}
 }
@@ -120,7 +120,7 @@ nodeformat_items_round_trip(const ProllyImplInfo *impl)
 			BlockNumber hint = PROLLY_CALL(nf, item_hint, page, i);
 
 			test_item(i, keybuf, valbuf, &want_key, &want_value);
-			PROLLY_CALL(nf, item_get, page, i, &key, &value);
+			PROLLY_CALL(nf, item_get, page, i, &key, &value, NULL);
 			if (key.len != want_key.len ||
 				memcmp(key.data, want_key.data, key.len) != 0)
 				elog(ERROR, "level %u item %d has the wrong key", level, i);
@@ -172,7 +172,7 @@ nodeformat_space_accounting(const ProllyImplInfo *impl)
 		test_item(i, keybuf, valbuf, &key, &value);
 		need = PROLLY_CALL(nf, item_space, 1, &key, &value);
 		before = PROLLY_CALL(nf, free_space, page);
-		ok = PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i));
+		ok = PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i), 0);
 
 		if (ok != (need <= before))
 			elog(ERROR, "item %d of %zu bytes %s with %zu bytes free",
@@ -241,7 +241,7 @@ nodeformat_canonical_bytes(const ProllyImplInfo *impl)
 		ProllyValue value;
 
 		test_item(i, keybuf, valbuf, &key, &value);
-		PROLLY_CALL(nf, item_append, b, &key, &value, InvalidBlockNumber);
+		PROLLY_CALL(nf, item_append, b, &key, &value, InvalidBlockNumber, 0);
 	}
 	canonical_copy(nf, b, &cb);
 	if (ca.len != cb.len || memcmp(ca.data, cb.data, ca.len) != 0)
