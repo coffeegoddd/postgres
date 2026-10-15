@@ -133,11 +133,19 @@ typedef struct ProllyRowIdRoutine
 							  TransactionId horizon, ItemPointer *tids);
 	void		(*tid_forget) (Relation rel, const ItemPointerData *tids,
 							   int ntids, CommandId cid);
+
+	/*
+	 * New storage at to replaces rel's (TRUNCATE, a rewrite): TIDs given out
+	 * from it must not be any rel has given out, as other branches and
+	 * commits keep rows with those.
+	 */
+	void		(*counter_carry) (Relation rel, const RelFileLocator *to);
 } ProllyRowIdRoutine;
 
 #define PROLLY_ROWID_CALLBACK_NAMES \
 	"tid_assign", "scan_begin", "tid_find", "scan_end", "tid_resolve", \
-	"tid_retire", "tid_renew", "tid_rename", "dead_tids", "tid_forget"
+	"tid_retire", "tid_renew", "tid_rename", "dead_tids", "tid_forget", \
+	"counter_carry"
 #define PROLLY_ROWID_FIRST_CALLBACK tid_assign
 
 static inline const ProllyRowIdRoutine *

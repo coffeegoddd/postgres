@@ -17,8 +17,10 @@
  * RESERVE_TIDS numbers at a time, WAL-logging the page (generic WAL), and
  * hands them out from memory, as sequences cache values; numbers reserved
  * but not handed out (the backend exits, the server crashes) are skipped.
- * The page is created on first use.  New storage (TRUNCATE, rewrites)
- * starts a new counter, as its indexes are rebuilt; SET TABLESPACE and
+ * The page is created on first use.  New storage that replaces a table's
+ * (TRUNCATE, rewrites) goes on from the old counter (counter_carry): other
+ * branches and commits keep the table's rows with their TIDs, so a TID
+ * must stay unique to the table, whatever its storage.  SET TABLESPACE and
  * CREATE DATABASE copy the page with the table.
  *
  * TIDs VACUUM forgets are given out again: they go on a stack of free
@@ -423,6 +425,57 @@ next_number(Relation rel)
 		UnlockReleaseBuffer(buf);
 	}
 	return res->next++;
+}
+
+static void
+counter_carry(Relation rel, const RelFileLocator *to)
+{
+	uint64		from = 0;
+	SMgrRelation dst = smgropen(*to, INVALID_PROC_NUMBER);
+	Buffer		buf;
+	GenericXLogState *state;
+	Page		page;
+	CounterPageData *cp;
+
+	/* How far rel's numbers have gone. */
+	if (RelationGetNumberOfBlocks(rel) > 0)
+	{
+		buf = counter_buffer(rel);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		from = counter_data(BufferGetPage(buf), rel)->reserved_to;
+		UnlockReleaseBuffer(buf);
+	}
+	if (from == 0)
+		return;
+
+	/* The new storage's counter, made or raised to go on from there. */
+	if (smgrnblocks(dst, MAIN_FORKNUM) == 0)
+	{
+		buf = ExtendBufferedRel(BMR_SMGR(dst, rel->rd_rel->relpersistence),
+								MAIN_FORKNUM, NULL, EB_LOCK_FIRST);
+		state = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		PageInit(page, BLCKSZ, sizeof(CounterPageData));
+		cp = (CounterPageData *) PageGetSpecialPointer(page);
+		cp->magic = COUNTER_MAGIC;
+		cp->version = COUNTER_VERSION;
+		cp->reserved_to = from;
+	}
+	else
+	{
+		buf = ReadBufferWithoutRelcache(*to, MAIN_FORKNUM, 0, RBM_NORMAL, NULL,
+										rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		state = GenericXLogStart(rel);
+		cp = counter_data(GenericXLogRegisterBuffer(state, buf, 0), rel);
+		cp->reserved_to = Max(cp->reserved_to, from);
+	}
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+
+	/* Numbers this backend reserved from the new storage come before. */
+	if (reservations)
+		(void) hash_search(reservations, to, HASH_REMOVE, NULL);
 }
 
 static void
@@ -1096,5 +1149,6 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.tid_renew = counter_tid_renew,
 	.tid_rename = counter_tid_rename,
 	.dead_tids = counter_dead_tids,
+	.counter_carry = counter_carry,
 	.tid_forget = counter_tid_forget,
 };

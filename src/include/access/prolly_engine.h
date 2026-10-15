@@ -84,10 +84,24 @@ typedef struct ProllyEngineRoutine
 	void		(*tree_reset) (Relation rel, ProllyTreeKind kind);
 
 	/*
-	 * Copy rel's trees, with the current transaction's writes, into new
-	 * storage at newrlocator (SET TABLESPACE, CLUSTER, VACUUM FULL).
+	 * Copy rel's trees, with the current transaction's writes, to relation
+	 * to's (CLUSTER, VACUUM FULL), as a private write.
+	 *
+	 * A relation's trees are its own on each branch, found by its OID:
+	 * a new relfilenumber (TRUNCATE, SET TABLESPACE, a rewrite) changes
+	 * nothing on other branches or in commits.
 	 */
-	void		(*tree_copy) (Relation rel, const RelFileLocator *newrlocator);
+	void		(*tree_copy) (Relation rel, Relation to);
+
+	/*
+	 * Exchange rel's trees with relation other's, as a private write: a
+	 * rewrite builds new contents in a new relation and swaps the two
+	 * (swap_relation_files); other has rel's columns, or no trees.
+	 */
+	void		(*tree_swap) (Relation rel, Oid other);
+
+	/* Remove rel's trees, as a private write (DROP). */
+	void		(*tree_drop) (Relation rel);
 
 	/*
 	 * The root set visible to snapshot: exactly one, consistent with
@@ -256,7 +270,7 @@ typedef struct ProllyEngineRoutine
 
 #define PROLLY_ENGINE_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
-	"tree_copy", \
+	"tree_copy", "tree_swap", "tree_drop", \
 	"roots_acquire", "roots_release", "roots_at", "diff", "pending_root", \
 	"tree_root", \
 	"cursor_open", "cursor_seek", \

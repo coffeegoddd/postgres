@@ -31,7 +31,7 @@
 #define NSLOTS		(PROLLY_NUM_SUBROOTS * NREL)
 
 /* Relids: catalog OIDs below FirstNormalObjectId, user ones above. */
-static RelFileNumber
+static Oid
 relnum_of(int sub, int i)
 {
 	return sub == PROLLY_SUBROOT_CATALOG ? 1000 + 3 * i : 16384 + 7 * i;
@@ -138,7 +138,7 @@ apply_to(Fixture *f, Ref *ref, const Ref *target, ProllyNodeRef *root)
 		if (ref->tree[s] == target->tree[s])
 			continue;
 		edits[n].sub = (ProllySubRoot) (s / NREL);
-		edits[n].relnumber = relnum_of(s / NREL, s % NREL);
+		edits[n].relid = relnum_of(s / NREL, s % NREL);
 		edits[n].is_remove = target->tree[s] == ABSENT;
 		if (!edits[n].is_remove)
 			edits[n].tree = f->trees[target->tree[s]];
@@ -177,7 +177,7 @@ typedef struct ScanSeen
 } ScanSeen;
 
 static void
-check_scanned(ProllySubRoot sub, RelFileNumber relnumber, const ProllyNodeRef *tree, void *arg)
+check_scanned(ProllySubRoot sub, Oid relid, const ProllyNodeRef *tree, void *arg)
 {
 	ScanSeen   *s = arg;
 
@@ -185,11 +185,11 @@ check_scanned(ProllySubRoot sub, RelFileNumber relnumber, const ProllyNodeRef *t
 		elog(ERROR, "scan of sub-root %d visited sub-root %d", s->sub, (int) sub);
 	while (s->next < NREL && s->ref->tree[s->sub * NREL + s->next] == ABSENT)
 		s->next++;
-	if (s->next >= NREL || relnum_of(s->sub, s->next) != relnumber)
+	if (s->next >= NREL || relnum_of(s->sub, s->next) != relid)
 		elog(ERROR, "scan of sub-root %d returned relnumber %u out of order or absent",
-			 s->sub, relnumber);
+			 s->sub, relid);
 	if (!same_hash(tree, &s->f->trees[s->ref->tree[s->sub * NREL + s->next]]))
-		elog(ERROR, "scan returned the wrong tree for relnumber %u", relnumber);
+		elog(ERROR, "scan returned the wrong tree for relnumber %u", relid);
 	s->next++;
 	s->n++;
 }
@@ -256,7 +256,7 @@ rootlayout_empty(const ProllyImplInfo *impl)
 
 		memset(&e, 0, sizeof(e));
 		e.sub = PROLLY_SUBROOT_USER_DATA;
-		e.relnumber = relnum_of(PROLLY_SUBROOT_USER_DATA, 0);
+		e.relid = relnum_of(PROLLY_SUBROOT_USER_DATA, 0);
 		e.is_remove = true;
 		PROLLY_CALL(f.rl, apply, &f.env, &a, NULL, 0, &b);
 		if (!same_hash(&a, &b))
@@ -396,7 +396,7 @@ rootlayout_subroots_independent(const ProllyImplInfo *impl)
 			ProllyNodeRef again;
 
 			e.sub = (ProllySubRoot) sub;
-			e.relnumber = relnum_of(sub, 5);
+			e.relid = relnum_of(sub, 5);
 			e.tree = f.trees[ref.tree[slot]];
 			e.is_remove = false;
 			PROLLY_CALL(f.rl, apply, &f.env, &root, &e, 1, &again);
@@ -468,7 +468,7 @@ rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl)
 			/* A real tree's reference, with its block hint, but a bad hash. */
 			memset(&e, 0, sizeof(e));
 			e.sub = (ProllySubRoot) sub;
-			e.relnumber = relnum_of(sub, 1);
+			e.relid = relnum_of(sub, 1);
 			e.tree = f.trees[3];
 			e.tree.hash.len = (uint8) bad_lengths[b];
 			e.is_remove = false;
@@ -491,10 +491,10 @@ rootlayout_apply_rejects_invalid_refs(const ProllyImplInfo *impl)
 
 		memset(&e, 0, sizeof(e));
 		e.sub = PROLLY_SUBROOT_USER_DATA;
-		e.relnumber = relnum_of(PROLLY_SUBROOT_USER_DATA, 1);
+		e.relid = relnum_of(PROLLY_SUBROOT_USER_DATA, 1);
 		e.tree = f.trees[3];
 		PROLLY_CALL(f.rl, apply, &f.env, &root, &e, 1, &newroot);
-		if (!PROLLY_CALL(f.rl, lookup, &f.env, &newroot, e.sub, e.relnumber, &got) ||
+		if (!PROLLY_CALL(f.rl, lookup, &f.env, &newroot, e.sub, e.relid, &got) ||
 			!same_hash(&got, &f.trees[3]))
 			elog(ERROR, "a valid reference was not stored after rejected ones");
 	}
@@ -510,26 +510,26 @@ typedef struct DiffSeen
 } DiffSeen;
 
 static int
-slot_of(ProllySubRoot sub, RelFileNumber relnumber)
+slot_of(ProllySubRoot sub, Oid relid)
 {
 	for (int i = 0; i < NREL; i++)
-		if (relnum_of(sub, i) == relnumber)
+		if (relnum_of(sub, i) == relid)
 			return sub * NREL + i;
-	elog(ERROR, "diff reported unknown relnumber %u", relnumber);
+	elog(ERROR, "diff reported unknown relnumber %u", relid);
 	return -1;					/* keep compiler quiet */
 }
 
 static void
-check_change(ProllyDiffKind kind, ProllySubRoot sub, RelFileNumber relnumber,
+check_change(ProllyDiffKind kind, ProllySubRoot sub, Oid relid,
 			 const ProllyNodeRef *before, const ProllyNodeRef *after, void *arg)
 {
 	DiffSeen   *d = arg;
-	int			s = slot_of(sub, relnumber);
+	int			s = slot_of(sub, relid);
 	int			ft = d->from->tree[s];
 	int			tt = d->to->tree[s];
 
 	if (s <= d->last)
-		elog(ERROR, "diff reported relnumber %u out of (sub-root, relnumber) order", relnumber);
+		elog(ERROR, "diff reported relnumber %u out of (sub-root, relid) order", relid);
 	d->last = s;
 	d->n++;
 	switch (kind)
@@ -537,19 +537,19 @@ check_change(ProllyDiffKind kind, ProllySubRoot sub, RelFileNumber relnumber,
 		case PROLLY_DIFF_ADDED:
 			if (ft != ABSENT || tt == ABSENT || before != NULL ||
 				!same_hash(after, &d->f->trees[tt]))
-				elog(ERROR, "diff: relnumber %u wrongly reported added", relnumber);
+				elog(ERROR, "diff: relnumber %u wrongly reported added", relid);
 			break;
 		case PROLLY_DIFF_REMOVED:
 			if (ft == ABSENT || tt != ABSENT || after != NULL ||
 				!same_hash(before, &d->f->trees[ft]))
-				elog(ERROR, "diff: relnumber %u wrongly reported removed", relnumber);
+				elog(ERROR, "diff: relnumber %u wrongly reported removed", relid);
 			break;
 		case PROLLY_DIFF_MODIFIED:
 			if (ft == ABSENT || tt == ABSENT ||
 				same_hash(&d->f->trees[ft], &d->f->trees[tt]) ||
 				!same_hash(before, &d->f->trees[ft]) ||
 				!same_hash(after, &d->f->trees[tt]))
-				elog(ERROR, "diff: relnumber %u wrongly reported modified", relnumber);
+				elog(ERROR, "diff: relnumber %u wrongly reported modified", relid);
 			break;
 	}
 }

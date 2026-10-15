@@ -19,4 +19,14 @@
  */
 extern void prolly_canonicalize_table(Relation rel);
 
+/*
+ * A rewrite swaps the storage of relations r1 and r2 (swap_relation_files,
+ * before the catalogs change): their trees on the current branch are
+ * swapped too, as trees are found by relation, not by storage.
+ */
+extern void prolly_swap_relations(Oid r1, Oid relam1, Oid r2, Oid relam2);
+
+/* rel, a prolly table or index, is being dropped: its trees go too. */
+extern void prolly_drop_relation(Relation rel);
+
 #endif							/* PROLLY_TABLEAM_H */

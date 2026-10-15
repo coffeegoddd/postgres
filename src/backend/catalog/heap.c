@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_tableam.h"
 #include "access/genam.h"
 #include "access/multixact.h"
 #include "access/relation.h"
@@ -1898,7 +1899,10 @@ heap_drop_with_catalog(Oid relid)
 	 * Schedule unlinking of the relation's physical files at commit.
 	 */
 	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+	{
+		prolly_drop_relation(rel);
 		RelationDropStorage(rel);
+	}
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(rel);

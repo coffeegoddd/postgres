@@ -36,7 +36,7 @@
  *   gives the empty root's hash.
  * - Which sub-root a relation belongs in is the caller's decision; the
  *   layout doesn't apply Postgres's catalog rules.
- * - apply() takes edits sorted by (sub-root, relnumber) with no duplicates.
+ * - apply() takes edits sorted by (sub-root, relid) with no duplicates.
  *   Setting a relation that is present replaces its tree; removing one that
  *   is absent does nothing.
  * - A relation's tree is referenced by hash only (no block hint), so the
@@ -76,22 +76,22 @@ typedef struct ProllyRootEnv
 	const ProllyTreeEnv *tree_env;
 } ProllyRootEnv;
 
-/* One change for apply(): set relnumber's tree in sub, or remove relnumber. */
+/* One change for apply(): set relid's tree in sub, or remove relid. */
 typedef struct ProllyRootEdit
 {
 	ProllySubRoot sub;
-	RelFileNumber relnumber;
+	Oid relid;
 	ProllyNodeRef tree;			/* ignored for a remove */
 	bool		is_remove;
 } ProllyRootEdit;
 
 /* Called for each relation in a sub-root (scan). */
-typedef void (*ProllyRootVisitRel) (ProllySubRoot sub, RelFileNumber relnumber,
+typedef void (*ProllyRootVisitRel) (ProllySubRoot sub, Oid relid,
 									const ProllyNodeRef *tree, void *arg);
 
 /* Called for each relation whose tree differs between two roots (diff). */
 typedef void (*ProllyRootVisitChange) (ProllyDiffKind kind, ProllySubRoot sub,
-									   RelFileNumber relnumber,
+									   Oid relid,
 									   const ProllyNodeRef *before,	/* NULL if added */
 									   const ProllyNodeRef *after,	/* NULL if removed */
 									   void *arg);
@@ -103,11 +103,11 @@ typedef struct ProllyRootLayoutRoutine
 	/* The root with no relations (every sub-root empty). */
 	void		(*empty) (const ProllyRootEnv *env, ProllyNodeRef *root);
 
-	/* Find relnumber's tree in sub; false if relnumber isn't there. */
+	/* Find relid's tree in sub; false if relid isn't there. */
 	bool		(*lookup) (const ProllyRootEnv *env, const ProllyNodeRef *root,
-						   ProllySubRoot sub, RelFileNumber relnumber, ProllyNodeRef *tree);
+						   ProllySubRoot sub, Oid relid, ProllyNodeRef *tree);
 
-	/* Apply edits (sorted by sub-root, then relnumber) to root, giving *new_root. */
+	/* Apply edits (sorted by sub-root, then relid) to root, giving *new_root. */
 	void		(*apply) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 						  const ProllyRootEdit *edits, int nedits,
 						  ProllyNodeRef *new_root);
@@ -116,7 +116,7 @@ typedef struct ProllyRootLayoutRoutine
 	void		(*subroot) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 							ProllySubRoot sub, ProllyNodeRef *subroot);
 
-	/* Visit each relation in sub, in relnumber order. */
+	/* Visit each relation in sub, in relation OID order. */
 	void		(*scan) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 						 ProllySubRoot sub, ProllyRootVisitRel visit, void *arg);
 
@@ -130,7 +130,7 @@ typedef struct ProllyRootLayoutRoutine
 
 	/*
 	 * Report each relation whose presence or tree differs between from and
-	 * to, once, in (sub-root, relnumber) order.  A sub-root with the same hash
+	 * to, once, in (sub-root, relid) order.  A sub-root with the same hash
 	 * in both is skipped.
 	 */
 	void		(*diff) (const ProllyRootEnv *env, const ProllyNodeRef *from,

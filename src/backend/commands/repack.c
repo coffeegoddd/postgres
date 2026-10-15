@@ -32,6 +32,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_tableam.h"
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
@@ -1690,6 +1691,11 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 	relfilenumber2 = relform2->relfilenode;
 	relam1 = relform1->relam;
 	relam2 = relform2->relam;
+
+	/* Prolly relations' trees, found by relation, are swapped too. */
+	if (RelFileNumberIsValid(relfilenumber1) &&
+		RelFileNumberIsValid(relfilenumber2))
+		prolly_swap_relations(r1, relam1, r2, relam2);
 
 	if (RelFileNumberIsValid(relfilenumber1) &&
 		RelFileNumberIsValid(relfilenumber2))
