@@ -110,6 +110,15 @@ typedef struct PrivateRefCountData
 	 * the buffer is not locked.
 	 */
 	BufferLockMode lockmode;
+
+#ifdef USE_ASSERT_CHECKING
+
+	/*
+	 * Locked exclusively without preparing the page for a change, which the
+	 * caller does before changing it (BufferPrepareForChange()).
+	 */
+	bool		unprepared;
+#endif
 } PrivateRefCountData;
 
 typedef struct PrivateRefCountEntry
@@ -402,6 +411,9 @@ NewPrivateRefCountEntry(Buffer buffer)
 	res->buffer = buffer;
 	res->data.refcount = 0;
 	res->data.lockmode = BUFFER_LOCK_UNLOCK;
+#ifdef USE_ASSERT_CHECKING
+	res->data.unprepared = false;
+#endif
 
 	/* update cache for the next lookup */
 	PrivateRefCountEntryLast = ReservedRefCountSlot;
@@ -671,8 +683,9 @@ static void AtProcExit_Buffers(int code, Datum arg);
 static void CheckForBufferLeaks(void);
 #ifdef USE_ASSERT_CHECKING
 static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
-static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr);
 #endif
+static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr);
+static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
 static int	rlocator_comparator(const void *p1, const void *p2);
 static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
@@ -3209,6 +3222,7 @@ MarkBufferDirty(Buffer buffer)
 
 	Assert(BufferIsPinned(buffer));
 	Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
+	Assert(!GetPrivateRefCountEntry(buffer, false)->data.unprepared);
 
 	/*
 	 * NB: We have to wait for the buffer header spinlock to be not held, as
@@ -5770,6 +5784,9 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		bool		wal_log = false;
 		uint64		buf_state;
 
+		if (unlikely(HintMayReachSharedPage(bufHdr)))
+			return;
+
 		/*
 		 * If we need to protect hint bit updates from torn writes, WAL-log a
 		 * full page image of the page. This full page image is only necessary
@@ -6343,6 +6360,9 @@ BufferLockDisownInternal(Buffer buffer, BufferDesc *buf_hdr)
 		elog(ERROR, "lock %d is not held", buffer);
 	mode = ref->data.lockmode;
 	ref->data.lockmode = BUFFER_LOCK_UNLOCK;
+#ifdef USE_ASSERT_CHECKING
+	ref->data.unprepared = false;
+#endif
 
 	return mode;
 }
@@ -6619,42 +6639,144 @@ UnlockBuffer(Buffer buffer)
 }
 
 /*
- * A buffer whose storage manager asked to prepare its page before it changes
- * (BM_SMGR_PREPARE) has just been locked exclusively: let it, so that a page
- * it shares with another relation is copied first.  Done once per time the
- * page is loaded, unless the storage manager marks it again
- * (MarkBufferedRelationShared()).  Not in recovery, which replays the
- * primary's preparations, nor before the page is valid.
+ * Pages a storage manager prepares before they change (BM_SMGR_PREPARE), so
+ * that a page it shares with another relation is copied first.  The flag is
+ * set when a page is loaded, and again when the storage manager begins
+ * sharing the relation's pages (MarkBufferedRelationShared()).  It is
+ * cleared once the page is prepared, or found not to be shared; a page
+ * found shared keeps it, with BM_SMGR_SHARED, until a change copies it.
  *
- * The flag is cleared before asking, so a mark made meanwhile is kept, and
- * set again if preparing fails, so a later change still asks.
+ * A check notes the marks made while it ran: marking sets BM_SMGR_REMARKED,
+ * which a check clears as it begins, and a check that finds it set again
+ * leaves the page as marked, since its answer may predate the sharing.
+ */
+
+static void
+BufferSmgrCheckBegin(BufferDesc *buf_hdr)
+{
+	uint64		buf_state = LockBufHdr(buf_hdr);
+
+	UnlockBufHdrExt(buf_hdr, buf_state, 0, BM_SMGR_REMARKED, 0);
+}
+
+static void
+BufferSmgrCheckEnd(BufferDesc *buf_hdr, bool shared)
+{
+	uint64		buf_state = LockBufHdr(buf_hdr);
+
+	if (buf_state & BM_SMGR_REMARKED)
+		UnlockBufHdr(buf_hdr);
+	else if (shared)
+		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_SHARED, 0, 0);
+	else
+		UnlockBufHdrExt(buf_hdr, buf_state,
+						0, BM_SMGR_PREPARE | BM_SMGR_SHARED, 0);
+}
+
+/*
+ * Prepare a page, locked exclusively, before it changes.  Not in recovery,
+ * which replays the primary's preparations, nor before the page is valid.
+ * An error leaves the page to be prepared by a later change.
  */
 static void
 PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr)
 {
-	uint64		buf_state;
-	SMgrRelation reln;
-
-	buf_state = pg_atomic_read_u64(&buf_hdr->state);
-	if (!(buf_state & BM_VALID) || RecoveryInProgress())
+	if (!(pg_atomic_read_u64(&buf_hdr->state) & BM_VALID) ||
+		RecoveryInProgress())
 		return;
 
-	buf_state = LockBufHdr(buf_hdr);
-	UnlockBufHdrExt(buf_hdr, buf_state, 0, BM_SMGR_PREPARE, 0);
+	BufferSmgrCheckBegin(buf_hdr);
+	smgrprepareforchange(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
+								  INVALID_PROC_NUMBER),
+						 BufTagGetForkNum(&buf_hdr->tag),
+						 buf_hdr->tag.blockNum, buffer);
+	BufferSmgrCheckEnd(buf_hdr, false);
+}
 
-	reln = smgropen(BufTagGetRelFileLocator(&buf_hdr->tag), INVALID_PROC_NUMBER);
-	PG_TRY();
-	{
-		smgrprepareforchange(reln, BufTagGetForkNum(&buf_hdr->tag),
-							 buf_hdr->tag.blockNum, buffer);
-	}
-	PG_CATCH();
-	{
-		buf_state = LockBufHdr(buf_hdr);
-		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_PREPARE, 0, 0);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+/*
+ * Is a page with BM_SMGR_PREPARE shared, so that preparing it copies it?
+ * Asked of the storage manager once, and remembered.  The caller holds the
+ * page's content lock, in any mode, so the page isn't being prepared
+ * meanwhile.
+ */
+static bool
+BufferSmgrPageIsShared(BufferDesc *buf_hdr)
+{
+	uint64		buf_state = pg_atomic_read_u64(&buf_hdr->state);
+	bool		shared;
+
+	if (!(buf_state & BM_SMGR_PREPARE))
+		return false;
+	if (buf_state & BM_SMGR_SHARED)
+		return true;
+
+	BufferSmgrCheckBegin(buf_hdr);
+	shared = smgrpageisshared(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
+									   INVALID_PROC_NUMBER),
+							  BufTagGetForkNum(&buf_hdr->tag),
+							  buf_hdr->tag.blockNum);
+	BufferSmgrCheckEnd(buf_hdr, shared);
+	return shared;
+}
+
+/*
+ * May a hint set on this page, if written out, reach another relation's
+ * page?  Then the page isn't dirtied for it: hints can be true of one
+ * relation alone (an index entry dead in it only).  The hint stays in the
+ * buffer, and is copied with the page when the page next changes.
+ *
+ * Recovery sets no hint of that kind.  A critical section can't ask the
+ * storage manager, and assumes the page shared.
+ */
+static bool
+HintMayReachSharedPage(BufferDesc *buf_hdr)
+{
+	if (likely(!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE)) ||
+		RecoveryInProgress())
+		return false;
+	if (CritSectionCount > 0)
+		return true;
+	return BufferSmgrPageIsShared(buf_hdr);
+}
+
+/*
+ * BufferPrepareForChange -- prepare a page locked without being prepared
+ *
+ * For a page locked by LockBufferForCleanupUnprepared() or
+ * ConditionalLockBufferForCleanupUnprepared(): called before the page
+ * changes, outside any critical section.  It may copy the page (a page its
+ * storage manager shares with another relation), which may error out.
+ */
+void
+BufferPrepareForChange(Buffer buffer)
+{
+	BufferDesc *buf_hdr;
+
+	Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
+	if (BufferIsLocal(buffer))
+		return;
+	buf_hdr = GetBufferDescriptor(buffer - 1);
+#ifdef USE_ASSERT_CHECKING
+	/* preparing it is a change of its own */
+	GetPrivateRefCountEntry(buffer, false)->data.unprepared = false;
+#endif
+	if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
+		PrepareBufferForChange(buffer, buf_hdr);
+}
+
+/*
+ * BufferPageIsShared -- would preparing the page for a change copy it?
+ *
+ * For changes worth skipping rather than paying a copy for.  The page must
+ * be locked, in any mode.
+ */
+bool
+BufferPageIsShared(Buffer buffer)
+{
+	Assert(BufferIsLockedByMe(buffer));
+	if (BufferIsLocal(buffer))
+		return false;
+	return BufferSmgrPageIsShared(GetBufferDescriptor(buffer - 1));
 }
 
 /*
@@ -6662,7 +6784,7 @@ PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr)
  * prepared before they next change
  *
  * For a storage manager that has just begun sharing the fork's pages with
- * another relation: pages already prepared (or loaded before) would
+ * another relation: pages already prepared (or found not shared) would
  * otherwise change in place.
  */
 void
@@ -6683,33 +6805,12 @@ MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum)
 		if (BufTagMatchesRelFileLocator(&buf_hdr->tag, &rlocator) &&
 			BufTagGetForkNum(&buf_hdr->tag) == forknum &&
 			(buf_state & BM_TAG_VALID))
-			UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_PREPARE, 0, 0);
+			UnlockBufHdrExt(buf_hdr, buf_state,
+							BM_SMGR_PREPARE | BM_SMGR_REMARKED,
+							BM_SMGR_SHARED, 0);
 		else
 			UnlockBufHdr(buf_hdr);
 	}
-}
-
-/*
- * BufferPageMayBeShared -- might a change to this page copy it first?
- *
- * For changes worth skipping rather than paying a copy for (opportunistic
- * pruning).  False for a page already prepared since it was loaded.  The
- * buffer must be pinned.
- */
-bool
-BufferPageMayBeShared(Buffer buffer)
-{
-	BufferDesc *buf_hdr;
-
-	if (BufferIsLocal(buffer))
-		return false;
-	buf_hdr = GetBufferDescriptor(buffer - 1);
-	if (!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
-		return false;
-	return smgrpageisshared(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
-									 INVALID_PROC_NUMBER),
-							BufTagGetForkNum(&buf_hdr->tag),
-							buf_hdr->tag.blockNum);
 }
 
 /*
@@ -6775,6 +6876,14 @@ ConditionalLockBuffer(Buffer buffer)
 
 	if (!BufferLockConditional(buffer, buf, BUFFER_LOCK_EXCLUSIVE))
 		return false;
+
+	/*
+	 * Preparing the page may copy it, which waits only for the storage
+	 * manager's own pages, never for another buffer's content lock: the
+	 * deadlocks callers avoid by not waiting can't arise.  Declining the
+	 * lock instead would make callers that retry until they get it (an
+	 * SP-GiST insertion) loop for as long as the page is shared.
+	 */
 	if (unlikely(pg_atomic_read_u64(&buf->state) & BM_SMGR_PREPARE))
 		PrepareBufferForChange(buffer, buf);
 	return true;
@@ -6804,6 +6913,23 @@ CheckBufferIsPinnedOnce(Buffer buffer)
 }
 
 /*
+ * A cleanup lock was just taken: prepare the page for a change, or note
+ * that it isn't.
+ */
+static void
+CleanupLockPrepare(Buffer buffer, BufferDesc *buf_hdr, bool prepare)
+{
+	if (likely(!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE)))
+		return;
+	if (prepare)
+		PrepareBufferForChange(buffer, buf_hdr);
+#ifdef USE_ASSERT_CHECKING
+	else if (!RecoveryInProgress())
+		GetPrivateRefCountEntry(buffer, false)->data.unprepared = true;
+#endif
+}
+
+/*
  * LockBufferForCleanup - lock a buffer in preparation for deleting items
  *
  * Items may be deleted from a disk page only when the caller (a) holds an
@@ -6819,8 +6945,8 @@ CheckBufferIsPinnedOnce(Buffer buffer)
  * LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE), except that it loops until
  * it has successfully observed pin count = 1.
  */
-void
-LockBufferForCleanup(Buffer buffer)
+static void
+LockBufferForCleanupInternal(Buffer buffer, bool prepare)
 {
 	BufferDesc *bufHdr;
 	TimestampTz waitStart = 0;
@@ -6851,7 +6977,7 @@ LockBufferForCleanup(Buffer buffer)
 		uint64		unset_bits = 0;
 
 		/* Try to acquire lock */
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		BufferLockAcquire(buffer, bufHdr, BUFFER_LOCK_EXCLUSIVE);
 		buf_state = LockBufHdr(bufHdr);
 
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
@@ -6985,7 +7111,27 @@ cleanup_lock_acquired:
 		waiting = false;
 	}
 
-	return;
+	CleanupLockPrepare(buffer, bufHdr, prepare);
+}
+
+void
+LockBufferForCleanup(Buffer buffer)
+{
+	LockBufferForCleanupInternal(buffer, true);
+}
+
+/*
+ * LockBufferForCleanupUnprepared - as LockBufferForCleanup, but the page
+ * isn't prepared for a change (copied, if its storage manager shares it
+ * with another relation)
+ *
+ * For callers that often change nothing, such as VACUUM, which visits every
+ * page: they call BufferPrepareForChange() before they change the page.
+ */
+void
+LockBufferForCleanupUnprepared(Buffer buffer)
+{
+	LockBufferForCleanupInternal(buffer, false);
 }
 
 /*
@@ -7018,8 +7164,8 @@ HoldingBufferPinThatDelaysRecovery(void)
  * We won't loop, but just check once to see if the pin count is OK.  If
  * not, return false with no lock held.
  */
-bool
-ConditionalLockBufferForCleanup(Buffer buffer)
+static bool
+ConditionalLockBufferForCleanupInternal(Buffer buffer, bool prepare)
 {
 	BufferDesc *bufHdr;
 	uint64		buf_state,
@@ -7046,11 +7192,11 @@ ConditionalLockBufferForCleanup(Buffer buffer)
 	if (refcount != 1)
 		return false;
 
-	/* Try to acquire lock */
-	if (!ConditionalLockBuffer(buffer))
+	/* Try to acquire lock; the page is prepared only once it's ours */
+	bufHdr = GetBufferDescriptor(buffer - 1);
+	if (!BufferLockConditional(buffer, bufHdr, BUFFER_LOCK_EXCLUSIVE))
 		return false;
 
-	bufHdr = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(bufHdr);
 	refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 
@@ -7059,6 +7205,7 @@ ConditionalLockBufferForCleanup(Buffer buffer)
 	{
 		/* Successfully acquired exclusive lock with pincount 1 */
 		UnlockBufHdr(bufHdr);
+		CleanupLockPrepare(buffer, bufHdr, prepare);
 		return true;
 	}
 
@@ -7066,6 +7213,22 @@ ConditionalLockBufferForCleanup(Buffer buffer)
 	UnlockBufHdr(bufHdr);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	return false;
+}
+
+bool
+ConditionalLockBufferForCleanup(Buffer buffer)
+{
+	return ConditionalLockBufferForCleanupInternal(buffer, true);
+}
+
+/*
+ * ConditionalLockBufferForCleanupUnprepared - as ConditionalLockBufferForCleanup,
+ * but the page isn't prepared for a change (see LockBufferForCleanupUnprepared)
+ */
+bool
+ConditionalLockBufferForCleanupUnprepared(Buffer buffer)
+{
+	return ConditionalLockBufferForCleanupInternal(buffer, false);
 }
 
 /*

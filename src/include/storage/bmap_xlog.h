@@ -83,16 +83,23 @@ typedef struct xl_bmap_unref
 } xl_bmap_unref;
 
 /*
- * REMAP's main data: the relation, the logical block copied and the block
- * it leaves, and the page store's high-water mark before and after.
+ * REMAP's main data: the relation, the logical block copied, the block it
+ * leaves and the one it takes, and the page store's high-water mark before
+ * and after.  The page's image comes as its last block, unless it is all
+ * zeroes (BMAP_REMAP_ZERO): then redo zeroes the new block, as extending
+ * does.
  */
+#define BMAP_REMAP_ZERO		0x01
+
 typedef struct xl_bmap_remap
 {
 	RelFileLocator locator;
 	BlockNumber blkno;
 	BlockNumber old_block;
+	BlockNumber new_block;
 	BlockNumber old_hw;
 	BlockNumber new_hw;
+	uint32		flags;
 } xl_bmap_remap;
 
 /*

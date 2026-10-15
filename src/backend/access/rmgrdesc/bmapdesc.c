@@ -60,10 +60,12 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 			{
 				xl_bmap_remap *xlrec = (xl_bmap_remap *) rec;
 
-				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> new; hw %u -> %u",
+				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> %u%s; hw %u -> %u",
 								 xlrec->locator.spcOid, xlrec->locator.dbOid,
 								 xlrec->locator.relNumber, xlrec->blkno,
-								 xlrec->old_block, xlrec->old_hw, xlrec->new_hw);
+								 xlrec->old_block, xlrec->new_block,
+								 (xlrec->flags & BMAP_REMAP_ZERO) ? " (zeroed)" : "",
+								 xlrec->old_hw, xlrec->new_hw);
 				break;
 			}
 		case XLOG_BMAP_UNREF:

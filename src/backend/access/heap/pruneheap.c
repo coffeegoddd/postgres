@@ -326,13 +326,6 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 		Size		freespace = 0;
 
 		/*
-		 * A page another relation shares would be copied first; reads don't
-		 * copy pages, so VACUUM or a change of the page prunes it instead.
-		 */
-		if (BufferPageMayBeShared(buffer))
-			return;
-
-		/*
 		 * Pin the VM page before taking the heap cleanup lock. This may
 		 * occasionally lead to an unnecessary pin when the buffer is
 		 * contended, but the same VM page covers many heap pages, so there is
@@ -341,8 +334,18 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 		visibilitymap_pin(relation, BufferGetBlockNumber(buffer), vmbuffer);
 
 		/* OK, try to get exclusive buffer lock */
-		if (!ConditionalLockBufferForCleanup(buffer))
+		if (!ConditionalLockBufferForCleanupUnprepared(buffer))
 			return;
+
+		/*
+		 * A page another relation shares would be copied first; reads don't
+		 * copy pages, so VACUUM or a change of the page prunes it instead.
+		 */
+		if (BufferPageIsShared(buffer))
+		{
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			return;
+		}
 
 		/*
 		 * Now that we have buffer lock, get accurate information about the
@@ -1285,6 +1288,10 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 		conflict_xid = prstate.pagefrz.FreezePageConflictXid;
 	if (do_prune && TransactionIdFollows(prstate.latest_xid_removed, conflict_xid))
 		conflict_xid = prstate.latest_xid_removed;
+
+	/* The caller's cleanup lock may leave the page to be prepared now */
+	if (do_prune || do_freeze || do_set_vm)
+		BufferPrepareForChange(prstate.buffer);
 
 	/* Lock vmbuffer before entering a critical section */
 	if (do_set_vm)

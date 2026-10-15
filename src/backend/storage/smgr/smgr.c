@@ -126,8 +126,9 @@ typedef struct f_smgr
 	/*
 	 * Must a fork's pages be prepared before they change (they may be
 	 * shared)?  Then the buffer manager calls smgr_prepareforchange once a
-	 * page is locked exclusively, before it changes, and smgr_pageisshared
-	 * answers whether that would copy it.  May be NULL.
+	 * page is locked exclusively (or, under a cleanup lock taken without
+	 * preparing, when the holder is about to change it), and
+	 * smgr_pageisshared answers whether that would copy it.  May be NULL.
 	 */
 	bool		(*smgr_preparesforchanges) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_prepareforchange) (SMgrRelation reln, ForkNumber forknum,

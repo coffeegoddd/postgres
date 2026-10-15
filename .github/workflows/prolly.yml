@@ -21,6 +21,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # code that only an assertion-enabled build compiles in can leave a
+  # release build broken
+  release-build:
+    name: build without assertions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          ./configure --enable-injection-points --with-openssl
+          make -s -j4 COPT=-Werror
+          make -s -j4 -C contrib COPT=-Werror
+          make -s -j4 -C src/test/modules COPT=-Werror
+
   build-and-test:
     name: build and test
     runs-on: ubuntu-24.04

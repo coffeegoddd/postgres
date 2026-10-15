@@ -140,3 +140,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_rows_digest(relnumber oid)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Read a block zeroed and locked, as an access method about to initialize
+-- it does (only if it isn't in a buffer), and leave it uninitialized.
+CREATE FUNCTION test_bmap_zero_block(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Try for a block's cleanup lock without waiting; true if it was free.
+CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

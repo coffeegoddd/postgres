@@ -603,6 +603,65 @@ refs_nblocks(RelFileLocator rel)
  */
 
 /*
+ * Logical block 'blkno''s entry, read under a share lock.  False if it has
+ * none: past the map, or on a map page left blank (added to the map fork
+ * by an extension that failed or whose record a crash lost).
+ */
+static bool
+lookup_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	bool		found = false;
+
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+		return false;
+	buf = map_read(rel, MAP_PAGE(blkno));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(buf)))
+	{
+		check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+				   MAP_PAGE(blkno));
+		*entry = PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blkno)];
+		found = BlockNumberIsValid(entry->block);
+	}
+	UnlockReleaseBuffer(buf);
+	return found;
+}
+
+/* the map's epoch, read under a share lock */
+static uint32
+lookup_epoch(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf = map_read(rel, 0);
+	uint32		epoch;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	epoch = PageGetBmapHeader(BufferGetPage(buf))->epoch;
+	UnlockReleaseBuffer(buf);
+	return epoch;
+}
+
+/* the reference count of 'phys', read under a share lock */
+static uint8
+lookup_ref(RelFileLocator rel, BlockNumber phys)
+{
+	Buffer		buf;
+	uint8		count;
+
+	if (REF_PAGE(phys) >= refs_nblocks(rel))
+		return 0;
+	buf = refs_read(rel, REF_PAGE(phys));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
+	count = page_ref(BufferGetPage(buf), phys);
+	UnlockReleaseBuffer(buf);
+	return count;
+}
+
+/*
  * Copy map page 'blk' of 'reln' into 'dst' (I/O-aligned).
  *
  * Writing a block-mapped page looks the page up, and a write may be the
@@ -1680,25 +1739,9 @@ bool
 bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  XLogRecPtr lsn)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
-	bool		result = false;
+	BmapEntry	entry;
 
-	if (MAP_PAGE(blocknum) >= mdnblocks(reln, BMAP_FORKNUM))
-		return false;
-	buf = map_read(rel, MAP_PAGE(blocknum));
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (!PageIsNew(BufferGetPage(buf)))
-	{
-		BmapEntry  *entry;
-
-		check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-				   MAP_PAGE(blocknum));
-		entry = &PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blocknum)];
-		result = entry->since > lsn;
-	}
-	UnlockReleaseBuffer(buf);
-	return result;
+	return lookup_entry(reln, blocknum, &entry) && entry.since > lsn;
 }
 
 /* ----------------------------------------------------------------
@@ -1856,13 +1899,6 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 			INJECTION_POINT("bmap-share-map-page", NULL);
 		}
 
-	/*
-	 * src's cached pages are checked before they next change, as pages read
-	 * from now on are: while the header is held, none can be checked
-	 * against the epoch about to be passed.
-	 */
-	MarkBufferedRelationShared(src, MAIN_FORKNUM);
-
 	dheader = map_read(drel, 0);
 	LockBuffer(dheader, BUFFER_LOCK_EXCLUSIVE);
 	check_page(BufferGetPage(dheader), BMAP_PAGE_HEADER, drel, BMAP_FORKNUM, 0);
@@ -1895,6 +1931,16 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 
 	/*
+	 * src's cached pages are checked again before they next change, as pages
+	 * read from now on are.  Done once src's map is unlocked, since it visits
+	 * every buffer.  A page found src's own before the epoch was raised may
+	 * change in place until it is marked; with src kept from changing, only
+	 * a hint or pruning can change it, and either holds for dst too, whose
+	 * page is the same (and gets it when flushed, below).
+	 */
+	MarkBufferedRelationShared(src, MAIN_FORKNUM);
+
+	/*
 	 * The shared blocks get src's latest pages, durably: recovery can't make
 	 * them again, since replaying src's changes writes its pages through
 	 * whatever map pages are on disk, which may already send them to the
@@ -1911,58 +1957,19 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
  * ----------------------------------------------------------------
  */
 
-/* logical block 'blkno''s entry, under a share lock; false if it has none */
-static bool
-peek_map_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
-{
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
-
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
-		return false;
-	buf = map_read(rel, MAP_PAGE(blkno));
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-			   MAP_PAGE(blkno));
-	*entry = PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blkno)];
-	UnlockReleaseBuffer(buf);
-	return BlockNumberIsValid(entry->block);
-}
-
 /*
- * The map's epoch and logical block 'blkno''s entry, read under share
- * locks one at a time.  False if the block has no entry.
+ * Is a page's hole (between pd_lower and pd_upper, as a standard page has)
+ * all zeroes?  Then an image may leave it out and lose nothing.
  */
 static bool
-peek_entry(SMgrRelation reln, BlockNumber blkno, uint32 *epoch,
-		   BmapEntry *entry)
+page_hole_is_zero(Page page)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
+	PageHeader	ph = (PageHeader) page;
 
-	buf = map_read(rel, 0);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	*epoch = PageGetBmapHeader(BufferGetPage(buf))->epoch;
-	UnlockReleaseBuffer(buf);
-	return peek_map_entry(reln, blkno, entry);
-}
-
-/* the reference count of 'phys', unlocked */
-static uint8
-peek_ref(RelFileLocator rel, BlockNumber phys)
-{
-	Buffer		buf;
-	uint8		count;
-
-	if (REF_PAGE(phys) >= refs_nblocks(rel))
-		return 0;
-	buf = refs_read(rel, REF_PAGE(phys));
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
-	count = page_ref(BufferGetPage(buf), phys);
-	UnlockReleaseBuffer(buf);
-	return count;
+	return ph->pd_lower >= SizeOfPageHeaderData &&
+		ph->pd_upper > ph->pd_lower && ph->pd_upper <= BLCKSZ &&
+		pg_memory_is_all_zeros((char *) page + ph->pd_lower,
+							   ph->pd_upper - ph->pd_lower);
 }
 
 bool
@@ -1981,10 +1988,12 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno)
 	uint32		epoch;
 	BmapEntry	entry;
 
-	if (forknum != MAIN_FORKNUM ||
-		!peek_entry(reln, blkno, &epoch, &entry) || entry.epoch >= epoch)
+	if (forknum != MAIN_FORKNUM)
 		return false;
-	return peek_ref(reln->smgr_rlocator.locator, entry.block) > 0;
+	epoch = lookup_epoch(reln);
+	if (!lookup_entry(reln, blkno, &entry) || entry.epoch >= epoch)
+		return false;
+	return lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0;
 }
 
 /*
@@ -1993,9 +2002,11 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno)
  * may be shared: if no other map holds its block any more, it is claimed
  * (born again in this epoch); otherwise the page is copied to a new block,
  * which the map takes, and the old block loses a reference.  The copy's
- * record carries the page's image, so redo makes the new block without
- * reading it; and before it, contents only in the buffer are written to
- * the old block, which other maps still read.
+ * record carries the page's image (without its hole, when that is all
+ * zeroes), so redo makes the new block without reading it; a page of
+ * zeroes, which its caller is about to initialize, needs no image.  Before
+ * the copy, contents only in the buffer are written to the old block,
+ * which other maps still read.
  *
  * Locks: the header shared (so the relation's extensions and sharing wait),
  * the old block's reference-count page, the allocator's pages, then the map
@@ -2023,18 +2034,15 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		return;
 
 	/* the common case, with share locks alone */
-	if (!peek_entry(reln, blkno, &epoch, &entry) || entry.epoch >= epoch)
+	epoch = lookup_epoch(reln);
+	if (!lookup_entry(reln, blkno, &entry) || entry.epoch >= epoch)
 		return;
-
-	/* the old block gets what other maps should read, if only buffered */
-	if (BufferIsDirty(buffer))
-		FlushOneBuffer(buffer);
 
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
-	if (!peek_map_entry(reln, blkno, &entry) || entry.epoch >= epoch)
+	if (!lookup_entry(reln, blkno, &entry) || entry.epoch >= epoch)
 	{
 		UnlockReleaseBuffer(headerbuf);
 		return;
@@ -2082,12 +2090,25 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xl_bmap_refs_delta *rdelta = NULL;
 		xl_bmap_remap xlrec;
 		int			id;
+		Page		page = BufferGetPage(buffer);
+		bool		zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
+		bool		reused;
+
+		/* the old block gets what other maps should read, if only buffered */
+		if (BufferIsDirty(buffer))
+			FlushOneBuffer(buffer);
 
 		alloc_take(rel, 1, &new_block, &alloc);
 		ent->block = new_block;
+		reused = new_block < alloc.old_hw;
 
-		/* the page store reaches the block; its contents come with the record */
-		prepare_store(rel, alloc.old_hw, alloc.new_hw, NULL, 0, false);
+		/*
+		 * The page store reaches the block.  The page's contents come with
+		 * the record, as an image; a page of zeroes (one being initialized)
+		 * is zeroed in the new block instead, here and in redo.
+		 */
+		prepare_store(rel, alloc.old_hw, alloc.new_hw,
+					  &new_block, zeroed && reused ? 1 : 0, false);
 
 		if (count != BMAP_REFS_STUCK)
 		{
@@ -2109,8 +2130,10 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xlrec.locator = rel;
 		xlrec.blkno = blkno;
 		xlrec.old_block = old_block;
+		xlrec.new_block = new_block;
 		xlrec.old_hw = alloc.old_hw;
 		xlrec.new_hw = alloc.new_hw;
+		xlrec.flags = zeroed ? BMAP_REMAP_ZERO : 0;
 
 		XLogEnsureRecordSpace(3 + BMAP_ALLOC_MAX_PAGES, 0);
 		ndelta->since = GetXLogInsertRecPtr();
@@ -2132,13 +2155,19 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			XLogRegisterBufData(id, rdelta, refs_delta_size(rdelta));
 			id++;
 		}
-		XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE);
+		if (zeroed)
+			XLogRegisterBuffer(id, buffer, REGBUF_WILL_INIT);
+		else
+			XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE |
+							   (page_hole_is_zero(page) ? REGBUF_STANDARD : 0));
 		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_REMAP);
 		PageSetLSN(BufferGetPage(mapbuf), lsn);
 		alloc_set_lsn(&alloc, lsn);
 		if (rdelta)
 			PageSetLSN(BufferGetPage(refbuf), lsn);
-		PageSetLSN(BufferGetPage(buffer), lsn);
+		/* a page of zeroes stays one: a new page has no LSN */
+		if (!zeroed)
+			PageSetLSN(page, lsn);
 		END_CRIT_SECTION();
 
 		alloc_release(&alloc);
@@ -2324,36 +2353,23 @@ void
 bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 				   uint32 *epoch, uint32 *refs)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	PGIOAlignedBlock copy;
+	BmapEntry	entry;
 
 	*phys = InvalidBlockNumber;
 	*epoch = 0;
 	*refs = 0;
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+	if (!lookup_entry(reln, blkno, &entry))
 		return;
-	read_node(reln, MAP_PAGE(blkno), false, copy.data, BMAP_PAGE_NODE);
-	*phys = PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)].block;
-	*epoch = PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)].epoch;
-	if (BlockNumberIsValid(*phys) && REF_PAGE(*phys) < refs_nblocks(rel))
-	{
-		Buffer		buf = refs_read(rel, REF_PAGE(*phys));
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		check_refs_page(BufferGetPage(buf), rel, REF_PAGE(*phys));
-		*refs = page_ref(BufferGetPage(buf), *phys);
-		UnlockReleaseBuffer(buf);
-	}
+	*phys = entry.block;
+	*epoch = entry.epoch;
+	*refs = lookup_ref(reln->smgr_rlocator.locator, entry.block);
 }
 
 /* a block-mapped relation's epoch */
 uint32
 bmap_inspect_epoch(SMgrRelation reln)
 {
-	PGIOAlignedBlock copy;
-
-	read_node(reln, 0, false, copy.data, BMAP_PAGE_HEADER);
-	return PageGetBmapHeader(copy.data)->epoch;
+	return lookup_epoch(reln);
 }
 
 /* the allocator's high-water mark and free count, of rel's page store */
@@ -3056,16 +3072,29 @@ bmap_redo(XLogReaderState *record)
 				xl_bmap_remap *xlrec = (xl_bmap_remap *) XLogRecGetData(record);
 				uint8		last = XLogRecMaxBlockId(record);
 
+				bool		zeroed = (xlrec->flags & BMAP_REMAP_ZERO) != 0;
+
 				/*
 				 * The page store reaches the new block; the page itself is
-				 * the last block, an image, so redo never reads the block.
-				 * The old block keeps what it had: shared blocks were synced
-				 * when shared.
+				 * the last block, an image, so redo never reads the block,
+				 * or zeroes, which redo writes there.  The old block keeps
+				 * what it had: shared blocks were synced when shared.
 				 */
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
-							  NULL, 0, true);
-				for (uint8 id = 0; id <= last; id++)
+							  &xlrec->new_block,
+							  zeroed && xlrec->new_block < xlrec->old_hw ? 1 : 0,
+							  !zeroed);
+				for (uint8 id = 0; id < last; id++)
 					redo_block(record, id);
+				if (zeroed)
+				{
+					/* zeroes in its buffer too, without an LSN, as a new page */
+					Buffer		buf = XLogInitBufferForRedo(record, last);
+
+					UnlockReleaseBuffer(buf);
+				}
+				else
+					redo_block(record, last);
 				XLogReplaceBlock(xlrec->locator, MAIN_FORKNUM, xlrec->blkno);
 				break;
 			}

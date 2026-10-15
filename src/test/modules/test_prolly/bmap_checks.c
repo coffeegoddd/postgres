@@ -273,3 +273,41 @@ test_bmap_write(PG_FUNCTION_ARGS)
 	UnlockReleaseBuffer(buf);
 	PG_RETURN_VOID();
 }
+
+/*
+ * Read a block zeroed and locked, as an access method about to initialize
+ * it does, and let it go uninitialized.  Zeroed only if not already in a
+ * buffer.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_zero_block);
+Datum
+test_bmap_zero_block(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	Buffer		buf;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, PG_GETARG_INT32(1),
+									RBM_ZERO_AND_LOCK, NULL, true);
+	UnlockReleaseBuffer(buf);
+	PG_RETURN_VOID();
+}
+
+/* Try for a block's cleanup lock without waiting, and let it go. */
+PG_FUNCTION_INFO_V1(test_bmap_cleanup_lock);
+Datum
+test_bmap_cleanup_lock(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	Buffer		buf;
+	bool		got;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, PG_GETARG_INT32(1),
+									RBM_NORMAL, NULL, true);
+	got = ConditionalLockBufferForCleanup(buf);
+	if (got)
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buf);
+	PG_RETURN_BOOL(got);
+}

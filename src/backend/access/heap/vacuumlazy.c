@@ -1430,8 +1430,12 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * the page in lazy_scan_prune.  But when it's not possible to acquire
 		 * a cleanup lock right away, we may be able to settle for reduced
 		 * processing using lazy_scan_noprune.
+		 *
+		 * The page is prepared for a change only when one is made: most pages
+		 * VACUUM visits don't change, and preparing a page another relation
+		 * shares copies it.
 		 */
-		got_cleanup_lock = ConditionalLockBufferForCleanup(buf);
+		got_cleanup_lock = ConditionalLockBufferForCleanupUnprepared(buf);
 
 		if (!got_cleanup_lock)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1461,7 +1465,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			 */
 			Assert(vacrel->aggressive);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			LockBufferForCleanup(buf);
+			LockBufferForCleanupUnprepared(buf);
 			got_cleanup_lock = true;
 		}
 
@@ -1954,6 +1958,8 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		 */
 		if (!PageIsAllVisible(page))
 		{
+			BufferPrepareForChange(buf);
+
 			/* Lock vmbuffer before entering critical section */
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 
