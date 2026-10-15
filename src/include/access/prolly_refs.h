@@ -25,6 +25,7 @@
 #define PROLLY_REFS_H
 
 #include "access/prolly_registry.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "datatype/timestamp.h"
 
@@ -63,11 +64,18 @@ typedef struct ProllyRefsRoutine
 							   ProllyCommitInfo *info);
 	bool		(*merge_base) (const ProllyHash *a, const ProllyHash *b,
 							   ProllyHash *base);
+
+	/*
+	 * Visit every node the refs keep alive, from the root of their own
+	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
+	 */
+	void		(*walk) (const ProllyNodeRef *refs, ProllyTreeVisitNode visit,
+						 void *arg);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
-	"commit", "resolve", "commit_get", "merge_base"
+	"commit", "resolve", "commit_get", "merge_base", "walk"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

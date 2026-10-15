@@ -25,6 +25,16 @@
 #include "access/transam.h"
 
 extern void prolly_xact_register_engine(const ProllyEngineRoutine *engine);
+
+/* Whether an engine holds private writes in the current transaction. */
+extern bool prolly_xact_has_writes(void);
+
+/*
+ * The session's branch (checkout), whose working set its transactions
+ * read and write: PROLLY_MAIN_BRANCH until a checkout.
+ */
+extern ProllyBranchId prolly_session_branch(void);
+extern void prolly_set_session_branch(ProllyBranchId branch);
 extern void AtPrepare_Prolly(void);
 extern void prolly_twophase_precommit(FullTransactionId fxid, uint16 info,
 									  void *recdata, uint32 len);

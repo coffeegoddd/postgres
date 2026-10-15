@@ -60,15 +60,16 @@ DROP TABLE prolly_heap;
 -- Version-control functions dispatch to the refs, diff/merge and transfer
 -- interfaces.
 --
-SELECT prolly_branch_create('feature', NULL);
+SELECT prolly_branch_create('feature', NULL) IS NULL AS created;
 SELECT prolly_branch_create(NULL, NULL);
-SELECT prolly_checkout('feature');
-SELECT prolly_commit('first commit');
+SELECT prolly_checkout('feature') IS NULL AS checked_out;
+SELECT prolly_commit('first commit') IS NOT NULL AS committed;
 SELECT * FROM prolly_diff('main', 'feature');
 SELECT prolly_merge('feature');
 SELECT prolly_clone('file:///nowhere');
 SELECT prolly_fetch('file:///nowhere', 'main');
 SELECT prolly_push('file:///nowhere', 'main');
+SELECT prolly_checkout('main') IS NULL AS back_on_main;
 
 --
 -- Canonical value bytes carry no local OIDs and no DDL history: the same

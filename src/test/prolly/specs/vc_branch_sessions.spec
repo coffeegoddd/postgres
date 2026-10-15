@@ -7,8 +7,8 @@ setup
 	CREATE TABLE vbs (id int PRIMARY KEY, v text);
 	INSERT INTO vbs VALUES (1, 'base');
 }
-setup		{ SELECT prolly_commit('vbs base'); }
-setup		{ SELECT prolly_branch_create('vbs_b', NULL); }
+setup		{ DO $$ BEGIN PERFORM prolly_commit('vbs base'); END $$; }
+setup		{ DO $$ BEGIN PERFORM prolly_branch_create('vbs_b', NULL); END $$; }
 
 teardown
 {

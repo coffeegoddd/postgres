@@ -1179,21 +1179,33 @@ serial_live_roots(ProllyRootVisit visit, void *arg)
 {
 	SerialShared *s = get_shared();
 	ProllyHash *roots;
+	ProllyBranchId *branches;
 	int			n = 0;
+	int			max;
 
 	/* Roots no snapshot needs any more aren't live. */
 	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
 	prune_history(s);
-	roots = palloc(sizeof(ProllyHash) *
-				   Max(s->nheads + s->npending + s->nhistory, 1));
+	max = Max(s->nheads + s->npending + s->nhistory, 1);
+	roots = palloc(sizeof(ProllyHash) * max);
+	branches = palloc(sizeof(ProllyBranchId) * max);
 	for (int i = 0; i < s->nheads; i++)
+	{
+		branches[n] = s->heads[i].branch;
 		roots[n++] = s->heads[i].root;
+	}
 	for (int i = 0; i < s->npending; i++)
+	{
+		branches[n] = s->pending[i].branch;
 		roots[n++] = s->pending[i].root;
+	}
 	for (int i = 0; i < s->nhistory; i++)
 	{
 		if (s->history[i].has_root)
+		{
+			branches[n] = s->history[i].branch;
 			roots[n++] = s->history[i].root;
+		}
 	}
 	LWLockRelease(ProllyHeadsLock);
 	for (int i = 0; i < n; i++)
@@ -1201,9 +1213,10 @@ serial_live_roots(ProllyRootVisit visit, void *arg)
 		ProllyNodeRef ref;
 
 		root_ref(&roots[i], &ref);
-		visit(&ref, arg);
+		visit(branches[i], &ref, arg);
 	}
 	pfree(roots);
+	pfree(branches);
 }
 
 static void
