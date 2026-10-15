@@ -71,6 +71,12 @@ typedef struct ProllyCoordRoutine
 	void		(*insert_intent_complete) (Relation tree, const ProllyKey *key,
 										   uint32 spec_token, bool succeeded);
 
+	/*
+	 * Transactions other than this one that hold write locks on tree now;
+	 * stores at most max of them in xids, returns how many there are.
+	 */
+	int			(*current_writers) (Relation tree, TransactionId *xids, int max);
+
 	/* SSI: record a read of [lo, hi] (NULL = unbounded) with predicate.c. */
 	void		(*predicate_lock_range) (Relation tree, Snapshot snapshot,
 										 const ProllyKey *lo,
@@ -95,7 +101,7 @@ typedef struct ProllyCoordRoutine
 
 #define PROLLY_COORD_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "lock_row", "writer_of", "insert_intent", \
-	"insert_intent_complete", "predicate_lock_range", "written_since", \
+	"insert_intent_complete", "current_writers", "predicate_lock_range", "written_since", \
 	"xact_commit", "xact_abort", "subxact_abort", "prune_markers"
 #define PROLLY_COORD_FIRST_CALLBACK shmem_size
 

@@ -232,6 +232,7 @@ static void entry_combine(RBTNode *existing, const RBTNode *newdata, void *arg);
 static RBTNode *entry_alloc(void *arg);
 static void entry_free(RBTNode *node, void *arg);
 static void spill_clear(D1Spill *sp);
+static bool same_hash(const ProllyNodeRef *a, const ProllyNodeRef *b);
 static void maybe_spill(void);
 
 static int
@@ -1840,6 +1841,40 @@ d1_cursor_can_seek(ProllyCursor *c)
 	return !c->unordered;
 }
 
+/*
+ * The commits since the snapshot's that changed tree's data (or index)
+ * tree: consecutive roots whose trees for it differ.
+ */
+static int
+d1_unseen_writers(Relation tree, Snapshot snapshot, TransactionId **xids)
+{
+	ProllyBranchCommit *commits;
+	int			n;
+	int			nx = 0;
+	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
+	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	ProllyNodeRef prev;
+
+	backend_init();
+	n = PROLLY_CALL(backend.c.commit, commits_since, PROLLY_MAIN_BRANCH,
+					snapshot, &commits);
+	*xids = palloc(sizeof(TransactionId) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		ProllyRootSet rs;
+		ProllyNodeRef t;
+
+		rs.has_root = commits[i].has_root;
+		rs.root = commits[i].root;
+		find_tree(&rs, sub, relnumber, &t);
+		if (i > 0 && !same_hash(&prev, &t))
+			(*xids)[nx++] = commits[i].xid;
+		prev = t;
+	}
+	pfree(commits);
+	return nx;
+}
+
 static bool
 d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	   const ProllyKey *key, CommandId cid, StringInfo value)
@@ -2918,6 +2953,7 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.cursor_next = d1_cursor_next,
 	.cursor_close = d1_cursor_close,
 	.cursor_can_seek = d1_cursor_can_seek,
+	.unseen_writers = d1_unseen_writers,
 	.get = d1_get,
 	.has_writes = d1_has_writes,
 	.key_at = d1_key_at,

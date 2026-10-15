@@ -96,6 +96,19 @@ singlewriter_writer_of(Relation tree, const ProllyKey *key)
 	return InvalidTransactionId;
 }
 
+/* The table's writer, if any. */
+static int
+singlewriter_current_writers(Relation tree, TransactionId *xids, int max)
+{
+	TransactionId xid = singlewriter_writer_of(tree, NULL);
+
+	if (!TransactionIdIsValid(xid))
+		return 0;
+	if (max > 0)
+		xids[0] = xid;
+	return 1;
+}
+
 /* Speculative insertion has no one to race with: the inserter is the writer. */
 static TM_Result
 singlewriter_insert_intent(Relation tree, const ProllyKey *key,
@@ -122,6 +135,7 @@ const ProllyCoordRoutine prolly_coord_single_writer = {
 	},
 	.lock_row = singlewriter_lock_row,
 	.writer_of = singlewriter_writer_of,
+	.current_writers = singlewriter_current_writers,
 	.insert_intent = singlewriter_insert_intent,
 	.insert_intent_complete = singlewriter_insert_intent_complete,
 };

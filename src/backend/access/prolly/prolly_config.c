@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "utils/lsyscache.h"
@@ -98,6 +99,29 @@ prolly_is_table_am(const char *amname)
 			return true;
 	}
 	return false;
+}
+
+Oid
+prolly_table_am_for_persistence(Oid amoid, char relpersistence, bool explicit)
+{
+	char	   *amname;
+	bool		prolly;
+
+	if (relpersistence == RELPERSISTENCE_PERMANENT || !OidIsValid(amoid))
+		return amoid;
+	amname = get_am_name(amoid);
+	prolly = prolly_is_table_am(amname);
+	if (amname)
+		pfree(amname);
+	if (!prolly)
+		return amoid;
+	if (explicit)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("prolly storage supports only permanent tables"),
+				 errdetail("Temporary and unlogged tables are never part of a commit."),
+				 errhint("Leave out USING, and the table is stored by heap.")));
+	return HEAP_TABLE_AM_OID;
 }
 
 void

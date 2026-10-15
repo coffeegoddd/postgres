@@ -59,6 +59,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "storage/proc.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
@@ -353,6 +354,9 @@ scan_start(ProllyScanDesc scan)
 				ForwardScanDirection);
 }
 
+static void serializable_read(Relation rel, const ProllyComponents *c,
+							  Snapshot snapshot);
+
 static TableScanDesc
 prolly_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 				  ScanKeyData *key, ParallelTableScanDesc pscan, uint32 flags)
@@ -377,6 +381,7 @@ prolly_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 	old = MemoryContextSwitchTo(scan->mcxt);
 	scan->cid = snapshot_cid(snapshot);
 	scan->roots = PROLLY_CALL(scan->c.engine, roots_acquire, snapshot);
+	serializable_read(rel, &scan->c, snapshot);
 	scan->keying = open_read_keying(&scan->c, scan->roots, rel, scan->mcxt);
 	scan->cursor = PROLLY_CALL(scan->c.engine, cursor_open, scan->roots, rel,
 							   PROLLY_TREE_DATA, scan->cid);
@@ -608,6 +613,41 @@ insert_keying(Relation rel, const ProllyComponents *c)
 }
 
 /*
+ * SERIALIZABLE: record a read of rel with predicate.c, and the read/write
+ * conflicts with the transactions whose writes to rel the snapshot doesn't
+ * see (committed since it, or still running), as heap finds them per tuple
+ * from xmin and xmax.  Reads are recorded for the whole relation.
+ */
+static void
+serializable_read(Relation rel, const ProllyComponents *c, Snapshot snapshot)
+{
+	TransactionId *xids;
+	TransactionId running_buf[64];
+	TransactionId *running = running_buf;
+	int			n;
+
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC ||
+		!CheckForSerializableConflictOutNeeded(rel, snapshot))
+		return;
+	PROLLY_CALL(c->coord, predicate_lock_range, rel, snapshot, NULL, NULL);
+	n = PROLLY_CALL(c->engine, unseen_writers, rel, snapshot, &xids);
+	for (int i = 0; i < n; i++)
+		CheckForSerializableConflictOut(rel, xids[i], snapshot);
+	pfree(xids);
+	n = PROLLY_CALL(c->coord, current_writers, rel, running_buf,
+					lengthof(running_buf));
+	if (n > lengthof(running_buf))
+	{
+		running = palloc(sizeof(TransactionId) * n);
+		n = PROLLY_CALL(c->coord, current_writers, rel, running, n);
+	}
+	for (int i = 0; i < n; i++)
+		CheckForSerializableConflictOut(rel, running[i], snapshot);
+	if (running != running_buf)
+		pfree(running);
+}
+
+/*
  * The key a row is locked by: its bytes, if they name it (keys equal by
  * the keying are the same bytes); else NULL, which locks all of rel.
  */
@@ -634,6 +674,8 @@ lock_for_write_mode(Relation rel, const ProllyComponents *c,
 {
 	TM_FailureData tmfd;
 
+	/* SERIALIZABLE readers of rel have a read/write conflict with this. */
+	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
 	if (PROLLY_CALL(c->coord, lock_row, rel, lock_key(rel, c, key), mode,
 					LockWaitBlock, &tmfd) != TM_Ok)
 		elog(ERROR, "could not lock a row of \"%s\" for writing",
@@ -1754,6 +1796,7 @@ prolly_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 
 	prolly_components_for_relation(rel, &c);
 	roots = PROLLY_CALL(c.engine, roots_acquire, snapshot);
+	serializable_read(rel, &c, snapshot);
 	keying = read_keying(rel, &c, roots, &owned);
 	row_at_init(&r);
 	found = row_for_snapshot(&c, roots, rel, keying, tid, snapshot, &r);
@@ -1936,6 +1979,7 @@ prolly_index_scan_begin(IndexScanDesc scan, uint32 flags)
 									 ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(is->mcxt);
 	is->roots = PROLLY_CALL(is->c.engine, roots_acquire, scan->xs_snapshot);
+	serializable_read(scan->heapRelation, &is->c, scan->xs_snapshot);
 	is->keying = read_keying(scan->heapRelation, &is->c, is->roots, &is->owned);
 	is->cid = snapshot_cid(scan->xs_snapshot);
 	row_at_init(&is->row);

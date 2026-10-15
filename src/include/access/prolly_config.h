@@ -95,4 +95,13 @@ extern void prolly_database_components(ProllyDatabaseComponents *components);
 /* Is amname a prolly table access method? */
 extern bool prolly_is_table_am(const char *amname);
 
+/*
+ * The table access method a new relation of relpersistence gets, given
+ * amoid: a temporary or unlogged relation is never stored by prolly (it is
+ * never part of a commit), so it gets heap; asking for prolly explicitly
+ * (explicit) for one is an error.
+ */
+extern Oid	prolly_table_am_for_persistence(Oid amoid, char relpersistence,
+											bool explicit);
+
 #endif							/* PROLLY_CONFIG_H */

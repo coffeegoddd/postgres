@@ -22,6 +22,7 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "access/prolly_config.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
 #include "commands/matview.h"
@@ -317,7 +318,9 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * will be gone).
 	 */
 	OIDNewHeap = make_new_heap(matviewOid, tableSpace,
-							   matviewRel->rd_rel->relam,
+							   prolly_table_am_for_persistence(matviewRel->rd_rel->relam,
+															   relpersistence,
+															   false),
 							   relpersistence, ExclusiveLock);
 	Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
 
