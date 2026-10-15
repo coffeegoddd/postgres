@@ -85,6 +85,21 @@ SELECT relname, relbranch = 99999 AS on_other FROM pg_class
   WHERE relnamespace = 'app'::regnamespace ORDER BY 1;
 SELECT 'app.t'::regclass::oid AS other_t \gset
 
+-- Parallel workers see the leader's branch.
+CREATE FUNCTION app.f(int) RETURNS int LANGUAGE plpgsql PARALLEL SAFE
+  AS 'BEGIN RETURN $1 + 1; END';
+SET debug_parallel_query = on;
+SELECT app.f(1);
+SELECT name, app.f(length(name)) FROM app.t;
+RESET debug_parallel_query;
+
+-- Rewriting an index keeps its pg_class row on the branch: a TOAST table's
+-- index, which is in pg_toast, too.
+SELECT i.indexrelid AS other_toast_index FROM pg_index i
+  WHERE i.indrelid = (SELECT reltoastrelid FROM pg_class WHERE oid = 'app.t'::regclass) \gset
+REINDEX TABLE app.t;
+SELECT relbranch = 99999 AS on_other FROM pg_class WHERE oid = :other_toast_index;
+
 -- Back on main, main's objects are back and other's can't be seen, even by
 -- an index-only scan over all-visible pages.
 SELECT test_branch_switch('main');
@@ -106,6 +121,7 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 SELECT count(*) AS other_t_seen FROM pg_class WHERE oid = :other_t;
 SELECT count(*) AS other_rows_seen FROM pg_class WHERE relbranch = 99999;
+SELECT count(*) AS other_toast_index_seen FROM pg_class WHERE oid = :other_toast_index;
 
 -- Each branch drops its own.
 DROP SCHEMA app CASCADE;

@@ -42,8 +42,8 @@ extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
 
-/* check out the branch a connection named; NULL means main */
-extern void branch_session_init(const char *branch);
+/* check out the pg_branch row a connection named; false if there is none */
+extern bool branch_session_init(const char *branch);
 
 /* switch the session to another branch */
 extern void set_session_branch(Oid branch);

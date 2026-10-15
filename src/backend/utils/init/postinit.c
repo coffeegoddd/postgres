@@ -35,7 +35,6 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
-#include "catalog/versioned.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -1298,17 +1297,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/*
 	 * Prolly's session state, and the branch the connection asked for: a
-	 * row of pg_branch if the database has versioned schemas, else a branch
-	 * of its prolly_d1 tables.
+	 * row of pg_branch if there is one by that name, else a branch of the
+	 * database's prolly_d1 tables.
 	 */
 	if (!bootstrap)
 	{
 		if (connect_branch != NULL && !MyDatabaseVersioned &&
-			database_has_versioned_schemas())
-		{
-			branch_session_init(connect_branch);
+			branch_session_init(connect_branch))
 			connect_branch = NULL;
-		}
 		prolly_session_init(connect_branch);
 	}
 

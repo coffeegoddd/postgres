@@ -31,6 +31,17 @@ is($node->safe_psql('postgres/other', q{SELECT to_regclass('app.t') IS NULL}),
 is($node->safe_psql('postgres', q{SELECT to_regclass('app.t') IS NULL}),
 	'f', 'main still has it');
 
+# Whether other is a pg_branch row doesn't depend on main's schemas.
+$node->safe_psql('postgres', q{
+	SELECT test_branch_switch('other');
+	CREATE SCHEMA app VERSIONED;
+	CREATE TABLE app.o (id int);
+});
+$node->safe_psql('postgres', q{DROP SCHEMA app CASCADE});
+is($node->safe_psql('postgres/other',
+		q{SELECT test_branch_current() || ',' || (to_regclass('app.o') IS NOT NULL)}),
+	'99999,true', 'dbname/other works when main has no versioned schema');
+
 my ($ret, $stdout, $stderr) =
   $node->psql('postgres/nope', q{SELECT 1});
 isnt($ret, 0, 'connecting to a branch that doesn\'t exist fails');
