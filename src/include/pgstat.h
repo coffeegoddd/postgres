@@ -230,7 +230,7 @@ typedef struct PgStat_RelationStatus
 		/* table counters */
 		struct
 		{
-			Oid			id;		/* table's OID */
+			uint64		id;		/* table's stats id */
 			bool		shared; /* is it a shared catalog? */
 			bool		truncdropped;	/* pending truncate/drop reset */
 			struct PgStat_TableXactStatus *trans;	/* lowest subxact's counts */
@@ -774,6 +774,7 @@ extern PgStat_FunctionCounts *find_funcstat_entry(Oid func_id);
 
 extern void pgstat_create_relation(Relation rel);
 extern void pgstat_drop_relation(Relation rel);
+extern void pgstat_drop_relation_by_id(char relkind, Oid relid, Oid branch);
 extern void pgstat_copy_relation_stats(Relation dst, Relation src);
 
 extern void pgstat_init_relation(Relation rel);
@@ -872,17 +873,32 @@ extern void pgstat_twophase_postcommit(FullTransactionId fxid, uint16 info,
 extern void pgstat_twophase_postabort(FullTransactionId fxid, uint16 info,
 									  void *recdata, uint32 len);
 
+/*
+ * A relation's statistics are kept by its OID and branch: a versioned
+ * relation has a copy, with the same OID, on each branch (0 for a shared
+ * relation, whose id is its OID).
+ */
+static inline uint64
+pgstat_relation_statsid(Oid relid, Oid branch)
+{
+	return ((uint64) branch << 32) | relid;
+}
+
+#define RelationGetStatsId(rel) \
+	pgstat_relation_statsid(RelationGetRelid(rel), (rel)->rd_rel->relbranch)
+
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry(Oid relid);
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry_ext(bool shared,
-														   Oid reloid,
+														   uint64 statsid,
 														   bool *may_free);
 extern PgStat_RelationStatus *find_relstat_entry_kind(PgStat_Kind kind,
 													  Oid rel_id);
 
 extern PgStat_StatIdxEntry *pgstat_fetch_stat_idxentry(Oid relid);
 extern PgStat_StatIdxEntry *pgstat_fetch_stat_idxentry_ext(bool shared,
-														   Oid reloid,
+														   uint64 statsid,
 														   bool *may_free);
+extern uint64 pgstat_relation_statsid_of(Oid relid);
 
 
 /*

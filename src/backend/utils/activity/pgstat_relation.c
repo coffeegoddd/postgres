@@ -17,12 +17,15 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/pg_class.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 
@@ -36,14 +39,14 @@ typedef struct TwoPhasePgStatRecord
 	PgStat_Counter inserted_pre_truncdrop;
 	PgStat_Counter updated_pre_truncdrop;
 	PgStat_Counter deleted_pre_truncdrop;
-	Oid			id;				/* table's OID */
+	uint64		id;				/* table's stats id */
 	bool		shared;			/* is it a shared catalog? */
 	bool		truncdropped;	/* was the relation truncated/dropped? */
 } TwoPhasePgStatRecord;
 
 
 static PgStat_RelationStatus *pgstat_prep_relation_pending(PgStat_Kind kind,
-														   Oid rel_id, bool isshared);
+														   uint64 rel_id, bool isshared);
 static void add_tabstat_xact_level(PgStat_RelationStatus *pgstat_info, int nest_level);
 static void ensure_tabstat_xact_level(PgStat_RelationStatus *pgstat_info);
 static void save_truncdrop_counters(PgStat_TableXactStatus *trans, bool is_drop);
@@ -77,14 +80,14 @@ pgstat_copy_relation_stats(Relation dst, Relation src)
 		PgStat_EntryRef *dst_ref;
 
 		srcstats = pgstat_fetch_stat_idxentry_ext(src->rd_rel->relisshared,
-												  RelationGetRelid(src),
+												  RelationGetStatsId(src),
 												  NULL);
 		if (!srcstats)
 			return;
 
 		dst_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_INDEX,
 											  dst->rd_rel->relisshared ? InvalidOid : MyDatabaseId,
-											  RelationGetRelid(dst),
+											  RelationGetStatsId(dst),
 											  false);
 
 		dstshstats = (PgStatShared_Index *) dst_ref->shared_stats;
@@ -99,14 +102,14 @@ pgstat_copy_relation_stats(Relation dst, Relation src)
 		PgStat_EntryRef *dst_ref;
 
 		srcstats = pgstat_fetch_stat_tabentry_ext(src->rd_rel->relisshared,
-												  RelationGetRelid(src),
+												  RelationGetStatsId(src),
 												  NULL);
 		if (!srcstats)
 			return;
 
 		dst_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_RELATION,
 											  dst->rd_rel->relisshared ? InvalidOid : MyDatabaseId,
-											  RelationGetRelid(dst),
+											  RelationGetStatsId(dst),
 											  false);
 
 		dstshstats = (PgStatShared_Relation *) dst_ref->shared_stats;
@@ -179,7 +182,7 @@ pgstat_assoc_relation(Relation rel)
 
 	/* find or make the PgStat_RelationStatus entry, and update link */
 	rel->pgstat_info = pgstat_prep_relation_pending(kind,
-													RelationGetRelid(rel),
+													RelationGetStatsId(rel),
 													rel->rd_rel->relisshared);
 
 	/* don't allow link a stats to multiple relcache entries */
@@ -216,7 +219,7 @@ pgstat_create_relation(Relation rel)
 
 	pgstat_create_transactional(kind,
 								rel->rd_rel->relisshared ? InvalidOid : MyDatabaseId,
-								RelationGetRelid(rel));
+								RelationGetStatsId(rel));
 }
 
 /*
@@ -231,7 +234,7 @@ pgstat_drop_relation(Relation rel)
 
 	pgstat_drop_transactional(kind,
 							  rel->rd_rel->relisshared ? InvalidOid : MyDatabaseId,
-							  RelationGetRelid(rel));
+							  RelationGetStatsId(rel));
 
 	if (!pgstat_should_count_relation(rel))
 		return;
@@ -257,6 +260,20 @@ pgstat_drop_relation(Relation rel)
 }
 
 /*
+ * Ensure that a relation's stats, named by its OID, kind and branch, are
+ * dropped if the transaction commits: for a relation dropped without being
+ * opened (with a branch's other copies).
+ */
+void
+pgstat_drop_relation_by_id(char relkind, Oid relid, Oid branch)
+{
+	if (!RELKIND_HAS_STORAGE(relkind) && relkind != RELKIND_PARTITIONED_TABLE)
+		return;
+	pgstat_drop_transactional(pgstat_get_relation_kind(relkind), MyDatabaseId,
+							  pgstat_relation_statsid(relid, branch));
+}
+
+/*
  * Report that the table was just vacuumed and flush IO statistics.
  */
 void
@@ -279,7 +296,7 @@ pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
 
 	/* block acquiring lock for the same reason as pgstat_report_autovac() */
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_RELATION, dboid,
-											RelationGetRelid(rel), false);
+											RelationGetStatsId(rel), false);
 
 	shtabentry = (PgStatShared_Relation *) entry_ref->shared_stats;
 	tabentry = &shtabentry->stats;
@@ -381,7 +398,7 @@ pgstat_report_analyze(Relation rel,
 
 	/* block acquiring lock for the same reason as pgstat_report_autovac() */
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_RELATION, dboid,
-											RelationGetRelid(rel),
+											RelationGetStatsId(rel),
 											false);
 	/* can't get dropped while accessed */
 	Assert(entry_ref != NULL && entry_ref->shared_stats != NULL);
@@ -524,6 +541,24 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 }
 
 /*
+ * The stats id of relation 'relid' as the session sees it: its copy on the
+ * session's branch if it is versioned.
+ */
+uint64
+pgstat_relation_statsid_of(Oid relid)
+{
+	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			branch = InvalidOid;
+
+	if (HeapTupleIsValid(tup))
+	{
+		branch = ((Form_pg_class) GETSTRUCT(tup))->relbranch;
+		ReleaseSysCache(tup);
+	}
+	return pgstat_relation_statsid(relid, branch);
+}
+
+/*
  * Support function for the SQL-callable pgstat* functions. Returns
  * the collected statistics for one table or NULL. NULL doesn't mean
  * that the table doesn't exist, just that there are no statistics, so the
@@ -532,7 +567,8 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 PgStat_StatTabEntry *
 pgstat_fetch_stat_tabentry(Oid relid)
 {
-	return pgstat_fetch_stat_tabentry_ext(IsSharedRelation(relid), relid, NULL);
+	return pgstat_fetch_stat_tabentry_ext(IsSharedRelation(relid),
+										  pgstat_relation_statsid_of(relid), NULL);
 }
 
 /*
@@ -541,7 +577,7 @@ pgstat_fetch_stat_tabentry(Oid relid)
  * also returns whether the caller can pfree() the result if desired.
  */
 PgStat_StatTabEntry *
-pgstat_fetch_stat_tabentry_ext(bool shared, Oid reloid, bool *may_free)
+pgstat_fetch_stat_tabentry_ext(bool shared, uint64 reloid, bool *may_free)
 {
 	Oid			dboid = (shared ? InvalidOid : MyDatabaseId);
 
@@ -570,10 +606,12 @@ find_relstat_entry_kind(PgStat_Kind kind, Oid rel_id)
 	PgStat_RelationStatus *relentry = NULL;
 	PgStat_RelationStatus *relstatus = NULL;
 
-	entry_ref = pgstat_fetch_pending_entry(kind, MyDatabaseId, rel_id);
+	entry_ref = pgstat_fetch_pending_entry(kind, MyDatabaseId,
+										   pgstat_relation_statsid_of(rel_id));
 	if (!entry_ref)
 	{
-		entry_ref = pgstat_fetch_pending_entry(kind, InvalidOid, rel_id);
+		entry_ref = pgstat_fetch_pending_entry(kind, InvalidOid,
+											   pgstat_relation_statsid_of(rel_id));
 		if (!entry_ref)
 			return relstatus;
 	}
@@ -998,7 +1036,7 @@ pgstat_relation_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
  * initialized if not exists.
  */
 static PgStat_RelationStatus *
-pgstat_prep_relation_pending(PgStat_Kind kind, Oid rel_id, bool isshared)
+pgstat_prep_relation_pending(PgStat_Kind kind, uint64 rel_id, bool isshared)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStat_RelationStatus *pending;

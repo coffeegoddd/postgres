@@ -74,8 +74,10 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_branch.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "commands/vacuum.h"
@@ -197,9 +199,16 @@ typedef struct avw_dbase
 } avw_dbase;
 
 /* struct to keep track of tables to vacuum and/or analyze, in 1st pass */
+/* a TOAST table, by OID and branch: each branch has its copy, same OID */
+typedef struct av_relkey
+{
+	Oid			toastrelid;
+	Oid			branch;
+} av_relkey;
+
 typedef struct av_relation
 {
-	Oid			ar_toastrelid;	/* hash key - must be first */
+	av_relkey	ar_key;			/* hash key - must be first */
 	StdRdOptions ar_reloptions; /* copy of main table's reloptions */
 } av_relation;
 
@@ -343,6 +352,7 @@ typedef struct
 typedef struct
 {
 	Oid			oid;
+	Oid			branch;			/* the branch whose copy this is */
 	double		score;
 } TableToProcess;
 
@@ -1966,7 +1976,11 @@ get_effective_relopts(HeapTuple tup, TupleDesc desc, HTAB *toast_map,
 
 	/* if we're a TOAST table, look up our main table's relopts, too */
 	if (classForm->relkind == RELKIND_TOASTVALUE)
-		hentry = hash_search(toast_map, &classForm->oid, HASH_FIND, NULL);
+	{
+		av_relkey	key = {classForm->oid, classForm->relbranch};
+
+		hentry = hash_search(toast_map, &key, HASH_FIND, NULL);
+	}
 	*main_opts = hentry ? &hentry->ar_reloptions : NULL;
 
 	/* return the merged reloptions */
@@ -2065,7 +2079,7 @@ do_autovacuum(void)
 	pg_class_desc = CreateTupleDescCopy(RelationGetDescr(classRel));
 
 	/* create hash table for toast <-> main relid mapping */
-	ctl.keysize = sizeof(Oid);
+	ctl.keysize = sizeof(av_relkey);
 	ctl.entrysize = sizeof(av_relation);
 
 	table_toast_map = hash_create("TOAST to main relid map",
@@ -2086,155 +2100,172 @@ do_autovacuum(void)
 	 * wide tables there might be proportionally much more activity in the
 	 * TOAST table than in its parent.
 	 */
-	relScan = table_beginscan_catalog(classRel, 0, NULL);
-
 	/*
-	 * On the first pass, we collect main tables to vacuum, and also the main
-	 * table relid to TOAST relid mapping.
+	 * Every branch's tables, each processed later on its branch: a branch's
+	 * copies need vacuuming as much as the session branch's.  Shared tables
+	 * are processed on main.
 	 */
-	while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
+	CatalogAllBranches = true;
+	PG_TRY();
 	{
-		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
-		StdRdOptions *relopts;
-		Oid			relid;
-		bool		dovacuum;
-		bool		doanalyze;
-		bool		wraparound;
-		AutoVacuumScores scores;
-
-		if (classForm->relkind != RELKIND_RELATION &&
-			classForm->relkind != RELKIND_MATVIEW)
-			continue;
-
-		relid = classForm->oid;
+		relScan = table_beginscan_catalog(classRel, 0, NULL);
 
 		/*
-		 * Check if it is a temp table (presumably, of some other backend's).
-		 * We cannot safely process other backends' temp tables.
+		 * On the first pass, we collect main tables to vacuum, and also the main
+		 * table relid to TOAST relid mapping.
 		 */
-		if (classForm->relpersistence == RELPERSISTENCE_TEMP)
+		while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
 		{
+			Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+			StdRdOptions *relopts;
+			Oid			relid;
+			bool		dovacuum;
+			bool		doanalyze;
+			bool		wraparound;
+			AutoVacuumScores scores;
+
+			if (classForm->relkind != RELKIND_RELATION &&
+				classForm->relkind != RELKIND_MATVIEW)
+				continue;
+
+			relid = classForm->oid;
+
 			/*
-			 * We just ignore it if the owning backend is still active and
-			 * using the temporary schema.  Also, for safety, ignore it if the
-			 * namespace doesn't exist or isn't a temp namespace after all.
+			 * Check if it is a temp table (presumably, of some other backend's).
+			 * We cannot safely process other backends' temp tables.
 			 */
-			if (checkTempNamespaceStatus(classForm->relnamespace) == TEMP_NAMESPACE_IDLE)
+			if (classForm->relpersistence == RELPERSISTENCE_TEMP)
 			{
 				/*
-				 * The table seems to be orphaned -- although it might be that
-				 * the owning backend has already deleted it and exited; our
-				 * pg_class scan snapshot is not necessarily up-to-date
-				 * anymore, so we could be looking at a committed-dead entry.
-				 * Remember it so we can try to delete it later.
+				 * We just ignore it if the owning backend is still active and
+				 * using the temporary schema.  Also, for safety, ignore it if the
+				 * namespace doesn't exist or isn't a temp namespace after all.
 				 */
-				orphan_oids = lappend_oid(orphan_oids, relid);
+				if (checkTempNamespaceStatus(classForm->relnamespace) == TEMP_NAMESPACE_IDLE)
+				{
+					/*
+					 * The table seems to be orphaned -- although it might be that
+					 * the owning backend has already deleted it and exited; our
+					 * pg_class scan snapshot is not necessarily up-to-date
+					 * anymore, so we could be looking at a committed-dead entry.
+					 * Remember it so we can try to delete it later.
+					 */
+					orphan_oids = lappend_oid(orphan_oids, relid);
+				}
+				continue;
 			}
-			continue;
+
+			/* Fetch reloptions and the pgstat entry for this table */
+			relopts = (StdRdOptions *) extractRelOptions(tuple, pg_class_desc, NULL);
+
+			/* Check if it needs vacuum or analyze */
+			relation_needs_vacanalyze(relid,
+									  relopts ? &relopts->autovacuum : NULL,
+									  classForm,
+									  effective_multixact_freeze_max_age,
+									  DEBUG3,
+									  &dovacuum, &doanalyze, &wraparound,
+									  &scores);
+
+			/* Relations that need work are added to tables_to_process */
+			if (dovacuum || doanalyze)
+			{
+				TableToProcess *table = palloc_object(TableToProcess);
+
+				table->oid = relid;
+				table->branch = OidIsValid(classForm->relbranch) ?
+					classForm->relbranch : BRANCH_MAIN_OID;
+				table->score = scores.max;
+				tables_to_process = lappend(tables_to_process, table);
+			}
+
+			/*
+			 * Remember TOAST associations for the second pass.  Note: we must do
+			 * this whether or not the table is going to be vacuumed, because we
+			 * don't automatically vacuum toast tables along the parent table.
+			 */
+			if (OidIsValid(classForm->reltoastrelid) && relopts)
+			{
+				av_relation *hentry;
+				av_relkey	toastkey = {classForm->reltoastrelid, classForm->relbranch};
+				bool		found;
+
+				hentry = hash_search(table_toast_map, &toastkey, HASH_ENTER, &found);
+				Assert(!found);		/* rels cannot share a TOAST table */
+
+				/* hash_search already filled in the key */
+				memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
+			}
+
+			/* Release stuff to avoid per-relation leakage */
+			if (relopts)
+				pfree(relopts);
 		}
 
-		/* Fetch reloptions and the pgstat entry for this table */
-		relopts = (StdRdOptions *) extractRelOptions(tuple, pg_class_desc, NULL);
+		table_endscan(relScan);
 
-		/* Check if it needs vacuum or analyze */
-		relation_needs_vacanalyze(relid,
-								  relopts ? &relopts->autovacuum : NULL,
-								  classForm,
-								  effective_multixact_freeze_max_age,
-								  DEBUG3,
-								  &dovacuum, &doanalyze, &wraparound,
-								  &scores);
+		/* second pass: check TOAST tables */
+		ScanKeyInit(&key,
+					Anum_pg_class_relkind,
+					BTEqualStrategyNumber, F_CHAREQ,
+					CharGetDatum(RELKIND_TOASTVALUE));
 
-		/* Relations that need work are added to tables_to_process */
-		if (dovacuum || doanalyze)
+		relScan = table_beginscan_catalog(classRel, 1, &key);
+		while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
 		{
-			TableToProcess *table = palloc_object(TableToProcess);
+			Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+			Oid			relid;
+			StdRdOptions *relopts;
+			StdRdOptions *main_relopts;
+			bool		dovacuum;
+			bool		doanalyze;
+			bool		wraparound;
+			AutoVacuumScores scores;
 
-			table->oid = relid;
-			table->score = scores.max;
-			tables_to_process = lappend(tables_to_process, table);
+			/*
+			 * We cannot safely process other backends' temp tables, so skip 'em.
+			 */
+			if (classForm->relpersistence == RELPERSISTENCE_TEMP)
+				continue;
+
+			relid = classForm->oid;
+
+			/* fetch reloptions -- merge any unset options from the main rel */
+			relopts = get_effective_relopts(tuple, pg_class_desc, table_toast_map,
+											&main_relopts);
+
+			relation_needs_vacanalyze(relid,
+									  relopts ? &relopts->autovacuum : NULL,
+									  classForm,
+									  effective_multixact_freeze_max_age,
+									  DEBUG3,
+									  &dovacuum, &doanalyze, &wraparound,
+									  &scores);
+
+			/* ignore analyze for toast tables */
+			if (dovacuum)
+			{
+				TableToProcess *table = palloc_object(TableToProcess);
+
+				table->oid = relid;
+				table->branch = OidIsValid(classForm->relbranch) ?
+					classForm->relbranch : BRANCH_MAIN_OID;
+				table->score = scores.max;
+				tables_to_process = lappend(tables_to_process, table);
+			}
+
+			/* Release stuff to avoid leakage */
+			if (relopts)
+				pfree(relopts);
 		}
 
-		/*
-		 * Remember TOAST associations for the second pass.  Note: we must do
-		 * this whether or not the table is going to be vacuumed, because we
-		 * don't automatically vacuum toast tables along the parent table.
-		 */
-		if (OidIsValid(classForm->reltoastrelid) && relopts)
-		{
-			av_relation *hentry;
-			bool		found;
-
-			hentry = hash_search(table_toast_map,
-								 &classForm->reltoastrelid,
-								 HASH_ENTER, &found);
-			Assert(!found);		/* rels cannot share a TOAST table */
-
-			/* hash_search already filled in the key */
-			memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
-		}
-
-		/* Release stuff to avoid per-relation leakage */
-		if (relopts)
-			pfree(relopts);
+		table_endscan(relScan);
 	}
-
-	table_endscan(relScan);
-
-	/* second pass: check TOAST tables */
-	ScanKeyInit(&key,
-				Anum_pg_class_relkind,
-				BTEqualStrategyNumber, F_CHAREQ,
-				CharGetDatum(RELKIND_TOASTVALUE));
-
-	relScan = table_beginscan_catalog(classRel, 1, &key);
-	while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
+	PG_FINALLY();
 	{
-		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
-		Oid			relid;
-		StdRdOptions *relopts;
-		StdRdOptions *main_relopts;
-		bool		dovacuum;
-		bool		doanalyze;
-		bool		wraparound;
-		AutoVacuumScores scores;
-
-		/*
-		 * We cannot safely process other backends' temp tables, so skip 'em.
-		 */
-		if (classForm->relpersistence == RELPERSISTENCE_TEMP)
-			continue;
-
-		relid = classForm->oid;
-
-		/* fetch reloptions -- merge any unset options from the main rel */
-		relopts = get_effective_relopts(tuple, pg_class_desc, table_toast_map,
-										&main_relopts);
-
-		relation_needs_vacanalyze(relid,
-								  relopts ? &relopts->autovacuum : NULL,
-								  classForm,
-								  effective_multixact_freeze_max_age,
-								  DEBUG3,
-								  &dovacuum, &doanalyze, &wraparound,
-								  &scores);
-
-		/* ignore analyze for toast tables */
-		if (dovacuum)
-		{
-			TableToProcess *table = palloc_object(TableToProcess);
-
-			table->oid = relid;
-			table->score = scores.max;
-			tables_to_process = lappend(tables_to_process, table);
-		}
-
-		/* Release stuff to avoid leakage */
-		if (relopts)
-			pfree(relopts);
+		CatalogAllBranches = false;
 	}
-
-	table_endscan(relScan);
+	PG_END_TRY();
 	table_close(classRel, AccessShareLock);
 
 	/*
@@ -2400,6 +2431,10 @@ do_autovacuum(void)
 		dlist_iter	iter;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/* a table is processed on its branch */
+		if (table->branch != MyBranch)
+			set_session_branch(table->branch);
 
 		/*
 		 * Check for config changes before processing each collected table.
@@ -2704,6 +2739,7 @@ deleted:
 	 * table due to concurrent autovacuum activity.  In that case, the other
 	 * worker has already done it, or will do so when it finishes.
 	 */
+	set_session_branch(BRANCH_MAIN_OID);
 	if (did_vacuum || !found_concurrent_worker)
 		vac_update_datfrozenxid();
 
@@ -3256,7 +3292,8 @@ relation_needs_vacanalyze(Oid relid,
 	 * forced.
 	 */
 	tabentry = pgstat_fetch_stat_tabentry_ext(classForm->relisshared,
-											  relid, &may_free);
+											  pgstat_relation_statsid(relid, classForm->relbranch),
+											  &may_free);
 	if (!tabentry)
 		return;
 
@@ -3667,7 +3704,7 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 	recentMulti = ReadNextMultiXactId();
 
 	/* create hash table for toast <-> main relid mapping */
-	ctl.keysize = sizeof(Oid);
+	ctl.keysize = sizeof(av_relkey);
 	ctl.entrysize = sizeof(av_relation);
 	ctl.hcxt = CurrentMemoryContext;
 	table_toast_map = hash_create("TOAST to main relid map",
@@ -3686,6 +3723,7 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 	{
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
 		StdRdOptions *relopts;
+		av_relkey	key;
 		av_relation *hentry;
 		bool		found;
 
@@ -3702,8 +3740,9 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 		if (!relopts)
 			continue;
 
-		hentry = hash_search(table_toast_map, &form->reltoastrelid,
-							 HASH_ENTER, &found);
+		key.toastrelid = form->reltoastrelid;
+		key.branch = form->relbranch;
+		hentry = hash_search(table_toast_map, &key, HASH_ENTER, &found);
 		Assert(!found);			/* rels cannot share a TOAST table */
 
 		/* hash_search already filled in the key */

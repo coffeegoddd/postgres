@@ -33,6 +33,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -311,10 +312,23 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 			continue;
 		}
 
-		/* Append relevant pg_class tuples for current page to rlocatorlist. */
-		rlocatorlist = ScanSourceDatabasePgClassPage(page, buf, tbid, dbid,
-													 srcpath, rlocatorlist,
-													 snapshot);
+		/*
+		 * Append relevant pg_class tuples for current page to rlocatorlist:
+		 * every branch's, since each branch's relations are copied (this
+		 * session's branch means nothing in the source database).
+		 */
+		CatalogAllBranches = true;
+		PG_TRY();
+		{
+			rlocatorlist = ScanSourceDatabasePgClassPage(page, buf, tbid, dbid,
+														 srcpath, rlocatorlist,
+														 snapshot);
+		}
+		PG_FINALLY();
+		{
+			CatalogAllBranches = false;
+		}
+		PG_END_TRY();
 
 		UnlockReleaseBuffer(buf);
 	}

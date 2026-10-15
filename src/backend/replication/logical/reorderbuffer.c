@@ -95,6 +95,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "common/int.h"
 #include "lib/binaryheap.h"
@@ -2351,6 +2352,15 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					if (reloid == InvalidOid &&
 						change->data.tp.newtuple == NULL &&
 						change->data.tp.oldtuple == NULL)
+						goto change_done;
+
+					/*
+					 * A change to another branch's copy of a versioned table:
+					 * this session decodes its own branch's changes only.
+					 */
+					if (reloid == InvalidOid &&
+						relfilenumber_on_other_branch(change->data.tp.rlocator.spcOid,
+													  change->data.tp.rlocator.relNumber))
 						goto change_done;
 					else if (reloid == InvalidOid)
 						elog(ERROR, "could not map filenumber \"%s\" to relation OID",

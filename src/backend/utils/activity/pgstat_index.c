@@ -113,7 +113,8 @@ pgstat_index_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 PgStat_StatIdxEntry *
 pgstat_fetch_stat_idxentry(Oid relid)
 {
-	return pgstat_fetch_stat_idxentry_ext(IsSharedRelation(relid), relid, NULL);
+	return pgstat_fetch_stat_idxentry_ext(IsSharedRelation(relid),
+										  pgstat_relation_statsid_of(relid), NULL);
 }
 
 /*
@@ -122,7 +123,7 @@ pgstat_fetch_stat_idxentry(Oid relid)
  * also returns whether the caller can pfree() the result if desired.
  */
 PgStat_StatIdxEntry *
-pgstat_fetch_stat_idxentry_ext(bool shared, Oid reloid, bool *may_free)
+pgstat_fetch_stat_idxentry_ext(bool shared, uint64 reloid, bool *may_free)
 {
 	Oid			dboid = (shared ? InvalidOid : MyDatabaseId);
 
