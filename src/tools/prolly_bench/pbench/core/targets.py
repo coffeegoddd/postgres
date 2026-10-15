@@ -3,7 +3,9 @@
 Setting default_table_access_method is enough for every AM except prolly,
 whose tables exist only in versioned schemas: with prolly as the default, a
 table created anywhere else is quietly a heap table.  A prolly target
-therefore creates its tables in a versioned schema.
+therefore creates its tables in a versioned schema, which its databases
+put first on their search_path, so every client and every unqualified name
+finds them there.
 """
 
 from __future__ import annotations
@@ -24,6 +26,26 @@ class Target:
     # A versioned schema to create the tables in, or None for the default
     # (public).
     schema: Optional[str] = None
+
+
+    def setup_sql(self, dbname: str) -> str:
+        """SQL to run in a new database before any tables are created."""
+        if not self.schema:
+            return ""
+        return (f"CREATE SCHEMA {self.schema} VERSIONED;\n"
+                f"ALTER DATABASE {dbname} SET search_path = {self.schema}, public;")
+
+    def wrong_am(self, cluster, dbname: str, tables: list[str]) -> list[str]:
+        """Those of tables (that exist) not on this target's AM, as
+        "table:am"."""
+        out = []
+        for t in tables:
+            am = cluster.scalar(
+                "SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam "
+                f"WHERE c.oid = to_regclass('{t}')", dbname=dbname)
+            if am and am != self.table_am:
+                out.append(f"{t}:{am}")
+        return out
 
 
 def for_am(table_am: str) -> Target:

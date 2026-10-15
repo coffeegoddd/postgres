@@ -252,6 +252,19 @@ class CSuiteTest(unittest.TestCase):
         self.assertIsNone(targets.for_am("heap").schema)
         self.assertIsNone(targets.for_am("prolly_d1").schema)
         self.assertEqual(targets.for_am("prolly").schema, targets.VERSIONED_SCHEMA)
+        self.assertEqual(targets.for_am("heap").setup_sql("bench"), "")
+        sql = targets.for_am("prolly").setup_sql("bench")
+        self.assertIn("CREATE SCHEMA versioned VERSIONED", sql)
+        self.assertIn("ALTER DATABASE bench SET search_path = versioned, public", sql)
+
+    def test_wrong_am(self):
+        class FakeCluster:
+            ams = {"t1": "prolly", "t2": "heap", "gone": ""}
+
+            def scalar(self, sql, dbname):
+                return next(am for t, am in self.ams.items() if f"'{t}'" in sql)
+        got = targets.for_am("prolly").wrong_am(FakeCluster(), "bench", ["t1", "t2", "gone"])
+        self.assertEqual(got, ["t2:heap"])
 
     def test_sample_per_directory(self):
         from pbench.workloads.c_suite import C3
