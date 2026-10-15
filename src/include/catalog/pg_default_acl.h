@@ -37,6 +37,7 @@ CATALOG(pg_default_acl,826,DefaultAclRelationId)
 	Oid			defaclnamespace BKI_LOOKUP_OPT(pg_namespace);	/* OID of namespace, or
 																 * 0 for all */
 	char		defaclobjtype;	/* see DEFACLOBJ_xxx constants below */
+	Oid			defaclbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	aclitem		defaclacl[] BKI_FORCE_NOT_NULL; /* permissions to add at
@@ -55,8 +56,8 @@ typedef FormData_pg_default_acl *Form_pg_default_acl;
 
 DECLARE_TOAST(pg_default_acl, 4143, 4144);
 
-DECLARE_UNIQUE_INDEX(pg_default_acl_role_nsp_obj_index, 827, DefaultAclRoleNspObjIndexId, pg_default_acl, btree(defaclrole oid_ops, defaclnamespace oid_ops, defaclobjtype char_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_default_acl_oid_index, 828, DefaultAclOidIndexId, pg_default_acl, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_default_acl_role_nsp_obj_index, 827, DefaultAclRoleNspObjIndexId, pg_default_acl, btree(defaclrole oid_ops, defaclnamespace oid_ops, defaclobjtype char_ops, defaclbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_default_acl_oid_index, 828, DefaultAclOidIndexId, pg_default_acl, btree(oid oid_ops, defaclbranch oid_ops));
 
 MAKE_SYSCACHE(DEFACLROLENSPOBJ, pg_default_acl_role_nsp_obj_index, 8);
 

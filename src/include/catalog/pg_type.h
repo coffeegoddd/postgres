@@ -229,6 +229,7 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
 	 */
 	Oid			typcollation BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_collation);
 
+	Oid			typbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/*
@@ -266,8 +267,8 @@ typedef FormData_pg_type *Form_pg_type;
 
 DECLARE_TOAST(pg_type, 4171, 4172);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_type_oid_index, 2703, TypeOidIndexId, pg_type, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, TypeNameNspIndexId, pg_type, btree(typname name_ops, typnamespace oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_type_oid_index, 2703, TypeOidIndexId, pg_type, btree(oid oid_ops, typbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, TypeNameNspIndexId, pg_type, btree(typname name_ops, typnamespace oid_ops, typbranch oid_ops));
 
 MAKE_SYSCACHE(TYPEOID, pg_type_oid_index, 64);
 MAKE_SYSCACHE(TYPENAMENSP, pg_type_typname_nsp_index, 64);

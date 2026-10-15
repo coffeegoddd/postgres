@@ -32,6 +32,7 @@ CATALOG(pg_sequence,2224,SequenceRelationId)
 	int64		seqmin;
 	int64		seqcache;
 	bool		seqcycle;
+	Oid			seqbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_sequence;
 
 END_CATALOG_STRUCT
@@ -43,7 +44,7 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_sequence *Form_pg_sequence;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_sequence_seqrelid_index, 5002, SequenceRelidIndexId, pg_sequence, btree(seqrelid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_sequence_seqrelid_index, 5002, SequenceRelidIndexId, pg_sequence, btree(seqrelid oid_ops, seqbranch oid_ops));
 
 MAKE_SYSCACHE(SEQRELID, pg_sequence_seqrelid_index, 32);
 

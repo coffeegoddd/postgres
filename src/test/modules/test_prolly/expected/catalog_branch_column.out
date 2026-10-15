@@ -1,0 +1,54 @@
+-- Catalogs that can hold versioned objects' rows have a branch column, 0 in
+-- shared rows.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+-- Rows formed with the branch column null are written with it set, and the
+-- rows written in their place are freed.
+BEGIN;
+SELECT test_catalog_null_branch_no_leak(2000);
+ test_catalog_null_branch_no_leak 
+----------------------------------
+ t
+(1 row)
+
+ROLLBACK;
+-- Extended statistics on expressions keep pg_statistic rows inside
+-- pg_statistic_ext_data; their branch column is set too.
+CREATE TABLE exprtest (a int);
+INSERT INTO exprtest SELECT generate_series(1, 1000);
+CREATE STATISTICS exprtest_stats ON (a + 1) FROM exprtest;
+ANALYZE exprtest;
+SELECT (stxdexpr[1]).stabranch, stxdbranch FROM pg_statistic_ext_data
+  WHERE stxoid = (SELECT oid FROM pg_statistic_ext WHERE stxname = 'exprtest_stats');
+ stabranch | stxdbranch 
+-----------+------------
+         0 |          0
+(1 row)
+
+-- ... and when imported.
+SELECT pg_clear_extended_stats('public', 'exprtest', 'public', 'exprtest_stats', false);
+ pg_clear_extended_stats 
+-------------------------
+ 
+(1 row)
+
+SELECT pg_restore_extended_stats(
+  'schemaname', 'public', 'relname', 'exprtest',
+  'statistics_schemaname', 'public', 'statistics_name', 'exprtest_stats',
+  'inherited', false,
+  'exprs', '[{"null_frac": "0", "avg_width": "4", "n_distinct": "-1"}]'::jsonb);
+ pg_restore_extended_stats 
+---------------------------
+ t
+(1 row)
+
+SELECT (stxdexpr[1]).stabranch, (stxdexpr[1]).stadistinct, stxdbranch
+  FROM pg_statistic_ext_data
+  WHERE stxoid = (SELECT oid FROM pg_statistic_ext WHERE stxname = 'exprtest_stats');
+ stabranch | stadistinct | stxdbranch 
+-----------+-------------+------------
+         0 |          -1 |          0
+(1 row)
+
+DROP TABLE exprtest;

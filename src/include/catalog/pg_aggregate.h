@@ -93,6 +93,7 @@ CATALOG(pg_aggregate,2600,AggregateRelationId)
 	/* estimated size of moving-agg state (0 for default est) */
 	int32		aggmtransspace BKI_DEFAULT(0);
 
+	Oid			aggbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/* initial value for transition state (can be NULL) */
@@ -114,7 +115,7 @@ typedef FormData_pg_aggregate *Form_pg_aggregate;
 
 DECLARE_TOAST(pg_aggregate, 4159, 4160);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650, AggregateFnoidIndexId, pg_aggregate, btree(aggfnoid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650, AggregateFnoidIndexId, pg_aggregate, btree(aggfnoid oid_ops, aggbranch oid_ops));
 
 MAKE_SYSCACHE(AGGFNOID, pg_aggregate_fnoid_index, 16);
 

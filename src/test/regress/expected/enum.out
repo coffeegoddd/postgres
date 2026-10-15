@@ -718,7 +718,7 @@ SELECT COUNT(*) FROM pg_type WHERE typname = 'rainbow';
 
 SELECT * FROM pg_enum WHERE NOT EXISTS
   (SELECT 1 FROM pg_type WHERE pg_type.oid = enumtypid);
- oid | enumtypid | enumsortorder | enumlabel 
------+-----------+---------------+-----------
+ oid | enumtypid | enumsortorder | enumlabel | enumbranch 
+-----+-----------+---------------+-----------+------------
 (0 rows)
 

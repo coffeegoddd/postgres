@@ -3018,8 +3018,8 @@ DROP SCHEMA testns5 CASCADE;
 SELECT d.*     -- check that entries went away
   FROM pg_default_acl d LEFT JOIN pg_namespace n ON defaclnamespace = n.oid
   WHERE nspname IS NULL AND defaclnamespace != 0;
- oid | defaclrole | defaclnamespace | defaclobjtype | defaclacl 
------+------------+-----------------+---------------+-----------
+ oid | defaclrole | defaclnamespace | defaclobjtype | defaclbranch | defaclacl 
+-----+------------+-----------------+---------------+--------------+-----------
 (0 rows)
 
 -- Grant on all objects of given type in a schema

@@ -45,14 +45,15 @@ CATALOG(pg_ts_config,3602,TSConfigRelationId)
 
 	/* OID of parser */
 	Oid			cfgparser BKI_LOOKUP(pg_ts_parser);
+	Oid			cfgbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_ts_config;
 
 END_CATALOG_STRUCT
 
 typedef FormData_pg_ts_config *Form_pg_ts_config;
 
-DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608, TSConfigNameNspIndexId, pg_ts_config, btree(cfgname name_ops, cfgnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712, TSConfigOidIndexId, pg_ts_config, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608, TSConfigNameNspIndexId, pg_ts_config, btree(cfgname name_ops, cfgnamespace oid_ops, cfgbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712, TSConfigOidIndexId, pg_ts_config, btree(oid oid_ops, cfgbranch oid_ops));
 
 MAKE_SYSCACHE(TSCONFIGNAMENSP, pg_ts_config_cfgname_index, 2);
 MAKE_SYSCACHE(TSCONFIGOID, pg_ts_config_oid_index, 2);

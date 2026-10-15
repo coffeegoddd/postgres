@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	aclchk.o \
+	branch.o \
 	catalog.o \
 	dependency.o \
 	heap.o \

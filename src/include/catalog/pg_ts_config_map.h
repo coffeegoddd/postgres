@@ -42,13 +42,14 @@ CATALOG(pg_ts_config_map,3603,TSConfigMapRelationId)
 
 	/* dictionary to consult */
 	Oid			mapdict BKI_LOOKUP(pg_ts_dict);
+	Oid			mapbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_ts_config_map;
 
 END_CATALOG_STRUCT
 
 typedef FormData_pg_ts_config_map *Form_pg_ts_config_map;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_map_index, 3609, TSConfigMapIndexId, pg_ts_config_map, btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_map_index, 3609, TSConfigMapIndexId, pg_ts_config_map, btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops, mapbranch oid_ops));
 
 MAKE_SYSCACHE(TSCONFIGMAP, pg_ts_config_map_index, 2);
 

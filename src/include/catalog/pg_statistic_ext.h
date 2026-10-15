@@ -46,6 +46,8 @@ CATALOG(pg_statistic_ext,3381,StatisticExtRelationId)
 
 	Oid			stxowner BKI_LOOKUP(pg_authid); /* statistics object's owner */
 
+	Oid			stxbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
+
 	/*
 	 * variable-length/nullable fields start here, but we allow direct access
 	 * to stxkeys
@@ -74,8 +76,8 @@ typedef FormData_pg_statistic_ext *Form_pg_statistic_ext;
 
 DECLARE_TOAST(pg_statistic_ext, 3439, 3440);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380, StatisticExtOidIndexId, pg_statistic_ext, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997, StatisticExtNameIndexId, pg_statistic_ext, btree(stxname name_ops, stxnamespace oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380, StatisticExtOidIndexId, pg_statistic_ext, btree(oid oid_ops, stxbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997, StatisticExtNameIndexId, pg_statistic_ext, btree(stxname name_ops, stxnamespace oid_ops, stxbranch oid_ops));
 DECLARE_INDEX(pg_statistic_ext_relid_index, 3379, StatisticExtRelidIndexId, pg_statistic_ext, btree(stxrelid oid_ops));
 
 MAKE_SYSCACHE(STATEXTOID, pg_statistic_ext_oid_index, 4);

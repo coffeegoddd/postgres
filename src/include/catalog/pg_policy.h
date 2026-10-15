@@ -37,6 +37,7 @@ CATALOG(pg_policy,3256,PolicyRelationId)
 	char		polcmd;			/* One of ACL_*_CHR, or '*' for all */
 	bool		polpermissive;	/* restrictive or permissive policy */
 
+	Oid			polbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN
 	/* Roles to which the policy is applied; zero means PUBLIC */
 	Oid			polroles[] BKI_LOOKUP_OPT(pg_authid) BKI_FORCE_NOT_NULL;
@@ -56,7 +57,7 @@ typedef FormData_pg_policy *Form_pg_policy;
 
 DECLARE_TOAST(pg_policy, 4167, 4168);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_policy_oid_index, 3257, PolicyOidIndexId, pg_policy, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_policy_polrelid_polname_index, 3258, PolicyPolrelidPolnameIndexId, pg_policy, btree(polrelid oid_ops, polname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_policy_oid_index, 3257, PolicyOidIndexId, pg_policy, btree(oid oid_ops, polbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_policy_polrelid_polname_index, 3258, PolicyPolrelidPolnameIndexId, pg_policy, btree(polrelid oid_ops, polname name_ops, polbranch oid_ops));
 
 #endif							/* PG_POLICY_H */

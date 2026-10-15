@@ -34,6 +34,7 @@ CATALOG(pg_seclabel,3596,SecLabelRelationId)
 												 * object */
 	int32		objsubid;		/* column number, or 0 if not used */
 
+	Oid			objbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text		provider BKI_FORCE_NOT_NULL;	/* name of label provider */
 	text		label BKI_FORCE_NOT_NULL;	/* security label of the object */
@@ -44,6 +45,6 @@ END_CATALOG_STRUCT
 
 DECLARE_TOAST(pg_seclabel, 3598, 3599);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_seclabel_object_index, 3597, SecLabelObjectIndexId, pg_seclabel, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, provider text_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_seclabel_object_index, 3597, SecLabelObjectIndexId, pg_seclabel, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, provider text_ops, objbranch oid_ops));
 
 #endif							/* PG_SECLABEL_H */

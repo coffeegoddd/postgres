@@ -77,3 +77,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION prolly_seek_sees_later_writes(rel regclass)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Check that catalog rows formed with a null branch column don't leak the
+-- rows written in their place.  Inserts into pg_description; roll back.
+CREATE FUNCTION test_catalog_null_branch_no_leak(n int)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -37,6 +37,8 @@ CATALOG(pg_partitioned_table,3350,PartitionedRelationId)
 	Oid			partdefid BKI_LOOKUP_OPT(pg_class); /* default partition oid;
 													 * 0 if there isn't one */
 
+	Oid			partbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
+
 	/*
 	 * variable-length fields start here, but we allow direct access to
 	 * partattrs via the C struct.  That's because the first variable-length
@@ -70,7 +72,7 @@ typedef FormData_pg_partitioned_table *Form_pg_partitioned_table;
 
 DECLARE_TOAST(pg_partitioned_table, 4165, 4166);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351, PartitionedRelidIndexId, pg_partitioned_table, btree(partrelid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351, PartitionedRelidIndexId, pg_partitioned_table, btree(partrelid oid_ops, partbranch oid_ops));
 
 MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index, 32);
 
