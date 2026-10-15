@@ -2339,6 +2339,9 @@ prolly_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 								   true);
 	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM,
 						rel->rd_rel->relpersistence);
+
+	/* The old storage goes when the transaction commits, as heap's does. */
+	RelationDropStorage(rel);
 	smgrclose(dstrel);
 }
 
