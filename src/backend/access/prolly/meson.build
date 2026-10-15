@@ -42,6 +42,7 @@ backend_sources += files(
   'prolly_xact.c',
   'reclaim_marksweep.c',
   'reclaim_stub.c',
+  'refs_tree.c',
   'refs_stub.c',
   'rootlayout_stub.c',
   'rootlayout_subroots.c',

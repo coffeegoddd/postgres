@@ -28,6 +28,31 @@ static const ProllyEngineRoutine *engines[MAX_ENGINES];
 static int	nengines = 0;
 static bool callbacks_registered = false;
 
+static ProllyBranchId session_branch = PROLLY_MAIN_BRANCH;
+
+ProllyBranchId
+prolly_session_branch(void)
+{
+	return session_branch;
+}
+
+void
+prolly_set_session_branch(ProllyBranchId branch)
+{
+	if (nengines > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot switch prolly branches with uncommitted writes"),
+				 errhint("Commit or roll back the transaction first.")));
+	session_branch = branch;
+}
+
+bool
+prolly_xact_has_writes(void)
+{
+	return nengines > 0;
+}
+
 /* States engines gave at PREPARE, until recorded. */
 static StringInfoData prepared[MAX_ENGINES];
 static int	nprepared = 0;

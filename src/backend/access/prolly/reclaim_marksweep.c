@@ -4,6 +4,10 @@
  *	  Reclamation implementation "mark_sweep": collect the node store's
  *	  garbage by marking from every live root, as dolt gc does.
  *
+ * The head of each database's refs branch isn't a working set but the
+ * refs' own tree, which the refs implementation walks (commits, the
+ * working sets they recorded, their roots).
+ *
  * collect() takes the store lock exclusively, which waits for every
  * transaction writing nodes (or keeping nodes it found in the store, or a
  * prepared one) to end and keeps new ones waiting until the current
@@ -102,12 +106,21 @@ mark_node(const ProllyNodeRef *node, uint16 level, void *arg)
 }
 
 static void
-mark_root(const ProllyNodeRef *root, void *arg)
+mark_root(ProllyBranchId branch, const ProllyNodeRef *root, void *arg)
 {
 	Marks	   *m = arg;
 
 	CHECK_FOR_INTERRUPTS();
-	PROLLY_CALL(m->root_layout, walk, &m->root_env, root, mark_node, m);
+	if (branch == PROLLY_REFS_BRANCH)
+	{
+		/* Not a working set: the refs, and the commits they keep. */
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		PROLLY_CALL(dc.refs, walk, root, mark_node, m);
+	}
+	else
+		PROLLY_CALL(m->root_layout, walk, &m->root_env, root, mark_node, m);
 }
 
 static void

@@ -704,6 +704,45 @@ version) stay until the index is rebuilt; once branches exist (4g), a TID
 gone on one branch may still name a version on another, so VACUUM must
 consult every branch before forgetting.
 
+**Plan (2026-10-14): 4g in stages.** 4g.1 refs, branches, commits and
+checkout, with data versioned per branch (catalogs still shared heap
+tables); 4g.2 the canonicalizer: commits' root hashes from canonical
+schema and data, by name; 4g.3 diff and three-way merge, with Dolt's
+conflict tables; 4g.4 Doltgres's SQL interface (`dolt_*` functions and
+system tables, `dbname/branch`); 4g.5 versioned catalogs (every catalog a
+prolly table: `09-versioned-catalogs.md`, B10), the largest piece, after
+which schema is per branch.
+
+**Status (2026-10-14): 4g.1 built.** A refs implementation, `tree`,
+keeps a database's branches and commits in a prolly tree that is the head
+of a reserved branch of the commit pipeline (`PROLLY_REFS_BRANCH`), so
+refs are transactional, WAL-logged, crash-safe and replicated as working
+sets are, without a refs file (question 32's proposal, met another way).
+The refs tree maps branch names to branch numbers and head commits, and
+commit ids to the working set each recorded; a commit is a small tree of
+its own (author, message, parents, root, time), its id the root's hash.
+Writers of refs take the refs branch's lock before reading what they
+change, so branch numbers are given out once. Each branch has its own
+working set, a head in the commit pipeline; a session's checkout picks
+which one its transactions read and write (D1 takes the branch when a
+transaction first writes; a checkout with uncommitted writes is refused),
+and a prepared transaction commits to the branch it wrote. K1's locks
+include the branch, so writers of one row on different branches don't
+wait for each other. `prolly_commit()` records the branch's working set;
+`prolly_branch_create()` starts a branch from a commit's working set (or
+the current branch's head commit), `prolly_checkout()` switches.
+Reclamation keeps what refs reach: the refs tree, every commit, the
+working set it recorded and its root (the refs interface's new `walk`;
+the commit pipeline's `live_roots` now says which branch a root is from).
+Tests: `019_d1_branches.pl` (rows per branch; row locks per branch; a
+prepared transaction's branch; a branch from an old commit after
+`prolly_gc()`; a crash; a standby; unknown branches). The requirements
+suite's `vc_branches` and `vc_branch_sessions` now pass (the latter's
+setup steps now print nothing: a commit id differs from run to run). Until 4g.2 a commit's root is its
+working set's local root, so root hashes depend on history; until 4g.5
+schema is shared by every branch (a table created on one branch exists,
+empty, on the others).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

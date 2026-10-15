@@ -30,7 +30,7 @@ hash_to_text(const ProllyHash *hash)
 	return cstring_to_text(hex);
 }
 
-/* prolly_branch_create(branch text, start_point text) returns void */
+/* prolly_branch_create(branch text, start_point text) returns void (null) */
 Datum
 prolly_branch_create(PG_FUNCTION_ARGS)
 {
@@ -50,10 +50,10 @@ prolly_branch_create(PG_FUNCTION_ARGS)
 	prolly_database_components(&components);
 	refs = components.refs;
 	PROLLY_CALL(refs, branch_create, branch, start_point);
-	PG_RETURN_VOID();
+	PG_RETURN_NULL();
 }
 
-/* prolly_checkout(branch text) returns void */
+/* prolly_checkout(branch text) returns void (null) */
 Datum
 prolly_checkout(PG_FUNCTION_ARGS)
 {
@@ -64,7 +64,7 @@ prolly_checkout(PG_FUNCTION_ARGS)
 	prolly_database_components(&components);
 	refs = components.refs;
 	PROLLY_CALL(refs, checkout, branch);
-	PG_RETURN_VOID();
+	PG_RETURN_NULL();
 }
 
 /* prolly_commit(message text) returns text (the commit id) */

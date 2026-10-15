@@ -223,6 +223,7 @@ typedef struct D1Xact
 	D1WriteSet *all;
 	bool		enqueued;
 	ProllyCommitTicket ticket;
+	ProllyBranchId branch;		/* the branch its writes go to */
 } D1Xact;
 
 static D1Xact *xact = NULL;
@@ -434,10 +435,17 @@ find_tree(const ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber
 	}
 }
 
+/* The transaction's branch once it writes; until then the session's. */
+static ProllyBranchId
+current_branch(void)
+{
+	return xact ? xact->branch : prolly_session_branch();
+}
+
 static void
 current_head(ProllyRootSet *roots)
 {
-	roots->has_root = PROLLY_CALL(backend.c.commit, head, PROLLY_MAIN_BRANCH,
+	roots->has_root = PROLLY_CALL(backend.c.commit, head, current_branch(),
 								  &roots->root);
 }
 
@@ -454,6 +462,7 @@ xact_init(void)
 	if (xact != NULL)
 		return;
 	xact = MemoryContextAllocZero(TopTransactionContext, sizeof(D1Xact));
+	xact->branch = prolly_session_branch();
 	xact->mcxt = AllocSetContextCreate(TopTransactionContext,
 									   "prolly d1 private writes",
 									   ALLOCSET_DEFAULT_SIZES);
@@ -1190,7 +1199,7 @@ d1_roots_acquire(Snapshot snapshot)
 	backend_init();
 	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_MVCC)
 		roots->has_root = PROLLY_CALL(backend.c.commit, snapshot_head,
-									  PROLLY_MAIN_BRANCH, snapshot,
+									  current_branch(), snapshot,
 									  &roots->root);
 	else
 		current_head(roots);
@@ -1856,7 +1865,7 @@ d1_unseen_writers(Relation tree, Snapshot snapshot, TransactionId **xids)
 	ProllyNodeRef prev;
 
 	backend_init();
-	n = PROLLY_CALL(backend.c.commit, commits_since, PROLLY_MAIN_BRANCH,
+	n = PROLLY_CALL(backend.c.commit, commits_since, current_branch(),
 					snapshot, &commits);
 	*xids = palloc(sizeof(TransactionId) * Max(n, 1));
 	for (int i = 0; i < n; i++)
@@ -2440,8 +2449,8 @@ d1_xact_precommit(void)
 		materialize(sets[i], &edits[i].tree);
 	}
 
-	PROLLY_CALL(commit, branch_lock, PROLLY_MAIN_BRANCH);
-	tip.has_root = PROLLY_CALL(commit, tip, PROLLY_MAIN_BRANCH, &tip.root);
+	PROLLY_CALL(commit, branch_lock, xact->branch);
+	tip.has_root = PROLLY_CALL(commit, tip, xact->branch, &tip.root);
 	if (!tip.has_root)
 		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
 	tip.has_root = true;
@@ -2464,10 +2473,10 @@ d1_xact_precommit(void)
 
 	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
 				edits, n, &new_root);
-	xact->ticket = PROLLY_CALL(commit, enqueue, PROLLY_MAIN_BRANCH, &new_root,
+	xact->ticket = PROLLY_CALL(commit, enqueue, xact->branch, &new_root,
 							   GetCurrentTransactionId());
 	xact->enqueued = true;
-	PROLLY_CALL(commit, branch_unlock, PROLLY_MAIN_BRANCH);
+	PROLLY_CALL(commit, branch_unlock, xact->branch);
 	pfree(sets);
 	pfree(edits);
 }
@@ -2489,7 +2498,7 @@ d1_xact_abort(void)
 }
 
 /*
- * Two-phase state, per write set: sub (1 byte), relnumber, relid, replaced
+ * Two-phase state: the branch, then per write set: sub (1 byte), relnumber, relid, replaced
  * (1 byte), the base's and the final tree's hashes (length byte, then the
  * bytes), the key order (kind byte: 0 memcmp, 1 table keying, 2 index
  * keying; suffixed byte; description length (4 bytes), description).
@@ -2535,6 +2544,7 @@ d1_xact_prepare(StringInfo state)
 	 * COMMIT PREPARED replays the difference from its base onto whatever
 	 * the branch holds then.
 	 */
+	appendBinaryStringInfo(state, &xact->branch, sizeof(ProllyBranchId));
 	for (int i = 0; i < n; i++)
 	{
 		D1WriteSet *ws = sets[i];
@@ -2690,8 +2700,10 @@ d1_commit_prepared(TransactionId xid, const char *state, Size len)
 	ProllyRootEdit *edits;
 	ProllyNodeRef new_root;
 	const ProllyCommitRoutine *commit;
+	ProllyBranchId branch;
 
 	backend_init();
+	p = get_bytes(p, end, &branch, sizeof(ProllyBranchId));
 	while (p < end)
 	{
 		D1PreparedTree *t;
@@ -2726,9 +2738,10 @@ d1_commit_prepared(TransactionId xid, const char *state, Size len)
 
 	/* This transaction publishes the root when it commits. */
 	xact_init();
+	xact->branch = branch;
 	commit = backend.c.commit;
-	PROLLY_CALL(commit, branch_lock, PROLLY_MAIN_BRANCH);
-	tip.has_root = PROLLY_CALL(commit, tip, PROLLY_MAIN_BRANCH, &tip.root);
+	PROLLY_CALL(commit, branch_lock, xact->branch);
+	tip.has_root = PROLLY_CALL(commit, tip, xact->branch, &tip.root);
 	if (!tip.has_root)
 		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
 	tip.has_root = true;
@@ -2788,10 +2801,10 @@ d1_commit_prepared(TransactionId xid, const char *state, Size len)
 	}
 	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
 				edits, n, &new_root);
-	xact->ticket = PROLLY_CALL(commit, enqueue, PROLLY_MAIN_BRANCH, &new_root,
+	xact->ticket = PROLLY_CALL(commit, enqueue, xact->branch, &new_root,
 							   xid);
 	xact->enqueued = true;
-	PROLLY_CALL(commit, branch_unlock, PROLLY_MAIN_BRANCH);
+	PROLLY_CALL(commit, branch_unlock, xact->branch);
 	pfree(edits);
 	pfree(trees);
 }

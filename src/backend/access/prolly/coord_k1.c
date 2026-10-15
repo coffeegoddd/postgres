@@ -13,6 +13,10 @@
  *	FOR NO KEY UPDATE	ExclusiveLock
  *	FOR UPDATE			AccessExclusiveLock
  *
+ * Rows are rows of a branch: the branch salts the key's hash, and is the
+ * table lock's third field, so writers on different branches never wait for
+ * each other.
+ *
  * Locks are held until the end of the (sub)transaction that took them, by
  * the lock manager, which also finds deadlocks; prepared transactions keep
  * theirs.  Two keys whose hashes agree in the tag's 48 bits share a lock: a
@@ -43,6 +47,7 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/prolly_xact.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -92,13 +97,14 @@ row_mode(LockTupleMode mode)
 static uint64
 key_hash(const ProllyKey *key)
 {
-	return hash_bytes_extended(key->data, key->len, 0);
+	return hash_bytes_extended(key->data, key->len, prolly_session_branch());
 }
 
 static void
 table_tag(LOCKTAG *tag, Relation tree)
 {
 	SET_LOCKTAG_PROLLY_TABLE(*tag, MyDatabaseId, RelationGetRelid(tree));
+	tag->locktag_field3 = prolly_session_branch();
 }
 
 static void

@@ -85,8 +85,9 @@
 
 typedef uint64 ProllyCommitTicket;
 
-/* Called with each root live_roots() finds. */
-typedef void (*ProllyRootVisit) (const ProllyNodeRef *root, void *arg);
+/* Called with each root live_roots() finds, and the branch it is from. */
+typedef void (*ProllyRootVisit) (ProllyBranchId branch,
+								 const ProllyNodeRef *root, void *arg);
 
 /* A commit to a branch: the transaction, and the root it made. */
 typedef struct ProllyBranchCommit

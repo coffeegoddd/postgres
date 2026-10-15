@@ -82,6 +82,12 @@ typedef uint32 ProllyBranchId;
 #define PROLLY_MAIN_BRANCH		((ProllyBranchId) 1)
 
 /*
+ * The branch whose head is a database's refs (branch names, commits), not
+ * a working set: the refs implementation keeps them there.
+ */
+#define PROLLY_REFS_BRANCH		((ProllyBranchId) 0xFFFFFFFE)
+
+/*
  * Which of a relation's trees is meant.  DATA is the relation's own rows
  * (or index entries); the others are local metadata, never part of a
  * version-control commit.  These numbers are persisted; never renumber.

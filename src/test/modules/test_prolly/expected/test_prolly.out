@@ -43,6 +43,7 @@ FROM prolly_implementations();
  row_identity    | counter          |       2 |              4
  row_identity    | stub             |       0 |              0
  refs            | stub             |       0 |              0
+ refs            | tree             |       1 |              1
  transfer        | stub             |       0 |              0
  diff_merge      | stub             |       0 |              0
  tree            | cow              |       1 |              1
@@ -53,7 +54,7 @@ FROM prolly_implementations();
  table_keying    | stub             |       0 |              0
  index_keying    | columns_then_row |       1 |              1
  index_keying    | stub             |       0 |              0
-(44 rows)
+(45 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -280,7 +281,12 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
  refs            | stub             | merge_base                              | not implemented (missing commit, merge_base)
- refs            | stub             | complete                                | not implemented (8 of 8 callbacks missing)
+ refs            | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ refs            | tree             | identity                                | pass
+ refs            | tree             | branch_lifecycle                        | no checks yet
+ refs            | tree             | commit_then_resolve                     | no checks yet
+ refs            | tree             | merge_base                              | no checks yet
+ refs            | tree             | complete                                | pass
  transfer        | stub             | identity                                | pass
  transfer        | stub             | clone                                   | not implemented (missing clone)
  transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
@@ -361,7 +367,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | identity                                | pass
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
-(299 rows)
+(304 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -468,14 +474,26 @@ DROP TABLE prolly_heap;
 -- Version-control functions dispatch to the refs, diff/merge and transfer
 -- interfaces.
 --
-SELECT prolly_branch_create('feature', NULL);
-ERROR:  refs implementation "stub" does not implement branch_create
+SELECT prolly_branch_create('feature', NULL) IS NULL AS created;
+ created 
+---------
+ t
+(1 row)
+
 SELECT prolly_branch_create(NULL, NULL);
 ERROR:  branch name must not be null
-SELECT prolly_checkout('feature');
-ERROR:  refs implementation "stub" does not implement checkout
-SELECT prolly_commit('first commit');
-ERROR:  refs implementation "stub" does not implement commit
+SELECT prolly_checkout('feature') IS NULL AS checked_out;
+ checked_out 
+-------------
+ t
+(1 row)
+
+SELECT prolly_commit('first commit') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
 SELECT * FROM prolly_diff('main', 'feature');
 ERROR:  diff_merge implementation "stub" does not implement diff
 SELECT prolly_merge('feature');
@@ -486,6 +504,12 @@ SELECT prolly_fetch('file:///nowhere', 'main');
 ERROR:  transfer implementation "stub" does not implement fetch
 SELECT prolly_push('file:///nowhere', 'main');
 ERROR:  transfer implementation "stub" does not implement push
+SELECT prolly_checkout('main') IS NULL AS back_on_main;
+ back_on_main 
+--------------
+ t
+(1 row)
+
 --
 -- Canonical value bytes carry no local OIDs and no DDL history: the same
 -- values of user-defined types encode identically after the types are
