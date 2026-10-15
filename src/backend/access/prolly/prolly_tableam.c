@@ -95,6 +95,9 @@ not_implemented(Relation rel, const char *callback)
  * ------------------------------------------------------------------------
  */
 
+/* Rebuilds of tables in another keying by this backend (rekey()). */
+static uint64 prolly_rekeys = 0;
+
 typedef struct ProllyScanDescData
 {
 	TableScanDescData base;
@@ -139,6 +142,7 @@ typedef struct ProllyScanDescData
 	ItemPointerData *sample_tids;
 
 	/* Bitmap scans: the current page's offsets, and which is next. */
+	uint64		bm_rekeys;		/* prolly_rekeys when keying was opened */
 	bool		bm_have_page;
 	TBMIterateResult bm_page;
 	OffsetNumber bm_offsets[TBM_MAX_TUPLES_PER_PAGE];
@@ -447,6 +451,7 @@ prolly_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 	scan->roots = PROLLY_CALL(scan->c.engine, roots_acquire, snapshot);
 	serializable_read(rel, &scan->c, snapshot);
 	scan->keying = open_read_keying(&scan->c, scan->roots, rel, scan->mcxt);
+	scan->bm_rekeys = prolly_rekeys;
 	scan->cursor = PROLLY_CALL(scan->c.engine, cursor_open, scan->roots, rel,
 							   PROLLY_TREE_DATA, scan->cid);
 	scan->rowid = PROLLY_CALL(scan->c.row_identity, scan_begin, scan->roots,
@@ -798,6 +803,12 @@ rekey(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 		uint64		count;
 		ItemPointerData *tids;	/* one per identical row */
 	} RekeyRow;
+
+	/*
+	 * Scans that read rows one by one (index and bitmap scans) read the
+	 * rebuilt rows from now on: they open the keying again.
+	 */
+	prolly_rekeys++;
 
 	rowid = PROLLY_CALL(c->row_identity, scan_begin, *roots, rel,
 						InvalidCommandId);
@@ -2150,6 +2161,7 @@ typedef struct ProllyIndexScan
 	ProllyRootSet *roots;
 	ProllyKeying *keying;
 	bool		owned;
+	uint64		rekeys;			/* prolly_rekeys when keying was opened */
 	CommandId	cid;
 	RowAt		row;
 } ProllyIndexScan;
@@ -2171,6 +2183,13 @@ prolly_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 		if (scan->xs_want_itup && scan->instrument)
 			scan->instrument->ntabletuplefetches++;
 		old = MemoryContextSwitchTo(is->mcxt);
+		if (is->rekeys != prolly_rekeys)
+		{
+			/* The statement rebuilt the table: read the rebuilt rows. */
+			release_keying(&is->c, is->keying, is->owned);
+			is->keying = read_keying(rel, &is->c, is->roots, &is->owned);
+			is->rekeys = prolly_rekeys;
+		}
 		(void) snapshot_cid(scan->xs_snapshot);
 		if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
 			found = row_at_dirty(&is->c, &is->roots, rel, is->keying,
@@ -2208,6 +2227,7 @@ prolly_index_scan_begin(IndexScanDesc scan, uint32 flags)
 	is->roots = PROLLY_CALL(is->c.engine, roots_acquire, scan->xs_snapshot);
 	serializable_read(scan->heapRelation, &is->c, scan->xs_snapshot);
 	is->keying = read_keying(scan->heapRelation, &is->c, is->roots, &is->owned);
+	is->rekeys = prolly_rekeys;
 	is->cid = snapshot_cid(scan->xs_snapshot);
 	row_at_init(&is->row);
 	MemoryContextSwitchTo(old);
@@ -3056,6 +3076,14 @@ prolly_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot,
 		}
 		ItemPointerSet(&tid, scan->bm_page.blockno,
 					   scan->bm_offsets[scan->bm_next++]);
+		if (scan->bm_rekeys != prolly_rekeys)
+		{
+			/* The statement rebuilt the table: read the rebuilt rows. */
+			PROLLY_CALL(scan->c.keying, close, scan->keying);
+			scan->keying = open_read_keying(&scan->c, scan->roots,
+											sscan->rs_rd, scan->mcxt);
+			scan->bm_rekeys = prolly_rekeys;
+		}
 		row_at(&scan->c, scan->roots, sscan->rs_rd, scan->keying, &tid,
 			   scan->cid, scan->bm_row);
 		if (scan->bm_row->present)

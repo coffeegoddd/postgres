@@ -989,3 +989,29 @@ SELECT count(*) FROM (SELECT ctid FROM bk WHERE ctid >= '(0,1)' ORDER BY ctid DE
 
 RESET enable_seqscan;
 DROP TABLE bk, bkk;
+-- A table keyed by a primary key added after its rows: the first write of
+-- an UPDATE rebuilds it in the new keying, and the index or bitmap scan
+-- feeding the UPDATE reads the rebuilt rows after that.
+CREATE TABLE rk (id int NOT NULL, v int, pad char(84)) USING prolly_d1;
+INSERT INTO rk SELECT g, 0, '' FROM generate_series(1, 2000) g;
+ALTER TABLE rk ADD PRIMARY KEY (id);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+UPDATE rk SET v = v + 1 WHERE id BETWEEN 100 AND 109;
+DROP TABLE rk;
+CREATE TABLE rk (id int NOT NULL, v int, pad char(84)) USING prolly_d1;
+INSERT INTO rk SELECT g, 0, '' FROM generate_series(1, 2000) g;
+ALTER TABLE rk ADD PRIMARY KEY (id);
+SET enable_bitmapscan = on;
+SET enable_indexscan = off;
+UPDATE rk SET v = v + 1 WHERE id BETWEEN 200 AND 209;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT sum(v) FROM rk;
+ sum 
+-----
+  10
+(1 row)
+
+DROP TABLE rk;
