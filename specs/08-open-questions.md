@@ -24,6 +24,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Scheduled in 4e.5 |
+| Step 4's remaining decisions (23, 25, 27, 29, 34, 35, 46–56) | Decided by the user 2026-10-14, as recommended: see each question |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 
@@ -209,6 +210,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     backend's caches reflect its branch by resetting on checkout;
     invalidation stays broadcast; separate cache sets per branch later if
     measured to matter (`09-versioned-catalogs.md` part 2).
+    **Decided (user, 2026-10-14):** the proposal: checkout resets the
+    backend's caches.
 24. **Code that reads catalog tuples' xmin/ctid.** Some code reads system
     columns of catalog tuples (for example to detect changed functions or
     for in-place updates). Those must work with synthetic TIDs and
@@ -217,6 +220,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 25. **Heap user tables in a versioned database.** A heap table's definition
     would change with the branch while its data doesn't. Forbid heap tables
     in a versioned database, or treat their catalog rows as unversioned?
+    **Decided (user, 2026-10-14):** a permanent heap table in a versioned
+    database is refused. Temporary and unlogged tables, which use heap
+    (question 28), are left out of commits: the canonicalizer skips their
+    catalog rows.
 26. **Schema merge validity.** Merging catalog rows row by row can produce an
     inconsistent schema (a column added on one branch to a table dropped on
     the other; a dependency on a removed object). What checks run after a
@@ -231,6 +238,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     database's catalogs? `pg_shdepend` links shared and per-database objects
     across those scopes.
     Options and proposal: `09-versioned-catalogs.md` part 2.
+    **Decided (user, 2026-10-14):** shared catalogs are prolly tables, but
+    unbranched and outside every commit (Dolt doesn't version users either).
+    This narrows question 21's decision: per-database catalogs are
+    versioned; cluster-wide ones are stored in prolly trees without history.
 28. **Temporary and unlogged prolly tables.** The cluster-wide store is
     WAL-logged and in shared buffers. Temporary tables use backend-local
     buffers, and unlogged tables are reset after a crash. Do they get their
@@ -243,6 +254,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 29. **Tablespaces.** With one store, `CREATE TABLE … TABLESPACE` can't place a
     prolly table's data. One store per tablespace, or tablespaces ignored for
     prolly tables?
+    **Decided (user, 2026-10-14):** the clause is accepted and ignored for
+    prolly tables, with a NOTICE; one store per tablespace later, if needed.
 30. **One store under concurrency.** Every writer in the cluster extends the
     same relation files, so the relation extension lock and the map are
     shared hot spots. Bulk extension and map partitioning may be needed;
@@ -281,10 +294,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 34. **Keyless catalogs.** `pg_depend` and `pg_shdepend` have no unique key.
     Key their trees by row content hash with a count (Dolt's keyless tables),
     or by a synthetic row id?
+    **Decided (user, 2026-10-14):** by row content hash with a count, as
+    keyless user tables are.
 35. **Canonicalizer details.**
     - Expressions are stored as deparsed SQL, but `ruleutils.c` output can
       change between Postgres versions, which would change hashes on upgrade.
       Pin a canonical deparse format, or version it with the format stamp?
+      **Decided (user, 2026-10-14):** a pinned canonical deparse, under the
+      format version stamp: a deparser change needs a format migration,
+      never a silent hash change.
     - User data that holds OIDs (`oid` and `reg*` columns, large object
       references) is local by nature. Translate where the type says what it
       refers to (`regclass` → name), and refuse or pass through the rest?
@@ -295,11 +313,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
       them); a version-control commit refuses a column of a type with no
       known OID-free encoding (`oid` itself, unknown extension types), with
       a clear error, rather than hashing a local identifier.
+      **Decided (user, 2026-10-14):** as recommended.
     - Column identity across renames: Dolt keeps column tags across
       renames, so a rename on one branch and an edit on another merge;
       identity here is by name. Rows are encoded by column position, so a
       rename leaves data trees untouched; the merge rules for a column
       renamed on one branch and changed on the other are still to decide.
+      **Decided (user, 2026-10-14):** a rename merges as a drop and an add,
+      so a column renamed on one branch and changed on the other is a
+      schema conflict. Stable column tags, as Dolt's, are a later option.
     - Rename detection in diff: by matching content hashes, with what
       threshold for "same table, changed"?
 36. **Keying user tables.** Postgres tables need not have a primary key,
@@ -452,6 +474,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     column's collation and its version; transfer and merge between
     mismatched versions refuse, or rebuild the affected trees. To settle
     with the format freeze (4g).
+    **Decided (user, 2026-10-14):** recorded per key column; merge and
+    transfer between mismatched versions refuse.
 47. **Bounded transaction memory.** D1 keeps a transaction's writes, with
     their command and subtransaction versions, in memory until commit, with
     no limit; Dolt flushes after about 64K pending entries, DoltLite at
@@ -464,6 +488,8 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     PREPARE TRANSACTION after prolly writes uses the same flush: the
     prepared transaction's write set becomes an intermediate tree whose
     root is kept in the two-phase state file (user, 2026-10-14, 4e.4).
+    **Decided (user, 2026-10-14):** the threshold is a setting,
+    `prolly.write_set_memory`, 64 MB by default.
 48. **Large values.** Items must fit a node, and prolly tables have no
     TOAST table.
     **Recommended (2026-10-14), for 4f:** out-of-line value trees in the
@@ -474,6 +500,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     split by a rolling hash (buzhash) over the bytes, as Dolt's blobs are:
     there are no keys to hash (user, 2026-10-14; the chunk rule is settled
     in step 5).
+    **Decided (user, 2026-10-14):** a value goes out of line past a size
+    fixed by the format, about 2 KB (near TOAST's threshold). Its canonical
+    bytes are uncompressed, so a hash never depends on a compression
+    method's version; compressing pages is a later storage choice.
 49. **What reclamation must keep.** Reachability from branch heads alone
     isn't enough.
     **Recommended (2026-10-14), for 4f:** the live roots are every
@@ -483,3 +513,35 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     commit log, and the value trees all of these refer to. Gone row
     versions still named by a live TID map are a separate retirement,
     under Postgres's visibility and index-lifetime rules (question 40).
+    **Decided (user, 2026-10-14):** reclamation of nodes is an explicit
+    `prolly_gc()`, as `dolt gc` is: finding what is reachable walks every
+    live root of the cluster's store. VACUUM retires a table's own gone
+    versions and TIDs. Automatic reclamation is later.
+50. **Row lock identity (K1).** Postgres's lock manager names a lock by a
+    fixed-size tag, so a row key that doesn't fit must be reduced.
+    **Decided (user, 2026-10-14):** the tag is (database, relation, 64-bit
+    hash of the row key). A collision makes a writer wait needlessly, never
+    lets two writers through; nothing is stored in the tree, and PREPARE
+    carries the locks over as it does any lock.
+51. **Serializing commits to a branch.** **Decided (user, 2026-10-14):**
+    one commit lock per branch. A transaction builds its new trees before
+    taking it; only the replay onto a newer head runs under it. Group
+    commit waits until step 5 shows the lock matters.
+52. **SQL interface for version control.** **Decided (user, 2026-10-14):**
+    Doltgres's: functions `dolt_commit()`, `dolt_checkout()`,
+    `dolt_branch()`, `dolt_merge()`, `dolt_reset()`, and system tables such
+    as `dolt_log`, `dolt_status`, `dolt_branches` and `dolt_diff_<table>`.
+53. **How a session picks a branch.** **Decided (user, 2026-10-14):** both
+    of Doltgres's ways: `dbname/branch` as the connection's database name,
+    and `dolt_checkout()` within a session.
+54. **Which databases are versioned.** **Decided (user, 2026-10-14):**
+    opt-in per database (`CREATE DATABASE … WITH (versioned)`, or a
+    template), so Postgres's own tests and the heap baseline run on plain
+    databases.
+55. **Merge conflicts.** **Decided (user, 2026-10-14):** Dolt's model. Row
+    conflicts are recorded in `dolt_conflicts_<table>` and block commit
+    until resolved; schema conflicts abort the merge with an error naming
+    the objects.
+56. **Commit author.** **Decided (user, 2026-10-14):** a setting,
+    `dolt.author`, defaulting to the session's user, overridable per
+    commit.
