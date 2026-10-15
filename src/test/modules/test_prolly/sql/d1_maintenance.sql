@@ -269,3 +269,18 @@ INSERT INTO ginp SELECT ARRAY[1, 2, g] FROM generate_series(1, 200) g;
 VACUUM ginp;
 SELECT gin_clean_pending_list('ginp_a');
 DROP TABLE ginp;
+
+-- SET TABLESPACE drops the old storage (the main fork, which holds the TID
+-- counter), as heap's does.
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE d1_ts LOCATION '';
+CREATE TABLE d1_moved (id int) USING prolly_d1;
+INSERT INTO d1_moved VALUES (1);
+SELECT pg_relation_filepath('d1_moved') AS old_path \gset
+ALTER TABLE d1_moved SET TABLESPACE d1_ts;
+CHECKPOINT;
+SELECT pg_stat_file(:'old_path', true) IS NULL AS old_storage_gone;
+SELECT * FROM d1_moved;
+DROP TABLE d1_moved;
+DROP TABLESPACE d1_ts;
+RESET allow_in_place_tablespaces;
