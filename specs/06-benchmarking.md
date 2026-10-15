@@ -44,6 +44,14 @@ stock Postgres's `make check` doesn't run it. Gates 1 and 2 are its
    Dolt's, in time and space. The V suite sweeps N with Δ fixed and Δ with N
    fixed, and engine counters of nodes read and written are checked against
    each operation's bound, with timing reported beside them.
+8. **The C suite** (`12-correctness-suite.md`, decided 2026-10-15):
+   sqllogictest's 5.7M records that run on Postgres, compared record by
+   record with heap's answers. The gate fails on a regression (heap
+   passes, the engine doesn't, and not by row order alone), a hidden
+   regression (both fail, differently), a crash, or a record only one side
+   ran, outside the documented exceptions
+   (`src/tools/prolly_bench/configs/c_exceptions.toml`). Run with
+   `prolly_bench run C --am heap,<engine>`.
 
 A failing gate is reported next to the numbers it affects.
 
@@ -149,7 +157,10 @@ affect how results are read:
   loading per cell is not (open question 18).
 - **Table AM under test** reaches every table through
   `default_table_access_method`, including tables pgbench and BenchBase
-  create. Indexes, including primary keys, are created with their default AM
+  create. For `prolly`, whose tables exist only in versioned schemas, each
+  benchmark database also gets a versioned schema first on its
+  `search_path` (until 2026-10-15, `--am prolly` measured heap). Every cell
+  checks its tables' AM. Indexes, including primary keys, are created with their default AM
   (btree); see open question 19.
 - **CPU** is measured system-wide (`/proc/stat`) minus the CPU of the client
   programs (pgbench, BenchBase), which run on the same machine.
