@@ -83,6 +83,7 @@ tests += {
       't/030_branch_connect.pl',
       't/031_bmap_share.pl',
       't/034_bmap_share_limits.pl',
+      't/035_bmap_replaced_blocks.pl',
     ],
   },
 }

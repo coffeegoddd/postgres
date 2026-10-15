@@ -34,6 +34,9 @@ extern void bmapclose(SMgrRelation reln, ForkNumber forknum);
 extern void bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool bmapexists(SMgrRelation reln, ForkNumber forknum);
 extern void bmapshare(SMgrRelation src, SMgrRelation dst);
+extern bool bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum);
+extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber blocknum, XLogRecPtr lsn);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);

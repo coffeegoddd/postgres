@@ -14,6 +14,7 @@
 #ifndef SMGR_H
 #define SMGR_H
 
+#include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
@@ -108,6 +109,9 @@ extern void smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum,
 						   bool isRedo);
 extern void smgrshare(SMgrRelation src, SMgrRelation dst);
 extern bool smgrcanshare(SMgrRelation reln);
+extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber blocknum, XLogRecPtr lsn);
+extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,

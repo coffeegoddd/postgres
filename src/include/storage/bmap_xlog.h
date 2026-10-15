@@ -122,12 +122,17 @@ typedef struct xl_bmap_header_delta
 	uint32		epoch;
 } xl_bmap_header_delta;
 
-/* Block data of a map page: entries set. */
+/*
+ * Block data of a map page: entries set.  An entry whose block changes
+ * takes 'since', a WAL position no later than the record's start and after
+ * every earlier record of the logical block.
+ */
 typedef struct xl_bmap_node_delta
 {
 	uint16		kind;			/* BMAP_DELTA_NODE */
 	uint16		flags;
 	uint32		nentries;
+	XLogRecPtr	since;
 	/* xl_bmap_entry_delta entries[nentries] follow */
 } xl_bmap_node_delta;
 

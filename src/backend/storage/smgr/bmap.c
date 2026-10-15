@@ -17,17 +17,24 @@
  * own, so a standby couldn't follow the primary's allocations for them; and
  * they are hints or rebuildable, so they need no sharing.
  *
- * The map fork.  Block 0 is a header holding the relation's logical length.
- * Logical block L's entry is at slot L % BMAP_FANOUT of map page
- * 1 + L / BMAP_FANOUT: found without following any pointer.  That matters in
- * recovery, where map pages on disk can be from different moments (one
- * written after the point redo has reached, another not yet written): an
- * entry never changes once set, so any version of its page that has it
- * gives the same answer, and a page that redo needs has it.  An entry is a
- * physical block and a birth epoch, which nothing uses yet: it is there so
- * that sharing pages between relations can be added without rewriting
- * maps.  The map fork's existence is the relation's; smgropen() chooses
- * this storage manager by it.
+ * The map fork.  Block 0 is a header holding the relation's logical length
+ * and epoch.  Logical block L's entry is at slot L % BMAP_FANOUT of map page
+ * 1 + L / BMAP_FANOUT: found without following any pointer.  An entry is a
+ * physical block, the epoch it was born in (one born before its map's epoch
+ * may be shared with another map), and the WAL position since which it has
+ * that block.  Its block changes only while nothing else can change the
+ * logical block: when an entry left past the relation's end by a truncation
+ * is let go because another map shares its block.  The map fork's existence
+ * is the relation's; smgropen() chooses this storage manager by it.
+ *
+ * Recovery reads map pages that can be from different moments: one written
+ * after the point redo has reached, another not yet written.  A version
+ * older than the record being replayed gives it the block it was made for.
+ * A newer one may give a block set after the record: redo skips the record
+ * (smgrreplacedafter()), since the logical block's contents from before
+ * the change aren't needed there, and doesn't write pages it made to that
+ * block, which may still hold another relation's page at this point of the
+ * replay.
  *
  * The allocator.  Per tablespace and database, BMAP_ALLOC_RELNUMBER is a
  * metapage (the page store's high-water mark, the count of free blocks, and
@@ -112,6 +119,7 @@ typedef struct BmapEntry
 {
 	BlockNumber block;			/* physical block */
 	uint32		epoch;
+	XLogRecPtr	since;			/* records before it are of another block */
 } BmapEntry;
 
 typedef struct BmapHeader
@@ -382,9 +390,13 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < delta->nentries; i++)
 	{
+		BmapEntry  *e = &entries[ent[i].slot];
+
 		Assert(ent[i].slot < BMAP_FANOUT);
-		entries[ent[i].slot].block = ent[i].block;
-		entries[ent[i].slot].epoch = ent[i].epoch;
+		if (e->block != ent[i].block)
+			e->since = delta->since;
+		e->block = ent[i].block;
+		e->epoch = ent[i].epoch;
 	}
 }
 
@@ -597,8 +609,9 @@ refs_nblocks(RelFileLocator rel)
  * lookup, and so on until no buffer is left.  So a lookup 'for_write' never
  * loads a map page into shared buffers: it uses the page if it is cached,
  * and otherwise reads it from disk, where an uncached page has every entry
- * a write can need (entries never change once set).  A torn read fails
- * verification and is read again.
+ * a write can need: an entry's block changes only while its logical block
+ * can't be written, so a write after the change finds the page cached or
+ * written out.  A torn read fails verification and is read again.
  */
 static void
 read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
@@ -1027,6 +1040,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	xlrec.nreused = nreused;
 
 	XLogEnsureRecordSpace(3 + nbits, 0);
+	ndelta->since = GetXLogInsertRecPtr();
 
 	START_CRIT_SECTION();
 	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
@@ -1389,6 +1403,8 @@ log_refs_record(uint8 info, const void *xlrec, uint32 xlrec_size,
 	/* the main data, the map page's delta and one delta per count page */
 	XLogEnsureRecordSpace(first + BMAP_REFS_PER_RECORD,
 						  1 + first + BMAP_REFS_PER_RECORD);
+	if (first)
+		ndelta->since = GetXLogInsertRecPtr();
 	START_CRIT_SECTION();
 	if (first)
 	{
@@ -1593,6 +1609,44 @@ unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from, BlockNumber to)
 		i += covered;
 	}
 	UnlockReleaseBuffer(mapbuf);
+}
+
+/* a main fork's logical blocks can be given other physical blocks */
+bool
+bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM;
+}
+
+/*
+ * In recovery: was logical block 'blocknum' given its physical block after
+ * WAL position 'lsn'?  The map page read may be newer than the record being
+ * replayed (written before a crash, or copied by a base backup), or not yet
+ * initialized.
+ */
+bool
+bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				  XLogRecPtr lsn)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	bool		result = false;
+
+	if (MAP_PAGE(blocknum) >= mdnblocks(reln, BMAP_FORKNUM))
+		return false;
+	buf = map_read(rel, MAP_PAGE(blocknum));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(buf)))
+	{
+		BmapEntry  *entry;
+
+		check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+				   MAP_PAGE(blocknum));
+		entry = &PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blocknum)];
+		result = entry->since > lsn;
+	}
+	UnlockReleaseBuffer(buf);
+	return result;
 }
 
 /* ----------------------------------------------------------------
@@ -2342,11 +2396,29 @@ bmapstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 				 phys, buffers, nblocks);
 }
 
+/*
+ * In recovery, the version of logical block 'blkno' in 'page' was made by
+ * records from before its entry's block was set: it is of the block it had
+ * then, which needs nothing from it (what it should keep was written out
+ * before the change), while the block it has now may still be another
+ * relation's.
+ */
+static bool
+page_predates_entry(SMgrRelation reln, BlockNumber blkno, const void *page)
+{
+	PGIOAlignedBlock copy;
+	BmapEntry  *entry = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
+
+	read_node(reln, MAP_PAGE(blkno), true, copy.data, BMAP_PAGE_NODE);
+	return PageGetLSN((const PageData *) page) < entry->since;
+}
+
 void
 bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
 	SMgrRelation ssrel;
+	bool		recovery = RecoveryInProgress();
 
 	if (forknum != MAIN_FORKNUM)
 	{
@@ -2357,10 +2429,11 @@ bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	while (nblocks > 0)
 	{
 		BlockNumber run;
-		BlockNumber phys = lookup_ext(reln, blocknum, nblocks, &run, false,
-									  true);
+		BlockNumber phys = lookup_ext(reln, blocknum, recovery ? 1 : nblocks,
+									  &run, false, true);
 
-		mdwritev(ssrel, MAIN_FORKNUM, phys, buffers, run, skipFsync);
+		if (!recovery || !page_predates_entry(reln, blocknum, buffers[0]))
+			mdwritev(ssrel, MAIN_FORKNUM, phys, buffers, run, skipFsync);
 		blocknum += run;
 		buffers += run;
 		nblocks -= run;
