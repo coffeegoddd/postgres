@@ -1690,8 +1690,8 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
  * Make 'dst', a new relation file number in the same tablespace and
  * database, a copy of 'src' that shares its blocks: dst's map holds src's
  * entries, each block's count grows by one, and both maps' epochs pass the
- * entries' births.  src's dirty buffers are written, so the blocks hold
- * what both copies start from.
+ * entries' births.  src's dirty buffers are written and the page store
+ * synced, so the blocks hold what both copies start from.
  */
 void
 bmapshare(SMgrRelation src, SMgrRelation dst)
@@ -1764,8 +1764,16 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	UnlockReleaseBuffer(sheader);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 
-	/* the shared blocks get src's latest pages */
+	/*
+	 * The shared blocks get src's latest pages, durably: recovery can't make
+	 * them again, since replaying src's changes writes its pages through
+	 * whatever map pages are on disk, which may already send them to the
+	 * blocks src moved to later.  A page src changes from here on is copied
+	 * first, its old contents written to the shared block if they were only
+	 * in its buffer.
+	 */
 	FlushRelationsAllBuffers(&src, 1);
+	mdimmedsync(store_smgr(srel), MAIN_FORKNUM);
 }
 
 /* Set a relation's length; the header is pinned and not locked. */
@@ -2648,9 +2656,10 @@ bmap_redo(XLogReaderState *record)
 
 				/*
 				 * As the primary did: the shared blocks get the source's
-				 * pages as of this record.
+				 * pages as of this record, durably.
 				 */
 				FlushRelationsAllBuffers(&src, 1);
+				mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
 				break;
 			}
 		default:
