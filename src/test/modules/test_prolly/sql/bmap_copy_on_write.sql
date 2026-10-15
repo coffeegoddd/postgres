@@ -1,0 +1,72 @@
+-- A page shared between copies is copied before its first change, so the
+-- change is one copy's alone: the page moves to a new block in that copy's
+-- map, and the old block loses a reference.  A page no other copy holds
+-- any more is claimed in place.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE SCHEMA cow VERSIONED;
+CREATE TABLE cow.t (a int8, b int8, c int8, d int8);
+INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(1, 20000) g;
+SELECT pg_relation_filenode('cow.t') AS src \gset
+SELECT test_bmap_share(:src) AS copy \gset
+SELECT test_bmap_digest(:src) AS src_digest \gset
+SELECT phys AS shared_phys FROM test_bmap_map(:copy) WHERE blkno = 3 \gset
+
+-- Changing the copy's page copies it: the source still reads the old page.
+SELECT test_bmap_write(:copy, 3, 42);
+SELECT test_bmap_digest(:src) = :'src_digest' AS source_unchanged;
+SELECT test_bmap_digest(:copy) <> :'src_digest' AS copy_changed;
+SELECT phys <> :shared_phys AS moved, epoch = test_bmap_epoch(:copy) AS born_now,
+       refs = 0 AS its_own
+  FROM test_bmap_map(:copy) WHERE blkno = 3;
+SELECT phys = :shared_phys AS stays, refs = 0 AS now_alone
+  FROM test_bmap_map(:src) WHERE blkno = 3;
+
+-- A second change of the copied page changes it in place.
+SELECT phys AS copied_phys FROM test_bmap_map(:copy) WHERE blkno = 3 \gset
+SELECT test_bmap_write(:copy, 3, 43);
+SELECT phys = :copied_phys AS in_place FROM test_bmap_map(:copy) WHERE blkno = 3;
+
+-- The source's page, now held by it alone, is claimed: same block, born
+-- again in the source's epoch.
+SELECT test_bmap_write(:src, 3, 44);
+SELECT phys = :shared_phys AS claimed, epoch = test_bmap_epoch(:src) AS born_now
+  FROM test_bmap_map(:src) WHERE blkno = 3;
+SELECT test_bmap_digest(:copy) <> test_bmap_digest(:src) AS diverged;
+
+-- Rows changed through SQL are copied the same way.  (Reading the source
+-- may set hint bits on pages still shared, which changes no row.)
+SELECT test_bmap_rows_digest(:copy) AS copy_digest \gset
+UPDATE cow.t SET b = -b WHERE a % 1000 = 0;
+DELETE FROM cow.t WHERE a > 19000;
+INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(20001, 21000) g;
+SELECT test_bmap_rows_digest(:copy) = :'copy_digest' AS copy_unaffected;
+SELECT count(*) > 0 AS source_moved_pages
+  FROM test_bmap_map(:src) s JOIN test_bmap_map(:copy) c USING (blkno)
+  WHERE s.phys <> c.phys;
+SELECT bool_and((s.phys = c.phys) = (s.refs = 1 AND c.refs = 1)) AS counts_agree
+  FROM test_bmap_map(:src) s JOIN test_bmap_map(:copy) c USING (blkno);
+SELECT count(*), sum(b) FROM cow.t;
+
+-- VACUUM copies the pages it prunes and freezes, and leaves the copy alone.
+VACUUM (FREEZE) cow.t;
+SELECT test_bmap_rows_digest(:copy) = :'copy_digest' AS copy_unaffected_by_vacuum;
+SELECT count(*), sum(b) FROM cow.t;
+
+-- Reads don't copy pages: opportunistic pruning skips a shared page.
+CREATE TABLE cow.p (a int8, b int8, c int8, d int8) WITH (fillfactor = 100);
+INSERT INTO cow.p SELECT g, g, g, g FROM generate_series(1, 1000) g;
+UPDATE cow.p SET b = b + 1;
+SELECT pg_relation_filenode('cow.p') AS p \gset
+SELECT test_bmap_share(:p) AS pcopy \gset
+SELECT string_agg(phys::text, ',' ORDER BY blkno) AS p_map FROM test_bmap_map(:p) \gset
+SELECT count(*) FROM cow.p WHERE b > 0;
+SELECT string_agg(phys::text, ',' ORDER BY blkno) = :'p_map' AS no_page_copied
+  FROM test_bmap_map(:p);
+
+SELECT test_bmap_unlink(:copy);
+SELECT test_bmap_unlink(:pcopy);
+DROP SCHEMA cow CASCADE;

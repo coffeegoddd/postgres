@@ -3,7 +3,7 @@
 # Sharing block-mapped storage survives crashes and reaches standbys: a
 # copy's map, the blocks' reference counts, and the source's pages as of
 # the share, which reach the shared blocks even when they were only in the
-# source's buffers.
+# source's buffers; and pages copied before they change.
 
 use strict;
 use warnings FATAL => 'all';
@@ -61,14 +61,32 @@ $primary->start;
 is(sql(qq{SELECT test_bmap_digest($copy)}), $digest, 'the copy survives a crash');
 is(sql($refs), $map, 'so do its blocks and counts');
 
-# Dropping the source frees nothing; dropping the copy then frees its blocks,
-# on the standby as on the primary.
-my $nblocks = sql(q{SELECT pg_relation_size('cow.t') / 8192});
+# Changing the source copies its pages first: the copy keeps reading the
+# rows it was made with, on the standby and after a crash too.  (Reading the
+# source may set hint bits on pages still shared, which changes no row.)
+my $rows = sql(qq{SELECT test_bmap_rows_digest($copy)});
+sql(q{UPDATE cow.t SET b = -b});
+my $sum = sql(q{SELECT sum(b) FROM cow.t});
+is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $rows, 'changing the source leaves the copy');
+$primary->wait_for_replay_catchup($standby);
+is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $rows, 'on the standby too');
+is(ssql(q{SELECT sum(b) FROM cow.t}), $sum, 'which sees the source changed');
+$primary->stop('immediate');
+$primary->start;
+is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $rows, 'and after a crash');
+is(sql(q{SELECT sum(b) FROM cow.t}), $sum, 'which keeps the source\'s change');
+
+# Dropping the source frees only the blocks it copied to; dropping the copy
+# then frees the rest, on the standby as on the primary.
+my $src_own = sql(qq{SELECT count(*) FROM test_bmap_map($src)
+	WHERE phys NOT IN (SELECT phys FROM test_bmap_map($copy))});
+my $copy_blocks = sql(qq{SELECT count(*) FROM test_bmap_map($copy)});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 sql(q{DROP TABLE cow.t});
-is(sql(q{SELECT test_bmap_free_blocks()}), $free, 'the copy keeps the source\'s blocks');
+is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $src_own,
+	'the copy keeps the blocks it shared');
 sql(qq{SELECT test_bmap_unlink($copy)});
-is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $nblocks,
+is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $src_own + $copy_blocks,
 	'the last map to go frees them');
 $primary->wait_for_replay_catchup($standby);
 is(ssql(q{SELECT test_bmap_free_blocks()}), sql(q{SELECT test_bmap_free_blocks()}),
@@ -76,7 +94,7 @@ is(ssql(q{SELECT test_bmap_free_blocks()}), sql(q{SELECT test_bmap_free_blocks()
 
 $primary->stop('immediate');
 $primary->start;
-is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $nblocks,
+is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $src_own + $copy_blocks,
 	'and so does crash recovery');
 
 $standby->stop;

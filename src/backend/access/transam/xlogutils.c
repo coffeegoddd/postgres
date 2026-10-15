@@ -539,8 +539,9 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 		 * yet (smgrreplacedafter()) and which fails verification here.  It
 		 * reads as uninitialized, so it is logged as invalid, as a page past
 		 * the end would be, and is forgotten when replay reaches the change
-		 * of storage (or what made it possible: a truncation); a page truly
-		 * damaged is reported when recovery reaches consistency.
+		 * of storage (XLogReplaceBlock()) or what made it possible (a
+		 * truncation); a page truly damaged is reported when recovery
+		 * reaches consistency.
 		 */
 		if (mode == RBM_NORMAL && smgrreplacesblocks(smgr, forknum))
 			readmode = RBM_ZERO_ON_ERROR;
@@ -713,6 +714,27 @@ XLogTruncateRelation(RelFileLocator rlocator, ForkNumber forkNum,
 					 BlockNumber nblocks)
 {
 	forget_invalid_pages(rlocator, forkNum, nblocks);
+}
+
+/*
+ * A block given other storage during XLOG replay
+ *
+ * The records before then were of the storage it had; any "invalid-page"
+ * records they left are superseded, as a truncation's are.
+ */
+void
+XLogReplaceBlock(RelFileLocator rlocator, ForkNumber forkNum,
+				 BlockNumber blkno)
+{
+	xl_invalid_page_key key;
+
+	if (invalid_page_tab == NULL)
+		return;
+	memset(&key, 0, sizeof(key));
+	key.locator = rlocator;
+	key.forkno = forkNum;
+	key.blkno = blkno;
+	hash_search(invalid_page_tab, &key, HASH_REMOVE, NULL);
 }
 
 /*

@@ -23,9 +23,11 @@
  * physical block, the epoch it was born in (one born before its map's epoch
  * may be shared with another map), and the WAL position since which it has
  * that block.  Its block changes only while nothing else can change the
- * logical block: when an entry left past the relation's end by a truncation
- * is let go because another map shares its block.  The map fork's existence
- * is the relation's; smgropen() chooses this storage manager by it.
+ * logical block: when a shared page is copied before it changes (its
+ * buffer locked exclusively), or when an entry left past the relation's end
+ * by a truncation is let go because another map shares its block.  The map
+ * fork's existence is the relation's; smgropen() chooses this storage
+ * manager by it.
  *
  * Recovery reads map pages that can be from different moments: one written
  * after the point redo has reached, another not yet written.  A version
@@ -776,6 +778,199 @@ bits_change(BitsChange *bits, int *nbits, Buffer buf, uint32 pageno,
 }
 
 /*
+ * Blocks taken from the allocator: its metapage and the bitmap pages that
+ * record them, locked exclusively, with their deltas, for one record.
+ */
+#define BMAP_ALLOC_MAX_PAGES	(1 + BMAP_SCAN_PAGES + 2)
+
+typedef struct Allocation
+{
+	Buffer		metabuf;
+	BlockNumber old_hw;
+	BlockNumber new_hw;
+	BitsChange	bits[BMAP_SCAN_PAGES + 2];
+	int			nbits;
+	xl_bmap_meta_delta *mdelta;
+} Allocation;
+
+/*
+ * Take 'nneed' physical blocks (at most BMAP_PIECE) into taken[]: freed
+ * blocks first, then the page store's high-water mark.  Freed blocks are
+ * not taken for a relation whose data skips WAL (made in this transaction
+ * at wal_level minimal): its pages are synced at commit, not logged, so
+ * nothing in redo would restore them if replaying an earlier record of the
+ * block's previous owner zeroed them.  Blocks above the high-water mark
+ * were never in an earlier record.  New blocks get their reference-count
+ * pages here, before they are mapped.
+ */
+static void
+alloc_take(RelFileLocator rel, uint32 nneed, BlockNumber *taken,
+		   Allocation *a)
+{
+	BmapMeta   *meta;
+	uint32		ntaken = 0;
+	BlockNumber added[2];
+	int			nadded = 0;
+	BlockNumber new_hw;
+	uint32		new_nfree;
+	uint32		new_hint;
+
+	Assert(nneed <= BMAP_PIECE);
+	a->nbits = 0;
+	a->metabuf = alloc_read(rel, 0);
+	LockBuffer(a->metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(a->metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(a->metabuf));
+	a->old_hw = new_hw = meta->hw;
+	new_nfree = meta->nfree;
+	new_hint = meta->hint;
+
+	if (nneed > 0 && meta->nfree > 0 && !RelFileLocatorSkippingWAL(rel))
+	{
+		for (uint32 k = 0; k < meta->nbitmap && ntaken < nneed &&
+			 a->nbits < BMAP_SCAN_PAGES; k++)
+		{
+			uint32		pageno = (meta->hint + k) % meta->nbitmap;
+			Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
+			uint64	   *words;
+			BitsChange *bc = NULL;
+			BlockNumber base = pageno * BMAP_BITS_PER_PAGE;
+
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
+					   MAIN_FORKNUM, meta->bitmap[pageno]);
+			words = PageGetBmapBits(BufferGetPage(buf));
+			for (uint32 b = 0; b < BMAP_BITS_PER_PAGE && ntaken < nneed &&
+				 base + b < a->old_hw; b++)
+			{
+				if (b % 64 == 0 && words[b / 64] == PG_UINT64_MAX)
+				{
+					b += 63;
+					continue;
+				}
+				if ((words[b / 64] & (UINT64CONST(1) << (b % 64))) == 0)
+				{
+					if (bc == NULL)
+						bc = bits_change(a->bits, &a->nbits, buf, pageno, 1,
+										 false, BMAP_PIECE);
+					((uint32 *) (bc->delta + 1))[bc->delta->nbits++] = b;
+					taken[ntaken++] = base + b;
+				}
+			}
+			if (bc == NULL)
+				UnlockReleaseBuffer(buf);
+			if (ntaken < nneed)
+				new_hint = (pageno + 1) % meta->nbitmap;
+		}
+		new_nfree -= ntaken;
+	}
+
+	/* then the high-water mark */
+	while (ntaken < nneed)
+	{
+		BlockNumber blk = new_hw++;
+		uint32		pageno = blk / BMAP_BITS_PER_PAGE;
+		BitsChange *bc = NULL;
+
+		for (int k = 0; k < a->nbits; k++)
+			if (a->bits[k].pageno == pageno)
+				bc = &a->bits[k];
+		if (bc == NULL)
+		{
+			if (pageno < meta->nbitmap)
+			{
+				Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
+
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
+						   MAIN_FORKNUM, meta->bitmap[pageno]);
+				bc = bits_change(a->bits, &a->nbits, buf, pageno, 1, false,
+								 BMAP_PIECE);
+			}
+			else
+			{
+				Buffer		buf;
+
+				/* a new bitmap page, the next one in order */
+				if (pageno != meta->nbitmap + nadded ||
+					meta->nbitmap + nadded >= BMAP_MAX_BITMAPS)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("block-mapped storage of database %u is full",
+									rel.dbOid)));
+				buf = alloc_new_page(rel);
+				added[nadded++] = BufferGetBlockNumber(buf);
+				bc = bits_change(a->bits, &a->nbits, buf, pageno, 1, true,
+								 BMAP_PIECE);
+			}
+		}
+		((uint32 *) (bc->delta + 1))[bc->delta->nbits++] = blk % BMAP_BITS_PER_PAGE;
+		taken[ntaken++] = blk;
+	}
+	a->new_hw = new_hw;
+
+	if (new_hw > a->old_hw)
+		refs_cover(rel, new_hw);
+
+	a->mdelta = palloc0(sizeof(xl_bmap_meta_delta) + 2 * sizeof(BlockNumber));
+	a->mdelta->kind = BMAP_DELTA_META;
+	a->mdelta->hw = new_hw;
+	a->mdelta->nfree = new_nfree;
+	a->mdelta->hint = new_hint;
+	a->mdelta->nbitmap_added = nadded;
+	for (int i = 0; i < nadded; i++)
+		((BlockNumber *) (a->mdelta + 1))[i] = added[i];
+}
+
+/*
+ * In the record's critical section: apply the allocation's deltas and
+ * register its pages from block id 'first'.  Returns the next id.
+ */
+static int
+alloc_apply_register(Allocation *a, int first)
+{
+	int			id = first;
+
+	apply_meta_delta(BufferGetPage(a->metabuf), a->mdelta);
+	MarkBufferDirty(a->metabuf);
+	XLogRegisterBuffer(id, a->metabuf, REGBUF_STANDARD);
+	XLogRegisterBufData(id, a->mdelta, meta_delta_size(a->mdelta));
+	id++;
+	for (int i = 0; i < a->nbits; i++)
+	{
+		apply_bits_delta(BufferGetPage(a->bits[i].buf), a->bits[i].delta);
+		MarkBufferDirty(a->bits[i].buf);
+		XLogRegisterBuffer(id, a->bits[i].buf, REGBUF_STANDARD |
+						   ((a->bits[i].delta->flags & BMAP_DELTA_INIT) ?
+							REGBUF_WILL_INIT : 0));
+		XLogRegisterBufData(id, a->bits[i].delta,
+							bits_delta_size(a->bits[i].delta));
+		id++;
+	}
+	return id;
+}
+
+static void
+alloc_set_lsn(Allocation *a, XLogRecPtr lsn)
+{
+	PageSetLSN(BufferGetPage(a->metabuf), lsn);
+	for (int i = 0; i < a->nbits; i++)
+		PageSetLSN(BufferGetPage(a->bits[i].buf), lsn);
+}
+
+static void
+alloc_release(Allocation *a)
+{
+	for (int i = 0; i < a->nbits; i++)
+	{
+		UnlockReleaseBuffer(a->bits[i].buf);
+		pfree(a->bits[i].delta);
+	}
+	UnlockReleaseBuffer(a->metabuf);
+	pfree(a->mdelta);
+}
+
+/*
  * Extend 'reln' by the blocks [from, to), all on one map page, with
  * 'content' written to block to - 1 if given.  The header is locked
  * exclusively, and the relation is 'from' blocks long.
@@ -790,29 +985,19 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	BlockNumber mapnblocks;
 	Buffer		mapbuf;
 	bool		mapnew;
-	Buffer		metabuf;
-	BmapMeta   *meta;
 	BlockNumber phys[BMAP_PIECE];
 	bool		need[BMAP_PIECE];
 	uint32		nneed = 0;
 	BlockNumber reused[BMAP_PIECE];
 	uint32		nreused = 0;
 	BlockNumber taken[BMAP_PIECE];
-	uint32		ntaken = 0;
-	BitsChange	bits[BMAP_SCAN_PAGES + 2];
-	int			nbits = 0;
-	BlockNumber added[2];
-	int			nadded = 0;
+	Allocation	alloc;
 	BlockNumber old_hw;
 	BlockNumber new_hw;
-	uint32		new_nfree;
-	uint32		new_hint;
 	xl_bmap_header_delta hdelta;
 	xl_bmap_node_delta *ndelta;
-	xl_bmap_meta_delta *mdelta;
 	xl_bmap_extend xlrec;
 	XLogRecPtr	lsn;
-	int			blockid;
 	uint32		epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
 
 	Assert(n > 0 && n <= BMAP_PIECE);
@@ -877,103 +1062,9 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
 
 	/* allocate under the allocator's metapage lock */
-	metabuf = alloc_read(rel, 0);
-	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
-	meta = PageGetBmapMeta(BufferGetPage(metabuf));
-	old_hw = new_hw = meta->hw;
-	new_nfree = meta->nfree;
-	new_hint = meta->hint;
-
-	/*
-	 * Freed blocks first, except for a relation whose data skips WAL (made
-	 * in this transaction at wal_level minimal): its pages are synced at
-	 * commit, not logged, so nothing in redo would restore them if replaying
-	 * an earlier record of the block's previous owner zeroed them.  Blocks
-	 * above the high-water mark were never in an earlier record.
-	 */
-	if (nneed > 0 && meta->nfree > 0 && !RelFileLocatorSkippingWAL(rel))
-	{
-		for (uint32 k = 0; k < meta->nbitmap && ntaken < nneed &&
-			 nbits < BMAP_SCAN_PAGES; k++)
-		{
-			uint32		pageno = (meta->hint + k) % meta->nbitmap;
-			Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
-			uint64	   *words;
-			BitsChange *bc = NULL;
-			BlockNumber base = pageno * BMAP_BITS_PER_PAGE;
-
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
-					   MAIN_FORKNUM, meta->bitmap[pageno]);
-			words = PageGetBmapBits(BufferGetPage(buf));
-			for (uint32 b = 0; b < BMAP_BITS_PER_PAGE && ntaken < nneed &&
-				 base + b < old_hw; b++)
-			{
-				if (b % 64 == 0 && words[b / 64] == PG_UINT64_MAX)
-				{
-					b += 63;
-					continue;
-				}
-				if ((words[b / 64] & (UINT64CONST(1) << (b % 64))) == 0)
-				{
-					if (bc == NULL)
-						bc = bits_change(bits, &nbits, buf, pageno, 1, false,
-										 BMAP_PIECE);
-					((uint32 *) (bc->delta + 1))[bc->delta->nbits++] = b;
-					taken[ntaken++] = base + b;
-				}
-			}
-			if (bc == NULL)
-				UnlockReleaseBuffer(buf);
-			if (ntaken < nneed)
-				new_hint = (pageno + 1) % meta->nbitmap;
-		}
-		new_nfree -= ntaken;
-	}
-
-	/* then the high-water mark */
-	while (ntaken < nneed)
-	{
-		BlockNumber blk = new_hw++;
-		uint32		pageno = blk / BMAP_BITS_PER_PAGE;
-		BitsChange *bc = NULL;
-
-		for (int k = 0; k < nbits; k++)
-			if (bits[k].pageno == pageno)
-				bc = &bits[k];
-		if (bc == NULL)
-		{
-			if (pageno < meta->nbitmap)
-			{
-				Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
-
-				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
-						   MAIN_FORKNUM, meta->bitmap[pageno]);
-				bc = bits_change(bits, &nbits, buf, pageno, 1, false,
-								 BMAP_PIECE);
-			}
-			else
-			{
-				Buffer		buf;
-
-				/* a new bitmap page, the next one in order */
-				if (pageno != meta->nbitmap + nadded ||
-					meta->nbitmap + nadded >= BMAP_MAX_BITMAPS)
-					ereport(ERROR,
-							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("block-mapped storage of database %u is full",
-									rel.dbOid)));
-				buf = alloc_new_page(rel);
-				added[nadded++] = BufferGetBlockNumber(buf);
-				bc = bits_change(bits, &nbits, buf, pageno, 1, true,
-								 BMAP_PIECE);
-			}
-		}
-		((uint32 *) (bc->delta + 1))[bc->delta->nbits++] = blk % BMAP_BITS_PER_PAGE;
-		taken[ntaken++] = blk;
-	}
+	alloc_take(rel, nneed, taken, &alloc);
+	old_hw = alloc.old_hw;
+	new_hw = alloc.new_hw;
 
 	/* hand the blocks out in logical order */
 	for (uint32 i = 0, t = 0; i < n; i++)
@@ -985,10 +1076,6 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 				reused[nreused++] = phys[i];
 		}
 	}
-
-	/* new blocks get their reference-count pages before they are mapped */
-	if (new_hw > old_hw)
-		refs_cover(rel, new_hw);
 
 	/* every read is done; now the map page can be locked for the update */
 	if (!mapnew)
@@ -1024,22 +1111,13 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		ent[ndelta->nentries].epoch = epoch;
 		ndelta->nentries++;
 	}
-	mdelta = palloc0(sizeof(xl_bmap_meta_delta) + 2 * sizeof(BlockNumber));
-	mdelta->kind = BMAP_DELTA_META;
-	mdelta->hw = new_hw;
-	mdelta->nfree = new_nfree;
-	mdelta->hint = new_hint;
-	mdelta->nbitmap_added = nadded;
-	for (int i = 0; i < nadded; i++)
-		((BlockNumber *) (mdelta + 1))[i] = added[i];
-
 	xlrec.locator = rel;
 	xlrec.old_hw = old_hw;
 	xlrec.new_hw = new_hw;
 	xlrec.flags = RelFileLocatorSkippingWAL(rel) ? BMAP_EXTEND_SKIP_ZERO : 0;
 	xlrec.nreused = nreused;
 
-	XLogEnsureRecordSpace(3 + nbits, 0);
+	XLogEnsureRecordSpace(2 + BMAP_ALLOC_MAX_PAGES, 0);
 	ndelta->since = GetXLogInsertRecPtr();
 
 	START_CRIT_SECTION();
@@ -1047,13 +1125,6 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	MarkBufferDirty(headerbuf);
 	apply_node_delta(BufferGetPage(mapbuf), ndelta);
 	MarkBufferDirty(mapbuf);
-	apply_meta_delta(BufferGetPage(metabuf), mdelta);
-	MarkBufferDirty(metabuf);
-	for (int i = 0; i < nbits; i++)
-	{
-		apply_bits_delta(BufferGetPage(bits[i].buf), bits[i].delta);
-		MarkBufferDirty(bits[i].buf);
-	}
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfBmapExtend);
@@ -1064,36 +1135,17 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	XLogRegisterBuffer(1, mapbuf, REGBUF_STANDARD |
 					   (mapnew ? REGBUF_WILL_INIT : 0));
 	XLogRegisterBufData(1, ndelta, node_delta_size(ndelta));
-	XLogRegisterBuffer(2, metabuf, REGBUF_STANDARD);
-	XLogRegisterBufData(2, mdelta, meta_delta_size(mdelta));
-	blockid = 3;
-	for (int i = 0; i < nbits; i++)
-	{
-		XLogRegisterBuffer(blockid, bits[i].buf, REGBUF_STANDARD |
-						   ((bits[i].delta->flags & BMAP_DELTA_INIT) ?
-							REGBUF_WILL_INIT : 0));
-		XLogRegisterBufData(blockid, bits[i].delta,
-							bits_delta_size(bits[i].delta));
-		blockid++;
-	}
+	alloc_apply_register(&alloc, 2);
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_EXTEND);
 
 	PageSetLSN(BufferGetPage(headerbuf), lsn);
 	PageSetLSN(BufferGetPage(mapbuf), lsn);
-	PageSetLSN(BufferGetPage(metabuf), lsn);
-	for (int i = 0; i < nbits; i++)
-		PageSetLSN(BufferGetPage(bits[i].buf), lsn);
+	alloc_set_lsn(&alloc, lsn);
 	END_CRIT_SECTION();
 
-	for (int i = 0; i < nbits; i++)
-	{
-		UnlockReleaseBuffer(bits[i].buf);
-		pfree(bits[i].delta);
-	}
-	UnlockReleaseBuffer(metabuf);
+	alloc_release(&alloc);
 	UnlockReleaseBuffer(mapbuf);
 	pfree(ndelta);
-	pfree(mdelta);
 }
 
 /*
@@ -1804,6 +1856,13 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 			INJECTION_POINT("bmap-share-map-page", NULL);
 		}
 
+	/*
+	 * src's cached pages are checked before they next change, as pages read
+	 * from now on are: while the header is held, none can be checked
+	 * against the epoch about to be passed.
+	 */
+	MarkBufferedRelationShared(src, MAIN_FORKNUM);
+
 	dheader = map_read(drel, 0);
 	LockBuffer(dheader, BUFFER_LOCK_EXCLUSIVE);
 	check_page(BufferGetPage(dheader), BMAP_PAGE_HEADER, drel, BMAP_FORKNUM, 0);
@@ -1845,6 +1904,258 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 */
 	FlushRelationsAllBuffers(&src, 1);
 	mdimmedsync(store_smgr(srel), MAIN_FORKNUM);
+}
+
+/* ----------------------------------------------------------------
+ * Copying shared pages before they change
+ * ----------------------------------------------------------------
+ */
+
+/* logical block 'blkno''s entry, under a share lock; false if it has none */
+static bool
+peek_map_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+		return false;
+	buf = map_read(rel, MAP_PAGE(blkno));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+			   MAP_PAGE(blkno));
+	*entry = PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blkno)];
+	UnlockReleaseBuffer(buf);
+	return BlockNumberIsValid(entry->block);
+}
+
+/*
+ * The map's epoch and logical block 'blkno''s entry, read under share
+ * locks one at a time.  False if the block has no entry.
+ */
+static bool
+peek_entry(SMgrRelation reln, BlockNumber blkno, uint32 *epoch,
+		   BmapEntry *entry)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+
+	buf = map_read(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	*epoch = PageGetBmapHeader(BufferGetPage(buf))->epoch;
+	UnlockReleaseBuffer(buf);
+	return peek_map_entry(reln, blkno, entry);
+}
+
+/* the reference count of 'phys', unlocked */
+static uint8
+peek_ref(RelFileLocator rel, BlockNumber phys)
+{
+	Buffer		buf;
+	uint8		count;
+
+	if (REF_PAGE(phys) >= refs_nblocks(rel))
+		return 0;
+	buf = refs_read(rel, REF_PAGE(phys));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
+	count = page_ref(BufferGetPage(buf), phys);
+	UnlockReleaseBuffer(buf);
+	return count;
+}
+
+bool
+bmappreparesforchanges(SMgrRelation reln, ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM;
+}
+
+/*
+ * Would preparing logical block 'blkno' for a change copy it: is its block
+ * held by another map too?
+ */
+bool
+bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno)
+{
+	uint32		epoch;
+	BmapEntry	entry;
+
+	if (forknum != MAIN_FORKNUM ||
+		!peek_entry(reln, blkno, &epoch, &entry) || entry.epoch >= epoch)
+		return false;
+	return peek_ref(reln->smgr_rlocator.locator, entry.block) > 0;
+}
+
+/*
+ * Prepare logical block 'blkno', locked exclusively in 'buffer', for a
+ * change.  An entry born in the map's epoch is the map's own.  An older one
+ * may be shared: if no other map holds its block any more, it is claimed
+ * (born again in this epoch); otherwise the page is copied to a new block,
+ * which the map takes, and the old block loses a reference.  The copy's
+ * record carries the page's image, so redo makes the new block without
+ * reading it; and before it, contents only in the buffer are written to
+ * the old block, which other maps still read.
+ *
+ * Locks: the header shared (so the relation's extensions and sharing wait),
+ * the old block's reference-count page, the allocator's pages, then the map
+ * page last: allocating may write out one of this relation's pages, which
+ * looks it up on that page.  No other change of this entry can come
+ * meanwhile, since the buffer is locked.
+ */
+void
+bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
+					 Buffer buffer)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	uint32		epoch;
+	BmapEntry	entry;
+	Buffer		headerbuf;
+	Buffer		refbuf = InvalidBuffer;
+	Buffer		mapbuf;
+	uint8		count = 0;
+	BlockNumber old_block;
+	xl_bmap_node_delta *ndelta;
+	xl_bmap_entry_delta *ent;
+	XLogRecPtr	lsn;
+
+	if (forknum != MAIN_FORKNUM)
+		return;
+
+	/* the common case, with share locks alone */
+	if (!peek_entry(reln, blkno, &epoch, &entry) || entry.epoch >= epoch)
+		return;
+
+	/* the old block gets what other maps should read, if only buffered */
+	if (BufferIsDirty(buffer))
+		FlushOneBuffer(buffer);
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+	if (!peek_map_entry(reln, blkno, &entry) || entry.epoch >= epoch)
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	old_block = entry.block;
+
+	if (REF_PAGE(old_block) < refs_nblocks(rel))
+	{
+		refbuf = refs_read(rel, REF_PAGE(old_block));
+		LockBuffer(refbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_refs_page(BufferGetPage(refbuf), rel, REF_PAGE(old_block));
+		count = page_ref(BufferGetPage(refbuf), old_block);
+	}
+
+	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
+	ndelta->kind = BMAP_DELTA_NODE;
+	ndelta->nentries = 1;
+	ent = (xl_bmap_entry_delta *) (ndelta + 1);
+	ent->slot = MAP_SLOT(blkno);
+	ent->epoch = epoch;
+
+	if (count == 0)
+	{
+		xl_bmap_unref xlrec;
+
+		/* no other map holds it: claim it */
+		ent->block = old_block;
+		mapbuf = map_read(rel, MAP_PAGE(blkno));
+		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+				   MAP_PAGE(blkno));
+
+		xlrec.locator = rel;
+		xlrec.flags = BMAP_UNREF_MAP;
+		START_CRIT_SECTION();
+		apply_node_delta(BufferGetPage(mapbuf), ndelta);
+		MarkBufferDirty(mapbuf);
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
+		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
+		PageSetLSN(BufferGetPage(mapbuf), lsn);
+		END_CRIT_SECTION();
+	}
+	else
+	{
+		Allocation	alloc;
+		BlockNumber new_block;
+		xl_bmap_refs_delta *rdelta = NULL;
+		xl_bmap_remap xlrec;
+		int			id;
+
+		alloc_take(rel, 1, &new_block, &alloc);
+		ent->block = new_block;
+
+		/* the page store reaches the block; its contents come with the record */
+		prepare_store(rel, alloc.old_hw, alloc.new_hw, NULL, 0, false);
+
+		if (count != BMAP_REFS_STUCK)
+		{
+			xl_bmap_ref_delta *ref;
+
+			rdelta = palloc0(sizeof(xl_bmap_refs_delta) + sizeof(xl_bmap_ref_delta));
+			rdelta->kind = BMAP_DELTA_REFS;
+			rdelta->nrefs = 1;
+			ref = (xl_bmap_ref_delta *) (rdelta + 1);
+			ref->slot = REF_SLOT(old_block);
+			ref->count = count - 1;
+		}
+
+		mapbuf = map_read(rel, MAP_PAGE(blkno));
+		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+				   MAP_PAGE(blkno));
+
+		xlrec.locator = rel;
+		xlrec.blkno = blkno;
+		xlrec.old_block = old_block;
+		xlrec.old_hw = alloc.old_hw;
+		xlrec.new_hw = alloc.new_hw;
+
+		XLogEnsureRecordSpace(3 + BMAP_ALLOC_MAX_PAGES, 0);
+		ndelta->since = GetXLogInsertRecPtr();
+		START_CRIT_SECTION();
+		apply_node_delta(BufferGetPage(mapbuf), ndelta);
+		MarkBufferDirty(mapbuf);
+		/* the page is written to its new block from here on */
+		MarkBufferDirty(buffer);
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
+		id = alloc_apply_register(&alloc, 1);
+		if (rdelta)
+		{
+			apply_refs_delta(BufferGetPage(refbuf), rdelta);
+			MarkBufferDirty(refbuf);
+			XLogRegisterBuffer(id, refbuf, REGBUF_STANDARD);
+			XLogRegisterBufData(id, rdelta, refs_delta_size(rdelta));
+			id++;
+		}
+		XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE);
+		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_REMAP);
+		PageSetLSN(BufferGetPage(mapbuf), lsn);
+		alloc_set_lsn(&alloc, lsn);
+		if (rdelta)
+			PageSetLSN(BufferGetPage(refbuf), lsn);
+		PageSetLSN(BufferGetPage(buffer), lsn);
+		END_CRIT_SECTION();
+
+		alloc_release(&alloc);
+		if (rdelta)
+			pfree(rdelta);
+	}
+
+	UnlockReleaseBuffer(mapbuf);
+	if (BufferIsValid(refbuf))
+		UnlockReleaseBuffer(refbuf);
+	UnlockReleaseBuffer(headerbuf);
+	pfree(ndelta);
 }
 
 /* Set a relation's length; the header is pinned and not locked. */
@@ -2301,8 +2612,18 @@ bmapprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber run;
 		BlockNumber phys = lookup_ext(reln, blocknum, nblocks, &run, true, false);
 
+		/*
+		 * A block without an entry has nothing to prefetch.  In recovery the
+		 * map's header on disk may be newer than the map page that will have
+		 * the entry, so a block below the length may have none yet; a
+		 * prefetch is only a hint.
+		 */
 		if (!BlockNumberIsValid(phys))
-			return false;
+		{
+			blocknum++;
+			nblocks--;
+			continue;
+		}
 		if (!mdprefetch(ssrel, MAIN_FORKNUM, phys, run))
 			return false;
 		blocknum += run;
@@ -2735,6 +3056,24 @@ bmap_redo(XLogReaderState *record)
 			for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 				redo_block(record, id);
 			break;
+		case XLOG_BMAP_REMAP:
+			{
+				xl_bmap_remap *xlrec = (xl_bmap_remap *) XLogRecGetData(record);
+				uint8		last = XLogRecMaxBlockId(record);
+
+				/*
+				 * The page store reaches the new block; the page itself is
+				 * the last block, an image, so redo never reads the block.
+				 * The old block keeps what it had: shared blocks were synced
+				 * when shared.
+				 */
+				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
+							  NULL, 0, true);
+				for (uint8 id = 0; id <= last; id++)
+					redo_block(record, id);
+				XLogReplaceBlock(xlrec->locator, MAIN_FORKNUM, xlrec->blkno);
+				break;
+			}
 		case XLOG_BMAP_SHARED:
 			{
 				xl_bmap_share *xlrec = (xl_bmap_share *) XLogRecGetData(record);

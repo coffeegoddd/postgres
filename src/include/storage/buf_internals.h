@@ -114,7 +114,8 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_IO_IN_PROGRESS			BUF_DEFINE_FLAG( 4)
 /* previous I/O failed */
 #define BM_IO_ERROR					BUF_DEFINE_FLAG( 5)
-/* flag bit 6 is not used anymore */
+/* the storage manager must prepare the page before it next changes */
+#define BM_SMGR_PREPARE				BUF_DEFINE_FLAG( 6)
 /* have waiter for sole pin */
 #define BM_PIN_COUNT_WAITER			BUF_DEFINE_FLAG( 7)
 /* must write for checkpoint */

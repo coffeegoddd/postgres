@@ -67,6 +67,8 @@ extern void XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum);
 extern void XLogDropDatabase(Oid dbid);
 extern void XLogTruncateRelation(RelFileLocator rlocator, ForkNumber forkNum,
 								 BlockNumber nblocks);
+extern void XLogReplaceBlock(RelFileLocator rlocator, ForkNumber forkNum,
+							 BlockNumber blkno);
 
 /* Result codes for XLogReadBufferForRedo[Extended] */
 typedef enum

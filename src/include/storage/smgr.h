@@ -112,6 +112,11 @@ extern bool smgrcanshare(SMgrRelation reln);
 extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
+extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
+extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber blocknum, Buffer buffer);
+extern bool smgrpageisshared(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber blocknum);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,

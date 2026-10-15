@@ -340,6 +340,8 @@ LockBuffer(Buffer buffer, BufferLockMode mode)
 }
 
 extern bool ConditionalLockBuffer(Buffer buffer);
+extern void MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum);
+extern bool BufferPageMayBeShared(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);

@@ -326,6 +326,13 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 		Size		freespace = 0;
 
 		/*
+		 * A page another relation shares would be copied first; reads don't
+		 * copy pages, so VACUUM or a change of the page prunes it instead.
+		 */
+		if (BufferPageMayBeShared(buffer))
+			return;
+
+		/*
 		 * Pin the VM page before taking the heap cleanup lock. This may
 		 * occasionally lead to an unnecessary pin when the buffer is
 		 * contended, but the same VM page covers many heap pages, so there is

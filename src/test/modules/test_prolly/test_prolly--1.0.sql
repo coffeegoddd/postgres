@@ -130,3 +130,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_extend(relnumber oid, n int)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Change a byte of a page's hole, as an access method changes a page.
+CREATE FUNCTION test_bmap_write(relnumber oid, blkno int, value int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A digest of heap pages' rows, leaving out hint bits.
+CREATE FUNCTION test_bmap_rows_digest(relnumber oid)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

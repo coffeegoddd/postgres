@@ -44,6 +44,7 @@ tests += {
       'catalog_branch_column',
       'branch_catalogs',
       'bmap_sharing',
+      'bmap_copy_on_write',
     ],
   },
   'tap': {

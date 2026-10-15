@@ -110,4 +110,116 @@ scenario('other_block', 1);
 # its page from before it got the block there, r's records would apply to it.
 scenario('same_block', 0);
 
+# A shared page copied before it changes, to a block r had: s's records
+# from before the copy, replayed through s's newer map page, would find r's
+# page of the same logical block there (the copy's image comes later).
+{
+	my $node = PostgreSQL::Test::Cluster->new('copied');
+	$node->init;
+	$node->append_conf('postgresql.conf', qq{
+autovacuum = off
+checkpoint_timeout = 1h
+bgwriter_lru_maxpages = 0
+full_page_writes = off
+});
+	$node->start;
+	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
+
+	$sql->(q{
+		CREATE EXTENSION test_prolly;
+		CREATE EXTENSION pg_buffercache;
+		CREATE SCHEMA cow VERSIONED;
+		CREATE TABLE cow.r (a int8, b int8);
+		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
+		CREATE TABLE cow.s (a int8, b int8);
+		INSERT INTO cow.s SELECT g, g FROM generate_series(1, 5) g;
+	});
+	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
+	my $s = $sql->(q{SELECT pg_relation_filenode('cow.s')});
+	my $r_block = $sql->(qq{SELECT phys FROM test_bmap_map($r) WHERE blkno = 0});
+	$sql->(q{CHECKPOINT});
+
+	# A change of s's page without an image, before it is shared.
+	$sql->(q{UPDATE cow.s SET b = -b WHERE a = 5});
+
+	# r is dropped, freeing its block; s, shared, copies its page to it.
+	$sql->(q{DROP TABLE cow.r});
+	my $copy = $sql->(qq{SELECT test_bmap_share($s)});
+	my $copy_digest = $sql->(qq{SELECT test_bmap_rows_digest($copy)});
+	$sql->(q{UPDATE cow.s SET b = 0 WHERE a = 1});
+	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0}), $r_block,
+		'copied: s\'s page went to r\'s old block');
+
+	# s's map page reaches disk, its page doesn't.
+	$sql->(qq{SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
+		WHERE relfilenode = $s AND relforknumber = 4});
+	$node->stop('immediate');
+	$node->start;
+
+	is($sql->(q{SELECT string_agg(a || ':' || b, ',' ORDER BY a) FROM cow.s}),
+		'1:0,2:2,3:3,4:4,5:-5', 'copied: s recovered');
+	is($sql->(qq{SELECT test_bmap_rows_digest($copy)}), $copy_digest,
+		'copied: the copy recovered');
+
+	$sql->(qq{SELECT test_bmap_unlink($copy)});
+	$node->stop;
+}
+
+# The other way: r copies its page away from a block it shared, which s
+# gets when the copy is dropped.  r's records from before, replayed through
+# r's older map page, find s's page of another logical block there: read as
+# invalid, until replaying r's copy forgets it.
+{
+	my $node = PostgreSQL::Test::Cluster->new('copied_away');
+	$node->init(allows_streaming => 1);
+	$node->append_conf('postgresql.conf', qq{
+autovacuum = off
+checkpoint_timeout = 1h
+bgwriter_lru_maxpages = 0
+full_page_writes = off
+});
+	$node->start;
+	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
+
+	$sql->(q{
+		CREATE EXTENSION test_prolly;
+		CREATE EXTENSION pg_buffercache;
+		CREATE SCHEMA cow VERSIONED;
+		CREATE TABLE cow.r (a int8, b int8);
+		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
+		CREATE TABLE cow.s (a int8, b char(1900));
+		INSERT INTO cow.s SELECT g, 'x' FROM generate_series(1, 4) g;
+	});
+	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
+	my $s = $sql->(q{SELECT pg_relation_filenode('cow.s')});
+	my $r_block = $sql->(qq{SELECT phys FROM test_bmap_map($r) WHERE blkno = 0});
+	$sql->(q{CHECKPOINT});
+
+	# A change of r's page without an image, before it is shared.
+	$sql->(q{UPDATE cow.r SET b = -b WHERE a = 150});
+
+	# r, shared, copies its page away; the copy, dropped, frees the block,
+	# which s's second page gets.
+	my $copy = $sql->(qq{SELECT test_bmap_share($r)});
+	$sql->(q{UPDATE cow.r SET b = 0 WHERE a = 1});
+	$sql->(qq{SELECT test_bmap_unlink($copy)});
+	$sql->(q{INSERT INTO cow.s VALUES (5, 'y')});
+	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 1}), $r_block,
+		'copied_away: s\'s second page has r\'s old block');
+
+	# s's pages reach disk, r's map page doesn't.  Recovery as a standby
+	# checks for invalid pages when it reaches consistency.
+	$sql->(q{SELECT pg_buffercache_evict_relation('cow.s')});
+	$node->stop('immediate');
+	$node->set_standby_mode;
+	$node->start;
+	$node->promote;
+	$node->poll_query_until('postgres', 'SELECT NOT pg_is_in_recovery()');
+
+	is($sql->(q{SELECT count(*), sum(b) FROM cow.r}), '150|11024',
+		'copied_away: r recovered');
+	is($sql->(q{SELECT count(*) FROM cow.s}), '5', 'copied_away: s recovered');
+	$node->stop;
+}
+
 done_testing();

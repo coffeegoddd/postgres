@@ -56,6 +56,16 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->src.relNumber, xlrec->dst.relNumber);
 				break;
 			}
+		case XLOG_BMAP_REMAP:
+			{
+				xl_bmap_remap *xlrec = (xl_bmap_remap *) rec;
+
+				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> new; hw %u -> %u",
+								 xlrec->locator.spcOid, xlrec->locator.dbOid,
+								 xlrec->locator.relNumber, xlrec->blkno,
+								 xlrec->old_block, xlrec->old_hw, xlrec->new_hw);
+				break;
+			}
 		case XLOG_BMAP_UNREF:
 			{
 				xl_bmap_unref *xlrec = (xl_bmap_unref *) rec;
@@ -92,6 +102,8 @@ bmap_identify(uint8 info)
 			return "SHARED";
 		case XLOG_BMAP_UNREF:
 			return "UNREF";
+		case XLOG_BMAP_REMAP:
+			return "REMAP";
 	}
 	return NULL;
 }

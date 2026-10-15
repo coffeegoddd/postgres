@@ -42,6 +42,10 @@
  *						(its epoch raised), block 1 the copy's (its length)
  * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
  *						map page whose entries change (BMAP_UNREF_MAP)
+ * XLOG_BMAP_REMAP		a shared page is copied before it changes: block 0 is
+ *						the map page, then the allocator's metapage and bitmap
+ *						pages, the old block's reference-count page if its
+ *						count changes, and last the page itself, as an image
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
@@ -51,6 +55,7 @@
 #define XLOG_BMAP_SHARE			0x60
 #define XLOG_BMAP_SHARED		0x70
 #define XLOG_BMAP_UNREF			0x80
+#define XLOG_BMAP_REMAP			0x90
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
@@ -76,6 +81,19 @@ typedef struct xl_bmap_unref
 	RelFileLocator locator;
 	uint32		flags;
 } xl_bmap_unref;
+
+/*
+ * REMAP's main data: the relation, the logical block copied and the block
+ * it leaves, and the page store's high-water mark before and after.
+ */
+typedef struct xl_bmap_remap
+{
+	RelFileLocator locator;
+	BlockNumber blkno;
+	BlockNumber old_block;
+	BlockNumber old_hw;
+	BlockNumber new_hw;
+} xl_bmap_remap;
 
 /*
  * EXTEND's main data: the relation, the page store's high-water mark before
