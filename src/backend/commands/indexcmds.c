@@ -20,6 +20,7 @@
 #include "access/gist.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
@@ -876,6 +877,7 @@ DefineIndex(ParseState *pstate,
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	accessMethodId = accessMethodForm->oid;
 	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
+	prolly_note_tablespace(accessMethodId, stmt->tableSpace);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,
 								 accessMethodId);

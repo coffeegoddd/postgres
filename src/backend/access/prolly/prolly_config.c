@@ -15,6 +15,8 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "access/prolly_config.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
@@ -110,7 +112,10 @@ prolly_table_am_for_persistence(Oid amoid, char relpersistence, bool explicit)
 	bool		prolly;
 
 	if (relpersistence == RELPERSISTENCE_PERMANENT || !OidIsValid(amoid))
+	{
+		prolly_check_versioned_am(amoid, relpersistence);
 		return amoid;
+	}
 	amname = get_am_name(amoid);
 	prolly = prolly_is_table_am(amname);
 	if (amname)
@@ -124,6 +129,42 @@ prolly_table_am_for_persistence(Oid amoid, char relpersistence, bool explicit)
 				 errdetail("Temporary and unlogged tables are never part of a commit."),
 				 errhint("Leave out USING, and the table is stored by heap.")));
 	return HEAP_TABLE_AM_OID;
+}
+
+void
+prolly_check_versioned_am(Oid amoid, char relpersistence)
+{
+	char	   *amname;
+
+	if (!MyDatabaseVersioned || relpersistence != RELPERSISTENCE_PERMANENT ||
+		!OidIsValid(amoid))
+		return;
+	amname = get_am_name(amoid);
+	if (!prolly_is_table_am(amname))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a versioned database can't have permanent tables stored by \"%s\"",
+						amname ? amname : "?"),
+				 errdetail("Every permanent table of a versioned database is versioned, so it is a prolly table."),
+				 errhint("Use a prolly table access method, or a temporary or unlogged table.")));
+	pfree(amname);
+}
+
+void
+prolly_note_tablespace(Oid amoid, const char *tablespacename)
+{
+	char	   *amname;
+
+	if (tablespacename == NULL || !OidIsValid(amoid))
+		return;
+	amname = get_am_name(amoid);
+	if (amname && (prolly_is_table_am(amname) || strcmp(amname, "prolly") == 0))
+		ereport(NOTICE,
+				(errmsg("prolly relations ignore tablespaces; tablespace \"%s\" is not used",
+						tablespacename),
+				 errdetail("Their rows are kept in the cluster's node store.")));
+	if (amname)
+		pfree(amname);
 }
 
 void

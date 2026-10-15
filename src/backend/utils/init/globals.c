@@ -98,6 +98,7 @@ Oid			MyDatabaseId = InvalidOid;
 Oid			MyDatabaseTableSpace = InvalidOid;
 
 bool		MyDatabaseHasLoginEventTriggers = false;
+bool		MyDatabaseVersioned = false;
 
 /*
  * DatabasePath is the path (relative to DataDir) of my database's

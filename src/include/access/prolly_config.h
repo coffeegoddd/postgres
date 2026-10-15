@@ -101,9 +101,24 @@ extern bool prolly_is_table_am(const char *amname);
  * The table access method a new relation of relpersistence gets, given
  * amoid: a temporary or unlogged relation is never stored by prolly (it is
  * never part of a commit), so it gets heap; asking for prolly explicitly
- * (explicit) for one is an error.
+ * (explicit) for one is an error.  In a versioned database, a permanent
+ * relation must be a prolly one (prolly_check_versioned_am).
  */
 extern Oid	prolly_table_am_for_persistence(Oid amoid, char relpersistence,
 											bool explicit);
+
+/*
+ * Error if a permanent relation stored by amoid can't be in the current
+ * database: a versioned database versions every permanent table, so they
+ * are all prolly tables.
+ */
+extern void prolly_check_versioned_am(Oid amoid, char relpersistence);
+
+/*
+ * NOTICE that a relation stored by amoid (a table or index access method)
+ * ignores the tablespace it is given, if it is a prolly one: its rows are
+ * in the node store.
+ */
+extern void prolly_note_tablespace(Oid amoid, const char *tablespacename);
 
 #endif							/* PROLLY_CONFIG_H */
