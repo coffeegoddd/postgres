@@ -44,15 +44,15 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_VALUE_ENCODER] = "canonical", \
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_content", \
 	[PROLLY_IFACE_INDEX_KEYING] = "columns_then_row", \
-	[PROLLY_IFACE_ALLOCATOR] = "stub", \
-	[PROLLY_IFACE_RECLAMATION] = "stub"
+	[PROLLY_IFACE_ALLOCATOR] = "stub"
 
 #define HASH_ADDRESSED \
 	[PROLLY_IFACE_NODE_STORE] = "global", \
 	[PROLLY_IFACE_TREE] = "cow", \
 	[PROLLY_IFACE_ROOT_LAYOUT] = "subroots", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "serial", \
-	[PROLLY_IFACE_ROW_IDENTITY] = "counter"
+	[PROLLY_IFACE_ROW_IDENTITY] = "counter", \
+	[PROLLY_IFACE_RECLAMATION] = "mark_sweep"
 
 #define NOT_YET \
 	[PROLLY_IFACE_NODE_STORE] = "stub", \
@@ -60,6 +60,7 @@ typedef struct ProllyProfile
 	[PROLLY_IFACE_ROOT_LAYOUT] = "stub", \
 	[PROLLY_IFACE_COMMIT_PIPELINE] = "stub", \
 	[PROLLY_IFACE_ROW_IDENTITY] = "stub", \
+	[PROLLY_IFACE_RECLAMATION] = "stub", \
 	[PROLLY_IFACE_LOG] = "stub"
 
 static const ProllyProfile profiles[] = {

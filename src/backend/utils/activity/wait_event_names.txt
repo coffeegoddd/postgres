@@ -447,5 +447,6 @@ applytransaction	"Waiting to acquire a lock on a remote transaction being applie
 prollybranch	"Waiting to commit to a prolly branch."
 prollytable	"Waiting to write to a prolly table."
 prollyrow	"Waiting to lock a row of a prolly table."
+prollystore	"Waiting to write to, or reclaim, the prolly node store."
 
 # No "ABI_compatibility" region here as WaitEventLock has its own C code.

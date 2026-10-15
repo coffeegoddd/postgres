@@ -52,6 +52,7 @@ OBJS = \
 	prolly_tableam.o \
 	prolly_vcs.o \
 	prolly_xact.o \
+	reclaim_marksweep.o \
 	reclaim_stub.o \
 	refs_stub.o \
 	rootlayout_stub.o \

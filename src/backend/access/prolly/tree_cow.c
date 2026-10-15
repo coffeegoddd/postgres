@@ -123,6 +123,7 @@ node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 			node->level = PROLLY_CALL(env->node_format, page_level, node->page);
 			node->nitems = PROLLY_CALL(env->node_format, item_count, node->page);
 			node->ref = r;
+			node->ref.location.blkno = BufferGetBlockNumber(buf);
 			return;
 		}
 		UnlockReleaseBuffer(buf);
@@ -1057,8 +1058,9 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 
 	CHECK_FOR_INTERRUPTS();
 	node_read(env, ref, &node);
-	visit(&node.ref, node.level, arg);
-	if (node.level == 0)
+	if (!visit(&node.ref, node.level, arg))
+		;						/* the visitor has seen what is below */
+	else if (node.level == 0)
 	{
 		/* Value trees of values stored out of line. */
 		for (int i = 0; i < node.nitems; i++)

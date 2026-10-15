@@ -36,10 +36,22 @@
  * replays; a split logs full images of every page it touches.  Writing node
  * contents is the log interface's job (prolly_log.h), not the store's.
  *
- * Limitations for now: release() removes a node from the map, but its
- * block is not reused (reclamation and space reuse come later).  Overflow
- * pages freed by splits are reused only by later splits.  Only permanent
- * relations are supported; temporary and unlogged ones are not decided yet.
+ * Reclamation.  reclaim() removes a node from the map and marks its block
+ * free in STORE_FREE, a bitmap of the node blocks: block 0 counts the free
+ * blocks; each later block covers FREE_BITS node blocks, with the newest
+ * transaction id that freed one of them (its stamp).  The node page itself
+ * is left alone: a transaction may still hold a pin on it and read it.
+ * new_node() reuses a free block once every transaction running when its
+ * page's stamp was taken has ended, which a hot standby enforces by
+ * cancelling queries older than the stamp when it replays the reuse.
+ * Writers hold the store lock (LockProllyStore, RowExclusiveLock) from
+ * their first new_node() or contains() to their transaction's end, so
+ * reclamation, which takes it exclusively, never frees a node a writer is
+ * about to publish or refer to.
+ *
+ * Limitations for now: release() removes a node from the map, but leaves
+ * its block alone.  Overflow pages freed by splits are reused only by later
+ * splits.  Only permanent relations are supported.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/nodestore_global.c
@@ -50,11 +62,13 @@
 
 #include "access/prolly_builtins.h"
 #include "access/prolly_xlog.h"
+#include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
@@ -62,10 +76,13 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/smgr.h"
+#include "storage/standby.h"
+#include "utils/snapmgr.h"
 
 #define STORE_NODES		((RelFileNumber) 9393)
 #define STORE_MAP		((RelFileNumber) 9394)
 #define STORE_OVERFLOW	((RelFileNumber) 9395)
+#define STORE_FREE		((RelFileNumber) 9398)
 
 #define STORE_IMPL_ID	1
 
@@ -85,6 +102,34 @@
 #define XLOG_STORE_MAP_INSERT_NEW	0x20	/* entry in a new overflow page */
 #define XLOG_STORE_MAP_DELETE		0x30	/* entry removed */
 #define XLOG_STORE_MAP_SPLIT		0x40	/* bucket split: full page images */
+#define XLOG_STORE_NODE_FREE		0x50	/* a node block marked free */
+#define XLOG_STORE_NODE_REUSE		0x60	/* a free node block taken */
+
+/* Free blocks: block 0 counts them; bitmap pages cover FREE_BITS each. */
+typedef struct FreeMeta
+{
+	uint32		magic;
+	uint64		nfree;
+} FreeMeta;
+
+typedef struct FreePageOpaque
+{
+	FullTransactionId stamp;	/* the newest freeing of a block here */
+	uint32		nfree;
+} FreePageOpaque;
+
+#define FREE_MAGIC		0x50465245	/* "PFRE" */
+#define FREE_BYTES		(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
+						 MAXALIGN(sizeof(FreePageOpaque)))
+#define FREE_BITS		((BlockNumber) FREE_BYTES * 8)
+
+/* The WAL records' data. */
+typedef struct xl_store_free
+{
+	uint32		bit;
+	FullTransactionId stamp;
+	uint64		nfree;			/* the store's free count after */
+} xl_store_free;
 
 typedef struct MapMeta
 {
@@ -104,6 +149,8 @@ typedef struct MapPageOpaque
 	uint16		nentries;
 	uint16		flags;
 } MapPageOpaque;
+
+static Buffer reuse_free_block(void);
 
 struct ProllyNodeStore
 {
@@ -811,11 +858,29 @@ global_read(ProllyNodeStore *store, const ProllyNodeRef *ref)
 									 blk, RBM_NORMAL, NULL, true);
 }
 
+/*
+ * Writers (and transactions keeping nodes the store has) hold the store
+ * lock until they end, so reclamation sees no node in flight.
+ */
+static void
+hold_store_lock(void)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_PROLLY_STORE(tag);
+	if (!LockHeldByMe(&tag, RowExclusiveLock, true))
+		(void) LockProllyStore(RowExclusiveLock, false);
+}
+
 static Buffer
 global_new_node(ProllyNodeStore *store, ProllyNodeRef *ref)
 {
-	Buffer		buf = store_extend(STORE_NODES);
+	Buffer		buf;
 
+	hold_store_lock();
+	buf = reuse_free_block();
+	if (!BufferIsValid(buf))
+		buf = store_extend(STORE_NODES);
 	memset(ref, 0, sizeof(*ref));
 	ref->location.blkno = BufferGetBlockNumber(buf);
 	return buf;
@@ -841,6 +906,9 @@ global_contains(ProllyNodeStore *store, const ProllyHash *hash,
 	blk = map_lookup(hash);
 	if (!BlockNumberIsValid(blk))
 		return false;
+
+	/* The caller will refer to the node: keep it from reclamation. */
+	hold_store_lock();
 	if (location)
 	{
 		memset(location, 0, sizeof(*location));
@@ -854,6 +922,285 @@ global_release(ProllyNodeStore *store, const ProllyNodeRef *ref)
 {
 	check_hash(&ref->hash);
 	map_delete(&ref->hash, ref->location.blkno);
+}
+
+/* ------------------------------------------------------------------------
+ * Reclamation
+ * ------------------------------------------------------------------------
+ */
+
+static void
+global_scan(ProllyNodeStore *store, ProllyStoreVisit visit, void *arg)
+{
+	Buffer		metabuf = store_read(STORE_MAP, 0, BUFFER_LOCK_SHARE);
+	MapMeta    *meta = meta_of(BufferGetPage(metabuf));
+
+	meta_check(meta);
+	for (uint32 bucket = 0; bucket <= meta->maxbucket; bucket++)
+	{
+		BlockNumber blk = bucket + 1;
+		RelFileNumber file = STORE_MAP;
+
+		while (BlockNumberIsValid(blk))
+		{
+			Buffer		buf = store_read(file, blk, BUFFER_LOCK_SHARE);
+			Page		page = BufferGetPage(buf);
+			int			n = opaque_of(page)->nentries;
+
+			CHECK_FOR_INTERRUPTS();
+			for (int i = 0; i < n; i++)
+			{
+				char	   *e = entry_at(page, i);
+				ProllyHash	hash;
+				BlockNumber node;
+
+				memset(&hash, 0, sizeof(hash));
+				hash.len = MAP_HASH_LEN;
+				memcpy(hash.bytes, e, MAP_HASH_LEN);
+				memcpy(&node, e + MAP_HASH_LEN, sizeof(node));
+				visit(&hash, node, arg);
+			}
+			blk = opaque_of(page)->next;
+			file = STORE_OVERFLOW;
+			UnlockReleaseBuffer(buf);
+		}
+	}
+	UnlockReleaseBuffer(metabuf);
+}
+
+static void
+free_page_init(Page page)
+{
+	FreePageOpaque *op;
+
+	PageInit(page, BLCKSZ, sizeof(FreePageOpaque));
+	op = (FreePageOpaque *) PageGetSpecialPointer(page);
+	op->stamp = InvalidFullTransactionId;
+	op->nfree = 0;
+	((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + FREE_BYTES;
+}
+
+static void
+free_meta_init(Page page)
+{
+	FreeMeta   *m;
+
+	PageInit(page, BLCKSZ, 0);
+	m = (FreeMeta *) PageGetContents(page);
+	m->magic = FREE_MAGIC;
+	m->nfree = 0;
+	((PageHeader) page)->pd_lower = (char *) (m + 1) - (char *) page;
+}
+
+static FreeMeta *
+free_meta(Page page)
+{
+	FreeMeta   *m = (FreeMeta *) PageGetContents(page);
+
+	if (m->magic != FREE_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly free block map has a bad metapage")));
+	return m;
+}
+
+/*
+ * Make sure STORE_FREE exists with its metapage and a bitmap page for
+ * node block blk; return that page's block number.  Caller holds the store
+ * lock exclusively (reclamation), so nothing else extends it.
+ */
+static BlockNumber
+free_page_for(BlockNumber blk)
+{
+	SMgrRelation srel = store_smgr(STORE_FREE);
+	BlockNumber want = blk / FREE_BITS + 1;
+
+	if (!smgrexists(srel, MAIN_FORKNUM))
+	{
+		smgrcreate(srel, MAIN_FORKNUM, false);
+		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+	}
+	while (smgrnblocks(srel, MAIN_FORKNUM) <= want)
+	{
+		Buffer		buf = store_extend(STORE_FREE);
+		Page		page = BufferGetPage(buf);
+
+		START_CRIT_SECTION();
+		if (BufferGetBlockNumber(buf) == 0)
+			free_meta_init(page);
+		else
+			free_page_init(page);
+		MarkBufferDirty(buf);
+		log_newpage_buffer(buf, true);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+	}
+	return want;
+}
+
+static void
+set_free_bit(Page page, uint32 bit, bool on)
+{
+	uint8	   *bits = (uint8 *) PageGetContents(page);
+
+	if (on)
+		bits[bit / 8] |= (uint8) (1 << (bit % 8));
+	else
+		bits[bit / 8] &= (uint8) ~(1 << (bit % 8));
+}
+
+static bool
+free_bit(Page page, uint32 bit)
+{
+	return (((uint8 *) PageGetContents(page))[bit / 8] & (1 << (bit % 8))) != 0;
+}
+
+static void
+log_free_change(Buffer pagebuf, Buffer metabuf, uint8 info, uint32 bit,
+				FullTransactionId stamp, uint64 nfree)
+{
+	xl_prolly_header hdr;
+	xl_store_free rec;
+	XLogRecPtr	recptr;
+
+	rec.bit = bit;
+	rec.stamp = stamp;
+	rec.nfree = nfree;
+	XLogBeginInsert();
+	log_header(&hdr);
+	XLogRegisterData(&rec, sizeof(rec));
+	XLogRegisterBuffer(0, pagebuf, REGBUF_STANDARD);
+	XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);
+	recptr = XLogInsert(RM_PROLLY_STORE_ID, info);
+	PageSetLSN(BufferGetPage(pagebuf), recptr);
+	PageSetLSN(BufferGetPage(metabuf), recptr);
+}
+
+static void
+global_reclaim(ProllyNodeStore *store, const ProllyHash *hash, BlockNumber block)
+{
+	BlockNumber fblk;
+	Buffer		pagebuf;
+	Buffer		metabuf;
+	Page		page;
+	FreePageOpaque *op;
+	FreeMeta   *m;
+	uint32		bit = block % FREE_BITS;
+	FullTransactionId stamp = ReadNextFullTransactionId();
+
+	if (hash)
+	{
+		check_hash(hash);
+		map_delete(hash, block);
+	}
+	fblk = free_page_for(block);
+	pagebuf = store_read(STORE_FREE, fblk, BUFFER_LOCK_EXCLUSIVE);
+	metabuf = store_read(STORE_FREE, 0, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(pagebuf);
+	op = (FreePageOpaque *) PageGetSpecialPointer(page);
+	m = free_meta(BufferGetPage(metabuf));
+	if (!free_bit(page, bit))
+	{
+		START_CRIT_SECTION();
+		set_free_bit(page, bit, true);
+		op->nfree++;
+		op->stamp = stamp;
+		m->nfree++;
+		MarkBufferDirty(pagebuf);
+		MarkBufferDirty(metabuf);
+		log_free_change(pagebuf, metabuf, XLOG_STORE_NODE_FREE, bit, stamp,
+						m->nfree);
+		END_CRIT_SECTION();
+	}
+	UnlockReleaseBuffer(metabuf);
+	UnlockReleaseBuffer(pagebuf);
+}
+
+/*
+ * Where this backend looks for a free block first, and the oldest stamp of
+ * a page it last found free blocks on that weren't reusable yet: until
+ * that stamp is old enough, nothing is.
+ */
+static BlockNumber free_hint = 1;
+static FullTransactionId free_wait = {0};
+
+/*
+ * A free block every transaction that could still read it has ended for,
+ * taken off the free map, zeroed and exclusive-locked; InvalidBuffer if
+ * there is none.
+ */
+static Buffer
+reuse_free_block(void)
+{
+	SMgrRelation srel = store_smgr(STORE_FREE);
+	BlockNumber npages;
+	Buffer		metabuf;
+	bool		any;
+	FullTransactionId oldest_waiting = InvalidFullTransactionId;
+
+	if (FullTransactionIdIsValid(free_wait) &&
+		!GlobalVisCheckRemovableFullXid(NULL, free_wait))
+		return InvalidBuffer;
+	free_wait = InvalidFullTransactionId;
+	if (!smgrexists(srel, MAIN_FORKNUM))
+		return InvalidBuffer;
+	npages = smgrnblocks(srel, MAIN_FORKNUM);
+	if (npages < 2)
+		return InvalidBuffer;
+	metabuf = store_read(STORE_FREE, 0, BUFFER_LOCK_SHARE);
+	any = free_meta(BufferGetPage(metabuf))->nfree > 0;
+	UnlockReleaseBuffer(metabuf);
+	if (!any)
+		return InvalidBuffer;
+
+	for (BlockNumber i = 0; i < npages - 1; i++)
+	{
+		BlockNumber fblk = (free_hint - 1 + i) % (npages - 1) + 1;
+		Buffer		pagebuf = store_read(STORE_FREE, fblk, BUFFER_LOCK_EXCLUSIVE);
+		Page		page = BufferGetPage(pagebuf);
+		FreePageOpaque *op = (FreePageOpaque *) PageGetSpecialPointer(page);
+
+		if (op->nfree > 0 && !GlobalVisCheckRemovableFullXid(NULL, op->stamp))
+		{
+			if (!FullTransactionIdIsValid(oldest_waiting) ||
+				FullTransactionIdPrecedes(op->stamp, oldest_waiting))
+				oldest_waiting = op->stamp;
+		}
+		else if (op->nfree > 0)
+		{
+			for (uint32 bit = 0; bit < FREE_BITS; bit++)
+			{
+				BlockNumber block;
+				FreeMeta   *m;
+				Buffer		nodebuf;
+
+				if (!free_bit(page, bit))
+					continue;
+				block = (fblk - 1) * FREE_BITS + bit;
+				metabuf = store_read(STORE_FREE, 0, BUFFER_LOCK_EXCLUSIVE);
+				m = free_meta(BufferGetPage(metabuf));
+				START_CRIT_SECTION();
+				set_free_bit(page, bit, false);
+				op->nfree--;
+				m->nfree--;
+				MarkBufferDirty(pagebuf);
+				MarkBufferDirty(metabuf);
+				log_free_change(pagebuf, metabuf, XLOG_STORE_NODE_REUSE, bit,
+								op->stamp, m->nfree);
+				END_CRIT_SECTION();
+				UnlockReleaseBuffer(metabuf);
+				UnlockReleaseBuffer(pagebuf);
+				free_hint = fblk;
+				nodebuf = ReadBufferWithoutRelcache(store_locator(STORE_NODES),
+													MAIN_FORKNUM, block,
+													RBM_ZERO_AND_LOCK, NULL, true);
+				return nodebuf;
+			}
+		}
+		UnlockReleaseBuffer(pagebuf);
+	}
+	free_wait = oldest_waiting;
+	return InvalidBuffer;
 }
 
 static void
@@ -925,6 +1272,54 @@ global_redo(XLogReaderState *record)
 				UnlockReleaseBuffer(buf);
 			break;
 
+		case XLOG_STORE_NODE_FREE:
+		case XLOG_STORE_NODE_REUSE:
+			{
+				xl_store_free rec;
+
+				memcpy(&rec, XLogRecGetData(record) + SizeOfProllyHeader,
+					   sizeof(rec));
+
+				/*
+				 * A reused block may hold a node a standby query still reads:
+				 * cancel queries older than the transactions that freed it.
+				 */
+				if (info == XLOG_STORE_NODE_REUSE && InHotStandby)
+				{
+					RelFileLocator loc = store_locator(STORE_NODES);
+
+					ResolveRecoveryConflictWithSnapshotFullXid(rec.stamp, false,
+															   loc);
+				}
+				if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+				{
+					Page		page = BufferGetPage(buf);
+					FreePageOpaque *op = (FreePageOpaque *) PageGetSpecialPointer(page);
+
+					set_free_bit(page, rec.bit, info == XLOG_STORE_NODE_FREE);
+					if (info == XLOG_STORE_NODE_FREE)
+					{
+						op->nfree++;
+						op->stamp = rec.stamp;
+					}
+					else
+						op->nfree--;
+					PageSetLSN(page, record->EndRecPtr);
+					MarkBufferDirty(buf);
+				}
+				if (BufferIsValid(buf))
+					UnlockReleaseBuffer(buf);
+				if (XLogReadBufferForRedo(record, 1, &buf) == BLK_NEEDS_REDO)
+				{
+					((FreeMeta *) PageGetContents(BufferGetPage(buf)))->nfree = rec.nfree;
+					PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
+					MarkBufferDirty(buf);
+				}
+				if (BufferIsValid(buf))
+					UnlockReleaseBuffer(buf);
+				break;
+			}
+
 		case XLOG_STORE_MAP_SPLIT:
 			for (int id = 0; id <= XLogRecMaxBlockId(record); id++)
 			{
@@ -956,5 +1351,7 @@ const ProllyNodeStoreRoutine prolly_nodestore_global = {
 	.publish = global_publish,
 	.contains = global_contains,
 	.release = global_release,
+	.scan = global_scan,
+	.reclaim = global_reclaim,
 	.redo = global_redo,
 };

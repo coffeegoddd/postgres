@@ -40,6 +40,7 @@ backend_sources += files(
   'prolly_tableam.c',
   'prolly_vcs.c',
   'prolly_xact.c',
+  'reclaim_marksweep.c',
   'reclaim_stub.c',
   'refs_stub.c',
   'rootlayout_stub.c',

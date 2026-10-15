@@ -60,6 +60,9 @@
  *   Errors if dst already has branches.
  * - drop_database() forgets every branch of dboid, at once and durably
  *   (DROP DATABASE removes the database's files the same way).
+ * - live_roots() visits every root the implementation holds, in every
+ *   database: heads, roots kept for older snapshots, and roots enqueued
+ *   and not yet published or abandoned (what reclamation must keep).
  * - usage() reports how many heads and roots waiting to be published or
  *   abandoned the implementation holds, across all databases.
  * - checkpoint() makes every branch's state as of the checkpoint's redo
@@ -81,6 +84,9 @@
 #include "utils/snapshot.h"
 
 typedef uint64 ProllyCommitTicket;
+
+/* Called with each root live_roots() finds. */
+typedef void (*ProllyRootVisit) (const ProllyNodeRef *root, void *arg);
 
 /* A commit to a branch: the transaction, and the root it made. */
 typedef struct ProllyBranchCommit
@@ -117,6 +123,7 @@ typedef struct ProllyCommitRoutine
 	void		(*copy_database) (Oid src_dboid, Oid dst_dboid);
 	void		(*drop_database) (Oid dboid);
 
+	void		(*live_roots) (ProllyRootVisit visit, void *arg);
 	void		(*usage) (int *nheads, int *npending);
 
 	void		(*checkpoint) (int flags);
@@ -128,7 +135,7 @@ typedef struct ProllyCommitRoutine
 	"branch_unlock", "publish", "abandon", "head", "snapshot_head", \
 	"commits_since", \
 	"copy_database", \
-	"drop_database", "usage", "checkpoint", "redo"
+	"drop_database", "live_roots", "usage", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
 
 /* For tests: if positive, fewer branch heads than an implementation's limit. */

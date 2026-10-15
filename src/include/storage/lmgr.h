@@ -120,6 +120,7 @@ extern void UnlockApplyTransactionForSession(Oid suboid, TransactionId xid, uint
 											 LOCKMODE lockmode);
 extern void LockProllyBranch(uint32 branch, LOCKMODE lockmode);
 extern bool LockProllyTable(Oid relid, LOCKMODE lockmode, bool dontWait);
+extern bool LockProllyStore(LOCKMODE lockmode, bool dontWait);
 
 /* Describe a locktag for error messages */
 extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);

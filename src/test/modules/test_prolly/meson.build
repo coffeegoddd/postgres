@@ -56,6 +56,7 @@ tests += {
       't/014_d1_spill.pl',
       't/015_d1_serializable.pl',
       't/016_d1_large_values.pl',
+      't/017_d1_gc.pl',
     ],
   },
 }

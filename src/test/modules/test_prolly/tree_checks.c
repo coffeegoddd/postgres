@@ -623,7 +623,7 @@ typedef struct HashSet
 	int			levels;
 } HashSet;
 
-static void
+static bool
 collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	HashSet    *s = arg;
@@ -636,6 +636,7 @@ collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
 	}
 	s->hashes[s->n++] = node->hash;
 	s->levels = Max(s->levels, level + 1);
+	return true;
 }
 
 static bool
@@ -1152,7 +1153,7 @@ typedef struct PageCheck
 	int			nodes;
 } PageCheck;
 
-static void
+static bool
 check_node_page(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	PageCheck  *pc = arg;
@@ -1167,6 +1168,7 @@ check_node_page(const ProllyNodeRef *node, uint16 level, void *arg)
 			 PROLLY_CALL(pc->env->node_format, page_level, BufferGetPage(buf)));
 	UnlockReleaseBuffer(buf);
 	pc->nodes++;
+	return true;
 }
 
 void
@@ -1211,10 +1213,11 @@ big_value(int k, int version, StringInfo buf)
 		buf->data[len / 2] = '#';
 }
 
-static void
+static bool
 count_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	(*(int *) arg)++;
+	return true;
 }
 
 typedef struct BigDiff

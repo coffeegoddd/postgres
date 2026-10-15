@@ -649,6 +649,36 @@ rewrites the value tree after it; Dolt's value trees, which are addressed
 by byte counts rather than keys, avoid that, and step 5 settles the
 format.
 
+**Status (2026-10-14): 4f.2 built.** `prolly_gc()` reclaims the node
+store's unreachable nodes (question 49; decided: explicit, as `dolt gc`).
+A new reclamation implementation, `mark_sweep`, marks every node reachable
+from a root the commit pipeline holds (its new `live_roots`: every
+database's branch heads, the roots older snapshots read, roots enqueued
+for commit; history no snapshot needs is pruned first), through the root
+layout into every relation tree and, through the node format's flags,
+into value trees; a walk skips what lies below a node already marked (the
+tree interface's walk visitor now says whether to descend), and marks are
+bits by block. It then sweeps what the node store can find by hash and
+isn't marked (the node store's new `scan` and `reclaim`). A reclaimed
+node's block is recorded in a bitmap of free blocks (a fourth store file)
+with the transaction id at the time, and reused by `new_node` once every
+transaction older than that has ended, as nbtree recycles pages; a hot
+standby cancels older queries when it replays the reuse. The node page
+itself is left alone until then, since a reader may still hold a pin on
+it. Nodes a transaction holds only in memory (trees it builds, spills or
+has prepared) are kept safe by a new heavyweight lock, `prollystore`:
+writers take it shared from their first node written or found until they
+end, `prolly_gc()` exclusively, so it waits for them (prepared ones too)
+and holds new ones off. Running it needs the privileges of `pg_maintain`.
+Tests: `017_d1_gc.pl` (nodes of replaced and dropped trees and of large
+values freed; current rows intact; an older REPEATABLE READ snapshot still
+reads its root, whose nodes go once it ends; freed blocks reused instead
+of growing the store; waiting for a writer with nodes written and for a
+prepared transaction; a crash; a standby; privileges). Not yet: blocks
+written but never published (a crash between the two) aren't found;
+reclamation runs only when asked; `prolly_gc()` holds every writer off for
+its whole run.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.
