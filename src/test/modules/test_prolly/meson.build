@@ -65,6 +65,7 @@ tests += {
       't/023_d1_conflicts.pl',
       't/024_versioned_database.pl',
       't/025_d1_relation_trees.pl',
+      't/026_d1_tid_reuse_branches.pl',
     ],
   },
 }

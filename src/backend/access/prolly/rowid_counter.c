@@ -70,6 +70,7 @@
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/xact.h"
 #include "miscadmin.h"
@@ -94,13 +95,20 @@
 #define MAX_TID_NUMBER	((uint64) (InvalidBlockNumber - 1) * MaxHeapTuplesPerPage)
 
 #define COUNTER_MAGIC	0x50544944	/* "PTID" */
-#define COUNTER_VERSION 1
+#define COUNTER_VERSION 2
 
 typedef struct CounterPageData
 {
 	uint32		magic;
 	uint32		version;
 	uint64		reserved_to;	/* numbers below this may have been used */
+
+	/*
+	 * Numbers below pinned_to may be held by a commit or another branch,
+	 * as of the refs' epoch pinned_epoch, so they are never reused.
+	 */
+	uint64		pinned_epoch;
+	uint64		pinned_to;
 } CounterPageData;
 
 /* Numbers a backend takes off the free stack at a time. */
@@ -219,6 +227,8 @@ counter_buffer(Relation rel)
 			cp->magic = COUNTER_MAGIC;
 			cp->version = COUNTER_VERSION;
 			cp->reserved_to = 0;
+			cp->pinned_epoch = 0;
+			cp->pinned_to = 0;
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(buf);
 		}
@@ -294,14 +304,41 @@ take_free_numbers(Relation rel, Reservation *res)
 	UnlockReleaseBuffer(cbuf);
 }
 
-/* Push numbers onto rel's free stack. */
+/*
+ * Push numbers onto rel's free stack, but for those a commit or another
+ * branch may hold: every number given out before the refs' epoch last
+ * changed (a commit or branch made since may have the version), which the
+ * counter page pins when it sees the epoch change.
+ */
 static void
-push_free_numbers(Relation rel, const uint64 *numbers, int n)
+push_free_numbers(Relation rel, const uint64 *in, int nin)
 {
 	Buffer		cbuf = counter_buffer(rel);
 	int			done = 0;
+	ProllyDatabaseComponents dc;
+	uint64		epoch;
+	CounterPageData *cp;
+	uint64	   *numbers = palloc(sizeof(uint64) * Max(nin, 1));
+	int			n = 0;
 
+	prolly_database_components(&dc);
+	epoch = PROLLY_CALL(dc.refs, epoch);
 	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+	cp = counter_data(BufferGetPage(cbuf), rel);
+	if (cp->pinned_epoch != epoch)
+	{
+		GenericXLogState *state = GenericXLogStart(rel);
+
+		cp = counter_data(GenericXLogRegisterBuffer(state, cbuf, 0), rel);
+		cp->pinned_epoch = epoch;
+		if (epoch > 0)
+			cp->pinned_to = Max(cp->pinned_to, cp->reserved_to);
+		GenericXLogFinish(state);
+		cp = counter_data(BufferGetPage(cbuf), rel);
+	}
+	for (int i = 0; i < nin; i++)
+		if (in[i] >= cp->pinned_to)
+			numbers[n++] = in[i];
 	while (done < n)
 	{
 		CounterFreeData *f = (CounterFreeData *) PageGetContents(BufferGetPage(cbuf));
@@ -460,6 +497,8 @@ counter_carry(Relation rel, const RelFileLocator *to)
 		cp->magic = COUNTER_MAGIC;
 		cp->version = COUNTER_VERSION;
 		cp->reserved_to = from;
+		cp->pinned_epoch = 0;
+		cp->pinned_to = from;	/* the old storage's numbers stay taken */
 	}
 	else
 	{
@@ -469,6 +508,7 @@ counter_carry(Relation rel, const RelFileLocator *to)
 		state = GenericXLogStart(rel);
 		cp = counter_data(GenericXLogRegisterBuffer(state, buf, 0), rel);
 		cp->reserved_to = Max(cp->reserved_to, from);
+		cp->pinned_to = Max(cp->pinned_to, from);
 	}
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);

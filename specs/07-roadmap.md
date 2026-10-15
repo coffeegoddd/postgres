@@ -711,7 +711,8 @@ fails without the index cleanup; a crash; a standby). Not yet: index
 entries of inserts that aborted (their TIDs never named a committed
 version) stay until the index is rebuilt; once branches exist (4g), a TID
 gone on one branch may still name a version on another, so VACUUM must
-consult every branch before forgetting.
+consult every branch before forgetting (done 2026-10-15: TIDs a commit or
+branch may hold aren't reused, below).
 
 **Plan (2026-10-14): 4g in stages.** 4g.1 refs, branches, commits and
 checkout, with data versioned per branch (catalogs still shared heap
@@ -924,6 +925,25 @@ rows (an index rebuilt with a new OID is empty on other branches; a type
 change reinterprets their rows), and indexes of other access methods
 (btree) are shared by every branch, so a TRUNCATE or rewrite on one branch
 empties or rebuilds them for all.
+
+**Fix (2026-10-15): VACUUM doesn't reuse TIDs a commit or branch may
+hold.** One TID counter serves every branch of a table, and VACUUM on one
+branch put the TIDs it forgot on the table's free stack: a branch made
+before it, or a reset to a commit made before it, still had rows with
+those TIDs, and its next inserts took them (two rows with one TID). The
+refs now keep an epoch, counted up by every commit and every new branch
+(roots that may share a working set's rows); a table's counter page pins
+the numbers it had given out when it sees the epoch change, and VACUUM
+puts only numbers above that on the free stack (it still removes the gone
+entries on its branch). Conservative: numbers given out between a commit
+and the next VACUUM aren't reused either. Found while fixing it: the refs'
+changes at commit were sorted by `list_sort()`, which isn't stable, so of
+several changes to one key (a merge's state set, then cleared) an earlier
+one could win once a transaction made enough changes; they are ordered by
+when they were made now (`023_d1_conflicts.pl` failed without it, once
+commits also counted up the epoch). Tests: `026_d1_tid_reuse_branches.pl`
+(a branch's and a reset's new rows keep distinct TIDs, which fails without
+the pin; TIDs are reused without commits or branches).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

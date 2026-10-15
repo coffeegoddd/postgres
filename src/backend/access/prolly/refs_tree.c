@@ -13,6 +13,10 @@
  *					   (hash length, hash; length 0: no commit yet)
  *	'C' commit id	-> the local root (hash length, hash) the commit
  *					   recorded: the working set to start a branch from
+ *	'E'				-> the epoch (8 bytes): how many commits and branches
+ *					   have been made, each a root that may share a
+ *					   working set's rows (so TIDs given out before it
+ *					   aren't reused)
  *	'M' branch id	-> its merge in progress: the merged head and the
  *					   common ancestor (hash length, hash each), then the
  *					   OIDs of tables with unresolved conflicts (4 bytes
@@ -61,6 +65,7 @@
 
 #define TAG_BRANCH		'B'
 #define TAG_COMMIT		'C'
+#define TAG_EPOCH		'E'
 #define TAG_MERGE		'M'
 #define TAG_NEXT		'N'
 
@@ -72,6 +77,7 @@ typedef struct RefEdit
 	StringInfoData key;
 	StringInfoData value;
 	bool		is_delete;
+	int			seq;			/* the order made in: the last one wins */
 } RefEdit;
 
 /* A new or reset branch's working set, to enqueue at commit. */
@@ -92,6 +98,9 @@ typedef struct RefsXact
 } RefsXact;
 
 static RefsXact *rx = NULL;
+
+static uint64 tree_epoch(void);
+static void bump_epoch(void);
 
 static bool tree_merge_state(ProllyMergeState *state);
 static void tree_set_merge_state(const ProllyMergeState *state);
@@ -232,6 +241,7 @@ add_edit(const char *key, int keylen, const StringInfoData *value)
 	if (value)
 		appendBinaryStringInfo(&e->value, value->data, value->len);
 	e->is_delete = (value == NULL);
+	e->seq = list_length(rx->edits);
 	rx->edits = lappend(rx->edits, e);
 	MemoryContextSwitchTo(old);
 }
@@ -710,6 +720,7 @@ tree_branch_create(const char *name, const char *start_point)
 	put_be32(&v, next + 1);
 	add_edit((char[]) {TAG_NEXT}, 1, &v);
 	branch_put(name, next, &start_commit);
+	bump_epoch();
 	old = MemoryContextSwitchTo(rx->mcxt);
 	nh = palloc(sizeof(NewHead));
 	nh->branch = next;
@@ -783,6 +794,7 @@ record_commit(const char *name, ProllyBranchId branch, const char *message,
 	put_hash(&v, &local);
 	add_edit(key.data, key.len, &v);
 	branch_put(name, branch, commit_id);
+	bump_epoch();
 	pfree(key.data);
 	pfree(v.data);
 }
@@ -1165,6 +1177,35 @@ tree_set_merge_state(const ProllyMergeState *state)
 	pfree(key.data);
 }
 
+static uint64
+tree_epoch(void)
+{
+	StringInfoData v;
+	uint64		epoch = 0;
+
+	refs_init();
+	initStringInfo(&v);
+	if (refs_get((char[]) {TAG_EPOCH}, 1, &v) && v.len == 8)
+		for (int i = 0; i < 8; i++)
+			epoch = (epoch << 8) | (uint8) v.data[i];
+	pfree(v.data);
+	return epoch;
+}
+
+/* A root that may share a working set's rows is being made. */
+static void
+bump_epoch(void)
+{
+	uint64		epoch = tree_epoch() + 1;
+	StringInfoData v;
+
+	initStringInfo(&v);
+	for (int i = 7; i >= 0; i--)
+		appendStringInfoChar(&v, (char) (epoch >> (i * 8)));
+	add_edit((char[]) {TAG_EPOCH}, 1, &v);
+	pfree(v.data);
+}
+
 static void
 tree_reset(const char *ref)
 {
@@ -1212,8 +1253,12 @@ edit_cmp(const ListCell *a, const ListCell *b)
 	const RefEdit *eb = lfirst(b);
 	ProllyKey	ka = {(const uint8 *) ea->key.data, ea->key.len};
 	ProllyKey	kb = {(const uint8 *) eb->key.data, eb->key.len};
+	int			r = memcmp_keys(&ka, &kb, NULL);
 
-	return memcmp_keys(&ka, &kb, NULL);
+	/* list_sort() isn't stable: keep the order made for each key. */
+	if (r == 0)
+		r = (ea->seq > eb->seq) - (ea->seq < eb->seq);
+	return r;
 }
 
 static void
@@ -1267,7 +1312,7 @@ refs_precommit(void)
 		ProllyNodeRef root;
 		ProllyNodeRef new_root;
 
-		/* A stable sort keeps the order made for each key; keep the last. */
+		/* Sorted by key, then the order made; keep the last for each key. */
 		list_sort(sorted, edit_cmp);
 		foreach(lc, sorted)
 		{
@@ -1346,6 +1391,7 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.merge_base = tree_merge_base,
 	.commit_working_set = tree_commit_working_set,
 	.commit_with = tree_commit_with,
+	.epoch = tree_epoch,
 	.branches = tree_branches,
 	.working_set = tree_working_set,
 	.reset = tree_reset,

@@ -51,7 +51,10 @@
  * - A TID is forgotten (tid_forget()) only when no index can still hold
  *   it (VACUUM removed other index AMs' entries for it); its map entries
  *   go with the current transaction, and an implementation may give the
- *   TID out again at once (the entries a reuse writes replace them).
+ *   TID out again at once (the entries a reuse writes replace them) --
+ *   unless another root may hold it: a commit, or another branch, made
+ *   since the TID was given out (the refs' epoch tells when those are
+ *   made), still has the version with that TID.
  * - The map lives in the relation's PROLLY_TREE_ROWID and
  *   PROLLY_TREE_ROWKEY trees, through the engine, so it is transactional
  *   and per branch like the data; whatever makes TIDs unique across aborts
