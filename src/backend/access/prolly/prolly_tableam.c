@@ -106,11 +106,18 @@ typedef struct ProllyScanDescData
 	ProllyRowIdScan *rowid;
 	CommandId	cid;
 
-	/* The current item: its key and row, and identical rows still to return. */
+	/*
+	 * The current item: its key and row, how many identical rows it holds,
+	 * and which of them the scan last returned.  The cursor moves the way
+	 * the scan last did (cursor_dir); have_item is false before the first
+	 * item and after the scan ran off an end.
+	 */
 	StringInfoData key;
 	StringInfoData row;
 	uint64		count;
-	uint64		next_ordinal;
+	uint64		ordinal;
+	bool		have_item;
+	ScanDirection cursor_dir;
 
 	/* TID range scans: rows whose TIDs are in [mintid, maxtid]. */
 	ItemPointerData mintid;
@@ -352,9 +359,63 @@ static void
 scan_start(ProllyScanDesc scan)
 {
 	scan->count = 0;
-	scan->next_ordinal = 0;
+	scan->ordinal = 0;
+	scan->have_item = false;
+	scan->cursor_dir = ForwardScanDirection;
 	PROLLY_CALL(scan->c.engine, cursor_seek, scan->cursor, NULL,
 				ForwardScanDirection);
+}
+
+/*
+ * Move to the next item in direction: the cursor goes on if it already
+ * moves that way; else it seeks back to the current item (or the end the
+ * scan ran off) in the new direction and steps past it.
+ */
+static bool
+scan_next_item(ProllyScanDesc scan, ScanDirection direction)
+{
+	const ProllyEngineRoutine *engine = scan->c.engine;
+	ProllyKey	key;
+	ProllyValue value;
+	ProllyValue row;
+	MemoryContext old;
+
+	if (direction != scan->cursor_dir)
+	{
+		if (scan->have_item)
+		{
+			ProllyKey	cur = {(const uint8 *) scan->key.data, scan->key.len};
+
+			PROLLY_CALL(engine, cursor_seek, scan->cursor, &cur, direction);
+			if (PROLLY_CALL(engine, cursor_next, scan->cursor, &key, &value) &&
+				(key.len != cur.len || memcmp(key.data, cur.data, key.len) != 0))
+			{
+				/* The current item is gone: this is the next one. */
+				scan->cursor_dir = direction;
+				goto found;
+			}
+		}
+		else
+			PROLLY_CALL(engine, cursor_seek, scan->cursor, NULL, direction);
+		scan->cursor_dir = direction;
+	}
+	if (!PROLLY_CALL(engine, cursor_next, scan->cursor, &key, &value))
+	{
+		scan->have_item = false;
+		return false;
+	}
+
+found:
+	old = MemoryContextSwitchTo(scan->mcxt);
+	PROLLY_CALL(scan->c.keying, parse_value, scan->keying, &value, &row,
+				&scan->count);
+	resetStringInfo(&scan->key);
+	appendBinaryStringInfo(&scan->key, (const char *) key.data, key.len);
+	resetStringInfo(&scan->row);
+	appendBinaryStringInfo(&scan->row, (const char *) row.data, row.len);
+	MemoryContextSwitchTo(old);
+	scan->have_item = true;
+	return true;
 }
 
 static void serializable_read(Relation rel, const ProllyComponents *c,
@@ -433,29 +494,21 @@ prolly_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	ProllyScanDesc scan = (ProllyScanDesc) sscan;
 	const ProllyKeyingRoutine *keying = scan->c.keying;
 	ProllyValue row;
+	bool		backward = ScanDirectionIsBackward(direction);
 
-	if (ScanDirectionIsBackward(direction))
-		not_implemented(sscan->rs_rd, "backward scans");
+	if (!backward)
+		direction = ForwardScanDirection;
 
-	if (scan->next_ordinal >= scan->count)
+	/* The next of the current item's identical rows, else the next item. */
+	if (scan->have_item &&
+		(backward ? scan->ordinal > 0 : scan->ordinal + 1 < scan->count))
+		scan->ordinal += backward ? -1 : 1;
+	else if (scan_next_item(scan, direction))
+		scan->ordinal = backward ? scan->count - 1 : 0;
+	else
 	{
-		ProllyKey	key;
-		ProllyValue value;
-		MemoryContext old;
-
-		if (!PROLLY_CALL(scan->c.engine, cursor_next, scan->cursor, &key, &value))
-		{
-			ExecClearTuple(slot);
-			return false;
-		}
-		old = MemoryContextSwitchTo(scan->mcxt);
-		PROLLY_CALL(keying, parse_value, scan->keying, &value, &row, &scan->count);
-		resetStringInfo(&scan->key);
-		appendBinaryStringInfo(&scan->key, (const char *) key.data, key.len);
-		resetStringInfo(&scan->row);
-		appendBinaryStringInfo(&scan->row, (const char *) row.data, row.len);
-		MemoryContextSwitchTo(old);
-		scan->next_ordinal = 0;
+		ExecClearTuple(slot);
+		return false;
 	}
 
 	row.data = (const uint8 *) scan->row.data;
@@ -465,14 +518,13 @@ prolly_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		ProllyKey	k = {(const uint8 *) scan->key.data, scan->key.len};
 
 		if (!PROLLY_CALL(scan->c.row_identity, tid_find, scan->rowid, &k,
-						 scan->next_ordinal, &slot->tts_tid))
+						 scan->ordinal, &slot->tts_tid))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("a row of \"%s\" has no TID",
 							RelationGetRelationName(sscan->rs_rd))));
 	}
 	slot->tts_tableOid = RelationGetRelid(sscan->rs_rd);
-	scan->next_ordinal++;
 	return true;
 }
 
@@ -497,8 +549,6 @@ prolly_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
 {
 	ProllyScanDesc scan = (ProllyScanDesc) sscan;
 
-	if (ScanDirectionIsBackward(direction))
-		not_implemented(sscan->rs_rd, "backward TID range scans");
 	while (prolly_scan_getnextslot(sscan, direction, slot))
 	{
 		if (ItemPointerCompare(&slot->tts_tid, &scan->mintid) >= 0 &&
