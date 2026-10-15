@@ -452,7 +452,13 @@ prolly_ambuild(Relation heapRelation, Relation indexRelation,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("prolly indexes do not support INCLUDE columns yet")));
+	/*
+	 * Built into new storage (CREATE INDEX, REINDEX, TRUNCATE, a rewrite):
+	 * the index's tree, found by the index rather than its storage, starts
+	 * empty on this branch.
+	 */
 	prolly_components_for_relation(indexRelation, &c);
+	PROLLY_CALL(c.engine, tree_reset, indexRelation, PROLLY_TREE_DATA);
 	result->heap_tuples = build_entries(&c, heapRelation, indexRelation, indexInfo);
 	result->index_tuples = result->heap_tuples;
 	return result;

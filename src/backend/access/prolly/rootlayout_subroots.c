@@ -13,7 +13,7 @@
  *
  *	key: uint32 relfilenumber, big-endian	value: uint8 hash length, hash
  *
- * Big-endian keys sort by memcmp in relnumber order.  Values hold hashes only,
+ * Big-endian keys sort by memcmp in relation OID order.  Values hold hashes only,
  * never block hints: trees' items are hashed, and physical locations must
  * never be part of a hash.  So reading through
  * a reference costs a hash -> block map lookup; a hint in an unhashed side
@@ -75,21 +75,21 @@ sub_key(ProllySubRoot sub, uint8 *byte)
 }
 
 static ProllyKey
-rel_key(RelFileNumber relnumber, RelKey *buf)
+rel_key(Oid relid, RelKey *buf)
 {
 	ProllyKey	key;
 
-	buf->bytes[0] = (uint8) (relnumber >> 24);
-	buf->bytes[1] = (uint8) (relnumber >> 16);
-	buf->bytes[2] = (uint8) (relnumber >> 8);
-	buf->bytes[3] = (uint8) relnumber;
+	buf->bytes[0] = (uint8) (relid >> 24);
+	buf->bytes[1] = (uint8) (relid >> 16);
+	buf->bytes[2] = (uint8) (relid >> 8);
+	buf->bytes[3] = (uint8) relid;
 	key.data = buf->bytes;
 	key.len = 4;
 	return key;
 }
 
-static RelFileNumber
-key_relnumber(const ProllyKey *key)
+static Oid
+key_relid(const ProllyKey *key)
 {
 	if (key->len != 4)
 		ereport(ERROR,
@@ -221,12 +221,12 @@ subroots_empty(const ProllyRootEnv *env, ProllyNodeRef *root)
 
 static bool
 subroots_lookup(const ProllyRootEnv *env, const ProllyNodeRef *root,
-				ProllySubRoot sub, RelFileNumber relnumber, ProllyNodeRef *tree)
+				ProllySubRoot sub, Oid relid, ProllyNodeRef *tree)
 {
 	ProllyTreeEnv tenv;
 	ProllyNodeRef subroot;
 	RelKey		kb;
-	ProllyKey	key = rel_key(relnumber, &kb);
+	ProllyKey	key = rel_key(relid, &kb);
 	StringInfoData v;
 	bool		found;
 
@@ -258,8 +258,8 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
 		if (k > 0 &&
 			(edits[k - 1].sub > edits[k].sub ||
 			 (edits[k - 1].sub == edits[k].sub &&
-			  edits[k - 1].relnumber >= edits[k].relnumber)))
-			elog(ERROR, "prolly root layout edits are not in strictly increasing (sub-root, relnumber) order");
+			  edits[k - 1].relid >= edits[k].relid)))
+			elog(ERROR, "prolly root layout edits are not in strictly increasing (sub-root, relid) order");
 	}
 
 	layout_env(env, &tenv);
@@ -286,7 +286,7 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
 		{
 			const ProllyRootEdit *e = &edits[start + k];
 
-			tedits[k].key = rel_key(e->relnumber, &kbs[k]);
+			tedits[k].key = rel_key(e->relid, &kbs[k]);
 			tedits[k].is_delete = e->is_remove;
 			initStringInfo(&vbufs[k]);
 			if (!e->is_remove)
@@ -316,7 +316,7 @@ subroots_apply(const ProllyRootEnv *env, const ProllyNodeRef *root,
  * ------------------------------------------------------------------------
  */
 
-/* Visit each (relnumber, tree) item of a sub-root tree. */
+/* Visit each (relid, tree) item of a sub-root tree. */
 static void
 scan_subroot(const ProllyRootEnv *env, const ProllyNodeRef *subroot,
 			 ProllySubRoot sub, ProllyRootVisitRel visit, void *arg)
@@ -332,11 +332,11 @@ scan_subroot(const ProllyRootEnv *env, const ProllyNodeRef *subroot,
 	while (PROLLY_CALL(env->tree, cursor_next, c, &key, &value))
 	{
 		ProllyNodeRef tree;
-		RelFileNumber			relnumber = key_relnumber(&key);
+		Oid			relid = key_relid(&key);
 
 		CHECK_FOR_INTERRUPTS();
 		decode_ref(value.data, value.len, &tree);
-		visit(sub, relnumber, &tree, arg);
+		visit(sub, relid, &tree, arg);
 	}
 	PROLLY_CALL(env->tree, cursor_close, c);
 }
@@ -360,7 +360,7 @@ typedef struct WalkTrees
 } WalkTrees;
 
 static void
-collect_tree(ProllySubRoot sub, RelFileNumber relnumber, const ProllyNodeRef *tree, void *arg)
+collect_tree(ProllySubRoot sub, Oid relid, const ProllyNodeRef *tree, void *arg)
 {
 	WalkTrees  *w = arg;
 
@@ -425,7 +425,7 @@ diff_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 		decode_ref(before->data, before->len, &b);
 	if (after)
 		decode_ref(after->data, after->len, &a);
-	d->visit(kind, d->sub, key_relnumber(key), before ? &b : NULL,
+	d->visit(kind, d->sub, key_relid(key), before ? &b : NULL,
 			 after ? &a : NULL, d->arg);
 }
 

@@ -64,6 +64,7 @@ tests += {
       't/022_d1_dolt_sql.pl',
       't/023_d1_conflicts.pl',
       't/024_versioned_database.pl',
+      't/025_d1_relation_trees.pl',
     ],
   },
 }

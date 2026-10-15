@@ -113,8 +113,10 @@ hints, node locations).
   to two sub-roots: a **catalog sub-root**, mapping each catalog to its
   trees, and a **user-data sub-root**, mapping each user relation to its
   data and index trees. "Did the schema change?" is one hash comparison.
-  Built for the working-set root (2026-10-13): relations by OID, one entry
-  per relation, interface `root_layout` (`prolly_rootlayout.h`). Commits'
+  Built for the working-set root (2026-10-13): one entry per relation,
+  interface `root_layout` (`prolly_rootlayout.h`); keyed by relation OID
+  since 2026-10-15 (it was keyed by relfilenumber, which TRUNCATE and
+  rewrites change for every branch while catalogs are shared). Commits'
   canonical roots use the same shape keyed by qualified name (4g).
 - **Catalog indexes are prolly index trees** in the same root (required:
   a heap btree index isn't versioned, so it would point at rows that don't

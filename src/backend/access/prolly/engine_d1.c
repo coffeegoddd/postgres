@@ -174,6 +174,7 @@ typedef struct D1Saved
 	MemoryContext data_mcxt;
 	ProllyNodeRef base;
 	bool		replaced;
+	bool		dropped;
 	D1Order		order;
 	D1Spill		spill;
 	struct D1Saved *prev;
@@ -186,12 +187,13 @@ typedef struct D1Saved
 typedef struct D1WriteSet
 {
 	ProllySubRoot sub;
-	RelFileNumber relnumber;
+	Oid relkey;
 	Oid			relid;			/* the relation, for its key order */
 	SubTransactionId created_subxid;
 
 	ProllyNodeRef base;			/* hash.len == 0: empty */
 	bool		replaced;		/* new storage: base ignores the head */
+	bool		dropped;		/* the relation was dropped: remove the tree */
 
 	RBTree	   *entries;
 	int			nentries;
@@ -203,10 +205,16 @@ typedef struct D1WriteSet
 	struct D1WriteSet *next;	/* all write sets, newest first */
 } D1WriteSet;
 
+/*
+ * Write sets are found by sub-root and relation OID: a relation's trees on
+ * a branch stay its own whatever relfilenumber the (shared) catalogs give
+ * it, so a TRUNCATE or rewrite on one branch leaves other branches' trees
+ * and commits alone.
+ */
 typedef struct D1WsKey
 {
 	ProllySubRoot sub;
-	RelFileNumber relnumber;
+	Oid			relkey;
 } D1WsKey;
 
 typedef struct D1WsHashEntry
@@ -215,18 +223,35 @@ typedef struct D1WsHashEntry
 	D1WriteSet *ws;
 } D1WsHashEntry;
 
+/* Two relations' trees exchanged by a rewrite (tree_swap). */
+typedef struct D1Swap
+{
+	SubTransactionId subxid;
+	Oid			a;
+	Oid			b;
+	struct D1Swap *prev;
+} D1Swap;
+
 /* The current transaction's state. */
 typedef struct D1Xact
 {
 	MemoryContext mcxt;
 	HTAB	   *writesets;
 	D1WriteSet *all;
+	D1Swap	   *swaps;			/* newest first */
 	bool		enqueued;
 	ProllyCommitTicket ticket;
 	ProllyBranchId branch;		/* the branch its writes go to */
 } D1Xact;
 
 static D1Xact *xact = NULL;
+
+/* The key of a relation's trees. */
+static inline Oid
+rel_key(Relation rel)
+{
+	return RelationGetRelid(rel);
+}
 
 static int	entry_compare(const RBTNode *a, const RBTNode *b, void *arg);
 static void entry_combine(RBTNode *existing, const RBTNode *newdata, void *arg);
@@ -418,9 +443,9 @@ close_order(D1Order *order)
 		PROLLY_CALL(order->ix_routine, close, order->ix);
 }
 
-/* relnumber's tree in sub of root, or an empty reference. */
+/* relkey's tree in sub of root, or an empty reference. */
 static void
-find_tree(const ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber,
+find_tree(const ProllyRootSet *roots, ProllySubRoot sub, Oid relkey,
 		  ProllyNodeRef *tree)
 {
 	memset(tree, 0, sizeof(*tree));
@@ -428,7 +453,7 @@ find_tree(const ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber
 	if (roots == NULL || !roots->has_root)
 		return;
 	if (!PROLLY_CALL(backend.c.root_layout, lookup, &backend.root_env,
-					 &roots->root, sub, relnumber, tree))
+					 &roots->root, sub, relkey, tree))
 	{
 		memset(tree, 0, sizeof(*tree));
 		tree->location.blkno = InvalidBlockNumber;
@@ -486,7 +511,7 @@ xact_reset(void)
 }
 
 static D1WriteSet *
-find_writeset(ProllySubRoot sub, RelFileNumber relnumber)
+find_writeset(ProllySubRoot sub, Oid relkey)
 {
 	D1WsKey		key;
 	D1WsHashEntry *he;
@@ -495,7 +520,7 @@ find_writeset(ProllySubRoot sub, RelFileNumber relnumber)
 		return NULL;
 	memset(&key, 0, sizeof(key));
 	key.sub = sub;
-	key.relnumber = relnumber;
+	key.relkey = relkey;
 	he = hash_search(xact->writesets, &key, HASH_FIND, NULL);
 	return he ? he->ws : NULL;
 }
@@ -521,12 +546,12 @@ refresh_order(D1WriteSet *ws, Relation rel)
 }
 
 /*
- * The write set of relnumber's tree in sub, made if needed.  A new write
+ * The write set of relkey's tree in sub, made if needed.  A new write
  * set over existing storage starts from the newest head, read after taking
  * the relation's write lock.
  */
 static D1WriteSet *
-get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
+get_writeset(Relation rel, ProllySubRoot sub, Oid relkey,
 			 bool replace)
 {
 	D1WsKey		key;
@@ -539,7 +564,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	xact_init();
 	memset(&key, 0, sizeof(key));
 	key.sub = sub;
-	key.relnumber = relnumber;
+	key.relkey = relkey;
 	he = hash_search(xact->writesets, &key, HASH_FIND, &found);
 	if (found)
 	{
@@ -560,6 +585,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 			saved->data_mcxt = ws->data_mcxt;
 			saved->base = ws->base;
 			saved->replaced = ws->replaced;
+			saved->dropped = ws->dropped;
 			saved->order = ws->order;
 			saved->spill = ws->spill;
 			saved->prev = ws->saved;
@@ -577,6 +603,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 			memset(&ws->base, 0, sizeof(ws->base));
 			ws->base.location.blkno = InvalidBlockNumber;
 			ws->replaced = true;
+			ws->dropped = false;
 		}
 		refresh_order(ws, rel);
 		return ws;
@@ -593,7 +620,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	old = MemoryContextSwitchTo(xact->mcxt);
 	ws = palloc0(sizeof(D1WriteSet));
 	ws->sub = sub;
-	ws->relnumber = relnumber;
+	ws->relkey = relkey;
 	ws->relid = RelationGetRelid(rel);
 	ws->data_mcxt = AllocSetContextCreate(xact->mcxt, "prolly d1 write set",
 										  ALLOCSET_DEFAULT_SIZES);
@@ -611,7 +638,7 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 		ProllyRootSet head;
 
 		current_head(&head);
-		find_tree(&head, sub, relnumber, &ws->base);
+		find_tree(&head, sub, relkey, &ws->base);
 	}
 	he = hash_search(xact->writesets, &key, HASH_ENTER, NULL);
 	he->ws = ws;
@@ -1221,13 +1248,13 @@ d1_roots_release(ProllyRootSet *roots)
  * transaction waited for the right to write the table.)
  */
 static void
-read_base(ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber,
+read_base(ProllyRootSet *roots, ProllySubRoot sub, Oid relkey,
 		  D1WriteSet *ws, ProllyNodeRef *base)
 {
 	if (ws && ws->replaced)
 		*base = ws->base;
 	else
-		find_tree(roots, sub, relnumber, base);
+		find_tree(roots, sub, relkey, base);
 }
 
 /* ------------------------------------------------------------------------
@@ -1306,9 +1333,9 @@ in_kind(ProllyCursor *c, const ProllyKey *key)
 static void
 cursor_bind(ProllyCursor *c)
 {
-	RelFileNumber relnumber = c->tree->rd_locator.relNumber;
+	Oid relkey = rel_key(c->tree);
 
-	c->ws = find_writeset(c->sub, relnumber);
+	c->ws = find_writeset(c->sub, relkey);
 	if (c->ws)
 	{
 		/* The write set's key order, which it keeps owning. */
@@ -1319,7 +1346,7 @@ cursor_bind(ProllyCursor *c)
 		open_order(c->tree, c->sub, c->roots, c->mcxt, &c->order);
 	c->unordered = order_lost(&c->order);
 	tree_env(c->unordered ? NULL : &c->order, &c->env);
-	read_base(c->roots, c->sub, relnumber, c->ws, &c->base);
+	read_base(c->roots, c->sub, relkey, c->ws, &c->base);
 	c->replaced = c->ws && c->ws->replaced;
 	c->tc = NULL;
 	if (c->base.hash.len > 0)
@@ -1433,7 +1460,7 @@ same_order(const D1Order *a, const D1Order *b)
 static bool
 cursor_stale(ProllyCursor *c)
 {
-	D1WriteSet *ws = find_writeset(c->sub, c->tree->rd_locator.relNumber);
+	D1WriteSet *ws = find_writeset(c->sub, rel_key(c->tree));
 	bool		changed;
 
 	if (ws != c->ws || (ws && ws->replaced) != c->replaced)
@@ -1861,7 +1888,7 @@ d1_unseen_writers(Relation tree, Snapshot snapshot, TransactionId **xids)
 	int			n;
 	int			nx = 0;
 	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	Oid relkey = rel_key(tree);
 	ProllyNodeRef prev;
 
 	backend_init();
@@ -1875,7 +1902,7 @@ d1_unseen_writers(Relation tree, Snapshot snapshot, TransactionId **xids)
 
 		rs.has_root = commits[i].has_root;
 		rs.root = commits[i].root;
-		find_tree(&rs, sub, relnumber, &t);
+		find_tree(&rs, sub, relkey, &t);
 		if (i > 0 && !same_hash(&prev, &t))
 			(*xids)[nx++] = commits[i].xid;
 		prev = t;
@@ -1889,7 +1916,7 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	   const ProllyKey *key, CommandId cid, StringInfo value)
 {
 	ProllySubRoot sub = subroot_for(tree, kind);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	Oid relkey = rel_key(tree);
 	D1WriteSet *ws;
 	D1KeyBuf	kb;
 	const ProllyKey *fk;
@@ -1897,7 +1924,7 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	bool		found = false;
 
 	backend_init();
-	ws = find_writeset(sub, relnumber);
+	ws = find_writeset(sub, relkey);
 	fk = full_key(sub, kind, key, &kb);
 	if (ws)
 	{
@@ -1960,7 +1987,7 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 		}
 	}
 
-	read_base(roots, sub, relnumber, ws, &base);
+	read_base(roots, sub, relkey, ws, &base);
 	if (base.hash.len > 0)
 	{
 		D1Order		order;
@@ -1991,18 +2018,18 @@ static bool
 d1_has_writes(Relation tree, ProllyTreeKind kind)
 {
 	backend_init();
-	return find_writeset(subroot_for(tree, kind), tree->rd_locator.relNumber) != NULL;
+	return find_writeset(subroot_for(tree, kind), rel_key(tree)) != NULL;
 }
 
 static bool
 d1_key_at(ProllyRootSet *roots, Relation tree, uint64 ordinal, StringInfo key)
 {
 	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	Oid relkey = rel_key(tree);
 	ProllyNodeRef base;
 
 	backend_init();
-	read_base(roots, sub, relnumber, find_writeset(sub, relnumber), &base);
+	read_base(roots, sub, relkey, find_writeset(sub, relkey), &base);
 	if (base.hash.len == 0)
 		return false;
 	return PROLLY_CALL(backend.c.tree, key_at, &backend.memcmp_env, &base,
@@ -2014,7 +2041,7 @@ d1_count_range(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 			   const ProllyKey *lo, const ProllyKey *hi)
 {
 	ProllySubRoot sub = subroot_for(tree, kind);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	Oid relkey = rel_key(tree);
 	D1WriteSet *ws;
 	ProllyNodeRef base;
 	uint64		n = 0;
@@ -2024,8 +2051,8 @@ d1_count_range(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("prolly engine \"d1\" counts only whole data trees so far")));
 	backend_init();
-	ws = find_writeset(sub, relnumber);
-	read_base(roots, sub, relnumber, ws, &base);
+	ws = find_writeset(sub, relkey);
+	read_base(roots, sub, relkey, ws, &base);
 	if (base.hash.len > 0)
 		n = PROLLY_CALL(backend.c.tree, count, &backend.memcmp_env, &base);
 	if (ws)
@@ -2043,7 +2070,7 @@ d1_put(Relation tree, ProllyTreeKind kind, const ProllyKey *key,
 	   const ProllyValue *value, CommandId cid)
 {
 	ProllySubRoot sub = subroot_for(tree, kind);
-	D1WriteSet *ws = get_writeset(tree, sub, tree->rd_locator.relNumber, false);
+	D1WriteSet *ws = get_writeset(tree, sub, rel_key(tree), false);
 	D1KeyBuf	kb;
 	const ProllyKey *fk = full_key(sub, kind, key, &kb);
 
@@ -2057,7 +2084,7 @@ d1_remove(Relation tree, ProllyTreeKind kind, const ProllyKey *key,
 		  CommandId cid)
 {
 	ProllySubRoot sub = subroot_for(tree, kind);
-	D1WriteSet *ws = get_writeset(tree, sub, tree->rd_locator.relNumber, false);
+	D1WriteSet *ws = get_writeset(tree, sub, rel_key(tree), false);
 	D1KeyBuf	kb;
 	const ProllyKey *fk = full_key(sub, kind, key, &kb);
 
@@ -2075,11 +2102,10 @@ d1_tree_create(Relation rel, const RelFileLocator *newrlocator, char persistence
 {
 	backend_init();
 	PROLLY_CALL(backend.c.node_store, create, rel, newrlocator, persistence);
-	(void) get_writeset(rel, subroot_for(rel, PROLLY_TREE_DATA),
-						newrlocator->relNumber, true);
-	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, newrlocator->relNumber, true);
-	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL_KEYED, newrlocator->relNumber,
+	(void) get_writeset(rel, subroot_for(rel, PROLLY_TREE_DATA), rel_key(rel),
 						true);
+	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, rel_key(rel), true);
+	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL_KEYED, rel_key(rel), true);
 }
 
 static void
@@ -2087,11 +2113,11 @@ d1_tree_truncate(Relation rel)
 {
 	backend_init();
 	(void) get_writeset(rel, subroot_for(rel, PROLLY_TREE_DATA),
-						rel->rd_locator.relNumber, true);
-	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, rel->rd_locator.relNumber,
+						rel_key(rel), true);
+	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, rel_key(rel),
 						true);
 	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL_KEYED,
-						rel->rd_locator.relNumber, true);
+						rel_key(rel), true);
 }
 
 static void
@@ -2104,7 +2130,7 @@ d1_tree_reset(Relation rel, ProllyTreeKind kind)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("prolly engine \"d1\" resets only data trees and local metadata by row")));
 	backend_init();
-	(void) get_writeset(rel, sub, rel->rd_locator.relNumber, true);
+	(void) get_writeset(rel, sub, rel_key(rel), true);
 }
 
 /*
@@ -2366,7 +2392,7 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 }
 
 static void
-d1_tree_copy(Relation rel, const RelFileLocator *newrlocator)
+d1_tree_copy(Relation rel, Relation to)
 {
 	ProllySubRoot subs[3] = {subroot_for(rel, PROLLY_TREE_DATA), PROLLY_SUBROOT_LOCAL,
 	PROLLY_SUBROOT_LOCAL_KEYED};
@@ -2374,14 +2400,87 @@ d1_tree_copy(Relation rel, const RelFileLocator *newrlocator)
 	backend_init();
 	for (int i = 0; i < lengthof(subs); i++)
 	{
-		D1WriteSet *from = get_writeset(rel, subs[i], rel->rd_locator.relNumber,
+		D1WriteSet *from = get_writeset(rel, subs[i], rel_key(rel),
 										false);
-		D1WriteSet *to;
+		D1WriteSet *dst;
 		ProllyNodeRef tree;
 
 		materialize(from, &tree);
-		to = get_writeset(rel, subs[i], newrlocator->relNumber, true);
-		to->base = tree;
+		dst = get_writeset(to, subs[i], rel_key(to), true);
+		dst->base = tree;
+	}
+}
+
+/* Exchange which relation the write sets of sub for a and b belong to. */
+static void
+swap_writesets(ProllySubRoot sub, Oid a, Oid b)
+{
+	D1WriteSet *wa = find_writeset(sub, a);
+	D1WriteSet *wb = find_writeset(sub, b);
+	D1WsKey		key;
+	D1WsHashEntry *he;
+
+	Assert(wa && wb);
+	memset(&key, 0, sizeof(key));
+	key.sub = sub;
+	key.relkey = a;
+	he = hash_search(xact->writesets, &key, HASH_FIND, NULL);
+	he->ws = wb;
+	key.relkey = b;
+	he = hash_search(xact->writesets, &key, HASH_FIND, NULL);
+	he->ws = wa;
+	wa->relkey = wa->relid = b;
+	wb->relkey = wb->relid = a;
+}
+
+/*
+ * Exchange rel's trees with other's on the current branch, as a private
+ * write: a rewrite (ALTER TABLE, CLUSTER, VACUUM FULL, SET ACCESS METHOD)
+ * builds the new contents in a new relation and swaps the two.  Both
+ * sides' write sets are ordered as rel is: other has the same columns, or
+ * isn't a prolly relation and has no trees.
+ */
+static void
+d1_tree_swap(Relation rel, Oid other)
+{
+	ProllySubRoot subs[3] = {subroot_for(rel, PROLLY_TREE_DATA), PROLLY_SUBROOT_LOCAL,
+	PROLLY_SUBROOT_LOCAL_KEYED};
+	D1Swap	   *sw;
+
+	backend_init();
+	for (int i = 0; i < lengthof(subs); i++)
+	{
+		(void) get_writeset(rel, subs[i], rel_key(rel), false);
+		if (find_writeset(subs[i], other) == NULL)
+		{
+			D1WriteSet *ws = get_writeset(rel, subs[i], other, false);
+
+			ws->relid = other;
+		}
+		swap_writesets(subs[i], rel_key(rel), other);
+	}
+	sw = MemoryContextAlloc(xact->mcxt, sizeof(D1Swap));
+	sw->subxid = GetCurrentSubTransactionId();
+	sw->a = rel_key(rel);
+	sw->b = other;
+	sw->prev = xact->swaps;
+	xact->swaps = sw;
+}
+
+/* Remove rel's trees from the current branch when the transaction commits. */
+static void
+d1_tree_drop(Relation rel)
+{
+	ProllySubRoot subs[3] = {subroot_for(rel, PROLLY_TREE_DATA), PROLLY_SUBROOT_LOCAL,
+	PROLLY_SUBROOT_LOCAL_KEYED};
+	int			nsubs = rel->rd_rel->relkind == RELKIND_INDEX ? 1 : 3;
+
+	backend_init();
+	for (int i = 0; i < nsubs; i++)
+	{
+		D1WriteSet *ws = get_writeset(rel, subs[i], rel_key(rel), true);
+
+		ws->dropped = true;
 	}
 }
 
@@ -2405,8 +2504,8 @@ ws_order(const void *a, const void *b)
 
 	if (wa->sub != wb->sub)
 		return wa->sub < wb->sub ? -1 : 1;
-	if (wa->relnumber != wb->relnumber)
-		return wa->relnumber < wb->relnumber ? -1 : 1;
+	if (wa->relkey != wb->relkey)
+		return wa->relkey < wb->relkey ? -1 : 1;
 	return 0;
 }
 
@@ -2445,9 +2544,10 @@ build_branch_root(ProllyNodeRef *new_root)
 	for (int i = 0; i < n; i++)
 	{
 		edits[i].sub = sets[i]->sub;
-		edits[i].relnumber = sets[i]->relnumber;
-		edits[i].is_remove = false;
-		materialize(sets[i], &edits[i].tree);
+		edits[i].relid = sets[i]->relkey;
+		edits[i].is_remove = sets[i]->dropped;
+		if (!sets[i]->dropped)
+			materialize(sets[i], &edits[i].tree);
 	}
 
 	PROLLY_CALL(commit, branch_lock, xact->branch);
@@ -2462,7 +2562,7 @@ build_branch_root(ProllyNodeRef *new_root)
 
 		if (ws->replaced)
 			continue;
-		find_tree(&tip, ws->sub, ws->relnumber, &current);
+		find_tree(&tip, ws->sub, ws->relkey, &current);
 		if (!same_hash(&current, &ws->base))
 			materialize_onto(ws, &current, &edits[i].tree);
 	}
@@ -2521,7 +2621,7 @@ d1_tree_root(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 			 ProllyNodeRef *root)
 {
 	backend_init();
-	find_tree(roots, subroot_for(tree, kind), tree->rd_locator.relNumber, root);
+	find_tree(roots, subroot_for(tree, kind), rel_key(tree), root);
 	if (root->hash.len == 0)
 	{
 		/* The empty tree: a leaf with no items, whatever the key order. */
@@ -2539,15 +2639,15 @@ d1_diff(ProllyRootSet *from, ProllyRootSet *to, Relation tree,
 		ProllyTreeVisitChange visit, void *arg)
 {
 	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	Oid relkey = rel_key(tree);
 	ProllyNodeRef a;
 	ProllyNodeRef b;
 	D1Order		order;
 	ProllyTreeEnv env;
 
 	backend_init();
-	find_tree(from, sub, relnumber, &a);
-	find_tree(to, sub, relnumber, &b);
+	find_tree(from, sub, relkey, &a);
+	find_tree(to, sub, relkey, &b);
 	open_order(tree, sub, NULL, CurrentMemoryContext, &order);
 	if (order_lost(&order))
 	{
@@ -2588,7 +2688,7 @@ d1_xact_abort(void)
 }
 
 /*
- * Two-phase state: the branch, then per write set: sub (1 byte), relnumber, relid, replaced
+ * Two-phase state: the branch, then per write set: sub (1 byte), relkey, relid, replaced, dropped
  * (1 byte), the base's and the final tree's hashes (length byte, then the
  * bytes), the key order (kind byte: 0 memcmp, 1 table keying, 2 index
  * keying; suffixed byte; description length (4 bytes), description).
@@ -2656,9 +2756,10 @@ d1_xact_prepare(StringInfo state)
 			PROLLY_CALL(ws->order.ix_routine, describe, ws->order.ix, &desc);
 		}
 		appendStringInfoChar(state, (char) ws->sub);
-		appendBinaryStringInfo(state, &ws->relnumber, sizeof(RelFileNumber));
+		appendBinaryStringInfo(state, &ws->relkey, sizeof(Oid));
 		appendBinaryStringInfo(state, &ws->relid, sizeof(Oid));
 		appendStringInfoChar(state, (char) ws->replaced);
+		appendStringInfoChar(state, (char) ws->dropped);
 		put_hash(state, &ws->base);
 		put_hash(state, &final);
 		appendStringInfoChar(state, (char) kind);
@@ -2677,9 +2778,10 @@ d1_xact_prepare(StringInfo state)
 typedef struct D1PreparedTree
 {
 	ProllySubRoot sub;
-	RelFileNumber relnumber;
+	Oid relkey;
 	Oid			relid;
 	bool		replaced;
+	bool		dropped;
 	ProllyNodeRef base;
 	ProllyNodeRef final;
 	uint8		kind;
@@ -2809,10 +2911,12 @@ d1_commit_prepared(TransactionId xid, const char *state, Size len)
 		t = &trees[n++];
 		p = get_bytes(p, end, &b, 1);
 		t->sub = (ProllySubRoot) b;
-		p = get_bytes(p, end, &t->relnumber, sizeof(RelFileNumber));
+		p = get_bytes(p, end, &t->relkey, sizeof(Oid));
 		p = get_bytes(p, end, &t->relid, sizeof(Oid));
 		p = get_bytes(p, end, &b, 1);
 		t->replaced = (b != 0);
+		p = get_bytes(p, end, &b, 1);
+		t->dropped = (b != 0);
 		p = get_hash(p, end, &t->base);
 		p = get_hash(p, end, &t->final);
 		p = get_bytes(p, end, &t->kind, 1);
@@ -2843,10 +2947,10 @@ d1_commit_prepared(TransactionId xid, const char *state, Size len)
 		ProllyNodeRef current;
 
 		edits[i].sub = t->sub;
-		edits[i].relnumber = t->relnumber;
-		edits[i].is_remove = false;
+		edits[i].relid = t->relkey;
+		edits[i].is_remove = t->dropped;
 		edits[i].tree = t->final;
-		find_tree(&tip, t->sub, t->relnumber, &current);
+		find_tree(&tip, t->sub, t->relkey, &current);
 		if (!t->replaced && !same_hash(&current, &t->base))
 		{
 			/*
@@ -2908,7 +3012,7 @@ drop_writeset(D1WriteSet *ws)
 
 	memset(&key, 0, sizeof(key));
 	key.sub = ws->sub;
-	key.relnumber = ws->relnumber;
+	key.relkey = ws->relkey;
 	(void) hash_search(xact->writesets, &key, HASH_REMOVE, NULL);
 	for (link = &xact->all; *link != ws; link = &(*link)->next)
 		;
@@ -2923,6 +3027,21 @@ d1_subxact_abort(SubTransactionId subxid)
 
 	if (xact == NULL)
 		return;
+
+	/* Swaps it made, undone newest first, while their write sets exist. */
+	while (xact->swaps && xact->swaps->subxid >= subxid)
+	{
+		D1Swap	   *sw = xact->swaps;
+		ProllySubRoot subs[4] = {PROLLY_SUBROOT_CATALOG, PROLLY_SUBROOT_USER_DATA,
+		PROLLY_SUBROOT_LOCAL, PROLLY_SUBROOT_LOCAL_KEYED};
+
+		for (int i = 0; i < lengthof(subs); i++)
+			if (find_writeset(subs[i], sw->a) && find_writeset(subs[i], sw->b))
+				swap_writesets(subs[i], sw->a, sw->b);
+		xact->swaps = sw->prev;
+		pfree(sw);
+	}
+
 	for (D1WriteSet *ws = xact->all; ws; ws = next)
 	{
 		RBTreeIterator it;
@@ -2954,6 +3073,7 @@ d1_subxact_abort(SubTransactionId subxid)
 			ws->nentries = saved->nentries;
 			ws->base = saved->base;
 			ws->replaced = saved->replaced;
+			ws->dropped = saved->dropped;
 			ws->order = saved->order;
 			ws->spill = saved->spill;
 			ws->spill_gen++;
@@ -3048,6 +3168,8 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.tree_create = d1_tree_create,
 	.tree_truncate = d1_tree_truncate,
 	.tree_reset = d1_tree_reset,
+	.tree_swap = d1_tree_swap,
+	.tree_drop = d1_tree_drop,
 	.tree_copy = d1_tree_copy,
 	.roots_acquire = d1_roots_acquire,
 	.roots_release = d1_roots_release,

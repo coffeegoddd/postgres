@@ -899,6 +899,32 @@ Tests: `024_versioned_database.pl`. The catalogs themselves are still heap
 tables, shared by every branch: making them prolly tables is the rest of
 4g.5 (below).
 
+**Fix (2026-10-15): a relation's trees are found by its OID.** D1 found
+a relation's trees by relfilenumber, which the catalogs (shared by every
+branch until they're versioned) change on TRUNCATE, rewrites (ALTER TABLE
+... TYPE, CLUSTER, VACUUM FULL, SET ACCESS METHOD) and SET TABLESPACE: a
+TRUNCATE on one branch emptied the table on every other branch and in
+every commit made before it. Trees are now found by relation OID, as the
+root layout was meant to be (`09-versioned-catalogs.md`): TRUNCATE empties
+the relation's trees on the current branch only; a rewrite builds the new
+contents in a new relation and the engine's new `tree_swap` exchanges the
+two relations' trees as the catalogs swap their storage
+(`swap_relation_files`); SET TABLESPACE moves nothing; a prolly index build
+starts from an empty tree; and the new `tree_drop` removes a dropped
+relation's trees from the branch, which until now stayed reachable (and
+unreclaimable) forever. TIDs stay unique to a table across its storage
+(the row identity's new `counter_carry`), as other branches and commits
+keep rows with theirs. Swaps and drops roll back with savepoints, and drops
+carry through PREPARE. Tests: `025_d1_relation_trees.pl` (another branch,
+its prolly index and a commit's rows through TRUNCATE, VACUUM FULL and a
+type change; TIDs after them; savepoints; SET ACCESS METHOD both ways; a
+crash; dropped tables' nodes reclaimed, prepared ones too). Still wrong
+until catalogs are versioned: DDL on one branch applies to every branch's
+rows (an index rebuilt with a new OID is empty on other branches; a type
+change reinterprets their rows), and indexes of other access methods
+(btree) are shared by every branch, so a TRUNCATE or rewrite on one branch
+empties or rebuilds them for all.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

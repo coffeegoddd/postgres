@@ -44,6 +44,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_indexam.h"
 #include "access/prolly_tableam.h"
+#include "access/relation.h"
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
@@ -2115,6 +2116,12 @@ prolly_relation_set_new_filelocator(Relation rel,
 	engine = components.engine;
 	PROLLY_CALL(engine, tree_create, rel, newrlocator, persistence);
 	smgrclose(RelationCreateStorage(*newrlocator, persistence, true));
+
+	/* New storage for an existing table (TRUNCATE): TIDs go on. */
+	if (!RelFileLocatorEquals(rel->rd_locator, *newrlocator) &&
+		RelFileNumberIsValid(rel->rd_locator.relNumber) &&
+		smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM))
+		PROLLY_CALL(components.row_identity, counter_carry, rel, newrlocator);
 }
 
 static void
@@ -2128,18 +2135,60 @@ prolly_relation_nontransactional_truncate(Relation rel)
 	PROLLY_CALL(engine, tree_truncate, rel);
 }
 
+void
+prolly_swap_relations(Oid r1, Oid relam1, Oid r2, Oid relam2)
+{
+	char	   *am1 = get_am_name(relam1);
+	char	   *am2 = get_am_name(relam2);
+	bool		prolly1 = prolly_is_table_am(am1);
+	bool		prolly2 = prolly_is_table_am(am2);
+	Relation	rel;
+	Relation	other;
+	ProllyComponents c;
+
+	if (!prolly1 && !prolly2)
+		return;
+
+	/*
+	 * The swap's prolly side orders both sides' trees (the other has its
+	 * columns, or no trees).  The rewritten table's TIDs go on from the
+	 * old storage's.
+	 */
+	rel = relation_open(prolly1 ? r1 : r2, NoLock);
+	other = relation_open(prolly1 ? r2 : r1, NoLock);
+	prolly_components_for_relation(rel, &c);
+	PROLLY_CALL(c.engine, tree_swap, rel, RelationGetRelid(other));
+	if (prolly1 && prolly2)
+		PROLLY_CALL(c.row_identity, counter_carry, rel, &other->rd_locator);
+	relation_close(other, NoLock);
+	relation_close(rel, NoLock);
+}
+
+void
+prolly_drop_relation(Relation rel)
+{
+	ProllyComponents c;
+	char	   *amname = get_am_name(rel->rd_rel->relam);
+	bool		prolly = rel->rd_rel->relkind == RELKIND_INDEX ?
+		amname != NULL && strcmp(amname, "prolly") == 0 :
+		prolly_is_table_am(amname);
+
+	if (!prolly)
+		return;
+	prolly_components_for_relation(rel, &c);
+	PROLLY_CALL(c.engine, tree_drop, rel);
+}
+
 static void
 prolly_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
-	ProllyComponents components;
-	const ProllyEngineRoutine *engine;
 	SMgrRelation dstrel;
 
-	prolly_components_for_relation(rel, &components);
-	engine = components.engine;
-	PROLLY_CALL(engine, tree_copy, rel, newrlocator);
-
-	/* The main fork holds the components' per-table pages (TID counter). */
+	/*
+	 * The trees stay where they are (they're found by relation, not by
+	 * storage); the main fork holds the components' per-table pages (TID
+	 * counter).
+	 */
 	FlushRelationBuffers(rel);
 	dstrel = RelationCreateStorage(*newrlocator, rel->rd_rel->relpersistence,
 								   true);
@@ -2191,7 +2240,7 @@ prolly_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 	bool		owned;
 
 	prolly_components_for_relation(OldTable, &c);
-	PROLLY_CALL(c.engine, tree_copy, OldTable, &NewTable->rd_locator);
+	PROLLY_CALL(c.engine, tree_copy, OldTable, NewTable);
 	FlushRelationBuffers(OldTable);
 	RelationCopyStorage(RelationGetSmgr(OldTable), RelationGetSmgr(NewTable),
 						MAIN_FORKNUM, NewTable->rd_rel->relpersistence);
