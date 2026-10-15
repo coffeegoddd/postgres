@@ -1,0 +1,307 @@
+-- Branch-aware catalogs: a versioned object's catalog rows carry the
+-- branch they were made on, and a session sees only shared rows and its own
+-- branch's.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT oid AS main FROM pg_branch WHERE brname = 'main' \gset
+SELECT test_branch_current() = :main AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE SCHEMA plain;
+CREATE TABLE plain.base (id int PRIMARY KEY);
+CREATE SCHEMA app VERSIONED;
+CREATE TYPE app.mood AS ENUM ('sad', 'ok');
+CREATE TABLE app.t (id serial PRIMARY KEY, m app.mood DEFAULT 'ok',
+                    CHECK (id > 0));
+CREATE TABLE app.child (id int REFERENCES app.t);
+CREATE INDEX t_m ON app.t (m);
+CREATE VIEW app.v AS SELECT id FROM app.t;
+CREATE FUNCTION app.f(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+COMMENT ON TABLE app.t IS 'versioned';
+COMMENT ON TABLE plain.base IS 'shared';
+-- Rows of versioned objects are on main; shared objects' rows are on no branch.
+SELECT nspname, nspbranch = :main AS on_main FROM pg_namespace
+  WHERE nspname IN ('app', 'plain') ORDER BY 1;
+ nspname | on_main 
+---------+---------
+ app     | t
+ plain   | f
+(2 rows)
+
+SELECT relname, relbranch = :main AS on_main FROM pg_class
+  WHERE relnamespace IN ('app'::regnamespace, 'plain'::regnamespace)
+  ORDER BY 1;
+  relname  | on_main 
+-----------+---------
+ base      | f
+ base_pkey | f
+ child     | t
+ t         | t
+ t_id_seq  | t
+ t_m       | t
+ t_pkey    | t
+ v         | t
+(8 rows)
+
+SELECT DISTINCT attrelid::regclass, attbranch = :main AS on_main
+  FROM pg_attribute
+  WHERE attrelid IN ('app.t'::regclass, 'app.t_m'::regclass, 'plain.base'::regclass)
+  ORDER BY 1;
+  attrelid  | on_main 
+------------+---------
+ plain.base | f
+ app.t      | t
+ app.t_m    | t
+(3 rows)
+
+SELECT indexrelid::regclass, indbranch = :main AS on_main FROM pg_index
+  WHERE indrelid IN ('app.t'::regclass, 'plain.base'::regclass) ORDER BY 1;
+   indexrelid    | on_main 
+-----------------+---------
+ plain.base_pkey | f
+ app.t_pkey      | t
+ app.t_m         | t
+(3 rows)
+
+SELECT conname, conbranch = :main AS on_main FROM pg_constraint
+  WHERE connamespace IN ('app'::regnamespace, 'plain'::regnamespace) ORDER BY 1;
+     conname      | on_main 
+------------------+---------
+ base_id_not_null | f
+ base_pkey        | f
+ child_id_fkey    | t
+ t_id_check       | t
+ t_id_not_null    | t
+ t_pkey           | t
+(6 rows)
+
+SELECT DISTINCT tgrelid::regclass, tgbranch = :main AS on_main FROM pg_trigger
+  WHERE tgrelid IN ('app.t'::regclass, 'app.child'::regclass) ORDER BY 1;
+  tgrelid  | on_main 
+-----------+---------
+ app.t     | t
+ app.child | t
+(2 rows)
+
+SELECT adrelid::regclass, adbranch = :main AS on_main FROM pg_attrdef
+  WHERE adrelid = 'app.t'::regclass ORDER BY adnum;
+ adrelid | on_main 
+---------+---------
+ app.t   | t
+ app.t   | t
+(2 rows)
+
+SELECT ev_class::regclass, ev_branch = :main AS on_main FROM pg_rewrite
+  WHERE ev_class = 'app.v'::regclass;
+ ev_class | on_main 
+----------+---------
+ app.v    | t
+(1 row)
+
+SELECT typname, typbranch = :main AS on_main FROM pg_type
+  WHERE typnamespace IN ('app'::regnamespace, 'plain'::regnamespace) ORDER BY 1;
+ typname | on_main 
+---------+---------
+ _base   | f
+ _child  | t
+ _mood   | t
+ _t      | t
+ _v      | t
+ base    | f
+ child   | t
+ mood    | t
+ t       | t
+ v       | t
+(10 rows)
+
+SELECT enumlabel, enumbranch = :main AS on_main FROM pg_enum
+  WHERE enumtypid = 'app.mood'::regtype ORDER BY enumsortorder;
+ enumlabel | on_main 
+-----------+---------
+ sad       | t
+ ok        | t
+(2 rows)
+
+SELECT proname, probranch = :main AS on_main FROM pg_proc
+  WHERE pronamespace = 'app'::regnamespace;
+ proname | on_main 
+---------+---------
+ f       | t
+(1 row)
+
+SELECT seqrelid::regclass, seqbranch = :main AS on_main FROM pg_sequence
+  WHERE seqrelid = 'app.t_id_seq'::regclass;
+   seqrelid   | on_main 
+--------------+---------
+ app.t_id_seq | t
+(1 row)
+
+SELECT objoid::regclass, objbranch = :main AS on_main FROM pg_description
+  WHERE objoid IN ('app.t'::regclass, 'plain.base'::regclass) ORDER BY 1;
+   objoid   | on_main 
+------------+---------
+ plain.base | f
+ app.t      | t
+(2 rows)
+
+SELECT DISTINCT classid::regclass, depbranch = :main AS on_main FROM pg_depend
+  WHERE objid IN (SELECT oid FROM pg_class WHERE relnamespace = 'app'::regnamespace
+                  UNION SELECT oid FROM pg_type WHERE typnamespace = 'app'::regnamespace
+                  UNION SELECT oid FROM pg_constraint WHERE connamespace = 'app'::regnamespace)
+  ORDER BY 1, 2;
+    classid    | on_main 
+---------------+---------
+ pg_type       | t
+ pg_class      | t
+ pg_constraint | t
+(3 rows)
+
+SELECT count(*) AS shared_deps_on_main FROM pg_depend
+  WHERE objid = 'plain.base'::regclass AND depbranch <> 0;
+ shared_deps_on_main 
+---------------------
+                   0
+(1 row)
+
+INSERT INTO app.t (m) VALUES ('sad'), (DEFAULT);
+-- Another branch (made by hand: branches can't be made yet) sees none of
+-- main's versioned objects, and can make its own with the same names.
+SET allow_system_table_mods = on;
+INSERT INTO pg_branch VALUES (99999, 'other');
+RESET allow_system_table_mods;
+SELECT test_branch_switch('other');
+ test_branch_switch 
+--------------------
+ 
+(1 row)
+
+SELECT test_branch_current() = 99999 AS on_other;
+ on_other 
+----------
+ t
+(1 row)
+
+SELECT to_regnamespace('app') IS NULL AS no_app, to_regclass('app.t') IS NULL AS no_t;
+ no_app | no_t 
+--------+------
+ t      | t
+(1 row)
+
+SELECT count(*) AS main_rows_seen FROM pg_class WHERE relbranch = :main;
+ main_rows_seen 
+----------------
+              0
+(1 row)
+
+SELECT count(*) FROM plain.base;
+ count 
+-------
+     0
+(1 row)
+
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (name text);
+INSERT INTO app.t VALUES ('other');
+SELECT * FROM app.t;
+ name  
+-------
+ other
+(1 row)
+
+SELECT relname, relbranch = 99999 AS on_other FROM pg_class
+  WHERE relnamespace = 'app'::regnamespace ORDER BY 1;
+ relname | on_other 
+---------+----------
+ t       | t
+(1 row)
+
+SELECT 'app.t'::regclass::oid AS other_t \gset
+-- Back on main, main's objects are back and other's can't be seen, even by
+-- an index-only scan over all-visible pages.
+SELECT test_branch_switch('main');
+ test_branch_switch 
+--------------------
+ 
+(1 row)
+
+SELECT id, m FROM app.t ORDER BY id;
+ id |  m  
+----+-----
+  1 | sad
+  2 | ok
+(2 rows)
+
+SELECT attname FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attnum > 0
+  ORDER BY attnum;
+ attname 
+---------
+ id
+ m
+(2 rows)
+
+VACUUM pg_class;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE FUNCTION pg_temp.plan_of(q text) RETURNS SETOF text LANGUAGE plpgsql AS
+$$ DECLARE l text; BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l LIKE '%Scan%' THEN RETURN NEXT l; END IF;
+  END LOOP;
+END $$;
+SELECT pg_temp.plan_of('SELECT oid FROM pg_class WHERE oid = ' || :other_t);
+                       plan_of                        
+------------------------------------------------------
+ Index Only Scan using pg_class_oid_index on pg_class
+(1 row)
+
+SELECT count(*) AS other_t_seen FROM pg_class WHERE oid = :other_t;
+ other_t_seen 
+--------------
+            0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS other_t_seen FROM pg_class WHERE oid = :other_t;
+ other_t_seen 
+--------------
+            0
+(1 row)
+
+SELECT count(*) AS other_rows_seen FROM pg_class WHERE relbranch = 99999;
+ other_rows_seen 
+-----------------
+               0
+(1 row)
+
+-- Each branch drops its own.
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to type app.mood
+drop cascades to table app.t
+drop cascades to table app.child
+drop cascades to view app.v
+drop cascades to function app.f(integer)
+SELECT test_branch_switch('other');
+ test_branch_switch 
+--------------------
+ 
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to table app.t
+SELECT test_branch_switch('main');
+ test_branch_switch 
+--------------------
+ 
+(1 row)
+
+DROP SCHEMA plain CASCADE;
+NOTICE:  drop cascades to table plain.base
+SET allow_system_table_mods = on;
+DELETE FROM pg_branch WHERE brname = 'other';
+RESET allow_system_table_mods;

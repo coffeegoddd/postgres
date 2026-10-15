@@ -19,6 +19,7 @@
 #include "access/relscan.h"
 #include "access/tableam_indexscan.h"
 #include "access/visibilitymap.h"
+#include "catalog/branch.h"
 #include "pgstat.h"
 #include "storage/predicate.h"
 
@@ -361,9 +362,11 @@ heapam_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 			 * so the result could be slightly stale.  See the comments above
 			 * visibilitymap_get_status for why this is okay.
 			 */
-			all_visible = VM_ALL_VISIBLE(scan->heapRelation,
-										 ItemPointerGetBlockNumber(&scan->xs_heaptid),
-										 &hscan->xs_vmbuffer);
+			all_visible =
+				!relation_has_branches(RelationGetRelid(scan->heapRelation)) &&
+				VM_ALL_VISIBLE(scan->heapRelation,
+							   ItemPointerGetBlockNumber(&scan->xs_heaptid),
+							   &hscan->xs_vmbuffer);
 
 			if (unlikely(!all_visible))
 			{

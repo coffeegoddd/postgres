@@ -91,6 +91,11 @@
      </row>
 
      <row>
+      <entry><link linkend="catalog-pg-branch"><structname>pg_branch</structname></link></entry>
+      <entry>branches of versioned schemas' objects</entry>
+     </row>
+
+     <row>
       <entry><link linkend="catalog-pg-cast"><structname>pg_cast</structname></link></entry>
       <entry>casts (data type conversions)</entry>
      </row>
@@ -1741,6 +1746,71 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
    </tgroup>
   </table>
 
+ </sect1>
+
+
+ <sect1 id="catalog-pg-branch">
+  <title><structname>pg_branch</structname></title>
+
+  <indexterm zone="catalog-pg-branch">
+   <primary>pg_branch</primary>
+  </indexterm>
+
+  <para>
+   The catalog <structname>pg_branch</structname> lists a database's
+   branches.  Every object in a versioned schema (see
+   <xref linkend="sql-createschema"/>) exists once per branch.  Each
+   system catalog that can hold such an object's rows has a branch column
+   (for example <structname>pg_class</structname>.<structfield>relbranch</structfield>),
+   which is the branch's OID in a versioned object's rows and zero in the
+   rows of objects every branch shares.  The branch column is the last of the
+   keys of each of the catalog's unique indexes, so an object has the same
+   OID and name on every branch.
+  </para>
+
+  <para>
+   A session works on one branch: it sees shared rows and its branch's
+   rows, and no other branch's.  Connecting to
+   <replaceable>dbname</replaceable><literal>/</literal><replaceable>branch</replaceable>
+   picks the branch; otherwise the session is on <literal>main</literal>,
+   which every database has.
+  </para>
+
+  <table>
+   <title><structname>pg_branch</structname> Columns</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>oid</structfield> <type>oid</type>
+      </para>
+      <para>
+       Row identifier; the value of versioned objects' branch columns
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>brname</structfield> <type>name</type>
+      </para>
+      <para>
+       Branch name
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
  </sect1>
 
 

@@ -73,6 +73,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/branch.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
@@ -1702,7 +1703,8 @@ HeapTupleSatisfiesMVCCBatch(Snapshot snapshot, Buffer buffer,
 		bool		valid;
 		HeapTuple	tup = &batchmvcc->tuples[i];
 
-		valid = HeapTupleSatisfiesMVCC(tup, snapshot, buffer, &state);
+		valid = HeapTupleSatisfiesMVCC(tup, snapshot, buffer, &state) &&
+			tuple_on_branch(tup);
 		batchmvcc->visible[i] = valid;
 
 		if (likely(valid))
@@ -1734,9 +1736,11 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	switch (snapshot->snapshot_type)
 	{
 		case SNAPSHOT_MVCC:
-			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL);
+			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL) &&
+				tuple_on_branch(htup);
 		case SNAPSHOT_SELF:
-			return HeapTupleSatisfiesSelf(htup, snapshot, buffer);
+			return HeapTupleSatisfiesSelf(htup, snapshot, buffer) &&
+				tuple_on_branch(htup);
 		case SNAPSHOT_ANY:
 			return HeapTupleSatisfiesAny(htup, snapshot, buffer);
 		case SNAPSHOT_TOAST:
@@ -1744,7 +1748,8 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		case SNAPSHOT_DIRTY:
 			return HeapTupleSatisfiesDirty(htup, snapshot, buffer);
 		case SNAPSHOT_HISTORIC_MVCC:
-			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer);
+			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer) &&
+				tuple_on_branch(htup);
 		case SNAPSHOT_NON_VACUUMABLE:
 			return HeapTupleSatisfiesNonVacuumable(htup, snapshot, buffer);
 	}

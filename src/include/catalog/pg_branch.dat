@@ -1,0 +1,19 @@
+#----------------------------------------------------------------------
+#
+# pg_branch.dat
+#    Initial contents of the pg_branch system catalog.
+#
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+# Portions Copyright (c) 1994, Regents of the University of California
+#
+# src/include/catalog/pg_branch.dat
+#
+#----------------------------------------------------------------------
+
+[
+
+{ oid => '9427', oid_symbol => 'BRANCH_MAIN_OID',
+  descr => 'every database\'s first branch',
+  brname => 'main' },
+
+]
