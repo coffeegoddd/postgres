@@ -1627,6 +1627,44 @@ prolly_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
  * lock: if the row changes before it's locked, the update finds it
  * changed and goes no further.
  */
+/*
+ * Whether two rows of rel have the same values in the columns of its
+ * unique indexes that foreign keys can reference (what FOR KEY SHARE
+ * protects): an update keeping them is a no-key update.
+ */
+static bool
+same_key_columns(Relation rel, const ProllyComponents *c, ProllyKeying *keying,
+				 const ProllyValue *a, const ProllyValue *b)
+{
+	Bitmapset  *keycols = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_KEY);
+	TupleTableSlot *sa = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	TupleTableSlot *sb = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	bool		same = true;
+	int			col = -1;
+
+	PROLLY_CALL(c->keying, decode_row, keying, a, sa);
+	PROLLY_CALL(c->keying, decode_row, keying, b, sb);
+	slot_getallattrs(sa);
+	slot_getallattrs(sb);
+	while (same && (col = bms_next_member(keycols, col)) >= 0)
+	{
+		int			attno = col + FirstLowInvalidHeapAttributeNumber;
+		Form_pg_attribute att;
+
+		if (attno <= 0)
+			continue;
+		att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+		same = sa->tts_isnull[attno - 1] == sb->tts_isnull[attno - 1] &&
+			(sa->tts_isnull[attno - 1] ||
+			 datumIsEqual(sa->tts_values[attno - 1], sb->tts_values[attno - 1],
+						  att->attbyval, att->attlen));
+	}
+	ExecDropSingleTupleTableSlot(sa);
+	ExecDropSingleTupleTableSlot(sb);
+	bms_free(keycols);
+	return same;
+}
+
 static LockTupleMode
 update_lock_mode(Relation rel, const ProllyComponents *c, ItemPointer otid,
 				 TupleTableSlot *slot)
@@ -1834,6 +1872,57 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 		keying = read_keying(rel, &c, roots, &owned);
 		row_at_init(&now);
 		fate = row_fate(&c, roots, rel, keying, tid, cid, &now, tmfd);
+
+		/*
+		 * FOR KEY SHARE doesn't conflict with an update that kept the key
+		 * columns: as heap does, it locks the row and returns the version
+		 * it was given, whatever the isolation level, rather than follow
+		 * the update.
+		 */
+		if (fate == ROW_CONCURRENTLY_MODIFIED && mode == LockTupleKeyShare &&
+			!ItemPointerEquals(&tmfd->ctid, tid))
+		{
+			RowAt		gone;
+			RowAt		last;
+			ItemPointerData next = tmfd->ctid;
+
+			row_at_init(&gone);
+			row_at_init(&last);
+			row_at(&c, roots, rel, keying, tid, InvalidCommandId, &gone);
+			for (;;)
+			{
+				row_at(&c, roots, rel, keying, &next, InvalidCommandId, &last);
+				if (last.present || last.state != PROLLY_TID_GONE ||
+					!ItemPointerIsValid(&last.info.successor))
+					break;
+				next = last.info.successor;
+			}
+			if (gone.state == PROLLY_TID_GONE && last.present &&
+				same_key_columns(rel, &c, keying, &gone.row, &last.row))
+			{
+				ProllyKey	lk = {(const uint8 *) last.key.data, last.key.len};
+
+				result = PROLLY_CALL(c.coord, lock_row, rel,
+									 lock_key(rel, &c, &lk), mode,
+									 wait_policy, tmfd);
+				if (result == TM_Ok)
+					store_row(&c, rel, keying, &gone, tid, slot);
+				row_at_free(&gone);
+				row_at_free(&last);
+				row_at_free(&now);
+				release_keying(&c, keying, owned);
+				PROLLY_CALL(c.engine, roots_release, roots);
+				if (result != TM_Ok)
+				{
+					tmfd->ctid = *tid;
+					tmfd->traversed = traversed;
+				}
+				return result;
+			}
+			row_at_free(&gone);
+			row_at_free(&last);
+		}
+
 		if (fate == ROW_CONCURRENTLY_MODIFIED &&
 			(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
 			!ItemPointerEquals(&tmfd->ctid, tid))
