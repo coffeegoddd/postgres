@@ -11,19 +11,28 @@ the code as it is today, open PRs included, to this design.
 
 ### Two layers
 
-- **The working set is pages.** A versioned database's tables, indexes,
-  catalogs, sequences and TOAST tables are ordinary Postgres relations
-  in 8 KB pages: heap, nbtree, GIN, GiST and the rest, unchanged. Reads,
-  writes, MVCC, row locks, SSI, HOT, TOAST, VACUUM, index-only scans and
-  parallel scans are Postgres's own, so performance and concurrency are
-  heap's.
+- **Prolly tables sit beside normal tables** (user). A database can hold
+  both. A prolly table (table access method `prolly`) is versioned; a
+  normal table isn't, and nothing here changes how it is stored or
+  behaves.
+- **The working set is pages.** A prolly table, its indexes and its TOAST
+  table are ordinary Postgres relations in 8 KB pages: heap's page format,
+  nbtree, GIN, GiST and the rest, unchanged. Reads, writes, MVCC, row
+  locks, SSI, HOT, TOAST, VACUUM, index-only scans and parallel scans are
+  Postgres's own, so performance and concurrency are heap's.
+- **Prolly pages are kept apart from normal pages** (user). Prolly
+  relations live in block-mapped storage (part 5); normal relations stay
+  in md.c's files, so prolly storage never interferes with normal
+  storage.
 - **History is a chunk store shaped like Dolt's.** Commits are immutable,
   content-addressed chunks of prolly trees, kept the way Dolt keeps them:
   new chunks appended to a journal, older ones in immutable table files
   with an index, and a manifest naming the root. The formats are our own
   (user: no Dolt or Doltgres byte compatibility); Dolt is the model for
   structure and behavior, not for bytes.
-- **A Dolt commit snapshots the working set into the store.** A SQL commit
+- **A Dolt commit snapshots the working set into the store**, and it
+  captures every prolly table in the database (user); normal tables are
+  never in commits. A SQL commit
   is not a Dolt commit: SQL commits only change pages; `dolt_commit()`
   folds the branch's changes since its head into new trees and a new
   commit.
@@ -33,45 +42,66 @@ the code as it is today, open PRs included, to this design.
 
 Both extremes are valid and cheap: a table that has only the initial Dolt
 commit and only ever changes in its working set is a heap table in all but
-name; a table where every SQL commit is also a Dolt commit keeps its delta
+name and storage; a table where every SQL commit is also a Dolt commit keeps its delta
 at one transaction's size.
 
-### Branches are page sets, copy-on-write (user)
+### Branches: each has its own copy of every prolly table (user)
 
-- Each branch of a versioned database has its own set of pages holding its
-  head plus its uncommitted (in the Dolt sense) changes. Every relation of
-  the database, the catalogs included, has a separate relation file number
-  on each branch, and each branch has its own relation map (the
-  relation mapper's file) for nailed and mapped catalogs.
-- **Pages are shared copy-on-write.** Under each branch's relation files is
-  a per-branch **block map** from logical block to physical block in a
-  shared page store. Creating a branch copies the parent's maps by
-  reference: no page is copied. The first logical change to a shared page
-  on either branch gives that branch its own copy.
-- Connections choose a branch by database name (`db/branch`, as built);
-  the connection's catalogs, relcache and everything else see that
-  branch's relations. DDL on a branch changes only that branch, because the
-  catalogs are that branch's pages. This gives versioned schema without
-  the staged catalog conversion of `09-versioned-catalogs.md` part 4.
+- **Catalogs are ordinary, shared catalogs.** Normal tables, functions,
+  types and everything else not tied to a prolly table look the same from
+  every branch.
+- **Each branch has its own copy of each prolly table** (user, option B):
+  its own relation with its own OID, catalog rows and relation file
+  number, and with it the table's indexes, TOAST table, constraints,
+  triggers, rules, policies, extended statistics and owned sequences.
+  DDL on a branch changes only that branch's copy, so branches can
+  diverge in schema and merge, as in Dolt.
+- **Copies share pages copy-on-write.** Under each copy's relation files is
+  a **block map** from logical block to physical block in a page store
+  shared by the database's prolly relations. Creating a branch copies the
+  prolly tables' catalog rows and their block maps by reference: no page
+  is copied. The first logical change to a shared page on either branch
+  gives that branch its own copy of the page.
+- **Names resolve to the session's branch.** Connections choose a branch
+  by database name (`db/branch`, as built). A prolly table's name, in its
+  schema, resolves to the copy on the session's branch; everything stored
+  by OID that refers to a prolly table belongs to that branch's copy.
+- **Objects that depend on prolly tables:**
+  - Views and materialized views over prolly tables, and rules on them,
+    are copied per branch with the tables.
+  - Foreign keys between prolly tables are per branch; a prolly table may
+    reference a normal table (shared data); a normal table referencing a
+    prolly table is refused (its rows would point into one branch only).
+  - Functions resolve names when they run, so they see the session's
+    branch; nothing to copy.
+  - Creating or dropping a prolly table on a branch affects that branch
+    only.
 - **Shared catalogs** (`pg_database`, `pg_authid`, tablespaces) stay
   cluster-wide and unversioned, as decided for question 27.
 - A branch that no connection uses and that has no uncommitted changes can
-  drop its page set; it is then only its head commit. Its pages are made
+  drop its page sets; it is then only its head commit. Its pages are made
   again when it is next used: copy-on-write from a branch whose head is
   close to it, then the difference applied (part 2), or, when no branch
   is close, materialized from the tree.
-- Temporary and unlogged relations are never versioned (as decided,
-  question 28): they stay ordinary relations outside the block map.
+- Temporary and unlogged prolly tables are refused, as before (question
+  28): a prolly table is permanent.
+- **How copies are named (step 2's first decision).** Recommended: a
+  copy keeps the table's schema and name, with a branch column added to
+  `pg_class` and `pg_type` and to their name keys, and name lookups match
+  the session's branch or no branch. Error messages, `regclass` output,
+  `\d` and `pg_dump` then print the names users wrote. The alternative,
+  a hidden schema per branch, leaves the catalogs' keys alone but leaks
+  the hidden names wherever a schema is printed.
 
 ### What is in pages and what is in the chunk store
 
 | | Pages (working set) | Chunk store (history) |
 |---|---|---|
-| Format | Postgres's: heap tuples, btree, catalogs | Ours: prolly trees of canonical rows, canonical schema, root values, commits |
+| Format | Postgres's: heap tuples, btree | Ours: prolly trees of canonical rows, canonical schema, root values, commits |
 | Mutability | Mutable, MVCC | Immutable, content-addressed |
 | Ordering | Postgres collations, opclasses | The canonical key encoding (memcmp order from btree opclasses) |
 | Durability | WAL, checkpoints, full-page writes | WAL-logged appends to the store's files (below) |
-| Per branch | Block maps (copy-on-write) | Refs (branch heads, working-set roots) |
+| Per branch | Each prolly table's copy: catalog rows and block maps (copy-on-write) | Refs (branch heads, working-set roots) |
 | Indexes | Every Postgres index AM | Only what history needs: each table's row tree by key |
 
 ### The chunk store
@@ -134,14 +164,14 @@ carries over; only what assumed chunks live in 8 KB pages changes:
 ### What this answers
 
 - **Step 4h's pending decisions:** types without binary send/receive
-  remain question 35; unlogged tables stay unversioned; btree and other
+  are stored as text (question 35); unlogged tables stay unversioned; btree and other
   index AMs are each branch's own, through the block map, so a TRUNCATE on
   one branch no longer affects another; merging into a branch with
   uncommitted changes is allowed when nothing conflicts, as in Dolt
   (part 2).
-- **Versioned catalogs** come from per-branch page sets instead of
-  catalogs on prolly trees: `09-versioned-catalogs.md` part 4's stages 2–7
-  are superseded. Its part 1 (canonical commits, identity by name) carries
+- **Versioned schema** comes from per-branch copies of prolly tables'
+  catalog rows instead of catalogs on prolly trees:
+  `09-versioned-catalogs.md` part 4's stages 2–7 are superseded. Its part 1 (canonical commits, identity by name) carries
   over.
 - **The 8 KB question:** pages are Postgres's; chunks are the store's and
   no longer depend on `BLCKSZ`.
@@ -152,10 +182,10 @@ carries over; only what assumed chunks live in 8 KB pages changes:
 
 | Operation | How | Cost |
 |---|---|---|
-| SQL read or write | Heap and indexes on the branch's pages | Heap's |
-| Create a branch at another branch's head | Copy the block maps by reference; new relation file numbers and relation map | O(relations), aim O(1) with the maps under one copy-on-write root |
+| SQL read or write | Heap and indexes on the branch's copies | Heap's |
+| Create a branch at another branch's head | Copy each prolly table's catalog rows (new OIDs and relation file numbers) and its block maps by reference | O(prolly relations); no page is read |
 | Create a branch at a commit | As above from a branch whose head is near it, then apply the tree diff between the two heads as row changes | O(Δ log N) |
-| Dolt commit | Fold: find rows changed since the head (below), write them into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
+| Dolt commit | Fold: find the branch's prolly rows changed since the head (below), write them into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
 | Working-set checkpoint | The same fold, published as the branch's working-set root instead of a commit | As a commit |
 | Diff, log, status | Over trees: subtree-skipping diff; working-set diffs fold first | Dolt's bounds |
 | Fast-forward, reset, checkout of a commit | Apply the tree diff from the current head to the target as row changes | O(Δ log N) |
@@ -187,8 +217,8 @@ What this design needs from each:
 
 | Facility | Interface today | Needed for this design |
 |---|---|---|
-| Storage manager (smgr) | Already a table of functions (`smgrsw[]`, `src/backend/storage/smgr/smgr.c`), with md.c the only entry | A second implementation, block-mapped copy-on-write storage, chosen per relation (versioned database, permanent relation); md.c stays the standard one |
-| Buffer manager | None | One hook: the first `MarkBufferDirty` of a page whose physical block is shared remaps it before the change is WAL-logged; `MarkBufferDirtyHint` writes stay in place (hint bits don't change any branch's rows). Buffer tags stay logical (per-branch relation file numbers) |
+| Storage manager (smgr) | Already a table of functions (`smgrsw[]`, `src/backend/storage/smgr/smgr.c`), with md.c the only entry | A second implementation, block-mapped copy-on-write storage, chosen per relation (prolly relations); md.c stays the standard one |
+| Buffer manager | None | One hook: an exclusive lock on a page whose physical block is shared remaps it first, outside any critical section, so the remap is WAL-logged before the change (part 5). Hint-bit writes under a share lock stay in place (hint bits don't change any branch's rows). Buffer tags stay logical (per-branch relation file numbers) |
 | Checksums | Computed with the logical block number | Unchanged: verification uses the same logical number |
 | AIO and read streams | md.c's callbacks | Implemented by the new smgr, mapping each logical block range to physical ones |
 | full_page_writes, WAL | Generic | Unchanged for pages; new records for block-map changes and the chunk store |
@@ -217,7 +247,8 @@ are interfaces (hash, key and value encoders, chunker, node format).
 
 | Today | In the new design |
 |---|---|
-| `dolt_*` functions, views, `dolt.author`, `db/branch` connections, conflicts as in Dolt, `CREATE DATABASE … VERSIONED`, pg_dump support (#25–#27) | Kept; their backend changes to page sets and the chunk store |
+| `dolt_*` functions, views, `dolt.author`, `db/branch` connections, conflicts as in Dolt (#25, #26) | Kept; their backend changes to per-branch copies and the chunk store |
+| `CREATE DATABASE … VERSIONED` and its refusal of heap tables (#27) | Superseded: version control is per table (prolly tables), so any database can hold both. Removed with D1 |
 | Hash, key encoding, canonical rows, value trees, canonicalizer (4a, #18, #23) | Kept: the chunk store's contents |
 | Copy-on-write trees, subtree-skipping diff, three-way merge, merge conflicts, refs, commits (4c, #9, #21, #22, #26) | Kept; they operate on chunks from the new store instead of node-store pages |
 | Chunker, node format | Reworked: the byte-based rule (step 5's plan) and pageless nodes |
@@ -225,52 +256,48 @@ are interfaces (hash, key and value encoders, chunker, node format).
 | Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests go with D1 |
 | The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC |
 | D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Kept building until the new design is measured against them (step 8), then removed |
-| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch catalogs in pages; #34 stays harmless |
+| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of prolly tables' catalog rows; #34 stays harmless |
 
 ### Steps
 
 Each step is a stack of PRs with its own tests (every bug with a test that
 fails without its fix), and Postgres's suites keep passing after each one.
 
-**Step 0. Settle the open stack and these specs.**
-- Recommended: merge #12–#46 as they are, then tag the result
-  (`prolly-d1`). They are tested, D1 is the measured alternative step 8
-  compares against, and most of their version-control code and tests
-  carry over. Rebasing the stack piecemeal would cost more than it saves.
-  **Decision for the user** (merging needs approval).
-- Mark this design in `README.md` and `08-open-questions.md`'s status
-  table; mark what it supersedes in `04`, `07`, `09` and `10`.
-- Decide question 35 (types without binary send formats) and whether
-  shared catalogs stay unversioned.
+**Step 0. Settle the open stack and these specs.** Done 2026-10-15.
+- #12–#47 merged; the D1 engine's final state is tagged `prolly-d1`.
+- Types without a binary send format are stored as their text output
+  (user, question 35).
+- Shared catalogs stay cluster-wide and unversioned (user).
 
-**Step 1. The page-store interface and the block-mapped store.**
+**Step 1. Block-mapped storage and the `prolly` table AM.**
 - Make smgr's implementation selectable per relation, md.c the default.
-- A block-mapped implementation: per-relation-fork block maps (logical →
-  physical, with a birth epoch per entry), a shared physical page file per
-  database, allocation and free-space reuse, WAL records for map changes,
-  redo, checkpoints, and AIO reads.
-- The buffer-manager hook: remap a shared page on its first
-  `MarkBufferDirty`.
-- **Exit:** with every permanent relation of a database on the block-mapped
-  store (one branch, no sharing yet), gates 1–3 match stock Postgres;
-  crash and standby tests of the map pass.
+- A block-mapped implementation (part 5): per-fork map trees, a page
+  store per database, allocation and free-space reuse, WAL, redo,
+  checkpoints, and AIO reads.
+- The `prolly` table access method: heap's implementation on block-mapped
+  storage, with its indexes and TOAST tables block-mapped too. D1's index
+  AM, which holds the name `prolly`, becomes `prolly_d1_index`.
+- No branches yet, so no sharing and no remapping.
+- **Exit:** with `default_table_access_method = prolly`, gates 1–3 match
+  stock Postgres; crash, standby and base-backup tests of the map pass.
 
-**Step 2. Branches as page sets.**
-- Branch creation copies block maps by reference; per-branch relation file
-  numbers and relation maps; `db/branch` connections open the branch's
-  relations and catalogs.
-- Freeing a branch's page set past the xmin horizon; VACUUM and freezing
-  on shared pages (visibility-neutral changes in place; line pointers made
-  unused only when no other branch shares the page); wraparound across
-  page sets.
-- `dolt_branch` and `dolt_checkout` on page sets, no commits yet.
+**Step 2. Branches: per-branch copies of prolly tables.**
+- The naming decision (part 1); copying a prolly table's catalog rows and
+  dependent objects per branch; name resolution by the session's branch;
+  the refusals in part 1.
+- Branch creation copies block maps by reference and flushes the source's
+  dirty buffers first; remapping shared pages (part 5); freeing a copy's
+  pages past the xmin horizon; VACUUM and freezing on shared pages
+  (visibility-neutral changes in place; line pointers made unused only
+  when no other branch shares the page).
+- `dolt_branch` and `dolt_checkout` on copies, no commits yet.
 - **Exit:** DDL and TRUNCATE on one branch leave the others alone
-  (`vc_schema` passes); branch creation reads no table's pages; the S
-  suite on a branch matches heap.
+  (`vc_schema` passes); normal tables are unaffected by branches; branch
+  creation reads no table's pages; the S suite on a branch matches heap.
 
 **Step 3. The chunk store, WAL-logged.**
 - The journal and its index, table files, the manifest and the refs map,
-  in each versioned database's directory under the data directory;
+  in the directory of each database with prolly tables;
   concurrent appends from backends serialized by a lock.
 - The resource manager: chunk appends, the root in the commit record,
   table files, manifests, unlinks; redo and base-backup consistency.
@@ -281,8 +308,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
   standby's store matches the primary's byte for byte.
 
 **Step 4. Dolt commits from pages.**
-- The fold: the change finder, tree edits, the canonicalizer, commit and
-  ancestry, refs and working-set roots; working-set checkpoints.
+- The fold over the branch's prolly tables: the change finder, tree
+  edits, the canonicalizer, commit and ancestry, refs and working-set roots; working-set checkpoints.
 - `dolt_commit`, `dolt_log`, `dolt_status`, `dolt_diff` and the views on
   the new store.
 - **Exit:** gate 6 (history independence) and the requirements suite's
@@ -326,3 +353,112 @@ fails without its fix), and Postgres's suites keep passing after each one.
   HOT, non-HOT and pruned pages.
 - **Two buffers for one physical page** (one per branch sharing it) cost
   cache, not correctness; measured in step 8.
+
+## 5. Step 1 design: the block-mapped storage manager
+
+### Selection
+
+- smgr already dispatches through `smgrsw[]`; `smgropen()` gains a
+  selector instead of always choosing md.c. A relation is block-mapped
+  when it is a prolly relation: a prolly table, or an index or TOAST
+  table of one. Temporary relations (a backend in the locator), shared
+  catalogs (database 0), the block map's own files and every normal
+  relation are md.c.
+- The choice is recorded in files, so it needs no catalog access and works
+  the same in backends, I/O workers, the startup process and tools: a
+  block-mapped fork has a stub file (below). A backend checks for stubs
+  only in databases that have a block map, which it learns once per
+  database.
+- Creating storage says which kind: `RelationCreateStorage` takes the
+  relation's storage kind, which the `prolly` AM sets for its tables and
+  TOAST tables, and index creation takes from the index's table.
+- Step 1 keeps prolly relations to the default tablespace (a tablespace
+  clause on one is ignored with a notice, as for D1's tables). Creating a
+  database with the `FILE_COPY` strategy copies the block map's files with
+  the rest after its checkpoint; the `WAL_LOG` strategy copies each prolly
+  relation into the new database's block map.
+
+### Files
+
+Per database, created with its first prolly relation, in its directory:
+
+| File | What | Accessed through |
+|---|---|---|
+| The page store (a reserved relation file number) | Every prolly relation's pages, at physical block numbers | md.c directly, never the buffer manager |
+| The map (another reserved number) | Metapage, free-space bitmap, and each prolly fork's map tree | The buffer manager, as an ordinary md.c relation: WAL, full-page writes and checkpoints apply unchanged |
+| `<relfilenumber>[_fork]_bm`, one per prolly relation fork | A stub: its map tree's root block. Written once when the fork is created | Files; their existence is the fork's existence |
+
+The stubs keep everything that works on files at file granularity
+(existence checks, unlink, directory scans) working, and their names
+aren't relation-file names, so tools that verify checksums skip them.
+The page store's pages carry checksums computed with their *logical*
+block numbers (the buffer manager computes and verifies them), so tools
+that verify checksums from files (`pg_checksums`, base backups) skip the
+page store too; the map relation verifies normally.
+
+### Maps
+
+- A fork's map is a radix tree of map pages, its root fixed at creation
+  (it records the fork's logical length and the tree's depth). Leaf
+  entries are (physical block, birth epoch), internal entries (map page,
+  birth epoch); about a thousand per page, so depth 2 covers 8 GB and
+  depth 3 8 TB. Growing a level copies the root's entries to a new page.
+- Epochs are unused in step 1 (no sharing); they are in the format now so
+  step 2 can decide sharing without rewriting maps.
+- Physical blocks are allocated from a free-space bitmap (the map's pages,
+  listed by its metapage), preferring free blocks, otherwise extending the
+  page store at its high-water mark. Reused blocks are zeroed before use,
+  so a crash can't expose a page's old contents at a new logical block.
+
+### WAL and crash safety
+
+The map is replicated state, identical on a primary and its standbys
+(as md.c's files are), so base backups and standbys work unchanged. Every map change is WAL-logged by our
+own resource manager, registering the map pages it changes so torn map
+pages are restored by full-page images:
+
+- **Create** a fork: its root page and stub.
+- **Extend**: allocation, leaf entries, the length, the bitmap and the
+  high-water mark, logged before the new blocks are used, so a data
+  record for a new block always follows its allocation. Redo zeroes the
+  blocks again.
+- **Truncate**: the length only, inside `RelationTruncate`'s critical
+  section with the root pinned beforehand (a new smgr callback prepares
+  truncation before the critical section). Blocks past the length are
+  reused by a later extension or freed with the fork.
+- **Drop**: after commit, the fork's map pages and blocks are freed by
+  records of their own. A crash between the commit and these records
+  leaks the blocks until reclamation (step 7) sweeps forks with no stub.
+
+Redo of `XLOG_SMGR_CREATE` and `XLOG_SMGR_TRUNCATE` finds the map already
+changed by the records above, which the primary always logs first.
+
+### I/O
+
+- Reads and writes translate logical runs to physical runs and call md.c
+  on the page store; `smgrmaxcombine` reports the physically contiguous
+  run, so the buffer manager's combined reads never cross a gap.
+- Asynchronous reads are started on the page store's md.c relation, so an
+  I/O worker reopening the target needs no map lookup.
+- Sync requests are md.c's, for the page store's segments and the map's;
+  `smgrimmedsync` syncs the page store.
+
+### Step 2's remapping rule (designed now, built then)
+
+A shared page must be copied before its first change is WAL-logged, and
+changes are WAL-logged inside critical sections, where allocating and
+logging a remap can't happen. So the remap happens when a backend takes an
+exclusive content lock (or a cleanup lock) on a buffer whose block is
+shared, before any critical section: allocate, log the remap, point the
+buffer at the new block. Redo never decides remaps; it replays them, and
+the primary's order (remap, then change) holds. Creating a branch flushes
+the source's dirty buffers first, so a shared block on disk holds the
+state both branches start from. An exclusive lock taken without a change
+copies a page needlessly, which costs space, not correctness; heap's
+opportunistic pruning skips shared pages.
+
+### Known limits after step 1
+
+- `pg_rewind` and `pg_upgrade` don't understand block-mapped databases yet.
+- Freed blocks are reused, but the page store never shrinks.
+- Map lookups cost a pinned map page or two per I/O; measured in step 8.
