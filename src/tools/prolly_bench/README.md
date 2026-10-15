@@ -163,7 +163,56 @@ the cluster in `post`.
 
 ## Tests
 
+The differential runner compares seeded transaction histories with heap:
+
+```sh
+bash src/tools/prolly_bench/build_diff.sh
+src/tools/prolly_bench/prolly_bench differential \
+  --pg-bin build-rel/inst/bin --am prolly --seeds 10 --steps 28 \
+  --self-test --out /tmp/prolly-differential
+```
+
+Each seed gets two fresh databases in an isolated local cluster, with
+durability enabled. `--am heap` validates the generator against heap on
+both sides; `prolly_d1` and the other experimental AMs use the same runner.
+The target canary checks the actual AM, and for `prolly` checks the table,
+index and TOAST block-map forks. Unsupported engines fail; they do not
+count as tested. `--self-test` proves a deliberate answer difference is
+rejected (using `prolly` as the candidate when `--am heap` is selected).
+
+Every 14 groups covers upserts, updates, deletes, nested savepoints,
+transaction aborts, DDL, expression indexes, rewrites, transactional
+truncate, vacuum/reindex, cursors, triggers, queries and NULL/empty values.
+Rows include exact numerics beyond 2^53 and large incompressible text.
+Results compare command tags, column types, SQLSTATEs, transaction state,
+row counts and ordered row digests. Only explicitly declared errors are
+allowed; matching unexpected errors on both sides fail. After each group,
+the runner compares all fixture rows and checks a sequential scan against
+a verified index scan within each target. Queries that return rows have
+defined ordering.
+
+The output directory must be new. It contains the revision, dirty flag,
+server version/settings, runner binary hash, server log, seed programs,
+result records, and a summary separating passed, failed and unexecuted
+seeds. On a failure, replay the saved program, not just the seed, so future
+generator changes cannot change the reproducer:
+
+```sh
+src/tools/prolly_bench/prolly_bench differential \
+  --pg-bin build-rel/inst/bin --am prolly \
+  --replay /tmp/prolly-differential/cases/seed-1/program.json \
+  --reduce 48 --out /tmp/prolly-replay
+```
+
+Reduction removes whole transaction groups and retains a candidate only
+when the same failure signature recurs. Setup is preserved. The original
+program remains available; `reduced.json` is a bounded reduction, not a
+guaranteed minimum. Timeouts, crashes and setup errors fail the run and
+retain the program but are not reduced. This runner is single-session SQL
+testing: concurrency, history operations, and injected crash points belong
+to separate suites.
+
 ```sh
 cd src/tools/prolly_bench && python3 -B -m unittest discover -s tests
-cd src/tools/prolly_bench/slt && go test .
+cd src/tools/prolly_bench/slt && go test ./...
 ```
