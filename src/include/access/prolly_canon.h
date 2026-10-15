@@ -1,0 +1,60 @@
+/*-------------------------------------------------------------------------
+ *
+ * prolly_canon.h
+ *	  Canonicalizer interface: a working set's canonical form.
+ *
+ * A version-control commit's root hash must depend only on the logical
+ * content (schema and data) of what it commits, never on how it was
+ * produced: not on OIDs, relfilenumbers, the order objects were created
+ * in, which columns were dropped or added with defaults, or the session's
+ * settings.  The canonicalizer derives that form from the database's
+ * catalogs and a working set, by name, sharing the working set's data
+ * trees (which are canonical as written).
+ *
+ * Contract:
+ * - prepare() makes every table's rows canonical, as writes of the current
+ *   transaction: rows stored before a column was dropped, or added with a
+ *   default, are rewritten.  The caller then takes the working set the
+ *   transaction will commit (the engine's pending_root).
+ * - canonical_root() builds the canonical root of a working set: the same
+ *   for the same logical content in any database or cluster.  An object
+ *   it doesn't cover yet is an error, never a hash that might depend on
+ *   history.
+ * - walk() visits every node a canonical root keeps alive, for
+ *   reclamation.
+ *
+ * Provisional (v0).
+ *
+ * src/include/access/prolly_canon.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PROLLY_CANON_H
+#define PROLLY_CANON_H
+
+#include "access/prolly_registry.h"
+#include "access/prolly_tree.h"
+#include "access/prolly_types.h"
+
+typedef struct ProllyCanonRoutine
+{
+	ProllyImplInfo info;
+
+	void		(*prepare) (void);
+	void		(*canonical_root) (const ProllyNodeRef *working_set,
+								   ProllyNodeRef *root);
+	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
+						 void *arg);
+} ProllyCanonRoutine;
+
+#define PROLLY_CANON_CALLBACK_NAMES "prepare", "canonical_root", "walk"
+#define PROLLY_CANON_FIRST_CALLBACK prepare
+
+static inline const ProllyCanonRoutine *
+prolly_canon_lookup(const char *name)
+{
+	return (const ProllyCanonRoutine *)
+		prolly_get_impl(PROLLY_IFACE_CANONICALIZER, name);
+}
+
+#endif							/* PROLLY_CANON_H */

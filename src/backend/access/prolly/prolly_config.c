@@ -82,6 +82,7 @@ static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "tree",
 	[PROLLY_IFACE_TRANSFER] = "stub",
 	[PROLLY_IFACE_DIFF_MERGE] = "rows",
+	[PROLLY_IFACE_CANONICALIZER] = "catalogs",
 };
 
 static const ProllyImplInfo *
@@ -226,4 +227,6 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(database_profile, PROLLY_IFACE_TRANSFER);
 	components->diff_merge = (const ProllyMergeRoutine *)
 		profile_impl(database_profile, PROLLY_IFACE_DIFF_MERGE);
+	components->canonicalizer = (const ProllyCanonRoutine *)
+		profile_impl(database_profile, PROLLY_IFACE_CANONICALIZER);
 }

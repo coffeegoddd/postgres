@@ -22,7 +22,8 @@
  *	"author"	-> the author
  *	"message"	-> the message
  *	"parents"	-> the parents' ids, each a length byte and the hash
- *	"root"		-> the commit's root hash (length byte, hash)
+ *	"root"		-> the commit's canonical root hash (length byte, hash),
+ *				   which the canonicalizer derives from the working set
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
  * The branch "main" (PROLLY_MAIN_BRANCH) exists from the start, without an
@@ -701,11 +702,15 @@ record_commit(const char *name, ProllyBranchId branch, const char *message,
 			  const ProllyNodeRef *wr, ProllyHash *commit_id)
 {
 	ProllyHash	local = wr->hash;
-	ProllyHash	canonical = local;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef canonical;
 	StringInfoData key;
 	StringInfoData v;
 
-	write_commit(&canonical, parents, nparents,
+	/* The commit's root: the working set's canonical form. */
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, canonical_root, wr, &canonical);
+	write_commit(&canonical.hash, parents, nparents,
 				 GetUserNameFromId(GetUserId(), false), message,
 				 GetCurrentTransactionStartTimestamp(), commit_id);
 
@@ -738,9 +743,19 @@ tree_commit(const char *message, ProllyHash *commit_id)
 	if (!branch_get(name, &id, &head))
 		memset(&head, 0, sizeof(head));
 
-	/* The branch's working set, as committed so far. */
-	if (!working_root(branch, &wr))
-		PROLLY_CALL(comps.root_layout, empty, &root_env, &wr);
+	/*
+	 * The branch's working set, with every table's rows made canonical:
+	 * holding the branch's commit lock, the working set this transaction
+	 * commits is the one recorded.
+	 */
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		PROLLY_CALL(comps.commit, branch_lock, branch);
+		PROLLY_CALL(dc.canonicalizer, prepare);
+		PROLLY_CALL(comps.engine, pending_root, &wr);
+	}
 	record_commit(name, branch, message, &head, head.len > 0 ? 1 : 0, &wr,
 				  commit_id);
 }
@@ -877,10 +892,12 @@ tree_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		{
 			ProllyHash	r;
 			ProllyNodeRef rref;
+			ProllyDatabaseComponents dc;
 
 			(void) get_hash(rv.data, rv.data + rv.len, &r);
 			ref_of(&r, &rref);
-			PROLLY_CALL(comps.root_layout, walk, &root_env, &rref, visit, arg);
+			prolly_database_components(&dc);
+			PROLLY_CALL(dc.canonicalizer, walk, &rref, visit, arg);
 		}
 		pfree(rv.data);
 		ref_of(&pair[1], &ref);

@@ -14,6 +14,8 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	alloc_stub.o \
+	canon_catalogs.o \
+	canon_stub.o \
 	chunker_keyhash.o \
 	chunker_stub.o \
 	commit_serial.o \

@@ -511,9 +511,13 @@ rows_merge(const char *branch, ProllyHash *commit_id)
 		}
 		table_close(rel, NoLock);
 	}
-	PopActiveSnapshot();
 
-	/* The merge commit: both heads, and the working set this commits. */
+	/*
+	 * The merge commit: both heads, and the working set this commits, its
+	 * tables' rows made canonical first.
+	 */
+	PROLLY_CALL(dc.canonicalizer, prepare);
+	PopActiveSnapshot();
 	PROLLY_CALL(c.engine, pending_root, &merged);
 	parents[0] = ours_c;
 	parents[1] = theirs_c;
