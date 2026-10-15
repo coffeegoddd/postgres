@@ -252,6 +252,20 @@ catalog_update(Relation heapRel, const ItemPointerData *otid, HeapTuple tup,
 }
 
 /*
+ * Done writing wtup, the row written for the caller's tup: the caller sees
+ * where it went, and a replacement row is freed.
+ */
+static void
+catalog_row_written(HeapTuple tup, HeapTuple wtup)
+{
+	if (wtup != tup)
+	{
+		tup->t_self = wtup->t_self;
+		heap_freetuple(wtup);
+	}
+}
+
+/*
  * CatalogTupleInsert - do heap and indexing work for a new catalog tuple
  *
  * Insert the tuple data in "tup" into the specified catalog relation.
@@ -266,16 +280,17 @@ void
 CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
+	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
-	catalog_row_set_branch(heapRel, tup);
-	CatalogTupleCheckConstraints(heapRel, tup);
+	CatalogTupleCheckConstraints(heapRel, wtup);
 
 	indstate = CatalogOpenIndexes(heapRel);
 
-	catalog_insert(heapRel, tup);
+	catalog_insert(heapRel, wtup);
 
-	CatalogIndexInsert(indstate, tup, TU_All);
+	CatalogIndexInsert(indstate, wtup, TU_All);
 	CatalogCloseIndexes(indstate);
+	catalog_row_written(tup, wtup);
 }
 
 /*
@@ -290,12 +305,14 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
-	catalog_row_set_branch(heapRel, tup);
-	CatalogTupleCheckConstraints(heapRel, tup);
+	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
-	catalog_insert(heapRel, tup);
+	CatalogTupleCheckConstraints(heapRel, wtup);
 
-	CatalogIndexInsert(indstate, tup, TU_All);
+	catalog_insert(heapRel, wtup);
+
+	CatalogIndexInsert(indstate, wtup, TU_All);
+	catalog_row_written(tup, wtup);
 }
 
 /*
@@ -353,16 +370,17 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
+	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
-	catalog_row_set_branch(heapRel, tup);
-	CatalogTupleCheckConstraints(heapRel, tup);
+	CatalogTupleCheckConstraints(heapRel, wtup);
 
 	indstate = CatalogOpenIndexes(heapRel);
 
-	catalog_update(heapRel, otid, tup, &updateIndexes);
+	catalog_update(heapRel, otid, wtup, &updateIndexes);
 
-	CatalogIndexInsert(indstate, tup, updateIndexes);
+	CatalogIndexInsert(indstate, wtup, updateIndexes);
 	CatalogCloseIndexes(indstate);
+	catalog_row_written(tup, wtup);
 }
 
 /*
@@ -378,13 +396,14 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 						   CatalogIndexState indstate)
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
+	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
-	catalog_row_set_branch(heapRel, tup);
-	CatalogTupleCheckConstraints(heapRel, tup);
+	CatalogTupleCheckConstraints(heapRel, wtup);
 
-	catalog_update(heapRel, otid, tup, &updateIndexes);
+	catalog_update(heapRel, otid, wtup, &updateIndexes);
 
-	CatalogIndexInsert(indstate, tup, updateIndexes);
+	CatalogIndexInsert(indstate, wtup, updateIndexes);
+	catalog_row_written(tup, wtup);
 }
 
 /*

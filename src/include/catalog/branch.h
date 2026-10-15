@@ -32,8 +32,11 @@ extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
 
-/* set a row's branch column before it is written */
-extern void catalog_row_set_branch(Relation rel, HeapTuple tup);
+/*
+ * The row to write for tup: tup itself with its branch column set, or, if
+ * the column is null, a new row with it set, which the caller frees.
+ */
+extern HeapTuple catalog_row_with_branch(Relation rel, HeapTuple tup);
 extern void catalog_slot_set_branch(Relation rel, TupleTableSlot *slot);
 
 #endif							/* CATALOG_BRANCH_H */
