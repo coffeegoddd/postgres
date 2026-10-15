@@ -30,6 +30,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Branch copies' OIDs (2026-10-16) | Decided by the user: a branch's copy of a versioned object keeps its source's OIDs; catalog rows carry a branch, and a backend sees one branch (`11-pages-and-dolt-snapshots.md`, part 1) |
 | What is versioned (2026-10-16) | Decided by the user: versioned schemas (`CREATE SCHEMA … VERSIONED`), every object in them per branch, Doltgres's scope; prolly tables only there; dependencies only from versioned objects to shared ones (`11-pages-and-dolt-snapshots.md`, part 1) |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
+| SQL correctness suite (C) | Decided by the user 2026-10-15: sqllogictest from `prolly_bench`, judged by agreement with heap; `prolly` runs it in a versioned schema; engines heap and `prolly` (`12-correctness-suite.md`, gate 8) |
 
 ## Questions
 
