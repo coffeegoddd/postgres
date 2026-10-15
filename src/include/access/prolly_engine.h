@@ -122,6 +122,15 @@ typedef struct ProllyEngineRoutine
 	 */
 	bool		(*cursor_can_seek) (ProllyCursor *cursor);
 
+	/*
+	 * The transactions that committed changes to tree's data (or index)
+	 * tree that an MVCC snapshot doesn't see, for SERIALIZABLE: a reader
+	 * with that snapshot has a read/write conflict with each.  Sets
+	 * *xids to a palloc'd array; returns how many.
+	 */
+	int			(*unseen_writers) (Relation tree, Snapshot snapshot,
+								   TransactionId **xids);
+
 	/* Look up key as a cursor would see it; on success append its value. */
 	bool		(*get) (ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 						const ProllyKey *key, CommandId cid, StringInfo value);
@@ -220,7 +229,7 @@ typedef struct ProllyEngineRoutine
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
 	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
-	"cursor_next", "cursor_close", "cursor_can_seek", "get", "has_writes", "key_at", "count_range", \
+	"cursor_next", "cursor_close", "cursor_can_seek", "unseen_writers", "get", "has_writes", "key_at", "count_range", \
 	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
 	"xact_prepare", "commit_prepared", "checkpoint", "install_root", "vacuum", \

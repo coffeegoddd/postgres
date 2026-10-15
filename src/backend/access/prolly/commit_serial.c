@@ -972,6 +972,92 @@ serial_snapshot_head(ProllyBranchId branch, Snapshot snapshot,
 	return false;				/* keep compiler quiet */
 }
 
+/*
+ * The branch's commits that a snapshot may tell apart, oldest first: its
+ * history, its head, then roots enqueued by transactions that committed
+ * (not settled yet).  Caller holds ProllyHeadsLock; *n counts them.
+ */
+static ProllyBranchCommit *
+branch_commits(SerialShared *s, ProllyBranchId branch, int *n)
+{
+	ProllyBranchCommit *all = palloc(sizeof(ProllyBranchCommit) *
+									 (s->nhistory + 1 + s->npending));
+	HeadEntry  *h = find_head(s, MyDatabaseId, branch);
+
+	*n = 0;
+	for (int i = 0; i < s->nhistory; i++)
+	{
+		HistoryEntry *e = &s->history[i];
+		ProllyBranchCommit *c;
+
+		if (e->dboid != MyDatabaseId || e->branch != branch)
+			continue;
+		c = &all[(*n)++];
+		c->xid = e->xid;
+		c->has_root = e->has_root;
+		if (e->has_root)
+			root_ref(&e->root, &c->root);
+	}
+	if (h != NULL)
+	{
+		ProllyBranchCommit *c = &all[(*n)++];
+
+		c->xid = s->head_xids[h - s->heads];
+		c->has_root = true;
+		root_ref(&h->root, &c->root);
+	}
+	for (int i = 0; i < s->npending; i++)
+	{
+		PendingEntry *p = &s->pending[i];
+		ProllyBranchCommit *c;
+
+		if (p->dboid != MyDatabaseId || p->branch != branch ||
+			!TransactionIdDidCommit(p->xid))
+			continue;
+		c = &all[(*n)++];
+		c->xid = p->xid;
+		c->has_root = true;
+		root_ref(&p->root, &c->root);
+	}
+	return all;
+}
+
+static int
+serial_commits_since(ProllyBranchId branch, Snapshot snapshot,
+					 ProllyBranchCommit **commits)
+{
+	SerialShared *s = get_shared();
+	ProllyBranchCommit *all;
+	int			n;
+	int			seen = -1;
+
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC)
+		elog(ERROR, "prolly commits_since needs an MVCC snapshot");
+	LWLockAcquire(ProllyHeadsLock, LW_SHARED);
+	all = branch_commits(s, branch, &n);
+	LWLockRelease(ProllyHeadsLock);
+
+	/* Commits end in order, so the snapshot sees a prefix of them. */
+	for (int i = n - 1; i >= 0 && seen < 0; i--)
+	{
+		if (seen_committed(all[i].xid, snapshot))
+			seen = i;
+	}
+	if (n == 0)
+	{
+		*commits = all;
+		return 0;
+	}
+	if (seen < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("snapshot too old"),
+				 errdetail("The prolly root this snapshot sees was given up to make room for newer ones.")));
+	memmove(all, all + seen, sizeof(ProllyBranchCommit) * (n - seen));
+	*commits = all;
+	return n - seen;
+}
+
 static void finish_ticket(ProllyCommitTicket ticket, bool committed);
 
 static void
@@ -1171,6 +1257,7 @@ const ProllyCommitRoutine prolly_commit_serial = {
 	.abandon = serial_abandon,
 	.head = serial_head,
 	.snapshot_head = serial_snapshot_head,
+	.commits_since = serial_commits_since,
 	.copy_database = serial_copy_database,
 	.drop_database = serial_drop_database,
 	.usage = serial_usage,

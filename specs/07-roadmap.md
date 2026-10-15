@@ -592,6 +592,30 @@ don't spill; versions saved when a write set is emptied (TRUNCATE in a
 transaction) stay in memory; spill and prepared trees are garbage once
 their transaction ends, for reclamation (4f) to free.
 
+**Status (2026-10-14): 4e.5 built; 4e is done.** SERIALIZABLE works on
+prolly tables, at table granularity: a read records a predicate lock on
+the whole relation (K1's `predicate_lock_range`), a write checks for
+others' read locks on it, and a reader finds its conflicts with the
+writers it doesn't see, as heap finds them per tuple from xmin and xmax:
+those still running (coordination's new `current_writers`, from the
+table's write locks) and those that committed after its snapshot (the
+engine's new `unseen_writers`, from the commit pipeline's new
+`commits_since`: the commits the snapshot doesn't see whose roots changed
+the table's tree). Coarser than heap, so more transactions fail to
+serialize, never fewer; key-range predicate locks are later work
+(`02-postgres-integration.md`, A4). Temporary and unlogged tables get heap
+when a prolly access method is the default (question 28); an explicit
+`USING prolly` on one is refused, and a concurrent refresh of a prolly
+materialized view builds its temporary diff table on heap. The isolation
+stalls of the single writer went with K1 (4e.3), and TIDs were already
+reserved per backend (1,024 at a time, 4d.2). Tests:
+`015_d1_serializable.pl` (write skew in the three orders reads and writes
+can come in, two of which fail without the conflict-out checks;
+transactions on different tables commit; temporary and unlogged tables;
+the concurrent refresh). The requirements suite's isolation group now
+passes in full, and its semantics group fails only on values larger than
+a node (4f).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

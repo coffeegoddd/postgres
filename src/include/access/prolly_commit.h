@@ -37,6 +37,10 @@
  *   was built on it.
  * - head() returns the published head, without the branch lock; false if
  *   the branch has never had a root.
+ * - commits_since() returns, oldest first, the commit an MVCC snapshot sees
+ *   (what snapshot_head() returns, as element 0) and then every commit to
+ *   the branch since that the snapshot doesn't see (SERIALIZABLE finds the
+ *   writes a reader missed from them), in a palloc'd array; it counts them.
  * - snapshot_head() returns the root of the newest commit to the branch
  *   that an MVCC snapshot sees as committed, as heap tuples' visibility
  *   follows xids: a root enqueued by a transaction the snapshot sees as
@@ -78,6 +82,14 @@
 
 typedef uint64 ProllyCommitTicket;
 
+/* A commit to a branch: the transaction, and the root it made. */
+typedef struct ProllyBranchCommit
+{
+	TransactionId xid;			/* invalid: seen by every snapshot */
+	bool		has_root;		/* false: the branch had no root yet */
+	ProllyNodeRef root;
+} ProllyBranchCommit;
+
 typedef struct ProllyCommitRoutine
 {
 	ProllyImplInfo info;
@@ -98,6 +110,8 @@ typedef struct ProllyCommitRoutine
 	bool		(*head) (ProllyBranchId branch, ProllyNodeRef *root);
 	bool		(*snapshot_head) (ProllyBranchId branch, Snapshot snapshot,
 								  ProllyNodeRef *root);
+	int			(*commits_since) (ProllyBranchId branch, Snapshot snapshot,
+								  ProllyBranchCommit **commits);
 
 	/* Databases. */
 	void		(*copy_database) (Oid src_dboid, Oid dst_dboid);
@@ -112,6 +126,7 @@ typedef struct ProllyCommitRoutine
 #define PROLLY_COMMIT_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "branch_lock", "tip", "enqueue", \
 	"branch_unlock", "publish", "abandon", "head", "snapshot_head", \
+	"commits_since", \
 	"copy_database", \
 	"drop_database", "usage", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size

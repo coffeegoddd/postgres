@@ -47,6 +47,7 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -247,6 +248,47 @@ k1_writer_of(Relation tree, const ProllyKey *key)
 	return holder(&tag, RowShareLock);
 }
 
+/* Holders of the table's write intents or whole-table write locks. */
+static int
+k1_current_writers(Relation tree, TransactionId *xids, int max)
+{
+	LOCKTAG		tag;
+	VirtualTransactionId *holders;
+	int			n = 0;
+
+	table_tag(&tag, tree);
+	holders = GetLockConflicts(&tag, ShareLock, NULL);
+	for (int i = 0; VirtualTransactionIdIsValid(holders[i]); i++)
+	{
+		TransactionId xid;
+		TransactionId xmin;
+		int			nsubxid;
+		bool		overflowed;
+
+		ProcNumberGetTransactionIds(holders[i].procNumber, &xid, &xmin,
+									&nsubxid, &overflowed);
+		if (!TransactionIdIsValid(xid))
+			continue;
+		if (n < max)
+			xids[n] = xid;
+		n++;
+	}
+	return n;
+}
+
+/*
+ * SSI at table granularity: a read of any range of a tree locks the whole
+ * relation in predicate.c, as Postgres does once a relation has too many
+ * finer locks.  More transactions fail to serialize than on heap, never
+ * fewer.
+ */
+static void
+k1_predicate_lock_range(Relation tree, Snapshot snapshot, const ProllyKey *lo,
+						const ProllyKey *hi)
+{
+	PredicateLockRelation(tree, snapshot);
+}
+
 /* The lock manager releases everything at the end of the (sub)transaction. */
 static void
 k1_xact_end(void)
@@ -270,6 +312,8 @@ const ProllyCoordRoutine prolly_coord_k1 = {
 	.insert_intent = k1_insert_intent,
 	.insert_intent_complete = k1_insert_intent_complete,
 	.writer_of = k1_writer_of,
+	.current_writers = k1_current_writers,
+	.predicate_lock_range = k1_predicate_lock_range,
 	.xact_commit = k1_xact_end,
 	.xact_abort = k1_xact_end,
 	.subxact_abort = k1_subxact_abort,

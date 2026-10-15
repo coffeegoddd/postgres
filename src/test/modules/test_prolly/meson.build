@@ -54,6 +54,7 @@ tests += {
       't/012_d1_snapshots.pl',
       't/013_d1_row_locks.pl',
       't/014_d1_spill.pl',
+      't/015_d1_serializable.pl',
     ],
   },
 }

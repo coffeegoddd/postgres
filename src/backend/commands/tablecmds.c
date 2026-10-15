@@ -35,6 +35,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
+#include "access/prolly_config.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_collation.h"
@@ -1073,6 +1074,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
+	accessMethodId = prolly_table_am_for_persistence(accessMethodId,
+													 stmt->relation->relpersistence,
+													 stmt->accessMethod != NULL);
 
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
