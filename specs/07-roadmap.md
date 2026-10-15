@@ -146,7 +146,7 @@ Order of work within the step:
 | 4c | D1 tree operations |
 | 4d | Table and index AM wiring, single writer per table |
 | 4e | Concurrency: root-carrying snapshots first (B1, B2: every scan of a snapshot reads the same root set); K1 row-level locks replacing single_writer, so writers to different rows of one table run concurrently, as on heap; a commit pipeline that materializes changed trees before taking the branch's commit lock and, under it, replays the transaction's write set onto a newer head (row locks keep concurrent writers off each other's rows, so replay needs no merge); bounded transaction memory: write sets flushed to intermediate trees, with savepoint roots, their edits recovered at replay by tree diff (question 47); tree diff that skips unchanged internal subtrees, not only leaves (needed by replay; also status, diff, merge and transfer); engine counters of nodes read and written, so tests can check complexity bounds (gate 7); TID counter ranges per backend already, per node if nodes share storage (question 37) |
-| 4f | Checkpoint, recovery, reclamation, and large values: out-of-line value trees whose references the node format exposes to walk, reclamation and transfer (question 48); reclamation from the full set of live roots (question 49), including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
+| 4f | Checkpoint, recovery, reclamation, and large values: out-of-line value trees (bytes split by a rolling hash) whose references the node format exposes to walk, reclamation and transfer (question 48); reclamation from the full set of live roots (question 49), including TID reuse after VACUUM and gone versions' rows (questions 37, 40) |
 | 4g | V1–V3 and versioned catalogs: first, the canonical format freeze (provisional until every engine implementation has been evaluated: step 5 and later may still change it; a chunk rule independent of `BLCKSZ` with size targets set by measurement, question 45; portable codecs or refusal for `reg*` and extension types, question 35; collation versions, question 46); then catalogs as prolly tables, the canonicalizer, the working-set/staged/commit model, refs and bootstrap, and three-way merge that reuses unchanged subtrees |
 | 4h | S and V suites and correctness gates, including the history-independence gate |
 
@@ -473,9 +473,11 @@ suite (`src/test/prolly`) passes against it, and the correctness gates in
 - Run the full B0 baseline (deferred from step 3) and both suites against
   D1+K1, on the same machine, in benchmark mode, with the same configuration.
 - Collect profiles (`perf`) for the workloads where D1+K1 differs most from B0.
-- Settle the chunk rule (question 3). The 4g freeze doesn't bind it yet:
-  the format stays provisional until every engine implementation has been
-  evaluated (user, 2026-10-14).
+- Settle the chunk rule and how chunks sit in pages (questions 3 and 45).
+  The 4g freeze doesn't bind either yet: the format stays provisional until
+  every engine implementation has been evaluated (user, 2026-10-14). The
+  plan (user, 2026-10-14): Dolt's chunking rules decide what a chunk is,
+  and Postgres's page machinery decides where it lives.
   - **Why:** the starting chunker (`keyhash`) aims at about 31 items per
     leaf whatever their size. In 4e.1 the node counters showed what that
     costs: narrow items leave pages mostly empty. A 20,000-row scan of an
@@ -483,25 +485,63 @@ suite (`src/test/prolly`) passes against it, and the correctness gates in
     leaves at about 3 KB each, and 655 row-identity-map leaves at about
     800 bytes each, in 8 KB pages. Filled by bytes to about 4 KB, it would
     read about 600.
-  - **Candidate:** a second chunker implementation, `keyhash_weibull`,
-    shaped like Dolt's default `keySplitter`. The boundary hash stays on the
-    key alone and is seeded by level. The chance of a boundary rises with
-    the bytes since the last one, following a Weibull curve (K = 4). The
-    format fixes its own minimum and maximum, independent of `BLCKSZ`
-    (question 45), with the maximum fitting an 8 KiB page.
-  - **Measure, for `keyhash` and `keyhash_weibull` at a few scales (4, 5
-    and 6 KiB):**
-    - Node fill, per tree kind (data, row-identity map, prolly indexes,
-      catalogs).
-    - Nodes read by scans, lookups and diffs.
+  - **A chunk is canonical; a page is storage.** Boundaries count canonical
+    bytes (encoded keys and values), never on-page bytes (line pointers,
+    alignment, page headers, the cached hash), so a physical layout change
+    can't change a hash. The minimum (about 512 bytes) and the maximum
+    (a fixed constant, about 7.5 KB, that fits an 8 KB page after its
+    overhead) are format constants, never derived from `BLCKSZ`. Prolly
+    tables require `BLCKSZ` of at least 8192, so a canonical chunk always
+    fits one block (question 45).
+  - **Tree nodes: `keyhash_weibull`,** a second chunker implementation,
+    shaped like Dolt's default `keySplitter`. The boundary hash covers the
+    key alone, salted by level; it is separate from the content hash, fast
+    and fully specified (xxh3, or the current FNV-1a with splitmix), since
+    it is frozen into the format. The chance of a boundary rises with the
+    canonical bytes since the last one, following a Weibull curve (K = 4).
+    At a 4 KB scale a node reaches the maximum about once in 10^5, so the
+    forced split is rare, and deterministic and the same on every build.
+  - **Value bytes: a rolling hash.** Out-of-line values (4f) are split by
+    a buzhash rolling hash over their bytes, as Dolt splits blobs; with
+    them out of line, tree items stay small and the Weibull rule decides
+    nearly every boundary (question 48).
+  - **Pages hold several chunks: a packing node store,** a new
+    implementation behind the node store interface. It appends a commit's
+    new chunks to pages, never splitting a chunk across pages, and seals
+    each page: written once, logged once as a new page, so checkpoints
+    never force another full-page image, and checksums and torn-page
+    protection work as for any page. A reference is (block, offset,
+    length), which the extent type already allows; a chunk stays within
+    one page, so items are still read in place from a pinned buffer.
+    Readers of published chunks need only a pin. The cost is the unused
+    tail of each commit's last page; if small commits make that matter, a
+    per-backend tail page takes appends logged as small chunk records.
+    Reclamation leaves holes in packed pages; the hash -> location map
+    stays, so compaction moves live chunks to new pages and updates only
+    the map, never their parents.
+  - **Locks are never keyed on nodes.** Row locks (K1) and SSI predicate
+    locks are keyed on rows and key ranges, so a boundary that moves when
+    a value changes size can't cause false conflicts or miss real ones.
+    That removes question 3's reason for key-only, item-count boundaries
+    (`02-postgres-integration.md`, A4).
+  - **Measure,** for `keyhash` and `keyhash_weibull` at 4, 5 and 6 KB
+    scales, each with one chunk per page and with the packing store:
+    - Node fill and page fill, per tree kind (data, row-identity map,
+      prolly indexes, catalogs), from the node counters and a walk of
+      page occupancy.
+    - Nodes and pages read by scans, lookups and diffs.
     - Nodes written by a value update that keeps its size, by one that
-      changes its size (byte-weighted boundaries can move for these, and
-      settle again after about a node), and by inserts and deletes.
-    - Store size and WAL volume.
-    - How often K2 lock entries and SSI page mappings move when values
-      change size (question 3's reason for key-only boundaries).
-  - **Decide:** the rule and its scale, recorded in question 3, with the
-    chunker interface keeping both implementations swappable.
+      changes its size (byte-weighted boundaries can move; the trees
+      should agree again within about a node), and by inserts and
+      deletes.
+    - Store size, WAL volume, and shared-buffer hit rates.
+  - **Prove** that the rule is history-independent: a property test builds
+    the same content through different orders of inserts and deletes, on
+    builds with different `BLCKSZ` (8 and 16 KB), and gets the same root
+    hash.
+  - **Decide:** the rule, its scale and the store, recorded in questions 3
+    and 45, with the chunker and node store interfaces keeping every
+    implementation swappable.
 
 **Exit criteria:** S results side by side with B0 (normalized to B0 = 1.0), V
 results, gate status, profiles; stored under `specs/results/`.

@@ -76,12 +76,18 @@ in each record (`src/include/access/prolly_xlog.h`).
   (`src/backend/storage/lmgr/lmgr.c`). The coordination state only records
   *which* xid to wait on, so deadlock detection is unchanged.
 - Multiple lockers via multixacts, as heap's `xmax` does.
-- SSI (`src/backend/storage/lmgr/predicate.c`): map tree ranges onto
-  predicate.c's vocabulary. Leaves get stable synthetic block numbers (keyed
-  by key range, not node identity) → `PredicateLockPage`; keys →
-  `PredicateLockTID`; splits/merges → `PredicateLockPageSplit/Combine`; writes
-  → `CheckForSerializableConflictIn`; reads that skip an invisible newer
-  version → `CheckForSerializableConflictOut`.
+- SSI (`src/backend/storage/lmgr/predicate.c`): map key ranges onto
+  predicate.c's vocabulary. Locks are never keyed on tree nodes or pages
+  (user, 2026-10-14): node boundaries can move when a value changes size,
+  and locks that followed them would conflict falsely or miss conflicts.
+  Key ranges get stable synthetic block numbers from a partition of the key
+  space that depends on keys alone (a boundary where a key's hash falls
+  below a fixed threshold, whatever the values) → `PredicateLockPage`; keys
+  → `PredicateLockTID`; a range boundary key inserted or deleted →
+  `PredicateLockPageSplit/Combine`; writes → `CheckForSerializableConflictIn`;
+  reads that skip an invisible newer version →
+  `CheckForSerializableConflictOut`. Row locks are keyed on rows the same
+  way.
 
 ### A5. Shared memory and lifecycle
 

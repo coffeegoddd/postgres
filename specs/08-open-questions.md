@@ -12,7 +12,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | First engine and its version-control scope (13, 14) | Decided by the user 2026-10-13: D1+K1, V1–V3 |
 | Row identity (2) | Decided for the first engine 2026-10-13: synthetic TIDs with a map |
 | Node store (1) | Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints. Built (step 4b). 28–30 open |
-| Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); sizes still to be measured |
+| Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); direction for the chunk rule and page packing set (user, 2026-10-14), settled by measurement in step 5 |
 | Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
 | Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
 | Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
@@ -72,6 +72,14 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    key-only chunker (`keyhash_weibull`, as Dolt's default) measured
    against `keyhash`; what is measured is listed in `07-roadmap.md`,
    step 5.
+   **Direction (user, 2026-10-14):** Dolt's rules decide what a chunk is,
+   Postgres's pages where it lives. Tree boundaries by `keyhash_weibull`
+   (key-only hash, Weibull on canonical bytes, minimum and maximum fixed by
+   the format); value bytes by a rolling hash (question 48); chunks packed
+   into write-once pages (question 45). Locks and SSI predicates are keyed
+   on rows and key ranges, never nodes (`02-postgres-integration.md`, A4),
+   so boundaries may move with value sizes without disturbing them, which
+   removes the reason for key-only, item-count boundaries.
 4. **Canonical format.** Our own Postgres-native format (node layout, key and
    value encoding, content hash), or Dolt byte compatibility for DoltHub
    interop? Dolt compatibility would constrain nearly every foundation choice,
@@ -427,6 +435,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     whose page can't hold a canonical chunk stores it in more than one
     block. Alternative: require `BLCKSZ` = 8192 for prolly databases. To
     settle with the format freeze (4g).
+    **Direction (user, 2026-10-14), settled in step 5:** the chunk rule's
+    limits are format constants, the maximum about 7.5 KB so a chunk fits
+    an 8 KB page after its overhead; prolly tables require `BLCKSZ` of at
+    least 8192, so a canonical chunk always fits one block and no engine
+    needs chunks spanning blocks. Chunks are packed into pages by a
+    packing node store (several chunks per page, written once and sealed;
+    references are block, offset and length; compaction moves chunks and
+    updates the hash -> location map), measured against one chunk per page
+    (`07-roadmap.md`, step 5).
 46. **Collation versions in canonical form.** Keys ordered by a collation
     (the key encoder's comparator fallback) are in an order that can change
     with the collation library's version, so two clusters can order the
@@ -453,7 +470,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     same root, as Dolt's blobs, reusing Postgres's compression methods; the
     node format records where a value refers to another tree, so walk,
     reclamation and transfer find every reference. Without that contract a
-    value tree would be invisible to GC and to push.
+    value tree would be invisible to GC and to push. A value's bytes are
+    split by a rolling hash (buzhash) over the bytes, as Dolt's blobs are:
+    there are no keys to hash (user, 2026-10-14; the chunk rule is settled
+    in step 5).
 49. **What reclamation must keep.** Reachability from branch heads alone
     isn't enough.
     **Recommended (2026-10-14), for 4f:** the live roots are every
