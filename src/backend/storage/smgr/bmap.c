@@ -2059,6 +2059,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	if (count == 0)
 	{
 		xl_bmap_unref xlrec;
+		RefsPages	norefs;
 
 		/* no other map holds it: claim it */
 		ent->block = old_block;
@@ -2067,18 +2068,12 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
 				   MAP_PAGE(blkno));
 
+		/* its count is zero already: only the map page changes */
+		norefs.n = 0;
 		xlrec.locator = rel;
 		xlrec.flags = BMAP_UNREF_MAP;
-		START_CRIT_SECTION();
-		apply_node_delta(BufferGetPage(mapbuf), ndelta);
-		MarkBufferDirty(mapbuf);
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
-		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
-		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
-		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
-		PageSetLSN(BufferGetPage(mapbuf), lsn);
-		END_CRIT_SECTION();
+		log_refs_record(XLOG_BMAP_UNREF, &xlrec, sizeof(xlrec),
+						mapbuf, ndelta, 0, &norefs);
 	}
 	else
 	{
