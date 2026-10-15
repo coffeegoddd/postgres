@@ -764,6 +764,9 @@ statatt_init_empty_tuple(Oid reloid, int16 attnum, bool inherited,
 	nulls[Anum_pg_statistic_stawidth - 1] = false;
 	values[Anum_pg_statistic_stadistinct - 1] = DEFAULT_STATATT_N_DISTINCT;
 	nulls[Anum_pg_statistic_stadistinct - 1] = false;
+	/* writing a pg_statistic row sets its branch; a stxdexpr element has none */
+	values[Anum_pg_statistic_stabranch - 1] = ObjectIdGetDatum(InvalidOid);
+	nulls[Anum_pg_statistic_stabranch - 1] = false;
 
 	/* initialize stakind, staop, and stacoll slots */
 	for (int slotnum = 0; slotnum < STATISTIC_NUM_SLOTS; slotnum++)

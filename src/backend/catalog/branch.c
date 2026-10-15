@@ -33,6 +33,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_conversion.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_enum.h"
@@ -96,6 +97,7 @@ static const CatalogBranchInfo branch_catalogs[] = {
 	{TSParserRelationId, offsetof(FormData_pg_ts_parser, prsbranch), Anum_pg_ts_parser_prsbranch},
 	{TSTemplateRelationId, offsetof(FormData_pg_ts_template, tmplbranch), Anum_pg_ts_template_tmplbranch},
 	{SecLabelRelationId, offsetof(FormData_pg_seclabel, objbranch), Anum_pg_seclabel_objbranch},
+	{DefaultAclRelationId, offsetof(FormData_pg_default_acl, defaclbranch), Anum_pg_default_acl_defaclbranch},
 };
 
 const CatalogBranchInfo *
@@ -128,14 +130,14 @@ row_branch(Relation rel, HeapTuple tup)
 	return InvalidOid;
 }
 
-void
-catalog_row_set_branch(Relation rel, HeapTuple tup)
+HeapTuple
+catalog_row_with_branch(Relation rel, HeapTuple tup)
 {
 	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
 	Oid			branch;
 
 	if (info == NULL)
-		return;
+		return tup;
 	branch = row_branch(rel, tup);
 
 	/*
@@ -147,15 +149,12 @@ catalog_row_set_branch(Relation rel, HeapTuple tup)
 		Datum		value = ObjectIdGetDatum(branch);
 		bool		isnull = false;
 		int			attnum = info->attnum;
-		HeapTuple	newtup;
 
-		newtup = heap_modify_tuple_by_cols(tup, RelationGetDescr(rel), 1,
-										   &attnum, &value, &isnull);
-		tup->t_len = newtup->t_len;
-		tup->t_data = newtup->t_data;
-		return;
+		return heap_modify_tuple_by_cols(tup, RelationGetDescr(rel), 1,
+										 &attnum, &value, &isnull);
 	}
 	memcpy((char *) GETSTRUCT(tup) + info->offset, &branch, sizeof(Oid));
+	return tup;
 }
 
 void
