@@ -25,6 +25,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
 #include "catalog/partition.h"
+#include "catalog/versioned.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -85,6 +86,9 @@ recordMultipleDependencies(const ObjectAddress *depender,
 	 */
 	if (IsBootstrapProcessingMode())
 		return;
+
+	/* shared objects can't depend on versioned ones */
+	check_versioned_dependencies(depender, referenced, nreferenced);
 
 	dependDesc = table_open(DependRelationId, RowExclusiveLock);
 
@@ -496,6 +500,12 @@ changeDependencyFor(Oid classId, Oid objectId,
 	objAddr.objectId = newRefObjectId;
 
 	newIsPinned = isObjectPinned(&objAddr);
+
+	/* shared objects can't come to depend on versioned ones */
+	depAddr.classId = classId;
+	depAddr.objectId = objectId;
+	depAddr.objectSubId = 0;
+	check_versioned_dependencies(&depAddr, &objAddr, 1);
 
 	if (oldIsPinned)
 	{

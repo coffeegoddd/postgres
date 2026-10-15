@@ -42,6 +42,18 @@
 Oid
 NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 {
+	return NamespaceCreateVersioned(nspName, ownerId, isTemp, false);
+}
+
+/*
+ * NamespaceCreateVersioned
+ *		As NamespaceCreate(), but the schema may be versioned: every object in
+ *		a versioned schema exists per branch.
+ */
+Oid
+NamespaceCreateVersioned(const char *nspName, Oid ownerId, bool isTemp,
+						 bool versioned)
+{
 	Relation	nspdesc;
 	HeapTuple	tup;
 	Oid			nspoid;
@@ -85,6 +97,7 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 	namestrcpy(&nname, nspName);
 	values[Anum_pg_namespace_nspname - 1] = NameGetDatum(&nname);
 	values[Anum_pg_namespace_nspowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_namespace_nspversioned - 1] = BoolGetDatum(versioned);
 	if (nspacl != NULL)
 		values[Anum_pg_namespace_nspacl - 1] = PointerGetDatum(nspacl);
 	else

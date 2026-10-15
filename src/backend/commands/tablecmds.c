@@ -58,6 +58,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/toasting.h"
+#include "catalog/versioned.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -1074,6 +1075,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
+	accessMethodId = versioned_relation_am(namespaceId, accessMethodId, relkind,
+										   stmt->relation->relpersistence,
+										   stmt->accessMethod != NULL);
 	accessMethodId = prolly_table_am_for_persistence(accessMethodId,
 													 stmt->relation->relpersistence,
 													 stmt->accessMethod != NULL);
@@ -10266,6 +10270,20 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	}
 
 	/*
+	 * A foreign key stays on one side of a versioned schema's boundary: it
+	 * puts triggers on both tables, so a shared table referenced from a
+	 * versioned one would have to check every branch's rows.
+	 */
+	if (namespace_is_versioned(RelationGetNamespace(rel)) !=
+		namespace_is_versioned(RelationGetNamespace(pkrel)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("a foreign key can't join a table in a versioned schema and one outside it"),
+				 errdetail("The tables are \"%s\" and \"%s\".",
+						   RelationGetRelationName(rel),
+						   RelationGetRelationName(pkrel))));
+
+	/*
 	 * Look up the referencing attributes to make sure they exist, and record
 	 * their attnums and type and collation OIDs.
 	 */
@@ -17191,6 +17209,9 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	/* if it's a match, phase 3 doesn't need to do anything */
 	if (rel->rd_rel->relam == amoid)
 		return;
+	(void) versioned_relation_am(RelationGetNamespace(rel), amoid,
+								 rel->rd_rel->relkind,
+								 rel->rd_rel->relpersistence, true);
 	(void) prolly_table_am_for_persistence(amoid, rel->rd_rel->relpersistence,
 										   true);
 	prolly_check_versioned_am(amoid, rel->rd_rel->relpersistence);

@@ -1999,7 +1999,7 @@ selectDumpableNamespace(NamespaceInfo *nsinfo, Archive *fout)
 		/* Other system schemas don't get dumped */
 		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
 	}
-	else if (strcmp(nsinfo->dobj.name, "public") == 0)
+	else if (strcmp(nsinfo->dobj.name, "public") == 0 && !nsinfo->versioned)
 	{
 		/*
 		 * The public schema is a strange beast that sits in a sort of
@@ -6068,6 +6068,7 @@ getNamespaces(Archive *fout)
 	int			i_nspname;
 	int			i_nspowner;
 	int			i_nspacl;
+	int			i_nspversioned;
 	int			i_acldefault;
 
 	query = createPQExpBuffer();
@@ -6079,7 +6080,8 @@ getNamespaces(Archive *fout)
 	appendPQExpBufferStr(query, "SELECT n.tableoid, n.oid, n.nspname, "
 						 "n.nspowner, "
 						 "n.nspacl, "
-						 "acldefault('n', n.nspowner) AS acldefault "
+						 "acldefault('n', n.nspowner) AS acldefault, "
+						 "coalesce((pg_catalog.to_jsonb(n) ->> 'nspversioned')::pg_catalog.bool, false) AS nspversioned "
 						 "FROM pg_namespace n");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
@@ -6094,6 +6096,7 @@ getNamespaces(Archive *fout)
 	i_nspowner = PQfnumber(res, "nspowner");
 	i_nspacl = PQfnumber(res, "nspacl");
 	i_acldefault = PQfnumber(res, "acldefault");
+	i_nspversioned = PQfnumber(res, "nspversioned");
 
 	for (i = 0; i < ntups; i++)
 	{
@@ -6104,6 +6107,7 @@ getNamespaces(Archive *fout)
 		nsinfo[i].dobj.catId.oid = atooid(PQgetvalue(res, i, i_oid));
 		AssignDumpId(&nsinfo[i].dobj);
 		nsinfo[i].dobj.name = pg_strdup(PQgetvalue(res, i, i_nspname));
+		nsinfo[i].versioned = (strcmp(PQgetvalue(res, i, i_nspversioned), "t") == 0);
 		nsinfo[i].dacl.acl = pg_strdup(PQgetvalue(res, i, i_nspacl));
 		nsinfo[i].dacl.acldefault = pg_strdup(PQgetvalue(res, i, i_acldefault));
 		nsinfo[i].dacl.privtype = 0;
@@ -6135,7 +6139,7 @@ getNamespaces(Archive *fout)
 		 * public schema depart from that, because changing its ACL so easily
 		 * breaks applications.
 		 */
-		if (strcmp(nsinfo[i].dobj.name, "public") == 0)
+		if (strcmp(nsinfo[i].dobj.name, "public") == 0 && !nsinfo[i].versioned)
 		{
 			PQExpBuffer aclarray = createPQExpBuffer();
 			PQExpBuffer aclitem = createPQExpBuffer();
@@ -11845,7 +11849,15 @@ dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo)
 	if (nspinfo->create)
 	{
 		appendPQExpBuffer(delq, "DROP SCHEMA %s;\n", qnspname);
-		appendPQExpBuffer(q, "CREATE SCHEMA %s;\n", qnspname);
+
+		/*
+		 * A versioned public schema replaced initdb's, so it replaces the
+		 * destination's too (which fails if anything is in it).
+		 */
+		if (nspinfo->versioned && strcmp(nspinfo->dobj.name, "public") == 0)
+			appendPQExpBuffer(q, "DROP SCHEMA IF EXISTS %s;\n", qnspname);
+		appendPQExpBuffer(q, "CREATE SCHEMA %s%s;\n", qnspname,
+						  nspinfo->versioned ? " VERSIONED" : "");
 	}
 	else
 	{

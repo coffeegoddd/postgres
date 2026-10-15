@@ -47,6 +47,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "commands/alter.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
@@ -2002,6 +2003,13 @@ CreateExtensionInternal(char *extensionName,
 	 */
 	if (isTempNamespace(schemaOid))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+
+	/* extensions are shared by every branch */
+	if (namespace_is_versioned(schemaOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("extensions can't be created in a versioned schema"),
+				 errdetail("An extension is shared by every branch.")));
 
 	/*
 	 * We don't check creation rights on the target namespace here.  If the

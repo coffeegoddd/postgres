@@ -1,0 +1,174 @@
+-- Versioned schemas: everything in one is versioned (exists per branch);
+-- tables there are prolly tables; shared objects can't depend on versioned
+-- ones.
+CREATE SCHEMA app VERSIONED;
+CREATE SCHEMA plain;
+CREATE SCHEMA IF NOT EXISTS app2 VERSIONED;
+SELECT nspname, nspversioned FROM pg_namespace
+  WHERE nspname IN ('app', 'app2', 'plain', 'public') ORDER BY 1;
+ nspname | nspversioned 
+---------+--------------
+ app     | t
+ app2    | t
+ plain   | f
+ public  | f
+(4 rows)
+
+-- Tables in a versioned schema are prolly tables, whatever the default.
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+SET default_table_access_method = heap;
+CREATE TABLE app.t2 (id int);
+RESET default_table_access_method;
+CREATE TABLE app.t3 (id int) USING prolly;
+CREATE TABLE app.p (id int) PARTITION BY RANGE (id);
+CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10);
+CREATE MATERIALIZED VIEW app.mv AS SELECT id FROM app.t;
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+  WHERE c.relnamespace = 'app'::regnamespace AND c.relkind IN ('r', 'm', 'p')
+  ORDER BY 1;
+ relname | amname 
+---------+--------
+ mv      | prolly
+ p       | prolly
+ p1      | prolly
+ t       | prolly
+ t2      | prolly
+ t3      | prolly
+(6 rows)
+
+CREATE TABLE app.h (id int) USING heap;
+ERROR:  tables in a versioned schema are prolly tables
+HINT:  Leave out USING, or use USING prolly.
+CREATE UNLOGGED TABLE app.u (id int);
+ERROR:  a versioned schema can't hold unlogged or temporary tables
+ALTER TABLE app.t SET ACCESS METHOD heap;
+ERROR:  tables in a versioned schema are prolly tables
+HINT:  Leave out USING, or use USING prolly.
+-- Prolly tables live only in versioned schemas.
+CREATE TABLE plain.p (id int) USING prolly;
+ERROR:  prolly tables can only be created in a versioned schema
+HINT:  Create the table in a schema made with CREATE SCHEMA ... VERSIONED.
+SET default_table_access_method = prolly;
+CREATE TABLE plain.d (id int);
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+  WHERE c.oid = 'plain.d'::regclass;
+ amname 
+--------
+ heap
+(1 row)
+
+RESET default_table_access_method;
+ALTER TABLE plain.d SET ACCESS METHOD prolly;
+ERROR:  prolly tables can only be created in a versioned schema
+HINT:  Create the table in a schema made with CREATE SCHEMA ... VERSIONED.
+-- Objects don't move across the boundary.
+ALTER TABLE app.t SET SCHEMA plain;
+ERROR:  cannot move objects between a versioned schema and a schema that isn't
+ALTER TABLE plain.d SET SCHEMA app;
+ERROR:  cannot move objects between a versioned schema and a schema that isn't
+CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'happy');
+ALTER TYPE app.mood SET SCHEMA plain;
+ERROR:  cannot move objects between a versioned schema and a schema that isn't
+-- Versioned objects may depend on shared ones.
+CREATE TABLE plain.base (id int PRIMARY KEY);
+CREATE TYPE plain.color AS ENUM ('red', 'blue');
+CREATE FUNCTION plain.twice(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 * 2';
+CREATE TABLE app.uses (id int DEFAULT plain.twice(21), c plain.color, m app.mood);
+CREATE VIEW app.v AS SELECT b.id FROM plain.base b JOIN app.t USING (id);
+INSERT INTO app.uses (c, m) VALUES ('red', 'ok');
+SELECT * FROM app.uses;
+ id |  c  | m  
+----+-----+----
+ 42 | red | ok
+(1 row)
+
+-- Shared objects can't depend on versioned ones.
+CREATE TABLE plain.bad1 (m app.mood);
+ERROR:  an object outside a versioned schema can't depend on type app.mood, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+CREATE VIEW plain.bad2 AS SELECT * FROM app.t;
+ERROR:  an object outside a versioned schema can't depend on column id of table app.t, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+CREATE FUNCTION plain.bad3() RETURNS bigint BEGIN ATOMIC SELECT count(*) FROM app.t; END;
+ERROR:  an object outside a versioned schema can't depend on table app.t, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+CREATE TABLE plain.bad4 (id int, CHECK (id::text::app.mood IS NOT NULL));
+ERROR:  an object outside a versioned schema can't depend on type app.mood, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+CREATE FUNCTION app.half(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 / 2';
+CREATE INDEX ON plain.base (app.half(id));
+ERROR:  an object outside a versioned schema can't depend on function app.half(integer), which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+-- ... nor come to depend on them when a dependency is replaced.
+CREATE FUNCTION plain.support(internal) RETURNS internal
+  AS 'text_starts_with_support' LANGUAGE internal;
+CREATE FUNCTION app.support(internal) RETURNS internal
+  AS 'text_starts_with_support' LANGUAGE internal;
+CREATE FUNCTION plain.f(text, text) RETURNS boolean
+  LANGUAGE sql SUPPORT plain.support AS 'SELECT starts_with($1, $2)';
+ALTER FUNCTION plain.f(text, text) SUPPORT app.support;
+ERROR:  function plain.f(text,text) can't depend on function app.support(internal), which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+CREATE FUNCTION app.g(text, text) RETURNS boolean
+  LANGUAGE sql SUPPORT plain.support AS 'SELECT starts_with($1, $2)';
+ALTER FUNCTION app.g(text, text) SUPPORT app.support;
+-- Default privileges for a versioned schema belong to it; global ones are
+-- shared.
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA plain GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC;
+CREATE TABLE app.granted (id int);
+SELECT has_table_privilege('public', 'app.granted', 'SELECT');
+ has_table_privilege 
+---------------------
+ t
+(1 row)
+
+-- Foreign keys stay on one side.
+CREATE TABLE app.child (id int REFERENCES app.t);
+CREATE TABLE app.bad5 (id int REFERENCES plain.base);
+ERROR:  a foreign key can't join a table in a versioned schema and one outside it
+DETAIL:  The tables are "bad5" and "base".
+CREATE TABLE plain.bad6 (id int REFERENCES app.t);
+ERROR:  a foreign key can't join a table in a versioned schema and one outside it
+DETAIL:  The tables are "bad6" and "t".
+-- A function whose body is a string resolves names when it runs.
+CREATE FUNCTION plain.count_t() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM app.t';
+INSERT INTO app.t VALUES (1, 'one'), (2, 'two');
+SELECT plain.count_t();
+ count_t 
+---------
+       2
+(1 row)
+
+-- Extensions are shared.
+DROP EXTENSION IF EXISTS tsm_system_rows;
+CREATE EXTENSION tsm_system_rows SCHEMA app;
+ERROR:  extensions can't be created in a versioned schema
+DETAIL:  An extension is shared by every branch.
+CREATE EXTENSION tsm_system_rows;
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 13 other objects
+DETAIL:  drop cascades to table app.t
+drop cascades to table app.t2
+drop cascades to table app.t3
+drop cascades to table app.p
+drop cascades to materialized view app.mv
+drop cascades to type app.mood
+drop cascades to table app.uses
+drop cascades to view app.v
+drop cascades to function app.half(integer)
+drop cascades to function app.support(internal)
+drop cascades to function app.g(text,text)
+drop cascades to table app.granted
+drop cascades to table app.child
+DROP SCHEMA app2, plain CASCADE;
+NOTICE:  drop cascades to 7 other objects
+DETAIL:  drop cascades to table plain.d
+drop cascades to table plain.base
+drop cascades to type plain.color
+drop cascades to function plain.twice(integer)
+drop cascades to function plain.support(internal)
+drop cascades to function plain.f(text,text)
+drop cascades to function plain.count_t()
