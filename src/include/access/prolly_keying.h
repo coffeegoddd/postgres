@@ -25,6 +25,10 @@
  *   give columns other types than the relation has now: a table rewrite
  *   reads the old rows with the types they were written with.
  * - compare() orders keys as the data tree must be ordered.
+ * - equal_bytes() is true when keys that compare() equal are always the
+ *   same bytes, so a key's bytes name its row (for row locks); false
+ *   when they may differ (numeric 1.0 and 1.00, a nondeterministic
+ *   collation) or the keys can't be compared any more.
  * - can_compare() is false when compare() can no longer order the keys
  *   of a keying opened from a description, because something it orders
  *   by (a key column's type, operator family or collation) has since
@@ -119,6 +123,7 @@ typedef struct ProllyKeyingRoutine
 	int			(*compare) (ProllyKeying *k, const ProllyKey *a,
 							const ProllyKey *b);
 	bool		(*can_compare) (ProllyKeying *k);
+	bool		(*equal_bytes) (ProllyKeying *k);
 
 	void		(*close) (ProllyKeying *k);
 } ProllyKeyingRoutine;
@@ -126,7 +131,7 @@ typedef struct ProllyKeyingRoutine
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "open_rewritten", "describe", "can_read", "keyless", "encode_row", "make_value", \
 	"parse_value", "content_hash", "decode_row", "compare", "can_compare", \
-	"close"
+	"equal_bytes", "close"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 
 static inline const ProllyKeyingRoutine *

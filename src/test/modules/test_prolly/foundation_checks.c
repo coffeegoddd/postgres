@@ -892,6 +892,91 @@ keyenc_decode_round_trip(const ProllyImplInfo *impl)
 		check_key_round_trip(ke, &cases[i]);
 }
 
+/*
+ * equal_bytes(): if true, keys that compare equal are the same bytes.
+ * Integer and C-collated text keys must say so (row locks name rows by
+ * their key bytes); numeric keys can't (1.0 and 1.00 are equal).
+ */
+static bool
+check_equal_bytes(const ProllyKeyEncoderRoutine *ke, KeyCase *kc)
+{
+	ProllyKeyEncoder *enc;
+	KeyRow	   *rows;
+	int			nrows;
+	StringInfoData *keys;
+	bool		says;
+
+	key_case_init(kc);
+	enc = PROLLY_CALL(ke, begin, &kc->desc, CurrentMemoryContext);
+	says = PROLLY_CALL(ke, equal_bytes, enc);
+	rows = key_rows(kc, true, &nrows);
+	keys = palloc(sizeof(StringInfoData) * nrows);
+	for (int r = 0; r < nrows; r++)
+	{
+		initStringInfo(&keys[r]);
+		PROLLY_CALL(ke, encode, enc, rows[r].values, rows[r].isnull, &keys[r]);
+	}
+	for (int a = 0; a < nrows && says; a++)
+	{
+		for (int b = 0; b < nrows; b++)
+		{
+			ProllyKey	ka = {(const uint8 *) keys[a].data, keys[a].len};
+			ProllyKey	kb = {(const uint8 *) keys[b].data, keys[b].len};
+
+			if (PROLLY_CALL(ke, compare, enc, &ka, &kb) == 0 &&
+				(ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0))
+				elog(ERROR, "%s and %s compare equal as different bytes, but equal_bytes says they can't",
+					 describe_row(kc, &rows[a]), describe_row(kc, &rows[b]));
+		}
+	}
+	PROLLY_CALL(ke, end, enc);
+	return says;
+}
+
+void
+keyenc_equal_bytes(const ProllyImplInfo *impl)
+{
+	const ProllyKeyEncoderRoutine *ke = (const ProllyKeyEncoderRoutine *) impl;
+	KeyCase		ints = {2, {{INT4OID}, {INT8OID, InvalidOid, INDOPTION_DESC}}};
+	KeyCase		text = {1, {{TEXTOID, C_COLLATION_OID}}};
+	KeyCase		other = {1, {{TEXTOID, non_c_collation()}}};
+	KeyCase		num = {1, {{NUMERICOID}}};
+	ProllyKeyEncoder *enc;
+	Datum		one[2];
+	bool		isnull[1] = {false};
+	StringInfoData a;
+	StringInfoData b;
+	ProllyKey	ka;
+	ProllyKey	kb;
+
+	if (!check_equal_bytes(ke, &ints))
+		elog(ERROR, "integer keys must be named by their bytes");
+	if (!check_equal_bytes(ke, &text))
+		elog(ERROR, "C-collated text keys must be named by their bytes");
+	(void) check_equal_bytes(ke, &other);
+
+	/* 1.0 and 1.00: equal, encoded differently. */
+	key_case_init(&num);
+	enc = PROLLY_CALL(ke, begin, &num.desc, CurrentMemoryContext);
+	one[0] = DirectFunctionCall3(numeric_in, CStringGetDatum("1.0"),
+								 ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	one[1] = DirectFunctionCall3(numeric_in, CStringGetDatum("1.00"),
+								 ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	initStringInfo(&a);
+	initStringInfo(&b);
+	PROLLY_CALL(ke, encode, enc, &one[0], isnull, &a);
+	PROLLY_CALL(ke, encode, enc, &one[1], isnull, &b);
+	ka.data = (const uint8 *) a.data;
+	ka.len = a.len;
+	kb.data = (const uint8 *) b.data;
+	kb.len = b.len;
+	if (PROLLY_CALL(ke, compare, enc, &ka, &kb) == 0 &&
+		(a.len != b.len || memcmp(a.data, b.data, a.len) != 0) &&
+		PROLLY_CALL(ke, equal_bytes, enc))
+		elog(ERROR, "numeric 1.0 and 1.00 are equal keys with different bytes, but equal_bytes says they can't be");
+	PROLLY_CALL(ke, end, enc);
+}
+
 /* ------------------------------------------------------------------------
  * Value encoder
  * ------------------------------------------------------------------------

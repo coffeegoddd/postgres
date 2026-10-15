@@ -446,5 +446,6 @@ advisory	"Waiting to acquire an advisory user lock."
 applytransaction	"Waiting to acquire a lock on a remote transaction being applied by a logical replication subscriber."
 prollybranch	"Waiting to commit to a prolly branch."
 prollytable	"Waiting to write to a prolly table."
+prollyrow	"Waiting to lock a row of a prolly table."
 
 # No "ABI_compatibility" region here as WaitEventLock has its own C code.

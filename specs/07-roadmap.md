@@ -507,6 +507,49 @@ the change (each scan read the newest commit); a commit pipeline
 conformance check that a snapshot doesn't see a running transaction's
 roots.
 
+**Status (2026-10-14): 4e.3 built.** Coordination K1 replaces
+`single_writer` for `prolly_d1`: a row is locked by a heavyweight lock on
+(database, table, 48 bits of a 64-bit hash of its key) (`LOCKTAG_PROLLY_ROW`,
+`prollyrow` in `pg_locks`; the tag has room for 48 bits of the hash,
+question 50), in the lock mode heap uses for a tuple lock of the same
+strength, so the four row lock modes conflict as on heap. Every row lock
+first takes an intent lock on the table's own lock (`prollytable`), which
+whole-tree writes (rebuilds) take in conflicting modes. Past
+`prolly_max_row_locks_per_table` (64) row locks on one table, a transaction
+locks the whole table instead, which bounds the lock manager's memory.
+A key's bytes name its row only if keys that compare equal are the same
+bytes (a new `equal_bytes` callback on the key encoder, table keying and
+index keying, from btree's `equalimage` support functions); tables keyed
+otherwise (numeric, nondeterministic collations) lock whole tables.
+Updates that keep every column a foreign key can reference take FOR NO
+KEY UPDATE, as heap's do, so foreign-key checks aren't blocked. Prolly
+unique indexes lock their key values, so inserters and removers of one
+value take turns. Uniqueness checks of other index AMs (btree) wait for a
+row's writer the way heap's do: the table AM reports the writer
+(coordination's new `writer_of`) in the dirty snapshot when the caller holds
+its page, and waits itself otherwise. At commit, D1 builds every changed
+tree before taking the branch lock; under it, a tree another transaction
+changed meanwhile gets the transaction's edits replayed onto the tip's
+version (no merge: row locks kept the writers apart). Bugs found and fixed,
+each with a test that fails without the fix: a write or row lock on a row
+updated meanwhile locked the whole table and deadlocked with row lockers
+(the lock path now follows the update chain and locks the new version's
+key); a uniqueness check waited for the other writer while btree held its
+leaf page, so lock timeouts and deadlocks went unseen. Tests:
+`013_d1_row_locks.pl` (writers of different rows run at once and both
+commits are kept, with their index entries; one row, one primary key and
+one unique value, btree's or a prolly index's, take turns; foreign-key
+checks and no-key updates; escalation; numeric keys; deadlocks; 600
+concurrent transfers keep every row and the total), `008_d1_writers.pl`
+and `003_d1_cleanup.pl` updated for row-level locks, and a key encoder
+conformance check of `equal_bytes`. The requirements suite's isolation
+group now passes except SERIALIZABLE (4e.5): row locks, unique waits,
+REPEATABLE READ conflicts, foreign-key key-share locks, READ COMMITTED
+re-checks, deadlocks and concurrent writers. Not yet: a uniqueness check
+that meets a TID nobody can resolve waits for every writer of the table,
+not only the one that wrote it (heap knows the inserter from the tuple);
+group commit.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

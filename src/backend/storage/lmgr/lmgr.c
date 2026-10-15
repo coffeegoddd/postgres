@@ -1374,6 +1374,14 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
+		case LOCKTAG_PROLLY_ROW:
+			appendStringInfo(buf,
+							 _("row %08x%04x of prolly table %u of database %u"),
+							 tag->locktag_field3,
+							 tag->locktag_field4,
+							 tag->locktag_field2,
+							 tag->locktag_field1);
+			break;
 		default:
 			appendStringInfo(buf,
 							 _("unrecognized locktag type %d"),

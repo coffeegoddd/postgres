@@ -466,6 +466,17 @@ pkcontent_can_compare(ProllyKeying *k)
 	return true;
 }
 
+/* Content hashes are equal only as bytes; key columns, as encoded. */
+static bool
+pkcontent_equal_bytes(ProllyKeying *k)
+{
+	if (k->keyless)
+		return true;
+	if (!pkcontent_can_compare(k))
+		return false;
+	return PROLLY_CALL(k->keyenc_routine, equal_bytes, key_encoder(k));
+}
+
 static void
 pkcontent_close(ProllyKeying *k)
 {
@@ -498,5 +509,6 @@ const ProllyKeyingRoutine prolly_keying_pk_or_content = {
 	.decode_row = pkcontent_decode_row,
 	.compare = pkcontent_compare,
 	.can_compare = pkcontent_can_compare,
+	.equal_bytes = pkcontent_equal_bytes,
 	.close = pkcontent_close,
 };

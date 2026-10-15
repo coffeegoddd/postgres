@@ -1,11 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Engine D1 with coordination "single_writer": a table has one writer at a
-# time, under a lock of its own (pg_locks type prollytable).  Writers that
-# both started don't deadlock; share row locks are held together while
-# writers wait; NOWAIT and SKIP LOCKED see the lock; and READ COMMITTED
-# follows a row a committed writer changed while it waited, as heap does,
-# for tables with and without a primary key.
+# Engine D1's writers of one row take turns, under row locks (pg_locks
+# type prollyrow, with an intent lock on the table, prollytable).  Writers
+# that both started don't deadlock; share row locks are held together while
+# writers of the row wait; NOWAIT and SKIP LOCKED see the lock; and READ
+# COMMITTED follows a row a committed writer changed while it waited, as
+# heap does, for tables with and without a primary key.
 
 use strict;
 use warnings FATAL => 'all';
@@ -25,12 +25,14 @@ $node->safe_psql('postgres', q{
 	INSERT INTO k VALUES (1, 0), (2, 0);
 });
 
-# Wait until some session waits for the right to write t.
+# Wait until some session waits for the right to write a row, or (as a
+# uniqueness check does, like heap's) for a writer's transaction to end.
 sub wait_for_writer_wait
 {
 	$node->poll_query_until('postgres', q{
 		SELECT count(*) > 0 FROM pg_locks
-		WHERE locktype = 'prollytable' AND NOT granted
+		WHERE locktype IN ('prollytable', 'prollyrow', 'transactionid')
+		AND NOT granted
 	}) or die 'no session waited for the write lock';
 }
 
@@ -40,8 +42,7 @@ my $s2 = $node->background_psql('postgres', on_error_stop => 0);
 $s1->query_safe('BEGIN; UPDATE t SET v = v WHERE id = -1;');
 $s2->query_safe('BEGIN; UPDATE t SET v = v WHERE id = -1;');
 $s1->query_safe('INSERT INTO t VALUES (3, 0)');
-$s2->query_until(qr/go/, "\\echo go\nINSERT INTO t VALUES (4, 0);\n");
-wait_for_writer_wait();
+$s2->query_safe('INSERT INTO t VALUES (4, 0)');
 $s1->query_safe('COMMIT');
 $s2->query_safe('COMMIT');
 is($node->safe_psql('postgres', 'SELECT array_agg(id ORDER BY id) FROM t'),
@@ -55,11 +56,15 @@ $s2->query_safe('COMMIT');
 pass('FOR KEY SHARE is granted while another session holds FOR SHARE');
 is($node->safe_psql('postgres', q{
 	SELECT locktype, mode, granted FROM pg_locks
-	WHERE locktype = 'prollytable'}),
-	'prollytable|ShareLock|t', 'pg_locks shows the share lock');
+	WHERE locktype IN ('prollytable', 'prollyrow') ORDER BY locktype}),
+	"prollyrow|RowShareLock|t\nprollytable|RowShareLock|t",
+	'pg_locks shows the share lock and its intent');
 my ($ret, $out, $err) = $node->psql('postgres', q{
-	SET lock_timeout = '100ms'; UPDATE t SET v = 1 WHERE id = 2;});
+	SET lock_timeout = '100ms'; UPDATE t SET v = 1 WHERE id = 1;});
 like($err, qr/lock timeout/, 'a writer waits for share row locks');
+is($node->safe_psql('postgres', q{
+	SET lock_timeout = '5s'; UPDATE t SET v = 0 WHERE id = 2 RETURNING v;}),
+	'0', 'a writer of another row doesn\'t wait');
 
 # NOWAIT and SKIP LOCKED.
 ($ret, $out, $err) = $node->psql('postgres',
@@ -68,7 +73,7 @@ like($err, qr/could not obtain lock on row in relation "t"/,
 	'FOR UPDATE NOWAIT fails at once');
 is($node->safe_psql('postgres',
 	'SELECT count(*) FROM (SELECT * FROM t FOR UPDATE SKIP LOCKED) s'),
-	'0', 'FOR UPDATE SKIP LOCKED skips the locked rows');
+	'3', 'FOR UPDATE SKIP LOCKED skips the locked row');
 $s1->query_safe('COMMIT');
 
 # READ COMMITTED follows a row updated meanwhile: the second update applies

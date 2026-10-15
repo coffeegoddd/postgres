@@ -31,6 +31,7 @@ extern void keyenc_order_matches_opclass(const ProllyImplInfo *impl);
 extern void keyenc_desc_and_nulls(const ProllyImplInfo *impl);
 extern void keyenc_decode_round_trip(const ProllyImplInfo *impl);
 extern void keyenc_prefix_lengths(const ProllyImplInfo *impl);
+extern void keyenc_equal_bytes(const ProllyImplInfo *impl);
 extern void ixkeying_entries(const ProllyImplInfo *impl);
 extern void valenc_round_trip(const ProllyImplInfo *impl);
 extern void valenc_platform_independent(const ProllyImplInfo *impl);

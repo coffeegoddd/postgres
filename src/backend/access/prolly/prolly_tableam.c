@@ -58,13 +58,16 @@
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 
@@ -605,18 +608,33 @@ insert_keying(Relation rel, const ProllyComponents *c)
 }
 
 /*
- * Get the right to write key of rel (NULL: all of rel) before writing it,
- * from the coordination module.  Getting it may have meant waiting for
- * another writer to commit, so *roots is replaced by the newest: whatever
- * the write reads (an existing row, a count) must be what it builds on.
+ * The key a row is locked by: its bytes, if they name it (keys equal by
+ * the keying are the same bytes); else NULL, which locks all of rel.
+ */
+static const ProllyKey *
+lock_key(Relation rel, const ProllyComponents *c, const ProllyKey *key)
+{
+	if (key == NULL || !PROLLY_CALL(c->keying, equal_bytes,
+									insert_keying(rel, c)->keying))
+		return NULL;
+	return key;
+}
+
+/*
+ * Get the right to write key of rel (NULL: all of rel) in mode before
+ * writing it, from the coordination module.  Getting it may have meant
+ * waiting for another writer to commit, so *roots is replaced by the
+ * newest: whatever the write reads (an existing row, a count) must be what
+ * it builds on.
  */
 static void
-lock_for_write(Relation rel, const ProllyComponents *c, const ProllyKey *key,
-			   ProllyRootSet **roots)
+lock_for_write_mode(Relation rel, const ProllyComponents *c,
+					const ProllyKey *key, LockTupleMode mode,
+					ProllyRootSet **roots)
 {
 	TM_FailureData tmfd;
 
-	if (PROLLY_CALL(c->coord, lock_row, rel, key, LockTupleExclusive,
+	if (PROLLY_CALL(c->coord, lock_row, rel, lock_key(rel, c, key), mode,
 					LockWaitBlock, &tmfd) != TM_Ok)
 		elog(ERROR, "could not lock a row of \"%s\" for writing",
 			 RelationGetRelationName(rel));
@@ -628,6 +646,23 @@ lock_for_write(Relation rel, const ProllyComponents *c, const ProllyKey *key,
 		*roots = PROLLY_CALL(c->engine, roots_acquire, NULL);
 		MemoryContextSwitchTo(old);
 	}
+}
+
+static void
+lock_for_write(Relation rel, const ProllyComponents *c, const ProllyKey *key,
+			   ProllyRootSet **roots)
+{
+	lock_for_write_mode(rel, c, key, LockTupleExclusive, roots);
+}
+
+static void
+newest_roots(const ProllyComponents *c, ProllyRootSet **roots)
+{
+	MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(*roots));
+
+	PROLLY_CALL(c->engine, roots_release, *roots);
+	*roots = PROLLY_CALL(c->engine, roots_acquire, NULL);
+	MemoryContextSwitchTo(old);
 }
 
 static void insert_row(Relation rel, const ProllyComponents *c,
@@ -849,7 +884,15 @@ insert_row(Relation rel, const ProllyComponents *c, ProllyKeying *keying,
 	k.len = key.len;
 	row.data = (const uint8 *) rowbuf.data;
 	row.len = rowbuf.len;
-	lock_for_write(rel, c, &k, roots);
+
+	/*
+	 * An update keeping its key holds the row's lock already, in the mode
+	 * it needs (FOR NO KEY UPDATE if no key column changed): asking for
+	 * that mode finds it held.
+	 */
+	lock_for_write_mode(rel, c, &k,
+						replaces ? LockTupleNoKeyExclusive : LockTupleExclusive,
+						roots);
 
 	if (PROLLY_CALL(c->keying, keyless, keying))
 	{
@@ -1051,21 +1094,52 @@ row_at(const ProllyComponents *c, ProllyRootSet *roots, Relation rel,
 }
 
 /*
- * row_at() for a dirty snapshot (uniqueness and exclusion checks): a TID
- * nobody knows may name another writer's row, private until it commits, so
- * wait for the right to write rel (which the caller, about to write, needs
- * anyway) and look again with what was committed meanwhile.  Heap reports
- * the inserter for its caller to wait for instead.
+ * row_at() for a dirty snapshot (uniqueness and exclusion checks), which
+ * must not decide while the row's writer is still running: a TID nobody
+ * knows may name another writer's row, private until it commits, so the
+ * table's writers matter; a row that exists may be being deleted or
+ * updated, so its key's writers do.  Returns whether the caller should
+ * take the row (or TID) as there.
+ *
+ * Without locks held (an executor's index scan), waits for each such
+ * writer to end and looks again at what was committed.  With them (a
+ * btree uniqueness check holds its leaf page) waiting could deadlock
+ * unseen, so instead it reports the writer in the snapshot, as heap does
+ * (xmin for an inserter, xmax for a deleter), and says the TID is there:
+ * the caller lets go of its page, waits, and checks again.
  */
-static void
+static bool
 row_at_dirty(const ProllyComponents *c, ProllyRootSet **roots, Relation rel,
-			 ProllyKeying *keying, ItemPointer tid, RowAt *r)
+			 ProllyKeying *keying, ItemPointer tid, Snapshot snapshot, RowAt *r)
 {
-	row_at(c, *roots, rel, keying, tid, InvalidCommandId, r);
-	if (r->state == PROLLY_TID_UNKNOWN)
+	for (;;)
 	{
-		lock_for_write(rel, c, NULL, roots);
+		TransactionId writer;
+
 		row_at(c, *roots, rel, keying, tid, InvalidCommandId, r);
+		if (r->state == PROLLY_TID_UNKNOWN)
+			writer = PROLLY_CALL(c->coord, writer_of, rel, NULL);
+		else if (r->present)
+		{
+			ProllyKey	k = {(const uint8 *) r->key.data, r->key.len};
+
+			writer = PROLLY_CALL(c->coord, writer_of, rel,
+								 lock_key(rel, c, &k));
+		}
+		else
+			return false;
+		if (!TransactionIdIsValid(writer))
+			return r->present;
+		if (InterruptHoldoffCount > 0)
+		{
+			if (r->present)
+				snapshot->xmax = writer;
+			else
+				snapshot->xmin = writer;
+			return true;
+		}
+		XactLockTableWait(writer, rel, tid, XLTW_None);
+		newest_roots(c, roots);
 	}
 }
 
@@ -1288,10 +1362,11 @@ remove_version(const ProllyComponents *c, ProllyRootSet *roots, Relation rel,
 				&r->row, cid);
 }
 
-/* Lock the row tid names for writing, then check rel's keying. */
+/* Lock the row tid names for writing in mode, then check rel's keying. */
 static void
 prepare_row_write(Relation rel, const ProllyComponents *c, ItemPointer tid,
-				  InsertKeying **ik_out, ProllyRootSet **roots_out)
+				  LockTupleMode mode, InsertKeying **ik_out,
+				  ProllyRootSet **roots_out)
 {
 	InsertKeying *ik = insert_keying(rel, c);
 	ProllyRootSet *roots = PROLLY_CALL(c->engine, roots_acquire, NULL);
@@ -1309,10 +1384,13 @@ prepare_row_write(Relation rel, const ProllyComponents *c, ItemPointer tid,
 	{
 		k.data = (const uint8 *) key.data;
 		k.len = key.len;
-		lock_for_write(rel, c, &k, &roots);
+		lock_for_write_mode(rel, c, &k, mode, &roots);
 	}
-	else
-		lock_for_write(rel, c, NULL, &roots);
+
+	/*
+	 * Else the row was updated or deleted meanwhile (or never was): there
+	 * is nothing to lock, and the caller finds it so and doesn't write.
+	 */
 	pfree(key.data);
 	check_keying(rel, c, &roots, ik);
 	*ik_out = ik;
@@ -1331,7 +1409,7 @@ prolly_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	RowFate		fate;
 
 	prolly_components_for_relation(rel, &c);
-	prepare_row_write(rel, &c, tid, &ik, &roots);
+	prepare_row_write(rel, &c, tid, LockTupleExclusive, &ik, &roots);
 	row_at_init(&now);
 	fate = row_fate(&c, roots, rel, ik->keying, tid, cid, &now, tmfd);
 	if (fate == ROW_LIVE)
@@ -1339,6 +1417,69 @@ prolly_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	row_at_free(&now);
 	PROLLY_CALL(c.engine, roots_release, roots);
 	return fate_result(fate, tmfd, tid);
+}
+
+/*
+ * The row lock an update of the row otid names to slot's values needs, as
+ * heap decides it: FOR NO KEY UPDATE if no column a foreign key can
+ * reference (one of a unique index's) changes, else FOR UPDATE, so
+ * foreign-key checks of other transactions (FOR KEY SHARE) aren't blocked
+ * by updates of other columns.  Read from the newest commit before the
+ * lock: if the row changes before it's locked, the update finds it
+ * changed and goes no further.
+ */
+static LockTupleMode
+update_lock_mode(Relation rel, const ProllyComponents *c, ItemPointer otid,
+				 TupleTableSlot *slot)
+{
+	Bitmapset  *keycols = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_KEY);
+	LockTupleMode mode = LockTupleNoKeyExclusive;
+	ProllyRootSet *roots;
+	ProllyKeying *keying;
+	bool		owned;
+	RowAt		r;
+	TupleTableSlot *old;
+	int			col = -1;
+
+	if (bms_is_empty(keycols))
+		return mode;
+	roots = PROLLY_CALL(c->engine, roots_acquire, NULL);
+	keying = read_keying(rel, c, roots, &owned);
+	row_at_init(&r);
+	row_at(c, roots, rel, keying, otid, InvalidCommandId, &r);
+	if (!r.present)
+		mode = LockTupleExclusive;
+	else
+	{
+		old = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+		PROLLY_CALL(c->keying, decode_row, keying, &r.row, old);
+		slot_getallattrs(old);
+		slot_getallattrs(slot);
+		while ((col = bms_next_member(keycols, col)) >= 0)
+		{
+			int			attno = col + FirstLowInvalidHeapAttributeNumber;
+			Form_pg_attribute att;
+
+			if (attno <= 0)
+				continue;
+			att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+			if (old->tts_isnull[attno - 1] != slot->tts_isnull[attno - 1] ||
+				(!old->tts_isnull[attno - 1] &&
+				 !datumIsEqual(old->tts_values[attno - 1],
+							   slot->tts_values[attno - 1],
+							   att->attbyval, att->attlen)))
+			{
+				mode = LockTupleExclusive;
+				break;
+			}
+		}
+		ExecDropSingleTupleTableSlot(old);
+	}
+	row_at_free(&r);
+	release_keying(c, keying, owned);
+	PROLLY_CALL(c->engine, roots_release, roots);
+	bms_free(keycols);
+	return mode;
 }
 
 /*
@@ -1360,9 +1501,9 @@ prolly_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	ProllyKeying *keying;
 
 	prolly_components_for_relation(rel, &c);
-	*lockmode = LockTupleExclusive;
+	*lockmode = update_lock_mode(rel, &c, otid, slot);
 	*update_indexes = TU_None;
-	prepare_row_write(rel, &c, otid, &ik, &roots);
+	prepare_row_write(rel, &c, otid, *lockmode, &ik, &roots);
 	keying = ik->keying;
 	row_at_init(&now);
 	fate = row_fate(&c, roots, rel, keying, otid, cid, &now, tmfd);
@@ -1454,58 +1595,70 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 	uint64		ordinal;
 	ProllyTidInfo info;
 	ProllyKey	k;
+	bool		traversed = false;
 
 	prolly_components_for_relation(rel, &c);
-	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
-	initStringInfo(&key);
-	if (PROLLY_CALL(c.row_identity, tid_resolve, roots, rel, tid,
-					InvalidCommandId, &key, &content, &ordinal,
-					&info) == PROLLY_TID_NAMED)
+	for (;;)
 	{
-		k.data = (const uint8 *) key.data;
-		k.len = key.len;
-		result = PROLLY_CALL(c.coord, lock_row, rel, &k, mode, wait_policy, tmfd);
-	}
-	else
-		result = PROLLY_CALL(c.coord, lock_row, rel, NULL, mode, wait_policy,
-							 tmfd);
-	pfree(key.data);
-	PROLLY_CALL(c.engine, roots_release, roots);
-	if (result != TM_Ok)
-	{
-		tmfd->ctid = *tid;
-		tmfd->traversed = false;
-		return result;
-	}
-
-	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
-	keying = read_keying(rel, &c, roots, &owned);
-	row_at_init(&now);
-	fate = row_fate(&c, roots, rel, keying, tid, cid, &now, tmfd);
-	if (fate == ROW_CONCURRENTLY_MODIFIED &&
-		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
-		!ItemPointerEquals(&tmfd->ctid, tid))
-	{
-		ItemPointerData next = tmfd->ctid;
-
-		/* Follow the successors to the version that exists now. */
-		for (;;)
+		/*
+		 * Lock the row tid names now, if it names one: one updated or
+		 * deleted meanwhile has nothing to lock, and is followed below.
+		 */
+		roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+		initStringInfo(&key);
+		result = TM_Ok;
+		if (PROLLY_CALL(c.row_identity, tid_resolve, roots, rel, tid,
+						InvalidCommandId, &key, &content, &ordinal,
+						&info) == PROLLY_TID_NAMED)
 		{
-			row_at(&c, roots, rel, keying, &next, InvalidCommandId, &now);
-			if (now.present || now.state != PROLLY_TID_GONE ||
-				!ItemPointerIsValid(&now.info.successor))
-				break;
-			next = now.info.successor;
+			k.data = (const uint8 *) key.data;
+			k.len = key.len;
+			result = PROLLY_CALL(c.coord, lock_row, rel, lock_key(rel, &c, &k),
+								 mode, wait_policy, tmfd);
 		}
-		if (now.present)
+		pfree(key.data);
+		PROLLY_CALL(c.engine, roots_release, roots);
+		if (result != TM_Ok)
 		{
-			*tid = next;
-			fate = ROW_LIVE;
-			tmfd->traversed = true;
+			tmfd->ctid = *tid;
+			tmfd->traversed = traversed;
+			return result;
 		}
-		else
+
+		roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+		keying = read_keying(rel, &c, roots, &owned);
+		row_at_init(&now);
+		fate = row_fate(&c, roots, rel, keying, tid, cid, &now, tmfd);
+		if (fate == ROW_CONCURRENTLY_MODIFIED &&
+			(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
+			!ItemPointerEquals(&tmfd->ctid, tid))
+		{
+			ItemPointerData next = tmfd->ctid;
+
+			/* Follow the successors to the version that exists now. */
+			for (;;)
+			{
+				row_at(&c, roots, rel, keying, &next, InvalidCommandId, &now);
+				if (now.present || now.state != PROLLY_TID_GONE ||
+					!ItemPointerIsValid(&now.info.successor))
+					break;
+				next = now.info.successor;
+			}
+			if (now.present)
+			{
+				/* Lock that version, and look at it again once locked. */
+				*tid = next;
+				traversed = true;
+				row_at_free(&now);
+				release_keying(&c, keying, owned);
+				PROLLY_CALL(c.engine, roots_release, roots);
+				continue;
+			}
 			tmfd->ctid = *tid;	/* deleted at the end of the chain */
+		}
+		break;
 	}
+	tmfd->traversed = traversed;
 	/*
 	 * The slot holds the row when it's live, and also when the command
 	 * can't see it because it inserted it itself: ON CONFLICT reads its
@@ -1553,7 +1706,7 @@ prolly_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 				succeeded);
 	if (succeeded)
 		return;
-	prepare_row_write(rel, &c, &slot->tts_tid, &ik, &roots);
+	prepare_row_write(rel, &c, &slot->tts_tid, LockTupleExclusive, &ik, &roots);
 	row_at_init(&now);
 	row_at(&c, roots, rel, ik->keying, &slot->tts_tid, InvalidCommandId, &now);
 	if (now.present)
@@ -1608,11 +1761,13 @@ prolly_fetch_tid(Relation rel, ItemPointer tid, Snapshot snapshot,
 	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_DIRTY)
 	{
 		(void) snapshot_cid(snapshot);
-		row_at_dirty(&c, &roots, rel, keying, tid, &r);
+		found = row_at_dirty(&c, &roots, rel, keying, tid, snapshot, &r);
 	}
 	else
+	{
 		row_at(&c, roots, rel, keying, tid, snapshot_cid(snapshot), &r);
-	found = r.present;
+		found = r.present;
+	}
 	row_at_free(&r);
 	release_keying(&c, keying, owned);
 	PROLLY_CALL(c.engine, roots_release, roots);
@@ -1723,12 +1878,15 @@ prolly_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 		old = MemoryContextSwitchTo(is->mcxt);
 		(void) snapshot_cid(scan->xs_snapshot);
 		if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
-			row_at_dirty(&is->c, &is->roots, rel, is->keying, &scan->xs_heaptid,
-						 &is->row);
+			found = row_at_dirty(&is->c, &is->roots, rel, is->keying,
+								 &scan->xs_heaptid, scan->xs_snapshot,
+								 &is->row) && is->row.present;
 		else
+		{
 			row_at(&is->c, is->roots, rel, is->keying, &scan->xs_heaptid,
 				   is->cid, &is->row);
-		found = is->row.present;
+			found = is->row.present;
+		}
 		MemoryContextSwitchTo(old);
 		if (!found)
 			continue;			/* no visible version, try the next entry */

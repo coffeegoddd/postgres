@@ -280,6 +280,37 @@ has_other_entry(const ProllyComponents *c, ProllyRootSet *roots,
 	return found;
 }
 
+/*
+ * Lock a unique index's key value for writing, so writers of the same
+ * value (inserting it, or removing it) take turns: one inserting it waits
+ * for another that inserted or removed it to end, and then sees what that
+ * one committed, as heap's uniqueness check waits for the other row's
+ * inserter or deleter.  The value's bytes name it if equal values encode
+ * alike; else the whole index is locked.
+ */
+static void
+lock_unique_value(const ProllyComponents *c, Relation index,
+				  ProllyIndexKeying *k, const Datum *values,
+				  const bool *isnull)
+{
+	int			nkeys = PROLLY_CALL(c->index_keying, nkeys, k);
+	StringInfoData bound;
+	ProllyKey	b;
+	TM_FailureData tmfd;
+
+	if (!index->rd_index->indisunique || !checks_unique(index, nkeys, isnull))
+		return;
+	initStringInfo(&bound);
+	PROLLY_CALL(c->index_keying, encode_bound, k, nkeys, values, isnull, false,
+				&bound);
+	b.data = (const uint8 *) bound.data;
+	b.len = bound.len;
+	(void) PROLLY_CALL(c->coord, lock_row, index,
+					   PROLLY_CALL(c->index_keying, equal_bytes, k) ? &b : NULL,
+					   LockTupleExclusive, LockWaitBlock, &tmfd);
+	pfree(bound.data);
+}
+
 /* ------------------------------------------------------------------------
  * Building
  * ------------------------------------------------------------------------
@@ -465,9 +496,15 @@ prolly_aminsert(Relation indexRelation, Datum *values, bool *isnull,
 	e.len = entry.len;
 
 	/*
-	 * Writers to the table are one at a time, so another row with the key
-	 * is either committed or this transaction's.
+	 * Once the value is locked, another row with it is either committed or
+	 * this transaction's: look at the newest commit.
 	 */
+	if (checkUnique != UNIQUE_CHECK_NO)
+	{
+		lock_unique_value(&c, indexRelation, k, values, isnull);
+		PROLLY_CALL(c.engine, roots_release, roots);
+		roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+	}
 	if (checkUnique != UNIQUE_CHECK_NO &&
 		checks_unique(indexRelation, PROLLY_CALL(c.index_keying, nkeys, k), isnull) &&
 		has_other_entry(&c, roots, indexRelation, k, values, isnull, &e))
@@ -536,6 +573,7 @@ prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 			continue;
 		}
 		FormIndexDatum(ii, slot, estate, values, isnull);
+		lock_unique_value(&c, index, k, values, isnull);
 		initStringInfo(&entry);
 		PROLLY_CALL(c.index_keying, encode_entry, k, values, isnull, rowkey,
 					ordinal, &entry);

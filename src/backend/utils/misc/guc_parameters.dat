@@ -2443,6 +2443,15 @@
   check_hook => 'check_primary_slot_name',
 },
 
+{ name => 'prolly_max_row_locks_per_table', type => 'int', context => 'PGC_USERSET', group => 'LOCK_MANAGEMENT',
+  short_desc => 'Sets how many rows of one prolly table a transaction locks one at a time.',
+  long_desc => 'Past this many, the transaction locks the whole table instead, which keeps other writers out of it until the transaction ends.',
+  variable => 'prolly_max_row_locks_per_table',
+  boot_val => '64',
+  min => '1',
+  max => 'INT_MAX',
+},
+
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',
   short_desc => 'When generating SQL fragments, quote all identifiers.',
   variable => 'quote_all_identifiers',

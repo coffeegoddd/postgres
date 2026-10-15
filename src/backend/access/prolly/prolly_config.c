@@ -63,7 +63,7 @@ typedef struct ProllyProfile
 
 static const ProllyProfile profiles[] = {
 	{"prolly_d1", {[PROLLY_IFACE_ENGINE] = "d1",
-	[PROLLY_IFACE_COORDINATION] = "single_writer", HASH_ADDRESSED,
+	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,
 	[PROLLY_IFACE_LOG] = "chunks", FOUNDATION}},
 	{"prolly_d2", {[PROLLY_IFACE_ENGINE] = "d2",
 	[PROLLY_IFACE_COORDINATION] = "k1", HASH_ADDRESSED,

@@ -49,9 +49,10 @@ typedef enum LockTagType
 								 * replication subscriber */
 	LOCKTAG_PROLLY_BRANCH,		/* the right to commit to a prolly branch */
 	LOCKTAG_PROLLY_TABLE,		/* the right to write a prolly table */
+	LOCKTAG_PROLLY_ROW,			/* a row of a prolly table, by key hash */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_TABLE
+#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_ROW
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -212,6 +213,19 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field3 = 0, \
 	 (locktag).locktag_field4 = 0, \
 	 (locktag).locktag_type = LOCKTAG_PROLLY_TABLE, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
+/*
+ * ID info for a row of a prolly table is DB OID + REL OID + 48 bits of a
+ * hash of the row's key: two keys with the same 48 bits share a lock,
+ * which can make a writer wait needlessly but never lets two through.
+ */
+#define SET_LOCKTAG_PROLLY_ROW(locktag,dboid,reloid,keyhash) \
+	((locktag).locktag_field1 = (dboid), \
+	 (locktag).locktag_field2 = (reloid), \
+	 (locktag).locktag_field3 = (uint32) ((keyhash) >> 32), \
+	 (locktag).locktag_field4 = (uint16) ((keyhash) >> 16), \
+	 (locktag).locktag_type = LOCKTAG_PROLLY_ROW, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 #endif							/* _PG_LOCKTAG_H_ */

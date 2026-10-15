@@ -62,6 +62,13 @@ typedef struct ProllyKeyEncoderRoutine
 	int			(*compare) (ProllyKeyEncoder *enc, const ProllyKey *a,
 							const ProllyKey *b);
 
+	/*
+	 * True if keys compare() equal only when their encodings are the same
+	 * bytes (false, e.g., for numeric, where 1.0 and 1.00 are equal, or a
+	 * nondeterministic collation), so a key's bytes can name it.
+	 */
+	bool		(*equal_bytes) (ProllyKeyEncoder *enc);
+
 	uint32		(*prefix_length) (ProllyKeyEncoder *enc, const ProllyKey *key,
 								  int ncols);
 
@@ -69,8 +76,8 @@ typedef struct ProllyKeyEncoderRoutine
 } ProllyKeyEncoderRoutine;
 
 #define PROLLY_KEYENC_CALLBACK_NAMES \
-	"supports", "begin", "encode", "decode", "compare", "prefix_length", \
-	"end"
+	"supports", "begin", "encode", "decode", "compare", "equal_bytes", \
+	"prefix_length", "end"
 #define PROLLY_KEYENC_FIRST_CALLBACK supports
 
 static inline const ProllyKeyEncoderRoutine *

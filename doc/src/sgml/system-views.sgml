@@ -1831,8 +1831,9 @@ AND c1.path[c2.level] = c2.path[c2.level];
        <literal>userlock</literal>,
        <literal>advisory</literal>,
        <literal>applytransaction</literal>,
-       <literal>prollybranch</literal>, or
-       <literal>prollytable</literal>.
+       <literal>prollybranch</literal>,
+       <literal>prollytable</literal>, or
+       <literal>prollyrow</literal>.
        (See also <xref linkend="wait-event-lock-table"/>.)
       </para></entry>
      </row>

@@ -14,7 +14,7 @@ FROM prolly_implementations();
  engine          | d3a              |       3 |              0
  engine          | d3b              |       4 |              0
  engine          | d4               |       5 |              0
- coordination    | k1               |       1 |              0
+ coordination    | k1               |       1 |              1
  coordination    | k2               |       2 |              0
  coordination    | k3               |       3 |              0
  coordination    | single_writer    |       4 |              1
@@ -117,13 +117,13 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d4               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
  engine          | d4               | complete                                | not implemented (30 of 30 callbacks missing)
  coordination    | k1               | identity                                | pass
- coordination    | k1               | lock_conflict_matrix                    | not implemented (missing lock_row)
- coordination    | k1               | wait_policies                           | not implemented (missing lock_row)
- coordination    | k1               | speculative_insertion                   | not implemented (missing insert_intent, insert_intent_complete)
- coordination    | k1               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
- coordination    | k1               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
+ coordination    | k1               | lock_conflict_matrix                    | no checks yet
+ coordination    | k1               | wait_policies                           | no checks yet
+ coordination    | k1               | speculative_insertion                   | no checks yet
+ coordination    | k1               | commit_markers_until_horizon            | not implemented (missing written_since, prune_markers)
+ coordination    | k1               | abort_releases_locks                    | no checks yet
  coordination    | k1               | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k1               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | k1               | complete                                | not implemented (5 of 12 callbacks missing)
  coordination    | k2               | identity                                | pass
  coordination    | k2               | lock_conflict_matrix                    | not implemented (missing lock_row)
  coordination    | k2               | wait_policies                           | not implemented (missing lock_row)
@@ -131,7 +131,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  coordination    | k2               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
  coordination    | k2               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
  coordination    | k2               | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k2               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | k2               | complete                                | not implemented (12 of 12 callbacks missing)
  coordination    | k3               | identity                                | pass
  coordination    | k3               | lock_conflict_matrix                    | not implemented (missing lock_row)
  coordination    | k3               | wait_policies                           | not implemented (missing lock_row)
@@ -139,7 +139,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  coordination    | k3               | commit_markers_until_horizon            | not implemented (missing lock_row, xact_commit, written_since, prune_markers)
  coordination    | k3               | abort_releases_locks                    | not implemented (missing lock_row, xact_abort, subxact_abort)
  coordination    | k3               | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | k3               | complete                                | not implemented (11 of 11 callbacks missing)
+ coordination    | k3               | complete                                | not implemented (12 of 12 callbacks missing)
  coordination    | single_writer    | identity                                | pass
  coordination    | single_writer    | lock_conflict_matrix                    | no checks yet
  coordination    | single_writer    | wait_policies                           | no checks yet
@@ -147,7 +147,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  coordination    | single_writer    | commit_markers_until_horizon            | not implemented (missing xact_commit, written_since, prune_markers)
  coordination    | single_writer    | abort_releases_locks                    | not implemented (missing xact_abort, subxact_abort)
  coordination    | single_writer    | predicate_locks                         | not implemented (missing predicate_lock_range)
- coordination    | single_writer    | complete                                | not implemented (8 of 11 callbacks missing)
+ coordination    | single_writer    | complete                                | not implemented (8 of 12 callbacks missing)
  node_format     | basic            | identity                                | pass
  node_format     | basic            | items_round_trip                        | pass
  node_format     | basic            | level_round_trip                        | pass
@@ -185,13 +185,15 @@ NOTICE:  drop cascades to column m of table conf_kt
  key_encoder     | ordered          | desc_and_nulls_ordering                 | pass
  key_encoder     | ordered          | decode_round_trip                       | pass
  key_encoder     | ordered          | self_delimiting_prefixes                | pass
+ key_encoder     | ordered          | equal_bytes_name_keys                   | pass
  key_encoder     | ordered          | complete                                | pass
  key_encoder     | stub             | identity                                | pass
  key_encoder     | stub             | order_matches_opclass                   | not implemented (missing supports, begin, encode, compare, end)
  key_encoder     | stub             | desc_and_nulls_ordering                 | not implemented (missing supports, begin, encode, compare, end)
  key_encoder     | stub             | decode_round_trip                       | not implemented (missing begin, encode, decode, end)
  key_encoder     | stub             | self_delimiting_prefixes                | not implemented (missing begin, encode, prefix_length, end)
- key_encoder     | stub             | complete                                | not implemented (7 of 7 callbacks missing)
+ key_encoder     | stub             | equal_bytes_name_keys                   | not implemented (missing begin, encode, compare, equal_bytes, end)
+ key_encoder     | stub             | complete                                | not implemented (8 of 8 callbacks missing)
  value_encoder   | heaptuple        | identity                                | pass
  value_encoder   | heaptuple        | round_trip                              | pass
  value_encoder   | heaptuple        | platform_independent                    | fail: row 1 encodes as 2a000000000000000000050002001800e103000009616263000000000001000000138082030087052823, the reference encoding is 050004000003e10361626308000001000000000001000e0003000000000005000305872328
@@ -345,14 +347,14 @@ NOTICE:  drop cascades to column m of table conf_kt
  table_keying    | stub             | reads_after_key_column_dropped          | not implemented (missing open, describe, encode_row, compare, decode_row, close)
  table_keying    | stub             | owns_its_memory                         | not implemented (missing open, encode_row, decode_row, close)
  table_keying    | stub             | cannot_compare_after_key_type_dropped   | not implemented (missing open, describe, can_compare, close)
- table_keying    | stub             | complete                                | not implemented (13 of 13 callbacks missing)
+ table_keying    | stub             | complete                                | not implemented (14 of 14 callbacks missing)
  index_keying    | columns_then_row | identity                                | pass
  index_keying    | columns_then_row | entries_and_bounds                      | pass
  index_keying    | columns_then_row | complete                                | pass
  index_keying    | stub             | identity                                | pass
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
- index_keying    | stub             | complete                                | not implemented (9 of 9 callbacks missing)
-(291 rows)
+ index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
+(293 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
