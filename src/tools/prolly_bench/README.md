@@ -163,6 +163,27 @@ the cluster in `post`.
 
 ## Tests
 
+CI runs the C smoke corpus on heap and `prolly`, then calls:
+
+```sh
+src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR
+```
+
+Unlike the reporting commands, this exits unsuccessfully for missing or
+duplicate workloads, empty results, incomplete runs, missing digests,
+incorrect AMs, stale exceptions, or differing answers. It requires C1-C4
+by default (`--workloads C1,C2` selects a smaller explicit set). Order-only
+findings also fail this strict gate until reviewed: the reporting
+comparator does not know whether a query's result order was required.
+Documented exceptions and matching PostgreSQL/corpus differences remain
+allowed.
+
+PR CI also runs the requirements suites against versioned `prolly`
+storage and five differential seeds on heap, `prolly`, and D1. The nightly
+run increases the seed budget and runs upstream regression, isolation and
+recovery against block-mapped storage. Logs, replay programs and summary
+records are uploaded on success and failure.
+
 The differential runner compares seeded transaction histories with heap:
 
 ```sh

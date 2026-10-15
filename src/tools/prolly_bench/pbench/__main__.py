@@ -125,6 +125,16 @@ def _cdiff(args) -> int:
     return 0
 
 
+def _cgate(args) -> int:
+    from pbench import ccompare, table
+    problems = ccompare.gate(table.load_set(args.baseline), table.load_set(args.dir), args.workloads)
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    if not problems:
+        print("C suite gate passed")
+    return int(bool(problems))
+
+
 def _table(args) -> int:
     from pbench import table
     if args.dirs:
@@ -214,6 +224,12 @@ def main(argv=None) -> int:
     d.add_argument("--limit", type=int, default=20, help="examples per group")
     d.add_argument("-o", "--output", type=Path)
     d.set_defaults(fn=_cdiff)
+
+    gate = sub.add_parser("cgate", help="fail on incomplete or differing C-suite results")
+    gate.add_argument("baseline", type=Path)
+    gate.add_argument("dir", type=Path)
+    gate.add_argument("--workloads", type=_csv(str), default=["C1", "C2", "C3", "C4"])
+    gate.set_defaults(fn=_cgate)
 
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")

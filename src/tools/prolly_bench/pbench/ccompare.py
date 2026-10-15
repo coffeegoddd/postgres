@@ -73,6 +73,8 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
         dest = eng.path / "compare" / base.path.name / w
         result = dest / "compare.json"
         inputs = [base_dirs[w] / "records.jsonl.gz", eng_dirs[w] / "records.jsonl.gz"]
+        if runner.is_file():
+            inputs.append(runner)
         if EXCEPTIONS.exists():
             inputs.append(EXCEPTIONS)
         if not result.exists() or result.stat().st_mtime < max(p.stat().st_mtime for p in inputs):
@@ -86,6 +88,54 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
                 raise RuntimeError(f"slt-runner compare failed: {r.stderr[-2000:]}")
         out[w] = json.loads(result.read_text())
     return out
+
+
+def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
+    """Strict CI gate: every requested cell must run and have comparable answers.
+
+    Order-only findings require review here; the reporting comparator doesn't
+    distinguish a required ORDER BY from an unspecified result order.
+    """
+    problems = []
+    if base.suite != "C" or eng.suite != "C" or base.table_am != "heap":
+        return ["the gate needs C results with heap as the baseline"]
+    required = set(workloads)
+    if not required:
+        return ["no required workloads"]
+    for name, rs in (("heap", base), (eng.table_am, eng)):
+        cells = [r["key"]["workload"] for r in rs.results]
+        if set(cells) != required or len(cells) != len(required):
+            problems.append(f"{name}: expected exactly one cell for {sorted(required)}, got {cells}")
+        dirs = slt_dirs(rs)
+        if set(dirs) != required:
+            problems.append(f"{name}: incomplete cells or missing records")
+        for w, d in dirs.items():
+            try:
+                summary = json.loads((d / "summary.json").read_text())
+                if summary["total"] <= 0 or summary["files"] <= 0:
+                    problems.append(f"{name}/{w}: empty run")
+                if summary["wrong_am_files"] or summary["unmatched_digests"]:
+                    problems.append(f"{name}/{w}: wrong AM or missing digests")
+                for status in ("not_implemented", "timeout", "did_not_run", "crashed"):
+                    if summary["counts"].get(status, 0):
+                        problems.append(f"{name}/{w}: {status}")
+            except (OSError, ValueError, KeyError) as e:
+                problems.append(f"{name}/{w}: invalid summary: {e}")
+    if problems:
+        return problems
+    comparisons = compare(base, eng)
+    if set(comparisons) != required:
+        problems.append("missing workload comparisons")
+    for w, result in comparisons.items():
+        counts = result["counts"]
+        if sum(counts.values()) <= 0:
+            problems.append(f"{w}: no compared records")
+        for kind, count in counts.items():
+            if count and kind not in ("agree", "postgres_semantics", "exception"):
+                problems.append(f"{w}: {count} {kind}")
+        if result["stale_exceptions"]:
+            problems.append(f"{w}: stale exceptions")
+    return problems
 
 
 def diffs(base: ResultSet, eng: ResultSet) -> Iterator[dict[str, Any]]:
