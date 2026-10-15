@@ -52,6 +52,7 @@
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/storage.h"
 #include "catalog/toasting.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
@@ -1273,6 +1274,7 @@ Oid
 make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 			  char relpersistence, LOCKMODE lockmode)
 {
+	int			save_smgr;
 	TupleDesc	OldHeapDesc;
 	char		NewHeapName[NAMEDATALEN];
 	Oid			OIDNewHeap;
@@ -1323,6 +1325,14 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	 */
 	snprintf(NewHeapName, sizeof(NewHeapName), "pg_temp_%u", OIDOldHeap);
 
+	/*
+	 * The new heap and its TOAST table are kept by the storage manager that
+	 * keeps the old heap.
+	 */
+	save_smgr = new_relation_smgr;
+	new_relation_smgr = RelationGetSmgr(OldHeap)->smgr_which;
+	PG_TRY();
+	{
 	OIDNewHeap = heap_create_with_catalog(NewHeapName,
 										  namespaceid,
 										  NewTableSpace,
@@ -1381,6 +1391,12 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 
 		ReleaseSysCache(tuple);
 	}
+	}
+	PG_FINALLY();
+	{
+		new_relation_smgr = save_smgr;
+	}
+	PG_END_TRY();
 
 	table_close(OldHeap, NoLock);
 

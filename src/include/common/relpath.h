@@ -60,6 +60,7 @@ typedef enum ForkNumber
 	FSM_FORKNUM,
 	VISIBILITYMAP_FORKNUM,
 	INIT_FORKNUM,
+	BMAP_FORKNUM,				/* block-mapped storage's map (storage/bmap.h) */
 
 	/*
 	 * NOTE: if you add a new fork, change MAX_FORKNUM and possibly
@@ -68,7 +69,7 @@ typedef enum ForkNumber
 	 */
 } ForkNumber;
 
-#define MAX_FORKNUM		INIT_FORKNUM
+#define MAX_FORKNUM		BMAP_FORKNUM
 
 #define FORKNAMECHARS	4		/* max chars for a fork name */
 

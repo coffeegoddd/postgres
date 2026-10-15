@@ -509,8 +509,16 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 		return false;
 
 	/*
-	 * Some BackendTypes will not do certain IOOps.
+	 * Some BackendTypes will not do certain IOOps.  The background writer
+	 * and checkpointer read relation pages only to write block-mapped
+	 * relations' pages: they read the block map, and may evict a buffer for
+	 * it.
 	 */
+	if ((bktype == B_BG_WRITER || bktype == B_CHECKPOINTER) &&
+		io_object == IOOBJECT_RELATION && io_context == IOCONTEXT_NORMAL &&
+		(io_op == IOOP_READ || io_op == IOOP_EVICT || io_op == IOOP_HIT))
+		return true;
+
 	if (bktype == B_BG_WRITER &&
 		(io_op == IOOP_READ || io_op == IOOP_EVICT || io_op == IOOP_HIT))
 		return false;

@@ -27,6 +27,11 @@ prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
+# Heap tables in block-mapped storage instead (debug_block_mapped_heap).
+bmap.conf: FORCE
+	@{ echo "debug_block_mapped_heap = on"; \
+	   echo "max_prepared_transactions = 10"; } > $@
+
 EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
@@ -70,6 +75,14 @@ check-upstream-regress: prolly_am.conf
 check-upstream-isolation: prolly_am.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
+# Postgres's regression, isolation and recovery suites with every user
+# table, index and TOAST table in block-mapped storage.  These pass in
+# full: block-mapped storage changes where pages live, not what they hold.
+check-upstream-bmap: bmap.conf
+	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(CURDIR)/bmap.conf
+	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/bmap.conf
+	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(CURDIR)/bmap.conf
+
 # What stock Postgres must pass: proves the tests are right.  The temporary
 # installation (with EXTRA_INSTALL) is made here: temp-install does nothing
 # in the recursive make below.
@@ -77,8 +90,8 @@ check-heap: temp-install
 	$(MAKE) check-semantics check-isolation check-tap-durability PROLLY_AM=heap
 
 clean distclean:
-	rm -rf $(pg_regress_clean_files) prolly_am.conf output_iso
+	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf output_iso
 
 .PHONY: check check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-upstream-regress check-upstream-isolation FORCE
+	check-upstream-regress check-upstream-isolation check-upstream-bmap FORCE

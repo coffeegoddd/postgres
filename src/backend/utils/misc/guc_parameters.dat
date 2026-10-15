@@ -632,6 +632,13 @@
   boot_val => 'DEFAULT_ASSERT_ENABLED',
 },
 
+{ name => 'debug_block_mapped_heap', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Creates permanent heap tables, and their indexes and TOAST tables, in block-mapped storage, for testing.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_block_mapped_heap',
+  boot_val => 'false',
+},
+
 { name => 'debug_copy_parse_plan_trees', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all parse and plan trees to be passed through copyObject(), to facilitate catching errors and omissions in copyObject().',
   flags => 'GUC_NOT_IN_SAMPLE',

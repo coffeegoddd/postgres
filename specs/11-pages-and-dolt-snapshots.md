@@ -356,92 +356,142 @@ fails without its fix), and Postgres's suites keep passing after each one.
 
 ## 5. Step 1 design: the block-mapped storage manager
 
+Built in `src/backend/storage/smgr/bmap.c` (2026-10-15); this part
+describes it as built.
+
 ### Selection
 
-- smgr already dispatches through `smgrsw[]`; `smgropen()` gains a
-  selector instead of always choosing md.c. A relation is block-mapped
-  when it is a prolly relation: a prolly table, or an index or TOAST
-  table of one. Temporary relations (a backend in the locator), shared
-  catalogs (database 0), the block map's own files and every normal
-  relation are md.c.
-- The choice is recorded in files, so it needs no catalog access and works
-  the same in backends, I/O workers, the startup process and tools: a
-  block-mapped fork has a stub file (below). A backend checks for stubs
-  only in databases that have a block map, which it learns once per
-  database.
-- Creating storage says which kind: `RelationCreateStorage` takes the
-  relation's storage kind, which the `prolly` AM sets for its tables and
-  TOAST tables, and index creation takes from the index's table.
-- Step 1 keeps prolly relations to the default tablespace (a tablespace
-  clause on one is ignored with a notice, as for D1's tables). Creating a
-  database with the `FILE_COPY` strategy copies the block map's files with
-  the rest after its checkpoint; the `WAL_LOG` strategy copies each prolly
-  relation into the new database's block map.
+- smgr already dispatched through `smgrsw[]`; `smgropen()` now asks each
+  implementation after md.c whether it holds the relation
+  (`smgr_claims`), falling back to md.c. A relation is block-mapped when
+  it has a map fork (below), so the choice needs no catalog access and
+  works the same in backends, I/O workers, the startup process and tools.
+- Creating storage says which kind: `RelationCreateStorageWith()` and
+  `smgrcreatewith()`. Indexes are created in their table's storage
+  manager; storage made anew (TRUNCATE, REINDEX, SET TABLESPACE, CREATE
+  DATABASE's copies, a rewrite's new heap) stays in the storage manager
+  that held the old. Only permanent relations outside the global
+  tablespace are block-mapped; anything else is md.c whatever the caller
+  asks, so `SET UNLOGGED` moves a table to md.c.
+- Until the `prolly` table AM exists, the developer setting
+  `debug_block_mapped_heap` puts new permanent user heap tables (and with
+  them their indexes and TOAST tables) in block-mapped storage. The gates
+  run with it (`make -C src/test/prolly check-upstream-bmap`).
 
 ### Files
 
-Per database, created with its first prolly relation, in its directory:
-
 | File | What | Accessed through |
 |---|---|---|
-| The page store (a reserved relation file number) | Every prolly relation's pages, at physical block numbers | md.c directly, never the buffer manager |
-| The map (another reserved number) | Metapage, free-space bitmap, and each prolly fork's map tree | The buffer manager, as an ordinary md.c relation: WAL, full-page writes and checkpoints apply unchanged |
-| `<relfilenumber>[_fork]_bm`, one per prolly relation fork | A stub: its map tree's root block. Written once when the fork is created | Files; their existence is the fork's existence |
+| `<relfilenumber>_bmap`, the map fork (a new fork, `BMAP_FORKNUM`) | Block 0: the relation's logical length. Block 1 + L / 1,019: the entry of logical block L (physical block, birth epoch) | The buffer manager, as an ordinary md.c fork: WAL, full-page writes and checkpoints apply unchanged |
+| The page store (relation file number 9421), per tablespace and database | Every block-mapped main fork's pages, at physical block numbers | md.c directly, never the buffer manager |
+| The allocator (9420), per tablespace and database | A metapage (the page store's high-water mark, free count, bitmap pages) and bitmap pages of used blocks | The buffer manager, as an ordinary md.c relation |
 
-The stubs keep everything that works on files at file granularity
-(existence checks, unlink, directory scans) working, and their names
-aren't relation-file names, so tools that verify checksums skip them.
-The page store's pages carry checksums computed with their *logical*
-block numbers (the buffer manager computes and verifies them), so tools
-that verify checksums from files (`pg_checksums`, base backups) skip the
-page store too; the map relation verifies normally.
+- **Direct addressing, not a tree.** A block's entry is found without
+  following any pointer. In recovery, map pages on disk can come from
+  different moments (one written after the point redo has reached,
+  another not yet written); a first design with a radix tree failed there
+  (`026_overwrite_contrecord`: a root already grown pointed at a node not
+  yet written). An entry never changes once set, so any version of its
+  page that has it gives the same answer, and a page redo needs has it.
+- **Only the main fork is block-mapped.** The free space map and the
+  visibility map are md.c files of the relation: they are extended during
+  recovery without WAL records of their own, so a standby can't follow a
+  primary's allocations for them, and they are hints or rebuildable, so
+  they need no sharing. A branch's copy (step 2) starts with an empty
+  visibility map, which is always correct.
+- The map fork is hidden from callers that walk every fork (copying a
+  relation, measuring it): `smgrexists` says no for it.
+- The page store's pages carry checksums of their *logical* block
+  numbers (the buffer manager computes and verifies them), so tools that
+  verify checksums from files skip it; map forks and the allocator verify
+  normally. `pg_checksums --enable` refuses a cluster with block-mapped
+  storage.
+- A dropped relation's map fork stays until after the next checkpoint, as
+  md.c keeps a main fork's first segment, so its relation file number
+  isn't reused while crash recovery may still replay records for it.
+  Dropping a tablespace removes a database's allocator and page store
+  there once no map fork remains.
+- `pg_relation_size` reads a block-mapped relation's length from its map.
 
-### Maps
+### Allocation
 
-- A fork's map is a radix tree of map pages, its root fixed at creation
-  (it records the fork's logical length and the tree's depth). Leaf
-  entries are (physical block, birth epoch), internal entries (map page,
-  birth epoch); about a thousand per page, so depth 2 covers 8 GB and
-  depth 3 8 TB. Growing a level copies the root's entries to a new page.
-- Epochs are unused in step 1 (no sharing); they are in the format now so
-  step 2 can decide sharing without rewriting maps.
-- Physical blocks are allocated from a free-space bitmap (the map's pages,
-  listed by its metapage), preferring free blocks, otherwise extending the
-  page store at its high-water mark. Reused blocks are zeroed before use,
-  so a crash can't expose a page's old contents at a new logical block.
+- Physical blocks are allocated from the bitmap, preferring freed blocks,
+  otherwise extending the page store at its high-water mark. Reused
+  blocks are zeroed before they are mapped, so a crash can't expose a
+  page's old contents at a new logical block. Truncation only shortens
+  the logical length; blocks past it are reused by a later extension or
+  freed with the relation.
+- Epochs in map entries are unused in step 1 (no sharing); they are in the
+  format now so step 2 can decide sharing without rewriting maps.
 
 ### WAL and crash safety
 
 The map is replicated state, identical on a primary and its standbys
-(as md.c's files are), so base backups and standbys work unchanged. Every map change is WAL-logged by our
-own resource manager, registering the map pages it changes so torn map
-pages are restored by full-page images:
+(as md.c's files are), so base backups and standbys work unchanged. Every
+map change is logged by the `BlockMap` resource manager, registering the
+map pages it changes, so torn pages are restored by full-page images; a
+record's per-page deltas are applied by the same code in normal running
+and in redo:
 
-- **Create** a fork: its root page and stub.
+- **Create**: the map fork's header.
 - **Extend**: allocation, leaf entries, the length, the bitmap and the
-  high-water mark, logged before the new blocks are used, so a data
-  record for a new block always follows its allocation. Redo zeroes the
-  blocks again.
-- **Truncate**: the length only, inside `RelationTruncate`'s critical
-  section with the root pinned beforehand (a new smgr callback prepares
-  truncation before the critical section). Blocks past the length are
-  reused by a later extension or freed with the fork.
-- **Drop**: after commit, the fork's map pages and blocks are freed by
-  records of their own. A crash between the commit and these records
-  leaks the blocks until reclamation (step 7) sweeps forks with no stub.
-
-Redo of `XLOG_SMGR_CREATE` and `XLOG_SMGR_TRUNCATE` finds the map already
-changed by the records above, which the primary always logs first.
+  high-water mark. Logged before the new blocks are used, and redo never
+  allocates: a data record for a new block always follows its
+  allocation. Callers that log a page's image before writing it (the bulk
+  writer behind index builds and copies, and hash indexes' bucket
+  allocation) call the new `smgrpreextend()` first. Redo zeroes reused
+  blocks and extends the page store again, except for a relation whose
+  data skips WAL (`wal_level = minimal`, created in the same
+  transaction): its pages were synced at commit, and zeroing them would
+  lose them (`018_wal_optimize`).
+- **Truncate**: the length, inside `RelationTruncate`'s critical section,
+  with the header pinned beforehand by the new `smgrpretruncate()`.
+- **Free**: after commit or abort, a dropped relation's length is cleared
+  and its blocks freed, in records of their own. A crash between the
+  commit and these records leaks the blocks until reclamation (step 7).
 
 ### I/O
 
 - Reads and writes translate logical runs to physical runs and call md.c
-  on the page store; `smgrmaxcombine` reports the physically contiguous
-  run, so the buffer manager's combined reads never cross a gap.
+  on the page store; `smgrmaxcombine` reports the physically consecutive
+  run, so combined reads never cross a gap.
 - Asynchronous reads are started on the page store's md.c relation, so an
-  I/O worker reopening the target needs no map lookup.
-- Sync requests are md.c's, for the page store's segments and the map's;
+  I/O worker reopening the target needs no map. The map is read before the
+  read's I/O handle is acquired, through the new `smgrprepareread()`: a
+  backend can hold only one handle.
+- Writing a page looks it up without loading map pages into shared
+  buffers: a cached map page is used, otherwise the page is read from
+  disk into private memory, where an uncached page is current. Otherwise
+  a write could need an eviction whose write needs a lookup, and so on
+  until no buffer is left (seen with a 1 MB buffer pool). The background
+  writer and checkpointer read map pages, so `pg_stat_io` counts their
+  reads, hits and evictions of relation pages.
+- A relation's extensions (and its map fork's growth) are serialized by
+  its map header's exclusive lock, the allocator's growth by its
+  metapage's: not by relation extension locks, since a backend extending a
+  relation holds that relation's extension lock and may take no other
+  heavyweight lock.
+- Sync requests are md.c's, for the page store's and the map's segments;
   `smgrimmedsync` syncs the page store.
+
+### Results (2026-10-15)
+
+With `debug_block_mapped_heap` (`make -C src/test/prolly
+check-upstream-bmap`):
+
+- Regression suite: 239 of 239.
+- Isolation suite: 134 of 134.
+- Recovery suite: everything passes, `027_stream_regress` (the regression
+  suite on a primary and a replaying standby) included, but for checks
+  that read relation files directly: `016_min_consistency` reads a
+  table's main-fork file to compare page LSNs, and two checks of
+  `018_wal_optimize` expect one numeric file per relation. A block-mapped
+  relation has no main-fork file, and the allocator and page store are
+  numeric files no relation names.
+
+`test_prolly`'s `028_bmap_storage.pl` covers crashes (including a lost
+first extension), a standby, promotion, block reuse, base backups,
+`pg_checksums`, rewrites, persistence changes and tablespaces.
 
 ### Step 2's remapping rule (designed now, built then)
 
@@ -459,6 +509,9 @@ opportunistic pruning skips shared pages.
 
 ### Known limits after step 1
 
-- `pg_rewind` and `pg_upgrade` don't understand block-mapped databases yet.
+- `pg_rewind` and `pg_upgrade` don't understand block-mapped storage yet.
 - Freed blocks are reused, but the page store never shrinks.
-- Map lookups cost a pinned map page or two per I/O; measured in step 8.
+- Online checksum enabling skips map forks, which `smgrexists` hides.
+- Each I/O looks up the map (a copied map page or two); a buffer header
+  that remembers its physical block would save the lookup on writes.
+  Measured in step 8.

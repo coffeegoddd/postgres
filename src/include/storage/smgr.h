@@ -17,6 +17,7 @@
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
+#include "storage/buf.h"
 #include "storage/relfilelocator.h"
 
 /*
@@ -62,6 +63,15 @@ typedef struct SMgrRelationData
 	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
 
 	/*
+	 * for bmap.c: the map's header pinned before a truncation, and the
+	 * lookup of a prepared read
+	 */
+	Buffer		bmap_pretrunc;
+	BlockNumber bmap_read_blkno;	/* logical start of a prepared read */
+	BlockNumber bmap_read_phys; /* its physical start */
+	BlockNumber bmap_read_run;	/* physically consecutive blocks */
+
+	/*
 	 * Pinning support.  If unpinned (ie. pincount == 0), 'node' is a list
 	 * link in list of all unpinned SMgrRelations.
 	 */
@@ -102,6 +112,8 @@ extern void smgrextend(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, const void *buffer, bool skipFsync);
 extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, int nblocks, bool skipFsync);
+extern void smgrpreextend(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber blocknum, int nblocks);
 extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks);
 extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -109,6 +121,8 @@ extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
 extern void smgrreadv(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum,
 					  void **buffers, BlockNumber nblocks);
+extern void smgrprepareread(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, BlockNumber nblocks);
 extern void smgrstartreadv(PgAioHandle *ioh,
 						   SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum,
@@ -121,6 +135,7 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

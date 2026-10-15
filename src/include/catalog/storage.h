@@ -22,6 +22,9 @@
 /* GUC variables */
 extern PGDLLIMPORT int wal_skip_threshold;
 
+/* while not -1, new permanent heap storage goes to this storage manager */
+extern PGDLLIMPORT int new_relation_smgr;
+
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,
 										  bool register_delete);

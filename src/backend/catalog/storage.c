@@ -39,6 +39,8 @@
 /* GUC variables */
 int			wal_skip_threshold = 2048;	/* in kilobytes */
 
+int			new_relation_smgr = -1;
+
 /*
  * We keep a list of all relations (represented as RelFileLocator values)
  * that have been created or deleted in the current transaction.  When
@@ -131,7 +133,8 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
  *		Create physical storage for a relation in a given storage manager.
  *
  * As RelationCreateStorage(), but in storage manager 'smgr_which' (SMGR_*).
- * Storage managers other than md.c hold permanent relations only.
+ * Storage managers other than md.c hold permanent relations only; other
+ * relations are created in md.c whatever 'smgr_which' says.
  */
 SMgrRelation
 RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
@@ -162,9 +165,9 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
-	if (smgr_which != SMGR_MD && relpersistence != RELPERSISTENCE_PERMANENT)
-		elog(ERROR, "storage manager %d holds permanent relations only",
-			 smgr_which);
+	/* other storage managers hold permanent relations only */
+	if (relpersistence != RELPERSISTENCE_PERMANENT)
+		smgr_which = SMGR_MD;
 
 	srel = smgropen(rlocator, procNumber);
 	smgrcreatewith(srel, smgr_which, MAIN_FORKNUM, false);
@@ -386,6 +389,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * corresponding sync request will be processed before the checkpoint
 	 * completes.
 	 */
+	/* anything the storage manager needs, read before the critical section */
+	smgrpretruncate(RelationGetSmgr(rel), forks, nforks);
+
 	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
 

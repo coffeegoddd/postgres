@@ -28,6 +28,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
+#include "storage/bmap.h"
 #include "storage/md.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -115,6 +116,12 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+	/* block-mapped storage's stubs */
+	[SYNC_HANDLER_BMAP] = {
+		.sync_syncfiletag = bmapsyncfiletag,
+		.sync_unlinkfiletag = bmapunlinkfiletag,
+		.sync_filetagmatches = bmapfiletagmatches
 	}
 };
 

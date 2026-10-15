@@ -69,6 +69,7 @@
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
+#include "storage/bmap.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
@@ -763,6 +764,9 @@ destroy_tablespace_directories(Oid tablespaceoid, bool redo)
 			continue;
 
 		subfile = psprintf("%s/%s", linkloc_with_version_dir, de->d_name);
+
+		/* a database's block map stays until its last relation is gone */
+		bmap_drop_unused(tablespaceoid, atooid(de->d_name), subfile);
 
 		/* This check is just to deliver a friendlier error message */
 		if (!redo && !directory_is_empty(subfile))
