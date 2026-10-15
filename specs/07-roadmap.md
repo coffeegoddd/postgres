@@ -957,6 +957,40 @@ on a copy. Heap catalogs take the same path, so every test exercises it;
 behavior is unchanged (core's 239 tests pass). Not yet: the scans that
 call `heap_getnext` directly (stage 1's other half).
 
+**Status (2026-10-15): 4h begun: gates 1-3 run.** Postgres's own regress,
+isolation and recovery suites ran with `prolly_d1` as the default table
+access method (`specs/results/2026-10-15-gates-prolly_d1/`). They found
+twelve bugs, fixed in this stack, each with its test: four crashes
+(parallel btree builds, a WITHOUT OVERLAPS primary key, a savepoint
+rollback in a fresh backend, a TID counter page left empty by a crash);
+four hangs, two of them over wrong answers underneath (SSI missed
+prepared writers, so `prepared_xacts` waited on a transaction that should
+have failed; size estimates ignored spilled writes, so `join_hash` ran
+nested loops for hours; `tuplelock-update` and
+`tuplelock-upgrade-no-deadlock` waited where heap doesn't); three
+gaps (backward scans, VACUUM's index cleanup, FOR KEY SHARE across no-key
+updates); and a leak (SET TABLESPACE kept a prolly table's old storage). What
+still differs is listed there: mostly heap-specific output (row order,
+plans and costs, TIDs, sizes, TOAST, BRIN, multixacts, statistics), SSI at
+table granularity (more serialization failures, never fewer), logical
+decoding (deferred), and a short list to triage (EvalPlanQual and MERGE
+isolation specs, `fk-snapshot`, `propagate-lock-delete`,
+`insert-conflict-specconflict`, `056_standby_snapshot_export`). Open decisions:
+types without binary I/O (stored as text, or refused as decision 15
+says), unlogged prolly tables, and indexes of other access methods on
+versioned tables (`09-versioned-catalogs.md` part 4). After the gates, the
+S8 smoke run found a thirteenth bug (an index or bitmap scan feeding an
+UPDATE read a table its first write had rebuilt in a new keying), fixed
+too. The S and V smoke runs (one repetition, five-second windows, an
+optimized build; `specs/results/2026-10-15-*-prolly_d1-smoke*/`, kept
+out of git like all results) are D1's first numbers: every S workload
+runs, at 0.01x-0.56x of heap's smoke figures (point lookups about 0.5x;
+writes about 0.2x; range scans 0.04x; bulk load and large transactions
+about 0.01x). V1-V3 run; V3 with background writes fails, as a merge
+needs its branch to have no changes since its head commit (Dolt merges
+into a dirty working set when the changes don't conflict: a decision);
+V4 (clone, push) needs remotes, not built.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.
