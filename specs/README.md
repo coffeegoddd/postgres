@@ -15,6 +15,11 @@ control; this project's premise is that we should not have to.
 
 ## Status (read this before anything else)
 
+- **Direction change proposed 2026-10-15:** `11-pages-and-dolt-snapshots.md`
+  replaces prolly trees as primary storage with Postgres pages for the
+  working set and a Doltgres-compatible Dolt store for history. Read it
+  before the rest; the step plan there supersedes the roadmap from step 4
+  on once agreed.
 - **Only what is marked decided is decided.** Decisions are recorded in
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
@@ -54,6 +59,7 @@ control; this project's premise is that we should not have to.
 | `src/test/prolly/README` | The requirements suite: what an engine must pass, and how to run it |
 | [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
 | [10-complexity-requirements.md](10-complexity-requirements.md) | **Requirement:** every version-control operation at worst matches Dolt's time and space bounds, ideally beats them; per-operation bounds, how the design meets them, and status |
+| [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **Proposed direction (2026-10-15):** the working set in Postgres pages, branches as copy-on-write page sets, history in a Doltgres-compatible Dolt store; and the steps from today's code and open PRs to it |
 
 ## Related local repositories
 
