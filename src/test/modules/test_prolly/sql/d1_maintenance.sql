@@ -260,3 +260,12 @@ SELECT prolly_tree_digest('added_keyless') = prolly_tree_digest('added_keyless_f
 
 DROP TABLE big, near, triples, bm, wide, digests, skewed, added, added_fresh,
 	added_tids, added_keyless, added_keyless_fresh;
+
+-- VACUUM lets other index AMs clean up even with no dead rows: GIN's pending
+-- list is flushed.
+CREATE TABLE ginp (a int[]) USING prolly_d1;
+CREATE INDEX ginp_a ON ginp USING gin (a) WITH (fastupdate = on);
+INSERT INTO ginp SELECT ARRAY[1, 2, g] FROM generate_series(1, 200) g;
+VACUUM ginp;
+SELECT gin_clean_pending_list('ginp_a');
+DROP TABLE ginp;

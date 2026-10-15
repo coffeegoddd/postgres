@@ -2370,7 +2370,12 @@ dead_tid(ItemPointer itemptr, void *state)
 				   (int (*) (const void *, const void *)) ItemPointerCompare) != NULL;
 }
 
-/* Remove the entries of rel's indexes, other than prolly's, for dead TIDs. */
+/*
+ * VACUUM rel's indexes other than prolly's: remove their entries for dead
+ * TIDs (if any), then let each clean up, as heap's VACUUM does whether or
+ * not it found dead tuples (GIN flushes its pending list, BRIN summarizes
+ * new ranges), unless INDEX_CLEANUP is off.
+ */
 static void
 vacuum_index_entries(Relation rel, ItemPointer dead, int ndead,
 					 const VacuumParams *params, BufferAccessStrategy bstrategy)
@@ -2378,9 +2383,11 @@ vacuum_index_entries(Relation rel, ItemPointer dead, int ndead,
 	Relation   *indexes;
 	int			nindexes;
 	DeadTids	d = {dead, ndead};
+	bool		cleanup = params->index_cleanup != VACOPTVALUE_DISABLED;
 
-	qsort(dead, ndead, sizeof(ItemPointerData),
-		  (int (*) (const void *, const void *)) ItemPointerCompare);
+	if (ndead > 0)
+		qsort(dead, ndead, sizeof(ItemPointerData),
+			  (int (*) (const void *, const void *)) ItemPointerCompare);
 	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indexes);
 	for (int i = 0; i < nindexes; i++)
 	{
@@ -2397,8 +2404,9 @@ vacuum_index_entries(Relation rel, ItemPointer dead, int ndead,
 		ivinfo.message_level = DEBUG2;
 		ivinfo.num_heap_tuples = -1;
 		ivinfo.strategy = bstrategy;
-		stats = index_bulk_delete(&ivinfo, NULL, dead_tid, &d);
-		stats = index_vacuum_cleanup(&ivinfo, stats);
+		stats = ndead > 0 ? index_bulk_delete(&ivinfo, NULL, dead_tid, &d) : NULL;
+		if (cleanup)
+			stats = index_vacuum_cleanup(&ivinfo, stats);
 		if (stats)
 			pfree(stats);
 	}
@@ -2428,12 +2436,10 @@ prolly_relation_vacuum(Relation rel, const VacuumParams *params,
 	ndead = PROLLY_CALL(c.row_identity, dead_tids, roots, rel,
 						GetOldestNonRemovableTransactionId(rel), &dead);
 	PROLLY_CALL(c.engine, roots_release, roots);
+	vacuum_index_entries(rel, dead, ndead, params, bstrategy);
 	if (ndead > 0)
-	{
-		vacuum_index_entries(rel, dead, ndead, params, bstrategy);
 		PROLLY_CALL(c.row_identity, tid_forget, rel, dead, ndead,
 					GetCurrentCommandId(true));
-	}
 	ereport(params->log_vacuum_min_duration == 0 ? LOG : DEBUG2,
 			(errmsg("prolly table \"%s\": %d gone row versions removed",
 					RelationGetRelationName(rel), ndead)));
