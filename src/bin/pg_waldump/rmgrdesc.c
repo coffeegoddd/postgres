@@ -19,6 +19,7 @@
 #include "access/multixact.h"
 #include "access/nbtxlog.h"
 #include "access/prolly_xlog.h"
+#include "storage/bmap_xlog.h"
 #include "access/rmgr.h"
 #include "access/spgxlog.h"
 #include "access/xact.h"

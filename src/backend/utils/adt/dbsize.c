@@ -21,6 +21,7 @@
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
+#include "storage/bmap.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -329,6 +330,16 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	RelPathStr	relationpath;
 	char		pathname[MAXPGPATH];
 	unsigned int segcount = 0;
+
+	/* the block map is storage's own, not the relation's data */
+	if (forknum == BMAP_FORKNUM)
+		return 0;
+
+	/* a block-mapped main fork's pages are in its database's page store */
+	if (forknum == MAIN_FORKNUM && backend == INVALID_PROC_NUMBER &&
+		bmap_relation_exists(*rfn))
+		return (int64) smgrnblocks(smgropen(*rfn, backend), MAIN_FORKNUM) *
+			BLCKSZ;
 
 	relationpath = relpathbackend(*rfn, backend, forknum);
 

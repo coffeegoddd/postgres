@@ -2024,6 +2024,13 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	 * doesn't really allow that because it doesn't have an API to report
 	 * "accumulated" time.
 	 */
+	/*
+	 * Let the storage manager read what it needs to start the read, while
+	 * this backend may still start other I/O.
+	 */
+	smgrprepareread(operation->smgr, forknum, blocknum,
+					operation->nblocks - nblocks_done);
+
 	ioh = pgaio_io_acquire_nb(CurrentResourceOwner, &operation->io_return);
 	if (unlikely(!ioh))
 	{

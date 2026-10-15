@@ -67,6 +67,7 @@ tests += {
       't/025_d1_relation_trees.pl',
       't/026_d1_tid_reuse_branches.pl',
       't/027_d1_counter_crash.pl',
+      't/028_bmap_storage.pl',
     ],
   },
 }

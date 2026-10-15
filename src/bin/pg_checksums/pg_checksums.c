@@ -28,6 +28,7 @@
 #include "fe_utils/version.h"
 #include "getopt_long.h"
 #include "pg_getopt.h"
+#include "storage/bmap_files.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
@@ -110,6 +111,8 @@ static const struct exclude_list_item skip[] = {
 	{"pg_filenode.map", false},
 	{"pg_internal.init", true},
 	{"PG_VERSION", false},
+	/* the prolly engine's branch heads, and their temporary file */
+	{"prolly_heads", true},
 #ifdef EXEC_BACKEND
 	{"config_exec_params", true},
 #endif
@@ -367,6 +370,19 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 			forkpath = strchr(fnonly, '_');
 			if (forkpath != NULL)
 				*forkpath++ = '\0';
+
+			/*
+			 * The block-mapped page store's pages carry checksums of their
+			 * logical block numbers, which only the server knows.
+			 */
+			if (forkpath == NULL &&
+				strcmp(fnonly, CppAsString2(BMAP_STORE_RELNUMBER)) == 0)
+			{
+				if (mode == PG_MODE_ENABLE)
+					pg_fatal("cannot enable checksums in a cluster with block-mapped storage (file \"%s\")",
+							 fn);
+				continue;
+			}
 
 			if (only_filenode && strcmp(only_filenode, fnonly) != 0)
 				/* filenode not to be included */

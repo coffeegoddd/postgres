@@ -42,6 +42,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "storage/bmap.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -639,6 +640,12 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		if (access(rpath.str, F_OK) == 0)
 		{
 			/* definite collision */
+			collides = true;
+		}
+		else if (rlocator.backend == INVALID_PROC_NUMBER &&
+				 bmap_relation_exists(rlocator.locator))
+		{
+			/* a block-mapped relation has the name */
 			collides = true;
 		}
 		else

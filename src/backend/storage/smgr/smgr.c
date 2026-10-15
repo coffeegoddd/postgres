@@ -67,6 +67,7 @@
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
@@ -101,12 +102,17 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
+	/* before a relation's buffers are dropped to unlink it; may be NULL */
+	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum, const void *buffer, bool skipFsync);
 	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum, int nblocks, bool skipFsync);
+	/* before WAL-logging blocks that will extend the fork; may be NULL */
+	void		(*smgr_preextend) (SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, int nblocks);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
@@ -114,6 +120,9 @@ typedef struct f_smgr
 	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
 							   BlockNumber blocknum,
 							   void **buffers, BlockNumber nblocks);
+	/* before an asynchronous read's handle is acquired; may be NULL */
+	void		(*smgr_prepareread) (SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber blocknum, BlockNumber nblocks);
 	void		(*smgr_startreadv) (PgAioHandle *ioh,
 									SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum,
@@ -125,6 +134,8 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	/* before the critical section a truncation runs in; may be NULL */
+	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
@@ -134,7 +145,7 @@ typedef struct f_smgr
 
 static const f_smgr smgrsw[] = {
 	/* magnetic disk */
-	{
+	[SMGR_MD] = {
 		.smgr_init = mdinit,
 		.smgr_shutdown = NULL,
 		.smgr_open = mdopen,
@@ -155,6 +166,34 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+	},
+	/* block-mapped */
+	[SMGR_BMAP] = {
+		.smgr_init = bmapinit,
+		.smgr_shutdown = NULL,
+		.smgr_claims = bmapclaims,
+		.smgr_open = bmapopen,
+		.smgr_close = bmapclose,
+		.smgr_create = bmapcreate,
+		.smgr_exists = bmapexists,
+		.smgr_predrop = bmappredrop,
+		.smgr_unlink = bmapunlink,
+		.smgr_extend = bmapextend,
+		.smgr_zeroextend = bmapzeroextend,
+		.smgr_preextend = bmappreextend,
+		.smgr_prefetch = bmapprefetch,
+		.smgr_maxcombine = bmapmaxcombine,
+		.smgr_readv = bmapreadv,
+		.smgr_prepareread = bmapprepareread,
+		.smgr_startreadv = bmapstartreadv,
+		.smgr_writev = bmapwritev,
+		.smgr_writeback = bmapwriteback,
+		.smgr_nblocks = bmapnblocks,
+		.smgr_pretruncate = bmappretruncate,
+		.smgr_truncate = bmaptruncate,
+		.smgr_immedsync = bmapimmedsync,
+		.smgr_registersync = bmapregistersync,
+		.smgr_fd = bmapfd,
 	}
 };
 
@@ -603,6 +642,15 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 */
 	HOLD_INTERRUPTS();
 
+	/* whatever a storage manager must read before the buffers go */
+	for (i = 0; i < nrels; i++)
+	{
+		int			which = rels[i]->smgr_which;
+
+		if (smgrsw[which].smgr_predrop)
+			smgrsw[which].smgr_predrop(rels[i], isRedo);
+	}
+
 	/*
 	 * Get rid of any remaining buffers for the relations.  bufmgr will just
 	 * drop them without bothering to write the contents.
@@ -720,6 +768,26 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * smgrpreextend() -- Prepare to extend a fork with blocks logged first.
+ *
+ * A caller that WAL-logs new blocks' contents before writing them with
+ * smgrextend() calls this before logging them, so a storage manager that
+ * must record where a block lives can do so before any record names it.
+ * Afterwards the fork may already be 'blocknum + nblocks' long.
+ */
+void
+smgrpreextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			  int nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_preextend == NULL)
+		return;
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_preextend(reln, forknum, blocknum, nblocks);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+	RESUME_INTERRUPTS();
+}
+
+/*
  * smgrprefetch() -- Initiate asynchronous read of the specified block of a relation.
  *
  * In recovery only, this can return false to indicate that a file
@@ -776,6 +844,25 @@ smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_readv(reln, forknum, blocknum, buffers,
 										nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrprepareread() -- Prepare to start an asynchronous read.
+ *
+ * Called before the read's I/O handle is acquired; a backend can hold only
+ * one handle, so whatever a storage manager must read to start the read
+ * (block-mapped storage reads its map), it reads here.
+ */
+void
+smgrprepareread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				BlockNumber nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepareread == NULL)
+		return;
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_prepareread(reln, forknum, blocknum,
+											  nblocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -907,6 +994,22 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 		return reln->smgr_cached_nblocks[forknum];
 
 	return InvalidBlockNumber;
+}
+
+/*
+ * smgrpretruncate() -- Prepare to truncate the given forks.
+ *
+ * smgrtruncate() runs in a critical section; anything a storage manager
+ * must read to truncate a fork, it reads here, before that section.
+ */
+void
+smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
+{
+	for (int i = 0; i < nforks; i++)
+	{
+		if (smgrsw[reln->smgr_which].smgr_pretruncate)
+			smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i]);
+	}
 }
 
 /*
