@@ -54,6 +54,9 @@ CATALOG(pg_database,1262,DatabaseRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	/* database has login event triggers? */
 	bool		dathasloginevt;
 
+	/* version-controlled: its tables are prolly tables, branched and committed */
+	bool		datversioned BKI_DEFAULT(f);
+
 	/*
 	 * Max connections allowed. Negative values have special meaning, see
 	 * DATCONNLIMIT_* defines below.

@@ -37,8 +37,10 @@ extern ProllyBranchId prolly_session_branch(void);
 extern void prolly_set_session_branch(ProllyBranchId branch);
 
 /*
- * Per-session setup once connected to a database: defines dolt.author,
- * and checks out branch (from a "dbname/branch" connection) unless NULL.
+ * Per-session setup once connected to a database: defines the dolt.*
+ * settings, makes prolly the default table access method of a versioned
+ * database, and checks out branch (from a "dbname/branch" connection)
+ * unless NULL.
  */
 extern void prolly_session_init(const char *branch);
 

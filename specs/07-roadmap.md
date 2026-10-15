@@ -880,6 +880,25 @@ versioned catalogs), resolving single rows (Dolt deletes rows from
 `dolt_conflicts_<table>`; here a table is resolved whole, after fixing its
 rows by hand if need be), constraint violations (`dolt_constraint_violations`).
 
+**Status (2026-10-15): 4g.5 begun: versioned databases are opt-in.**
+`CREATE DATABASE ... VERSIONED` (question 54; otherwise the template's
+setting, so a versioned template makes versioned databases) sets a new
+`pg_database.datversioned`, and sessions see it as `MyDatabaseVersioned`.
+In a versioned database, `prolly_d1` is the default table access method
+(a dynamic default, below any setting for the server, database, role or
+session), and a permanent table stored by any other table access method
+can't be made: not by CREATE TABLE, CREATE TABLE AS, a materialized view,
+SET ACCESS METHOD, or SET LOGGED on an unlogged heap table (question 25's
+decision for user tables: every permanent table of a versioned database is
+versioned). Temporary and unlogged tables are heap, as before. Other
+databases are Postgres as it is; version control of the prolly tables
+they hold still works, as before. Prolly tables and indexes ignore
+tablespaces, with a NOTICE on CREATE TABLE, CREATE INDEX and SET
+TABLESPACE (question 29's decision). pg_dump writes `VERSIONED = true`.
+Tests: `024_versioned_database.pl`. The catalogs themselves are still heap
+tables, shared by every branch: making them prolly tables is the rest of
+4g.5 (below).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

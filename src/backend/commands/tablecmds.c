@@ -1077,6 +1077,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	accessMethodId = prolly_table_am_for_persistence(accessMethodId,
 													 stmt->relation->relpersistence,
 													 stmt->accessMethod != NULL);
+	prolly_note_tablespace(accessMethodId, stmt->tablespacename);
 
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
@@ -17190,6 +17191,7 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	/* if it's a match, phase 3 doesn't need to do anything */
 	if (rel->rd_rel->relam == amoid)
 		return;
+	prolly_check_versioned_am(amoid, rel->rd_rel->relpersistence);
 
 	/* Save info for Phase 3 to do the real work */
 	tab->rewrite |= AT_REWRITE_ACCESS_METHOD;
@@ -17301,6 +17303,7 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 
 	/* Check that the tablespace exists */
 	tablespaceId = get_tablespace_oid(tablespacename, false);
+	prolly_note_tablespace(rel->rd_rel->relam, tablespacename);
 
 	/* Check permissions except when moving to database's default */
 	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
@@ -19555,6 +19558,8 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 			if (!toLogged)
 				/* nothing to do */
 				return;
+			prolly_check_versioned_am(rel->rd_rel->relam,
+									  RELPERSISTENCE_PERMANENT);
 			break;
 	}
 

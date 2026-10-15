@@ -86,6 +86,13 @@ prolly_session_init(const char *branch)
 								 NULL, NULL, NULL);
 		defined = true;
 	}
+	/*
+	 * A versioned database's tables are prolly tables by default: below any
+	 * setting made for the server, database, role or session.
+	 */
+	if (MyDatabaseVersioned)
+		SetConfigOption("default_table_access_method", "prolly_d1",
+						PGC_USERSET, PGC_S_DYNAMIC_DEFAULT);
 	if (branch)
 	{
 		ProllyDatabaseComponents dc;
