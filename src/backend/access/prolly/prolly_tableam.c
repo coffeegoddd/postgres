@@ -1951,6 +1951,35 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			}
 			if (now.present)
 			{
+				RowAt		seen;
+
+				/*
+				 * A version this transaction wrote, in this command or a
+				 * later one, isn't the command's to lock: as heap does,
+				 * report it modified by this transaction (when, in cmax,
+				 * this command or a later one: the caller tells them apart).
+				 */
+				row_at_init(&seen);
+				row_at(&c, roots, rel, keying, &next, cid, &seen);
+				if (!seen.present)
+				{
+					RowAt		after;
+
+					row_at_init(&after);
+					row_at(&c, roots, rel, keying, &next, cid + 1, &after);
+					tmfd->ctid = next;
+					tmfd->xmax = GetCurrentTransactionId();
+					tmfd->cmax = after.present ? cid : cid + 1;
+					tmfd->traversed = true;
+					row_at_free(&after);
+					row_at_free(&seen);
+					row_at_free(&now);
+					release_keying(&c, keying, owned);
+					PROLLY_CALL(c.engine, roots_release, roots);
+					return TM_SelfModified;
+				}
+				row_at_free(&seen);
+
 				/* Lock that version, and look at it again once locked. */
 				*tid = next;
 				traversed = true;

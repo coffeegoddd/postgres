@@ -974,7 +974,8 @@ still differs is listed there: mostly heap-specific output (row order,
 plans and costs, TIDs, sizes, TOAST, BRIN, multixacts, statistics), SSI at
 table granularity (more serialization failures, never fewer), logical
 decoding (deferred), and a short list to triage (EvalPlanQual and MERGE
-isolation specs, `fk-snapshot`, `propagate-lock-delete`,
+isolation specs (the EvalPlanQual ones' errors fixed since, below; what's
+left is row order and TIDs), `fk-snapshot`, `propagate-lock-delete`,
 `insert-conflict-specconflict`, `056_standby_snapshot_export`). Open decisions:
 types without binary I/O (stored as text, or refused as decision 15
 says), unlogged prolly tables, and indexes of other access methods on
@@ -989,7 +990,10 @@ writes about 0.2x; range scans 0.04x; bulk load and large transactions
 about 0.01x). V1-V3 run; V3 with background writes fails, as a merge
 needs its branch to have no changes since its head commit (Dolt merges
 into a dirty working set when the changes don't conflict: a decision);
-V4 (clone, push) needs remotes, not built.
+V4 (clone, push) needs remotes, not built. Then a fourteenth: an update whose row's
+newest version its own command wrote (a data-modifying WITH) got an
+unexpected lock status; locking the end of an update chain now reports a
+version this transaction wrote later as modified by it, as heap does.
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

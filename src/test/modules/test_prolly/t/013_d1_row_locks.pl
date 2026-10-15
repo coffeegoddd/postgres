@@ -240,6 +240,22 @@ $s2->{stderr} = '';
 $s2->query_safe('COMMIT');
 is($node->safe_psql('postgres', 'SELECT parent_id FROM child WHERE id = 100'), '1', 'and the row is inserted');
 
+# An update that waited, and whose row's newest version this command wrote
+# itself (a data-modifying WITH), skips it as heap does, rather than fail
+# with an unexpected lock status (Postgres's eval-plan-qual test).
+$node->safe_psql('postgres', q{CREATE TABLE cte_acc (id text PRIMARY KEY, bal int);
+	INSERT INTO cte_acc VALUES ('a', 100), ('b', 200);});
+$s1->query_safe(q{BEGIN; UPDATE cte_acc SET bal = bal - 10 WHERE id = 'a';});
+$s2->query_until(qr/go/, "\\echo go\nWITH doup AS (UPDATE cte_acc SET bal = bal + 1000 WHERE id = 'a' RETURNING *) UPDATE cte_acc t SET bal = doup.bal + 1 FROM doup;\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted})
+  or die 'the update never waited';
+$s1->query_safe('COMMIT');
+$s2->query('SELECT 1');
+is($s2->{stderr}, '', 'an update meeting its own command\'s newer version skips it');
+$s2->{stderr} = '';
+is($node->safe_psql('postgres', q{SELECT string_agg(id || ':' || bal, ',' ORDER BY id) FROM cte_acc}),
+	'a:1090,b:1091', 'and the rows are as on heap');
+
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{
 	CREATE TABLE acct (id int PRIMARY KEY, bal int);
