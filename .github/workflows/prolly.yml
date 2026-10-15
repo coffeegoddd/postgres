@@ -110,6 +110,66 @@ jobs:
             --cases src/tools/prolly_bench/slt/internal/vcscenario/cases/sql-values.json \
             --out "$PWD/engine-results/vc-sql-adapters"
 
+      - name: Fetch pinned Dolt test source
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/dolt
+          ref: 51cc4458b740ac132cb2302fe5394a2abbfba39d
+          path: dolt-vc-source
+          sparse-checkout: go/libraries/doltcore/sqle/enginetest
+
+      - name: Verify Dolt source inventory and reviewed mappings
+        working-directory: src/tools/prolly_bench/slt
+        run: |
+          go run ./cmd/dolt-catalog \
+            --repo "$GITHUB_WORKSPACE/dolt-vc-source" \
+            --revision 51cc4458b740ac132cb2302fe5394a2abbfba39d \
+            --check ../corpus/dolt/source-lock.json \
+            --out "$GITHUB_WORKSPACE/engine-results/dolt-catalog"
+          go run ./cmd/dolt-corpus --root ../corpus/dolt \
+            --catalog "$GITHUB_WORKSPACE/engine-results/dolt-catalog/catalog.json" \
+            --out "$GITHUB_WORKSPACE/engine-results/dolt-port-review.json"
+          go build -o "$GITHUB_WORKSPACE/build-bench/vc/dolt-corpus" ./cmd/dolt-corpus
+
+      - name: Imported Dolt scenarios on D1
+        run: |
+          src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
+            --cases src/tools/prolly_bench/corpus/dolt/scenarios \
+            --out "$PWD/engine-results/dolt-d1"
+          build-bench/vc/dolt-corpus --root src/tools/prolly_bench/corpus/dolt \
+            --catalog engine-results/dolt-catalog/catalog.json \
+            --results engine-results/dolt-d1/results/summary.json \
+            --out engine-results/dolt-d1-coverage.json
+
+      - name: Verify explicit unsupported ledger for other engines
+        run: |
+          status=0
+          src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
+            --am heap,prolly,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4 \
+            --cases src/tools/prolly_bench/corpus/dolt/scenarios \
+            --out "$PWD/engine-results/dolt-unsupported" || status=$?
+          test "$status" -eq 1
+          status=0
+          build-bench/vc/dolt-corpus --root src/tools/prolly_bench/corpus/dolt \
+            --catalog engine-results/dolt-catalog/catalog.json \
+            --results engine-results/dolt-unsupported/results/summary.json \
+            --out engine-results/dolt-unsupported-coverage.json || status=$?
+          test "$status" -eq 1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("engine-results/dolt-unsupported-coverage.json").read_text())
+          engines = {e["engine"]: e for e in report["engines"]}
+          assert set(engines) == {"heap", "prolly", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"}
+          planned = report["ported_cases"] + report["partial_cases"]
+          assert planned > 0
+          for engine in engines.values():
+              assert engine["unsupported"] == planned, engine
+              assert engine["passed"] == engine["failed"] == engine["not_run"] == engine["passed_mapped_assertions"] == 0, engine
+          PY
+
       - name: Seeded differential histories
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' }}
