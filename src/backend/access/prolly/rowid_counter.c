@@ -21,13 +21,25 @@
  * starts a new counter, as its indexes are rebuilt; SET TABLESPACE and
  * CREATE DATABASE copy the page with the table.
  *
+ * TIDs VACUUM forgets are given out again: they go on a stack of free
+ * numbers in blocks 1 .. n of the main fork (the counter page's contents
+ * say how many of those blocks the stack fills), each with the xid of the
+ * transaction that forgot it, and a backend takes up to REUSE_TIDS of them
+ * at a time before it reserves new numbers.  A number is taken only once
+ * that transaction has committed: until then its removal of the TID's map
+ * entries isn't in the branch, and a commit replayed after it would remove
+ * the entries a reuse wrote.  Numbers forgotten by a transaction that
+ * aborted are dropped (they stay taken).
+ *
  * The relation's row-identity tree (PROLLY_TREE_ROWID) holds, keyed by a
  * tag byte:
  *
  *	'T' block(4) offset(2)
  *		-> content-length content varint-ordinal xmin(4) row-key
  *		for every TID whose version may exist, or once its version is gone
- *		-> 0 cid(4) xmin(4) flag [successor TID (6 bytes) if flag]
+ *		-> 0 cid(4) xmin(4) xmax(4) flag [successor TID (6 bytes) if flag]
+ *		where xmax is the transaction that retired it (VACUUM forgets the
+ *		TID once no snapshot can see the version)
  *	'G' block(4) offset(2)
  *		-> the gone version's row, kept like a dead tuple, as its own item:
  *		the same bytes the data tree held, so a large row's value tree is
@@ -61,6 +73,8 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -87,12 +101,41 @@ typedef struct CounterPageData
 	uint64		reserved_to;	/* numbers below this may have been used */
 } CounterPageData;
 
+/* Numbers a backend takes off the free stack at a time. */
+#define REUSE_TIDS		256
+
+/* The counter page's contents: how many blocks the free stack fills. */
+typedef struct CounterFreeData
+{
+	uint32		magic;			/* FREE_STACK_MAGIC, or never set */
+	uint32		npages;
+} CounterFreeData;
+
+#define FREE_STACK_MAGIC	0x50465453	/* "PFTS" */
+
+/* A free stack block's special space; its contents are FreeNumbers. */
+typedef struct FreeStackPage
+{
+	uint32		count;
+} FreeStackPage;
+
+typedef struct FreeNumber
+{
+	uint64		number;
+	TransactionId xid;			/* the transaction that forgot it */
+} FreeNumber;
+
+#define FREE_STACK_CAP	((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
+						  MAXALIGN(sizeof(FreeStackPage))) / sizeof(FreeNumber))
+
 /* A backend's reserved numbers, per table storage. */
 typedef struct Reservation
 {
 	RelFileLocator locator;		/* hash key */
 	uint64		next;
 	uint64		end;
+	uint64		reuse[REUSE_TIDS];	/* numbers taken off the free stack */
+	int			nreuse;
 } Reservation;
 
 static HTAB *reservations = NULL;
@@ -182,6 +225,147 @@ counter_buffer(Relation rel)
 	return ReadBuffer(rel, 0);
 }
 
+static CounterFreeData *
+counter_free(Page page)
+{
+	CounterFreeData *f = (CounterFreeData *) PageGetContents(page);
+
+	if (f->magic != FREE_STACK_MAGIC)
+	{
+		f->magic = FREE_STACK_MAGIC;
+		f->npages = 0;
+		((PageHeader) page)->pd_lower = (char *) (f + 1) - (char *) page;
+	}
+	return f;
+}
+
+/* Take up to REUSE_TIDS numbers off rel's free stack, into res. */
+static void
+take_free_numbers(Relation rel, Reservation *res)
+{
+	Buffer		cbuf = counter_buffer(rel);
+	GenericXLogState *state;
+	CounterFreeData *f;
+	Buffer		sbuf;
+	Page		spage;
+	FreeStackPage *sp;
+	int			take;
+
+	LockBuffer(cbuf, BUFFER_LOCK_SHARE);
+	f = (CounterFreeData *) PageGetContents(BufferGetPage(cbuf));
+	if (f->magic != FREE_STACK_MAGIC || f->npages == 0)
+	{
+		UnlockReleaseBuffer(cbuf);
+		return;
+	}
+	LockBuffer(cbuf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+	f = (CounterFreeData *) PageGetContents(BufferGetPage(cbuf));
+	if (f->magic != FREE_STACK_MAGIC || f->npages == 0)
+	{
+		UnlockReleaseBuffer(cbuf);
+		return;
+	}
+	sbuf = ReadBuffer(rel, f->npages);
+	LockBuffer(sbuf, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(rel);
+	f = counter_free(GenericXLogRegisterBuffer(state, cbuf, 0));
+	spage = GenericXLogRegisterBuffer(state, sbuf, 0);
+	sp = (FreeStackPage *) PageGetSpecialPointer(spage);
+	take = Min(sp->count, REUSE_TIDS);
+	for (int i = 0; i < take; i++)
+	{
+		FreeNumber *fn = &((FreeNumber *) PageGetContents(spage))[sp->count - 1];
+
+		if (TransactionIdIsInProgress(fn->xid))
+			break;				/* not given out until it commits */
+		sp->count--;
+		if (TransactionIdDidCommit(fn->xid))
+			res->reuse[res->nreuse++] = fn->number;
+	}
+	((PageHeader) spage)->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
+		sp->count * sizeof(FreeNumber);
+	if (sp->count == 0)
+		f->npages--;
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(sbuf);
+	UnlockReleaseBuffer(cbuf);
+}
+
+/* Push numbers onto rel's free stack. */
+static void
+push_free_numbers(Relation rel, const uint64 *numbers, int n)
+{
+	Buffer		cbuf = counter_buffer(rel);
+	int			done = 0;
+
+	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+	while (done < n)
+	{
+		CounterFreeData *f = (CounterFreeData *) PageGetContents(BufferGetPage(cbuf));
+		uint32		npages = f->magic == FREE_STACK_MAGIC ? f->npages : 0;
+		BlockNumber top = npages;
+		Buffer		sbuf = InvalidBuffer;
+		GenericXLogState *state;
+		Page		spage;
+		FreeStackPage *sp;
+		bool		fresh = false;
+
+		/* The top block, if it has room; else the next, made if needed. */
+		if (top > 0)
+		{
+			sbuf = ReadBuffer(rel, top);
+			LockBuffer(sbuf, BUFFER_LOCK_EXCLUSIVE);
+			if (((FreeStackPage *) PageGetSpecialPointer(BufferGetPage(sbuf)))->count >=
+				FREE_STACK_CAP)
+			{
+				UnlockReleaseBuffer(sbuf);
+				sbuf = InvalidBuffer;
+			}
+		}
+		if (!BufferIsValid(sbuf))
+		{
+			top = npages + 1;
+			fresh = true;
+			/* The file's blocks, not the table AM's estimate of its size. */
+			if (smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM) <= top)
+				sbuf = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM, NULL,
+										 EB_LOCK_FIRST);
+			else
+			{
+				sbuf = ReadBuffer(rel, top);
+				LockBuffer(sbuf, BUFFER_LOCK_EXCLUSIVE);
+			}
+			if (BufferGetBlockNumber(sbuf) != top)
+				elog(ERROR, "prolly TID free stack of \"%s\" is out of order",
+					 RelationGetRelationName(rel));
+		}
+		state = GenericXLogStart(rel);
+		f = counter_free(GenericXLogRegisterBuffer(state, cbuf, 0));
+		spage = GenericXLogRegisterBuffer(state, sbuf,
+										  fresh ? GENERIC_XLOG_FULL_IMAGE : 0);
+		if (fresh)
+		{
+			PageInit(spage, BLCKSZ, sizeof(FreeStackPage));
+			((FreeStackPage *) PageGetSpecialPointer(spage))->count = 0;
+			f->npages = top;
+		}
+		sp = (FreeStackPage *) PageGetSpecialPointer(spage);
+		while (done < n && sp->count < FREE_STACK_CAP)
+		{
+			FreeNumber *fn = &((FreeNumber *) PageGetContents(spage))[sp->count++];
+
+			fn->number = numbers[done++];
+			fn->xid = GetCurrentTransactionId();
+		}
+		((PageHeader) spage)->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
+			sp->count * sizeof(FreeNumber);
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(sbuf);
+	}
+	UnlockReleaseBuffer(cbuf);
+}
+
 /* The next TID number for rel: never one handed out before. */
 static uint64
 next_number(Relation rel)
@@ -201,7 +385,16 @@ next_number(Relation rel)
 	}
 	res = hash_search(reservations, &rel->rd_locator, HASH_ENTER, &found);
 	if (!found)
+	{
 		res->next = res->end = 0;
+		res->nreuse = 0;
+	}
+
+	/* Forgotten numbers first. */
+	if (res->nreuse == 0)
+		take_free_numbers(rel, res);
+	if (res->nreuse > 0)
+		return res->reuse[--res->nreuse];
 
 	if (res->next >= res->end)
 	{
@@ -383,25 +576,29 @@ encode_gone(ItemPointer successor, CommandId cid, TransactionId xmin,
 	appendStringInfoChar(out, 0);
 	put_uint32(out, cid);
 	put_uint32(out, xmin);
+	put_uint32(out, GetCurrentTransactionId());
 	appendStringInfoChar(out, successor ? 1 : 0);
 	if (successor)
 		encode_tid(successor, out);
 }
 
-/* A gone entry: sets *info. */
+/* A gone entry: sets *info, and *xmax unless it is NULL. */
 static void
-decode_gone(const StringInfoData *v, ProllyTidInfo *info)
+decode_gone(const StringInfoData *v, ProllyTidInfo *info, TransactionId *xmax)
 {
 	const uint8 *d = (const uint8 *) v->data;
 
-	if (v->len != (d[9] ? 10 + TID_BYTES : 10) || (d[9] != 0 && d[9] != 1))
+	if (v->len < 14 || (d[13] != 0 && d[13] != 1) ||
+		v->len != (d[13] ? 14 + TID_BYTES : 14))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid prolly row identity entry")));
 	info->cid = get_uint32(d + 1);
 	info->xmin = get_uint32(d + 5);
-	if (d[9])
-		decode_tid(d + 10, TID_BYTES, &info->successor);
+	if (xmax)
+		*xmax = get_uint32(d + 9);
+	if (d[13])
+		decode_tid(d + 14, TID_BYTES, &info->successor);
 	else
 		ItemPointerSetInvalid(&info->successor);
 }
@@ -701,7 +898,7 @@ counter_tid_resolve(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 		state = PROLLY_TID_UNKNOWN;
 	else if (entry_gone(&v))
 	{
-		decode_gone(&v, info);
+		decode_gone(&v, info, NULL);
 		get_gone_row(engine_for(rel), roots, rel, tid, cid, out);
 		state = PROLLY_TID_GONE;
 	}
@@ -810,11 +1007,82 @@ counter_tid_rename(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 	pfree(v.data);
 }
 
+/*
+ * Every 'T' entry, in TID order: the TIDs whose versions were retired by
+ * transactions before horizon.
+ */
+static int
+counter_dead_tids(ProllyRootSet *roots, Relation rel, TransactionId horizon,
+				  ItemPointer *tids)
+{
+	const ProllyEngineRoutine *engine = engine_for(rel);
+	ProllyCursor *cur = PROLLY_CALL(engine, cursor_open, roots, rel,
+									PROLLY_TREE_ROWID, InvalidCommandId);
+	uint8		start = TAG_TID;
+	ProllyKey	from = {&start, 1};
+	ProllyKey	key;
+	ProllyValue value;
+	int			n = 0;
+	int			max = 64;
+
+	*tids = palloc(sizeof(ItemPointerData) * max);
+	PROLLY_CALL(engine, cursor_seek, cur, &from, ForwardScanDirection);
+	while (PROLLY_CALL(engine, cursor_next, cur, &key, &value))
+	{
+		StringInfoData v;
+		ProllyTidInfo info;
+		TransactionId xmax;
+
+		if (key.len != TID_KEY_LEN || key.data[0] != TAG_TID)
+			break;
+		if (value.len == 0 || value.data[0] != 0)
+			continue;			/* names a version */
+		v.data = (char *) value.data;
+		v.len = value.len;
+		decode_gone(&v, &info, &xmax);
+		if (!TransactionIdPrecedes(xmax, horizon))
+			continue;
+		if (n == max)
+		{
+			max *= 2;
+			*tids = repalloc(*tids, sizeof(ItemPointerData) * max);
+		}
+		decode_tid(key.data + 1, TID_BYTES, &(*tids)[n++]);
+	}
+	PROLLY_CALL(engine, cursor_close, cur);
+	return n;
+}
+
+/* Drop the TIDs' entries, and give their numbers out again. */
+static void
+counter_tid_forget(Relation rel, const ItemPointerData *tids, int ntids,
+				   CommandId cid)
+{
+	const ProllyEngineRoutine *engine = engine_for(rel);
+	uint64	   *numbers = palloc(sizeof(uint64) * Max(ntids, 1));
+
+	for (int i = 0; i < ntids; i++)
+	{
+		ItemPointerData tid = tids[i];
+		uint8		tbuf[TID_KEY_LEN];
+		uint8		gbuf[TID_KEY_LEN];
+		ProllyKey	tkey = tid_key(&tid, tbuf);
+		ProllyKey	gkey = tagged_tid_key(&tid, gbuf, TAG_GONE_ROW);
+
+		PROLLY_CALL(engine, remove, rel, PROLLY_TREE_ROWID, &tkey, cid);
+		PROLLY_CALL(engine, remove, rel, PROLLY_TREE_ROWID, &gkey, cid);
+		numbers[i] = (uint64) ItemPointerGetBlockNumber(&tid) * MaxHeapTuplesPerPage +
+			ItemPointerGetOffsetNumber(&tid) - 1;
+	}
+	push_free_numbers(rel, numbers, ntids);
+	pfree(numbers);
+}
+
 const ProllyRowIdRoutine prolly_rowid_counter = {
 	.info = {
 		.iface = PROLLY_IFACE_ROW_IDENTITY,
 		.impl_id = 2,
-		.format_version = 3,
+		.format_version = 4,
 		.name = "counter",
 		.description = "TIDs from a per-table counter that aborts don't roll "
 		"back, with a map both ways",
@@ -827,5 +1095,6 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.tid_retire = counter_tid_retire,
 	.tid_renew = counter_tid_renew,
 	.tid_rename = counter_tid_rename,
-	/* tid_forget comes with VACUUM, which must also drop version entries */
+	.dead_tids = counter_dead_tids,
+	.tid_forget = counter_tid_forget,
 };

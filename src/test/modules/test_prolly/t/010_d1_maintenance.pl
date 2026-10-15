@@ -18,11 +18,16 @@ my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->append_conf('postgresql.conf', $conf);
 $primary->start;
+$primary->safe_psql('postgres',
+	q{SELECT pg_create_physical_replication_slot('standby')});
 $primary->backup('base');
 
+# The slot keeps the WAL the standby still needs through the primary's
+# checkpoints and its crash below.
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($primary, 'base', has_streaming => 1);
 $standby->append_conf('postgresql.conf', $conf);
+$standby->append_conf('postgresql.conf', "primary_slot_name = 'standby'\n");
 $standby->start;
 
 $primary->safe_psql('postgres', q{

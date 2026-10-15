@@ -679,6 +679,31 @@ written but never published (a crash between the two) aren't found;
 reclamation runs only when asked; `prolly_gc()` holds every writer off for
 its whole run.
 
+**Status (2026-10-14): 4f.3 built; 4f is done.** VACUUM of a prolly
+table removes row versions no snapshot can still see, as heap removes dead
+tuples (questions 37, 40). The row-identity map's gone entries now record
+the transaction that retired them (format version 4); VACUUM asks it for
+the TIDs retired before the table's oldest non-removable xid
+(`dead_tids`), removes other index AMs' entries for them with their bulk
+delete (a prolly index's entries point at row keys and go with their
+rows), then forgets the TIDs (`tid_forget`): their map entries go with
+VACUUM's transaction, and their numbers go on a free stack in the
+table's main fork, each with VACUUM's xid. New versions take numbers off
+the stack before reserving new ones, but only those whose VACUUM has
+committed: until then its removal of the map entries isn't in the branch,
+and a reuse committed first would have its entries removed by VACUUM's
+replayed commit. Found and fixed: the free stack sized itself by the table
+AM's size estimate rather than the file; `010_d1_maintenance.pl`'s
+standby lost WAL now that VACUUM writes (it has a replication slot now).
+`017` and `018` run with WAL consistency checking. Tests: `018_d1_vacuum.pl`
+(VACUUM keeps what an open snapshot sees; afterwards new rows reuse freed
+TIDs, and no index entry of a removed version reaches a reused TID, which
+fails without the index cleanup; a crash; a standby). Not yet: index
+entries of inserts that aborted (their TIDs never named a committed
+version) stay until the index is rebuilt; once branches exist (4g), a TID
+gone on one branch may still name a version on another, so VACUUM must
+consult every branch before forgetting.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.
