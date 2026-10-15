@@ -59,6 +59,7 @@ tests += {
       't/017_d1_gc.pl',
       't/018_d1_vacuum.pl',
       't/019_d1_branches.pl',
+      't/020_d1_merge.pl',
     ],
   },
 }

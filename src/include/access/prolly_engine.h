@@ -48,6 +48,7 @@
 #define PROLLY_ENGINE_H
 
 #include "access/prolly_registry.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/sdir.h"
 #include "lib/stringinfo.h"
@@ -94,6 +95,27 @@ typedef struct ProllyEngineRoutine
 	 */
 	ProllyRootSet *(*roots_acquire) (Snapshot snapshot);
 	void		(*roots_release) (ProllyRootSet *roots);
+
+	/*
+	 * The root set of a working set (a branch head or one a commit
+	 * recorded), for reading as it was; released with roots_release.  It
+	 * has none of the transaction's writes over it.
+	 */
+	ProllyRootSet *(*roots_at) (const ProllyNodeRef *root);
+
+	/*
+	 * The changes to tree's data tree from one root set to another, in its
+	 * key order, as the tree interface's diff reports them.
+	 */
+	void		(*diff) (ProllyRootSet *from, ProllyRootSet *to, Relation tree,
+						 ProllyTreeVisitChange visit, void *arg);
+
+	/*
+	 * The working set the current transaction's commit would make of its
+	 * branch's tip, with nothing enqueued: the caller holds the branch's
+	 * commit lock, so the commit makes exactly this root.
+	 */
+	void		(*pending_root) (ProllyNodeRef *root);
 
 	/*
 	 * Cursors over tree in roots, overlaid with the current transaction's own
@@ -228,7 +250,8 @@ typedef struct ProllyEngineRoutine
 #define PROLLY_ENGINE_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
-	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
+	"roots_acquire", "roots_release", "roots_at", "diff", "pending_root", \
+	"cursor_open", "cursor_seek", \
 	"cursor_next", "cursor_close", "cursor_can_seek", "unseen_writers", "get", "has_writes", "key_at", "count_range", \
 	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \

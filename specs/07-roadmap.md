@@ -706,9 +706,8 @@ consult every branch before forgetting.
 
 **Plan (2026-10-14): 4g in stages.** 4g.1 refs, branches, commits and
 checkout, with data versioned per branch (catalogs still shared heap
-tables); 4g.2 the canonicalizer: commits' root hashes from canonical
-schema and data, by name; 4g.3 diff and three-way merge, with Dolt's
-conflict tables; 4g.4 Doltgres's SQL interface (`dolt_*` functions and
+tables); 4g.2 diff and three-way merge; 4g.3 the canonicalizer: commits'
+root hashes from canonical schema and data, by name; 4g.4 Doltgres's SQL interface (`dolt_*` functions and
 system tables, `dbname/branch`); 4g.5 versioned catalogs (every catalog a
 prolly table: `09-versioned-catalogs.md`, B10), the largest piece, after
 which schema is per branch.
@@ -742,6 +741,30 @@ setup steps now print nothing: a commit id differs from run to run). Until 4g.2 
 working set's local root, so root hashes depend on history; until 4g.5
 schema is shared by every branch (a table created on one branch exists,
 empty, on the others).
+
+**Status (2026-10-14): 4g.2 built.** A diff and merge implementation,
+`rows`. Diff compares, for every prolly table, its data tree in the
+working sets two commits recorded (the engine's new `diff`, which skips
+equal subtrees; `roots_at` opens a root set at any working set). Merge is
+three-way from the newest common ancestor of the current branch's head
+commit (`HEAD`, which refs now resolve) and the other branch's: for each
+table, the other side's changes since the ancestor are applied as row
+writes through the executor, as logical replication applies changes, so
+row identity, every index (btree and prolly alike), constraints and
+triggers see ordinary writes. A key both sides changed alike is left
+alone; changed differently, it is a conflict, and the merge fails with
+nothing changed (Dolt's conflict tables, decided in question 55, are not
+built yet). Copies of a keyless table's rows add up. The merge holds the
+branch's commit lock from the start, so the working set its commit
+records (the engine's new `pending_root`) is the one the transaction
+commits; the commit has both heads as parents (refs' new `commit_with`;
+`commit_working_set` gives a commit's working set). A branch with changes
+since its head commit isn't merged into; a merge already done is a no-op.
+Tests: `020_d1_merge.pl` (diff by kind; a merge of updates, deletes,
+inserts and large values on both sides; btree and prolly indexes after
+it; keyless copies; merging again; a conflict that changes nothing; a
+branch with uncommitted changes; a crash). The requirements suite's
+`vc_diff_merge` now passes.
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
