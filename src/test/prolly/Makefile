@@ -88,7 +88,8 @@ check-upstream-isolation: prolly_am.conf
 # Postgres's regression, isolation and recovery suites with every user
 # table, index and TOAST table in block-mapped storage.  These pass in
 # full: block-mapped storage changes where pages live, not what they hold.
-check-upstream-bmap: bmap.conf
+check-upstream-bmap: temp-install bmap.conf
+	$(MAKE) -C $(top_builddir)/src/test/recovery checkprep
 	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(CURDIR)/bmap.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/bmap.conf
 	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(CURDIR)/bmap.conf

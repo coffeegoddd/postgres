@@ -1,4 +1,4 @@
-# CI for the prolly storage fork: every pull request into master builds and
+# CI for the prolly storage fork: every pull request (including stack layers) builds and
 # runs the tests that must pass before it is merged.  (Upstream's pg-ci.yml
 # is left as it is; it only runs when the PG_CI_ENABLED variable is set.)
 
@@ -6,11 +6,12 @@ name: prolly
 
 on:
   pull_request:
-    branches: [master]
     # the specs are documentation; changing only them builds nothing
     paths-ignore:
       - 'specs/**'
   workflow_dispatch:
+  schedule:
+    - cron: '23 7 * * *'
 
 permissions:
   contents: read
@@ -23,7 +24,7 @@ jobs:
   build-and-test:
     name: build and test
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -51,12 +52,69 @@ jobs:
       - name: Requirements suite, validated against heap
         run: make -C src/test/prolly check-heap
 
+      - name: Requirements on versioned prolly storage
+        run: |
+          make -C src/test/prolly check-target check-semantics check-isolation \
+            check-tap-durability PROLLY_AM=prolly
+
+      - name: Upstream suites on block-mapped storage (nightly)
+        if: github.event_name == 'schedule'
+        run: make -C src/test/prolly check-upstream-bmap
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/tools/prolly_bench/slt/go.mod
+          cache-dependency-path: src/tools/prolly_bench/slt/go.sum
+
+      - name: Runner tests and builds
+        run: |
+          (cd src/tools/prolly_bench/slt && go test ./...)
+          bash src/tools/prolly_bench/build_diff.sh
+          bash src/tools/prolly_bench/build_slt.sh
+
+      - name: Seeded differential histories
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' }}
+        run: |
+          seeds=5
+          steps=28
+          seed=1
+          if [ "$NIGHTLY" = true ]; then
+            seeds=100
+            steps=56
+            seed="$GITHUB_RUN_NUMBER"
+          fi
+          failed=0
+          for am in heap prolly prolly_d1; do
+            src/tools/prolly_bench/prolly_bench differential \
+              --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am "$am" \
+              --seed "$seed" --seeds "$seeds" --steps "$steps" --self-test \
+              --reduce 24 --out "$PWD/engine-results/differential-$am" || failed=1
+          done
+          exit "$failed"
+
+      - name: Fetch pinned SQLLogicTest corpus
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/sqllogictest
+          ref: 04b0d198bf9dff62ddfbf0e5d04f5ae63a649ba3
+          path: slt-corpus
+
+      - name: SQLLogicTest smoke and strict heap comparison
+        run: |
+          src/tools/prolly_bench/prolly_bench run C --am heap,prolly \
+            --config src/tools/prolly_bench/configs/c_ci.toml \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
+            --work-dir "$RUNNER_TEMP/c-suite" --out "$PWD/engine-results/c-suite"
+          src/tools/prolly_bench/prolly_bench cgate \
+            engine-results/c-suite/*-C-B0 engine-results/c-suite/*-C-prolly
+
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench
         run: python3 -m unittest discover -s tests
 
-      - name: Upload logs
-        if: failure()
+      - name: Upload logs and coverage evidence
+        if: always()
         uses: actions/upload-artifact@v5
         with:
           name: test-logs
@@ -64,4 +122,7 @@ jobs:
             **/regression.diffs
             **/tmp_check/log/*
             **/output_iso/regression.diffs
+            **/tmp_check/semantics/**
+            **/tmp_check/isolation/**
+            engine-results/**
           if-no-files-found: ignore

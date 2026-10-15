@@ -117,8 +117,27 @@ $standby->stop('fast');
 # done by directly scanning the on-disk relation blocks and what
 # pg_controldata lets know.
 my $standby_data = $standby->data_dir;
-my $offline_max_lsn =
-  find_largest_lsn($blocksize, "$standby_data/$relfilenode");
+my @page_files = ("$standby_data/$relfilenode");
+if (-f "$standby_data/${relfilenode}_bmap")
+{
+	# Block-mapped main forks live in the database's shared page store.
+	# Check all its pages (a stronger condition than just test1's), along
+	# with this relation's map and the allocator.  Include file segments.
+	# Reserved file numbers are defined in storage/bmap_files.h.
+	(my $dir = "$standby_data/$relfilenode") =~ s{/[^/]+$}{};
+	(my $rel = $relfilenode) =~ s{.*/}{};
+	@page_files = map { "$dir/$_" }
+	  grep { /^(?:9420|9421|${rel}_bmap)(?:\.[0-9]+)?$/ }
+	  slurp_dir($dir);
+	die "missing block-map allocator or page store"
+	  unless -f "$dir/9420" && -f "$dir/9421";
+}
+my $offline_max_lsn = '0/00000000';
+foreach my $file (@page_files)
+{
+	my $lsn = find_largest_lsn($blocksize, $file);
+	$offline_max_lsn = $lsn if $lsn gt $offline_max_lsn;
+}
 
 # Fetch minRecoveryPoint from the control file itself
 my ($stdout, $stderr) = run_command([ 'pg_controldata', $standby_data ]);
