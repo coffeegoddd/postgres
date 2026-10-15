@@ -3876,7 +3876,9 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		/* handle these directly, at least for now */
 		SMgrRelation srel;
 
-		srel = RelationCreateStorage(newrlocator, persistence, true);
+		/* the new storage stays with the storage manager that held the old */
+		srel = RelationCreateStorageWith(newrlocator, persistence, true,
+										 RelationGetSmgr(relation)->smgr_which);
 		smgrclose(srel);
 	}
 	else

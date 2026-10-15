@@ -62,7 +62,8 @@ extern Relation heap_create(const char *relname,
 							bool allow_system_table_mods,
 							TransactionId *relfrozenxid,
 							MultiXactId *relminmxid,
-							bool create_storage);
+							bool create_storage,
+							int smgr_which);
 
 extern Oid	heap_create_with_catalog(const char *relname,
 									 Oid relnamespace,
