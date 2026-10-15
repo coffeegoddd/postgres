@@ -75,6 +75,7 @@ CATALOG(pg_opclass,2616,OperatorClassRelationId)
 
 	/* type of data in index, or InvalidOid if same as input column type */
 	Oid			opckeytype BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_type);
+	Oid			opcbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_opclass;
 
 END_CATALOG_STRUCT
@@ -86,8 +87,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_opclass *Form_pg_opclass;
 
-DECLARE_UNIQUE_INDEX(pg_opclass_am_name_nsp_index, 2686, OpclassAmNameNspIndexId, pg_opclass, btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_opclass_oid_index, 2687, OpclassOidIndexId, pg_opclass, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_opclass_am_name_nsp_index, 2686, OpclassAmNameNspIndexId, pg_opclass, btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops, opcbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_opclass_oid_index, 2687, OpclassOidIndexId, pg_opclass, btree(oid oid_ops, opcbranch oid_ops));
 
 MAKE_SYSCACHE(CLAAMNAMENSP, pg_opclass_am_name_nsp_index, 8);
 MAKE_SYSCACHE(CLAOID, pg_opclass_oid_index, 8);

@@ -41,6 +41,7 @@ CATALOG(pg_collation,3456,CollationRelationId)
 	char		collprovider;	/* see constants below */
 	bool		collisdeterministic BKI_DEFAULT(t);
 	int32		collencoding;	/* encoding for this collation; -1 = "all" */
+	Oid			collbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text		collcollate BKI_DEFAULT(_null_);	/* LC_COLLATE setting */
 	text		collctype BKI_DEFAULT(_null_);	/* LC_CTYPE setting */
@@ -63,8 +64,8 @@ typedef FormData_pg_collation *Form_pg_collation;
 
 DECLARE_TOAST(pg_collation, 6175, 6176);
 
-DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, CollationNameEncNspIndexId, pg_collation, btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_collation_oid_index, 3085, CollationOidIndexId, pg_collation, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, CollationNameEncNspIndexId, pg_collation, btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops, collbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_collation_oid_index, 3085, CollationOidIndexId, pg_collation, btree(oid oid_ops, collbranch oid_ops));
 
 MAKE_SYSCACHE(COLLNAMEENCNSP, pg_collation_name_enc_nsp_index, 8);
 MAKE_SYSCACHE(COLLOID, pg_collation_oid_index, 8);

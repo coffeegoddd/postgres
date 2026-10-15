@@ -43,6 +43,7 @@ CATALOG(pg_opfamily,2753,OperatorFamilyRelationId)
 
 	/* opfamily owner */
 	Oid			opfowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
+	Oid			opfbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_opfamily;
 
 END_CATALOG_STRUCT
@@ -54,8 +55,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_opfamily *Form_pg_opfamily;
 
-DECLARE_UNIQUE_INDEX(pg_opfamily_am_name_nsp_index, 2754, OpfamilyAmNameNspIndexId, pg_opfamily, btree(opfmethod oid_ops, opfname name_ops, opfnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_opfamily_oid_index, 2755, OpfamilyOidIndexId, pg_opfamily, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_opfamily_am_name_nsp_index, 2754, OpfamilyAmNameNspIndexId, pg_opfamily, btree(opfmethod oid_ops, opfname name_ops, opfnamespace oid_ops, opfbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_opfamily_oid_index, 2755, OpfamilyOidIndexId, pg_opfamily, btree(oid oid_ops, opfbranch oid_ops));
 
 MAKE_SYSCACHE(OPFAMILYAMNAMENSP, pg_opfamily_am_name_nsp_index, 8);
 MAKE_SYSCACHE(OPFAMILYOID, pg_opfamily_oid_index, 8);

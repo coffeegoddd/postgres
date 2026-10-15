@@ -80,6 +80,7 @@ CATALOG(pg_amop,2602,AccessMethodOperatorRelationId)
 
 	/* ordering opfamily OID, or 0 if search op */
 	Oid			amopsortfamily BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_opfamily);
+	Oid			amopbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_amop;
 
 END_CATALOG_STRUCT
@@ -91,9 +92,9 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_amop *Form_pg_amop;
 
-DECLARE_UNIQUE_INDEX(pg_amop_fam_strat_index, 2653, AccessMethodStrategyIndexId, pg_amop, btree(amopfamily oid_ops, amoplefttype oid_ops, amoprighttype oid_ops, amopstrategy int2_ops));
-DECLARE_UNIQUE_INDEX(pg_amop_opr_fam_index, 2654, AccessMethodOperatorIndexId, pg_amop, btree(amopopr oid_ops, amoppurpose char_ops, amopfamily oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_amop_oid_index, 2756, AccessMethodOperatorOidIndexId, pg_amop, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_amop_fam_strat_index, 2653, AccessMethodStrategyIndexId, pg_amop, btree(amopfamily oid_ops, amoplefttype oid_ops, amoprighttype oid_ops, amopstrategy int2_ops, amopbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_amop_opr_fam_index, 2654, AccessMethodOperatorIndexId, pg_amop, btree(amopopr oid_ops, amoppurpose char_ops, amopfamily oid_ops, amopbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_amop_oid_index, 2756, AccessMethodOperatorOidIndexId, pg_amop, btree(oid oid_ops, amopbranch oid_ops));
 
 MAKE_SYSCACHE(AMOPSTRATEGY, pg_amop_fam_strat_index, 64);
 MAKE_SYSCACHE(AMOPOPID, pg_amop_opr_fam_index, 64);

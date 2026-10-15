@@ -114,6 +114,8 @@ foreach my $header (@ARGV)
 				}
 				else
 				{
+					# built-in objects are shared by every branch
+					$descr{objbranch} = 0;
 					push @{ $catalog_data{pg_description} }, \%descr;
 				}
 			}
@@ -168,6 +170,11 @@ foreach my $header (@ARGV)
 		$key =~ s/^\w+\(//;
 		$key =~ s/\)$//;
 		$key =~ s/(\w+)\s+\w+/Anum_${tblname}_$1/g;
+
+		# A catalog's branch column ends its unique indexes so that a
+		# versioned object's rows can repeat once per branch; a backend sees
+		# one branch, so caches leave it out of their keys.
+		$key =~ s/,\s*Anum_${tblname}_\w*branch$//;
 
 		$syscaches{ $syscache->{syscache_name} } = {
 			table_oid_macro => $catalogs{$tblname}->{relation_oid_macro},

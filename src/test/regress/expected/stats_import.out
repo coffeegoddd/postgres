@@ -22,7 +22,7 @@ SELECT COUNT(*) FROM pg_attribute
     attnum > 0;
  count 
 -------
-    31
+    32
 (1 row)
 
 -- Create a view that is used purely for the type based on pg_statistic.

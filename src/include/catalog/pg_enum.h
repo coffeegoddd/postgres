@@ -36,6 +36,7 @@ CATALOG(pg_enum,3501,EnumRelationId)
 	Oid			enumtypid BKI_LOOKUP(pg_type);	/* OID of owning enum type */
 	float4		enumsortorder;	/* sort position of this enum value */
 	NameData	enumlabel;		/* text representation of enum value */
+	Oid			enumbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_enum;
 
 END_CATALOG_STRUCT
@@ -47,9 +48,9 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_enum *Form_pg_enum;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_enum_oid_index, 3502, EnumOidIndexId, pg_enum, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_enum_typid_label_index, 3503, EnumTypIdLabelIndexId, pg_enum, btree(enumtypid oid_ops, enumlabel name_ops));
-DECLARE_UNIQUE_INDEX(pg_enum_typid_sortorder_index, 3534, EnumTypIdSortOrderIndexId, pg_enum, btree(enumtypid oid_ops, enumsortorder float4_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_enum_oid_index, 3502, EnumOidIndexId, pg_enum, btree(oid oid_ops, enumbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_enum_typid_label_index, 3503, EnumTypIdLabelIndexId, pg_enum, btree(enumtypid oid_ops, enumlabel name_ops, enumbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_enum_typid_sortorder_index, 3534, EnumTypIdSortOrderIndexId, pg_enum, btree(enumtypid oid_ops, enumsortorder float4_ops, enumbranch oid_ops));
 
 MAKE_SYSCACHE(ENUMOID, pg_enum_oid_index, 8);
 MAKE_SYSCACHE(ENUMTYPOIDNAME, pg_enum_typid_label_index, 8);

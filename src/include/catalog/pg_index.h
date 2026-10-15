@@ -47,6 +47,8 @@ CATALOG(pg_index,2610,IndexRelationId) BKI_SCHEMA_MACRO
 	bool		indislive;		/* is this index alive at all? */
 	bool		indisreplident; /* is this index the identity for replication? */
 
+	Oid			indbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
+
 	/* variable-length fields start here, but we allow direct access to indkey */
 	int2vector	indkey BKI_FORCE_NOT_NULL;	/* column numbers of indexed cols,
 											 * or 0 */
@@ -76,7 +78,7 @@ typedef FormData_pg_index *Form_pg_index;
 DECLARE_TOAST_WITH_MACRO(pg_index, 6351, 6352, PgIndexToastTable, PgIndexToastIndex);
 
 DECLARE_INDEX(pg_index_indrelid_index, 2678, IndexIndrelidIndexId, pg_index, btree(indrelid oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_index_indexrelid_index, 2679, IndexRelidIndexId, pg_index, btree(indexrelid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_index_indexrelid_index, 2679, IndexRelidIndexId, pg_index, btree(indexrelid oid_ops, indbranch oid_ops));
 
 MAKE_SYSCACHE(INDEXRELID, pg_index_indexrelid_index, 64);
 

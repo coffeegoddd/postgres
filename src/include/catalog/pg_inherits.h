@@ -37,6 +37,7 @@ CATALOG(pg_inherits,2611,InheritsRelationId)
 	Oid			inhparent BKI_LOOKUP(pg_class);
 	int32		inhseqno;
 	bool		inhdetachpending;
+	Oid			inhbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_inherits;
 
 END_CATALOG_STRUCT
@@ -48,7 +49,7 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_inherits *Form_pg_inherits;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_inherits_relid_seqno_index, 2680, InheritsRelidSeqnoIndexId, pg_inherits, btree(inhrelid oid_ops, inhseqno int4_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_inherits_relid_seqno_index, 2680, InheritsRelidSeqnoIndexId, pg_inherits, btree(inhrelid oid_ops, inhseqno int4_ops, inhbranch oid_ops));
 DECLARE_INDEX(pg_inherits_parent_index, 2187, InheritsParentIndexId, pg_inherits, btree(inhparent oid_ops));
 
 

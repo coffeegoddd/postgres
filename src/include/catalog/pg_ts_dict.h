@@ -45,6 +45,7 @@ CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)
 	/* dictionary's template */
 	Oid			dicttemplate BKI_LOOKUP(pg_ts_template);
 
+	Oid			dictbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* options passed to dict_init() */
 	text		dictinitoption;
@@ -57,8 +58,8 @@ typedef FormData_pg_ts_dict *Form_pg_ts_dict;
 
 DECLARE_TOAST(pg_ts_dict, 4169, 4170);
 
-DECLARE_UNIQUE_INDEX(pg_ts_dict_dictname_index, 3604, TSDictionaryNameNspIndexId, pg_ts_dict, btree(dictname name_ops, dictnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_ts_dict_oid_index, 3605, TSDictionaryOidIndexId, pg_ts_dict, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_ts_dict_dictname_index, 3604, TSDictionaryNameNspIndexId, pg_ts_dict, btree(dictname name_ops, dictnamespace oid_ops, dictbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ts_dict_oid_index, 3605, TSDictionaryOidIndexId, pg_ts_dict, btree(oid oid_ops, dictbranch oid_ops));
 
 MAKE_SYSCACHE(TSDICTNAMENSP, pg_ts_dict_dictname_index, 2);
 MAKE_SYSCACHE(TSDICTOID, pg_ts_dict_oid_index, 2);

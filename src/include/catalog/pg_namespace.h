@@ -43,6 +43,7 @@ CATALOG(pg_namespace,2615,NamespaceRelationId)
 	Oid			nspowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
 	bool		nspversioned BKI_DEFAULT(f);	/* objects in it are per branch */
 
+	Oid			nspbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	aclitem		nspacl[];
 #endif
@@ -59,8 +60,8 @@ typedef FormData_pg_namespace *Form_pg_namespace;
 
 DECLARE_TOAST(pg_namespace, 4163, 4164);
 
-DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops, nspbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops, nspbranch oid_ops));
 
 MAKE_SYSCACHE(NAMESPACENAME, pg_namespace_nspname_index, 4);
 MAKE_SYSCACHE(NAMESPACEOID, pg_namespace_oid_index, 16);

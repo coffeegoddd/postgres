@@ -60,6 +60,7 @@ CATALOG(pg_amproc,2603,AccessMethodProcedureRelationId)
 
 	/* OID of the proc */
 	regproc		amproc BKI_LOOKUP(pg_proc);
+	Oid			amprocbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_amproc;
 
 END_CATALOG_STRUCT
@@ -71,8 +72,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_amproc *Form_pg_amproc;
 
-DECLARE_UNIQUE_INDEX(pg_amproc_fam_proc_index, 2655, AccessMethodProcedureIndexId, pg_amproc, btree(amprocfamily oid_ops, amproclefttype oid_ops, amprocrighttype oid_ops, amprocnum int2_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_amproc_oid_index, 2757, AccessMethodProcedureOidIndexId, pg_amproc, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_amproc_fam_proc_index, 2655, AccessMethodProcedureIndexId, pg_amproc, btree(amprocfamily oid_ops, amproclefttype oid_ops, amprocrighttype oid_ops, amprocnum int2_ops, amprocbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_amproc_oid_index, 2757, AccessMethodProcedureOidIndexId, pg_amproc, btree(oid oid_ops, amprocbranch oid_ops));
 
 MAKE_SYSCACHE(AMPROCNUM, pg_amproc_fam_proc_index, 16);
 

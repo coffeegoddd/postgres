@@ -20,6 +20,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
@@ -266,6 +267,7 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 
+	catalog_row_set_branch(heapRel, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -288,6 +290,7 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
+	catalog_row_set_branch(heapRel, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	catalog_insert(heapRel, tup);
@@ -308,6 +311,9 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
+
+	for (int i = 0; i < ntuples; i++)
+		catalog_slot_set_branch(heapRel, slot[i]);
 
 	table_multi_insert(heapRel, slot, ntuples,
 					   GetCurrentCommandId(true), 0, NULL);
@@ -348,6 +354,7 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	catalog_row_set_branch(heapRel, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -372,6 +379,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	catalog_row_set_branch(heapRel, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	catalog_update(heapRel, otid, tup, &updateIndexes);

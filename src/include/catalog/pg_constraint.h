@@ -116,6 +116,7 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	 */
 	bool		conperiod;
 
+	Oid			conbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/*
@@ -181,9 +182,9 @@ typedef FormData_pg_constraint *Form_pg_constraint;
 DECLARE_TOAST(pg_constraint, 2832, 2833);
 
 DECLARE_INDEX(pg_constraint_conname_nsp_index, 2664, ConstraintNameNspIndexId, pg_constraint, btree(conname name_ops, connamespace oid_ops));
-DECLARE_UNIQUE_INDEX(pg_constraint_conrelid_contypid_conname_index, 2665, ConstraintRelidTypidNameIndexId, pg_constraint, btree(conrelid oid_ops, contypid oid_ops, conname name_ops));
+DECLARE_UNIQUE_INDEX(pg_constraint_conrelid_contypid_conname_index, 2665, ConstraintRelidTypidNameIndexId, pg_constraint, btree(conrelid oid_ops, contypid oid_ops, conname name_ops, conbranch oid_ops));
 DECLARE_INDEX(pg_constraint_contypid_index, 2666, ConstraintTypidIndexId, pg_constraint, btree(contypid oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_constraint_oid_index, 2667, ConstraintOidIndexId, pg_constraint, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_constraint_oid_index, 2667, ConstraintOidIndexId, pg_constraint, btree(oid oid_ops, conbranch oid_ops));
 DECLARE_INDEX(pg_constraint_conparentid_index, 2579, ConstraintParentIndexId, pg_constraint, btree(conparentid oid_ops));
 
 MAKE_SYSCACHE(CONSTROID, pg_constraint_oid_index, 16);
