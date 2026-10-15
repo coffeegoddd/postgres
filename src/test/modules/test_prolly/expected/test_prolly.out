@@ -39,14 +39,14 @@ FROM prolly_implementations();
  log             | stub             |       0 |              0
  commit_pipeline | serial           |       1 |              1
  commit_pipeline | stub             |       0 |              0
- row_identity    | counter          |       2 |              1
+ row_identity    | counter          |       2 |              2
  row_identity    | stub             |       0 |              0
  refs            | stub             |       0 |              0
  transfer        | stub             |       0 |              0
  diff_merge      | stub             |       0 |              0
  tree            | cow              |       1 |              1
  tree            | stub             |       0 |              0
- root_layout     | subroots         |       1 |              2
+ root_layout     | subroots         |       1 |              3
  root_layout     | stub             |       0 |              0
  table_keying    | pk_or_content    |       1 |              2
  table_keying    | stub             |       0 |              0
@@ -71,7 +71,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d1               | count_range_matches_scan                | pass
  engine          | d1               | canonical_root_independent_of_history   | not implemented (missing canonical_root)
  engine          | d1               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d1               | complete                                | not implemented (6 of 29 callbacks missing)
+ engine          | d1               | complete                                | not implemented (6 of 30 callbacks missing)
  engine          | d2               | identity                                | pass
  engine          | d2               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d2               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
@@ -82,7 +82,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d2               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
  engine          | d2               | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
  engine          | d2               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d2               | complete                                | not implemented (29 of 29 callbacks missing)
+ engine          | d2               | complete                                | not implemented (30 of 30 callbacks missing)
  engine          | d3a              | identity                                | pass
  engine          | d3a              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3a              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
@@ -93,7 +93,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d3a              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
  engine          | d3a              | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
  engine          | d3a              | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d3a              | complete                                | not implemented (29 of 29 callbacks missing)
+ engine          | d3a              | complete                                | not implemented (30 of 30 callbacks missing)
  engine          | d3b              | identity                                | pass
  engine          | d3b              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3b              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
@@ -104,7 +104,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d3b              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
  engine          | d3b              | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
  engine          | d3b              | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d3b              | complete                                | not implemented (29 of 29 callbacks missing)
+ engine          | d3b              | complete                                | not implemented (30 of 30 callbacks missing)
  engine          | d4               | identity                                | pass
  engine          | d4               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d4               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
@@ -115,7 +115,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d4               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
  engine          | d4               | canonical_root_independent_of_history   | not implemented (missing put, remove, xact_precommit, canonical_root)
  engine          | d4               | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine          | d4               | complete                                | not implemented (29 of 29 callbacks missing)
+ engine          | d4               | complete                                | not implemented (30 of 30 callbacks missing)
  coordination    | k1               | identity                                | pass
  coordination    | k1               | lock_conflict_matrix                    | not implemented (missing lock_row)
  coordination    | k1               | wait_policies                           | not implemented (missing lock_row)
@@ -369,7 +369,7 @@ SELECT * FROM prolly_conformance('engine', 'd1');
  engine    | d1             | count_range_matches_scan                | pass
  engine    | d1             | canonical_root_independent_of_history   | not implemented (missing canonical_root)
  engine    | d1             | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
- engine    | d1             | complete                                | not implemented (6 of 29 callbacks missing)
+ engine    | d1             | complete                                | not implemented (6 of 30 callbacks missing)
 (11 rows)
 
 SELECT * FROM prolly_conformance('content_hash');

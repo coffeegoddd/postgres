@@ -796,6 +796,27 @@ FROM prolly_node_counters('prolly_d1');
  t
 (1 row)
 
+-- The same for keys whose bytes don't sort in key order (numeric keys are
+-- compared by their comparison function): a scan still reads each node
+-- about once, finding TIDs in the order it reads rows.
+CREATE TABLE d1_counted_numeric (id numeric PRIMARY KEY, v text) USING prolly_d1;
+INSERT INTO d1_counted_numeric
+SELECT g * 7.25, repeat('v', 50) || g FROM generate_series(1, 20000) g;
+SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
+SELECT count(*) FROM d1_counted_numeric;
+ count 
+-------
+ 20000
+(1 row)
+
+SELECT nodes_read - :r0 BETWEEN 1 AND 2000 AS reads_each_node_once
+FROM prolly_node_counters('prolly_d1');
+ reads_each_node_once 
+----------------------
+ t
+(1 row)
+
+DROP TABLE d1_counted_numeric;
 SELECT * FROM prolly_node_counters('heap');
 ERROR:  access method "heap" is not a prolly table access method
 -- A scan finds TIDs by seeking one cursor over the row identity map, so a

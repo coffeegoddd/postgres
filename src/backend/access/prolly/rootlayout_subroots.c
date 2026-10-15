@@ -456,7 +456,7 @@ const ProllyRootLayoutRoutine prolly_rootlayout_subroots = {
 	.info = {
 		.iface = PROLLY_IFACE_ROOT_LAYOUT,
 		.impl_id = SUBROOTS_IMPL_ID,
-		.format_version = 2,
+		.format_version = 3,
 		.name = "subroots",
 		.description = "catalog, user-data and local sub-roots, each a tree of relfilenumbers",
 	},

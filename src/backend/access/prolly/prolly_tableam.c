@@ -638,7 +638,8 @@ static void insert_row(Relation rel, const ProllyComponents *c,
 
 /*
  * Rebuild rel's data tree, written with the keying old describes, under
- * rel's keying now.  Rows are collected first: they are read from the
+ * rel's keying now, and its local metadata by row (kept in the data tree's
+ * order) with it.  Rows are collected first: they are read from the
  * tree being replaced.  The rebuilt rows are tagged InvalidCommandId, so
  * every command, this one included, sees the table's rows as before.  A
  * row whose bytes changed (a dropped column's value is gone) keeps its
@@ -695,6 +696,7 @@ rekey(Relation rel, const ProllyComponents *c, ProllyRootSet **roots,
 	PROLLY_CALL(c->row_identity, scan_end, rowid);
 
 	PROLLY_CALL(c->engine, tree_reset, rel, PROLLY_TREE_DATA);
+	PROLLY_CALL(c->engine, tree_reset, rel, PROLLY_TREE_ROWKEY);
 	foreach(lr, rows)
 	{
 		RekeyRow   *r = lfirst(lr);
