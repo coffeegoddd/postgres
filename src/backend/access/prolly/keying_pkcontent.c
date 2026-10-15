@@ -262,7 +262,29 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 	}
 	k->keyless = d.keyless;
 	if (!k->keyless)
+	{
+		bool		supported = true;
+
 		setup_key(k, rel, d.nkeys, d.cols, c.key_encoder);
+
+		/*
+		 * Begin the key encoder now, while the catalogs can be read: keys
+		 * may be compared next while a (sub)transaction aborts.  One whose
+		 * operator family or collation is gone is begun if it's ever needed.
+		 */
+		for (int i = 0; i < k->nkeys && supported; i++)
+			supported = SearchSysCacheExists1(TYPEOID,
+											  ObjectIdGetDatum(k->types[i])) &&
+				SearchSysCacheExists1(OPFAMILYOID,
+									  ObjectIdGetDatum(k->opfamilies[i])) &&
+				(!OidIsValid(k->collations[i]) ||
+				 SearchSysCacheExists1(COLLOID,
+									   ObjectIdGetDatum(k->collations[i]))) &&
+				PROLLY_CALL(c.key_encoder, supports, k->opfamilies[i],
+							k->types[i], k->collations[i]);
+		if (supported)
+			(void) key_encoder(k);
+	}
 	initStringInfo(&k->layout);
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);

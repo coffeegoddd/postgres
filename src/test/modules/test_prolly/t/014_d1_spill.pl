@@ -125,6 +125,20 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM pp'), '20013',
 is($standby->safe_psql('postgres', 'SELECT count(*) FROM pp'), '20013',
 	'and a standby replays it');
 
+# Rolling back to a savepoint compares keys of the writes it undoes, while
+# the catalogs can't be read: a backend whose caches are cold (a restart)
+# must have what that takes already (Postgres's 018_wal_optimize crashed).
 $standby->stop;
+$node->restart;
+is($node->safe_psql('postgres', q{
+	BEGIN;
+	CREATE TABLE sp_cold (c int PRIMARY KEY);
+	SAVEPOINT q;
+	INSERT INTO sp_cold VALUES (1);
+	ROLLBACK TO q;
+	COMMIT;
+	SELECT count(*) FROM sp_cold;}), '0',
+	'a rollback to a savepoint in a fresh backend');
+
 $node->stop;
 done_testing();
