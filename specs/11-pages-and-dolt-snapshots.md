@@ -11,10 +11,11 @@ the code as it is today, open PRs included, to this design.
 
 ### Two layers
 
-- **Prolly tables sit beside normal tables** (user). A database can hold
-  both. A prolly table (table access method `prolly`) is versioned; a
-  normal table isn't, and nothing here changes how it is stored or
-  behaves.
+- **Versioned schemas sit beside ordinary ones** (user, 2026-10-16). A
+  database can hold both. Everything in a versioned schema is versioned:
+  its tables, which are prolly tables (table access method `prolly`), and
+  its views, functions, types, sequences and every other object. Ordinary
+  schemas and their normal tables are untouched by any of this.
 - **The working set is pages.** A prolly table, its indexes and its TOAST
   table are ordinary Postgres relations in 8 KB pages: heap's page format,
   nbtree, GIN, GiST and the rest, unchanged. Reads, writes, MVCC, row
@@ -31,8 +32,9 @@ the code as it is today, open PRs included, to this design.
   (user: no Dolt or Doltgres byte compatibility); Dolt is the model for
   structure and behavior, not for bytes.
 - **A Dolt commit snapshots the working set into the store**, and it
-  captures every prolly table in the database (user); normal tables are
-  never in commits. A SQL commit
+  captures every versioned schema in the database: every prolly table's
+  rows and every versioned object's definition (user). Ordinary schemas
+  are never in commits. A SQL commit
   is not a Dolt commit: SQL commits only change pages; `dolt_commit()`
   folds the branch's changes since its head into new trees and a new
   commit.
@@ -45,53 +47,85 @@ commit and only ever changes in its working set is a heap table in all but
 name and storage; a table where every SQL commit is also a Dolt commit keeps its delta
 at one transaction's size.
 
-### Branches: each has its own copy of every prolly table (user)
+### Versioned schemas and branches (user, 2026-10-16)
 
-- **Catalogs are ordinary, shared catalogs.** Normal tables, functions,
-  types and everything else not tied to a prolly table look the same from
-  every branch.
-- **Each branch has its own copy of each prolly table** (user, option B):
-  its own relation with its own OID, catalog rows and relation file
-  number, and with it the table's indexes, TOAST table, constraints,
-  triggers, rules, policies, extended statistics and owned sequences.
-  DDL on a branch changes only that branch's copy, so branches can
-  diverge in schema and merge, as in Dolt.
-- **Copies share pages copy-on-write.** Under each copy's relation files is
-  a **block map** from logical block to physical block in a page store
-  shared by the database's prolly relations. Creating a branch copies the
-  prolly tables' catalog rows and their block maps by reference: no page
-  is copied. The first logical change to a shared page on either branch
+- **A versioned schema** is made by `CREATE SCHEMA … VERSIONED`. Every
+  object in it is versioned per branch: tables, indexes, sequences,
+  views, materialized views, composite and other types, domains, enums,
+  functions, procedures, aggregates, operators, operator classes and
+  families, collations, conversions, text search objects and extended
+  statistics, with everything attached to them (constraints, defaults,
+  triggers, rules, policies, privileges, comments). This is Doltgres's
+  scope (its root value versions tables, types, functions, sequences,
+  triggers and more), drawn at a schema instead of a database because
+  ordinary schemas share the database.
+- **Tables in a versioned schema are prolly tables**: `prolly` is their
+  access method whatever the default, and another access method,
+  `UNLOGGED` or moving a table into an ordinary schema is refused (a
+  temporary table lives in `pg_temp`, outside). A prolly table can't be
+  created outside a versioned schema; this replaces step 1's rule that
+  any permanent table could be one.
+- **Dependencies point one way.** A versioned object may depend on shared
+  ones (an ordinary schema's table, type or function, an extension, a
+  role, a cast, a language); a shared object may never depend on a
+  versioned one, since it would point into one branch only. The rule is
+  checked where Postgres records dependencies (`pg_depend`), so it covers
+  foreign keys, column types, defaults, views, triggers and function
+  bodies parsed at creation alike. Extensions, event triggers,
+  publications, foreign data wrappers and other objects outside schemas
+  stay shared; creating an extension inside a versioned schema is refused
+  for now.
+- **Each branch has its own copy of each versioned schema.** The schema
+  itself is copied: each branch's copy has its own namespace OID, and the
+  copy's objects their own OIDs and relation file numbers. Names then
+  need no further help: an object's name key includes its namespace, and
+  every branch's namespace is distinct, so only the schema's own name is
+  looked up by branch. `pg_namespace` gains a branch column and its name
+  key with it; looking up a schema name (`search_path`, qualified names)
+  finds the session's branch's copy. Error messages, `regclass` output,
+  `\d` and `pg_dump` print the names users wrote. (This replaces the
+  earlier recommendation of a branch column in `pg_class` and `pg_type`.)
+- **Creating or dropping a versioned schema, and DDL in one, happens on
+  the session's branch only**, so branches diverge in schema and merge,
+  as in Dolt.
+- **Copies share pages copy-on-write.** Under each prolly relation's
+  files is a **block map** from logical block to physical block in a page
+  store shared by the database's prolly relations. A branch's copy of a
+  table shares its source's pages: no page is copied when the branch is
+  made, and the first logical change to a shared page on either branch
   gives that branch its own copy of the page.
-- **Names resolve to the session's branch.** Connections choose a branch
-  by database name (`db/branch`, as built). A prolly table's name, in its
-  schema, resolves to the copy on the session's branch; everything stored
-  by OID that refers to a prolly table belongs to that branch's copy.
-- **Objects that depend on prolly tables:**
-  - Views and materialized views over prolly tables, and rules on them,
-    are copied per branch with the tables.
-  - Foreign keys between prolly tables are per branch; a prolly table may
-    reference a normal table (shared data); a normal table referencing a
-    prolly table is refused (its rows would point into one branch only).
-  - Functions resolve names when they run, so they see the session's
-    branch; nothing to copy.
-  - Creating or dropping a prolly table on a branch affects that branch
-    only.
+- **Making a branch's copies is the same operation as checkout and
+  clone.** Recommended: the canonicalizer, which already turns a schema's
+  catalog rows into a canonical form by name, gains the reverse, making a
+  schema's objects from canonical form; a new branch's copies are made
+  from its source's canonical schema, and its prolly tables then attach
+  their source's pages copy-on-write instead of being loaded. Checkout of
+  a commit and clone use the same path, loading pages from trees where
+  there is no source to share. The alternative, copying catalog rows and
+  remapping the OIDs inside them (defaults, view and rule trees, function
+  bodies stored as parse trees, `pg_depend`), is faster but is a second
+  path that must track every catalog that stores OIDs.
+- **Connections choose a branch** by database name (`db/branch`, as
+  built).
 - **Shared catalogs** (`pg_database`, `pg_authid`, tablespaces) stay
   cluster-wide and unversioned, as decided for question 27.
 - A branch that no connection uses and that has no uncommitted changes can
-  drop its page sets; it is then only its head commit. Its pages are made
-  again when it is next used: copy-on-write from a branch whose head is
-  close to it, then the difference applied (part 2), or, when no branch
-  is close, materialized from the tree.
-- Temporary and unlogged prolly tables are refused, as before (question
-  28): a prolly table is permanent.
-- **How copies are named (step 2's first decision).** Recommended: a
-  copy keeps the table's schema and name, with a branch column added to
-  `pg_class` and `pg_type` and to their name keys, and name lookups match
-  the session's branch or no branch. Error messages, `regclass` output,
-  `\d` and `pg_dump` then print the names users wrote. The alternative,
-  a hidden schema per branch, leaves the catalogs' keys alone but leaks
-  the hidden names wherever a schema is printed.
+  drop its copies; it is then only its head commit. Its copies are made
+  again when it is next used: from a branch whose head is close to it,
+  then the difference applied (part 2), or, when no branch is close, from
+  the commit itself.
+
+### Clone, fetch and push
+
+Commits carry everything needed to rebuild a branch's versioned schemas:
+each prolly table's rows as trees, and every versioned object's canonical
+definition by name. Clone, fetch and push transfer chunks and refs, as in
+Dolt; a branch received this way is only a ref until it is first used,
+when its copies are made from its head commit. Uncommitted working-set
+changes are local, as in Dolt. The only things a commit doesn't carry are
+the shared objects versioned ones depend on (extensions, roles, ordinary
+schemas' objects); a clone checks that the receiving database has them
+and refuses, naming what is missing, if it doesn't.
 
 ### What is in pages and what is in the chunk store
 
@@ -101,7 +135,7 @@ at one transaction's size.
 | Mutability | Mutable, MVCC | Immutable, content-addressed |
 | Ordering | Postgres collations, opclasses | The canonical key encoding (memcmp order from btree opclasses) |
 | Durability | WAL, checkpoints, full-page writes | WAL-logged appends to the store's files (below) |
-| Per branch | Each prolly table's copy: catalog rows and block maps (copy-on-write) | Refs (branch heads, working-set roots) |
+| Per branch | Each versioned schema's copy: its objects' catalog rows, and its prolly relations' block maps (copy-on-write) | Refs (branch heads, working-set roots) |
 | Indexes | Every Postgres index AM | Only what history needs: each table's row tree by key |
 
 ### The chunk store
@@ -169,8 +203,8 @@ carries over; only what assumed chunks live in 8 KB pages changes:
   one branch no longer affects another; merging into a branch with
   uncommitted changes is allowed when nothing conflicts, as in Dolt
   (part 2).
-- **Versioned schema** comes from per-branch copies of prolly tables'
-  catalog rows instead of catalogs on prolly trees:
+- **Versioned schema** comes from per-branch copies of versioned schemas
+  instead of catalogs on prolly trees:
   `09-versioned-catalogs.md` part 4's stages 2–7 are superseded. Its part 1 (canonical commits, identity by name) carries
   over.
 - **The 8 KB question:** pages are Postgres's; chunks are the store's and
@@ -183,23 +217,63 @@ carries over; only what assumed chunks live in 8 KB pages changes:
 | Operation | How | Cost |
 |---|---|---|
 | SQL read or write | Heap and indexes on the branch's copies | Heap's |
-| Create a branch at another branch's head | Copy each prolly table's catalog rows (new OIDs and relation file numbers) and its block maps by reference | O(prolly relations); no page is read |
+| Create a branch at another branch's head | Make the versioned schemas' objects from their canonical schema, then attach each prolly relation's pages by reference | O(versioned objects); no page is read |
 | Create a branch at a commit | As above from a branch whose head is near it, then apply the tree diff between the two heads as row changes | O(Δ log N) |
-| Dolt commit | Fold: find the branch's prolly rows changed since the head (below), write them into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
+| Dolt commit | Fold: the working-set diff (below), written into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
 | Working-set checkpoint | The same fold, published as the branch's working-set root instead of a commit | As a commit |
-| Diff, log, status | Over trees: subtree-skipping diff; working-set diffs fold first | Dolt's bounds |
+| Working set vs head: diff, status | The change finder (below) over the changed-page lists | O(changed pages + Δ); "changed at all?" O(1) a table |
+| Diff of commits, log | Over trees: subtree-skipping diff | Dolt's bounds |
+| Working set vs any commit | The working-set diff merged by key with the head-to-commit tree diff | Both bounds |
 | Fast-forward, reset, checkout of a commit | Apply the tree diff from the current head to the target as row changes | O(Δ log N) |
 | Three-way merge | Merge trees as Dolt does (base, the target branch's folded working set, the source), then apply the diff from the target's working set to the result as row changes; conflicts as `dolt_conflicts` rows, as built | Dolt's merge bound plus O(Δ log N) |
 | Fetch, push, clone, pull | Our protocol, chunks by address; a cloned branch gets pages when first used | Dolt's bounds; first use O(N log N) materialization |
 
-**Finding changes since the head.** The block map records, per branch,
-the epoch of its last fold. A page first changed after that epoch is
-copied (even when no other branch shares it), so its pre-fold version
-survives until the next fold. The fold reads both versions of each such
-page; every tuple on either is a candidate key; each candidate's new row is
-read from the branch's pages through the primary key (or the content hash
-for keyless tables), its old row from the head's tree, and equal pairs are
-dropped. The cost is in changed pages, not in table size.
+**Diffing the working set against the head (user, 2026-10-16).** Dolt
+diffs a working set against its head in O(Δ log N) because both are
+prolly trees; Dolt's status, diff and commit all rest on it. Pages lose
+that structure, so the change finder recovers it from copy-on-write, and
+it is a first-class operation: `dolt_status`, `dolt_diff` and the fold of a
+commit or checkpoint all use it.
+
+- **Old pages are kept.** Each branch has a fold epoch (its last commit
+  or checkpoint). The first logical change to a page after it copies the
+  page even when no other branch shares it, so the page's version as of
+  the head survives until the next fold. Map entries already carry a
+  birth epoch for this.
+- **Changed pages are listed, not searched for.** The first copy of a page
+  after the fold epoch appends the page to a per-relation changed-page
+  list (in the map fork, WAL-logged with the copy); the next fold clears
+  it. Finding a relation's changed pages is O(changed pages), not a scan
+  of its map. A per-relation counter of listed pages answers "has this
+  table changed since the head?" in O(1), which `dolt_status` needs.
+- **Rows, not pages, are compared.** Every tuple on either version of a
+  listed page gives a candidate key (the primary key, or the content hash
+  for keyless tables). A candidate's old row is read from the old pages
+  as of the head's snapshot, its new row from the branch's current pages,
+  and equal pairs drop out. A row an update moved to another page is on
+  two listed pages, and matching by key pairs it up.
+- **The head's snapshot is kept with the commit.** Old page versions can
+  hold row versions that weren't committed when the head was taken, so
+  reading them as of the head needs that fold's snapshot (its xmin, xmax
+  and running transactions), stored with the branch's head. Reading old
+  rows from the head's tree by key instead needs nothing stored but costs
+  O(log N) a row; the snapshot is the recommended choice.
+- **Changes that change no rows don't count.** Hint bits never copy a
+  page. Pruning and freezing change no row's visibility, so they write a
+  page in place and don't list it, unless another branch shares it (then
+  it is copied for that reason alone, and not listed).
+- **Old pages are bounded.** A branch that goes long without a commit
+  keeps up to two versions of each changed page; a working-set checkpoint
+  folds the changes into a tree, makes the current pages the new
+  baseline, and frees the old versions, bounding both the space and the
+  next diff.
+- **Other diffs.** Head against any commit is a diff of two trees, as in
+  Dolt. The working set against any commit merges the working-set diff
+  with the head-to-commit tree diff by key.
+
+The cost of a working-set diff is O(changed pages + Δ): a changed row
+touches one or two pages, so changed pages are a small multiple of Δ, and
+each costs a page read rather than a few tree nodes.
 
 **Applying a tree diff as row changes** reuses the machinery of logical
 replication's apply worker (`src/backend/replication/logical/worker.c`):
@@ -248,7 +322,7 @@ are interfaces (hash, key and value encoders, chunker, node format).
 | Today | In the new design |
 |---|---|
 | `dolt_*` functions, views, `dolt.author`, `db/branch` connections, conflicts as in Dolt (#25, #26) | Kept; their backend changes to per-branch copies and the chunk store |
-| `CREATE DATABASE … VERSIONED` and its refusal of heap tables (#27) | Superseded: version control is per table (prolly tables), so any database can hold both. Removed with D1 |
+| `CREATE DATABASE … VERSIONED` and its refusal of heap tables (#27) | Superseded: version control is per schema (versioned schemas), so any database can hold both. Removed with D1 |
 | Hash, key encoding, canonical rows, value trees, canonicalizer (4a, #18, #23) | Kept: the chunk store's contents |
 | Copy-on-write trees, subtree-skipping diff, three-way merge, merge conflicts, refs, commits (4c, #9, #21, #22, #26) | Kept; they operate on chunks from the new store instead of node-store pages |
 | Chunker, node format | Reworked: the byte-based rule (step 5's plan) and pageless nodes |
@@ -256,7 +330,7 @@ are interfaces (hash, key and value encoders, chunker, node format).
 | Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests go with D1 |
 | The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC |
 | D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Kept building until the new design is measured against them (step 8), then removed |
-| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of prolly tables' catalog rows; #34 stays harmless |
+| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of versioned schemas; #34 stays harmless |
 
 ### Steps
 
@@ -281,19 +355,27 @@ fails without its fix), and Postgres's suites keep passing after each one.
 - **Exit:** with `default_table_access_method = prolly`, gates 1–3 match
   stock Postgres; crash, standby and base-backup tests of the map pass.
 
-**Step 2. Branches: per-branch copies of prolly tables.**
-- The naming decision (part 1); copying a prolly table's catalog rows and
-  dependent objects per branch; name resolution by the session's branch;
-  the refusals in part 1.
+**Step 2. Branches: per-branch copies of versioned schemas.**
+- `CREATE SCHEMA … VERSIONED`; prolly tables only there, and only prolly
+  tables there; the one-way dependency rule, checked in `pg_depend`.
+- The canonicalizer for every object kind in a versioned schema, both
+  ways (catalog rows to canonical form, and canonical form to objects);
+  making a branch's copies with it; the branch column of `pg_namespace`
+  and schema-name lookup by the session's branch.
 - Branch creation copies block maps by reference and flushes the source's
   dirty buffers first; remapping shared pages (part 5); freeing a copy's
   pages past the xmin horizon; VACUUM and freezing on shared pages
   (visibility-neutral changes in place; line pointers made unused only
   when no other branch shares the page).
+- Fold epochs, copy on first change after the fold, the changed-page
+  list and its counter (part 2), with pruning and freezing in place on
+  unshared pages.
 - `dolt_branch` and `dolt_checkout` on copies, no commits yet.
-- **Exit:** DDL and TRUNCATE on one branch leave the others alone
-  (`vc_schema` passes); normal tables are unaffected by branches; branch
-  creation reads no table's pages; the S suite on a branch matches heap.
+- **Exit:** DDL and TRUNCATE on one branch leave the others alone, for
+  tables and every other object kind (`vc_schema` passes); ordinary
+  schemas are unaffected by branches; a shared object depending on a
+  versioned one is refused; branch creation reads no table's pages; the
+  S suite on a branch matches heap.
 
 **Step 3. The chunk store, WAL-logged.**
 - The journal and its index, table files, the manifest and the refs map,
@@ -308,12 +390,16 @@ fails without its fix), and Postgres's suites keep passing after each one.
   standby's store matches the primary's byte for byte.
 
 **Step 4. Dolt commits from pages.**
-- The fold over the branch's prolly tables: the change finder, tree
-  edits, the canonicalizer, commit and ancestry, refs and working-set roots; working-set checkpoints.
+- The fold over the branch's versioned schemas: the change finder and
+  tree edits for prolly tables, the canonical schema for every object,
+  commit and ancestry, refs and working-set roots; working-set checkpoints.
 - `dolt_commit`, `dolt_log`, `dolt_status`, `dolt_diff` and the views on
   the new store.
+- The working-set diff (part 2) behind `dolt_diff`, `dolt_status` and
+  the fold; the head's snapshot kept with it.
 - **Exit:** gate 6 (history independence) and the requirements suite's
-  commit and history tests pass; commit cost tracks changed pages.
+  commit and history tests pass; commit, diff and status cost track
+  changed pages (counted, as the tree diff's node reads are).
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
@@ -326,7 +412,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
 
 **Step 6. Remotes.**
 - File remotes first, then a network protocol of our own: fetch, push,
-  clone, pull; a cloned branch materialized on first use.
+  clone, pull; a cloned branch's copies made on first use from its head
+  commit; the check for shared dependencies (part 1).
 - **Exit:** V4.
 
 **Step 7. Reclamation.**
