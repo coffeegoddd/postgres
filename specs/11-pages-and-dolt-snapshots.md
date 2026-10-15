@@ -75,16 +75,45 @@ at one transaction's size.
   publications, foreign data wrappers and other objects outside schemas
   stay shared; creating an extension inside a versioned schema is refused
   for now.
-- **Each branch has its own copy of each versioned schema.** The schema
-  itself is copied: each branch's copy has its own namespace OID, and the
-  copy's objects their own OIDs and relation file numbers. Names then
-  need no further help: an object's name key includes its namespace, and
-  every branch's namespace is distinct, so only the schema's own name is
-  looked up by branch. `pg_namespace` gains a branch column and its name
-  key with it; looking up a schema name (`search_path`, qualified names)
-  finds the session's branch's copy. Error messages, `regclass` output,
-  `\d` and `pg_dump` print the names users wrote. (This replaces the
-  earlier recommendation of a branch column in `pg_class` and `pg_type`.)
+- **Each branch has its own copy of each versioned schema, with the same
+  OIDs** (user, 2026-10-16). A branch's copy of an object keeps its
+  source's OID; only its catalog rows' branch and, for a relation, its
+  relation file number differ. Row data holds OIDs: a TOAST pointer names
+  its TOAST table, an enum value is the OID of its label, an array or a
+  composite value names its type, a `reg*` column names an object. Pages
+  shared between branches carry them unchanged, so identical OIDs are
+  what lets a branch read them as its own: a TOAST pointer finds the
+  branch's TOAST table, an enum value the branch's label. New OIDs per
+  copy would leave every such value pointing at the source branch's
+  objects, and translating them where they are read would be a special
+  case per kind of value.
+- **Catalog rows carry a branch.** Every catalog that can hold a versioned
+  object's rows (`pg_class`, `pg_attribute`, `pg_type`, `pg_proc`,
+  `pg_namespace`, `pg_constraint`, `pg_index`, `pg_attrdef`, `pg_trigger`,
+  `pg_rewrite`, `pg_policy`, `pg_enum`, `pg_sequence`, `pg_depend`,
+  `pg_description`, `pg_statistic`, `pg_statistic_ext` and its data,
+  `pg_inherits`, `pg_partitioned_table`, the operator, opclass, collation,
+  conversion, aggregate and text search catalogs, and the rest found by
+  the same rule) gains a branch column: zero for shared rows, the
+  branch's id for a versioned object's. Each unique index gains the
+  column, so a versioned object's rows can repeat its OID and name once
+  per branch.
+- **A backend sees one branch.** Catalog scans, by index or not, return
+  shared rows and the session's branch's rows only. A backend's caches
+  (relcache, catcache, typcache, plan cache) are keyed by OID as before:
+  within one backend an OID names one row. Changing a session's branch
+  resets them, as an invalidation overflow does. An invalidation from a
+  backend on another branch costs a needless reload, nothing more.
+- **New objects get new OIDs from the cluster's counter**, so an object
+  created on one branch never collides with an object on another. A
+  merge that brings an object from another branch keeps its OID when no
+  object on the target branch has it, so copies stay identical along
+  their lineage.
+- **Names follow from the namespace.** A versioned schema keeps its OID on
+  every branch too, so qualified names, `search_path`, `regclass` output,
+  error messages, `\d` and `pg_dump` print and resolve the names users
+  wrote, and two branches' objects of the same name differ only in
+  branch.
 - **Creating or dropping a versioned schema, and DDL in one, happens on
   the session's branch only**, so branches diverge in schema and merge,
   as in Dolt.
@@ -94,17 +123,16 @@ at one transaction's size.
   table shares its source's pages: no page is copied when the branch is
   made, and the first logical change to a shared page on either branch
   gives that branch its own copy of the page.
-- **Making a branch's copies is the same operation as checkout and
-  clone.** Recommended: the canonicalizer, which already turns a schema's
-  catalog rows into a canonical form by name, gains the reverse, making a
-  schema's objects from canonical form; a new branch's copies are made
-  from its source's canonical schema, and its prolly tables then attach
-  their source's pages copy-on-write instead of being loaded. Checkout of
-  a commit and clone use the same path, loading pages from trees where
-  there is no source to share. The alternative, copying catalog rows and
-  remapping the OIDs inside them (defaults, view and rule trees, function
-  bodies stored as parse trees, `pg_depend`), is faster but is a second
-  path that must track every catalog that stores OIDs.
+- **Making a branch's copies** copies its source's catalog rows with the
+  new branch's id and new relation file numbers, and attaches each
+  prolly relation's pages copy-on-write. Nothing inside the rows changes:
+  with the same OIDs, defaults, view and rule trees, function bodies
+  stored as parse trees and `pg_depend` are already right. Checkout of a
+  commit with no source branch to copy from, and clone, make objects
+  from the commit's canonical schema instead (the canonicalizer's reverse
+  direction) and load pages from trees; rows read from trees carry no
+  OIDs, so the new objects' OIDs are free to differ from another
+  cluster's.
 - **Connections choose a branch** by database name (`db/branch`, as
   built).
 - **Shared catalogs** (`pg_database`, `pg_authid`, tablespaces) stay
@@ -217,7 +245,7 @@ carries over; only what assumed chunks live in 8 KB pages changes:
 | Operation | How | Cost |
 |---|---|---|
 | SQL read or write | Heap and indexes on the branch's copies | Heap's |
-| Create a branch at another branch's head | Make the versioned schemas' objects from their canonical schema, then attach each prolly relation's pages by reference | O(versioned objects); no page is read |
+| Create a branch at another branch's head | Copy the versioned objects' catalog rows (same OIDs, new branch, new relation file numbers), then attach each prolly relation's pages by reference | O(versioned catalog rows); no page is read |
 | Create a branch at a commit | As above from a branch whose head is near it, then apply the tree diff between the two heads as row changes | O(Δ log N) |
 | Dolt commit | Fold: the working-set diff (below), written into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
 | Working-set checkpoint | The same fold, published as the branch's working-set root instead of a commit | As a commit |
@@ -235,41 +263,55 @@ that structure, so the change finder recovers it from copy-on-write, and
 it is a first-class operation: `dolt_status`, `dolt_diff` and the fold of a
 commit or checkpoint all use it.
 
-- **Old pages are kept.** Each branch has a fold epoch (its last commit
-  or checkpoint). The first logical change to a page after it copies the
-  page even when no other branch shares it, so the page's version as of
-  the head survives until the next fold. Map entries already carry a
-  birth epoch for this.
+- **A baseline, distinct from the head.** Each branch has a baseline: the
+  tree of its last fold, whether a Dolt commit (then it is the head) or a
+  working-set checkpoint (then it isn't), and the epoch of that fold.
+  Pages describe changes since the baseline; trees describe the rest.
+- **Old pages are kept.** The first logical change to a page after the
+  fold epoch copies the page even when no other branch shares it, so the
+  page's version as of the baseline survives until the next fold. Map
+  entries already carry a birth epoch for this.
 - **Changed pages are listed, not searched for.** The first copy of a page
   after the fold epoch appends the page to a per-relation changed-page
   list (in the map fork, WAL-logged with the copy); the next fold clears
   it. Finding a relation's changed pages is O(changed pages), not a scan
-  of its map. A per-relation counter of listed pages answers "has this
-  table changed since the head?" in O(1), which `dolt_status` needs.
-- **Rows, not pages, are compared.** Every tuple on either version of a
-  listed page gives a candidate key (the primary key, or the content hash
-  for keyless tables). A candidate's old row is read from the old pages
-  as of the head's snapshot, its new row from the branch's current pages,
-  and equal pairs drop out. A row an update moved to another page is on
-  two listed pages, and matching by key pairs it up.
-- **The head's snapshot is kept with the commit.** Old page versions can
-  hold row versions that weren't committed when the head was taken, so
-  reading them as of the head needs that fold's snapshot (its xmin, xmax
-  and running transactions), stored with the branch's head. Reading old
-  rows from the head's tree by key instead needs nothing stored but costs
-  O(log N) a row; the snapshot is the recommended choice.
+  of its map.
+- **Old rows come from the tree; old pages only name candidates.** Every
+  tuple on either version of a listed page, visible or not, gives a
+  candidate key (the primary key, or the content hash for keyless
+  tables). A candidate's old row is read from the baseline's tree by key,
+  its new row from the branch's current pages, and equal pairs drop out.
+  A row an update moved to another page is on two listed pages, and
+  matching by key pairs it up. Since visibility on old pages is never
+  consulted, no snapshot is kept, and VACUUM, freezing and the truncation
+  of transaction status need not respect old pages. A candidate whose key
+  can't be read from an old version (a key value stored out of line
+  that VACUUM has since removed, or any out-of-line value of a keyless
+  table, whose key is a hash of the whole row) makes the diff compare
+  that table in full instead: correct, but O(N) for that table.
+- **A fold keeps what it couldn't see.** A fold's snapshot leaves out
+  transactions still running. Pages holding tuples written or deleted by
+  them stay on the list after the fold (their old versions become the new
+  baseline's), so when those transactions commit, which changes no page,
+  the next diff still visits them.
+- **Status is O(1) a table.** A table has changed since the head if its
+  baseline tree differs from the head's (one hash comparison) or its
+  changed-page list isn't empty.
 - **Changes that change no rows don't count.** Hint bits never copy a
-  page. Pruning and freezing change no row's visibility, so they write a
-  page in place and don't list it, unless another branch shares it (then
-  it is copied for that reason alone, and not listed).
+  page. Pruning and freezing write a page in place and don't list it,
+  unless another branch shares it (then it is copied for that reason
+  alone, and not listed). Candidates come from every tuple of an old
+  version, so a page changed in place this way loses none.
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
-  folds the changes into a tree, makes the current pages the new
-  baseline, and frees the old versions, bounding both the space and the
-  next diff.
-- **Other diffs.** Head against any commit is a diff of two trees, as in
-  Dolt. The working set against any commit merges the working-set diff
-  with the head-to-commit tree diff by key.
+  folds the changes into a tree, which becomes the new baseline, and
+  frees the old versions, bounding both the space and the next diff.
+- **The diffs.** The working set against the head merges, by key, the
+  tree diff from the head to the baseline with the page changes since the
+  baseline (when the baseline is the head, only the latter). Head against
+  any commit is a diff of two trees, as in Dolt. The working set against
+  any commit merges the working-set diff with the head-to-commit tree diff
+  by key.
 
 The cost of a working-set diff is O(changed pages + Δ): a changed row
 touches one or two pages, so changed pages are a small multiple of Δ, and
@@ -358,10 +400,11 @@ fails without its fix), and Postgres's suites keep passing after each one.
 **Step 2. Branches: per-branch copies of versioned schemas.**
 - `CREATE SCHEMA … VERSIONED`; prolly tables only there, and only prolly
   tables there; the one-way dependency rule, checked in `pg_depend`.
-- The canonicalizer for every object kind in a versioned schema, both
-  ways (catalog rows to canonical form, and canonical form to objects);
-  making a branch's copies with it; the branch column of `pg_namespace`
-  and schema-name lookup by the session's branch.
+- The branch column in the catalogs that hold versioned objects, their
+  unique indexes, catalog scans filtered by the session's branch, and
+  cache resets on a change of branch.
+- Making a branch's copies: catalog rows copied with the same OIDs, new
+  relation file numbers, pages attached copy-on-write.
 - Branch creation copies block maps by reference and flushes the source's
   dirty buffers first; remapping shared pages (part 5); freeing a copy's
   pages past the xmin horizon; VACUUM and freezing on shared pages
@@ -391,12 +434,14 @@ fails without its fix), and Postgres's suites keep passing after each one.
 
 **Step 4. Dolt commits from pages.**
 - The fold over the branch's versioned schemas: the change finder and
-  tree edits for prolly tables, the canonical schema for every object,
-  commit and ancestry, refs and working-set roots; working-set checkpoints.
+  tree edits for prolly tables, the canonical schema for every object
+  (the canonicalizer in both directions, the reverse for checkout and
+  clone), commit and ancestry, refs and working-set roots; working-set checkpoints.
 - `dolt_commit`, `dolt_log`, `dolt_status`, `dolt_diff` and the views on
   the new store.
 - The working-set diff (part 2) behind `dolt_diff`, `dolt_status` and
-  the fold; the head's snapshot kept with it.
+  the fold: baselines distinct from heads, candidates from old pages,
+  old rows from trees, pages of transactions running at a fold kept.
 - **Exit:** gate 6 (history independence) and the requirements suite's
   commit and history tests pass; commit, diff and status cost track
   changed pages (counted, as the tree diff's node reads are).
