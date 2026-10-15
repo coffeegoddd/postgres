@@ -6,8 +6,9 @@
 # take turns, as on heap; an update that keeps the key columns doesn't
 # block foreign-key checks; a transaction locking many rows of a table
 # locks the whole table instead; tables whose key bytes don't name their
-# rows (numeric keys) lock whole tables; deadlocks are found; and many
-# concurrent transfers keep their total.
+# rows (numeric keys) lock whole tables; deadlocks are found; a uniqueness
+# check isn't held up by other rows' writers; and many concurrent transfers
+# keep their total.
 
 use strict;
 use warnings FATAL => 'all';
@@ -78,8 +79,13 @@ $s1->query_safe('BEGIN; UPDATE t SET v = v + 10 WHERE id = 3;');
 ok(waits('UPDATE t SET v = v + 1 WHERE id = 3'),
 	'a writer of a locked row waits');
 is($node->safe_psql('postgres', q{
-	SELECT count(*) FROM pg_locks WHERE locktype = 'prollyrow' AND granted}),
+	SELECT count(*) FROM pg_locks WHERE locktype = 'prollyrow' AND granted
+	AND relation = 't'::regclass}),
 	'1', 'pg_locks shows the row lock');
+is($node->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_locks WHERE locktype = 'prollyrow' AND granted
+	AND relation = 't_u'::regclass}),
+	'1', 'and the value it has in a btree unique index');
 $s2->query_until(qr/go/, "\\echo go\nUPDATE t SET v = v + 1 WHERE id = 3;\n");
 $s1->query_safe('COMMIT');
 $s2->query_safe('SELECT 1');
@@ -142,7 +148,7 @@ $s1->query_safe(q{BEGIN; SET LOCAL prolly_max_row_locks_per_table = 3;
 	UPDATE t SET v = v + 1 WHERE id BETWEEN 5 AND 9;});
 is($node->safe_psql('postgres', q{
 	SELECT mode FROM pg_locks WHERE locktype = 'prollytable' AND granted
-	AND mode = 'ExclusiveLock'}),
+	AND mode = 'ExclusiveLock' AND relation = 't'::regclass}),
 	'ExclusiveLock', 'a transaction locking many rows locks the table');
 ok(waits('UPDATE t SET v = 0 WHERE id = 10'),
 	'then writers of other rows wait for it');
@@ -169,6 +175,21 @@ $s1->query('ROLLBACK');
 $s2->query('ROLLBACK');
 $s1->{stderr} = '';
 $s2->{stderr} = '';
+
+# An aborted insert leaves btree entries whose TID names no row.  A later
+# uniqueness check for the same value meets them and knows their writer is
+# gone, without waiting for the table's other writers.
+$node->safe_psql('postgres', q{
+	BEGIN; INSERT INTO t VALUES (40, 0, 40); ROLLBACK;
+});
+$s1->query_safe('BEGIN; UPDATE t SET v = 1 WHERE id = 3;');
+$s2->query_safe('SET lock_timeout = 2000');
+$s2->query('INSERT INTO t VALUES (40, 0, 40)');
+is($s2->{stderr}, '',
+	'a uniqueness check doesn\'t wait for other rows\' writers over an aborted insert\'s entry');
+$s2->{stderr} = '';
+$s1->query_safe('ROLLBACK');
+$s2->query_safe('RESET lock_timeout');
 
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{

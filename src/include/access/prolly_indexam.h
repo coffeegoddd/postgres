@@ -34,6 +34,14 @@ extern void prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 extern void prolly_index_rebuild_all(Relation heap);
 
 /*
+ * Lock the values the row in slot has in heap's unique indexes of other
+ * access methods (btree's), as a prolly unique index locks its own: so
+ * their writers take turns, and a uniqueness check that meets a TID it
+ * can't resolve knows the row's writer is gone.
+ */
+extern void prolly_lock_unique_values(Relation heap, TupleTableSlot *slot);
+
+/*
  * Rebuild index from heap's rows as every write so far sees them; the
  * caller holds the right to write heap, so nothing changes meanwhile.
  */
