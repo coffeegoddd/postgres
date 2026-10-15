@@ -31,6 +31,10 @@
  *   beyond the buffer content locks needed to read a page.
  * - Errors are raised with ereport(); an item too large for a node is an
  *   error (large values go out of line, in a later step).
+ * - If env->counters is set, every node an operation reads from the node
+ *   store adds one to nodes_read, and every node it writes (not one the
+ *   store already had) one to nodes_written, so callers can check an
+ *   operation's cost by counting.
  *
  * Provisional (v0).
  *
@@ -66,6 +70,7 @@ typedef struct ProllyTreeEnv
 	const ProllyLogRoutine *log;
 	ProllyKeyCompare compare;
 	void	   *compare_arg;
+	ProllyNodeCounters *counters;	/* optional */
 } ProllyTreeEnv;
 
 /* One change for apply(): a put, or a delete if is_delete. */
@@ -144,7 +149,8 @@ typedef struct ProllyTreeRoutine
 	 * Report each key whose presence or value differs between from and to,
 	 * once, in key order; a key equal in both by the tree's order but
 	 * written differently is modified (reported as to writes it).  Subtrees
-	 * with the same hash are skipped.
+	 * with the same hash are skipped without being read, so with d changed
+	 * keys it reads O((d + 1) log n) nodes, not every leaf.
 	 */
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyTreeVisitChange visit,

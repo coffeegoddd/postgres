@@ -40,7 +40,7 @@ do better than Dolt. Status is as of 2026-10-14.
 | Stage s tables | O(M + s log T + log R) | O(s log T + log R); aim without the database-wide O(M) term | Staging updates s directory entries; only the staged tables' metadata is examined | 4g |
 | Commit (staged data materialized, one parent) | O(M + log H + log R) | O(M + log H + log R) | A commit's canonical root refers to the working set's trees themselves (structural sharing, `09-versioned-catalogs.md`); the canonicalizer runs over changed catalog rows only; ancestry as a persistent map updated in O(log H) | 4g. Tables with rows not yet canonical (written before an ADD COLUMN with a default or a DROP COLUMN) are rewritten at commit, Ω(N) per such table, as a Dolt schema rewrite is |
 | SQL transaction commit (publishing the working set) | Concurrent transactions: O((I + 1)(Δ + 1) log N) working-set merge | O((I + 1)(Δ + 1) log N) | Changed trees materialized before the commit lock; over a newer head, the write set is replayed (row locks keep writers apart), O((I + 1) Δ log N) | Built for one writer per table (4d); concurrent writers and replay in 4e |
-| Row diff | Sparse: O((Δ + 1) log N); full traversal O(N) | O((Δ + 1) log N) | Skipping matching internal subtrees, not only leaves; streaming | **Not met:** the tree's diff skips matching leaves but walks every leaf, O(N / leaf size). Fixed in 4e |
+| Row diff | Sparse: O((Δ + 1) log N); full traversal O(N) | O((Δ + 1) log N) | Skipping matching internal subtrees, not only leaves; streaming | Built (4e.1): subtrees with equal hashes are skipped unread; a conformance check counts the nodes read (one change in a 4-level tree of 837 nodes: 8, two root-to-leaf paths; eight changes: 40; the leaf walk read 1,674 for one) |
 | Find merge base, test fast-forward | O(log H + a), worst O(H) | O(log H + a); aim O(log H) | Ancestry closure as a persistent map, with seeks rather than a walk (Dolt notes seeking would improve its own path); fast-forward by closure membership, O(log H) | 4g |
 | Fast-forward merge | Ancestry check + metadata + O(log R) | The same; aim O(log H + log R) | As above, then publishing the destination root | 4g |
 | Three-way merge | O(M + a + log H + (I + 1)(Δ + 1) log N) plus commit work; schema rewrites Ω(N), index rebuilds O(N log N) each | The same bound | Diff both sides with subtree skipping, apply patches reusing unchanged subtrees (handling the last node of a level that ends with its input, not at a boundary); prolly indexes merged as trees; non-prolly indexes updated with the Δ merged rows, O(Δ log N), never rebuilt for a data-only merge | 4g |
@@ -69,7 +69,9 @@ do better than Dolt. Status is as of 2026-10-14.
 - **Gate 7** (`06-benchmarking.md`): the V suite sweeps N with Δ fixed and Δ
   with N fixed, and checks each operation's growth against its bound.
 - Work is counted, not timed, where it can be: engines expose counters of
-  nodes read and written, so a requirements test can assert, for example,
+  nodes read and written (built in 4e.1: the tree interface counts into
+  the caller's counters, and `prolly_node_counters(access_method)` returns
+  a backend's for an engine), so a requirements test can assert, for example,
   that a one-row diff in a table of N rows reads O(log N) nodes, and a
   branch creation reads none of any table's nodes. Timing is reported beside
   the counts.

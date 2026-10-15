@@ -136,4 +136,11 @@ struct ProllyDiffSink
 						   const ProllyValue *after);	/* NULL if removed */
 };
 
+/* Nodes read from and written to a node store, for counting work. */
+typedef struct ProllyNodeCounters
+{
+	uint64		nodes_read;
+	uint64		nodes_written;		/* new nodes, not ones already stored */
+} ProllyNodeCounters;
+
 #endif							/* PROLLY_TYPES_H */

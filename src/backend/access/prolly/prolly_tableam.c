@@ -56,6 +56,7 @@
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "utils/fmgrprotos.h"
@@ -2769,4 +2770,27 @@ Datum
 prolly_d4_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&prolly_methods);
+}
+
+/*
+ * prolly_node_counters(access_method name, OUT nodes_read int8,
+ * OUT nodes_written int8): nodes this backend has read and written for the
+ * engine of a prolly table access method.
+ */
+Datum
+prolly_node_counters(PG_FUNCTION_ARGS)
+{
+	ProllyComponents c;
+	ProllyNodeCounters counters;
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	prolly_components_for_am(NameStr(*PG_GETARG_NAME(0)), &c);
+	PROLLY_CALL(c.engine, node_counters, &counters);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum((int64) counters.nodes_read);
+	values[1] = Int64GetDatum((int64) counters.nodes_written);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
