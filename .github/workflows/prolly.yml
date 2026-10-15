@@ -79,6 +79,11 @@ jobs:
           make -C src/test/prolly check-target check-semantics check-isolation \
             check-tap-durability PROLLY_AM=prolly
 
+      - name: Version-control targeting on D1 and negative controls
+        run: |
+          make -C src/test/prolly check-vc-target check-vc-target-guard \
+            PROLLY_AM=prolly_d1
+
       - name: Upstream suites on block-mapped storage (nightly)
         if: github.event_name == 'schedule'
         run: make -C src/test/prolly check-upstream-bmap
