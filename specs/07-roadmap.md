@@ -545,10 +545,19 @@ and `003_d1_cleanup.pl` updated for row-level locks, and a key encoder
 conformance check of `equal_bytes`. The requirements suite's isolation
 group now passes except SERIALIZABLE (4e.5): row locks, unique waits,
 REPEATABLE READ conflicts, foreign-key key-share locks, READ COMMITTED
-re-checks, deadlocks and concurrent writers. Not yet: a uniqueness check
-that meets a TID nobody can resolve waits for every writer of the table,
-not only the one that wrote it (heap knows the inserter from the tuple);
-group commit.
+re-checks, deadlocks and concurrent writers. Not yet: group commit.
+
+Later (after 4g.3): a btree uniqueness check that met a TID nobody could
+resolve (another writer's private row, or an aborted insert's) waited for
+every writer of the table, which deadlocked concurrent transfers on
+`013_d1_row_locks.pl` now and then. Writers now lock the values their rows
+have in unique indexes of other access methods too, on write and delete,
+as a prolly unique index locks its own (by bytes when equal values encode
+alike, else the whole index). A btree check, which holds that lock for
+its own value, takes such a TID as gone; checks from the executor (ON
+CONFLICT, exclusion) still wait for the table's writers. Test: an aborted
+insert's entry no longer makes a later insert of the same value wait for
+another row's writer (fails without the change).
 
 **Status (2026-10-14): 4e.4 built.** A transaction's private writes stay
 bounded (question 47): past `prolly_write_set_memory` (64 MB; named with

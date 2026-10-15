@@ -1024,6 +1024,7 @@ insert_row(Relation rel, const ProllyComponents *c, ProllyKeying *keying,
 	lock_for_write_mode(rel, c, &k,
 						replaces ? LockTupleNoKeyExclusive : LockTupleExclusive,
 						roots);
+	prolly_lock_unique_values(rel, slot);
 
 	if (PROLLY_CALL(c->keying, keyless, keying))
 	{
@@ -1226,18 +1227,17 @@ row_at(const ProllyComponents *c, ProllyRootSet *roots, Relation rel,
 
 /*
  * row_at() for a dirty snapshot (uniqueness and exclusion checks), which
- * must not decide while the row's writer is still running: a TID nobody
- * knows may name another writer's row, private until it commits, so the
- * table's writers matter; a row that exists may be being deleted or
- * updated, so its key's writers do.  Returns whether the caller should
- * take the row (or TID) as there.
+ * must not decide while the row's writer is still running: a row that
+ * exists may be being deleted or updated, so its key's writers matter, and
+ * a TID nobody knows may be another writer's private row.  Returns whether
+ * the caller should take the row as there.
  *
  * Without locks held (an executor's index scan), waits for each such
  * writer to end and looks again at what was committed.  With them (a
  * btree uniqueness check holds its leaf page) waiting could deadlock
- * unseen, so instead it reports the writer in the snapshot, as heap does
- * (xmin for an inserter, xmax for a deleter), and says the TID is there:
- * the caller lets go of its page, waits, and checks again.
+ * unseen, so instead it reports the writer in the snapshot as heap reports
+ * a deleter (xmax), and says the row is there: the caller lets go of its
+ * page, waits, and checks again.
  */
 static bool
 row_at_dirty(const ProllyComponents *c, ProllyRootSet **roots, Relation rel,
@@ -1248,9 +1248,28 @@ row_at_dirty(const ProllyComponents *c, ProllyRootSet **roots, Relation rel,
 		TransactionId writer;
 
 		row_at(c, *roots, rel, keying, tid, InvalidCommandId, r);
+
+		/*
+		 * A TID nobody knows names no committed version.  In a btree
+		 * uniqueness check (the caller holds its page), the caller already
+		 * holds the lock on the row's unique value, so a writer still
+		 * running with that value would have made it wait: it is a TID of
+		 * a writer that is gone (its transaction aborted).  An executor's
+		 * check (ON CONFLICT, exclusion) hasn't locked anything, so it
+		 * waits for the table's writers.
+		 */
 		if (r->state == PROLLY_TID_UNKNOWN)
+		{
+			if (InterruptHoldoffCount > 0)
+				return false;
 			writer = PROLLY_CALL(c->coord, writer_of, rel, NULL);
-		else if (r->present)
+			if (!TransactionIdIsValid(writer))
+				return false;
+			XactLockTableWait(writer, rel, tid, XLTW_None);
+			newest_roots(c, roots);
+			continue;
+		}
+		if (r->present)
 		{
 			ProllyKey	k = {(const uint8 *) r->key.data, r->key.len};
 
@@ -1260,13 +1279,10 @@ row_at_dirty(const ProllyComponents *c, ProllyRootSet **roots, Relation rel,
 		else
 			return false;
 		if (!TransactionIdIsValid(writer))
-			return r->present;
+			return true;
 		if (InterruptHoldoffCount > 0)
 		{
-			if (r->present)
-				snapshot->xmax = writer;
-			else
-				snapshot->xmin = writer;
+			snapshot->xmax = writer;	/* its deleter, for the caller */
 			return true;
 		}
 		XactLockTableWait(writer, rel, tid, XLTW_None);
@@ -1451,6 +1467,7 @@ remove_version(const ProllyComponents *c, ProllyRootSet *roots, Relation rel,
 														&TTSOpsVirtual);
 
 		PROLLY_CALL(c->keying, decode_row, keying, &r->row, slot);
+		prolly_lock_unique_values(rel, slot);
 		prolly_index_remove_row(rel, slot, &k,
 								PROLLY_CALL(c->keying, keyless, keying) ?
 								r->count - 1 : 0,

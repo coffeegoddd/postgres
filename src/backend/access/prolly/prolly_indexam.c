@@ -589,6 +589,95 @@ prolly_index_remove_row(Relation heap, TupleTableSlot *slot,
 }
 
 void
+prolly_lock_unique_values(Relation heap, TupleTableSlot *slot)
+{
+	List	   *indexes;
+	ListCell   *lc;
+	EState	   *estate = NULL;
+	ProllyComponents c;
+
+	if (!heap->rd_rel->relhasindex)
+		return;
+	prolly_components_for_relation(heap, &c);
+	indexes = RelationGetIndexList(heap);
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), RowExclusiveLock);
+		IndexInfo  *ii;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		int			nkeys = IndexRelationGetNumberOfKeyAttributes(index);
+		ProllyKeyDesc desc;
+		Oid			types[INDEX_MAX_KEYS];
+		bool		encodable = true;
+		StringInfoData bound;
+		ProllyKey	b;
+		bool		named = false;
+		TM_FailureData tmfd;
+
+		if (!index->rd_index->indisunique || !index->rd_index->indisready ||
+			prolly_index_is_prolly(index))
+		{
+			index_close(index, NoLock);
+			continue;
+		}
+		ii = BuildIndexInfo(index);
+		if (ii->ii_Expressions != NIL || ii->ii_Predicate != NIL)
+		{
+			if (estate == NULL)
+				estate = CreateExecutorState();
+			GetPerTupleExprContext(estate)->ecxt_scantuple = slot;
+		}
+		if ((ii->ii_Predicate != NIL &&
+			 !ExecQual(ExecPrepareQual(ii->ii_Predicate, estate),
+					   GetPerTupleExprContext(estate))))
+		{
+			index_close(index, NoLock);
+			continue;
+		}
+		FormIndexDatum(ii, slot, estate, values, isnull);
+		if (!checks_unique(index, nkeys, isnull))
+		{
+			index_close(index, NoLock);
+			continue;
+		}
+
+		/* The value's bytes, if equal values encode alike; else the index. */
+		for (int i = 0; i < nkeys; i++)
+		{
+			types[i] = index->rd_opcintype[i];
+			encodable &= PROLLY_CALL(c.key_encoder, supports,
+									 index->rd_opfamily[i], types[i],
+									 index->rd_indcollation[i]);
+		}
+		initStringInfo(&bound);
+		if (encodable)
+		{
+			ProllyKeyEncoder *enc;
+
+			desc.nkeys = nkeys;
+			desc.types = types;
+			desc.opfamilies = index->rd_opfamily;
+			desc.collations = index->rd_indcollation;
+			desc.options = index->rd_indoption;
+			enc = PROLLY_CALL(c.key_encoder, begin, &desc, CurrentMemoryContext);
+			PROLLY_CALL(c.key_encoder, encode, enc, values, isnull, &bound);
+			named = PROLLY_CALL(c.key_encoder, equal_bytes, enc);
+			PROLLY_CALL(c.key_encoder, end, enc);
+		}
+		b.data = (const uint8 *) bound.data;
+		b.len = bound.len;
+		(void) PROLLY_CALL(c.coord, lock_row, index, named ? &b : NULL,
+						   LockTupleExclusive, LockWaitBlock, &tmfd);
+		pfree(bound.data);
+		index_close(index, NoLock);
+	}
+	if (estate)
+		FreeExecutorState(estate);
+	list_free(indexes);
+}
+
+void
 prolly_index_rebuild(Relation heap, Relation index)
 {
 	ProllyComponents c;
