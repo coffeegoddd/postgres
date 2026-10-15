@@ -945,6 +945,18 @@ commits also counted up the epoch). Tests: `026_d1_tid_reuse_branches.pl`
 (a branch's and a reset's new rows keep distinct TIDs, which fails without
 the pin; TIDs are reused without commits or branches).
 
+**Status (2026-10-15): 4g.5 stage 1, catalog writes through the table
+AM.** The six `CatalogTuple*` functions (`indexing.c`), through which all
+of Postgres's catalog writes go, call the catalog's table access method
+(`table_tuple_insert`, `table_multi_insert`, `simple_table_tuple_update`,
+`simple_table_tuple_delete`) with the tuple in a slot, copying the TID the
+access method gave it back into `t_self`; whether an update needs index
+entries comes from the access method's `update_indexes` (heap's HOT
+decision), not from the tuple's HOT flag, which the access method may set
+on a copy. Heap catalogs take the same path, so every test exercises it;
+behavior is unchanged (core's 239 tests pass). Not yet: the scans that
+call `heap_getnext` directly (stage 1's other half).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

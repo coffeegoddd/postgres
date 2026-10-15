@@ -18,6 +18,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -86,17 +87,14 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
 	bool		onlySummarized = (updateIndexes == TU_Summarizing);
 
 	/*
-	 * HOT update does not require index inserts. But with asserts enabled we
-	 * want to check that it'd be legal to currently insert into the
-	 * table/index.
+	 * An update the table AM made without new index entries (HOT) does not
+	 * require index inserts. But with asserts enabled we want to check that
+	 * it'd be legal to currently insert into the table/index.
 	 */
 #ifndef USE_ASSERT_CHECKING
-	if (HeapTupleIsHeapOnly(heapTuple) && !onlySummarized)
+	if (updateIndexes == TU_None)
 		return;
 #endif
-
-	/* When only updating summarized indexes, the tuple has to be HOT. */
-	Assert((!onlySummarized) || HeapTupleIsHeapOnly(heapTuple));
 
 	/*
 	 * Get information from the state structure.  Fall out if nothing to do.
@@ -140,7 +138,7 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
 
 		/* see earlier check above */
 #ifdef USE_ASSERT_CHECKING
-		if (HeapTupleIsHeapOnly(heapTuple) && !onlySummarized)
+		if (updateIndexes == TU_None)
 		{
 			Assert(!ReindexIsProcessingIndex(RelationGetRelid(index)));
 			continue;
@@ -219,6 +217,40 @@ CatalogTupleCheckConstraints(Relation heapRel, HeapTuple tup)
 #endif							/* USE_ASSERT_CHECKING */
 
 /*
+ * Catalog tuples are written through the catalog's table access method, as
+ * any table's are, so a catalog needn't be stored by heap.  The tuple is
+ * handed over in a slot (the access method may write a copy), and gets the
+ * TID and table the access method gave it, as callers expect of t_self.
+ */
+static void
+catalog_insert(Relation heapRel, HeapTuple tup)
+{
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRel),
+													&TTSOpsHeapTuple);
+
+	ExecStoreHeapTuple(tup, slot, false);
+	table_tuple_insert(heapRel, slot, GetCurrentCommandId(true), 0, NULL);
+	tup->t_self = slot->tts_tid;
+	tup->t_tableOid = slot->tts_tableOid;
+	ExecDropSingleTupleTableSlot(slot);
+}
+
+static void
+catalog_update(Relation heapRel, const ItemPointerData *otid, HeapTuple tup,
+			   TU_UpdateIndexes *updateIndexes)
+{
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRel),
+													&TTSOpsHeapTuple);
+
+	ExecStoreHeapTuple(tup, slot, false);
+	simple_table_tuple_update(heapRel, unconstify(ItemPointerData *, otid),
+							  slot, InvalidSnapshot, updateIndexes);
+	tup->t_self = slot->tts_tid;
+	tup->t_tableOid = slot->tts_tableOid;
+	ExecDropSingleTupleTableSlot(slot);
+}
+
+/*
  * CatalogTupleInsert - do heap and indexing work for a new catalog tuple
  *
  * Insert the tuple data in "tup" into the specified catalog relation.
@@ -238,7 +270,7 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 
 	indstate = CatalogOpenIndexes(heapRel);
 
-	simple_heap_insert(heapRel, tup);
+	catalog_insert(heapRel, tup);
 
 	CatalogIndexInsert(indstate, tup, TU_All);
 	CatalogCloseIndexes(indstate);
@@ -258,7 +290,7 @@ CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 {
 	CatalogTupleCheckConstraints(heapRel, tup);
 
-	simple_heap_insert(heapRel, tup);
+	catalog_insert(heapRel, tup);
 
 	CatalogIndexInsert(indstate, tup, TU_All);
 }
@@ -277,8 +309,8 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	if (ntuples <= 0)
 		return;
 
-	heap_multi_insert(heapRel, slot, ntuples,
-					  GetCurrentCommandId(true), 0, NULL);
+	table_multi_insert(heapRel, slot, ntuples,
+					   GetCurrentCommandId(true), 0, NULL);
 
 	/*
 	 * There is no equivalent to heap_multi_insert for the catalog indexes, so
@@ -290,6 +322,7 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 		HeapTuple	tuple;
 
 		tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
+		tuple->t_self = slot[i]->tts_tid;
 		tuple->t_tableOid = slot[i]->tts_tableOid;
 		CatalogIndexInsert(indstate, tuple, TU_All);
 
@@ -319,7 +352,7 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 
 	indstate = CatalogOpenIndexes(heapRel);
 
-	simple_heap_update(heapRel, otid, tup, &updateIndexes);
+	catalog_update(heapRel, otid, tup, &updateIndexes);
 
 	CatalogIndexInsert(indstate, tup, updateIndexes);
 	CatalogCloseIndexes(indstate);
@@ -341,7 +374,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
-	simple_heap_update(heapRel, otid, tup, &updateIndexes);
+	catalog_update(heapRel, otid, tup, &updateIndexes);
 
 	CatalogIndexInsert(indstate, tup, updateIndexes);
 }
@@ -364,5 +397,6 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 void
 CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
 {
-	simple_heap_delete(heapRel, tid);
+	simple_table_tuple_delete(heapRel, unconstify(ItemPointerData *, tid),
+							  InvalidSnapshot);
 }
