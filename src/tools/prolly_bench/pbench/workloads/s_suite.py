@@ -94,14 +94,15 @@ class S4(Workload):
     def prepare(self, ctx: Context) -> None:
         rows = int(ctx.size_params["s4_rows"])
         # The source rows are generated in a heap table and written to a file,
-        # so generation is not part of the measurement.
+        # so generation is not part of the measurement.  The heap table is in
+        # public: a versioned schema holds only prolly tables.
         ctx.cluster.sql(f"""
-            CREATE TABLE s4_src USING heap AS
+            CREATE TABLE public.s4_src USING heap AS
               SELECT g::bigint AS id, (g * 7919 % {rows})::int AS k,
                      md5(g::text) || md5((g + 1)::text) AS payload
               FROM generate_series(1, {rows}) g;
-            COPY s4_src TO '{self._file(ctx)}';
-            DROP TABLE s4_src;
+            COPY public.s4_src TO '{self._file(ctx)}';
+            DROP TABLE public.s4_src;
             CREATE TABLE s4 (id bigint, k int, payload text);
         """, dbname=ctx.dbname, options=ctx.session_options())
 

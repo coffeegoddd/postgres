@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from itertools import product
 from typing import Any
 
-from pbench.core import registry
+from pbench.core import registry, targets
 from pbench.core.interfaces import Context, Outcome, Window, Workload
 from pbench.workloads._common import BackgroundPgbench, pgbench_init, timed_session
 
@@ -174,6 +174,9 @@ class V4(VWorkload):
         remote = ctx.make_cluster("remote")
         try:
             remote.sql(f"CREATE DATABASE {ctx.dbname}")
+            setup = targets.for_am(ctx.table_am).setup_sql(ctx.dbname)
+            if setup:
+                remote.sql(setup, dbname=ctx.dbname)
             local_url = ctx.cluster.libpq_url(ctx.dbname)
             clone = timed_session(ctx, [f"SELECT prolly_clone('{local_url}')"],
                                   "v4-clone", cluster=remote)

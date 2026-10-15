@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 
 from pbench.core import config as config_mod
 from pbench.core import env as env_mod
-from pbench.core import registry
+from pbench.core import registry, targets
 from pbench.core.interfaces import (CellKey, CellResult, Cluster, Collector, Context,
                                     NotApplicable, NotImplementedByEngine, Outcome,
                                     RunInfo, Sink, Status, Unavailable, Window,
@@ -208,6 +208,9 @@ class Runner:
             cluster.create(config_mod.server_settings(self.cfg))
             cluster.start()
             cluster.sql(f"CREATE DATABASE {ctx.dbname}")
+            target = targets.for_am(self.table_am)
+            if target.setup_sql(ctx.dbname):
+                cluster.sql(target.setup_sql(ctx.dbname), dbname=ctx.dbname)
             log_pos = cluster.log_position()
 
             workload.check(ctx)
@@ -219,6 +222,9 @@ class Runner:
 
             workload.prepare(ctx)
             ctx.tables = workload.tables(ctx)
+            wrong = target.wrong_am(cluster, ctx.dbname, ctx.tables)
+            if wrong:
+                raise RuntimeError(f"tables not on {self.table_am}: {', '.join(wrong)}")
             cluster.sql("CHECKPOINT")
             workload.warmup(ctx)
 
