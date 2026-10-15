@@ -60,6 +60,7 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
+#include "storage/procarray.h"
 #include "storage/proc.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
@@ -2169,16 +2170,89 @@ prolly_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 	*tups_recently_dead = 0;
 }
 
+typedef struct DeadTids
+{
+	ItemPointer tids;			/* sorted */
+	int			n;
+} DeadTids;
+
+static bool
+dead_tid(ItemPointer itemptr, void *state)
+{
+	DeadTids   *d = state;
+
+	return bsearch(itemptr, d->tids, d->n, sizeof(ItemPointerData),
+				   (int (*) (const void *, const void *)) ItemPointerCompare) != NULL;
+}
+
+/* Remove the entries of rel's indexes, other than prolly's, for dead TIDs. */
+static void
+vacuum_index_entries(Relation rel, ItemPointer dead, int ndead,
+					 const VacuumParams *params, BufferAccessStrategy bstrategy)
+{
+	Relation   *indexes;
+	int			nindexes;
+	DeadTids	d = {dead, ndead};
+
+	qsort(dead, ndead, sizeof(ItemPointerData),
+		  (int (*) (const void *, const void *)) ItemPointerCompare);
+	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indexes);
+	for (int i = 0; i < nindexes; i++)
+	{
+		IndexVacuumInfo ivinfo = {0};
+		IndexBulkDeleteResult *stats;
+
+		if (prolly_index_is_prolly(indexes[i]))
+			continue;
+		ivinfo.index = indexes[i];
+		ivinfo.heaprel = rel;
+		ivinfo.analyze_only = false;
+		ivinfo.report_progress = false;
+		ivinfo.estimated_count = true;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = -1;
+		ivinfo.strategy = bstrategy;
+		stats = index_bulk_delete(&ivinfo, NULL, dead_tid, &d);
+		stats = index_vacuum_cleanup(&ivinfo, stats);
+		if (stats)
+			pfree(stats);
+	}
+	vac_close_indexes(nindexes, indexes, NoLock);
+}
+
 static void
 prolly_relation_vacuum(Relation rel, const VacuumParams *params,
 					   BufferAccessStrategy bstrategy)
 {
-	ProllyComponents components;
-	const ProllyEngineRoutine *engine;
+	ProllyComponents c;
+	ProllyRootSet *roots;
+	ItemPointer dead;
+	int			ndead;
 
-	prolly_components_for_relation(rel, &components);
-	engine = components.engine;
-	PROLLY_CALL(engine, vacuum, rel, params, bstrategy);
+	prolly_components_for_relation(rel, &c);
+	PROLLY_CALL(c.engine, vacuum, rel, params, bstrategy);
+
+	/*
+	 * Versions retired by transactions no snapshot can still see as
+	 * running are gone for everyone, like heap's dead tuples: drop other
+	 * index AMs' entries for their TIDs (a prolly index's entries point at
+	 * row keys, and go when a row does), then forget the TIDs, which frees
+	 * them for reuse.
+	 */
+	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+	ndead = PROLLY_CALL(c.row_identity, dead_tids, roots, rel,
+						GetOldestNonRemovableTransactionId(rel), &dead);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	if (ndead > 0)
+	{
+		vacuum_index_entries(rel, dead, ndead, params, bstrategy);
+		PROLLY_CALL(c.row_identity, tid_forget, rel, dead, ndead,
+					GetCurrentCommandId(true));
+	}
+	ereport(params->log_vacuum_min_duration == 0 ? LOG : DEBUG2,
+			(errmsg("prolly table \"%s\": %d gone row versions removed",
+					RelationGetRelationName(rel), ndead)));
+	pfree(dead);
 }
 
 /* ------------------------------------------------------------------------

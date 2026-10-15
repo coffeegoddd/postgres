@@ -46,8 +46,12 @@
  * - The map records, as the version's local metadata, the transaction that
  *   wrote it (xmin): tid_assign() records the current transaction for a
  *   new version; renaming or retiring it keeps it.
+ * - dead_tids() returns the TIDs whose versions were retired by
+ *   transactions that precede horizon: no snapshot can see them any more.
  * - A TID is forgotten (tid_forget()) only when no index can still hold
- *   it (VACUUM); only then may an implementation give it out again.
+ *   it (VACUUM removed other index AMs' entries for it); its map entries
+ *   go with the current transaction, and an implementation may give the
+ *   TID out again at once (the entries a reuse writes replace them).
  * - The map lives in the relation's PROLLY_TREE_ROWID and
  *   PROLLY_TREE_ROWKEY trees, through the engine, so it is transactional
  *   and per branch like the data; whatever makes TIDs unique across aborts
@@ -125,12 +129,15 @@ typedef struct ProllyRowIdRoutine
 							   uint64 ordinal, const ProllyKey *key,
 							   CommandId cid);
 
-	void		(*tid_forget) (Relation rel, ItemPointer tid, CommandId cid);
+	int			(*dead_tids) (ProllyRootSet *roots, Relation rel,
+							  TransactionId horizon, ItemPointer *tids);
+	void		(*tid_forget) (Relation rel, const ItemPointerData *tids,
+							   int ntids, CommandId cid);
 } ProllyRowIdRoutine;
 
 #define PROLLY_ROWID_CALLBACK_NAMES \
 	"tid_assign", "scan_begin", "tid_find", "scan_end", "tid_resolve", \
-	"tid_retire", "tid_renew", "tid_rename", "tid_forget"
+	"tid_retire", "tid_renew", "tid_rename", "dead_tids", "tid_forget"
 #define PROLLY_ROWID_FIRST_CALLBACK tid_assign
 
 static inline const ProllyRowIdRoutine *

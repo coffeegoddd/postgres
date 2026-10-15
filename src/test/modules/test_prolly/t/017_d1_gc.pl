@@ -19,6 +19,7 @@ $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf', qq{
 default_table_access_method = prolly_d1
 max_prepared_transactions = 10
+wal_consistency_checking = 'Prolly,ProllyStore'
 });
 $node->start;
 $node->backup('b');

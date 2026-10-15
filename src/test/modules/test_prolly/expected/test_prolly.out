@@ -40,7 +40,7 @@ FROM prolly_implementations();
  log             | stub             |       0 |              0
  commit_pipeline | serial           |       1 |              1
  commit_pipeline | stub             |       0 |              0
- row_identity    | counter          |       2 |              3
+ row_identity    | counter          |       2 |              4
  row_identity    | stub             |       0 |              0
  refs            | stub             |       0 |              0
  transfer        | stub             |       0 |              0
@@ -266,8 +266,8 @@ NOTICE:  drop cascades to column m of table conf_kt
  row_identity    | counter          | find_sees_later_assign                  | pass
  row_identity    | counter          | renew_makes_new_version                 | pass
  row_identity    | counter          | never_reused                            | pass
- row_identity    | counter          | forget                                  | not implemented (missing tid_forget)
- row_identity    | counter          | complete                                | not implemented (1 of 9 callbacks missing)
+ row_identity    | counter          | forget                                  | no checks yet
+ row_identity    | counter          | complete                                | pass
  row_identity    | stub             | identity                                | pass
  row_identity    | stub             | assign_then_resolve                     | not implemented (missing tid_assign, scan_begin, tid_find, scan_end, tid_resolve)
  row_identity    | stub             | rename_keeps_tid                        | not implemented (missing tid_assign, tid_rename, tid_resolve, scan_begin, tid_find, scan_end)
@@ -275,7 +275,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  row_identity    | stub             | renew_makes_new_version                 | not implemented (missing tid_assign, tid_renew, tid_resolve, scan_begin, tid_find, scan_end)
  row_identity    | stub             | never_reused                            | not implemented (missing tid_assign, tid_retire, tid_resolve, scan_begin, tid_find, scan_end)
  row_identity    | stub             | forget                                  | not implemented (missing tid_assign, tid_resolve, tid_forget)
- row_identity    | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ row_identity    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  refs            | stub             | identity                                | pass
  refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
