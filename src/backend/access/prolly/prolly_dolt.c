@@ -2,8 +2,9 @@
  *
  * prolly_dolt.c
  *	  Doltgres's SQL interface to version control: the dolt_* functions
- *	  and the functions behind the dolt_log, dolt_branches and dolt_status
- *	  system views, the dolt.author setting, and "dbname/branch"
+ *	  and the functions behind the dolt_log, dolt_branches, dolt_status
+ *	  and dolt_conflicts system views, the dolt.author and
+ *	  dolt.allow_commit_conflicts settings, and "dbname/branch"
  *	  connections.
  *
  * The functions take Dolt's command-line arguments as text and return
@@ -32,6 +33,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "access/tableam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -42,6 +44,9 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/regproc.h"
+#include "nodes/makefuncs.h"
+#include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -51,6 +56,7 @@
 
 /* dolt.author's value; read through GetConfigOption so a placeholder works. */
 static char *dolt_author = NULL;
+static bool dolt_allow_commit_conflicts = false;
 
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
@@ -70,6 +76,14 @@ prolly_session_init(const char *branch)
 								   PGC_USERSET,
 								   0,
 								   NULL, NULL, NULL);
+		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
+								 "Lets a transaction commit with unresolved merge conflicts.",
+								 "They stay to be resolved later; until then the branch can't commit.",
+								 &dolt_allow_commit_conflicts,
+								 false,
+								 PGC_USERSET,
+								 0,
+								 NULL, NULL, NULL);
 		defined = true;
 	}
 	if (branch)
@@ -79,6 +93,15 @@ prolly_session_init(const char *branch)
 		prolly_database_components(&dc);
 		PROLLY_CALL(dc.refs, checkout, branch);
 	}
+}
+
+bool
+prolly_allow_commit_conflicts(void)
+{
+	const char *v = GetConfigOption("dolt.allow_commit_conflicts", true, false);
+	bool		result = false;
+
+	return v != NULL && parse_bool(v, &result) && result;
 }
 
 const char *
@@ -229,6 +252,13 @@ split_author(const char *author, char **name, char **email)
 	}
 }
 
+static char *
+qualified_name(Oid relid)
+{
+	return quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+									  get_rel_name(relid));
+}
+
 /* The session branch's name. */
 typedef struct FindBranch
 {
@@ -333,7 +363,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 
 	/* Nothing changed: the root is its parent's. */
 	if (!allow_empty && PROLLY_CALL(refs(), commit_get, &id, &info) &&
-		info.nparents > 0)
+		info.nparents == 1)
 	{
 		ProllyCommitInfo parent;
 
@@ -461,8 +491,12 @@ dolt_branch(PG_FUNCTION_ARGS)
  * dolt_merge(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward, conflicts, message}
  *
- * branch; --no-ff; -m/--message message.  Conflicts raise an error and
- * change nothing (Dolt's conflict tables aren't there yet).
+ * branch; --no-ff; -m/--message message; --abort.  Rows changed
+ * differently on both sides leave the merge in progress, with conflicts
+ * (dolt_conflicts) to resolve before dolt_commit makes the merge commit.
+ * As in Dolt, a transaction can't commit with conflicts unless
+ * dolt.allow_commit_conflicts is on: outside a transaction block, the
+ * merge fails and changes nothing.
  */
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
@@ -476,6 +510,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 	ProllyHash	theirs = {0};
 	ProllyHash	id = {0};
 	bool		had_head;
+	bool		abort_merge = false;
+	int			conflicts;
 	const char *result[4];
 
 	for (int i = 0; i < nargs; i++)
@@ -484,6 +520,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 
 		if (strcmp(a, "--no-ff") == 0)
 			flags |= PROLLY_MERGE_NO_FF;
+		else if (strcmp(a, "--abort") == 0)
+			abort_merge = true;
 		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
 			message = option_value(args, nargs, &i, "dolt_merge");
 		else if (a[0] == '-')
@@ -493,13 +531,51 @@ dolt_merge(PG_FUNCTION_ARGS)
 		else
 			unexpected("dolt_merge", a);
 	}
+	if (abort_merge)
+	{
+		ProllyMergeState ms;
+
+		if (branch != NULL)
+			unexpected("dolt_merge", branch);
+		if (!PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("there is no merge to abort")));
+		if (prolly_xact_has_writes())
+			ereport(ERROR,
+					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+					 errmsg("cannot abort a merge in a transaction that has written to prolly tables"),
+					 errhint("Roll the transaction back instead.")));
+		PROLLY_CALL(refs(), reset, "HEAD");
+		result[0] = "";
+		result[1] = "0";
+		result[2] = "0";
+		result[3] = "merge aborted";
+		PG_RETURN_DATUM(text_array(4, result));
+	}
 	if (branch == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_merge needs a branch")));
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
-	PROLLY_CALL(diff_merge(), merge, branch, message, flags, &id);
+	conflicts = PROLLY_CALL(diff_merge(), merge, branch, message, flags, &id);
+	if (conflicts > 0)
+	{
+		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("merge conflict detected, transaction rolled back"),
+					 errdetail_plural("%d row was changed differently on both branches.",
+									  "%d rows were changed differently on both branches.",
+									  conflicts, conflicts),
+					 errhint("Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
+		result[0] = "";
+		result[1] = "0";
+		result[2] = "1";
+		result[3] = "conflicts found";
+		PG_RETURN_DATUM(text_array(4, result));
+	}
 	result[0] = hash_hex(&id);
 	result[1] = had_head && same_hash(&id, &theirs) &&
 		!same_hash(&before, &theirs) ? "1" : "0";
@@ -807,7 +883,8 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
  *	  returns setof record
  *
  * The tables whose rows changed since the session branch's head commit
- * (until catalogs are versioned, schema changes don't show).
+ * (until catalogs are versioned, schema changes don't show), and those
+ * with merge conflicts (status "conflict", not staged).
  */
 Datum
 dolt_status(PG_FUNCTION_ARGS)
@@ -818,27 +895,43 @@ dolt_status(PG_FUNCTION_ARGS)
 	List	   *names = NIL;
 	ListCell   *lc;
 
+	ProllyMergeState ms;
+	List	   *conflicted = NIL;
+
 	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
 		return (Datum) 0;
 	PROLLY_CALL(diff_merge(), diff, "HEAD", "WORKING", InvalidOid, &s.sink);
+	if (PROLLY_CALL(refs(), merge_state, &ms))
+	{
+		for (int i = 0; i < ms.ntables; i++)
+		{
+			conflicted = lappend_oid(conflicted, ms.tables[i]);
+			s.relids = list_append_unique_oid(s.relids, ms.tables[i]);
+		}
+	}
 	foreach(lc, s.relids)
 	{
 		Oid			relid = lfirst_oid(lc);
 
+		/* Name, then a tab and the status, to sort by name. */
 		names = lappend(names,
-						quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
-												   get_rel_name(relid)));
+						psprintf("%s\t%s",
+								 qualified_name(relid),
+								 list_member_oid(conflicted, relid) ?
+								 "conflict" : "modified"));
 	}
 	list_sort(names, name_cmp);
 	foreach(lc, names)
 	{
 		Datum		values[3];
 		bool		nulls[3] = {0};
+		char	   *tab = strchr(lfirst(lc), '\t');
 
+		*tab = '\0';
 		values[0] = CStringGetTextDatum(lfirst(lc));
-		values[1] = BoolGetDatum(true);
-		values[2] = CStringGetTextDatum("modified");
+		values[1] = BoolGetDatum(strcmp(tab + 1, "conflict") != 0);
+		values[2] = CStringGetTextDatum(tab + 1);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;
@@ -849,27 +942,74 @@ dolt_status(PG_FUNCTION_ARGS)
  * ------------------------------------------------------------------------
  */
 
-typedef struct RowDiffSink
+/* Decodes a table's tree values into rows of its row type. */
+typedef struct Rows
 {
-	ProllyDiffSink sink;		/* must be first */
-	ReturnSetInfo *rsinfo;
 	ProllyComponents c;
 	ProllyKeying *keying;
 	bool		keyless;
 	TupleTableSlot *slot;
-} RowDiffSink;
+} Rows;
+
+static void
+rows_begin(Rows *r, Relation rel)
+{
+	prolly_components_for_relation(rel, &r->c);
+	r->keying = PROLLY_CALL(r->c.keying, open, rel, NULL, CurrentMemoryContext);
+	r->keyless = PROLLY_CALL(r->c.keying, keyless, r->keying);
+	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+}
+
+static void
+rows_end(Rows *r)
+{
+	ExecDropSingleTupleTableSlot(r->slot);
+	PROLLY_CALL(r->c.keying, close, r->keying);
+}
 
 /* The row a tree value holds, as a composite datum; and its copies. */
 static Datum
-row_datum(RowDiffSink *s, const ProllyValue *value, uint64 *count)
+rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
-	PROLLY_CALL(s->c.keying, parse_value, s->keying, value, &row, count);
-	ExecClearTuple(s->slot);
-	PROLLY_CALL(s->c.keying, decode_row, s->keying, &row, s->slot);
-	return ExecFetchSlotHeapTupleDatum(s->slot);
+	PROLLY_CALL(r->c.keying, parse_value, r->keying, value, &row, count);
+	ExecClearTuple(r->slot);
+	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
+	return ExecFetchSlotHeapTupleDatum(r->slot);
 }
+
+/*
+ * The prolly table whose row type is type, opened, if the user has mode
+ * on it.
+ */
+static Relation
+open_row_type_table(Oid relid, const char *fn, AclMode mode)
+{
+	Relation	rel;
+	AclResult	aclresult;
+
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("%s needs a table's row type, as in NULL::tablename", fn)));
+	aclresult = pg_class_aclcheck(relid, GetUserId(), mode);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	rel = table_open(relid, AccessShareLock);
+	if (!prolly_is_table_am(get_am_name(rel->rd_rel->relam)))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a prolly table", RelationGetRelationName(rel))));
+	return rel;
+}
+
+typedef struct RowDiffSink
+{
+	ProllyDiffSink sink;		/* must be first */
+	ReturnSetInfo *rsinfo;
+	Rows		rows;
+} RowDiffSink;
 
 static void
 put_diff(RowDiffSink *s, const char *kind, Datum from, bool from_null,
@@ -898,12 +1038,12 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	Datum		to = (Datum) 0;
 
 	if (before)
-		from = row_datum(s, before, &nbefore);
+		from = rows_datum(&s->rows, before, &nbefore);
 	if (after)
-		to = row_datum(s, after, &nafter);
+		to = rows_datum(&s->rows, after, &nafter);
 
 	/* A keyless row's copies: each one added or removed is a row. */
-	if (s->keyless)
+	if (s->rows.keyless)
 	{
 		if (nafter > nbefore)
 			put_diff(s, "added", (Datum) 0, true, to, false, nafter - nbefore);
@@ -939,32 +1079,187 @@ dolt_diff(PG_FUNCTION_ARGS)
 	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
 	Relation	rel;
 	RowDiffSink s;
-	AclResult	aclresult;
-
-	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("dolt_diff needs a table's row type, as in NULL::tablename")));
-	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 
 	InitMaterializedSRF(fcinfo, 0);
-	rel = table_open(relid, AccessShareLock);
-	if (!prolly_is_table_am(get_am_name(rel->rd_rel->relam)))
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a prolly table", RelationGetRelationName(rel))));
+	rel = open_row_type_table(relid, "dolt_diff", ACL_SELECT);
 	memset(&s, 0, sizeof(s));
 	s.sink.change = row_change;
 	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	prolly_components_for_relation(rel, &s.c);
-	s.keying = PROLLY_CALL(s.c.keying, open, rel, NULL, CurrentMemoryContext);
-	s.keyless = PROLLY_CALL(s.c.keying, keyless, s.keying);
-	s.slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	rows_begin(&s.rows, rel);
 	PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
-	ExecDropSingleTupleTableSlot(s.slot);
-	PROLLY_CALL(s.c.keying, close, s.keying);
+	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
 	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Conflicts
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * dolt_conflicts(OUT table_name text, OUT num_conflicts int8)
+ *	  returns setof record
+ *
+ * The tables with unresolved conflicts in the session branch's merge.
+ */
+typedef struct CountSink
+{
+	ProllyConflictSink sink;	/* must be first */
+	int64		n;
+} CountSink;
+
+static void
+count_conflict(ProllyConflictSink *self, const ProllyKey *key,
+			   const ProllyValue *base, const ProllyValue *ours,
+			   const ProllyValue *theirs)
+{
+	((CountSink *) self)->n++;
+}
+
+Datum
+dolt_conflicts_summary(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyMergeState ms;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_CALL(refs(), merge_state, &ms))
+		return (Datum) 0;
+	for (int i = 0; i < ms.ntables; i++)
+	{
+		CountSink	cs = {{count_conflict}, 0};
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		PROLLY_CALL(diff_merge(), conflicts, ms.tables[i], &cs.sink);
+		values[0] = CStringGetTextDatum(qualified_name(ms.tables[i]));
+		values[1] = Int64GetDatum(cs.n);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+typedef struct RowConflictSink
+{
+	ProllyConflictSink sink;	/* must be first */
+	ReturnSetInfo *rsinfo;
+	Rows		rows;
+} RowConflictSink;
+
+static const char *
+change_kind(const ProllyValue *base, const ProllyValue *side)
+{
+	if (base == NULL)
+		return "added";
+	if (side == NULL)
+		return "removed";
+	return "modified";
+}
+
+static void
+row_conflict(ProllyConflictSink *self, const ProllyKey *key,
+			 const ProllyValue *base, const ProllyValue *ours,
+			 const ProllyValue *theirs)
+{
+	RowConflictSink *s = (RowConflictSink *) self;
+	Datum		values[5];
+	bool		nulls[5] = {base == NULL, ours == NULL, theirs == NULL, false, false};
+	uint64		count;
+
+	if (base)
+		values[0] = datumCopy(rows_datum(&s->rows, base, &count), false, -1);
+	if (ours)
+		values[1] = datumCopy(rows_datum(&s->rows, ours, &count), false, -1);
+	if (theirs)
+		values[2] = rows_datum(&s->rows, theirs, &count);
+	values[3] = CStringGetTextDatum(change_kind(base, ours));
+	values[4] = CStringGetTextDatum(change_kind(base, theirs));
+	tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
+						 nulls);
+}
+
+/*
+ * dolt_conflicts(tbl anyelement, OUT base_row anyelement,
+ *				  OUT our_row anyelement, OUT their_row anyelement,
+ *				  OUT our_diff_type text, OUT their_diff_type text)
+ *	  returns setof record
+ *
+ * A table's unresolved conflicts, each row as the common ancestor, the
+ * current branch and the merged branch have it: Doltgres's
+ * dolt_conflicts_<table>, with rows of the table's row type for its
+ * base_, our_ and their_ columns.
+ */
+Datum
+dolt_conflicts(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	Relation	rel;
+	RowConflictSink s;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rel = open_row_type_table(relid, "dolt_conflicts", ACL_SELECT);
+	memset(&s, 0, sizeof(s));
+	s.sink.conflict = row_conflict;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	rows_begin(&s.rows, rel);
+	PROLLY_CALL(diff_merge(), conflicts, relid, &s.sink);
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_conflicts_resolve(VARIADIC args text[]) returns text[]: {status}
+ *
+ * --ours or --theirs, then tables (or "." for every one with conflicts):
+ * keep the current branch's rows, or take the merged branch's.
+ */
+Datum
+dolt_conflicts_resolve(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	int			side = 0;		/* 1 ours, 2 theirs */
+	List	   *tables = NIL;
+	ListCell   *lc;
+	ProllyMergeState ms;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (strcmp(a, "--ours") == 0)
+			side = 1;
+		else if (strcmp(a, "--theirs") == 0)
+			side = 2;
+		else if (a[0] == '-')
+			unsupported("dolt_conflicts_resolve", a);
+		else if (strcmp(a, ".") == 0)
+		{
+			if (PROLLY_CALL(refs(), merge_state, &ms))
+				for (int j = 0; j < ms.ntables; j++)
+					tables = list_append_unique_oid(tables, ms.tables[j]);
+		}
+		else
+		{
+			Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(a, NULL)),
+												 NoLock, false);
+			AclResult	aclresult = pg_class_aclcheck(relid, GetUserId(),
+													  ACL_INSERT | ACL_UPDATE | ACL_DELETE);
+
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+			tables = list_append_unique_oid(tables, relid);
+		}
+	}
+	if (side == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_conflicts_resolve needs --ours or --theirs")));
+	foreach(lc, tables)
+		PROLLY_CALL(diff_merge(), resolve, lfirst_oid(lc), side == 2);
+	PG_RETURN_DATUM(text_array(1, result));
 }

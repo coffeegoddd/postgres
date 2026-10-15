@@ -15,8 +15,11 @@
  * row writes through the executor (as logical replication applies
  * changes), so row identity, every index and constraint, and triggers see
  * an ordinary insert, update or delete.  A key both sides changed, to
- * different rows, is a conflict, and the merge fails; a key both changed
- * alike is left alone.  A keyless table's rows have no identity, so the
+ * different rows, is a conflict: the current branch's row stays, and the
+ * merge is left in progress, recorded in the refs, without a commit; its
+ * conflicts are found again from the three commits when they're listed or
+ * resolved (taking the other side's rows writes them as the merge does).
+ * A key both changed alike is left alone.  A keyless table's rows have no identity, so the
  * two sides' changes to how many copies of a row there are add up.  The
  * merge then records a commit with both heads as parents, of the working
  * set this transaction will commit: it holds the branch's commit lock from
@@ -212,18 +215,23 @@ typedef struct Apply
 	TupleTableSlot *search;
 	ProllyRootSet *roots;
 	ProllyRowIdScan *rowids;
+	bool		writes;			/* set up to write rows */
 } Apply;
 
+/* Set up to compare rel's rows, and to write them if writes. */
 static void
-apply_begin(Apply *a, Relation rel)
+apply_begin(Apply *a, Relation rel, bool writes)
 {
 	RangeTblEntry *rte;
 	List	   *perminfos = NIL;
 
 	memset(a, 0, sizeof(*a));
 	a->rel = rel;
+	a->writes = writes;
 	prolly_components_for_relation(rel, &a->c);
 	a->keying = PROLLY_CALL(a->c.keying, open, rel, NULL, CurrentMemoryContext);
+	if (!writes)
+		return;
 	a->estate = CreateExecutorState();
 	rte = makeNode(RangeTblEntry);
 	rte->rtekind = RTE_RELATION;
@@ -252,6 +260,11 @@ apply_end(Apply *a)
 		PROLLY_CALL(a->c.row_identity, scan_end, a->rowids);
 	if (a->roots)
 		PROLLY_CALL(a->c.engine, roots_release, a->roots);
+	if (!a->writes)
+	{
+		PROLLY_CALL(a->c.keying, close, a->keying);
+		return;
+	}
 	AfterTriggerEndQuery(a->estate);
 	EvalPlanQualEnd(&a->epq);
 	ExecCloseIndices(a->rri);
@@ -288,12 +301,12 @@ insert_copies(Apply *a, const StringInfoData *value, uint64 n)
 	}
 }
 
-/* The current version of the row at key (copy ordinal) into a->search. */
-static void
-find_current(Apply *a, const StringInfoData *key, uint64 ordinal)
+/* The TID of the current version of the row at key (copy ordinal). */
+static bool
+current_tid(Apply *a, const StringInfoData *key, uint64 ordinal,
+			ItemPointer tid)
 {
 	ProllyKey	k = {(const uint8 *) key->data, key->len};
-	ItemPointerData tid;
 
 	if (a->rowids)
 		PROLLY_CALL(a->c.row_identity, scan_end, a->rowids);
@@ -302,7 +315,29 @@ find_current(Apply *a, const StringInfoData *key, uint64 ordinal)
 	a->roots = PROLLY_CALL(a->c.engine, roots_acquire, NULL);
 	a->rowids = PROLLY_CALL(a->c.row_identity, scan_begin, a->roots, a->rel,
 							InvalidCommandId);
-	if (!PROLLY_CALL(a->c.row_identity, tid_find, a->rowids, &k, ordinal, &tid) ||
+	return PROLLY_CALL(a->c.row_identity, tid_find, a->rowids, &k, ordinal,
+					   tid);
+}
+
+/* How many copies of the row at key there are now (keyed: 0 or 1). */
+static uint64
+current_copies(Apply *a, const StringInfoData *key)
+{
+	ItemPointerData tid;
+	uint64		n = 0;
+
+	while (current_tid(a, key, n, &tid))
+		n++;
+	return n;
+}
+
+/* The current version of the row at key (copy ordinal) into a->search. */
+static void
+find_current(Apply *a, const StringInfoData *key, uint64 ordinal)
+{
+	ItemPointerData tid;
+
+	if (!current_tid(a, key, ordinal, &tid) ||
 		!table_tuple_fetch_row_version(a->rel, &tid, SnapshotAny, a->search))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -355,13 +390,36 @@ copies(Apply *a, const StringInfoData *value)
 	return count;
 }
 
+/* What walk_table() does with each change of theirs. */
+typedef enum WalkMode
+{
+	WALK_MERGE,					/* apply it, unless it conflicts */
+	WALK_LIST,					/* report it if it conflicts */
+	WALK_TAKE_THEIRS			/* if it conflicts, make the row theirs */
+} WalkMode;
+
+static const ProllyValue *
+value_or_null(const StringInfoData *s, ProllyValue *v)
+{
+	if (s->len == 0)
+		return NULL;
+	v->data = (const uint8 *) s->data;
+	v->len = s->len;
+	return v;
+}
+
 /*
- * Apply theirs (changes since the ancestor) to rel, which has ours since
- * the ancestor already; both in key order.  Returns how many keys
- * conflict.
+ * Walk theirs (changes since the ancestor) against ours (rel's changes
+ * since the ancestor, as of the current branch's head commit), both in key
+ * order, as mode says.  A key both sides changed to different rows is a
+ * conflict; one they changed alike isn't.  A keyless table's rows have no
+ * identity: the two sides' changes in a row's count of copies add up, and
+ * conflict only when theirs removes more copies than there are.  Returns
+ * how many keys conflict.
  */
 static int
-merge_table(Relation rel, List *ours, List *theirs)
+walk_table(Relation rel, List *ours, List *theirs, WalkMode mode,
+		   ProllyConflictSink *sink)
 {
 	Apply		a;
 	ListCell   *lo = list_head(ours);
@@ -369,13 +427,16 @@ merge_table(Relation rel, List *ours, List *theirs)
 	int			conflicts = 0;
 	bool		keyless;
 
-	apply_begin(&a, rel);
+	apply_begin(&a, rel, mode != WALK_LIST);
 	keyless = PROLLY_CALL(a.c.keying, keyless, a.keying);
 	foreach(lt, theirs)
 	{
 		RowChange  *t = lfirst(lt);
 		RowChange  *o = NULL;
 		ProllyKey	tk = {(const uint8 *) t->key.data, t->key.len};
+		int64		have = 0;
+		int64		delta = 0;
+		bool		conflict;
 
 		while (lo)
 		{
@@ -395,27 +456,56 @@ merge_table(Relation rel, List *ours, List *theirs)
 
 		if (keyless)
 		{
-			/* Copies of a row add up: apply their change in the count. */
-			int64		have = (int64) copies(&a, o ? &o->after : &t->before);
-			int64		delta = (int64) copies(&a, &t->after) -
+			have = (int64) copies(&a, o ? &o->after : &t->before);
+			delta = (int64) copies(&a, &t->after) -
 				(int64) copies(&a, &t->before);
+			conflict = have + delta < 0;
+		}
+		else
+			conflict = o != NULL && !same_bytes(&o->after, &t->after);
 
-			if (have + delta < 0)
-				conflicts++;
-			else if (delta > 0)
+		if (conflict)
+		{
+			conflicts++;
+			if (mode == WALK_LIST)
+			{
+				ProllyValue bv,
+							ov,
+							tv;
+
+				sink->conflict(sink, &tk, value_or_null(&t->before, &bv),
+							   value_or_null(o ? &o->after : &t->before, &ov),
+							   value_or_null(&t->after, &tv));
+			}
+			else if (mode == WALK_TAKE_THEIRS)
+			{
+				/* As many copies as theirs has (keyed: one or none). */
+				int64		now = (int64) current_copies(&a, &t->key);
+				int64		want = (int64) copies(&a, &t->after);
+
+				if (!keyless && now == 1 && want == 1)
+					update_row(&a, &t->key, &t->after);
+				else if (want > now)
+					insert_copies(&a, &t->after, want - now);
+				else if (want < now)
+					delete_copies(&a, &t->key, now, now - want);
+			}
+			continue;
+		}
+		if (mode != WALK_MERGE)
+			continue;
+
+		if (keyless)
+		{
+			/* Apply their change in the count. */
+			if (delta > 0)
 				insert_copies(&a, &t->after, delta);
 			else if (delta < 0)
 				delete_copies(&a, &t->key, have, -delta);
 			continue;
 		}
-
-		/* Both sides changed the key: alike, or a conflict. */
 		if (o != NULL)
-		{
-			if (!same_bytes(&o->after, &t->after))
-				conflicts++;
-			continue;
-		}
+			continue;			/* both changed it alike */
 		if (t->kind == PROLLY_DIFF_ADDED)
 			insert_copies(&a, &t->after, 1);
 		else if (t->kind == PROLLY_DIFF_REMOVED)
@@ -433,7 +523,23 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
+/* The changes base -> ours and base -> theirs of rel. */
 static void
+table_changes(Relation rel, ProllyRootSet *base, ProllyRootSet *ours,
+			  ProllyRootSet *theirs, Changes *ours_changes,
+			  Changes *theirs_changes)
+{
+	ProllyComponents rc;
+
+	prolly_components_for_relation(rel, &rc);
+	PROLLY_CALL(rc.engine, diff, base, theirs, rel, collect_change,
+				theirs_changes);
+	if (theirs_changes->list != NIL)
+		PROLLY_CALL(rc.engine, diff, base, ours, rel, collect_change,
+					ours_changes);
+}
+
+static int
 rows_merge(const char *branch, const char *message, int flags,
 		   ProllyHash *commit_id)
 {
@@ -453,9 +559,17 @@ rows_merge(const char *branch, const char *message, int flags,
 	ProllyNodeRef merged;
 	List	   *tables;
 	ListCell   *lc;
+	ProllyMergeState ms;
+	List	   *conflicted = NIL;
+	int			conflicts = 0;
 
 	prolly_database_components(&dc);
 	prolly_components_for_engine(&prolly_engine_d1.info, &c);
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a merge is in progress on the current prolly branch"),
+				 errhint("Resolve its conflicts and commit, or abort it.")));
 	if (prolly_xact_has_writes())
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
@@ -473,7 +587,7 @@ rows_merge(const char *branch, const char *message, int flags,
 	if (same_hash(&base_c, &theirs_c))
 	{
 		*commit_id = ours_c;	/* already merged */
-		return;
+		return 0;
 	}
 	if (strcmp(branch, "WORKING") == 0)
 		ereport(ERROR,
@@ -502,7 +616,7 @@ rows_merge(const char *branch, const char *message, int flags,
 		hex[theirs_c.len * 2] = '\0';
 		PROLLY_CALL(dc.refs, reset, hex);
 		*commit_id = theirs_c;
-		return;
+		return 0;
 	}
 	(void) PROLLY_CALL(dc.refs, commit_working_set, &base_c, &base_ws);
 	base = PROLLY_CALL(c.engine, roots_at, &base_ws);
@@ -514,20 +628,16 @@ rows_merge(const char *branch, const char *message, int flags,
 	foreach(lc, tables)
 	{
 		Relation	rel = table_open(lfirst_oid(lc), RowExclusiveLock);
-		ProllyComponents rc;
 		Changes		ours_changes = {NIL};
 		Changes		theirs_changes = {NIL};
 		int			n;
 
-		prolly_components_for_relation(rel, &rc);
-		PROLLY_CALL(rc.engine, diff, base, theirs, rel, collect_change,
-					&theirs_changes);
+		table_changes(rel, base, ours, theirs, &ours_changes, &theirs_changes);
 		if (theirs_changes.list != NIL)
 		{
-			PROLLY_CALL(rc.engine, diff, base, ours, rel, collect_change,
-						&ours_changes);
-			n = merge_table(rel, ours_changes.list, theirs_changes.list);
-			if (n > 0)
+			n = walk_table(rel, ours_changes.list, theirs_changes.list,
+						   WALK_MERGE, NULL);
+			if (n > 0 && (flags & PROLLY_MERGE_FAIL_ON_CONFLICT))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 						 errmsg("prolly merge of branch \"%s\" conflicts in table \"%s\"",
@@ -535,8 +645,33 @@ rows_merge(const char *branch, const char *message, int flags,
 						 errdetail_plural("%d row was changed differently on both branches.",
 										  "%d rows were changed differently on both branches.",
 										  n, n)));
+			if (n > 0)
+			{
+				conflicts += n;
+				conflicted = lappend_oid(conflicted, RelationGetRelid(rel));
+			}
 		}
 		table_close(rel, NoLock);
+	}
+
+	/* Conflicts: a merge in progress, to resolve before its commit. */
+	if (conflicts > 0)
+	{
+		int			i = 0;
+
+		PopActiveSnapshot();
+		ms.theirs = theirs_c;
+		ms.base = base_c;
+		ms.ntables = list_length(conflicted);
+		ms.tables = palloc(sizeof(Oid) * ms.ntables);
+		foreach(lc, conflicted)
+			ms.tables[i++] = lfirst_oid(lc);
+		PROLLY_CALL(dc.refs, set_merge_state, &ms);
+		memset(commit_id, 0, sizeof(*commit_id));
+		PROLLY_CALL(c.engine, roots_release, base);
+		PROLLY_CALL(c.engine, roots_release, ours);
+		PROLLY_CALL(c.engine, roots_release, theirs);
+		return conflicts;
 	}
 
 	/*
@@ -554,6 +689,108 @@ rows_merge(const char *branch, const char *message, int flags,
 	PROLLY_CALL(c.engine, roots_release, base);
 	PROLLY_CALL(c.engine, roots_release, ours);
 	PROLLY_CALL(c.engine, roots_release, theirs);
+	return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Conflicts of a merge in progress
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The merge in progress, if relid has unresolved conflicts in it (its
+ * position in state->tables), else -1.
+ */
+static int
+conflicted_table(const ProllyRefsRoutine *refs, Oid relid,
+				 ProllyMergeState *state)
+{
+	if (!PROLLY_CALL(refs, merge_state, state))
+		return -1;
+	for (int i = 0; i < state->ntables; i++)
+		if (state->tables[i] == relid)
+			return i;
+	return -1;
+}
+
+/* Walk relid's changes in the merge in progress, as mode says. */
+static void
+walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
+			   ProllyConflictSink *sink)
+{
+	ProllyDatabaseComponents dc;
+	ProllyComponents c;
+	ProllyHash	ours_c;
+	ProllyHash	commit;
+	ProllyNodeRef ws;
+	ProllyRootSet *base;
+	ProllyRootSet *ours;
+	ProllyRootSet *theirs;
+	Relation	rel;
+	Changes		ours_changes = {NIL};
+	Changes		theirs_changes = {NIL};
+	char	   *hex;
+
+	prolly_database_components(&dc);
+	prolly_components_for_engine(&prolly_engine_d1.info, &c);
+
+	/* The merge left the head where it was: ours is the head commit. */
+	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours_c))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a merge is in progress on a prolly branch with no commit")));
+	(void) PROLLY_CALL(dc.refs, commit_working_set, &ms->base, &ws);
+	base = PROLLY_CALL(c.engine, roots_at, &ws);
+	(void) PROLLY_CALL(dc.refs, commit_working_set, &ours_c, &ws);
+	ours = PROLLY_CALL(c.engine, roots_at, &ws);
+	hex = palloc(ms->theirs.len * 2 + 1);
+	hex_encode((const char *) ms->theirs.bytes, ms->theirs.len, hex);
+	hex[ms->theirs.len * 2] = '\0';
+	resolve_working_set(dc.refs, hex, &commit, &ws);
+	theirs = PROLLY_CALL(c.engine, roots_at, &ws);
+
+	rel = table_open(relid, mode == WALK_LIST ? AccessShareLock : RowExclusiveLock);
+	table_changes(rel, base, ours, theirs, &ours_changes, &theirs_changes);
+	if (mode != WALK_LIST)
+		PushActiveSnapshot(GetTransactionSnapshot());
+	(void) walk_table(rel, ours_changes.list, theirs_changes.list, mode, sink);
+	if (mode != WALK_LIST)
+		PopActiveSnapshot();
+	table_close(rel, NoLock);
+	PROLLY_CALL(c.engine, roots_release, base);
+	PROLLY_CALL(c.engine, roots_release, ours);
+	PROLLY_CALL(c.engine, roots_release, theirs);
+}
+
+static void
+rows_conflicts(Oid relid, ProllyConflictSink *sink)
+{
+	ProllyDatabaseComponents dc;
+	ProllyMergeState ms;
+
+	prolly_database_components(&dc);
+	if (conflicted_table(dc.refs, relid, &ms) < 0)
+		return;
+	walk_conflicts(relid, &ms, WALK_LIST, sink);
+}
+
+static void
+rows_resolve(Oid relid, bool theirs)
+{
+	ProllyDatabaseComponents dc;
+	ProllyMergeState ms;
+	int			i;
+
+	prolly_database_components(&dc);
+	i = conflicted_table(dc.refs, relid, &ms);
+	if (i < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("table \"%s\" has no merge conflicts", get_rel_name(relid))));
+	if (theirs)
+		walk_conflicts(relid, &ms, WALK_TAKE_THEIRS, NULL);
+	ms.tables[i] = ms.tables[--ms.ntables];
+	PROLLY_CALL(dc.refs, set_merge_state, &ms);
 }
 
 const ProllyMergeRoutine prolly_merge_rows = {
@@ -567,4 +804,6 @@ const ProllyMergeRoutine prolly_merge_rows = {
 	},
 	.diff = rows_diff,
 	.merge = rows_merge,
+	.conflicts = rows_conflicts,
+	.resolve = rows_resolve,
 };

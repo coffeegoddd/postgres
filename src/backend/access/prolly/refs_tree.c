@@ -13,6 +13,10 @@
  *					   (hash length, hash; length 0: no commit yet)
  *	'C' commit id	-> the local root (hash length, hash) the commit
  *					   recorded: the working set to start a branch from
+ *	'M' branch id	-> its merge in progress: the merged head and the
+ *					   common ancestor (hash length, hash each), then the
+ *					   OIDs of tables with unresolved conflicts (4 bytes
+ *					   each, big-endian)
  *	'N'				-> the next branch id to give out (4 bytes)
  *
  * A commit is a tree of its own (keys by memcmp), and its id is that
@@ -51,11 +55,13 @@
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #define TAG_BRANCH		'B'
 #define TAG_COMMIT		'C'
+#define TAG_MERGE		'M'
 #define TAG_NEXT		'N'
 
 #define MAX_BRANCH_NAME	255
@@ -86,6 +92,9 @@ typedef struct RefsXact
 } RefsXact;
 
 static RefsXact *rx = NULL;
+
+static bool tree_merge_state(ProllyMergeState *state);
+static void tree_set_merge_state(const ProllyMergeState *state);
 static bool callback_registered = false;
 
 /* Components, and an environment for trees keyed by memcmp. */
@@ -786,16 +795,32 @@ tree_commit(const char *message, ProllyHash *commit_id)
 	ProllyBranchId id;
 	ProllyHash	head;
 	ProllyNodeRef wr;
+	ProllyMergeState ms;
+	bool		merging;
+	ProllyHash	parents[2];
+	int			nparents = 0;
 
-	if (prolly_xact_has_writes())
-		ereport(ERROR,
-				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-				 errmsg("cannot make a prolly commit in a transaction that has written to prolly tables"),
-				 errhint("Commit the transaction's writes first.")));
 	lock_refs();
 	name = branch_name(branch);
 	if (!branch_get(name, &id, &head))
 		memset(&head, 0, sizeof(head));
+	if (head.len > 0)
+		parents[nparents++] = head;
+
+	/* Ending a merge: once its conflicts are resolved, both heads. */
+	merging = tree_merge_state(&ms);
+	if (merging)
+	{
+		if (ms.ntables > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit with unresolved merge conflicts"),
+					 errdetail("Table \"%s\" has conflicts.",
+							   get_rel_name(ms.tables[0])),
+					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
+		parents[nparents++] = ms.theirs;
+		tree_set_merge_state(NULL);
+	}
 
 	/*
 	 * The branch's working set, with every table's rows made canonical:
@@ -810,8 +835,7 @@ tree_commit(const char *message, ProllyHash *commit_id)
 		PROLLY_CALL(dc.canonicalizer, prepare);
 		PROLLY_CALL(comps.engine, pending_root, &wr);
 	}
-	record_commit(name, branch, message, &head, head.len > 0 ? 1 : 0, &wr,
-				  commit_id);
+	record_commit(name, branch, message, parents, nparents, &wr, commit_id);
 }
 
 static void
@@ -1082,6 +1106,66 @@ tree_working_set(const char *branch, ProllyNodeRef *root)
 }
 
 static void
+merge_key(ProllyBranchId branch, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_MERGE);
+	put_be32(key, branch);
+}
+
+static bool
+tree_merge_state(ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_key(prolly_session_branch(), &key);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+
+		p = get_hash(p, end, &state->theirs);
+		p = get_hash(p, end, &state->base);
+		state->ntables = (end - p) / 4;
+		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
+		for (int i = 0; i < state->ntables; i++)
+			state->tables[i] = get_be32(p + i * 4);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+static void
+tree_set_merge_state(const ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	lock_refs();
+	initStringInfo(&key);
+	merge_key(prolly_session_branch(), &key);
+	if (state == NULL)
+		add_edit(key.data, key.len, NULL);
+	else
+	{
+		initStringInfo(&v);
+		put_hash(&v, &state->theirs);
+		put_hash(&v, &state->base);
+		for (int i = 0; i < state->ntables; i++)
+			put_be32(&v, state->tables[i]);
+		add_edit(key.data, key.len, &v);
+		pfree(v.data);
+	}
+	pfree(key.data);
+}
+
+static void
 tree_reset(const char *ref)
 {
 	ProllyBranchId branch = prolly_session_branch();
@@ -1107,6 +1191,7 @@ tree_reset(const char *ref)
 	/* Nothing else commits to the branch until this transaction ends. */
 	PROLLY_CALL(comps.commit, branch_lock, branch);
 	branch_put(branch_name(branch), branch, &target);
+	tree_set_merge_state(NULL);	/* a reset ends a merge */
 	old = MemoryContextSwitchTo(rx->mcxt);
 	nh = palloc(sizeof(NewHead));
 	nh->branch = branch;
@@ -1140,6 +1225,20 @@ refs_precommit(void)
 
 	if (rx->edits == NIL && rx->heads == NIL)
 		return;
+
+	/* A merge this transaction left with conflicts. */
+	if (!prolly_allow_commit_conflicts())
+	{
+		ProllyMergeState ms;
+
+		if (tree_merge_state(&ms) && ms.ntables > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot commit a transaction with unresolved merge conflicts"),
+					 errdetail("Table \"%s\" has conflicts.",
+							   get_rel_name(ms.tables[0])),
+					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+	}
 	xid = GetCurrentTransactionId();
 
 	/* New branches' working sets, and reset ones'. */
@@ -1250,5 +1349,7 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.branches = tree_branches,
 	.working_set = tree_working_set,
 	.reset = tree_reset,
+	.merge_state = tree_merge_state,
+	.set_merge_state = tree_set_merge_state,
 	.walk = tree_walk,
 };
