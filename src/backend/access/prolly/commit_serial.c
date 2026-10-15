@@ -244,21 +244,27 @@ history_limit(void)
  * Drop history entries no snapshot can need: those whose successor every
  * snapshot sees.  If that leaves no room, give up the oldest.
  */
+/* Drop history entries every running snapshot sees the successor of. */
 static void
-make_history_room(SerialShared *s)
+prune_history(SerialShared *s)
 {
-	TransactionId horizon;
+	TransactionId horizon = GetOldestNonRemovableTransactionId(NULL);
 	int			n = 0;
 
-	if (s->nhistory < history_limit())
-		return;
-	horizon = GetOldestNonRemovableTransactionId(NULL);
 	for (int i = 0; i < s->nhistory; i++)
 	{
 		if (!TransactionIdPrecedes(s->history[i].succ_xid, horizon))
 			s->history[n++] = s->history[i];
 	}
 	s->nhistory = n;
+}
+
+static void
+make_history_room(SerialShared *s)
+{
+	if (s->nhistory < history_limit())
+		return;
+	prune_history(s);
 	while (s->nhistory >= history_limit())
 	{
 		memmove(&s->history[0], &s->history[1],
@@ -1169,6 +1175,38 @@ serial_drop_database(Oid dboid)
 }
 
 static void
+serial_live_roots(ProllyRootVisit visit, void *arg)
+{
+	SerialShared *s = get_shared();
+	ProllyHash *roots;
+	int			n = 0;
+
+	/* Roots no snapshot needs any more aren't live. */
+	LWLockAcquire(ProllyHeadsLock, LW_EXCLUSIVE);
+	prune_history(s);
+	roots = palloc(sizeof(ProllyHash) *
+				   Max(s->nheads + s->npending + s->nhistory, 1));
+	for (int i = 0; i < s->nheads; i++)
+		roots[n++] = s->heads[i].root;
+	for (int i = 0; i < s->npending; i++)
+		roots[n++] = s->pending[i].root;
+	for (int i = 0; i < s->nhistory; i++)
+	{
+		if (s->history[i].has_root)
+			roots[n++] = s->history[i].root;
+	}
+	LWLockRelease(ProllyHeadsLock);
+	for (int i = 0; i < n; i++)
+	{
+		ProllyNodeRef ref;
+
+		root_ref(&roots[i], &ref);
+		visit(&ref, arg);
+	}
+	pfree(roots);
+}
+
+static void
 serial_usage(int *nheads, int *npending)
 {
 	SerialShared *s = get_shared();
@@ -1260,6 +1298,7 @@ const ProllyCommitRoutine prolly_commit_serial = {
 	.commits_since = serial_commits_since,
 	.copy_database = serial_copy_database,
 	.drop_database = serial_drop_database,
+	.live_roots = serial_live_roots,
 	.usage = serial_usage,
 	.checkpoint = serial_checkpoint,
 	.redo = serial_redo,

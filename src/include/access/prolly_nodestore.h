@@ -35,6 +35,10 @@
 #include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
+/* Called with each node scan() finds. */
+typedef void (*ProllyStoreVisit) (const ProllyHash *hash, BlockNumber block,
+								  void *arg);
+
 typedef struct ProllyNodeStoreRoutine
 {
 	ProllyImplInfo info;
@@ -59,13 +63,27 @@ typedef struct ProllyNodeStoreRoutine
 	/* Free the node's space; called by the reclamation interface. */
 	void		(*release) (ProllyNodeStore *store, const ProllyNodeRef *ref);
 
+	/*
+	 * Reclamation.  scan() visits every node the store can find by hash
+	 * (hash and block); reclaim() drops the one at block and gives its
+	 * block to later new_node() calls once every transaction running now
+	 * has ended (a reader may still hold a reference to it).  The caller
+	 * holds the store exclusively (LockProllyStore), so nothing is written
+	 * meanwhile; writers take it in RowExclusiveLock in new_node() and
+	 * contains(), until their transaction ends.
+	 */
+	void		(*scan) (ProllyNodeStore *store, ProllyStoreVisit visit,
+						 void *arg);
+	void		(*reclaim) (ProllyNodeStore *store, const ProllyHash *hash,
+							BlockNumber block);
+
 	/* Replay a ProllyStore record this implementation wrote. */
 	void		(*redo) (XLogReaderState *record);
 } ProllyNodeStoreRoutine;
 
 #define PROLLY_NODESTORE_CALLBACK_NAMES \
 	"create", "open", "close", "read", "new_node", "publish", "contains", \
-	"release", "redo"
+	"release", "scan", "reclaim", "redo"
 #define PROLLY_NODESTORE_FIRST_CALLBACK create
 
 static inline const ProllyNodeStoreRoutine *

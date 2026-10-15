@@ -30,6 +30,13 @@
 
 struct VacuumParams;
 
+/* What one reclamation of the node store did. */
+typedef struct ProllyGcResult
+{
+	uint64		nodes_kept;
+	uint64		nodes_freed;
+} ProllyGcResult;
+
 typedef struct ProllyReclaimRoutine
 {
 	ProllyImplInfo info;
@@ -43,11 +50,18 @@ typedef struct ProllyReclaimRoutine
 	/* One reclamation pass over rel (VACUUM or background worker). */
 	void		(*run) (Relation rel, const struct VacuumParams *params,
 						BufferAccessStrategy bstrategy);
+
+	/*
+	 * Reclaim every node of the cluster's node store that no live root
+	 * reaches (prolly_gc()).  Waits for, and holds off, every transaction
+	 * that writes nodes, until the current transaction ends.
+	 */
+	void		(*collect) (ProllyGcResult *result);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \
 	"may_modify_in_place", "node_created", "node_dropped", "root_retired", \
-	"run"
+	"run", "collect"
 #define PROLLY_RECLAIM_FIRST_CALLBACK may_modify_in_place
 
 static inline const ProllyReclaimRoutine *

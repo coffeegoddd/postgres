@@ -35,6 +35,7 @@ FROM prolly_implementations();
  node_store      | stub             |       0 |              0
  allocator       | stub             |       0 |              0
  reclamation     | stub             |       0 |              0
+ reclamation     | mark_sweep       |       1 |              1
  log             | chunks           |       1 |              1
  log             | stub             |       0 |              0
  commit_pipeline | serial           |       1 |              1
@@ -52,7 +53,7 @@ FROM prolly_implementations();
  table_keying    | stub             |       0 |              0
  index_keying    | columns_then_row |       1 |              1
  index_keying    | stub             |       0 |              0
-(43 rows)
+(44 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -227,14 +228,18 @@ NOTICE:  drop cascades to column m of table conf_kt
  node_store      | stub             | new_publish_read                        | not implemented (missing create, open, new_node, publish, read, contains, close)
  node_store      | stub             | many_nodes_findable                     | not implemented (missing create, open, new_node, publish, read, contains, close)
  node_store      | stub             | release_frees                           | not implemented (missing create, open, new_node, publish, release, contains, close)
- node_store      | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+ node_store      | stub             | complete                                | not implemented (11 of 11 callbacks missing)
  allocator       | stub             | identity                                | pass
  allocator       | stub             | no_overlapping_extents                  | not implemented (missing open, allocate, free, close)
  allocator       | stub             | complete                                | not implemented (4 of 4 callbacks missing)
  reclamation     | stub             | identity                                | pass
  reclamation     | stub             | reachable_never_freed                   | not implemented (missing node_created, node_dropped, root_retired, run)
  reclamation     | stub             | in_place_only_when_private              | not implemented (missing may_modify_in_place)
- reclamation     | stub             | complete                                | not implemented (5 of 5 callbacks missing)
+ reclamation     | stub             | complete                                | not implemented (6 of 6 callbacks missing)
+ reclamation     | mark_sweep       | identity                                | pass
+ reclamation     | mark_sweep       | reachable_never_freed                   | not implemented (missing node_created, node_dropped, root_retired, run)
+ reclamation     | mark_sweep       | in_place_only_when_private              | not implemented (missing may_modify_in_place)
+ reclamation     | mark_sweep       | complete                                | not implemented (5 of 6 callbacks missing)
  log             | chunks           | identity                                | pass
  log             | chunks           | commit_record                           | not implemented (missing log_commit)
  log             | chunks           | redo_restores_committed_root            | not implemented (missing log_commit, startup, cleanup)
@@ -254,7 +259,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  commit_pipeline | stub             | publishes_in_enqueue_order              | not implemented (missing branch_lock, tip, enqueue, branch_unlock, publish, abandon, head, snapshot_head)
  commit_pipeline | stub             | survives_crash_and_replays              | not implemented (missing enqueue, publish, checkpoint, redo)
  commit_pipeline | stub             | copies_and_drops_databases              | not implemented (missing copy_database, drop_database, usage, head, checkpoint, redo)
- commit_pipeline | stub             | complete                                | not implemented (16 of 16 callbacks missing)
+ commit_pipeline | stub             | complete                                | not implemented (17 of 17 callbacks missing)
  row_identity    | counter          | identity                                | pass
  row_identity    | counter          | assign_then_resolve                     | pass
  row_identity    | counter          | rename_keeps_tid                        | pass
@@ -356,7 +361,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | identity                                | pass
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
-(295 rows)
+(299 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

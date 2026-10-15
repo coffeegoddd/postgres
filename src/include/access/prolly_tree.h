@@ -84,8 +84,11 @@ typedef struct ProllyEdit
 typedef struct ProllyTreeBuilder ProllyTreeBuilder;
 typedef struct ProllyTreeCursor ProllyTreeCursor;
 
-/* Called for each node of a tree (walk). */
-typedef void (*ProllyTreeVisitNode) (const ProllyNodeRef *node, uint16 level,
+/*
+ * Called for each node of a tree (walk); returns whether to visit the
+ * nodes below it (its children, and a leaf's value trees).
+ */
+typedef bool (*ProllyTreeVisitNode) (const ProllyNodeRef *node, uint16 level,
 									 void *arg);
 
 /* Called for each key that differs between two trees (diff). */
@@ -144,7 +147,11 @@ typedef struct ProllyTreeRoutine
 	bool		(*key_at) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						   uint64 ordinal, StringInfo key);
 
-	/* Visit every node reachable from root, parents before children. */
+	/*
+	 * Visit every node reachable from root (value trees too), parents
+	 * before children, skipping what lies below a node the visitor
+	 * declines.
+	 */
 	void		(*walk) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						 ProllyTreeVisitNode visit, void *arg);
 

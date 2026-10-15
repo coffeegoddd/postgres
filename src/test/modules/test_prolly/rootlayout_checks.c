@@ -626,7 +626,7 @@ typedef struct HashSet
 	int			max;
 } HashSet;
 
-static void
+static bool
 collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	HashSet    *s = arg;
@@ -638,6 +638,7 @@ collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
 			palloc(sizeof(ProllyHash) * s->max);
 	}
 	s->hashes[s->n++] = node->hash;
+	return true;
 }
 
 static bool

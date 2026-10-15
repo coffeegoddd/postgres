@@ -1254,6 +1254,23 @@ LockProllyTable(Oid relid, LOCKMODE lockmode, bool dontWait)
 }
 
 /*
+ *		LockProllyStore
+ *
+ * Obtain the right to write to the prolly node store (or to keep nodes it
+ * holds), or to reclaim it.  Held until the end of the transaction.  With
+ * dontWait, returns false instead of waiting if the lock isn't free.
+ */
+bool
+LockProllyStore(LOCKMODE lockmode, bool dontWait)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_PROLLY_STORE(tag);
+
+	return LockAcquire(&tag, lockmode, false, dontWait) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+/*
  *		UnlockApplyTransactionForSession
  */
 void
@@ -1373,6 +1390,9 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 _("writing prolly table %u of database %u"),
 							 tag->locktag_field2,
 							 tag->locktag_field1);
+			break;
+		case LOCKTAG_PROLLY_STORE:
+			appendStringInfoString(buf, _("the prolly node store"));
 			break;
 		case LOCKTAG_PROLLY_ROW:
 			appendStringInfo(buf,

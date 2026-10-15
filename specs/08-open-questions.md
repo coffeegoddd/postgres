@@ -525,6 +525,9 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     `prolly_gc()`, as `dolt gc` is: finding what is reachable walks every
     live root of the cluster's store. VACUUM retires a table's own gone
     versions and TIDs. Automatic reclamation is later.
+    **Built (4f.2):** `prolly_gc()`, mark and sweep from every live root
+    the commit pipeline holds, freed blocks reused once older snapshots
+    end; writers and it are kept apart by a store lock.
 50. **Row lock identity (K1).** Postgres's lock manager names a lock by a
     fixed-size tag, so a row key that doesn't fit must be reduced.
     **Decided (user, 2026-10-14):** the tag is (database, relation, 64-bit
