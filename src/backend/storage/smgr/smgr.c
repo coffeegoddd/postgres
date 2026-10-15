@@ -89,6 +89,13 @@ typedef struct f_smgr
 {
 	void		(*smgr_init) (void);	/* may be NULL */
 	void		(*smgr_shutdown) (void);	/* may be NULL */
+
+	/*
+	 * Does this implementation hold the relation's storage?  Asked by
+	 * smgropen() of every implementation but md.c, which holds whatever no
+	 * other one claims.  May be NULL.
+	 */
+	bool		(*smgr_claims) (RelFileLocatorBackend rlocator);
 	void		(*smgr_open) (SMgrRelation reln);
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
@@ -152,6 +159,8 @@ static const f_smgr smgrsw[] = {
 };
 
 static const int NSmgr = lengthof(smgrsw);
+
+static int	smgr_select(RelFileLocatorBackend rlocator);
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
@@ -273,7 +282,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = smgr_select(brlocator);
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -286,6 +295,22 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 	RESUME_INTERRUPTS();
 
 	return reln;
+}
+
+/*
+ * smgr_select() -- Choose the implementation that holds a relation.
+ *
+ * The first implementation after md.c that claims the relation, else md.c.
+ */
+static int
+smgr_select(RelFileLocatorBackend rlocator)
+{
+	for (int i = SMGR_MD + 1; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_claims && smgrsw[i].smgr_claims(rlocator))
+			return i;
+	}
+	return SMGR_MD;
 }
 
 /*
@@ -482,6 +507,33 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrcreatewith() -- Create a new relation's fork in a given implementation.
+ *
+ * Like smgrcreate(), but the storage is created by implementation 'which'
+ * (SMGR_*), which holds the relation from then on.  An SMgrRelation opened
+ * before the relation existed was given md.c, so it is switched here.
+ */
+void
+smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum, bool isRedo)
+{
+	Assert(which >= 0 && which < NSmgr);
+
+	HOLD_INTERRUPTS();
+	if (reln->smgr_which != which)
+	{
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+		{
+			smgrsw[reln->smgr_which].smgr_close(reln, fork);
+			reln->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+		}
+		reln->smgr_which = which;
+		smgrsw[which].smgr_open(reln);
+	}
+	smgrsw[which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
 }
 

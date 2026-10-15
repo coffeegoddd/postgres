@@ -5508,7 +5508,8 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	 * directory.  Therefore, each individual relation doesn't need to be
 	 * registered for cleanup.
 	 */
-	RelationCreateStorage(dst_rlocator, relpersistence, false);
+	RelationCreateStorageWith(dst_rlocator, relpersistence, false,
+							  src_rel->smgr_which);
 
 	/* copy main fork. */
 	RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, MAIN_FORKNUM,

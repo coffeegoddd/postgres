@@ -122,6 +122,21 @@ SMgrRelation
 RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 					  bool register_delete)
 {
+	return RelationCreateStorageWith(rlocator, relpersistence,
+									 register_delete, SMGR_MD);
+}
+
+/*
+ * RelationCreateStorageWith
+ *		Create physical storage for a relation in a given storage manager.
+ *
+ * As RelationCreateStorage(), but in storage manager 'smgr_which' (SMGR_*).
+ * Storage managers other than md.c hold permanent relations only.
+ */
+SMgrRelation
+RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
+						  bool register_delete, int smgr_which)
+{
 	SMgrRelation srel;
 	ProcNumber	procNumber;
 	bool		needs_wal;
@@ -147,8 +162,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
+	if (smgr_which != SMGR_MD && relpersistence != RELPERSISTENCE_PERMANENT)
+		elog(ERROR, "storage manager %d holds permanent relations only",
+			 smgr_which);
+
 	srel = smgropen(rlocator, procNumber);
-	smgrcreate(srel, MAIN_FORKNUM, false);
+	smgrcreatewith(srel, smgr_which, MAIN_FORKNUM, false);
 
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);

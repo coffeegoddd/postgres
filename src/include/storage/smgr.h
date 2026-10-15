@@ -52,7 +52,7 @@ typedef struct SMgrRelationData
 	 * Fields below here are intended to be private to smgr.c and its
 	 * submodules.  Do not touch them from elsewhere.
 	 */
-	int			smgr_which;		/* storage manager selector */
+	int			smgr_which;		/* storage manager selector (SMGR_*) */
 
 	/*
 	 * for md.c; per-fork arrays of the number of open segments
@@ -71,6 +71,13 @@ typedef struct SMgrRelationData
 
 typedef SMgrRelationData *SMgrRelation;
 
+/*
+ * Storage manager implementations, the values of smgr_which.  md.c is the
+ * default; smgropen() picks another implementation for a relation that one
+ * claims, and smgrcreatewith() creates a relation's storage in a given one.
+ */
+#define SMGR_MD			0
+
 #define SmgrIsTemp(smgr) \
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
 
@@ -87,6 +94,8 @@ extern void smgrrelease(SMgrRelation reln);
 extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum,
+						   bool isRedo);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,

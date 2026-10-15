@@ -759,6 +759,7 @@ index_create(Relation heapRelation,
 	Oid			heapRelationId = RelationGetRelid(heapRelation);
 	Relation	pg_class;
 	Relation	indexRelation;
+	int			index_smgr = SMGR_MD;
 	TupleDesc	indexTupDesc;
 	bool		shared_relation;
 	bool		mapped_relation;
@@ -985,6 +986,13 @@ index_create(Relation heapRelation,
 	 * physical disk file. (If we fail further down, it's the smgr's
 	 * responsibility to remove the disk file again, if any.)
 	 */
+	/*
+	 * An index is kept by the storage manager that keeps its table, so a
+	 * table's storage manager holds all of its relations.
+	 */
+	if (RELKIND_HAS_STORAGE(heapRelation->rd_rel->relkind))
+		index_smgr = RelationGetSmgr(heapRelation)->smgr_which;
+
 	indexRelation = heap_create(indexRelationName,
 								namespaceId,
 								tableSpaceId,
@@ -999,7 +1007,8 @@ index_create(Relation heapRelation,
 								allow_system_table_mods,
 								&relfrozenxid,
 								&relminmxid,
-								create_storage);
+								create_storage,
+								index_smgr);
 
 	Assert(relfrozenxid == InvalidTransactionId);
 	Assert(relminmxid == InvalidMultiXactId);
