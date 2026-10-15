@@ -733,6 +733,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'debug_prolly_max_root_history', type => 'int', context => 'PGC_SIGHUP', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Lowers the number of replaced prolly branch roots kept for older snapshots, for testing.',
+  long_desc => '0 means the commit pipeline\'s own limit.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_max_root_history',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',

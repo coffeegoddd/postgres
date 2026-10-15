@@ -32,6 +32,16 @@
  * standby they are settled through the commit log like any other.  DROP
  * DATABASE removes the database's heads and pending entries and logs that.
  *
+ * Snapshots.  A head replaced by a newer one goes into a history, with
+ * the xid that committed it and the xid that replaced it, so a snapshot
+ * that doesn't see the newer commit can still find the root it does see
+ * (snapshot_head()).  An entry is dropped once the xid that replaced it
+ * precedes the oldest xmin of any snapshot (every snapshot sees the newer
+ * root); if the history is full of entries still needed, the oldest is
+ * given up, and a snapshot that needed it gets "snapshot too old".  The
+ * history lives only in shared memory: after a restart no snapshot is
+ * older than the heads, and a standby keeps its own for its own snapshots.
+ *
  * Settling lazily leaves entries behind that nobody reads again: those of
  * a database nobody opens after a crash, or of transactions that ended in
  * a crash.  Their xids are invisible to the commit log's truncation and
@@ -79,6 +89,7 @@
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
+#include "utils/snapmgr.h"
 
 #define SERIAL_IMPL_ID	1
 
@@ -88,6 +99,7 @@
 
 #define MAX_HEADS		1024
 #define MAX_PENDING		1024
+#define MAX_HISTORY		4096
 
 #define HEADS_FILE		"global/prolly_heads"
 #define HEADS_TEMP		"global/prolly_heads.tmp"
@@ -110,13 +122,28 @@ typedef struct PendingEntry
 	ProllyHash	root;
 } PendingEntry;
 
+/* A head that was replaced, kept for snapshots that don't see its successor. */
+typedef struct HistoryEntry
+{
+	Oid			dboid;
+	ProllyBranchId branch;
+	TransactionId xid;			/* committed it; invalid: seen by everyone */
+	TransactionId succ_xid;		/* committed its successor */
+	bool		has_root;		/* false: the branch had no root yet */
+	ProllyHash	root;
+} HistoryEntry;
+
 typedef struct SerialShared
 {
 	uint64		next_seq;
 	int			nheads;
 	int			npending;
+	int			nhistory;
 	HeadEntry	heads[MAX_HEADS];
+	TransactionId head_xids[MAX_HEADS]; /* committed heads[i]; invalid: seen
+										 * by everyone */
 	PendingEntry pending[MAX_PENDING];	/* in seq order */
+	HistoryEntry history[MAX_HISTORY];	/* oldest first */
 } SerialShared;
 
 /* On disk: this header, the entries, then a CRC of everything before it. */
@@ -148,6 +175,7 @@ typedef struct xl_serial_drop_database
 static SerialShared *shared = NULL;
 
 int			debug_prolly_max_branch_heads = 0;
+int			debug_prolly_max_root_history = 0;
 
 /*
  * Pending entries this backend's transaction added by copying a database,
@@ -203,9 +231,65 @@ find_head(SerialShared *s, Oid dboid, ProllyBranchId branch)
 	return NULL;
 }
 
+static int
+history_limit(void)
+{
+	if (debug_prolly_max_root_history > 0 &&
+		debug_prolly_max_root_history < MAX_HISTORY)
+		return debug_prolly_max_root_history;
+	return MAX_HISTORY;
+}
+
+/*
+ * Drop history entries no snapshot can need: those whose successor every
+ * snapshot sees.  If that leaves no room, give up the oldest.
+ */
+static void
+make_history_room(SerialShared *s)
+{
+	TransactionId horizon;
+	int			n = 0;
+
+	if (s->nhistory < history_limit())
+		return;
+	horizon = GetOldestNonRemovableTransactionId(NULL);
+	for (int i = 0; i < s->nhistory; i++)
+	{
+		if (!TransactionIdPrecedes(s->history[i].succ_xid, horizon))
+			s->history[n++] = s->history[i];
+	}
+	s->nhistory = n;
+	while (s->nhistory >= history_limit())
+	{
+		memmove(&s->history[0], &s->history[1],
+				sizeof(HistoryEntry) * (s->nhistory - 1));
+		s->nhistory--;
+	}
+}
+
+static void
+add_history(SerialShared *s, Oid dboid, ProllyBranchId branch,
+			TransactionId xid, TransactionId succ_xid, bool has_root,
+			const ProllyHash *root)
+{
+	HistoryEntry *e;
+
+	make_history_room(s);
+	e = &s->history[s->nhistory++];
+	memset(e, 0, sizeof(*e));
+	e->dboid = dboid;
+	e->branch = branch;
+	e->xid = xid;
+	e->succ_xid = succ_xid;
+	e->has_root = has_root;
+	if (has_root)
+		e->root = *root;
+}
+
+/* root, committed by xid, becomes the head; the old one goes to history. */
 static void
 set_head(SerialShared *s, Oid dboid, ProllyBranchId branch,
-		 const ProllyHash *root)
+		 const ProllyHash *root, TransactionId xid)
 {
 	HeadEntry  *h = find_head(s, dboid, branch);
 
@@ -215,11 +299,16 @@ set_head(SerialShared *s, Oid dboid, ProllyBranchId branch,
 		if (s->nheads >= MAX_HEADS)
 			ereport(PANIC,
 					(errmsg("too many prolly branch heads (limit %d)", MAX_HEADS)));
+		add_history(s, dboid, branch, InvalidTransactionId, xid, false, NULL);
 		h = &s->heads[s->nheads++];
 		h->dboid = dboid;
 		h->branch = branch;
 	}
+	else
+		add_history(s, dboid, branch, s->head_xids[h - s->heads], xid, true,
+					&h->root);
 	h->root = *root;
+	s->head_xids[h - s->heads] = xid;
 }
 
 static void
@@ -316,7 +405,7 @@ settle_pending(SerialShared *s, Oid dboid, ProllyBranchId branch,
 		if (sweeping && !can_sweep(s, p))
 			break;
 		if (TransactionIdDidCommit(p->xid))
-			set_head(s, dboid, branch, &p->root);
+			set_head(s, dboid, branch, &p->root, p->xid);
 		else if (check_running && TransactionIdIsInProgress(p->xid))
 			break;
 		remove_pending(s, i);
@@ -392,7 +481,7 @@ settle_replayed(SerialShared *s)
 		PendingEntry *p = &s->pending[i];
 
 		if (TransactionIdDidCommit(p->xid))
-			set_head(s, p->dboid, p->branch, &p->root);
+			set_head(s, p->dboid, p->branch, &p->root, p->xid);
 		else if (!TransactionIdDidAbort(p->xid))
 		{
 			i++;
@@ -476,9 +565,19 @@ forget_database(SerialShared *s, Oid dboid)
 	for (int i = 0; i < s->nheads; i++)
 	{
 		if (s->heads[i].dboid != dboid)
+		{
+			s->head_xids[n] = s->head_xids[i];
 			s->heads[n++] = s->heads[i];
+		}
 	}
 	s->nheads = n;
+	n = 0;
+	for (int i = 0; i < s->nhistory; i++)
+	{
+		if (s->history[i].dboid != dboid)
+			s->history[n++] = s->history[i];
+	}
+	s->nhistory = n;
 	for (int i = 0; i < s->npending;)
 	{
 		if (s->pending[i].dboid == dboid)
@@ -744,7 +843,7 @@ finish_ticket(ProllyCommitTicket ticket, bool committed)
 		if (p->seq == ticket)
 		{
 			if (committed)
-				set_head(s, p->dboid, p->branch, &p->root);
+				set_head(s, p->dboid, p->branch, &p->root, p->xid);
 			remove_pending(s, i);
 			break;
 		}
@@ -792,6 +891,85 @@ serial_head(ProllyBranchId branch, ProllyNodeRef *root)
 	}
 	LWLockRelease(ProllyHeadsLock);
 	return found;
+}
+
+/* Does snapshot see xid as committed?  Invalid: seen by everyone. */
+static bool
+seen_committed(TransactionId xid, Snapshot snapshot)
+{
+	if (!TransactionIdIsValid(xid))
+		return true;
+	return !XidInMVCCSnapshot(xid, snapshot) && TransactionIdDidCommit(xid);
+}
+
+static bool
+serial_snapshot_head(ProllyBranchId branch, Snapshot snapshot,
+					 ProllyNodeRef *root)
+{
+	SerialShared *s = get_shared();
+	HeadEntry  *h;
+	bool		known = false;
+
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC)
+		elog(ERROR, "prolly snapshot_head needs an MVCC snapshot");
+
+	LWLockAcquire(ProllyHeadsLock, LW_SHARED);
+
+	/* Newest first: roots enqueued, then the head, then older heads. */
+	for (int i = s->npending - 1; i >= 0; i--)
+	{
+		PendingEntry *p = &s->pending[i];
+
+		if (p->dboid == MyDatabaseId && p->branch == branch &&
+			seen_committed(p->xid, snapshot))
+		{
+			root_ref(&p->root, root);
+			LWLockRelease(ProllyHeadsLock);
+			return true;
+		}
+	}
+	h = find_head(s, MyDatabaseId, branch);
+	if (h != NULL)
+	{
+		known = true;
+		if (seen_committed(s->head_xids[h - s->heads], snapshot))
+		{
+			root_ref(&h->root, root);
+			LWLockRelease(ProllyHeadsLock);
+			return true;
+		}
+	}
+	for (int i = s->nhistory - 1; i >= 0; i--)
+	{
+		HistoryEntry *e = &s->history[i];
+
+		if (e->dboid != MyDatabaseId || e->branch != branch)
+			continue;
+		known = true;
+		if (seen_committed(e->xid, snapshot))
+		{
+			bool		has_root = e->has_root;
+
+			if (has_root)
+				root_ref(&e->root, root);
+			LWLockRelease(ProllyHeadsLock);
+			return has_root;
+		}
+	}
+	LWLockRelease(ProllyHeadsLock);
+
+	/*
+	 * A branch with no head and no history has never had a root this
+	 * snapshot could see.  One that has, with nothing the snapshot sees
+	 * left, gave up the root it needed.
+	 */
+	if (!known)
+		return false;
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("snapshot too old"),
+			 errdetail("The prolly root this snapshot sees was given up to make room for newer ones.")));
+	return false;				/* keep compiler quiet */
 }
 
 static void finish_ticket(ProllyCommitTicket ticket, bool committed);
@@ -992,6 +1170,7 @@ const ProllyCommitRoutine prolly_commit_serial = {
 	.publish = serial_publish,
 	.abandon = serial_abandon,
 	.head = serial_head,
+	.snapshot_head = serial_snapshot_head,
 	.copy_database = serial_copy_database,
 	.drop_database = serial_drop_database,
 	.usage = serial_usage,

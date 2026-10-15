@@ -482,6 +482,31 @@ versioned databases by opt-in; shared catalogs unbranched; permanent heap
 tables refused in a versioned database; Dolt's conflict tables; renames
 merged as drop and add; a pinned canonical deparse; `dolt.author`.
 
+**Status (2026-10-14): 4e.2 built.** An MVCC snapshot reads the root of
+the newest commit it sees as committed, decided by xids as heap tuples'
+visibility is: the commit pipeline gained `snapshot_head`, which looks at
+roots enqueued by transactions the snapshot sees as committed (published or
+not yet), then the head, then a history of replaced heads, each with the
+xid that committed it and the xid that replaced it. Commits to a branch end
+in enqueue order (the branch lock is held to the end of the transaction),
+so a snapshot that sees one commit sees every earlier one. History entries
+are dropped once every running snapshot sees their successor (the oldest
+xmin passed it); if the history (4,096 entries) is full of entries still
+needed, the oldest is given up and a snapshot that needed it gets
+"snapshot too old" (a serialization failure, so clients retry). Standbys
+keep their own history from the commits they replay. Snapshots other than
+MVCC (dirty, self, any) and writes read the newest head, as before. No
+change to `SnapshotData`: exported, imported and parallel snapshots carry
+their xids, which is all the choice needs. Tests: `012_d1_snapshots.pl`
+(REPEATABLE READ keeps its root through sequential and index scans, also
+when the snapshot was taken by a heap table first; READ COMMITTED moves
+on; an update of a row changed since the snapshot is a serialization
+failure; history pruning and "snapshot too old" with
+`debug_prolly_max_root_history`; a standby snapshot), which fails without
+the change (each scan read the newest commit); a commit pipeline
+conformance check that a snapshot doesn't see a running transaction's
+roots.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

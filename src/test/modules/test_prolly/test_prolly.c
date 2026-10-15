@@ -185,7 +185,7 @@ static const ConformanceCase cases[] = {
 
 	/* commit pipeline */
 	{PROLLY_IFACE_COMMIT_PIPELINE, "publishes_in_enqueue_order",
-	"branch_lock tip enqueue branch_unlock publish abandon head",
+	"branch_lock tip enqueue branch_unlock publish abandon head snapshot_head",
 	commit_publishes_in_enqueue_order},
 	{PROLLY_IFACE_COMMIT_PIPELINE, "survives_crash_and_replays",
 	"enqueue publish checkpoint redo", NULL},

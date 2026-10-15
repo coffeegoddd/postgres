@@ -36,6 +36,16 @@
  *   was built on it.
  * - head() returns the published head, without the branch lock; false if
  *   the branch has never had a root.
+ * - snapshot_head() returns the root of the newest commit to the branch
+ *   that an MVCC snapshot sees as committed, as heap tuples' visibility
+ *   follows xids: a root enqueued by a transaction the snapshot sees as
+ *   committed, whether or not it is published yet, else the root before
+ *   it; false if the branch had no root then.  Commits to a branch end in
+ *   the order they were enqueued (the branch lock is held until the
+ *   transaction ends), so a snapshot that sees one sees every earlier one.
+ *   Roots superseded before every running snapshot's xmin may be
+ *   forgotten; one a snapshot still needs is kept while room allows, and
+ *   asking for one that was given up raises "snapshot too old".
  * - copy_database() gives a new database dst_dboid the branches of
  *   src_dboid, as part of the current transaction: their heads become
  *   dst's when, and only when, the transaction commits (CREATE DATABASE
@@ -63,6 +73,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "access/xlogreader.h"
+#include "utils/snapshot.h"
 
 typedef uint64 ProllyCommitTicket;
 
@@ -83,6 +94,8 @@ typedef struct ProllyCommitRoutine
 
 	/* The branch's current published head. */
 	bool		(*head) (ProllyBranchId branch, ProllyNodeRef *root);
+	bool		(*snapshot_head) (ProllyBranchId branch, Snapshot snapshot,
+								  ProllyNodeRef *root);
 
 	/* Databases. */
 	void		(*copy_database) (Oid src_dboid, Oid dst_dboid);
@@ -96,12 +109,19 @@ typedef struct ProllyCommitRoutine
 
 #define PROLLY_COMMIT_CALLBACK_NAMES \
 	"shmem_size", "shmem_init", "branch_lock", "tip", "enqueue", \
-	"branch_unlock", "publish", "abandon", "head", "copy_database", \
+	"branch_unlock", "publish", "abandon", "head", "snapshot_head", \
+	"copy_database", \
 	"drop_database", "usage", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
 
 /* For tests: if positive, fewer branch heads than an implementation's limit. */
 extern PGDLLIMPORT int debug_prolly_max_branch_heads;
+
+/*
+ * For tests: if positive, fewer superseded roots kept for older snapshots
+ * than an implementation's limit.
+ */
+extern PGDLLIMPORT int debug_prolly_max_root_history;
 
 static inline const ProllyCommitRoutine *
 prolly_commit_lookup(const char *name)

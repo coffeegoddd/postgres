@@ -51,6 +51,7 @@ tests += {
       't/009_d1_index.pl',
       't/010_d1_maintenance.pl',
       't/011_d1_respelled_keys.pl',
+      't/012_d1_snapshots.pl',
     ],
   },
 }

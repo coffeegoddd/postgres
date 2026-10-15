@@ -35,6 +35,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
+#include "utils/snapmgr.h"
 
 /* ------------------------------------------------------------------------
  * Helpers
@@ -648,6 +649,13 @@ commit_publishes_in_enqueue_order_body(const ProllyImplInfo *impl)
 	PROLLY_CALL(cp, publish, t3);
 	if (!PROLLY_CALL(cp, head, b, &got) || !same_root(&got, &r3))
 		elog(ERROR, "the second publish did not move the head");
+
+	/*
+	 * This transaction hasn't committed, so a snapshot sees none of its
+	 * roots, published or not: the branch had no root before them.
+	 */
+	if (PROLLY_CALL(cp, snapshot_head, b, GetActiveSnapshot(), &got))
+		elog(ERROR, "a snapshot sees a root of a transaction still running");
 }
 
 /* ------------------------------------------------------------------------
