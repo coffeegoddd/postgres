@@ -1,0 +1,13 @@
+Dolt test excerpts and adapted scenarios
+Copyright 2021 Dolthub, Inc.
+
+Source: https://github.com/dolthub/dolt
+Revision: 51cc4458b740ac132cb2302fe5394a2abbfba39d
+File: go/libraries/doltcore/sqle/enginetest/dolt_queries.go
+License: Apache License, Version 2.0 (see LICENSE)
+
+The sources/*.go.txt files retain exact upstream case literal bytes.
+The scenarios/*.json files are modified PostgreSQL ports. Changes include
+typed native VC operations, explicit commit bindings, PostgreSQL identity
+columns, text result values, and SQLSTATE assertions. Per-case changes and
+source-to-step mappings are documented in ports.json.

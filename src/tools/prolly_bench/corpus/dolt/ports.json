@@ -1,0 +1,503 @@
+{
+  "version": 1,
+  "ports": [
+    {
+      "id": "dolt-checkout-working-set",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 0,
+      "name": "dolt_checkout changes working set",
+      "source_sha256": "cd3d2b88247cde756dc93b2bc5a92085ea1bbcd17b5e422f6bbec67497ded7b8",
+      "scenario_sha256": "711c7277005b4706bab684ea9ade71d5db5a8ddb61c3e5c5a4f1bd8ba8fb7d7a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by native operation success and adapter active-branch verification."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by native operation success and adapter active-branch verification."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by native operation success and adapter active-branch verification."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "MySQL CALL becomes typed native VC operations.",
+        "D1 commits all data without a staging area; no staging-specific assertion is present.",
+        "SQL result values are exact strings; unordered result multiplicity is preserved."
+      ]
+    },
+    {
+      "id": "dolt-checkout-new-branch",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 1,
+      "name": "dolt_checkout with new branch",
+      "source_sha256": "68a848299ac653355e96960d114c6fd0464082ea1438cacb31e82e2bde8af977",
+      "scenario_sha256": "781ca5ae92127f014ea5fa1c865bbdcba361af15c9461812b541c9e783a3e1e5",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3-branch",
+            "setup-3"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by native operation success and adapter active-branch verification."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by native operation success and adapter active-branch verification."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "MySQL CALL becomes typed native VC operations.",
+        "D1 commits all data without a staging area; no staging-specific assertion is present.",
+        "SQL result values are exact strings; unordered result multiplicity is preserved."
+      ]
+    },
+    {
+      "id": "dolt-hashof",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 29,
+      "name": "test hashof",
+      "source_sha256": "6c8297864baea78a2675fee67667bc576be4039848d21b34a77c40992542e59a",
+      "scenario_sha256": "79a95f8c1ccbb6c43cdaadf7e673789a3a22ec8e951711b5de4438cc3c085d8a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert-first"
+          ],
+          "note": "Preserved rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "first"
+          ],
+          "note": "D1 commit snapshots all tables without staging; source dolt_add prepares the same first commit."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "first"
+          ],
+          "note": "Native commit returns captured first ID."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "first"
+          ],
+          "note": "Replace session variable populated through DOLT_LOG with the returned first commit ID."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "insert-second"
+          ],
+          "note": "Preserved rows."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "second"
+          ],
+          "note": "Native commit returns captured second ID."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "second"
+          ],
+          "note": "Replace session variable populated through DOLT_LOG with the returned second commit ID."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching."
+        }
+      ],
+      "adaptations": [
+        "hashof alias maps to dolt_hashof. Native commit IDs are opaque and captured directly.",
+        "Staging is absent in D1; all-table commit preserves this case's snapshots.",
+        "PostgreSQL text booleans and error SQLSTATE replace MySQL booleans and error strings."
+      ]
+    },
+    {
+      "id": "dolt-reset-identity",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 11,
+      "name": "hard reset inserted rows continues auto increment",
+      "source_sha256": "cef0aa3b8c3c3014d5cf7b79d6c505619bb97e6305ceaa18794af7dcb3036bc8",
+      "scenario_sha256": "7667b8a72c2cdd3ff850eae9b7d89f044467c074ab92f563bf35d7a1db94e132",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL AUTO_INCREMENT maps to PostgreSQL GENERATED BY DEFAULT AS IDENTITY."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved generated-key inserts."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit"
+          ],
+          "note": "Native commit-all snapshots table data."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "dirty"
+          ],
+          "note": "Preserved generated-key inserts before reset."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "reset"
+          ],
+          "note": "Omitted reset ref becomes explicit HEAD; data changes must be discarded."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "insert-after-reset"
+          ],
+          "note": "MySQL RowsAffected=1 and InsertID=5 become exactly one RETURNING row with key 5."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "rows-after-reset"
+          ],
+          "note": "Preserved ordered rows, including missing discarded keys 3 and 4."
+        }
+      ],
+      "adaptations": [
+        "AUTO_INCREMENT uses a PostgreSQL identity sequence; both must continue allocation after hard-resetting table data.",
+        "RETURNING checks generated key and one-row insert instead of MySQL OK-packet fields.",
+        "D1 commit-all and explicit reset HEAD replace staging flags and implicit HEAD."
+      ]
+    }
+  ],
+  "deferred": [
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltResetTestScripts",
+      "index": 2,
+      "name": "dolt_reset('--hard') commits the active SQL transaction",
+      "source_sha256": "8b66b23de2450b01b85304fea5e8a7be99557bc2f161f52a7842a6691e3487b2",
+      "reason": "Dolt reset commits an active SQL transaction; the native adapter requires idle transactions. This semantic difference needs its own contract, not an inserted COMMIT that would erase the assertion."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltResetTestScripts",
+      "index": 5,
+      "name": "dolt_reset(rev) moves HEAD, resets the index, and leaves the working tree alone",
+      "source_sha256": "132b2fc5896a967ff25ff007594dffa9374f7649ae257724072f98acfad2bc90",
+      "reason": "Mixed reset and staged/working tree separation have no D1 counterpart. Only hard reset is currently supported."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltResetTestScripts",
+      "index": 0,
+      "name": "CALL DOLT_RESET('--hard') should reset the merge state after uncommitted merge",
+      "source_sha256": "3beb1bcd37dc2863e171d39c216e979fa489ab2ac4c85538cde3f59118fd3e72",
+      "reason": "Merge-state reset requires merge and abort operations beyond the current vc.core adapter contract."
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "id": "dolt-hashof",
+  "description": "Reviewed Dolt port: test hashof",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltScripts: test hashof"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE hashof_test (pk int primary key, c1 int)"
+    },
+    {
+      "id": "insert-first",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO hashof_test values (1,1), (2,2), (3,3)"
+    },
+    {
+      "id": "first",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "first commit"
+      ],
+      "save": "first"
+    },
+    {
+      "id": "insert-second",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO hashof_test values (4,4), (5,5), (6,6)"
+    },
+    {
+      "id": "second",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "second commit"
+      ],
+      "save": "second"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof($1) = dolt_hashof($2)",
+      "expect": {
+        "rows": [
+          [
+            "f"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "first"
+        },
+        {
+          "ref": "second"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof($1) = dolt_hashof('HEAD~1')",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "first"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof($1) = dolt_hashof('HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "second"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof($1) = dolt_hashof('main')",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "second"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof('non_branch')",
+      "params": [],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_hashof(left($1,30))",
+      "params": [
+        {
+          "ref": "second"
+        }
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    }
+  ]
+}
