@@ -63,6 +63,15 @@ Nothing below is decided unless its entry says so. Update this file when somethi
    512 bytes, forced at 16 KiB). The forced split at a full page also
    makes boundaries depend on `BLCKSZ` (question 45). Measure occupancy
    first; the rule and targets are settled with the format freeze (4g).
+   **Measured (2026-10-14, 4e.1 node counters):** about 31 items per leaf
+   holds 800 bytes of row-identity entries and 3 KB of narrow rows per
+   8 KiB page, so a 20,000-row scan reads 1,334 nodes where nodes filled
+   to about 4 KB would make it about 600. **Plan (user, 2026-10-14):**
+   settled in step 5, which may still change the 4g freeze (the format is
+   provisional until every engine has been evaluated): a size-weighted
+   key-only chunker (`keyhash_weibull`, as Dolt's default) measured
+   against `keyhash`; what is measured is listed in `07-roadmap.md`,
+   step 5.
 4. **Canonical format.** Our own Postgres-native format (node layout, key and
    value encoding, content hash), or Dolt byte compatibility for DoltHub
    interop? Dolt compatibility would constrain nearly every foundation choice,
