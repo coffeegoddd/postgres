@@ -256,6 +256,23 @@ $s2->{stderr} = '';
 is($node->safe_psql('postgres', q{SELECT string_agg(id || ':' || bal, ',' ORDER BY id) FROM cte_acc}),
 	'a:1090,b:1091', 'and the rows are as on heap');
 
+# A row an update moved to another partition: those that waited for it
+# learn it moved, as on heap (Postgres's partition-key-update tests).
+$node->safe_psql('postgres', q{
+	CREATE TABLE pfoo (a int, b text) PARTITION BY LIST (a);
+	CREATE TABLE pfoo1 PARTITION OF pfoo FOR VALUES IN (1);
+	CREATE TABLE pfoo2 PARTITION OF pfoo FOR VALUES IN (2);
+	INSERT INTO pfoo VALUES (1, 'ABC');});
+$s1->query_safe('BEGIN; UPDATE pfoo SET a = 2 WHERE a = 1;');
+$s2->query_until(qr/go/, "\\echo go\nSELECT * FROM pfoo WHERE a = 1 FOR UPDATE;\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted})
+  or die 'the lock never waited';
+$s1->query_safe('COMMIT');
+$s2->query('SELECT 1');
+like($s2->{stderr}, qr/tuple to be locked was already moved to another partition due to concurrent update/,
+	'locking a row that moved partitions reports it');
+$s2->{stderr} = '';
+
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{
 	CREATE TABLE acct (id int PRIMARY KEY, bal int);

@@ -1623,7 +1623,19 @@ prolly_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	row_at_init(&now);
 	fate = row_fate(&c, roots, rel, ik->keying, tid, cid, &now, tmfd);
 	if (fate == ROW_LIVE)
-		remove_version(&c, roots, rel, ik->keying, tid, &now, NULL, false, cid);
+	{
+		/*
+		 * A row moved to another partition by an update of its partition
+		 * key is retired with heap's "moved" successor, so those that find
+		 * it later learn where it went, as on heap.
+		 */
+		ItemPointerData moved;
+
+		ItemPointerSetMovedPartitions(&moved);
+		remove_version(&c, roots, rel, ik->keying, tid, &now,
+					   (options & TABLE_DELETE_CHANGING_PARTITION) ? &moved : NULL,
+					   false, cid);
+	}
 	row_at_free(&now);
 	PROLLY_CALL(c.engine, roots_release, roots);
 	return fate_result(fate, tmfd, tid);
@@ -1891,7 +1903,8 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 		 * the update.
 		 */
 		if (fate == ROW_CONCURRENTLY_MODIFIED && mode == LockTupleKeyShare &&
-			!ItemPointerEquals(&tmfd->ctid, tid))
+			!ItemPointerEquals(&tmfd->ctid, tid) &&
+			!ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
 		{
 			RowAt		gone;
 			RowAt		last;
@@ -1904,7 +1917,8 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			{
 				row_at(&c, roots, rel, keying, &next, InvalidCommandId, &last);
 				if (last.present || last.state != PROLLY_TID_GONE ||
-					!ItemPointerIsValid(&last.info.successor))
+					!ItemPointerIsValid(&last.info.successor) ||
+					ItemPointerIndicatesMovedPartitions(&last.info.successor))
 					break;
 				next = last.info.successor;
 			}
@@ -1934,6 +1948,13 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			row_at_free(&last);
 		}
 
+		/* As heap's, following a row that moved partitions is an error. */
+		if (fate == ROW_CONCURRENTLY_MODIFIED &&
+			(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
+			ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
 		if (fate == ROW_CONCURRENTLY_MODIFIED &&
 			(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
 			!ItemPointerEquals(&tmfd->ctid, tid))
@@ -1945,7 +1966,8 @@ prolly_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			{
 				row_at(&c, roots, rel, keying, &next, InvalidCommandId, &now);
 				if (now.present || now.state != PROLLY_TID_GONE ||
-					!ItemPointerIsValid(&now.info.successor))
+					!ItemPointerIsValid(&now.info.successor) ||
+					ItemPointerIndicatesMovedPartitions(&now.info.successor))
 					break;
 				next = now.info.successor;
 			}
@@ -2134,7 +2156,8 @@ prolly_tuple_get_latest_tid(TableScanDesc sscan, ItemPointer tid)
 			break;
 		}
 		if (r.state != PROLLY_TID_GONE ||
-			!ItemPointerIsValid(&r.info.successor))
+			!ItemPointerIsValid(&r.info.successor) ||
+			ItemPointerIndicatesMovedPartitions(&r.info.successor))
 			break;
 		at = r.info.successor;
 		CHECK_FOR_INTERRUPTS();
