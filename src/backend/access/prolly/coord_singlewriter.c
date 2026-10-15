@@ -34,7 +34,10 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "storage/procarray.h"
 #include "utils/rel.h"
 
 static LOCKMODE
@@ -69,6 +72,30 @@ singlewriter_lock_row(Relation tree, const ProllyKey *key, LockTupleMode mode,
 	return TM_WouldBlock;
 }
 
+/* The table's writer: whoever holds its lock exclusively. */
+static TransactionId
+singlewriter_writer_of(Relation tree, const ProllyKey *key)
+{
+	LOCKTAG		tag;
+	VirtualTransactionId *holders;
+
+	SET_LOCKTAG_PROLLY_TABLE(tag, MyDatabaseId, RelationGetRelid(tree));
+	holders = GetLockConflicts(&tag, ShareLock, NULL);
+	for (int i = 0; VirtualTransactionIdIsValid(holders[i]); i++)
+	{
+		TransactionId xid;
+		TransactionId xmin;
+		int			nsubxid;
+		bool		overflowed;
+
+		ProcNumberGetTransactionIds(holders[i].procNumber, &xid, &xmin,
+									&nsubxid, &overflowed);
+		if (TransactionIdIsValid(xid))
+			return xid;
+	}
+	return InvalidTransactionId;
+}
+
 /* Speculative insertion has no one to race with: the inserter is the writer. */
 static TM_Result
 singlewriter_insert_intent(Relation tree, const ProllyKey *key,
@@ -94,6 +121,7 @@ const ProllyCoordRoutine prolly_coord_single_writer = {
 		"by share row locks",
 	},
 	.lock_row = singlewriter_lock_row,
+	.writer_of = singlewriter_writer_of,
 	.insert_intent = singlewriter_insert_intent,
 	.insert_intent_complete = singlewriter_insert_intent_complete,
 };

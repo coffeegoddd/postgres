@@ -67,12 +67,18 @@ typedef struct ProllyIndexKeyingRoutine
 	bool		(*columns_equal) (ProllyIndexKeying *k, const ProllyKey *a,
 								  const ProllyKey *b, int ncols);
 
+	/*
+	 * True if key values that compare equal always encode (encode_bound)
+	 * to the same bytes, so the bytes name the value (for locks).
+	 */
+	bool		(*equal_bytes) (ProllyIndexKeying *k);
+
 	void		(*close) (ProllyIndexKeying *k);
 } ProllyIndexKeyingRoutine;
 
 #define PROLLY_IXKEYING_CALLBACK_NAMES \
 	"open", "describe", "nkeys", "encode_entry", "decode_entry", \
-	"encode_bound", "compare", "columns_equal", "close"
+	"encode_bound", "compare", "columns_equal", "equal_bytes", "close"
 #define PROLLY_IXKEYING_FIRST_CALLBACK open
 
 static inline const ProllyIndexKeyingRoutine *

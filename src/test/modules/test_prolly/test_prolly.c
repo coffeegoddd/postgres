@@ -141,6 +141,8 @@ static const ConformanceCase cases[] = {
 	keyenc_decode_round_trip},
 	{PROLLY_IFACE_KEY_ENCODER, "self_delimiting_prefixes",
 	"begin encode prefix_length end", keyenc_prefix_lengths},
+	{PROLLY_IFACE_KEY_ENCODER, "equal_bytes_name_keys",
+	"begin encode compare equal_bytes end", keyenc_equal_bytes},
 
 	/* value encoder */
 	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end",

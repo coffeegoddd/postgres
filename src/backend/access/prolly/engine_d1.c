@@ -31,13 +31,17 @@
  * keying when it is written: the table AM rebuilds a tree whose keying
  * changed before writing it.
  *
- * Commit.  xact_precommit locks the branch, applies every write set's
- * newest versions to the branch tip's trees, builds the new branch root
- * and enqueues it; xact_commit publishes it.  D1 relies on its writers
- * holding the right to write a table (coordination "single_writer") from
- * before their first write to it until their transaction ends: a write
- * set reads its base trees from the newest head when it's made, so the
- * rebase at commit is a plain replay.
+ * Commit.  xact_precommit applies every write set's newest versions to
+ * the tree it was based on, then locks the branch and looks at the tip:
+ * a tree nobody else changed meanwhile takes the result as it is; one
+ * another transaction changed gets the same edits replayed onto the tip's
+ * version.  It builds the new branch root and enqueues it; xact_commit
+ * publishes it.  The replay needs no merge: D1 relies on its writers
+ * holding the right to write what they write (a row's key, or a whole
+ * tree being rebuilt, from coordination) from before they write it until
+ * their transaction ends, so no other transaction committed a change to
+ * a key in the write set, and a replaced tree (emptied or rebuilt) was
+ * written by nobody else.
  *
  * Snapshots.  An MVCC snapshot reads the root of the newest commit it sees
  * as committed (the commit pipeline's snapshot_head), so every scan of a
@@ -522,10 +526,10 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	}
 
 	/*
-	 * The caller holds the right to write rel (coordination), so the
-	 * newest head is the base nobody else will change before this
-	 * transaction ends.  The write set is entered only once it's complete,
-	 * so an error here leaves nothing behind for a retry to find.
+	 * The newest head is the base; others may commit changes to keys this
+	 * transaction doesn't write meanwhile, which commit replays these
+	 * writes over.  The write set is entered only once it's complete, so
+	 * an error here leaves nothing behind for a retry to find.
 	 */
 	(void) GetCurrentTransactionId();
 
@@ -1489,7 +1493,8 @@ row_bytes_cmp(const void *a, const void *b)
 }
 
 static void
-materialize_unordered(D1WriteSet *ws, ProllyNodeRef *out)
+materialize_unordered(D1WriteSet *ws, const ProllyNodeRef *base,
+					  ProllyNodeRef *out)
 {
 	int			nentries;
 	D1Entry   **entries = entries_by_bytes(ws, &nentries);
@@ -1501,10 +1506,10 @@ materialize_unordered(D1WriteSet *ws, ProllyNodeRef *out)
 	rows = palloc(sizeof(D1Row) * cap);
 
 	/* The base's rows the write set doesn't replace or delete. */
-	if (ws->base.hash.len > 0)
+	if (base->hash.len > 0)
 	{
 		ProllyTreeCursor *tc = PROLLY_CALL(backend.c.tree, cursor_open,
-										   &backend.memcmp_env, &ws->base,
+										   &backend.memcmp_env, base,
 										   CurrentMemoryContext);
 		ProllyKey	key;
 		ProllyValue value;
@@ -1566,21 +1571,24 @@ materialize_unordered(D1WriteSet *ws, ProllyNodeRef *out)
 	pfree(entries);
 }
 
-/* Write ws's newest versions into a tree; returns its root in *out. */
+/*
+ * Write ws's newest versions into the tree from (its base, or a newer
+ * version of the tree to replay them onto); returns its root in *out.
+ */
 static void
-materialize(D1WriteSet *ws, ProllyNodeRef *out)
+materialize_onto(D1WriteSet *ws, const ProllyNodeRef *from, ProllyNodeRef *out)
 {
 	ProllyEdit *edits;
 	int			n = 0;
 	RBTreeIterator it;
 	D1Entry    *e;
-	ProllyNodeRef base = ws->base;
+	ProllyNodeRef base = *from;
 	D1Order		order = ws->order;
 	ProllyTreeEnv env;
 
 	if (order_lost(&order))
 	{
-		materialize_unordered(ws, out);
+		materialize_unordered(ws, from, out);
 		return;
 	}
 	tree_env(&order, &env);
@@ -1612,6 +1620,12 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 	else
 		*out = base;
 	pfree(edits);
+}
+
+static void
+materialize(D1WriteSet *ws, ProllyNodeRef *out)
+{
+	materialize_onto(ws, &ws->base, out);
 }
 
 static void
@@ -1680,12 +1694,6 @@ d1_xact_precommit(void)
 		return;
 	commit = backend.c.commit;
 
-	PROLLY_CALL(commit, branch_lock, PROLLY_MAIN_BRANCH);
-	tip.has_root = PROLLY_CALL(commit, tip, PROLLY_MAIN_BRANCH, &tip.root);
-	if (!tip.has_root)
-		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
-	tip.has_root = true;
-
 	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
 		n++;
 	sets = palloc(sizeof(D1WriteSet *) * n);
@@ -1694,29 +1702,36 @@ d1_xact_precommit(void)
 		sets[n++] = ws;
 	qsort(sets, n, sizeof(D1WriteSet *), ws_order);
 
+	/* The new trees, built before the branch lock: the costly part. */
 	edits = palloc(sizeof(ProllyRootEdit) * n);
 	for (int i = 0; i < n; i++)
 	{
-		D1WriteSet *ws = sets[i];
-
-		if (!ws->replaced)
-		{
-			ProllyNodeRef current;
-
-			/*
-			 * The transaction has held the right to write this table since
-			 * the write set read it, so nobody else changed it.
-			 */
-			find_tree(&tip, ws->sub, ws->relnumber, &current);
-			if (!same_hash(&current, &ws->base))
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("could not serialize access due to concurrent update of a prolly table")));
-		}
-		edits[i].sub = ws->sub;
-		edits[i].relnumber = ws->relnumber;
+		edits[i].sub = sets[i]->sub;
+		edits[i].relnumber = sets[i]->relnumber;
 		edits[i].is_remove = false;
-		materialize(ws, &edits[i].tree);
+		materialize(sets[i], &edits[i].tree);
+	}
+
+	PROLLY_CALL(commit, branch_lock, PROLLY_MAIN_BRANCH);
+	tip.has_root = PROLLY_CALL(commit, tip, PROLLY_MAIN_BRANCH, &tip.root);
+	if (!tip.has_root)
+		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
+	tip.has_root = true;
+
+	/*
+	 * Under it, replay the edits onto trees others changed since: their
+	 * changes are to keys this transaction didn't write.
+	 */
+	for (int i = 0; i < n; i++)
+	{
+		D1WriteSet *ws = sets[i];
+		ProllyNodeRef current;
+
+		if (ws->replaced)
+			continue;
+		find_tree(&tip, ws->sub, ws->relnumber, &current);
+		if (!same_hash(&current, &ws->base))
+			materialize_onto(ws, &current, &edits[i].tree);
 	}
 
 	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,

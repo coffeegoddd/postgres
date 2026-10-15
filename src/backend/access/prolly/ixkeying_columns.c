@@ -362,6 +362,12 @@ columns_columns_equal(ProllyIndexKeying *k, const ProllyKey *a,
 	return PROLLY_CALL(k->keyenc, compare, encoder(k, ncols), &ca, &cb) == 0;
 }
 
+static bool
+columns_equal_bytes(ProllyIndexKeying *k)
+{
+	return PROLLY_CALL(k->keyenc, equal_bytes, encoder(k, k->nkeys));
+}
+
 static void
 columns_close(ProllyIndexKeying *k)
 {
@@ -387,5 +393,6 @@ const ProllyIndexKeyingRoutine prolly_ixkeying_columns_then_row = {
 	.encode_bound = columns_encode_bound,
 	.compare = columns_compare,
 	.columns_equal = columns_columns_equal,
+	.equal_bytes = columns_equal_bytes,
 	.close = columns_close,
 };

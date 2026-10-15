@@ -884,6 +884,7 @@
                                         # (max_pred_locks_per_transaction
                                         #  / -max_pred_locks_per_relation) - 1
 #max_pred_locks_per_page = 2            # min 0
+#prolly_max_row_locks_per_table = 64    # min 1
 
 
 #------------------------------------------------------------------------------

@@ -86,6 +86,7 @@ struct ProllyKeyEncoder
 {
 	int			ncols;
 	bool		all_memcmp;
+	bool		equal_bytes;	/* equal keys are the same bytes */
 	KeyColumn  *cols;
 };
 
@@ -188,6 +189,23 @@ classify(Oid opfamily, Oid type, Oid collation, ColumnKind *kind,
 	return true;
 }
 
+/*
+ * Does equality under the opfamily imply equal values, byte for byte
+ * (btree's "equalimage" support function, as deduplication asks)?  Then
+ * equal values encode to the same bytes, since encodings are functions of
+ * the value.  memcmp-ordered columns need no asking.
+ */
+static bool
+equal_image(Oid opfamily, Oid base, Oid collation)
+{
+	Oid			proc = get_opfamily_proc(opfamily, base, base, BTEQUALIMAGE_PROC);
+
+	if (!OidIsValid(proc))
+		return false;
+	return DatumGetBool(OidFunctionCall1Coll(proc, collation,
+											 ObjectIdGetDatum(base)));
+}
+
 static bool
 ordered_supports(Oid opfamily, Oid type, Oid collation)
 {
@@ -206,6 +224,7 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 	enc->ncols = desc->nkeys;
 	enc->cols = MemoryContextAllocZero(mcxt, sizeof(KeyColumn) * desc->nkeys);
 	enc->all_memcmp = true;
+	enc->equal_bytes = true;
 
 	for (int i = 0; i < desc->nkeys; i++)
 	{
@@ -229,6 +248,8 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 		{
 			enc->all_memcmp = false;
 			fmgr_info_cxt(cmpproc, &col->cmp, mcxt);
+			if (!equal_image(desc->opfamilies[i], base, col->collation))
+				enc->equal_bytes = false;
 		}
 		if (col->kind == KIND_SEND)
 			col->codec = prolly_datum_codec(desc->types[i], -1, mcxt);
@@ -533,6 +554,12 @@ ordered_prefix_length(ProllyKeyEncoder *enc, const ProllyKey *key, int ncols)
 	return p - key->data;
 }
 
+static bool
+ordered_equal_bytes(ProllyKeyEncoder *enc)
+{
+	return enc->equal_bytes;
+}
+
 static void
 ordered_end(ProllyKeyEncoder *enc)
 {
@@ -554,6 +581,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.encode = ordered_encode,
 	.decode = ordered_decode,
 	.compare = ordered_compare,
+	.equal_bytes = ordered_equal_bytes,
 	.prefix_length = ordered_prefix_length,
 	.end = ordered_end,
 };

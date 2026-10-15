@@ -52,6 +52,16 @@ typedef struct ProllyCoordRoutine
 							 TM_FailureData *tmfd);
 
 	/*
+	 * A transaction other than this one that holds a write lock on key in
+	 * tree (NULL: on any part of tree), or InvalidTransactionId: the one a
+	 * uniqueness check must wait for before deciding a row it found (or a
+	 * TID it can't resolve) is really there, as heap reports a tuple's
+	 * inserter or deleter.  The caller waits (XactLockTableWait()) and
+	 * asks again: there may be more than one.
+	 */
+	TransactionId (*writer_of) (Relation tree, const ProllyKey *key);
+
+	/*
 	 * Speculative insertion (INSERT ... ON CONFLICT): announce intent to
 	 * insert key with spec_token, so others wait with
 	 * SpeculativeInsertionWait(); then confirm or withdraw it.
@@ -84,10 +94,13 @@ typedef struct ProllyCoordRoutine
 } ProllyCoordRoutine;
 
 #define PROLLY_COORD_CALLBACK_NAMES \
-	"shmem_size", "shmem_init", "lock_row", "insert_intent", \
+	"shmem_size", "shmem_init", "lock_row", "writer_of", "insert_intent", \
 	"insert_intent_complete", "predicate_lock_range", "written_since", \
 	"xact_commit", "xact_abort", "subxact_abort", "prune_markers"
 #define PROLLY_COORD_FIRST_CALLBACK shmem_size
+
+/* Row locks a transaction takes on one table before locking all of it. */
+extern PGDLLIMPORT int prolly_max_row_locks_per_table;
 
 static inline const ProllyCoordRoutine *
 prolly_coord_lookup(const char *name)
