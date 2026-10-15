@@ -664,3 +664,96 @@ opportunistic pruning skips shared pages.
 - Each I/O looks up the map (a copied map page or two); a buffer header
   that remembers its physical block would save the lookup on writes.
   Measured in step 8.
+
+## 6. Step 2 design: branches as copies of versioned schemas
+
+Proposed 2026-10-16; built as a stack, one PR per part, in this order.
+
+### 6.1 Versioned schemas
+
+- `CREATE SCHEMA name VERSIONED` sets `pg_namespace.nspversioned`.
+  Turning an existing schema versioned (or not) is refused for now.
+- A relation created in a versioned schema gets the `prolly` access
+  method whatever the default; another explicit access method, `UNLOGGED`,
+  and `ALTER TABLE … SET SCHEMA` between a versioned and an ordinary schema
+  are refused. `USING prolly` outside a versioned schema is refused.
+- An object is versioned if its schema is, or, for an object without a
+  schema (a column, constraint, trigger, rule, policy, default, index
+  entry, enum label, TOAST table), if the object it belongs to is.
+  `object_is_versioned(classid, objid)` answers this from the catalogs.
+- **The dependency rule** is checked in `recordMultipleDependencies()`:
+  a dependency from a shared object to a versioned one is an error, so it
+  covers every kind of dependency Postgres records. Extensions are shared;
+  `CREATE EXTENSION … SCHEMA` into a versioned schema is refused.
+
+### 6.2 Branches and sessions
+
+- **`pg_branch`**, a database-local catalog, lists the database's
+  branches: an OID (the branch id used in catalog rows), a name, and
+  later its head and baseline. `main` is a bootstrap row with a fixed OID.
+  Branch id 0 means "shared": no branch.
+- A session's branch, `MyBranch`, is `main` unless the connection named
+  another (`dbname/branch`, as D1 sessions do; a database D1 versions
+  keeps D1's meaning). `dolt_checkout()` changes it and resets the
+  backend's caches as an invalidation overflow does.
+
+### 6.3 Branch-aware catalogs
+
+- **Which catalogs:** every database-local catalog that can hold a
+  versioned object's rows gains a branch column (`<prefix>branch`, type
+  `oid`, default 0), listed in one table (`catalog/branch.c`) with each
+  catalog's rule for deciding a row's branch:
+  - a schema column (`pg_class.relnamespace`, `pg_type.typnamespace`,
+    `pg_proc.pronamespace` and the like): the row is versioned if its
+    schema is;
+  - an owning-object column (`pg_attribute.attrelid`, `pg_index.indexrelid`,
+    `pg_trigger.tgrelid`, `pg_enum.enumtypid`, `pg_depend`'s depender,
+    `pg_description`'s object, …): the row is versioned if that object is;
+  - TOAST tables and their indexes, which live in `pg_toast`, are
+    versioned if their table is: `create_toast_table()` passes its parent.
+- **Unique indexes** of these catalogs gain the branch column as their
+  last key, so a versioned object's rows can repeat its OID and name once
+  per branch.
+- **Writes:** `CatalogTupleInsert` and `CatalogTupleUpdate` set the branch
+  column by the catalog's rule: `MyBranch` for a versioned object's row,
+  0 otherwise. Callers don't change.
+- **Reads:** heap scans and index fetches of these catalogs skip rows
+  whose branch is neither 0 nor `MyBranch`, in heapam (the catalogs are
+  heap tables), so `systable_*`, `heap_getnext` loops and the caches built
+  on them all see one branch. A relcache flag marks the catalogs and the
+  column, so other relations pay one test.
+
+### 6.4 Copy-on-write pages
+
+- Block-map entries gain meaning for their birth epoch: a relation fork's
+  map header holds its sharing epoch, and an entry born before it may be
+  shared with another branch's copy.
+- **Remapping** (part 5's rule): an exclusive content lock on a buffer
+  whose page is shared first copies the page to a new physical block and
+  logs the new entry, outside any critical section.
+- **Fold epochs and changed-page lists** (part 2): a page's first logical
+  change after its relation's fold epoch is copied even when not shared,
+  and listed; built here, used by step 4.
+- **Reference counts:** a physical block shared by several maps is freed
+  when the last map that holds it drops it; a per-block count in the
+  allocator's bitmap pages (one byte per block, saturating at 255, then
+  the block is never freed until reclamation in step 7 sweeps).
+
+### 6.5 Making a branch
+
+- `dolt_branch(name)` flushes the session branch's dirty buffers of its
+  versioned relations, inserts a `pg_branch` row, copies every catalog row
+  whose branch is `MyBranch` with the new branch's id (same OIDs), gives
+  each copied relation a new relation file number whose map is a copy of
+  its source's with every entry marked shared, and raises the source's
+  sharing epoch. Cost: O(versioned catalog rows + map pages).
+- `dolt_branch_delete(name)` deletes the branch's rows and drops its
+  relations' storage; shared physical blocks survive in their other maps.
+
+### 6.6 Maintenance on shared pages
+
+- Hint bits are written in place on shared pages (they change no row).
+- Pruning and freezing remap a shared page first (they write WAL), so
+  they never change a page another branch can see.
+- Opportunistic pruning (on a read) skips shared pages, so reads don't
+  copy pages.
