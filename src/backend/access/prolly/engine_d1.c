@@ -2417,30 +2417,31 @@ same_hash(const ProllyNodeRef *a, const ProllyNodeRef *b)
 		memcmp(a->hash.bytes, b->hash.bytes, a->hash.len) == 0;
 }
 
+/*
+ * The branch root this transaction's writes make of the tip: every write
+ * set's tree built first (the costly part), then, under the branch lock
+ * (which the caller keeps), the tip's other trees taken as they are and the
+ * edits replayed onto trees others changed since (their changes are to keys
+ * this transaction didn't write).
+ */
 static void
-d1_xact_precommit(void)
+build_branch_root(ProllyNodeRef *new_root)
 {
-	const ProllyCommitRoutine *commit;
+	const ProllyCommitRoutine *commit = backend.c.commit;
 	ProllyRootSet tip;
 	D1WriteSet **sets;
 	ProllyRootEdit *edits;
 	int			n = 0;
-	ProllyNodeRef new_root;
-
-	if (xact == NULL || xact->all == NULL)
-		return;
-	commit = backend.c.commit;
 
 	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
 		n++;
-	sets = palloc(sizeof(D1WriteSet *) * n);
+	sets = palloc(sizeof(D1WriteSet *) * Max(n, 1));
 	n = 0;
 	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
 		sets[n++] = ws;
 	qsort(sets, n, sizeof(D1WriteSet *), ws_order);
 
-	/* The new trees, built before the branch lock: the costly part. */
-	edits = palloc(sizeof(ProllyRootEdit) * n);
+	edits = palloc(sizeof(ProllyRootEdit) * Max(n, 1));
 	for (int i = 0; i < n; i++)
 	{
 		edits[i].sub = sets[i]->sub;
@@ -2454,11 +2455,6 @@ d1_xact_precommit(void)
 	if (!tip.has_root)
 		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
 	tip.has_root = true;
-
-	/*
-	 * Under it, replay the edits onto trees others changed since: their
-	 * changes are to keys this transaction didn't write.
-	 */
 	for (int i = 0; i < n; i++)
 	{
 		D1WriteSet *ws = sets[i];
@@ -2470,15 +2466,92 @@ d1_xact_precommit(void)
 		if (!same_hash(&current, &ws->base))
 			materialize_onto(ws, &current, &edits[i].tree);
 	}
-
-	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
-				edits, n, &new_root);
-	xact->ticket = PROLLY_CALL(commit, enqueue, xact->branch, &new_root,
-							   GetCurrentTransactionId());
-	xact->enqueued = true;
-	PROLLY_CALL(commit, branch_unlock, xact->branch);
+	if (n > 0)
+		PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
+					edits, n, new_root);
+	else
+		*new_root = tip.root;
 	pfree(sets);
 	pfree(edits);
+}
+
+static void
+d1_xact_precommit(void)
+{
+	ProllyNodeRef new_root;
+
+	if (xact == NULL || xact->all == NULL)
+		return;
+	build_branch_root(&new_root);
+	xact->ticket = PROLLY_CALL(backend.c.commit, enqueue, xact->branch,
+							   &new_root, GetCurrentTransactionId());
+	xact->enqueued = true;
+	PROLLY_CALL(backend.c.commit, branch_unlock, xact->branch);
+}
+
+static void
+d1_pending_root(ProllyNodeRef *root)
+{
+	backend_init();
+	if (xact == NULL || xact->all == NULL)
+	{
+		ProllyBranchId branch = current_branch();
+
+		PROLLY_CALL(backend.c.commit, branch_lock, branch);
+		if (!PROLLY_CALL(backend.c.commit, tip, branch, root))
+			PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, root);
+		return;
+	}
+	build_branch_root(root);
+}
+
+static ProllyRootSet *
+d1_roots_at(const ProllyNodeRef *root)
+{
+	ProllyRootSet *roots = palloc0(sizeof(ProllyRootSet));
+
+	backend_init();
+	roots->has_root = true;
+	roots->root = *root;
+	return roots;
+}
+
+/* The committed trees' changes, in tree's current key order. */
+static void
+d1_diff(ProllyRootSet *from, ProllyRootSet *to, Relation tree,
+		ProllyTreeVisitChange visit, void *arg)
+{
+	ProllySubRoot sub = subroot_for(tree, PROLLY_TREE_DATA);
+	RelFileNumber relnumber = tree->rd_locator.relNumber;
+	ProllyNodeRef a;
+	ProllyNodeRef b;
+	D1Order		order;
+	ProllyTreeEnv env;
+
+	backend_init();
+	find_tree(from, sub, relnumber, &a);
+	find_tree(to, sub, relnumber, &b);
+	open_order(tree, sub, NULL, CurrentMemoryContext, &order);
+	if (order_lost(&order))
+	{
+		close_order(&order);
+		order_lost_error();
+	}
+	tree_env(&order, &env);
+	if (a.hash.len == 0 || b.hash.len == 0)
+	{
+		ProllyTreeBuilder *bld = PROLLY_CALL(backend.c.tree, build_begin, &env,
+											 CurrentMemoryContext);
+		ProllyNodeRef empty;
+
+		PROLLY_CALL(backend.c.tree, build_finish, bld, &empty);
+		if (a.hash.len == 0)
+			a = empty;
+		if (b.hash.len == 0)
+			b = empty;
+	}
+	PROLLY_CALL(backend.c.tree, diff, &env, &a, &b, visit, arg);
+	close_order(&order);
 }
 
 static void
@@ -2961,6 +3034,9 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.tree_copy = d1_tree_copy,
 	.roots_acquire = d1_roots_acquire,
 	.roots_release = d1_roots_release,
+	.roots_at = d1_roots_at,
+	.diff = d1_diff,
+	.pending_root = d1_pending_root,
 	.cursor_open = d1_cursor_open,
 	.cursor_seek = d1_cursor_seek,
 	.cursor_next = d1_cursor_next,

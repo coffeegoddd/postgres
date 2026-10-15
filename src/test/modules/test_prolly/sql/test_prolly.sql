@@ -65,7 +65,7 @@ SELECT prolly_branch_create(NULL, NULL);
 SELECT prolly_checkout('feature') IS NULL AS checked_out;
 SELECT prolly_commit('first commit') IS NOT NULL AS committed;
 SELECT * FROM prolly_diff('main', 'feature');
-SELECT prolly_merge('feature');
+SELECT prolly_merge('feature') IS NOT NULL AS merged;
 SELECT prolly_clone('file:///nowhere');
 SELECT prolly_fetch('file:///nowhere', 'main');
 SELECT prolly_push('file:///nowhere', 'main');

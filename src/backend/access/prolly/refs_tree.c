@@ -550,6 +550,10 @@ tree_resolve(const char *refname, ProllyHash *commit_id)
 	ProllyHash	root;
 
 	refs_init();
+
+	/* HEAD: the session branch's head commit, as in Dolt. */
+	if (strcmp(refname, "HEAD") == 0)
+		refname = branch_name(prolly_session_branch());
 	if (branch_get(refname, &id, &head))
 	{
 		if (head.len == 0)
@@ -690,6 +694,31 @@ tree_checkout(const char *name)
 	prolly_set_session_branch(id);
 }
 
+/* Write a commit of branch name's working set wr; make it the head. */
+static void
+record_commit(const char *name, ProllyBranchId branch, const char *message,
+			  const ProllyHash *parents, int nparents,
+			  const ProllyNodeRef *wr, ProllyHash *commit_id)
+{
+	ProllyHash	local = wr->hash;
+	ProllyHash	canonical = local;
+	StringInfoData key;
+	StringInfoData v;
+
+	write_commit(&canonical, parents, nparents,
+				 GetUserNameFromId(GetUserId(), false), message,
+				 GetCurrentTransactionStartTimestamp(), commit_id);
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	commit_key(commit_id, &key);
+	put_hash(&v, &local);
+	add_edit(key.data, key.len, &v);
+	branch_put(name, branch, commit_id);
+	pfree(key.data);
+	pfree(v.data);
+}
+
 static void
 tree_commit(const char *message, ProllyHash *commit_id)
 {
@@ -698,10 +727,6 @@ tree_commit(const char *message, ProllyHash *commit_id)
 	ProllyBranchId id;
 	ProllyHash	head;
 	ProllyNodeRef wr;
-	ProllyHash	local;
-	ProllyHash	canonical;
-	StringInfoData key;
-	StringInfoData v;
 
 	if (prolly_xact_has_writes())
 		ereport(ERROR,
@@ -716,21 +741,31 @@ tree_commit(const char *message, ProllyHash *commit_id)
 	/* The branch's working set, as committed so far. */
 	if (!working_root(branch, &wr))
 		PROLLY_CALL(comps.root_layout, empty, &root_env, &wr);
-	local = wr.hash;
-	canonical = local;
+	record_commit(name, branch, message, &head, head.len > 0 ? 1 : 0, &wr,
+				  commit_id);
+}
 
-	write_commit(&canonical, &head, head.len > 0 ? 1 : 0,
-				 GetUserNameFromId(GetUserId(), false), message,
-				 GetCurrentTransactionStartTimestamp(), commit_id);
+static void
+tree_commit_with(const char *message, const ProllyHash *parents, int nparents,
+				 const ProllyNodeRef *working_set, ProllyHash *commit_id)
+{
+	ProllyBranchId branch = prolly_session_branch();
 
-	initStringInfo(&key);
-	initStringInfo(&v);
-	commit_key(commit_id, &key);
-	put_hash(&v, &local);
-	add_edit(key.data, key.len, &v);
-	branch_put(name, branch, commit_id);
-	pfree(key.data);
-	pfree(v.data);
+	lock_refs();
+	record_commit(branch_name(branch), branch, message, parents, nparents,
+				  working_set, commit_id);
+}
+
+static bool
+tree_commit_working_set(const ProllyHash *commit_id, ProllyNodeRef *root)
+{
+	ProllyHash	local;
+
+	refs_init();
+	if (!commit_local_root(commit_id, &local))
+		return false;
+	ref_of(&local, root);
+	return true;
 }
 
 /* The newest common ancestor of a and b: breadth first from both. */
@@ -983,5 +1018,7 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.resolve = tree_resolve,
 	.commit_get = tree_commit_get,
 	.merge_base = tree_merge_base,
+	.commit_working_set = tree_commit_working_set,
+	.commit_with = tree_commit_with,
 	.walk = tree_walk,
 };

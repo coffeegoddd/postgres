@@ -65,6 +65,19 @@ typedef struct ProllyRefsRoutine
 	bool		(*merge_base) (const ProllyHash *a, const ProllyHash *b,
 							   ProllyHash *base);
 
+	/* The working set a commit recorded; false if the refs don't know it. */
+	bool		(*commit_working_set) (const ProllyHash *commit_id,
+									   ProllyNodeRef *root);
+
+	/*
+	 * Record a commit of the current branch with these parents and this
+	 * working set (a merge, whose working set the transaction is about to
+	 * commit), and make it the branch's head commit.
+	 */
+	void		(*commit_with) (const char *message, const ProllyHash *parents,
+								int nparents, const ProllyNodeRef *working_set,
+								ProllyHash *commit_id);
+
 	/*
 	 * Visit every node the refs keep alive, from the root of their own
 	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
@@ -75,7 +88,8 @@ typedef struct ProllyRefsRoutine
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
-	"commit", "resolve", "commit_get", "merge_base", "walk"
+	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
+	"commit_with", "walk"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

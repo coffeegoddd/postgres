@@ -81,7 +81,7 @@ static const ProllyProfile profiles[] = {
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "tree",
 	[PROLLY_IFACE_TRANSFER] = "stub",
-	[PROLLY_IFACE_DIFF_MERGE] = "stub",
+	[PROLLY_IFACE_DIFF_MERGE] = "rows",
 };
 
 static const ProllyImplInfo *
