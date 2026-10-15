@@ -279,17 +279,9 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 
 	memset(ref, 0, sizeof(*ref));
 	ref->hash = hash;
-	ref->location.blkno = InvalidBlockNumber;
-	if (PROLLY_CALL(env->node_store, contains, env->store, &hash))
-	{
-		Buffer		buf = PROLLY_CALL(env->node_store, read, env->store, ref);
-
-		if (env->counters)
-			env->counters->nodes_read++;
-		ref->location.blkno = BufferGetBlockNumber(buf);
-		ReleaseBuffer(buf);
-	}
-	else
+	/* A node the store already has is reused where it is, unread. */
+	if (!PROLLY_CALL(env->node_store, contains, env->store, &hash,
+					 &ref->location))
 	{
 		ProllyNodeRef newref;
 		Buffer		buf = PROLLY_CALL(env->node_store, new_node, env->store, &newref);
