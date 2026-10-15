@@ -10,6 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use ProllyTest;
 
 my $am = $ENV{PROLLY_AM} // 'prolly_d1';
 my $conf = "default_table_access_method = '$am'\n"
@@ -27,6 +28,7 @@ $standby->append_conf('postgresql.conf', $conf);
 $standby->start;
 
 $primary->safe_psql('postgres', 'CREATE DATABASE src');
+setup_target($primary, 'src', $am);
 $primary->safe_psql('src', q{
 	CREATE TABLE t (id int PRIMARY KEY, v text);
 	INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
@@ -42,6 +44,7 @@ for my $strategy ('file_copy', 'wal_log')
 {
 	$primary->safe_psql('postgres',
 		"CREATE DATABASE copy_$strategy TEMPLATE src STRATEGY $strategy");
+	check_target($primary, "copy_$strategy", $am);
 	is($primary->safe_psql("copy_$strategy", $rows), $expect,
 		"a $strategy copy has the template's rows");
 }

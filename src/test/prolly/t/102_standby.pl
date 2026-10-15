@@ -8,6 +8,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use ProllyTest;
 
 my $am = $ENV{PROLLY_AM} // 'prolly_d1';
 my $conf = qq(
@@ -19,6 +20,7 @@ my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->append_conf('postgresql.conf', $conf);
 $primary->start;
+setup_target($primary, 'postgres', $am);
 $primary->safe_psql('postgres', q(
 	CREATE TABLE rep (id int PRIMARY KEY, v text);
 	INSERT INTO rep SELECT g, 'v' || g FROM generate_series(1, 1000) g;
