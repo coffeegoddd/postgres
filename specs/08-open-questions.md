@@ -23,6 +23,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | ANALYZE sampling (44) | Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts; keyless tables and tables the transaction wrote are read whole. Built in 4d.4 |
 | Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
 | TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
+| Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Scheduled in 4e.5 |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 
@@ -217,6 +218,11 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     WAL-logged and in shared buffers. Temporary tables use backend-local
     buffers, and unlogged tables are reset after a crash. Do they get their
     own stores, stay heap, or aren't they supported?
+    **Decided (user, 2026-10-14):** they use heap. They are never part of a
+    commit (Dolt's temporary tables aren't either), so heap keeps their
+    Postgres behaviour exactly; a temporary or unlogged table created while
+    prolly is the default access method gets heap, and an explicit
+    `USING prolly` on one is refused.
 29. **Tablespaces.** With one store, `CREATE TABLE … TABLESPACE` can't place a
     prolly table's data. One store per tablespace, or tablespaces ignored for
     prolly tables?
@@ -429,6 +435,9 @@ Nothing below is decided unless its entry says so. Update this file when somethi
     a root per open savepoint (Dolt's checkpoints) so rollback still works;
     commit replays edits recovered by diffing the intermediate tree against
     the base, which is why subtree-skipping diff comes with it.
+    PREPARE TRANSACTION after prolly writes uses the same flush: the
+    prepared transaction's write set becomes an intermediate tree whose
+    root is kept in the two-phase state file (user, 2026-10-14, 4e.4).
 48. **Large values.** Items must fit a node, and prolly tables have no
     TOAST table.
     **Recommended (2026-10-14), for 4f:** out-of-line value trees in the

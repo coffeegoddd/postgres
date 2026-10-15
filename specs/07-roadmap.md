@@ -426,6 +426,17 @@ and pending-write memory (unbounded). The rest are met by design and
 checked when built (4g, V4); engines expose node read and write counters so
 tests can assert the bounds (gate 7).
 
+**Plan (2026-10-14, user): 4e in five stacked PRs, riskiest dependencies
+first.**
+
+| | Work |
+|---|---|
+| 4e.1 | Engine counters of nodes read and written; tree diff that skips matching internal subtrees, O((Δ + 1) log N), with a counted test of the bound (gate 7) |
+| 4e.2 | Root-carrying snapshots: a snapshot keeps the root set it started with, so every scan of a REPEATABLE READ transaction reads the same roots (B1, B2) |
+| 4e.3 | K1 row-level locks replacing `single_writer`, so writers to different rows of one table run concurrently; the commit pipeline materializes changed trees before the branch's commit lock and, under it, replays the write set onto a newer head |
+| 4e.4 | Bounded transaction memory (question 47): write sets flushed to intermediate trees with savepoint roots, edits recovered at replay by diff; PREPARE TRANSACTION after prolly writes, its write set flushed and its root recorded in the two-phase state file, replayed at COMMIT PREPARED (user, 2026-10-14) |
+| 4e.5 | SERIALIZABLE on prolly tables; the isolation-suite stalls from the single writer; temporary and unlogged tables use heap (question 28); TID counter ranges per backend |
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.
