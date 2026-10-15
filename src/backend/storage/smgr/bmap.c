@@ -118,11 +118,6 @@ typedef struct BmapHeader
 	BlockNumber nblocks;		/* the relation's logical length */
 } BmapHeader;
 
-typedef struct BmapNode
-{
-	BmapEntry	entries[FLEXIBLE_ARRAY_MEMBER];
-} BmapNode;
-
 typedef struct BmapMeta
 {
 	uint32		version;
@@ -155,7 +150,8 @@ typedef struct BmapMeta
 #define PageGetBmapOpaque(page) \
 	((BmapPageOpaqueData *) PageGetSpecialPointer(page))
 #define PageGetBmapHeader(page)	((BmapHeader *) PageGetContents(page))
-#define PageGetBmapNode(page)	((BmapNode *) PageGetContents(page))
+/* a map page's contents are BMAP_FANOUT entries */
+#define PageGetBmapEntries(page)	((BmapEntry *) PageGetContents(page))
 #define PageGetBmapMeta(page)	((BmapMeta *) PageGetContents(page))
 #define PageGetBmapBits(page)	((uint64 *) PageGetContents(page))
 
@@ -286,12 +282,12 @@ init_page(Page page, uint16 type)
 static void
 init_node(Page page)
 {
-	BmapNode   *node;
+	BmapEntry  *entries;
 
 	init_page(page, BMAP_PAGE_NODE);
-	node = PageGetBmapNode(page);
+	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < BMAP_FANOUT; i++)
-		node->entries[i].block = InvalidBlockNumber;
+		entries[i].block = InvalidBlockNumber;
 }
 
 static void
@@ -324,16 +320,16 @@ static void
 apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 {
 	const xl_bmap_entry_delta *ent = (const xl_bmap_entry_delta *) (delta + 1);
-	BmapNode   *node;
+	BmapEntry  *entries;
 
 	if (delta->flags & BMAP_DELTA_INIT)
 		init_node(page);
-	node = PageGetBmapNode(page);
+	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < delta->nentries; i++)
 	{
 		Assert(ent[i].slot < BMAP_FANOUT);
-		node->entries[ent[i].slot].block = ent[i].block;
-		node->entries[ent[i].slot].epoch = ent[i].epoch;
+		entries[ent[i].slot].block = ent[i].block;
+		entries[ent[i].slot].epoch = ent[i].epoch;
 	}
 }
 
@@ -539,7 +535,7 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 		   BlockNumber *run, bool missing_ok, bool for_write)
 {
 	PGIOAlignedBlock copy;
-	BmapNode   *node = PageGetBmapNode(copy.data);
+	BmapEntry  *entries = PageGetBmapEntries(copy.data);
 	uint32		slot = MAP_SLOT(blkno);
 	BlockNumber phys;
 	BlockNumber n;
@@ -549,7 +545,7 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	else
 	{
 		read_node(reln, MAP_PAGE(blkno), for_write, copy.data, BMAP_PAGE_NODE);
-		phys = node->entries[slot].block;
+		phys = entries[slot].block;
 	}
 	if (!BlockNumberIsValid(phys))
 	{
@@ -563,7 +559,7 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	}
 	n = 1;
 	while (n < maxrun && slot + n < BMAP_FANOUT &&
-		   node->entries[slot + n].block == phys + n)
+		   entries[slot + n].block == phys + n)
 		n++;
 
 	if (run)
@@ -730,7 +726,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	for (uint32 i = 0; i < n; i++)
 	{
 		phys[i] = mapnew ? InvalidBlockNumber :
-			PageGetBmapNode(BufferGetPage(mapbuf))->entries[MAP_SLOT(from + i)].block;
+			PageGetBmapEntries(BufferGetPage(mapbuf))[MAP_SLOT(from + i)].block;
 		need[i] = !BlockNumberIsValid(phys[i]);
 		if (need[i])
 			nneed++;
@@ -1157,16 +1153,16 @@ drop_blocks(SMgrRelation reln)
 		for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
 		{
 			Buffer		buf = map_read(rel, mapblk);
-			BmapNode   *node;
+			BmapEntry  *entries;
 			uint32		n = 0;
 
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
 					   mapblk);
-			node = PageGetBmapNode(BufferGetPage(buf));
+			entries = PageGetBmapEntries(BufferGetPage(buf));
 			for (uint32 i = 0; i < BMAP_FANOUT; i++)
-				if (BlockNumberIsValid(node->entries[i].block))
-					blocks[n++] = node->entries[i].block;
+				if (BlockNumberIsValid(entries[i].block))
+					blocks[n++] = entries[i].block;
 			UnlockReleaseBuffer(buf);
 
 			qsort(blocks, n, sizeof(BlockNumber), cmp_block);
