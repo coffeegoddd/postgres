@@ -8,7 +8,9 @@ from pbench.core import registry
 from pbench.core.interfaces import CellResult, RunInfo, Sink, Status
 
 _SHOW = [("tps", "tps", "{:.0f}"), ("latency_p99_ms", "p99", "{:.2f}ms"),
-         ("rows_per_second", "rows/s", "{:.0f}"), ("commit_ms", "commit", "{:.1f}ms")]
+         ("rows_per_second", "rows/s", "{:.0f}"), ("commit_ms", "commit", "{:.1f}ms"),
+         ("pass_percent", "pass", "{:.3f}%"), ("not_ok", "not_ok", "{:.0f}"),
+         ("not_implemented", "not_impl", "{:.0f}"), ("crashed", "crashed", "{:.0f}")]
 
 
 @registry.sinks.register("console")

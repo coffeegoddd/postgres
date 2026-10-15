@@ -116,6 +116,9 @@ class LocalCluster(Cluster):
         return (f"postgresql:///{dbname}?host={quote(str(self.sock_dir), safe='')}"
                 f"&port={self.port}&user=postgres")
 
+    def conninfo(self) -> str:
+        return f"host={self.sock_dir} port={self.port} user=postgres"
+
     def sql(self, sql: str, *, dbname: str = "postgres",
             options: Optional[dict[str, str]] = None,
             check: bool = True) -> SqlResult:

@@ -1,0 +1,32 @@
+# A quick C suite (under a minute): C1 and C2 whole, and the first file of
+# each directory of C3 and C4.  Settings as in c_standard.toml.
+
+[run]
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 0
+sizes = ["corpus"]
+collectors = []
+fio_baseline = false
+
+[postgres]
+shared_buffers = "2GB"
+max_connections = 100
+fsync = "off"
+synchronous_commit = "off"
+full_page_writes = "off"
+autovacuum = "off"
+
+[sizes.corpus]
+
+[workloads.C3]
+sample = "per_directory"
+
+[workloads.C4]
+sample = "per_directory"
+
+[tools]
+sqllogictest = "~/cursor_src/sqllogictest"
+slt_runner = "build-bench/slt/slt-runner"
+slt_source_hash_file = "build-bench/slt/SOURCE_HASH"

@@ -151,7 +151,7 @@ class Runner:
         if self.cfg["run"]["fio_baseline"]:
             environment["fio"] = env_mod.fio_baseline(
                 self.work_dir, int(self.cfg["run"]["fio_seconds"]), raw_root)
-        warnings = env_mod.warnings(environment)
+        warnings = env_mod.warnings(environment, self.suite)
         info = RunInfo(suite=self.suite, label=self.label, table_am=self.table_am,
                        started=dt.datetime.now().isoformat(timespec="seconds"),
                        command=self.command, config=self.cfg, environment=environment,

@@ -4,6 +4,7 @@ warnings for conditions that make results less trustworthy."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -86,11 +87,34 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
         env["benchbase_source"] = _git(Path(tools["benchbase_source"]))
     if tools.get("benchbase_build_commit_file"):
         env["benchbase_build_commit"] = _read(tools["benchbase_build_commit_file"])
+    if tools.get("sqllogictest"):
+        env["sqllogictest"] = _git(Path(tools["sqllogictest"]))
+    if tools.get("slt_source_hash_file"):
+        env["slt_build_source_hash"] = _read(tools["slt_source_hash_file"])
+        env["slt_source_hash"] = slt_source_hash(repo)
     return env
 
 
-def warnings(env: dict[str, Any]) -> list[str]:
+def slt_source_hash(repo: Path) -> str:
+    """The hash build_slt.sh records: go.mod, go.sum and *.go of the
+    runner's source, concatenated in byte order of their names."""
+    src = repo / "src" / "tools" / "prolly_bench" / "slt"
+    names = sorted(p.name for p in src.iterdir()
+                   if p.name in ("go.mod", "go.sum") or p.suffix == ".go")
+    h = hashlib.sha256()
+    for n in names:
+        h.update((src / n).read_bytes())
+    return h.hexdigest()
+
+
+def warnings(env: dict[str, Any], suite: str = "S") -> list[str]:
     w = []
+    if env.get("slt_build_source_hash") is not None and \
+            env["slt_build_source_hash"] != env.get("slt_source_hash"):
+        w.append("slt-runner was built from other source than slt/ holds now; "
+                 "run build_slt.sh")
+    if suite == "C":
+        return w  # the rest concern performance
     if env["cpu_governors"] != ["performance"]:
         w.append(f"CPU governor is {env['cpu_governors']}, not performance "
                  "(run system/system_prepare.sh)")

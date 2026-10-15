@@ -31,8 +31,14 @@ RUN_DEFAULTS: dict[str, Any] = {
     "fio_seconds": 20,
 }
 
-# Settings every run requires: results are only comparable when durable.
+# Settings every S and V run requires: results are only comparable when
+# durable.  The C suite measures correctness, not speed, and doesn't crash
+# the server on purpose, so it may run without them.
 REQUIRED_SETTINGS = {"fsync": "on", "synchronous_commit": "on"}
+DURABILITY_EXEMPT_SUITES = {"C"}
+
+# The default configuration per suite, in configs/.
+DEFAULT_CONFIGS = {"S": "standard.toml", "V": "standard.toml", "C": "c_standard.toml"}
 
 # Settings the harness itself needs, under the config's settings.
 HARNESS_SETTINGS = {
@@ -59,7 +65,7 @@ def merge(base: dict, over: dict) -> dict:
     return out
 
 
-def load(path: Path, overrides: dict[str, Any]) -> dict[str, Any]:
+def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, Any]:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     unknown = set(raw) - _TOP_LEVEL
@@ -83,6 +89,8 @@ def load(path: Path, overrides: dict[str, Any]) -> dict[str, Any]:
         if name not in cfg["sizes"]:
             raise ConfigError(f"size {name!r} has no [sizes.{name}] section")
     for k, v in REQUIRED_SETTINGS.items():
+        if suite in DURABILITY_EXEMPT_SUITES:
+            break
         actual = cfg["postgres"].get(k, v)
         if actual != v:
             raise ConfigError(f"{k} = {actual}: the procedure requires {k} = {v} "
