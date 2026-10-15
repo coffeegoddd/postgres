@@ -229,6 +229,17 @@ $s1->query_safe('ROLLBACK');
 $s2->query_safe('ROLLBACK');
 $s3->quit;
 
+# FOR KEY SHARE doesn't conflict with an update that keeps the key: a
+# REPEATABLE READ foreign-key check of a parent updated meanwhile (another
+# column) succeeds, as on heap (Postgres's lock-committed-update test).
+$s2->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM parent;');
+$node->safe_psql('postgres', q{UPDATE parent SET note = 'changed' WHERE id = 1});
+$s2->query('INSERT INTO child VALUES (100, 1)');
+is($s2->{stderr}, '', 'a foreign-key check of a parent whose other columns changed meanwhile succeeds');
+$s2->{stderr} = '';
+$s2->query_safe('COMMIT');
+is($node->safe_psql('postgres', 'SELECT parent_id FROM child WHERE id = 100'), '1', 'and the row is inserted');
+
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{
 	CREATE TABLE acct (id int PRIMARY KEY, bal int);
