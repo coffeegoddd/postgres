@@ -48,9 +48,10 @@
  *   new version; renaming or retiring it keeps it.
  * - A TID is forgotten (tid_forget()) only when no index can still hold
  *   it (VACUUM); only then may an implementation give it out again.
- * - The map lives in the relation's PROLLY_TREE_ROWID tree, through the
- *   engine, so it is transactional and per branch like the data; whatever
- *   makes TIDs unique across aborts is not.
+ * - The map lives in the relation's PROLLY_TREE_ROWID and
+ *   PROLLY_TREE_ROWKEY trees, through the engine, so it is transactional
+ *   and per branch like the data; whatever makes TIDs unique across aborts
+ *   is not.
  *
  * Provisional (v0).
  *

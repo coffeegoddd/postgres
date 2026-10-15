@@ -23,7 +23,11 @@
  *   (rd_locator.relNumber), so new storage (TRUNCATE, rewrites) starts a
  *   new tree and the old one stays readable until the transaction ends.
  * - Keys of a table's data tree are ordered by the table keying
- *   (prolly_keying.h); keys of local metadata trees by memcmp.
+ *   (prolly_keying.h); keys of local metadata trees by memcmp, except
+ *   local metadata by row (PROLLY_TREE_ROWKEY): each of its keys is a data
+ *   tree key followed by PROLLY_ROWKEY_SUFFIX_LEN bytes, ordered by the data
+ *   key as the data tree is (and with it re-keyed, by the table AM), then
+ *   by the suffix's bytes.
  * - A command sees the writes of earlier commands of its transaction, not
  *   its own (cid), as heap does.  A write tagged InvalidCommandId (rows
  *   rebuilt in another encoding, which are not new writes) is seen by
@@ -97,7 +101,9 @@ typedef struct ProllyEngineRoutine
 	 * cursor_seek positions before the first key >= key (forward) or after
 	 * the last key <= key (backward); a NULL key means the start or end.
 	 * cursor_next returns false at the end.  A seek sees the writes made
-	 * before it, as get does, and keeps the nodes the cursor already holds,
+	 * before it, as get does (unless the tree was rebuilt in another key
+	 * order since the cursor began: it goes on reading the tree in the
+	 * order it began with), and keeps the nodes the cursor already holds,
 	 * so seeks in key order cost about what a scan does: a cursor kept
 	 * open and sought is how a caller looks up many keys in order.
 	 */
@@ -108,6 +114,13 @@ typedef struct ProllyEngineRoutine
 	bool		(*cursor_next) (ProllyCursor *cursor, ProllyKey *key,
 								ProllyValue *value);
 	void		(*cursor_close) (ProllyCursor *cursor);
+
+	/*
+	 * False while the tree's key order is lost (a type, operator family or
+	 * collation its keys are ordered by was dropped): the cursor can then
+	 * only scan forward from the start, and get() raises an error.
+	 */
+	bool		(*cursor_can_seek) (ProllyCursor *cursor);
 
 	/* Look up key as a cursor would see it; on success append its value. */
 	bool		(*get) (ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
@@ -193,7 +206,7 @@ typedef struct ProllyEngineRoutine
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
 	"roots_acquire", "roots_release", "cursor_open", "cursor_seek", \
-	"cursor_next", "cursor_close", "get", "has_writes", "key_at", "count_range", \
+	"cursor_next", "cursor_close", "cursor_can_seek", "get", "has_writes", "key_at", "count_range", \
 	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
 	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \

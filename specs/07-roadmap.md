@@ -459,10 +459,17 @@ reading O(N log N) nodes (about six per row on a 20,000-row table). Fixed
 in a follow-up PR before 4e.2: a tree cursor's seek keeps the nodes of the
 path it holds, so seeks in key order read each node about once; a D1
 cursor's seek sees writes made since it opened, as a lookup does; and a
-scan finds TIDs by seeking one cursor over the version entries. The scan
-now reads each node of the data tree and of the version entries once
-(1,334 reads for 20,000 rows, the minimum; checked in `d1_tables`, and
-seeks in order by a tree conformance check).
+scan finds TIDs by seeking one cursor over the version entries. The
+version entries moved to their own local tree, ordered as the data tree
+is (`PROLLY_TREE_ROWKEY`, in a keyed local sub-root), so the seeks move
+forward for every key type: collated text, numeric and other keys whose
+bytes don't sort in key order included (a review found 40,726 reads for an
+ICU-collated scan of 20,000 rows when the entries were in byte order; now
+1,384). The scan reads each node of the data tree and of the version
+entries once (1,358 reads for 20,000 integer keys, 1,437 for numeric ones;
+checked in `d1_tables`, and seeks in order by a tree conformance check).
+While a table's key order is lost, a scan reads the version entries whole
+and looks them up by bytes, until the next write rebuilds them.
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

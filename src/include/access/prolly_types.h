@@ -91,9 +91,13 @@ typedef enum ProllyTreeKind
 	PROLLY_TREE_DATA = 0,
 	PROLLY_TREE_ROWID = 1,		/* row identity: TIDs <-> rows */
 	PROLLY_TREE_META = 2,		/* facts about the data tree, such as its keying */
+	PROLLY_TREE_ROWKEY = 3,		/* local metadata by row, in the data tree's order */
 } ProllyTreeKind;
 
-#define PROLLY_TREE_KIND_LAST	PROLLY_TREE_META
+#define PROLLY_TREE_KIND_LAST	PROLLY_TREE_ROWKEY
+
+/* Bytes that follow the data key in each key of a PROLLY_TREE_ROWKEY tree. */
+#define PROLLY_ROWKEY_SUFFIX_LEN	8
 
 /*
  * Opaque handles.  Each is defined privately by the implementation that

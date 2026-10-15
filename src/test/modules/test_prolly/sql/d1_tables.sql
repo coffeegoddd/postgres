@@ -409,6 +409,17 @@ SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
 SELECT count(*) FROM d1_counted;
 SELECT nodes_read - :r0 BETWEEN 1 AND 2000 AS reads_each_node_once
 FROM prolly_node_counters('prolly_d1');
+-- The same for keys whose bytes don't sort in key order (numeric keys are
+-- compared by their comparison function): a scan still reads each node
+-- about once, finding TIDs in the order it reads rows.
+CREATE TABLE d1_counted_numeric (id numeric PRIMARY KEY, v text) USING prolly_d1;
+INSERT INTO d1_counted_numeric
+SELECT g * 7.25, repeat('v', 50) || g FROM generate_series(1, 20000) g;
+SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
+SELECT count(*) FROM d1_counted_numeric;
+SELECT nodes_read - :r0 BETWEEN 1 AND 2000 AS reads_each_node_once
+FROM prolly_node_counters('prolly_d1');
+DROP TABLE d1_counted_numeric;
 SELECT * FROM prolly_node_counters('heap');
 -- A scan finds TIDs by seeking one cursor over the row identity map, so a
 -- seek must see writes made since the cursor opened, even when the tree

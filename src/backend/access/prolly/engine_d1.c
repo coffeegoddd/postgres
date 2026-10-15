@@ -10,7 +10,9 @@
  * are found in it by relfilenumber: its data tree in the catalog or
  * user-data sub-root, its local metadata (row identity map) in the local
  * sub-root.  Local metadata of every kind shares one tree per relation,
- * each key prefixed by its kind byte.  A relation absent from the root
+ * each key prefixed by its kind byte, except local metadata by row
+ * (PROLLY_TREE_ROWKEY), which has its own tree in the keyed local sub-root,
+ * ordered as the data tree is.  A relation absent from the root
  * has empty trees, and an absent root (a database that never committed a
  * prolly write) has no relations.
  *
@@ -117,6 +119,7 @@ typedef struct D1Order
 	ProllyKeying *keying;
 	const ProllyIndexKeyingRoutine *ix_routine;
 	ProllyIndexKeying *ix;
+	bool		suffixed;		/* keys are a data key, then suffix bytes */
 } D1Order;
 
 static inline bool
@@ -233,6 +236,8 @@ static ProllySubRoot
 subroot_for(Relation rel, ProllyTreeKind kind)
 {
 	check_kind(kind);
+	if (kind == PROLLY_TREE_ROWKEY)
+		return PROLLY_SUBROOT_LOCAL_KEYED;
 	if (kind != PROLLY_TREE_DATA)
 		return PROLLY_SUBROOT_LOCAL;
 	return IsCatalogRelation(rel) ? PROLLY_SUBROOT_CATALOG :
@@ -279,10 +284,26 @@ static int
 keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
 	D1Order    *o = arg;
+	ProllyKey	da;
+	ProllyKey	db;
+	int			r;
 
 	if (o->ix)
 		return PROLLY_CALL(o->ix_routine, compare, o->ix, a, b);
-	return PROLLY_CALL(o->routine, compare, o->keying, a, b);
+	if (!o->suffixed)
+		return PROLLY_CALL(o->routine, compare, o->keying, a, b);
+
+	/* By the data keys, then by the suffixes' bytes. */
+	if (a->len < PROLLY_ROWKEY_SUFFIX_LEN || b->len < PROLLY_ROWKEY_SUFFIX_LEN)
+		elog(ERROR, "prolly key by row is too short");
+	da.data = a->data;
+	da.len = a->len - PROLLY_ROWKEY_SUFFIX_LEN;
+	db.data = b->data;
+	db.len = b->len - PROLLY_ROWKEY_SUFFIX_LEN;
+	r = PROLLY_CALL(o->routine, compare, o->keying, &da, &db);
+	if (r != 0)
+		return r;
+	return memcmp(a->data + da.len, b->data + db.len, PROLLY_ROWKEY_SUFFIX_LEN);
 }
 
 /* The tree environment for a tree in order (NULL: memcmp). */
@@ -318,6 +339,7 @@ open_order(Relation rel, ProllySubRoot sub, ProllyRootSet *roots,
 	memset(order, 0, sizeof(*order));
 	if (is_local(sub))
 		return;
+	order->suffixed = (sub == PROLLY_SUBROOT_LOCAL_KEYED);
 	prolly_components_for_relation(rel, &c);
 	initStringInfo(&desc);
 	if (roots)
@@ -879,23 +901,67 @@ cursor_unbind(ProllyCursor *c)
 		close_order(&c->order);
 }
 
+/* Whether two orders put keys in the same order (the same keying). */
+static bool
+same_order(const D1Order *a, const D1Order *b)
+{
+	StringInfoData da;
+	StringInfoData db;
+	bool		same;
+
+	if (a->keying == NULL || b->keying == NULL)
+		return a->keying == b->keying && a->ix == b->ix;
+	if (a->keying == b->keying)
+		return true;
+	initStringInfo(&da);
+	initStringInfo(&db);
+	PROLLY_CALL(a->routine, describe, a->keying, &da);
+	PROLLY_CALL(b->routine, describe, b->keying, &db);
+	same = da.len == db.len && memcmp(da.data, db.data, da.len) == 0;
+	pfree(da.data);
+	pfree(db.data);
+	return same;
+}
+
 /*
  * Whether the transaction has, since the cursor was bound, made the tree's
  * write set or given the tree a new base (emptied or rebuilt it).  A write
  * set already bound is read live, so later writes to it need no rebind.
+ * A tree rebuilt in another key order (the table was re-keyed) is not
+ * rebound: the cursor goes on reading the tree in the order it began with,
+ * as a scan of the tree from before the rebuild does.
  */
 static bool
 cursor_stale(ProllyCursor *c)
 {
 	D1WriteSet *ws = find_writeset(c->sub, c->tree->rd_locator.relNumber);
+	bool		changed;
 
 	if (ws != c->ws || (ws && ws->replaced) != c->replaced)
-		return true;
-	if (c->replaced)
-		return ws->base.hash.len != c->base.hash.len ||
+		changed = true;
+	else if (c->replaced)
+		changed = ws->base.hash.len != c->base.hash.len ||
 			memcmp(ws->base.hash.bytes, c->base.hash.bytes,
 				   ws->base.hash.len) != 0;
-	return false;
+	else
+		changed = false;
+
+	if (changed && c->order.keying != NULL)
+	{
+		D1Order		now;
+		bool		same;
+
+		if (ws)
+		{
+			refresh_order(ws, c->tree);
+			return same_order(&c->order, &ws->order);
+		}
+		open_order(c->tree, c->sub, c->roots, CurrentMemoryContext, &now);
+		same = same_order(&c->order, &now);
+		close_order(&now);
+		return same;
+	}
+	return changed;
 }
 
 static ProllyCursor *
@@ -1198,6 +1264,12 @@ d1_cursor_close(ProllyCursor *c)
 }
 
 static bool
+d1_cursor_can_seek(ProllyCursor *c)
+{
+	return !c->unordered;
+}
+
+static bool
 d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	   const ProllyKey *key, CommandId cid, StringInfo value)
 {
@@ -1357,6 +1429,8 @@ d1_tree_create(Relation rel, const RelFileLocator *newrlocator, char persistence
 	(void) get_writeset(rel, subroot_for(rel, PROLLY_TREE_DATA),
 						newrlocator->relNumber, true);
 	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, newrlocator->relNumber, true);
+	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL_KEYED, newrlocator->relNumber,
+						true);
 }
 
 static void
@@ -1367,6 +1441,8 @@ d1_tree_truncate(Relation rel)
 						rel->rd_locator.relNumber, true);
 	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL, rel->rd_locator.relNumber,
 						true);
+	(void) get_writeset(rel, PROLLY_SUBROOT_LOCAL_KEYED,
+						rel->rd_locator.relNumber, true);
 }
 
 static void
@@ -1377,7 +1453,7 @@ d1_tree_reset(Relation rel, ProllyTreeKind kind)
 	if (is_local(sub))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("prolly engine \"d1\" resets only data trees")));
+				 errmsg("prolly engine \"d1\" resets only data trees and local metadata by row")));
 	backend_init();
 	(void) get_writeset(rel, sub, rel->rd_locator.relNumber, true);
 }
@@ -1531,10 +1607,11 @@ materialize(D1WriteSet *ws, ProllyNodeRef *out)
 static void
 d1_tree_copy(Relation rel, const RelFileLocator *newrlocator)
 {
-	ProllySubRoot subs[2] = {subroot_for(rel, PROLLY_TREE_DATA), PROLLY_SUBROOT_LOCAL};
+	ProllySubRoot subs[3] = {subroot_for(rel, PROLLY_TREE_DATA), PROLLY_SUBROOT_LOCAL,
+	PROLLY_SUBROOT_LOCAL_KEYED};
 
 	backend_init();
-	for (int i = 0; i < 2; i++)
+	for (int i = 0; i < lengthof(subs); i++)
 	{
 		D1WriteSet *from = get_writeset(rel, subs[i], rel->rd_locator.relNumber,
 										false);
@@ -1796,6 +1873,7 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.cursor_seek = d1_cursor_seek,
 	.cursor_next = d1_cursor_next,
 	.cursor_close = d1_cursor_close,
+	.cursor_can_seek = d1_cursor_can_seek,
 	.get = d1_get,
 	.has_writes = d1_has_writes,
 	.key_at = d1_key_at,

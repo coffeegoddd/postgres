@@ -21,21 +21,27 @@
  * starts a new counter, as its indexes are rebuilt; SET TABLESPACE and
  * CREATE DATABASE copy the page with the table.
  *
- * The relation's row-identity tree holds, keyed by a tag byte:
+ * The relation's row-identity tree (PROLLY_TREE_ROWID) holds, keyed by a
+ * tag byte:
  *
  *	'T' block(4) offset(2)
  *		-> content-length content varint-ordinal xmin(4) row-key
  *		for every TID whose version may exist, or once its version is gone
  *		-> 0 cid(4) xmin(4) flag [successor TID (6 bytes) if flag] row
  *		where row is the gone version's row, kept like a dead tuple
- *	'V' row-key ordinal(8) -> TID (6 bytes)
- *		for every version in the table; an entry may outlive its version
- *		(see tid_rename), but only while no version is at its key
  *
- * (integers big-endian), where xmin is the transaction that wrote the
- * version: local metadata, like the TIDs themselves, never part of
- * canonical content.  A scan finds a row's TID by its 'V' entry, seeking
- * one cursor over the map as it goes.
+ * and its tree of local metadata by row (PROLLY_TREE_ROWKEY), in the data
+ * tree's key order, holds a version entry for every version in the table:
+ *
+ *	row-key ordinal(8) -> TID (6 bytes)
+ *
+ * An entry may outlive its version (see tid_rename), but only while no
+ * version is at its key.  Integers are big-endian; xmin is the transaction
+ * that wrote the version: local metadata, like the TIDs themselves, never
+ * part of canonical content.  A scan finds a row's TID by its version
+ * entry, seeking one cursor over them as it goes: they are in the order
+ * the scan reads rows, whatever the table's key order, so the cursor only
+ * moves forward.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/rowid_counter.c
@@ -49,6 +55,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "access/xact.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/hsearch.h"
@@ -56,7 +63,6 @@
 #include "utils/rel.h"
 
 #define TAG_TID			'T'
-#define TAG_VERSION		'V'
 
 #define TID_KEY_LEN		7
 #define TID_BYTES		6
@@ -87,13 +93,26 @@ typedef struct Reservation
 
 static HTAB *reservations = NULL;
 
+/* A version entry, read whole while the entries' key order is lost. */
+typedef struct LoadedVersion
+{
+	uint8	   *key;
+	uint32		keylen;
+	ItemPointerData tid;
+} LoadedVersion;
+
 struct ProllyRowIdScan
 {
 	ProllyRootSet *roots;
 	Relation	rel;
 	CommandId	cid;
 	StringInfoData buf;
-	ProllyCursor *cursor;		/* over the map, made on first use */
+	ProllyCursor *cursor;		/* over the version entries, made on first use */
+
+	/* The cursor can't seek: every entry, sorted by bytes */
+	bool		loaded;
+	LoadedVersion *versions;
+	int			nversions;
 };
 
 static const ProllyEngineRoutine *
@@ -275,14 +294,15 @@ tid_key(ItemPointer tid, uint8 *buf)
 	return key;
 }
 
-/* The 'V' key of the version at key with ordinal, in buf. */
+/* The version entry's key of the version at key with ordinal, in buf. */
 static ProllyKey
 version_key(const ProllyKey *key, uint64 ordinal, StringInfo buf)
 {
 	ProllyKey	k;
 
+	StaticAssertDecl(PROLLY_ROWKEY_SUFFIX_LEN == 8,
+					 "a version key's suffix is its ordinal");
 	resetStringInfo(buf);
-	appendStringInfoChar(buf, TAG_VERSION);
 	appendBinaryStringInfo(buf, (const char *) key->data, key->len);
 	for (int i = 7; i >= 0; i--)
 		appendStringInfoChar(buf, (char) (ordinal >> (i * 8)));
@@ -386,7 +406,7 @@ same_content(const ProllyHash *a, const ProllyHash *b)
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
-/* The TID the 'V' entry of (key, ordinal) holds, seeing writes before cid. */
+/* The TID the version entry of (key, ordinal) holds, seeing writes before cid. */
 static bool
 version_tid(const ProllyEngineRoutine *engine, ProllyRootSet *roots,
 			Relation rel, const ProllyKey *key, uint64 ordinal, CommandId cid,
@@ -397,14 +417,14 @@ version_tid(const ProllyEngineRoutine *engine, ProllyRootSet *roots,
 	bool		found;
 
 	initStringInfo(&v);
-	found = PROLLY_CALL(engine, get, roots, rel, PROLLY_TREE_ROWID, &vkey, cid, &v);
+	found = PROLLY_CALL(engine, get, roots, rel, PROLLY_TREE_ROWKEY, &vkey, cid, &v);
 	if (found)
 		decode_tid((const uint8 *) v.data, v.len, tid);
 	pfree(v.data);
 	return found;
 }
 
-/* Remove the 'V' entry of (key, ordinal) if it holds tid. */
+/* Remove the version entry of (key, ordinal) if it holds tid. */
 static void
 drop_version(const ProllyEngineRoutine *engine, ProllyRootSet *roots,
 			 Relation rel, const ProllyKey *key, uint64 ordinal,
@@ -419,7 +439,7 @@ drop_version(const ProllyEngineRoutine *engine, ProllyRootSet *roots,
 	{
 		ProllyKey	vkey = version_key(key, ordinal, &buf);
 
-		PROLLY_CALL(engine, remove, rel, PROLLY_TREE_ROWID, &vkey, cid);
+		PROLLY_CALL(engine, remove, rel, PROLLY_TREE_ROWKEY, &vkey, cid);
 	}
 	pfree(buf.data);
 }
@@ -440,7 +460,7 @@ put_version(const ProllyEngineRoutine *engine, Relation rel,
 	encode_tid(tid, &t);
 	v.data = (const uint8 *) t.data;
 	v.len = t.len;
-	PROLLY_CALL(engine, put, rel, PROLLY_TREE_ROWID, &vkey, &v, cid);
+	PROLLY_CALL(engine, put, rel, PROLLY_TREE_ROWKEY, &vkey, &v, cid);
 	pfree(buf.data);
 	pfree(t.data);
 }
@@ -528,10 +548,58 @@ counter_scan_begin(ProllyRootSet *roots, Relation rel, CommandId cid)
 	return scan;
 }
 
+static int
+loaded_cmp(const void *a, const void *b)
+{
+	const LoadedVersion *va = a;
+	const LoadedVersion *vb = b;
+	int			r = memcmp(va->key, vb->key, Min(va->keylen, vb->keylen));
+
+	if (r != 0)
+		return r;
+	return (va->keylen > vb->keylen) - (va->keylen < vb->keylen);
+}
+
 /*
- * A scan finds rows in its key order, so it seeks one cursor over the map
- * rather than looking up each row: seeks near the last one read no new
- * nodes, where a lookup reads a whole path.
+ * Read every version entry, in the scan's memory: while the table's key
+ * order is lost, the entries can't be sought, only scanned (the table's
+ * next write rebuilds them).
+ */
+static void
+load_versions(const ProllyEngineRoutine *engine, ProllyRowIdScan *scan)
+{
+	ProllyKey	k;
+	ProllyValue v;
+	int			cap = 1024;
+
+	scan->versions = palloc(sizeof(LoadedVersion) * cap);
+	PROLLY_CALL(engine, cursor_seek, scan->cursor, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(engine, cursor_next, scan->cursor, &k, &v))
+	{
+		LoadedVersion *lv;
+
+		if (scan->nversions == cap)
+		{
+			cap *= 2;
+			scan->versions = repalloc_huge(scan->versions,
+										   sizeof(LoadedVersion) * cap);
+		}
+		lv = &scan->versions[scan->nversions++];
+		lv->key = palloc(k.len);
+		memcpy(lv->key, k.data, k.len);
+		lv->keylen = k.len;
+		decode_tid(v.data, v.len, &lv->tid);
+		CHECK_FOR_INTERRUPTS();
+	}
+	qsort(scan->versions, scan->nversions, sizeof(LoadedVersion), loaded_cmp);
+	scan->loaded = true;
+}
+
+/*
+ * A scan finds rows in its key order, and the version entries are in that
+ * order, so it seeks one cursor over them rather than looking up each row:
+ * seeks near the last one read no new nodes, where a lookup reads a whole
+ * path.
  */
 static bool
 counter_tid_find(ProllyRowIdScan *scan, const ProllyKey *key, uint64 ordinal,
@@ -548,8 +616,24 @@ counter_tid_find(ProllyRowIdScan *scan, const ProllyKey *key, uint64 ordinal,
 		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(scan));
 
 		scan->cursor = PROLLY_CALL(engine, cursor_open, scan->roots, scan->rel,
-								   PROLLY_TREE_ROWID, scan->cid);
+								   PROLLY_TREE_ROWKEY, scan->cid);
+		if (!PROLLY_CALL(engine, cursor_can_seek, scan->cursor))
+			load_versions(engine, scan);
 		MemoryContextSwitchTo(old);
+	}
+	if (scan->loaded)
+	{
+		LoadedVersion probe;
+		LoadedVersion *found;
+
+		probe.key = (uint8 *) vkey.data;
+		probe.keylen = vkey.len;
+		found = bsearch(&probe, scan->versions, scan->nversions,
+						sizeof(LoadedVersion), loaded_cmp);
+		if (found == NULL)
+			return false;
+		*tid = found->tid;
+		return true;
 	}
 	PROLLY_CALL(engine, cursor_seek, scan->cursor, &vkey, ForwardScanDirection);
 	if (!PROLLY_CALL(engine, cursor_next, scan->cursor, &k, &v) ||
@@ -674,15 +758,15 @@ counter_tid_rename(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 	named_entry(engine, roots, rel, tid, &v, &e);
 
 	/*
-	 * The entry at the old key and ordinal stays: a reader of the tree the
-	 * row was renamed from (a statement whose own write rebuilt the table
-	 * while it was scanning it) still finds the TID there.  Only a version
-	 * at that key and ordinal is ever looked up, and writing one replaces
-	 * the entry.
+	 * The entry at the new key and ordinal is always written: a re-keyed
+	 * table's version entries were emptied to be rebuilt in its new key
+	 * order.  The entry at the old key and ordinal stays: a reader of the
+	 * tree the row was renamed from (a statement whose own write rebuilt the
+	 * table while it was scanning it) still finds the TID there, reading the
+	 * entries as they were.  Only a version at that key and ordinal is ever
+	 * looked up, and writing one replaces the entry.
 	 */
-	if (e.ordinal != ordinal || e.key.len != key->len ||
-		memcmp(e.key.data, key->data, key->len) != 0)
-		put_version(engine, rel, key, ordinal, tid, cid);
+	put_version(engine, rel, key, ordinal, tid, cid);
 	initStringInfo(&entry);
 	encode_entry(content, ordinal, e.xmin, key, &entry);
 	put_entry(engine, rel, tid, &entry, cid);
@@ -694,7 +778,7 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.info = {
 		.iface = PROLLY_IFACE_ROW_IDENTITY,
 		.impl_id = 2,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "counter",
 		.description = "TIDs from a per-table counter that aborts don't roll "
 		"back, with a map both ways",
@@ -707,5 +791,5 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.tid_retire = counter_tid_retire,
 	.tid_renew = counter_tid_renew,
 	.tid_rename = counter_tid_rename,
-	/* tid_forget comes with VACUUM, which must also drop 'V' entries */
+	/* tid_forget comes with VACUUM, which must also drop version entries */
 };

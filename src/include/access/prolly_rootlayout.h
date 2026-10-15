@@ -6,8 +6,9 @@
  * A branch's root (its working-set root, published at SQL COMMIT) points
  * to three sub-roots: the catalog sub-root, holding every system catalog's
  * trees; the user-data sub-root, holding user tables' and indexes' trees;
- * and the local sub-root, holding per-relation metadata that is never part
- * of a version-control commit (TID maps).  Each sub-root maps a relation to
+ * the local sub-root, holding per-relation metadata that is never part of
+ * a version-control commit (TID maps); and the keyed local sub-root, holding
+ * local metadata kept in a relation's data order.  Each sub-root maps a relation to
  * the root of its tree.  "Did the schema change?" is one hash comparison of
  * catalog sub-roots, diff skips whichever sub-root didn't change, and
  * local metadata never changes the user-data sub-root's hash.
@@ -63,9 +64,10 @@ typedef enum ProllySubRoot
 	PROLLY_SUBROOT_CATALOG = 0,
 	PROLLY_SUBROOT_USER_DATA = 1,
 	PROLLY_SUBROOT_LOCAL = 2,
+	PROLLY_SUBROOT_LOCAL_KEYED = 3,
 } ProllySubRoot;
 
-#define PROLLY_NUM_SUBROOTS 3
+#define PROLLY_NUM_SUBROOTS 4
 
 /* What a layout is made of; filled in by the caller. */
 typedef struct ProllyRootEnv
