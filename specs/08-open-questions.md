@@ -26,6 +26,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Built in 4e.5 |
 | Step 4's remaining decisions (23, 25, 27, 29, 34, 35, 46–56) | Decided by the user 2026-10-14, as recommended: see each question |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
+| Direction (2026-10-15) | Proposed by the user: Postgres pages for the working set, copy-on-write page sets per branch, a Dolt-shaped chunk store for history (`11-pages-and-dolt-snapshots.md`). Supersedes prolly trees as primary storage; D1 tagged `prolly-d1` |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 
 ## Questions
@@ -314,6 +315,11 @@ Nothing below is decided unless its entry says so. Update this file when somethi
       known OID-free encoding (`oid` itself, unknown extension types), with
       a clear error, rather than hashing a local identifier.
       **Decided (user, 2026-10-14):** as recommended.
+    - Types with no binary send format (`aclitem`, user and extension
+      types declared with text I/O only). **Decided (user, 2026-10-15):**
+      stored as their text output, with the settings that affect output
+      fixed while encoding, and the column's canonical schema recording
+      the text form.
     - Column identity across renames: Dolt keeps column tags across
       renames, so a rename on one branch and an edit on another merge;
       identity here is by name. Rows are encoded by column position, so a
