@@ -180,7 +180,7 @@ test_bmap_unlink(PG_FUNCTION_ARGS)
 	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
 
 	smgrdounlinkall(&srel, 1, false);
-	XLogFlush(GetXLogInsertRecPtr());
+	XLogFlush(XactLastRecEnd);
 	PG_RETURN_VOID();
 }
 
