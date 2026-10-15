@@ -2055,8 +2055,14 @@ d1_count_range(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	read_base(roots, sub, relkey, ws, &base);
 	if (base.hash.len > 0)
 		n = PROLLY_CALL(backend.c.tree, count, &backend.memcmp_env, &base);
+	/* An estimate: some versions replace or delete others. */
 	if (ws)
-		n += ws->nentries;		/* an estimate: some may replace or delete */
+	{
+		n += ws->nentries;
+		if (ws->spill.root.hash.len > 0)
+			n += PROLLY_CALL(backend.c.tree, count, &backend.memcmp_env,
+							 &ws->spill.root);
+	}
 	return n;
 }
 
