@@ -7,6 +7,7 @@
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
   prolly_bench table [DIR ...]                  engines side by side, per metric
+  prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.label and len(ams) > 1:
         raise SystemExit("--label names one result set; give one --am with it")
     ok = True
+    out_dirs = []
     for am in ams:
         label = args.label
         if not label:
@@ -74,7 +76,11 @@ def _run(args: argparse.Namespace) -> int:
                         command="prolly_bench " + shlex.join(sys.argv[1:]),
                         allow_heap_v=args.allow_heap_v, keep_failed=args.keep_failed)
         results = runner.run()
+        out_dirs.append(runner.out_dir)
         ok = ok and all(r.status.value != "error" for r in results)
+    if args.suite == "C" and len(out_dirs) > 1:
+        from pbench import ccompare, table
+        print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
     return 0 if ok else 1
 
 
@@ -108,6 +114,17 @@ def _compare(args) -> int:
     return 0
 
 
+def _cdiff(args) -> int:
+    from pbench import ccompare, table
+    text = ccompare.cdiff(table.load_set(args.baseline), table.load_set(args.dir),
+                          args.classes, args.limit)
+    if args.output:
+        args.output.write_text(text)
+    else:
+        print(text)
+    return 0
+
+
 def _table(args) -> int:
     from pbench import table
     if args.dirs:
@@ -121,8 +138,15 @@ def _table(args) -> int:
         sets = table.discover(args.results, suite)
     if not sets:
         raise SystemExit(f"no {suite} result sets under {args.results}")
-    md = table.to_markdown(sets, suite)
     out = args.output or args.results / f"summary-{suite}"
+    if suite == "C":
+        from pbench import ccompare
+        md = ccompare.to_markdown(sets)
+        out.with_suffix(".md").write_text(md)
+        print(md)
+        print(f"written: {out.with_suffix('.md')}")
+        return 0
+    md = table.to_markdown(sets, suite)
     out.with_suffix(".md").write_text(md)
     out.with_suffix(".html").write_text(table.to_html(sets, suite))
     print(md)
@@ -176,11 +200,20 @@ def main(argv=None) -> int:
     t = sub.add_parser("table", help="engines side by side: a table per metric")
     t.add_argument("dirs", type=Path, nargs="*",
                    help="result sets (default: the latest per label)")
-    t.add_argument("--suite", choices=["S", "V"], default="S")
+    t.add_argument("--suite", choices=["S", "V", "C"], default="S")
     t.add_argument("--results", type=Path, default=REPO / "specs" / "results")
     t.add_argument("-o", "--output", type=Path,
                    help="output path without extension (default RESULTS/summary-SUITE)")
     t.set_defaults(fn=_table)
+
+    d = sub.add_parser("cdiff", help="C suite: one engine's differences from heap")
+    d.add_argument("baseline", type=Path)
+    d.add_argument("dir", type=Path)
+    d.add_argument("--class", dest="classes", type=_csv(str),
+                   help="only these classes (default: all but agree and postgres_semantics)")
+    d.add_argument("--limit", type=int, default=20, help="examples per group")
+    d.add_argument("-o", "--output", type=Path)
+    d.set_defaults(fn=_cdiff)
 
     args = p.parse_args(argv)
     return args.fn(args)

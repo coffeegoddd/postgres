@@ -5,6 +5,7 @@ Run: cd src/tools/prolly_bench && python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
+import gzip
 import json
 import random
 import tempfile
@@ -282,3 +283,57 @@ def _ctx(*, tools, params):
     return Context(key=key, cluster=None, table_am="heap", size_params={}, params=params,
                    warmup_seconds=0, measure_seconds=0, raw_dir=Path("."),
                    scratch_dir=Path("."), tools=tools)
+
+
+class CCompareTest(unittest.TestCase):
+    """Rendering of comparisons slt-runner already wrote (it isn't run)."""
+
+    def _set(self, root: Path, name: str, am: str, label: str):
+        from pbench.table import ResultSet
+        d = root / name
+        raw = d / "raw" / "C2" / "corpus" / "c1" / "r1"
+        (raw / "slt").mkdir(parents=True)
+        with gzip.open(raw / "slt" / "records.jsonl.gz", "wt") as f:
+            f.write("{}\n")
+        (d / "config.json").write_text(json.dumps({"tools": {
+            "slt_runner": "/nonexistent", "sqllogictest": str(root / "corpus")}}))
+        result = {"key": {"workload": "C2"}, "status": "ok", "raw_dir": str(raw),
+                  "metrics": {"records": 10, "skipped": 2, "ok": 6}}
+        return ResultSet(d, "C", label, am, "2026-10-15T00:00:00", [result])
+
+    def test_table_and_cdiff(self):
+        from pbench import ccompare
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "corpus" / "test" / "evidence").mkdir(parents=True)
+            (root / "corpus" / "test" / "evidence" / "in1.test").write_text(
+                "query I nosort\nSELECT 1\n  FROM t1\n----\n1\n")
+            base = self._set(root, "B0", "heap", "B0")
+            eng = self._set(root, "eng", "prolly", "prolly")
+            dest = eng.path / "compare" / "B0" / "C2"
+            dest.mkdir(parents=True)
+            (dest / "compare.json").write_text(json.dumps({
+                "counts": {"agree": 5, "regression": 1}, "gate_failures": 1,
+                "stale_exceptions": []}))
+            with gzip.open(dest / "diffs.jsonl.gz", "wt") as f:
+                f.write(json.dumps({"file": "evidence/in1.test", "line": 2,
+                                    "class": "regression",
+                                    "baseline": {"status": "ok", "rows": 1},
+                                    "engine": {"status": "not_ok", "sqlstate": "XX000",
+                                               "msg": "boom"}}) + "\n")
+            md = ccompare.to_markdown([eng, base])
+            self.assertIn("| C2 | 75.000% | 75.000% |", md)
+            self.assertIn("| C2 | 5 | 1 | FAIL |", md)
+            text = ccompare.cdiff(base, eng)
+            self.assertIn("## regression: 1", text)
+            self.assertIn("SELECT 1\n    FROM t1", text)
+            self.assertIn("prolly: not_ok, XX000, boom", text)
+
+    def test_exceptions_for(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as f:
+            f.write('[[exception]]\nfile = "a.test"\nline = 3\nreason = "all"\n'
+                    '[[exception]]\nfile = "b.test"\nline = 4\nam = "prolly"\nreason = "p"\n')
+            f.flush()
+            from pbench import ccompare
+            self.assertEqual(len(ccompare.exceptions_for("prolly", Path(f.name))), 2)
+            self.assertEqual(len(ccompare.exceptions_for("heap", Path(f.name))), 1)

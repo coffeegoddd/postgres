@@ -18,6 +18,10 @@
 //
 // The exit status is 0 when every file ran with its tables on the AM under
 // test, 3 when a table was on another AM, and 1 on any other failure.
+//
+//	slt-runner compare BASELINE_DIR ENGINE_DIR OUT_DIR [EXCEPTIONS_JSON]
+//
+// compares two runs' records (compare.go).
 package main
 
 import (
@@ -69,6 +73,9 @@ func (c *config) testSchema() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "compare" {
+		os.Exit(runCompare(os.Args[2:]))
+	}
 	cfg := &config{}
 	flag.StringVar(&cfg.dsn, "dsn", "", "libpq connection string (keyword form) of the server, without dbname")
 	flag.StringVar(&cfg.am, "am", "heap", "table access method under test")
