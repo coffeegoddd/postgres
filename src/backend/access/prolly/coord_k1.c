@@ -46,6 +46,8 @@
  */
 #include "postgres.h"
 
+#include "access/twophase.h"
+
 #include "access/prolly_builtins.h"
 #include "access/prolly_xact.h"
 #include "common/hashfn.h"
@@ -208,6 +210,26 @@ k1_insert_intent_complete(Relation tree, const ProllyKey *key,
 }
 
 /* The first holder of a lock conflicting with mode on tag that has an xid. */
+/*
+ * The xid of a lock holder, a running transaction or a prepared one (whose
+ * locks a dummy PGPROC holds, with no process); invalid if it has none.
+ */
+static TransactionId
+holder_xid(VirtualTransactionId vxid)
+{
+	TransactionId xid;
+	TransactionId xmin;
+	int			nsubxid;
+	bool		overflowed;
+	bool		more;
+
+	ProcNumberGetTransactionIds(vxid.procNumber, &xid, &xmin, &nsubxid,
+								&overflowed);
+	if (!TransactionIdIsValid(xid))
+		xid = TwoPhaseGetXidByVirtualXID(vxid, &more);
+	return xid;
+}
+
 static TransactionId
 holder(const LOCKTAG *tag, LOCKMODE mode)
 {
@@ -215,17 +237,12 @@ holder(const LOCKTAG *tag, LOCKMODE mode)
 
 	for (int i = 0; VirtualTransactionIdIsValid(holders[i]); i++)
 	{
-		TransactionId xid;
-		TransactionId xmin;
-		int			nsubxid;
-		bool		overflowed;
-
 		/*
 		 * A writer that has no xid yet hasn't written anything: what the
 		 * caller sees is still what is committed.
 		 */
-		ProcNumberGetTransactionIds(holders[i].procNumber, &xid, &xmin,
-									&nsubxid, &overflowed);
+		TransactionId xid = holder_xid(holders[i]);
+
 		if (TransactionIdIsValid(xid))
 			return xid;
 	}
@@ -266,13 +283,8 @@ k1_current_writers(Relation tree, TransactionId *xids, int max)
 	holders = GetLockConflicts(&tag, ShareLock, NULL);
 	for (int i = 0; VirtualTransactionIdIsValid(holders[i]); i++)
 	{
-		TransactionId xid;
-		TransactionId xmin;
-		int			nsubxid;
-		bool		overflowed;
+		TransactionId xid = holder_xid(holders[i]);
 
-		ProcNumberGetTransactionIds(holders[i].procNumber, &xid, &xmin,
-									&nsubxid, &overflowed);
 		if (!TransactionIdIsValid(xid))
 			continue;
 		if (n < max)
