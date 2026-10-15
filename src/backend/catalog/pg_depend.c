@@ -25,6 +25,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
 #include "catalog/partition.h"
+#include "catalog/versioned.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -85,6 +86,9 @@ recordMultipleDependencies(const ObjectAddress *depender,
 	 */
 	if (IsBootstrapProcessingMode())
 		return;
+
+	/* shared objects can't depend on versioned ones */
+	check_versioned_dependencies(depender, referenced, nreferenced);
 
 	dependDesc = table_open(DependRelationId, RowExclusiveLock);
 

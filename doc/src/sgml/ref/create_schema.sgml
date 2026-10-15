@@ -21,10 +21,10 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ]
-CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_specification</replaceable>
+CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ VERSIONED ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ VERSIONED ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ VERSIONED ]
+CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ VERSIONED ]
 
 <phrase>where <replaceable class="parameter">role_specification</replaceable> can be:</phrase>
 
@@ -117,6 +117,19 @@ CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_sp
         Do nothing (except issuing a notice) if a schema with the same name
         already exists.  <replaceable class="parameter">schema_element</replaceable>
         subcommands cannot be included when this option is used.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>VERSIONED</literal></term>
+      <listitem>
+       <para>
+        Make the schema versioned: every object in it exists once per
+        branch, and its tables are prolly tables.  Objects outside it can't
+        depend on objects in it, foreign keys can't join a table in it with
+        one outside it, objects can't move into or out of it, and
+        extensions can't be created in it.
        </para>
       </listitem>
      </varlistentry>

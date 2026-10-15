@@ -47,6 +47,7 @@ OBJS = \
 	pg_tablespace.o \
 	pg_type.o \
 	storage.o \
+	versioned.o \
 	toasting.o
 
 include $(top_srcdir)/src/backend/common.mk

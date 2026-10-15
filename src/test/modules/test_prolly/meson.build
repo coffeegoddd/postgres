@@ -37,6 +37,7 @@ tests += {
       'd1_index',
       'd1_maintenance',
       'prolly_tables',
+      'versioned_schemas',
     ],
   },
   'tap': {
@@ -69,6 +70,7 @@ tests += {
       't/026_d1_tid_reuse_branches.pl',
       't/027_d1_counter_crash.pl',
       't/028_bmap_storage.pl',
+      't/029_versioned_schema_dump.pl',
     ],
   },
 }

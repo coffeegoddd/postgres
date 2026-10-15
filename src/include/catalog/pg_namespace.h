@@ -29,6 +29,7 @@
  *
  *	nspname				name of the namespace
  *	nspowner			owner (creator) of the namespace
+ *	nspversioned		versioned: every object in it exists per branch
  *	nspacl				access privilege list
  * ----------------------------------------------------------------
  */
@@ -40,6 +41,7 @@ CATALOG(pg_namespace,2615,NamespaceRelationId)
 
 	NameData	nspname;
 	Oid			nspowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
+	bool		nspversioned BKI_DEFAULT(f);	/* objects in it are per branch */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	aclitem		nspacl[];
@@ -67,5 +69,7 @@ MAKE_SYSCACHE(NAMESPACEOID, pg_namespace_oid_index, 16);
  * prototypes for functions in pg_namespace.c
  */
 extern Oid	NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp);
+extern Oid	NamespaceCreateVersioned(const char *nspName, Oid ownerId,
+									 bool isTemp, bool versioned);
 
 #endif							/* PG_NAMESPACE_H */

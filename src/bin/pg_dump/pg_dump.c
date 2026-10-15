@@ -6068,6 +6068,7 @@ getNamespaces(Archive *fout)
 	int			i_nspname;
 	int			i_nspowner;
 	int			i_nspacl;
+	int			i_nspversioned;
 	int			i_acldefault;
 
 	query = createPQExpBuffer();
@@ -6079,7 +6080,8 @@ getNamespaces(Archive *fout)
 	appendPQExpBufferStr(query, "SELECT n.tableoid, n.oid, n.nspname, "
 						 "n.nspowner, "
 						 "n.nspacl, "
-						 "acldefault('n', n.nspowner) AS acldefault "
+						 "acldefault('n', n.nspowner) AS acldefault, "
+						 "coalesce((pg_catalog.to_jsonb(n) ->> 'nspversioned')::pg_catalog.bool, false) AS nspversioned "
 						 "FROM pg_namespace n");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
@@ -6094,6 +6096,7 @@ getNamespaces(Archive *fout)
 	i_nspowner = PQfnumber(res, "nspowner");
 	i_nspacl = PQfnumber(res, "nspacl");
 	i_acldefault = PQfnumber(res, "acldefault");
+	i_nspversioned = PQfnumber(res, "nspversioned");
 
 	for (i = 0; i < ntups; i++)
 	{
@@ -6104,6 +6107,7 @@ getNamespaces(Archive *fout)
 		nsinfo[i].dobj.catId.oid = atooid(PQgetvalue(res, i, i_oid));
 		AssignDumpId(&nsinfo[i].dobj);
 		nsinfo[i].dobj.name = pg_strdup(PQgetvalue(res, i, i_nspname));
+		nsinfo[i].versioned = (strcmp(PQgetvalue(res, i, i_nspversioned), "t") == 0);
 		nsinfo[i].dacl.acl = pg_strdup(PQgetvalue(res, i, i_nspacl));
 		nsinfo[i].dacl.acldefault = pg_strdup(PQgetvalue(res, i, i_acldefault));
 		nsinfo[i].dacl.privtype = 0;
@@ -11845,7 +11849,8 @@ dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo)
 	if (nspinfo->create)
 	{
 		appendPQExpBuffer(delq, "DROP SCHEMA %s;\n", qnspname);
-		appendPQExpBuffer(q, "CREATE SCHEMA %s;\n", qnspname);
+		appendPQExpBuffer(q, "CREATE SCHEMA %s%s;\n", qnspname,
+						  nspinfo->versioned ? " VERSIONED" : "");
 	}
 	else
 	{

@@ -150,7 +150,8 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
 	/* Create the schema's namespace */
-	namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+	namespaceId = NamespaceCreateVersioned(schemaName, owner_uid, false,
+										   stmt->versioned);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();

@@ -1,5 +1,5 @@
--- Prolly tables: heap's pages in block-mapped storage, beside heap tables.
--- A relation is block-mapped if it has a map fork.
+-- Prolly tables: heap's pages in block-mapped storage, in versioned
+-- schemas.  A relation is block-mapped if it has a map fork.
 CREATE FUNCTION pg_temp.block_mapped(rel regclass) RETURNS bool
 LANGUAGE sql AS $$
   SELECT (pg_stat_file(pg_relation_filepath(rel) || '_bmap', true)).size IS NOT NULL
@@ -15,20 +15,21 @@ LANGUAGE sql AS $$
     FROM pg_index WHERE indrelid = tbl
   ORDER BY 1
 $$;
-CREATE TABLE p (id int PRIMARY KEY, t text) USING prolly;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.p (id int PRIMARY KEY, t text);
 CREATE TABLE h (id int PRIMARY KEY, t text);
-SELECT amname FROM pg_am JOIN pg_class ON relam = pg_am.oid WHERE relname = 'p';
+SELECT amname FROM pg_am JOIN pg_class ON relam = pg_am.oid WHERE pg_class.oid = 'app.p'::regclass;
  amname 
 --------
  prolly
 (1 row)
 
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | t
- table        | t
- toast        | t
+SELECT * FROM pg_temp.storage('app.p');
+       rel        | block_mapped 
+------------------+--------------
+ index app.p_pkey | t
+ table            | t
+ toast            | t
 (3 rows)
 
 SELECT * FROM pg_temp.storage('h');
@@ -40,17 +41,17 @@ SELECT * FROM pg_temp.storage('h');
 (3 rows)
 
 -- Rows, out-of-line values, an index scan.
-INSERT INTO p SELECT g, repeat(md5(g::text), 100) FROM generate_series(1, 2000) g;
-UPDATE p SET t = 'short' WHERE id % 10 = 0;
-DELETE FROM p WHERE id % 7 = 0;
-SELECT count(*), sum(length(t)) FROM p;
+INSERT INTO app.p SELECT g, repeat(md5(g::text), 100) FROM generate_series(1, 2000) g;
+UPDATE app.p SET t = 'short' WHERE id % 10 = 0;
+DELETE FROM app.p WHERE id % 7 = 0;
+SELECT count(*), sum(length(t)) FROM app.p;
  count |   sum   
 -------+---------
   1715 | 4938460
 (1 row)
 
 SET enable_seqscan = off;
-SELECT id, length(t) FROM p WHERE id BETWEEN 9 AND 11 ORDER BY id;
+SELECT id, length(t) FROM app.p WHERE id BETWEEN 9 AND 11 ORDER BY id;
  id | length 
 ----+--------
   9 |   3200
@@ -59,171 +60,121 @@ SELECT id, length(t) FROM p WHERE id BETWEEN 9 AND 11 ORDER BY id;
 (3 rows)
 
 RESET enable_seqscan;
-SELECT pg_relation_size('p') > 0 AS has_size;
+SELECT pg_relation_size('app.p') > 0 AS has_size;
  has_size 
 ----------
  t
 (1 row)
 
 -- Storage made anew stays block-mapped.
-VACUUM p;
-VACUUM FULL p;
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | t
- table        | t
- toast        | t
+VACUUM app.p;
+VACUUM FULL app.p;
+SELECT * FROM pg_temp.storage('app.p');
+       rel        | block_mapped 
+------------------+--------------
+ index app.p_pkey | t
+ table            | t
+ toast            | t
 (3 rows)
 
-CLUSTER p USING p_pkey;
-REINDEX TABLE p;
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | t
- table        | t
- toast        | t
+CLUSTER app.p USING p_pkey;
+REINDEX TABLE app.p;
+SELECT * FROM pg_temp.storage('app.p');
+       rel        | block_mapped 
+------------------+--------------
+ index app.p_pkey | t
+ table            | t
+ toast            | t
 (3 rows)
 
-TRUNCATE p;
-INSERT INTO p VALUES (1, 'one');
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | t
- table        | t
- toast        | t
+TRUNCATE app.p;
+INSERT INTO app.p VALUES (1, 'one');
+SELECT * FROM pg_temp.storage('app.p');
+       rel        | block_mapped 
+------------------+--------------
+ index app.p_pkey | t
+ table            | t
+ toast            | t
 (3 rows)
 
-SELECT * FROM p;
+SELECT * FROM app.p;
  id |  t  
 ----+-----
   1 | one
 (1 row)
-
--- Changing the access method moves the storage.
-ALTER TABLE p SET ACCESS METHOD heap;
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | f
- table        | f
- toast        | f
-(3 rows)
-
-ALTER TABLE p SET ACCESS METHOD prolly;
-SELECT * FROM pg_temp.storage('p');
-     rel      | block_mapped 
---------------+--------------
- index p_pkey | t
- table        | t
- toast        | t
-(3 rows)
-
-SELECT * FROM p;
- id |  t  
-----+-----
-  1 | one
-(1 row)
-
-ALTER TABLE h SET ACCESS METHOD prolly;
-SELECT * FROM pg_temp.storage('h');
-     rel      | block_mapped 
---------------+--------------
- index h_pkey | t
- table        | t
- toast        | t
-(3 rows)
 
 -- Prolly tables are permanent.
-CREATE UNLOGGED TABLE u (id int) USING prolly;
-ERROR:  prolly storage supports only permanent tables
-DETAIL:  Temporary and unlogged tables are never part of a commit.
-HINT:  Leave out USING, and the table is stored by heap.
+CREATE UNLOGGED TABLE app.u (id int);
+ERROR:  a versioned schema can't hold unlogged or temporary tables
 CREATE TEMPORARY TABLE tmp (id int) USING prolly;
-ERROR:  prolly storage supports only permanent tables
-DETAIL:  Temporary and unlogged tables are never part of a commit.
-HINT:  Leave out USING, and the table is stored by heap.
-ALTER TABLE p SET UNLOGGED;
+ERROR:  prolly tables can only be created in a versioned schema
+HINT:  Create the table in a schema made with CREATE SCHEMA ... VERSIONED.
+ALTER TABLE app.p SET UNLOGGED;
 ERROR:  cannot change prolly table "p" to unlogged
 DETAIL:  Prolly tables are always permanent.
 HINT:  Use ALTER TABLE ... SET ACCESS METHOD heap first.
-CREATE UNLOGGED TABLE u (id int);
-ALTER TABLE u SET ACCESS METHOD prolly;
-ERROR:  prolly storage supports only permanent tables
-DETAIL:  Temporary and unlogged tables are never part of a commit.
-HINT:  Leave out USING, and the table is stored by heap.
 SET default_table_access_method = prolly;
 CREATE TEMPORARY TABLE tmp (id int);
 CREATE UNLOGGED TABLE u2 (id int);
+CREATE TABLE d (id int);
 SELECT relname, amname FROM pg_class JOIN pg_am ON relam = pg_am.oid
-  WHERE relname IN ('tmp', 'u2') ORDER BY 1;
+  WHERE relname IN ('tmp', 'u2', 'd') ORDER BY 1;
  relname | amname 
 ---------+--------
+ d       | heap
  tmp     | heap
  u2      | heap
-(2 rows)
-
-CREATE TABLE d (id int);
-SELECT * FROM pg_temp.storage('d');
-  rel  | block_mapped 
--------+--------------
- table | t
-(1 row)
+(3 rows)
 
 RESET default_table_access_method;
 -- Partitions, materialized views, CREATE TABLE AS.
-CREATE TABLE parted (id int, v text) PARTITION BY RANGE (id) USING prolly;
-CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100);
-CREATE TABLE parted_2 PARTITION OF parted FOR VALUES FROM (100) TO (200) USING heap;
-INSERT INTO parted SELECT g, 'v' FROM generate_series(0, 199) g;
-SELECT * FROM pg_temp.storage('parted_1');
+CREATE TABLE app.parted (id int, v text) PARTITION BY RANGE (id);
+CREATE TABLE app.parted_1 PARTITION OF app.parted FOR VALUES FROM (0) TO (100);
+INSERT INTO app.parted SELECT g, 'v' FROM generate_series(0, 99) g;
+SELECT * FROM pg_temp.storage('app.parted_1');
   rel  | block_mapped 
 -------+--------------
  table | t
  toast | t
 (2 rows)
 
-SELECT * FROM pg_temp.storage('parted_2');
-  rel  | block_mapped 
--------+--------------
- table | f
- toast | f
-(2 rows)
-
-SELECT count(*) FROM parted;
- count 
--------
-   200
-(1 row)
-
-CREATE MATERIALIZED VIEW mv USING prolly AS SELECT id FROM p;
-SELECT * FROM pg_temp.storage('mv');
-  rel  | block_mapped 
--------+--------------
- table | t
-(1 row)
-
-REFRESH MATERIALIZED VIEW mv;
-SELECT * FROM pg_temp.storage('mv');
-  rel  | block_mapped 
--------+--------------
- table | t
-(1 row)
-
-CREATE TABLE ctas USING prolly AS SELECT g AS id FROM generate_series(1, 100) g;
-SELECT * FROM pg_temp.storage('ctas');
-  rel  | block_mapped 
--------+--------------
- table | t
-(1 row)
-
-SELECT count(*) FROM ctas;
+SELECT count(*) FROM app.parted;
  count 
 -------
    100
 (1 row)
 
-DROP MATERIALIZED VIEW mv;
-DROP TABLE p, h, d, u, parted, ctas;
+CREATE MATERIALIZED VIEW app.mv AS SELECT id FROM app.p;
+SELECT * FROM pg_temp.storage('app.mv');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+REFRESH MATERIALIZED VIEW app.mv;
+SELECT * FROM pg_temp.storage('app.mv');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+CREATE TABLE app.ctas AS SELECT g AS id FROM generate_series(1, 100) g;
+SELECT * FROM pg_temp.storage('app.ctas');
+  rel  | block_mapped 
+-------+--------------
+ table | t
+(1 row)
+
+SELECT count(*) FROM app.ctas;
+ count 
+-------
+   100
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table app.p
+drop cascades to table app.parted
+drop cascades to materialized view app.mv
+drop cascades to table app.ctas
+DROP TABLE h, d, u2;

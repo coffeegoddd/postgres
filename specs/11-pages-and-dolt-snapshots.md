@@ -685,6 +685,18 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
   a dependency from a shared object to a versioned one is an error, so it
   covers every kind of dependency Postgres records. Extensions are shared;
   `CREATE EXTENSION … SCHEMA` into a versioned schema is refused.
+- **Foreign keys stay on one side** (built 2026-10-16). A foreign key puts
+  triggers on both tables, so even one from a versioned table to a shared
+  table would leave the shared table checking every branch's rows; the
+  dependency rule catches it (the referenced table's triggers depend on
+  the versioned constraint), and the foreign key code refuses it first
+  with a clearer message. This narrows part 1, which allowed references
+  from prolly tables to shared tables.
+- `default_table_access_method = prolly` means heap outside versioned
+  schemas; only an explicit `USING prolly` there is an error.
+- A function whose body is a string (not `BEGIN ATOMIC`) records no
+  dependency on what it queries; it resolves names when it runs, so a
+  shared function sees the session's branch.
 
 ### 6.2 Branches and sessions
 
