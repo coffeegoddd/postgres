@@ -215,6 +215,21 @@ def main(argv=None) -> int:
     d.add_argument("-o", "--output", type=Path)
     d.set_defaults(fn=_cdiff)
 
+    from pbench import differential
+    diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")
+    diff.add_argument("--am", default="prolly",
+                      choices=["heap", "prolly", "prolly_d1", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"])
+    diff.add_argument("--pg-bin", type=Path, required=True)
+    diff.add_argument("--out", type=Path, required=True, help="new artifact directory")
+    diff.add_argument("--runner", type=Path, default=REPO / "build-bench/differential/engine-diff")
+    diff.add_argument("--seed", type=int, default=1)
+    diff.add_argument("--seeds", type=int, default=10)
+    diff.add_argument("--steps", type=int, default=28)
+    diff.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
+    diff.add_argument("--replay", type=Path, help="saved program.json or reduced.json")
+    diff.add_argument("--self-test", action="store_true", help="also prove the comparator rejects a known mismatch")
+    diff.set_defaults(fn=differential.run)
+
     args = p.parse_args(argv)
     return args.fn(args)
 
