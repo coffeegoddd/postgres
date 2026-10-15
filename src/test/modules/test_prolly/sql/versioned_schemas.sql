@@ -56,6 +56,27 @@ CREATE TABLE plain.bad4 (id int, CHECK (id::text::app.mood IS NOT NULL));
 CREATE FUNCTION app.half(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 / 2';
 CREATE INDEX ON plain.base (app.half(id));
 
+-- ... nor come to depend on them when a dependency is replaced.
+CREATE FUNCTION plain.support(internal) RETURNS internal
+  AS 'text_starts_with_support' LANGUAGE internal;
+CREATE FUNCTION app.support(internal) RETURNS internal
+  AS 'text_starts_with_support' LANGUAGE internal;
+CREATE FUNCTION plain.f(text, text) RETURNS boolean
+  LANGUAGE sql SUPPORT plain.support AS 'SELECT starts_with($1, $2)';
+ALTER FUNCTION plain.f(text, text) SUPPORT app.support;
+CREATE FUNCTION app.g(text, text) RETURNS boolean
+  LANGUAGE sql SUPPORT plain.support AS 'SELECT starts_with($1, $2)';
+ALTER FUNCTION app.g(text, text) SUPPORT app.support;
+
+-- Default privileges for a versioned schema belong to it; global ones are
+-- shared.
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA plain GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC;
+CREATE TABLE app.granted (id int);
+SELECT has_table_privilege('public', 'app.granted', 'SELECT');
+
 -- Foreign keys stay on one side.
 CREATE TABLE app.child (id int REFERENCES app.t);
 CREATE TABLE app.bad5 (id int REFERENCES plain.base);

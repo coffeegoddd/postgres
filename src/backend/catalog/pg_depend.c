@@ -501,6 +501,12 @@ changeDependencyFor(Oid classId, Oid objectId,
 
 	newIsPinned = isObjectPinned(&objAddr);
 
+	/* shared objects can't come to depend on versioned ones */
+	depAddr.classId = classId;
+	depAddr.objectId = objectId;
+	depAddr.objectSubId = 0;
+	check_versioned_dependencies(&depAddr, &objAddr, 1);
+
 	if (oldIsPinned)
 	{
 		/*

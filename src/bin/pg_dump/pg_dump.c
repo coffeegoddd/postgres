@@ -1999,7 +1999,7 @@ selectDumpableNamespace(NamespaceInfo *nsinfo, Archive *fout)
 		/* Other system schemas don't get dumped */
 		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
 	}
-	else if (strcmp(nsinfo->dobj.name, "public") == 0)
+	else if (strcmp(nsinfo->dobj.name, "public") == 0 && !nsinfo->versioned)
 	{
 		/*
 		 * The public schema is a strange beast that sits in a sort of
@@ -6139,7 +6139,7 @@ getNamespaces(Archive *fout)
 		 * public schema depart from that, because changing its ACL so easily
 		 * breaks applications.
 		 */
-		if (strcmp(nsinfo[i].dobj.name, "public") == 0)
+		if (strcmp(nsinfo[i].dobj.name, "public") == 0 && !nsinfo[i].versioned)
 		{
 			PQExpBuffer aclarray = createPQExpBuffer();
 			PQExpBuffer aclitem = createPQExpBuffer();
@@ -11849,6 +11849,13 @@ dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo)
 	if (nspinfo->create)
 	{
 		appendPQExpBuffer(delq, "DROP SCHEMA %s;\n", qnspname);
+
+		/*
+		 * A versioned public schema replaced initdb's, so it replaces the
+		 * destination's too (which fails if anything is in it).
+		 */
+		if (nspinfo->versioned && strcmp(nspinfo->dobj.name, "public") == 0)
+			appendPQExpBuffer(q, "DROP SCHEMA IF EXISTS %s;\n", qnspname);
 		appendPQExpBuffer(q, "CREATE SCHEMA %s%s;\n", qnspname,
 						  nspinfo->versioned ? " VERSIONED" : "");
 	}

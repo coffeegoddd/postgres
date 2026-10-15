@@ -41,6 +41,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
@@ -206,6 +207,14 @@ object_is_versioned(const ObjectAddress *object)
 			return namespace_is_versioned(object->objectId);
 		case RelationRelationId:
 			return relation_is_versioned(object->objectId);
+		case DefaultAclRelationId:
+			/* versioned if it is for a versioned schema; global ones are shared */
+			tup = fetch_row(DefaultAclRelationId, object->objectId);
+			if (!HeapTupleIsValid(tup))
+				return false;
+			versioned = namespace_is_versioned(((Form_pg_default_acl) GETSTRUCT(tup))->defaclnamespace);
+			heap_freetuple(tup);
+			return versioned;
 		case AttrDefaultRelationId:
 		case TriggerRelationId:
 		case RewriteRelationId:
