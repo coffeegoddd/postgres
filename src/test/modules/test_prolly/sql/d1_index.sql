@@ -271,6 +271,19 @@ SELECT count(*) FROM mj WHERE v = 1;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
+-- A btree index on a prolly table isn't built in parallel: the table has no
+-- parallel scans (workers can't see a transaction's private writes).
+BEGIN;
+SET LOCAL max_parallel_maintenance_workers = 4;
+SET LOCAL min_parallel_table_scan_size = 0;
+INSERT INTO mj VALUES (2, 2);
+CREATE INDEX mj_btree ON mj USING btree (v);
+CREATE INDEX mj_expr ON mj USING btree ((k + 1));
+COMMIT;
+SET enable_seqscan = off;
+SELECT k, v FROM mj WHERE v = 2;
+RESET enable_seqscan;
+
 -- Not supported: prolly indexes on heap tables, INCLUDE columns.
 CREATE TABLE hx (a int) USING heap;
 CREATE INDEX hx_a ON hx USING prolly (a);

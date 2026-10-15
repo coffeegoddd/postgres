@@ -339,3 +339,56 @@ catalogs can be opened before catalogs are readable.
 - Order: versioned catalogs need a complete engine (concurrency, WAL,
   recovery), so they come in step 4g, with the canonicalizer and the
   working-set/commit model.
+
+## 4. Build plan (2026-10-15)
+
+What is built so far, and the order proposed for the rest. Each stage is a
+PR with its own tests, and Postgres's own suites must keep passing on heap
+catalogs after each one.
+
+**Built.** Data is versioned per branch: prolly tables' trees (found by
+relation OID), branches, commits, diff, merge with Dolt's conflicts,
+canonical commit roots by name from the (shared) catalogs, the `dolt_*`
+interface, and opt-in versioned databases. Catalogs are heap tables shared
+by every branch, so DDL on one branch applies to all of them, and indexes
+of other access methods (btree) are shared too.
+
+**Stages, in order.**
+
+1. **Catalog access through the table AM** (survey 1 and 3). The six
+   `CatalogTuple*` functions in `indexing.c` call `table_tuple_insert`,
+   `simple_table_tuple_update` and `simple_table_tuple_delete` through a
+   slot, setting `t_self` from the slot's TID and taking `update_indexes`
+   from the AM (HOT stays heap's business); the 34 `heap_getnext` loops
+   become `table_scan_getnextslot`. Heap catalogs go through the same path,
+   so every test exercises it.
+2. **A catalog AM that can be swapped in per catalog**, still storing in
+   heap: bootstrap and `formrdesc` take the AM from one table instead of
+   `HEAP_TABLE_AM_OID` (survey 5), and nailed catalogs reach it without a
+   catalog lookup. With heap there, behavior doesn't change; a debug
+   setting puts one non-nailed catalog (`pg_description`) on prolly, the
+   first versioned catalog, with its indexes as prolly indexes.
+3. **System columns and in-place updates** (survey 2 and 4): an emulated
+   `xmin` (the version's writer, kept in the TID map) and stable TIDs for
+   the tuple-lock interlock; in-place updates on a prolly catalog become
+   unversioned side records (statistics, `relfrozenxid`).
+4. **Per-database catalogs on prolly in a versioned database**, one
+   catalog family at a time (types and functions first, then `pg_class`
+   and `pg_attribute`, which are nailed), with catalog snapshots read from
+   the session branch's root, invalidation on checkout (a cache reset), and
+   relcache init files keyed by the catalog root's hash.
+5. **Schema in commits from the catalog trees**: the canonicalizer reads
+   catalog rows from the commit's root instead of the live catalogs;
+   checkout of a commit restores its schema; merge merges catalog rows
+   three-way and checks names and dependencies (question 26); schema
+   conflicts abort the merge (question 55).
+6. **Shared catalogs** stay heap and unbranched (question 27's decision),
+   left out of commits.
+7. **Indexes of other access methods on versioned tables**: each branch's
+   own (a btree on a prolly table is rebuilt for a branch when it diverges),
+   or refused in versioned databases in favor of prolly indexes. Open: not
+   decided.
+
+Until stage 4, these are known wrong across branches and are documented in
+`07-roadmap.md`: DDL on one branch applies to every branch's rows, and
+btree indexes are shared by every branch.
