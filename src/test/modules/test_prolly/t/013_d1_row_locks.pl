@@ -212,6 +212,23 @@ $s1->query_safe('COMMIT');
 $s2->query_safe('RESET lock_timeout');
 is($node->safe_psql('postgres', 'SELECT data FROM ks'), '101', 'and it updates the newer version');
 
+# A row locker waits only for the holders it conflicts with, as on heap:
+# FOR KEY SHARE gets a row that FOR UPDATE is waiting for (Postgres's
+# tuplelock-upgrade-no-deadlock test).
+my $s3 = $node->background_psql('postgres', on_error_stop => 0);
+$s1->query_safe('BEGIN; SELECT id FROM ks WHERE id = 1 FOR KEY SHARE;');
+$s2->query_until(qr/go/, "\\echo go\nBEGIN; SELECT id FROM ks WHERE id = 1 FOR UPDATE;\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'prollyrow' AND NOT granted})
+  or die 'FOR UPDATE never waited';
+$s3->query_safe('SET lock_timeout = 3000');
+$s3->query('BEGIN; SELECT id FROM ks WHERE id = 1 FOR KEY SHARE;');
+is($s3->{stderr}, '', 'FOR KEY SHARE doesn\'t wait behind a waiting FOR UPDATE');
+$s3->{stderr} = '';
+$s3->query_safe('ROLLBACK');
+$s1->query_safe('ROLLBACK');
+$s2->query_safe('ROLLBACK');
+$s3->quit;
+
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{
 	CREATE TABLE acct (id int PRIMARY KEY, bal int);
