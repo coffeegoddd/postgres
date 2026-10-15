@@ -185,21 +185,61 @@ carries over; only what assumed chunks live in 8 KB pages changes:
 | SQL read or write | Heap and indexes on the branch's copies | Heap's |
 | Create a branch at another branch's head | Copy each prolly table's catalog rows (new OIDs and relation file numbers) and its block maps by reference | O(prolly relations); no page is read |
 | Create a branch at a commit | As above from a branch whose head is near it, then apply the tree diff between the two heads as row changes | O(Δ log N) |
-| Dolt commit | Fold: find the branch's prolly rows changed since the head (below), write them into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
+| Dolt commit | Fold: the working-set diff (below), written into the head's trees, then the schema, root value, commit, ancestry and refs | O(changed pages + Δ log N + log H) |
 | Working-set checkpoint | The same fold, published as the branch's working-set root instead of a commit | As a commit |
-| Diff, log, status | Over trees: subtree-skipping diff; working-set diffs fold first | Dolt's bounds |
+| Working set vs head: diff, status | The change finder (below) over the changed-page lists | O(changed pages + Δ); "changed at all?" O(1) a table |
+| Diff of commits, log | Over trees: subtree-skipping diff | Dolt's bounds |
+| Working set vs any commit | The working-set diff merged by key with the head-to-commit tree diff | Both bounds |
 | Fast-forward, reset, checkout of a commit | Apply the tree diff from the current head to the target as row changes | O(Δ log N) |
 | Three-way merge | Merge trees as Dolt does (base, the target branch's folded working set, the source), then apply the diff from the target's working set to the result as row changes; conflicts as `dolt_conflicts` rows, as built | Dolt's merge bound plus O(Δ log N) |
 | Fetch, push, clone, pull | Our protocol, chunks by address; a cloned branch gets pages when first used | Dolt's bounds; first use O(N log N) materialization |
 
-**Finding changes since the head.** The block map records, per branch,
-the epoch of its last fold. A page first changed after that epoch is
-copied (even when no other branch shares it), so its pre-fold version
-survives until the next fold. The fold reads both versions of each such
-page; every tuple on either is a candidate key; each candidate's new row is
-read from the branch's pages through the primary key (or the content hash
-for keyless tables), its old row from the head's tree, and equal pairs are
-dropped. The cost is in changed pages, not in table size.
+**Diffing the working set against the head (user, 2026-10-16).** Dolt
+diffs a working set against its head in O(Δ log N) because both are
+prolly trees; Dolt's status, diff and commit all rest on it. Pages lose
+that structure, so the change finder recovers it from copy-on-write, and
+it is a first-class operation: `dolt_status`, `dolt_diff` and the fold of a
+commit or checkpoint all use it.
+
+- **Old pages are kept.** Each branch has a fold epoch (its last commit
+  or checkpoint). The first logical change to a page after it copies the
+  page even when no other branch shares it, so the page's version as of
+  the head survives until the next fold. Map entries already carry a
+  birth epoch for this.
+- **Changed pages are listed, not searched for.** The first copy of a page
+  after the fold epoch appends the page to a per-relation changed-page
+  list (in the map fork, WAL-logged with the copy); the next fold clears
+  it. Finding a relation's changed pages is O(changed pages), not a scan
+  of its map. A per-relation counter of listed pages answers "has this
+  table changed since the head?" in O(1), which `dolt_status` needs.
+- **Rows, not pages, are compared.** Every tuple on either version of a
+  listed page gives a candidate key (the primary key, or the content hash
+  for keyless tables). A candidate's old row is read from the old pages
+  as of the head's snapshot, its new row from the branch's current pages,
+  and equal pairs drop out. A row an update moved to another page is on
+  two listed pages, and matching by key pairs it up.
+- **The head's snapshot is kept with the commit.** Old page versions can
+  hold row versions that weren't committed when the head was taken, so
+  reading them as of the head needs that fold's snapshot (its xmin, xmax
+  and running transactions), stored with the branch's head. Reading old
+  rows from the head's tree by key instead needs nothing stored but costs
+  O(log N) a row; the snapshot is the recommended choice.
+- **Changes that change no rows don't count.** Hint bits never copy a
+  page. Pruning and freezing change no row's visibility, so they write a
+  page in place and don't list it, unless another branch shares it (then
+  it is copied for that reason alone, and not listed).
+- **Old pages are bounded.** A branch that goes long without a commit
+  keeps up to two versions of each changed page; a working-set checkpoint
+  folds the changes into a tree, makes the current pages the new
+  baseline, and frees the old versions, bounding both the space and the
+  next diff.
+- **Other diffs.** Head against any commit is a diff of two trees, as in
+  Dolt. The working set against any commit merges the working-set diff
+  with the head-to-commit tree diff by key.
+
+The cost of a working-set diff is O(changed pages + Δ): a changed row
+touches one or two pages, so changed pages are a small multiple of Δ, and
+each costs a page read rather than a few tree nodes.
 
 **Applying a tree diff as row changes** reuses the machinery of logical
 replication's apply worker (`src/backend/replication/logical/worker.c`):
@@ -290,6 +330,9 @@ fails without its fix), and Postgres's suites keep passing after each one.
   pages past the xmin horizon; VACUUM and freezing on shared pages
   (visibility-neutral changes in place; line pointers made unused only
   when no other branch shares the page).
+- Fold epochs, copy on first change after the fold, the changed-page
+  list and its counter (part 2), with pruning and freezing in place on
+  unshared pages.
 - `dolt_branch` and `dolt_checkout` on copies, no commits yet.
 - **Exit:** DDL and TRUNCATE on one branch leave the others alone
   (`vc_schema` passes); normal tables are unaffected by branches; branch
@@ -312,8 +355,11 @@ fails without its fix), and Postgres's suites keep passing after each one.
   edits, the canonicalizer, commit and ancestry, refs and working-set roots; working-set checkpoints.
 - `dolt_commit`, `dolt_log`, `dolt_status`, `dolt_diff` and the views on
   the new store.
+- The working-set diff (part 2) behind `dolt_diff`, `dolt_status` and
+  the fold; the head's snapshot kept with it.
 - **Exit:** gate 6 (history independence) and the requirements suite's
-  commit and history tests pass; commit cost tracks changed pages.
+  commit and history tests pass; commit, diff and status cost track
+  changed pages (counted, as the tree diff's node reads are).
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
