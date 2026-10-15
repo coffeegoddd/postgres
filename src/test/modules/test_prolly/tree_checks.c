@@ -1185,3 +1185,180 @@ tree_nodes_are_valid(const ProllyImplInfo *impl)
 	if (pc.nodes < 10)
 		elog(ERROR, "tree has only %d nodes", pc.nodes);
 }
+
+/*
+ * Large values: a value longer than a node goes out of line, and comes
+ * back whole from get, cursors and diff; the root hash still depends only
+ * on the items (built at once, or by edits that wrote the values another
+ * way); a small change to a large value writes a few nodes; and walks visit
+ * the out-of-line values' nodes.
+ */
+#define BIG_KEYS	40
+
+static void
+big_value(int k, int version, StringInfo buf)
+{
+	int			len = (k % 4 == 0) ? 100 : 3000 + k * 7919 % 200000;
+	uint64		x = (uint64) k * 2654435761u + version;
+
+	resetStringInfo(buf);
+	while (buf->len < len)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(buf, (char) ('a' + (x >> 59)));
+	}
+	if (version > 0)
+		buf->data[len / 2] = '#';
+}
+
+static void
+count_visit(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+typedef struct BigDiff
+{
+	int			nchanges;
+	int			key;
+	bool		values_ok;
+} BigDiff;
+
+static void
+big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
+			   const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	BigDiff    *d = arg;
+	StringInfoData want;
+
+	d->nchanges++;
+	d->key = key_int(key);
+	initStringInfo(&want);
+	big_value(d->key, 0, &want);
+	d->values_ok = kind == PROLLY_DIFF_MODIFIED && before && after &&
+		before->len == want.len && memcmp(before->data, want.data, want.len) == 0;
+	big_value(d->key, 1, &want);
+	d->values_ok &= after->len == want.len &&
+		memcmp(after->data, want.data, want.len) == 0;
+	pfree(want.data);
+}
+
+void
+tree_large_values(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyNodeCounters counters = {0};
+	ProllyTreeBuilder *b;
+	ProllyNodeRef built;
+	ProllyNodeRef edited;
+	ProllyNodeRef changed;
+	StringInfoData vbuf;
+	ProllyTreeCursor *c;
+	ProllyKey	key;
+	ProllyValue value;
+	int			nkeys = 0;
+	int			nnodes = 0;
+	BigDiff		d = {0};
+
+	make_env(tr, &env);
+	initStringInfo(&vbuf);
+
+	/* Built at once. */
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	for (int k = 0; k < BIG_KEYS; k++)
+	{
+		KeyBuf		kb;
+
+		key = key_of(k, &kb);
+		big_value(k, 0, &vbuf);
+		value.data = (const uint8 *) vbuf.data;
+		value.len = vbuf.len;
+		PROLLY_CALL(tr, build_add, b, &key, &value);
+	}
+	PROLLY_CALL(tr, build_finish, b, &built);
+
+	/* By edits, each value first written as another, in two batches. */
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tr, build_finish, b, &edited);
+	for (int pass = 0; pass < 2; pass++)
+	{
+		for (int half = 0; half < 2; half++)
+		{
+			ProllyEdit	edits[BIG_KEYS];
+			KeyBuf		kbs[BIG_KEYS];
+			StringInfoData bufs[BIG_KEYS];
+			int			n = 0;
+
+			for (int k = half; k < BIG_KEYS; k += 2)
+			{
+				initStringInfo(&bufs[n]);
+				big_value(k, pass == 0 ? 1 : 0, &bufs[n]);
+				edits[n].key = key_of(k, &kbs[n]);
+				edits[n].value.data = (const uint8 *) bufs[n].data;
+				edits[n].value.len = bufs[n].len;
+				edits[n].is_delete = false;
+				n++;
+			}
+			PROLLY_CALL(tr, apply, &env, &edited, edits, n, &edited);
+		}
+	}
+	if (!same_hash(&built, &edited))
+		elog(ERROR, "a tree of large values built at once and by edits differ");
+
+	/* Every value comes back whole, from get and from a cursor. */
+	for (int k = 0; k < BIG_KEYS; k++)
+	{
+		KeyBuf		kb;
+		StringInfoData got;
+
+		key = key_of(k, &kb);
+		initStringInfo(&got);
+		big_value(k, 0, &vbuf);
+		if (!PROLLY_CALL(tr, get, &env, &built, &key, &got) ||
+			got.len != vbuf.len || memcmp(got.data, vbuf.data, got.len) != 0)
+			elog(ERROR, "get of key %d returned another value", k);
+		pfree(got.data);
+	}
+	c = PROLLY_CALL(tr, cursor_open, &env, &built, CurrentMemoryContext);
+	PROLLY_CALL(tr, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tr, cursor_next, c, &key, &value))
+	{
+		big_value(key_int(&key), 0, &vbuf);
+		if (value.len != vbuf.len || memcmp(value.data, vbuf.data, value.len) != 0)
+			elog(ERROR, "a cursor returned another value for key %d", key_int(&key));
+		nkeys++;
+	}
+	PROLLY_CALL(tr, cursor_close, c);
+	if (nkeys != BIG_KEYS)
+		elog(ERROR, "a cursor returned %d of %d keys", nkeys, BIG_KEYS);
+
+	/* Walks visit the values' nodes: many more than the leaves of keys. */
+	PROLLY_CALL(tr, walk, &env, &built, count_visit, &nnodes);
+	if (nnodes < BIG_KEYS)
+		elog(ERROR, "a walk visited only %d nodes of %d large values", nnodes,
+			 BIG_KEYS);
+
+	/* One byte changed in a large value: few nodes written; diff shows it. */
+	{
+		ProllyEdit	edit;
+		KeyBuf		kb;
+
+		big_value(13, 1, &vbuf);
+		edit.key = key_of(13, &kb);
+		edit.value.data = (const uint8 *) vbuf.data;
+		edit.value.len = vbuf.len;
+		edit.is_delete = false;
+		env.counters = &counters;
+		PROLLY_CALL(tr, apply, &env, &built, &edit, 1, &changed);
+		env.counters = NULL;
+		if (counters.nodes_written > 12)
+			elog(ERROR, "changing one byte of a %u-byte value wrote %llu nodes",
+				 vbuf.len, (unsigned long long) counters.nodes_written);
+	}
+	PROLLY_CALL(tr, diff, &env, &built, &changed, big_diff_visit, &d);
+	if (d.nchanges != 1 || d.key != 13 || !d.values_ok)
+		elog(ERROR, "diff of one changed large value reported %d changes (key %d, values %s)",
+			 d.nchanges, d.key, d.values_ok ? "right" : "wrong");
+	pfree(vbuf.data);
+}

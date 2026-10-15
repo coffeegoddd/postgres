@@ -58,6 +58,7 @@ extern void tree_diff_reads_changed_paths(const ProllyImplInfo *impl);
 extern void tree_diff_across_heights(const ProllyImplInfo *impl);
 extern void tree_seeks_in_order(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
+extern void tree_large_values(const ProllyImplInfo *impl);
 
 /* engine_checks.c */
 extern void engine_read_empty_tree(const ProllyImplInfo *impl);

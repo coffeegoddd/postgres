@@ -616,6 +616,39 @@ the concurrent refresh). The requirements suite's isolation group now
 passes in full, and its semantics group fails only on values larger than
 a node (4f).
 
+**Plan (2026-10-14): 4f in three PRs.** 4f.1 large values; 4f.2
+reclamation of nodes (`prolly_gc()`, reusing freed blocks); 4f.3 VACUUM of
+gone versions, and TID reuse. Checkpoints and recovery were built in 4b
+and 4d and are covered by the durability suite.
+
+**Status (2026-10-14): 4f.1 built.** Values larger than a node work
+(question 48). The tree stores a leaf value longer than 2 KB out of line,
+in a value tree: its bytes cut where a buzhash rolling hash (48-byte
+window, table fixed by the format) says so, between 512 bytes and 4 KB,
+about every 2 KB, keyed by offset. The leaf item holds the value tree's
+root hash and the value's length, flagged in the node format (the top bit
+of the item's value length, in the canonical region), so walks, and
+reclamation and transfer through them, find every value tree. Get,
+cursors and diff return the bytes; diff compares references, so equal
+large values cost nothing. Canonical bytes are uncompressed. Every tree
+gets this, so rows, the row-identity map's gone versions and spill trees
+all hold large values. The row-identity map now keeps a gone version's
+row as its own item ('G'), the same bytes the data tree held, so a large
+row's value tree is shared rather than written again (format version 3).
+Found and fixed, with a test that fails without the fix: updating a few
+bytes of a 192 KB value wrote 59 nodes, because the gone version's row
+was stored behind a header and its offsets shifted (now under 40, most of
+them the row-identity map's and data tree's own paths). Tests: a tree
+conformance check (`large_values`: round trip through get, cursors and
+diff, history independence of trees built at once and by edits, walks
+reaching value trees, a one-byte change writing at most 12 nodes);
+`016_d1_large_values.pl` (rows up to 1.3 MB, keyless tables, a crash, a
+standby). The requirements suite's semantics group now passes in full.
+Not yet: keys by offset mean an insertion in the middle of a large value
+rewrites the value tree after it; Dolt's value trees, which are addressed
+by byte counts rather than keys, avoid that, and step 5 settles the
+format.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

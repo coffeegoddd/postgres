@@ -279,6 +279,9 @@ static const ConformanceCase cases[] = {
 	tree_seeks_in_order},
 	{PROLLY_IFACE_TREE, "nodes_are_valid",
 	"build_begin build_add build_finish walk", tree_nodes_are_valid},
+	{PROLLY_IFACE_TREE, "large_values",
+	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff",
+	tree_large_values},
 
 	/* root layout */
 	{PROLLY_IFACE_ROOT_LAYOUT, "empty", "empty subroot lookup scan apply",

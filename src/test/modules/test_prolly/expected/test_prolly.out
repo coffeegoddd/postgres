@@ -39,7 +39,7 @@ FROM prolly_implementations();
  log             | stub             |       0 |              0
  commit_pipeline | serial           |       1 |              1
  commit_pipeline | stub             |       0 |              0
- row_identity    | counter          |       2 |              2
+ row_identity    | counter          |       2 |              3
  row_identity    | stub             |       0 |              0
  refs            | stub             |       0 |              0
  transfer        | stub             |       0 |              0
@@ -298,6 +298,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  tree            | cow              | diff_across_heights                     | pass
  tree            | cow              | seeks_in_order                          | pass
  tree            | cow              | nodes_are_valid                         | pass
+ tree            | cow              | large_values                            | pass
  tree            | cow              | complete                                | pass
  tree            | stub             | identity                                | pass
  tree            | stub             | build_and_get                           | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
@@ -313,6 +314,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  tree            | stub             | diff_across_heights                     | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree            | stub             | seeks_in_order                          | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree            | stub             | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree            | stub             | large_values                            | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff)
  tree            | stub             | complete                                | not implemented (13 of 13 callbacks missing)
  root_layout     | subroots         | identity                                | pass
  root_layout     | subroots         | empty                                   | pass
@@ -354,7 +356,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | identity                                | pass
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
-(293 rows)
+(295 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

@@ -55,6 +55,7 @@ tests += {
       't/013_d1_row_locks.pl',
       't/014_d1_spill.pl',
       't/015_d1_serializable.pl',
+      't/016_d1_large_values.pl',
     ],
   },
 }

@@ -27,8 +27,11 @@
  *	'T' block(4) offset(2)
  *		-> content-length content varint-ordinal xmin(4) row-key
  *		for every TID whose version may exist, or once its version is gone
- *		-> 0 cid(4) xmin(4) flag [successor TID (6 bytes) if flag] row
- *		where row is the gone version's row, kept like a dead tuple
+ *		-> 0 cid(4) xmin(4) flag [successor TID (6 bytes) if flag]
+ *	'G' block(4) offset(2)
+ *		-> the gone version's row, kept like a dead tuple, as its own item:
+ *		the same bytes the data tree held, so a large row's value tree is
+ *		shared with it, not written again
  *
  * and its tree of local metadata by row (PROLLY_TREE_ROWKEY), in the data
  * tree's key order, holds a version entry for every version in the table:
@@ -63,6 +66,7 @@
 #include "utils/rel.h"
 
 #define TAG_TID			'T'
+#define TAG_GONE_ROW	'G'
 
 #define TID_KEY_LEN		7
 #define TID_BYTES		6
@@ -276,13 +280,13 @@ decode_tid(const uint8 *data, Size len, ItemPointer tid)
 }
 
 static ProllyKey
-tid_key(ItemPointer tid, uint8 *buf)
+tagged_tid_key(ItemPointer tid, uint8 *buf, uint8 tag)
 {
 	BlockNumber blk = ItemPointerGetBlockNumber(tid);
 	OffsetNumber off = ItemPointerGetOffsetNumber(tid);
 	ProllyKey	key;
 
-	buf[0] = TAG_TID;
+	buf[0] = tag;
 	buf[1] = (uint8) (blk >> 24);
 	buf[2] = (uint8) (blk >> 16);
 	buf[3] = (uint8) (blk >> 8);
@@ -292,6 +296,12 @@ tid_key(ItemPointer tid, uint8 *buf)
 	key.data = buf;
 	key.len = TID_KEY_LEN;
 	return key;
+}
+
+static ProllyKey
+tid_key(ItemPointer tid, uint8 *buf)
+{
+	return tagged_tid_key(tid, buf, TAG_TID);
 }
 
 /* The version entry's key of the version at key with ordinal, in buf. */
@@ -368,7 +378,7 @@ bad:
 
 static void
 encode_gone(ItemPointer successor, CommandId cid, TransactionId xmin,
-			const ProllyValue *row, StringInfo out)
+			StringInfo out)
 {
 	appendStringInfoChar(out, 0);
 	put_uint32(out, cid);
@@ -376,18 +386,15 @@ encode_gone(ItemPointer successor, CommandId cid, TransactionId xmin,
 	appendStringInfoChar(out, successor ? 1 : 0);
 	if (successor)
 		encode_tid(successor, out);
-	appendBinaryStringInfo(out, (const char *) row->data, row->len);
 }
 
-/* A gone entry: sets *info, and appends the gone version's row to out. */
+/* A gone entry: sets *info. */
 static void
-decode_gone(const StringInfoData *v, ProllyTidInfo *info, StringInfo out)
+decode_gone(const StringInfoData *v, ProllyTidInfo *info)
 {
 	const uint8 *d = (const uint8 *) v->data;
-	int			head;
 
-	if (v->len < 10 || (d[9] != 0 && d[9] != 1) ||
-		v->len < (head = d[9] ? 10 + TID_BYTES : 10))
+	if (v->len != (d[9] ? 10 + TID_BYTES : 10) || (d[9] != 0 && d[9] != 1))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid prolly row identity entry")));
@@ -397,7 +404,6 @@ decode_gone(const StringInfoData *v, ProllyTidInfo *info, StringInfo out)
 		decode_tid(d + 10, TID_BYTES, &info->successor);
 	else
 		ItemPointerSetInvalid(&info->successor);
-	appendBinaryStringInfo(out, v->data + head, v->len - head);
 }
 
 static bool
@@ -474,6 +480,33 @@ put_entry(const ProllyEngineRoutine *engine, Relation rel, ItemPointer tid,
 	ProllyValue v = {(const uint8 *) entry->data, entry->len};
 
 	PROLLY_CALL(engine, put, rel, PROLLY_TREE_ROWID, &tkey, &v, cid);
+}
+
+/* tid's gone version's row: its own entry, keyed 'G'. */
+static void
+put_gone_row(const ProllyEngineRoutine *engine, Relation rel, ItemPointer tid,
+			 const ProllyValue *row, CommandId cid)
+{
+	uint8		gbuf[TID_KEY_LEN];
+	ProllyKey	gkey = tagged_tid_key(tid, gbuf, TAG_GONE_ROW);
+
+	PROLLY_CALL(engine, put, rel, PROLLY_TREE_ROWID, &gkey, row, cid);
+}
+
+static void
+get_gone_row(const ProllyEngineRoutine *engine, ProllyRootSet *roots,
+			 Relation rel, ItemPointer tid, CommandId cid, StringInfo out)
+{
+	uint8		gbuf[TID_KEY_LEN];
+	ProllyKey	gkey = tagged_tid_key(tid, gbuf, TAG_GONE_ROW);
+
+	if (!PROLLY_CALL(engine, get, roots, rel, PROLLY_TREE_ROWID, &gkey, cid, out))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("gone TID (%u,%u) of \"%s\" has no row",
+						ItemPointerGetBlockNumber(tid),
+						ItemPointerGetOffsetNumber(tid),
+						RelationGetRelationName(rel))));
 }
 
 /* The 'T' entry of tid with every write; false if there is none. */
@@ -668,7 +701,8 @@ counter_tid_resolve(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 		state = PROLLY_TID_UNKNOWN;
 	else if (entry_gone(&v))
 	{
-		decode_gone(&v, info, out);
+		decode_gone(&v, info);
+		get_gone_row(engine_for(rel), roots, rel, tid, cid, out);
 		state = PROLLY_TID_GONE;
 	}
 	else
@@ -715,8 +749,9 @@ counter_tid_retire(ProllyRootSet *roots, Relation rel, ItemPointer tid,
 	named_entry(engine, roots, rel, tid, &v, &e);
 	drop_version(engine, roots, rel, &e.key, e.ordinal, tid, cid);
 	initStringInfo(&entry);
-	encode_gone(successor, cid, e.xmin, row, &entry);
+	encode_gone(successor, cid, e.xmin, &entry);
 	put_entry(engine, rel, tid, &entry, cid);
+	put_gone_row(engine, rel, tid, row, cid);
 	pfree(entry.data);
 	pfree(v.data);
 }
@@ -738,8 +773,9 @@ counter_tid_renew(ProllyRootSet *roots, Relation rel, ItemPointer otid,
 	put_entry(engine, rel, ntid, &entry, cid);
 	put_version(engine, rel, &e.key, e.ordinal, ntid, cid);
 	resetStringInfo(&entry);
-	encode_gone(ntid, cid, e.xmin, row, &entry);
+	encode_gone(ntid, cid, e.xmin, &entry);
 	put_entry(engine, rel, otid, &entry, cid);
+	put_gone_row(engine, rel, otid, row, cid);
 	pfree(entry.data);
 	pfree(v.data);
 }
@@ -778,7 +814,7 @@ const ProllyRowIdRoutine prolly_rowid_counter = {
 	.info = {
 		.iface = PROLLY_IFACE_ROW_IDENTITY,
 		.impl_id = 2,
-		.format_version = 2,
+		.format_version = 3,
 		.name = "counter",
 		.description = "TIDs from a per-table counter that aborts don't roll "
 		"back, with a map both ways",
