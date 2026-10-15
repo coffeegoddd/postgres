@@ -747,9 +747,14 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
 - **Fold epochs and changed-page lists** (part 2) are built in step 4,
   with the fold that uses them: nothing folds before then.
 - **Reference counts:** a physical block shared by several maps is freed
-  when the last map that holds it drops it; a per-block count in the
-  allocator's bitmap pages (one byte per block, saturating at 255, then
-  the block is never freed until reclamation in step 7 sweeps).
+  when the last map that holds it drops it.  The counts are a file of
+  their own per tablespace and database (relation file number 9419,
+  beside the allocator and the page store), one byte per physical block:
+  how many maps hold it besides the first, saturating at 255, after which
+  the block is never freed until reclamation in step 7 sweeps.  (Kept
+  apart from the allocator's bitmap pages, which hold one bit per block:
+  a byte there would cut the blocks a bitmap page covers, and so the page
+  store's size, eightfold.)
 
 ### 6.5 Making a branch
 
