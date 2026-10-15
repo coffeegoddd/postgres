@@ -748,5 +748,38 @@ SELECT prolly_tree_digest('d1_respelled_n') = prolly_tree_digest('d1_spelled_n')
  t
 (1 row)
 
-DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled;
+-- The engine counts the nodes it reads and writes: reading a row by its
+-- key (a btree index scan) reads a few root-to-leaf paths of the table's
+-- trees, and an update of one row writes a few new paths, out of trees of
+-- hundreds of nodes.
+CREATE TABLE d1_counted (id int PRIMARY KEY, v text) USING prolly_d1;
+INSERT INTO d1_counted SELECT g, repeat('v', 50) || g FROM generate_series(1, 20000) g;
+SET enable_seqscan = off;
+SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
+SELECT v FROM d1_counted WHERE id = 12345;
+                            v                            
+---------------------------------------------------------
+ vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv12345
+(1 row)
+
+SELECT nodes_read - :r0 BETWEEN 1 AND 50 AS few_reads
+FROM prolly_node_counters('prolly_d1');
+ few_reads 
+-----------
+ t
+(1 row)
+
+SELECT nodes_written AS w0 FROM prolly_node_counters('prolly_d1') \gset
+UPDATE d1_counted SET v = 'changed' WHERE id = 12345;
+SELECT nodes_written - :w0 BETWEEN 1 AND 50 AS few_writes
+FROM prolly_node_counters('prolly_d1');
+ few_writes 
+------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+SELECT * FROM prolly_node_counters('heap');
+ERROR:  access method "heap" is not a prolly table access method
+DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled, d1_counted;
 DROP OPERATOR CLASS d1_numeric_ops USING prolly;

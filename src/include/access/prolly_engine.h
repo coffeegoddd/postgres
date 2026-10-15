@@ -178,6 +178,12 @@ typedef struct ProllyEngineRoutine
 								   ProllyHash *root);
 	void		(*export_chunks) (ProllyRootSet *roots, Relation tree,
 								  ProllyChunkSink *sink);
+
+	/*
+	 * Nodes this backend has read and written for the engine's trees since
+	 * it started, so tests can check an operation's cost by counting.
+	 */
+	void		(*node_counters) (ProllyNodeCounters *counters);
 } ProllyEngineRoutine;
 
 #define PROLLY_ENGINE_CALLBACK_NAMES \
@@ -188,7 +194,7 @@ typedef struct ProllyEngineRoutine
 	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
 	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \
-	"export_chunks"
+	"export_chunks", "node_counters"
 #define PROLLY_ENGINE_FIRST_CALLBACK shmem_size
 
 static inline const ProllyEngineRoutine *

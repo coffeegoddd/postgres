@@ -437,6 +437,28 @@ first.**
 | 4e.4 | Bounded transaction memory (question 47): write sets flushed to intermediate trees with savepoint roots, edits recovered at replay by diff; PREPARE TRANSACTION after prolly writes, its write set flushed and its root recorded in the two-phase state file, replayed at COMMIT PREPARED (user, 2026-10-14) |
 | 4e.5 | SERIALIZABLE on prolly tables; the isolation-suite stalls from the single writer; temporary and unlogged tables use heap (question 28); TID counter ranges per backend |
 
+**Status (2026-10-14): 4e.1 built.** The tree interface counts nodes:
+a caller that sets `counters` in its tree environment gets one per node
+read from the node store and one per new node written (not one the store
+already had). The engine interface gained `node_counters`, D1 counts every
+tree it uses, and `prolly_node_counters(access_method)` returns a backend's
+counts. The tree's diff walks both trees with cursors that stand on whole
+subtrees, judged by the child hash in the parent's item: equal subtrees at
+equal heights are skipped unread, the taller side descends, and leaf items
+merge by key, so a diff reads O((Δ + 1) log N) nodes. Tests: conformance
+checks that the counters count builds, rebuilds and walks exactly; that a
+diff of d spread changes reads at most d(4 levels + 4) nodes (measured: 8
+for one change in a 4-level tree of 837 nodes, 40 for eight; the leaf walk
+read 1,674 for one, and fails the check), nothing for a tree against
+itself, and every node once against the empty tree; diffs across trees of
+different heights and of unrelated trees; and, in `d1_tables`, that a
+primary-key lookup and a one-row update of a 20,000-row table read and
+write a few paths. Found by the counters, not fixed here: a sequential scan
+of a prolly table finds each row's TID with a point lookup in the
+row-identity tree, so it reads O(N log N) nodes, not O(N / leaf size)
+(about six per row on a 20,000-row table); a cursor over the version
+entries, advanced with the scan, would read each leaf once.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

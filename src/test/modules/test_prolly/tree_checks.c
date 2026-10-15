@@ -767,6 +767,217 @@ tree_diff_reports_changes(const ProllyImplInfo *impl)
 	}
 }
 
+/* Counts changes and checks their order (diffs of unrelated trees). */
+static void
+count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
+			 const ProllyValue *after, void *arg)
+{
+	DiffSeen   *s = arg;
+	int			k = key_int(key);
+
+	if (k <= s->last)
+		elog(ERROR, "diff reported key %d after key %d", k, s->last);
+	s->last = k;
+	s->changes++;
+}
+
+/*
+ * The counters count every node read and every new node written: building
+ * a tree writes each of its nodes, building it again writes none, and a
+ * walk reads each once.
+ */
+void
+tree_counts_nodes(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyNodeCounters cnt = {0};
+	Ref		   *ref = palloc(sizeof(Ref));
+	ProllyNodeRef root;
+	ProllyNodeRef again;
+	HashSet		nodes = {0};
+	HashSet		walked = {0};
+
+	make_env(tr, &env);
+	/* Values not in the store yet, even when the check runs again. */
+	fill_ref(ref, 1, 1000 + (int) pg_prng_uint64_range(&pg_global_prng_state, 0, 1000000));
+	env.counters = &cnt;
+	build_ref(tr, &env, ref, &root);
+	env.counters = NULL;
+	PROLLY_CALL(tr, walk, &env, &root, collect_node, &nodes);
+	if (cnt.nodes_written != (uint64) nodes.n)
+		elog(ERROR, "building a tree of %d nodes counted %llu written", nodes.n,
+			 (unsigned long long) cnt.nodes_written);
+
+	memset(&cnt, 0, sizeof(cnt));
+	env.counters = &cnt;
+	build_ref(tr, &env, ref, &again);
+	if (!same_hash(&root, &again) || cnt.nodes_written != 0)
+		elog(ERROR, "building a stored tree again counted %llu nodes written",
+			 (unsigned long long) cnt.nodes_written);
+
+	memset(&cnt, 0, sizeof(cnt));
+	PROLLY_CALL(tr, walk, &env, &root, collect_node, &walked);
+	if (cnt.nodes_read != (uint64) nodes.n || cnt.nodes_written != 0)
+		elog(ERROR, "walking a tree of %d nodes counted %llu read, %llu written",
+			 nodes.n, (unsigned long long) cnt.nodes_read,
+			 (unsigned long long) cnt.nodes_written);
+}
+
+/*
+ * Diff reads only what changed: with d changed keys spread over the tree,
+ * it reads O(d log n) nodes, a few root-to-leaf paths per change, never
+ * every leaf.  A tree diffed against itself reads nothing, and against the
+ * empty tree reads each node of the other once.
+ */
+void
+tree_diff_reads_changed_paths(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *from = palloc(sizeof(Ref));
+	Ref		   *to = palloc(sizeof(Ref));
+	Ref		   *none = palloc(sizeof(Ref));
+	ProllyNodeRef rfrom;
+	ProllyNodeRef rempty;
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+	int			ds[] = {1, 2, 4, 8};
+
+	make_env(tr, &env);
+	fill_ref(from, 1, 1);
+	build_ref(tr, &env, from, &rfrom);
+	PROLLY_CALL(tr, walk, &env, &rfrom, collect_node, &nodes);
+	if (nodes.levels < 3 || nodes.n < 200)
+		elog(ERROR, "test tree has only %d nodes in %d levels", nodes.n, nodes.levels);
+
+	for (int t = 0; t < lengthof(ds); t++)
+	{
+		int			d = ds[t];
+		int			keys[8];
+		int			versions[8];
+		ProllyNodeRef rto = rfrom;
+		DiffSeen	seen = {from, to, -1, 0};
+		uint64		bound = (uint64) d * (4 * nodes.levels + 4);
+
+		memcpy(to, from, sizeof(Ref));
+		for (int i = 0; i < d; i++)
+		{
+			keys[i] = i * (MAX_KEY / d) + 17;
+			/* A modification, a removal, a modification, ... */
+			versions[i] = i % 2 == 0 ? 5 : ABSENT;
+		}
+		apply_batch(tr, &env, to, keys, versions, d, &rto);
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, check_change, &seen);
+		env.counters = NULL;
+		if (seen.changes != d)
+			elog(ERROR, "diff reported %d changes, expected %d", seen.changes, d);
+		if (cnt.nodes_read > bound)
+			elog(ERROR, "diff of %d changes in a %d-level tree of %d nodes read %llu nodes, more than %llu",
+				 d, nodes.levels, nodes.n, (unsigned long long) cnt.nodes_read,
+				 (unsigned long long) bound);
+		if (cnt.nodes_written != 0)
+			elog(ERROR, "diff wrote nodes");
+	}
+
+	/* Against itself: nothing read. */
+	memset(&cnt, 0, sizeof(cnt));
+	env.counters = &cnt;
+	{
+		DiffSeen	seen = {from, from, -1, 0};
+
+		PROLLY_CALL(tr, diff, &env, &rfrom, &rfrom, check_change, &seen);
+		if (seen.changes != 0 || cnt.nodes_read != 0)
+			elog(ERROR, "a tree diffed against itself reported %d changes and read %llu nodes",
+				 seen.changes, (unsigned long long) cnt.nodes_read);
+	}
+
+	/* Against the empty tree, both ways: every key, every node once. */
+	fill_ref(none, 1, ABSENT);
+	build_ref(tr, &env, none, &rempty);
+	for (int way = 0; way < 2; way++)
+	{
+		DiffSeen	seen = {way == 0 ? none : from, way == 0 ? from : none, -1, 0};
+
+		memset(&cnt, 0, sizeof(cnt));
+		PROLLY_CALL(tr, diff, &env, way == 0 ? &rempty : &rfrom,
+					way == 0 ? &rfrom : &rempty, check_change, &seen);
+		if (seen.changes != MAX_KEY)
+			elog(ERROR, "diff with the empty tree reported %d changes, expected %d",
+				 seen.changes, MAX_KEY);
+		if (cnt.nodes_read != (uint64) nodes.n + 1)
+			elog(ERROR, "diff with the empty tree read %llu nodes, expected %d",
+				 (unsigned long long) cnt.nodes_read, nodes.n + 1);
+	}
+	env.counters = NULL;
+}
+
+/*
+ * Diff of trees that share nothing, and of trees whose heights differ: a
+ * small tree against a large one, both ways, against a reference merge.
+ */
+void
+tree_diff_across_heights(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *small = palloc(sizeof(Ref));
+	Ref		   *large = palloc(sizeof(Ref));
+	ProllyNodeRef rsmall;
+	ProllyNodeRef rlarge;
+	HashSet		hs = {0};
+	HashSet		hl = {0};
+
+	make_env(tr, &env);
+	fill_ref(large, 1, 2);
+	/* A few keys, some in large with the same value, some with another. */
+	fill_ref(small, 1, ABSENT);
+	for (int k = 0; k < MAX_KEY; k += 997)
+		small->version[k] = (k / 997) % 2 == 0 ? 2 : 3;
+	small->version[MAX_KEY - 1] = 2;
+	build_ref(tr, &env, small, &rsmall);
+	build_ref(tr, &env, large, &rlarge);
+	PROLLY_CALL(tr, walk, &env, &rsmall, collect_node, &hs);
+	PROLLY_CALL(tr, walk, &env, &rlarge, collect_node, &hl);
+	if (hs.levels >= hl.levels)
+		elog(ERROR, "test trees have the same height (%d)", hs.levels);
+
+	for (int way = 0; way < 2; way++)
+	{
+		Ref		   *rf = way == 0 ? small : large;
+		Ref		   *rt = way == 0 ? large : small;
+		DiffSeen	seen = {rf, rt, -1, 0};
+		int			want = 0;
+
+		for (int k = 0; k < MAX_KEY; k++)
+			if (rf->version[k] != rt->version[k])
+				want++;
+		PROLLY_CALL(tr, diff, &env, way == 0 ? &rsmall : &rlarge,
+					way == 0 ? &rlarge : &rsmall, check_change, &seen);
+		if (seen.changes != want)
+			elog(ERROR, "diff across heights reported %d changes, expected %d",
+				 seen.changes, want);
+	}
+
+	/* Two unrelated trees: every key of both, in order. */
+	{
+		Ref		   *odd = palloc(sizeof(Ref));
+		ProllyNodeRef rodd;
+		DiffSeen	seen = {large, odd, -1, 0};
+
+		for (int k = 0; k < MAX_KEY; k++)
+			odd->version[k] = k % 2 == 1 ? 7 : ABSENT;
+		build_ref(tr, &env, odd, &rodd);
+		PROLLY_CALL(tr, diff, &env, &rlarge, &rodd, count_change, &seen);
+		if (seen.changes != MAX_KEY)
+			elog(ERROR, "diff of unrelated trees reported %d changes, expected %d",
+				 seen.changes, MAX_KEY);
+	}
+}
+
 /*
  * Keys of five bytes whose order ignores the last (a "spelling"), as a
  * collation can find 'a' and 'A' equal.

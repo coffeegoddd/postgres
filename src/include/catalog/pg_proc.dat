@@ -12845,5 +12845,12 @@
   proname => 'prolly_root_hash', provolatile => 'v', proparallel => 'u',
   prorettype => 'text', proargtypes => 'text', proargnames => '{ref}',
   prosrc => 'prolly_root_hash' },
+{ oid => '9397',
+  descr => 'prolly: nodes this backend has read and written for an engine',
+  proname => 'prolly_node_counters', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => 'name',
+  proallargtypes => '{name,int8,int8}', proargmodes => '{i,o,o}',
+  proargnames => '{access_method,nodes_read,nodes_written}',
+  prosrc => 'prolly_node_counters' },
 
 ]

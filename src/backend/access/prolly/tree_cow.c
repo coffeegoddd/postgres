@@ -37,8 +37,15 @@
  * rebuilt whole, growing new levels if it now needs more than one node,
  * and single-child roots are then removed.
  *
- * Diff.  Both trees' leaves are walked in key order; whenever both walks
- * stand at the start of leaves with the same hash, both skip them.
+ * Diff.  Each tree is walked by a cursor that stands on an item of some
+ * node: a leaf item, or an internal item standing for its child's whole
+ * subtree, whose hash the item holds.  A cursor that finishes a node moves
+ * up to the parent's next item, so it walks as coarsely as it can.  Where
+ * both stand on subtrees of the same height and hash, both skip them
+ * unread; otherwise the taller descends (both, at equal heights), and leaf
+ * items are merged by key.  A node is read only when one of its ancestors'
+ * subtrees differed, so equal regions cost nothing below the level where
+ * the chunkings of the two trees line up again.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/tree_cow.c
@@ -92,6 +99,8 @@ node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 		Buffer		buf = PROLLY_CALL(env->node_store, read, env->store, &r);
 		bool		ok;
 
+		if (env->counters)
+			env->counters->nodes_read++;
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		check_cached_hash(env, BufferGetPage(buf), &r.hash, &ok);
 		if (ok)
@@ -283,6 +292,8 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 		ProllyNodeRef newref;
 		Buffer		buf = PROLLY_CALL(env->node_store, new_node, env->store, &newref);
 
+		if (env->counters)
+			env->counters->nodes_written++;
 		START_CRIT_SECTION();
 		memcpy(BufferGetPage(buf), page, BLCKSZ);
 		MarkBufferDirty(buf);
@@ -1343,39 +1354,106 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
-/* Step a leaf iterator to its next item; false at the end. */
-static bool
-diff_step(Iter *it)
+/* A diff cursor: frames 0 .. depth are read, and it stands on f[depth]. */
+typedef struct DiffSide
 {
-	Frame	   *fr = iter_frame(it);
+	const ProllyTreeEnv *env;
+	Frame		f[MAX_LEVELS];
+	int			depth;			/* -1 at the end */
+} DiffSide;
 
-	if (it->at_end)
-		return false;
-	fr->idx++;
-	if (fr->idx < fr->node.nitems)
-		return true;
-	return iter_next_node(it);
+static void
+side_open(DiffSide *s, const ProllyTreeEnv *env, const ProllyNodeRef *root)
+{
+	s->env = env;
+	s->depth = 0;
+	node_read(env, root, &s->f[0].node);
+	s->f[0].idx = 0;
+	if (s->f[0].node.nitems == 0)
+	{
+		node_release(&s->f[0].node);
+		s->depth = -1;			/* the empty tree */
+	}
+}
+
+static void
+side_close(DiffSide *s)
+{
+	for (int d = 0; d <= s->depth; d++)
+		node_release(&s->f[d].node);
+}
+
+/* The level of the node it stands in: 0 for a leaf item. */
+static uint16
+side_height(const DiffSide *s)
+{
+	return s->f[s->depth].node.level;
+}
+
+/* The child of the internal item it stands on. */
+static void
+side_child(const DiffSide *s, ProllyNodeRef *ref)
+{
+	uint64		count;
+
+	node_child(s->env, &s->f[s->depth].node, s->f[s->depth].idx, ref, &count);
+}
+
+/* Stand on the first item of the child of the item it stands on. */
+static void
+side_descend(DiffSide *s)
+{
+	ProllyNodeRef ref;
+	Frame	   *child;
+
+	if (s->depth + 1 >= MAX_LEVELS)
+		elog(ERROR, "prolly tree is more than %d levels high", MAX_LEVELS);
+	side_child(s, &ref);
+	child = &s->f[s->depth + 1];
+	node_read(s->env, &ref, &child->node);
+	if (child->node.nitems == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly tree has an empty node below its root")));
+	child->idx = 0;
+	s->depth++;
+}
+
+/* Move past the item (or subtree) it stands on, up past finished nodes. */
+static void
+side_advance(DiffSide *s)
+{
+	s->f[s->depth].idx++;
+	while (s->f[s->depth].idx >= s->f[s->depth].node.nitems)
+	{
+		node_release(&s->f[s->depth].node);
+		if (--s->depth < 0)
+			return;
+		s->f[s->depth].idx++;
+	}
+}
+
+static void
+side_leaf_item(const DiffSide *s, ProllyKey *key, ProllyValue *value)
+{
+	node_item(s->env, &s->f[s->depth].node, s->f[s->depth].idx, key, value);
 }
 
 static void
 cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		 const ProllyNodeRef *to, ProllyTreeVisitChange visit, void *arg)
 {
-	Iter		a;
-	Iter		b;
+	DiffSide	a;
+	DiffSide	b;
 
 	if (same_hash(&from->hash, &to->hash))
 		return;
 
-	iter_open(&a, env, from, 0);
-	iter_open(&b, env, to, 0);
-	iter_seek_node(&a, NULL, false);
-	iter_seek_node(&b, NULL, false);
+	side_open(&a, env, from);
+	side_open(&b, env, to);
 
 	for (;;)
 	{
-		Frame	   *fa = iter_frame(&a);
-		Frame	   *fb = iter_frame(&b);
 		ProllyKey	ka,
 					kb;
 		ProllyValue va,
@@ -1383,41 +1461,79 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		int			r;
 
 		CHECK_FOR_INTERRUPTS();
-		if (a.at_end && b.at_end)
+		if (a.depth < 0 && b.depth < 0)
 			break;
 
-		/* Both at the start of the same leaf: skip it. */
-		if (!a.at_end && !b.at_end && fa->idx == 0 && fb->idx == 0 &&
-			same_hash(&fa->node.ref.hash, &fb->node.ref.hash))
+		/* What is left of one tree: its leaf items, reported one by one. */
+		if (a.depth < 0 || b.depth < 0)
 		{
-			if (!iter_next_node(&a))
-				a.at_end = true;
-			if (!iter_next_node(&b))
-				b.at_end = true;
+			DiffSide   *rest = a.depth < 0 ? &b : &a;
+
+			if (side_height(rest) > 0)
+				side_descend(rest);
+			else if (rest == &b)
+			{
+				side_leaf_item(&b, &kb, &vb);
+				visit(PROLLY_DIFF_ADDED, &kb, NULL, &vb, arg);
+				side_advance(&b);
+			}
+			else
+			{
+				side_leaf_item(&a, &ka, &va);
+				visit(PROLLY_DIFF_REMOVED, &ka, &va, NULL, arg);
+				side_advance(&a);
+			}
 			continue;
 		}
 
-		if (!a.at_end)
-			node_item(env, &fa->node, fa->idx, &ka, &va);
-		if (!b.at_end)
-			node_item(env, &fb->node, fb->idx, &kb, &vb);
+		/*
+		 * Subtrees are compared only at equal heights.  Equal hashes mean
+		 * equal items, which start right after what each side has already
+		 * passed, so both skip them.
+		 */
+		if (side_height(&a) > side_height(&b))
+		{
+			side_descend(&a);
+			continue;
+		}
+		if (side_height(&b) > side_height(&a))
+		{
+			side_descend(&b);
+			continue;
+		}
+		if (side_height(&a) > 0)
+		{
+			ProllyNodeRef ca;
+			ProllyNodeRef cb;
 
-		if (b.at_end)
-			r = -1;
-		else if (a.at_end)
-			r = 1;
-		else
-			r = cmp_keys(env, &ka, &kb);
+			side_child(&a, &ca);
+			side_child(&b, &cb);
+			if (same_hash(&ca.hash, &cb.hash))
+			{
+				side_advance(&a);
+				side_advance(&b);
+			}
+			else
+			{
+				side_descend(&a);
+				side_descend(&b);
+			}
+			continue;
+		}
 
+		/* Both on leaf items: merge by key. */
+		side_leaf_item(&a, &ka, &va);
+		side_leaf_item(&b, &kb, &vb);
+		r = cmp_keys(env, &ka, &kb);
 		if (r < 0)
 		{
 			visit(PROLLY_DIFF_REMOVED, &ka, &va, NULL, arg);
-			diff_step(&a);
+			side_advance(&a);
 		}
 		else if (r > 0)
 		{
 			visit(PROLLY_DIFF_ADDED, &kb, NULL, &vb, arg);
-			diff_step(&b);
+			side_advance(&b);
 		}
 		else
 		{
@@ -1425,12 +1541,12 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			if (va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0 ||
 				ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0)
 				visit(PROLLY_DIFF_MODIFIED, &kb, &va, &vb, arg);
-			diff_step(&a);
-			diff_step(&b);
+			side_advance(&a);
+			side_advance(&b);
 		}
 	}
-	iter_close(&a);
-	iter_close(&b);
+	side_close(&a);
+	side_close(&b);
 }
 
 const ProllyTreeRoutine prolly_tree_cow = {

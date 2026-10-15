@@ -67,6 +67,7 @@ typedef struct D1Backend
 	ProllyNodeStore *store;
 	ProllyTreeEnv memcmp_env;	/* layout and local-metadata trees */
 	ProllyRootEnv root_env;
+	ProllyNodeCounters counters;	/* every tree's, through memcmp_env */
 } D1Backend;
 
 static D1Backend backend;
@@ -210,6 +211,7 @@ backend_init(void)
 	backend.memcmp_env.store = backend.store;
 	backend.memcmp_env.log = backend.c.log;
 	backend.memcmp_env.compare = memcmp_keys;
+	backend.memcmp_env.counters = &backend.counters;
 	backend.root_env.tree = backend.c.tree;
 	backend.root_env.tree_env = &backend.memcmp_env;
 	backend.ready = true;
@@ -1720,6 +1722,12 @@ d1_subxact_abort(SubTransactionId subxid)
 	}
 }
 
+static void
+d1_node_counters(ProllyNodeCounters *counters)
+{
+	*counters = backend.counters;
+}
+
 const ProllyEngineRoutine prolly_engine_d1 = {
 	.info = {
 		.iface = PROLLY_IFACE_ENGINE,
@@ -1750,4 +1758,5 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.xact_commit = d1_xact_commit,
 	.xact_prepare = d1_xact_prepare,
 	.vacuum = d1_vacuum,
+	.node_counters = d1_node_counters,
 };
