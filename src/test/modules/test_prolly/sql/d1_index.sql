@@ -284,6 +284,22 @@ SET enable_seqscan = off;
 SELECT k, v FROM mj WHERE v = 2;
 RESET enable_seqscan;
 
+-- A table's size estimate counts the transaction's writes once they are
+-- spilled too (else the planner thinks it empty).
+CREATE FUNCTION d1_plan_rows(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+  RETURN (p -> 0 -> 'Plan' ->> 'Plan Rows')::float8;
+END $$;
+BEGIN;
+SET LOCAL prolly_write_set_memory = 64;
+CREATE TABLE spilled AS SELECT generate_series(1, 5000) AS id;
+CREATE TABLE more AS SELECT generate_series(1, 20000) AS id, repeat('x', 50) AS pad;
+SELECT d1_plan_rows('SELECT * FROM spilled') > 4000 AS counted;
+ROLLBACK;
+DROP FUNCTION d1_plan_rows(text);
+
 -- Not supported: prolly indexes on heap tables, INCLUDE columns.
 CREATE TABLE hx (a int) USING heap;
 CREATE INDEX hx_a ON hx USING prolly (a);
