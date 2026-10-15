@@ -206,35 +206,58 @@ bad:
 	return NULL;				/* keep compiler quiet */
 }
 
-/* Block 0 of rel's main fork, made if the fork is still empty. */
+/* Make buf (exclusively locked) a fresh counter page, WAL-logged. */
+static void
+counter_init(Relation rel, Buffer buf)
+{
+	GenericXLogState *state = GenericXLogStart(rel);
+	Page		page = GenericXLogRegisterBuffer(state, buf,
+												 GENERIC_XLOG_FULL_IMAGE);
+	CounterPageData *cp;
+
+	PageInit(page, BLCKSZ, sizeof(CounterPageData));
+	cp = (CounterPageData *) PageGetSpecialPointer(page);
+	cp->magic = COUNTER_MAGIC;
+	cp->version = COUNTER_VERSION;
+	cp->reserved_to = 0;
+	cp->pinned_epoch = 0;
+	cp->pinned_to = 0;
+	GenericXLogFinish(state);
+}
+
+/*
+ * Block 0 of rel's main fork, made if the fork is still empty, or made
+ * again if it is a new page: extending a file writes its new block at
+ * once, while the WAL that fills it in can be lost in a crash.  Then no
+ * number it had reserved can be in a committed row, whose WAL would have
+ * flushed it.
+ */
 static Buffer
 counter_buffer(Relation rel)
 {
+	Buffer		buf;
+
 	if (RelationGetNumberOfBlocks(rel) == 0)
 	{
 		LockRelationForExtension(rel, ExclusiveLock);
 		if (RelationGetNumberOfBlocks(rel) == 0)
 		{
-			Buffer		buf = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM,
-												NULL, EB_LOCK_FIRST);
-			GenericXLogState *state = GenericXLogStart(rel);
-			Page		page = GenericXLogRegisterBuffer(state, buf,
-														 GENERIC_XLOG_FULL_IMAGE);
-			CounterPageData *cp;
-
-			PageInit(page, BLCKSZ, sizeof(CounterPageData));
-			cp = (CounterPageData *) PageGetSpecialPointer(page);
-			cp->magic = COUNTER_MAGIC;
-			cp->version = COUNTER_VERSION;
-			cp->reserved_to = 0;
-			cp->pinned_epoch = 0;
-			cp->pinned_to = 0;
-			GenericXLogFinish(state);
+			buf = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM, NULL,
+									EB_LOCK_FIRST);
+			counter_init(rel, buf);
 			UnlockReleaseBuffer(buf);
 		}
 		UnlockRelationForExtension(rel, ExclusiveLock);
 	}
-	return ReadBuffer(rel, 0);
+	buf = ReadBuffer(rel, 0);
+	if (PageIsNew(BufferGetPage(buf)))
+	{
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		if (PageIsNew(BufferGetPage(buf)))
+			counter_init(rel, buf);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	}
+	return buf;
 }
 
 static CounterFreeData *
