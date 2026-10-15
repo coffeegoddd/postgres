@@ -191,6 +191,27 @@ $s2->{stderr} = '';
 $s1->query_safe('ROLLBACK');
 $s2->query_safe('RESET lock_timeout');
 
+# An update whose row was updated while it waited follows the newer
+# version in the mode its own change needs: here FOR NO KEY UPDATE, which a
+# FOR KEY SHARE lock on the newer version doesn't block (as Postgres's
+# tuplelock-update test expects).
+$node->safe_psql('postgres', q{CREATE TABLE ks (id int PRIMARY KEY, data int);
+	INSERT INTO ks VALUES (1, 0);});
+$s1->query_safe('SELECT pg_advisory_lock(4242)');
+$s2->query_safe('SET lock_timeout = 3000');
+$s2->query_until(qr/go/, "\\echo go\nUPDATE ks SET data = data + 1 WHERE pg_advisory_lock_shared(4242) IS NOT NULL;\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted})
+  or die 'the update never waited';
+$s1->query_safe('UPDATE ks SET data = 100');
+$s1->query_safe('BEGIN; SELECT * FROM ks FOR KEY SHARE;');
+$s1->query_safe('SELECT pg_advisory_unlock(4242)');
+$s2->query('SELECT 1');
+is($s2->{stderr}, '', 'an update of a row updated meanwhile isn\'t blocked by a key share lock');
+$s2->{stderr} = '';
+$s1->query_safe('COMMIT');
+$s2->query_safe('RESET lock_timeout');
+is($node->safe_psql('postgres', 'SELECT data FROM ks'), '101', 'and it updates the newer version');
+
 # Concurrent transfers between accounts keep the total.
 $node->safe_psql('postgres', q{
 	CREATE TABLE acct (id int PRIMARY KEY, bal int);

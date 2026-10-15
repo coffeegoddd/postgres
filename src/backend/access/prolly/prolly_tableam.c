@@ -1596,7 +1596,13 @@ update_lock_mode(Relation rel, const ProllyComponents *c, ItemPointer otid,
 	keying = read_keying(rel, c, roots, &owned);
 	row_at_init(&r);
 	row_at(c, roots, rel, keying, otid, InvalidCommandId, &r);
-	if (!r.present)
+
+	/*
+	 * Compared with the version otid names, gone or not: an update whose
+	 * version was updated meanwhile follows the newer one in the mode its
+	 * own change needs, as heap's does (comparing with the old tuple).
+	 */
+	if (!r.present && r.state != PROLLY_TID_GONE)
 		mode = LockTupleExclusive;
 	else
 	{
