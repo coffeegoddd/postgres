@@ -864,6 +864,9 @@ cursor_bind(ProllyCursor *c)
 	if (c->base.hash.len > 0)
 		c->tc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env, &c->base,
 							c->mcxt);
+	/* Unpositioned until a seek; an empty base stays done. */
+	c->t_have = c->o_have = false;
+	c->t_done = c->o_done = true;
 }
 
 static void
@@ -915,7 +918,6 @@ d1_cursor_open(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	cursor_bind(c);
 	initStringInfo(&c->o_bound);
 	c->dir = ForwardScanDirection;
-	c->t_done = c->o_done = true;
 	MemoryContextSwitchTo(old);
 	return c;
 }

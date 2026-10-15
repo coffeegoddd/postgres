@@ -453,7 +453,9 @@ seek_one(const ProllyEngineRoutine *e, ProllyCursor *cur, int key)
 /*
  * A seek sees the writes made before it, as get does, even when they come
  * after the cursor was opened: the tree's first write, more writes, and a
- * data tree being emptied to be rebuilt.  rel's trees start empty.
+ * data tree being emptied to be rebuilt.  rel's trees start empty, or rel
+ * holds committed rows (keys of other forms than the check's), which a
+ * cursor reads before the data tree is emptied.
  */
 static void
 seek_sees_later_writes(const ProllyEngineRoutine *e, Relation rel)
@@ -469,7 +471,19 @@ seek_sees_later_writes(const ProllyEngineRoutine *e, Relation rel)
 										InvalidCommandId);
 		ProllyKey	k;
 		ProllyValue v = int_value(1, vb);
+		ProllyKey	got;
+		ProllyValue gotv;
 
+		PROLLY_CALL(e, cursor_seek, cur, NULL, ForwardScanDirection);
+		if (kinds[t] == PROLLY_TREE_DATA &&
+			PROLLY_CALL(e, cursor_next, cur, &got, &gotv))
+		{
+			/* Committed rows, one read: emptying the tree hides them. */
+			PROLLY_CALL(e, tree_reset, rel, kinds[t]);
+			PROLLY_CALL(e, cursor_seek, cur, NULL, ForwardScanDirection);
+			if (PROLLY_CALL(e, cursor_next, cur, &got, &gotv))
+				elog(ERROR, "a seek sees committed rows of a tree emptied after it read them");
+		}
 		if (seek_one(e, cur, 0) != -1)
 			elog(ERROR, "the tree is not empty");
 		k = int_key(5, kb);
@@ -505,9 +519,9 @@ engine_seek_sees_later_writes_body(const ProllyImplInfo *impl)
 }
 
 /*
- * prolly_seek_sees_later_writes(rel): the same, on an empty table the
- * transaction hasn't written yet (made by an earlier transaction), whose
- * cursors open before it has any writes.  The writes are rolled back.
+ * prolly_seek_sees_later_writes(rel): the same, on a table the transaction
+ * hasn't written yet (made by an earlier transaction), whose cursors open
+ * before it has any writes.  The writes are rolled back.
  */
 static Relation seek_rel;
 
