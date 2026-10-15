@@ -38,7 +38,7 @@ COMMIT;
 UPDATE deferred SET a = a;
 
 -- Exclusion constraint.
-CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA extensions;
 CREATE TABLE booking (room int, during int4range,
 					  EXCLUDE USING gist (room WITH =, during WITH &&));
 INSERT INTO booking VALUES (1, '[1,5)'), (1, '[5,9)'), (2, '[1,5)');

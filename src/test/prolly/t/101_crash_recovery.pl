@@ -10,6 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use ProllyTest;
 
 my $am = $ENV{PROLLY_AM} // 'prolly_d1';
 
@@ -21,6 +22,7 @@ max_prepared_transactions = 10
 wal_consistency_checking = 'all'
 ));
 $node->start;
+setup_target($node, 'postgres', $am);
 
 $node->safe_psql('postgres', q(
 	CREATE TABLE dur (id int PRIMARY KEY, v text);

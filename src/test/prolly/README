@@ -15,11 +15,14 @@ Running
 
 	make -C src/test/prolly check PROLLY_AM=prolly_d1
 
-PROLLY_AM is the table access method under test (default prolly_d1); every
-instance the suite starts uses it as default_table_access_method, so every
-table the tests create is stored by the engine.  Individual groups:
+PROLLY_AM is the table access method under test (default prolly_d1).
+Semantics, isolation and durability use a shared target setup and verify a
+canary's AM before testing.  For prolly, public is a versioned schema, and
+the canary's table, index and TOAST storage must have block-map forks.
+Extensions live in an ordinary extensions schema.  Individual groups:
 
 	check-semantics       SQL behaves exactly as on heap
+	check-target          guard rejects accidental fallback to heap
 	check-isolation       concurrency behaves exactly as on heap
 	check-tap-durability  crash recovery, standby replay, prepared xacts
 	check-vc              branches, versioned schema, diff, merge,
@@ -27,7 +30,11 @@ table the tests create is stored by the engine.  Individual groups:
 	check-vc-isolation    sessions on different branches at once
 	check-tap-vc          history independence across clusters
 
-The TAP groups need a build configured with --enable-tap-tests.
+Semantics, isolation and TAP groups require --enable-tap-tests; a build
+without TAP support fails these targets instead of reporting success.
+For the page-based prolly AM, run check-semantics, check-isolation and
+check-tap-durability with PROLLY_AM=prolly.  The VC groups still describe
+the legacy tree-engine API and reject that target.
 
 Postgres's own regression and isolation suites, run with the engine as
 the default table AM, are separate targets, not part of "check":
@@ -37,6 +44,8 @@ the default table AM, are separate targets, not part of "check":
 
 Some upstream tests print heap-specific details (ctid values, page counts);
 those exceptions are still to be documented.
+For block-mapped storage use check-upstream-bmap.  The default-AM upstream
+targets reject prolly, since they don't create versioned schemas.
 
 Validating the tests themselves
 -------------------------------

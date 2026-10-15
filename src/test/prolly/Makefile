@@ -22,6 +22,9 @@ include $(top_builddir)/src/Makefile.global
 PROLLY_AM ?= prolly_d1
 export PROLLY_AM
 
+# TAP groups share tmp_check and the temporary installation.
+.NOTPARALLEL:
+
 # Server settings for every instance the suite starts.
 prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
@@ -36,20 +39,25 @@ EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
-check: check-semantics check-isolation check-vc check-vc-isolation check-tap
+check: check-target check-semantics check-isolation check-vc check-vc-isolation check-tap
 
-check-semantics: temp-install prolly_am.conf
-	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/semantics_schedule
+check-target: PROVE_TESTS = t/003_target_guard.pl
+check-target: require-tap temp-install
+	$(prove_check)
 
-check-vc: temp-install prolly_am.conf
+check-semantics: PROVE_TESTS = t/001_semantics.pl
+check-semantics: require-tap temp-install
+	$(prove_check)
+
+check-vc: require-legacy-vc temp-install prolly_am.conf
 	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_schedule
 
-check-isolation: temp-install prolly_am.conf
+check-isolation: PROVE_TESTS = t/002_isolation.pl
+check-isolation: require-tap temp-install
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
-	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
-		--schedule=$(srcdir)/isolation_schedule
+	$(prove_check)
 
-check-vc-isolation: temp-install prolly_am.conf
+check-vc-isolation: require-legacy-vc temp-install prolly_am.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
 		--schedule=$(srcdir)/vc_isolation_schedule
@@ -58,11 +66,11 @@ check-vc-isolation: temp-install prolly_am.conf
 check-tap: check-tap-durability check-tap-vc
 
 check-tap-durability: PROVE_TESTS = t/1*.pl
-check-tap-durability: temp-install
+check-tap-durability: require-tap temp-install
 	$(prove_check)
 
 check-tap-vc: PROVE_TESTS = t/2*.pl
-check-tap-vc: temp-install
+check-tap-vc: require-legacy-vc require-tap temp-install
 	$(prove_check)
 
 # Upstream correctness checks: Postgres's own
@@ -70,9 +78,11 @@ check-tap-vc: temp-install
 # Not part of "check": some upstream tests print heap-specific details
 # (ctid values, page counts), and those exceptions aren't documented yet.
 check-upstream-regress: prolly_am.conf
+	@test '$(PROLLY_AM)' != prolly || { echo 'Use check-upstream-bmap for upstream tests of block-mapped storage'; exit 1; }
 	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
 check-upstream-isolation: prolly_am.conf
+	@test '$(PROLLY_AM)' != prolly || { echo 'Use check-upstream-bmap for upstream tests of block-mapped storage'; exit 1; }
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
 # Postgres's regression, isolation and recovery suites with every user
@@ -89,9 +99,15 @@ check-upstream-bmap: bmap.conf
 check-heap: temp-install
 	$(MAKE) check-semantics check-isolation check-tap-durability PROLLY_AM=heap
 
+require-tap:
+	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
+
+require-legacy-vc:
+	@test '$(PROLLY_AM)' != prolly || { echo 'The VC requirements use the legacy tree-engine API; run semantics, isolation and durability for prolly'; exit 1; }
+
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf output_iso
 
-.PHONY: check check-semantics check-vc check-isolation check-vc-isolation \
+.PHONY: check check-target check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-upstream-regress check-upstream-isolation check-upstream-bmap FORCE
+	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE
