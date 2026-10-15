@@ -47,6 +47,9 @@ tests += {
     ],
   },
   'tap': {
+    'env': {
+       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
     'tests': [
       't/001_store_recovery.pl',
       't/002_d1_heads.pl',
@@ -79,6 +82,7 @@ tests += {
       't/029_versioned_schema_dump.pl',
       't/030_branch_connect.pl',
       't/031_bmap_share.pl',
+      't/034_bmap_share_limits.pl',
     ],
   },
 }

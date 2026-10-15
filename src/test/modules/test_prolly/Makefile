@@ -19,7 +19,9 @@ DATA = test_prolly--1.0.sql
 
 REGRESS = test_prolly d1_tables d1_index d1_maintenance prolly_tables versioned_schemas catalog_branch_column branch_catalogs bmap_sharing
 TAP_TESTS = 1
-EXTRA_INSTALL = contrib/tsm_system_rows
+EXTRA_INSTALL = contrib/tsm_system_rows src/test/modules/injection_points
+
+export enable_injection_points
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

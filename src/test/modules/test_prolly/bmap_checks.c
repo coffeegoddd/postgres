@@ -57,8 +57,9 @@ bmap_smgr(Oid relnumber)
 }
 
 /*
- * test_bmap_share(relnumber): a new relation file number whose storage
- * shares relnumber's pages.
+ * test_bmap_share(relnumber, transactional): a new relation file number
+ * whose storage shares relnumber's pages, dropped if the transaction aborts
+ * when transactional.
  */
 PG_FUNCTION_INFO_V1(test_bmap_share);
 
@@ -69,7 +70,7 @@ test_bmap_share(PG_FUNCTION_ARGS)
 	RelFileNumber copy = GetNewRelFileNumber(MyDatabaseTableSpace, NULL,
 											 RELPERSISTENCE_PERMANENT);
 
-	RelationCreateStorageShared(locator_of(copy), src, false);
+	RelationCreateStorageShared(locator_of(copy), src, PG_GETARG_BOOL(1));
 	PG_RETURN_OID(copy);
 }
 

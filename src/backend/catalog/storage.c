@@ -216,12 +216,12 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 {
 	SMgrRelation srel;
 
-	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
+	Assert(!IsInParallelMode());
 
-	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
-	smgrshare(src, srel);
-	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
-
+	/*
+	 * Registered first: a share that fails partway leaves the new storage
+	 * holding some of src's pages, which only dropping it gives back.
+	 */
 	if (register_delete)
 	{
 		PendingRelDelete *pending;
@@ -236,9 +236,15 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 		pendingDeletes = pending;
 	}
 
-	if (!XLogIsNeeded())
-		AddPendingSync(&rlocator);
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrshare(src, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
+	/*
+	 * No pending sync, even when WAL is skipped for new relations: the share
+	 * is logged and synced, and syncing the new relation at commit could
+	 * log and write every page it shares.
+	 */
 	return srel;
 }
 

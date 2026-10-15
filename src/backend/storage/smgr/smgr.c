@@ -589,6 +589,10 @@ smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum, bool isRedo)
  * dst is a new relation in the same tablespace and database, held by src's
  * implementation from then on.  The pages stay shared until either relation
  * changes one, which gives it its own copy of the page.
+ *
+ * The caller keeps src's pages from changing meanwhile, and arranges for dst
+ * to be dropped if the share fails partway, which may leave it holding some
+ * of src's pages.
  */
 void
 smgrshare(SMgrRelation src, SMgrRelation dst)

@@ -81,6 +81,7 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/md.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
@@ -1120,8 +1121,10 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 
 		end = Min(to, nblocks + BMAP_PIECE);
 		end = Min(end, (nblocks / BMAP_FANOUT + 1) * BMAP_FANOUT);
-		unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
-					  nblocks, end);
+		/* a map never shared has no entry born before its epoch */
+		if (PageGetBmapHeader(BufferGetPage(headerbuf))->epoch > 0)
+			unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
+						  nblocks, end);
 		extend_piece(reln, headerbuf, nblocks, end,
 					 end == to ? content : NULL, skipFsync);
 	}
@@ -1370,6 +1373,44 @@ refs_release(RefsPages *rp)
 }
 
 /*
+ * Log a record that changes the reference counts of the pages rp locked
+ * and, if mapbuf is valid, a map page by ndelta (registered with
+ * REGBUF_STANDARD | mapflags): apply the changes, register the pages,
+ * insert, and set the pages' LSNs.
+ */
+static void
+log_refs_record(uint8 info, const void *xlrec, uint32 xlrec_size,
+				Buffer mapbuf, xl_bmap_node_delta *ndelta, int mapflags,
+				RefsPages *rp)
+{
+	int			first = BufferIsValid(mapbuf) ? 1 : 0;
+	XLogRecPtr	lsn;
+
+	/* the main data, the map page's delta and one delta per count page */
+	XLogEnsureRecordSpace(first + BMAP_REFS_PER_RECORD,
+						  1 + first + BMAP_REFS_PER_RECORD);
+	START_CRIT_SECTION();
+	if (first)
+	{
+		apply_node_delta(BufferGetPage(mapbuf), ndelta);
+		MarkBufferDirty(mapbuf);
+	}
+	XLogBeginInsert();
+	XLogRegisterData(xlrec, xlrec_size);
+	if (first)
+	{
+		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD | mapflags);
+		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
+	}
+	refs_apply_register(rp, first);
+	lsn = XLogInsert(RM_BMAP_ID, info);
+	if (first)
+		PageSetLSN(BufferGetPage(mapbuf), lsn);
+	refs_set_lsn(rp, lsn);
+	END_CRIT_SECTION();
+}
+
+/*
  * Drop one reference to each of the physical blocks blocks[0 .. n), sorted,
  * held by a map that is going away.  A block no other map holds (count
  * zero) goes into tofree[] for the caller to free; a stuck count stays.
@@ -1417,18 +1458,11 @@ unref_blocks(RelFileLocator rel, const BlockNumber *blocks, uint32 n,
 		if (changed)
 		{
 			xl_bmap_unref xlrec;
-			XLogRecPtr	lsn;
 
 			xlrec.locator = rel;
 			xlrec.flags = 0;
-			XLogEnsureRecordSpace(BMAP_REFS_PER_RECORD, 0);
-			START_CRIT_SECTION();
-			XLogBeginInsert();
-			XLogRegisterData(&xlrec, sizeof(xlrec));
-			refs_apply_register(&rp, 0);
-			lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
-			refs_set_lsn(&rp, lsn);
-			END_CRIT_SECTION();
+			log_refs_record(XLOG_BMAP_UNREF, &xlrec, sizeof(xlrec),
+							InvalidBuffer, NULL, 0, &rp);
 		}
 		refs_release(&rp);
 		i += covered;
@@ -1514,7 +1548,6 @@ unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from, BlockNumber to)
 		xl_bmap_unref xlrec;
 		uint32		end = i;
 		uint32		covered = 0;
-		XLogRecPtr	lsn;
 
 		ndelta = palloc0(sizeof(xl_bmap_node_delta) + nitems * sizeof(xl_bmap_entry_delta));
 		ndelta->kind = BMAP_DELTA_NODE;
@@ -1552,19 +1585,8 @@ unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from, BlockNumber to)
 
 		xlrec.locator = rel;
 		xlrec.flags = BMAP_UNREF_MAP;
-		XLogEnsureRecordSpace(1 + BMAP_REFS_PER_RECORD, 0);
-		START_CRIT_SECTION();
-		apply_node_delta(BufferGetPage(mapbuf), ndelta);
-		MarkBufferDirty(mapbuf);
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
-		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
-		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
-		refs_apply_register(&rp, 1);
-		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
-		PageSetLSN(BufferGetPage(mapbuf), lsn);
-		refs_set_lsn(&rp, lsn);
-		END_CRIT_SECTION();
+		log_refs_record(XLOG_BMAP_UNREF, &xlrec, sizeof(xlrec),
+						mapbuf, ndelta, 0, &rp);
 
 		refs_release(&rp);
 		pfree(ndelta);
@@ -1636,7 +1658,6 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 		xl_bmap_entry_delta *ent;
 		xl_bmap_share xlrec;
 		uint32		covered = 0;
-		XLogRecPtr	lsn;
 
 		ndelta = palloc0(sizeof(xl_bmap_node_delta) + nitems * sizeof(xl_bmap_entry_delta));
 		ndelta->kind = BMAP_DELTA_NODE;
@@ -1661,20 +1682,8 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 
 		xlrec.src = srel;
 		xlrec.dst = drel;
-		XLogEnsureRecordSpace(1 + BMAP_REFS_PER_RECORD, 0);
-		START_CRIT_SECTION();
-		apply_node_delta(BufferGetPage(mapbuf), ndelta);
-		MarkBufferDirty(mapbuf);
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
-		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD |
-						   (first ? REGBUF_WILL_INIT : 0));
-		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
-		refs_apply_register(&rp, 1);
-		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_SHARE);
-		PageSetLSN(BufferGetPage(mapbuf), lsn);
-		refs_set_lsn(&rp, lsn);
-		END_CRIT_SECTION();
+		log_refs_record(XLOG_BMAP_SHARE, &xlrec, sizeof(xlrec), mapbuf, ndelta,
+						first ? REGBUF_WILL_INIT : 0, &rp);
 
 		refs_release(&rp);
 		pfree(ndelta);
@@ -1692,6 +1701,11 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
  * entries, each block's count grows by one, and both maps' epochs pass the
  * entries' births.  src's dirty buffers are written and the page store
  * synced, so the blocks hold what both copies start from.
+ *
+ * The caller keeps src from changing meanwhile (a lock that waits for its
+ * writers): a change made to one of src's buffers before the epochs are
+ * raised would be written to a block dst shares.  An error partway leaves
+ * dst with some of src's blocks counted; dropping dst gives them back.
  */
 void
 bmapshare(SMgrRelation src, SMgrRelation dst)
@@ -1731,7 +1745,10 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	if (nblocks > 0)
 		for (BlockNumber mapblk = 1; mapblk <= MAP_PAGE(nblocks - 1); mapblk++)
+		{
 			share_map_page(src, dst, mapblk, nblocks);
+			INJECTION_POINT("bmap-share-map-page", NULL);
+		}
 
 	dheader = map_read(drel, 0);
 	LockBuffer(dheader, BUFFER_LOCK_EXCLUSIVE);

@@ -96,8 +96,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Block-mapped storage's sharing, below the catalogs: storage is named by
 -- relation file number in the database's default tablespace.  A copy
--- made by test_bmap_share() lasts until test_bmap_unlink() drops it.
-CREATE FUNCTION test_bmap_share(relnumber oid)
+-- made by test_bmap_share() lasts until test_bmap_unlink() drops it, or,
+-- if transactional, until the transaction aborts.
+CREATE FUNCTION test_bmap_share(relnumber oid, transactional bool DEFAULT false)
 RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
