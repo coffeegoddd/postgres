@@ -92,6 +92,13 @@ Not yet exercised: the perf collector (needs `system/system_prepare.sh`),
 and the larger-than-RAM size (open question 18). S10 (sysbench) was added
 during step 2 at the user's request.
 
+**C suite (2026-10-15, user request):** a third suite, SQL correctness,
+added after step 2: the sqllogictest corpus against heap and each engine,
+judged by agreement with heap (`12-correctness-suite.md`, gate 8 in
+`06-benchmarking.md`). Building it found that `--am prolly` had been
+measuring heap in S and V; they now create prolly's tables in a versioned
+schema.
+
 ## 3. Demonstrate the harness and record a local baseline
 
 - Run the S suite against stock heap (B0) on the local machine, at the

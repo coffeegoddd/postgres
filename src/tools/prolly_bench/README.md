@@ -1,11 +1,13 @@
 # prolly_bench
 
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
-compared with stock heap) and the V suite (version control, prolly engines
-only).
+compared with stock heap), the V suite (version control, prolly engines
+only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
+with stock heap).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
-(S9), sysbench (S10), `fio` and `perf`.
+(S9), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
+slt-runner (`slt/`).
 
 ## Quick start
 
@@ -41,6 +43,52 @@ VACUUM, recovery) with each S number's ratio to B0, and writes
 better than B0 are green and worse are red (beyond 5%), and hovering a cell
 shows its spread.  `compare BASELINE_DIR DIR` gives one result set's ratios
 to a baseline in a single wide table.
+
+## The C suite
+
+```sh
+# once, and whenever slt/ changes (needs Go): build-bench/slt/slt-runner
+src/tools/prolly_bench/build_slt.sh
+
+# heap (B0) and an engine, then the comparison; about 5 minutes
+src/tools/prolly_bench/prolly_bench run C --am heap,prolly
+
+# about 50 seconds per AM: C1 and C2 whole, a file per directory of C3 and C4
+src/tools/prolly_bench/prolly_bench run C --am heap,prolly --config src/tools/prolly_bench/configs/c_smoke.toml
+
+src/tools/prolly_bench/prolly_bench table --suite C          # latest per label
+src/tools/prolly_bench/prolly_bench cdiff specs/results/<B0 dir> specs/results/<engine dir>
+```
+
+The corpus is Dolthub's sqllogictest (`~/cursor_src/sqllogictest`, set in
+the config's `[tools]`): C1 `select1`-`select5`, C2 `evidence/`, C3
+`index/`, C4 `random/`; 5,675,180 records run on Postgres.  Each cell runs
+its part through slt-runner, which runs every test file in a fresh database
+over one session, a file per worker process (one per CPU), and records each
+record's status with a digest of the answer it got.
+
+An engine is judged by agreement with heap, not only by the corpus's
+expected answers: `table --suite C` gives the pass rate per engine, then
+each engine's records in classes against B0 (`agree`, `order_only`,
+`regression`, `postgres_semantics`, ...), and a gate that fails on
+`regression`, `hidden_regression`, `crashed` and `unmatched`.  `cdiff`
+lists the differences with the queries.  Records expected to differ go in
+`configs/c_exceptions.toml` with a reason.
+
+C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
+autovacuum: the suite measures correctness and never crashes the server on
+purpose.  S and V refuse those settings.
+
+## Targets
+
+`prolly` tables exist only in versioned schemas, and with `prolly` as the
+default table AM a table created anywhere else is a heap table.  So for
+`prolly`, every suite creates its tables in a versioned schema
+(`pbench/core/targets.py`): S and V make it first on the benchmark
+database's `search_path`, and the C suite runs the corpus in it.  Every
+cell checks that its tables are on the AM under test, and fails otherwise.
+
+## A quick check
 
 A quick check that everything works (tiny data, 10-second windows):
 
@@ -102,7 +150,7 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
-| `Workload` | S1-S10, V1-V4 | `pbench/workloads/` |
+| `Workload` | S1-S10, V1-V4, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local | `pbench/clusters/` |
@@ -116,5 +164,6 @@ the cluster in `post`.
 ## Tests
 
 ```sh
-cd src/tools/prolly_bench && python3 -m unittest discover -s tests
+cd src/tools/prolly_bench && python3 -B -m unittest discover -s tests
+cd src/tools/prolly_bench/slt && go test .
 ```
