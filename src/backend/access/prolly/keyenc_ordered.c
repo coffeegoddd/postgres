@@ -42,6 +42,8 @@
  */
 #include "postgres.h"
 
+#include "access/amapi.h"
+
 #include "access/nbtree.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
@@ -110,8 +112,16 @@ typedef struct Segment
 static Oid
 comparison_proc(Oid opfamily, Oid base)
 {
-	Oid			proc = get_opfamily_proc(opfamily, base, base, BTORDER_PROC);
+	Oid			proc;
 	Oid			poly = InvalidOid;
+
+	/*
+	 * Only an ordering access method's support function 1 compares (btree's,
+	 * or prolly's): GiST's, for one, is its consistent function.
+	 */
+	if (!GetIndexAmRoutineByAmId(get_opfamily_method(opfamily), false)->amcanorder)
+		return InvalidOid;
+	proc = get_opfamily_proc(opfamily, base, base, BTORDER_PROC);
 
 	if (OidIsValid(proc))
 		return proc;

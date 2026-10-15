@@ -245,6 +245,17 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 
 		d.keyless = !OidIsValid(pkoid);
 		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
+
+		/*
+		 * A primary key the key encoder can't order (WITHOUT OVERLAPS, kept
+		 * by a GiST index) doesn't key the rows: they are keyed by content.
+		 */
+		for (int i = 0; i < d.nkeys && !d.keyless; i++)
+			if (!PROLLY_CALL(c.key_encoder, supports, d.cols[i].opfamily,
+							 d.cols[i].type, d.cols[i].collation))
+				d.keyless = true;
+		if (d.keyless)
+			d.nkeys = 0;
 		k->valenc = PROLLY_CALL(c.value_encoder, begin,
 								rewritten ? k->desc : RelationGetDescr(rel),
 								mcxt);
