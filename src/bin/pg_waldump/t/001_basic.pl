@@ -99,7 +99,8 @@ LogicalMessage
 XLOG2
 Prolly
 ProllyStore
-ProllyCommit$/,
+ProllyCommit
+BlockMap$/,
 	'rmgr list');
 
 
@@ -174,6 +175,14 @@ SELECT pg_logical_emit_message(true, 'foo', 'bar');
 
 -- relmap
 VACUUM FULL pg_authid;
+
+-- block-mapped storage
+SET debug_block_mapped_heap = on;
+CREATE TABLE bmap_tbl (a int PRIMARY KEY);
+INSERT INTO bmap_tbl SELECT generate_series(1, 1000);
+TRUNCATE bmap_tbl;
+DROP TABLE bmap_tbl;
+RESET debug_block_mapped_heap;
 
 -- database
 CREATE DATABASE d1;
@@ -489,6 +498,11 @@ for my $scenario (@scenarios)
 		@lines =
 		  test_pg_waldump($path, $start_lsn, $end_lsn, '--rmgr' => 'Btree');
 		is(grep(!/^rmgr: Btree/, @lines), 0, 'only Btree lines');
+
+		@lines =
+		  test_pg_waldump($path, $start_lsn, $end_lsn, '--rmgr' => 'BlockMap');
+		is(grep(!/^rmgr: BlockMap/, @lines), 0, 'only BlockMap lines');
+		ok(grep(/desc: EXTEND/, @lines), 'BlockMap extensions decoded');
 
 		@lines =
 		  test_pg_waldump($path, $start_lsn, $end_lsn, '--fork' => 'init');
