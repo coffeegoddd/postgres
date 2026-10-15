@@ -203,6 +203,28 @@ catalog_object_branch(Oid classid, Oid objid)
 	return branch;
 }
 
+/* the table an existing index is on, from its pg_index row */
+static Oid
+index_table(Oid indexid)
+{
+	Relation	rel = table_open(IndexRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			relid = InvalidOid;
+
+	ScanKeyInit(&key, Anum_pg_index_indexrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(indexid));
+	scan = systable_beginscan(rel, IndexRelidIndexId, true, SnapshotSelf,
+							  1, &key);
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+		relid = ((Form_pg_index) GETSTRUCT(tup))->indrelid;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return relid;
+}
+
 static Oid
 namespace_branch(Oid nspid)
 {
@@ -240,12 +262,17 @@ row_branch(Relation rel, HeapTuple tup)
 				if (namespace_is_versioned(c->relnamespace) ||
 					c->relam == PROLLY_TABLE_AM_OID)
 					return MyBranch;
-				/* an index belongs where its table does (a TOAST table's, too) */
-				if ((c->relkind == RELKIND_INDEX ||
-					 c->relkind == RELKIND_PARTITIONED_INDEX) &&
-					OidIsValid(CatalogBranchIndexTable))
+				/*
+				 * An index belongs where its table does (a TOAST table's,
+				 * too): the table index_create is making it for, or, once
+				 * made, the one its pg_index row names.
+				 */
+				if (c->relkind == RELKIND_INDEX ||
+					c->relkind == RELKIND_PARTITIONED_INDEX)
 					return catalog_object_branch(RelationRelationId,
-												 CatalogBranchIndexTable);
+												 OidIsValid(CatalogBranchIndexTable) ?
+												 CatalogBranchIndexTable :
+												 index_table(c->oid));
 				return InvalidOid;
 			}
 		case TypeRelationId:
@@ -386,24 +413,22 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 }
 
 /*
- * Check out the branch a connection named ("dbname/branch"), or main.
+ * Check out the branch a connection named ("dbname/branch"), if the
+ * database has one by that name; false if it has none.
  */
-void
+bool
 branch_session_init(const char *branch)
 {
 	HeapTuple	tup;
 	Oid			oid;
 
-	if (branch == NULL)
-		return;
 	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(branch));
 	if (!HeapTupleIsValid(tup))
-		ereport(FATAL,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" does not exist", branch)));
+		return false;
 	oid = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 	ReleaseSysCache(tup);
 	set_session_branch(oid);
+	return true;
 }
 
 /*
