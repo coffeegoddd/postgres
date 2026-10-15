@@ -471,6 +471,17 @@ checked in `d1_tables`, and seeks in order by a tree conformance check).
 While a table's key order is lost, a scan reads the version entries whole
 and looks them up by bytes, until the next write rebuilds them.
 
+**Decisions for the rest of step 4 (user, 2026-10-14).** Every open choice
+the remaining work reaches was settled as recommended (questions 23, 25,
+27, 29, 34, 35, 46–56): K1 locks by (relation, key hash) on the lock
+manager; one commit lock per branch; `prolly.write_set_memory`; values out
+of line past about 2 KB, uncompressed in canonical form; an explicit
+`prolly_gc()`; tablespaces ignored for prolly tables; Doltgres's SQL
+interface (`dolt_*` functions and system tables, `dbname/branch`);
+versioned databases by opt-in; shared catalogs unbranched; permanent heap
+tables refused in a versioned database; Dolt's conflict tables; renames
+merged as drop and add; a pinned canonical deparse; `dolt.author`.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.
