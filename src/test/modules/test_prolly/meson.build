@@ -45,6 +45,7 @@ tests += {
       'branch_catalogs',
       'bmap_sharing',
       'bmap_copy_on_write',
+      'branches',
     ],
   },
   'tap': {
@@ -83,6 +84,7 @@ tests += {
       't/029_versioned_schema_dump.pl',
       't/030_branch_connect.pl',
       't/031_bmap_share.pl',
+      't/032_branches.pl',
       't/034_bmap_share_limits.pl',
       't/035_bmap_replaced_blocks.pl',
       't/036_bmap_shared_changes.pl',

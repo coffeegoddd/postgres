@@ -35,6 +35,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/tableam.h"
+#include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -422,9 +423,18 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_checkout needs a branch")));
-	if (create)
-		PROLLY_CALL(refs(), branch_create, branch, start);
-	PROLLY_CALL(refs(), checkout, branch);
+	if (database_uses_branch_copies())
+	{
+		if (create)
+			branch_ops()->create(branch, start);
+		branch_ops()->checkout(branch);
+	}
+	else
+	{
+		if (create)
+			PROLLY_CALL(refs(), branch_create, branch, start);
+		PROLLY_CALL(refs(), checkout, branch);
+	}
 	result[0] = "0";
 	result[1] = psprintf("Switched to branch '%s'", branch);
 	PG_RETURN_DATUM(text_array(2, result));
@@ -468,6 +478,34 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+	if (database_uses_branch_copies())
+	{
+		const BranchOpsRoutine *ops = branch_ops();
+		ListCell   *lc;
+
+		/* no commits yet, so nothing is unmerged: -D is -d */
+		if (delete)
+		{
+			foreach(lc, names)
+				ops->drop((char *) lfirst(lc));
+		}
+		else if (copy)
+		{
+			if (list_length(names) != 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("dolt_branch -c needs the branch to copy and a new name")));
+			ops->create((char *) lsecond(names), (char *) linitial(names));
+		}
+		else
+		{
+			if (list_length(names) > 2)
+				unexpected("dolt_branch", (char *) lthird(names));
+			ops->create((char *) linitial(names),
+						list_length(names) > 1 ? (char *) lsecond(names) : NULL);
+		}
+		PG_RETURN_DATUM(text_array(1, result));
+	}
 	if (delete)
 	{
 		ListCell   *lc;
@@ -670,6 +708,8 @@ dolt_hashof(PG_FUNCTION_ARGS)
 Datum
 active_branch(PG_FUNCTION_ARGS)
 {
+	if (database_uses_branch_copies())
+		PG_RETURN_TEXT_P(cstring_to_text(branch_ops()->current()));
 	PG_RETURN_TEXT_P(cstring_to_text(session_branch_name()));
 }
 
@@ -843,6 +883,18 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 						 nulls);
 }
 
+/* A branch made by copying: a name, and no commits yet. */
+static void
+copies_branch_row(const char *name, Oid branch, void *arg)
+{
+	BranchRows *br = (BranchRows *) arg;
+	Datum		values[7] = {0};
+	bool		nulls[7] = {false, true, true, true, true, true, true};
+
+	values[0] = CStringGetTextDatum(name);
+	tuplestore_putvalues(br->rsinfo->setResult, br->rsinfo->setDesc, values, nulls);
+}
+
 /*
  * dolt_branches(OUT name text, OUT hash text, OUT latest_committer text,
  *				 OUT latest_committer_email text,
@@ -859,7 +911,10 @@ dolt_branches(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 	br.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	PROLLY_CALL(refs(), branches, branch_row, &br);
+	if (database_uses_branch_copies())
+		branch_ops()->branches(copies_branch_row, &br);
+	else
+		PROLLY_CALL(refs(), branches, branch_row, &br);
 	return (Datum) 0;
 }
 

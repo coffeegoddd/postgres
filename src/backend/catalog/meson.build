@@ -3,6 +3,7 @@
 backend_sources += files(
   'aclchk.c',
   'branch.c',
+  'branch_copies.c',
   'catalog.c',
   'dependency.c',
   'heap.c',

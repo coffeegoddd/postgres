@@ -67,6 +67,7 @@
 #include "catalog/versioned.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/rel.h"
@@ -75,6 +76,7 @@
 
 Oid			MyBranch = BRANCH_MAIN_OID;
 Oid			CatalogBranchIndexTable = InvalidOid;
+bool		CatalogKeepRowBranch = false;
 
 static const CatalogBranchInfo branch_catalogs[] = {
 	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch},
@@ -119,6 +121,13 @@ static const CatalogBranchInfo branch_catalogs[] = {
 
 static const CatalogBranchInfo *by_oid[BRANCH_CATALOG_OID_LIMIT];
 static bool by_oid_built = false;
+
+const CatalogBranchInfo *
+catalog_branch_catalogs(int *n)
+{
+	*n = lengthof(branch_catalogs);
+	return branch_catalogs;
+}
 
 const CatalogBranchInfo *
 catalog_branch_info(Oid relid)
@@ -373,6 +382,12 @@ catalog_row_with_branch(Relation rel, HeapTuple tup)
 
 	if (info == NULL)
 		return tup;
+
+	/* a branch's copy of a row carries its branch already */
+	if (CatalogKeepRowBranch &&
+		!heap_attisnull(tup, info->attnum, RelationGetDescr(rel)))
+		return tup;
+
 	branch = row_branch(rel, tup);
 
 	/*
@@ -439,6 +454,8 @@ branch_session_init(const char *branch)
 void
 set_session_branch(Oid branch)
 {
+	if (MyProc != NULL)
+		MyProc->branchId = branch;
 	if (branch == MyBranch)
 		return;
 	MyBranch = branch;

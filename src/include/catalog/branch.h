@@ -36,8 +36,14 @@ extern PGDLLIMPORT Oid MyBranch;
  */
 extern PGDLLIMPORT Oid CatalogBranchIndexTable;
 
+/* while set, catalog writes keep the branch a row carries: a branch's copy */
+extern PGDLLIMPORT bool CatalogKeepRowBranch;
+
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
+
+/* every branch-aware catalog */
+extern const CatalogBranchInfo *catalog_branch_catalogs(int *n);
 
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
