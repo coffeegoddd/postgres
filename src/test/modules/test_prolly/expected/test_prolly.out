@@ -65,6 +65,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d1               | create_and_truncate                     | pass
  engine          | d1               | read_empty_tree                         | pass
  engine          | d1               | read_own_writes                         | pass
+ engine          | d1               | seek_sees_later_writes                  | pass
  engine          | d1               | subxact_abort_discards_writes           | pass
  engine          | d1               | commit_publishes_roots                  | no checks yet
  engine          | d1               | count_range_matches_scan                | pass
@@ -75,6 +76,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d2               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d2               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
  engine          | d2               | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d2               | seek_sees_later_writes                  | not implemented (missing tree_create, put, tree_reset, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d2               | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
  engine          | d2               | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
  engine          | d2               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
@@ -85,6 +87,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d3a              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3a              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
  engine          | d3a              | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3a              | seek_sees_later_writes                  | not implemented (missing tree_create, put, tree_reset, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3a              | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
  engine          | d3a              | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
  engine          | d3a              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
@@ -95,6 +98,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d3b              | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3b              | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
  engine          | d3b              | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d3b              | seek_sees_later_writes                  | not implemented (missing tree_create, put, tree_reset, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d3b              | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
  engine          | d3b              | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
  engine          | d3b              | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
@@ -105,6 +109,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  engine          | d4               | create_and_truncate                     | not implemented (missing tree_create, tree_truncate, put, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d4               | read_empty_tree                         | not implemented (missing tree_create, roots_acquire, roots_release, cursor_open, cursor_seek, cursor_next, cursor_close, get)
  engine          | d4               | read_own_writes                         | not implemented (missing tree_create, put, remove, get, cursor_open, cursor_seek, cursor_next, cursor_close)
+ engine          | d4               | seek_sees_later_writes                  | not implemented (missing tree_create, put, tree_reset, cursor_open, cursor_seek, cursor_next, cursor_close)
  engine          | d4               | subxact_abort_discards_writes           | not implemented (missing tree_create, put, remove, subxact_abort, xact_abort, cursor_open, cursor_next)
  engine          | d4               | commit_publishes_roots                  | not implemented (missing put, xact_precommit, xact_commit, roots_acquire)
  engine          | d4               | count_range_matches_scan                | not implemented (missing tree_create, put, count_range, cursor_next)
@@ -251,6 +256,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  row_identity    | counter          | identity                                | pass
  row_identity    | counter          | assign_then_resolve                     | pass
  row_identity    | counter          | rename_keeps_tid                        | pass
+ row_identity    | counter          | find_sees_later_assign                  | pass
  row_identity    | counter          | renew_makes_new_version                 | pass
  row_identity    | counter          | never_reused                            | pass
  row_identity    | counter          | forget                                  | not implemented (missing tid_forget)
@@ -258,6 +264,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  row_identity    | stub             | identity                                | pass
  row_identity    | stub             | assign_then_resolve                     | not implemented (missing tid_assign, scan_begin, tid_find, scan_end, tid_resolve)
  row_identity    | stub             | rename_keeps_tid                        | not implemented (missing tid_assign, tid_rename, tid_resolve, scan_begin, tid_find, scan_end)
+ row_identity    | stub             | find_sees_later_assign                  | not implemented (missing scan_begin, tid_find, tid_assign, scan_end)
  row_identity    | stub             | renew_makes_new_version                 | not implemented (missing tid_assign, tid_renew, tid_resolve, scan_begin, tid_find, scan_end)
  row_identity    | stub             | never_reused                            | not implemented (missing tid_assign, tid_retire, tid_resolve, scan_begin, tid_find, scan_end)
  row_identity    | stub             | forget                                  | not implemented (missing tid_assign, tid_resolve, tid_forget)
@@ -287,6 +294,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  tree            | cow              | counts_nodes                            | pass
  tree            | cow              | diff_reads_changed_paths                | pass
  tree            | cow              | diff_across_heights                     | pass
+ tree            | cow              | seeks_in_order                          | pass
  tree            | cow              | nodes_are_valid                         | pass
  tree            | cow              | complete                                | pass
  tree            | stub             | identity                                | pass
@@ -301,6 +309,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  tree            | stub             | counts_nodes                            | not implemented (missing build_begin, build_add, build_finish, walk)
  tree            | stub             | diff_reads_changed_paths                | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
  tree            | stub             | diff_across_heights                     | not implemented (missing build_begin, build_add, build_finish, walk, diff)
+ tree            | stub             | seeks_in_order                          | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree            | stub             | nodes_are_valid                         | not implemented (missing build_begin, build_add, build_finish, walk)
  tree            | stub             | complete                                | not implemented (13 of 13 callbacks missing)
  root_layout     | subroots         | identity                                | pass
@@ -343,7 +352,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | identity                                | pass
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (9 of 9 callbacks missing)
-(282 rows)
+(291 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -354,13 +363,14 @@ SELECT * FROM prolly_conformance('engine', 'd1');
  engine    | d1             | create_and_truncate                     | pass
  engine    | d1             | read_empty_tree                         | pass
  engine    | d1             | read_own_writes                         | pass
+ engine    | d1             | seek_sees_later_writes                  | pass
  engine    | d1             | subxact_abort_discards_writes           | pass
  engine    | d1             | commit_publishes_roots                  | no checks yet
  engine    | d1             | count_range_matches_scan                | pass
  engine    | d1             | canonical_root_independent_of_history   | not implemented (missing canonical_root)
  engine    | d1             | export_chunks_closed_under_reachability | not implemented (missing canonical_root, export_chunks)
  engine    | d1             | complete                                | not implemented (6 of 29 callbacks missing)
-(10 rows)
+(11 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

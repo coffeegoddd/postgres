@@ -34,7 +34,8 @@
  *
  * (integers big-endian), where xmin is the transaction that wrote the
  * version: local metadata, like the TIDs themselves, never part of
- * canonical content.  A scan finds a row's TID by its 'V' entry.
+ * canonical content.  A scan finds a row's TID by its 'V' entry, seeking
+ * one cursor over the map as it goes.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/rowid_counter.c
@@ -92,6 +93,7 @@ struct ProllyRowIdScan
 	Relation	rel;
 	CommandId	cid;
 	StringInfoData buf;
+	ProllyCursor *cursor;		/* over the map, made on first use */
 };
 
 static const ProllyEngineRoutine *
@@ -526,17 +528,42 @@ counter_scan_begin(ProllyRootSet *roots, Relation rel, CommandId cid)
 	return scan;
 }
 
+/*
+ * A scan finds rows in its key order, so it seeks one cursor over the map
+ * rather than looking up each row: seeks near the last one read no new
+ * nodes, where a lookup reads a whole path.
+ */
 static bool
 counter_tid_find(ProllyRowIdScan *scan, const ProllyKey *key, uint64 ordinal,
 				 ItemPointer tid)
 {
-	return version_tid(engine_for(scan->rel), scan->roots, scan->rel, key,
-					   ordinal, scan->cid, &scan->buf, tid);
+	const ProllyEngineRoutine *engine = engine_for(scan->rel);
+	ProllyKey	vkey = version_key(key, ordinal, &scan->buf);
+	ProllyKey	k;
+	ProllyValue v;
+
+	if (scan->cursor == NULL)
+	{
+		/* It lives as long as the scan, not the caller's current context. */
+		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(scan));
+
+		scan->cursor = PROLLY_CALL(engine, cursor_open, scan->roots, scan->rel,
+								   PROLLY_TREE_ROWID, scan->cid);
+		MemoryContextSwitchTo(old);
+	}
+	PROLLY_CALL(engine, cursor_seek, scan->cursor, &vkey, ForwardScanDirection);
+	if (!PROLLY_CALL(engine, cursor_next, scan->cursor, &k, &v) ||
+		k.len != vkey.len || memcmp(k.data, vkey.data, k.len) != 0)
+		return false;
+	decode_tid(v.data, v.len, tid);
+	return true;
 }
 
 static void
 counter_scan_end(ProllyRowIdScan *scan)
 {
+	if (scan->cursor)
+		PROLLY_CALL(engine_for(scan->rel), cursor_close, scan->cursor);
 	pfree(scan->buf.data);
 	pfree(scan);
 }

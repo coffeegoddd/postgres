@@ -829,6 +829,60 @@ tree_counts_nodes(const ProllyImplInfo *impl)
 }
 
 /*
+ * A cursor seeking keys in order reads each node about once, as a scan
+ * does: a seek keeps the nodes of the path it already holds.  Seeking every
+ * key forward, then every key backward, each reads no more than the tree's
+ * nodes plus a path.
+ */
+void
+tree_seeks_in_order(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *ref = palloc(sizeof(Ref));
+	ProllyNodeRef root;
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+	ScanDirection dirs[] = {ForwardScanDirection, BackwardScanDirection};
+
+	make_env(tr, &env);
+	fill_ref(ref, 1, 1);
+	build_ref(tr, &env, ref, &root);
+	PROLLY_CALL(tr, walk, &env, &root, collect_node, &nodes);
+
+	for (int t = 0; t < lengthof(dirs); t++)
+	{
+		bool		forward = ScanDirectionIsForward(dirs[t]);
+		ProllyTreeCursor *c;
+		uint64		bound = (uint64) nodes.n + nodes.levels;
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		c = PROLLY_CALL(tr, cursor_open, &env, &root, CurrentMemoryContext);
+		for (int i = 0; i < MAX_KEY; i++)
+		{
+			int			k = forward ? i : MAX_KEY - 1 - i;
+			KeyBuf		kb;
+			ProllyKey	target = key_of(k, &kb);
+			ProllyKey	key;
+			ProllyValue value;
+
+			PROLLY_CALL(tr, cursor_seek, c, &target, dirs[t]);
+			if (!PROLLY_CALL(tr, cursor_next, c, &key, &value) ||
+				key_int(&key) != k)
+				elog(ERROR, "seeking key %d did not find it", k);
+		}
+		PROLLY_CALL(tr, cursor_close, c);
+		env.counters = NULL;
+		if (cnt.nodes_read > bound)
+			elog(ERROR, "seeking %d keys %s in a tree of %d nodes read %llu nodes, more than %llu",
+				 MAX_KEY, forward ? "forward" : "backward", nodes.n,
+				 (unsigned long long) cnt.nodes_read,
+				 (unsigned long long) bound);
+	}
+}
+
+/*
  * Diff reads only what changed: with d changed keys spread over the tree,
  * it reads O(d log n) nodes, a few root-to-leaf paths per change, never
  * every leaf.  A tree diffed against itself reads nothing, and against the

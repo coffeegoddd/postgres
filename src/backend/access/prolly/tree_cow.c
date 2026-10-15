@@ -609,6 +609,12 @@ iter_load_child(Iter *it, int d)
 	uint64		count;
 
 	node_child(it->env, &it->f[d].node, it->f[d].idx, &ref, &count);
+	/* Already loaded (a seek near the last one): keep it, unread. */
+	if (BufferIsValid(it->f[d + 1].node.buf) &&
+		it->f[d + 1].node.ref.hash.len == ref.hash.len &&
+		memcmp(it->f[d + 1].node.ref.hash.bytes, ref.hash.bytes,
+			   ref.hash.len) == 0)
+		return;
 	node_release(&it->f[d + 1].node);
 	node_read(it->env, &ref, &it->f[d + 1].node);
 }

@@ -115,6 +115,9 @@ typedef struct ProllyTreeRoutine
 	 * Cursors.  cursor_seek positions before the first key >= key (forward)
 	 * or after the last key <= key (backward); a NULL key means the start or
 	 * the end.  cursor_next returns false when there are no more items.
+	 * A seek reads only the nodes on the new key's path that the cursor
+	 * doesn't hold already, so seeks in key order read each node about
+	 * once, as a scan does.
 	 */
 	ProllyTreeCursor *(*cursor_open) (const ProllyTreeEnv *env,
 									  const ProllyNodeRef *root,

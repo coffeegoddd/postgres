@@ -71,3 +71,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION prolly_tree_digest(rel regclass)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Check that seeks of rel's cursors see writes made after they opened;
+-- rel is an empty table the transaction hasn't written.
+CREATE FUNCTION prolly_seek_sees_later_writes(rel regclass)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

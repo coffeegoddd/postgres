@@ -402,7 +402,22 @@ UPDATE d1_counted SET v = 'changed' WHERE id = 12345;
 SELECT nodes_written - :w0 BETWEEN 1 AND 50 AS few_writes
 FROM prolly_node_counters('prolly_d1');
 RESET enable_seqscan;
+-- A sequential scan reads each node about once, its row identity map's
+-- included: under one read per ten rows (a lookup of each row's TID read
+-- about six per row).
+SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
+SELECT count(*) FROM d1_counted;
+SELECT nodes_read - :r0 BETWEEN 1 AND 2000 AS reads_each_node_once
+FROM prolly_node_counters('prolly_d1');
 SELECT * FROM prolly_node_counters('heap');
+-- A scan finds TIDs by seeking one cursor over the row identity map, so a
+-- seek must see writes made since the cursor opened, even when the tree
+-- had none then.
+CREATE TABLE d1_seek (a int) USING prolly_d1;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+SELECT prolly_seek_sees_later_writes('d1_seek');
+SELECT count(*) FROM d1_seek;
+DROP TABLE d1_seek;
 
 DROP TABLE d1_keyless, d1_pk, d1_new, d1_rekey, d1_sp, d1_respelled, d1_spelled, d1_counted;
 DROP OPERATOR CLASS d1_numeric_ops USING prolly;
