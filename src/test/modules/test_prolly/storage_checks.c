@@ -93,21 +93,28 @@ nodestore_new_publish_read(const ProllyImplInfo *impl)
 	ProllyNodeRef by_hash;
 	ProllyHash	hash;
 	ProllyHash	other;
+	ProllyExtent found;
 	Buffer		buf;
 
 	random_hash(&hash);
 	random_hash(&other);
 	buf = write_node(ns, store, 42, &ref);
-	if (PROLLY_CALL(ns, contains, store, &hash))
+	if (PROLLY_CALL(ns, contains, store, &hash, NULL))
 		elog(ERROR, "store contains a hash before it was published");
 	PROLLY_CALL(ns, publish, store, buf, &hash, &ref);
 	UnlockReleaseBuffer(buf);
 
 	if (ref.hash.len != hash.len || memcmp(ref.hash.bytes, hash.bytes, hash.len) != 0)
 		elog(ERROR, "publish did not set the reference's hash");
-	if (!PROLLY_CALL(ns, contains, store, &hash))
+	if (!PROLLY_CALL(ns, contains, store, &hash, NULL))
 		elog(ERROR, "store does not contain a published hash");
-	if (PROLLY_CALL(ns, contains, store, &other))
+	memset(&found, 0xff, sizeof(found));
+	if (!PROLLY_CALL(ns, contains, store, &hash, &found) ||
+		found.blkno != ref.location.blkno ||
+		found.offset != ref.location.offset ||
+		found.length != ref.location.length)
+		elog(ERROR, "store does not give a published node's location");
+	if (PROLLY_CALL(ns, contains, store, &other, NULL))
 		elog(ERROR, "store contains a hash that was never published");
 
 	check_marker(ns, store, &ref, 42, "by hash and location");
@@ -145,7 +152,7 @@ nodestore_many_nodes(const ProllyImplInfo *impl)
 	{
 		ProllyNodeRef ref;
 
-		if (!PROLLY_CALL(ns, contains, store, &hashes[i]))
+		if (!PROLLY_CALL(ns, contains, store, &hashes[i], NULL))
 			elog(ERROR, "node %d of %d is no longer found", i, n);
 		memset(&ref, 0, sizeof(ref));
 		ref.hash = hashes[i];
@@ -176,9 +183,9 @@ nodestore_release_frees(const ProllyImplInfo *impl)
 	UnlockReleaseBuffer(buf);
 
 	PROLLY_CALL(ns, release, store, &released);
-	if (PROLLY_CALL(ns, contains, store, &h2))
+	if (PROLLY_CALL(ns, contains, store, &h2, NULL))
 		elog(ERROR, "a released node is still found");
-	if (!PROLLY_CALL(ns, contains, store, &h1))
+	if (!PROLLY_CALL(ns, contains, store, &h1, NULL))
 		elog(ERROR, "releasing one node lost another");
 	check_marker(ns, store, &kept, 1, "a node after another was released");
 	PROLLY_CALL(ns, close, store);
@@ -267,7 +274,7 @@ prolly_store_verify(PG_FUNCTION_ARGS)
 		memset(&ref, 0, sizeof(ref));
 		seeded_hash(seed, i, &ref.hash);
 		ref.location.blkno = InvalidBlockNumber;
-		if (!PROLLY_CALL(ns, contains, store, &ref.hash))
+		if (!PROLLY_CALL(ns, contains, store, &ref.hash, NULL))
 			elog(ERROR, "node %d of seed " INT64_FORMAT " is not in the store",
 				 i, seed);
 		check_marker(ns, store, &ref, seeded_marker(seed, i), "after the fact");

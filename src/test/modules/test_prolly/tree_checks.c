@@ -783,8 +783,8 @@ count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 
 /*
  * The counters count every node read and every new node written: building
- * a tree writes each of its nodes, building it again writes none but reads
- * each stored node it reuses, and a walk reads each once.
+ * a tree writes each of its nodes, building it again reads and writes none,
+ * and a walk reads each once.
  */
 void
 tree_counts_nodes(const ProllyImplInfo *impl)
@@ -815,8 +815,8 @@ tree_counts_nodes(const ProllyImplInfo *impl)
 	if (!same_hash(&root, &again) || cnt.nodes_written != 0)
 		elog(ERROR, "building a stored tree again counted %llu nodes written",
 			 (unsigned long long) cnt.nodes_written);
-	/* Reusing a stored node still reads it from the store, once per node. */
-	if (cnt.nodes_read != (uint64) nodes.n)
+	/* The store says where a stored node is; reusing it reads nothing. */
+	if (cnt.nodes_read != 0)
 		elog(ERROR, "building a stored tree of %d nodes again counted %llu read",
 			 nodes.n, (unsigned long long) cnt.nodes_read);
 

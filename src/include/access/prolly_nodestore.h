@@ -12,6 +12,8 @@
  *   releases it as for any Postgres buffer.  new_node() returns it
  *   exclusive-locked, with ref->location filled in.
  * - A node made findable by publish() stays readable until release().
+ * - contains() answers from the store's own structures, without reading the
+ *   node, and if location is not NULL sets it to where the node is.
  * - WAL logging of node contents is the log interface's job.  The store
  *   logs changes to its own structures (such as a hash -> block map) as
  *   ProllyStore records (prolly_xlog.h) and replays them in redo().
@@ -51,7 +53,8 @@ typedef struct ProllyNodeStoreRoutine
 	void		(*publish) (ProllyNodeStore *store, Buffer buf,
 							const ProllyHash *hash, ProllyNodeRef *ref);
 
-	bool		(*contains) (ProllyNodeStore *store, const ProllyHash *hash);
+	bool		(*contains) (ProllyNodeStore *store, const ProllyHash *hash,
+							 ProllyExtent *location);
 
 	/* Free the node's space; called by the reclamation interface. */
 	void		(*release) (ProllyNodeStore *store, const ProllyNodeRef *ref);

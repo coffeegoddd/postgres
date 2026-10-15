@@ -832,10 +832,21 @@ global_publish(ProllyNodeStore *store, Buffer buf, const ProllyHash *hash,
 }
 
 static bool
-global_contains(ProllyNodeStore *store, const ProllyHash *hash)
+global_contains(ProllyNodeStore *store, const ProllyHash *hash,
+				ProllyExtent *location)
 {
+	BlockNumber blk;
+
 	check_hash(hash);
-	return BlockNumberIsValid(map_lookup(hash));
+	blk = map_lookup(hash);
+	if (!BlockNumberIsValid(blk))
+		return false;
+	if (location)
+	{
+		memset(location, 0, sizeof(*location));
+		location->blkno = blk;
+	}
+	return true;
 }
 
 static void
