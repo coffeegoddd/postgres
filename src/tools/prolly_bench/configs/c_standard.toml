@@ -1,0 +1,36 @@
+# The C suite (SQL correctness) on the whole sqllogictest corpus: about two
+# minutes on heap with 16 workers.  Correctness, not performance: one
+# repetition, no collectors, and durability off, since nothing here crashes
+# the server on purpose.  Autovacuum is off so plans don't change during a
+# run.
+
+[run]
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 0
+sizes = ["corpus"]
+collectors = []
+fio_baseline = false
+
+[postgres]
+shared_buffers = "2GB"
+max_connections = 100
+fsync = "off"
+synchronous_commit = "off"
+full_page_writes = "off"
+autovacuum = "off"
+
+[sizes.corpus]
+
+# workers: slt-runner processes (default: one per CPU).
+# timeout_seconds: per record; a timeout ends its file.
+[workloads.C1]
+[workloads.C2]
+[workloads.C3]
+[workloads.C4]
+
+[tools]
+sqllogictest = "~/cursor_src/sqllogictest"
+slt_runner = "build-bench/slt/slt-runner"
+slt_source_hash_file = "build-bench/slt/SOURCE_HASH"

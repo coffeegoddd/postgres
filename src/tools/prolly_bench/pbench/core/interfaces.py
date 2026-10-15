@@ -106,6 +106,11 @@ class Cluster(abc.ABC):
         """A postgresql:// URL other instances can use to reach this one."""
 
     @abc.abstractmethod
+    def conninfo(self) -> str:
+        """A libpq keyword connection string for this instance, without a
+        database name, over the fastest local path."""
+
+    @abc.abstractmethod
     def bin(self, program: str) -> str:
         """Path of a Postgres client program (psql, pgbench, ...)."""
 
@@ -201,10 +206,10 @@ class Window(abc.ABC):
 # ---------------------------------------------------------------------------
 
 class Workload(abc.ABC):
-    """One S or V workload."""
+    """One S, V or C workload."""
 
     id: ClassVar[str]               # "S1", "V3", ...
-    suite: ClassVar[str]            # "S" or "V"
+    suite: ClassVar[str]            # "S", "V" or "C"
     title: ClassVar[str]
 
     def variants(self, params: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:

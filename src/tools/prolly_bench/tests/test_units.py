@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from pbench import report
-from pbench.core import config, registry
+from pbench.core import config, registry, targets
 from pbench.core.interfaces import (CellKey, CellResult, Collector, NotImplementedByEngine,
                                     SqlResult, Status, Workload)
 from pbench.core.sqlerr import raise_for_sql_error, sqlstate_of
@@ -128,6 +128,14 @@ class ConfigTest(unittest.TestCase):
             cfg = config.load(HERE / "configs" / name, {})
             self.assertEqual(cfg["postgres"]["fsync"], "on")
 
+    def test_c_configs_may_run_without_durability(self):
+        for name in ("c_standard.toml", "c_smoke.toml"):
+            cfg = config.load(HERE / "configs" / name, {}, "C")
+            self.assertEqual(cfg["postgres"]["fsync"], "off")
+            self.assertEqual(cfg["run"]["collectors"], [])
+        with self.assertRaises(config.ConfigError):
+            config.load(HERE / "configs" / "c_smoke.toml", {}, "S")
+
     def test_fsync_off_refused(self):
         with self.assertRaises(config.ConfigError):
             config.load(HERE / "configs" / "smoke.toml", {"postgres": {"fsync": "off"}})
@@ -156,6 +164,12 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(cls.name, name)
         for name in config.RUN_DEFAULTS["collectors"]:
             registry.collectors.get(name)
+
+    def test_c_workloads(self):
+        registry.load_all()
+        self.assertEqual([n for n in registry.workloads.names() if n.startswith("C")],
+                         [f"C{i}" for i in range(1, 5)])
+        self.assertEqual(registry.workloads.get("C4")().client_counts([1, 4], {}), [1])
 
     def test_v_variants_include_background(self):
         registry.load_all()
@@ -230,3 +244,41 @@ class TableTest(unittest.TestCase):
         self.assertEqual(table._cell(rs, "throughput", None).text, "5.00")
         rs[0]["read_only"] = False
         self.assertEqual(table._cell(rs, "wal_bytes_per_txn", None).text, "0.01")
+
+
+class CSuiteTest(unittest.TestCase):
+    def test_targets(self):
+        self.assertIsNone(targets.for_am("heap").schema)
+        self.assertIsNone(targets.for_am("prolly_d1").schema)
+        self.assertEqual(targets.for_am("prolly").schema, targets.VERSIONED_SCHEMA)
+
+    def test_sample_per_directory(self):
+        from pbench.workloads.c_suite import C3
+        with tempfile.TemporaryDirectory() as d:
+            for f in ("index/between/1/a.test", "index/between/1/b.test",
+                      "index/in/10/c.test", "index/in/10/d.test"):
+                (Path(d) / "test" / f).parent.mkdir(parents=True, exist_ok=True)
+                (Path(d) / "test" / f).write_text("")
+            ctx = _ctx(tools={"sqllogictest": d}, params={"sample": "per_directory"})
+            got = [Path(f).relative_to(Path(d) / "test").as_posix() for f in C3().files(ctx)]
+            self.assertEqual(got, ["index/between/1/a.test", "index/in/10/c.test"])
+            ctx = _ctx(tools={"sqllogictest": d}, params={})
+            self.assertEqual(C3().files(ctx), [str(Path(d) / "test" / "index")])
+
+    def test_metrics(self):
+        from pbench.workloads.c_suite import metrics
+        m = metrics({"total": 10, "files": 2, "pass_percent": 87.5, "reruns": [],
+                     "unmatched_digests": 0,
+                     "counts": {"ok": 7, "not_ok": 1, "skipped": 2}})
+        self.assertEqual((m["records"], m["ok"], m["not_ok"], m["crashed"]), (10, 7, 1, 0))
+        m = metrics({"total": 3, "files": 1, "pass_percent": 0, "reruns": [],
+                     "unmatched_digests": 0, "counts": {"skipped": 3}})
+        self.assertIsNone(m["pass_percent"])
+
+
+def _ctx(*, tools, params):
+    from pbench.core.interfaces import Context
+    key = CellKey("C", "C3", "corpus", "", 1, 1)
+    return Context(key=key, cluster=None, table_am="heap", size_params={}, params=params,
+                   warmup_seconds=0, measure_seconds=0, raw_dir=Path("."),
+                   scratch_dir=Path("."), tools=tools)

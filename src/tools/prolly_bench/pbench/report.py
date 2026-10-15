@@ -28,6 +28,10 @@ V_METRICS = [
     "merge_ms", "clone_ms", "fetch_ms", "push_ms", "background_tps",
     "wal_bytes", "device_write_bytes", "hash_cpu_percent",
 ]
+C_METRICS = [
+    "pass_percent", "records", "ok", "not_ok", "not_implemented", "crashed",
+    "timeout", "did_not_run", "skipped", "files", "reruns",
+]
 # For comparisons: whether a larger value is better.
 HIGHER_IS_BETTER = {"tps", "rows_per_second", "io_hit_ratio", "background_tps"}
 
@@ -65,7 +69,7 @@ def _status(rs: list[dict]) -> str:
 
 
 def summary_tables(results: list[dict], suite: str) -> str:
-    wanted = S_METRICS if suite == "S" else V_METRICS
+    wanted = {"S": S_METRICS, "V": V_METRICS, "C": C_METRICS}[suite]
     by_workload: OrderedDict[str, list] = OrderedDict()
     for key, rs in _group(results).items():
         by_workload.setdefault(key[0], []).append((key, rs))
@@ -129,6 +133,10 @@ def _environment(env: dict) -> str:
         f"- Source: {env.get('repo', {}).get('commit', '?')[:12]} "
         f"({env.get('repo', {}).get('dirty_files', '?')} uncommitted files)",
     ]
+    if "sqllogictest" in env:
+        lines.append(f"- sqllogictest: {env['sqllogictest'].get('commit', '?')[:12]} "
+                     f"at {env['sqllogictest'].get('path')}; slt-runner source "
+                     f"{(env.get('slt_source_hash') or '?')[:12]}")
     if "benchbase_source" in env:
         lines.append(f"- BenchBase: {env['benchbase_source'].get('commit', '?')[:12]} "
                      f"({env['benchbase_source'].get('branch')})")

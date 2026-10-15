@@ -2,6 +2,7 @@
 
   prolly_bench run S --am heap                  S suite against stock heap (B0)
   prolly_bench run V --am prolly_d1             V suite against an engine
+  prolly_bench run C --am heap,prolly           C suite (SQL correctness), heap first
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
@@ -47,31 +48,39 @@ def _run(args: argparse.Namespace) -> int:
     for s in args.set:
         k, _, v = s.partition("=")
         over["postgres"][k] = v
-    cfg = config_mod.load(args.config, over)
+    config = args.config or HERE / "configs" / config_mod.DEFAULT_CONFIGS[args.suite]
+    cfg = config_mod.load(config, over, args.suite)
 
     # Paths in [tools] are relative to the repository root.
     for k, v in list(cfg["tools"].items()):
         p = Path(v).expanduser()
         cfg["tools"][k] = str(p if p.is_absolute() else REPO / p)
 
-    label = args.label
-    if not label:
-        label = "B0" if args.am == "heap" else args.am
-        if cfg["postgres"].get("full_page_writes") == "off":
-            label += "-fpw-off"
-
-    runner = Runner(suite=args.suite, cfg=cfg, table_am=args.am, label=label,
-                    repo=REPO, bin_dir=args.pg_bin.resolve(),
-                    work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
-                    command="prolly_bench " + shlex.join(sys.argv[1:]),
-                    allow_heap_v=args.allow_heap_v, keep_failed=args.keep_failed)
-    results = runner.run()
-    return 0 if all(r.status.value != "error" for r in results) else 1
+    # Several AMs run one after another, heap first, each its own result set.
+    ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
+    if args.label and len(ams) > 1:
+        raise SystemExit("--label names one result set; give one --am with it")
+    ok = True
+    for am in ams:
+        label = args.label
+        if not label:
+            label = "B0" if am == "heap" else am
+            if cfg["postgres"].get("full_page_writes") == "off" and \
+                    args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
+                label += "-fpw-off"
+        runner = Runner(suite=args.suite, cfg=cfg, table_am=am, label=label,
+                        repo=REPO, bin_dir=args.pg_bin.resolve(),
+                        work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
+                        command="prolly_bench " + shlex.join(sys.argv[1:]),
+                        allow_heap_v=args.allow_heap_v, keep_failed=args.keep_failed)
+        results = runner.run()
+        ok = ok and all(r.status.value != "error" for r in results)
+    return 0 if ok else 1
 
 
 def _list(_args) -> int:
     registry.load_all()
-    for suite in ("S", "V"):
+    for suite in ("S", "V", "C"):
         print(f"{suite} suite workloads:")
         for name, cls in registry.workloads.items():
             if cls.suite == suite:
@@ -127,10 +136,12 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="run a suite")
-    r.add_argument("suite", choices=["S", "V"])
-    r.add_argument("--am", required=True, help="table AM under test (heap, prolly_d1, ...)")
+    r.add_argument("suite", choices=["S", "V", "C"])
+    r.add_argument("--am", required=True, type=_csv(str),
+                   help="table AM under test (heap, prolly, ...); a list runs each, heap first")
     r.add_argument("--label", help="result set label (default B0 for heap, else the AM)")
-    r.add_argument("--config", type=Path, default=HERE / "configs" / "standard.toml")
+    r.add_argument("--config", type=Path,
+                   help="default configs/standard.toml for S and V, configs/c_standard.toml for C")
     r.add_argument("--workloads", type=_csv(str), help="e.g. S1,S2 (default: all)")
     r.add_argument("--sizes", type=_csv(str))
     r.add_argument("--clients", type=_csv(int))
