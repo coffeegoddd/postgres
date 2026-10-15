@@ -453,11 +453,16 @@ read 1,674 for one, and fails the check), nothing for a tree against
 itself, and every node once against the empty tree; diffs across trees of
 different heights and of unrelated trees; and, in `d1_tables`, that a
 primary-key lookup and a one-row update of a 20,000-row table read and
-write a few paths. Found by the counters, not fixed here: a sequential scan
-of a prolly table finds each row's TID with a point lookup in the
-row-identity tree, so it reads O(N log N) nodes, not O(N / leaf size)
-(about six per row on a 20,000-row table); a cursor over the version
-entries, advanced with the scan, would read each leaf once.
+write a few paths. Found by the counters: a sequential scan of a prolly
+table found each row's TID with a point lookup in the row-identity tree,
+reading O(N log N) nodes (about six per row on a 20,000-row table). Fixed
+in a follow-up PR before 4e.2: a tree cursor's seek keeps the nodes of the
+path it holds, so seeks in key order read each node about once; a D1
+cursor's seek sees writes made since it opened, as a lookup does; and a
+scan finds TIDs by seeking one cursor over the version entries. The scan
+now reads each node of the data tree and of the version entries once
+(1,334 reads for 20,000 rows, the minimum; checked in `d1_tables`, and
+seeks in order by a tree conformance check).
 
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in

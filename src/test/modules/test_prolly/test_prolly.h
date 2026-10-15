@@ -55,11 +55,13 @@ extern void tree_equal_keys_take_new_bytes(const ProllyImplInfo *impl);
 extern void tree_counts_nodes(const ProllyImplInfo *impl);
 extern void tree_diff_reads_changed_paths(const ProllyImplInfo *impl);
 extern void tree_diff_across_heights(const ProllyImplInfo *impl);
+extern void tree_seeks_in_order(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 
 /* engine_checks.c */
 extern void engine_read_empty_tree(const ProllyImplInfo *impl);
 extern void engine_read_own_writes(const ProllyImplInfo *impl);
+extern void engine_seek_sees_later_writes(const ProllyImplInfo *impl);
 extern void engine_subxact_abort_discards_writes(const ProllyImplInfo *impl);
 extern void engine_create_and_truncate(const ProllyImplInfo *impl);
 extern void engine_count_range_matches_scan(const ProllyImplInfo *impl);
@@ -73,6 +75,7 @@ extern void keying_owns_its_memory(const ProllyImplInfo *impl);
 extern void valenc_decodes_earlier_layouts(const ProllyImplInfo *impl);
 extern void rowid_assign_then_resolve(const ProllyImplInfo *impl);
 extern void rowid_rename_keeps_tid(const ProllyImplInfo *impl);
+extern void rowid_find_sees_later_assign(const ProllyImplInfo *impl);
 extern void rowid_never_reused(const ProllyImplInfo *impl);
 extern void rowid_renew(const ProllyImplInfo *impl);
 

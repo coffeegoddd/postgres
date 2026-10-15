@@ -435,6 +435,102 @@ engine_create_and_truncate_body(const ProllyImplInfo *impl)
 	table_close(rel, AccessShareLock);
 }
 
+/* The key a seek to key then a step finds, or -1 if none. */
+static int
+seek_one(const ProllyEngineRoutine *e, ProllyCursor *cur, int key)
+{
+	uint8		kb[4];
+	ProllyKey	k = int_key(key, kb);
+	ProllyKey	got;
+	ProllyValue v;
+
+	PROLLY_CALL(e, cursor_seek, cur, &k, ForwardScanDirection);
+	if (!PROLLY_CALL(e, cursor_next, cur, &got, &v))
+		return -1;
+	return key_int(&got);
+}
+
+/*
+ * A seek sees the writes made before it, as get does, even when they come
+ * after the cursor was opened: the tree's first write, more writes, and a
+ * data tree being emptied to be rebuilt.  rel's trees start empty.
+ */
+static void
+seek_sees_later_writes(const ProllyEngineRoutine *e, Relation rel)
+{
+	ProllyRootSet *roots = PROLLY_CALL(e, roots_acquire, GetActiveSnapshot());
+	ProllyTreeKind kinds[] = {PROLLY_TREE_DATA, PROLLY_TREE_ROWID};
+	uint8		kb[4];
+	uint8		vb[4];
+
+	for (int t = 0; t < lengthof(kinds); t++)
+	{
+		ProllyCursor *cur = PROLLY_CALL(e, cursor_open, roots, rel, kinds[t],
+										InvalidCommandId);
+		ProllyKey	k;
+		ProllyValue v = int_value(1, vb);
+
+		if (seek_one(e, cur, 0) != -1)
+			elog(ERROR, "the tree is not empty");
+		k = int_key(5, kb);
+		PROLLY_CALL(e, put, rel, kinds[t], &k, &v, 1);
+		if (seek_one(e, cur, 0) != 5)
+			elog(ERROR, "a seek does not see the tree's first write");
+		k = int_key(3, kb);
+		PROLLY_CALL(e, put, rel, kinds[t], &k, &v, 1);
+		if (seek_one(e, cur, 0) != 3)
+			elog(ERROR, "a seek does not see a later write");
+		if (kinds[t] == PROLLY_TREE_DATA)
+		{
+			PROLLY_CALL(e, tree_reset, rel, kinds[t]);
+			if (seek_one(e, cur, 0) != -1)
+				elog(ERROR, "a seek sees rows of a tree emptied after it opened");
+			k = int_key(9, kb);
+			PROLLY_CALL(e, put, rel, kinds[t], &k, &v, 1);
+			if (seek_one(e, cur, 0) != 9)
+				elog(ERROR, "a seek does not see a write to an emptied tree");
+		}
+		PROLLY_CALL(e, cursor_close, cur);
+	}
+	PROLLY_CALL(e, roots_release, roots);
+}
+
+static void
+engine_seek_sees_later_writes_body(const ProllyImplInfo *impl)
+{
+	Relation	rel = make_table_for_engine(impl->name, "conf_seek", "a int");
+
+	seek_sees_later_writes((const ProllyEngineRoutine *) impl, rel);
+	table_close(rel, AccessShareLock);
+}
+
+/*
+ * prolly_seek_sees_later_writes(rel): the same, on an empty table the
+ * transaction hasn't written yet (made by an earlier transaction), whose
+ * cursors open before it has any writes.  The writes are rolled back.
+ */
+static Relation seek_rel;
+
+static void
+seek_sees_later_writes_on_rel(const ProllyImplInfo *impl)
+{
+	seek_sees_later_writes((const ProllyEngineRoutine *) impl, seek_rel);
+}
+
+PG_FUNCTION_INFO_V1(prolly_seek_sees_later_writes);
+
+Datum
+prolly_seek_sees_later_writes(PG_FUNCTION_ARGS)
+{
+	ProllyComponents c;
+
+	seek_rel = table_open(PG_GETARG_OID(0), RowExclusiveLock);
+	prolly_components_for_relation(seek_rel, &c);
+	rolled_back(seek_sees_later_writes_on_rel, &c.engine->info);
+	table_close(seek_rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
 static void
 engine_count_range_matches_scan_body(const ProllyImplInfo *impl)
 {
@@ -1466,6 +1562,12 @@ engine_count_range_matches_scan(const ProllyImplInfo *impl)
 }
 
 void
+engine_seek_sees_later_writes(const ProllyImplInfo *impl)
+{
+	rolled_back(engine_seek_sees_later_writes_body, impl);
+}
+
+void
 commit_publishes_in_enqueue_order(const ProllyImplInfo *impl)
 {
 	rolled_back(commit_publishes_in_enqueue_order_body, impl);
@@ -1493,6 +1595,48 @@ void
 rowid_rename_keeps_tid(const ProllyImplInfo *impl)
 {
 	rolled_back(rowid_rename_keeps_tid_body, impl);
+}
+
+/*
+ * A scan's tid_find sees versions assigned after the scan began, when its
+ * command can see them: one scan, finding as it goes.
+ */
+static void
+rowid_find_sees_later_assign_body(const ProllyImplInfo *impl)
+{
+	const ProllyRowIdRoutine *ri = (const ProllyRowIdRoutine *) impl;
+	Relation	rel = make_table_for_engine(engine_for_impl(impl), "conf_rowid5", "a int");
+	ProllyComponents c;
+	ProllyRootSet *roots;
+	ProllyRowIdScan *scan;
+
+	prolly_components_for_relation(rel, &c);
+	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
+	scan = PROLLY_CALL(ri, scan_begin, roots, rel, InvalidCommandId);
+	for (int i = 0; i < 20; i++)
+	{
+		ProllyHash	h = content_of(i);
+		uint8		kb[4];
+		ProllyKey	k = int_key(i, kb);
+		ItemPointerData assigned;
+		ItemPointerData found;
+
+		if (PROLLY_CALL(ri, tid_find, scan, &k, 0, &found))
+			elog(ERROR, "tid_find finds version %d before it was assigned", i);
+		PROLLY_CALL(ri, tid_assign, roots, rel, &h, 0, &k, 1, &assigned);
+		if (!PROLLY_CALL(ri, tid_find, scan, &k, 0, &found) ||
+			!ItemPointerEquals(&found, &assigned))
+			elog(ERROR, "tid_find does not see version %d, assigned during the scan", i);
+	}
+	PROLLY_CALL(ri, scan_end, scan);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	table_close(rel, AccessShareLock);
+}
+
+void
+rowid_find_sees_later_assign(const ProllyImplInfo *impl)
+{
+	rolled_back(rowid_find_sees_later_assign_body, impl);
 }
 
 /*

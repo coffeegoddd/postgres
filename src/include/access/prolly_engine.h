@@ -96,7 +96,10 @@ typedef struct ProllyEngineRoutine
 	 * writes made before command cid (InvalidCommandId: all of them).
 	 * cursor_seek positions before the first key >= key (forward) or after
 	 * the last key <= key (backward); a NULL key means the start or end.
-	 * cursor_next returns false at the end.
+	 * cursor_next returns false at the end.  A seek sees the writes made
+	 * before it, as get does, and keeps the nodes the cursor already holds,
+	 * so seeks in key order cost about what a scan does: a cursor kept
+	 * open and sought is how a caller looks up many keys in order.
 	 */
 	ProllyCursor *(*cursor_open) (ProllyRootSet *roots, Relation tree,
 								  ProllyTreeKind kind, CommandId cid);

@@ -792,12 +792,16 @@ read_base(ProllyRootSet *roots, ProllySubRoot sub, RelFileNumber relnumber,
 struct ProllyCursor
 {
 	MemoryContext mcxt;
+	ProllyRootSet *roots;
+	Relation	tree;
 	ProllySubRoot sub;
 	ProllyTreeKind kind;
 	CommandId	cid;
 	D1Order		order;			/* data trees without a write set */
 	ProllyTreeEnv env;
 	D1WriteSet *ws;
+	ProllyNodeRef base;			/* the base tree read */
+	bool		replaced;		/* ...was the write set's own */
 
 	/* the base tree */
 	ProllyTreeCursor *tc;		/* NULL: empty */
@@ -837,38 +841,78 @@ in_kind(ProllyCursor *c, const ProllyKey *key)
 	return !is_local(c->sub) || (key->len > 0 && key->data[0] == (uint8) c->kind);
 }
 
+/* Find the cursor's write set, key order and base tree; in c->mcxt. */
+static void
+cursor_bind(ProllyCursor *c)
+{
+	RelFileNumber relnumber = c->tree->rd_locator.relNumber;
+
+	c->ws = find_writeset(c->sub, relnumber);
+	if (c->ws)
+	{
+		/* The write set's key order, which it keeps owning. */
+		refresh_order(c->ws, c->tree);
+		c->order = c->ws->order;
+	}
+	else
+		open_order(c->tree, c->sub, c->roots, c->mcxt, &c->order);
+	c->unordered = order_lost(&c->order);
+	tree_env(c->unordered ? NULL : &c->order, &c->env);
+	read_base(c->roots, c->sub, relnumber, c->ws, &c->base);
+	c->replaced = c->ws && c->ws->replaced;
+	c->tc = NULL;
+	if (c->base.hash.len > 0)
+		c->tc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env, &c->base,
+							c->mcxt);
+}
+
+static void
+cursor_unbind(ProllyCursor *c)
+{
+	if (c->tc)
+		PROLLY_CALL(backend.c.tree, cursor_close, c->tc);
+	c->tc = NULL;
+	if (c->ws == NULL)
+		close_order(&c->order);
+}
+
+/*
+ * Whether the transaction has, since the cursor was bound, made the tree's
+ * write set or given the tree a new base (emptied or rebuilt it).  A write
+ * set already bound is read live, so later writes to it need no rebind.
+ */
+static bool
+cursor_stale(ProllyCursor *c)
+{
+	D1WriteSet *ws = find_writeset(c->sub, c->tree->rd_locator.relNumber);
+
+	if (ws != c->ws || (ws && ws->replaced) != c->replaced)
+		return true;
+	if (c->replaced)
+		return ws->base.hash.len != c->base.hash.len ||
+			memcmp(ws->base.hash.bytes, c->base.hash.bytes,
+				   ws->base.hash.len) != 0;
+	return false;
+}
+
 static ProllyCursor *
 d1_cursor_open(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 			   CommandId cid)
 {
-	ProllySubRoot sub = subroot_for(tree, kind);
-	RelFileNumber relnumber = tree->rd_locator.relNumber;
 	MemoryContext mcxt = AllocSetContextCreate(CurrentMemoryContext,
 											   "prolly d1 cursor",
 											   ALLOCSET_SMALL_SIZES);
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyCursor *c = palloc0(sizeof(ProllyCursor));
-	ProllyNodeRef base;
 
 	backend_init();
 	c->mcxt = mcxt;
-	c->sub = sub;
+	c->roots = roots;
+	c->tree = tree;
+	c->sub = subroot_for(tree, kind);
 	c->kind = kind;
 	c->cid = cid;
-	c->ws = find_writeset(sub, relnumber);
-	if (c->ws)
-	{
-		/* The write set's key order, which it keeps owning. */
-		refresh_order(c->ws, tree);
-		c->order = c->ws->order;
-	}
-	else
-		open_order(tree, sub, roots, mcxt, &c->order);
-	c->unordered = order_lost(&c->order);
-	tree_env(c->unordered ? NULL : &c->order, &c->env);
-	read_base(roots, sub, relnumber, c->ws, &base);
-	if (base.hash.len > 0)
-		c->tc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env, &base, mcxt);
+	cursor_bind(c);
 	initStringInfo(&c->o_bound);
 	c->dir = ForwardScanDirection;
 	c->t_done = c->o_done = true;
@@ -888,6 +932,13 @@ d1_cursor_seek(ProllyCursor *c, const ProllyKey *key, ScanDirection direction)
 	ProllyKey	bound;
 
 	c->dir = forward ? ForwardScanDirection : BackwardScanDirection;
+
+	/* A seek sees every write made before it, as a lookup does. */
+	if (cursor_stale(c))
+	{
+		cursor_unbind(c);
+		cursor_bind(c);
+	}
 
 	if (c->unordered)
 	{
@@ -1140,10 +1191,7 @@ d1_cursor_next(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 static void
 d1_cursor_close(ProllyCursor *c)
 {
-	if (c->tc)
-		PROLLY_CALL(backend.c.tree, cursor_close, c->tc);
-	if (c->ws == NULL)
-		close_order(&c->order);
+	cursor_unbind(c);
 	MemoryContextDelete(c->mcxt);
 }
 
