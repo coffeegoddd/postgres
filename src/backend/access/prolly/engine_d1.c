@@ -37,8 +37,13 @@
  * holding the right to write a table (coordination "single_writer") from
  * before their first write to it until their transaction ends: a write
  * set reads its base trees from the newest head when it's made, so the
- * rebase at commit is a plain replay.  Snapshots read the newest published
- * head; roots that follow snapshots come with row-level coordination.
+ * rebase at commit is a plain replay.
+ *
+ * Snapshots.  An MVCC snapshot reads the root of the newest commit it sees
+ * as committed (the commit pipeline's snapshot_head), so every scan of a
+ * snapshot reads the same roots, and a prolly table agrees with heap
+ * tables read with the same snapshot.  Other snapshots (dirty, self, any,
+ * none) read the newest head, as writes do.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/engine_d1.c
@@ -778,7 +783,12 @@ d1_roots_acquire(Snapshot snapshot)
 	ProllyRootSet *roots = palloc0(sizeof(ProllyRootSet));
 
 	backend_init();
-	current_head(roots);
+	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_MVCC)
+		roots->has_root = PROLLY_CALL(backend.c.commit, snapshot_head,
+									  PROLLY_MAIN_BRANCH, snapshot,
+									  &roots->root);
+	else
+		current_head(roots);
 	return roots;
 }
 
