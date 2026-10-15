@@ -284,6 +284,8 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 	{
 		Buffer		buf = PROLLY_CALL(env->node_store, read, env->store, ref);
 
+		if (env->counters)
+			env->counters->nodes_read++;
 		ref->location.blkno = BufferGetBlockNumber(buf);
 		ReleaseBuffer(buf);
 	}
