@@ -21,6 +21,7 @@
 #include "access/session.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/branch.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
@@ -90,6 +91,7 @@ typedef struct FixedParallelState
 	Oid			current_user_id;
 	Oid			temp_namespace_id;
 	Oid			temp_toast_namespace_id;
+	Oid			branch;
 	int			sec_context;
 	bool		session_user_is_superuser;
 	bool		role_is_superuser;
@@ -340,6 +342,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	fps = (FixedParallelState *)
 		shm_toc_allocate(pcxt->toc, sizeof(FixedParallelState));
 	fps->database_id = MyDatabaseId;
+	fps->branch = MyBranch;
 	fps->authenticated_user_id = GetAuthenticatedUserId();
 	fps->session_user_id = GetSessionUserId();
 	fps->outer_user_id = GetCurrentRoleId();
@@ -1449,6 +1452,9 @@ ParallelWorkerMain(Datum main_arg)
 											  fps->authenticated_user_id,
 											  BGWORKER_BYPASS_ALLOWCONN |
 											  BGWORKER_BYPASS_ROLELOGINCHECK);
+
+	/* See the leader's branch before anything reads versioned catalog rows. */
+	set_session_branch(fps->branch);
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what

@@ -15,6 +15,7 @@
 #define CATALOG_BRANCH_H
 
 #include "access/htup.h"
+#include "access/transam.h"
 #include "executor/tuptable.h"
 #include "utils/relcache.h"
 
@@ -26,11 +27,54 @@ typedef struct CatalogBranchInfo
 	AttrNumber	attnum;			/* the column */
 } CatalogBranchInfo;
 
+/* the session's branch: a versioned object's rows on it are the ones seen */
+extern PGDLLIMPORT Oid MyBranch;
+
+/*
+ * While set, index_create() is making an index of this table: its pg_class
+ * row belongs where the table's does (a TOAST table's index is in pg_toast).
+ */
+extern PGDLLIMPORT Oid CatalogBranchIndexTable;
+
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
 
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
+
+/* check out the pg_branch row a connection named; false if there is none */
+extern bool branch_session_init(const char *branch);
+
+/* switch the session to another branch */
+extern void set_session_branch(Oid branch);
+
+/* the branch of the catalog row of object objid in catalog classid (0: shared) */
+extern Oid	catalog_object_branch(Oid classid, Oid objid);
+
+/* is a row of a branch-aware catalog on the session's branch (or shared)? */
+extern bool catalog_tuple_on_branch(HeapTuple tup);
+
+/*
+ * Can this row be seen from the session's branch?  Only branch-aware
+ * catalogs hold rows of other branches; every other table answers at once.
+ */
+static inline bool
+tuple_on_branch(HeapTuple tup)
+{
+	if (likely(tup->t_tableOid >= FirstGenbkiObjectId))
+		return true;
+	return catalog_tuple_on_branch(tup);
+}
+
+/*
+ * Does this relation hold rows of several branches?  Its pages' all-visible
+ * flags then say nothing about which rows a session sees.
+ */
+static inline bool
+relation_has_branches(Oid relid)
+{
+	return relid < FirstGenbkiObjectId && catalog_branch_info(relid) != NULL;
+}
 
 /*
  * The row to write for tup: tup itself with its branch column set, or, if

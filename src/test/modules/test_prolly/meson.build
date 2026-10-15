@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'branch_checks.c',
   'catalog_checks.c',
   'engine_checks.c',
   'foundation_checks.c',
@@ -40,6 +41,7 @@ tests += {
       'prolly_tables',
       'versioned_schemas',
       'catalog_branch_column',
+      'branch_catalogs',
     ],
   },
   'tap': {
@@ -73,6 +75,7 @@ tests += {
       't/027_d1_counter_crash.pl',
       't/028_bmap_storage.pl',
       't/029_versioned_schema_dump.pl',
+      't/030_branch_connect.pl',
     ],
   },
 }

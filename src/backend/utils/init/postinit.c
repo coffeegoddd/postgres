@@ -28,6 +28,7 @@
 #include "access/prolly_xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/branch.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -1294,9 +1295,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	if ((flags & INIT_PG_LOAD_SESSION_LIBS) != 0)
 		process_session_preload_libraries();
 
-	/* Prolly's session state, and the branch the connection asked for. */
+	/*
+	 * Prolly's session state, and the branch the connection asked for: a
+	 * row of pg_branch if there is one by that name, else a branch of the
+	 * database's prolly_d1 tables.
+	 */
 	if (!bootstrap)
+	{
+		if (connect_branch != NULL && !MyDatabaseVersioned &&
+			branch_session_init(connect_branch))
+			connect_branch = NULL;
 		prolly_session_init(connect_branch);
+	}
 
 	/* fill in the remainder of this entry in the PgBackendStatus array */
 	if (!bootstrap)
