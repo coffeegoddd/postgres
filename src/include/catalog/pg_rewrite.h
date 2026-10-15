@@ -40,6 +40,7 @@ CATALOG(pg_rewrite,2618,RewriteRelationId)
 	char		ev_enabled;
 	bool		is_instead;
 
+	Oid			ev_branch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	pg_node_tree ev_qual BKI_FORCE_NOT_NULL;
 	pg_node_tree ev_action BKI_FORCE_NOT_NULL;
@@ -57,8 +58,8 @@ typedef FormData_pg_rewrite *Form_pg_rewrite;
 
 DECLARE_TOAST(pg_rewrite, 2838, 2839);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_rewrite_oid_index, 2692, RewriteOidIndexId, pg_rewrite, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_rewrite_rel_rulename_index, 2693, RewriteRelRulenameIndexId, pg_rewrite, btree(ev_class oid_ops, rulename name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_rewrite_oid_index, 2692, RewriteOidIndexId, pg_rewrite, btree(oid oid_ops, ev_branch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_rewrite_rel_rulename_index, 2693, RewriteRelRulenameIndexId, pg_rewrite, btree(ev_class oid_ops, rulename name_ops, ev_branch oid_ops));
 
 MAKE_SYSCACHE(RULERELNAME, pg_rewrite_rel_rulename_index, 8);
 

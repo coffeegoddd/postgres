@@ -53,6 +53,7 @@ CATALOG(pg_description,2609,DescriptionRelationId)
 	Oid			classoid;		/* OID of table containing object */
 	int32		objsubid;		/* column number, or 0 if not used */
 
+	Oid			objbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text		description BKI_FORCE_NOT_NULL; /* description of object */
 #endif
@@ -69,7 +70,7 @@ typedef FormData_pg_description * Form_pg_description;
 
 DECLARE_TOAST(pg_description, 2834, 2835);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_description_o_c_o_index, 2675, DescriptionObjIndexId, pg_description, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_description_o_c_o_index, 2675, DescriptionObjIndexId, pg_description, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, objbranch oid_ops));
 
 /* We do not use BKI_LOOKUP here because it causes problems for genbki.pl */
 DECLARE_FOREIGN_KEY((classoid), pg_class, (oid));

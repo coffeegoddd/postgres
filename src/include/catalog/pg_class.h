@@ -133,6 +133,7 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	/* all multixacts in this rel are >= this; it is really a MultiXactId */
 	TransactionId relminmxid BKI_DEFAULT(1);	/* FirstMultiXactId */
 
+	Oid			relbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* NOTE: These fields are not present in a relcache entry's rd_rel field. */
 	/* access permissions */
@@ -159,8 +160,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_class *Form_pg_class;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_class_oid_index, 2662, ClassOidIndexId, pg_class, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_class_relname_nsp_index, 2663, ClassNameNspIndexId, pg_class, btree(relname name_ops, relnamespace oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_class_oid_index, 2662, ClassOidIndexId, pg_class, btree(oid oid_ops, relbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_class_relname_nsp_index, 2663, ClassNameNspIndexId, pg_class, btree(relname name_ops, relnamespace oid_ops, relbranch oid_ops));
 DECLARE_INDEX(pg_class_tblspc_relfilenode_index, 3455, ClassTblspcRelfilenodeIndexId, pg_class, btree(reltablespace oid_ops, relfilenode oid_ops));
 
 MAKE_SYSCACHE(RELOID, pg_class_oid_index, 128);

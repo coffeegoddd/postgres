@@ -75,6 +75,7 @@ CATALOG(pg_operator,2617,OperatorRelationId)
 
 	/* OID of join estimator, or 0 */
 	regproc		oprjoin BKI_DEFAULT(-) BKI_LOOKUP_OPT(pg_proc);
+	Oid			oprbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_operator;
 
 END_CATALOG_STRUCT
@@ -86,8 +87,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_operator *Form_pg_operator;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_operator_oid_index, 2688, OperatorOidIndexId, pg_operator, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_operator_oprname_l_r_n_index, 2689, OperatorNameNspIndexId, pg_operator, btree(oprname name_ops, oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_operator_oid_index, 2688, OperatorOidIndexId, pg_operator, btree(oid oid_ops, oprbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_operator_oprname_l_r_n_index, 2689, OperatorNameNspIndexId, pg_operator, btree(oprname name_ops, oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops, oprbranch oid_ops));
 
 MAKE_SYSCACHE(OPEROID, pg_operator_oid_index, 32);
 MAKE_SYSCACHE(OPERNAMENSP, pg_operator_oprname_l_r_n_index, 256);

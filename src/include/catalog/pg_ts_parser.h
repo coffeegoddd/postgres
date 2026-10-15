@@ -52,14 +52,15 @@ CATALOG(pg_ts_parser,3601,TSParserRelationId)
 
 	/* return descriptions of lexeme's types */
 	regproc		prslextype BKI_LOOKUP(pg_proc);
+	Oid			prsbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_ts_parser;
 
 END_CATALOG_STRUCT
 
 typedef FormData_pg_ts_parser *Form_pg_ts_parser;
 
-DECLARE_UNIQUE_INDEX(pg_ts_parser_prsname_index, 3606, TSParserNameNspIndexId, pg_ts_parser, btree(prsname name_ops, prsnamespace oid_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_ts_parser_oid_index, 3607, TSParserOidIndexId, pg_ts_parser, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_ts_parser_prsname_index, 3606, TSParserNameNspIndexId, pg_ts_parser, btree(prsname name_ops, prsnamespace oid_ops, prsbranch oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ts_parser_oid_index, 3607, TSParserOidIndexId, pg_ts_parser, btree(oid oid_ops, prsbranch oid_ops));
 
 MAKE_SYSCACHE(TSPARSERNAMENSP, pg_ts_parser_prsname_index, 2);
 MAKE_SYSCACHE(TSPARSEROID, pg_ts_parser_oid_index, 2);

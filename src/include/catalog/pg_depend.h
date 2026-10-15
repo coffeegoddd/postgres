@@ -64,6 +64,7 @@ CATALOG(pg_depend,2608,DependRelationId)
 	 * field.  See DependencyType in catalog/dependency.h.
 	 */
 	char		deptype;		/* see codes in dependency.h */
+	Oid			depbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_depend;
 
 END_CATALOG_STRUCT

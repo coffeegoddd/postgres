@@ -36,6 +36,7 @@ CATALOG(pg_statistic_ext_data,3429,StatisticExtDataRelationId)
 														 * this data is for */
 	bool		stxdinherit;	/* true if inheritance children are included */
 
+	Oid			stxdbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	pg_ndistinct stxdndistinct; /* ndistinct coefficients (serialized) */
@@ -58,7 +59,7 @@ typedef FormData_pg_statistic_ext_data *Form_pg_statistic_ext_data;
 
 DECLARE_TOAST(pg_statistic_ext_data, 3430, 3431);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_data_stxoid_inh_index, 3433, StatisticExtDataStxoidInhIndexId, pg_statistic_ext_data, btree(stxoid oid_ops, stxdinherit bool_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_data_stxoid_inh_index, 3433, StatisticExtDataStxoidInhIndexId, pg_statistic_ext_data, btree(stxoid oid_ops, stxdinherit bool_ops, stxdbranch oid_ops));
 
 MAKE_SYSCACHE(STATEXTDATASTXOID, pg_statistic_ext_data_stxoid_inh_index, 4);
 

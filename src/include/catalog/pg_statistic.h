@@ -105,6 +105,7 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
 	Oid			stacoll4 BKI_LOOKUP_OPT(pg_collation);
 	Oid			stacoll5 BKI_LOOKUP_OPT(pg_collation);
 
+	Oid			stabranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	float4		stanumbers1[];
 	float4		stanumbers2[];
@@ -140,7 +141,7 @@ typedef FormData_pg_statistic *Form_pg_statistic;
 
 DECLARE_TOAST(pg_statistic, 2840, 2841);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696, StatisticRelidAttnumInhIndexId, pg_statistic, btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696, StatisticRelidAttnumInhIndexId, pg_statistic, btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops, stabranch oid_ops));
 
 MAKE_SYSCACHE(STATRELATTINH, pg_statistic_relid_att_inh_index, 128);
 
