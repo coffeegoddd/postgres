@@ -203,6 +203,46 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 }
 
 /*
+ * RelationCreateStorageShared
+ *		Create a permanent relation's storage as a copy of another's.
+ *
+ * The new main fork shares src's pages until either relation changes one
+ * (smgrshare()); its other forks start empty.  As RelationCreateStorage(),
+ * the storage is deleted if the transaction aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
+							bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrshare(src, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	if (!XLogIsNeeded())
+		AddPendingSync(&rlocator);
+
+	return srel;
+}
+
+/*
  * Perform XLogInsert of an XLOG_SMGR_CREATE record to WAL.
  */
 void

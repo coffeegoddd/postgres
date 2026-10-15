@@ -35,18 +35,47 @@
  * XLOG_BMAP_TRUNCATE	the relation's length: block 0 is the map's header
  * XLOG_BMAP_FREE		blocks are freed: block 0 is the allocator's metapage,
  *						then bitmap pages
+ * XLOG_BMAP_SHARE		part of a map copied into another relation's, sharing
+ *						its blocks: block 0 is the copy's map page, then the
+ *						reference-count pages of the blocks
+ * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
+ *						(its epoch raised), block 1 the copy's (its length)
+ * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
+ *						map page whose entries change (BMAP_UNREF_MAP)
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
 #define XLOG_BMAP_EXTEND		0x30
 #define XLOG_BMAP_TRUNCATE		0x40
 #define XLOG_BMAP_FREE			0x50
+#define XLOG_BMAP_SHARE			0x60
+#define XLOG_BMAP_SHARED		0x70
+#define XLOG_BMAP_UNREF			0x80
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
 {
 	RelFileLocator locator;
 } xl_bmap_rel;
+
+/* SHARE's and SHARED's main data: the relation shared and its copy. */
+typedef struct xl_bmap_share
+{
+	RelFileLocator src;
+	RelFileLocator dst;
+} xl_bmap_share;
+
+/*
+ * UNREF's main data.  With BMAP_UNREF_MAP, block 0 is a map page of
+ * 'locator' whose entries change; the reference-count pages follow.
+ */
+#define BMAP_UNREF_MAP			0x01
+
+typedef struct xl_bmap_unref
+{
+	RelFileLocator locator;
+	uint32		flags;
+} xl_bmap_unref;
 
 /*
  * EXTEND's main data: the relation, the page store's high-water mark before
@@ -77,15 +106,20 @@ typedef struct xl_bmap_extend
 #define BMAP_DELTA_NODE		2
 #define BMAP_DELTA_BITS		3
 #define BMAP_DELTA_META		4
+#define BMAP_DELTA_REFS		5
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
-/* Block data of a map's header: its relation's length. */
+/*
+ * Block data of a map's header: its relation's length, and its epoch: the
+ * entries born before it may be shared with another map.
+ */
 typedef struct xl_bmap_header_delta
 {
 	uint16		kind;			/* BMAP_DELTA_HEADER */
 	uint16		flags;
 	BlockNumber nblocks;
+	uint32		epoch;
 } xl_bmap_header_delta;
 
 /* Block data of a map page: entries set. */
@@ -113,6 +147,24 @@ typedef struct xl_bmap_bits_delta
 	uint32		nbits;
 	/* uint32 bits[nbits] follow */
 } xl_bmap_bits_delta;
+
+/*
+ * Block data of a reference-count page: counts set.  A block's count is the
+ * number of maps holding it besides the first.
+ */
+typedef struct xl_bmap_refs_delta
+{
+	uint16		kind;			/* BMAP_DELTA_REFS */
+	uint16		flags;
+	uint32		nrefs;
+	/* xl_bmap_ref_delta refs[nrefs] follow */
+} xl_bmap_refs_delta;
+
+typedef struct xl_bmap_ref_delta
+{
+	uint32		slot;
+	uint32		count;
+} xl_bmap_ref_delta;
 
 /* Block data of the allocator's metapage: new counters, bitmap pages added. */
 typedef struct xl_bmap_meta_delta

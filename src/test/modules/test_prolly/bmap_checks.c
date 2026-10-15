@@ -1,0 +1,214 @@
+/*--------------------------------------------------------------------------
+ *
+ * bmap_checks.c
+ *		Checks of block-mapped storage's sharing: copies of a relation's
+ *		storage made with smgrshare(), inspected and dropped below the
+ *		catalogs.
+ *
+ * Every function names storage by relation file number, in the database's
+ * default tablespace.  A copy made here has no catalog row; it lasts until
+ * test_bmap_unlink() drops it.
+ *
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *		src/test/modules/test_prolly/bmap_checks.c
+ *
+ * -------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/htup_details.h"
+#include "access/xlog.h"
+#include "catalog/catalog.h"
+#include "catalog/pg_class.h"
+#include "catalog/storage.h"
+#include "common/cryptohash.h"
+#include "common/md5.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "storage/bmap.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
+#include "storage/smgr.h"
+#include "utils/builtins.h"
+#include "utils/tuplestore.h"
+
+static RelFileLocator
+locator_of(Oid relnumber)
+{
+	RelFileLocator loc;
+
+	loc.spcOid = MyDatabaseTableSpace;
+	loc.dbOid = MyDatabaseId;
+	loc.relNumber = relnumber;
+	return loc;
+}
+
+static SMgrRelation
+bmap_smgr(Oid relnumber)
+{
+	SMgrRelation srel = smgropen(locator_of(relnumber), INVALID_PROC_NUMBER);
+
+	if (srel->smgr_which != SMGR_BMAP)
+		elog(ERROR, "relation file number %u is not block-mapped", relnumber);
+	return srel;
+}
+
+/*
+ * test_bmap_share(relnumber): a new relation file number whose storage
+ * shares relnumber's pages.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_share);
+
+Datum
+test_bmap_share(PG_FUNCTION_ARGS)
+{
+	SMgrRelation src = bmap_smgr(PG_GETARG_OID(0));
+	RelFileNumber copy = GetNewRelFileNumber(MyDatabaseTableSpace, NULL,
+											 RELPERSISTENCE_PERMANENT);
+
+	RelationCreateStorageShared(locator_of(copy), src, false);
+	PG_RETURN_OID(copy);
+}
+
+/*
+ * test_bmap_digest(relnumber): an MD5 digest of every page, read through
+ * shared buffers, with each page's checksum left out (it is set only when
+ * a page is written).
+ */
+PG_FUNCTION_INFO_V1(test_bmap_digest);
+
+Datum
+test_bmap_digest(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	SMgrRelation srel = bmap_smgr(loc.relNumber);
+	BlockNumber nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_MD5);
+	uint8		sum[MD5_DIGEST_LENGTH];
+	char		hex[2 * MD5_DIGEST_LENGTH + 1];
+	PGAlignedBlock copy;
+
+	if (pg_cryptohash_init(ctx) < 0)
+		elog(ERROR, "could not initialize MD5");
+	for (BlockNumber blk = 0; blk < nblocks; blk++)
+	{
+		Buffer		buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, blk,
+													RBM_NORMAL, NULL, true);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
+		((PageHeader) copy.data)->pd_checksum = 0;
+		if (pg_cryptohash_update(ctx, (uint8 *) copy.data, BLCKSZ) < 0)
+			elog(ERROR, "could not update MD5");
+	}
+	if (pg_cryptohash_final(ctx, sum, sizeof(sum)) < 0)
+		elog(ERROR, "could not finish MD5");
+	pg_cryptohash_free(ctx);
+	hex_encode((char *) sum, sizeof(sum), hex);
+	hex[sizeof(hex) - 1] = '\0';
+	PG_RETURN_TEXT_P(cstring_to_text(hex));
+}
+
+/*
+ * test_bmap_map(relnumber): every logical block's physical block, birth
+ * epoch and reference count.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_map);
+
+Datum
+test_bmap_map(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+	BlockNumber nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (BlockNumber blk = 0; blk < nblocks; blk++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+		BlockNumber phys;
+		uint32		epoch;
+		uint32		refs;
+
+		bmap_inspect_block(srel, blk, &phys, &epoch, &refs);
+		values[0] = Int64GetDatum(blk);
+		values[1] = Int64GetDatum(phys);
+		values[2] = Int64GetDatum(epoch);
+		values[3] = Int32GetDatum(refs);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* test_bmap_epoch(relnumber): the map's epoch */
+PG_FUNCTION_INFO_V1(test_bmap_epoch);
+
+Datum
+test_bmap_epoch(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(bmap_inspect_epoch(bmap_smgr(PG_GETARG_OID(0))));
+}
+
+/* test_bmap_free_blocks(): the page store's count of free blocks */
+PG_FUNCTION_INFO_V1(test_bmap_free_blocks);
+
+Datum
+test_bmap_free_blocks(PG_FUNCTION_ARGS)
+{
+	BlockNumber hw;
+	uint32		nfree;
+
+	bmap_inspect_allocator(locator_of(InvalidRelFileNumber), &hw, &nfree);
+	PG_RETURN_INT64(nfree);
+}
+
+/*
+ * test_bmap_unlink(relnumber): drop storage, freeing what no copy holds.
+ * The records are flushed before returning: this transaction has no
+ * commit record that would flush them.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_unlink);
+
+Datum
+test_bmap_unlink(PG_FUNCTION_ARGS)
+{
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+
+	smgrdounlinkall(&srel, 1, false);
+	XLogFlush(GetXLogInsertRecPtr());
+	PG_RETURN_VOID();
+}
+
+/* test_bmap_truncate(relnumber, nblocks): shorten the logical length */
+PG_FUNCTION_INFO_V1(test_bmap_truncate);
+
+Datum
+test_bmap_truncate(PG_FUNCTION_ARGS)
+{
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber old = smgrnblocks(srel, MAIN_FORKNUM);
+	BlockNumber nblocks = PG_GETARG_INT32(1);
+
+	smgrpretruncate(srel, &fork, 1);
+	smgrtruncate(srel, &fork, 1, &old, &nblocks);
+	PG_RETURN_VOID();
+}
+
+/* test_bmap_extend(relnumber, n): add n zeroed blocks */
+PG_FUNCTION_INFO_V1(test_bmap_extend);
+
+Datum
+test_bmap_extend(PG_FUNCTION_ARGS)
+{
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+
+	smgrzeroextend(srel, MAIN_FORKNUM, smgrnblocks(srel, MAIN_FORKNUM),
+				   PG_GETARG_INT32(1), false);
+	PG_RETURN_VOID();
+}

@@ -106,6 +106,8 @@ extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum,
 						   bool isRedo);
+extern void smgrshare(SMgrRelation src, SMgrRelation dst);
+extern bool smgrcanshare(SMgrRelation reln);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,
