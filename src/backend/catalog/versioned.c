@@ -68,7 +68,7 @@ namespace_changed(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
  * Most databases have no versioned schema; then nothing here costs more
  * than this test.
  */
-static bool
+bool
 database_has_versioned_schemas(void)
 {
 	if (!callback_registered)

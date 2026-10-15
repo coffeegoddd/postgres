@@ -70,6 +70,7 @@ CATALOG_HEADERS := \
 	pg_default_acl.h \
 	pg_init_privs.h \
 	pg_seclabel.h \
+	pg_branch.h \
 	pg_shseclabel.h \
 	pg_collation.h \
 	pg_parameter_acl.h \
@@ -94,6 +95,7 @@ POSTGRES_BKI_DATA = \
 	pg_amop.dat \
 	pg_amproc.dat \
 	pg_authid.dat \
+	pg_branch.dat \
 	pg_auth_members.dat \
 	pg_cast.dat \
 	pg_class.dat \

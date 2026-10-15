@@ -16,6 +16,9 @@
 
 #include "catalog/objectaddress.h"
 
+/* does the database have any versioned schema?  (cheap after the first call) */
+extern bool database_has_versioned_schemas(void);
+
 /* is this schema versioned? */
 extern bool namespace_is_versioned(Oid nspid);
 

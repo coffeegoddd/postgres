@@ -36,6 +36,7 @@
 #include "access/xact.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/binary_upgrade.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -1034,10 +1035,19 @@ index_create(Relation heapRelation,
 	/*
 	 * store index's pg_class entry
 	 */
-	InsertPgClassTuple(pg_class, indexRelation,
-					   RelationGetRelid(indexRelation),
-					   (Datum) 0,
-					   reloptions);
+	CatalogBranchIndexTable = heapRelationId;
+	PG_TRY();
+	{
+		InsertPgClassTuple(pg_class, indexRelation,
+						   RelationGetRelid(indexRelation),
+						   (Datum) 0,
+						   reloptions);
+	}
+	PG_FINALLY();
+	{
+		CatalogBranchIndexTable = InvalidOid;
+	}
+	PG_END_TRY();
 
 	/* done with pg_class */
 	table_close(pg_class, RowExclusiveLock);

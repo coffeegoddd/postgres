@@ -29,6 +29,7 @@
 #include "access/tsmapi.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
@@ -2276,7 +2277,8 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 
 	page = BufferGetPage(hscan->rs_cbuf);
 	all_visible = PageIsAllVisible(page) &&
-		!scan->rs_snapshot->takenDuringRecovery;
+		!scan->rs_snapshot->takenDuringRecovery &&
+		!relation_has_branches(RelationGetRelid(scan->rs_rd));
 	maxoffset = PageGetMaxOffsetNumber(page);
 
 	for (;;)

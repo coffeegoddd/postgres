@@ -83,3 +83,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Make the branch called name the session's branch.
+CREATE FUNCTION test_branch_switch(name text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The session's branch.
+CREATE FUNCTION test_branch_current()
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
