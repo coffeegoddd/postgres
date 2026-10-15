@@ -37,6 +37,18 @@ ALTER TABLE plain.d SET ACCESS METHOD prolly;
 ALTER TABLE app.t SET SCHEMA plain;
 ALTER TABLE plain.d SET SCHEMA app;
 CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE app.pair AS (m app.mood, n int);
+CREATE TABLE app.pairs (p app.pair);
+INSERT INTO app.pairs VALUES (ROW('happy', 42));
+SELECT (p).m, (p).n FROM app.pairs;
+SELECT count(*) = 1 AS internal_dependency
+FROM pg_depend d JOIN pg_type t ON t.typrelid = d.objid
+WHERE t.oid = 'app.pair'::regtype
+  AND d.classid = 'pg_class'::regclass
+  AND d.refclassid = 'pg_type'::regclass AND d.refobjid = t.oid
+  AND d.deptype = 'i';
+DROP TABLE app.pairs;
+DROP TYPE app.pair;
 ALTER TYPE app.mood SET SCHEMA plain;
 
 -- Versioned objects may depend on shared ones.

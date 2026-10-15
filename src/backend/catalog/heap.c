@@ -1464,6 +1464,17 @@ heap_create_with_catalog(const char *relname,
 	 */
 	AddNewAttributeTuples(relid, new_rel_desc->rd_att, relkind);
 
+	/* The dependency validator must be able to read both catalog rows. */
+	if (relkind == RELKIND_COMPOSITE_TYPE)
+	{
+		ObjectAddress myself,
+					referenced;
+
+		ObjectAddressSet(myself, RelationRelationId, relid);
+		ObjectAddressSet(referenced, TypeRelationId, new_type_oid);
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	}
+
 	/*
 	 * Make a dependency link to force the relation to be deleted if its
 	 * namespace is.  Also make a dependency link to its owner, as well as

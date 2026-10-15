@@ -729,8 +729,9 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 
 		if (relationKind != RELKIND_COMPOSITE_TYPE)
 			recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
-		else
+		else if (rebuild)
 			recordDependencyOn(&referenced, &myself, DEPENDENCY_INTERNAL);
+		/* New composite relations get this link after their pg_class row. */
 	}
 
 	/*
