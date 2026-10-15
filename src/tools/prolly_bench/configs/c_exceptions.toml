@@ -1,0 +1,9 @@
+# C suite records expected to differ from heap (B0), each with its reason.
+# A listed record that differs is counted as "exception" instead of failing
+# the gate; one that no longer differs is reported as stale.
+#
+# [[exception]]
+# file = "index/orderby_nosort/10/slt_good_0.test"   # as slt-runner names it
+# line = 1234                                        # the record's first SQL line
+# am = "prolly"                                      # leave out for every AM
+# reason = "..."

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"compress/gzip"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -131,5 +135,78 @@ func TestHashSortedRows(t *testing.T) {
 	c := []string{"1", "y", "2", "x"}
 	if hashSortedRows(a, 2) == hashSortedRows(c, 2) {
 		t.Error("different rows with the same values hash the same")
+	}
+}
+
+func TestClassify(t *testing.T) {
+	ok := func(s string) *record { return &record{Status: stOk, Sorted: s, Rows: 1} }
+	bad := func(s string) *record { return &record{Status: stNotOk, Sorted: s, Rows: 1} }
+	errRec := func(st, code string) *record { return &record{Status: st, SQLState: code} }
+	cases := []struct {
+		b, e *record
+		want string
+	}{
+		{ok("a"), ok("a"), clAgree},
+		{ok("a"), bad("a"), clOrderOnly},
+		{ok("a"), bad("b"), clRegression},
+		{ok("a"), errRec(stNotOk, "XX000"), clRegression},
+		{ok("a"), errRec(stNotImplemented, "0A000"), clNotImplemented},
+		{bad("a"), bad("a"), clPostgresSemantics},
+		{bad("a"), bad("b"), clHiddenRegression},
+		{errRec(stNotOk, "42601"), errRec(stNotOk, "42601"), clPostgresSemantics},
+		{errRec(stNotOk, "42601"), errRec(stNotOk, "XX000"), clHiddenRegression},
+		{&record{Status: stNotOk, Message: "Expected error but didn't get one"},
+			&record{Status: stNotOk, Message: "Expected error but didn't get one"}, clPostgresSemantics},
+		{bad("a"), ok("a"), clEngineOnlyPass},
+		{ok("a"), &record{Status: stCrashed}, clCrashed},
+		{ok("a"), &record{Status: stTimeout}, clTimeout},
+		{&record{Status: stTimeout}, ok("a"), clBaseDidNotRun},
+		{nil, ok("a"), clUnmatched},
+	}
+	for i, c := range cases {
+		if got := classify(c.b, c.e); got != c.want {
+			t.Errorf("case %d: classify = %s, want %s", i, got, c.want)
+		}
+	}
+}
+
+func TestCompareDirs(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, recs ...record) string {
+		d := filepath.Join(dir, name)
+		os.MkdirAll(d, 0o755)
+		f, _ := os.Create(filepath.Join(d, "records.jsonl.gz"))
+		gz := gzip.NewWriter(f)
+		for _, r := range recs {
+			b, _ := json.Marshal(r)
+			gz.Write(append(b, '\n'))
+		}
+		gz.Close()
+		f.Close()
+		return d
+	}
+	base := write("base",
+		record{File: "a.test", Line: 1, Status: stOk, Sorted: "x", Rows: 1},
+		record{File: "a.test", Line: 2, Status: stOk, Sorted: "y", Rows: 1},
+		record{File: "a.test", Line: 3, Status: stOk, Sorted: "z", Rows: 1})
+	eng := write("eng",
+		record{File: "a.test", Line: 1, Status: stOk, Sorted: "x", Rows: 1},
+		record{File: "a.test", Line: 2, Status: stNotOk, Sorted: "q", Rows: 2},
+		record{File: "a.test", Line: 3, Status: stNotOk, Sorted: "w", Rows: 1})
+	exc := filepath.Join(dir, "exc.json")
+	os.WriteFile(exc, []byte(`[{"file":"a.test","line":3,"reason":"known"},
+		{"file":"a.test","line":1,"reason":"stale"}]`), 0o644)
+	cmp, err := compareDirs(base, eng, filepath.Join(dir, "out"), exc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmp.Counts[clAgree] != 1 || cmp.Counts[clRegression] != 1 || cmp.Counts[clException] != 1 {
+		t.Errorf("counts %v", cmp.Counts)
+	}
+	if cmp.GateFailures != 1 {
+		t.Errorf("gate failures %d", cmp.GateFailures)
+	}
+	if len(cmp.StaleExceptions) != 1 || cmp.StaleExceptions[0].Line != 1 {
+		t.Errorf("stale %v", cmp.StaleExceptions)
 	}
 }
