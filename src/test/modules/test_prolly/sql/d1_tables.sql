@@ -448,3 +448,31 @@ SELECT * FROM wo ORDER BY valid_at;
 UPDATE wo SET valid_at = '[2020-03-01,2020-04-01)' WHERE valid_at = '[2020-02-01,2020-03-01)';
 SELECT * FROM wo ORDER BY valid_at;
 DROP TABLE wo;
+
+-- Backward scans: SCROLL cursors, keyed and keyless (identical rows come
+-- back one by one, either way), and changes of direction.
+CREATE TABLE bk (id int PRIMARY KEY, v text) USING prolly_d1;
+INSERT INTO bk SELECT g, 'v' || g FROM generate_series(1, 5) g;
+CREATE TABLE bkk (v int) USING prolly_d1;
+INSERT INTO bkk VALUES (1), (2), (2), (2), (3);
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT id FROM bk;
+FETCH 2 FROM c;
+FETCH BACKWARD 1 FROM c;
+FETCH LAST FROM c;
+FETCH PRIOR FROM c;
+FETCH ABSOLUTE 2 FROM c;
+FETCH BACKWARD ALL FROM c;
+FETCH NEXT FROM c;
+FETCH FORWARD ALL FROM c;
+FETCH PRIOR FROM c;
+DECLARE k SCROLL CURSOR FOR SELECT v FROM bkk;
+FETCH 3 FROM k;
+FETCH BACKWARD 2 FROM k;
+FETCH FORWARD ALL FROM k;
+FETCH BACKWARD ALL FROM k;
+COMMIT;
+SET enable_seqscan = off;
+SELECT count(*) FROM (SELECT ctid FROM bk WHERE ctid >= '(0,1)' ORDER BY ctid DESC) s;
+RESET enable_seqscan;
+DROP TABLE bk, bkk;
