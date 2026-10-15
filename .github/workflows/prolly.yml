@@ -7,6 +7,9 @@ name: prolly
 on:
   pull_request:
     branches: [master]
+    # the specs are documentation; changing only them builds nothing
+    paths-ignore:
+      - 'specs/**'
   workflow_dispatch:
 
 permissions:
