@@ -41,6 +41,7 @@ backend_sources += files(
   'prolly_rmgr.c',
   'prolly_shmem.c',
   'prolly_tableam.c',
+  'prolly_dolt.c',
   'prolly_vcs.c',
   'prolly_xact.c',
   'reclaim_marksweep.c',

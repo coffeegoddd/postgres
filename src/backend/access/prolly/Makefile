@@ -53,6 +53,7 @@ OBJS = \
 	prolly_rmgr.o \
 	prolly_shmem.o \
 	prolly_tableam.o \
+	prolly_dolt.o \
 	prolly_vcs.o \
 	prolly_xact.o \
 	reclaim_marksweep.o \

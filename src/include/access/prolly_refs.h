@@ -42,6 +42,10 @@ typedef struct ProllyCommitInfo
 	char	   *message;		/* palloc'd */
 } ProllyCommitInfo;
 
+/* Visits one branch: its name and head commit (len 0: none yet). */
+typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
+								   void *arg);
+
 typedef struct ProllyRefsRoutine
 {
 	ProllyImplInfo info;
@@ -57,7 +61,12 @@ typedef struct ProllyRefsRoutine
 	/* Record a commit of the current branch's working root. */
 	void		(*commit) (const char *message, ProllyHash *commit_id);
 
-	/* Resolve a branch name or commit id to a commit id. */
+	/*
+	 * Resolve a branch name, commit id or HEAD (the session branch's head
+	 * commit), each optionally followed by ancestry steps as in Dolt and
+	 * Git (~n: the nth first-parent ancestor; ^n: the nth parent), to a
+	 * commit id.
+	 */
 	bool		(*resolve) (const char *refname, ProllyHash *commit_id);
 
 	bool		(*commit_get) (const ProllyHash *commit_id,
@@ -78,6 +87,23 @@ typedef struct ProllyRefsRoutine
 								int nparents, const ProllyNodeRef *working_set,
 								ProllyHash *commit_id);
 
+	/* Visit every branch, by name. */
+	void		(*branches) (ProllyBranchVisit visit, void *arg);
+
+	/*
+	 * A branch's working set as last committed (NULL: the session's
+	 * branch); false if there's no such branch.
+	 */
+	bool		(*working_set) (const char *branch, ProllyNodeRef *root);
+
+	/*
+	 * Make the commit ref names the session branch's head commit, and its
+	 * working set the one that commit recorded, when the transaction
+	 * commits (a hard reset, or a fast-forward).  The transaction must not
+	 * have written to prolly tables.
+	 */
+	void		(*reset) (const char *ref);
+
 	/*
 	 * Visit every node the refs keep alive, from the root of their own
 	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
@@ -89,7 +115,7 @@ typedef struct ProllyRefsRoutine
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
-	"commit_with", "walk"
+	"commit_with", "branches", "working_set", "reset", "walk"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

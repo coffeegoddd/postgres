@@ -42,6 +42,8 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_xact.h"
@@ -66,7 +68,7 @@ typedef struct RefEdit
 	bool		is_delete;
 } RefEdit;
 
-/* A new branch's working set, to enqueue at commit. */
+/* A new or reset branch's working set, to enqueue at commit. */
 typedef struct NewHead
 {
 	ProllyBranchId branch;
@@ -379,10 +381,15 @@ branch_name(ProllyBranchId id)
 	return name;
 }
 
+/*
+ * Names can't be empty, start with '-' (an option to the dolt_ functions),
+ * or hold '~' or '^' (ancestry steps in refs) or whitespace.
+ */
 static void
 check_branch_name(const char *name)
 {
-	if (name[0] == '\0' || strlen(name) > MAX_BRANCH_NAME)
+	if (name[0] == '\0' || name[0] == '-' || strlen(name) > MAX_BRANCH_NAME ||
+		strpbrk(name, "~^ \t\n\r") != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid prolly branch name \"%s\"", name)));
@@ -544,13 +551,11 @@ parse_commit_id(const char *refname, ProllyHash *id)
 }
 
 static bool
-tree_resolve(const char *refname, ProllyHash *commit_id)
+resolve_base(const char *refname, ProllyHash *commit_id)
 {
 	ProllyBranchId id;
 	ProllyHash	head;
 	ProllyHash	root;
-
-	refs_init();
 
 	/* HEAD: the session branch's head commit, as in Dolt. */
 	if (strcmp(refname, "HEAD") == 0)
@@ -566,6 +571,55 @@ tree_resolve(const char *refname, ProllyHash *commit_id)
 		commit_local_root(commit_id, &root))
 		return true;
 	return false;
+}
+
+static bool
+tree_resolve(const char *refname, ProllyHash *commit_id)
+{
+	size_t		baselen = strcspn(refname, "~^");
+	char	   *base = pnstrdup(refname, baselen);
+	const char *p = refname + baselen;
+	bool		found;
+
+	refs_init();
+	found = resolve_base(base, commit_id);
+	pfree(base);
+
+	/* Ancestry steps: ~n, the nth first parent; ^n, the nth parent. */
+	while (found && *p != '\0')
+	{
+		char		op = *p++;
+		long		n = 1;
+		ProllyCommitInfo info;
+
+		if (isdigit((unsigned char) *p))
+		{
+			char	   *end;
+
+			n = strtol(p, &end, 10);
+			p = end;
+		}
+		if (op == '~')
+		{
+			for (long i = 0; i < n && found; i++)
+			{
+				found = tree_commit_get(commit_id, &info) && info.nparents > 0;
+				if (found)
+					*commit_id = info.parents[0];
+			}
+		}
+		else if (op == '^')
+		{
+			if (n == 0)
+				continue;
+			found = tree_commit_get(commit_id, &info) && n <= info.nparents;
+			if (found)
+				*commit_id = info.parents[n - 1];
+		}
+		else
+			found = false;
+	}
+	return found;
 }
 
 /* ------------------------------------------------------------------------
@@ -711,7 +765,7 @@ record_commit(const char *name, ProllyBranchId branch, const char *message,
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, canonical_root, wr, &canonical);
 	write_commit(&canonical.hash, parents, nparents,
-				 GetUserNameFromId(GetUserId(), false), message,
+				 prolly_commit_author(), message,
 				 GetCurrentTransactionStartTimestamp(), commit_id);
 
 	initStringInfo(&key);
@@ -906,6 +960,162 @@ tree_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 }
 
 /* ------------------------------------------------------------------------
+ * Listing, working sets and reset
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct BranchEntry
+{
+	char	   *name;
+	ProllyHash	head;
+	bool		gone;
+} BranchEntry;
+
+static int
+branch_entry_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((BranchEntry *) lfirst(a))->name,
+				  ((BranchEntry *) lfirst(b))->name);
+}
+
+static BranchEntry *
+find_entry(List *entries, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, entries)
+	{
+		BranchEntry *be = lfirst(lc);
+
+		if (strcmp(be->name, name) == 0)
+			return be;
+	}
+	return NULL;
+}
+
+/* The branches committed, with the transaction's changes over them. */
+static void
+tree_branches(ProllyBranchVisit visit, void *arg)
+{
+	ProllyNodeRef root;
+	List	   *entries = NIL;
+	ListCell   *lc;
+	BranchEntry *be;
+
+	refs_init();
+	if (refs_root(&root))
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(comps.tree, cursor_open, &env, &root,
+										  CurrentMemoryContext);
+		uint8		tag = TAG_BRANCH;
+		ProllyKey	from = {&tag, 1};
+		ProllyKey	k;
+		ProllyValue v;
+
+		PROLLY_CALL(comps.tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (PROLLY_CALL(comps.tree, cursor_next, c, &k, &v))
+		{
+			if (k.len < 1 || k.data[0] != TAG_BRANCH)
+				break;
+			be = palloc0(sizeof(BranchEntry));
+			be->name = pnstrdup((const char *) k.data + 1, k.len - 1);
+			if (v.len >= 4)
+				(void) get_hash((const char *) v.data + 4,
+								(const char *) v.data + v.len, &be->head);
+			entries = lappend(entries, be);
+		}
+		PROLLY_CALL(comps.tree, cursor_close, c);
+	}
+	if (rx)
+	{
+		foreach(lc, rx->edits)
+		{
+			RefEdit    *e = lfirst(lc);
+			char	   *name;
+
+			if (e->key.len < 1 || e->key.data[0] != TAG_BRANCH)
+				continue;
+			name = pnstrdup(e->key.data + 1, e->key.len - 1);
+			be = find_entry(entries, name);
+			if (be == NULL)
+			{
+				be = palloc0(sizeof(BranchEntry));
+				be->name = name;
+				entries = lappend(entries, be);
+			}
+			be->gone = e->is_delete;
+			memset(&be->head, 0, sizeof(be->head));
+			if (!e->is_delete && e->value.len >= 4)
+				(void) get_hash(e->value.data + 4, e->value.data + e->value.len,
+								&be->head);
+		}
+	}
+	if (find_entry(entries, "main") == NULL)
+	{
+		be = palloc0(sizeof(BranchEntry));
+		be->name = pstrdup("main");
+		entries = lappend(entries, be);
+	}
+	list_sort(entries, branch_entry_cmp);
+	foreach(lc, entries)
+	{
+		be = lfirst(lc);
+		if (!be->gone)
+			visit(be->name, &be->head, arg);
+	}
+}
+
+static bool
+tree_working_set(const char *branch, ProllyNodeRef *root)
+{
+	ProllyBranchId id;
+	ProllyHash	head;
+
+	refs_init();
+	if (branch == NULL)
+		id = prolly_session_branch();
+	else if (!branch_get(branch, &id, &head))
+		return false;
+	if (!working_root(id, root))
+		PROLLY_CALL(comps.root_layout, empty, &root_env, root);
+	return true;
+}
+
+static void
+tree_reset(const char *ref)
+{
+	ProllyBranchId branch = prolly_session_branch();
+	ProllyHash	target;
+	ProllyHash	root;
+	NewHead    *nh;
+	MemoryContext old;
+
+	if (prolly_xact_has_writes())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot reset a prolly branch in a transaction that has written to prolly tables")));
+	lock_refs();
+	if (!tree_resolve(ref, &target))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	if (!commit_local_root(&target, &root))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit has no working set")));
+
+	/* Nothing else commits to the branch until this transaction ends. */
+	PROLLY_CALL(comps.commit, branch_lock, branch);
+	branch_put(branch_name(branch), branch, &target);
+	old = MemoryContextSwitchTo(rx->mcxt);
+	nh = palloc(sizeof(NewHead));
+	nh->branch = branch;
+	nh->root = root;
+	rx->heads = lappend(rx->heads, nh);
+	MemoryContextSwitchTo(old);
+}
+
+/* ------------------------------------------------------------------------
  * Transaction end
  * ------------------------------------------------------------------------
  */
@@ -932,7 +1142,7 @@ refs_precommit(void)
 		return;
 	xid = GetCurrentTransactionId();
 
-	/* New branches' working sets. */
+	/* New branches' working sets, and reset ones'. */
 	foreach(lc, rx->heads)
 	{
 		NewHead    *nh = lfirst(lc);
@@ -1037,5 +1247,8 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.merge_base = tree_merge_base,
 	.commit_working_set = tree_commit_working_set,
 	.commit_with = tree_commit_with,
+	.branches = tree_branches,
+	.working_set = tree_working_set,
+	.reset = tree_reset,
 	.walk = tree_walk,
 };

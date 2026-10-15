@@ -35,6 +35,15 @@ extern bool prolly_xact_has_writes(void);
  */
 extern ProllyBranchId prolly_session_branch(void);
 extern void prolly_set_session_branch(ProllyBranchId branch);
+
+/*
+ * Per-session setup once connected to a database: defines dolt.author,
+ * and checks out branch (from a "dbname/branch" connection) unless NULL.
+ */
+extern void prolly_session_init(const char *branch);
+
+/* Who the session's commits are by: dolt.author, else the session user. */
+extern const char *prolly_commit_author(void);
 extern void AtPrepare_Prolly(void);
 extern void prolly_twophase_precommit(FullTransactionId fxid, uint16 info,
 									  void *recdata, uint32 len);

@@ -812,6 +812,41 @@ under the format stamp (question 35; today's deparser output is used
 as it is), collation versions in the canonical schema (question 46),
 portable codecs for `reg*` types (question 35).
 
+**Status (2026-10-15): 4g.4 built (functions, views, connections).**
+Doltgres's SQL interface (question 52), in a file of adapters onto the
+refs and diff/merge interfaces: `dolt_commit`, `dolt_checkout`,
+`dolt_branch`, `dolt_merge`, `dolt_reset`, `dolt_add` take Dolt's
+arguments as `VARIADIC text` and return `text[]` as Doltgres's do;
+`dolt_hashof`, `active_branch`; the `dolt_log`, `dolt_branches` and
+`dolt_status` views; `dolt_diff(from, to, NULL::t)`, whose rows are the
+table's row type as it was and is (Doltgres spreads them into `from_` and
+`to_` columns; a row type is the Postgres way to return a table's columns
+from one function for any table); `dolt.author` ("Name <email>"; the
+session user when empty) for commit authors (question 56); and
+`dbname/branch` connections (question 53: the part after the first `/`
+when no database has the whole name; a branch that doesn't exist fails the
+connection). There's no separate staging area: a commit records the whole
+working set, so every change counts as staged (`dolt_add` has nothing to
+do, `dolt_status` shows changes as staged, `dolt_reset` only does `--hard`).
+`WORKING` is the branch's working set as last committed, so status and
+diff don't see the current transaction's own writes. `dolt_commit` refuses
+a commit whose root equals its parent's, as Dolt does, unless
+`--allow-empty`. Interfaces: refs gained `branches`, `working_set` and
+`reset` (a hard reset: the branch's head commit and working set become a
+commit's, enqueued at commit under the branch's lock), and `resolve` takes
+Dolt's ancestry steps (`HEAD~2`, `HEAD^2`); branch names can't start with
+`-` or hold `~`, `^` or whitespace; diff takes one table or all, and the
+ref `WORKING`; merge takes a message and `PROLLY_MERGE_NO_FF`, and
+fast-forwards (a reset to the other head) when the current head is the
+common ancestor. Tests: `022_d1_dolt_sql.pl` (authors, empty commits,
+log order and ancestry, branches and connections to them, status, diffs
+of keyed, keyless and large rows, fast-forward, merge commit and
+`--no-ff` merges, hard resets through a crash, branch copy and delete).
+Not yet: conflict tables (merges with conflicts still fail and change
+nothing), `dolt_diff_<table>` and other per-table system tables (they
+need a relation per table, which waits for versioned catalogs), schema
+changes in `dolt_status`, remotes.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

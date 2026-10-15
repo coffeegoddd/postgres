@@ -284,7 +284,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
  refs            | stub             | merge_base                              | not implemented (missing commit, merge_base)
- refs            | stub             | complete                                | not implemented (11 of 11 callbacks missing)
+ refs            | stub             | complete                                | not implemented (14 of 14 callbacks missing)
  refs            | tree             | identity                                | pass
  refs            | tree             | branch_lifecycle                        | no checks yet
  refs            | tree             | commit_then_resolve                     | no checks yet

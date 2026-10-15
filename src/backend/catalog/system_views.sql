@@ -1572,3 +1572,16 @@ CREATE VIEW pg_aios AS
     SELECT * FROM pg_get_aios();
 REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
+
+--
+-- Version control of prolly tables, as Doltgres's system tables
+--
+
+CREATE VIEW dolt_log AS
+    SELECT * FROM dolt_log('HEAD');
+
+CREATE VIEW dolt_branches AS
+    SELECT * FROM dolt_branches();
+
+CREATE VIEW dolt_status AS
+    SELECT * FROM dolt_status();
