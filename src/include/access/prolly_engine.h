@@ -172,8 +172,22 @@ typedef struct ProllyEngineRoutine
 	/* After the commit record: publish what xact_precommit enqueued. */
 	void		(*xact_commit) (void);
 
-	/* PREPARE TRANSACTION: persist private writes for later commit. */
-	void		(*xact_prepare) (void);
+	/*
+	 * PREPARE TRANSACTION: make the private writes durable for a later
+	 * COMMIT PREPARED (in any backend, after a restart too), appending to
+	 * state what commit_prepared will need (nothing if there were no
+	 * writes), and forget them here.
+	 */
+	void		(*xact_prepare) (StringInfo state);
+
+	/*
+	 * COMMIT PREPARED of transaction xid, before its commit record: what
+	 * xact_precommit does for a transaction of this backend, from the
+	 * state xact_prepare gave; the current transaction's commit then
+	 * publishes it (xact_commit), or its abort abandons it.
+	 */
+	void		(*commit_prepared) (TransactionId xid, const char *state,
+									Size len);
 
 	/* Checkpoint: make everything up to the redo point durable. */
 	void		(*checkpoint) (int flags);
@@ -209,9 +223,13 @@ typedef struct ProllyEngineRoutine
 	"cursor_next", "cursor_close", "cursor_can_seek", "get", "has_writes", "key_at", "count_range", \
 	"put", "remove", \
 	"subxact_abort", "xact_abort", "xact_precommit", "xact_commit", \
-	"xact_prepare", "checkpoint", "install_root", "vacuum", "canonical_root", \
+	"xact_prepare", "commit_prepared", "checkpoint", "install_root", "vacuum", \
+	"canonical_root", \
 	"export_chunks", "node_counters"
 #define PROLLY_ENGINE_FIRST_CALLBACK shmem_size
+
+/* Memory a transaction's private writes may use before spilling (kB). */
+extern PGDLLIMPORT int prolly_write_set_memory;
 
 static inline const ProllyEngineRoutine *
 prolly_engine_lookup(const char *name)

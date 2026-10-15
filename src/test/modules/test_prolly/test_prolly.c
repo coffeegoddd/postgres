@@ -789,7 +789,8 @@ prolly_commit_test_enqueue(PG_FUNCTION_ARGS)
 	(void) PROLLY_CALL(r, tip, (ProllyBranchId) branch, &base);
 	test_tickets_routine = r;
 	test_tickets[ntest_tickets++] = PROLLY_CALL(r, enqueue,
-												(ProllyBranchId) branch, &root);
+												(ProllyBranchId) branch, &root,
+												GetCurrentTransactionId());
 	PROLLY_CALL(r, branch_unlock, (ProllyBranchId) branch);
 	PG_RETURN_VOID();
 }

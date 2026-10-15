@@ -45,6 +45,7 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "access/prolly_xact.h"
 #include "pgstat.h"
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"
@@ -819,6 +820,30 @@ SubTransactionIsActive(SubTransactionId subxid)
 	return false;
 }
 
+/*
+ *	GetOpenSubTransactionIds
+ *
+ * The IDs of the subtransactions open now (not aborted), innermost first,
+ * without the top level.  Stores at most max of them in ids; returns how
+ * many there are.
+ */
+int
+GetOpenSubTransactionIds(SubTransactionId *ids, int max)
+{
+	TransactionState s;
+	int			n = 0;
+
+	for (s = CurrentTransactionState; s != NULL && s->parent != NULL;
+		 s = s->parent)
+	{
+		if (s->state == TRANS_ABORT)
+			continue;
+		if (n < max)
+			ids[n] = s->subTransactionId;
+		n++;
+	}
+	return n;
+}
 
 /*
  *	GetCurrentCommandId
@@ -2719,6 +2744,7 @@ PrepareTransaction(void)
 	 */
 	StartPrepare(gxact);
 
+	AtPrepare_Prolly();
 	AtPrepare_Notify();
 	AtPrepare_Locks();
 	AtPrepare_PredicateLocks();

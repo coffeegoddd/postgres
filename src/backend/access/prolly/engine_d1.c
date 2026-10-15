@@ -24,7 +24,18 @@
  * never sees its own writes (Halloween protection) and later commands see
  * earlier ones.  Aborting subtransaction S drops every version written by
  * S or a subtransaction started after it, which are exactly S's
- * descendants.  Nothing reaches the node store until commit.
+ * descendants.
+ *
+ * Spilling.  Past prolly_write_set_memory, a transaction's write sets are
+ * spilled: each moves its keys into a spill tree in the node store (keyed
+ * as the write set is, each value a key's newest version and, if it
+ * differs, the newest one the current command may see, with their command
+ * ids), and starts over empty in memory.  Reads look at memory, then the
+ * spill tree, then the base.  A command that began before the spill (an
+ * open cursor) can't be served, since versions it mustn't see are gone
+ * from memory: reading for it is an error.  For each subtransaction open
+ * at a spill, a mark keeps the spill tree as it was without that
+ * subtransaction's versions, which rolling back to it restores.
  *
  * Key order.  A data tree is ordered by the keying its META tree records
  * (PROLLY_META_KEYING) when it is only read, and by the relation's current
@@ -57,6 +68,7 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/relation.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -137,15 +149,33 @@ order_set(const D1Order *order)
 	return order->keying != NULL || order->ix != NULL;
 }
 
+/* The spill tree as it was without a subtransaction's versions. */
+typedef struct D1SpillMark
+{
+	SubTransactionId subxid;
+	ProllyNodeRef root;			/* hash.len == 0: no spill tree */
+	struct D1SpillMark *next;	/* newer subtransactions first */
+} D1SpillMark;
+
+/* A write set's spilled state. */
+typedef struct D1Spill
+{
+	ProllyNodeRef root;			/* hash.len == 0: none */
+	CommandId	cid;			/* the command current at the last spill */
+	D1SpillMark *marks;
+} D1Spill;
+
 /* A write set's contents before it was emptied, for subtransaction abort. */
 typedef struct D1Saved
 {
 	SubTransactionId subxid;	/* the subtransaction that emptied it */
 	RBTree	   *entries;
 	int			nentries;
+	MemoryContext data_mcxt;
 	ProllyNodeRef base;
 	bool		replaced;
 	D1Order		order;
+	D1Spill		spill;
 	struct D1Saved *prev;
 } D1Saved;
 
@@ -157,6 +187,7 @@ typedef struct D1WriteSet
 {
 	ProllySubRoot sub;
 	RelFileNumber relnumber;
+	Oid			relid;			/* the relation, for its key order */
 	SubTransactionId created_subxid;
 
 	ProllyNodeRef base;			/* hash.len == 0: empty */
@@ -164,6 +195,9 @@ typedef struct D1WriteSet
 
 	RBTree	   *entries;
 	int			nentries;
+	MemoryContext data_mcxt;	/* entries and their versions */
+	D1Spill		spill;
+	uint64		spill_gen;		/* changes when spill.root does */
 	D1Saved    *saved;			/* contents before each emptying */
 	D1Order		order;			/* data and index trees: the key order */
 	struct D1WriteSet *next;	/* all write sets, newest first */
@@ -197,6 +231,8 @@ static int	entry_compare(const RBTNode *a, const RBTNode *b, void *arg);
 static void entry_combine(RBTNode *existing, const RBTNode *newdata, void *arg);
 static RBTNode *entry_alloc(void *arg);
 static void entry_free(RBTNode *node, void *arg);
+static void spill_clear(D1Spill *sp);
+static void maybe_spill(void);
 
 static int
 memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
@@ -454,13 +490,16 @@ find_writeset(ProllySubRoot sub, RelFileNumber relnumber)
 	return he ? he->ws : NULL;
 }
 
-/* Keep the key order of a data tree's write set current while it's empty. */
+/*
+ * Keep the key order of a data tree's write set current while it's empty
+ * (a spill tree, ordered too, counts as contents).
+ */
 static void
 refresh_order(D1WriteSet *ws, Relation rel)
 {
 	D1Order		order;
 
-	if (is_local(ws->sub) || ws->nentries > 0)
+	if (is_local(ws->sub) || ws->nentries > 0 || ws->spill.root.hash.len > 0)
 		return;
 
 	/*
@@ -508,15 +547,23 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 			saved->subxid = GetCurrentSubTransactionId();
 			saved->entries = ws->entries;
 			saved->nentries = ws->nentries;
+			saved->data_mcxt = ws->data_mcxt;
 			saved->base = ws->base;
 			saved->replaced = ws->replaced;
 			saved->order = ws->order;
+			saved->spill = ws->spill;
 			saved->prev = ws->saved;
 			ws->saved = saved;
+			ws->data_mcxt = AllocSetContextCreate(xact->mcxt,
+												  "prolly d1 write set",
+												  ALLOCSET_DEFAULT_SIZES);
+			MemoryContextSwitchTo(ws->data_mcxt);
 			ws->entries = rbt_create(sizeof(D1Entry), entry_compare,
 									 entry_combine, entry_alloc, entry_free, ws);
 			MemoryContextSwitchTo(old);
 			ws->nentries = 0;
+			spill_clear(&ws->spill);
+			ws->spill_gen++;
 			memset(&ws->base, 0, sizeof(ws->base));
 			ws->base.location.blkno = InvalidBlockNumber;
 			ws->replaced = true;
@@ -537,6 +584,11 @@ get_writeset(Relation rel, ProllySubRoot sub, RelFileNumber relnumber,
 	ws = palloc0(sizeof(D1WriteSet));
 	ws->sub = sub;
 	ws->relnumber = relnumber;
+	ws->relid = RelationGetRelid(rel);
+	ws->data_mcxt = AllocSetContextCreate(xact->mcxt, "prolly d1 write set",
+										  ALLOCSET_DEFAULT_SIZES);
+	spill_clear(&ws->spill);
+	MemoryContextSwitchTo(ws->data_mcxt);
 	ws->entries = rbt_create(sizeof(D1Entry), entry_compare, entry_combine,
 							 entry_alloc, entry_free, ws);
 	MemoryContextSwitchTo(old);
@@ -590,7 +642,7 @@ entry_combine(RBTNode *existing, const RBTNode *newdata, void *arg)
 static RBTNode *
 entry_alloc(void *arg)
 {
-	return MemoryContextAlloc(xact->mcxt, sizeof(D1Entry));
+	return MemoryContextAlloc(((D1WriteSet *) arg)->data_mcxt, sizeof(D1Entry));
 }
 
 /*
@@ -619,7 +671,7 @@ ws_write(D1WriteSet *ws, const ProllyKey *key, const ProllyValue *value,
 {
 	D1Entry    *e = ws_find(ws, key);
 	SubTransactionId subxid = GetCurrentSubTransactionId();
-	MemoryContext old = MemoryContextSwitchTo(xact->mcxt);
+	MemoryContext old = MemoryContextSwitchTo(ws->data_mcxt);
 	D1Version  *v;
 
 	if (e == NULL)
@@ -677,6 +729,7 @@ ws_write(D1WriteSet *ws, const ProllyKey *key, const ProllyValue *value,
 		v->len = value->len;
 	}
 	MemoryContextSwitchTo(old);
+	maybe_spill();
 }
 
 /* The key bytes version v of entry e was written with. */
@@ -777,6 +830,353 @@ order_lost_error(void)
 }
 
 /* ------------------------------------------------------------------------
+ * Spilling
+ * ------------------------------------------------------------------------
+ */
+
+#define SPILL_DELETE	0x01	/* the version deletes the key */
+#define SPILL_OWN_KEY	0x02	/* the version wrote the key with other bytes */
+
+/* Keys a spill or a commit applies at once. */
+#define EDIT_CHUNK		8192
+
+/*
+ * A spilled version, pointing into its encoding.  A spill tree's value is
+ * a count (1 or 2), then each version, oldest first: command id (4 bytes),
+ * flags, the key's bytes if the version wrote it with other bytes than
+ * the tree's key (length, 4 bytes, then the bytes), and the value (length,
+ * then the bytes).  Native byte order: spill trees are local and live only
+ * as long as their transaction.
+ */
+typedef struct D1SpillVersion
+{
+	CommandId	cid;
+	bool		is_delete;
+	ProllyKey	key;
+	ProllyValue value;
+} D1SpillVersion;
+
+static void
+spill_clear(D1Spill *sp)
+{
+	memset(sp, 0, sizeof(*sp));
+	sp->root.location.blkno = InvalidBlockNumber;
+	sp->cid = InvalidCommandId;
+}
+
+static int
+spill_decode(const ProllyKey *key, const ProllyValue *value, D1SpillVersion *out)
+{
+	const uint8 *p = value->data;
+	const uint8 *end = p + value->len;
+	int			n;
+
+	if (value->len < 1)
+		elog(ERROR, "prolly spilled value is empty");
+	n = *p++;
+	if (n < 1 || n > 2)
+		elog(ERROR, "prolly spilled value has %d versions", n);
+	for (int i = 0; i < n; i++)
+	{
+		uint8		flags;
+		uint32		len;
+
+		if (end - p < 5)
+			elog(ERROR, "prolly spilled value is corrupt");
+		memcpy(&out[i].cid, p, 4);
+		p += 4;
+		flags = *p++;
+		out[i].is_delete = (flags & SPILL_DELETE) != 0;
+		out[i].key = *key;
+		if (flags & SPILL_OWN_KEY)
+		{
+			if (end - p < 4)
+				elog(ERROR, "prolly spilled value is corrupt");
+			memcpy(&len, p, 4);
+			p += 4;
+			if (end - p < len)
+				elog(ERROR, "prolly spilled value is corrupt");
+			out[i].key.data = p;
+			out[i].key.len = len;
+			p += len;
+		}
+		if (end - p < 4)
+			elog(ERROR, "prolly spilled value is corrupt");
+		memcpy(&len, p, 4);
+		p += 4;
+		if (end - p < len)
+			elog(ERROR, "prolly spilled value is corrupt");
+		out[i].value.data = p;
+		out[i].value.len = len;
+		p += len;
+	}
+	if (p != end)
+		elog(ERROR, "prolly spilled value is corrupt");
+	return n;
+}
+
+static void
+spill_encode(const ProllyKey *key, const D1SpillVersion *v, int n, StringInfo out)
+{
+	appendStringInfoChar(out, (char) n);
+	for (int i = 0; i < n; i++)
+	{
+		uint8		flags = v[i].is_delete ? SPILL_DELETE : 0;
+		bool		own = v[i].key.len != key->len ||
+			memcmp(v[i].key.data, key->data, key->len) != 0;
+		uint32		len;
+
+		if (own)
+			flags |= SPILL_OWN_KEY;
+		appendBinaryStringInfo(out, &v[i].cid, 4);
+		appendStringInfoChar(out, (char) flags);
+		if (own)
+		{
+			len = v[i].key.len;
+			appendBinaryStringInfo(out, &len, 4);
+			appendBinaryStringInfo(out, v[i].key.data, len);
+		}
+		len = v[i].is_delete ? 0 : v[i].value.len;
+		appendBinaryStringInfo(out, &len, 4);
+		if (len > 0)
+			appendBinaryStringInfo(out, v[i].value.data, len);
+	}
+}
+
+/* The newest spilled version command cid may see, as visible_version(). */
+static const D1SpillVersion *
+spill_visible(const D1SpillVersion *v, int n, CommandId cid)
+{
+	for (int i = n - 1; i >= 0; i--)
+	{
+		if (cid == InvalidCommandId || v[i].cid < cid ||
+			v[i].cid == InvalidCommandId)
+			return &v[i];
+	}
+	return NULL;
+}
+
+/*
+ * A command that began before the last spill may need versions the spill
+ * kept only the newest of.
+ */
+static void
+spill_check_reader(const D1WriteSet *ws, CommandId cid)
+{
+	if (ws->spill.root.hash.len > 0 && cid != InvalidCommandId &&
+		ws->spill.cid != InvalidCommandId && cid < ws->spill.cid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot read a prolly table as of an earlier command once the transaction's writes were spilled"),
+				 errhint("Raise \"prolly_write_set_memory\", or close cursors before writing much.")));
+}
+
+/*
+ * Of a key's versions, oldest first, keep those commands from cid on can
+ * need: the newest, and the newest command cid may see if that's older.
+ */
+static int
+spill_prune(D1SpillVersion *v, int n, CommandId cid)
+{
+	const D1SpillVersion *seen;
+
+	if (n == 0)
+		return 0;
+	seen = spill_visible(v, n - 1, cid);
+	if (seen == NULL)
+	{
+		v[0] = v[n - 1];
+		return 1;
+	}
+	v[0] = *seen;
+	v[1] = v[n - 1];
+	return 2;
+}
+
+static int
+edit_cmp(const ProllyKey *a, const ProllyKey *b, const ProllyTreeEnv *env)
+{
+	return env->compare(a, b, env->compare_arg);
+}
+
+/*
+ * The spill tree from with ws's versions of subtransactions before below
+ * (InvalidSubTransactionId: all of them) added, as of command cid.
+ */
+static void
+spill_into(D1WriteSet *ws, const ProllyTreeEnv *env, const ProllyNodeRef *from,
+		   CommandId cid, SubTransactionId below, ProllyNodeRef *out)
+{
+	ProllyEdit *edits = palloc(sizeof(ProllyEdit) * Max(ws->nentries, 1));
+	int			n = 0;
+	RBTreeIterator it;
+	D1Entry    *e;
+	ProllyNodeRef base = *from;
+
+	if (base.hash.len == 0)
+	{
+		ProllyTreeBuilder *b = PROLLY_CALL(backend.c.tree, build_begin, env,
+										   CurrentMemoryContext);
+
+		PROLLY_CALL(backend.c.tree, build_finish, b, &base);
+	}
+	rbt_begin_iterate(ws->entries, LeftRightWalk, &it);
+	while ((e = (D1Entry *) rbt_iterate(&it)) != NULL)
+	{
+		D1SpillVersion *v = palloc(sizeof(D1SpillVersion) * (e->nversions + 2));
+		int			nv = 0;
+		ProllyKey	k = {e->key, e->keylen};
+		StringInfoData old;
+		StringInfoData enc;
+		bool		mine = false;
+
+		for (int i = 0; i < e->nversions; i++)
+			mine |= (below == InvalidSubTransactionId ||
+					 e->versions[i].subxid < below);
+		if (!mine)
+			continue;
+		initStringInfo(&old);
+		if (from->hash.len > 0 &&
+			PROLLY_CALL(backend.c.tree, get, env, from, &k, &old))
+		{
+			ProllyValue ov = {(const uint8 *) old.data, old.len};
+
+			nv = spill_decode(&k, &ov, v);
+		}
+		for (int i = 0; i < e->nversions; i++)
+		{
+			const D1Version *ver = &e->versions[i];
+
+			if (below != InvalidSubTransactionId && ver->subxid >= below)
+				continue;
+			v[nv].cid = ver->cid;
+			v[nv].is_delete = ver->is_delete;
+			v[nv].key = version_key(e, ver);
+			v[nv].value.data = ver->value;
+			v[nv].value.len = ver->len;
+			nv++;
+		}
+		nv = spill_prune(v, nv, cid);
+		initStringInfo(&enc);
+		spill_encode(&k, v, nv, &enc);
+		edits[n].key = k;
+		edits[n].is_delete = false;
+		edits[n].value.data = (const uint8 *) enc.data;
+		edits[n].value.len = enc.len;
+		n++;
+	}
+	if (n > 0)
+		PROLLY_CALL(backend.c.tree, apply, env, &base, edits, n, out);
+	else
+		*out = base;
+}
+
+static D1SpillMark *
+find_mark(D1SpillMark *marks, SubTransactionId subxid)
+{
+	for (; marks; marks = marks->next)
+	{
+		if (marks->subxid == subxid)
+			return marks;
+	}
+	return NULL;
+}
+
+/*
+ * Move ws's versions into its spill tree, and into the mark of each open
+ * subtransaction, then empty it in memory.
+ */
+static void
+spill_writeset(D1WriteSet *ws, CommandId cid, const SubTransactionId *open,
+			   int nopen)
+{
+	D1Order		order = ws->order;
+	ProllyTreeEnv env;
+	ProllyNodeRef old_root = ws->spill.root;
+	ProllyNodeRef new_root;
+	D1SpillMark *marks = NULL;
+	MemoryContext tmp;
+	MemoryContext old;
+
+	if (ws->nentries == 0 || order_lost(&order))
+		return;
+	tree_env(&order, &env);
+	tmp = AllocSetContextCreate(CurrentMemoryContext, "prolly d1 spill",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(tmp);
+	spill_into(ws, &env, &old_root, cid, InvalidSubTransactionId, &new_root);
+
+	/*
+	 * Open subtransactions, innermost first; each mark is the spill tree
+	 * without that subtransaction's versions (nor its children's).  One new
+	 * since the last spill starts from that spill's tree, all of whose
+	 * versions were written before it began.
+	 */
+	for (int i = nopen - 1; i >= 0; i--)
+	{
+		D1SpillMark *had = find_mark(ws->spill.marks, open[i]);
+		D1SpillMark *m;
+
+		m = MemoryContextAlloc(xact->mcxt, sizeof(D1SpillMark));
+		m->subxid = open[i];
+		spill_into(ws, &env, had ? &had->root : &old_root, cid, open[i],
+				   &m->root);
+		m->next = marks;
+		marks = m;
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(tmp);
+
+	while (ws->spill.marks)
+	{
+		D1SpillMark *next = ws->spill.marks->next;
+
+		pfree(ws->spill.marks);
+		ws->spill.marks = next;
+	}
+	ws->spill.root = new_root;
+	ws->spill.cid = cid;
+	ws->spill.marks = marks;
+	ws->spill_gen++;
+
+	/* Empty in memory. */
+	MemoryContextReset(ws->data_mcxt);
+	old = MemoryContextSwitchTo(ws->data_mcxt);
+	ws->entries = rbt_create(sizeof(D1Entry), entry_compare, entry_combine,
+							 entry_alloc, entry_free, ws);
+	MemoryContextSwitchTo(old);
+	ws->nentries = 0;
+}
+
+/* Spill every write set if the transaction's writes use too much memory. */
+static void
+maybe_spill(void)
+{
+	Size		used = 0;
+	SubTransactionId open_buf[64];
+	SubTransactionId *open = open_buf;
+	int			nopen;
+	CommandId	cid;
+
+	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
+		used += MemoryContextMemAllocated(ws->data_mcxt, true);
+	if (used <= (Size) prolly_write_set_memory * 1024)
+		return;
+
+	nopen = GetOpenSubTransactionIds(open_buf, lengthof(open_buf));
+	if (nopen > lengthof(open_buf))
+	{
+		open = palloc(sizeof(SubTransactionId) * nopen);
+		(void) GetOpenSubTransactionIds(open, nopen);
+	}
+	cid = GetCurrentCommandId(false);
+	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
+		spill_writeset(ws, cid, open, nopen);
+	if (open != open_buf)
+		pfree(open);
+}
+
+/* ------------------------------------------------------------------------
  * Root sets
  * ------------------------------------------------------------------------
  */
@@ -846,6 +1246,15 @@ struct ProllyCursor
 	ProllyKey	t_key;
 	ProllyValue t_value;
 
+	/* the write set's spill tree */
+	ProllyTreeCursor *sc;		/* NULL: none */
+	uint64		spill_gen;		/* ws->spill_gen when sc was opened */
+	bool		s_have;
+	bool		s_done;
+	bool		s_skip_last;	/* skip keys equal to last */
+	ProllyKey	s_key;
+	ProllyValue s_value;
+
 	/* the write set, by the last key taken from it */
 	bool		o_started;
 	bool		o_have;
@@ -854,6 +1263,12 @@ struct ProllyCursor
 	StringInfoData o_bound;		/* seek key, or last key taken */
 	bool		o_inclusive;
 	bool		o_from_end;		/* no bound: start at the first/last key */
+
+	/* where the scan is: the seek, and the last full key returned */
+	StringInfoData seek;
+	bool		seek_from_end;
+	StringInfoData last;
+	bool		have_last;
 
 	ScanDirection dir;
 
@@ -900,9 +1315,15 @@ cursor_bind(ProllyCursor *c)
 	if (c->base.hash.len > 0)
 		c->tc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env, &c->base,
 							c->mcxt);
+	c->sc = NULL;
+	if (c->ws && c->ws->spill.root.hash.len > 0)
+		c->sc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env,
+							&c->ws->spill.root, c->mcxt);
+	c->spill_gen = c->ws ? c->ws->spill_gen : 0;
 	/* Unpositioned until a seek; an empty base stays done. */
-	c->t_have = c->o_have = false;
-	c->t_done = c->o_done = true;
+	c->t_have = c->o_have = c->s_have = false;
+	c->t_done = c->o_done = c->s_done = true;
+	c->s_skip_last = false;
 }
 
 static void
@@ -911,8 +1332,62 @@ cursor_unbind(ProllyCursor *c)
 	if (c->tc)
 		PROLLY_CALL(backend.c.tree, cursor_close, c->tc);
 	c->tc = NULL;
+	if (c->sc)
+		PROLLY_CALL(backend.c.tree, cursor_close, c->sc);
+	c->sc = NULL;
 	if (c->ws == NULL)
 		close_order(&c->order);
+}
+
+/*
+ * The write set was spilled (or a spill undone) since the cursor looked:
+ * read the new spill tree, and the emptied write set, from where the scan
+ * is.  Keys already returned are not returned again.
+ */
+static void
+cursor_respill(ProllyCursor *c)
+{
+	MemoryContext old = MemoryContextSwitchTo(c->mcxt);
+
+	spill_check_reader(c->ws, c->cid);
+	if (c->sc)
+		PROLLY_CALL(backend.c.tree, cursor_close, c->sc);
+	c->sc = NULL;
+	if (c->ws->spill.root.hash.len > 0)
+		c->sc = PROLLY_CALL(backend.c.tree, cursor_open, &c->env,
+							&c->ws->spill.root, c->mcxt);
+	c->spill_gen = c->ws->spill_gen;
+	c->s_have = false;
+	c->s_done = (c->sc == NULL);
+	c->o_have = false;
+	c->o_done = false;
+	resetStringInfo(&c->o_bound);
+	if (c->have_last)
+	{
+		ProllyKey	last = {(const uint8 *) c->last.data, c->last.len};
+
+		if (c->sc)
+			PROLLY_CALL(backend.c.tree, cursor_seek, c->sc, &last, c->dir);
+		c->s_skip_last = true;
+		appendBinaryStringInfo(&c->o_bound, c->last.data, c->last.len);
+		c->o_inclusive = false;
+		c->o_from_end = false;
+		c->o_started = true;
+	}
+	else
+	{
+		ProllyKey	seek = {(const uint8 *) c->seek.data, c->seek.len};
+
+		if (c->sc)
+			PROLLY_CALL(backend.c.tree, cursor_seek, c->sc,
+						c->seek_from_end ? NULL : &seek, c->dir);
+		c->s_skip_last = false;
+		appendBinaryStringInfo(&c->o_bound, c->seek.data, c->seek.len);
+		c->o_inclusive = true;
+		c->o_from_end = c->seek_from_end;
+		c->o_started = false;
+	}
+	MemoryContextSwitchTo(old);
 }
 
 /* Whether two orders put keys in the same order (the same keying). */
@@ -995,6 +1470,8 @@ d1_cursor_open(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 	c->sub = subroot_for(tree, kind);
 	c->kind = kind;
 	c->cid = cid;
+	initStringInfo(&c->seek);
+	initStringInfo(&c->last);
 	cursor_bind(c);
 	initStringInfo(&c->o_bound);
 	c->dir = ForwardScanDirection;
@@ -1022,10 +1499,12 @@ d1_cursor_seek(ProllyCursor *c, const ProllyKey *key, ScanDirection direction)
 		cursor_bind(c);
 	}
 
+	if (c->ws)
+		spill_check_reader(c->ws, c->cid);
 	if (c->unordered)
 	{
 		/* Only a forward scan of everything needs no order. */
-		if (key || !forward)
+		if (key || !forward || c->sc)
 			order_lost_error();
 		if (c->tc)
 		{
@@ -1070,6 +1549,18 @@ d1_cursor_seek(ProllyCursor *c, const ProllyKey *key, ScanDirection direction)
 		c->t_done = false;
 	}
 	c->t_have = false;
+	if (c->sc)
+	{
+		PROLLY_CALL(backend.c.tree, cursor_seek, c->sc, fk, c->dir);
+		c->s_done = false;
+	}
+	c->s_have = false;
+	c->s_skip_last = false;
+	resetStringInfo(&c->seek);
+	c->seek_from_end = (fk == NULL);
+	if (fk)
+		appendBinaryStringInfo(&c->seek, (const char *) fk->data, fk->len);
+	c->have_last = false;
 
 	resetStringInfo(&c->o_bound);
 	c->o_from_end = (fk == NULL);
@@ -1098,6 +1589,31 @@ fill_tree(ProllyCursor *c)
 		return;
 	}
 	c->t_have = true;
+}
+
+/* Fetch the spill tree's next item, if none is pending. */
+static void
+fill_spill(ProllyCursor *c)
+{
+	while (!c->s_have && !c->s_done)
+	{
+		if (!PROLLY_CALL(backend.c.tree, cursor_next, c->sc, &c->s_key,
+						 &c->s_value) ||
+			!in_kind(c, &c->s_key))
+		{
+			c->s_done = true;
+			return;
+		}
+		if (c->s_skip_last)
+		{
+			ProllyKey	last = {(const uint8 *) c->last.data, c->last.len};
+
+			if (cursor_compare(c, &c->s_key, &last) == 0)
+				continue;
+			c->s_skip_last = false;
+		}
+		c->s_have = true;
+	}
 }
 
 /* Fetch the write set's next key, if none is pending. */
@@ -1201,72 +1717,113 @@ next_unordered(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 	}
 }
 
+/* Return full key fk and value, remembering where the scan is. */
+static bool
+emit(ProllyCursor *c, ProllyKey fk, const uint8 *data, uint32 len,
+	 ProllyKey *key, ProllyValue *value)
+{
+	MemoryContext old = MemoryContextSwitchTo(c->mcxt);
+
+	resetStringInfo(&c->last);
+	appendBinaryStringInfo(&c->last, (const char *) fk.data, fk.len);
+	c->have_last = true;
+	MemoryContextSwitchTo(old);
+	return_key(c, fk.data, fk.len, key);
+	value->data = data;
+	value->len = len;
+	return true;
+}
+
+/* Compare in the scan's direction. */
+static int
+dir_compare(ProllyCursor *c, const ProllyKey *a, const ProllyKey *b)
+{
+	int			r = cursor_compare(c, a, b);
+
+	return ScanDirectionIsForward(c->dir) ? r : -r;
+}
+
+/*
+ * The next key of the merge of the write set (newest), its spill tree,
+ * then the base tree, each key's newest version the command may see.
+ */
 static bool
 d1_cursor_next(ProllyCursor *c, ProllyKey *key, ProllyValue *value)
 {
-	bool		forward = ScanDirectionIsForward(c->dir);
-
 	if (c->unordered)
 		return next_unordered(c, key, value);
+	if (c->ws && c->ws->spill_gen != c->spill_gen)
+		cursor_respill(c);
 
 	for (;;)
 	{
-		int			cmp;
-		const D1Version *v;
+		ProllyKey	ok = {NULL, 0};
+		ProllyKey	mink;
+		const ProllyKey *min = NULL;
+		bool		at_t;
+		bool		at_s;
+		bool		at_o;
 
 		fill_tree(c);
+		if (c->sc)
+			fill_spill(c);
 		fill_overlay(c);
-		if (!c->t_have && !c->o_have)
+		if (!c->t_have && !c->s_have && !c->o_have)
 			return false;
 
-		if (!c->o_have)
-			cmp = -1;
-		else if (!c->t_have)
-			cmp = 1;
-		else
+		if (c->o_have)
 		{
-			ProllyKey	ok = {c->o_entry->key, c->o_entry->keylen};
-
-			cmp = cursor_compare(c, &c->t_key, &ok);
-			if (!forward)
-				cmp = -cmp;
+			ok.data = c->o_entry->key;
+			ok.len = c->o_entry->keylen;
 		}
+		if (c->t_have)
+			min = &c->t_key;
+		if (c->s_have && (min == NULL || dir_compare(c, &c->s_key, min) < 0))
+			min = &c->s_key;
+		if (c->o_have && (min == NULL || dir_compare(c, &ok, min) < 0))
+			min = &ok;
+		mink = *min;
+		at_t = c->t_have && dir_compare(c, &c->t_key, &mink) == 0;
+		at_s = c->s_have && dir_compare(c, &c->s_key, &mink) == 0;
+		at_o = c->o_have && dir_compare(c, &ok, &mink) == 0;
 
-		if (cmp < 0)
+		if (at_o)
 		{
-			/* Only in the base tree. */
-			c->t_have = false;
-			return_key(c, c->t_key.data, c->t_key.len, key);
-			*value = c->t_value;
-			return true;
-		}
+			const D1Version *v = visible_version(c->o_entry, c->cid);
 
-		/* In the write set, and maybe in the base tree too. */
-		c->o_have = false;
-		v = visible_version(c->o_entry, c->cid);
-		if (v == NULL)
-		{
-			if (cmp == 0)
+			c->o_have = false;
+			if (v)
 			{
-				c->t_have = false;
-				return_key(c, c->t_key.data, c->t_key.len, key);
-				*value = c->t_value;
-				return true;
+				c->s_have &= !at_s;
+				c->t_have &= !at_t;
+				if (v->is_delete)
+					continue;
+				return emit(c, version_key(c->o_entry, v), v->value, v->len,
+							key, value);
 			}
-			continue;			/* written only by this command */
+			/* Written only by this command: what it sees comes next. */
 		}
-		if (cmp == 0)
-			c->t_have = false;
-		if (v->is_delete)
-			continue;
+		if (at_s)
 		{
-			ProllyKey	vk = version_key(c->o_entry, v);
+			D1SpillVersion sv[2];
+			int			n = spill_decode(&c->s_key, &c->s_value, sv);
+			const D1SpillVersion *v = spill_visible(sv, n, c->cid);
 
-			return_key(c, vk.data, vk.len, key);
+			c->s_have = false;
+			if (v)
+			{
+				c->t_have &= !at_t;
+				if (v->is_delete)
+					continue;
+				return emit(c, v->key, v->value.data, v->value.len, key, value);
+			}
 		}
-		value->data = v->value;
-		value->len = v->len;
-		return true;
+		if (at_t)
+		{
+			c->t_have = false;
+			return emit(c, c->t_key, c->t_value.data, c->t_value.len, key,
+						value);
+		}
 	}
 }
 
@@ -1321,6 +1878,40 @@ d1_get(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
 					appendBinaryStringInfo(value, (const char *) v->value, v->len);
 				free_key(sub, &kb);
 				return !v->is_delete;
+			}
+		}
+		if (ws->spill.root.hash.len > 0)
+		{
+			D1Order		o = ws->order;
+			ProllyTreeEnv env;
+			StringInfoData sv;
+			bool		decided = false;
+
+			spill_check_reader(ws, cid);
+			tree_env(&o, &env);
+			initStringInfo(&sv);
+			if (PROLLY_CALL(backend.c.tree, get, &env, &ws->spill.root, fk, &sv))
+			{
+				ProllyValue enc = {(const uint8 *) sv.data, sv.len};
+				D1SpillVersion v[2];
+				int			n = spill_decode(fk, &enc, v);
+				const D1SpillVersion *seen = spill_visible(v, n, cid);
+
+				if (seen)
+				{
+					decided = true;
+					found = !seen->is_delete;
+					if (found)
+						appendBinaryStringInfo(value,
+											   (const char *) seen->value.data,
+											   seen->value.len);
+				}
+			}
+			pfree(sv.data);
+			if (decided)
+			{
+				free_key(sub, &kb);
+				return found;
 			}
 		}
 	}
@@ -1572,6 +2163,101 @@ materialize_unordered(D1WriteSet *ws, const ProllyNodeRef *base,
 }
 
 /*
+ * materialize_onto() for a write set with a spill tree: the spill tree's
+ * and memory's newest versions, merged in key order (memory's win), applied
+ * a chunk at a time, so memory stays bounded however much was spilled.
+ */
+static void
+materialize_spilled(D1WriteSet *ws, const ProllyTreeEnv *env,
+					const ProllyNodeRef *from, ProllyNodeRef *out)
+{
+	MemoryContext chunk = AllocSetContextCreate(CurrentMemoryContext,
+												"prolly d1 commit chunk",
+												ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+	ProllyEdit *edits = palloc(sizeof(ProllyEdit) * EDIT_CHUNK);
+	int			n = 0;
+	ProllyTreeCursor *sc = PROLLY_CALL(backend.c.tree, cursor_open, env,
+									   &ws->spill.root, CurrentMemoryContext);
+	RBTreeIterator it;
+	D1Entry    *e;
+	ProllyKey	sk;
+	ProllyValue sv;
+	bool		s_have;
+	ProllyNodeRef root = *from;
+
+	PROLLY_CALL(backend.c.tree, cursor_seek, sc, NULL, ForwardScanDirection);
+	s_have = PROLLY_CALL(backend.c.tree, cursor_next, sc, &sk, &sv);
+	rbt_begin_iterate(ws->entries, LeftRightWalk, &it);
+	e = (D1Entry *) rbt_iterate(&it);
+	while (s_have || e)
+	{
+		int			cmp;
+		ProllyEdit *ed = &edits[n];
+
+		while (e && e->nversions == 0)
+			e = (D1Entry *) rbt_iterate(&it);
+		if (!s_have && !e)
+			break;
+		if (!e)
+			cmp = -1;
+		else if (!s_have)
+			cmp = 1;
+		else
+		{
+			ProllyKey	ek = {e->key, e->keylen};
+
+			cmp = edit_cmp(&sk, &ek, env);
+		}
+
+		old = MemoryContextSwitchTo(chunk);
+		if (cmp >= 0)
+		{
+			/* Memory's newest version. */
+			const D1Version *v = &e->versions[e->nversions - 1];
+
+			ed->key = version_key(e, v);
+			ed->is_delete = v->is_delete;
+			ed->value.data = v->value;
+			ed->value.len = v->len;
+			e = (D1Entry *) rbt_iterate(&it);
+		}
+		else
+		{
+			/* The spill tree's newest, copied: the cursor moves on. */
+			D1SpillVersion v[2];
+			int			nv = spill_decode(&sk, &sv, v);
+			uint8	   *copy = palloc(Max(v[nv - 1].key.len + v[nv - 1].value.len, 1));
+
+			memcpy(copy, v[nv - 1].key.data, v[nv - 1].key.len);
+			memcpy(copy + v[nv - 1].key.len, v[nv - 1].value.data,
+				   v[nv - 1].value.len);
+			ed->key.data = copy;
+			ed->key.len = v[nv - 1].key.len;
+			ed->is_delete = v[nv - 1].is_delete;
+			ed->value.data = copy + v[nv - 1].key.len;
+			ed->value.len = v[nv - 1].value.len;
+		}
+		MemoryContextSwitchTo(old);
+		n++;
+		if (cmp <= 0)
+			s_have = PROLLY_CALL(backend.c.tree, cursor_next, sc, &sk, &sv);
+		if (n == EDIT_CHUNK)
+		{
+			PROLLY_CALL(backend.c.tree, apply, env, &root, edits, n, &root);
+			MemoryContextReset(chunk);
+			n = 0;
+		}
+	}
+	if (n > 0)
+		PROLLY_CALL(backend.c.tree, apply, env, &root, edits, n, &root);
+	PROLLY_CALL(backend.c.tree, cursor_close, sc);
+	MemoryContextDelete(chunk);
+	pfree(edits);
+	*out = root;
+}
+
+/*
  * Write ws's newest versions into the tree from (its base, or a newer
  * version of the tree to replay them onto); returns its root in *out.
  */
@@ -1588,6 +2274,8 @@ materialize_onto(D1WriteSet *ws, const ProllyNodeRef *from, ProllyNodeRef *out)
 
 	if (order_lost(&order))
 	{
+		if (ws->spill.root.hash.len > 0)
+			order_lost_error();
 		materialize_unordered(ws, from, out);
 		return;
 	}
@@ -1598,6 +2286,11 @@ materialize_onto(D1WriteSet *ws, const ProllyNodeRef *from, ProllyNodeRef *out)
 										   CurrentMemoryContext);
 
 		PROLLY_CALL(backend.c.tree, build_finish, b, &base);
+	}
+	if (ws->spill.root.hash.len > 0)
+	{
+		materialize_spilled(ws, &env, &base, out);
+		return;
 	}
 
 	edits = palloc(sizeof(ProllyEdit) * Max(ws->nentries, 1));
@@ -1736,7 +2429,8 @@ d1_xact_precommit(void)
 
 	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
 				edits, n, &new_root);
-	xact->ticket = PROLLY_CALL(commit, enqueue, PROLLY_MAIN_BRANCH, &new_root);
+	xact->ticket = PROLLY_CALL(commit, enqueue, PROLLY_MAIN_BRANCH, &new_root,
+							   GetCurrentTransactionId());
 	xact->enqueued = true;
 	PROLLY_CALL(commit, branch_unlock, PROLLY_MAIN_BRANCH);
 	pfree(sets);
@@ -1759,20 +2453,312 @@ d1_xact_abort(void)
 	xact_reset();
 }
 
+/*
+ * Two-phase state, per write set: sub (1 byte), relnumber, relid, replaced
+ * (1 byte), the base's and the final tree's hashes (length byte, then the
+ * bytes), the key order (kind byte: 0 memcmp, 1 table keying, 2 index
+ * keying; suffixed byte; description length (4 bytes), description).
+ * Native byte order: the state never leaves this cluster.
+ */
+#define ORDER_MEMCMP	0
+#define ORDER_KEYING	1
+#define ORDER_INDEX		2
+
 static void
-d1_xact_prepare(void)
+put_hash(StringInfo out, const ProllyNodeRef *ref)
 {
-	if (xact != NULL && xact->all != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot PREPARE a transaction that has written to a prolly table")));
+	appendStringInfoChar(out, (char) ref->hash.len);
+	appendBinaryStringInfo(out, ref->hash.bytes, ref->hash.len);
+}
+
+static void
+d1_xact_prepare(StringInfo state)
+{
+	D1WriteSet **sets;
+	int			n = 0;
+
+	if (xact == NULL || xact->all == NULL)
+	{
+		/*
+		 * Writes made and rolled back in subtransactions leave state but
+		 * nothing to carry into the prepared transaction.
+		 */
+		xact_reset();
+		return;
+	}
+
+	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
+		n++;
+	sets = palloc(sizeof(D1WriteSet *) * n);
+	n = 0;
+	for (D1WriteSet *ws = xact->all; ws; ws = ws->next)
+		sets[n++] = ws;
+	qsort(sets, n, sizeof(D1WriteSet *), ws_order);
 
 	/*
-	 * Writes made and rolled back in subtransactions leave state but
-	 * nothing to carry into the prepared transaction.  Its memory goes
-	 * with the transaction's, and no commit or abort event follows here.
+	 * Each tree as this transaction leaves it, durable in the node store;
+	 * COMMIT PREPARED replays the difference from its base onto whatever
+	 * the branch holds then.
 	 */
+	for (int i = 0; i < n; i++)
+	{
+		D1WriteSet *ws = sets[i];
+		ProllyNodeRef final;
+		StringInfoData desc;
+		uint8		kind = ORDER_MEMCMP;
+		uint32		dlen;
+
+		materialize(ws, &final);
+		initStringInfo(&desc);
+		if (ws->order.keying)
+		{
+			kind = ORDER_KEYING;
+			PROLLY_CALL(ws->order.routine, describe, ws->order.keying, &desc);
+		}
+		else if (ws->order.ix)
+		{
+			kind = ORDER_INDEX;
+			PROLLY_CALL(ws->order.ix_routine, describe, ws->order.ix, &desc);
+		}
+		appendStringInfoChar(state, (char) ws->sub);
+		appendBinaryStringInfo(state, &ws->relnumber, sizeof(RelFileNumber));
+		appendBinaryStringInfo(state, &ws->relid, sizeof(Oid));
+		appendStringInfoChar(state, (char) ws->replaced);
+		put_hash(state, &ws->base);
+		put_hash(state, &final);
+		appendStringInfoChar(state, (char) kind);
+		appendStringInfoChar(state, (char) ws->order.suffixed);
+		dlen = desc.len;
+		appendBinaryStringInfo(state, &dlen, sizeof(uint32));
+		appendBinaryStringInfo(state, desc.data, desc.len);
+		pfree(desc.data);
+	}
+	pfree(sets);
+
+	/* Its memory goes with the transaction's; no commit or abort follows. */
 	xact_reset();
+}
+
+typedef struct D1PreparedTree
+{
+	ProllySubRoot sub;
+	RelFileNumber relnumber;
+	Oid			relid;
+	bool		replaced;
+	ProllyNodeRef base;
+	ProllyNodeRef final;
+	uint8		kind;
+	bool		suffixed;
+	ProllyValue desc;
+} D1PreparedTree;
+
+static const char *
+get_bytes(const char *p, const char *end, void *out, Size len)
+{
+	if (end - p < (ptrdiff_t) len)
+		elog(ERROR, "prolly prepared state is corrupt");
+	memcpy(out, p, len);
+	return p + len;
+}
+
+static const char *
+get_hash(const char *p, const char *end, ProllyNodeRef *ref)
+{
+	uint8		len;
+
+	memset(ref, 0, sizeof(*ref));
+	ref->location.blkno = InvalidBlockNumber;
+	p = get_bytes(p, end, &len, 1);
+	if (len > PROLLY_HASH_MAX_LEN)
+		elog(ERROR, "prolly prepared state is corrupt");
+	ref->hash.len = len;
+	return get_bytes(p, end, ref->hash.bytes, len);
+}
+
+/* Replaying a diff as edits onto a tree, a chunk at a time. */
+typedef struct D1Replay
+{
+	const ProllyTreeEnv *env;
+	ProllyNodeRef root;
+	ProllyEdit *edits;
+	int			n;
+	MemoryContext chunk;
+} D1Replay;
+
+static void
+replay_flush(D1Replay *r)
+{
+	if (r->n > 0)
+		PROLLY_CALL(backend.c.tree, apply, r->env, &r->root, r->edits, r->n,
+					&r->root);
+	MemoryContextReset(r->chunk);
+	r->n = 0;
+}
+
+static void
+replay_change(ProllyDiffKind kind, const ProllyKey *key,
+			  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	D1Replay   *r = arg;
+	ProllyEdit *ed = &r->edits[r->n];
+	uint32		vlen = after ? after->len : 0;
+	uint8	   *copy = MemoryContextAlloc(r->chunk, Max(key->len + vlen, 1));
+
+	memcpy(copy, key->data, key->len);
+	if (after)
+		memcpy(copy + key->len, after->data, after->len);
+	ed->key.data = copy;
+	ed->key.len = key->len;
+	ed->is_delete = (after == NULL);
+	ed->value.data = copy + key->len;
+	ed->value.len = vlen;
+	if (++r->n == EDIT_CHUNK)
+		replay_flush(r);
+}
+
+/* The key order a prepared tree was written in. */
+static void
+prepared_order(const D1PreparedTree *t, Relation *rel, D1Order *order)
+{
+	ProllyComponents c;
+
+	memset(order, 0, sizeof(*order));
+	*rel = NULL;
+	if (t->kind == ORDER_MEMCMP)
+		return;
+	*rel = relation_open(t->relid, AccessShareLock);
+	prolly_components_for_relation(*rel, &c);
+	order->suffixed = t->suffixed;
+	if (t->kind == ORDER_INDEX)
+	{
+		order->ix_routine = c.index_keying;
+		order->ix = PROLLY_CALL(c.index_keying, open, *rel, &t->desc,
+								CurrentMemoryContext);
+	}
+	else
+	{
+		order->routine = c.keying;
+		order->keying = PROLLY_CALL(c.keying, open, *rel, &t->desc,
+									CurrentMemoryContext);
+	}
+}
+
+static void
+d1_commit_prepared(TransactionId xid, const char *state, Size len)
+{
+	const char *p = state;
+	const char *end = state + len;
+	D1PreparedTree *trees = NULL;
+	int			n = 0;
+	int			cap = 0;
+	ProllyRootSet tip;
+	ProllyRootEdit *edits;
+	ProllyNodeRef new_root;
+	const ProllyCommitRoutine *commit;
+
+	backend_init();
+	while (p < end)
+	{
+		D1PreparedTree *t;
+		uint8		b;
+		uint32		dlen;
+
+		if (n == cap)
+		{
+			cap = Max(cap * 2, 8);
+			trees = trees ? repalloc(trees, sizeof(D1PreparedTree) * cap) :
+				palloc(sizeof(D1PreparedTree) * cap);
+		}
+		t = &trees[n++];
+		p = get_bytes(p, end, &b, 1);
+		t->sub = (ProllySubRoot) b;
+		p = get_bytes(p, end, &t->relnumber, sizeof(RelFileNumber));
+		p = get_bytes(p, end, &t->relid, sizeof(Oid));
+		p = get_bytes(p, end, &b, 1);
+		t->replaced = (b != 0);
+		p = get_hash(p, end, &t->base);
+		p = get_hash(p, end, &t->final);
+		p = get_bytes(p, end, &t->kind, 1);
+		p = get_bytes(p, end, &b, 1);
+		t->suffixed = (b != 0);
+		p = get_bytes(p, end, &dlen, sizeof(uint32));
+		if (end - p < (ptrdiff_t) dlen)
+			elog(ERROR, "prolly prepared state is corrupt");
+		t->desc.data = (const uint8 *) p;
+		t->desc.len = dlen;
+		p += dlen;
+	}
+
+	/* This transaction publishes the root when it commits. */
+	xact_init();
+	commit = backend.c.commit;
+	PROLLY_CALL(commit, branch_lock, PROLLY_MAIN_BRANCH);
+	tip.has_root = PROLLY_CALL(commit, tip, PROLLY_MAIN_BRANCH, &tip.root);
+	if (!tip.has_root)
+		PROLLY_CALL(backend.c.root_layout, empty, &backend.root_env, &tip.root);
+	tip.has_root = true;
+
+	edits = palloc(sizeof(ProllyRootEdit) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		D1PreparedTree *t = &trees[i];
+		ProllyNodeRef current;
+
+		edits[i].sub = t->sub;
+		edits[i].relnumber = t->relnumber;
+		edits[i].is_remove = false;
+		edits[i].tree = t->final;
+		find_tree(&tip, t->sub, t->relnumber, &current);
+		if (!t->replaced && !same_hash(&current, &t->base))
+		{
+			/*
+			 * Others committed to the tree since: replay this transaction's
+			 * changes, the difference from its base, onto theirs.  Its row
+			 * locks, held since, kept them off these keys.
+			 */
+			Relation	rel;
+			D1Order		order;
+			ProllyTreeEnv env;
+			D1Replay	r;
+			ProllyNodeRef from = t->base;
+
+			prepared_order(t, &rel, &order);
+			tree_env(&order, &env);
+			if (from.hash.len == 0)
+			{
+				ProllyTreeBuilder *b = PROLLY_CALL(backend.c.tree, build_begin,
+												   &env, CurrentMemoryContext);
+
+				PROLLY_CALL(backend.c.tree, build_finish, b, &from);
+			}
+			r.env = &env;
+			r.root = current;
+			if (r.root.hash.len == 0)
+				r.root = from;
+			r.edits = palloc(sizeof(ProllyEdit) * EDIT_CHUNK);
+			r.n = 0;
+			r.chunk = AllocSetContextCreate(CurrentMemoryContext,
+											"prolly d1 replay",
+											ALLOCSET_DEFAULT_SIZES);
+			PROLLY_CALL(backend.c.tree, diff, &env, &from, &t->final,
+						replay_change, &r);
+			replay_flush(&r);
+			MemoryContextDelete(r.chunk);
+			pfree(r.edits);
+			edits[i].tree = r.root;
+			close_order(&order);
+			if (rel)
+				relation_close(rel, AccessShareLock);
+		}
+	}
+	PROLLY_CALL(backend.c.root_layout, apply, &backend.root_env, &tip.root,
+				edits, n, &new_root);
+	xact->ticket = PROLLY_CALL(commit, enqueue, PROLLY_MAIN_BRANCH, &new_root,
+							   xid);
+	xact->enqueued = true;
+	PROLLY_CALL(commit, branch_unlock, PROLLY_MAIN_BRANCH);
+	pfree(edits);
+	pfree(trees);
 }
 
 /* Forget a write set made in an aborted subtransaction. */
@@ -1789,6 +2775,7 @@ drop_writeset(D1WriteSet *ws)
 	for (link = &xact->all; *link != ws; link = &(*link)->next)
 		;
 	*link = ws->next;
+	MemoryContextDelete(ws->data_mcxt);
 }
 
 static void
@@ -1823,12 +2810,44 @@ d1_subxact_abort(SubTransactionId subxid)
 		{
 			D1Saved    *saved = ws->saved;
 
+			MemoryContextDelete(ws->data_mcxt);
+			ws->data_mcxt = saved->data_mcxt;
 			ws->entries = saved->entries;
 			ws->nentries = saved->nentries;
 			ws->base = saved->base;
 			ws->replaced = saved->replaced;
 			ws->order = saved->order;
+			ws->spill = saved->spill;
+			ws->spill_gen++;
 			ws->saved = saved->prev;
+		}
+
+		/*
+		 * Spilled versions of the subtransaction (or its children): the
+		 * spill tree as it was without them, kept when it was open at a
+		 * spill.
+		 */
+		{
+			D1SpillMark **link = &ws->spill.marks;
+			D1SpillMark *keep = find_mark(ws->spill.marks, subxid);
+
+			if (keep)
+			{
+				ws->spill.root = keep->root;
+				ws->spill_gen++;
+			}
+			while (*link)
+			{
+				if ((*link)->subxid >= subxid)
+				{
+					D1SpillMark *gone = *link;
+
+					*link = gone->next;
+					pfree(gone);
+				}
+				else
+					link = &(*link)->next;
+			}
 		}
 
 		/* Keys left with no versions, deleted after the walk. */
@@ -1910,6 +2929,7 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.xact_precommit = d1_xact_precommit,
 	.xact_commit = d1_xact_commit,
 	.xact_prepare = d1_xact_prepare,
+	.commit_prepared = d1_commit_prepared,
 	.vacuum = d1_vacuum,
 	.node_counters = d1_node_counters,
 };

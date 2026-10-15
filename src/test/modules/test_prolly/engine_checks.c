@@ -623,7 +623,7 @@ commit_publishes_in_enqueue_order_body(const ProllyImplInfo *impl)
 	if (PROLLY_CALL(cp, tip, b, &got) || PROLLY_CALL(cp, head, b, &got))
 		elog(ERROR, "a new branch has a root");
 
-	t1 = PROLLY_CALL(cp, enqueue, b, &r1);
+	t1 = PROLLY_CALL(cp, enqueue, b, &r1, GetCurrentTransactionId());
 	if (!PROLLY_CALL(cp, tip, b, &got) || !same_root(&got, &r1))
 		elog(ERROR, "tip is not the enqueued root");
 	if (PROLLY_CALL(cp, head, b, &got))
@@ -635,7 +635,7 @@ commit_publishes_in_enqueue_order_body(const ProllyImplInfo *impl)
 
 	/* An abandoned root never becomes the head. */
 	PROLLY_CALL(cp, branch_lock, b);
-	t2 = PROLLY_CALL(cp, enqueue, b, &r2);
+	t2 = PROLLY_CALL(cp, enqueue, b, &r2, GetCurrentTransactionId());
 	PROLLY_CALL(cp, branch_unlock, b);
 	PROLLY_CALL(cp, abandon, t2);
 	if (!PROLLY_CALL(cp, head, b, &got) || !same_root(&got, &r1))
@@ -644,7 +644,7 @@ commit_publishes_in_enqueue_order_body(const ProllyImplInfo *impl)
 	if (!PROLLY_CALL(cp, tip, b, &got) || !same_root(&got, &r1))
 		elog(ERROR, "tip still shows an abandoned root");
 
-	t3 = PROLLY_CALL(cp, enqueue, b, &r3);
+	t3 = PROLLY_CALL(cp, enqueue, b, &r3, GetCurrentTransactionId());
 	PROLLY_CALL(cp, branch_unlock, b);
 	PROLLY_CALL(cp, publish, t3);
 	if (!PROLLY_CALL(cp, head, b, &got) || !same_root(&got, &r3))

@@ -14,7 +14,7 @@
  * Usage at commit, for each branch the transaction changed:
  *		branch_lock(b);
  *		tip(b, &base);		(the engine rebases its writes onto base)
- *		ticket = enqueue(b, &new_root);
+ *		ticket = enqueue(b, &new_root, GetCurrentTransactionId());
  *		branch_unlock(b);
  *		... the commit record is written and flushed ...
  *		publish(ticket);	(or abandon(ticket) if the transaction aborts)
@@ -25,8 +25,9 @@
  * - tip() and enqueue() need the branch lock.  tip() returns the root the
  *   next commit must build on: the newest root enqueued for the branch, or
  *   its head; false if the branch has never had a root.
- * - enqueue() WAL-logs the new root with the current transaction's xid
- *   (assigning one if needed).  After a crash, and on a standby, a
+ * - enqueue() WAL-logs the new root with the xid of the transaction whose
+ *   commit makes it the head: the current one, or a prepared transaction
+ *   being committed (COMMIT PREPARED).  After a crash, and on a standby, a
  *   branch's head is the root of the last enqueued transaction that
  *   committed.
  * - Roots are published in enqueue order per branch; publish() returns once
@@ -87,7 +88,8 @@ typedef struct ProllyCommitRoutine
 	void		(*branch_lock) (ProllyBranchId branch);
 	bool		(*tip) (ProllyBranchId branch, ProllyNodeRef *root);
 	ProllyCommitTicket (*enqueue) (ProllyBranchId branch,
-								   const ProllyNodeRef *new_root);
+								   const ProllyNodeRef *new_root,
+								   TransactionId xid);
 	void		(*branch_unlock) (ProllyBranchId branch);
 	void		(*publish) (ProllyCommitTicket ticket);
 	void		(*abandon) (ProllyCommitTicket ticket);

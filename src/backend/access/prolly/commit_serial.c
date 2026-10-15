@@ -810,10 +810,10 @@ log_enqueue(Oid dboid, ProllyBranchId branch, TransactionId xid,
 }
 
 static ProllyCommitTicket
-serial_enqueue(ProllyBranchId branch, const ProllyNodeRef *new_root)
+serial_enqueue(ProllyBranchId branch, const ProllyNodeRef *new_root,
+			   TransactionId xid)
 {
 	SerialShared *s = get_shared();
-	TransactionId xid = GetCurrentTransactionId();
 	uint64		seq;
 
 	check_root(new_root);

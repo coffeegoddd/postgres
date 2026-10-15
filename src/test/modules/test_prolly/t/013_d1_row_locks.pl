@@ -64,6 +64,15 @@ is($node->safe_psql('postgres', q{SET enable_seqscan = off;
 	SELECT count(*) FROM t WHERE u BETWEEN 1 AND 12}), '12',
 	'index entries of both commits are kept');
 
+# A new table's first writers don't wait for each other either.
+$node->safe_psql('postgres', 'CREATE TABLE fresh (id int PRIMARY KEY)');
+$s1->query_safe('BEGIN; INSERT INTO fresh VALUES (1);');
+ok(!waits('INSERT INTO fresh VALUES (2)'),
+	'a new table\'s first writers run at once');
+$s1->query_safe('COMMIT');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM fresh'), '2',
+	'and both commits are kept');
+
 # One row: the second writer waits, then updates the committed version.
 $s1->query_safe('BEGIN; UPDATE t SET v = v + 10 WHERE id = 3;');
 ok(waits('UPDATE t SET v = v + 1 WHERE id = 3'),

@@ -550,6 +550,48 @@ that meets a TID nobody can resolve waits for every writer of the table,
 not only the one that wrote it (heap knows the inserter from the tuple);
 group commit.
 
+**Status (2026-10-14): 4e.4 built.** A transaction's private writes stay
+bounded (question 47): past `prolly_write_set_memory` (64 MB; named with
+an underscore, as core settings have no dots), D1 spills every write set
+into a spill tree in the node store and empties it in memory. A spill
+tree is a delta, not a rebuilt table: keyed as the write set, each value
+the key's newest version and, if it differs, the newest one the current
+command may see, with their command ids, so even one statement that
+writes more than the limit (and reads the table it writes) spills, which
+the plan's "versions older than the current command" would not have
+allowed. Reads merge memory, the spill tree and the base; commit streams
+the spill tree and memory onto the base (or the tip) a chunk at a time,
+so commit needs no more memory than a spill. Each subtransaction open at
+a spill gets a mark, the spill tree without its versions, which rolling
+back to it restores (a new core function lists the open subtransactions).
+A command that began before a spill (an open cursor) and would need
+versions the spill dropped gets an error, rather than wrong rows.
+PREPARE TRANSACTION with prolly writes works: each written tree is built
+as the transaction leaves it and recorded in the two-phase state (base and
+final roots, key order); the transaction keeps its row locks across a
+crash as any lock; COMMIT PREPARED replays the difference from the base
+onto the branch's tip (tree diff, so O(changes)), under the branch lock,
+before the commit record, and enqueues the root under the prepared xid
+(the commit pipeline's `enqueue` now takes the xid). Core changes: a
+two-phase resource manager for prolly (`TWOPHASE_RM_PROLLY_ID`),
+`AtPrepare_Prolly()`, pre-commit two-phase callbacks, and
+`GetOpenSubTransactionIds()` (`02-postgres-integration.md`, B5, B12).
+Found and fixed, each with a test that fails without the fix: a new
+table's first writers locked the whole table to record its keying, so
+they ran one at a time (a table with no rows now records it without the
+lock); after each spill, the emptied write set reopened its key order in
+transaction memory (8 MB leaked in a 30,000-row insert) and could have
+reordered a spill tree. Tests: `014_d1_spill.pl` (memory stays under
+2 MB with a 64 kB limit; reads, index scans, savepoint rollbacks,
+self-reading inserts and a concurrent commit around spills; the cursor
+error; PREPARE across an immediate restart, row locks kept, COMMIT
+PREPARED replayed onto others' commits, ROLLBACK PREPARED, a spilled
+prepared transaction on a standby); `013_d1_row_locks.pl` gained the
+new-table case. Not yet: write sets of tables whose key order was lost
+don't spill; versions saved when a write set is emptied (TRUNCATE in a
+transaction) stay in memory; spill and prepared trees are garbage once
+their transaction ends, for reclamation (4f) to free.
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

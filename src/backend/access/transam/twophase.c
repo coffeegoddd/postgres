@@ -1574,8 +1574,11 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 * pg_xact, then remove its PGPROC from the global ProcArray (which means
 	 * TransactionIdIsInProgress will stop saying the prepared xact is in
 	 * progress), then run the post-commit or post-abort callbacks. The
-	 * callbacks will release the locks the transaction held.
+	 * callbacks will release the locks the transaction held.  Before all
+	 * that, the pre-commit callbacks may still refuse the commit.
 	 */
+	if (isCommit)
+		ProcessRecords(bufptr, fxid, twophase_precommit_callbacks);
 	if (isCommit)
 		RecordTransactionCommitPrepared(xid,
 										hdr->nsubxacts, children,
