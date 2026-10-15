@@ -7,7 +7,7 @@
 # transactions on different tables commit.  Temporary and unlogged tables
 # get heap when prolly is the default, an explicit USING prolly on one is
 # refused, and a concurrent refresh of a prolly materialized view (which
-# diffs through a temporary table) works.
+# diffs through a temporary table) works.  Prepared writers count.
 
 use strict;
 use warnings FATAL => 'all';
@@ -17,7 +17,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('serializable');
 $node->init;
-$node->append_conf('postgresql.conf', "default_table_access_method = prolly_d1\n");
+$node->append_conf('postgresql.conf', "default_table_access_method = prolly_d1\nmax_prepared_transactions = 2\n");
 $node->start;
 
 $node->safe_psql('postgres', q{
@@ -124,6 +124,24 @@ $node->safe_psql('postgres', q{
 });
 is($node->safe_psql('postgres', 'SELECT count(*) FROM mv'), '2',
 	'a concurrent refresh of a prolly materialized view works');
+
+# A prepared writer counts: its locks are held by no process, and its
+# xid must still be found (as Postgres's prepared_xacts test expects).
+($ret, $out, $err) = $node->psql('postgres', q{
+	CREATE TABLE px (v text);
+	INSERT INTO px VALUES ('aaa'), ('ddd');
+	BEGIN ISOLATION LEVEL SERIALIZABLE;
+	UPDATE px SET v = 'eee' WHERE v = 'ddd';
+	PREPARE TRANSACTION 'px1';
+	BEGIN ISOLATION LEVEL SERIALIZABLE;
+	SELECT count(*) FROM px;
+	INSERT INTO px VALUES ('fff');
+	PREPARE TRANSACTION 'px2';});
+like($err, qr/could not serialize access due to read\/write dependencies among transactions/,
+	'write skew with a prepared transaction fails to serialize');
+is($node->safe_psql('postgres', q{SELECT string_agg(gid, ',') FROM pg_prepared_xacts}), 'px1',
+	'and the second transaction isn\'t prepared');
+$node->safe_psql('postgres', q{ROLLBACK PREPARED 'px1'});
 
 $s1->quit;
 $s2->quit;
