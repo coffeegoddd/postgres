@@ -2,6 +2,8 @@
 
 backend_sources += files(
   'alloc_stub.c',
+  'canon_catalogs.c',
+  'canon_stub.c',
   'chunker_keyhash.c',
   'chunker_stub.c',
   'commit_serial.c',

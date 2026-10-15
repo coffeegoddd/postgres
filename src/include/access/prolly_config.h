@@ -20,6 +20,7 @@
 #define PROLLY_CONFIG_H
 
 #include "access/prolly_alloc.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_chunker.h"
 #include "access/prolly_commit.h"
 #include "access/prolly_coord.h"
@@ -68,6 +69,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyRefsRoutine *refs;
 	const ProllyTransferRoutine *transfer;
 	const ProllyMergeRoutine *diff_merge;
+	const ProllyCanonRoutine *canonicalizer;
 } ProllyDatabaseComponents;
 
 /*

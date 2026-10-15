@@ -43,6 +43,7 @@
 #include "access/multixact.h"
 #include "access/prolly_config.h"
 #include "access/prolly_indexam.h"
+#include "access/prolly_tableam.h"
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
@@ -868,6 +869,68 @@ done:
 	pfree(now.data);
 	ik->checked_lxid = MyProc->vxid.lxid;
 	ik->checked_subxid = GetCurrentSubTransactionId();
+}
+
+/*
+ * The key, in a table's META tree, of the keying description its rows were
+ * last made canonical under (prolly_canonicalize_table).
+ */
+#define META_CANONICAL		"canonical"
+#define META_CANONICAL_LEN	9
+
+void
+prolly_canonicalize_table(Relation rel)
+{
+	ProllyComponents c;
+	InsertKeying *ik;
+	ProllyRootSet *roots;
+	StringInfoData now;
+	StringInfoData mark;
+	ProllyKey	key = {(const uint8 *) META_CANONICAL, META_CANONICAL_LEN};
+	ProllyValue v;
+	bool		missing = false;
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	prolly_components_for_relation(rel, &c);
+	ik = insert_keying(rel, &c);
+	roots = PROLLY_CALL(c.engine, roots_acquire, NULL);
+	initStringInfo(&now);
+	initStringInfo(&mark);
+	PROLLY_CALL(c.keying, describe, ik->keying, &now);
+	if (PROLLY_CALL(c.engine, get, roots, rel, PROLLY_TREE_META, &key,
+					InvalidCommandId, &mark) &&
+		mark.len == now.len && memcmp(mark.data, now.data, now.len) == 0)
+	{
+		PROLLY_CALL(c.engine, roots_release, roots);
+		return;
+	}
+
+	/*
+	 * Rows written before a column was dropped are rebuilt by the keying
+	 * check (they don't read as the table is now); rows written before a
+	 * column was added with a default lack it, though they read with it,
+	 * so they are written again with it.
+	 */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->atthasmissing)
+			missing = true;
+	}
+	if (has_rows(rel, &c, roots))
+	{
+		lock_for_write(rel, &c, NULL, &roots);
+		check_keying(rel, &c, &roots, ik);
+		if (missing)
+			rekey(rel, &c, &roots, ik->keying, ik->keying);
+	}
+	v.data = (const uint8 *) now.data;
+	v.len = now.len;
+	PROLLY_CALL(c.engine, put, rel, PROLLY_TREE_META, &key, &v, InvalidCommandId);
+	PROLLY_CALL(c.engine, roots_release, roots);
+	pfree(now.data);
+	pfree(mark.data);
 }
 
 /* Does rel's data tree hold any row, as roots and this transaction see it? */

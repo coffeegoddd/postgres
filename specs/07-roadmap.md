@@ -766,6 +766,43 @@ it; keyless copies; merging again; a conflict that changes nothing; a
 branch with uncommitted changes; a crash). The requirements suite's
 `vc_diff_merge` now passes.
 
+**Status (2026-10-14): 4g.3 built.** A canonicalizer interface (the
+21st) and its implementation, `catalogs`: a commit's root is now the
+canonical form of the working set it records, so its hash depends only on
+what it holds (gate 6). The canonical root is a tree by kind and qualified
+name: prolly tables (their data tree, then their schema: live columns in
+order with types, nullness, collations, defaults, identity and generation;
+constraints, indexes, triggers and rules by name, as Postgres's deparser
+prints them), prolly index trees, views and materialized views, functions
+and procedures, enum, domain and composite types, sequences, and
+extensions by name and version (their members aren't listed). Strings are
+UTF-8 and names are qualified whatever the session's search path (it is
+pinned while deparsing), so OIDs, relfilenumbers, creation order and
+dropped columns never reach the hash. Data and prolly index trees are
+shared with the working set, as they are canonical as written; at commit
+(and before a merge commit) the canonicalizer's `prepare` rewrites the
+rows of tables whose rows aren't canonical: rows from before a column was
+dropped (the keying check rebuilds them) or added with a default (written
+again with it), once per schema change (a META record notes the keying
+the rows were last made canonical under). Objects not covered yet
+(aggregates, policies, partitioned and foreign tables, other types) make a
+commit fail, never a hash that might depend on history; heap tables are
+not versioned and are left out. The engine gained `tree_root`; reclamation
+walks canonical roots through the canonicalizer. Tests: `021_d1_canonical.pl`
+(two databases reach the same content by different histories and get the
+same root hash, which fails without the rewrite of rows from before an
+added column; one changed value changes it; committing again keeps it;
+views, functions and triggers count; an aggregate and a policy make a
+commit fail). Found while running the requirements suite: a function
+left by one test made every later commit in the database fail, which led
+to covering functions, views and triggers. The requirements suite's
+`201_history_clusters.pl` now passes (two clusters, different OIDs and
+histories, enums and a dropped column, the same root hash), and so does
+`vc_canonical`'s cross-database check. Not yet: a pinned deparse format
+under the format stamp (question 35; today's deparser output is used
+as it is), collation versions in the canonical schema (question 46),
+portable codecs for `reg*` types (question 35).
+
 **Exit criteria:** the S and V suites run against D1+K1, the requirements
 suite (`src/test/prolly`) passes against it, and the correctness gates in
 `06-benchmarking.md` are run, with their status recorded.

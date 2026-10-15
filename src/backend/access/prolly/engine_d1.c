@@ -2516,6 +2516,23 @@ d1_roots_at(const ProllyNodeRef *root)
 	return roots;
 }
 
+static void
+d1_tree_root(ProllyRootSet *roots, Relation tree, ProllyTreeKind kind,
+			 ProllyNodeRef *root)
+{
+	backend_init();
+	find_tree(roots, subroot_for(tree, kind), tree->rd_locator.relNumber, root);
+	if (root->hash.len == 0)
+	{
+		/* The empty tree: a leaf with no items, whatever the key order. */
+		ProllyTreeBuilder *b = PROLLY_CALL(backend.c.tree, build_begin,
+										   &backend.memcmp_env,
+										   CurrentMemoryContext);
+
+		PROLLY_CALL(backend.c.tree, build_finish, b, root);
+	}
+}
+
 /* The committed trees' changes, in tree's current key order. */
 static void
 d1_diff(ProllyRootSet *from, ProllyRootSet *to, Relation tree,
@@ -3037,6 +3054,7 @@ const ProllyEngineRoutine prolly_engine_d1 = {
 	.roots_at = d1_roots_at,
 	.diff = d1_diff,
 	.pending_root = d1_pending_root,
+	.tree_root = d1_tree_root,
 	.cursor_open = d1_cursor_open,
 	.cursor_seek = d1_cursor_seek,
 	.cursor_next = d1_cursor_next,

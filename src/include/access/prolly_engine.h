@@ -118,6 +118,13 @@ typedef struct ProllyEngineRoutine
 	void		(*pending_root) (ProllyNodeRef *root);
 
 	/*
+	 * The root of tree's tree of kind in roots, as committed (none of the
+	 * transaction's writes): the empty tree's if it has none.
+	 */
+	void		(*tree_root) (ProllyRootSet *roots, Relation tree,
+							  ProllyTreeKind kind, ProllyNodeRef *root);
+
+	/*
 	 * Cursors over tree in roots, overlaid with the current transaction's own
 	 * writes made before command cid (InvalidCommandId: all of them).
 	 * cursor_seek positions before the first key >= key (forward) or after
@@ -251,6 +258,7 @@ typedef struct ProllyEngineRoutine
 	"shmem_size", "shmem_init", "tree_create", "tree_truncate", "tree_reset", \
 	"tree_copy", \
 	"roots_acquire", "roots_release", "roots_at", "diff", "pending_root", \
+	"tree_root", \
 	"cursor_open", "cursor_seek", \
 	"cursor_next", "cursor_close", "cursor_can_seek", "unseen_writers", "get", "has_writes", "key_at", "count_range", \
 	"put", "remove", \

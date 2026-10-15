@@ -60,6 +60,7 @@ tests += {
       't/018_d1_vacuum.pl',
       't/019_d1_branches.pl',
       't/020_d1_merge.pl',
+      't/021_d1_canonical.pl',
     ],
   },
 }
