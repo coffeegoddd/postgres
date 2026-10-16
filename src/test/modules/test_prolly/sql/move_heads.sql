@@ -86,3 +86,17 @@ SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
 
 SELECT dolt_branch('-D', 'at_first', 'at_second');
 DROP SCHEMA app CASCADE;
+
+-- A move writes a NULL in a column added with a default as NULL, not the
+-- default (the commit's rows are as a rewrite has them).
+CREATE SCHEMA mhd VERSIONED;
+CREATE TABLE mhd.t (id int PRIMARY KEY, a text);
+INSERT INTO mhd.t VALUES (1, 'one');
+ALTER TABLE mhd.t ADD COLUMN c int DEFAULT 5;
+UPDATE mhd.t SET c = NULL;
+SELECT length(dolt_commit('-Am', 'a NULL in c')::text) AS committed;
+UPDATE mhd.t SET c = 7;
+SELECT dolt_reset('--hard');
+SELECT id, c IS NULL AS c_is_null FROM mhd.t;
+DROP SCHEMA mhd CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
