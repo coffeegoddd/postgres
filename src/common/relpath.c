@@ -36,6 +36,7 @@ const char *const forkNames[] = {
 	[VISIBILITYMAP_FORKNUM] = "vm",
 	[INIT_FORKNUM] = "init",
 	[BMAP_FORKNUM] = "bmap",
+	[BMAP_CHANGES_FORKNUM] = "chg",
 };
 
 StaticAssertDecl(lengthof(forkNames) == (MAX_FORKNUM + 1),

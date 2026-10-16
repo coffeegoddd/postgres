@@ -68,6 +68,7 @@ typedef struct SMgrRelationData
 	 * lookup of a prepared read
 	 */
 	Buffer		bmap_pretrunc;
+	Buffer		bmap_pretrunc_chg[2];	/* its changes list's header, page */
 	BlockNumber bmap_read_blkno;	/* logical start of a prepared read */
 	BlockNumber bmap_read_phys; /* its physical start */
 	BlockNumber bmap_read_run;	/* physically consecutive blocks */
@@ -114,9 +115,10 @@ extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
 extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
 extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber blocknum, Buffer buffer);
+								 BlockNumber blocknum, Buffer buffer,
+								 bool neutral);
 extern bool smgrpageisshared(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber blocknum);
+							 BlockNumber blocknum, bool *copies);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,

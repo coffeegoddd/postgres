@@ -1,0 +1,182 @@
+-- Folds: once a fold of a block-mapped relation begins, the first change
+-- to each page copies it and lists the block it leaves, which keeps the
+-- page as it was; truncations are listed too.  A copy of the relation
+-- gets its list; pruning lets go of what changed before a later fold;
+-- dropping the relation frees what the list holds.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+RESET client_min_messages;
+CREATE SCHEMA folds VERSIONED;
+CREATE TABLE folds.t (a int8 PRIMARY KEY, b int8);
+INSERT INTO folds.t SELECT g, g FROM generate_series(1, 3000) g;
+SELECT pg_relation_filenode('folds.t') AS rel \gset
+SELECT lineage, epoch AS e1, nblocks AS n1 FROM test_bmap_fold_begin(:rel) \gset
+SELECT :n1 = pg_relation_size('folds.t') / 8192 AS length_then,
+	:e1 = test_bmap_epoch(:rel) AS map_epoch_raised;
+ length_then | map_epoch_raised 
+-------------+------------------
+ t           | t
+(1 row)
+
+SELECT count(*) AS nothing_yet FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+ nothing_yet 
+-------------
+           0
+(1 row)
+
+-- The first change to a page copies it, even though nothing shares it.
+SELECT phys AS phys0 FROM test_bmap_map(:rel) WHERE blkno = 0 \gset
+SELECT test_bmap_free_blocks() AS free_before \gset
+UPDATE folds.t SET b = -b WHERE a = 1;	-- its new version goes to another page
+UPDATE folds.t SET b = -b WHERE a = 2;	-- block 0 again: in place
+UPDATE folds.t SET b = -b WHERE a = 2000;
+SELECT kind, blkno, old_block = :phys0 AS old_is_fold_page,
+	made = :e1 AS made_in_fold_epoch
+FROM test_bmap_fold_changes(:rel, :lineage, :e1) ORDER BY blkno;
+ kind | blkno | old_is_fold_page | made_in_fold_epoch 
+------+-------+------------------+--------------------
+ copy |     0 | t                | t
+ copy |    10 | f                | t
+ copy |    16 | f                | t
+(3 rows)
+
+SELECT phys <> :phys0 AS moved, refs FROM test_bmap_map(:rel) WHERE blkno = 0;
+ moved | refs 
+-------+------
+ t     |    0
+(1 row)
+
+-- The listed block keeps the page as of the fold: none of its tuples
+-- deleted yet, where the page now has one updated.
+SELECT bool_and(t_xmax = 0) AS old_page_untouched
+FROM heap_page_items(test_bmap_read_old(:rel, 0, :phys0));
+ old_page_untouched 
+--------------------
+ t
+(1 row)
+
+SELECT bool_and(t_xmax = 0) AS page_now_untouched
+FROM heap_page_items(get_raw_page('folds.t', 0));
+ page_now_untouched 
+--------------------
+ f
+(1 row)
+
+-- A copy of the relation gets the list, and holds its blocks too.
+SELECT test_bmap_share(:rel, false) AS copy \gset
+SELECT count(*) AS copy_listed FROM test_bmap_fold_changes(:copy, :lineage, :e1);
+ copy_listed 
+-------------
+           3
+(1 row)
+
+SELECT test_bmap_unlink(:copy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT count(*) AS still_listed FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+ still_listed 
+--------------
+            3
+(1 row)
+
+SELECT bool_and(t_xmax = 0) AS old_page_still_kept
+FROM heap_page_items(test_bmap_read_old(:rel, 0, :phys0));
+ old_page_still_kept 
+---------------------
+ t
+(1 row)
+
+-- A truncation is listed, with the length it cut to.
+DELETE FROM folds.t WHERE ctid >= '(14,0)';
+VACUUM folds.t;
+SELECT kind, blkno = pg_relation_size('folds.t') / 8192 AS cut_to_length
+FROM test_bmap_fold_changes(:rel, :lineage, :e1) WHERE kind = 'truncate';
+   kind   | cut_to_length 
+----------+---------------
+ truncate | t
+(1 row)
+
+-- A later fold: changes since are listed in its epoch, and pruning lets go
+-- of those made before it, freeing the blocks they held.
+SELECT epoch AS e2 FROM test_bmap_fold_begin(:rel) \gset
+SELECT :e2 > :e1 AS later;
+ later 
+-------
+ t
+(1 row)
+
+UPDATE folds.t SET b = 0 WHERE a = 3;
+SELECT count(*) AS since_second FROM test_bmap_fold_changes(:rel, :lineage, :e2);
+ since_second 
+--------------
+            1
+(1 row)
+
+SELECT count(*) FILTER (WHERE kind = 'copy') AS copies_before_second
+FROM test_bmap_fold_changes(:rel, :lineage, :e1) WHERE made < :e2 \gset
+SELECT test_bmap_free_blocks() AS free_before_prune \gset
+SELECT test_bmap_fold_prune(:rel, :lineage, :e2);
+ test_bmap_fold_prune 
+----------------------
+ 
+(1 row)
+
+SELECT count(*) AS left_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+ left_after_prune 
+------------------
+                1
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before_prune = :copies_before_second
+	AS freed_what_was_let_go;
+ freed_what_was_let_go 
+-----------------------
+ t
+(1 row)
+
+SELECT count(*), sum(b) FROM folds.t;
+ count |   sum   
+-------+---------
+  2588 | 3353337
+(1 row)
+
+-- Another lineage knows nothing of it.
+SELECT count(*) FROM test_bmap_fold_changes(:rel, :lineage + 1, :e1);
+NOTICE:  no changes list of that lineage
+ count 
+-------
+     0
+(1 row)
+
+-- A rewritten table starts without a list.
+TRUNCATE folds.t;
+SELECT pg_relation_filenode('folds.t') AS rel2 \gset
+SELECT count(*) FROM test_bmap_fold_changes(:rel2, :lineage, :e1);
+NOTICE:  no changes list of that lineage
+ count 
+-------
+     0
+(1 row)
+
+-- Dropping a relation frees the blocks its list holds.
+CREATE TABLE folds.d (a int8 PRIMARY KEY, b int8);
+INSERT INTO folds.d SELECT g, g FROM generate_series(1, 3000) g;
+SELECT pg_relation_filenode('folds.d') AS d \gset
+SELECT lineage AS dl, epoch AS de FROM test_bmap_fold_begin(:d) \gset
+UPDATE folds.d SET b = -b;
+SELECT count(*) AS d_listed FROM test_bmap_fold_changes(:d, :dl, :de) \gset
+SELECT test_bmap_free_blocks() AS free_before_drop \gset
+DROP TABLE folds.d;
+SELECT test_bmap_free_blocks() - :free_before_drop >= 2 * :d_listed
+	AS freed_map_and_list;
+ freed_map_and_list 
+--------------------
+ t
+(1 row)
+
+DROP SCHEMA folds CASCADE;
+NOTICE:  drop cascades to table folds.t

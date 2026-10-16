@@ -128,13 +128,16 @@ typedef struct f_smgr
 	 * shared)?  Then the buffer manager calls smgr_prepareforchange once a
 	 * page is locked exclusively (or, under a cleanup lock taken without
 	 * preparing, when the holder is about to change it), and
-	 * smgr_pageisshared answers whether that would copy it.  May be NULL.
+	 * smgr_pageisshared answers whether the page is another relation's too,
+	 * and whether preparing it would copy it, which it may do for reasons
+	 * of its own.  May be NULL.
 	 */
 	bool		(*smgr_preparesforchanges) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_prepareforchange) (SMgrRelation reln, ForkNumber forknum,
-										  BlockNumber blocknum, Buffer buffer);
+										  BlockNumber blocknum, Buffer buffer,
+										  bool neutral);
 	bool		(*smgr_pageisshared) (SMgrRelation reln, ForkNumber forknum,
-									  BlockNumber blocknum);
+									  BlockNumber blocknum, bool *copies);
 	/* before a relation's buffers are dropped to unlink it; may be NULL */
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
@@ -696,26 +699,35 @@ smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum)
  *							 before it changes.
  *
  * A page shared with another relation is copied, so the change is this
- * relation's alone.  Called before any critical section: it may allocate,
- * write and log.
+ * relation's alone.  A 'neutral' change changes no row the page holds
+ * (pruning, freezing): the storage manager may then leave the page as it
+ * would leave it unchanged.  Called before any critical section: it may
+ * allocate, write and log.
  */
 void
 smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, Buffer buffer)
+					 BlockNumber blocknum, Buffer buffer, bool neutral)
 {
 	if (smgrsw[reln->smgr_which].smgr_prepareforchange)
 		smgrsw[reln->smgr_which].smgr_prepareforchange(reln, forknum, blocknum,
-													   buffer);
+													   buffer, neutral);
 }
 
 /*
- * smgrpageisshared() -- Would preparing the page for a change copy it?
+ * smgrpageisshared() -- Is the page another relation's too, so that
+ *						 preparing it for a change copies it?
+ *
+ * *copies says whether preparing it would copy it, for that reason or
+ * another.
  */
 bool
-smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				 bool *copies)
 {
+	*copies = false;
 	return smgrsw[reln->smgr_which].smgr_pageisshared != NULL &&
-		smgrsw[reln->smgr_which].smgr_pageisshared(reln, forknum, blocknum);
+		smgrsw[reln->smgr_which].smgr_pageisshared(reln, forknum, blocknum,
+												   copies);
 }
 
 /* does this relation's storage implementation share pages (smgrshare())? */
