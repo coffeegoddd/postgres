@@ -288,6 +288,48 @@ test_refs_walk_reaches(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(r.found);
 }
 
+typedef struct FindTree
+{
+	const char *name;
+	ProllyNodeRef data;
+	bool		found;
+} FindTree;
+
+static void
+find_tree(const char *name, const ProllyNodeRef *data,
+		  const ProllyValue *description, void *arg)
+{
+	FindTree   *ft = arg;
+
+	if (strcmp(name, ft->name) == 0)
+	{
+		ft->data = *data;
+		ft->found = true;
+	}
+}
+
+/*
+ * The hash of a table's data tree in the session branch's working set,
+ * folded; NULL if it has no such table.  (The tree depends on the rows'
+ * keys and encodings, the node format and the hash, not on the table's
+ * definition.)
+ */
+PG_FUNCTION_INFO_V1(test_fold_tree_hash);
+Datum
+test_fold_tree_hash(PG_FUNCTION_ARGS)
+{
+	const ProllyCanonRoutine *canon = prolly_canon_lookup("folded");
+	ProllyNodeRef root;
+	FindTree	ft = {0};
+
+	ft.name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	PROLLY_CALL(canon, fold, NULL, &root, NULL);
+	PROLLY_CALL(canon, tables, &root, find_tree, &ft);
+	if (!ft.found)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(hash_text(&ft.data.hash));
+}
+
 /* What the session's folds have read: pages, candidates, full tables. */
 PG_FUNCTION_INFO_V1(test_fold_counters);
 Datum
