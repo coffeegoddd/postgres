@@ -1,0 +1,165 @@
+-- A branch starts at its start point's head commit, as in Dolt: made from
+-- a branch with uncommitted changes, rows or objects, it has none of them,
+-- and they stay the other branch's.  Whether made by dolt_branch or
+-- dolt_checkout -b, from the session's branch or another.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA bs VERSIONED;
+CREATE TABLE bs.t (id int PRIMARY KEY, v text);
+INSERT INTO bs.t VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- uncommitted on main: a row changed, added and removed, and a new table
+UPDATE bs.t SET v = 'uno' WHERE id = 1;
+INSERT INTO bs.t VALUES (3, 'three');
+DELETE FROM bs.t WHERE id = 2;
+CREATE TABLE bs.u (a int PRIMARY KEY);
+INSERT INTO bs.u VALUES (1);
+SELECT dolt_branch('b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT (dolt_checkout('-b', 'c'))[2];
+     dolt_checkout      
+------------------------
+ Switched to branch 'c'
+(1 row)
+
+SELECT * FROM bs.t ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+SELECT to_regclass('bs.u') AS u;
+ u 
+---
+ 
+(1 row)
+
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('b') IS NOT NULL AS on_b;
+ on_b 
+------
+ t
+(1 row)
+
+SELECT * FROM bs.t ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+SELECT to_regclass('bs.u') AS u;
+ u 
+---
+ 
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+-- (and from a branch other than the session's, with changes of its own)
+INSERT INTO bs.t VALUES (4, 'four');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('d', 'b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- main still has its changes
+SELECT * FROM bs.t ORDER BY id;
+ id |   v   
+----+-------
+  1 | uno
+  3 | three
+(2 rows)
+
+SELECT * FROM bs.u;
+ a 
+---
+ 1
+(1 row)
+
+SELECT dolt_checkout('d') IS NOT NULL AS on_d;
+ on_d 
+------
+ t
+(1 row)
+
+SELECT * FROM bs.t ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+SELECT dolt_checkout('b') IS NOT NULL AS on_b;
+ on_b 
+------
+ t
+(1 row)
+
+SELECT * FROM bs.t ORDER BY id;
+ id |  v   
+----+------
+  1 | one
+  2 | two
+  4 | four
+(3 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'b', 'c', 'd');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA bs CASCADE;
+NOTICE:  drop cascades to table bs.t

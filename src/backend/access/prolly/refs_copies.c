@@ -817,13 +817,21 @@ copies_branch_create(const char *name, const char *start_point)
 	if (OidIsValid(branch_oid(from)))
 	{
 		ProllyNodeRef baseline;
+		bool		has_head = branch_head(from, &head);
 
+		/*
+		 * A branch starts at the other's head commit, as in Dolt: the
+		 * other's uncommitted changes stay its own.  Its copies are the
+		 * other's (they have the same changes since the same baseline),
+		 * then moved to the head, undoing the changes.
+		 */
 		branch_ops()->create(name, from);
 		/* (a branch of the same name deleted before left no entry) */
-		branch_set_head(name, branch_head(from, &head) ? &head : NULL);
-		/* its copies have the same changes since the same baseline */
+		branch_set_head(name, has_head ? &head : NULL);
 		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL,
 							NULL);
+		if (has_head && copies_commit_get(&head, &info))
+			branch_ops()->run_on(name, move_to, &info.root);
 		return;
 	}
 

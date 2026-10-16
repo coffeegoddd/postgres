@@ -69,6 +69,7 @@ tests += {
       'redefined_merges',
       'type_moves',
       'detached_checkout',
+      'branch_start',
     ],
   },
   'tap': {
