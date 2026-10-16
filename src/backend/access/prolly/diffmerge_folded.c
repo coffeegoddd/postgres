@@ -35,7 +35,9 @@
 /* A table as one version has it. */
 typedef struct Table
 {
-	char	   *name;			/* qualified */
+	char	   *name;			/* qualified, in the server's encoding */
+	char	   *utf8;			/* the same in UTF-8, as the canonical tree
+								 * orders them */
 	ProllyNodeRef data;
 	ProllyHash	description;	/* of its definition */
 } Table;
@@ -98,6 +100,7 @@ add_table(const char *name, const ProllyNodeRef *data,
 
 	/* (the canonical tree's names are UTF-8; the catalogs' the server's) */
 	t->name = pstrdup(pg_any_to_server(name, strlen(name), PG_UTF8));
+	t->utf8 = pstrdup(name);
 	t->data = *data;
 	PROLLY_CALL(h, update, ctx, description->data, description->len);
 	PROLLY_CALL(h, finish, ctx, &t->description);
@@ -273,12 +276,12 @@ folded_tables(const char *from_ref, const char *to_ref,
 	ListCell   *a = list_head(from);
 	ListCell   *b = list_head(to);
 
-	/* both in name order: a merge */
+	/* both in the canonical tree's order (UTF-8 bytes): a merge */
 	while (a || b)
 	{
 		Table	   *ta = a ? lfirst(a) : NULL;
 		Table	   *tb = b ? lfirst(b) : NULL;
-		int			c = !ta ? 1 : !tb ? -1 : strcmp(ta->name, tb->name);
+		int			c = !ta ? 1 : !tb ? -1 : strcmp(ta->utf8, tb->utf8);
 
 		if (c < 0)
 		{
