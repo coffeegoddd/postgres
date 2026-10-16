@@ -120,7 +120,7 @@ SELECT dolt_conflicts_resolve('--theirs', 'app.k');
 SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
 ROLLBACK;
 
--- Not yet: different definitions.
+-- Definitions that differ: merged, then the rows (here, a keyless conflict).
 SELECT dolt_checkout('feature');
 ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;

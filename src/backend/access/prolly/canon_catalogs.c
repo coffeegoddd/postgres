@@ -2568,6 +2568,84 @@ unsupported:
 			 errmsg("the branch can't be moved to a commit that defines types or materialized views differently yet")));
 }
 
+/*
+ * The definitions of base, ours and theirs merged: each object as the side
+ * that changed it since base has it (ours if neither, or both alike).  An
+ * object both changed differently is a schema conflict, and fails.  The
+ * root's tables name ours' rows, or theirs' for tables only theirs has:
+ * the definitions are what count.
+ */
+static void
+folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_root,
+					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur[3];
+	bool		more[3];
+	ProllyKey	k[3];
+	ProllyValue v[3];
+	ProllyTreeBuilder *b;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, base_root, CurrentMemoryContext);
+	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, ours_root, CurrentMemoryContext);
+	cur[2] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, theirs_root, CurrentMemoryContext);
+	for (int i = 0; i < 3; i++)
+	{
+		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
+		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+	}
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
+	while (more[0] || more[1] || more[2])
+	{
+		const ProllyKey *least = NULL;
+		bool		has[3];
+		ProllyValue def[3];
+		const ProllyValue *take = NULL;
+
+		/* the least key of the three, and which have it */
+		for (int i = 0; i < 3; i++)
+			if (more[i] && (least == NULL || memcmp_keys(&k[i], least, NULL) < 0))
+				least = &k[i];
+		for (int i = 0; i < 3; i++)
+		{
+			has[i] = more[i] && memcmp_keys(&k[i], least, NULL) == 0;
+			if (has[i])
+				definition_of(&k[i], &v[i], &def[i]);
+		}
+#define SAME(a, b) (has[a] == has[b] && (!has[a] || \
+					(def[a].len == def[b].len && memcmp(def[a].data, def[b].data, def[a].len) == 0)))
+		if (SAME(0, 2))
+			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
+		else if (SAME(0, 1) || SAME(1, 2))
+			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
+		else if (least->data[0] == 'c')
+			take = has[1] ? &v[1] : &v[2];	/* (collations: as recorded) */
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: %s was changed differently on both sides",
+							from_utf8(least->data + 2, least->len - 2)),
+					 errdetail("Both branches made, dropped or redefined it since their common ancestor.")));
+#undef SAME
+		if (take)
+			PROLLY_CALL(cn.tree, build_add, b, least, take);
+
+		/* (the least key last: the others point into its cursor's node) */
+		for (int i = 0; i < 3; i++)
+			if (has[i] && &k[i] != least)
+				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+		for (int i = 0; i < 3; i++)
+			if (has[i] && &k[i] == least)
+				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, merged);
+	for (int i = 0; i < 3; i++)
+		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -2584,6 +2662,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.same_schema = folded_same_schema,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
+	.merge_schema = folded_merge_schema,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {
