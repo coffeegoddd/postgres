@@ -112,6 +112,25 @@ prolly_root_hash(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_to_text(&info.root.hash));
 }
 
+/*
+ * prolly_checkpoint() returns text
+ *
+ * Take a working-set checkpoint of the session's branch: its working set
+ * folded as a commit would fold it, without a commit, so later commits,
+ * diffs and statuses start from it.  Returns the working set's canonical
+ * root hash.
+ */
+Datum
+prolly_checkpoint(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents components;
+	ProllyNodeRef root;
+
+	prolly_database_components(&components);
+	PROLLY_CALL(components.refs, checkpoint, &root);
+	PG_RETURN_TEXT_P(hash_to_text(&root.hash));
+}
+
 /* Collects diff rows into a tuplestore. */
 typedef struct DiffCollector
 {

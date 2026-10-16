@@ -154,13 +154,20 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*walk) (const ProllyNodeRef *refs, ProllyTreeVisitNode visit,
 						 void *arg);
+
+	/*
+	 * A working-set checkpoint: fold the session branch's working set as a
+	 * commit would, without a commit, so later folds start from it; with
+	 * the transaction.  *root gets the working set's canonical root.
+	 */
+	void		(*checkpoint) (ProllyNodeRef *root);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
-	"set_merge_state", "hold", "walk"
+	"set_merge_state", "hold", "walk", "checkpoint"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

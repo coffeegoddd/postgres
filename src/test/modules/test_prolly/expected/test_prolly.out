@@ -301,7 +301,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
  refs            | stub             | merge_base                              | not implemented (missing commit, merge_base)
- refs            | stub             | complete                                | not implemented (18 of 18 callbacks missing)
+ refs            | stub             | complete                                | not implemented (19 of 19 callbacks missing)
  refs            | tree             | identity                                | pass
  refs            | tree             | branch_lifecycle                        | no checks yet
  refs            | tree             | commit_then_resolve                     | no checks yet
@@ -311,7 +311,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | copies           | branch_lifecycle                        | no checks yet
  refs            | copies           | commit_then_resolve                     | no checks yet
  refs            | copies           | merge_base                              | no checks yet
- refs            | copies           | complete                                | not implemented (1 of 18 callbacks missing)
+ refs            | copies           | complete                                | not implemented (1 of 19 callbacks missing)
  transfer        | stub             | identity                                | pass
  transfer        | stub             | clone                                   | not implemented (missing clone)
  transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)

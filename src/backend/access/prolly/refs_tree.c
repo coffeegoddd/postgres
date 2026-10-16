@@ -1117,6 +1117,16 @@ tree_working_set(const char *branch, ProllyNodeRef *root)
 	return true;
 }
 
+/*
+ * A working-set checkpoint: the working set is kept as trees already, so
+ * there is nothing to fold; its root is the session's.
+ */
+static void
+tree_checkpoint(ProllyNodeRef *root)
+{
+	(void) tree_working_set(NULL, root);
+}
+
 static void
 merge_key(ProllyBranchId branch, StringInfo key)
 {
@@ -1407,4 +1417,5 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.set_merge_state = tree_set_merge_state,
 	.hold = tree_hold,
 	.walk = tree_walk,
+	.checkpoint = tree_checkpoint,
 };
