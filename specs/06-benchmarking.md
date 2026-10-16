@@ -71,6 +71,11 @@ A failing gate is reported next to the numbers it affects.
 | S10 | sysbench OLTP | sysbench 1.0 Lua tests, one variant each: `oltp_read_write`, `oltp_read_only`, `oltp_write_only`, `oltp_point_select`, `oltp_update_index`, `oltp_update_non_index`, `oltp_insert`, `select_random_ranges`, `bulk_insert` | Standard OLTP mixes; the tool Dolt and Doltgres publish latency comparisons with, so results can be set beside theirs (for orientation only) |
 | S11 | Many tables | Many tables, small transactions touching a few | Root-layout directory cost: paths through the sub-root trees vs a flat catalog |
 | S12 | Duplicate-heavy keyless tables | Tables without a primary key, many identical rows | Item counts, ANALYZE, per-duplicate TID metadata |
+| S13 | Analytical queries | BenchBase TPC-H, Q1-Q22; complete serial pass and timed query mix | Joins, aggregates, subqueries and analytical scans; one stream because upstream Q15 uses a shared view |
+
+S11 and S12 are planned workloads; S1-S10 and S13 are implemented in the
+harness. TPC-H serial mode runs each query cold then hot and records the
+hot execution, following BenchBase's untimed serial procedure.
 
 Scale each workload at two sizes: fits in `shared_buffers`, and several times
 larger than RAM.

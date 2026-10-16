@@ -6,7 +6,7 @@ only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
 with stock heap).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
-(S9), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
+(S9 and S13), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
 slt-runner (`slt/`).
 
 ## Quick start
@@ -43,6 +43,64 @@ VACUUM, recovery) with each S number's ratio to B0, and writes
 better than B0 are green and worse are red (beyond 5%), and hovering a cell
 shows its spread.  `compare BASELINE_DIR DIR` gives one result set's ratios
 to a baseline in a single wide table.
+
+## BenchBase TPC workloads
+
+The runnable TPC plugins in the local BenchBase checkout (revision
+`a3a748326f4d1e615fd12db4a6ae59a60190a6ee`) are both available:
+
+| Workload | Benchmark | Size setting | Execution |
+|---|---|---|---|
+| S9 | TPC-C | `tpcc_warehouses` (integer) | Timed mix of NewOrder, Payment, OrderStatus, Delivery and StockLevel; configured client sweep |
+| S13 | TPC-H | `tpch_scale` (fractional values supported) | All 22 queries; serial and throughput variants |
+
+TPC-DS is unfinished upstream: it has no registered plugin or runnable
+query suite. TPC-E is not provided. CH-benCHmark is a separate hybrid
+workload, not one of these TPC plugins. S1 remains pgbench's TPC-B-like
+workload. These measurements are not certified TPC results.
+
+```sh
+bash src/tools/prolly_bench/build_benchbase.sh
+
+# Both BenchBase TPC workloads on heap and block-mapped prolly storage.
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
+  --workloads S9,S13 --config src/tools/prolly_bench/configs/smoke.toml
+
+# Standard procedure; select an experimental engine with --am prolly_d1, etc.
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --workloads S9,S13
+src/tools/prolly_bench/prolly_bench table
+```
+
+Set `[workloads.S13] modes = ["serial", "throughput"]` to select variants
+(both shipped configs select both). `serial` executes Q1 through Q22 in
+order with no time limit; each query runs cold once and then hot once,
+with only the hot execution recorded, following BenchBase's untimed
+serial procedure. `--measure` does not truncate that pass. With warmup
+enabled, it first runs a separate complete, discarded pass. Latency
+samples cover the hot executions; the collector window also includes
+the cold executions and client startup.
+`throughput` randomly selects from all 22 queries for the configured
+warmup and measurement durations. A short throughput run need not visit
+every query; the serial variant verifies complete coverage.
+
+Both TPC-H variants use one client, regardless of `--clients`: upstream
+Q15 creates and drops the shared `revenue0` view, which collides across
+concurrent workers. TPC-H reads user data, but Q15 writes catalogs, so
+WAL and device-write metrics remain applicable. Data loading and ANALYZE
+happen before measurement. Smoke scale is 0.01; standard scales are 1
+and 100 for the in-memory and larger-than-RAM configurations respectively.
+
+Results retain BenchBase summaries and transaction outcome counts in
+`raw/.../benchbase-measure/`, plus TPC-H `queries.json` with each query's
+count, mean latency and total time. `qps` reports TPC-H query throughput;
+the common throughput column uses the same value. Logged loader errors,
+unexpected SQL errors, empty runs, or incomplete serial query coverage
+fail the cell rather than producing successful timing results. Engine
+features that are not implemented still receive the harness's explicit
+`not_implemented` status. PostgreSQL deadlocks (`40P01`) in TPC-C are
+reported as `failed_transactions`: this BenchBase revision classifies
+them as unexpected errors rather than retrying them. Other unexpected
+SQL errors still fail the cell.
 
 ## The C suite
 
@@ -150,7 +208,7 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
-| `Workload` | S1-S10, V1-V4, C1-C4 | `pbench/workloads/` |
+| `Workload` | S1-S10 and S13, V1-V4, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local | `pbench/clusters/` |

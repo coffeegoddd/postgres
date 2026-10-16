@@ -24,6 +24,7 @@ pgbench_scale = 5
 s4_rows = 200000
 s7_rows = 50000
 tpcc_warehouses = 1
+tpch_scale = 0.01
 v_rows = 10000
 sysbench_tables = 4
 sysbench_table_size = 10000
@@ -36,6 +37,10 @@ percents = [1]
 
 [workloads.S10]
 tests = ["oltp_read_write", "oltp_point_select", "bulk_insert"]
+
+[workloads.S13]
+# Serial measures all 22 queries, regardless of measure_seconds.
+modes = ["serial", "throughput"]
 
 [workloads.V1]
 iterations = 3
