@@ -56,6 +56,7 @@ tests += {
       'move_heads',
       'merge',
       'cherry_pick',
+      'schema_moves',
     ],
   },
   'tap': {

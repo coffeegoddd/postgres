@@ -17,8 +17,8 @@
  * then every row arriving inserted, so the rows are always a subset of
  * the root's or of the branch's, and a unique constraint both satisfy
  * isn't violated on the way, as it could be by changing rows one at a
- * time (two rows swapping a value).  Definitions must be the same on both
- * sides for now.
+ * time (two rows swapping a value).  Definitions that differ are changed
+ * first, by the canonicalizer.
  *
  * Merge is three-way, from the newest common ancestor of the session's
  * head and the other one, as in implementation "rows": for each table,
@@ -527,9 +527,11 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	table_close(ap.rel, NoLock);
 }
 
+/* Write every table's rows that differ from the root's (arg). */
 static void
-folded_move_to(const ProllyNodeRef *target)
+move_rows(void *arg)
 {
+	const ProllyNodeRef *target = arg;
 	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef working;
 	Tables		from = {NIL};
@@ -537,11 +539,6 @@ folded_move_to(const ProllyNodeRef *target)
 	ListCell   *lc;
 
 	PROLLY_CALL(dc.canonicalizer, fold, &working);
-	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &working, target))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("the branch can't be moved to a commit that defines its objects differently yet"),
-				 errdetail("Its versioned schemas' tables or other objects are made, dropped or defined differently there.")));
 	PROLLY_CALL(dc.canonicalizer, tables, &working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, tables, target, add_table, &to);
 	/* materialized views' rows too: a commit holds them as it was made */
@@ -557,6 +554,21 @@ folded_move_to(const ProllyNodeRef *target)
 		if (!same_hash(&f->data.hash, &t->data.hash))
 			apply_rows(table_named(t->name), f, t);
 	}
+}
+
+/* The definitions first, if they differ, then the rows. */
+static void
+folded_move_to(const ProllyNodeRef *target)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef working;
+
+	PROLLY_CALL(dc.canonicalizer, fold, &working);
+	if (PROLLY_CALL(dc.canonicalizer, same_schema, &working, target))
+		move_rows((void *) target);
+	else
+		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
+					(void *) target);
 }
 
 /* ------------------------------------------------------------------------
