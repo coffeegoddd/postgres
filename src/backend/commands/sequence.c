@@ -22,6 +22,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "catalog/branch.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -68,6 +69,7 @@ typedef struct SeqTableData
 	Oid			relid;			/* pg_class OID of this sequence (hash key) */
 	RelFileNumber filenumber;	/* last seen relfilenumber of this sequence */
 	LocalTransactionId lxid;	/* xact in which we last did a seq op */
+	Oid			lxid_branch;	/* the session's branch when it locked it */
 	bool		last_valid;		/* do we have a valid "last" value? */
 	int64		last;			/* value last returned by nextval */
 	int64		cached;			/* last value already cached for nextval */
@@ -1087,8 +1089,12 @@ lock_and_open_sequence(SeqTable seq)
 {
 	LocalTransactionId thislxid = MyProc->vxid.lxid;
 
-	/* Get the lock if not already held in this xact */
-	if (seq->lxid != thislxid)
+	/*
+	 * Get the lock if not already held in this xact.  A versioned sequence's
+	 * lock is its copy's on the session's branch, so one taken on another
+	 * branch (before a checkout) isn't this one.
+	 */
+	if (seq->lxid != thislxid || seq->lxid_branch != MyBranch)
 	{
 		ResourceOwner currentOwner;
 
@@ -1101,6 +1107,7 @@ lock_and_open_sequence(SeqTable seq)
 
 		/* Flag that we have a lock in the current xact */
 		seq->lxid = thislxid;
+		seq->lxid_branch = MyBranch;
 	}
 
 	/* We now know we have the lock, and can safely open the rel */
@@ -1152,6 +1159,7 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 		/* relid already filled in */
 		elm->filenumber = InvalidRelFileNumber;
 		elm->lxid = InvalidLocalTransactionId;
+		elm->lxid_branch = InvalidOid;
 		elm->last_valid = false;
 		elm->last = elm->cached = 0;
 	}
