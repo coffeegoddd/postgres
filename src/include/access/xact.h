@@ -195,6 +195,7 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_AE_LOCKS			(1U << 6)
 #define XACT_XINFO_HAS_GID				(1U << 7)
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
+#define XACT_XINFO_HAS_CHUNK_ROOT		(1U << 9)
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -404,6 +405,10 @@ typedef struct xl_xact_parsed_commit
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
+
+	/* a chunk store's root move (prolly_chunkstore.h), if any */
+	uint32		chunk_root_len;
+	char	   *chunk_root;
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
@@ -512,7 +517,9 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  bool relcacheInval,
 									  int xactflags,
 									  TransactionId twophase_xid,
-									  const char *twophase_gid);
+									  const char *twophase_gid,
+									  const char *chunk_root,
+									  uint32 chunk_root_len);
 
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,

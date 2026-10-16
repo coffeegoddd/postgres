@@ -373,6 +373,7 @@ DataChecksumsWorker	"Waiting for data checksums worker."
 AioWorkerControl	"Waiting to update AIO worker information."
 DataChecksumTransition	"Waiting for a data checksum state transition to be written to WAL."
 ProllyHeads	"Waiting to read or update prolly branch heads."
+ProllyJournal	"Waiting to append to a prolly chunk journal."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)

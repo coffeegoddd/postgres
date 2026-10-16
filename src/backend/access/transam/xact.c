@@ -22,6 +22,7 @@
 
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/prolly_chunkstore.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -1383,6 +1384,12 @@ RecordTransactionCommit(void)
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
 	bool		wrote_xlog;
+	char	   *chunk_root = NULL;
+	Size		chunk_root_len;
+
+	/* a chunk store root this transaction moved goes with its commit record */
+	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
+	Assert(chunk_root_len == 0 || markXidCommitted);
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress
@@ -1516,7 +1523,8 @@ RecordTransactionCommit(void)
 							nmsgs, invalMessages,
 							RelcacheInitFileInval,
 							MyXactFlags,
-							InvalidTransactionId, NULL /* plain commit */ );
+							InvalidTransactionId, NULL /* plain commit */ ,
+							chunk_root, chunk_root_len);
 
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
@@ -1568,9 +1576,16 @@ RecordTransactionCommit(void)
 	 */
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
-		forceSyncCommit || nrels > 0)
+		forceSyncCommit || nrels > 0 || chunk_root_len > 0)
 	{
 		XLogFlush(XactLastRecEnd);
+
+		/*
+		 * A chunk store's root moved: written now that the commit record is
+		 * flushed, still before a checkpoint can be taken (as for CLOG).
+		 */
+		if (chunk_root_len > 0)
+			prolly_chunkstore_committed();
 
 		/*
 		 * The commit record is on disk, but not in CLOG yet.  A test can stop
@@ -5930,7 +5945,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 					int nmsgs, SharedInvalidationMessage *msgs,
 					bool relcacheInval,
 					int xactflags, TransactionId twophase_xid,
-					const char *twophase_gid)
+					const char *twophase_gid,
+					const char *chunk_root, uint32 chunk_root_len)
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
@@ -6026,6 +6042,9 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_origin.origin_timestamp = replorigin_xact_state.origin_timestamp;
 	}
 
+	if (chunk_root_len > 0)
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_CHUNK_ROOT;
+
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
@@ -6081,6 +6100,12 @@ XactLogCommitRecord(TimestampTz commit_time,
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
 		XLogRegisterData(&xl_origin, sizeof(xl_xact_origin));
+
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+	{
+		XLogRegisterData(&chunk_root_len, sizeof(uint32));
+		XLogRegisterData(chunk_root, chunk_root_len);
+	}
 
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -6326,6 +6351,10 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		replorigin_advance(origin_id, parsed->origin_lsn, lsn,
 						   false /* backward */ , false /* WAL */ );
 	}
+
+	/* the chunk store's root, if the transaction moved it */
+	if (parsed->xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+		prolly_chunkstore_commit_redo(parsed->chunk_root, parsed->chunk_root_len);
 
 	/* Make sure files supposed to be dropped are dropped */
 	if (parsed->nrels > 0)

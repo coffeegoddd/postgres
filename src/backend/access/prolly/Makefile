@@ -18,6 +18,7 @@ OBJS = \
 	canon_stub.o \
 	chunker_keyhash.o \
 	chunker_stub.o \
+	chunkstore_journal.o \
 	commit_serial.o \
 	commit_stub.o \
 	coord_k1.o \
@@ -45,6 +46,7 @@ OBJS = \
 	nodeformat_stub.o \
 	nodestore_global.o \
 	nodestore_stub.o \
+	prolly_chunkstore.o \
 	prolly_config.o \
 	prolly_database.o \
 	prolly_datum.o \

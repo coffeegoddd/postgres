@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_shmem.h"
 #include "storage/shmem.h"
@@ -163,6 +164,9 @@ CheckPointProlly(int flags)
 		if (PROLLY_HAS(r, checkpoint))
 			r->checkpoint(flags);
 	}
+
+	/* the chunk stores' appends before the redo point */
+	prolly_chunkstore_checkpoint();
 	list_free(impls);
 
 	impls = prolly_list_impls(PROLLY_IFACE_ENGINE);

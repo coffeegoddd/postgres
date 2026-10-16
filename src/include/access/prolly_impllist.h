@@ -41,6 +41,7 @@ PG_PROLLY_IMPL(ProllyIndexKeyingRoutine, prolly_ixkeying_columns_then_row)
 
 /* node storage */
 PG_PROLLY_IMPL(ProllyNodeStoreRoutine, prolly_nodestore_global)
+PG_PROLLY_IMPL(ProllyChunkStoreRoutine, prolly_chunkstore_journal)
 PG_PROLLY_IMPL(ProllyLogRoutine, prolly_log_chunks)
 
 /* trees */

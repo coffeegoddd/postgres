@@ -80,3 +80,15 @@ prolly_commit_identify(uint8 info)
 {
 	return generic_identify(info);
 }
+
+void
+prolly_chunks_desc(StringInfo buf, XLogReaderState *record)
+{
+	generic_desc(buf, record);
+}
+
+const char *
+prolly_chunks_identify(uint8 info)
+{
+	return generic_identify(info);
+}
