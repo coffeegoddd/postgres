@@ -8,7 +8,8 @@
  * update and delete with index maintenance and constraint checks.  A row
  * to change is found by the primary key's index, or, for a table without
  * one, by a row whose every column has the same bytes, through an index
- * on its columns if there is one.
+ * on its columns if there is one, or else through the rows' hashes, taken
+ * in one scan of the table when a row is first looked for.
  *
  * The apply worker turns triggers off with session_replication_role, but
  * that also skips the recheck of deferrable unique and exclusion
@@ -35,6 +36,7 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_trigger.h"
 #include "commands/trigger.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -43,6 +45,7 @@
 #include "utils/acl.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -61,7 +64,18 @@ struct ProllyApplier
 	EPQState	epq;
 	TupleTableSlot *found;
 	bool		matview;		/* rows written as REFRESH writes them */
+	/* without a key or match_index: its rows by the hash of their values */
+	HTAB	   *rows;
 };
+
+/* The rows of a hash: where they are (some perhaps gone since). */
+typedef struct RowsEntry
+{
+	uint32		hash;			/* (the key) */
+	int			n;
+	int			cap;
+	ItemPointerData *tids;
+} RowsEntry;
 
 /* RLS would decide which rows the user may write; it isn't applied here. */
 static void
@@ -420,6 +434,110 @@ let_go(ProllyApplier *a)
 	ExecClearTuple(a->found);
 }
 
+/* The hash of a row's values (their images: equal rows' are alike). */
+static uint32
+row_hash(TupleTableSlot *slot)
+{
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	uint32		h = 0;
+
+	slot_getallattrs(slot);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		h = hash_combine(h, slot->tts_isnull[i] ? 0x9e3779b9 :
+						 datum_image_hash(slot->tts_values[i], att->attbyval,
+										  att->attlen));
+	}
+	return h;
+}
+
+static void
+rows_add(ProllyApplier *a, TupleTableSlot *row)
+{
+	uint32		h = row_hash(row);
+	bool		found;
+	RowsEntry  *e = hash_search(a->rows, &h, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		e->n = 0;
+		e->cap = 1;
+		e->tids = MemoryContextAlloc(a->estate->es_query_cxt, sizeof(ItemPointerData));
+	}
+	else if (e->n == e->cap)
+	{
+		e->cap *= 2;
+		e->tids = repalloc_array(e->tids, ItemPointerData, e->cap);
+	}
+	e->tids[e->n++] = row->tts_tid;
+}
+
+/* Index the rows of a table without a key: one scan. */
+static void
+rows_build(ProllyApplier *a)
+{
+	HASHCTL		ctl;
+	TableScanDesc scan;
+	TupleTableSlot *slot = table_slot_create(a->rel, NULL);
+	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(RowsEntry);
+	ctl.hcxt = a->estate->es_query_cxt;
+	a->rows = hash_create("prolly applier rows", 1024, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	scan = table_beginscan(a->rel, snap, 0, NULL, SO_NONE);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		rows_add(a, slot);
+	table_endscan(scan);
+	UnregisterSnapshot(snap);
+	ExecDropSingleTupleTableSlot(slot);
+}
+
+/*
+ * A row of a table without a key, alike to old, found through the index and
+ * locked, into a->found; it leaves the index (it is about to change).
+ * False if none is: the index may have missed it (a row whose values are
+ * equal but not alike, or one written by another session), so the caller
+ * scans for it.
+ */
+static bool
+rows_find(ProllyApplier *a, TupleTableSlot *old)
+{
+	uint32		h;
+	RowsEntry  *e;
+
+	if (a->rows == NULL)
+		rows_build(a);
+	h = row_hash(old);
+	e = hash_search(a->rows, &h, HASH_FIND, NULL);
+	for (int i = e ? e->n - 1 : -1; i >= 0; i--)
+	{
+		ItemPointerData tid = e->tids[i];
+		bool		visible;
+		TM_FailureData tmfd;
+		TM_Result	res = TM_Invisible;
+
+		e->tids[i] = e->tids[--e->n];
+		PushActiveSnapshot(GetLatestSnapshot());
+		visible = table_tuple_fetch_row_version(a->rel, &tid, GetActiveSnapshot(),
+												a->found);
+		if (visible && same_row(a->found, old))
+			res = table_tuple_lock(a->rel, &tid, GetActiveSnapshot(), a->found,
+								   GetCurrentCommandId(false), LockTupleExclusive,
+								   LockWaitBlock, 0, &tmfd);
+		PopActiveSnapshot();
+		if (res == TM_Ok)
+			return true;
+	}
+	ExecClearTuple(a->found);
+	return false;
+}
+
 /* A row equal to old (by the key, or every column) into a->found. */
 static bool
 find_row(ProllyApplier *a, TupleTableSlot *old)
@@ -428,6 +546,10 @@ find_row(ProllyApplier *a, TupleTableSlot *old)
 	if (OidIsValid(a->key_index))
 		return RelationFindReplTupleByIndex(a->rel, a->key_index, true,
 											LockTupleExclusive, old, a->found);
+	if (OidIsValid(a->match_index))
+		return find_copy(a, old);
+	if (rows_find(a, old))
+		return true;
 	return find_copy(a, old);
 }
 
@@ -458,6 +580,8 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 		matview_insert(a, row);
 	else
 		ExecSimpleRelationInsert(a->rri, a->estate, row);
+	if (a->rows)
+		rows_add(a, row);
 	advance(a);
 }
 
@@ -485,6 +609,8 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (a->rows)
+		rows_add(a, row);
 	advance(a);
 	return true;
 }
