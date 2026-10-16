@@ -97,11 +97,24 @@ SELECT dolt_hashof('also_first') = :'c1' AS made_there;
 
 INSERT INTO dc.t VALUES (4, 'four');
 ERROR:  cannot execute INSERT in a read-only transaction
--- A branch checked out ends it.
+-- A branch checked out ends it, and the hidden branch, which no session
+-- is on any more, is deleted.
+SELECT count(*) AS hidden FROM pg_branch WHERE brname LIKE 'detached/%';
+ hidden 
+--------
+      1
+(1 row)
+
 SELECT (dolt_checkout('main'))[2];
        dolt_checkout       
 ---------------------------
  Switched to branch 'main'
+(1 row)
+
+SELECT count(*) AS hidden FROM pg_branch WHERE brname LIKE 'detached/%';
+ hidden 
+--------
+      0
 (1 row)
 
 INSERT INTO dc.t VALUES (4, 'four');

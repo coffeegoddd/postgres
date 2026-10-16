@@ -1,0 +1,191 @@
+-- A branch made at a commit has only its head until it is first used:
+-- making it copies nothing.  It is listed, resolved, diffed, merged from,
+-- branched from, copied and deleted like any other; checking it out (or
+-- reading its working set) makes its copies, at its head.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.copied(text) RETURNS bool
+  LANGUAGE sql AS $$ SELECT EXISTS (SELECT FROM pg_branch WHERE brname = $1) $$;
+CREATE SCHEMA ho VERSIONED;
+CREATE TABLE ho.t (id int PRIMARY KEY, v text);
+INSERT INTO ho.t VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE ho.t SET v = 'uno' WHERE id = 1;	-- uncommitted on main
+SELECT dolt_branch('h1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_temp.copied('h1') AS copied;
+ copied 
+--------
+ f
+(1 row)
+
+SELECT name, hash = dolt_hashof('main') AS at_main_head FROM dolt_branches ORDER BY name;
+ name | at_main_head 
+------+--------------
+ h1   | t
+ main | t
+(2 rows)
+
+SELECT dolt_branch('h1');
+ERROR:  branch "h1" already exists
+SELECT dolt_hashof('h1') = dolt_hashof('HEAD') AS resolves;
+ resolves 
+----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).v, (to_row).v FROM dolt_diff('h1', 'WORKING', NULL::ho.t);
+ diff_type |  v  |  v  
+-----------+-----+-----
+ modified  | one | uno
+(1 row)
+
+-- branched from, copied: still only heads
+SELECT dolt_branch('h2', 'h1'), dolt_branch('-c', 'h1', 'h3');
+ dolt_branch | dolt_branch 
+-------------+-------------
+ {0}         | {0}
+(1 row)
+
+SELECT pg_temp.copied('h2') OR pg_temp.copied('h3') AS copied;
+ copied 
+--------
+ f
+(1 row)
+
+-- checked out: copies made, at the head
+SELECT dolt_checkout('h1') IS NOT NULL AS on_h1;
+ on_h1 
+-------
+ t
+(1 row)
+
+SELECT pg_temp.copied('h1') AS copied;
+ copied 
+--------
+ t
+(1 row)
+
+SELECT * FROM ho.t;
+ id |  v  
+----+-----
+  1 | one
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+INSERT INTO ho.t VALUES (2, 'two');
+SELECT length(dolt_commit('-am', 'on h1')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT * FROM ho.t ORDER BY id;
+ id |  v  
+----+-----
+  1 | uno
+(1 row)
+
+-- one not merged needs -D to delete, copies or not: h5 (only a head) is
+-- at h1's commit, which main hasn't
+SELECT dolt_branch('h5', 'h1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_temp.copied('h5') AS copied;
+ copied 
+--------
+ f
+(1 row)
+
+SELECT dolt_branch('-d', 'h5');
+ERROR:  branch "h5" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-d', 'h1');
+ERROR:  branch "h1" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-D', 'h5');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- merged from: h2, only a head, is at main's head (a no-op); h1 is ahead
+SELECT (dolt_merge('h2'))[2:4];
+          dolt_merge           
+-------------------------------
+ {0,0,"Everything up-to-date"}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT (dolt_merge('h1'))[3];
+ dolt_merge 
+------------
+ 0
+(1 row)
+
+SELECT * FROM ho.t ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+-- deleted once merged: with copies (h1), or only a head (h3, and h4 at
+-- an older commit)
+SELECT dolt_branch('-d', 'h1', 'h3');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('h4', dolt_hashof('HEAD~1'));
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-d', 'h4', 'h2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches ORDER BY name;
+ name 
+------
+ main
+(1 row)
+
+SELECT dolt_branch('-d', 'nope');
+ERROR:  branch "nope" does not exist
+DROP SCHEMA ho CASCADE;
+NOTICE:  drop cascades to table ho.t

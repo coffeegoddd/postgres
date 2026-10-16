@@ -99,6 +99,7 @@ static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
 									  ProllyNodeRef *root);
 static bool copies_working_set(const char *branch, ProllyNodeRef *root);
+static void fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next);
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
@@ -528,6 +529,110 @@ branch_oid(const char *name)
 	return fb.branch;
 }
 
+/*
+ * A branch is its head in the refs, and its copies of the versioned
+ * schemas.  A branch made at a commit has only the head until it is first
+ * used (checked out, or its working set read): making it is O(1), and one
+ * never used costs nothing more.
+ */
+static bool
+branch_exists(const char *name)
+{
+	ProllyHash	head;
+
+	return OidIsValid(branch_oid(name)) || branch_head(name, &head);
+}
+
+/* Move the session's branch to a commit's root: its rows written. */
+static void
+move_to(void *arg)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.diff_merge, move_to, (const ProllyNodeRef *) arg);
+}
+
+static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+
+/* The session's branch folded, as a commit's fold would be: its baseline. */
+static void
+fold_as_baseline(void *arg)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef next;
+
+	fold_from_baseline(&root, &next);
+	branch_set_baseline(branch_ops()->current(), &next, &root);
+}
+
+/*
+ * Make the copies of a branch that has only its head: a copy of the
+ * session's branch's (which has the same changes since the same
+ * baseline), moved to the head's root.
+ */
+static void
+materialize(const char *name)
+{
+	ProllyHash	head;
+	ProllyCommitInfo info;
+	ProllyNodeRef baseline;
+	ProllyNodeRef working;
+
+	if (OidIsValid(branch_oid(name)) || !branch_head(name, &head))
+		return;
+	if (!copies_commit_get(&head, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the head commit of branch \"%s\" is missing", name)));
+	branch_ops()->create(name, NULL);
+	branch_set_baseline(name,
+						branch_baseline(branch_ops()->current(), &baseline) ?
+						&baseline : NULL, NULL);
+
+	/*
+	 * Moved to the head, unless the copies are there already (the session's
+	 * branch has nothing else); then folded from the head, so its folds
+	 * don't read the pages the move wrote again and again.
+	 */
+	if (!(copies_working_set(name, &working) &&
+		  same_hash(&working.hash, &info.root.hash)))
+	{
+		branch_ops()->run_on(name, move_to, &info.root);
+		branch_ops()->run_on(name, fold_as_baseline, NULL);
+	}
+}
+
+/* Visit the branches that have only a head (not yet copies). */
+static void
+visit_head_only(void (*visit) (const char *name, void *arg), void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	start = {(const uint8 *) "B", 1};
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &start, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		if (k.len < 1 || k.data[0] != TAG_BRANCH)
+			break;
+		names = lappend(names, pnstrdup((const char *) k.data + 1, k.len - 1));
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	foreach(lc, names)
+	{
+		if (!OidIsValid(branch_oid(lfirst(lc))))
+			visit(lfirst(lc), arg);
+	}
+}
+
 /* ------------------------------------------------------------------------
  * Commits
  * ------------------------------------------------------------------------
@@ -656,8 +761,8 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	/* HEAD: the session branch's head commit, as in Dolt. */
 	if (strcmp(refname, "HEAD") == 0)
 		refname = branch_ops()->current();
-	if (OidIsValid(branch_oid(refname)))
-		return branch_head(refname, commit_id);
+	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
+		return commit_id->len > 0;
 	return parse_commit_id(refname, commit_id) &&
 		copies_commit_get(commit_id, &info);
 }
@@ -796,85 +901,52 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
  * ------------------------------------------------------------------------
  */
 
-/* The session's branch folded, as a commit's fold would be: its baseline. */
-static void
-fold_as_baseline(void *arg)
-{
-	ProllyNodeRef root;
-	ProllyNodeRef next;
-
-	fold_from_baseline(&root, &next);
-	branch_set_baseline(branch_ops()->current(), &next, &root);
-}
-
-/* Move the session's branch to a commit's root: its rows written. */
-static void
-move_to(void *arg)
-{
-	ProllyDatabaseComponents dc;
-
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.diff_merge, move_to, (const ProllyNodeRef *) arg);
-}
-
 static void
 copies_branch_create(const char *name, const char *start_point)
 {
 	const char *from = start_point ? start_point : branch_ops()->current();
-	ProllyHash	head;
 	ProllyHash	id;
 	ProllyCommitInfo info;
 
 	lock_refs();
-	if (OidIsValid(branch_oid(from)))
+	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("invalid branch name \"%s\"", name)));
+	if (branch_exists(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", name)));
+
+	/*
+	 * A branch starts at its start point's head commit, as in Dolt: a
+	 * branch's uncommitted changes stay its own.  It has only the head
+	 * until it is first used.
+	 */
+	if (branch_exists(from) ? !branch_head(from, &id) :
+		!copies_resolve(from, &id))
 	{
 		ProllyNodeRef baseline;
-		ProllyNodeRef working;
-		bool		has_head = branch_head(from, &head);
 
-		if (has_head && !copies_commit_get(&head, &info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("the head commit of branch \"%s\" is missing", from)));
-
-		/*
-		 * A branch starts at the other's head commit, as in Dolt: the
-		 * other's uncommitted changes stay its own.  Its copies are the
-		 * other's (they have the same changes since the same baseline),
-		 * then moved to the head, undoing the changes, unless the other has
-		 * none; then folded from the head, so its folds don't read the
-		 * pages the move wrote again and again.
-		 */
-		branch_ops()->create(name, from);
-		/* (a branch of the same name deleted before left no entry) */
-		branch_set_head(name, has_head ? &head : NULL);
-		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL,
-							NULL);
-		if (has_head &&
-			!(copies_working_set(from, &working) &&
-			  same_hash(&working.hash, &info.root.hash)))
+		if (branch_exists(from))
 		{
-			branch_ops()->run_on(name, move_to, &info.root);
-			branch_ops()->run_on(name, fold_as_baseline, NULL);
+			/* (a branch without commits: a copy of it, as it is) */
+			materialize(from);
+			branch_ops()->create(name, from);
+			branch_set_baseline(name, branch_baseline(from, &baseline) ?
+								&baseline : NULL, NULL);
+			return;
 		}
-		return;
-	}
-
-	/* A commit: a copy of the session's branch, moved there. */
-	if (!copies_resolve(from, &id) || !copies_commit_get(&id, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch or commit \"%s\" does not exist", from)));
-	branch_ops()->create(name, NULL);
-	{
-		ProllyNodeRef baseline;
-
-		branch_set_baseline(name,
-							branch_baseline(branch_ops()->current(), &baseline) ?
-							&baseline : NULL, NULL);
 	}
-	branch_ops()->run_on(name, move_to, &info.root);
+	if (!copies_commit_get(&id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch or commit \"%s\" does not exist", from)));
 	branch_set_head(name, &id);
+	branch_set_baseline(name, NULL, NULL);
 }
 
 static void
@@ -885,14 +957,15 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	base;
 
 	lock_refs();
-	if (!force && OidIsValid(branch_oid(name)) && branch_head(name, &head) &&
+	if (!force && branch_head(name, &head) &&
 		!(branch_head(branch_ops()->current(), &ours) &&
 		  copies_merge_base(&head, &ours, &base) && same_hash(&base, &head)))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" is not fully merged", name),
 				 errhint("Delete it anyway with -D.")));
-	branch_ops()->drop(name);
+	if (OidIsValid(branch_oid(name)) || !branch_exists(name))
+		branch_ops()->drop(name);	/* (which refuses one that doesn't exist) */
 	branch_set_head(name, NULL);
 	branch_set_baseline(name, NULL, NULL);
 
@@ -923,8 +996,8 @@ copies_branch_lookup(const char *name, ProllyBranchId *branch)
 {
 	Oid			oid = branch_oid(name);
 
-	*branch = (ProllyBranchId) oid;
-	return OidIsValid(oid);
+	*branch = (ProllyBranchId) oid;	/* (invalid for one with only a head) */
+	return OidIsValid(oid) || branch_exists(name);
 }
 
 /*
@@ -963,6 +1036,18 @@ copies_checkout(const char *name)
 {
 	char	   *current = branch_ops()->current();
 
+	/* (one with only a head gets its copies, a connection's too) */
+	if (strcmp(current, name) != 0 && !OidIsValid(branch_oid(name)) &&
+		branch_exists(name))
+	{
+		bool		pushed = !ActiveSnapshotSet();
+
+		if (pushed)
+			PushActiveSnapshot(GetTransactionSnapshot());
+		materialize(name);
+		if (pushed)
+			PopActiveSnapshot();
+	}
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(branch_oid(name)))
@@ -1095,12 +1180,19 @@ visit_branch(const char *name, Oid branch, void *arg)
 }
 
 static void
+visit_head_only_branch(const char *name, void *arg)
+{
+	visit_branch(name, InvalidOid, arg);
+}
+
+static void
 copies_branches(ProllyBranchVisit visit, void *arg)
 {
 	VisitBranches vb = {visit, arg};
 
 	refs_init();
 	branch_ops()->branches(visit_branch, &vb);
+	visit_head_only(visit_head_only_branch, &vb);
 }
 
 /* A branch's versioned schemas as they are, folded: its working set. */
@@ -1119,7 +1211,16 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 		return true;
 	}
 	if (!OidIsValid(branch_oid(branch)))
-		return false;
+	{
+		ProllyHash	head;
+		ProllyCommitInfo info;
+
+		/* one with only a head: its working set is the head's */
+		if (!branch_head(branch, &head) || !copies_commit_get(&head, &info))
+			return false;
+		*root = info.root;
+		return true;
+	}
 	branch_ops()->run_on(branch, fold_into, root);
 	return true;
 }
