@@ -18,6 +18,8 @@ OBJS = \
 	canon_stub.o \
 	chunker_bytes.o \
 	chunker_keyhash.o \
+	applier_replication.o \
+	applier_stub.o \
 	chunkformat_basic.o \
 	chunker_stub.o \
 	chunkstore_journal.o \

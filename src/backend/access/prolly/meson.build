@@ -6,6 +6,8 @@ backend_sources += files(
   'canon_stub.c',
   'chunker_bytes.c',
   'chunker_keyhash.c',
+  'applier_replication.c',
+  'applier_stub.c',
   'chunkformat_basic.c',
   'chunker_stub.c',
   'chunkstore_journal.c',

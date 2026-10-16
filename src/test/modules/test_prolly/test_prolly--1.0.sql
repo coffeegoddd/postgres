@@ -186,3 +186,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_fold_items(OUT key text, OUT value text)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The row applier: insert new, update old to new, or remove old, in the
+-- table whose row type they are.
+CREATE FUNCTION test_apply(op text, old anyelement, new anyelement)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;
