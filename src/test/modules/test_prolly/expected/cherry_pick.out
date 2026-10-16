@@ -121,8 +121,9 @@ ERROR:  dolt_cherry_pick conflicts in table "t"
 DETAIL:  1 row was changed differently on both sides.
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_cherry_pick(:'two');
-ERROR:  cannot cherry-pick with uncommitted changes
-HINT:  Commit them, or reset the branch, first.
+ERROR:  local changes would be stomped by cherry-pick
+DETAIL:  Table "app.t" has uncommitted changes, and the cherry-pick changes it too.
+HINT:  Commit the changes, or reset the branch, first.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -266,8 +267,9 @@ SELECT committer, email, message FROM dolt_log('main') ORDER BY commit_order DES
 -- changes from a parent to undo.
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_revert('HEAD');
-ERROR:  cannot revert with uncommitted changes
-HINT:  Commit them, or reset the branch, first.
+ERROR:  local changes would be stomped by revert
+DETAIL:  Table "app.t" has uncommitted changes, and the revert changes it too.
+HINT:  Commit the changes, or reset the branch, first.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------

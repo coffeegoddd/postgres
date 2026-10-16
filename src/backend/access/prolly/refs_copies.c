@@ -986,13 +986,39 @@ copies_commit(const char *message, ProllyHash *commit_id)
 	commit_branch(message, parents, nparents, commit_id);
 }
 
-/* The working set: the branch as it is (the transaction sees it). */
+/*
+ * The working set: the branch as it is (the transaction sees it), or, if
+ * given, a root to commit instead; the branch's fold is its next baseline
+ * either way.
+ */
 static void
 copies_commit_with(const char *message, const ProllyHash *parents,
 				   int nparents, const ProllyNodeRef *working_set,
 				   ProllyHash *commit_id)
 {
-	commit_branch(message, parents, nparents, commit_id);
+	ProllyNodeRef root;
+	ProllyNodeRef next;
+	char	   *name;
+
+	if (working_set == NULL)
+	{
+		commit_branch(message, parents, nparents, commit_id);
+		return;
+	}
+	name = branch_ops()->current();
+	lock_refs();
+	fold_from_baseline(&root, &next);
+	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
+				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+	branch_set_head(name, commit_id);
+	branch_set_baseline(name, &next, &root);
+}
+
+static void
+copies_set_head(const ProllyHash *commit_id)
+{
+	lock_refs();
+	branch_set_head(branch_ops()->current(), commit_id);
 }
 
 /*
@@ -1302,4 +1328,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.hold = copies_hold,
 	.walk = copies_walk,
 	.checkpoint = copies_checkpoint,
+	.set_head = copies_set_head,
 };

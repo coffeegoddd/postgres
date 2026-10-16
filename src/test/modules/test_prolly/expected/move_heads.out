@@ -212,8 +212,9 @@ SELECT dolt_reset('--hard', :'c1');
 
 UPDATE app.t SET v = 'mine' WHERE id = 1;
 SELECT (dolt_merge('at_second'))[2:4];
-ERROR:  cannot merge with uncommitted changes
-HINT:  Commit them, or reset the branch, first.
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "app.t" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------

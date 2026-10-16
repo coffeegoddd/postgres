@@ -96,9 +96,10 @@ typedef struct ProllyRefsRoutine
 									   ProllyNodeRef *root);
 
 	/*
-	 * Record a commit of the current branch with these parents and this
-	 * working set (a merge, whose working set the transaction is about to
-	 * commit), and make it the branch's head commit.
+	 * Record a commit of the current branch with these parents, and make
+	 * it the branch's head commit: of its working set as the transaction
+	 * will commit it, or of working_set if it isn't NULL (a canonical root:
+	 * a merge's, leaving uncommitted changes out).
 	 */
 	void		(*commit_with) (const char *message, const ProllyHash *parents,
 								int nparents, const ProllyNodeRef *working_set,
@@ -161,13 +162,20 @@ typedef struct ProllyRefsRoutine
 	 * the transaction.  *root gets the working set's canonical root.
 	 */
 	void		(*checkpoint) (ProllyNodeRef *root);
+
+	/*
+	 * Make a commit the session branch's head commit, with the
+	 * transaction, changing nothing of its working set (a fast-forward
+	 * whose rows the caller wrote).
+	 */
+	void		(*set_head) (const ProllyHash *commit_id);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
-	"set_merge_state", "hold", "walk", "checkpoint"
+	"set_merge_state", "hold", "walk", "checkpoint", "set_head"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

@@ -1128,6 +1128,15 @@ tree_checkpoint(ProllyNodeRef *root)
 }
 
 static void
+tree_set_head(const ProllyHash *commit_id)
+{
+	ProllyBranchId branch = prolly_session_branch();
+
+	lock_refs();
+	branch_put(branch_name(branch), branch, commit_id);
+}
+
+static void
 merge_key(ProllyBranchId branch, StringInfo key)
 {
 	appendStringInfoChar(key, TAG_MERGE);
@@ -1418,4 +1427,5 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.hold = tree_hold,
 	.walk = tree_walk,
 	.checkpoint = tree_checkpoint,
+	.set_head = tree_set_head,
 };
