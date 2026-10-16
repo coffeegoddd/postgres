@@ -394,6 +394,32 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
+/* The hidden branches of sessions on commits. */
+#define DETACHED_PREFIX		"detached/"
+
+static void
+reserved_branch_name(const char *name)
+{
+	if (strncmp(name, DETACHED_PREFIX, strlen(DETACHED_PREFIX)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", DETACHED_PREFIX)));
+}
+
+/*
+ * A session on a commit leaving it, for a branch: its transactions are no
+ * longer read-only, this one included (a branch made from the commit is
+ * written now).
+ */
+static void
+leave_detached(void)
+{
+	if (!XactReadOnlyForced)
+		return;
+	XactReadOnlyForced = false;
+	XactReadOnly = DefaultXactReadOnly;
+}
+
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
  *
@@ -431,6 +457,36 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_checkout needs a branch")));
+	if (create)
+		reserved_branch_name(branch);
+
+	/*
+	 * A commit that names no branch: a detached session on it, read-only,
+	 * on a hidden branch at the commit that every session detached there
+	 * shares.  Changing anything takes a branch made from it.
+	 */
+	if (!create && !PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
+	{
+		ProllyHash	id;
+		char	   *hidden;
+
+		if (!PROLLY_CALL(refs(), resolve, branch, &id))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch or commit \"%s\" does not exist", branch)));
+		/* (a branch name has room for 40 of the hash's 64 digits) */
+		hidden = psprintf("%s%.40s", DETACHED_PREFIX, hash_hex(&id));
+		leave_detached();
+		if (!PROLLY_CALL(refs(), branch_lookup, hidden, &(ProllyBranchId) {0}))
+			PROLLY_CALL(refs(), branch_create, hidden, hash_hex(&id));
+		PROLLY_CALL(refs(), checkout, hidden);
+		XactReadOnlyForced = true;
+		XactReadOnly = true;
+		result[0] = "0";
+		result[1] = psprintf("HEAD is now at %s (detached, read-only)", hash_hex(&id));
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	leave_detached();
 	if (create)
 		PROLLY_CALL(refs(), branch_create, branch, start);
 	PROLLY_CALL(refs(), checkout, branch);
@@ -484,21 +540,35 @@ dolt_branch(PG_FUNCTION_ARGS)
 		foreach(lc, names)
 			PROLLY_CALL(refs(), branch_delete, (char *) lfirst(lc), force);
 	}
-	else if (copy)
+	else
 	{
-		if (list_length(names) != 2)
+		char	   *name;
+		char	   *from;
+		bool		was_read_only = XactReadOnly;
+
+		if (copy && list_length(names) != 2)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_branch -c needs the branch to copy and a new name")));
-		PROLLY_CALL(refs(), branch_create, (char *) lsecond(names),
-					(char *) linitial(names));
-	}
-	else
-	{
-		if (list_length(names) > 2)
+		if (!copy && list_length(names) > 2)
 			unexpected("dolt_branch", (char *) lthird(names));
-		PROLLY_CALL(refs(), branch_create, (char *) linitial(names),
-					list_length(names) > 1 ? (char *) lsecond(names) : NULL);
+		name = copy ? lsecond(names) : linitial(names);
+		from = copy ? linitial(names) :
+			list_length(names) > 1 ? (char *) lsecond(names) : NULL;
+		reserved_branch_name(name);
+
+		/* a session on a commit makes branches there, though read-only */
+		if (XactReadOnlyForced)
+			XactReadOnly = false;
+		PG_TRY();
+		{
+			PROLLY_CALL(refs(), branch_create, name, from);
+		}
+		PG_FINALLY();
+		{
+			XactReadOnly = was_read_only;
+		}
+		PG_END_TRY();
 	}
 	PG_RETURN_DATUM(text_array(1, result));
 }

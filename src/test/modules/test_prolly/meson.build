@@ -68,6 +68,7 @@ tests += {
       'constraint_violations',
       'redefined_merges',
       'type_moves',
+      'detached_checkout',
     ],
   },
   'tap': {

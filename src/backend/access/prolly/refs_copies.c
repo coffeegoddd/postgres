@@ -1057,6 +1057,10 @@ visit_branch(const char *name, Oid branch, void *arg)
 	VisitBranches *vb = arg;
 	ProllyHash	head;
 
+	/* (the hidden branches of sessions checked out at commits) */
+	if (strncmp(name, "detached/", 9) == 0)
+		return;
+
 	(void) branch_head(name, &head);
 	vb->visit(name, &head, vb->arg);
 }

@@ -545,6 +545,14 @@ assign_timezone_abbreviations(const char *newval, void *extra)
 bool
 check_transaction_read_only(bool *newval, void **extra, GucSource source)
 {
+	if (*newval == false && XactReadOnlyForced && IsTransactionState() &&
+		!InitializingParallelWorker)
+	{
+		GUC_check_errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION);
+		GUC_check_errmsg("cannot set transaction read-write mode in a session that is read-only");
+		GUC_check_errhint("A session checked out at a commit is read-only; check out a branch, or make one there.");
+		return false;
+	}
 	if (*newval == false && XactReadOnly && IsTransactionState() && !InitializingParallelWorker)
 	{
 		/* Can't go to r/w mode inside a r/o transaction */

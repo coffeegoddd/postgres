@@ -481,7 +481,7 @@ SELECT dolt_branch('-d', 'feature');
 (1 row)
 
 SELECT dolt_checkout('feature');
-ERROR:  branch "feature" does not exist
+ERROR:  branch or commit "feature" does not exist
 SELECT dolt_checkout('feature2');
             dolt_checkout            
 -------------------------------------
