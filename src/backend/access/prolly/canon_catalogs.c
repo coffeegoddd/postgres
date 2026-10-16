@@ -1359,6 +1359,67 @@ folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+/* An item's value without the data tree a table's or view's starts with. */
+static void
+definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
+{
+	*def = *v;
+	if (k->len >= 2 && (k->data[0] == 't' || k->data[0] == 'm') &&
+		k->data[1] == ':' && v->len >= 1 && v->len >= 1 + v->data[0])
+	{
+		def->data = v->data + 1 + v->data[0];
+		def->len = v->len - 1 - v->data[0];
+	}
+}
+
+/* The same items, the same values but for tables' and views' rows. */
+static bool
+folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
+{
+	Canon		cn;
+	ProllyTreeCursor *ca;
+	ProllyTreeCursor *cb;
+	bool		same = true;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	ca = PROLLY_CALL(cn.tree, cursor_open, &cn.env, a, CurrentMemoryContext);
+	cb = PROLLY_CALL(cn.tree, cursor_open, &cn.env, b, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, ca, NULL, ForwardScanDirection);
+	PROLLY_CALL(cn.tree, cursor_seek, cb, NULL, ForwardScanDirection);
+	for (;;)
+	{
+		ProllyKey	ka,
+					kb;
+		ProllyValue va,
+					vb,
+					da,
+					db;
+		bool		more_a = PROLLY_CALL(cn.tree, cursor_next, ca, &ka, &va);
+		bool		more_b = PROLLY_CALL(cn.tree, cursor_next, cb, &kb, &vb);
+
+		if (more_a != more_b)
+		{
+			same = false;
+			break;
+		}
+		if (!more_a)
+			break;
+		definition_of(&ka, &va, &da);
+		definition_of(&kb, &vb, &db);
+		if (ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0 ||
+			da.len != db.len || memcmp(da.data, db.data, da.len) != 0)
+		{
+			same = false;
+			break;
+		}
+	}
+	PROLLY_CALL(cn.tree, cursor_close, ca);
+	PROLLY_CALL(cn.tree, cursor_close, cb);
+	return same;
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -1371,6 +1432,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk = folded_walk,
 	.fold = folded_fold,
 	.tables = folded_tables,
+	.same_schema = folded_same_schema,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {

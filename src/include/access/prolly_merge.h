@@ -30,6 +30,9 @@
  *   its definition), by qualified name, in name order: added, removed or
  *   modified.  diff() may leave out the rows of tables the session branch
  *   doesn't have; tables() names them.
+ * - move_to() makes the session branch hold what a canonical root holds,
+ *   writing the rows that differ as changes (prolly_applier.h), with the
+ *   calling transaction.
  *
  * Provisional (v0).
  *
@@ -74,10 +77,11 @@ typedef struct ProllyMergeRoutine
 	void		(*resolve) (Oid relid, bool theirs);
 	void		(*tables) (const char *from_ref, const char *to_ref,
 						   ProllyTableChangeVisit visit, void *arg);
+	void		(*move_to) (const ProllyNodeRef *root);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
-	"diff", "merge", "conflicts", "resolve", "tables"
+	"diff", "merge", "conflicts", "resolve", "tables", "move_to"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 
 static inline const ProllyMergeRoutine *

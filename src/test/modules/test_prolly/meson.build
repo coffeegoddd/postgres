@@ -53,6 +53,7 @@ tests += {
       'status_diff',
       'collations',
       'applier',
+      'move_heads',
     ],
   },
   'tap': {

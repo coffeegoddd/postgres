@@ -63,7 +63,7 @@ SELECT prolly_root_hash('h') <> prolly_root_hash('main') AS other_root;
 
 -- Bad refs and start points.
 SELECT dolt_hashof('nope');
-SELECT dolt_branch('k', dolt_hashof('main~1'));
+SELECT dolt_branch('k', 'nope~1');
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'h');
 

@@ -21,6 +21,10 @@
  *				   form of the branch's versioned schemas, folded
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
+ * A branch made at a commit starts as a copy of the session's branch,
+ * moved to the commit (the rows that differ written, as a reset writes
+ * them).
+ *
  * A transaction that changes the refs first moves the store's root to
  * itself, which makes other movers wait until it ends; then each change
  * moves the root again, with the transaction.  So writers of refs take
@@ -622,29 +626,41 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
  * ------------------------------------------------------------------------
  */
 
+/* Move the session's branch to a commit's root: its rows written. */
+static void
+move_to(void *arg)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.diff_merge, move_to, (const ProllyNodeRef *) arg);
+}
+
 static void
 copies_branch_create(const char *name, const char *start_point)
 {
 	const char *from = start_point ? start_point : branch_ops()->current();
 	ProllyHash	head;
+	ProllyHash	id;
+	ProllyCommitInfo info;
 
 	lock_refs();
-	if (!OidIsValid(branch_oid(from)))
+	if (OidIsValid(branch_oid(from)))
 	{
-		ProllyHash	id;
+		branch_ops()->create(name, from);
+		/* (a branch of the same name deleted before left no entry) */
+		branch_set_head(name, branch_head(from, &head) ? &head : NULL);
+		return;
+	}
 
-		if (copies_resolve(from, &id))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("a branch can't start at a commit yet"),
-					 errhint("Start it at a branch.")));
+	/* A commit: a copy of the session's branch, moved there. */
+	if (!copies_resolve(from, &id) || !copies_commit_get(&id, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" does not exist", from)));
-	}
-	branch_ops()->create(name, from);
-	/* (a branch of the same name deleted before left no entry) */
-	branch_set_head(name, branch_head(from, &head) ? &head : NULL);
+				 errmsg("branch or commit \"%s\" does not exist", from)));
+	branch_ops()->create(name, NULL);
+	branch_ops()->run_on(name, move_to, &info.root);
+	branch_set_head(name, &id);
 }
 
 static void
@@ -763,6 +779,25 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 	return true;
 }
 
+/*
+ * Make the commit ref names the session branch's head, and move the branch
+ * there: its rows written as the commit has them.
+ */
+static void
+copies_reset(const char *ref)
+{
+	ProllyHash	target;
+	ProllyCommitInfo info;
+
+	lock_refs();
+	if (!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	move_to(&info.root);
+	branch_set_head(branch_ops()->current(), &target);
+}
+
 /* No merges yet: none is in progress. */
 static bool
 copies_merge_state(ProllyMergeState *state)
@@ -855,6 +890,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_with = copies_commit_with,
 	.branches = copies_branches,
 	.working_set = copies_working_set,
+	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.walk = copies_walk,
 };

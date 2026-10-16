@@ -1,0 +1,88 @@
+-- Moving a branch made by copying to a commit: reset, a branch at a
+-- commit, and fast-forward merges write the rows that differ.
+
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text, u int UNIQUE);
+CREATE TABLE app.k (a text);
+CREATE TABLE app.log (what text);
+CREATE FUNCTION app.logged() RETURNS trigger LANGUAGE plpgsql AS
+$$BEGIN INSERT INTO app.log VALUES (TG_OP); RETURN COALESCE(NEW, OLD); END$$;
+CREATE TRIGGER t_trig BEFORE INSERT OR UPDATE OR DELETE ON app.t
+  FOR EACH ROW EXECUTE FUNCTION app.logged();
+INSERT INTO app.t SELECT g, 'v' || g, g FROM generate_series(1, 500) g;
+INSERT INTO app.k VALUES ('x'), ('y'), ('y');
+DELETE FROM app.log;
+SELECT (dolt_commit('-Am', 'first'))[1] AS c1 \gset
+
+UPDATE app.t SET v = 'changed' WHERE id <= 3;
+DELETE FROM app.t WHERE id BETWEEN 10 AND 12;
+INSERT INTO app.t VALUES (501, 'new', 501);
+-- a row taking a unique value another row gives up
+UPDATE app.t SET u = -20 WHERE id = 20;
+UPDATE app.t SET u = 20 WHERE id = 21;
+INSERT INTO app.k VALUES ('y'), ('z');
+DELETE FROM app.k WHERE a = 'x';
+DELETE FROM app.log;
+SELECT (dolt_commit('-Am', 'second'))[1] AS c2 \gset
+SELECT count(*), sum(u) FROM app.t;
+
+-- reset --hard to the first commit: its rows, no triggers fired
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_hashof('HEAD') = :'c1' AS head_is_first;
+SELECT count(*), sum(u) FROM app.t;
+SELECT * FROM app.t WHERE id IN (1, 2, 3, 10, 11, 12, 20, 21, 501) ORDER BY id;
+SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
+SELECT count(*) AS triggered FROM app.log;
+SELECT * FROM dolt_status();
+SELECT prolly_root_hash('HEAD') = prolly_root_hash(:'c1') AS same_root;
+
+-- reset --hard HEAD drops uncommitted changes
+UPDATE app.t SET v = 'uncommitted' WHERE id = 5;
+DELETE FROM app.k;
+SELECT dolt_reset('--hard');
+SELECT v FROM app.t WHERE id = 5;
+SELECT count(*) FROM app.k;
+SELECT * FROM dolt_status();
+
+-- and goes with its transaction
+BEGIN;
+SELECT dolt_reset('--hard', :'c2');
+SELECT count(*) FROM app.t;
+ROLLBACK;
+SELECT dolt_hashof('HEAD') = :'c1' AS still_first, count(*) FROM app.t;
+
+-- A branch at a commit.
+SELECT dolt_branch('at_second', :'c2');
+SELECT dolt_hashof('at_second') = :'c2' AS at_second;
+SELECT dolt_checkout('at_second');
+SELECT count(*), sum(u) FROM app.t;
+SELECT * FROM dolt_status();
+SELECT dolt_checkout('-b', 'at_first', 'main');
+SELECT count(*) FROM app.t;
+
+-- Fast-forward: main is behind at_second.
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('at_first'))[2:4];		-- merged already
+SELECT (dolt_merge('at_second'))[2:4];
+SELECT dolt_hashof('HEAD') = :'c2' AS fast_forwarded, count(*), sum(u) FROM app.t;
+SELECT * FROM dolt_status();
+-- not over uncommitted changes
+SELECT dolt_reset('--hard', :'c1');
+UPDATE app.t SET v = 'mine' WHERE id = 1;
+SELECT (dolt_merge('at_second'))[2:4];
+SELECT dolt_reset('--hard');
+
+-- Not yet: other definitions, three-way merges.
+SELECT dolt_checkout('at_first');
+ALTER TABLE app.t ADD COLUMN w int;
+SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('at_first'))[2:4];
+SELECT dolt_reset('--hard', 'at_first');
+UPDATE app.t SET v = 'diverged' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
+SELECT (dolt_merge('at_second'))[2:4];
+SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
+
+SELECT dolt_branch('-D', 'at_first', 'at_second');
+DROP SCHEMA app CASCADE;
