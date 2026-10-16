@@ -34,10 +34,10 @@ prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
-# Commits of branches made by copying: only the page-based engine keeps
-# branches as copies, so these tests' tables are prolly's whatever
+# Version control of branches made by copying: only the page-based engine
+# keeps branches as copies, so these tests' tables are prolly's whatever
 # PROLLY_AM is.
-vc_commits.conf: FORCE
+vc.conf: FORCE
 	@{ echo "default_table_access_method = 'prolly'"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
@@ -50,7 +50,7 @@ EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
-check: check-target check-semantics check-isolation check-vc-commits check-vc check-vc-isolation check-tap
+check: check-target check-semantics check-isolation check-vc check-vc-isolation check-tap
 
 check-target: PROVE_TESTS = t/003_target_guard.pl
 check-target: require-tap temp-install
@@ -68,26 +68,23 @@ check-semantics: PROVE_TESTS = t/001_semantics.pl
 check-semantics: require-tap temp-install
 	$(prove_check)
 
-check-vc: require-legacy-vc check-vc-target temp-install prolly_am.conf
-	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_schedule
-
-# The commit and history tests on prolly claim its VC coverage only after
-# the probe passes on it.
+# The VC tests on prolly claim its coverage only after the probe passes
+# on it.
 check-vc-target-prolly: temp-install
 	$(MAKE) check-vc-target PROLLY_AM=prolly
 
-check-vc-commits: temp-install check-vc-target-prolly vc_commits.conf
-	$(pg_regress_check) --temp-config=$(CURDIR)/vc_commits.conf \
-		--schedule=$(srcdir)/vc_commits_schedule
+check-vc: temp-install check-vc-target-prolly vc.conf
+	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
+		--schedule=$(srcdir)/vc_schedule
 
 check-isolation: PROVE_TESTS = t/002_isolation.pl
 check-isolation: require-tap temp-install
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(prove_check)
 
-check-vc-isolation: require-legacy-vc check-vc-target temp-install prolly_am.conf
+check-vc-isolation: temp-install check-vc-target-prolly vc.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
-	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
+	$(pg_isolation_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_isolation_schedule
 
 # TAP tests: 1xx are durability (also run against heap), 2xx version control.
@@ -135,8 +132,8 @@ require-legacy-vc:
 	@test '$(PROLLY_AM)' != prolly || { echo 'The VC requirements use the legacy tree-engine API; run semantics, isolation and durability for prolly'; exit 1; }
 
 clean distclean:
-	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc_commits.conf output_iso
+	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
 
-.PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-vc-commits check-isolation check-vc-isolation \
+.PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE

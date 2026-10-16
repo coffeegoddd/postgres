@@ -19,5 +19,5 @@ branch from commit|t
 checkout old|t
 old rows|1:base,3:main
 after rollback|2
-ERROR:  prolly branch "vb_no_such_branch" does not exist
+ERROR:  branch "vb_no_such_branch" does not exist
 back to main|t

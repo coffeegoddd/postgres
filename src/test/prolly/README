@@ -27,20 +27,19 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	check-vc-target-guard rejects disconnected VC paths and no-op functions
 	check-isolation       concurrency behaves exactly as on heap
 	check-tap-durability  crash recovery, standby replay, prepared xacts
-	check-vc-commits      versioned schema, history independence and
-	                      canonical form of branches made by copying
-	                      (always on prolly, whatever PROLLY_AM is, after
-	                      check-vc-target passes on prolly)
-	check-vc              branches, diff and merge (tree engines only)
-	check-vc-isolation    sessions on different branches at once
-	check-tap-vc          history independence across clusters
+	check-vc              branches, versioned schema, diff, merge, history
+	                      independence and canonical form of branches made
+	                      by copying (always on prolly, whatever PROLLY_AM is)
+	check-vc-isolation    sessions on different branches at once (likewise)
+	check-tap-vc          history independence across clusters (tree
+	                      engines only)
 
 Semantics, isolation and TAP groups require --enable-tap-tests; a build
 without TAP support fails these targets instead of reporting success.
-For the page-based prolly AM, run check-semantics, check-isolation and
-check-tap-durability with PROLLY_AM=prolly.  check-vc-commits runs on it
-always; the other VC groups still describe the legacy tree-engine API and
-reject that target.
+For the page-based prolly AM, run check-semantics, check-isolation,
+check-tap-durability and check-vc-target with PROLLY_AM=prolly.  check-vc
+and check-vc-isolation run on it always; check-tap-vc still describes the
+legacy tree-engine API and rejects that target.
 
 Run check-vc-target before claiming version-control coverage for an AM:
 
@@ -53,16 +52,16 @@ using new connections so SQL writes are committed before history snapshots.
 It uses a disposable cluster and leaves its fixtures there for diagnosis.
 An unsupported or disconnected VC path fails; a successful dolt_* call or
 an empty history is not evidence of coverage. D1 and the page-based prolly
-engine pass; heap does not. check-vc-commits runs the probe on prolly
-before its tests. This is a data targeting canary, not a claim of schema,
-merge or crash-recovery coverage.
+engine pass; heap does not. check-vc and check-vc-isolation run the probe
+on prolly before their tests. This is a data targeting canary, not a claim
+of schema, merge or crash-recovery coverage.
 
-The legacy VC groups require check-vc-target before running their suites.
-CI runs the D1 probe and check-vc-target-guard. The latter proves that the
+check-tap-vc requires check-vc-target before running. CI runs the probe
+on D1 and on prolly, and check-vc-target-guard. The latter proves that the
 same probe rejects heap, plus deliberately ineffective commit, checkout
-and reset functions.
-It checks the specific failing invariant, not arbitrary SQL errors. These
-are negative controls for the harness, not functional VC passes.
+and reset functions. It checks the specific failing invariant, not
+arbitrary SQL errors. These are negative controls for the harness, not
+functional VC passes.
 
 Postgres's own regression and isolation suites, run with the engine as
 the default table AM, are separate targets, not part of "check":
