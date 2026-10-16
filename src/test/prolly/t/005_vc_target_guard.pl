@@ -21,11 +21,11 @@ my @controls = (
 		error => qr/VC target heap \[main isolated from feature rows\]: expected/,
 	},
 	{
-		# Branches copy block-mapped tables, so main is isolated from the
-		# branch's rows; but a commit captures none of them.
-		name => 'block-mapped prolly is not captured by legacy tree refs',
+		# Branches copy block-mapped tables, and commits capture their rows,
+		# but a branch can't be reset to a commit yet.
+		name => 'block-mapped prolly is not restored to a commit yet',
 		am => 'prolly',
-		error => qr/VC target prolly \[feature commit\]: SQL failed: .*nothing to commit/,
+		error => qr/VC target prolly \[restore feature HEAD\]: SQL failed: .*does not implement reset/,
 	},
 	{
 		name => 'successful no-op reset is rejected',
