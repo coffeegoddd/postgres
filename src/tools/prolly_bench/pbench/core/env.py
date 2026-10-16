@@ -13,6 +13,7 @@ import socket
 import subprocess
 from pathlib import Path
 from typing import Any
+from pbench.core.validation import sha256, fingerprint
 
 STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) \
     / "prolly_bench" / "system_settings.saved"
@@ -39,7 +40,8 @@ def _git(repo: Path) -> dict[str, Any]:
     return {"path": str(repo),
             "commit": _cmd(["git", "rev-parse", "HEAD"], repo),
             "branch": _cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo),
-            "dirty_files": len(_cmd(["git", "status", "--porcelain"], repo).splitlines())}
+            "dirty_files": len(_cmd(["git", "status", "--porcelain"], repo).splitlines()),
+            "diff_sha256": hashlib.sha256(_cmd(["git", "diff", "HEAD", "--binary"], repo).encode()).hexdigest()}
 
 
 def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str]) -> dict[str, Any]:
@@ -59,8 +61,8 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
         "os": dict(line.split("=", 1) for line in _read("/etc/os-release").splitlines()
                    if "=" in line),
         "cpu": json.loads(_cmd(["lscpu", "-J"]) or "{}"),
-        "memory_kb": next((int(l.split()[1]) for l in _read("/proc/meminfo").splitlines()
-                           if l.startswith("MemTotal")), None),
+        "memory_kb": next((int(line.split()[1]) for line in _read("/proc/meminfo").splitlines()
+                           if line.startswith("MemTotal")), None),
         "cpu_governors": governors,
         "cpu_energy_preference": epp,
         "cpu_boost": _read("/sys/devices/system/cpu/cpufreq/boost"),
@@ -92,6 +94,26 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     if tools.get("slt_source_hash_file"):
         env["slt_build_source_hash"] = _read(tools["slt_source_hash_file"])
         env["slt_source_hash"] = slt_source_hash(repo)
+    env["postgres"]["binary_hashes"] = {
+        name: sha256(bin_dir / name) for name in ("postgres", "pg_config", "psql", "pgbench", "initdb", "pg_ctl")
+        if (bin_dir / name).is_file()}
+    provenance = bin_dir.parent / "pbench-build.json"
+    env["postgres"]["build_provenance"] = json.loads(provenance.read_text()) if provenance.exists() else None
+    src = repo / "src/tools/prolly_bench"
+    env["harness_hash"] = fingerprint({str(p.relative_to(src)): sha256(p)
+        for p in sorted(src.rglob("*")) if p.is_file() and p.suffix in (".py", ".go", ".sql", ".sh", ".java")})
+    env["client_hashes"] = {name: env["postgres"]["binary_hashes"].get(name)
+                            for name in ("pgbench", "psql")}
+    for name in ("java", "sysbench"):
+        executable = shutil.which(name)
+        if executable:
+            env["client_hashes"][name] = sha256(Path(executable))
+    if tools.get("benchbase"):
+        dist = Path(tools["benchbase"])
+        env["client_hashes"]["benchbase"] = fingerprint({str(p.relative_to(dist)): sha256(p)
+            for p in sorted(dist.rglob("*.jar"))})
+    if tools.get("slt_runner") and Path(tools["slt_runner"]).is_file():
+        env["client_hashes"]["slt_runner"] = sha256(Path(tools["slt_runner"]))
     return env
 
 
@@ -115,17 +137,24 @@ def warnings(env: dict[str, Any], suite: str = "S") -> list[str]:
                  "run build_slt.sh")
     if suite == "C":
         return w  # the rest concern performance
+    provenance = env["postgres"].get("build_provenance")
+    if not provenance or provenance.get("binary_hashes") != env["postgres"].get("binary_hashes"):
+        w.append("server binary has no matching build provenance; use build_postgres.sh")
     if env["cpu_governors"] != ["performance"]:
         w.append(f"CPU governor is {env['cpu_governors']}, not performance "
                  "(run system/system_prepare.sh)")
     if env["cpu_boost"] == "1":
         w.append("CPU boost is on; clock speed varies between repetitions")
+    elif env["cpu_boost"] != "0":
+        w.append("cannot verify that CPU boost is disabled")
     if "--enable-cassert" in env["postgres"]["configure"]:
         w.append("Postgres was built with --enable-cassert; not valid for benchmarking")
     if "-O0" in env["postgres"]["cflags"] or "-O2" not in env["postgres"]["cflags"]:
         w.append(f"Postgres CFLAGS are not -O2: {env['postgres']['cflags']}")
     try:
         fs = env["filesystem"]["filesystems"][0]
+        if fs["fstype"] in ("tmpfs", "ramfs", "overlay"):
+            w.append(f"data directory uses {fs['fstype']}; not a controlled storage benchmark")
         if fs["fstype"] == "btrfs":
             w.append("data directory is on btrfs: device bytes include a large "
                      "per-fsync filesystem cost; compare WAL "

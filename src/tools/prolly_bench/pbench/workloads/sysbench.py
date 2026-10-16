@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
+from pbench.core import process
 from typing import Optional
 
 from pbench.core import registry
@@ -81,12 +81,13 @@ class S10(Workload):
                 "--pgsql-user=postgres", f"--pgsql-db={ctx.dbname}",
                 f"--tables={self._tables(ctx)}",
                 f"--table-size={int(ctx.size_params.get('sysbench_table_size', 100000))}",
-                f"--threads={ctx.key.clients}", *extra, command]
+                f"--threads={ctx.key.clients}", f"--rand-seed={ctx.params.get('seed', 1)}", *extra, command]
 
     def _sysbench(self, ctx: Context, command: str, tag: str,
                   extra: Optional[list[str]] = None) -> str:
         args = self._args(ctx, command, extra or [])
-        r = subprocess.run(args, capture_output=True, text=True,
+        r = process.run(args, capture_output=True, text=True,
+                           timeout=int(ctx.params.get("timeout_seconds", 7200)),
                            env=ctx.cluster.client_env(ctx.session_options()))
         out = " ".join(args) + "\n\n" + r.stdout + r.stderr
         (ctx.raw_dir / f"sysbench-{tag}.out").write_text(out)
@@ -112,12 +113,12 @@ class S10(Workload):
                 ctx.cluster.sql("CHECKPOINT")
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
-        cpu0 = children_cpu_seconds()
         with window:
+            cpu0 = children_cpu_seconds()
             out = self._sysbench(ctx, "run", "measure",
                                  [f"--time={ctx.measure_seconds}", "--histogram=on",
                                   "--percentile=99"])
-        client_cpu = children_cpu_seconds() - cpu0
+            client_cpu = children_cpu_seconds() - cpu0
         hist = LatencyHistogram()
         parsed = parse_sysbench_output(out, hist)
         save_histogram(ctx, "measure", hist)
@@ -135,10 +136,11 @@ class S10(Workload):
                            transactions=rows, client_cpu_seconds=client_cpu,
                            unit="row")
         metrics = {**parsed,
+                   "latency_samples": hist.count,
                    "latency_mean_ms": ms(hist.mean()),
-                   "latency_p50_ms": ms(hist.percentile(50)),
-                   "latency_p99_ms": ms(hist.percentile(99)),
-                   "latency_p999_ms": ms(hist.percentile(99.9)),
+                   "latency_p50_ms": ms(hist.reported_percentile(50)),
+                   "latency_p99_ms": ms(hist.reported_percentile(99)),
+                   "latency_p999_ms": ms(hist.reported_percentile(99.9)),
                    "latency_max_ms": ms(hist.max_us or None)}
         return Outcome(metrics=metrics, transactions=parsed["transactions"],
                        client_cpu_seconds=client_cpu,

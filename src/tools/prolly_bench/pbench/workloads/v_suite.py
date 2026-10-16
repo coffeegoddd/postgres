@@ -12,6 +12,7 @@ of background pgbench clients; without it, only one client count is run.
 from __future__ import annotations
 
 import statistics
+import math
 from contextlib import nullcontext
 from itertools import product
 from typing import Any
@@ -70,6 +71,30 @@ def vc_sql(ctx: Context):
 class VWorkload(Workload):
     suite = "V"
 
+    def check(self, ctx):
+        if ctx.table_am != "prolly_d1":
+            raise NotImplementedByEngine(f"{ctx.table_am}: no verified data-history adapter for V benchmarks")
+        # Same data-history requirement as vcscenario: restoring a committed
+        # value must actually restore SQL-visible data. Timing a ref-only
+        # function is not a version-control benchmark.
+        db = "pbench_vc_probe"
+        ctx.cluster.sql(f"CREATE DATABASE {db}")
+        try:
+            ctx.cluster.sql("""
+                CREATE TABLE target (id int PRIMARY KEY, v text);
+                INSERT INTO target VALUES (1, 'base');
+                SELECT prolly_commit('probe base');
+                UPDATE target SET v = 'dirty';
+                SELECT dolt_reset('--hard', 'HEAD');
+                DO $$ BEGIN
+                  IF (SELECT v FROM target WHERE id=1) IS DISTINCT FROM 'base' THEN
+                    RAISE EXCEPTION 'history does not restore SQL data';
+                  END IF;
+                END $$;
+            """, dbname=db, options=ctx.session_options())
+        finally:
+            ctx.cluster.sql(f"DROP DATABASE {db} WITH (FORCE)")
+
     def own_variants(self, params: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
         return [("", {})]
 
@@ -105,8 +130,9 @@ class VWorkload(Workload):
         return nullcontext()
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
-        with window, self.background(ctx) as bg:
-            outcome = self.operations(ctx)
+        with self.background(ctx) as bg:
+            with window:
+                outcome = self.operations(ctx)
         if bg is not None:
             outcome.metrics["background_tps"] = bg.tps()
         return outcome
@@ -115,7 +141,8 @@ class VWorkload(Workload):
         raise NotImplementedError
 
     def tables(self, ctx):
-        return ["vc_data"]
+        return ["vc_data"] + (["pgbench_accounts", "pgbench_branches", "pgbench_tellers",
+                               "pgbench_history"] if ctx.params["background"] == "S1" else [])
 
     def iterations(self, ctx: Context) -> int:
         return int(ctx.params.get("iterations", 10))
@@ -153,7 +180,9 @@ class V2(VWorkload):
         timed_session(ctx, [vc_sql(ctx).branch("v2_work")], "v2-prepare")
 
     def operations(self, ctx):
-        n = min(ctx.params["changes"], self.rows(ctx))
+        n = ctx.params["changes"]
+        if n > self.rows(ctx):
+            raise ValueError("V2 changes exceed the dataset; refusing to clamp the workload")
         vc = vc_sql(ctx)
         # (a checkout is the session's own, so it is this session's first
         # statement; the timings leave it out)
@@ -188,17 +217,29 @@ class V3(VWorkload):
         """SQL predicate selecting this side's changed rows."""
         n, rows = ctx.params["changes"], self.rows(ctx)
         overlap = int(n * ctx.params["conflict_percent"] / 100)
+        if n <= 0 or 2 * n - overlap > rows:
+            raise ValueError("V3 dataset cannot hold the requested change sets and overlap")
+        lo = side * (n - overlap)
         if ctx.params["locality"] == "clustered":
-            lo = 1 + side * (n - overlap)
-            return f"id BETWEEN {lo} AND {lo + n - 1}"
-        stride = max(1, rows // (2 * n))
-        offset = 0 if side == 0 else (stride // 2 or 1)
-        pred = f"id % {stride} = {offset} AND id <= {stride * n}"
-        if overlap and side == 1:
-            pred = f"({pred}) OR id % {stride} = 0 AND id <= {stride * overlap}"
-        return pred
+            return f"id BETWEEN {lo + 1} AND {lo + n}"
+        stride = max(1, rows // n)
+        while math.gcd(stride, rows) != 1:
+            stride += 1
+        # A bijection of [0, rows) gives exactly n rows per side and exactly
+        # overlap shared rows, including dense changes where old stride=1.
+        return f"((id - 1) * {stride} % {rows}) BETWEEN {lo} AND {lo + n - 1}"
 
     def operations(self, ctx):
+        predicates = [self._ids(ctx, i) for i in (0, 1)]
+        n = ctx.params["changes"]
+        overlap = int(n * ctx.params["conflict_percent"] / 100)
+        observed = ctx.cluster.scalar(
+            f"SELECT count(*) FILTER (WHERE {predicates[0]}), "
+            f"count(*) FILTER (WHERE {predicates[1]}), "
+            f"count(*) FILTER (WHERE ({predicates[0]}) AND ({predicates[1]})) FROM vc_data",
+            dbname=ctx.dbname)
+        if observed != f"{n}|{n}|{overlap}":
+            raise RuntimeError(f"V3 change-set cardinalities differ: {observed}")
         # Both sides are branches of their own, so a background workload's
         # writes (on main) are on neither and the merge doesn't touch them.
         vc = vc_sql(ctx)

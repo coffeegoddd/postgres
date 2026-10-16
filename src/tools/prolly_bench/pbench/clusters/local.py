@@ -12,6 +12,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from pbench.core import registry
+from pbench.core import process
 from pbench.core.interfaces import Cluster, SqlResult
 from pbench.core.sqlerr import raise_for_sql_error, sqlstate_of
 
@@ -41,7 +42,7 @@ class LocalCluster(Cluster):
         return str(self.bin_dir / program)
 
     def _run(self, args: list[str], **kw) -> subprocess.CompletedProcess:
-        return subprocess.run(args, capture_output=True, text=True, **kw)
+        return process.run(args, capture_output=True, text=True, timeout=600, **kw)
 
     def create(self, settings: dict[str, str]) -> None:
         if self._running:
@@ -64,7 +65,7 @@ class LocalCluster(Cluster):
 
     def start(self) -> None:
         r = self._run([self.bin("pg_ctl"), "-D", str(self.data_dir), "-l",
-                       str(self.log_file), "-w", "-t", "3600", "start"])
+                       str(self.log_file), "-w", "-t", "300", "start"])
         if r.returncode != 0:
             raise RuntimeError(f"pg_ctl start failed: {r.stdout}{r.stderr}\n"
                                f"{self.log_since(0)[-3000:]}")
@@ -74,7 +75,7 @@ class LocalCluster(Cluster):
         if not self.data_dir.exists():
             return
         r = self._run([self.bin("pg_ctl"), "-D", str(self.data_dir), "-m", mode,
-                       "-w", "-t", "3600", "stop"])
+                       "-w", "-t", "300", "stop"])
         if r.returncode != 0 and "Is server running?" not in r.stderr:
             raise RuntimeError(f"pg_ctl stop failed: {r.stdout}{r.stderr}")
         self._running = False
@@ -90,12 +91,10 @@ class LocalCluster(Cluster):
         raise RuntimeError("server did not become ready")
 
     def destroy(self) -> None:
-        try:
-            self.stop("immediate")
-        finally:
-            if self.base.exists():
-                shutil.rmtree(self.base)
-            shutil.rmtree(self.sock_dir, ignore_errors=True)
+        self.stop("immediate")
+        if self.base.exists():
+            shutil.rmtree(self.base)
+        shutil.rmtree(self.sock_dir, ignore_errors=True)
 
     # -- clients ----------------------------------------------------------
 
@@ -122,7 +121,7 @@ class LocalCluster(Cluster):
     def sql(self, sql: str, *, dbname: str = "postgres",
             options: Optional[dict[str, str]] = None,
             check: bool = True) -> SqlResult:
-        r = subprocess.run(
+        r = process.run(
             [self.bin("psql"), "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
              "-v", "VERBOSITY=verbose", "-d", dbname, "-f", "-"],
             input=sql, capture_output=True, text=True, env=self.client_env(options))

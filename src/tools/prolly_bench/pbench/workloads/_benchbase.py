@@ -13,7 +13,8 @@ import json
 import math
 import re
 import shutil
-import subprocess
+import time
+from pbench.core import process
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,7 @@ def check(ctx: Context) -> None:
 
 
 def _config(ctx: Context, bench: str, scalefactor: float, seconds: int,
-            serial: bool = False) -> Path:
+            serial: bool = False, suffix: str = "") -> Path:
     if bench not in {"tpcc", "tpch"}:
         raise ValueError(f"no BenchBase config template for {bench}")
     if not math.isfinite(scalefactor) or scalefactor <= 0:
@@ -61,6 +62,7 @@ def _config(ctx: Context, bench: str, scalefactor: float, seconds: int,
   <reconnectOnConnectionFailure>true</reconnectOnConnectionFailure>
   <isolation>{escape(isolation)}</isolation>
   <batchsize>128</batchsize>
+  <randomSeed>{ctx.params.get('seed', 1)}</randomSeed>
   <scalefactor>{scalefactor}</scalefactor>
   <terminals>{ctx.key.clients}</terminals>
   <works>
@@ -76,7 +78,7 @@ def _config(ctx: Context, bench: str, scalefactor: float, seconds: int,
   </transactiontypes>
 </parameters>
 """
-    path = ctx.raw_dir / f"benchbase-{bench}.xml"
+    path = ctx.raw_dir / f"benchbase-{bench}{suffix}.xml"
     path.write_text(xml)
     return path
 
@@ -86,10 +88,13 @@ def _run(ctx: Context, bench: str, cfg: Path, out_dir: Path, *, create: bool,
     args = ["java", "-jar", "benchbase.jar", "-b", bench, "-c", str(cfg.resolve()),
             f"--create={str(create).lower()}", f"--load={str(load).lower()}",
             f"--execute={str(execute).lower()}", "-d", str(out_dir.resolve())]
+    if tag == "correctness":
+        args.insert(1, "-Dpbench.answers=" + str((ctx.raw_dir / "tpch-answers.jsonl").resolve()))
     if execute:
         out_dir.mkdir(parents=True, exist_ok=True)
         args += ["--json-histograms", str((out_dir / "transactions.json").resolve())]
-    r = subprocess.run(args, cwd=_dist(ctx), capture_output=True, text=True)
+    r = process.run(args, cwd=_dist(ctx), capture_output=True, text=True,
+                    timeout=int(ctx.params.get("timeout_seconds", 7200)))
     logged = r.stdout + r.stderr
     out = " ".join(args) + "\n\n" + logged
     (ctx.raw_dir / f"benchbase-{tag}.out").write_text(out)
@@ -127,11 +132,13 @@ def execute(ctx: Context, bench: str, window: Optional[Window], *,
     # RAM, and copy only the small summary files to the results.
     out_dir = ctx.scratch_dir / f"benchbase-{tag}"
     cfg = _config(ctx, bench, scalefactor, seconds, serial)
-    cpu0 = children_cpu_seconds()
     with window or nullcontext():
+        cpu0 = children_cpu_seconds()
+        started = time.monotonic()
         output = _run(ctx, bench, cfg, out_dir, create=False, load=False, execute=True,
                       tag=tag)
-    client_cpu = children_cpu_seconds() - cpu0
+        process_seconds = time.monotonic() - started
+        client_cpu = children_cpu_seconds() - cpu0
 
     summary_files = sorted(out_dir.glob("*.summary.json"))
     if not summary_files:
@@ -169,13 +176,19 @@ def execute(ctx: Context, bench: str, window: Optional[Window], *,
     if summary.get("Final State") not in {"DONE", "EXIT"} or requests <= 0:
         raise RuntimeError(f"BenchBase {tag} did not complete useful work: {summary}")
     counts = json.loads((keep / "transactions.json").read_text())
+    for kind in ("completed", "aborted", "rejected", "unexpected"):
+        count = counts[kind]["NUM_SAMPLES"]
+        if type(count) is not int or count < 0:
+            raise RuntimeError(f"invalid BenchBase {kind} count")
+    completed = counts["completed"]["NUM_SAMPLES"]
+    if not completed or requests != hist.count:
+        raise RuntimeError("BenchBase has no successful work or incomplete latency records")
     unexpected = counts["unexpected"]["NUM_SAMPLES"]
     # This BenchBase revision treats PostgreSQL deadlocks as unexpected,
     # not retryable. They are ordinary contention failures in TPC-C; keep
     # them in failed_transactions, but reject any other unexpected error.
     # (BenchBase counts in the histogram only errors while measuring, but
     # logs every one, and may log one twice: the log can have more.)
-    executions = requests
     failed = re.findall(r"will not be retried\.\.\. sql state \[(\w*)\]", output)
     deadlocks = failed.count("40P01") if bench == "tpcc" else 0
     others = len(failed) - deadlocks
@@ -191,21 +204,30 @@ def execute(ctx: Context, bench: str, window: Optional[Window], *,
             if (set(queries) != set(_TPCH_TYPES)
                     or any(query["count"] != 1 for query in queries.values())):
                 raise RuntimeError(f"TPC-H {tag} did not complete one measured run of Q1-Q22")
-            # BenchBase's serial mode runs each query cold first, unrecorded
-            # in the samples but counted as completed: the window's work
-            # (WAL, CPU, writes per query) is every execution's.
-            executions = max(requests, float(counts["completed"]["NUM_SAMPLES"]))
     metrics = {
-        "tps": summary.get("Throughput (requests/second)"),
-        "goodput_tps": summary.get("Goodput (requests/second)"),
-        "transactions": requests,
+        "latency_samples": hist.count,
+        "completed_operations": completed,
+        "aborted_operations": counts["aborted"]["NUM_SAMPLES"],
+        "rejected_operations": counts["rejected"]["NUM_SAMPLES"],
+        # Upstream latency samples count attempts in its active phase,
+        # while outcome histograms span the entire client lifecycle.
+        # Its goodput divides the latter by the former's time, and can
+        # exceed throughput. Keep these as client-reported diagnostics.
+        "client_reported_tps": summary.get("Throughput (requests/second)"),
+        "client_reported_goodput_tps": summary.get("Goodput (requests/second)"),
+        "measured_requests": requests,
+        "tps": completed / process_seconds,
+        "client_process_seconds": process_seconds,
+        "transactions": completed,
         "failed_transactions": unexpected,
         "latency_mean_ms": ms(hist.mean()),
-        "latency_p50_ms": ms(hist.percentile(50)),
-        "latency_p99_ms": ms(hist.percentile(99)),
-        "latency_p999_ms": ms(hist.percentile(99.9)),
+        "latency_p50_ms": ms(hist.reported_percentile(50)),
+        "latency_p99_ms": ms(hist.reported_percentile(99)),
+        "latency_p999_ms": ms(hist.reported_percentile(99.9)),
         "latency_max_ms": ms(hist.max_us or None),
     }
-    return Outcome(metrics=metrics, transactions=executions,
+    return Outcome(metrics=metrics, transactions=completed,
                    client_cpu_seconds=client_cpu,
-                   notes=[f"BenchBase final state: {summary.get('Final State')}"])
+                   notes=[f"BenchBase final state: {summary.get('Final State')}",
+                          "throughput and resource denominator use successful operations over the client process; "
+                          "latencies cover active-phase attempts, including failures"])

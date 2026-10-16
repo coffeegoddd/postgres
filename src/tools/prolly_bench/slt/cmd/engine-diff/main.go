@@ -83,6 +83,11 @@ func run() error {
 		}
 	}
 	completed := 0
+	// Persist every requested seed and family before the first execution.
+	// A process crash must leave a denominator, including work not yet run.
+	if err := writeJSON(filepath.Join(*out, "planned.json"), programs); err != nil {
+		return err
+	}
 	for _, p := range programs {
 		dir := filepath.Join(*out, fmt.Sprintf("seed-%d", p.Seed))
 		if err := os.Mkdir(dir, 0755); err != nil {

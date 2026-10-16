@@ -167,8 +167,9 @@ affect how results are read:
   `search_path` (until 2026-10-15, `--am prolly` measured heap). Every cell
   checks its tables' AM. Indexes, including primary keys, are created with their default AM
   (btree); see open question 19.
-- **CPU** is measured system-wide (`/proc/stat`) minus the CPU of the client
-  programs (pgbench, BenchBase), which run on the same machine.
+- **CPU** from `/proc/stat` and perf is explicitly labeled host activity.
+  It is not attributed to the server by subtracting client CPU. A server-only
+  CPU figure requires a separate trustworthy accounting source.
 - **Device bytes** come from `/proc/diskstats` for the device holding the data
   directory, so they include anything else writing to that device. The data
   directory is made copy-on-write-free on btrfs (`chattr +C`), which also
@@ -178,12 +179,19 @@ affect how results are read:
   tmpfs directory; only a latency histogram and small summaries are kept with
   the results. `latency_sampling_rate` (0.1 in the standard config) bounds
   how much pgbench logs in long, fast windows.
-- **Recovery time** is measured after every cell's window: crash with
+- **Process restart time** is measured before post-run maintenance: crash with
   `pg_ctl -m immediate`, restart, time to accepting connections. The WAL
   volume replayed (since the last redo point) is recorded with it rather than
-  fixed in advance.
-- **Space amplification** is `pg_total_relation_size` of the workload's tables
-  over the sum of `pg_column_size` of their rows.
+  fixed in advance. Typed table-content digests must match before and after
+  restart. The OS cache is warm; this does not simulate power loss.
+- **Storage accounting** reports relation/database bytes separately from cluster
+  apparent and allocated bytes including global engine stores and WAL. The old
+  relation-size/row-representation ratio is not a valid D1 space amplification.
+- **Evidence** uses a versioned pre-run plan and atomic completion manifest with
+  artifact hashes. Reports and gates reject incomplete, corrupt, mistargeted or
+  incompatible evidence. Paired cells are interleaved in seeded random order.
+  Smoke ratios do not establish performance differences; benchmark-quality
+  repetitions carry paired-bootstrap intervals and explicit metric scopes.
 - **V workloads** take a "background" variant (`none` or `S1`); with `S1` the
   client count is the number of background pgbench clients.
 - **Statuses.** `not_implemented` (SQLSTATE 0A000 from the engine, read from

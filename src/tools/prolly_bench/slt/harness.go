@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -43,6 +43,8 @@ const (
 // result, summarized, or the error's SQLSTATE.  Records are identified by
 // file and line, the same for every engine.
 type digest struct {
+	Version  int    `json:"version"`
+	SortMode string `json:"sort_mode,omitempty"`
 	File     string `json:"f"`
 	Line     int    `json:"l"`
 	Rows     int    `json:"n,omitempty"`
@@ -185,6 +187,7 @@ func (h *harness) finishFile() {
 		tables, wrong, err := h.checkAM()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: checking table AMs: %v\n", h.file, err)
+			wrong = append(wrong, "target-check-failed:"+err.Error())
 		}
 		res.Tables, res.WrongAM = tables, wrong
 	}
@@ -254,9 +257,18 @@ func (h *harness) ExecuteStatementContext(ctx context.Context, statement string)
 	if h.event != "" {
 		return h.notRun(line)
 	}
-	_, err := h.conn.Exec(ctx, statement).ReadAll()
+	results, err := h.conn.Exec(ctx, statement).ReadAll()
 	if err != nil {
 		h.recordError(ctx, line, err)
+	} else if ctx.Err() == nil {
+		// Statements need evidence too: absence of an error log is not proof
+		// of execution. Include every command tag (including affected rows).
+		var tags []string
+		for _, r := range results {
+			tags = append(tags, r.CommandTag.String())
+		}
+		h.writeDigest(digest{Version: 2, File: h.file, Line: line,
+			Ordered: hashValues(tags), Sorted: hashValues(tags)})
 	}
 	return err
 }
@@ -288,8 +300,10 @@ func (h *harness) ExecuteQueryContext(ctx context.Context, statement string) (st
 	}
 	schema, values := formatResult(res)
 	if ctx.Err() == nil {
-		h.writeDigest(digest{File: h.file, Line: line, Rows: len(res.Rows),
-			Ordered: hashValues(values), Sorted: hashSortedRows(values, len(schema))})
+		ordered, sorted := exactResult(res)
+		mode := h.records[h.next-1].SortString()
+		h.writeDigest(digest{Version: 2, File: h.file, Line: line, Rows: len(res.Rows),
+			Ordered: ordered, Sorted: sorted, SortMode: mode})
 	}
 	return schema, values, nil
 }
@@ -312,7 +326,7 @@ func (h *harness) notRun(line int) error {
 	if h.event == evInitFailed {
 		ev = evInitFailed
 	}
-	h.writeDigest(digest{File: h.file, Line: line, Event: ev})
+	h.writeDigest(digest{Version: 2, File: h.file, Line: line, Event: ev})
 	return fmt.Errorf("not run: %s earlier in this file", h.event)
 }
 
@@ -320,7 +334,7 @@ func (h *harness) recordError(ctx context.Context, line int, err error) {
 	if ctx.Err() != nil {
 		return // a timeout; the runner logs it
 	}
-	d := digest{File: h.file, Line: line}
+	d := digest{Version: 2, File: h.file, Line: line}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		d.SQLState = pgErr.Code
@@ -489,8 +503,28 @@ func formatValue(oid uint32, v []byte) string {
 }
 
 func hashValues(values []string) string {
-	sum := md5.Sum([]byte(strings.Join(values, "\n")))
-	return hex.EncodeToString(sum[:8])
+	b, _ := json.Marshal(values)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// exactResult is deliberately separate from corpus formatting. JSON frames
+// preserve NULL versus empty/text, cell/row boundaries, all bytes and types.
+// Sorting whole rows preserves duplicates and column associations.
+func exactResult(res *pgconn.Result) (string, string) {
+	types := make([]uint32, len(res.FieldDescriptions))
+	for i, fd := range res.FieldDescriptions {
+		types[i] = fd.DataTypeOID
+	}
+	t, _ := json.Marshal(types)
+	rows := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		b, _ := json.Marshal(row)
+		rows = append(rows, string(b))
+	}
+	ordered := hashValues(append([]string{string(t)}, rows...))
+	sort.Strings(rows)
+	return ordered, hashValues(append([]string{string(t)}, rows...))
 }
 
 // hashSortedRows hashes the rows in sorted order, so two results with the
@@ -501,7 +535,8 @@ func hashSortedRows(values []string, cols int) string {
 	}
 	rows := make([]string, 0, len(values)/cols)
 	for i := 0; i+cols <= len(values); i += cols {
-		rows = append(rows, strings.Join(values[i:i+cols], "\t"))
+		b, _ := json.Marshal(values[i : i+cols])
+		rows = append(rows, string(b))
 	}
 	sort.Strings(rows)
 	return hashValues(rows)

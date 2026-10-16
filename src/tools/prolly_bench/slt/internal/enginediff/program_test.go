@@ -7,7 +7,7 @@ import (
 )
 
 func TestGenerateReplayAndCoverage(t *testing.T) {
-	p := Generate(42, 28)
+	p := Generate(42, 36)
 	b, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)
@@ -16,17 +16,17 @@ func TestGenerateReplayAndCoverage(t *testing.T) {
 	if err := json.Unmarshal(b, &replay); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(p, replay) || !reflect.DeepEqual(p, Generate(42, 28)) {
+	if !reflect.DeepEqual(p, replay) || !reflect.DeepEqual(p, Generate(42, 36)) {
 		t.Fatal("seed and serialized replay must reproduce the same program")
 	}
-	if reflect.DeepEqual(p, Generate(43, 28)) {
+	if reflect.DeepEqual(p, Generate(43, 36)) {
 		t.Fatal("seeds did not change the workload")
 	}
 	seen := map[string]int{}
 	for _, g := range p.Groups {
 		seen[g.Name]++
 	}
-	if len(seen) != 14 {
+	if len(seen) != 18 {
 		t.Fatalf("missing workload families: %v", seen)
 	}
 	for _, n := range seen {

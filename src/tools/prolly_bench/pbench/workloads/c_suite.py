@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+from pbench.core import process
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -73,7 +73,7 @@ class CWorkload(Workload):
             args += ["-schema", target.schema]
         args += self.files(ctx)
         with window:
-            r = subprocess.run(args, capture_output=True, text=True)
+            r = process.run(args, capture_output=True, text=True)
         (ctx.raw_dir / "slt-runner.out").write_text(" ".join(args) + "\n\n" + r.stdout + r.stderr)
         summary_path = out / "summary.json"
         if r.returncode not in (0, 3) or not summary_path.exists():

@@ -18,8 +18,12 @@ echo "BenchBase $src at $commit ($(git -C "$src" rev-parse --abbrev-ref HEAD), $
 
 mkdir -p "$out"
 rsync -a --delete --exclude .git --exclude target "$src/" "$out/src/"
-(cd "$out/src" && ./mvnw -q -B package -P postgres -DskipTests)
+python3 "$repo/src/tools/prolly_bench/benchbase/instrument.py" "$out/src"
+# Source is copied without .git. Do not let the metadata plugin discover
+# and fetch the enclosing PostgreSQL repository; provenance is recorded here.
+(cd "$out/src" && ./mvnw -q -B package -P postgres -DskipTests -Dmaven.gitcommitid.skip=true)
 rm -rf "$out/benchbase-postgres"
 tar xzf "$out/src/target/benchbase-postgres.tgz" -C "$out"
 echo "$commit" > "$out/BUILD_COMMIT"
+echo "1" > "$out/benchbase-postgres/PBENCH_ANSWERS_VERSION"
 echo "built $out/benchbase-postgres"

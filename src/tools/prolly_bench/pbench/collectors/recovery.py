@@ -8,14 +8,17 @@ import time
 
 from pbench.core import registry
 from pbench.core.interfaces import Collector
+from pbench.core.correctness import table_digests
+from pbench.core.validation import atomic_json
 
 
 @registry.collectors.register("recovery")
 class RecoveryCollector(Collector):
     name = "recovery"
-    post_order = 100  # last: it crashes the server
+    post_order = -100  # before VACUUM or other maintenance changes the fixture
 
     def post(self, ctx, outcome):
+        before = table_digests(ctx)
         replay = float(ctx.cluster.scalar(
             "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), redo_lsn) "
             "FROM pg_control_checkpoint()"))
@@ -24,5 +27,11 @@ class RecoveryCollector(Collector):
         ctx.cluster.start()
         ctx.cluster.wait_ready()
         seconds = time.monotonic() - t0
-        return {"recovery_seconds": seconds, "recovery_wal_bytes": replay,
+        after = table_digests(ctx)
+        atomic_json(ctx.raw_dir / "recovery-correctness.json", {
+            "before": before, "after": after, "equal": before == after,
+            "scope": "process crash, warm OS cache after integrity scan, before maintenance"})
+        if before != after:
+            raise RuntimeError("recovered table contents differ from committed pre-crash data")
+        return {"process_restart_seconds": seconds, "recovery_wal_bytes": replay,
                 "recovery_seconds_per_gb": seconds / (replay / 2**30) if replay else None}

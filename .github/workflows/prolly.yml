@@ -21,12 +21,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sanitizers:
+    name: nightly address and undefined-behavior checks
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang bison flex \
+            libicu-dev libipc-run-perl libreadline-dev libssl-dev zlib1g-dev
+      - name: Build and exercise storage and durability
+        run: |
+          ./configure --enable-cassert --enable-tap-tests --enable-injection-points \
+            CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            LDFLAGS='-fsanitize=address,undefined'
+          make -s -j4
+          make -s -j4 -C contrib
+          make -C src/test/modules/test_prolly check
+          make -C src/test/prolly check-target check-semantics check-isolation \
+            check-tap-durability PROLLY_AM=prolly
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: sanitizer-evidence
+          path: |
+            **/tmp_check/log/**
+            **/regression.diffs
+
+  controlled-performance:
+    name: controlled host performance evidence
+    if: github.event_name == 'workflow_dispatch' && vars.PROLLY_BENCHMARK_RUNNER_ENABLED == 'true'
+    runs-on: [self-hosted, linux, prolly-benchmark]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build attested release binaries
+        run: |
+          bash src/tools/prolly_bench/build_postgres.sh \
+            --build-dir "$PWD/build-bench/controlled-${GITHUB_RUN_ID}" -- --with-openssl
+      - name: Paired storage sweeps on the provisioned data device
+        env:
+          PBENCH_DATA_ROOT: ${{ vars.PROLLY_BENCHMARK_DATA_ROOT }}
+        run: |
+          test -n "$PBENCH_DATA_ROOT"
+          src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
+            --workloads S1,S2 --clients 1 --quality benchmark \
+            --pg-bin "$PWD/build-bench/controlled-${GITHUB_RUN_ID}/inst/bin" \
+            --work-dir "$PBENCH_DATA_ROOT" --out "$PWD/engine-results/performance"
+          src/tools/prolly_bench/prolly_bench table --results "$PWD/engine-results/performance"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: controlled-performance-evidence
+          path: engine-results/performance/**
+
   # code that only an assertion-enabled build compiles in can leave a
   # release build broken
   release-build:
     name: build without assertions
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -34,19 +94,52 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench
 
       - name: Build
         run: |
-          ./configure --enable-injection-points --with-openssl
+          ./configure --prefix="$PWD/build-rel/inst" --enable-injection-points --with-openssl
           make -s -j4 COPT=-Werror
           make -s -j4 -C contrib COPT=-Werror
           make -s -j4 -C src/test/modules COPT=-Werror
+          make -s install
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Fetch pinned BenchBase source
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/benchbase
+          ref: a3a748326f4d1e615fd12db4a6ae59a60190a6ee
+          path: benchbase-source
+
+      - name: Build BenchBase
+        run: bash src/tools/prolly_bench/build_benchbase.sh "$PWD/benchbase-source"
+
+      - name: Release benchmark clients, collectors and invariants
+        run: |
+          src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
+            --workloads S1,S4,S9,S10,S13 --config src/tools/prolly_bench/configs/integration.toml \
+            --work-dir "$RUNNER_TEMP/benchmark-smoke" --out "$PWD/engine-results/benchmark-smoke"
+          src/tools/prolly_bench/prolly_bench table --results "$PWD/engine-results/benchmark-smoke"
+          src/tools/prolly_bench/prolly_bench run V --am prolly_d1 \
+            --workloads V1,V2 --config src/tools/prolly_bench/configs/integration.toml \
+            --work-dir "$RUNNER_TEMP/v-smoke" --out "$PWD/engine-results/v-smoke"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-benchmark-evidence
+          path: engine-results/**
 
   build-and-test:
     name: build and test
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -176,11 +269,11 @@ jobs:
           NIGHTLY: ${{ github.event_name == 'schedule' }}
         run: |
           seeds=5
-          steps=28
+          steps=36
           seed=1
           if [ "$NIGHTLY" = true ]; then
             seeds=100
-            steps=56
+            steps=72
             seed="$GITHUB_RUN_NUMBER"
           fi
           failed=0
@@ -207,6 +300,14 @@ jobs:
             --work-dir "$RUNNER_TEMP/c-suite" --out "$PWD/engine-results/c-suite"
           src/tools/prolly_bench/prolly_bench cgate \
             engine-results/c-suite/*-C-B0 engine-results/c-suite/*-C-prolly
+
+      - name: Full pinned SQLLogicTest corpus (nightly)
+        if: github.event_name == 'schedule'
+        run: |
+          src/tools/prolly_bench/prolly_bench run C --am heap,prolly \
+            --config src/tools/prolly_bench/configs/c_full_ci.toml \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
+            --work-dir "$RUNNER_TEMP/c-full" --out "$PWD/engine-results/c-full"
 
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench

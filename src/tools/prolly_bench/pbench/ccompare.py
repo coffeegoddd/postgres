@@ -16,10 +16,12 @@ import subprocess
 import tempfile
 import tomllib
 from collections import Counter, defaultdict
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from pbench.table import ResultSet
+from pbench.core.validation import sha256, compatible
 
 HERE = Path(__file__).resolve().parents[1]
 EXCEPTIONS = HERE / "configs" / "c_exceptions.toml"
@@ -28,7 +30,7 @@ EXCEPTIONS = HERE / "configs" / "c_exceptions.toml"
 CLASSES = ["agree", "order_only", "not_implemented", "regression", "hidden_regression",
            "postgres_semantics", "engine_only_pass", "crashed", "timeout", "did_not_run",
            "baseline_did_not_run", "exception", "unmatched"]
-GATE_CLASSES = ["regression", "hidden_regression", "crashed", "unmatched"]
+GATE_CLASSES = [c for c in CLASSES if c not in ("agree", "postgres_semantics", "exception")]
 # Engine statuses in display order (slt/merge.go).
 STATUSES = ["ok", "not_ok", "not_implemented", "crashed", "timeout", "did_not_run"]
 
@@ -37,7 +39,7 @@ def slt_dirs(rs: ResultSet) -> dict[str, Path]:
     """Workload -> slt-runner output directory, for cells that completed."""
     out = {}
     for r in rs.results:
-        d = Path(r["raw_dir"]) / "slt"
+        d = rs.path / r["raw_dir"] / "slt"
         if r["status"] == "ok" and (d / "records.jsonl.gz").exists():
             out[r["key"]["workload"]] = d
     return out
@@ -58,8 +60,10 @@ def exceptions_for(am: str, path: Path = EXCEPTIONS) -> list[dict[str, Any]]:
         return []
     with open(path, "rb") as f:
         entries = tomllib.load(f).get("exception", [])
-    return [{"file": e["file"], "line": int(e["line"]), "reason": e["reason"]}
-            for e in entries if e.get("am") in (None, am)]
+    if any(not e.get("am") for e in entries):
+        raise ValueError("correctness exceptions must name one engine")
+    return [{k: v for k, v in e.items() if k != "am"}
+            for e in entries if e["am"] == am]
 
 
 def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
@@ -77,17 +81,73 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
             inputs.append(runner)
         if EXCEPTIONS.exists():
             inputs.append(EXCEPTIONS)
-        if not result.exists() or result.stat().st_mtime < max(p.stat().st_mtime for p in inputs):
+        stamp = dest / "inputs.json"
+        identity = {str(p): sha256(p) for p in inputs}
+        differences = dest / "diffs.jsonl.gz"
+        valid_cache = False
+        if result.exists() and stamp.exists() and differences.exists():
+            try:
+                valid_cache = json.loads(stamp.read_text()) == {
+                    "inputs": identity, "result": sha256(result), "diffs": sha256(differences)}
+            except ValueError:
+                pass
+        if not valid_cache:
             with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
                 json.dump(exc, f)
                 f.flush()
                 r = subprocess.run([str(runner), "compare", str(base_dirs[w]),
                                     str(eng_dirs[w]), str(dest), f.name],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, timeout=3600)
             if r.returncode != 0:
                 raise RuntimeError(f"slt-runner compare failed: {r.stderr[-2000:]}")
+            stamp.write_text(json.dumps({"inputs": identity, "result": sha256(result),
+                                        "diffs": sha256(differences)}, sort_keys=True))
         out[w] = json.loads(result.read_text())
     return out
+
+
+def evidence(d: Path, am: str) -> tuple[list[str], dict]:
+    """Reconcile raw records against the plan and summary; never trust counts alone."""
+    problems = []
+    try:
+        summary = json.loads((d / "summary.json").read_text())
+        corpus = json.loads((d / "corpus.json").read_text())
+        if summary["am"] != am or not corpus:
+            problems.append("wrong engine or empty corpus")
+        if summary["wrong_am_files"] or summary["unmatched_digests"] or summary["unparsed_lines"]:
+            problems.append("wrong target, unmatched digests or unparsed log records")
+        counts, previous, total = Counter(), None, 0
+        with gzip.open(d / "planned.jsonl.gz", "rt") as plan, gzip.open(d / "records.jsonl.gz", "rt") as records:
+            for expected, actual in zip_longest(plan, records):
+                if expected is None or actual is None:
+                    raise ValueError("missing or unexpected records")
+                expected, r = json.loads(expected), json.loads(actual)
+                key = (r["file"], r["line"])
+                status = r["status"]
+                if (key != (expected["file"], expected["line"]) or r["file"] not in corpus
+                        or previous is not None and key <= previous or r.get("version") != 2):
+                    raise ValueError("duplicate, unordered, unplanned or legacy record")
+                if expected["skip"] != (status == "skipped"):
+                    raise ValueError("unexpected skip or execution of excluded record")
+                if status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
+                    problems.append(f"{key}: {status}")
+                if status in ("ok", "not_ok") and not (r.get("sqlstate") or (r.get("o") and r.get("s"))):
+                    raise ValueError("missing actual execution evidence")
+                previous = key
+                total += 1
+                counts[status] += 1
+        if not total:
+            problems.append("empty run")
+        if summary["total"] != total or +Counter(summary["counts"]) != counts:
+            problems.append("summary counts differ from raw records")
+        files = [json.loads(line) for line in (d / "files.jsonl").read_text().splitlines()]
+        if (summary["files"] != len(files) or len(files) != len(corpus)
+                or {f["file"] for f in files} != corpus.keys()
+                or any(f.get("wrong_am") or f.get("event") for f in files)):
+            problems.append("incomplete or failed file evidence")
+        return problems, corpus
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as e:
+        return [f"invalid correctness evidence: {e}"], {}
 
 
 def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
@@ -96,7 +156,7 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
     Order-only findings require review here; the reporting comparator doesn't
     distinguish a required ORDER BY from an unspecified result order.
     """
-    problems = []
+    problems = compatible(base.path, eng.path)
     if base.suite != "C" or eng.suite != "C" or base.table_am != "heap":
         return ["the gate needs C results with heap as the baseline"]
     required = set(workloads)
@@ -110,25 +170,24 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
         if set(dirs) != required:
             problems.append(f"{name}: incomplete cells or missing records")
         for w, d in dirs.items():
-            try:
-                summary = json.loads((d / "summary.json").read_text())
-                if summary["total"] <= 0 or summary["files"] <= 0:
-                    problems.append(f"{name}/{w}: empty run")
-                if summary["wrong_am_files"] or summary["unmatched_digests"]:
-                    problems.append(f"{name}/{w}: wrong AM or missing digests")
-                for status in ("not_implemented", "timeout", "did_not_run", "crashed"):
-                    if summary["counts"].get(status, 0):
-                        problems.append(f"{name}/{w}: {status}")
-            except (OSError, ValueError, KeyError) as e:
-                problems.append(f"{name}/{w}: invalid summary: {e}")
+            errors, corpus = evidence(d, rs.table_am)
+            problems.extend(f"{name}/{w}: {e}" for e in errors)
+            if name != "heap" and w in slt_dirs(base):
+                _, baseline_corpus = evidence(slt_dirs(base)[w], "heap")
+                if corpus != baseline_corpus:
+                    problems.append(f"{name}/{w}: different corpus contents")
     if problems:
         return problems
-    comparisons = compare(base, eng)
+    try:
+        comparisons = compare(base, eng)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return [f"comparison failed: {e}"]
     if set(comparisons) != required:
         problems.append("missing workload comparisons")
     for w, result in comparisons.items():
         counts = result["counts"]
-        if sum(counts.values()) <= 0:
+        expected = json.loads((slt_dirs(eng)[w] / "summary.json").read_text())["total"]
+        if sum(counts.values()) != expected or expected <= 0:
             problems.append(f"{w}: no compared records")
         for kind, count in counts.items():
             if count and kind not in ("agree", "postgres_semantics", "exception"):
@@ -159,6 +218,8 @@ def _pct(ok: int, ran: int) -> str:
 
 
 def to_markdown(sets: list[ResultSet]) -> str:
+    if len({s.label for s in sets}) != len(sets):
+        raise ValueError("result labels must be unique")
     sets = sorted(sets, key=lambda s: (not s.is_baseline, s.label))
     base = next((s for s in sets if s.is_baseline), None)
     workloads = sorted({r["key"]["workload"] for s in sets for r in s.results},
@@ -197,7 +258,11 @@ def to_markdown(sets: list[ResultSet]) -> str:
     for s in sets:
         if s is base:
             continue
-        cmps = compare(base, s)
+        problems = gate(base, s, workloads)
+        try:
+            cmps = compare(base, s) if not problems else {}
+        except (RuntimeError, OSError, ValueError):
+            cmps = {}
         out.append(f"## {s.label} compared with {base.label}\n")
         present = [c for c in CLASSES
                    if c == "regression" or any(cm["counts"].get(c) for cm in cmps.values())]
@@ -207,7 +272,7 @@ def to_markdown(sets: list[ResultSet]) -> str:
         for w in workloads:
             cm = cmps.get(w)
             if cm is None:
-                out.append(f"| {w} | " + " | ".join("-" for _ in present) + " | - |")
+                out.append(f"| {w} | " + " | ".join("-" for _ in present) + " | FAIL |")
                 continue
             total.update(cm["counts"])
             failures += cm["gate_failures"]
@@ -215,7 +280,8 @@ def to_markdown(sets: list[ResultSet]) -> str:
             out.append(f"| {w} | " + " | ".join(f"{cm['counts'].get(c, 0):,}" for c in present)
                        + f" | {'pass' if cm['gate_failures'] == 0 else 'FAIL'} |")
         out.append("| total | " + " | ".join(f"{total.get(c, 0):,}" for c in present)
-                   + f" | {'pass' if failures == 0 else 'FAIL'} |")
+                   + f" | {'pass' if not problems and total else 'FAIL'} |")
+        out.extend(f"\n- {p}" for p in problems)
         out.append("")
         if stale:
             out.append("Stale exceptions (they no longer differ): "

@@ -15,6 +15,10 @@ from pbench.workloads import _benchbase as bb
 from pbench.workloads.tpch import S13
 
 
+class MeasuredWindow(nullcontext):
+    seconds = 2
+
+
 class BenchBaseTest(unittest.TestCase):
     def setUp(self):
         self.output = ""
@@ -85,12 +89,13 @@ class BenchBaseTest(unittest.TestCase):
     def test_serial_results_require_every_query_and_keep_timings(self):
         self.names, self.errors = [f"Q{i}" for i in range(1, 23)], 0
         with patch.object(bb, "_run", side_effect=self.write_results):
-            out = S13().measure(self.ctx, nullcontext())
+            out = S13().measure(self.ctx, MeasuredWindow())
         self.assertEqual(out.unit, "query")
-        # (the window's work is the cold and the measured runs')
         self.assertEqual(out.transactions, 44)
-        self.assertEqual(out.metrics["transactions"], 22)
-        self.assertEqual(out.metrics["qps"], 11)
+        self.assertIsNone(out.metrics["qps"])
+        self.assertEqual(out.metrics["hot_queries"], 22)
+        self.assertEqual(out.metrics["client_process_qps"], 22)
+        self.assertIsNone(out.metrics["latency_p99_ms"])
         self.assertFalse(out.read_only)  # Q15 writes catalogs
         timings = json.loads((self.ctx.raw_dir / "benchbase-measure/queries.json").read_text())
         self.assertEqual(timings["Q22"], {"count": 1, "mean_ms": 1, "total_ms": 1})
@@ -107,14 +112,14 @@ class BenchBaseTest(unittest.TestCase):
 
     def test_zero_exit_with_logged_loader_error_is_rejected(self):
         result = SimpleNamespace(returncode=0, stdout="[ERROR] loader SQL failed", stderr="")
-        with patch.object(bb.subprocess, "run", return_value=result):
+        with patch.object(bb.process, "run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "logged errors"):
                 bb.load(self.ctx, "tpch", scalefactor=0.01)
 
     def test_retryable_tpcc_sql_errors_are_left_to_histogram_validation(self):
         result = SimpleNamespace(returncode=0,
             stdout="[WARN] Retrying transaction\nPSQLException: ERROR: deadlock detected", stderr="")
-        with patch.object(bb.subprocess, "run", return_value=result):
+        with patch.object(bb.process, "run", return_value=result):
             out = bb._run(self.ctx, "tpcc", self.ctx.raw_dir / "config.xml",
                           self.ctx.scratch_dir, create=False, load=False,
                           execute=True, tag="measure")
@@ -125,7 +130,7 @@ class BenchBaseTest(unittest.TestCase):
         self.ctx.tools["benchbase"] = str(self.ctx.raw_dir / "ERROR-repro")
         result = SimpleNamespace(returncode=0,
             stdout="[INFO ] retrying after PSQLException: ERROR: could not serialize", stderr="")
-        with patch.object(bb.subprocess, "run", return_value=result):
+        with patch.object(bb.process, "run", return_value=result):
             bb.load(self.ctx, "tpch", scalefactor=0.01)
 
     def test_serial_warmup_is_bounded_by_warmup_seconds(self):
@@ -154,6 +159,10 @@ class BenchBaseTest(unittest.TestCase):
         with patch.object(bb, "_run", side_effect=self.write_results):
             out = bb.execute(self.ctx, "tpcc", nullcontext(), scalefactor=1)
             self.assertEqual(out.metrics["failed_transactions"], 1)
+            self.assertEqual(out.transactions, 2)
+            self.assertEqual(out.metrics["measured_requests"], 1)
+            self.assertEqual(out.metrics["client_reported_goodput_tps"], 11)
+            self.assertAlmostEqual(out.metrics["tps"] * out.metrics["client_process_seconds"], 2)
             self.output = "will not be retried... sql state [XX000], error code [0]."
             with self.assertRaisesRegex(RuntimeError, "unexpected SQL errors"):
                 bb.execute(self.ctx, "tpcc", nullcontext(), scalefactor=1)
@@ -163,6 +172,15 @@ class BenchBaseTest(unittest.TestCase):
         # (S13's headline metric: a comparison colors more as better)
         from pbench import report
         self.assertIn("qps", report.HIGHER_IS_BETTER)
+
+
+    def test_correctness_pass_is_serial_in_either_mode(self):
+        self.ctx.params["mode"] = "throughput"
+        with patch.object(bb, "_run") as run, \
+                patch("pbench.core.validation.tpch_answers"):
+            S13().verify(self.ctx)
+        xml = ET.parse(run.call_args.args[2])
+        self.assertEqual(xml.findtext("works/work/serial"), "true")
 
 
 if __name__ == "__main__":

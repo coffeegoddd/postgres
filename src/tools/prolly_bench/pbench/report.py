@@ -13,20 +13,22 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pbench.core.stats import summarize
+from pbench.core.validation import cell_problems, compatible, validate_run
 
 # Metrics shown in summaries, in this order, when a workload produces them.
 S_METRICS = [
     "tps", "rows_per_second", "copy_seconds", "index_seconds", "checkpoint_seconds",
     "qps", "latency_p50_ms", "latency_p99_ms", "latency_p999_ms",
     "failed_transactions", "ignored_errors",
-    "wal_bytes_per_txn", "wal_fpi", "device_write_bytes_per_txn",
-    "server_cpu_ms_per_txn", "hash_cpu_percent", "io_hit_ratio", "io_evictions",
-    "space_amplification", "vacuum_seconds", "recovery_seconds",
+    "wal_bytes_per_operation", "wal_fpi", "device_write_bytes_per_operation",
+    "host_busy_cpu_seconds", "host_hash_sample_percent", "io_hit_ratio", "io_evictions",
+    "cluster_allocated_bytes_including_wal", "vacuum_seconds", "process_restart_seconds",
+    "latency_samples", "hot_query_seconds", "client_process_qps", "skipped_transactions",
 ]
 V_METRICS = [
     "branch_create_ms", "checkout_ms", "change_ms", "commit_ms", "diff_ms",
     "merge_ms", "clone_ms", "fetch_ms", "push_ms", "background_tps",
-    "wal_bytes", "device_write_bytes", "hash_cpu_percent",
+    "wal_bytes", "device_write_bytes", "host_hash_sample_percent",
 ]
 C_METRICS = [
     "pass_percent", "records", "ok", "not_ok", "not_implemented", "crashed",
@@ -63,7 +65,8 @@ def _fmt(x: Optional[float]) -> str:
 def _status(rs: list[dict]) -> str:
     counts: dict[str, int] = {}
     for r in rs:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        status = "invalid" if r.get("validation_errors") else r["status"]
+        counts[status] = counts.get(status, 0) + 1
     return ", ".join(f"{s} {n}/{len(rs)}" if s != "ok" else f"ok {n}/{len(rs)}"
                      for s, n in counts.items())
 
@@ -86,6 +89,9 @@ def summary_tables(results: list[dict], suite: str) -> str:
         for (w, size, variant, clients), rs in groups:
             row = [size, variant or "-", str(clients), _status(rs)]
             for m in present:
+                if any(cell_problems(r) for r in rs):
+                    row.append("INVALID")
+                    continue
                 s = summarize(r["metrics"].get(m) for r in rs if r["status"] == "ok")
                 if s["median"] is None:
                     row.append("-")
@@ -171,6 +177,10 @@ def write_readme(out_dir: Path) -> None:
         + ", ".join(f"`{k}={v}`" for k, v in cfg["postgres"].items()) + "\n",
         "## Environment\n", _environment(env),
     ]
+    problems = validate_run(out_dir)
+    text += ["## Evidence validation\n", "FAIL: " + "; ".join(problems) if problems else "Complete, intact execution evidence.",
+             "Quality profile: " + cfg["run"].get("quality", "legacy/unverified") +
+             ". Smoke results do not establish performance rankings.\n"]
     if run["warnings"]:
         text.append("## Warnings\n")
         text += [f"- {w}" for w in run["warnings"]]
@@ -182,6 +192,9 @@ def write_readme(out_dir: Path) -> None:
 
 def compare(baseline_dir: Path, other_dir: Path) -> str:
     """S results of other_dir normalized to baseline_dir (baseline = 1.0)."""
+    problems = compatible(baseline_dir, other_dir)
+    if problems:
+        return "Comparison withheld:\n\n" + "\n".join(f"- {p}" for p in problems) + "\n"
     base = _group(load_results(baseline_dir))
     other = _group(load_results(other_dir))
     out = [f"# {other_dir.name} relative to {baseline_dir.name}\n",
@@ -196,7 +209,8 @@ def compare(baseline_dir: Path, other_dir: Path) -> str:
         for m in S_METRICS:
             mine = summarize(r["metrics"].get(m) for r in rs if r["status"] == "ok")
             theirs = summarize(r["metrics"].get(m) for r in (b or []) if r["status"] == "ok")
-            if mine["median"] is None or not theirs["median"]:
+            if (mine["median"] is None or not theirs["median"] or mine["n"] != len(rs)
+                    or theirs["n"] != len(b or [])):
                 row.append("-")
             else:
                 row.append(f"{mine['median'] / theirs['median']:.2f}")

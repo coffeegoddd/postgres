@@ -110,7 +110,7 @@ func main() {
 		return
 	}
 	code := runParent(cfg, flag.Args())
-	if !*keepScratch {
+	if !*keepScratch && code == 0 {
 		os.RemoveAll(cfg.scratch)
 	}
 	os.Exit(code)
@@ -148,6 +148,9 @@ func runParent(cfg *config, paths []string) int {
 	}
 	if len(files) == 0 {
 		fatal(fmt.Errorf("no .test files in %v", paths))
+	}
+	if err := writePlan(cfg, files); err != nil {
+		fatal(err)
 	}
 	if err := canary(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "slt-runner: canary:", err)
@@ -257,7 +260,7 @@ func canary(cfg *config) error {
 	}
 	ctx := context.Background()
 	defer h.conn.Close(ctx)
-	if _, err := h.conn.Exec(ctx, "CREATE TABLE canary (id int)").ReadAll(); err != nil {
+	if _, err := h.conn.Exec(ctx, "CREATE TABLE canary (id int PRIMARY KEY, payload text)").ReadAll(); err != nil {
 		return err
 	}
 	rows, err := query(ctx, h.conn, amCheckSQL(cfg.testSchema()))
@@ -266,6 +269,16 @@ func canary(cfg *config) error {
 	}
 	if len(rows) != 1 || rows[0][1] != cfg.am {
 		return fmt.Errorf("a table created in %s is on %v, not %s", cfg.testSchema(), rows, cfg.am)
+	}
+	if cfg.am == "prolly" {
+		if _, err := h.conn.Exec(ctx, `DO $$ BEGIN
+IF (SELECT count(*) FROM pg_class WHERE
+ (oid = 'canary'::regclass OR oid = 'canary_pkey'::regclass OR
+ oid = (SELECT reltoastrelid FROM pg_class WHERE oid = 'canary'::regclass))
+ AND (pg_stat_file(pg_relation_filepath(oid) || '_bmap', true)).size IS NOT NULL) <> 3
+THEN RAISE EXCEPTION 'table, index or TOAST is not block-mapped'; END IF; END $$`).ReadAll(); err != nil {
+			return err
+		}
 	}
 	h.conn.Close(ctx)
 	m, err := connect(cfg.maintDSN(), nil)

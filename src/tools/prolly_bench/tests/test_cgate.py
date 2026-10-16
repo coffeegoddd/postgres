@@ -1,4 +1,5 @@
 import json
+import gzip
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 from pbench import ccompare
 from pbench.table import ResultSet
+from evidence_helpers import seal
 
 
 class GateTest(unittest.TestCase):
@@ -21,14 +23,25 @@ class GateTest(unittest.TestCase):
         path = Path(self.tmp.name) / am
         raw = path / "raw" / "slt"
         raw.mkdir(parents=True)
-        (raw / "records.jsonl.gz").touch()
+        records = [{"file": "a.test", "line": i + 1, "version": 2,
+                    "status": "ok" if i < 12 else "not_ok", "o": "a", "s": "a"}
+                   for i in range(14)]
+        with gzip.open(raw / "records.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps(r) + "\n" for r in records)
+        with gzip.open(raw / "planned.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps({"file": r["file"], "line": r["line"], "skip": False}) + "\n"
+                         for r in records)
+        (raw / "corpus.json").write_text(json.dumps({"a.test": "source-hash"}))
+        (raw / "files.jsonl").write_text(json.dumps({"file": "a.test", "tables": 1}) + "\n")
         (raw / "summary.json").write_text(json.dumps({
             "total": 14, "files": 1, "counts": {"ok": 12, "not_ok": 2},
-            "wrong_am_files": [], "unmatched_digests": 0,
+            "wrong_am_files": [], "unmatched_digests": 0, "unparsed_lines": 0, "am": am,
         }))
-        return ResultSet(path, "C", am, am, "", [
-            {"key": {"workload": "C1"}, "status": "ok", "raw_dir": str(path / "raw")},
-        ])
+        results = [{"key": {"workload": "C1"}, "status": "ok", "raw_dir": "raw",
+                    "metrics": {"records": 14, "skipped": 0, "ok": 12}}]
+        (path / "results.jsonl").write_text(json.dumps(results[0]) + "\n")
+        seal(path, "C", am)
+        return ResultSet(path, "C", "B0" if am == "heap" else am, am, "", results)
 
     def gate(self):
         with patch.object(ccompare, "compare", return_value=self.comparison):
@@ -59,6 +72,22 @@ class GateTest(unittest.TestCase):
             self.assertTrue(self.gate())
         path.unlink()
         self.assertTrue(self.gate())
+
+    def test_unparsed_missing_duplicate_and_tampered_evidence(self):
+        raw = self.engine.path / "raw/slt"
+        summary = json.loads((raw / "summary.json").read_text())
+        (raw / "summary.json").write_text(json.dumps({**summary, "unparsed_lines": 37}))
+        seal(self.engine.path)
+        self.assertTrue(self.gate())
+        (raw / "summary.json").write_text(json.dumps(summary))
+        with gzip.open(raw / "records.jsonl.gz", "at") as f:
+            f.write(json.dumps({"file": "a.test", "line": 1, "version": 2, "status": "ok"}) + "\n")
+        seal(self.engine.path)
+        self.assertTrue(self.gate())
+
+    def test_report_cannot_pass_empty_comparison(self):
+        with patch.object(ccompare, "compare", return_value={}):
+            self.assertIn("| total | 0 | FAIL |", ccompare.to_markdown([self.base, self.engine]))
 
     def test_missing_comparison_and_stale_exception(self):
         self.comparison["C1"]["stale_exceptions"] = [{"file": "old.test"}]

@@ -1,0 +1,46 @@
+# Release-build integration coverage. These are smoke measurements only.
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 1
+measure_seconds = 2
+sizes = ["tiny"]
+fio_baseline = false
+collectors = ["wal", "pg_stat_io", "cpu", "space", "recovery"]
+required_collectors = ["wal", "pg_stat_io", "cpu", "space", "recovery"]
+
+[postgres]
+shared_buffers = "128MB"
+max_connections = 32
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+
+[sizes.tiny]
+pgbench_scale = 1
+s4_rows = 1000
+s7_rows = 1000
+tpcc_warehouses = 1
+tpch_scale = 0.01
+v_rows = 1000
+sysbench_tables = 1
+sysbench_table_size = 1000
+
+[workloads.S10]
+tests = ["oltp_point_select", "oltp_read_write", "bulk_insert"]
+
+[workloads.S13]
+modes = ["serial", "throughput"]
+
+[workloads.V1]
+background = ["none"]
+iterations = 2
+
+[workloads.V2]
+background = ["none"]
+changes = [10]
+iterations = 2
+
+[tools]
+benchbase = "build-bench/benchbase/benchbase-postgres"

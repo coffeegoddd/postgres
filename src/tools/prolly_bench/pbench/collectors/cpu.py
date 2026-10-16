@@ -1,6 +1,4 @@
-"""CPU time during the window, system-wide from /proc/stat.  Server CPU is
-the total minus what the client programs (pgbench, BenchBase) used, so the
-machine should be otherwise idle."""
+"""Machine-wide busy CPU, explicitly not attributed to the database server."""
 
 from __future__ import annotations
 
@@ -8,7 +6,7 @@ import os
 
 from pbench.core import registry
 from pbench.core.interfaces import Collector
-from pbench.core.stats import per
+from pbench.core.stats import counter_delta
 
 _HZ = os.sysconf("SC_CLK_TCK")
 
@@ -31,13 +29,10 @@ class CpuCollector(Collector):
         self.after = busy_seconds()
 
     def results(self, ctx, outcome):
-        total = self.after - self.before
-        server = total - outcome.client_cpu_seconds \
-            if outcome.client_cpu_seconds is not None else None
-        n = outcome.transactions
+        total = counter_delta({"busy": self.before}, {"busy": self.after})["busy"]
+        # /proc/stat cannot identify the server. Do not subtract child CPU
+        # from a machine-wide counter and publish it as server CPU.
         return {
-            "cpu_seconds": total,
+            "host_busy_cpu_seconds": total,
             "client_cpu_seconds": outcome.client_cpu_seconds,
-            "server_cpu_seconds": server,
-            "server_cpu_ms_per_txn": None if per(server, n) is None else per(server, n) * 1000,
         }

@@ -14,6 +14,8 @@ class EngineCountersCollector(Collector):
     name = "engine_counters"
 
     def check(self, ctx):
+        if ctx.table_am == "prolly_d1" and ctx.key.suite == "V":
+            raise NotApplicable("backend-local counters are captured in each timed SQL session's *-counters.json")
         if not ctx.table_am.startswith("prolly"):
             raise NotApplicable(f"{ctx.table_am} has no engine counters")
         if ctx.cluster.scalar(f"SELECT to_regclass('{VIEW}') IS NOT NULL") != "t":

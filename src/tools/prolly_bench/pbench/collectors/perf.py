@@ -42,22 +42,29 @@ class PerfCollector(Collector):
         self.proc.send_signal(signal.SIGINT)
         _, err = self.proc.communicate(timeout=300)
         (ctx.raw_dir / "perf-record.log").write_text(err)
+        if self.proc.returncode not in (0, -signal.SIGINT):
+            raise RuntimeError(f"perf record failed: {err[-1000:]}")
 
     def results(self, ctx, outcome):
-        report = subprocess.run(
+        result = subprocess.run(
             ["perf", "report", "-i", str(self.data), "--stdio", "--no-children",
              "--sort", "dso,symbol", "--percent-limit", "0.1"],
-            capture_output=True, text=True).stdout
+            capture_output=True, text=True, timeout=300)
+        if result.returncode:
+            raise RuntimeError(f"perf report failed: {result.stderr[-1000:]}")
+        report = result.stdout
         (ctx.raw_dir / "perf-report.txt").write_text(report)
         pattern = re.compile(ctx.params.get("hash_symbols", DEFAULT_HASH_SYMBOLS))
         samples = re.search(r"# Samples: (\S+)", report)
+        if not samples or _count(samples.group(1)) <= 0:
+            raise RuntimeError("perf produced no samples")
         hash_share = 0.0
         for line in report.splitlines():
             m = re.match(r"\s+([\d.]+)%\s+(\S+)\s+\[.\]\s+(\S+)", line)
             if m and pattern.search(m.group(3)):
                 hash_share += float(m.group(1))
         return {"perf_samples": _count(samples.group(1)) if samples else None,
-                "hash_cpu_percent": hash_share}
+                "host_hash_sample_percent": hash_share}
 
 
 def _count(s: str) -> float:
