@@ -42,10 +42,16 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 
-/* Visits one table of a canonical root. */
+/*
+ * Visits one table of a canonical root.  unreadable is NULL, or why its
+ * rows can't be read here (its tree's keys may be in another order than
+ * the database's collations give now): its name, data and description
+ * are still the root's.
+ */
 typedef void (*ProllyCanonTableVisit) (const char *name,
 									   const ProllyNodeRef *data,
 									   const ProllyValue *description,
+									   const char *unreadable,
 									   void *arg);
 
 typedef struct ProllyCanonRoutine
