@@ -78,6 +78,82 @@ SELECT dolt_branch('rolled_back');
 ROLLBACK;
 SELECT name FROM dolt_branches() ORDER BY name;
 
+-- A checkout of a branch whose making rolls back goes back to the branch
+-- it left: at a rollback, a rollback to a savepoint, through a chain.
+BEGIN;
+SELECT dolt_checkout('-b', 'aborted');
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+SELECT count(*) > 0 AS has_rows FROM app.t;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'aborted_sub');
+ROLLBACK TO s;
+SELECT active_branch();
+SELECT count(*) > 0 AS has_rows FROM app.t;
+COMMIT;
+BEGIN;
+SELECT dolt_checkout('-b', 'aborted1');
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'aborted2');
+ROLLBACK;
+SELECT active_branch();
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'kept');
+RELEASE s;
+COMMIT;
+SELECT active_branch();
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-d', 'kept');
+SELECT name FROM dolt_branches() ORDER BY name;
+
+-- Making a branch takes CREATE on the database; deleting one, owning it.
+CREATE ROLE regress_branch_user;
+SET ROLE regress_branch_user;
+DO $$ BEGIN
+	PERFORM dolt_branch('by_user');
+EXCEPTION WHEN insufficient_privilege THEN
+	RAISE NOTICE 'making a branch was refused';
+END $$;
+RESET ROLE;
+DO $$ BEGIN
+	EXECUTE format('GRANT CREATE ON DATABASE %I TO regress_branch_user',
+				   current_database());
+END $$;
+SET ROLE regress_branch_user;
+SELECT dolt_branch('by_user');
+\set VERBOSITY terse
+SELECT dolt_branch('-d', 'by_user');
+\set VERBOSITY default
+RESET ROLE;
+SELECT dolt_branch('-d', 'by_user');
+DO $$ BEGIN
+	EXECUTE format('REVOKE CREATE ON DATABASE %I FROM regress_branch_user',
+				   current_database());
+END $$;
+DROP ROLE regress_branch_user;
+
+-- A role a branch's copy references can't be dropped, even once no other
+-- branch's copy does; dropping what it owns there, or the branch, frees it.
+CREATE ROLE regress_branch_owner;
+CREATE TABLE app.owned (x int);
+ALTER TABLE app.owned OWNER TO regress_branch_owner;
+SELECT dolt_branch('keeps_owner');
+SELECT dolt_branch('also_keeps_owner');
+DROP TABLE app.owned;
+DROP ROLE regress_branch_owner;
+SELECT dolt_checkout('keeps_owner');
+SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'app.owned'::regclass;
+DROP OWNED BY regress_branch_owner;
+SELECT to_regclass('app.owned') IS NULL AS dropped_here;
+SELECT dolt_checkout('main');
+DROP ROLE regress_branch_owner;
+SELECT dolt_branch('-d', 'also_keeps_owner');
+DROP ROLE regress_branch_owner;
+SELECT dolt_branch('-d', 'keeps_owner');
+
 -- Deleting: not main, not the session's branch.  A branch of a deleted
 -- branch keeps the pages it shared.
 SELECT dolt_branch('-d', 'main');

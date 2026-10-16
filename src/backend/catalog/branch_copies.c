@@ -17,7 +17,14 @@
  * of the same objects on other branches for as long.
  *
  * Deleting a branch deletes its rows and drops its relations' storage when
- * the transaction commits; pages another branch still shares stay.
+ * the transaction commits; pages another branch still shares stay.  It
+ * waits for no session: one on the branch holds a lock deleting conflicts
+ * with (check_out_branch()), and deleting fails instead.
+ *
+ * Privileges: making a branch copies every versioned object and locks
+ * them, so it takes CREATE on the database; deleting one drops every
+ * branch's copies of objects whoever owns them, so it takes owning the
+ * database.  The copies keep their owners and privileges.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -37,18 +44,21 @@
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -295,12 +305,14 @@ copy_from_here(void *arg)
 {
 	lock_versioned_relations();
 	copy_rows(*(Oid *) arg);
+	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
 }
 
 static void
 delete_here(void *arg)
 {
 	delete_rows();
+	dropBranchSharedDependencies(MyBranch);
 }
 
 static Oid
@@ -313,12 +325,18 @@ copies_create(const char *name, const char *start_point)
 	bool		nulls[Natts_pg_branch] = {0};
 	NameData	brname;
 	HeapTuple	tup;
+	AclResult	aclresult;
 
 	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name)));
 	PreventCommandIfReadOnly("dolt_branch()");
+	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
+								ACL_CREATE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_DATABASE,
+					   get_database_name(MyDatabaseId));
 
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	if (OidIsValid(branch_oid(name, true)))
@@ -338,6 +356,7 @@ copies_create(const char *name, const char *start_point)
 
 	on_branch(source, copy_from_here, &branch);
 	CommandCounterIncrement();
+	note_new_branch(branch);
 
 	table_close(brel, NoLock);
 	return branch;
@@ -351,6 +370,12 @@ copies_drop(const char *name)
 	HeapTuple	tup;
 
 	PreventCommandIfReadOnly("dolt_branch()");
+	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to delete branch \"%s\"", name),
+				 errdetail("Only the owner of database \"%s\" can delete its branches.",
+						   get_database_name(MyDatabaseId))));
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)
@@ -362,7 +387,7 @@ copies_drop(const char *name)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
-	if (CountBranchBackends(MyDatabaseId, branch) > 0)
+	if (!lock_branch_for_delete(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out in another session", name)));
@@ -381,7 +406,10 @@ copies_drop(const char *name)
 static void
 copies_checkout(const char *name)
 {
-	set_session_branch(branch_oid(name, false));
+	if (!check_out_branch(branch_oid(name, false)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" does not exist", name)));
 }
 
 static char *

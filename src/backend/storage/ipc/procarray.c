@@ -3657,34 +3657,6 @@ CountDBBackends(Oid databaseid)
 }
 
 /*
- * CountBranchBackends --- count backends of a database on one of its
- * branches, besides this one
- */
-int
-CountBranchBackends(Oid databaseid, Oid branch)
-{
-	ProcArrayStruct *arrayP = procArray;
-	int			count = 0;
-
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
-
-	for (int index = 0; index < arrayP->numProcs; index++)
-	{
-		int			pgprocno = arrayP->pgprocnos[index];
-		PGPROC	   *proc = &allProcs[pgprocno];
-
-		if (proc->pid == 0 || proc == MyProc)
-			continue;
-		if (proc->databaseId == databaseid && proc->branchId == branch)
-			count++;
-	}
-
-	LWLockRelease(ProcArrayLock);
-
-	return count;
-}
-
-/*
  * CountDBConnections --- counts database backends (only regular backends)
  */
 int

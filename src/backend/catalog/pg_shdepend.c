@@ -56,6 +56,8 @@
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/typecmds.h"
+#include "catalog/branch.h"
+#include "catalog/pg_branch.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -69,6 +71,7 @@ typedef enum
 	LOCAL_OBJECT,
 	SHARED_OBJECT,
 	REMOTE_OBJECT,
+	BRANCH_OBJECTS,
 } SharedDependencyObjectType;
 
 typedef struct
@@ -106,6 +109,33 @@ static void storeObjectDescription(StringInfo descs,
 static void shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid newrole);
 static void shdepReassignOwned_InitAcl(Form_pg_shdepend sdepForm,
 									   Oid oldrole, Oid newrole);
+
+/*
+ * An object of a versioned schema has a copy on each branch of its
+ * database, with the same OID, and each copy has entries of its own: a
+ * role stays referenced while any branch's copy references it.  Entries
+ * are recorded, changed and dropped for the session branch's copy.
+ */
+
+/* the objbranch of a new entry: the branch of its object's rows */
+static Oid
+shdepObjectBranch(Oid dbid, Oid classId, Oid objectId)
+{
+	if (dbid != MyDatabaseId || catalog_branch_info(classId) == NULL)
+		return InvalidOid;
+	return catalog_object_branch(classId, objectId);
+}
+
+/*
+ * Is an entry of this database's for an object the session sees: one
+ * without copies, or the session branch's copy?
+ */
+static inline bool
+shdepOnSessionBranch(Form_pg_shdepend sdepForm)
+{
+	return sdepForm->objbranch == InvalidOid ||
+		sdepForm->objbranch == MyBranch;
+}
 
 
 /*
@@ -248,6 +278,9 @@ shdepChangeDep(Relation sdepRel,
 		/* Ignore if not of the target dependency type */
 		if (((Form_pg_shdepend) GETSTRUCT(scantup))->deptype != deptype)
 			continue;
+		/* or of another branch's copy of the object */
+		if (!shdepOnSessionBranch((Form_pg_shdepend) GETSTRUCT(scantup)))
+			continue;
 		/* Caller screwed up if multiple matches */
 		if (oldtup)
 			elog(ERROR,
@@ -291,6 +324,8 @@ shdepChangeDep(Relation sdepRel,
 		values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(refclassid);
 		values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(refobjid);
 		values[Anum_pg_shdepend_deptype - 1] = CharGetDatum(deptype);
+		values[Anum_pg_shdepend_objbranch - 1] =
+			ObjectIdGetDatum(shdepObjectBranch(dbid, classid, objid));
 
 		/*
 		 * we are reusing oldtup just to avoid declaring a new variable, but
@@ -684,6 +719,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	int			numNotReportedDeps = 0;
 	int			numNotReportedDbs = 0;
 	List	   *remDeps = NIL;
+	List	   *branchDeps = NIL;
 	ListCell   *cell;
 	ObjectAddress object;
 	ShDependObjectInfo *objects;
@@ -750,8 +786,32 @@ checkSharedDependencies(Oid classId, Oid objectId,
 		 * If it's a remote dependency, keep track of it so we can report the
 		 * number of them later.
 		 */
-		if (sdepForm->dbid == MyDatabaseId ||
-			sdepForm->dbid == InvalidOid)
+		if (sdepForm->dbid == MyDatabaseId && !shdepOnSessionBranch(sdepForm))
+		{
+			/* another branch's copy: counted, as other databases' are */
+			remoteDep  *dep;
+			bool		stored = false;
+
+			foreach(cell, branchDeps)
+			{
+				dep = lfirst(cell);
+				if (dep->dbOid == sdepForm->objbranch)
+				{
+					dep->count++;
+					stored = true;
+					break;
+				}
+			}
+			if (!stored)
+			{
+				dep = palloc_object(remoteDep);
+				dep->dbOid = sdepForm->objbranch;
+				dep->count = 1;
+				branchDeps = lappend(branchDeps, dep);
+			}
+		}
+		else if (sdepForm->dbid == MyDatabaseId ||
+				 sdepForm->dbid == InvalidOid)
 		{
 			if (numobjects >= allocedobjects)
 			{
@@ -828,6 +888,27 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	}
 
 	/*
+	 * Summarize dependencies of this database's other branches.
+	 */
+	foreach(cell, branchDeps)
+	{
+		remoteDep  *dep = lfirst(cell);
+
+		object.classId = BranchRelationId;
+		object.objectId = dep->dbOid;
+		object.objectSubId = 0;
+
+		if (numReportedDeps < MAX_REPORTED_DEPS)
+		{
+			numReportedDeps++;
+			storeObjectDescription(&descs, BRANCH_OBJECTS, &object,
+								   SHARED_DEPENDENCY_INVALID, dep->count);
+		}
+		storeObjectDescription(&alldescs, BRANCH_OBJECTS, &object,
+							   SHARED_DEPENDENCY_INVALID, dep->count);
+	}
+
+	/*
 	 * Summarize dependencies in remote databases.
 	 */
 	foreach(cell, remDeps)
@@ -852,6 +933,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 
 	pfree(objects);
 	list_free_deep(remDeps);
+	list_free_deep(branchDeps);
 
 	if (descs.len == 0)
 	{
@@ -959,6 +1041,7 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(shdep->refclassid);
 		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(shdep->refobjid);
 		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_deptype - 1] = CharGetDatum(shdep->deptype);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objbranch - 1] = ObjectIdGetDatum(shdep->objbranch);
 
 		ExecStoreVirtualTuple(slot[slot_stored_count]);
 		slot_stored_count++;
@@ -1092,6 +1175,9 @@ shdepAddDependency(Relation sdepRel,
 	values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(refclassId);
 	values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(refobjId);
 	values[Anum_pg_shdepend_deptype - 1] = CharGetDatum(deptype);
+	values[Anum_pg_shdepend_objbranch - 1] =
+		ObjectIdGetDatum(shdepObjectBranch(classIdGetDbId(classId),
+										   classId, objectId));
 
 	tup = heap_form_tuple(sdepRel->rd_att, values, nulls);
 
@@ -1161,6 +1247,8 @@ shdepDropDependency(Relation sdepRel,
 		Form_pg_shdepend shdepForm = (Form_pg_shdepend) GETSTRUCT(tup);
 
 		/* Filter entries according to additional parameters */
+		if (!shdepOnSessionBranch(shdepForm))
+			continue;
 		if (OidIsValid(refclassId) && shdepForm->refclassid != refclassId)
 			continue;
 		if (OidIsValid(refobjId) && shdepForm->refobjid != refobjId)
@@ -1275,7 +1363,21 @@ storeObjectDescription(StringInfo descs,
 					   SharedDependencyType deptype,
 					   int count)
 {
-	char	   *objdesc = getObjectDescription(object, false);
+	char	   *objdesc;
+
+	if (type == BRANCH_OBJECTS)
+	{
+		HeapTuple	tup = SearchSysCache1(BRANCHOID,
+										  ObjectIdGetDatum(object->objectId));
+
+		if (!HeapTupleIsValid(tup))
+			return;
+		objdesc = psprintf("branch \"%s\"",
+						   NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+		ReleaseSysCache(tup);
+	}
+	else
+		objdesc = getObjectDescription(object, false);
 
 	/*
 	 * An object being dropped concurrently doesn't need to be reported.
@@ -1310,6 +1412,14 @@ storeObjectDescription(StringInfo descs,
 			/* translator: %s will always be "database %s" */
 			appendStringInfo(descs, ngettext("%d object in %s",
 											 "%d objects in %s",
+											 count),
+							 count, objdesc);
+			break;
+
+		case BRANCH_OBJECTS:
+			/* translator: %s will always be "branch %s" */
+			appendStringInfo(descs, ngettext("%d object on %s",
+											 "%d objects on %s",
 											 count),
 							 count, objdesc);
 			break;
@@ -1396,10 +1506,12 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 
 			/*
 			 * We only operate on shared objects and objects in the current
-			 * database
+			 * database, as the session's branch has them
 			 */
 			if (sdepForm->dbid != MyDatabaseId &&
 				sdepForm->dbid != InvalidOid)
+				continue;
+			if (sdepForm->dbid == MyDatabaseId && !shdepOnSessionBranch(sdepForm))
 				continue;
 
 			switch (sdepForm->deptype)
@@ -1599,10 +1711,12 @@ shdepReassignOwned(List *roleids, Oid newrole)
 
 			/*
 			 * We only operate on shared objects and objects in the current
-			 * database
+			 * database, as the session's branch has them
 			 */
 			if (sdepForm->dbid != MyDatabaseId &&
 				sdepForm->dbid != InvalidOid)
+				continue;
+			if (sdepForm->dbid == MyDatabaseId && !shdepOnSessionBranch(sdepForm))
 				continue;
 
 			/*
@@ -1783,4 +1897,75 @@ shdepReassignOwned_InitAcl(Form_pg_shdepend sdepForm, Oid oldrole, Oid newrole)
 						  sdepForm->classid,
 						  sdepForm->objid,
 						  sdepForm->objsubid);
+}
+
+/*
+ * copyBranchSharedDependencies
+ *
+ * Give branch 'target''s new copies of this database's versioned objects
+ * the entries branch 'source''s copies have.
+ */
+void
+copyBranchSharedDependencies(Oid source, Oid target)
+{
+	Relation	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+	CatalogIndexState indstate = CatalogOpenIndexes(sdepRel);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *copies = NIL;
+	ListCell   *lc;
+
+	ScanKeyInit(&key[0],
+				Anum_pg_shdepend_dbid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(MyDatabaseId));
+	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
+							  NULL, 1, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		HeapTuple	copy;
+
+		if (((Form_pg_shdepend) GETSTRUCT(tup))->objbranch != source)
+			continue;
+		copy = heap_copytuple(tup);
+		((Form_pg_shdepend) GETSTRUCT(copy))->objbranch = target;
+		copies = lappend(copies, copy);
+	}
+	systable_endscan(scan);
+
+	foreach(lc, copies)
+		CatalogTupleInsertWithInfo(sdepRel, (HeapTuple) lfirst(lc), indstate);
+	list_free_deep(copies);
+	CatalogCloseIndexes(indstate);
+	table_close(sdepRel, RowExclusiveLock);
+}
+
+/*
+ * dropBranchSharedDependencies
+ *
+ * Remove the entries of branch 'branch''s copies of this database's
+ * versioned objects, as the branch is deleted.
+ */
+void
+dropBranchSharedDependencies(Oid branch)
+{
+	Relation	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	ScanKeyInit(&key[0],
+				Anum_pg_shdepend_dbid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(MyDatabaseId));
+	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
+							  NULL, 1, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		if (((Form_pg_shdepend) GETSTRUCT(tup))->objbranch == branch)
+			CatalogTupleDelete(sdepRel, &tup->t_self);
+	}
+	systable_endscan(scan);
+	table_close(sdepRel, RowExclusiveLock);
 }

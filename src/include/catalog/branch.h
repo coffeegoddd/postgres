@@ -54,6 +54,15 @@ extern bool branch_session_init(const char *branch);
 /* switch the session to another branch */
 extern void set_session_branch(Oid branch);
 
+/* check out a branch, locked while the session is on it; false if gone */
+extern bool check_out_branch(Oid branch);
+
+/* lock a branch to delete it; false if a session is on it */
+extern bool lock_branch_for_delete(Oid branch);
+
+/* note a branch the current subtransaction made */
+extern void note_new_branch(Oid branch);
+
 /* the branch of the catalog row of object objid in catalog classid (0: shared) */
 extern Oid	catalog_object_branch(Oid classid, Oid objid);
 

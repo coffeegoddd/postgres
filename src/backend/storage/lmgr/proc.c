@@ -481,7 +481,6 @@ InitProcess(void)
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	/* databaseId and roleId will be filled in later */
 	MyProc->databaseId = InvalidOid;
-	MyProc->branchId = InvalidOid;
 	MyProc->roleId = InvalidOid;
 	MyProc->tempNamespaceId = InvalidOid;
 	MyProc->backendType = MyBackendType;
@@ -685,7 +684,6 @@ InitAuxiliaryProcess(void)
 	MyProc->vxid.procNumber = INVALID_PROC_NUMBER;
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	MyProc->databaseId = InvalidOid;
-	MyProc->branchId = InvalidOid;
 	MyProc->roleId = InvalidOid;
 	MyProc->tempNamespaceId = InvalidOid;
 	MyProc->backendType = MyBackendType;

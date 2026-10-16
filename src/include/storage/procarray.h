@@ -82,7 +82,6 @@ extern void SignalRecoveryConflictWithDatabase(Oid databaseid, RecoveryConflictR
 
 extern bool MinimumActiveBackends(int min);
 extern int	CountDBBackends(Oid databaseid);
-extern int	CountBranchBackends(Oid databaseid, Oid branch);
 extern int	CountDBConnections(Oid databaseid);
 extern int	CountUserBackends(Oid roleid);
 extern bool CountOtherDBBackends(Oid databaseId,

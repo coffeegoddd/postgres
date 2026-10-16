@@ -53,6 +53,33 @@ $primary->start;
 is(sql($rows), $main_rows, 'main survives a crash');
 is(sql($rows, 'postgres/feature'), $feature_rows, 'and so does the branch');
 
+# A checkout waits for a deletion of the branch to end: rolled back, the
+# branch is checked out; committed, the checkout fails.
+my $deleter = $primary->background_psql('postgres');
+my $waiter = $primary->background_psql('postgres', on_error_stop => 0);
+$deleter->query_safe(q{BEGIN; SELECT dolt_branch('-d', 'feature')});
+$waiter->query_until(qr/start/, "\\echo start\nSELECT dolt_checkout('feature');\n");
+$primary->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'object' AND NOT granted})
+  or die 'the checkout did not wait';
+$deleter->query_safe('ROLLBACK');
+# (the output has the waiting checkout's result first)
+like($waiter->query_safe('SELECT active_branch()'), qr/\nfeature\z/,
+	'a checkout waits out a deletion that rolls back');
+$waiter->query_safe(q{SELECT dolt_checkout('main')});
+$deleter->query_safe(q{BEGIN; SELECT dolt_branch('-d', 'feature')});
+$waiter->query_until(qr/start/, "\\echo start\nSELECT dolt_checkout('feature');\n");
+$primary->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_locks WHERE locktype = 'object' AND NOT granted})
+  or die 'the checkout did not wait';
+$deleter->query_safe('COMMIT');
+is($waiter->query('SELECT active_branch()'), 'main',
+	'and fails once one commits');
+like($waiter->{stderr}, qr/branch "feature" does not exist/, 'saying so');
+$waiter->quit;
+$deleter->quit;
+sql(q{SELECT dolt_branch('feature')});
+
 # A session on a branch keeps it from being deleted.
 my $session = $primary->background_psql('postgres/feature');
 $session->query_safe('SELECT 1');
