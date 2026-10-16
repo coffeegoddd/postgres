@@ -866,6 +866,81 @@ refuse_local_changes(void)
 }
 
 /*
+ * Write to the session's branch (at ours, with no changes since) what
+ * changed from base to theirs, three-way: what (a merge, a cherry-pick)
+ * fails if a row conflicts and fail_on_conflict, else conflicted gets the
+ * tables with conflicts.  Returns how many keys conflict.
+ */
+static int
+merge_commits(const ProllyHash *base, const ProllyHash *ours,
+			  const ProllyHash *theirs, bool fail_on_conflict,
+			  const char *what, List **conflicted)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef roots[3];
+	List	   *base_tables;
+	List	   *ours_tables;
+	List	   *theirs_tables;
+	ListCell   *lc;
+	int			conflicts = 0;
+
+	commit_root(base, &roots[0]);
+	commit_root(ours, &roots[1]);
+	commit_root(theirs, &roots[2]);
+	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("commits whose objects are defined differently can't be merged yet"),
+				 errdetail("A table or other object of the versioned schemas was made, dropped or redefined between them.")));
+	base_tables = tables_in_root(&roots[0]);
+	ours_tables = tables_in_root(&roots[1]);
+	theirs_tables = tables_in_root(&roots[2]);
+	foreach(lc, theirs_tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *b = find_table(base_tables, t->name);
+		Table	   *o = find_table(ours_tables, t->name);
+		Oid			relid;
+		int			n;
+
+		if (same_hash(&b->data.hash, &t->data.hash))
+			continue;
+		relid = table_named(t->name);
+		if (same_hash(&b->data.hash, &o->data.hash))
+		{
+			apply_rows(relid, o, t);
+			continue;
+		}
+		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
+		if (n > 0 && fail_on_conflict)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("%s conflicts in table \"%s\"", what, get_rel_name(relid)),
+					 errdetail_plural("%d row was changed differently on both sides.",
+									  "%d rows were changed differently on both sides.",
+									  n, n)));
+		if (n > 0)
+		{
+			conflicts += n;
+			*conflicted = lappend_oid(*conflicted, relid);
+		}
+	}
+	return conflicts;
+}
+
+/* Refuse a merge or pick over uncommitted changes, which it would lose. */
+static void
+check_clean(void)
+{
+	bool		changed = false;
+
+	folded_tables("HEAD", "WORKING", note_change, &changed);
+	if (changed)
+		refuse_local_changes();
+}
+
+/*
  * Merge branch into the session's: nothing to do if it is merged already,
  * a fast-forward if the session's head is its ancestor, else three-way.
  * The heads are read with the refs held, so they stay as read until the
@@ -882,10 +957,6 @@ merge_held(const char *branch, const char *message, int flags,
 	bool		have_ours;
 
 	ProllyMergeState ms;
-	ProllyNodeRef roots[3];
-	List	   *base_tables;
-	List	   *ours_tables;
-	List	   *theirs_tables;
 	List	   *conflicted = NIL;
 	int			conflicts = 0;
 	ListCell   *lc;
@@ -925,14 +996,7 @@ merge_held(const char *branch, const char *message, int flags,
 		return 0;
 	}
 
-	/* uncommitted changes would be lost, or merged */
-	{
-		bool		changed = false;
-
-		folded_tables("HEAD", "WORKING", note_change, &changed);
-		if (changed)
-			refuse_local_changes();
-	}
+	check_clean();
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
 		reset_to(&theirs);
@@ -941,49 +1005,10 @@ merge_held(const char *branch, const char *message, int flags,
 	}
 
 	/* Three-way. */
-	commit_root(&base, &roots[0]);
-	commit_root(&ours, &roots[1]);
-	commit_root(&theirs, &roots[2]);
-	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
-		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("branches whose objects are defined differently can't be merged yet"),
-				 errdetail("A table or other object of the versioned schemas was made, dropped or redefined since the common ancestor.")));
-	base_tables = tables_in_root(&roots[0]);
-	ours_tables = tables_in_root(&roots[1]);
-	theirs_tables = tables_in_root(&roots[2]);
-	foreach(lc, theirs_tables)
-	{
-		Table	   *t = lfirst(lc);
-		Table	   *b = find_table(base_tables, t->name);
-		Table	   *o = find_table(ours_tables, t->name);
-		Oid			relid;
-		int			n;
-
-		if (same_hash(&b->data.hash, &t->data.hash))
-			continue;
-		relid = table_named(t->name);
-		if (same_hash(&b->data.hash, &o->data.hash))
-		{
-			apply_rows(relid, o, t);
-			continue;
-		}
-		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
-		if (n > 0 && (flags & PROLLY_MERGE_FAIL_ON_CONFLICT))
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("merge of branch \"%s\" conflicts in table \"%s\"",
-							branch, get_rel_name(relid)),
-					 errdetail_plural("%d row was changed differently on both branches.",
-									  "%d rows were changed differently on both branches.",
-									  n, n)));
-		if (n > 0)
-		{
-			conflicts += n;
-			conflicted = lappend_oid(conflicted, relid);
-		}
-	}
+	conflicts = merge_commits(&base, &ours, &theirs,
+							  (flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
+							  psprintf("merge of branch \"%s\"", branch),
+							  &conflicted);
 
 	/* Conflicts: a merge in progress, to resolve before its commit. */
 	if (conflicts > 0)
@@ -1020,6 +1045,54 @@ folded_merge(const char *branch, const char *message, int flags,
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
+}
+
+/*
+ * Commit ref's changes again on the session's branch (from its parent to
+ * it), or, reverting, undo them (from it to its parent): three-way, as a
+ * merge, with one parent.  Conflicts are an error, for now.
+ */
+static void
+folded_cherry_pick(const char *ref, bool revert, ProllyHash *commit_id)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyHash	ours;
+	ProllyHash	picked;
+	ProllyCommitInfo info;
+	ProllyMergeState ms;
+	List	   *conflicted = NIL;
+	char	   *message;
+	const char *what = revert ? "dolt_revert" : "dolt_cherry_pick";
+
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a merge is in progress on the current branch"),
+				 errhint("Resolve its conflicts and commit, or abort it.")));
+	if (!PROLLY_CALL(dc.refs, resolve, ref, &picked) ||
+		!PROLLY_CALL(dc.refs, commit_get, &picked, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	if (info.nparents != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s of a commit with %d parents isn't supported", what,
+						info.nparents),
+				 errdetail("Its changes are changes from one parent.")));
+	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no commit to apply changes to")));
+	check_clean();
+	if (revert)
+		(void) merge_commits(&picked, &ours, &info.parents[0], true, what,
+							 &conflicted);
+	else
+		(void) merge_commits(&info.parents[0], &ours, &picked, true, what,
+							 &conflicted);
+	message = revert ? psprintf("Revert \"%s\"", info.message) : info.message;
+	PROLLY_CALL(dc.refs, commit_with, message, &ours, 1, NULL, commit_id);
 }
 
 /*
@@ -1095,4 +1168,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.resolve = folded_resolve,
 	.tables = folded_tables,
 	.move_to = folded_move_to,
+	.cherry_pick = folded_cherry_pick,
 };
