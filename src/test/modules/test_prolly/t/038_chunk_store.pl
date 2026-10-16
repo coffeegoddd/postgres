@@ -41,6 +41,26 @@ is(sql(q{SELECT test_chunk_has(encode(sha256('aborted'), 'hex'))}), 'f',
 	'an aborted transaction\'s chunk is gone');
 is(sql("SELECT test_chunk_put('one')"), $h1, 'putting a chunk again names it the same');
 
+# The same for a transaction's chunks written to the journal before it
+# commits (a batch, past a megabyte): others don't find them meanwhile.
+# One putting the same chunk then writes its own copy, which is found once
+# it commits, whatever becomes of the first.
+my $batch = q{convert_to(repeat('x', 1048576), 'UTF8')};
+my $hbig = sql("SELECT encode(sha256($batch), 'hex')");
+$a->query_safe("BEGIN; SELECT test_chunk_put($batch)");
+is(sql("SELECT test_chunk_has('$hbig')"), 'f',
+	'others don\'t find a chunk written in a batch, before it commits');
+is(sql("SELECT test_chunk_put($batch)"), $hbig, 'one puts it too, and commits');
+is(sql("SELECT length(test_chunk_get('$hbig'))"), '1048576', 'its copy is found');
+$a->query_safe('ROLLBACK');
+is(sql("SELECT length(test_chunk_get('$hbig'))"), '1048576',
+	'and still, the first one\'s transaction rolled back');
+$a->query_safe("BEGIN; SELECT test_chunk_put($batch || '\\x01'::bytea)");
+my $hbig1 = sql("SELECT encode(sha256($batch || '\\x01'::bytea), 'hex')");
+is(sql("SELECT test_chunk_has('$hbig1')"), 'f', 'another batch, before its commit');
+$a->query_safe('COMMIT');
+is(sql("SELECT test_chunk_has('$hbig1')"), 't', 'and found after');
+
 # The root.
 is(sql('SELECT test_chunk_root() IS NULL'), 't', 'a new store has no root');
 is(sql("SELECT test_chunk_move_root(NULL, '$h1')"), 't', 'the root moves');
@@ -121,6 +141,7 @@ is($standby->safe_psql('postgres', $file), sql($file),
 is($standby->safe_psql('postgres', 'SELECT test_chunk_root()'), $bigroot,
 	'and so is its root');
 
+
 # (every segment archived, for recovery from the archive)
 my $seg = sql('SELECT pg_walfile_name(pg_current_wal_lsn())');
 sql('SELECT pg_switch_wal()');
@@ -189,6 +210,22 @@ is($restored->safe_psql('postgres', 'SELECT test_chunk_root()'), $bigroot,
 	'a base backup has the root');
 is($restored->safe_psql('postgres', $all), '120', 'and the chunks');
 $restored->stop;
+
+# A database made from this one has its store, whichever way it is made,
+# on the standby too.
+sql('CREATE DATABASE clone_wal TEMPLATE postgres');
+sql('CREATE DATABASE clone_files TEMPLATE postgres STRATEGY FILE_COPY');
+for my $db ('clone_wal', 'clone_files')
+{
+	is($node->safe_psql($db, 'SELECT test_chunk_root()'), $bigroot,
+		"a database made from it ($db) has its root");
+	is($node->safe_psql($db, $all), '120', 'and its chunks');
+}
+$node->safe_psql('clone_wal', q{SELECT test_chunk_move_root(test_chunk_root(),
+	test_chunk_put('the clone moves on'))});
+is(sql('SELECT test_chunk_root()'), $bigroot, 'which are its own from then on');
+$node->wait_for_replay_catchup($standby);
+is($standby->safe_psql('clone_wal', $all), '120', 'the standby\'s copy has them too');
 
 $standby->stop;
 $node->stop;

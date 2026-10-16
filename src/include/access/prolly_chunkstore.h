@@ -15,7 +15,8 @@
  *   a chunk of a transaction that aborts may stay, unreachable, until
  *   reclamation.  Putting a chunk the store has is allowed (the store may
  *   keep one copy or several).  Every change to the store's files is
- *   WAL-logged, so recovery, standbys and base backups carry the history.
+ *   WAL-logged, so recovery, standbys and base backups carry the history,
+ *   and a database made from another (CREATE DATABASE) gets a copy of it.
  * - get() appends a chunk's bytes to out; false if the store has none by
  *   that hash.  has() answers without reading the chunk.
  * - root() is the root as last committed (or as moved by the calling
@@ -78,11 +79,18 @@ typedef struct ProllyChunkStoreRoutine
 
 	/* Replay the store's own records. */
 	void		(*redo) (XLogReaderState *record);
+
+	/*
+	 * Give a new database (CREATE DATABASE's, its files copied or not) the
+	 * store of the one it was made from, WAL-logged as any change.
+	 */
+	void		(*copy_database) (Oid src_dboid, Oid src_spcoid,
+								  Oid dst_dboid, Oid dst_spcoid);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
-	"committed", "commit_redo", "checkpoint", "redo"
+	"committed", "commit_redo", "checkpoint", "redo", "copy_database"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 
 static inline const ProllyChunkStoreRoutine *
