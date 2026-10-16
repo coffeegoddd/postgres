@@ -40,8 +40,11 @@ SELECT dolt_branch('also_first');
 SELECT dolt_hashof('also_first') = :'c1' AS made_there;
 INSERT INTO dc.t VALUES (4, 'four');
 
--- A branch checked out ends it.
+-- A branch checked out ends it, and the hidden branch, which no session
+-- is on any more, is deleted.
+SELECT count(*) AS hidden FROM pg_branch WHERE brname LIKE 'detached/%';
 SELECT (dolt_checkout('main'))[2];
+SELECT count(*) AS hidden FROM pg_branch WHERE brname LIKE 'detached/%';
 INSERT INTO dc.t VALUES (4, 'four');
 SELECT * FROM dc.t ORDER BY id;
 SELECT dolt_branch('detached/mine');

@@ -49,6 +49,7 @@
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
 #include "utils/regproc.h"
+#include "utils/resowner.h"
 #include "nodes/makefuncs.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
@@ -442,6 +443,29 @@ create_branch(const char *name, const char *from)
 	PG_END_TRY();
 }
 
+/*
+ * Check out a branch, though the transaction is read-only for the branch it
+ * started on: a branch first used gets its copies (writes), as one made
+ * there does.
+ */
+static void
+checkout_branch(const char *name)
+{
+	bool		was_read_only = XactReadOnly;
+
+	if (XactReadOnlyFromBranch)
+		XactReadOnly = false;
+	PG_TRY();
+	{
+		PROLLY_CALL(refs(), checkout, name);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+}
+
 typedef struct DetachedBranches
 {
 	List	   *names;
@@ -500,6 +524,7 @@ sweep_detached(char *current)
 	}
 	XactReadOnly = was_read_only;
 }
+
 
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
@@ -567,7 +592,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the hidden branch of commit %s has moved off it", hash_hex(&id))));
-		PROLLY_CALL(refs(), checkout, hidden);
+		checkout_branch(hidden);
 		MyBranchReadOnly = true;
 		XactReadOnly = true;
 		result[0] = "0";
@@ -581,7 +606,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	 */
 	if (create)
 		create_branch(branch, start);
-	PROLLY_CALL(refs(), checkout, branch);
+	checkout_branch(branch);
 	sweep_detached(branch);
 	result[0] = "0";
 	result[1] = psprintf("Switched to branch '%s'", branch);

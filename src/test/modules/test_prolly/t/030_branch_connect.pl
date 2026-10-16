@@ -47,5 +47,23 @@ my ($ret, $stdout, $stderr) =
 isnt($ret, 0, 'connecting to a branch that doesn\'t exist fails');
 like($stderr, qr/branch "nope" does not exist/, 'and says why');
 
+# A branch made at a commit has only its head until first used; a
+# connection to it makes its copies, at the head.
+$node->safe_psql('postgres', 'CREATE DATABASE heads');
+$node->safe_psql('heads', q{
+	CREATE SCHEMA app VERSIONED;
+	CREATE TABLE app.t (id int PRIMARY KEY);
+	INSERT INTO app.t VALUES (1);
+	SELECT dolt_commit('-Am', 'one');
+	INSERT INTO app.t VALUES (2);
+	SELECT dolt_branch('lazy');
+});
+is($node->safe_psql('heads', q{SELECT count(*) FROM pg_branch WHERE brname = 'lazy'}),
+	'0', 'a branch made at a commit has no copies');
+is($node->safe_psql('heads/lazy', q{SELECT active_branch() || ':' || string_agg(id::text, ',') FROM app.t}),
+	'lazy:1', 'dbname/branch connects to it, at its head');
+is($node->safe_psql('heads', q{SELECT count(*) FROM pg_branch WHERE brname = 'lazy'}),
+	'1', 'its copies made');
+
 $node->stop;
 done_testing();
