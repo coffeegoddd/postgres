@@ -18,6 +18,7 @@
 #include "miscadmin.h"
 
 #include "access/prolly_config.h"
+#include "catalog/branch_ops.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
@@ -105,6 +106,17 @@ static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 };
 
 /* NULL for an interface the profile has no implementation of */
+/*
+ * A database whose branches are copies of its versioned schemas: commits
+ * of them, folded, in its chunk store.
+ */
+static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
+	[PROLLY_IFACE_REFS] = "copies",
+	[PROLLY_IFACE_TRANSFER] = "stub",
+	[PROLLY_IFACE_DIFF_MERGE] = "rows",
+	[PROLLY_IFACE_CANONICALIZER] = "folded",
+};
+
 static const ProllyImplInfo *
 profile_impl(const char *const *impls, ProllyInterface iface)
 {
@@ -302,12 +314,15 @@ prolly_components_for_engine(const ProllyImplInfo *engine,
 void
 prolly_database_components(ProllyDatabaseComponents *components)
 {
+	const char *const *impls = database_uses_branch_copies() ?
+		copies_profile : database_profile;
+
 	components->refs = (const ProllyRefsRoutine *)
-		profile_impl(database_profile, PROLLY_IFACE_REFS);
+		profile_impl(impls, PROLLY_IFACE_REFS);
 	components->transfer = (const ProllyTransferRoutine *)
-		profile_impl(database_profile, PROLLY_IFACE_TRANSFER);
+		profile_impl(impls, PROLLY_IFACE_TRANSFER);
 	components->diff_merge = (const ProllyMergeRoutine *)
-		profile_impl(database_profile, PROLLY_IFACE_DIFF_MERGE);
+		profile_impl(impls, PROLLY_IFACE_DIFF_MERGE);
 	components->canonicalizer = (const ProllyCanonRoutine *)
-		profile_impl(database_profile, PROLLY_IFACE_CANONICALIZER);
+		profile_impl(impls, PROLLY_IFACE_CANONICALIZER);
 }
