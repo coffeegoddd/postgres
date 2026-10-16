@@ -26,6 +26,8 @@
  *   schemas as the calling transaction sees them, folding their tables'
  *   rows into trees: the same for the same logical content, however the
  *   rows and objects came to be.
+ * - tables() visits each table a folded root holds, in name order: its
+ *   qualified name, its data tree and its definition as described.
  *
  * Provisional (v0).
  *
@@ -40,6 +42,12 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 
+/* Visits one table of a canonical root. */
+typedef void (*ProllyCanonTableVisit) (const char *name,
+									   const ProllyNodeRef *data,
+									   const ProllyValue *description,
+									   void *arg);
+
 typedef struct ProllyCanonRoutine
 {
 	ProllyImplInfo info;
@@ -50,9 +58,12 @@ typedef struct ProllyCanonRoutine
 	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
 						 void *arg);
 	void		(*fold) (ProllyNodeRef *root);
+	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
+						   void *arg);
 } ProllyCanonRoutine;
 
-#define PROLLY_CANON_CALLBACK_NAMES "prepare", "canonical_root", "walk", "fold"
+#define PROLLY_CANON_CALLBACK_NAMES \
+	"prepare", "canonical_root", "walk", "fold", "tables"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

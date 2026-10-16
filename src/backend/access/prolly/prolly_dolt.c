@@ -37,6 +37,7 @@
 #include "access/tableam.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
@@ -896,6 +897,24 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
  * (until catalogs are versioned, schema changes don't show), and those
  * with merge conflicts (status "conflict", not staged).
  */
+static void
+status_table(const char *name, ProllyDiffKind kind, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+	static const char *const statuses[] = {
+		[PROLLY_DIFF_ADDED] = "new table",
+		[PROLLY_DIFF_REMOVED] = "deleted",
+		[PROLLY_DIFF_MODIFIED] = "modified",
+	};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = BoolGetDatum(true);
+	values[2] = CStringGetTextDatum(statuses[kind]);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
 Datum
 dolt_status(PG_FUNCTION_ARGS)
 {
@@ -911,6 +930,14 @@ dolt_status(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
 		return (Datum) 0;
+
+	/* Tables by name, so ones made or dropped since the head are too. */
+	if (PROLLY_HAS(diff_merge(), tables))
+	{
+		PROLLY_CALL(diff_merge(), tables, "HEAD", "WORKING", status_table,
+					rsinfo);
+		return (Datum) 0;
+	}
 	PROLLY_CALL(diff_merge(), diff, "HEAD", "WORKING", InvalidOid, &s.sink);
 	if (PROLLY_CALL(refs(), merge_state, &ms))
 	{
@@ -1007,7 +1034,8 @@ open_row_type_table(Oid relid, const char *fn, AclMode mode)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 	rel = table_open(relid, AccessShareLock);
-	if (!prolly_is_table_am(get_am_name(rel->rd_rel->relam)))
+	if (!prolly_is_table_am(get_am_name(rel->rd_rel->relam)) &&
+		rel->rd_rel->relam != PROLLY_TABLE_AM_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a prolly table", RelationGetRelationName(rel))));

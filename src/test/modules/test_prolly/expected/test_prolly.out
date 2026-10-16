@@ -49,6 +49,7 @@ FROM prolly_implementations();
  transfer        | stub             |       0 |              0
  diff_merge      | stub             |       0 |              0
  diff_merge      | rows             |       1 |              1
+ diff_merge      | folded           |       3 |              1
  tree            | cow              |       1 |              1
  tree            | stub             |       0 |              0
  root_layout     | subroots         |       1 |              3
@@ -62,7 +63,7 @@ FROM prolly_implementations();
  canonicalizer   | folded           |       2 |              1
  chunk_store     | journal          |       1 |              1
  chunk_format    | basic            |       1 |              1
-(53 rows)
+(54 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -312,11 +313,15 @@ NOTICE:  drop cascades to column m of table conf_kt
  diff_merge      | stub             | identity                                | pass
  diff_merge      | stub             | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub             | merge                                   | not implemented (missing merge)
- diff_merge      | stub             | complete                                | not implemented (4 of 4 callbacks missing)
+ diff_merge      | stub             | complete                                | not implemented (5 of 5 callbacks missing)
  diff_merge      | rows             | identity                                | pass
  diff_merge      | rows             | diff_reports_each_change_once           | no checks yet
  diff_merge      | rows             | merge                                   | no checks yet
- diff_merge      | rows             | complete                                | pass
+ diff_merge      | rows             | complete                                | not implemented (1 of 5 callbacks missing)
+ diff_merge      | folded           | identity                                | pass
+ diff_merge      | folded           | diff_reports_each_change_once           | no checks yet
+ diff_merge      | folded           | merge                                   | not implemented (missing merge)
+ diff_merge      | folded           | complete                                | not implemented (3 of 5 callbacks missing)
  tree            | cow              | identity                                | pass
  tree            | cow              | build_and_get                           | pass
  tree            | cow              | large_keys                              | pass
@@ -392,18 +397,18 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (4 of 4 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (5 of 5 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | not implemented (1 of 4 callbacks missing)
+ canonicalizer   | catalogs         | complete                                | not implemented (2 of 5 callbacks missing)
  canonicalizer   | folded           | identity                                | pass
- canonicalizer   | folded           | complete                                | not implemented (2 of 4 callbacks missing)
+ canonicalizer   | folded           | complete                                | not implemented (2 of 5 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass
  chunk_format    | basic            | items_round_trip                        | pass
  chunk_format    | basic            | rejects_other_bytes                     | pass
  chunk_format    | basic            | complete                                | pass
-(332 rows)
+(336 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

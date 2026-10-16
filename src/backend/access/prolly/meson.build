@@ -15,6 +15,7 @@ backend_sources += files(
   'coord_k2.c',
   'coord_k3.c',
   'coord_singlewriter.c',
+  'diffmerge_folded.c',
   'diffmerge_rows.c',
   'engine_d1.c',
   'engine_d2.c',

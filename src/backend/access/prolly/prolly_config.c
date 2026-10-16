@@ -114,7 +114,7 @@ static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "copies",
 	[PROLLY_IFACE_TRANSFER] = "stub",
-	[PROLLY_IFACE_DIFF_MERGE] = "rows",
+	[PROLLY_IFACE_DIFF_MERGE] = "folded",
 	[PROLLY_IFACE_CANONICALIZER] = "folded",
 };
 

@@ -49,6 +49,7 @@ tests += {
       'branches',
       'fold',
       'commits',
+      'status_diff',
     ],
   },
   'tap': {

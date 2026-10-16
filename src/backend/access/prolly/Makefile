@@ -27,6 +27,7 @@ OBJS = \
 	coord_k2.o \
 	coord_k3.o \
 	coord_singlewriter.o \
+	diffmerge_folded.o \
 	diffmerge_rows.o \
 	engine_d1.o \
 	engine_d2.o \
