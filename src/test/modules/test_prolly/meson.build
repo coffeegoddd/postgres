@@ -55,6 +55,7 @@ tests += {
       'applier',
       'move_heads',
       'merge',
+      'cherry_pick',
     ],
   },
   'tap': {

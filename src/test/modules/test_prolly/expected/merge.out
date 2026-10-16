@@ -443,8 +443,8 @@ SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
 (1 row)
 
 SELECT dolt_merge('feature');
-ERROR:  branches whose objects are defined differently can't be merged yet
-DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined since the common ancestor.
+ERROR:  commits whose objects are defined differently can't be merged yet
+DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined between them.
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

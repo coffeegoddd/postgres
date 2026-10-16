@@ -315,11 +315,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  diff_merge      | stub             | identity                                | pass
  diff_merge      | stub             | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub             | merge                                   | not implemented (missing merge)
- diff_merge      | stub             | complete                                | not implemented (6 of 6 callbacks missing)
+ diff_merge      | stub             | complete                                | not implemented (7 of 7 callbacks missing)
  diff_merge      | rows             | identity                                | pass
  diff_merge      | rows             | diff_reports_each_change_once           | no checks yet
  diff_merge      | rows             | merge                                   | no checks yet
- diff_merge      | rows             | complete                                | not implemented (2 of 6 callbacks missing)
+ diff_merge      | rows             | complete                                | not implemented (3 of 7 callbacks missing)
  diff_merge      | folded           | identity                                | pass
  diff_merge      | folded           | diff_reports_each_change_once           | no checks yet
  diff_merge      | folded           | merge                                   | no checks yet

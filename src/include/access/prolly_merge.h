@@ -33,6 +33,9 @@
  * - move_to() makes the session branch hold what a canonical root holds,
  *   writing the rows that differ as changes (prolly_applier.h), with the
  *   calling transaction.
+ * - cherry_pick() commits a commit's changes (from its parent) again on the
+ *   current branch, or with revert undoes them, merging them three-way
+ *   with the branch's, and returns the new commit.
  *
  * Provisional (v0).
  *
@@ -78,10 +81,13 @@ typedef struct ProllyMergeRoutine
 	void		(*tables) (const char *from_ref, const char *to_ref,
 						   ProllyTableChangeVisit visit, void *arg);
 	void		(*move_to) (const ProllyNodeRef *root);
+	void		(*cherry_pick) (const char *ref, bool revert,
+								ProllyHash *commit_id);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
-	"diff", "merge", "conflicts", "resolve", "tables", "move_to"
+	"diff", "merge", "conflicts", "resolve", "tables", "move_to", \
+	"cherry_pick"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 
 static inline const ProllyMergeRoutine *
