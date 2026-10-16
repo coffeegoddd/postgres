@@ -70,6 +70,7 @@ SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
 CREATE DATABASE sd_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'
   TEMPLATE template0;
 \c sd_latin1
+SET client_encoding = 'UTF8';
 CREATE SCHEMA "appé" VERSIONED;
 CREATE TABLE "appé"."tablé" (id int PRIMARY KEY, v text);
 INSERT INTO "appé"."tablé" VALUES (1, 'a');
@@ -79,3 +80,18 @@ SELECT * FROM dolt_status;
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::"appé"."tablé");
 \c contrib_regression
 DROP DATABASE sd_latin1;
+
+-- One whose encoding orders names otherwise than UTF-8 does ("я" before
+-- "€" in UTF-8, after it in WIN1251): only the table dropped is.
+CREATE DATABASE sd_win1251 ENCODING 'WIN1251' LC_COLLATE 'C' LC_CTYPE 'C'
+  TEMPLATE template0;
+\c sd_win1251
+SET client_encoding = 'UTF8';
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app."я" (id int PRIMARY KEY);
+CREATE TABLE app."€" (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'two tables')::text) AS committed;
+DROP TABLE app."я";
+SELECT * FROM dolt_status ORDER BY table_name;
+\c contrib_regression
+DROP DATABASE sd_win1251;
