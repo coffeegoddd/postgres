@@ -1372,7 +1372,20 @@ definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
 	}
 }
 
-/* The same items, the same values but for tables' and views' rows. */
+/*
+ * The next item that defines an object: collations' items are left out,
+ * as what the fold notes of the tables (checked when rows are read).
+ */
+static bool
+next_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
+{
+	while (PROLLY_CALL(cn->tree, cursor_next, c, k, v))
+		if (!(k->len >= 2 && k->data[0] == 'c' && k->data[1] == ':'))
+			return true;
+	return false;
+}
+
+/* The same objects, the same values but for tables' and views' rows. */
 static bool
 folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
 {
@@ -1396,8 +1409,8 @@ folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
 					vb,
 					da,
 					db;
-		bool		more_a = PROLLY_CALL(cn.tree, cursor_next, ca, &ka, &va);
-		bool		more_b = PROLLY_CALL(cn.tree, cursor_next, cb, &kb, &vb);
+		bool		more_a = next_object(&cn, ca, &ka, &va);
+		bool		more_b = next_object(&cn, cb, &kb, &vb);
 
 		if (more_a != more_b)
 		{

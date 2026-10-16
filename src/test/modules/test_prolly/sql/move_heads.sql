@@ -100,3 +100,19 @@ SELECT dolt_reset('--hard');
 SELECT id, c IS NULL AS c_is_null FROM mhd.t;
 DROP SCHEMA mhd CASCADE;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- A move doesn't write the rows of a table whose collation differs now
+-- from what the commit recorded (its keys may be in another order).
+CREATE SCHEMA mhc VERSIONED;
+CREATE COLLATION mhc.c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE mhc.t (k text COLLATE mhc.c_utf8 PRIMARY KEY, v int);
+INSERT INTO mhc.t VALUES ('a', 1);
+SELECT length(dolt_commit('-Am', 'collated')::text) AS committed;
+UPDATE mhc.t SET v = 2;
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+SELECT dolt_reset('--hard');
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
+SELECT dolt_reset('--hard');
+SELECT * FROM mhc.t;
+DROP SCHEMA mhc CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
