@@ -350,3 +350,26 @@ class CCompareTest(unittest.TestCase):
             from pbench import ccompare
             self.assertEqual(len(ccompare.exceptions_for("prolly", Path(f.name))), 2)
             self.assertEqual(len(ccompare.exceptions_for("heap", Path(f.name))), 1)
+
+
+class VSuiteSQLTest(unittest.TestCase):
+    """Each engine family gets its own version-control functions: page-based
+    prolly has no prolly_* ones."""
+
+    def ctx(self, am):
+        from types import SimpleNamespace
+        return SimpleNamespace(table_am=am)
+
+    def test_prolly_uses_dolt_functions(self):
+        from pbench.workloads.v_suite import vc_sql
+        vc = vc_sql(self.ctx("prolly"))
+        stmts = [vc.branch("b"), vc.checkout("b"), vc.commit("m"),
+                 vc.diff_count("main", "b", "vc_data"), vc.merge("b")]
+        self.assertTrue(all("dolt_" in s and "prolly_" not in s for s in stmts), stmts)
+        self.assertEqual(vc.commit("m"), "SELECT dolt_commit('-Am', 'm')")
+
+    def test_tree_engines_use_prolly_functions(self):
+        from pbench.workloads.v_suite import vc_sql
+        vc = vc_sql(self.ctx("prolly_d1"))
+        self.assertEqual(vc.branch("b"), "SELECT prolly_branch_create('b', NULL)")
+        self.assertEqual(vc.merge("b"), "SELECT prolly_merge('b')")

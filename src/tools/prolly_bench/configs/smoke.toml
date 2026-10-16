@@ -37,6 +37,9 @@ percents = [1]
 [workloads.S10]
 tests = ["oltp_read_write", "oltp_point_select", "bulk_insert"]
 
+[workloads.V1]
+iterations = 3
+
 [workloads.V2]
 changes = [100]
 iterations = 3
