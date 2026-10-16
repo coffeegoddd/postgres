@@ -2317,6 +2317,8 @@ RelationReloadIndexInfo(Relation relation)
 	heap_freetuple(pg_class_tuple);
 	/* We must recalculate physical address in case it changed */
 	RelationInitPhysicalAddr(relation);
+	/* ... and the branch its locks are on, the entry perhaps another copy */
+	relation->rd_lockInfo.lockRelId.branchId = relation->rd_rel->relbranch;
 
 	/*
 	 * For a non-system index, there are fields of the pg_index row that are

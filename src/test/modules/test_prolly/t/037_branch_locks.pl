@@ -87,6 +87,36 @@ $s2->query('COMMIT');
 is($s1->{stderr} . $s2->{stderr}, '', 'serializable transactions on two branches both commit');
 $_->quit for ($s1, $s2);
 
+# An index whose relcache entry is kept across a checkout (it has new
+# storage in the transaction) takes the new branch's predicate locks:
+# write skew on one branch is caught, whichever way its sessions got there.
+my $w1 = $primary->background_psql('postgres', on_error_stop => 0);
+my $w2 = $primary->background_psql('postgres/b1', on_error_stop => 0);
+$w1->query_safe(q{BEGIN ISOLATION LEVEL SERIALIZABLE; REINDEX INDEX app.t_pkey;
+	SELECT dolt_checkout('b1'); SET LOCAL enable_seqscan = off;
+	SELECT * FROM app.t WHERE id > 5000});
+$w2->query_safe(q{BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL enable_seqscan = off;
+	SELECT * FROM app.t WHERE id > 5000});
+$w1->query('INSERT INTO app.t VALUES (5001, 1)');
+$w2->query('INSERT INTO app.t VALUES (5002, 2)');
+$w1->query('COMMIT');
+$w2->query('COMMIT');
+like($w1->{stderr} . $w2->{stderr}, qr/could not serialize access/,
+	'write skew on one branch fails, an index reloaded across a checkout');
+$_->quit for ($w1, $w2);
+
+# A sequence's lock is its copy's on the session's branch: one used before
+# a checkout and after it is locked on each branch in turn.
+sql(q{CREATE SEQUENCE app.s; SELECT dolt_branch('b3')});
+my $seq = $primary->background_psql('postgres', on_error_stop => 0);
+$seq->query(q{BEGIN; SELECT nextval('app.s'); SELECT dolt_checkout('b3');
+	SELECT nextval('app.s')});
+is($seq->{stderr}, '', 'a sequence used on two branches in one transaction');
+is(gets_lock('b3', 'ALTER SEQUENCE app.s RESTART'), 'waits',
+	'the second branch\'s copy is locked');
+$seq->query('COMMIT');
+$seq->quit;
+
 # Two branches vacuum the same index at once: each copy's btree vacuum
 # cycle is its own.
 sql(q{DELETE FROM app.t WHERE id % 2 = 0}, "postgres/$_") for qw(b1 b2);
