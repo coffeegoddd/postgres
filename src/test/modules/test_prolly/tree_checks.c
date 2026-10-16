@@ -20,10 +20,12 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/memutils.h"
 #include "test_prolly.h"
 
 #define MAX_KEY		20000
@@ -218,12 +220,22 @@ random_batch(pg_prng_state *rng, int maxn, int range, int version, int *keys,
 	return count;
 }
 
-/* Every item of the tree, in order, matches ref; so does count. */
+/*
+ * Every item of the tree, in order, matches ref; so does count.  The
+ * cursor lives in a context of its own, opened, sought and advanced while
+ * a shorter one is current, reset after every step: what it keeps between
+ * calls must be in its own.
+ */
 static void
 check_matches(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env,
 			  const ProllyNodeRef *root, const Ref *ref, const char *when)
 {
-	ProllyTreeCursor *c = PROLLY_CALL(tr, cursor_open, env, root, CurrentMemoryContext);
+	MemoryContext outer = CurrentMemoryContext;
+	MemoryContext ccxt = AllocSetContextCreate(outer, "tree check cursor",
+											   ALLOCSET_DEFAULT_SIZES);
+	MemoryContext step = AllocSetContextCreate(outer, "tree check step",
+											   ALLOCSET_DEFAULT_SIZES);
+	ProllyTreeCursor *c;
 	ProllyKey	key;
 	ProllyValue value;
 	int			next = 0;
@@ -232,7 +244,10 @@ check_matches(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env,
 	StringInfoData at;
 
 	initStringInfo(&at);
+	MemoryContextSwitchTo(step);
+	c = PROLLY_CALL(tr, cursor_open, env, root, ccxt);
 	PROLLY_CALL(tr, cursor_seek, c, NULL, ForwardScanDirection);
+	MemoryContextReset(step);
 	while (PROLLY_CALL(tr, cursor_next, c, &key, &value))
 	{
 		int			k = key_int(&key);
@@ -252,13 +267,17 @@ check_matches(const ProllyTreeRoutine *tr, const ProllyTreeEnv *env,
 				 when, n, k);
 		next++;
 		n++;
+		MemoryContextReset(step);
 	}
+	MemoryContextSwitchTo(outer);
 	resetStringInfo(&at);
 	if (PROLLY_CALL(tr, key_at, env, root, n, &at) ||
 		PROLLY_CALL(tr, key_at, env, root, n + 1000, &at))
 		elog(ERROR, "%s: key_at past the last item found one", when);
 	pfree(at.data);
 	PROLLY_CALL(tr, cursor_close, c);
+	MemoryContextDelete(step);
+	MemoryContextDelete(ccxt);
 	while (next < MAX_KEY && ref->version[next] == ABSENT)
 		next++;
 	if (next != MAX_KEY)
@@ -1407,4 +1426,120 @@ tree_large_values(const ProllyImplInfo *impl)
 		elog(ERROR, "diff of one changed large value reported %d changes (key %d, values %s)",
 			 d.nchanges, d.key, d.values_ok ? "right" : "wrong");
 	pfree(vbuf.data);
+}
+
+/* The key of large_keys' item i: n bytes, all 'a' but its first few. */
+static ProllyKey
+large_key(int i, int n, StringInfo buf)
+{
+	ProllyKey	key;
+
+	resetStringInfo(buf);
+	appendStringInfo(buf, "%04d", i);
+	while (buf->len < n)
+		appendStringInfoChar(buf, 'a');
+	key.data = (const uint8 *) buf->data;
+	key.len = buf->len;
+	return key;
+}
+
+/*
+ * Keys of many kilobytes (each one ending every node it is in, by the
+ * chunker's odds): a tree of one, or of many, still has a root, the same
+ * however it was made; a key too large for two to fit in a node is
+ * refused.  Over chunks only (a page doesn't hold such keys).
+ */
+void
+tree_large_keys(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	StringInfoData kbuf;
+	ProllyValue value = {(const uint8 *) "v", 1};
+	ProllyNodeRef root;
+	ProllyNodeRef edited;
+	ProllyTreeBuilder *b;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bool		refused = false;
+
+	if (!tree_checks_in_chunks)
+		return;
+	make_env(tr, &env);
+	initStringInfo(&kbuf);
+
+	for (int nkeys = 1; nkeys <= 40; nkeys += 39)
+	{
+		ProllyKey	key;
+		StringInfoData got;
+
+		/* built at once */
+		b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+		for (int i = 0; i < nkeys; i++)
+		{
+			key = large_key(i, 10000, &kbuf);
+			PROLLY_CALL(tr, build_add, b, &key, &value);
+		}
+		PROLLY_CALL(tr, build_finish, b, &root);
+		if (PROLLY_CALL(tr, count, &env, &root) != nkeys)
+			elog(ERROR, "a tree of %d large keys counts " UINT64_FORMAT, nkeys,
+				 PROLLY_CALL(tr, count, &env, &root));
+		initStringInfo(&got);
+		key = large_key(nkeys - 1, 10000, &kbuf);
+		if (!PROLLY_CALL(tr, get, &env, &root, &key, &got) ||
+			got.len != 1 || got.data[0] != 'v')
+			elog(ERROR, "a tree of %d large keys lost its last", nkeys);
+
+		/* and by edits, one key at a time: the same tree */
+		b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+		PROLLY_CALL(tr, build_finish, b, &edited);
+		for (int i = nkeys - 1; i >= 0; i--)
+		{
+			ProllyEdit	edit;
+			ProllyNodeRef next;
+
+			edit.key = large_key(i, 10000, &kbuf);
+			edit.value = value;
+			edit.is_delete = false;
+			PROLLY_CALL(tr, apply, &env, &edited, &edit, 1, &next);
+			edited = next;
+		}
+		if (!same_hash(&root, &edited))
+			elog(ERROR, "a tree of %d large keys built at once and by edits differ",
+				 nkeys);
+		pfree(got.data);
+	}
+
+	/* a key larger than half a node */
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		ProllyKey	key = large_key(0, 40000, &kbuf);
+
+		b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+		PROLLY_CALL(tr, build_add, b, &key, &value);
+		key = large_key(1, 40000, &kbuf);
+		PROLLY_CALL(tr, build_add, b, &key, &value);
+		PROLLY_CALL(tr, build_finish, b, &root);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		refused = strstr(edata->message, "is too large") != NULL;
+		if (!refused)
+			elog(ERROR, "a key of 40000 bytes failed otherwise: %s", edata->message);
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (!refused)
+		elog(ERROR, "a tree of keys of 40000 bytes was built");
+	pfree(kbuf.data);
 }

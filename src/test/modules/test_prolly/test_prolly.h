@@ -51,6 +51,7 @@ extern void nodestore_release_frees(const ProllyImplInfo *impl);
 
 /* tree_checks.c */
 extern void tree_build_and_get(const ProllyImplInfo *impl);
+extern void tree_large_keys(const ProllyImplInfo *impl);
 extern void tree_cursor_scans(const ProllyImplInfo *impl);
 extern void tree_apply_matches_reference(const ProllyImplInfo *impl);
 extern void tree_apply_past_the_end(const ProllyImplInfo *impl);
