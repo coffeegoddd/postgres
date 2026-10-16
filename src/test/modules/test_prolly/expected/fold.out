@@ -151,8 +151,39 @@ SELECT dolt_branch('-D', 'fa', 'fb', 'fc');
  {0}
 (1 row)
 
+-- A column added with a default is folded the same whether or not the
+-- table was rewritten since (which clears the catalog's missing value).
+CREATE TABLE app.m (id int PRIMARY KEY);
+INSERT INTO app.m VALUES (1), (2);
+ALTER TABLE app.m ADD COLUMN c int DEFAULT 5;
+UPDATE app.m SET c = NULL WHERE id = 1;
+SELECT test_fold_root() AS before_rewrite \gset
+VACUUM FULL app.m;
+SELECT test_fold_root() = :'before_rewrite' AS rewrite_changes_nothing;
+ rewrite_changes_nothing 
+-------------------------
+ t
+(1 row)
+
+-- A versioned schema is part of the fold, empty or not.
+SELECT test_fold_root() AS no_empty \gset
+CREATE SCHEMA empty_versioned VERSIONED;
+SELECT test_fold_root() <> :'no_empty' AS empty_schema_counts;
+ empty_schema_counts 
+---------------------
+ t
+(1 row)
+
+DROP SCHEMA empty_versioned;
+SELECT test_fold_root() = :'no_empty' AS and_its_dropping;
+ and_its_dropping 
+------------------
+ t
+(1 row)
+
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 3 other objects
+NOTICE:  drop cascades to 4 other objects
 DETAIL:  drop cascades to function app.f()
 drop cascades to table app.k
 drop cascades to table app.t
+drop cascades to table app.m

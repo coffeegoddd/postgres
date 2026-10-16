@@ -85,4 +85,22 @@ SELECT test_fold_root() = :'fc' AS ordinary_tables_left_out;
 
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'fa', 'fb', 'fc');
+
+-- A column added with a default is folded the same whether or not the
+-- table was rewritten since (which clears the catalog's missing value).
+CREATE TABLE app.m (id int PRIMARY KEY);
+INSERT INTO app.m VALUES (1), (2);
+ALTER TABLE app.m ADD COLUMN c int DEFAULT 5;
+UPDATE app.m SET c = NULL WHERE id = 1;
+SELECT test_fold_root() AS before_rewrite \gset
+VACUUM FULL app.m;
+SELECT test_fold_root() = :'before_rewrite' AS rewrite_changes_nothing;
+
+-- A versioned schema is part of the fold, empty or not.
+SELECT test_fold_root() AS no_empty \gset
+CREATE SCHEMA empty_versioned VERSIONED;
+SELECT test_fold_root() <> :'no_empty' AS empty_schema_counts;
+DROP SCHEMA empty_versioned;
+SELECT test_fold_root() = :'no_empty' AS and_its_dropping;
+
 DROP SCHEMA app CASCADE;
