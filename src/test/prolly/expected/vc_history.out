@@ -16,7 +16,7 @@ a: content|t
 checkout b|t
 b: content|t
 checkout c|t
-a and b: same content|t
+c: content|t
 a and b: same root|t
 a and b: different commits|t
 c: different root|t
