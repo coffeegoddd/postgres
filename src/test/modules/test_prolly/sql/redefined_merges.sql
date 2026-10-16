@@ -1,0 +1,63 @@
+-- Merging the rows of a table one side redefined while the other changed
+-- them: the three versions' rows are read as the merged definition has
+-- them, column by column by name, and merged three-way.  dolt_diff and
+-- dolt_conflicts read rows of other definitions the same way.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.t (id int PRIMARY KEY, v text, n int);
+INSERT INTO rm.t SELECT g, 'v' || g, g FROM generate_series(1, 5) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT dolt_branch('feature');
+
+-- Theirs adds a column and changes a row; ours changes others.
+SELECT dolt_checkout('feature');
+ALTER TABLE rm.t ADD COLUMN w int DEFAULT 7;
+UPDATE rm.t SET v = 'feature' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: a column, a row')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE rm.t SET v = 'main' WHERE id = 2;
+INSERT INTO rm.t VALUES (6, 'six', 6);
+SELECT length(dolt_commit('-am', 'main: rows')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged'))[3:4];
+SELECT * FROM rm.t ORDER BY id;
+SELECT count(*) AS clean FROM dolt_status;
+
+-- dolt_diff of versions defined otherwise reads their rows as now.
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rm.t)
+ORDER BY (coalesce(to_row, from_row)).id;
+
+-- Ours retypes and drops a column; theirs changes rows.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+UPDATE rm.t SET v = 'feature again' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: a row')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE rm.t ALTER COLUMN n TYPE bigint, DROP COLUMN w;
+UPDATE rm.t SET n = 400 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'main: n bigint, no w')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged again'))[3:4];
+SELECT * FROM rm.t ORDER BY id;
+
+-- A row both changed is a conflict, listed as now defined.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+ALTER TABLE rm.t ADD COLUMN z text;
+UPDATE rm.t SET v = 'theirs' WHERE id = 5;
+SELECT length(dolt_commit('-am', 'feature: z, row 5')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE rm.t SET v = 'ours' WHERE id = 5;
+SELECT length(dolt_commit('-am', 'main: row 5')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rm.t);
+SELECT dolt_conflicts_resolve('--theirs', 'rm.t');
+SELECT id, v, z FROM rm.t WHERE id = 5;
+SELECT length(dolt_commit('-am', 'resolved')::text) AS committed;
+COMMIT;
+
+SELECT dolt_branch('-D', 'feature');
+DROP SCHEMA rm CASCADE;

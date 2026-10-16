@@ -229,7 +229,8 @@ SELECT * FROM dolt_status();
 ------------+--------+--------
 (0 rows)
 
--- One with a default changes every row: not yet.
+-- One with a default changes every row: the rows are merged as the
+-- merged definition has them.
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -262,9 +263,20 @@ SELECT length(dolt_commit('-Am', 'main changes u again')::text) AS committed;
         66
 (1 row)
 
-SELECT dolt_merge('feature');
-ERROR:  merge of branch "feature" can't combine the rows of table app.u yet
-DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM app.u WHERE id <= 3 ORDER BY id;
+ id |       w        | more | most 
+----+----------------+------+------
+  1 | main           |      |    5
+  2 | main again     |      |    5
+  3 | main once more |      |    5
+(3 rows)
+
 SELECT * FROM dolt_status();
  table_name | staged | status 
 ------------+--------+--------

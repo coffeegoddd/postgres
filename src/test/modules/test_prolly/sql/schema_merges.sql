@@ -68,7 +68,8 @@ SELECT length(dolt_commit('-Am', 'main changes u')::text) AS committed;
 SELECT (dolt_merge('feature'))[2:4];
 SELECT * FROM app.u WHERE id <= 2 ORDER BY id;
 SELECT * FROM dolt_status();
--- One with a default changes every row: not yet.
+-- One with a default changes every row: the rows are merged as the
+-- merged definition has them.
 SELECT dolt_checkout('feature');
 SELECT (dolt_merge('main'))[2:4];
 ALTER TABLE app.u ADD COLUMN most int DEFAULT 5;
@@ -76,7 +77,8 @@ SELECT length(dolt_commit('-Am', 'feature fills u')::text) AS committed;
 SELECT dolt_checkout('main');
 UPDATE app.u SET w = 'main once more' WHERE id = 3;
 SELECT length(dolt_commit('-Am', 'main changes u again')::text) AS committed;
-SELECT dolt_merge('feature');
+SELECT (dolt_merge('feature'))[2:4];
+SELECT * FROM app.u WHERE id <= 3 ORDER BY id;
 SELECT * FROM dolt_status();
 
 SELECT dolt_reset('--hard');
