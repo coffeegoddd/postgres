@@ -11,6 +11,8 @@
  *				hash -> block map
  *	ProllyCommit	records written by a commit pipeline implementation
  *				(prolly_commit.h): new branch heads
+ *	ProllyChunks	records written by a chunk store implementation
+ *				(prolly_chunkstore.h) for its files
  *
  * Every record's main data starts with xl_prolly_header, naming the
  * implementation (by impl_id within the interface) that wrote it; redo is
@@ -58,5 +60,10 @@ extern const char *prolly_store_identify(uint8 info);
 extern void prolly_commit_redo(XLogReaderState *record);
 extern void prolly_commit_desc(StringInfo buf, XLogReaderState *record);
 extern const char *prolly_commit_identify(uint8 info);
+
+/* The ProllyChunks rmgr (chunk store interface) */
+extern void prolly_chunks_redo(XLogReaderState *record);
+extern void prolly_chunks_desc(StringInfo buf, XLogReaderState *record);
+extern const char *prolly_chunks_identify(uint8 info);
 
 #endif							/* PROLLY_XLOG_H */

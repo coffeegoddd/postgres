@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	bmap_checks.o \
 	branch_checks.o \
+	chunkstore_checks.o \
 	catalog_checks.o \
 	engine_checks.o \
 	foundation_checks.o \

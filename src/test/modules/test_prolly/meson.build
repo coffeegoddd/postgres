@@ -3,6 +3,7 @@
 test_prolly_sources = files(
   'bmap_checks.c',
   'branch_checks.c',
+  'chunkstore_checks.c',
   'catalog_checks.c',
   'engine_checks.c',
   'foundation_checks.c',
@@ -90,6 +91,7 @@ tests += {
       't/035_bmap_replaced_blocks.pl',
       't/036_bmap_shared_changes.pl',
       't/037_branch_locks.pl',
+      't/038_chunk_store.pl',
     ],
   },
 }

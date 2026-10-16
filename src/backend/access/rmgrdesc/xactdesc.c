@@ -135,6 +135,15 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += sizeof(xl_xact_origin);
 	}
+
+	if (parsed->xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+	{
+		/* a length, then the payload; unaligned */
+		memcpy(&parsed->chunk_root_len, data, sizeof(uint32));
+		data += sizeof(uint32);
+		parsed->chunk_root = data;
+		data += parsed->chunk_root_len;
+	}
 }
 
 void
@@ -364,6 +373,10 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, ReplOriginId
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
 	}
+
+	if (parsed.xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+		appendStringInfo(buf, "; chunk store root move: %u bytes",
+						 parsed.chunk_root_len);
 }
 
 static void

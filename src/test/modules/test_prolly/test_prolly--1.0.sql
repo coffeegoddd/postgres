@@ -151,3 +151,27 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The server's chunk store, from SQL: chunks are named by their SHA-256,
+-- in hex.
+CREATE FUNCTION test_chunk_put(data bytea)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_chunk_get(hash text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_chunk_has(hash text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_chunk_root()
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Move the root from expected (NULL: none) to root; false if another
+-- transaction moved it since.
+CREATE FUNCTION test_chunk_move_root(expected text, root text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;

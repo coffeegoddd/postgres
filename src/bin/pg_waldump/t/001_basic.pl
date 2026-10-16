@@ -100,7 +100,8 @@ XLOG2
 Prolly
 ProllyStore
 ProllyCommit
-BlockMap$/,
+BlockMap
+ProllyChunks$/,
 	'rmgr list');
 
 

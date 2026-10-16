@@ -52,3 +52,4 @@ PG_RMGR(RM_PROLLY_ID, "Prolly", prolly_redo, prolly_desc, prolly_identify, NULL,
 PG_RMGR(RM_PROLLY_STORE_ID, "ProllyStore", prolly_store_redo, prolly_store_desc, prolly_store_identify, NULL, NULL, prolly_mask, NULL)
 PG_RMGR(RM_PROLLY_COMMIT_ID, "ProllyCommit", prolly_commit_redo, prolly_commit_desc, prolly_commit_identify, NULL, NULL, NULL, NULL)
 PG_RMGR(RM_BMAP_ID, "BlockMap", bmap_redo, bmap_desc, bmap_identify, NULL, NULL, bmap_mask, NULL)
+PG_RMGR(RM_PROLLY_CHUNKS_ID, "ProllyChunks", prolly_chunks_redo, prolly_chunks_desc, prolly_chunks_identify, NULL, NULL, NULL, NULL)

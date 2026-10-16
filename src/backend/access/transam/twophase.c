@@ -2382,7 +2382,7 @@ RecordTransactionCommitPrepared(TransactionId xid,
 								 ninvalmsgs, invalmsgs,
 								 initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
-								 xid, gid);
+								 xid, gid, NULL, 0);
 
 
 	if (replorigin)
