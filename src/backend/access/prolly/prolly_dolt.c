@@ -647,7 +647,10 @@ dolt_reset(PG_FUNCTION_ARGS)
  *	  {commit id, data conflicts, schema conflicts, constraint violations}
  *
  * [--allow-empty] commit: its changes, committed again on the current
- * branch, with its author.
+ * branch, with its author.  Rows changed differently on both sides leave
+ * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
+ * (or --continue, with the picked commit's message) makes its commit,
+ * with one parent; --abort ends it.
  */
 Datum
 dolt_cherry_pick(PG_FUNCTION_ARGS)
@@ -658,11 +661,18 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	bool		allow_empty = false;
 	ProllyHash	id;
 	const char *result[4] = {NULL, "0", "0", "0"};
+	bool		abort_pick = false;
+	bool		continue_pick = false;
+	int			conflicts;
 
 	for (int i = 0; i < nargs; i++)
 	{
 		if (strcmp(args[i], "--allow-empty") == 0)
 			allow_empty = true;
+		else if (strcmp(args[i], "--abort") == 0)
+			abort_pick = true;
+		else if (strcmp(args[i], "--continue") == 0)
+			continue_pick = true;
 		else if (args[i][0] == '-')
 			unsupported("dolt_cherry_pick", args[i]);
 		else if (ref == NULL)
@@ -670,11 +680,53 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		else
 			unexpected("dolt_cherry_pick", args[i]);
 	}
+	if (abort_pick || continue_pick)
+	{
+		ProllyMergeState ms;
+
+		if (ref != NULL)
+			unexpected("dolt_cherry_pick", ref);
+		if (!PROLLY_CALL(refs(), merge_state, &ms) || !ms.pick)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("there is no cherry-pick to %s",
+							abort_pick ? "abort" : "continue")));
+		if (abort_pick)
+		{
+			/* (as for a merge: branch copies reset their own writes) */
+			if (!prolly_database_uses_copies() && prolly_xact_has_writes())
+				ereport(ERROR,
+						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						 errmsg("cannot abort a cherry-pick in a transaction that has written to prolly tables"),
+						 errhint("Roll the transaction back instead.")));
+			PROLLY_CALL(refs(), reset, "HEAD");
+			result[0] = "";
+			PG_RETURN_DATUM(text_array(4, result));
+		}
+		PROLLY_CALL(refs(), commit, ms.message, &id);
+		result[0] = hash_hex(&id);
+		PG_RETURN_DATUM(text_array(4, result));
+	}
 	if (ref == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
-	PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1, false, allow_empty, &id);
+	conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1, false, allow_empty,
+							&id);
+	if (conflicts > 0)
+	{
+		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cherry-pick conflict detected, transaction rolled back"),
+					 errdetail_plural("%d row was changed differently on both sides.",
+									  "%d rows were changed differently on both sides.",
+									  conflicts, conflicts),
+					 errhint("Cherry-pick in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
+		result[0] = "";
+		result[1] = psprintf("%d", conflicts);
+		PG_RETURN_DATUM(text_array(4, result));
+	}
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(4, result));
 }

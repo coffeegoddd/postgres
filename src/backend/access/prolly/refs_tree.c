@@ -1099,6 +1099,7 @@ tree_merge_state(ProllyMergeState *state)
 	initStringInfo(&key);
 	initStringInfo(&v);
 	merge_key(prolly_session_branch(), &key);
+	memset(state, 0, sizeof(*state));
 	found = refs_get(key.data, key.len, &v);
 	if (found)
 	{

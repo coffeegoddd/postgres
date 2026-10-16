@@ -666,6 +666,7 @@ rows_merge(const char *branch, const char *message, int flags,
 		int			i = 0;
 
 		PopActiveSnapshot();
+		memset(&ms, 0, sizeof(ms));
 		ms.theirs = theirs_c;
 		ms.base = base_c;
 		ms.ntables = list_length(conflicted);
