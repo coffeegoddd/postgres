@@ -46,6 +46,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/jsonb.h"
 #include "utils/regproc.h"
 #include "nodes/makefuncs.h"
 #include "utils/datum.h"
@@ -605,18 +606,31 @@ dolt_merge(PG_FUNCTION_ARGS)
 	conflicts = PROLLY_CALL(diff_merge(), merge, branch, message, flags, &id);
 	if (conflicts > 0)
 	{
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+
+		conflicts -= nviolations;
 		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
+		{
+			if (conflicts > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("merge conflict detected, transaction rolled back"),
+						 errdetail_plural("%d row was changed differently on both branches.",
+										  "%d rows were changed differently on both branches.",
+										  conflicts, conflicts),
+						 errhint("Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("merge conflict detected, transaction rolled back"),
-					 errdetail_plural("%d row was changed differently on both branches.",
-									  "%d rows were changed differently on both branches.",
-									  conflicts, conflicts),
-					 errhint("Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
+					 errmsg("merge constraint violations detected, transaction rolled back"),
+					 errdetail_plural("%d row violates a constraint.",
+									  "%d rows violate constraints.",
+									  nviolations, nviolations),
+					 errhint("Merge in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
+		}
 		result[0] = "";
 		result[1] = "0";
 		result[2] = "1";
-		result[3] = "conflicts found";
+		result[3] = conflicts > 0 ? "conflicts found" : "constraint violations found";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
 	result[0] = hash_hex(&id);
@@ -743,16 +757,30 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 							&id);
 	if (conflicts > 0)
 	{
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+
+		conflicts -= nviolations;
 		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
+		{
+			if (conflicts > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("cherry-pick conflict detected, transaction rolled back"),
+						 errdetail_plural("%d row was changed differently on both sides.",
+										  "%d rows were changed differently on both sides.",
+										  conflicts, conflicts),
+						 errhint("Cherry-pick in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("cherry-pick conflict detected, transaction rolled back"),
-					 errdetail_plural("%d row was changed differently on both sides.",
-									  "%d rows were changed differently on both sides.",
-									  conflicts, conflicts),
-					 errhint("Cherry-pick in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
+					 errmsg("cherry-pick constraint violations detected, transaction rolled back"),
+					 errdetail_plural("%d row violates a constraint.",
+									  "%d rows violate constraints.",
+									  nviolations, nviolations),
+					 errhint("Cherry-pick in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
+		}
 		result[0] = "";
 		result[1] = psprintf("%d", conflicts);
+		result[3] = psprintf("%d", nviolations);
 		PG_RETURN_DATUM(text_array(4, result));
 	}
 	result[0] = hash_hex(&id);
@@ -1350,6 +1378,132 @@ dolt_conflicts_summary(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;
+}
+
+/*
+ * dolt_constraint_violations(OUT table_name text, OUT num_violations int8)
+ *
+ * The tables with constraint violations a merge (or cherry-pick) left on
+ * the session's branch, as Dolt's dolt_constraint_violations table.
+ */
+Datum
+dolt_constraint_violations_summary(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *vs;
+	List	   *tables = NIL;
+	ListCell   *lc;
+	ListCell   *lt;
+
+	InitMaterializedSRF(fcinfo, 0);
+	vs = PROLLY_CALL(refs(), violations);
+	foreach(lc, vs)
+		tables = list_append_unique_oid(tables, ((ProllyViolation *) lfirst(lc))->relid);
+	foreach(lt, tables)
+	{
+		Oid			relid = lfirst_oid(lt);
+		int64		n = 0;
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		foreach(lc, vs)
+			if (((ProllyViolation *) lfirst(lc))->relid == relid)
+				n++;
+		values[0] = CStringGetTextDatum(qualified_name(relid));
+		values[1] = Int64GetDatum(n);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * dolt_constraint_violations(tbl regclass, OUT violation_type text,
+ *		OUT violating_row jsonb, OUT violation_info jsonb)
+ *
+ * A table's constraint violations, as Dolt's dolt_constraint_violations_
+ * <table>: each row, and what it violates.
+ */
+Datum
+dolt_constraint_violations(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			relid = PG_GETARG_OID(0);
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(relid));
+	foreach(lc, PROLLY_CALL(refs(), violations))
+	{
+		ProllyViolation *pv = lfirst(lc);
+		Datum		values[3];
+		bool		nulls[3] = {0};
+
+		if (pv->relid != relid)
+			continue;
+		values[0] = CStringGetTextDatum(pv->type);
+		values[1] = DirectFunctionCall1(jsonb_in, CStringGetDatum(pv->row));
+		values[2] = DirectFunctionCall1(jsonb_in, CStringGetDatum(pv->info));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * dolt_verify_constraints(VARIADIC tables text[]) returns text[]: {status}
+ *
+ * Check the tables (none: every versioned one) against their foreign keys
+ * again, as Dolt's dolt_verify_constraints: their recorded violations are
+ * replaced by what is found now (rows a merge didn't write for breaking a
+ * unique, check or not-null constraint are dropped: what to do with them
+ * is the user's).  Status 1 if any are left, else 0.
+ */
+Datum
+dolt_verify_constraints(PG_FUNCTION_ARGS)
+{
+	char	  **args = NULL;
+	int			nargs = PG_NARGS() > 0 ? text_args(fcinfo, &args) : 0;
+	List	   *relids = NIL;
+	List	   *kept = NIL;
+	List	   *found;
+	ListCell   *lc;
+	const char *result[1];
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (args[i][0] == '-')
+			unsupported("dolt_verify_constraints", args[i]);
+		relids = lappend_oid(relids,
+							 RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(args[i], NULL)),
+											  AccessShareLock, false));
+	}
+	foreach(lc, PROLLY_CALL(refs(), violations))
+	{
+		ProllyViolation *pv = lfirst(lc);
+
+		if (relids != NIL && !list_member_oid(relids, pv->relid))
+			kept = lappend(kept, pv);
+	}
+	found = PROLLY_CALL(diff_merge(), verify, relids);
+	if (relids != NIL)
+	{
+		/* (a table's own foreign keys, not those of tables referencing it) */
+		foreach(lc, found)
+			if (list_member_oid(relids, ((ProllyViolation *) lfirst(lc))->relid))
+				kept = lappend(kept, lfirst(lc));
+	}
+	else
+		kept = found;
+	PROLLY_CALL(refs(), set_violations, kept);
+	result[0] = kept != NIL ? "1" : "0";
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_verify_constraints() returns text[]: every versioned table */
+Datum
+dolt_verify_constraints_all(PG_FUNCTION_ARGS)
+{
+	return dolt_verify_constraints(fcinfo);
 }
 
 typedef struct RowConflictSink

@@ -278,7 +278,7 @@ UPDATE app.k SET a = 'uncommitted';
 BEGIN;
 SELECT (dolt_cherry_pick('feature~1'))[2:4];
 ERROR:  cannot cherry-pick with uncommitted changes when the cherry-pick conflicts
-DETAIL:  The cherry-pick has 1 conflicting rows.
+DETAIL:  The cherry-pick has 1 conflicting rows and 0 constraint violations.
 HINT:  Commit the changes, or reset the branch, first.
 ROLLBACK;
 SELECT a FROM app.k;

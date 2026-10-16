@@ -65,6 +65,7 @@ tests += {
       'checkpoints',
       'format_freeze',
       'dirty_merges',
+      'constraint_violations',
     ],
   },
   'tap': {

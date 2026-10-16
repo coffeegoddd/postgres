@@ -1,0 +1,198 @@
+-- Constraint violations a merge leaves, as in Dolt: rows it would write
+-- that break a unique constraint aren't written, and rows of tables it
+-- wrote that break a foreign key (which it doesn't check as it writes)
+-- stay; both are recorded, listed in dolt_constraint_violations(), and
+-- keep the merge from being committed until dolt_verify_constraints()
+-- finds none left.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA cv VERSIONED;
+CREATE TABLE cv.parent (id int PRIMARY KEY);
+CREATE TABLE cv.child (id int PRIMARY KEY, pid int REFERENCES cv.parent,
+	code text UNIQUE);
+INSERT INTO cv.parent VALUES (1), (2);
+INSERT INTO cv.child VALUES (1, 1, 'a');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+INSERT INTO cv.child VALUES (2, 2, 'b');	-- a child of the parent main drops
+INSERT INTO cv.child VALUES (4, 1, 'x');	-- a code main gives another row
+SELECT length(dolt_commit('-am', 'feature children')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DELETE FROM cv.parent WHERE id = 2;
+INSERT INTO cv.child VALUES (3, 1, 'x');
+SELECT length(dolt_commit('-am', 'main changes')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Outside a transaction block, the merge is rolled back.
+SELECT dolt_merge('feature');
+ERROR:  merge constraint violations detected, transaction rolled back
+DETAIL:  2 rows violate constraints.
+HINT:  Merge in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.
+SELECT id FROM cv.child ORDER BY id;
+ id 
+----
+  1
+  3
+(2 rows)
+
+-- In one, it stops with them recorded.
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+            dolt_merge             
+-----------------------------------
+ {1,"constraint violations found"}
+(1 row)
+
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ cv.child   |              2
+(1 row)
+
+SELECT violation_type, violating_row, violation_info
+FROM dolt_constraint_violations('cv.child') ORDER BY violation_type;
+ violation_type |          violating_row           |                                                             violation_info                                                             
+----------------+----------------------------------+----------------------------------------------------------------------------------------------------------------------------------------
+ foreign key    | {"id": 2, "pid": 2, "code": "b"} | {"Table": "cv.child", "Columns": ["pid"], "ForeignKey": "child_pid_fkey", "ReferencedTable": "cv.parent", "ReferencedColumns": ["id"]}
+ unique index   | {"id": 4, "pid": 1, "code": "x"} | {"Name": "child_code_key"}
+(2 rows)
+
+SELECT id, pid, code FROM cv.child ORDER BY id;
+ id | pid | code 
+----+-----+------
+  1 |   1 | a
+  2 |   2 | b
+  3 |   1 | x
+(3 rows)
+
+SAVEPOINT s;
+SELECT dolt_commit('-am', 'too soon');
+ERROR:  cannot commit with constraint violations
+HINT:  Fix the rows and check them again with dolt_verify_constraints().
+ROLLBACK TO s;
+-- fixed, and checked again
+INSERT INTO cv.parent VALUES (2);
+INSERT INTO cv.child VALUES (5, 1, 'x again');
+SELECT dolt_verify_constraints('cv.child');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT count(*) AS left_over FROM dolt_constraint_violations();
+ left_over 
+-----------
+         0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'merged')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT dolt_hashof('HEAD^2') = dolt_hashof('feature') AS merge_commit;
+ merge_commit 
+--------------
+ t
+(1 row)
+
+SELECT id, pid, code FROM cv.child ORDER BY id;
+ id | pid |  code   
+----+-----+---------
+  1 |   1 | a
+  2 |   2 | b
+  3 |   1 | x
+  5 |   1 | x again
+(4 rows)
+
+-- dolt_verify_constraints() finds what other changes break, and a reset
+-- clears what was recorded.
+SET session_replication_role = replica;	-- (no foreign key checks)
+INSERT INTO cv.child VALUES (6, 99, 'orphan');
+RESET session_replication_role;
+BEGIN;
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
+ violation_type |             violating_row              
+----------------+----------------------------------------
+ foreign key    | {"id": 6, "pid": 99, "code": "orphan"}
+(1 row)
+
+ROLLBACK;
+SELECT dolt_verify_constraints();	-- can't be committed
+ERROR:  cannot commit a transaction with constraint violations
+DETAIL:  Table "child" has a row that violates a foreign key constraint.
+HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints();	-- kept
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT count(*) FROM dolt_constraint_violations();
+ count 
+-------
+     1
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) FROM dolt_constraint_violations();
+ count 
+-------
+     0
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cv CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table cv.parent
+drop cascades to table cv.child
