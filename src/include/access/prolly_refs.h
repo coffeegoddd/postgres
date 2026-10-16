@@ -43,8 +43,8 @@ typedef struct ProllyCommitInfo
 } ProllyCommitInfo;
 
 /*
- * A merge in progress on a branch: it stopped with conflicts in tables,
- * which must be resolved before the merge commit is made.
+ * A merge (or cherry-pick) in progress on a branch: it stopped with
+ * conflicts in tables, which must be resolved before its commit is made.
  */
 typedef struct ProllyMergeState
 {
@@ -52,6 +52,8 @@ typedef struct ProllyMergeState
 	ProllyHash	base;			/* the common ancestor */
 	int			ntables;
 	Oid		   *tables;			/* with unresolved conflicts (palloc'd) */
+	bool		pick;			/* a cherry-pick: its commit has one parent */
+	char	   *message;		/* a pick's: the picked commit's message */
 } ProllyMergeState;
 
 /* Visits one branch: its name and head commit (len 0: none yet). */

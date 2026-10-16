@@ -18,6 +18,8 @@
  *				   common ancestor (hash length, hash each), then the OIDs
  *				   of tables with unresolved conflicts (4 bytes each,
  *				   big-endian)
+ *	'P' name	-> if that merge is a cherry-pick: the picked commit's
+ *				   message
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts it left, unless
@@ -69,6 +71,7 @@
 #define TAG_BRANCH		'B'
 #define TAG_MERGE		'M'
 #define TAG_BASELINE	'W'
+#define TAG_PICK		'P'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
@@ -832,7 +835,16 @@ copies_branch_delete(const char *name, bool force)
 		initStringInfo(&key);
 		merge_key(&key, name);
 		if (merge_state_of(name, &ms))
+		{
 			refs_put(key.data, key.len, NULL);
+			if (ms.pick)
+			{
+				resetStringInfo(&key);
+				appendStringInfoChar(&key, TAG_PICK);
+				appendStringInfoString(&key, name);
+				refs_put(key.data, key.len, NULL);
+			}
+		}
 		pfree(key.data);
 	}
 }
@@ -932,7 +944,8 @@ copies_commit(const char *message, ProllyHash *commit_id)
 					 errdetail("Table \"%s\" has conflicts.",
 							   get_rel_name(ms.tables[0])),
 					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
-		parents[nparents++] = ms.theirs;
+		if (!ms.pick)
+			parents[nparents++] = ms.theirs;
 		copies_set_merge_state(NULL);
 	}
 	commit_branch(message, parents, nparents, commit_id);
@@ -1097,6 +1110,7 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 	initStringInfo(&key);
 	initStringInfo(&v);
 	merge_key(&key, branch);
+	memset(state, 0, sizeof(*state));
 	found = refs_get(key.data, key.len, &v);
 	if (found)
 	{
@@ -1109,6 +1123,14 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
 		for (int i = 0; i < state->ntables; i++)
 			state->tables[i] = get_be32(p + i * 4);
+
+		/* a cherry-pick's */
+		resetStringInfo(&key);
+		resetStringInfo(&v);
+		appendStringInfoChar(&key, TAG_PICK);
+		appendStringInfoString(&key, branch);
+		state->pick = refs_get(key.data, key.len, &v);
+		state->message = state->pick ? pnstrdup(v.data, v.len) : NULL;
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -1130,13 +1152,22 @@ copies_set_merge_state(const ProllyMergeState *state)
 	ProllyMergeState cur;
 	char	   *branch = branch_ops()->current();
 
+	StringInfoData pkey;
+	bool		had;
+
 	refs_init();
 	initStringInfo(&key);
 	merge_key(&key, branch);
+	initStringInfo(&pkey);
+	appendStringInfoChar(&pkey, TAG_PICK);
+	appendStringInfoString(&pkey, branch);
+	had = merge_state_of(branch, &cur);
 	if (state == NULL)
 	{
-		if (copies_merge_state(&cur))
+		if (had)
 			refs_put(key.data, key.len, NULL);
+		if (had && cur.pick)
+			refs_put(pkey.data, pkey.len, NULL);
 	}
 	else
 	{
@@ -1146,6 +1177,14 @@ copies_set_merge_state(const ProllyMergeState *state)
 		for (int i = 0; i < state->ntables; i++)
 			put_be32(&v, state->tables[i]);
 		refs_put(key.data, key.len, &v);
+		resetStringInfo(&v);
+		if (state->pick)
+		{
+			appendStringInfoString(&v, state->message ? state->message : "");
+			refs_put(pkey.data, pkey.len, &v);
+		}
+		else if (had && cur.pick)
+			refs_put(pkey.data, pkey.len, NULL);
 		pfree(v.data);
 		if (!name_listed(merge_changed, branch))
 		{
@@ -1156,6 +1195,7 @@ copies_set_merge_state(const ProllyMergeState *state)
 		}
 	}
 	pfree(key.data);
+	pfree(pkey.data);
 }
 
 typedef struct WalkState

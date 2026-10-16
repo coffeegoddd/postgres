@@ -1765,6 +1765,7 @@ merge_held(const char *branch, const char *message, int flags,
 	{
 		int			i = 0;
 
+		memset(&ms, 0, sizeof(ms));
 		ms.theirs = theirs;
 		ms.base = base;
 		ms.ntables = list_length(conflicted);
@@ -1811,10 +1812,11 @@ folded_merge(const char *branch, const char *message, int flags,
  * branch, or, reverting, undo them (each from it to its parent): every ref
  * resolved before anything moves, each merged three-way into the branch as
  * the ones before left it, and one commit made of them all, with one
- * parent.  Conflicts are an error, for now; so is a commit of nothing,
- * unless allow_empty.  A cherry-pick keeps its commit's author.
+ * parent.  A pick's conflicts leave it in progress, to resolve before
+ * its commit; a revert's are an error.  So is a commit of nothing, unless
+ * allow_empty.  A cherry-pick keeps its commit's author.
  */
-static void
+static int
 pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		  ProllyHash *commit_id)
 {
@@ -1876,9 +1878,30 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 	initStringInfo(&message);
 	for (int i = 0; i < nrefs; i++)
 	{
+		int			conflicts;
+
 		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
 		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
-		(void) merge_roots(roots, true, fn, NULL, &conflicted);
+		conflicts = merge_roots(roots, revert, fn, NULL, &conflicted);
+		if (conflicts > 0)
+		{
+			/* a pick's (a revert's failed): the pick in progress */
+			int			j = 0;
+			ListCell   *lc;
+
+			memset(&ms, 0, sizeof(ms));
+			ms.theirs = picked[i];
+			ms.base = info[i].parents[0];
+			ms.ntables = list_length(conflicted);
+			ms.tables = palloc(sizeof(Oid) * ms.ntables);
+			foreach(lc, conflicted)
+				ms.tables[j++] = lfirst_oid(lc);
+			ms.pick = true;
+			ms.message = info[i].message;
+			PROLLY_CALL(dc.refs, set_merge_state, &ms);
+			memset(commit_id, 0, sizeof(*commit_id));
+			return conflicts;
+		}
 		/* the next merges into the rows as this one left them */
 		root_of("WORKING", &roots[1]);
 		if (!revert)
@@ -1915,6 +1938,7 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		prolly_set_commit_author(NULL);
 	}
 	PG_END_TRY();
+	return 0;
 }
 
 /*
@@ -1976,16 +2000,17 @@ folded_resolve(Oid relid, bool theirs)
 	PROLLY_CALL(components().refs, set_merge_state, &ms);
 }
 
-static void
+static int
 folded_cherry_pick(const char *const *refs, int nrefs, bool revert,
 				   bool allow_empty, ProllyHash *commit_id)
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
+	int			result = pick_held(refs, nrefs, revert, allow_empty, commit_id);
 
-	pick_held(refs, nrefs, revert, allow_empty, commit_id);
 	if (pushed)
 		PopActiveSnapshot();
+	return result;
 }
 
 const ProllyMergeRoutine prolly_merge_folded = {

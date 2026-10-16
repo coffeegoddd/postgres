@@ -33,10 +33,43 @@ SELECT id, v FROM app.t WHERE id IN (1, 2, 5, 11) ORDER BY id;
 SELECT a, count(*) FROM app.k GROUP BY a;
 SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 
--- A conflict is refused, and so are uncommitted changes and merges.
+-- A conflict outside a transaction block rolls the pick back; so are
+-- uncommitted changes it would change refused, and merges.
 UPDATE app.t SET v = 'main one' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'main one')::text) AS committed;
 SELECT dolt_cherry_pick('feature~1');
+
+-- In a transaction block, a conflict leaves the pick in progress, to
+-- resolve and commit: with one parent, and the picked commit's message
+-- (--continue) or one's own.
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.t);
+SAVEPOINT s;
+SELECT dolt_merge('feature');
+ROLLBACK TO s;
+SELECT dolt_conflicts_resolve('--theirs', 'app.t');
+SELECT length((dolt_cherry_pick('--continue'))[1]) AS picked;
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+SELECT id, v FROM app.t WHERE id = 1;
+SELECT dolt_hashof('HEAD^2');
+SELECT dolt_reset('--hard', 'HEAD~1');
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+SELECT dolt_conflicts_resolve('--ours', 'app.t');
+SELECT length(dolt_commit('--allow-empty', '-am', 'picked, ours kept')::text) AS committed;
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+SELECT dolt_hashof('HEAD^2');
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- one kept with its conflicts is aborted
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+RESET dolt.allow_commit_conflicts;
+SELECT (dolt_cherry_pick('--abort'))[1:2];
+SELECT id, v FROM app.t WHERE id = 1;
+SELECT dolt_cherry_pick('--continue');
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_cherry_pick(:'two');
 SELECT dolt_reset('--hard');

@@ -37,7 +37,11 @@
  *   the current branch, or with revert undoes them, merging each three-way
  *   with the branch as the ones before left it, every ref resolved first,
  *   and returns the one commit made of them; a commit of nothing fails
- *   unless allow_empty.
+ *   unless allow_empty.  A pick's rows changed differently on both sides
+ *   are conflicts, as a merge's: it makes no commit (commit_id's len is
+ *   0), records the pick in progress, whose commit, once they are
+ *   resolved, has the one parent, and returns how many there are.  A
+ *   revert's conflicts are an error.
  *
  * Provisional (v0).
  *
@@ -83,7 +87,7 @@ typedef struct ProllyMergeRoutine
 	void		(*tables) (const char *from_ref, const char *to_ref,
 						   ProllyTableChangeVisit visit, void *arg);
 	void		(*move_to) (const ProllyNodeRef *root);
-	void		(*cherry_pick) (const char *const *refs, int nrefs, bool revert,
+	int			(*cherry_pick) (const char *const *refs, int nrefs, bool revert,
 								bool allow_empty, ProllyHash *commit_id);
 } ProllyMergeRoutine;
 

@@ -108,7 +108,8 @@ SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
  Revert "feature two"
 (1 row)
 
--- A conflict is refused, and so are uncommitted changes and merges.
+-- A conflict outside a transaction block rolls the pick back; so are
+-- uncommitted changes it would change refused, and merges.
 UPDATE app.t SET v = 'main one' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'main one')::text) AS committed;
  committed 
@@ -117,8 +118,120 @@ SELECT length(dolt_commit('-Am', 'main one')::text) AS committed;
 (1 row)
 
 SELECT dolt_cherry_pick('feature~1');
-ERROR:  dolt_cherry_pick conflicts in table "t"
+ERROR:  cherry-pick conflict detected, transaction rolled back
 DETAIL:  1 row was changed differently on both sides.
+HINT:  Cherry-pick in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+-- In a transaction block, a conflict leaves the pick in progress, to
+-- resolve and commit: with one parent, and the picked commit's message
+-- (--continue) or one's own.
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {1,0,0}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.t);
+ base_row |    our_row     | their_row 
+----------+----------------+-----------
+ (1,v1)   | (1,"main one") | (1,one)
+(1 row)
+
+SAVEPOINT s;
+SELECT dolt_merge('feature');
+ERROR:  a merge is in progress on the current branch
+HINT:  Resolve its conflicts and commit, or abort it.
+ROLLBACK TO s;
+SELECT dolt_conflicts_resolve('--theirs', 'app.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT length((dolt_cherry_pick('--continue'))[1]) AS picked;
+ picked 
+--------
+     64
+(1 row)
+
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+   message   
+-------------
+ feature one
+(1 row)
+
+SELECT id, v FROM app.t WHERE id = 1;
+ id |  v  
+----+-----
+  1 | one
+(1 row)
+
+SELECT dolt_hashof('HEAD^2');
+ERROR:  prolly ref "HEAD^2" does not exist
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {1,0,0}
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', 'app.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-am', 'picked, ours kept')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+      message      
+-------------------
+ picked, ours kept
+(1 row)
+
+SELECT dolt_hashof('HEAD^2');
+ERROR:  prolly ref "HEAD^2" does not exist
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- one kept with its conflicts is aborted
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {1,0,0}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT (dolt_cherry_pick('--abort'))[1:2];
+ dolt_cherry_pick 
+------------------
+ {"",0}
+(1 row)
+
+SELECT id, v FROM app.t WHERE id = 1;
+ id |    v     
+----+----------
+  1 | main one
+(1 row)
+
+SELECT dolt_cherry_pick('--continue');
+ERROR:  there is no cherry-pick to continue
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_cherry_pick(:'two');
 ERROR:  local changes would be stomped by cherry-pick
