@@ -130,3 +130,24 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_extend(relnumber oid, n int)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Change a byte of a page's hole, as an access method changes a page.
+CREATE FUNCTION test_bmap_write(relnumber oid, blkno int, value int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A digest of heap pages' rows, leaving out hint bits.
+CREATE FUNCTION test_bmap_rows_digest(relnumber oid)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Read a block zeroed and locked, as an access method about to initialize
+-- it does (only if it isn't in a buffer), and leave it uninitialized.
+CREATE FUNCTION test_bmap_zero_block(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Try for a block's cleanup lock without waiting; true if it was free.
+CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -7,7 +7,8 @@
  *
  * Every function names storage by relation file number, in the database's
  * default tablespace.  A copy made here has no catalog row; it lasts until
- * test_bmap_unlink() drops it.
+ * test_bmap_unlink() drops it.  test_bmap_write() changes a page as an
+ * access method would, so a shared page is copied first.
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -18,8 +19,10 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
@@ -75,16 +78,15 @@ test_bmap_share(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_bmap_digest(relnumber): an MD5 digest of every page, read through
- * shared buffers, with each page's checksum left out (it is set only when
- * a page is written).
+ * An MD5 digest of every page of relnumber's storage, read through shared
+ * buffers, with each page's checksum left out (it is set only when a page
+ * is written); with 'heap', as heap pages with what changes no row (hint
+ * bits, free space) left out too.
  */
-PG_FUNCTION_INFO_V1(test_bmap_digest);
-
-Datum
-test_bmap_digest(PG_FUNCTION_ARGS)
+static Datum
+digest(Oid relnumber, bool heap)
 {
-	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	RelFileLocator loc = locator_of(relnumber);
 	SMgrRelation srel = bmap_smgr(loc.relNumber);
 	BlockNumber nblocks = smgrnblocks(srel, MAIN_FORKNUM);
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_MD5);
@@ -103,6 +105,8 @@ test_bmap_digest(PG_FUNCTION_ARGS)
 		memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
 		UnlockReleaseBuffer(buf);
 		((PageHeader) copy.data)->pd_checksum = 0;
+		if (heap)
+			heap_mask(copy.data, blk);
 		if (pg_cryptohash_update(ctx, (uint8 *) copy.data, BLCKSZ) < 0)
 			elog(ERROR, "could not update MD5");
 	}
@@ -112,6 +116,27 @@ test_bmap_digest(PG_FUNCTION_ARGS)
 	hex_encode((char *) sum, sizeof(sum), hex);
 	hex[sizeof(hex) - 1] = '\0';
 	PG_RETURN_TEXT_P(cstring_to_text(hex));
+}
+
+/* test_bmap_digest(relnumber): a digest of the storage's pages */
+PG_FUNCTION_INFO_V1(test_bmap_digest);
+
+Datum
+test_bmap_digest(PG_FUNCTION_ARGS)
+{
+	return digest(PG_GETARG_OID(0), false);
+}
+
+/*
+ * test_bmap_rows_digest(relnumber): a digest of the storage's heap pages'
+ * rows, leaving out hint bits, which may be set on a shared page in place.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_rows_digest);
+
+Datum
+test_bmap_rows_digest(PG_FUNCTION_ARGS)
+{
+	return digest(PG_GETARG_OID(0), true);
 }
 
 /*
@@ -212,4 +237,77 @@ test_bmap_extend(PG_FUNCTION_ARGS)
 	smgrzeroextend(srel, MAIN_FORKNUM, smgrnblocks(srel, MAIN_FORKNUM),
 				   PG_GETARG_INT32(1), false);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_bmap_write(relnumber, blkno, value): change a page as an access
+ * method would (an exclusive lock, a change, a WAL record): a byte of its
+ * hole, between pd_lower and pd_upper, which no reader looks at.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_write);
+
+Datum
+test_bmap_write(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	BlockNumber blkno = PG_GETARG_INT32(1);
+	int32		value = PG_GETARG_INT32(2);
+	Buffer		buf;
+	Page		page;
+	PageHeader	ph;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	ph = (PageHeader) page;
+	if (ph->pd_upper <= ph->pd_lower)
+		elog(ERROR, "block %u has no hole", blkno);
+
+	START_CRIT_SECTION();
+	((char *) page)[ph->pd_lower] = (char) value;
+	MarkBufferDirty(buf);
+	log_newpage_buffer(buf, false);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Read a block zeroed and locked, as an access method about to initialize
+ * it does, and let it go uninitialized.  Zeroed only if not already in a
+ * buffer.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_zero_block);
+Datum
+test_bmap_zero_block(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	Buffer		buf;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, PG_GETARG_INT32(1),
+									RBM_ZERO_AND_LOCK, NULL, true);
+	UnlockReleaseBuffer(buf);
+	PG_RETURN_VOID();
+}
+
+/* Try for a block's cleanup lock without waiting, and let it go. */
+PG_FUNCTION_INFO_V1(test_bmap_cleanup_lock);
+Datum
+test_bmap_cleanup_lock(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	Buffer		buf;
+	bool		got;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, PG_GETARG_INT32(1),
+									RBM_NORMAL, NULL, true);
+	got = ConditionalLockBufferForCleanup(buf);
+	if (got)
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buf);
+	PG_RETURN_BOOL(got);
 }

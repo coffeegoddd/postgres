@@ -36,7 +36,7 @@
  * State of the buffer itself (in order):
  * - 18 bits refcount
  * - 4 bits usage count
- * - 12 bits of flags
+ * - 14 bits of flags
  * - 18 bits share-lock count
  * - 1 bit share-exclusive locked
  * - 1 bit exclusive locked
@@ -48,7 +48,7 @@
  */
 #define BUF_REFCOUNT_BITS 18
 #define BUF_USAGECOUNT_BITS 4
-#define BUF_FLAG_BITS 12
+#define BUF_FLAG_BITS 14
 #define BUF_LOCK_BITS (18+2)
 
 StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_LOCK_BITS <= 64,
@@ -114,7 +114,8 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_IO_IN_PROGRESS			BUF_DEFINE_FLAG( 4)
 /* previous I/O failed */
 #define BM_IO_ERROR					BUF_DEFINE_FLAG( 5)
-/* flag bit 6 is not used anymore */
+/* the storage manager must prepare the page before it next changes */
+#define BM_SMGR_PREPARE				BUF_DEFINE_FLAG( 6)
 /* have waiter for sole pin */
 #define BM_PIN_COUNT_WAITER			BUF_DEFINE_FLAG( 7)
 /* must write for checkpoint */
@@ -125,6 +126,10 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_LOCK_HAS_WAITERS			BUF_DEFINE_FLAG(10)
 /* waiter for content lock has been signalled but not yet run */
 #define BM_LOCK_WAKE_IN_PROGRESS	BUF_DEFINE_FLAG(11)
+/* with BM_SMGR_PREPARE: the page is shared, so preparing it copies it */
+#define BM_SMGR_SHARED				BUF_DEFINE_FLAG(12)
+/* BM_SMGR_PREPARE was set again since a check of the page began */
+#define BM_SMGR_REMARKED			BUF_DEFINE_FLAG(13)
 
 
 StaticAssertDecl(MAX_BACKENDS_BITS <= BUF_REFCOUNT_BITS,
