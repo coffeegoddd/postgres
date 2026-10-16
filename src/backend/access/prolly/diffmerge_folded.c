@@ -115,7 +115,7 @@ root_of(const char *ref, ProllyNodeRef *root)
 
 	if (strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0)
 	{
-		PROLLY_CALL(dc.canonicalizer, fold, root);
+		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
 		return;
 	}
 	if (!PROLLY_CALL(dc.refs, resolve, ref, &id) ||
@@ -720,7 +720,7 @@ move_rows(void *arg)
 {
 	ProllyNodeRef working;
 
-	PROLLY_CALL(components().canonicalizer, fold, &working);
+	(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
 	rows_from(&working, arg);
 }
 
@@ -731,7 +731,7 @@ folded_move_to(const ProllyNodeRef *target)
 	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef working;
 
-	PROLLY_CALL(dc.canonicalizer, fold, &working);
+	(void) PROLLY_CALL(dc.refs, working_set, NULL, &working);
 	if (PROLLY_CALL(dc.canonicalizer, same_schema, &working, target))
 		rows_from(&working, target);	/* (folded already) */
 	else
@@ -1127,7 +1127,7 @@ merge_rows(void *arg)
 		ProllyNodeRef working;
 		Tables		ts = {NIL};
 
-		PROLLY_CALL(components().canonicalizer, fold, &working);
+		(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
 		PROLLY_CALL(components().canonicalizer, tables, &working, add_table, &ts);
 		now = ts.tables;
 	}

@@ -67,7 +67,9 @@ FROM prolly_implementations();
  row_applier     | stub             |       0 |              0
  table_file      | basic            |       1 |              1
  table_file      | stub             |       0 |              0
-(58 rows)
+ change_finder   | pages            |       1 |              1
+ change_finder   | stub             |       0 |              0
+(60 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -401,11 +403,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (10 of 10 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (11 of 11 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | not implemented (7 of 10 callbacks missing)
+ canonicalizer   | catalogs         | complete                                | not implemented (8 of 11 callbacks missing)
  canonicalizer   | folded           | identity                                | pass
- canonicalizer   | folded           | complete                                | not implemented (2 of 10 callbacks missing)
+ canonicalizer   | folded           | complete                                | not implemented (2 of 11 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass
@@ -424,7 +426,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  table_file      | stub             | round_trip                              | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
  table_file      | stub             | rejects_other_bytes                     | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
  table_file      | stub             | complete                                | not implemented (9 of 9 callbacks missing)
-(348 rows)
+ change_finder   | pages            | identity                                | pass
+ change_finder   | pages            | complete                                | pass
+ change_finder   | stub             | identity                                | pass
+ change_finder   | stub             | complete                                | not implemented (3 of 3 callbacks missing)
+(352 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

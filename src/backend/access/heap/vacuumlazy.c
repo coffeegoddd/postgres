@@ -1939,7 +1939,7 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		if (sharelock)
 		{
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			LockBufferForNeutralChange(buf);
 
 			if (!PageIsEmpty(page))
 			{
@@ -2727,8 +2727,11 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		 */
 		visibilitymap_pin(vacrel->rel, blkno, &vmbuffer);
 
-		/* We need a non-cleanup exclusive lock to mark dead_items unused */
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		/*
+		 * We need a non-cleanup exclusive lock to mark dead_items unused,
+		 * which changes no row
+		 */
+		LockBufferForNeutralChange(buf);
 		lazy_vacuum_heap_page(vacrel, blkno, buf, offsets,
 							  num_offsets, vmbuffer);
 

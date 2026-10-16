@@ -25,7 +25,12 @@
  * - fold() builds the canonical root of the session branch's versioned
  *   schemas as the calling transaction sees them, folding their tables'
  *   rows into trees: the same for the same logical content, however the
- *   rows and objects came to be.
+ *   rows and objects came to be.  'baseline' (NULL: none) is the branch's
+ *   last fold for a commit or checkpoint: its tables' trees are the
+ *   starting point, and only what changed since is read.  With
+ *   'next_baseline', the fold begins a new one, which holds once the
+ *   transaction commits it as the branch's baseline.
+ * - walk_baseline() visits every node a baseline keeps alive.
  * - tables() visits each table a folded root holds, in name order: its
  *   qualified name, its data tree and its definition as described.
  * - same_schema() is whether two folded roots hold the same objects with
@@ -81,7 +86,8 @@ typedef struct ProllyCanonRoutine
 								   ProllyNodeRef *root);
 	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
 						 void *arg);
-	void		(*fold) (ProllyNodeRef *root);
+	void		(*fold) (const ProllyNodeRef *baseline, ProllyNodeRef *root,
+						 ProllyNodeRef *next_baseline);
 	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 						   void *arg);
 	/* Its materialized views' rows, as tables' (never unreadable). */
@@ -96,12 +102,14 @@ typedef struct ProllyCanonRoutine
 								 const ProllyNodeRef *ours,
 								 const ProllyNodeRef *theirs,
 								 ProllyNodeRef *merged);
+	void		(*walk_baseline) (const ProllyNodeRef *baseline,
+								  ProllyTreeVisitNode visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
 	"materialized_views", "same_schema", "move_schema", "sequences", \
-	"merge_schema"
+	"merge_schema", "walk_baseline"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

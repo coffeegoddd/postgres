@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_chunkstore.h"
@@ -225,15 +226,26 @@ test_chunk_table_files(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-/* The canonical root of the session branch's versioned schemas, folded. */
+/*
+ * The canonical root of the session branch's versioned schemas, folded from
+ * the branch's baseline (as commits fold), or from nothing with 'full': the
+ * two must be the same.
+ */
 PG_FUNCTION_INFO_V1(test_fold_root);
 Datum
 test_fold_root(PG_FUNCTION_ARGS)
 {
-	const ProllyCanonRoutine *canon = prolly_canon_lookup("folded");
 	ProllyNodeRef root;
 
-	PROLLY_CALL(canon, fold, &root);
+	if (PG_NARGS() > 0 && PG_GETARG_BOOL(0))
+		PROLLY_CALL(prolly_canon_lookup("folded"), fold, NULL, &root, NULL);
+	else
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		(void) PROLLY_CALL(dc.refs, working_set, NULL, &root);
+	}
 	PG_RETURN_TEXT_P(hash_text(&root.hash));
 }
 
@@ -276,6 +288,26 @@ test_refs_walk_reaches(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(r.found);
 }
 
+/* What the session's folds have read: pages, candidates, full tables. */
+PG_FUNCTION_INFO_V1(test_fold_counters);
+Datum
+test_fold_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	ProllyChangeCounters c;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(prolly_changes_lookup("pages"), counters, &c, PG_GETARG_BOOL(0));
+	values[0] = Int64GetDatum((int64) c.pages);
+	values[1] = Int64GetDatum((int64) c.candidates);
+	values[2] = Int64GetDatum((int64) c.full);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
 static int
 memcmp_order(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
@@ -302,7 +334,7 @@ test_fold_items(PG_FUNCTION_ARGS)
 	ProllyValue v;
 
 	InitMaterializedSRF(fcinfo, 0);
-	PROLLY_CALL(canon, fold, &root);
+	PROLLY_CALL(canon, fold, NULL, &root, NULL);
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");
