@@ -162,6 +162,19 @@ is($restored->safe_psql('postgres', $files), sql($files),
 is($restored->safe_psql('postgres', $big), '40', 'and reads them');
 $restored->stop;
 
+# A database made from this one has its table files and manifest,
+# whichever way it is made, on the standby too.
+sql('CREATE DATABASE tables_wal TEMPLATE postgres');
+sql('CREATE DATABASE tables_files TEMPLATE postgres STRATEGY FILE_COPY');
+my $want = sql($named);
+for my $db ('tables_wal', 'tables_files')
+{
+	is($node->safe_psql($db, $named), $want, "a database made from it ($db) has its table files");
+	is($node->safe_psql($db, $big), '40', 'and reads them');
+}
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+is($standby->safe_psql('tables_wal', $big), '40', 'the standby\'s copy reads them too');
+
 $standby->stop;
 $node->stop;
 done_testing();
