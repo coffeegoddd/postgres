@@ -1518,3 +1518,222 @@ chunkformat_rejects_other_bytes(const ProllyImplInfo *impl)
 	if (PROLLY_CALL(cf, open, (const uint8 *) "random bytes, not a node", 24, &node))
 		elog(ERROR, "random bytes open as a node");
 }
+
+/* Table files, read from memory. */
+typedef struct MemFile
+{
+	const char *data;
+	Size		len;
+} MemFile;
+
+static bool
+memfile_read(void *arg, uint64 offset, char *buf, Size len)
+{
+	MemFile    *f = arg;
+
+	if (offset > f->len || len > f->len - offset)
+		return false;
+	memcpy(buf, f->data + offset, len);
+	return true;
+}
+
+/* chunk i of a test file: some repetitive (compressible), some not */
+static void
+tablefile_chunk(int i, StringInfo out, ProllyHash *hash)
+{
+	const ProllyHashRoutine *h = prolly_hash_lookup("sha256");
+	ProllyHashCtx *ctx;
+	uint32		x = 2166136261u ^ (uint32) i;
+
+	resetStringInfo(out);
+	for (int j = 0; j < (i * 131) % 9000; j++)
+	{
+		if (i % 2 == 0)
+			appendStringInfoChar(out, (char) ('a' + j % 3));
+		else
+		{
+			x = x * 16777619u + 7;
+			appendStringInfoChar(out, (char) (x >> 24));
+		}
+	}
+	ctx = PROLLY_CALL(h, begin, CurrentMemoryContext);
+	PROLLY_CALL(h, update, ctx, (const uint8 *) out->data, out->len);
+	PROLLY_CALL(h, finish, ctx, hash);
+}
+
+static void
+tablefile_build(const ProllyTableFileRoutine *tf, int n, StringInfo file)
+{
+	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
+	StringInfoData chunk;
+	StringInfoData part;
+
+	initStringInfo(&chunk);
+	initStringInfo(&part);
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	hash;
+
+		tablefile_chunk(i, &chunk, &hash);
+		PROLLY_CALL(tf, write_add, w, &hash, chunk.data, chunk.len, &part);
+		/* the caller may write each part out and start again */
+		if (i % 7 == 0)
+		{
+			appendBinaryStringInfo(file, part.data, part.len);
+			resetStringInfo(&part);
+		}
+	}
+	PROLLY_CALL(tf, write_finish, w, &part);
+	appendBinaryStringInfo(file, part.data, part.len);
+}
+
+static int
+hash_order(const ProllyHash *a, const ProllyHash *b)
+{
+	int			r = memcmp(a->bytes, b->bytes, Min(a->len, b->len));
+
+	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
+}
+
+/*
+ * Table file format: every chunk added is found and decodes to its bytes;
+ * the index lists them in hash order; a chunk not added isn't found; and
+ * the same chunks in the same order give the same bytes.
+ */
+void
+tablefile_round_trip(const ProllyImplInfo *impl)
+{
+	const ProllyTableFileRoutine *tf = (const ProllyTableFileRoutine *) impl;
+	int			n = 200;
+	StringInfoData a;
+	StringInfoData b;
+	StringInfoData chunk;
+	StringInfoData out;
+	MemFile		mf;
+	ProllyTableFile *f;
+	ProllyHash	prev = {0};
+
+	initStringInfo(&a);
+	initStringInfo(&b);
+	initStringInfo(&chunk);
+	initStringInfo(&out);
+	tablefile_build(tf, n, &a);
+	tablefile_build(tf, n, &b);
+	if (a.len != b.len || memcmp(a.data, b.data, a.len) != 0)
+		elog(ERROR, "the same chunks gave different table files");
+
+	mf.data = a.data;
+	mf.len = a.len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	if (f == NULL)
+		elog(ERROR, "a table file written doesn't open");
+	if (PROLLY_CALL(tf, count, f) != n)
+		elog(ERROR, "a table file of %d chunks lists %d", n,
+			 PROLLY_CALL(tf, count, f));
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(i, &chunk, &hash);
+		if (!PROLLY_CALL(tf, find, f, &hash, &offset, &len))
+			elog(ERROR, "chunk %d isn't found", i);
+		if (offset > (uint64) a.len || len > a.len - offset)
+			elog(ERROR, "chunk %d is past the file's end", i);
+		resetStringInfo(&out);
+		PROLLY_CALL(tf, decode, f, a.data + offset, len, &out);
+		if (out.len != chunk.len || memcmp(out.data, chunk.data, out.len) != 0)
+			elog(ERROR, "chunk %d doesn't decode to its bytes", i);
+	}
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		PROLLY_CALL(tf, entry, f, i, &hash, &offset, &len);
+		if (i > 0 && hash_order(&prev, &hash) >= 0)
+			elog(ERROR, "entries %d and %d aren't in hash order", i - 1, i);
+		prev = hash;
+	}
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(n, &chunk, &hash);
+		if (PROLLY_CALL(tf, find, f, &hash, &offset, &len))
+			elog(ERROR, "a chunk not added is found");
+	}
+	PROLLY_CALL(tf, close, f);
+
+	/* and a file of no chunks */
+	resetStringInfo(&a);
+	tablefile_build(tf, 0, &a);
+	mf.data = a.data;
+	mf.len = a.len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	if (f == NULL || PROLLY_CALL(tf, count, f) != 0)
+		elog(ERROR, "an empty table file doesn't read back");
+	PROLLY_CALL(tf, close, f);
+}
+
+/*
+ * Bytes that aren't a whole table file don't open as one, and a chunk's
+ * bytes changed don't decode.
+ */
+void
+tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
+{
+	const ProllyTableFileRoutine *tf = (const ProllyTableFileRoutine *) impl;
+	StringInfoData a;
+	MemFile		mf;
+	ProllyTableFile *f;
+	ProllyHash	hash;
+	uint64		offset;
+	uint32		len;
+	StringInfoData out;
+	char	   *copy;
+	volatile bool failed = false;
+
+	initStringInfo(&a);
+	initStringInfo(&out);
+	tablefile_build(tf, 20, &a);
+	for (Size cut = 0; cut < (Size) a.len; cut += 1 + cut / 8)
+	{
+		mf.data = a.data;
+		mf.len = cut;
+		if (PROLLY_CALL(tf, open, memfile_read, &mf, cut, CurrentMemoryContext))
+			elog(ERROR, "%zu of a table file's %d bytes open as one", cut, a.len);
+	}
+	/* a byte of the index changed */
+	f = NULL;
+	mf.data = a.data;
+	mf.len = a.len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	PROLLY_CALL(tf, entry, f, 0, &hash, &offset, &len);
+	copy = palloc(a.len);
+	memcpy(copy, a.data, a.len);
+	copy[a.len - 40] ^= 1;
+	mf.data = copy;
+	if (PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext))
+		elog(ERROR, "a table file with its index changed opens");
+
+	/* a byte of a chunk changed */
+	memcpy(copy, a.data, a.len);
+	copy[offset + len / 2] ^= 1;
+	PG_TRY();
+	{
+		PROLLY_CALL(tf, decode, f, copy + offset, len, &out);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		failed = true;
+	}
+	PG_END_TRY();
+	if (!failed)
+		elog(ERROR, "a changed chunk decodes");
+	PROLLY_CALL(tf, close, f);
+}

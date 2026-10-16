@@ -65,7 +65,9 @@ FROM prolly_implementations();
  chunk_format    | basic            |       1 |              1
  row_applier     | replication      |       1 |              1
  row_applier     | stub             |       0 |              0
-(56 rows)
+ table_file      | basic            |       1 |              1
+ table_file      | stub             |       0 |              0
+(58 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -414,7 +416,15 @@ NOTICE:  drop cascades to column m of table conf_kt
  row_applier     | replication      | complete                                | pass
  row_applier     | stub             | identity                                | pass
  row_applier     | stub             | complete                                | not implemented (5 of 5 callbacks missing)
-(340 rows)
+ table_file      | basic            | identity                                | pass
+ table_file      | basic            | round_trip                              | pass
+ table_file      | basic            | rejects_other_bytes                     | pass
+ table_file      | basic            | complete                                | pass
+ table_file      | stub             | identity                                | pass
+ table_file      | stub             | round_trip                              | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
+ table_file      | stub             | rejects_other_bytes                     | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
+ table_file      | stub             | complete                                | not implemented (9 of 9 callbacks missing)
+(348 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

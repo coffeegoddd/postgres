@@ -27,6 +27,14 @@
  *   it, until its transaction ends; the move is made durable by the
  *   transaction's commit record, and is gone if the transaction aborts.
  * - A transaction can't be prepared (two-phase) after moving a root.
+ * - add_table_file() adds a table file of the chunks next() gives (until it
+ *   returns false), at once and for every transaction: the chunks of
+ *   another store, received whole, or of a rewrite.  It isn't undone if the
+ *   transaction aborts; its chunks are reachable once a root naming them
+ *   is.  conjoin() rewrites the table files as one.  table_files() visits
+ *   the store's table files.
+ * - shmem_size() and shmem_init() reserve and set up the shared state of
+ *   the server's stores (optional).
  *
  * Provisional (v0).
  *
@@ -43,6 +51,13 @@
 #include "lib/stringinfo.h"
 
 typedef struct ProllyChunkStore ProllyChunkStore;
+
+/* The next chunk to add, in hash and data; false when there are no more. */
+typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
+
+/* Visits a table file: its name, its chunk count and its size in bytes. */
+typedef void (*ProllyChunkFileVisit) (const char *name, int nchunks,
+									  uint64 size, void *arg);
 
 typedef struct ProllyChunkStoreRoutine
 {
@@ -80,6 +95,17 @@ typedef struct ProllyChunkStoreRoutine
 	/* Replay the store's own records. */
 	void		(*redo) (XLogReaderState *record);
 
+	/* Table files. */
+	void		(*add_table_file) (ProllyChunkStore *store, ProllyChunkNext next,
+								   void *arg);
+	void		(*conjoin) (ProllyChunkStore *store);
+	void		(*table_files) (ProllyChunkStore *store,
+								ProllyChunkFileVisit visit, void *arg);
+
+	/* Shared state. */
+	Size		(*shmem_size) (void);
+	void		(*shmem_init) (void *area);
+
 	/*
 	 * Give a new database (CREATE DATABASE's, its files copied or not) the
 	 * store of the one it was made from, WAL-logged as any change.
@@ -90,7 +116,8 @@ typedef struct ProllyChunkStoreRoutine
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
-	"committed", "commit_redo", "checkpoint", "redo", "copy_database"
+	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
+	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 
 static inline const ProllyChunkStoreRoutine *

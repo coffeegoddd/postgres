@@ -32,6 +32,8 @@ extern void chunker_forced_split(const ProllyImplInfo *impl);
 extern void chunker_reset_equals_begin(const ProllyImplInfo *impl);
 extern void chunkformat_items_round_trip(const ProllyImplInfo *impl);
 extern void chunkformat_rejects_other_bytes(const ProllyImplInfo *impl);
+extern void tablefile_round_trip(const ProllyImplInfo *impl);
+extern void tablefile_rejects_other_bytes(const ProllyImplInfo *impl);
 extern void keyenc_order_matches_opclass(const ProllyImplInfo *impl);
 extern void keyenc_desc_and_nulls(const ProllyImplInfo *impl);
 extern void keyenc_decode_round_trip(const ProllyImplInfo *impl);

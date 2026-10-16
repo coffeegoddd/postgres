@@ -4,10 +4,11 @@
  *	  Shared memory and checkpoints for prolly implementations.
  *
  * Implementations of the interfaces that have shared state (engine,
- * coordination, commit pipeline) declare its size with shmem_size() and
- * set it up in shmem_init(area).  The prolly shared-memory subsystem
- * reserves one area per implementation at postmaster startup, so
- * implementations added by shared_preload_libraries get theirs too.
+ * coordination, commit pipeline, chunk store) declare its size with
+ * shmem_size() and set it up in shmem_init(area).  The prolly
+ * shared-memory subsystem reserves one area per implementation at
+ * postmaster startup, so implementations added by shared_preload_libraries
+ * get theirs too.
  *
  * CheckPointProlly() runs inside every checkpoint and restartpoint and
  * calls each implementation's checkpoint callback.

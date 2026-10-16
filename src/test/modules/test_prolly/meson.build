@@ -59,6 +59,7 @@ tests += {
       'schema_moves',
       'sequences',
       'schema_merges',
+      'table_files',
     ],
   },
   'tap': {
@@ -104,6 +105,8 @@ tests += {
       't/036_bmap_shared_changes.pl',
       't/037_branch_locks.pl',
       't/038_chunk_store.pl',
+      't/039_branch_commits.pl',
+      't/040_table_files.pl',
     ],
   },
 }

@@ -4,9 +4,9 @@
  *	  The prolly shared-memory subsystem and checkpoint hook.
  *
  * At postmaster startup this reserves a shared area for every registered
- * engine, coordination and commit pipeline implementation whose
- * shmem_size() is non-zero, named after the implementation, and calls its
- * shmem_init() with the area once.  Every process finds the area again
+ * engine, coordination, commit pipeline and chunk store implementation
+ * whose shmem_size() is non-zero, named after the implementation, and calls
+ * its shmem_init() with the area once.  Every process finds the area again
  * with prolly_shmem_area().
  *
  * IDENTIFICATION
@@ -27,6 +27,7 @@ static const ProllyInterface shmem_interfaces[] = {
 	PROLLY_IFACE_ENGINE,
 	PROLLY_IFACE_COORDINATION,
 	PROLLY_IFACE_COMMIT_PIPELINE,
+	PROLLY_IFACE_CHUNK_STORE,
 };
 
 #define MAX_AREAS 64
@@ -65,6 +66,12 @@ impl_shmem_size(const ProllyImplInfo *impl)
 
 				return r->shmem_size ? r->shmem_size() : 0;
 			}
+		case PROLLY_IFACE_CHUNK_STORE:
+			{
+				const ProllyChunkStoreRoutine *r = (const ProllyChunkStoreRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
 		default:
 			return 0;
 	}
@@ -83,6 +90,9 @@ impl_shmem_init(const ProllyImplInfo *impl, void *area)
 			break;
 		case PROLLY_IFACE_COMMIT_PIPELINE:
 			PROLLY_CALL(((const ProllyCommitRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_CHUNK_STORE:
+			PROLLY_CALL(((const ProllyChunkStoreRoutine *) impl), shmem_init, area);
 			break;
 		default:
 			elog(ERROR, "prolly %s implementations have no shared memory",
