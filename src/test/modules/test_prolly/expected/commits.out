@@ -215,9 +215,8 @@ SELECT prolly_root_hash('h') <> prolly_root_hash('main') AS other_root;
 -- Bad refs and start points.
 SELECT dolt_hashof('nope');
 ERROR:  prolly ref "nope" does not exist
-SELECT dolt_branch('k', dolt_hashof('main~1'));
-ERROR:  a branch can't start at a commit yet
-HINT:  Start it at a branch.
+SELECT dolt_branch('k', 'nope~1');
+ERROR:  branch or commit "nope~1" does not exist
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------

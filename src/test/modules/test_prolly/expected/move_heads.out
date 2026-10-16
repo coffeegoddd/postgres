@@ -1,0 +1,273 @@
+-- Moving a branch made by copying to a commit: reset, a branch at a
+-- commit, and fast-forward merges write the rows that differ.
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text, u int UNIQUE);
+CREATE TABLE app.k (a text);
+CREATE TABLE app.log (what text);
+CREATE FUNCTION app.logged() RETURNS trigger LANGUAGE plpgsql AS
+$$BEGIN INSERT INTO app.log VALUES (TG_OP); RETURN COALESCE(NEW, OLD); END$$;
+CREATE TRIGGER t_trig BEFORE INSERT OR UPDATE OR DELETE ON app.t
+  FOR EACH ROW EXECUTE FUNCTION app.logged();
+INSERT INTO app.t SELECT g, 'v' || g, g FROM generate_series(1, 500) g;
+INSERT INTO app.k VALUES ('x'), ('y'), ('y');
+DELETE FROM app.log;
+SELECT (dolt_commit('-Am', 'first'))[1] AS c1 \gset
+UPDATE app.t SET v = 'changed' WHERE id <= 3;
+DELETE FROM app.t WHERE id BETWEEN 10 AND 12;
+INSERT INTO app.t VALUES (501, 'new', 501);
+-- a row taking a unique value another row gives up
+UPDATE app.t SET u = -20 WHERE id = 20;
+UPDATE app.t SET u = 20 WHERE id = 21;
+INSERT INTO app.k VALUES ('y'), ('z');
+DELETE FROM app.k WHERE a = 'x';
+DELETE FROM app.log;
+SELECT (dolt_commit('-Am', 'second'))[1] AS c2 \gset
+SELECT count(*), sum(u) FROM app.t;
+ count |  sum   
+-------+--------
+   498 | 125677
+(1 row)
+
+-- reset --hard to the first commit: its rows, no triggers fired
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'c1' AS head_is_first;
+ head_is_first 
+---------------
+ t
+(1 row)
+
+SELECT count(*), sum(u) FROM app.t;
+ count |  sum   
+-------+--------
+   500 | 125250
+(1 row)
+
+SELECT * FROM app.t WHERE id IN (1, 2, 3, 10, 11, 12, 20, 21, 501) ORDER BY id;
+ id |  v  | u  
+----+-----+----
+  1 | v1  |  1
+  2 | v2  |  2
+  3 | v3  |  3
+ 10 | v10 | 10
+ 11 | v11 | 11
+ 12 | v12 | 12
+ 20 | v20 | 20
+ 21 | v21 | 21
+(8 rows)
+
+SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
+ a | count 
+---+-------
+ x |     1
+ y |     2
+(2 rows)
+
+SELECT count(*) AS triggered FROM app.log;
+ triggered 
+-----------
+         0
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT prolly_root_hash('HEAD') = prolly_root_hash(:'c1') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- reset --hard HEAD drops uncommitted changes
+UPDATE app.t SET v = 'uncommitted' WHERE id = 5;
+DELETE FROM app.k;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT v FROM app.t WHERE id = 5;
+ v  
+----
+ v5
+(1 row)
+
+SELECT count(*) FROM app.k;
+ count 
+-------
+     3
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- and goes with its transaction
+BEGIN;
+SELECT dolt_reset('--hard', :'c2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) FROM app.t;
+ count 
+-------
+   498
+(1 row)
+
+ROLLBACK;
+SELECT dolt_hashof('HEAD') = :'c1' AS still_first, count(*) FROM app.t;
+ still_first | count 
+-------------+-------
+ t           |   500
+(1 row)
+
+-- A branch at a commit.
+SELECT dolt_branch('at_second', :'c2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('at_second') = :'c2' AS at_second;
+ at_second 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('at_second');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'at_second'"}
+(1 row)
+
+SELECT count(*), sum(u) FROM app.t;
+ count |  sum   
+-------+--------
+   498 | 125677
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_checkout('-b', 'at_first', 'main');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'at_first'"}
+(1 row)
+
+SELECT count(*) FROM app.t;
+ count 
+-------
+   500
+(1 row)
+
+-- Fast-forward: main is behind at_second.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('at_first'))[2:4];		-- merged already
+          dolt_merge           
+-------------------------------
+ {0,0,"Everything up-to-date"}
+(1 row)
+
+SELECT (dolt_merge('at_second'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'c2' AS fast_forwarded, count(*), sum(u) FROM app.t;
+ fast_forwarded | count |  sum   
+----------------+-------+--------
+ t              |   498 | 125677
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- not over uncommitted changes
+SELECT dolt_reset('--hard', :'c1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE app.t SET v = 'mine' WHERE id = 1;
+SELECT (dolt_merge('at_second'))[2:4];
+ERROR:  cannot merge with uncommitted changes
+HINT:  Commit them, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- Not yet: other definitions, three-way merges.
+SELECT dolt_checkout('at_first');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'at_first'"}
+(1 row)
+
+ALTER TABLE app.t ADD COLUMN w int;
+SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('at_first'))[2:4];
+ERROR:  the branch can't be moved to a commit that defines its objects differently yet
+DETAIL:  Its versioned schemas' tables or other objects are made, dropped or defined differently there.
+SELECT dolt_reset('--hard', 'at_first');
+ERROR:  the branch can't be moved to a commit that defines its objects differently yet
+DETAIL:  Its versioned schemas' tables or other objects are made, dropped or defined differently there.
+UPDATE app.t SET v = 'diverged' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('at_second'))[2:4];
+ERROR:  branches made by copying can only fast-forward so far
+DETAIL:  The branches have each changed since their common ancestor.
+SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
+ERROR:  branches made by copying can only fast-forward so far
+DETAIL:  The branches have each changed since their common ancestor.
+SELECT dolt_branch('-D', 'at_first', 'at_second');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table app.t
+drop cascades to table app.k
+drop cascades to table app.log
+drop cascades to function app.logged()

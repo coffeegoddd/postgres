@@ -28,6 +28,8 @@
  *   rows and objects came to be.
  * - tables() visits each table a folded root holds, in name order: its
  *   qualified name, its data tree and its definition as described.
+ * - same_schema() is whether two folded roots hold the same objects with
+ *   the same definitions, whatever their tables' rows.
  *
  * Provisional (v0).
  *
@@ -66,10 +68,11 @@ typedef struct ProllyCanonRoutine
 	void		(*fold) (ProllyNodeRef *root);
 	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 						   void *arg);
+	bool		(*same_schema) (const ProllyNodeRef *a, const ProllyNodeRef *b);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
-	"prepare", "canonical_root", "walk", "fold", "tables"
+	"prepare", "canonical_root", "walk", "fold", "tables", "same_schema"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

@@ -307,7 +307,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | copies           | branch_lifecycle                        | no checks yet
  refs            | copies           | commit_then_resolve                     | no checks yet
  refs            | copies           | merge_base                              | no checks yet
- refs            | copies           | complete                                | not implemented (3 of 17 callbacks missing)
+ refs            | copies           | complete                                | not implemented (2 of 17 callbacks missing)
  transfer        | stub             | identity                                | pass
  transfer        | stub             | clone                                   | not implemented (missing clone)
  transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
@@ -315,15 +315,15 @@ NOTICE:  drop cascades to column m of table conf_kt
  diff_merge      | stub             | identity                                | pass
  diff_merge      | stub             | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub             | merge                                   | not implemented (missing merge)
- diff_merge      | stub             | complete                                | not implemented (5 of 5 callbacks missing)
+ diff_merge      | stub             | complete                                | not implemented (6 of 6 callbacks missing)
  diff_merge      | rows             | identity                                | pass
  diff_merge      | rows             | diff_reports_each_change_once           | no checks yet
  diff_merge      | rows             | merge                                   | no checks yet
- diff_merge      | rows             | complete                                | not implemented (1 of 5 callbacks missing)
+ diff_merge      | rows             | complete                                | not implemented (2 of 6 callbacks missing)
  diff_merge      | folded           | identity                                | pass
  diff_merge      | folded           | diff_reports_each_change_once           | no checks yet
- diff_merge      | folded           | merge                                   | not implemented (missing merge)
- diff_merge      | folded           | complete                                | not implemented (3 of 5 callbacks missing)
+ diff_merge      | folded           | merge                                   | no checks yet
+ diff_merge      | folded           | complete                                | not implemented (2 of 6 callbacks missing)
  tree            | cow              | identity                                | pass
  tree            | cow              | build_and_get                           | pass
  tree            | cow              | large_keys                              | pass
@@ -399,11 +399,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (5 of 5 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (6 of 6 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | not implemented (2 of 5 callbacks missing)
+ canonicalizer   | catalogs         | complete                                | not implemented (3 of 6 callbacks missing)
  canonicalizer   | folded           | identity                                | pass
- canonicalizer   | folded           | complete                                | not implemented (2 of 5 callbacks missing)
+ canonicalizer   | folded           | complete                                | not implemented (2 of 6 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass
