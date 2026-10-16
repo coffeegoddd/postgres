@@ -50,6 +50,7 @@ tests += {
       'fold',
       'commits',
       'status_diff',
+      'collations',
     ],
   },
   'tap': {
