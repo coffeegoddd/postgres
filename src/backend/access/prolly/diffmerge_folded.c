@@ -415,7 +415,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	memset(&c, 0, sizeof(c));
 	c.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	c.rd.k = PROLLY_CALL(c.rd.kr, open, rel, NULL, CurrentMemoryContext);
+	c.rd.k = PROLLY_CALL(c.rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(c.rd.kr, keyless, c.rd.k);
 	chunk_env(&env);
 	env.compare = changes_compare;
