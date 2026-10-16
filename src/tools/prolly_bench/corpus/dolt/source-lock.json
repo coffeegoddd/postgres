@@ -1,0 +1,463 @@
+{
+  "version": 1,
+  "repository": "https://github.com/dolthub/dolt",
+  "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+  "scope": "top-level literal arrays of queries.ScriptTest, queries.TransactionTest and MergeScriptTest; source entries, not executed tests; excludes singletons, generated/appended cases, other Go tests and Bats",
+  "counts": {
+    "cases": 1233,
+    "assertions": 5820,
+    "unresolved_fields": 161
+  },
+  "files": [
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/blob_queries.go",
+      "sha256": "59e9b13e8d1e7fd0da6f62dc8b09857c7cf5633032ffdbb2a76a92cbad34d490",
+      "counts": {
+        "cases": 12,
+        "assertions": 59,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/branch_activity_queries.go",
+      "sha256": "115787f8f0ffd298fba71460c4982f248026d8ddc874a97480f8f1e3a518667e",
+      "counts": {
+        "cases": 6,
+        "assertions": 15,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/branch_control_test.go",
+      "sha256": "9633b83e619b213974a06352f98c58a225673c4c9097221b1b503e0e914490fe",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/ddl_queries.go",
+      "sha256": "4eafe3152ce17d38bb0d4d6eb76613a8aeb4b54388f326ff34275469b45d4373",
+      "counts": {
+        "cases": 33,
+        "assertions": 75,
+        "unresolved_fields": 11
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_branch_queries.go",
+      "sha256": "b87ecd42b0d374b7a88ed1602106eb34389411ec2d5fdc8464956fbf3ea656ea",
+      "counts": {
+        "cases": 14,
+        "assertions": 68,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_commit_allocs_test.go",
+      "sha256": "20488f31d13f3de0ec38b2694c8254dfc264c5e7f2618cef06c3d818ea69be56",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_concurrent_autoincrement_test.go",
+      "sha256": "e710c24a91ad973e9b589cd32fcfc7ac6a59147ec575be1c02d12b4269d6d8b7",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_engine_test.go",
+      "sha256": "a77af2f22b2ce74761f421f49069a680a5f1fae83a6456c0cdf9a99b00f176a2",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_engine_tests.go",
+      "sha256": "3b5fca6df7074f5f9d9eb27b573915ac38b70852b51ae232047fcc4c862553d3",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_harness.go",
+      "sha256": "8268a29057b12f57cdd23c393abe20de7b244d0b1815e908d2f844d0a3776293",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_privilege_test.go",
+      "sha256": "35e5841a1ded6b38a8cf16eb90135f3788848fd4fc5a744d66b673b76db8581f",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "sha256": "c42096cd830387b85fdd8b837a37d753548b048763803ff3d84051ce8b8ffbc6",
+      "counts": {
+        "cases": 215,
+        "assertions": 1075,
+        "unresolved_fields": 2
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
+      "sha256": "631ff1b4f5f72aa5852c8c5c45de2c589ac9ffd8986b50a6ff3800fb83633c4c",
+      "counts": {
+        "cases": 23,
+        "assertions": 133,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_clean.go",
+      "sha256": "bcd837760a564d697dc1c4cb634e7a26f280c866e906f39e831febad79834f18",
+      "counts": {
+        "cases": 2,
+        "assertions": 8,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_commit_verification.go",
+      "sha256": "0762d2f3ef850e788e040d09aa3d544e6d28611e1497a64d6c5e5aefd52890ae",
+      "counts": {
+        "cases": 18,
+        "assertions": 71,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_create_database.go",
+      "sha256": "85eb8c1232bcbbcdcd8a733a57e39fd250b721e8b2ca041ce3dccb1db887e621",
+      "counts": {
+        "cases": 4,
+        "assertions": 24,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "sha256": "acf7fbca72233e1cbb33410ecf2da1c66464ce9ba04653c65d6b6ac44e2892a2",
+      "counts": {
+        "cases": 152,
+        "assertions": 712,
+        "unresolved_fields": 7
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_dtables.go",
+      "sha256": "3ad30fbf418fe942832a138712ef08ad4bcbc242d10330dc4fa817c470612c6a",
+      "counts": {
+        "cases": 2,
+        "assertions": 11,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_foreign_keys.go",
+      "sha256": "32db427ebe9550ddceb5ac8eb0c0e9800011e833c7dc5bb6e96adf04009ae060",
+      "counts": {
+        "cases": 6,
+        "assertions": 28,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_help.go",
+      "sha256": "4ff5303c07fe476db9b6b07107901cc6faeabf30b6326c73d58b464e504f0e87",
+      "counts": {
+        "cases": 8,
+        "assertions": 16,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_legacy.go",
+      "sha256": "90b74d54a098a73c242cb2bf22b33d102287f60df4f202ae7187ca8b97d70c12",
+      "counts": {
+        "cases": 117,
+        "assertions": 333,
+        "unresolved_fields": 113
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "sha256": "912489348755f21c088d1a8edc7cfb2445de9e3bb65cd8c7d7cb21bebf5f47ef",
+      "counts": {
+        "cases": 145,
+        "assertions": 688,
+        "unresolved_fields": 9
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_nonlocal.go",
+      "sha256": "06d55b59b33c6ed1d15ef98aa7070826cf2f0eb1b2068b49c87d196c1819461b",
+      "counts": {
+        "cases": 15,
+        "assertions": 64,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_procedures.go",
+      "sha256": "6eecde4a163dc949476293a5fdd2e9e3f7e117c32f6d28e95651f9d8bf2e6c42",
+      "counts": {
+        "cases": 20,
+        "assertions": 117,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_query_catalog.go",
+      "sha256": "f10cbcf41d4bb5fa993b699e8e75b6e502c96c35a34a169f9606e84f2001e062",
+      "counts": {
+        "cases": 7,
+        "assertions": 11,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "sha256": "01e8cdcb784e1d8f3a49b929a463330c813817d4d3bd158218c7edc007a7c361",
+      "counts": {
+        "cases": 32,
+        "assertions": 264,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+      "sha256": "d904e1751fccc08aa5a99f4c0c8c4f462beaf74e1c07eed44373ae9a02c1f88d",
+      "counts": {
+        "cases": 22,
+        "assertions": 98,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revision_specs.go",
+      "sha256": "950c848b429c2d1f7a83b1b95be5586af764a7e9fda9b67e37338b9687e64c22",
+      "counts": {
+        "cases": 9,
+        "assertions": 146,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rm.go",
+      "sha256": "e826b3d8391ccecadbd8d740cc962893451b24b718a5da05daa43acd6bfd4dad",
+      "counts": {
+        "cases": 14,
+        "assertions": 18,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "sha256": "f5040bbe1af07e91342c330418e46d17bd8f427d35a99b20f567ec496a535078",
+      "counts": {
+        "cases": 91,
+        "assertions": 267,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_override.go",
+      "sha256": "e0696e64dfbae18212d941d806ba7e05fe25f7d5accec776cefdd9c29bb72a46",
+      "counts": {
+        "cases": 26,
+        "assertions": 106,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_squash_history.go",
+      "sha256": "ac4e54fac5f51e04be6410f8d3302187066ed172c1fd12e5327ef126454e26f9",
+      "counts": {
+        "cases": 18,
+        "assertions": 50,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "sha256": "f7157039f125dd7c458fcfe64a37eb42797c0bd93c02e0cdb38f43ce11c6eb1b",
+      "counts": {
+        "cases": 21,
+        "assertions": 74,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_test_table.go",
+      "sha256": "a5ef8d337a6bea75f01c15f9222bddb3828c7a20a6cd8b607f0c1e71fa6a34bd",
+      "counts": {
+        "cases": 25,
+        "assertions": 34,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_verify_constraints.go",
+      "sha256": "205e382266ad7d078ab73cda1bfa04404d5372427347df82f7f3c6febbb79041",
+      "counts": {
+        "cases": 22,
+        "assertions": 119,
+        "unresolved_fields": 19
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_workspace.go",
+      "sha256": "db4c672a9504a91ce36a6784a4e2a4ea66b7aa5cc0db0f76348a5cdf84536d11",
+      "counts": {
+        "cases": 35,
+        "assertions": 156,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_query_plans.go",
+      "sha256": "5a4ee732e8c529092b9f24108d06bba48fe2c545812843bd32da23a7e7272d50",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_test.go",
+      "sha256": "e1452be7b91d022d917e96f5fef90d03b8e127ddc345e275e6f824ff51f1ee6b",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "sha256": "b98b8c71bec9a48b581c433378ccc759cc2b7d33a954843fd7e8037f14abcc45",
+      "counts": {
+        "cases": 12,
+        "assertions": 78,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_system_table_queries.go",
+      "sha256": "84a92dd7bf80cdae89d46cf720f5409d94f7138c428646723c450ecf07bc303a",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_commit_test.go",
+      "sha256": "016ad2f2a54846006202f36292a944bc3925c10d99e1a4a35bf1eb6ab0b13146",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "sha256": "c9429e4de281d874ceea8cb0eed7dc4a54d176d4c4169145d19253e5ec9dfa3e",
+      "counts": {
+        "cases": 64,
+        "assertions": 704,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/prepared_queries.go",
+      "sha256": "b0b43bb26d047812479a7ae028246a5a08eb53bdd6e0f6b08e3f89ea35f39c45",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/ref_name_index_test.go",
+      "sha256": "129fd8e3d75c39710490fdf93b0c4b02e1d360dcfb5ff938682e7f46ab76be2d",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/row_lookup_join_test.go",
+      "sha256": "24b8e4910b59a6aec7ac5b2b5fde3e7959c2b6700c251514a74db3a9062ca861",
+      "counts": {
+        "cases": 17,
+        "assertions": 102,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/stats_queries.go",
+      "sha256": "087ee2c5a0d7eccd5267a44eb5bc4d55d7ab490c9108f8be0d3bbfce5af69cdc",
+      "counts": {
+        "cases": 20,
+        "assertions": 76,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/sysbench_test.go",
+      "sha256": "8461673c926d4f4ee8323266d861aeee9963e37033cb2a75c4d505e00616be01",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/system_table_function_index_tests.go",
+      "sha256": "736c9fb8a9346b70c3569ae719283bffefade364ff15eff272c9cae1ee8f87b6",
+      "counts": {
+        "cases": 6,
+        "assertions": 20,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/validation.go",
+      "sha256": "fca0122a7a16dc66167961fa710da08dd72f96edbf31668e4d36058802c7cad2",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/versioned_queries.go",
+      "sha256": "3e996716bb2f88fec5ce9d35f9691510d52beb135318d7f781d4232726b28358",
+      "counts": {
+        "cases": 0,
+        "assertions": 0,
+        "unresolved_fields": 0
+      }
+    }
+  ]
+}
