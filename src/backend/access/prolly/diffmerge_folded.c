@@ -1372,6 +1372,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 
 	if (x == NULL || same_hash(&x->description, &now->description))
 		return out;
+	require_readable(x);
 
 	rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
