@@ -1,0 +1,184 @@
+-- A branch's sequences are its data: commits record their values, moves
+-- set them, and a merge gives each the larger of the two.
+CREATE SCHEMA app VERSIONED;
+CREATE SEQUENCE app.s;
+CREATE SEQUENCE app.untouched START 50;
+CREATE TABLE app.t (id int PRIMARY KEY DEFAULT nextval('app.s'), v text);
+INSERT INTO app.t (v) VALUES ('a'), ('b');
+SELECT (dolt_commit('-Am', 'base'))[1] AS base \gset
+SELECT nextval('app.s');
+ nextval 
+---------
+       3
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'a value taken')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT nextval('app.s');		-- as the base left it
+ nextval 
+---------
+       3
+(1 row)
+
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- Merges: the larger value of each sequence the other side changed.
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO app.t (v) SELECT 'main' FROM generate_series(1, 3);
+SELECT length(dolt_commit('-Am', 'main takes 3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT setval('app.s', 40);
+ setval 
+--------
+     40
+(1 row)
+
+INSERT INTO app.t (v) VALUES ('feature');
+SELECT length(dolt_commit('-Am', 'feature goes to 41')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT last_value, is_called FROM app.s;
+ last_value | is_called 
+------------+-----------
+         41 | t
+(1 row)
+
+SELECT last_value, is_called FROM app.untouched;
+ last_value | is_called 
+------------+-----------
+         50 | f
+(1 row)
+
+INSERT INTO app.t (v) VALUES ('after');
+SELECT id FROM app.t WHERE v = 'after';
+ id 
+----
+ 42
+(1 row)
+
+-- and keeps ours when it's larger, or theirs didn't change it
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT nextval('app.untouched');
+ nextval 
+---------
+      50
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'feature takes untouched')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT setval('app.s', 1000);
+ setval 
+--------
+   1000
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'main jumps')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT last_value, is_called FROM app.s;
+ last_value | is_called 
+------------+-----------
+       1000 | t
+(1 row)
+
+SELECT last_value, is_called FROM app.untouched;
+ last_value | is_called 
+------------+-----------
+         50 | t
+(1 row)
+
+-- A sequence's value alone is a change to commit.
+SELECT nextval('app.untouched');
+ nextval 
+---------
+      51
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'just a value')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_commit('-Am', 'nothing');
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to sequence app.s
+drop cascades to sequence app.untouched
+drop cascades to table app.t

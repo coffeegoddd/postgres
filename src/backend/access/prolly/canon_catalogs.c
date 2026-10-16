@@ -14,7 +14,9 @@
  *						   query
  *	"n:" schema			-> nothing: a versioned schema (folded only), there
  *						   whether or not anything is in it
- *	"s:" sequence		-> its definition
+ *	"s:" sequence		-> its definition; in folded roots then, a line of
+ *						   its own, its value: the last value, and whether it
+ *						   was given out ("t" or "f")
  *	"t:" table			-> its data tree (hash length, hash), then its schema
  *	"v:" view			-> its query
  *	"y:" type			-> an enum's labels, a domain's or a composite
@@ -102,6 +104,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "mb/pg_wchar.h"
@@ -109,6 +112,7 @@
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
@@ -735,6 +739,27 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 					 format_type_extended(seq->seqtypid, -1, FORMAT_TYPE_FORCE_QUALIFY),
 					 seq->seqstart, seq->seqincrement, seq->seqmax, seq->seqmin,
 					 seq->seqcache, seq->seqcycle ? "cycle" : "no cycle");
+
+	/* A branch's sequences are its data too. */
+	if (cn->folded)
+	{
+		HeapTupleHeader data;
+		bool		isnull;
+		int64		last;
+		bool		called;
+
+		/* (without the privilege, the data reads as NULLs) */
+		if (pg_class_aclcheck(seqid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for sequence %s", name)));
+		data = DatumGetHeapTupleHeader(DirectFunctionCall1(pg_get_sequence_data,
+														   ObjectIdGetDatum(seqid)));
+		last = DatumGetInt64(GetAttributeByNum(data, 1, &isnull));
+		called = DatumGetBool(GetAttributeByNum(data, 2, &isnull));
+		appendStringInfo(&it->value, INT64_FORMAT "\t%s\n", last,
+						 called ? "t" : "f");
+	}
 	ReleaseSysCache(tup);
 }
 
@@ -1436,10 +1461,59 @@ folded_materialized_views(const ProllyNodeRef *root,
 }
 
 /* An item's value without the data tree a table's or view's starts with. */
+static char *from_utf8(const uint8 *data, int len);
+
+/* (and without a sequence's value) */
 static void
 definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
 {
-	(void) tree_item(k, v, NULL, def);
+	if (tree_item(k, v, NULL, def))
+		return;
+	if (k->len >= 2 && k->data[0] == 's' && k->data[1] == ':')
+	{
+		const uint8 *nl = memchr(v->data, '\n', v->len);
+
+		if (nl)
+			def->len = nl + 1 - v->data;
+	}
+}
+
+/* The sequences of a folded root, with their values. */
+static void
+folded_sequences(const ProllyNodeRef *root, ProllyCanonSequenceVisit visit,
+				 void *arg)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	from = {(const uint8 *) "s:", 2};
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		char	   *value;
+		char	   *nl;
+		char	   *tab;
+		char	   *name;
+
+		if (k.len < 2 || memcmp(k.data, "s:", 2) != 0)
+			break;
+		value = pnstrdup((const char *) v.data, v.len);
+		nl = strchr(value, '\n');
+		tab = nl ? strchr(nl + 1, '\t') : NULL;
+		if (tab == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical tree holds a sequence without its value")));
+		name = from_utf8(k.data + 2, k.len - 2);
+		visit(name, strtoi64(nl + 1, NULL, 10), tab[1] == 't', arg);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
 /*
@@ -2512,6 +2586,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
 	.move_schema = folded_move_schema,
+	.sequences = folded_sequences,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {
