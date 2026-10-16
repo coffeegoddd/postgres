@@ -1420,3 +1420,101 @@ prolly_canonical_round_trip(PG_FUNCTION_ARGS)
 	prolly_datum_encode(codec, PG_GETARG_DATUM(0), &buf);
 	PG_RETURN_DATUM(prolly_datum_decode(codec, buf.data, buf.len));
 }
+
+/*
+ * Chunk node format: a node's items read back as written, at its level,
+ * with its flags; the node's size is its header plus its items' spaces;
+ * and the same items give the same bytes.
+ */
+void
+chunkformat_items_round_trip(const ProllyImplInfo *impl)
+{
+	const ProllyChunkFormatRoutine *cf = (const ProllyChunkFormatRoutine *) impl;
+	int			n = 300;
+	ProllyKey  *keys = palloc(sizeof(ProllyKey) * n);
+	ProllyValue *values = palloc(sizeof(ProllyValue) * n);
+	uint8	   *flags = palloc(n);
+	StringInfoData a;
+	StringInfoData b;
+	ProllyChunkNode node;
+	Size		expect;
+
+	for (int i = 0; i < n; i++)
+	{
+		/* keys and values of 0 to a few hundred bytes */
+		char	   *k = psprintf("key %05d", i);
+		StringInfoData v;
+
+		initStringInfo(&v);
+		for (int j = 0; j < (i * 37) % 400; j++)
+			appendStringInfoChar(&v, (char) (i + j));
+		keys[i].data = (const uint8 *) k;
+		keys[i].len = strlen(k);
+		values[i].data = (const uint8 *) v.data;
+		values[i].len = v.len;
+		flags[i] = i % 3 == 0 ? PROLLY_ITEM_VALUE_REF : 0;
+	}
+	initStringInfo(&a);
+	initStringInfo(&b);
+	appendStringInfoString(&b, "not the start");
+	PROLLY_CALL(cf, encode, 7, n, keys, values, flags, &a);
+	PROLLY_CALL(cf, encode, 7, n, keys, values, flags, &b);
+	if (b.len - strlen("not the start") != a.len ||
+		memcmp(a.data, b.data + strlen("not the start"), a.len) != 0)
+		elog(ERROR, "the same items gave different bytes");
+
+	expect = PROLLY_CALL(cf, header_size);
+	for (int i = 0; i < n; i++)
+		expect += PROLLY_CALL(cf, item_space, 7, &keys[i], &values[i]);
+	if (expect != a.len)
+		elog(ERROR, "a node of %d bytes, where its header and items take %zu",
+			 a.len, expect);
+
+	if (!PROLLY_CALL(cf, open, (const uint8 *) a.data, a.len, &node))
+		elog(ERROR, "an encoded node doesn't open");
+	if (node.level != 7 || node.nitems != n)
+		elog(ERROR, "node level %u with %d items, written as 7 with %d",
+			 node.level, node.nitems, n);
+	for (int i = 0; i < n; i++)
+	{
+		ProllyKey	k;
+		ProllyValue v;
+		uint8		f;
+
+		PROLLY_CALL(cf, item_get, &node, i, &k, &v, &f);
+		if (k.len != keys[i].len || memcmp(k.data, keys[i].data, k.len) != 0 ||
+			v.len != values[i].len || memcmp(v.data, values[i].data, v.len) != 0 ||
+			f != flags[i])
+			elog(ERROR, "item %d doesn't read back as written", i);
+	}
+
+	/* an empty leaf too */
+	resetStringInfo(&a);
+	PROLLY_CALL(cf, encode, 0, 0, keys, values, flags, &a);
+	if (!PROLLY_CALL(cf, open, (const uint8 *) a.data, a.len, &node) ||
+		node.nitems != 0 || node.level != 0)
+		elog(ERROR, "an empty leaf doesn't read back");
+}
+
+/* Bytes that aren't a whole node of the format don't open as one. */
+void
+chunkformat_rejects_other_bytes(const ProllyImplInfo *impl)
+{
+	const ProllyChunkFormatRoutine *cf = (const ProllyChunkFormatRoutine *) impl;
+	ProllyKey	key = {(const uint8 *) "k", 1};
+	ProllyValue value = {(const uint8 *) "a value", 7};
+	StringInfoData a;
+	ProllyChunkNode node;
+
+	initStringInfo(&a);
+	PROLLY_CALL(cf, encode, 0, 1, &key, &value, NULL, &a);
+	for (Size cut = 0; cut < (Size) a.len; cut++)
+	{
+		/* a cut short node whose items no longer fit opens as none */
+		if (cut < PROLLY_CALL(cf, header_size) + 4 &&
+			PROLLY_CALL(cf, open, (const uint8 *) a.data, cut, &node))
+			elog(ERROR, "%zu of a node's %d bytes open as a node", cut, a.len);
+	}
+	if (PROLLY_CALL(cf, open, (const uint8 *) "random bytes, not a node", 24, &node))
+		elog(ERROR, "random bytes open as a node");
+}

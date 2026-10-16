@@ -14,6 +14,12 @@
  * through a hint can check that it found the right node and fall back to
  * the node store's hash lookup if not.
  *
+ * Storage.  Nodes are pages in a node store, or, in a tree whose
+ * environment names a chunk store, chunks of their own length there
+ * (prolly_chunkformat.h): all of a chunk is canonical, so it has no hints
+ * or cached hash, and a node is found by its hash alone.  Only the node
+ * layer below (reading, items, children, writing, capacity) knows which.
+ *
  * Shape.  Each level's items are cut into nodes by the chunker.  The root
  * is the first level, counting up from the leaves, that has exactly one
  * node.  So the shape, and every hash, is a function of the items alone
@@ -74,6 +80,9 @@
 #define COW_IMPL_ID		1
 #define MAX_LEVELS		32
 
+/* a chunk node's limit, for the chunker's forced split */
+#define CHUNK_NODE_MAX	(64 * 1024)
+
 /* ------------------------------------------------------------------------
  * Nodes
  * ------------------------------------------------------------------------
@@ -83,10 +92,50 @@ typedef struct TNode
 {
 	Buffer		buf;			/* pinned; InvalidBuffer if none */
 	Page		page;
+	ProllyChunkNode chunk;		/* a chunk node: its bytes (ours) */
 	uint16		level;
 	int			nitems;
 	ProllyNodeRef ref;
 } TNode;
+
+static inline bool
+in_chunks(const ProllyTreeEnv *env)
+{
+	return env->chunk_store != NULL;
+}
+
+/* Does the node hold a node read (a page pinned, or a chunk's bytes)? */
+static inline bool
+node_loaded(const TNode *node)
+{
+	return BufferIsValid(node->buf) || node->chunk.data != NULL;
+}
+
+/* A chunk node by hash, from the chunk store. */
+static void
+chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
+{
+	StringInfoData data;
+
+	initStringInfo(&data);
+	if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly tree node missing from its chunk store")));
+	if (env->counters)
+		env->counters->nodes_read++;
+	if (!PROLLY_CALL(env->chunk_format, open, (const uint8 *) data.data,
+					 data.len, &node->chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly chunk is not a tree node")));
+	node->buf = InvalidBuffer;
+	node->page = NULL;
+	node->level = node->chunk.level;
+	node->nitems = node->chunk.nitems;
+	node->ref = *ref;
+	node->ref.location.blkno = InvalidBlockNumber;
+}
 
 static void
 check_cached_hash(const ProllyTreeEnv *env, Page page, const ProllyHash *hash,
@@ -105,6 +154,12 @@ node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 {
 	ProllyNodeRef r = *ref;
 
+	node->chunk.data = NULL;
+	if (in_chunks(env))
+	{
+		chunk_node_read(env, ref, node);
+		return;
+	}
 	for (;;)
 	{
 		Buffer		buf = PROLLY_CALL(env->node_store, read, env->store, &r);
@@ -142,13 +197,21 @@ node_release(TNode *node)
 	if (BufferIsValid(node->buf))
 		ReleaseBuffer(node->buf);
 	node->buf = InvalidBuffer;
+	if (node->chunk.data != NULL)
+		pfree((void *) node->chunk.data);
+	node->chunk.data = NULL;
 }
 
 static void
 node_item(const ProllyTreeEnv *env, const TNode *node, int i, ProllyKey *key,
 		  ProllyValue *value, uint8 *flags)
 {
-	PROLLY_CALL(env->node_format, item_get, node->page, i, key, value, flags);
+	if (in_chunks(env))
+		PROLLY_CALL(env->chunk_format, item_get, &node->chunk, i, key, value,
+					flags);
+	else
+		PROLLY_CALL(env->node_format, item_get, node->page, i, key, value,
+					flags);
 }
 
 static void
@@ -189,7 +252,8 @@ node_child(const ProllyTreeEnv *env, const TNode *node, int i,
 	node_item(env, node, i, &key, &value, NULL);
 	memset(ref, 0, sizeof(*ref));
 	decode_child(&value, &ref->hash, count);
-	ref->location.blkno = PROLLY_CALL(env->node_format, item_hint, node->page, i);
+	ref->location.blkno = in_chunks(env) ? InvalidBlockNumber :
+		PROLLY_CALL(env->node_format, item_hint, node->page, i);
 }
 
 static int
@@ -255,17 +319,64 @@ typedef struct Item
 	bool		ref;			/* leaf items: the value is a value tree's */
 } Item;
 
+/* A chunk node, put in the chunk store unless it has it. */
+static void
+write_chunk_node(const ProllyTreeEnv *env, uint16 level, const Item *items,
+				 int n, ProllyNodeRef *ref, uint64 *count)
+{
+	ProllyKey  *keys = palloc(sizeof(ProllyKey) * Max(n, 1));
+	ProllyValue *values = palloc(sizeof(ProllyValue) * Max(n, 1));
+	uint8	   *flags = palloc(Max(n, 1));
+	StringInfoData chunk;
+	ProllyHashCtx *hctx;
+
+	*count = 0;
+	for (int i = 0; i < n; i++)
+	{
+		keys[i] = items[i].key;
+		values[i] = items[i].value;
+		flags[i] = items[i].ref ? PROLLY_ITEM_VALUE_REF : 0;
+		*count += level == 0 ? 1 : items[i].count;
+	}
+	initStringInfo(&chunk);
+	PROLLY_CALL(env->chunk_format, encode, level, n, keys, values, flags, &chunk);
+
+	memset(ref, 0, sizeof(*ref));
+	ref->location.blkno = InvalidBlockNumber;
+	hctx = PROLLY_CALL(env->hash, begin, CurrentMemoryContext);
+	PROLLY_CALL(env->hash, update, hctx, (const uint8 *) chunk.data, chunk.len);
+	PROLLY_CALL(env->hash, finish, hctx, &ref->hash);
+	if (!PROLLY_CALL(env->chunk_store, has, env->chunks, &ref->hash))
+	{
+		if (env->counters)
+			env->counters->nodes_written++;
+		PROLLY_CALL(env->chunk_store, put, env->chunks, &ref->hash, chunk.data,
+					chunk.len);
+	}
+	pfree(chunk.data);
+	pfree(keys);
+	pfree(values);
+	pfree(flags);
+}
+
 static void
 write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 		   ProllyNodeRef *ref, uint64 *count)
 {
-	Page		page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
+	Page		page;
 	const uint8 *canon;
 	Size		canon_len;
 	ProllyHashCtx *hctx;
 	ProllyHash	hash;
 	uint8	   *special;
 	Size		special_len;
+
+	if (in_chunks(env))
+	{
+		write_chunk_node(env, level, items, n, ref, count);
+		return;
+	}
+	page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
 
 	PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, level);
 	*count = 0;
@@ -317,8 +428,12 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 static Size
 level_capacity(const ProllyTreeEnv *env, uint16 level)
 {
-	Page		page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
+	Page		page;
 	Size		capacity;
+
+	if (in_chunks(env))
+		return CHUNK_NODE_MAX - PROLLY_CALL(env->chunk_format, header_size);
+	page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
 
 	PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, level);
 	capacity = PROLLY_CALL(env->node_format, free_space, page);
@@ -608,8 +723,11 @@ levelbuf_append(LevelBuf *lb, const Item *item)
 static void
 levelbuf_add(LevelBuf *lb, const Item *item)
 {
-	Size		space = PROLLY_CALL(lb->env->node_format, item_space, lb->level,
-									&item->key, &item->value);
+	Size		space = in_chunks(lb->env) ?
+		PROLLY_CALL(lb->env->chunk_format, item_space, lb->level, &item->key,
+					&item->value) :
+		PROLLY_CALL(lb->env->node_format, item_space, lb->level, &item->key,
+					&item->value);
 	ProllyChunkDecision d;
 
 	if (space > lb->capacity)
@@ -821,7 +939,7 @@ iter_load_child(Iter *it, int d)
 
 	node_child(it->env, &it->f[d].node, it->f[d].idx, &ref, &count);
 	/* Already loaded (a seek near the last one): keep it, unread. */
-	if (BufferIsValid(it->f[d + 1].node.buf) &&
+	if (node_loaded(&it->f[d + 1].node) &&
 		it->f[d + 1].node.ref.hash.len == ref.hash.len &&
 		memcmp(it->f[d + 1].node.ref.hash.bytes, ref.hash.bytes,
 			   ref.hash.len) == 0)

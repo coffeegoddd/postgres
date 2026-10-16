@@ -23,8 +23,11 @@
  *   strictly increasing order; apply() takes edits sorted by key with no
  *   duplicate keys.  Deleting an absent key does nothing; putting an
  *   existing key replaces its value.
- * - New nodes are WAL-logged through env->log before they are published in
- *   env->node_store, so a published node survives a crash.
+ * - Nodes are pages in a node store, or chunks in a chunk store (when
+ *   env->chunk_store is set).  New pages are WAL-logged through env->log
+ *   before they are published in env->node_store; new chunks are put in
+ *   the chunk store, which logs them.  Either way a published node
+ *   survives a crash.
  * - Keys and values returned by a cursor stay valid until the next call on
  *   it, or until it is closed.  Cursors and other operations hold buffer
  *   pins only while they run; nodes are immutable, so they take no locks
@@ -46,6 +49,8 @@
 #define PROLLY_TREE_H
 
 #include "access/prolly_chunker.h"
+#include "access/prolly_chunkformat.h"
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_log.h"
 #include "access/prolly_nodeformat.h"
@@ -71,6 +76,15 @@ typedef struct ProllyTreeEnv
 	ProllyKeyCompare compare;
 	void	   *compare_arg;
 	ProllyNodeCounters *counters;	/* optional */
+
+	/*
+	 * Nodes kept as chunks of their own length in a chunk store, instead of
+	 * pages: then these are set, and node_format, node_store, store and log
+	 * are unused.
+	 */
+	const ProllyChunkFormatRoutine *chunk_format;
+	const ProllyChunkStoreRoutine *chunk_store;
+	ProllyChunkStore *chunks;	/* opened by the caller */
 } ProllyTreeEnv;
 
 /* One change for apply(): a put, or a delete if is_delete. */

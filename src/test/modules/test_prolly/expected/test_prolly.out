@@ -21,6 +21,7 @@ FROM prolly_implementations();
  node_format     | basic            |       1 |              1
  node_format     | stub             |       0 |              0
  chunker         | keyhash          |       1 |              1
+ chunker         | bytes            |       2 |              1
  chunker         | stub             |       0 |              0
  content_hash    | sha256           |       1 |              1
  content_hash    | stub             |       0 |              0
@@ -58,7 +59,8 @@ FROM prolly_implementations();
  canonicalizer   | stub             |       0 |              0
  canonicalizer   | catalogs         |       1 |              1
  chunk_store     | journal          |       1 |              1
-(49 rows)
+ chunk_format    | basic            |       1 |              1
+(51 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -173,6 +175,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  chunker         | keyhash          | forced_split_respects_capacity          | pass
  chunker         | keyhash          | reset_equals_begin                      | pass
  chunker         | keyhash          | complete                                | pass
+ chunker         | bytes            | identity                                | pass
+ chunker         | bytes            | deterministic                           | pass
+ chunker         | bytes            | forced_split_respects_capacity          | pass
+ chunker         | bytes            | reset_equals_begin                      | pass
+ chunker         | bytes            | complete                                | pass
  chunker         | stub             | identity                                | pass
  chunker         | stub             | deterministic                           | not implemented (missing begin, add, end)
  chunker         | stub             | forced_split_respects_capacity          | not implemented (missing begin, add, end)
@@ -381,7 +388,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  canonicalizer   | catalogs         | complete                                | pass
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
-(314 rows)
+ chunk_format    | basic            | identity                                | pass
+ chunk_format    | basic            | items_round_trip                        | pass
+ chunk_format    | basic            | rejects_other_bytes                     | pass
+ chunk_format    | basic            | complete                                | pass
+(323 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
