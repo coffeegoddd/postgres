@@ -8,15 +8,21 @@
  * checkout of a commit) applies the rows that differ, one at a time.
  *
  * Contract:
- * - begin() opens rel for writing, if the user may insert, update and
- *   delete its rows; end() finishes the writes.
+ * - begin() opens rel, a table with storage (a partition's rows are
+ *   applied to the partition), for writing, if the user may select,
+ *   insert, update and delete its rows, row-level security doesn't apply
+ *   to them, and they may update and delete the rows of each table whose
+ *   foreign keys reference rel, without row-level security there either;
+ *   end() finishes the writes.
  * - insert() adds a row.  update() replaces a row equal to old with new,
- *   and remove() deletes one; both find old by the table's primary key, or
- *   by every column if it has none, and return false if there's no such
- *   row.
+ *   and remove() deletes one; both find old by the table's primary key
+ *   (deferrable or not), or, if it has none, a row whose every column has
+ *   old's bytes, and return false if there's no such row.
  * - Rows are written with index maintenance and the checks of NOT NULL,
- *   CHECK and unique constraints, but fire no user triggers and recheck no
- *   foreign keys, as logical replication's apply does.
+ *   CHECK and unique and exclusion constraints (deferrable ones when they
+ *   are due), but fire no user triggers and check no foreign keys, as
+ *   logical replication's apply does.  Nothing else in the session
+ *   changes.
  * - Each write is visible to the next.
  *
  * Provisional (v0).

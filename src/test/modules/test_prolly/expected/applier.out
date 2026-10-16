@@ -15,6 +15,9 @@ CREATE FUNCTION app.no_writes() RETURNS trigger LANGUAGE plpgsql AS
 $$BEGIN INSERT INTO app.log VALUES (TG_OP); RETURN NEW; END$$;
 CREATE TRIGGER t_trig BEFORE INSERT OR UPDATE OR DELETE ON app.t
   FOR EACH ROW EXECUTE FUNCTION app.no_writes();
+CREATE TRIGGER t_always AFTER INSERT OR UPDATE OR DELETE ON app.t
+  FOR EACH ROW EXECUTE FUNCTION app.no_writes();
+ALTER TABLE app.t ENABLE ALWAYS TRIGGER t_always;
 -- Rows by key.
 SELECT test_apply('insert', NULL, ROW(1, 'one', 10, NULL)::app.t);
  test_apply 
@@ -67,7 +70,7 @@ SELECT id FROM app.t WHERE v = 'uno';
 (1 row)
 
 RESET enable_seqscan;
--- no user triggers fired, no foreign key checked
+-- no user triggers fired (ALWAYS ones neither), no foreign key checked
 SELECT count(*) AS triggered FROM app.log;
  triggered 
 -----------
@@ -104,7 +107,7 @@ INSERT INTO app.t VALUES (5, 'five', 50, NULL);
 SELECT count(*) AS triggered FROM app.log;
  triggered 
 -----------
-         1
+         2
 (1 row)
 
 -- A keyless table's rows: one copy at a time, matched by every column.
@@ -151,20 +154,201 @@ SELECT * FROM app.k ORDER BY a;
  z | 2
 (2 rows)
 
--- Writing takes the privileges to insert, update and delete.
+-- Copies match by their bytes, not by their types' equality, through an
+-- index on the table or not, and types without equality work.
+CREATE TABLE app.kb (a text, n numeric, f float8, pt point);
+CREATE INDEX kb_n ON app.kb (n);
+SELECT test_apply('insert', NULL, ROW('x', 1.0, 0, '(1,1)')::app.kb);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('insert', NULL, ROW('x', 1.00, '-0', '(1,1)')::app.kb);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('remove', ROW('x', 1.00, 0, '(1,1)')::app.kb, NULL::app.kb) AS found;
+ found 
+-------
+ f
+(1 row)
+
+SELECT test_apply('remove', ROW('x', 1.00, '-0', '(1,1)')::app.kb, NULL::app.kb);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('update', ROW('x', 1.0, 0, '(1,1)')::app.kb, ROW('y', NULL, 1, '(2,2)')::app.kb);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('remove', ROW('y', NULL, 1, '(2,2)')::app.kb, NULL::app.kb);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT count(*) AS left FROM app.kb;
+ left 
+------
+    0
+(1 row)
+
+-- an index that can't search for NULL isn't used for one
+CREATE TABLE app.kh (a int, b text);
+CREATE INDEX kh_a ON app.kh USING hash (a);
+SELECT test_apply('insert', NULL, ROW(NULL, 'n')::app.kh);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('remove', ROW(NULL, 'n')::app.kh, NULL::app.kh);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT count(*) AS left FROM app.kh;
+ left 
+------
+    0
+(1 row)
+
+-- Deferrable constraints: the primary key finds rows, unique ones are
+-- checked when due.
+CREATE TABLE app.d (id int PRIMARY KEY DEFERRABLE, v text,
+                    u int UNIQUE DEFERRABLE,
+                    w int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+SELECT test_apply('insert', NULL, ROW(1, 'one', 1, 1)::app.d);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('update', ROW(1, NULL, NULL, NULL)::app.d, ROW(1, 'uno', 1, 1)::app.d);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT * FROM app.d;
+ id |  v  | u | w 
+----+-----+---+---
+  1 | uno | 1 | 1
+(1 row)
+
+SELECT test_apply('insert', NULL, ROW(2, 'two', 1, 2)::app.d);
+ERROR:  duplicate key value violates unique constraint "d_u_key"
+DETAIL:  Key (u)=(1) already exists.
+BEGIN;
+SELECT test_apply('insert', NULL, ROW(3, 'three', 3, 1)::app.d);
+ test_apply 
+------------
+ t
+(1 row)
+
+COMMIT;
+ERROR:  duplicate key value violates unique constraint "d_w_key"
+DETAIL:  Key (w)=(1) already exists.
+SELECT count(*) AS rows FROM app.d;
+ rows 
+------
+    1
+(1 row)
+
+-- Only tables with storage: a partitioned table's rows go to its
+-- partitions.
+CREATE TABLE app.pt (id int PRIMARY KEY) PARTITION BY RANGE (id);
+CREATE TABLE app.pt1 PARTITION OF app.pt FOR VALUES FROM (0) TO (10);
+SELECT test_apply('insert', NULL, ROW(1)::app.pt);
+ERROR:  cannot apply rows to relation "pt"
+DETAIL:  This operation is not supported for partitioned tables.
+SELECT test_apply('insert', NULL, ROW(1)::app.pt1);
+ test_apply 
+------------
+ t
+(1 row)
+
+SELECT test_apply('insert', NULL, ROW(11)::app.pt1);
+ERROR:  new row for relation "pt1" violates partition constraint
+DETAIL:  Failing row contains (11).
+SELECT * FROM app.pt;
+ id 
+----
+  1
+(1 row)
+
+-- Writing takes the privileges to select, insert, update and delete,
+-- and no row-level security on the table.
 CREATE ROLE applier_reader;
 GRANT USAGE ON SCHEMA app TO applier_reader;
 GRANT SELECT, INSERT ON app.k TO applier_reader;
+GRANT INSERT, UPDATE, DELETE ON app.kb TO applier_reader;
+CREATE TABLE app.r (id int PRIMARY KEY, tenant text);
+GRANT ALL ON app.r TO applier_reader;
+ALTER TABLE app.r ENABLE ROW LEVEL SECURITY;
+CREATE POLICY r_mine ON app.r USING (tenant = current_user);
 SET ROLE applier_reader;
 SELECT test_apply('insert', NULL, ROW('q', 1)::app.k);
 ERROR:  permission denied for table k
+SELECT test_apply('insert', NULL, ROW('q', 1, 1, '(0,0)')::app.kb);
+ERROR:  permission denied for table kb
+SELECT test_apply('remove', ROW(1, 'other')::app.r, NULL::app.r);
+ERROR:  user "applier_reader" cannot apply rows to relation with row-level security enabled: "r"
 RESET ROLE;
+-- Skipping the checks of foreign keys referencing a table takes UPDATE and
+-- DELETE on the tables that hold them, without row-level security there.
+CREATE TABLE app.fp (id int PRIMARY KEY);
+CREATE TABLE app.fc (id int PRIMARY KEY, p int REFERENCES app.fp ON DELETE RESTRICT);
+INSERT INTO app.fp VALUES (1);
+INSERT INTO app.fc VALUES (1, 1);
+GRANT ALL ON app.fp TO applier_reader;
+SET ROLE applier_reader;
+SELECT test_apply('remove', ROW(1)::app.fp, NULL::app.fp);
+ERROR:  permission denied for table fc
+DETAIL:  Applying rows to "fp" skips the checks of foreign keys referencing it, which takes UPDATE and DELETE on "fc".
+RESET ROLE;
+GRANT UPDATE, DELETE ON app.fc TO applier_reader;
+ALTER TABLE app.fc ENABLE ROW LEVEL SECURITY;
+SET ROLE applier_reader;
+SELECT test_apply('remove', ROW(1)::app.fp, NULL::app.fp);
+ERROR:  user "applier_reader" cannot apply rows to relation with row-level security enabled: "fc"
+RESET ROLE;
+ALTER TABLE app.fc DISABLE ROW LEVEL SECURITY;
+SET ROLE applier_reader;
+SELECT test_apply('remove', ROW(1)::app.fp, NULL::app.fp);
+ test_apply 
+------------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT * FROM app.fc;
+ id | p 
+----+---
+  1 | 1
+(1 row)
+
 DROP OWNED BY applier_reader;
 DROP ROLE applier_reader;
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 5 other objects
+NOTICE:  drop cascades to 12 other objects
 DETAIL:  drop cascades to table app.p
 drop cascades to table app.t
 drop cascades to table app.k
 drop cascades to table app.log
 drop cascades to function app.no_writes()
+drop cascades to table app.kb
+drop cascades to table app.kh
+drop cascades to table app.d
+drop cascades to table app.pt
+drop cascades to table app.r
+drop cascades to table app.fp
+drop cascades to table app.fc
