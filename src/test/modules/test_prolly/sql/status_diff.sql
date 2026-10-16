@@ -52,3 +52,30 @@ DROP TABLE plain;
 
 SELECT dolt_branch('-D', 'f');
 DROP SCHEMA app CASCADE;
+
+-- A column added with a default: a row's NULL in it is NULL in the diff,
+-- not the default (rows are folded, and read back, as a rewrite has them).
+CREATE SCHEMA sdd VERSIONED;
+CREATE TABLE sdd.t (id int PRIMARY KEY, a text);
+INSERT INTO sdd.t VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 'before the column')::text) AS committed;
+ALTER TABLE sdd.t ADD COLUMN c int DEFAULT 5;
+UPDATE sdd.t SET c = NULL WHERE id = 1;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdd.t)
+  ORDER BY to_row;
+DROP SCHEMA sdd CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- Names in a database whose encoding isn't UTF-8 (the canonical tree's).
+CREATE DATABASE sd_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'
+  TEMPLATE template0;
+\c sd_latin1
+CREATE SCHEMA "appé" VERSIONED;
+CREATE TABLE "appé"."tablé" (id int PRIMARY KEY, v text);
+INSERT INTO "appé"."tablé" VALUES (1, 'a');
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+INSERT INTO "appé"."tablé" VALUES (2, 'b');
+SELECT * FROM dolt_status;
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::"appé"."tablé");
+\c contrib_regression
+DROP DATABASE sd_latin1;
