@@ -874,6 +874,20 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		walk_commit(&ws, lfirst(lc));
 }
 
+static void
+copies_hold(void)
+{
+	char	   *name = branch_ops()->current();
+
+	lock_refs();
+	if (head_moved_unseen(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -897,5 +911,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_set = copies_working_set,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
+	.hold = copies_hold,
 	.walk = copies_walk,
 };

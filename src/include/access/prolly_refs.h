@@ -138,6 +138,15 @@ typedef struct ProllyRefsRoutine
 	void		(*set_merge_state) (const ProllyMergeState *state);
 
 	/*
+	 * Hold the refs until the transaction ends, before reading heads to
+	 * move one by (a merge's): other movers wait, and it waits for one
+	 * moving them now.  If the session's branch was moved by a transaction
+	 * the snapshot doesn't see, it fails to be retried instead (what it
+	 * would read of the branch's rows isn't the head's).
+	 */
+	void		(*hold) (void);
+
+	/*
 	 * Visit every node the refs keep alive, from the root of their own
 	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
 	 */
@@ -149,7 +158,7 @@ typedef struct ProllyRefsRoutine
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
-	"set_merge_state", "walk"
+	"set_merge_state", "hold", "walk"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 static inline const ProllyRefsRoutine *

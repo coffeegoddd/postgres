@@ -346,3 +346,203 @@ SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
         66
 (1 row)
 
+-- Merges into a branch with no commit yet, and between branches with no
+-- history in common.
+CREATE DATABASE mh_fresh TEMPLATE template0;
+\c mh_fresh
+CREATE SCHEMA app VERSIONED;
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('other') IS NOT NULL AS on_other;
+ on_other 
+----------
+ t
+(1 row)
+
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'other');
+SELECT length(dolt_commit('-Am', 'on other')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- main has no commit: what it has is uncommitted, and isn't overwritten
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'mine'), (2, 'mine');
+SELECT dolt_merge('other');
+ERROR:  cannot merge with uncommitted changes
+HINT:  Commit them, or reset the branch, first.
+SELECT * FROM app.t ORDER BY id;
+ id |  v   
+----+------
+  1 | mine
+  2 | mine
+(2 rows)
+
+-- nor merged with --no-ff, there being nothing to make a merge commit on
+SELECT dolt_merge('--no-ff', 'other');
+ERROR:  the current branch has no commit to merge into
+-- committed, main's history and other's have nothing in common
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('other');
+ERROR:  branch "other" has no history in common with the current one
+\c contrib_regression
+DROP DATABASE mh_fresh;
+-- --no-ff where a fast-forward would do: no merge commit is made yet
+CREATE SCHEMA mhf VERSIONED;
+CREATE TABLE mhf.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mhf')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mh_ahead');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('mh_ahead') IS NOT NULL AS on_ahead;
+ on_ahead 
+----------
+ t
+(1 row)
+
+INSERT INTO mhf.t VALUES (1);
+SELECT length(dolt_commit('-am', 'ahead')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('--no-ff', 'mh_ahead'))[2:4];
+ERROR:  branches made by copying can only fast-forward so far
+DETAIL:  A merge commit where a fast-forward would do (--no-ff) isn't made yet.
+SELECT count(*) FROM mhf.t;
+ count 
+-------
+     0
+(1 row)
+
+SELECT dolt_branch('-D', 'mh_ahead');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mhf CASCADE;
+NOTICE:  drop cascades to table mhf.t
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A materialized view's rows move too, as the commit holds them, its
+-- indexes kept up; the working set then folds to the commit's root.
+CREATE SCHEMA mhm VERSIONED;
+CREATE TABLE mhm.t (id int PRIMARY KEY, v int);
+INSERT INTO mhm.t VALUES (1, 1), (2, 2), (3, 2);
+CREATE MATERIALIZED VIEW mhm.sums AS SELECT sum(v) AS s FROM mhm.t;
+CREATE MATERIALIZED VIEW mhm.vs AS SELECT v FROM mhm.t;
+CREATE MATERIALIZED VIEW mhm.ids AS SELECT id, v FROM mhm.t;
+CREATE UNIQUE INDEX ON mhm.ids (id);
+SELECT length(dolt_commit('-Am', 'views')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE mhm.t SET v = 10 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mhm.sums;
+REFRESH MATERIALIZED VIEW mhm.vs;
+REFRESH MATERIALIZED VIEW mhm.ids;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM mhm.sums;
+ s 
+---
+ 5
+(1 row)
+
+SELECT v, count(*) FROM mhm.vs GROUP BY v ORDER BY v;
+ v | count 
+---+-------
+ 1 |     1
+ 2 |     2
+(2 rows)
+
+SET enable_seqscan = off;
+SELECT * FROM mhm.ids WHERE id = 1;
+ id | v 
+----+---
+  1 | 1
+(1 row)
+
+RESET enable_seqscan;
+SELECT dolt_commit('-Am', 'nothing') IS NULL AS committed;
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+-- refreshing takes MAINTAIN, and so does moving its rows
+CREATE ROLE mhm_writer;
+GRANT USAGE ON SCHEMA mhm TO mhm_writer;
+GRANT ALL ON mhm.t TO mhm_writer;
+GRANT SELECT ON mhm.sums, mhm.vs, mhm.ids TO mhm_writer;
+UPDATE mhm.t SET v = 10 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mhm.sums;
+SET ROLE mhm_writer;
+SELECT dolt_reset('--hard');
+ERROR:  permission denied for materialized view sums
+RESET ROLE;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM mhm.sums;
+ s 
+---
+ 5
+(1 row)
+
+DROP SCHEMA mhm CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table mhm.t
+drop cascades to materialized view mhm.sums
+drop cascades to materialized view mhm.vs
+drop cascades to materialized view mhm.ids
+DROP ROLE mhm_writer;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

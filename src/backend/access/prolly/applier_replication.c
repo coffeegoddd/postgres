@@ -60,6 +60,7 @@ struct ProllyApplier
 	ResultRelInfo *rri;
 	EPQState	epq;
 	TupleTableSlot *found;
+	bool		matview;		/* rows written as REFRESH writes them */
 };
 
 /* RLS would decide which rows the user may write; it isn't applied here. */
@@ -334,14 +335,28 @@ replication_begin(Relation rel)
 	RangeTblEntry *rte;
 	List	   *perminfos = NIL;
 
-	/* A partition's rows are applied to it, not to its parent. */
-	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	/*
+	 * A partition's rows are applied to it, not to its parent.  A
+	 * materialized view's are written as its refresh writes them, which
+	 * takes the privilege to refresh it.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_MATVIEW)
+	{
+		AclResult	r = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
+										  ACL_MAINTAIN);
+
+		if (r != ACLCHECK_OK)
+			aclcheck_error(r, OBJECT_MATVIEW, RelationGetRelationName(rel));
+		a->matview = true;
+	}
+	else if (rel->rd_rel->relkind != RELKIND_RELATION)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot apply rows to relation \"%s\"",
 						RelationGetRelationName(rel)),
 				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
-	check_privileges(rel);
+	else
+		check_privileges(rel);
 
 	a->rel = rel;
 	a->key_index = RelationGetPrimaryKeyIndex(rel, true);
@@ -389,10 +404,33 @@ find_row(ProllyApplier *a, TupleTableSlot *old)
 	return find_copy(a, old);
 }
 
+/*
+ * A materialized view's rows, as a refresh writes them: no constraints or
+ * triggers to check (it has none), its indexes maintained.  (The
+ * executor's simple-relation routines take tables only.)
+ */
+static void
+matview_insert(ProllyApplier *a, TupleTableSlot *row)
+{
+	simple_table_tuple_insert(a->rel, row);
+	if (a->rri->ri_NumIndices > 0)
+		list_free(ExecInsertIndexTuples(a->rri, a->estate, 0, row, NIL, NULL));
+}
+
+static void
+matview_delete(ProllyApplier *a)
+{
+	simple_table_tuple_delete(a->rel, &a->found->tts_tid,
+							  a->estate->es_snapshot);
+}
+
 static void
 replication_insert(ProllyApplier *a, TupleTableSlot *row)
 {
-	ExecSimpleRelationInsert(a->rri, a->estate, row);
+	if (a->matview)
+		matview_insert(a, row);
+	else
+		ExecSimpleRelationInsert(a->rri, a->estate, row);
 	advance(a);
 }
 
@@ -401,7 +439,13 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
 {
 	if (!find_row(a, old))
 		return false;
-	ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found, row);
+	if (a->matview)
+	{
+		matview_delete(a);
+		matview_insert(a, row);
+	}
+	else
+		ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found, row);
 	advance(a);
 	return true;
 }
@@ -411,7 +455,10 @@ replication_remove(ProllyApplier *a, TupleTableSlot *old)
 {
 	if (!find_row(a, old))
 		return false;
-	ExecSimpleRelationDelete(a->rri, a->estate, &a->epq, a->found);
+	if (a->matview)
+		matview_delete(a);
+	else
+		ExecSimpleRelationDelete(a->rri, a->estate, &a->epq, a->found);
 	advance(a);
 	return true;
 }

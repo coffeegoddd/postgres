@@ -116,3 +116,79 @@ SELECT dolt_reset('--hard');
 SELECT * FROM mhc.t;
 DROP SCHEMA mhc CASCADE;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- Merges into a branch with no commit yet, and between branches with no
+-- history in common.
+CREATE DATABASE mh_fresh TEMPLATE template0;
+\c mh_fresh
+CREATE SCHEMA app VERSIONED;
+SELECT dolt_branch('other');
+SELECT dolt_checkout('other') IS NOT NULL AS on_other;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'other');
+SELECT length(dolt_commit('-Am', 'on other')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+-- main has no commit: what it has is uncommitted, and isn't overwritten
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'mine'), (2, 'mine');
+SELECT dolt_merge('other');
+SELECT * FROM app.t ORDER BY id;
+-- nor merged with --no-ff, there being nothing to make a merge commit on
+SELECT dolt_merge('--no-ff', 'other');
+-- committed, main's history and other's have nothing in common
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+SELECT dolt_merge('other');
+\c contrib_regression
+DROP DATABASE mh_fresh;
+
+-- --no-ff where a fast-forward would do: no merge commit is made yet
+CREATE SCHEMA mhf VERSIONED;
+CREATE TABLE mhf.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mhf')::text) AS committed;
+SELECT dolt_branch('mh_ahead');
+SELECT dolt_checkout('mh_ahead') IS NOT NULL AS on_ahead;
+INSERT INTO mhf.t VALUES (1);
+SELECT length(dolt_commit('-am', 'ahead')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', 'mh_ahead'))[2:4];
+SELECT count(*) FROM mhf.t;
+SELECT dolt_branch('-D', 'mh_ahead');
+DROP SCHEMA mhf CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- A materialized view's rows move too, as the commit holds them, its
+-- indexes kept up; the working set then folds to the commit's root.
+CREATE SCHEMA mhm VERSIONED;
+CREATE TABLE mhm.t (id int PRIMARY KEY, v int);
+INSERT INTO mhm.t VALUES (1, 1), (2, 2), (3, 2);
+CREATE MATERIALIZED VIEW mhm.sums AS SELECT sum(v) AS s FROM mhm.t;
+CREATE MATERIALIZED VIEW mhm.vs AS SELECT v FROM mhm.t;
+CREATE MATERIALIZED VIEW mhm.ids AS SELECT id, v FROM mhm.t;
+CREATE UNIQUE INDEX ON mhm.ids (id);
+SELECT length(dolt_commit('-Am', 'views')::text) AS committed;
+UPDATE mhm.t SET v = 10 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mhm.sums;
+REFRESH MATERIALIZED VIEW mhm.vs;
+REFRESH MATERIALIZED VIEW mhm.ids;
+SELECT dolt_reset('--hard');
+SELECT * FROM mhm.sums;
+SELECT v, count(*) FROM mhm.vs GROUP BY v ORDER BY v;
+SET enable_seqscan = off;
+SELECT * FROM mhm.ids WHERE id = 1;
+RESET enable_seqscan;
+SELECT dolt_commit('-Am', 'nothing') IS NULL AS committed;
+-- refreshing takes MAINTAIN, and so does moving its rows
+CREATE ROLE mhm_writer;
+GRANT USAGE ON SCHEMA mhm TO mhm_writer;
+GRANT ALL ON mhm.t TO mhm_writer;
+GRANT SELECT ON mhm.sums, mhm.vs, mhm.ids TO mhm_writer;
+UPDATE mhm.t SET v = 10 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mhm.sums;
+SET ROLE mhm_writer;
+SELECT dolt_reset('--hard');
+RESET ROLE;
+SELECT dolt_reset('--hard');
+SELECT * FROM mhm.sums;
+DROP SCHEMA mhm CASCADE;
+DROP ROLE mhm_writer;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
