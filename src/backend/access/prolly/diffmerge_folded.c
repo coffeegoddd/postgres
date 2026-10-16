@@ -610,7 +610,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	memset(&tc, 0, sizeof(tc));
 	tc.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, NULL, CurrentMemoryContext);
+	tc.rd.k = PROLLY_CALL(tc.rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	oc = tc;
 	chunk_env(&env);
