@@ -131,3 +131,25 @@ SELECT dolt_merge('feature');
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA app CASCADE;
+
+-- A merge reads rows as they were folded: a NULL in a column added with a
+-- default is NULL in the conflict's rows, not the default.
+CREATE SCHEMA mgd VERSIONED;
+CREATE TABLE mgd.t (id int PRIMARY KEY, a text);
+INSERT INTO mgd.t VALUES (1, 'one');
+ALTER TABLE mgd.t ADD COLUMN c int DEFAULT 5;
+SELECT length(dolt_commit('-Am', 'c is 5')::text) AS committed;
+SELECT dolt_branch('mgd_side');
+SELECT dolt_checkout('mgd_side') IS NOT NULL AS on_side;
+UPDATE mgd.t SET c = NULL;
+SELECT length(dolt_commit('-am', 'c is NULL')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mgd.t SET a = 'uno';
+SELECT length(dolt_commit('-am', 'a is uno')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('mgd_side'))[2:4];
+SELECT our_row, their_row FROM dolt_conflicts(NULL::mgd.t);
+ROLLBACK;
+SELECT dolt_branch('-D', 'mgd_side');
+DROP SCHEMA mgd CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;

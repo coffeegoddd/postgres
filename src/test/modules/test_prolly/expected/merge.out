@@ -456,3 +456,75 @@ NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.k
 drop cascades to table app.untouched
+-- A merge reads rows as they were folded: a NULL in a column added with a
+-- default is NULL in the conflict's rows, not the default.
+CREATE SCHEMA mgd VERSIONED;
+CREATE TABLE mgd.t (id int PRIMARY KEY, a text);
+INSERT INTO mgd.t VALUES (1, 'one');
+ALTER TABLE mgd.t ADD COLUMN c int DEFAULT 5;
+SELECT length(dolt_commit('-Am', 'c is 5')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mgd_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('mgd_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE mgd.t SET c = NULL;
+SELECT length(dolt_commit('-am', 'c is NULL')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE mgd.t SET a = 'uno';
+SELECT length(dolt_commit('-am', 'a is uno')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('mgd_side'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT our_row, their_row FROM dolt_conflicts(NULL::mgd.t);
+  our_row  | their_row 
+-----------+-----------
+ (1,uno,5) | (1,one,)
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'mgd_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mgd CASCADE;
+NOTICE:  drop cascades to table mgd.t
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
