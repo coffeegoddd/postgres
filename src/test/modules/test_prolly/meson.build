@@ -63,6 +63,7 @@ tests += {
       'table_files',
       'incremental_folds',
       'checkpoints',
+      'format_freeze',
     ],
   },
   'tap': {

@@ -223,6 +223,12 @@ CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The hash of a table's data tree (by qualified name) in the session
+-- branch's working set, folded.
+CREATE FUNCTION test_fold_tree_hash(name text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- What the session's folds have read (pages, candidate rows, tables read
 -- in full) since the counters were last reset.
 CREATE FUNCTION test_fold_counters(reset bool DEFAULT false, OUT pages int8,
