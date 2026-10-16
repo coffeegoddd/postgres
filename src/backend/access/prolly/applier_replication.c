@@ -381,6 +381,17 @@ replication_begin(Relation rel)
 	ExecOpenIndices(a->rri, false);
 	EvalPlanQualInit(&a->epq, a->estate, NULL, NIL, -1, NIL);
 	a->found = table_slot_create(rel, &a->estate->es_tupleTable);
+
+	/*
+	 * The slots after-row triggers' events would take are made now, not on
+	 * the first write: a write made in a subtransaction would otherwise own
+	 * them.
+	 */
+	if (a->rri->ri_TrigDesc)
+	{
+		(void) ExecGetTriggerOldSlot(a->estate, a->rri);
+		(void) ExecGetTriggerNewSlot(a->estate, a->rri);
+	}
 	AfterTriggerBeginQuery();
 	return a;
 }

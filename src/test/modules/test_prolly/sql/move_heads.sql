@@ -73,7 +73,8 @@ SELECT (dolt_merge('at_second'))[2:4];
 SELECT dolt_reset('--hard');
 
 -- Other definitions: the branch moves to them too; diverged branches whose
--- definitions differ don't merge yet.
+-- definitions differ merge their rows as the merged definition has them
+-- (here, row 1 changed on both: a conflict).
 SELECT dolt_checkout('at_first');
 ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;

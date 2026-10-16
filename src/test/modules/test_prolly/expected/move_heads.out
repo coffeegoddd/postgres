@@ -222,7 +222,8 @@ SELECT dolt_reset('--hard');
 (1 row)
 
 -- Other definitions: the branch moves to them too; diverged branches whose
--- definitions differ don't merge yet.
+-- definitions differ merge their rows as the merged definition has them
+-- (here, row 1 changed on both: a conflict).
 SELECT dolt_checkout('at_first');
             dolt_checkout            
 -------------------------------------
@@ -262,11 +263,13 @@ SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('at_second'))[2:4];
-ERROR:  merge of branch "at_second" can't combine the rows of table app.t yet
-DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
-ERROR:  merge of branch "at_second" can't combine the rows of table app.t yet
-DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT dolt_branch('-D', 'at_first', 'at_second');
  dolt_branch 
 -------------

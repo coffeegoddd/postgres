@@ -66,6 +66,7 @@ tests += {
       'format_freeze',
       'dirty_merges',
       'constraint_violations',
+      'redefined_merges',
     ],
   },
   'tap': {
