@@ -45,6 +45,10 @@ check-target: PROVE_TESTS = t/003_target_guard.pl
 check-target: require-tap temp-install
 	$(prove_check)
 
+check-vc-target: PROVE_TESTS = t/004_vc_target.pl
+check-vc-target: require-tap temp-install
+	$(prove_check)
+
 check-semantics: PROVE_TESTS = t/001_semantics.pl
 check-semantics: require-tap temp-install
 	$(prove_check)
@@ -109,6 +113,6 @@ require-legacy-vc:
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf output_iso
 
-.PHONY: check check-target check-semantics check-vc check-isolation check-vc-isolation \
+.PHONY: check check-target check-vc-target check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE

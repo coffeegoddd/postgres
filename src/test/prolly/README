@@ -23,6 +23,7 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 
 	check-semantics       SQL behaves exactly as on heap
 	check-target          guard rejects accidental fallback to heap
+	check-vc-target       commits, branches and restores the actual AM's data
 	check-isolation       concurrency behaves exactly as on heap
 	check-tap-durability  crash recovery, standby replay, prepared xacts
 	check-vc              branches, versioned schema, diff, merge,
@@ -35,6 +36,20 @@ without TAP support fails these targets instead of reporting success.
 For the page-based prolly AM, run check-semantics, check-isolation and
 check-tap-durability with PROLLY_AM=prolly.  The VC groups still describe
 the legacy tree-engine API and reject that target.
+
+Run check-vc-target before claiming version-control coverage for an AM:
+
+	make -C src/test/prolly check-vc-target PROLLY_AM=prolly_d1
+
+This strict probe checks actual table AMs, branch heads and commit parents,
+insert/update/delete isolation in both directions, and hard reset to HEAD
+and an older commit. It verifies full row contents, including large text,
+using new connections so SQL writes are committed before history snapshots.
+It uses a disposable cluster and leaves its fixtures there for diagnosis.
+An unsupported or disconnected VC path fails; a successful dolt_* call or
+an empty history is not evidence of coverage. D1 currently passes; heap and
+the page-based prolly engine do not yet satisfy this probe. This is a data
+targeting canary, not a claim of schema, merge or crash-recovery coverage.
 
 Postgres's own regression and isolation suites, run with the engine as
 the default table AM, are separate targets, not part of "check":
