@@ -246,6 +246,17 @@ def main(argv=None) -> int:
     diff.add_argument("--self-test", action="store_true", help="also prove the comparator rejects a known mismatch")
     diff.set_defaults(fn=differential.run)
 
+    from pbench import vc
+    scenario = sub.add_parser("vc", help="version-control scenarios with explicit engine capabilities")
+    scenario.add_argument("--am", default="prolly_d1", help="comma-separated engine names")
+    scenario.add_argument("--pg-bin", type=Path, required=True)
+    scenario.add_argument("--out", type=Path, required=True, help="new artifact directory")
+    scenario.add_argument("--runner", type=Path, default=REPO / "build-bench/vc/engine-vc")
+    scenario.add_argument("--cases", type=Path, default=HERE / "slt/internal/vcscenario/cases",
+                          help="scenario JSON file or directory; saved scenarios can be replayed here")
+    scenario.add_argument("--self-test", action="store_true", help="also exercise native adapter negative controls")
+    scenario.set_defaults(fn=vc.run)
+
     args = p.parse_args(argv)
     return args.fn(args)
 

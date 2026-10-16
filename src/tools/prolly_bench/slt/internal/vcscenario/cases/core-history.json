@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "id": "core-history",
+  "description": "Native data-targeting scenario: independent branches, captured parents and historical restore",
+  "requires": ["sql", "vc.core"],
+  "sessions": ["a", "b"],
+  "steps": [
+    {"id":"create","session":"a","op":"exec","sql":"CREATE TABLE history_target (id int PRIMARY KEY, v text)","expect":{"tag":"CREATE TABLE"}},
+    {"id":"seed","session":"a","op":"exec","sql":"INSERT INTO history_target VALUES (1, 'base'), (2, 'remove')","expect":{"tag":"INSERT 0 2"}},
+    {"id":"base","session":"a","op":"commit","args":["base"],"save":"base"},
+    {"id":"branch","session":"a","op":"branch","args":["feature",{"ref":"base"}]},
+    {"id":"checkout","session":"a","op":"checkout","args":["feature"]},
+    {"id":"branch-copy","session":"a","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","base"],["2","remove"]],"order":"ordered"}},
+    {"id":"edit","session":"a","op":"exec","sql":"UPDATE history_target SET v='feature' WHERE id=1","expect":{"tag":"UPDATE 1"}},
+    {"id":"delete","session":"a","op":"exec","sql":"DELETE FROM history_target WHERE id=2","expect":{"tag":"DELETE 1"}},
+    {"id":"insert","session":"a","op":"exec","sql":"INSERT INTO history_target VALUES (3, 'feature-only')","expect":{"tag":"INSERT 0 1"}},
+    {"id":"main-isolation","session":"b","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","base"],["2","remove"]],"order":"ordered"}},
+    {"id":"feature","session":"a","op":"commit","args":["feature"],"save":"feature"},
+    {"id":"feature-head","session":"a","op":"query","sql":"SELECT dolt_hashof('HEAD'), dolt_hashof('HEAD^')","expect":{"rows":[[{"ref":"feature"},{"ref":"base"}]],"order":"ordered"}},
+    {"id":"main-edit","session":"b","op":"exec","sql":"UPDATE history_target SET v='main' WHERE id=1","expect":{"tag":"UPDATE 1"}},
+    {"id":"main","session":"b","op":"commit","args":["main"],"save":"main"},
+    {"id":"feature-isolation","session":"a","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","feature"],["3","feature-only"]],"order":"ordered"}},
+    {"id":"dirty","session":"a","op":"exec","sql":"UPDATE history_target SET v='discard'","expect":{"tag":"UPDATE 2"}},
+    {"id":"reset-head","session":"a","op":"reset","args":["HEAD"]},
+    {"id":"restored-head","session":"a","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","feature"],["3","feature-only"]],"order":"ordered"}},
+    {"id":"reset-base","session":"a","op":"reset","args":[{"ref":"base"}]},
+    {"id":"restored-base","session":"a","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","base"],["2","remove"]],"order":"ordered"}},
+    {"id":"restored-head-ref","session":"a","op":"query","sql":"SELECT dolt_hashof('HEAD')","expect":{"rows":[[{"ref":"base"}]],"order":"ordered"}},
+    {"id":"main-survives","session":"b","op":"query","sql":"SELECT id, v FROM history_target ORDER BY id","expect":{"rows":[["1","main"],["2","remove"]],"order":"ordered"}},
+    {"id":"main-parents","session":"b","op":"query","sql":"SELECT dolt_hashof('HEAD'), dolt_hashof('HEAD^')","expect":{"rows":[[{"ref":"main"},{"ref":"base"}]],"order":"ordered"}}
+  ]
+}

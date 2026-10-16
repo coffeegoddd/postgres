@@ -1,0 +1,293 @@
+package vcscenario
+
+import (
+	"context"
+	"crypto/rand"
+	_ "embed"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type Profile struct {
+	Engine      string   `json:"engine"`
+	Supported   []string `json:"supported"`
+	Limitations string   `json:"limitations"`
+}
+
+func EngineProfile(am string) (Profile, error) {
+	p := Profile{Engine: am}
+	switch am {
+	case "prolly_d1":
+		p.Supported = []string{"sql", "vc.core"}
+		p.Limitations = "Data commit/branch/hard-reset only; no schema-merge or concurrency claim."
+	case "prolly":
+		p.Supported = []string{"sql"}
+		p.Limitations = "Legacy refs do not capture block-mapped tables; VC is not supported by this adapter."
+	case "heap":
+		p.Supported = []string{"sql"}
+		p.Limitations = "Ordinary heap has no version-control capability."
+	case "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4":
+		p.Supported = []string{}
+		p.Limitations = "Unimplemented engine; no functional capabilities declared."
+	default:
+		return p, fmt.Errorf("unknown engine %q", am)
+	}
+	return p, nil
+}
+
+type Postgres struct {
+	profile  Profile
+	dsn      string
+	timeout  time.Duration
+	admin    *pgconn.PgConn
+	db       string
+	sessions map[string]*pgconn.PgConn
+}
+
+func NewPostgres(dsn, am string, timeout time.Duration) (*Postgres, error) {
+	p, err := EngineProfile(am)
+	if err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("timeout must be positive")
+	}
+	return &Postgres{profile: p, dsn: dsn, timeout: timeout}, nil
+}
+func (p *Postgres) Name() string           { return p.profile.Engine }
+func (p *Postgres) Capabilities() []string { return p.profile.Supported }
+
+// The built-in target probe is also a reviewable scenario, interpreted by the
+// same executor as the corpus. Its database is dropped before the actual case.
+//
+//go:embed cases/core-history.json
+var targetScenario []byte
+
+func (p *Postgres) Verify(ctx context.Context, requires []string) (err error) {
+	probe, _ := NewPostgres(p.dsn, p.Name(), p.timeout)
+	defer func() { err = errors.Join(err, probe.Close(context.Background())) }()
+	s, e := Parse(targetScenario)
+	if e != nil {
+		return e
+	}
+	if e = probe.Open(ctx, s.Sessions); e != nil {
+		return e
+	}
+	for _, r := range requires {
+		if r == "vc.core" {
+			_, detail := execute(ctx, s, probe)
+			if detail != "" {
+				return fmt.Errorf("VC canary: %s", detail)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Postgres) connect(ctx context.Context, db string) (*pgconn.PgConn, error) {
+	cfg, err := pgconn.ParseConfig(p.dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Database = db
+	cfg.RuntimeParams["search_path"] = "public"
+	cfg.RuntimeParams["timezone"] = "UTC"
+	cfg.RuntimeParams["datestyle"] = "ISO, YMD"
+	cfg.RuntimeParams["extra_float_digits"] = "3"
+	cfg.RuntimeParams["statement_timeout"] = fmt.Sprint(p.timeout.Milliseconds())
+	cfg.RuntimeParams["lock_timeout"] = fmt.Sprint(p.timeout.Milliseconds())
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	return pgconn.ConnectConfig(ctx, cfg)
+}
+
+func (p *Postgres) query(ctx context.Context, c *pgconn.PgConn, sql string, params []*string) (Outcome, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	args := make([][]byte, len(params))
+	for i, v := range params {
+		if v != nil {
+			args[i] = []byte(*v)
+		}
+	}
+	r := c.ExecParams(ctx, sql, args, nil, nil, nil).Read()
+	o := Outcome{Tag: r.CommandTag.String(), Transaction: string(c.TxStatus()), Rows: [][]*string{}}
+	if r.Err != nil {
+		var pgerr *pgconn.PgError
+		if !errors.As(r.Err, &pgerr) || c.IsClosed() || pgerr.Severity == "FATAL" || pgerr.Severity == "PANIC" || pgerr.Code == "57014" {
+			return o, r.Err
+		}
+		o.SQLState = pgerr.Code
+	}
+	for _, f := range r.FieldDescriptions {
+		o.Columns = append(o.Columns, f.Name)
+	}
+	for _, row := range r.Rows {
+		cells := make([]*string, len(row))
+		for i, v := range row {
+			if v != nil {
+				x := string(v)
+				cells[i] = &x
+			}
+		}
+		o.Rows = append(o.Rows, cells)
+	}
+	return o, nil
+}
+
+func (p *Postgres) must(ctx context.Context, c *pgconn.PgConn, sql string, params ...*string) (Outcome, error) {
+	o, err := p.query(ctx, c, sql, params)
+	if err == nil && o.SQLState != "" {
+		err = fmt.Errorf("SQLSTATE %s executing %s", o.SQLState, sql)
+	}
+	return o, err
+}
+
+func (p *Postgres) Open(ctx context.Context, names []string) (err error) {
+	if p.admin != nil {
+		return fmt.Errorf("adapter already open")
+	}
+	p.admin, err = p.connect(ctx, "postgres")
+	if err != nil {
+		return err
+	}
+	var nonce [8]byte
+	if _, err = rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	p.db = fmt.Sprintf("vc_case_%x", nonce)
+	if _, err = p.must(ctx, p.admin, "CREATE DATABASE "+p.db+" TEMPLATE template0"); err != nil {
+		return err
+	}
+	// The AM is from the closed EngineProfile whitelist; database names are random hex.
+	if _, err = p.must(ctx, p.admin, "ALTER DATABASE "+p.db+" SET default_table_access_method = '"+p.Name()+"'"); err != nil {
+		return err
+	}
+	p.sessions = map[string]*pgconn.PgConn{}
+	for _, name := range names {
+		c, e := p.connect(ctx, p.db)
+		if e != nil {
+			return e
+		}
+		p.sessions[name] = c
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("no sessions")
+	}
+	c := p.sessions[names[0]]
+	if p.Name() == "prolly" {
+		for _, q := range []string{"DROP SCHEMA public", "CREATE SCHEMA public VERSIONED"} {
+			if _, err = p.must(ctx, c, q); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err = p.must(ctx, c, "CREATE TABLE __vc_target (id int PRIMARY KEY, payload text)"); err != nil {
+		return err
+	}
+	if err = p.CheckTarget(ctx, names[0]); err != nil {
+		return err
+	}
+	if p.Name() == "prolly" {
+		_, err = p.must(ctx, c, `DO $$ BEGIN
+IF (SELECT count(*) FROM pg_class WHERE
+ (oid = '__vc_target'::regclass OR oid = '__vc_target_pkey'::regclass OR
+  oid = (SELECT reltoastrelid FROM pg_class WHERE oid = '__vc_target'::regclass))
+ AND (pg_stat_file(pg_relation_filepath(oid) || '_bmap', true)).size IS NOT NULL) <> 3
+THEN RAISE EXCEPTION 'table, index or TOAST is not block-mapped'; END IF; END $$`)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = p.must(ctx, c, "DROP TABLE __vc_target")
+	return err
+}
+
+func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) (Outcome, error) {
+	c, ok := p.sessions[s.Session]
+	if !ok {
+		return Outcome{}, fmt.Errorf("unknown session %s", s.Session)
+	}
+	if s.Op == "exec" || s.Op == "query" {
+		return p.query(ctx, c, s.SQL, params)
+	}
+	if c.TxStatus() != 'I' {
+		return Outcome{}, fmt.Errorf("VC operations require SQL-committed writes; session is in transaction state %c", c.TxStatus())
+	}
+	var sql string
+	switch s.Op {
+	case "commit":
+		sql = "SELECT (dolt_commit('-m', $1))[1]"
+	case "branch":
+		sql = "SELECT dolt_branch($1)"
+		if len(args) == 2 {
+			sql = "SELECT dolt_branch($1, $2)"
+		}
+	case "checkout":
+		sql = "SELECT dolt_checkout($1)"
+	case "reset":
+		sql = "SELECT dolt_reset('--hard', $1)"
+	default:
+		return Outcome{}, fmt.Errorf("unsupported operation %s", s.Op)
+	}
+	o, err := p.query(ctx, c, sql, args)
+	if err != nil || o.SQLState != "" {
+		return o, err
+	}
+	if s.Op == "checkout" {
+		check, e := p.must(ctx, c, "SELECT active_branch()")
+		if e != nil {
+			return o, e
+		}
+		if len(check.Rows) != 1 || len(check.Rows[0]) != 1 || check.Rows[0][0] == nil || *check.Rows[0][0] != *args[0] {
+			return o, fmt.Errorf("checkout did not select requested branch")
+		}
+	}
+	return o, nil
+}
+
+func (p *Postgres) CheckTarget(ctx context.Context, session string) error {
+	c := p.sessions[session]
+	if c.IsClosed() {
+		return fmt.Errorf("session connection closed")
+	}
+	// Catalog reads cannot run in an aborted transaction. Recheck on rollback.
+	if c.TxStatus() == 'E' {
+		return nil
+	}
+	am := p.Name()
+	o, err := p.must(ctx, c, `SELECT count(*) FROM pg_class c JOIN pg_am a ON a.oid=c.relam
+WHERE c.relnamespace='public'::regnamespace AND c.relkind IN ('r','m') AND a.amname<>$1`, &am)
+	if err != nil {
+		return err
+	}
+	if len(o.Rows) != 1 || len(o.Rows[0]) != 1 || o.Rows[0][0] == nil || *o.Rows[0][0] != "0" {
+		return fmt.Errorf("public contains a table using the wrong AM (expected %s)", am)
+	}
+	return nil
+}
+
+func (p *Postgres) Close(ctx context.Context) error {
+	var errs []error
+	for _, c := range p.sessions {
+		deadline, cancel := context.WithTimeout(ctx, p.timeout)
+		errs = append(errs, c.Close(deadline))
+		cancel()
+	}
+	p.sessions = nil
+	if p.admin != nil {
+		if p.db != "" {
+			_, err := p.must(ctx, p.admin, "DROP DATABASE IF EXISTS "+p.db+" WITH (FORCE)")
+			errs = append(errs, err)
+		}
+		deadline, cancel := context.WithTimeout(ctx, p.timeout)
+		errs = append(errs, p.admin.Close(deadline))
+		cancel()
+		p.admin = nil
+		p.db = ""
+	}
+	return errors.Join(errs...)
+}

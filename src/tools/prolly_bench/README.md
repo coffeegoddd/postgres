@@ -270,3 +270,55 @@ and cleans up. Missing declared capabilities report `unsupported`, never
 The result contains the failing phase and an ordered step trace, including
 actual rows and SQLSTATEs. The runner stops that case at its first failure.
 This format has no implicit skips or result-check bypasses.
+
+Run the PostgreSQL adapters with:
+
+```sh
+bash src/tools/prolly_bench/build_vc.sh
+src/tools/prolly_bench/prolly_bench vc \
+  --pg-bin build-rel/inst/bin --am prolly_d1 --self-test \
+  --out /tmp/vc-d1
+```
+
+The bundled fixtures are native harness acceptance cases, not imported Dolt
+coverage: one checks core history, the other checks SQL values, persistent
+sessions, transaction rollback and expected errors. D1 declares `sql` and
+`vc.core`; heap and prolly declare only `sql`; D2-D4 declare neither. Each
+case gets a new database and one persistent connection per named session.
+Operations run sequentially; these schedules do not exercise concurrent
+blocking queries. VC operations require an idle SQL transaction, since this
+adapter snapshots SQL-committed writes. One SQL statement is allowed per
+step, using extended-protocol bind parameters. Prepared-plan reuse, merge,
+schema history, crash injection and corpus import are subsequent work.
+
+Before running a case, the adapter creates and drops a separate probe
+database. It verifies the actual AM (and prolly's table/index/TOAST block-map
+forks); for `vc.core`, it runs the built-in history scenario, including
+branch isolation and restoration. Case fixtures therefore start with fresh
+history. The adapter also checks public tables' AMs after steps, deferring
+that check until rollback if a SQL error aborted the transaction. Scenario
+tables belong in public; arbitrary other schemas are outside this check.
+
+To see coverage gaps, run `--am heap,prolly,prolly_d1,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4`.
+Any unsupported case makes the command fail, with an explicit `unsupported`
+result. An engine's claim of support must also pass the live preflight;
+failure there is a failed target, not an automatic exclusion. `--self-test`
+checks wrong rows, unexpected SQL errors, wrong AMs, a deliberately false
+prolly VC claim, and explicit unsupported reporting. These controls are
+recorded separately and never added to corpus passes.
+
+Artifacts include the source revision/dirty flag, binary hash, server
+settings/log, exact input scenarios and their SHA-256 hashes, declared
+engine profiles, step results, and counts of planned/passed/failed/
+unsupported/not-run cases. Invalid inputs fail before scenarios execute;
+the summary initially records every planned case as not run and updates
+after each result. Replay the saved input with `--cases`:
+
+```sh
+src/tools/prolly_bench/prolly_bench vc \
+  --pg-bin build-rel/inst/bin --am prolly_d1 \
+  --cases /tmp/vc-d1/results/scenarios/core-history.json --out /tmp/vc-replay
+```
+
+CI runs both fixtures on D1 and the SQL fixture on heap/prolly. Logs and
+coverage artifacts are uploaded with the existing engine results.

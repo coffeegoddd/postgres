@@ -1,0 +1,18 @@
+{
+  "version":1,
+  "id":"sql-values",
+  "description":"Native adapter checks: exact values, bag multiplicity, named sessions and transaction errors",
+  "requires":["sql"],
+  "sessions":["a","b"],
+  "steps":[
+    {"id":"values","session":"a","op":"query","sql":"SELECT $1::text AS v UNION ALL SELECT $2::text UNION ALL SELECT $3::text UNION ALL SELECT $3::text","params":[null,"","9007199254740993"],"expect":{"columns":["v"],"rows":[["9007199254740993"],[null],["9007199254740993"],[""]],"order":"bag","transaction":"I"}},
+    {"id":"create","session":"a","op":"exec","sql":"CREATE TABLE adapter_values (id int PRIMARY KEY)","expect":{"tag":"CREATE TABLE"}},
+    {"id":"begin","session":"a","op":"exec","sql":"BEGIN","expect":{"transaction":"T"}},
+    {"id":"insert","session":"a","op":"exec","sql":"INSERT INTO adapter_values VALUES (1)","expect":{"tag":"INSERT 0 1"}},
+    {"id":"own-write","session":"a","op":"query","sql":"SELECT id FROM adapter_values","expect":{"rows":[["1"]],"order":"ordered"}},
+    {"id":"other-session","session":"b","op":"query","sql":"SELECT id FROM adapter_values","expect":{"rows":[],"order":"ordered","transaction":"I"}},
+    {"id":"duplicate","session":"a","op":"exec","sql":"INSERT INTO adapter_values VALUES (1)","expect":{"sqlstate":"23505","transaction":"E"}},
+    {"id":"rollback","session":"a","op":"exec","sql":"ROLLBACK","expect":{"transaction":"I"}},
+    {"id":"rolled-back","session":"b","op":"query","sql":"SELECT id FROM adapter_values","expect":{"rows":[],"order":"ordered"}}
+  ]
+}

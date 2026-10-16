@@ -97,7 +97,18 @@ jobs:
         run: |
           (cd src/tools/prolly_bench/slt && go test ./...)
           bash src/tools/prolly_bench/build_diff.sh
+          bash src/tools/prolly_bench/build_vc.sh
           bash src/tools/prolly_bench/build_slt.sh
+
+      - name: Version-control scenario adapters
+        run: |
+          src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
+            --self-test --out "$PWD/engine-results/vc-d1"
+          src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am heap,prolly \
+            --cases src/tools/prolly_bench/slt/internal/vcscenario/cases/sql-values.json \
+            --out "$PWD/engine-results/vc-sql-adapters"
 
       - name: Seeded differential histories
         env:
