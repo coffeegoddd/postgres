@@ -1,0 +1,68 @@
+-- A commit records the versions of the collations ordering its tables'
+-- keys, and isn't read where they differ.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA app VERSIONED;
+CREATE COLLATION app.c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE app.t (k text COLLATE app.c_utf8 PRIMARY KEY, v int);
+CREATE TABLE app.c (k text COLLATE "C" PRIMARY KEY);	-- no version
+CREATE TABLE app.n (k int PRIMARY KEY);				-- not collatable
+INSERT INTO app.t VALUES ('a', 1), ('b', 2);
+SELECT key, replace(value, E'\n', ' | ') AS value
+FROM test_fold_items() WHERE key LIKE 'c:app.%' ORDER BY key;
+     key      |      value      
+--------------+-----------------
+ c:app.c_utf8 | b | C.UTF-8 | 1
+(1 row)
+
+SELECT length(dolt_commit('-m', 'first')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE app.t SET v = 3 WHERE k = 'a';
+SELECT * FROM dolt_status();
+ table_name | staged |  status  
+------------+--------+----------
+ app.t      | t      | modified
+(1 row)
+
+-- The collation's version changes: the commit's keys may be in another
+-- order now.
+SELECT collversion AS saved FROM pg_collation WHERE collname = 'c_utf8' \gset
+UPDATE pg_collation SET collversion = 'other' WHERE collname = 'c_utf8';
+SELECT * FROM dolt_status();
+ERROR:  collation "app.c_utf8" isn't what the commit's keys were ordered by
+DETAIL:  The commit recorded provider b, locale 'C.UTF-8', version '1'; the database has provider b, locale 'C.UTF-8', version 'other'.
+HINT:  A commit can only be read where its collations have the versions it recorded.
+SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+ERROR:  collation "app.c_utf8" isn't what the commit's keys were ordered by
+DETAIL:  The commit recorded provider b, locale 'C.UTF-8', version '1'; the database has provider b, locale 'C.UTF-8', version 'other'.
+HINT:  A commit can only be read where its collations have the versions it recorded.
+UPDATE pg_collation SET collversion = :'saved' WHERE collname = 'c_utf8';
+SELECT * FROM dolt_status();
+ table_name | staged |  status  
+------------+--------+----------
+ app.t      | t      | modified
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (a,1)    | (a,3)
+(1 row)
+
+SELECT length(dolt_commit('-m', 'second')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to collation app.c_utf8
+drop cascades to table app.t
+drop cascades to table app.c
+drop cascades to table app.n
