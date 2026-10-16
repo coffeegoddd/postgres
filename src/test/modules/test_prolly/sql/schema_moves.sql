@@ -162,8 +162,8 @@ SELECT dolt_branch('-D', 'sm7_feature');
 DROP SCHEMA sm7 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm7')::text) AS committed;
 
--- A view's unchanged dependents aren't dropped with it: a move that would
--- fails instead.
+-- A view's unchanged dependents aren't lost with it: a materialized view
+-- over it is made again, with the rows the commit holds.
 CREATE SCHEMA sm8 VERSIONED;
 CREATE TABLE sm8.t (id int PRIMARY KEY);
 CREATE VIEW sm8.v AS SELECT id FROM sm8.t;
@@ -173,6 +173,7 @@ CREATE TABLE sm8.u (id int);
 SELECT length(dolt_commit('-Am', 'sm8 more')::text) AS committed;
 SELECT dolt_reset('--hard', :'sm8_base');
 SELECT to_regclass('sm8.mv') IS NOT NULL AS mv_kept;
+SELECT test_fold_root() = prolly_root_hash(:'sm8_base') AS same_root;
 DROP SCHEMA sm8 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm8')::text) AS committed;
 

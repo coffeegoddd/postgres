@@ -1,0 +1,151 @@
+-- Moving a branch to a commit that defines types or materialized views
+-- otherwise (a reset, a fast-forward): each changed type is made again
+-- under its name and the columns using it converted, before the rows are
+-- written; materialized views are made again or refreshed after.  The
+-- branch then folds to the commit's root.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA tm VERSIONED;
+CREATE TYPE tm.mood AS ENUM ('sad', 'ok');
+CREATE DOMAIN tm.pos AS int CHECK (VALUE > 0);
+CREATE TYPE tm.pair AS (x int, y int);
+CREATE TABLE tm.t (id int PRIMARY KEY, m tm.mood, ms tm.mood[], p tm.pos, pr tm.pair);
+INSERT INTO tm.t VALUES (1, 'sad', '{sad,ok}', 1, ROW(1, 2)), (2, 'ok', '{}', 2, ROW(3, 4));
+CREATE MATERIALIZED VIEW tm.counts AS SELECT m, count(*) AS n FROM tm.t GROUP BY m;
+CREATE MATERIALIZED VIEW tm.ids AS SELECT id FROM tm.t;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+-- An enum gains a label and a row uses it; a domain's check changes; a
+-- composite gains an attribute; a materialized view's query changes and
+-- another's rows.
+ALTER TYPE tm.mood ADD VALUE 'happy';
+INSERT INTO tm.t VALUES (3, 'happy', '{happy}', 3, ROW(5, 6));
+ALTER DOMAIN tm.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN tm.pos ADD CONSTRAINT pos_check CHECK (VALUE > 0 AND VALUE < 100);
+ALTER TYPE tm.pair ADD ATTRIBUTE z int;
+DROP MATERIALIZED VIEW tm.counts;
+CREATE MATERIALIZED VIEW tm.counts AS SELECT m, count(*) AS n, max(id) AS last FROM tm.t GROUP BY m;
+REFRESH MATERIALIZED VIEW tm.ids;
+SELECT length(dolt_commit('-Am', 'feature types')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- A fast-forward moves main there.
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('feature') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM tm.t ORDER BY id;
+ id |   m   |    ms    | p |   pr   
+----+-------+----------+---+--------
+  1 | sad   | {sad,ok} | 1 | (1,2,)
+  2 | ok    | {}       | 2 | (3,4,)
+  3 | happy | {happy}  | 3 | (5,6,)
+(3 rows)
+
+SELECT enum_range(NULL::tm.mood);
+   enum_range   
+----------------
+ {sad,ok,happy}
+(1 row)
+
+SELECT * FROM tm.counts ORDER BY m;
+   m   | n | last 
+-------+---+------
+ sad   | 1 |    1
+ ok    | 1 |    2
+ happy | 1 |    3
+(3 rows)
+
+SELECT count(*) FROM tm.ids;
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) AS no_leftovers FROM pg_type WHERE typname LIKE 'prolly_moving_%';
+ no_leftovers 
+--------------
+            0
+(1 row)
+
+-- And back: a label goes (a row using it goes first), the rest as before.
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM tm.t ORDER BY id;
+ id |  m  |    ms    | p |  pr   
+----+-----+----------+---+-------
+  1 | sad | {sad,ok} | 1 | (1,2)
+  2 | ok  | {}       | 2 | (3,4)
+(2 rows)
+
+SELECT enum_range(NULL::tm.mood);
+ enum_range 
+------------
+ {sad,ok}
+(1 row)
+
+SELECT * FROM tm.counts ORDER BY m;
+  m  | n 
+-----+---
+ sad | 1
+ ok  | 1
+(2 rows)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA tm CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table tm.t
+drop cascades to type tm.mood
+drop cascades to type tm.pair
+drop cascades to type tm.pos
+drop cascades to materialized view tm.counts
+drop cascades to materialized view tm.ids
