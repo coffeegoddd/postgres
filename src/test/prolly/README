@@ -24,6 +24,7 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	check-semantics       SQL behaves exactly as on heap
 	check-target          guard rejects accidental fallback to heap
 	check-vc-target       commits, branches and restores the actual AM's data
+	check-vc-target-guard rejects disconnected VC paths and no-op functions
 	check-isolation       concurrency behaves exactly as on heap
 	check-tap-durability  crash recovery, standby replay, prepared xacts
 	check-vc              branches, versioned schema, diff, merge,
@@ -50,6 +51,16 @@ An unsupported or disconnected VC path fails; a successful dolt_* call or
 an empty history is not evidence of coverage. D1 currently passes; heap and
 the page-based prolly engine do not yet satisfy this probe. This is a data
 targeting canary, not a claim of schema, merge or crash-recovery coverage.
+
+The legacy VC groups require check-vc-target before running their suites.
+CI runs the D1 probe and check-vc-target-guard. The latter proves that the
+same probe rejects heap and the currently disconnected prolly history
+path, plus deliberately ineffective commit, checkout and reset functions.
+It checks the specific failing invariant, not arbitrary SQL errors. These
+are negative controls for the harness, not functional VC passes for heap
+or prolly. When prolly gains history support, move it to a positive CI
+probe and remove its negative expectation; keep the deliberately broken
+function controls.
 
 Postgres's own regression and isolation suites, run with the engine as
 the default table AM, are separate targets, not part of "check":

@@ -49,11 +49,15 @@ check-vc-target: PROVE_TESTS = t/004_vc_target.pl
 check-vc-target: require-tap temp-install
 	$(prove_check)
 
+check-vc-target-guard: PROVE_TESTS = t/005_vc_target_guard.pl
+check-vc-target-guard: require-tap temp-install
+	$(prove_check)
+
 check-semantics: PROVE_TESTS = t/001_semantics.pl
 check-semantics: require-tap temp-install
 	$(prove_check)
 
-check-vc: require-legacy-vc temp-install prolly_am.conf
+check-vc: require-legacy-vc check-vc-target temp-install prolly_am.conf
 	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_schedule
 
 check-isolation: PROVE_TESTS = t/002_isolation.pl
@@ -61,7 +65,7 @@ check-isolation: require-tap temp-install
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(prove_check)
 
-check-vc-isolation: require-legacy-vc temp-install prolly_am.conf
+check-vc-isolation: require-legacy-vc check-vc-target temp-install prolly_am.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
 		--schedule=$(srcdir)/vc_isolation_schedule
@@ -74,7 +78,7 @@ check-tap-durability: require-tap temp-install
 	$(prove_check)
 
 check-tap-vc: PROVE_TESTS = t/2*.pl
-check-tap-vc: require-legacy-vc require-tap temp-install
+check-tap-vc: require-legacy-vc check-vc-target require-tap temp-install
 	$(prove_check)
 
 # Upstream correctness checks: Postgres's own
@@ -113,6 +117,6 @@ require-legacy-vc:
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf output_iso
 
-.PHONY: check check-target check-vc-target check-semantics check-vc check-isolation check-vc-isolation \
+.PHONY: check check-target check-vc-target check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE
