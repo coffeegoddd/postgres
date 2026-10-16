@@ -45,6 +45,7 @@ FROM prolly_implementations();
  row_identity    | stub             |       0 |              0
  refs            | stub             |       0 |              0
  refs            | tree             |       1 |              1
+ refs            | copies           |       2 |              1
  transfer        | stub             |       0 |              0
  diff_merge      | stub             |       0 |              0
  diff_merge      | rows             |       1 |              1
@@ -61,7 +62,7 @@ FROM prolly_implementations();
  canonicalizer   | folded           |       2 |              1
  chunk_store     | journal          |       1 |              1
  chunk_format    | basic            |       1 |              1
-(52 rows)
+(53 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -299,6 +300,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | tree             | commit_then_resolve                     | no checks yet
  refs            | tree             | merge_base                              | no checks yet
  refs            | tree             | complete                                | pass
+ refs            | copies           | identity                                | pass
+ refs            | copies           | branch_lifecycle                        | no checks yet
+ refs            | copies           | commit_then_resolve                     | no checks yet
+ refs            | copies           | merge_base                              | no checks yet
+ refs            | copies           | complete                                | not implemented (3 of 17 callbacks missing)
  transfer        | stub             | identity                                | pass
  transfer        | stub             | clone                                   | not implemented (missing clone)
  transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
@@ -397,7 +403,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  chunk_format    | basic            | items_round_trip                        | pass
  chunk_format    | basic            | rejects_other_bytes                     | pass
  chunk_format    | basic            | complete                                | pass
-(327 rows)
+(332 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

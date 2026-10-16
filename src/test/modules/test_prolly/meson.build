@@ -48,6 +48,7 @@ tests += {
       'bmap_copy_on_write',
       'branches',
       'fold',
+      'commits',
     ],
   },
   'tap': {

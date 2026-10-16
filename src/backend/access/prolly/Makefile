@@ -63,6 +63,7 @@ OBJS = \
 	prolly_xact.o \
 	reclaim_marksweep.o \
 	reclaim_stub.o \
+	refs_copies.o \
 	refs_tree.o \
 	refs_stub.o \
 	rootlayout_stub.o \

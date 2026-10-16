@@ -47,6 +47,12 @@ typedef struct BranchOpsRoutine
 
 	/* Visit every branch. */
 	void		(*branches) (BranchVisit visit, void *arg);
+
+	/*
+	 * Run fn with the session on branch name, back on its own branch after,
+	 * whatever happens.
+	 */
+	void		(*run_on) (const char *name, void (*fn) (void *arg), void *arg);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

@@ -438,6 +438,12 @@ copies_branches(BranchVisit visit, void *arg)
 	table_close(brel, AccessShareLock);
 }
 
+static void
+copies_run_on(const char *name, void (*fn) (void *arg), void *arg)
+{
+	on_branch(branch_oid(name, false), fn, arg);
+}
+
 static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
@@ -445,6 +451,7 @@ static const BranchOpsRoutine branch_copies = {
 	.checkout = copies_checkout,
 	.current = copies_current,
 	.branches = copies_branches,
+	.run_on = copies_run_on,
 };
 
 const BranchOpsRoutine *

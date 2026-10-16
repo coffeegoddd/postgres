@@ -1,0 +1,234 @@
+-- Commits of a database whose branches are copies of its versioned
+-- schemas: heads and commits in the chunk store, each commit's root the
+-- branch folded.
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'a');
+SELECT length(dolt_commit('-m', 'first')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_commit('-m', 'again');
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+INSERT INTO app.t VALUES (2, 'b');
+SELECT length(dolt_commit('-m', 'second')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT message, commit_order FROM dolt_log('main');
+ message | commit_order 
+---------+--------------
+ second  |            2
+ first   |            1
+(2 rows)
+
+SELECT dolt_hashof('main~1') = (SELECT commit_hash FROM dolt_log('main') WHERE message = 'first') AS ancestry;
+ ancestry 
+----------
+ t
+(1 row)
+
+SELECT name, latest_commit_message, dirty FROM dolt_branches();
+ name | latest_commit_message | dirty 
+------+-----------------------+-------
+ main | second                | f
+(1 row)
+
+-- A commit goes with its transaction, and with its savepoint.
+INSERT INTO app.t VALUES (3, 'c');
+BEGIN;
+SELECT length(dolt_commit('-m', 'rolled back')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT length(dolt_commit('-m', 'rolled back to a savepoint')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ROLLBACK TO s;
+COMMIT;
+SELECT message FROM dolt_log('main');
+ message 
+---------
+ second
+ first
+(2 rows)
+
+SELECT name, dirty FROM dolt_branches();
+ name | dirty 
+------+-------
+ main | t
+(1 row)
+
+-- and includes the transaction's own writes
+BEGIN;
+INSERT INTO app.t VALUES (4, 'd');
+SELECT length(dolt_commit('-m', 'third')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT message FROM dolt_log('main');
+ message 
+---------
+ third
+ second
+ first
+(3 rows)
+
+SELECT name, dirty FROM dolt_branches();
+ name | dirty 
+------+-------
+ main | f
+(1 row)
+
+-- A branch starts at its start point's head.
+SELECT dolt_branch('f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('f') = dolt_hashof('main') AS same_head;
+ same_head 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('f');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'f'"}
+(1 row)
+
+UPDATE app.t SET v = 'B' WHERE id = 2;
+SELECT length(dolt_commit('-m', 'on f')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') = dolt_hashof('f') AS head_is_f;
+ head_is_f 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('f~1') = dolt_hashof('main') AS parent_is_main;
+ parent_is_main 
+----------------
+ t
+(1 row)
+
+SELECT dolt_branch('-c', 'f', 'g');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('g') = dolt_hashof('f') AS copy_same_head;
+ copy_same_head 
+----------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-d', 'g');
+ERROR:  branch "g" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-d', 'f');		-- not merged into main
+ERROR:  branch "f" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-D', 'f', 'g');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches();
+ name 
+------
+ main
+(1 row)
+
+SELECT dolt_hashof('f');
+ERROR:  prolly ref "f" does not exist
+-- Commit roots depend only on content: the same rows by another history.
+SELECT dolt_branch('h');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('h');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'h'"}
+(1 row)
+
+DELETE FROM app.t;
+INSERT INTO app.t VALUES (4, 'd'), (3, 'c'), (2, 'b'), (1, 'a');
+SELECT length(dolt_commit('-m', 'same rows', '--allow-empty')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT prolly_root_hash('h') = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+UPDATE app.t SET v = 'x' WHERE id = 1;
+SELECT length(dolt_commit('-m', 'other rows')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT prolly_root_hash('h') <> prolly_root_hash('main') AS other_root;
+ other_root 
+------------
+ t
+(1 row)
+
+-- Bad refs and start points.
+SELECT dolt_hashof('nope');
+ERROR:  prolly ref "nope" does not exist
+SELECT dolt_branch('k', dolt_hashof('main~1'));
+ERROR:  a branch can't start at a commit yet
+HINT:  Start it at a branch.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'h');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to table app.t
