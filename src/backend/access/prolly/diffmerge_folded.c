@@ -1448,8 +1448,9 @@ local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		l->tables = lappend(l->tables, name);
 	else if (key->len >= 2 && memcmp(key->data, "s:", 2) == 0)
 		l->sequences = lappend(l->sequences, name);
-	else
-		l->definitions = true;
+	else if (!(key->len >= 2 && memcmp(key->data, "c:", 2) == 0))
+		l->definitions = true;	/* (collations aren't objects: the rows of
+								 * the tables they key are checked as read) */
 }
 
 static void
