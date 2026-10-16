@@ -155,7 +155,7 @@ class RegistryTest(unittest.TestCase):
         names = registry.workloads.names()
         self.assertEqual(sorted((n for n in names if n.startswith("S")),
                                 key=lambda n: int(n[1:])),
-                         [f"S{i}" for i in range(1, 11)])
+                         [f"S{i}" for i in range(1, 11)] + ["S13"])
         self.assertEqual([n for n in names if n.startswith("V")],
                          [f"V{i}" for i in range(1, 5)])
         for _, cls in registry.workloads.items():
