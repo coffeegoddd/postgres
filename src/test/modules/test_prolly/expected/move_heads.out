@@ -220,7 +220,7 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
--- Not yet: other definitions, three-way merges.
+-- Not yet: other definitions.  (Diverged branches merge, three-way.)
 SELECT dolt_checkout('at_first');
             dolt_checkout            
 -------------------------------------
@@ -254,11 +254,13 @@ SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('at_second'))[2:4];
-ERROR:  branches made by copying can only fast-forward so far
-DETAIL:  The branches have each changed since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
-ERROR:  branches made by copying can only fast-forward so far
-DETAIL:  The branches have each changed since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT dolt_branch('-D', 'at_first', 'at_second');
  dolt_branch 
 -------------

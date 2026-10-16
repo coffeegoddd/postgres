@@ -889,23 +889,18 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	s->relids = list_append_unique_oid(s->relids, relid);
 }
 
-/* A table changed, as dolt_status() reports it. */
+/* A table changed: its name, a tab, and its status. */
 static void
 status_table(const char *name, ProllyDiffKind kind, void *arg)
 {
-	ReturnSetInfo *rsinfo = arg;
-	Datum		values[3];
-	bool		nulls[3] = {0};
+	List	  **names = arg;
 	static const char *const statuses[] = {
 		[PROLLY_DIFF_ADDED] = "new table",
 		[PROLLY_DIFF_REMOVED] = "deleted",
 		[PROLLY_DIFF_MODIFIED] = "modified",
 	};
 
-	values[0] = CStringGetTextDatum(name);
-	values[1] = BoolGetDatum(true);
-	values[2] = CStringGetTextDatum(statuses[kind]);
-	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	*names = lappend(*names, psprintf("%s\t%s", name, statuses[kind]));
 }
 
 /*
@@ -932,32 +927,54 @@ dolt_status(PG_FUNCTION_ARGS)
 	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
 		return (Datum) 0;
 
-	/* Tables by name, so ones made or dropped since the head are too. */
+	/*
+	 * Tables by name, so ones made or dropped since the head are too; a
+	 * table with conflicts, as that.
+	 */
 	if (PROLLY_HAS(diff_merge(), tables))
 	{
 		PROLLY_CALL(diff_merge(), tables, "HEAD", "WORKING", status_table,
-					rsinfo);
-		return (Datum) 0;
-	}
-	PROLLY_CALL(diff_merge(), diff, "HEAD", "WORKING", InvalidOid, &s.sink);
-	if (PROLLY_CALL(refs(), merge_state, &ms))
-	{
-		for (int i = 0; i < ms.ntables; i++)
+					&names);
+		if (PROLLY_CALL(refs(), merge_state, &ms))
 		{
-			conflicted = lappend_oid(conflicted, ms.tables[i]);
-			s.relids = list_append_unique_oid(s.relids, ms.tables[i]);
+			for (int i = 0; i < ms.ntables; i++)
+			{
+				char	   *name = qualified_name(ms.tables[i]);
+				size_t		len = strlen(name);
+
+				foreach(lc, names)
+				{
+					char	   *n = lfirst(lc);
+
+					if (strncmp(n, name, len) == 0 && n[len] == '\t')
+						names = foreach_delete_current(names, lc);
+				}
+				names = lappend(names, psprintf("%s\tconflict", name));
+			}
 		}
 	}
-	foreach(lc, s.relids)
+	else
 	{
-		Oid			relid = lfirst_oid(lc);
+		PROLLY_CALL(diff_merge(), diff, "HEAD", "WORKING", InvalidOid, &s.sink);
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+		{
+			for (int i = 0; i < ms.ntables; i++)
+			{
+				conflicted = lappend_oid(conflicted, ms.tables[i]);
+				s.relids = list_append_unique_oid(s.relids, ms.tables[i]);
+			}
+		}
+		foreach(lc, s.relids)
+		{
+			Oid			relid = lfirst_oid(lc);
 
-		/* Name, then a tab and the status, to sort by name. */
-		names = lappend(names,
-						psprintf("%s\t%s",
-								 qualified_name(relid),
-								 list_member_oid(conflicted, relid) ?
-								 "conflict" : "modified"));
+			/* Name, then a tab and the status, to sort by name. */
+			names = lappend(names,
+							psprintf("%s\t%s",
+									 qualified_name(relid),
+									 list_member_oid(conflicted, relid) ?
+									 "conflict" : "modified"));
+		}
 	}
 	list_sort(names, name_cmp);
 	foreach(lc, names)

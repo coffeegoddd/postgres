@@ -9,8 +9,14 @@
  * The chunk store's root is a tree keyed by memcmp:
  *
  *	'B' name	-> the branch's head commit (hash length, hash)
+ *	'M' name	-> the branch's merge in progress: the merged head and the
+ *				   common ancestor (hash length, hash each), then the OIDs
+ *				   of tables with unresolved conflicts (4 bytes each,
+ *				   big-endian)
  *
- * A branch without an entry has no commits yet.  A commit is a tree of its
+ * A branch without an entry has no commits yet.  A transaction can't
+ * commit a merge with unresolved conflicts it left, unless
+ * dolt.allow_commit_conflicts is on.  A commit is a tree of its
  * own (keys by memcmp), and its id is that tree's root hash, so the same
  * commit content has the same id in every database:
  *
@@ -49,14 +55,23 @@
 #include "catalog/branch_ops.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 #define TAG_BRANCH		'B'
+#define TAG_MERGE		'M'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
+
+/* the transaction changed a merge state (checked at its commit) */
+static bool merge_changed = false;
+
+static void refs_xact_callback(XactEvent event, void *arg);
+static bool copies_merge_state(ProllyMergeState *state);
+static void copies_set_merge_state(const ProllyMergeState *state);
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
@@ -84,7 +99,35 @@ refs_init(void)
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
 	env.compare = memcmp_keys;
+	RegisterXactCallback(refs_xact_callback, NULL);
 	ready = true;
+}
+
+static void
+refs_xact_callback(XactEvent event, void *arg)
+{
+	ProllyMergeState ms;
+
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+			if (merge_changed && !prolly_allow_commit_conflicts() &&
+				copies_merge_state(&ms) && ms.ntables > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("cannot commit a transaction with unresolved merge conflicts"),
+						 errdetail("Table \"%s\" has conflicts.",
+								   get_rel_name(ms.tables[0])),
+						 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+			merge_changed = false;
+			break;
+		default:
+			break;
+	}
 }
 
 static void
@@ -697,16 +740,33 @@ copies_checkout(const char *name)
 	branch_ops()->checkout(name);
 }
 
+/*
+ * Commit the session's branch; ending a merge in progress, once its
+ * conflicts are resolved, with both heads as parents.
+ */
 static void
 copies_commit(const char *message, ProllyHash *commit_id)
 {
-	ProllyHash	head;
+	ProllyHash	parents[2];
+	int			nparents = 0;
+	ProllyMergeState ms;
 
 	lock_refs();
-	if (branch_head(branch_ops()->current(), &head))
-		commit_branch(message, &head, 1, commit_id);
-	else
-		commit_branch(message, NULL, 0, commit_id);
+	if (branch_head(branch_ops()->current(), &parents[0]))
+		nparents++;
+	if (copies_merge_state(&ms))
+	{
+		if (ms.ntables > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit with unresolved merge conflicts"),
+					 errdetail("Table \"%s\" has conflicts.",
+							   get_rel_name(ms.tables[0])),
+					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
+		parents[nparents++] = ms.theirs;
+		copies_set_merge_state(NULL);
+	}
+	commit_branch(message, parents, nparents, commit_id);
 }
 
 /* The working set: the branch as it is (the transaction sees it). */
@@ -801,13 +861,89 @@ copies_reset(const char *ref)
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
+	copies_set_merge_state(NULL);	/* a reset ends a merge */
 }
 
-/* No merges yet: none is in progress. */
+static void
+put_be32(StringInfo out, uint32 v)
+{
+	for (int i = 3; i >= 0; i--)
+		appendStringInfoChar(out, (char) (v >> (i * 8)));
+}
+
+static uint32
+get_be32(const char *p)
+{
+	const uint8 *d = (const uint8 *) p;
+
+	return ((uint32) d[0] << 24) | ((uint32) d[1] << 16) |
+		((uint32) d[2] << 8) | (uint32) d[3];
+}
+
+static void
+merge_key(StringInfo key)
+{
+	appendStringInfoChar(key, TAG_MERGE);
+	appendStringInfoString(key, branch_ops()->current());
+}
+
 static bool
 copies_merge_state(ProllyMergeState *state)
 {
-	return false;
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_key(&key);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+
+		p = get_hash(p, end, &state->theirs);
+		p = get_hash(p, end, &state->base);
+		state->ntables = (end - p) / 4;
+		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
+		for (int i = 0; i < state->ntables; i++)
+			state->tables[i] = get_be32(p + i * 4);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/* (NULL: none) */
+static void
+copies_set_merge_state(const ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	ProllyMergeState cur;
+
+	refs_init();
+	initStringInfo(&key);
+	merge_key(&key);
+	if (state == NULL)
+	{
+		if (copies_merge_state(&cur))
+			refs_put(key.data, key.len, NULL);
+	}
+	else
+	{
+		initStringInfo(&v);
+		put_hash(&v, &state->theirs);
+		put_hash(&v, &state->base);
+		for (int i = 0; i < state->ntables; i++)
+			put_be32(&v, state->tables[i]);
+		refs_put(key.data, key.len, &v);
+		pfree(v.data);
+		merge_changed = true;
+	}
+	pfree(key.data);
 }
 
 typedef struct WalkState
@@ -904,6 +1040,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_set = copies_working_set,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
+	.set_merge_state = copies_set_merge_state,
 	.hold = copies_hold,
 	.walk = copies_walk,
 };

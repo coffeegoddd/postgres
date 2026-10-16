@@ -73,6 +73,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -1276,7 +1277,20 @@ folded_fold(ProllyNodeRef *root)
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	canon_env(&cn);
-	build_canonical(&cn, root);
+
+	/* Everything the transaction wrote, this statement's writes too. */
+	CommandCounterIncrement();
+	PushCopiedSnapshot(GetActiveSnapshot());
+	UpdateActiveSnapshotCommandId();
+	PG_TRY();
+	{
+		build_canonical(&cn, root);
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
 }
 
 /*
