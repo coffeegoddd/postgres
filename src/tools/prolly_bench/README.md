@@ -289,7 +289,9 @@ Operations run sequentially; these schedules do not exercise concurrent
 blocking queries. VC operations require an idle SQL transaction, since this
 adapter snapshots SQL-committed writes. One SQL statement is allowed per
 step, using extended-protocol bind parameters. Prepared-plan reuse, merge,
-schema history, crash injection and corpus import are subsequent work.
+schema history and crash injection are subsequent work. The first reviewed
+Dolt ports, pinned source inventory, assertion mappings, and execution coverage
+reports are described in [corpus/dolt/README.md](corpus/dolt/README.md).
 
 Before running a case, the adapter creates and drops a separate probe
 database. It verifies the actual AM (and prolly's table/index/TOAST block-map

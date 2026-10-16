@@ -97,3 +97,22 @@ Update the scenario hash only after reviewing the mapping. A new upstream
 pin requires regenerating and reviewing the source lock and all affected
 excerpts/mappings. The tools deliberately do not perform generic SQL
 translation or execute arbitrary upstream Go.
+
+## CI
+
+Each PR fetches the pinned Dolt source, regenerates the catalog and verifies
+the committed lock and mappings before running the imported scenarios on D1.
+The D1 execution and coverage commands must both exit successfully.
+
+A separate contract check records the same cases as unsupported on heap,
+prolly, D2, D3a, D3b and D4. Both commands must exit with the expected
+incomplete-coverage status, and the generated ledger must contain exactly
+those six engines, every selected case unsupported, and zero passes, failures,
+not-run cases or credited assertions. This checks truthful capability
+reporting; it does not test VC correctness on those engines. Enabling VC on
+another engine requires moving it into the success gate and updating this
+explicit ledger expectation.
+
+The existing `test-logs` artifact includes the generated source catalog,
+mapping review, saved scenarios and runner/server logs, plus separate D1 and
+unsupported-engine coverage reports under `engine-results/dolt-*`.
