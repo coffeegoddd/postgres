@@ -16,7 +16,9 @@ OBJS = \
 	alloc_stub.o \
 	canon_catalogs.o \
 	canon_stub.o \
+	chunker_bytes.o \
 	chunker_keyhash.o \
+	chunkformat_basic.o \
 	chunker_stub.o \
 	chunkstore_journal.o \
 	commit_serial.o \

@@ -126,6 +126,12 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_CHUNKER, "reset_equals_begin", "begin add reset end",
 	chunker_reset_equals_begin},
 
+	/* chunk node format */
+	{PROLLY_IFACE_CHUNK_FORMAT, "items_round_trip",
+	"encode open item_get item_space header_size", chunkformat_items_round_trip},
+	{PROLLY_IFACE_CHUNK_FORMAT, "rejects_other_bytes", "encode open",
+	chunkformat_rejects_other_bytes},
+
 	/* content hash */
 	{PROLLY_IFACE_CONTENT_HASH, "deterministic", "begin update finish",
 	hash_deterministic},
@@ -513,7 +519,15 @@ run_body(ConformanceBody body, const ProllyImplInfo *impl)
 
 	PG_TRY();
 	{
+		/* tree checks run over pages, then over chunks */
+		tree_checks_in_chunks = false;
 		body(impl);
+		if (impl->iface == PROLLY_IFACE_TREE)
+		{
+			tree_checks_in_chunks = true;
+			body(impl);
+			tree_checks_in_chunks = false;
+		}
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
@@ -533,7 +547,10 @@ run_body(ConformanceBody body, const ProllyImplInfo *impl)
 		if (edata->sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED)
 			result = psprintf("not implemented (%s)", edata->message);
 		else
-			result = psprintf("fail: %s", edata->message);
+			result = psprintf("fail%s: %s",
+							  tree_checks_in_chunks ? " (in chunks)" : "",
+							  edata->message);
+		tree_checks_in_chunks = false;
 	}
 	PG_END_TRY();
 

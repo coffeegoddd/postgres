@@ -68,6 +68,7 @@ static const char *const keying_callbacks[] = {PROLLY_KEYING_CALLBACK_NAMES};
 static const char *const ixkeying_callbacks[] = {PROLLY_IXKEYING_CALLBACK_NAMES};
 static const char *const canon_callbacks[] = {PROLLY_CANON_CALLBACK_NAMES};
 static const char *const chunkstore_callbacks[] = {PROLLY_CHUNKSTORE_CALLBACK_NAMES};
+static const char *const chunkformat_callbacks[] = {PROLLY_CHUNKFORMAT_CALLBACK_NAMES};
 
 #define CHECK_ROUTINE(type, first, names) \
 	static_assert(offsetof(type, info) == 0 && \
@@ -97,6 +98,7 @@ CHECK_ROUTINE(ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, keying_callback
 CHECK_ROUTINE(ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, ixkeying_callbacks);
 CHECK_ROUTINE(ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, canon_callbacks);
 CHECK_ROUTINE(ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, chunkstore_callbacks);
+CHECK_ROUTINE(ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, chunkformat_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -146,6 +148,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("canonicalizer", ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, canon_callbacks),
 	[PROLLY_IFACE_CHUNK_STORE] =
 	IFACE("chunk_store", ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, chunkstore_callbacks),
+	[PROLLY_IFACE_CHUNK_FORMAT] =
+	IFACE("chunk_format", ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, chunkformat_callbacks),
 };
 
 static const ProllyInterfaceDesc *

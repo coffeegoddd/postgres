@@ -4,7 +4,9 @@
  *		Conformance checks for the tree interface.
  *
  * Trees are built from the prolly_d1 profile's foundation components (node
- * format, chunker, hash, node store, log) and compared against an in-memory
+ * format, chunker, hash, node store, log), or, when tree_checks_in_chunks
+ * is set, as chunks in the database's chunk store (basic chunk format,
+ * byte chunker, SHA-256), and compared against an in-memory
  * reference map: keys are 0 .. MAX_KEY-1 as 4-byte big-endian integers, and
  * each key's value is derived from a version number, so any state of the
  * map is (key -> version or absent).
@@ -47,14 +49,27 @@ memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return (a->len > b->len) - (a->len < b->len);
 }
 
+bool		tree_checks_in_chunks = false;
+
 static void
 make_env(const ProllyTreeRoutine *tree, ProllyTreeEnv *env)
 {
 	ProllyComponents c;
 
 	(void) tree;
-	prolly_components_for_am("prolly_d1", &c);
 	memset(env, 0, sizeof(*env));
+	if (tree_checks_in_chunks)
+	{
+		env->chunk_format = prolly_chunkformat_lookup("basic");
+		env->chunker = prolly_chunker_lookup("bytes");
+		env->hash = prolly_hash_lookup("sha256");
+		env->chunk_store = prolly_chunk_store();
+		env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
+								  MyDatabaseTableSpace);
+		env->compare = memcmp_keys;
+		return;
+	}
+	prolly_components_for_am("prolly_d1", &c);
 	env->node_format = c.node_format;
 	env->chunker = c.chunker;
 	env->hash = c.hash;
@@ -435,18 +450,25 @@ leaf_boundary_key(const ProllyTreeEnv *env, int min_key)
 	ProllyChunker *ch;
 	StringInfoData vbuf;
 	int			found = -1;
+	Size		capacity;
 
-	PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, 0);
-	ch = PROLLY_CALL(env->chunker, begin, 0,
-					 PROLLY_CALL(env->node_format, free_space, page),
-					 CurrentMemoryContext);
+	if (env->chunk_store != NULL)
+		capacity = 64 * 1024 - PROLLY_CALL(env->chunk_format, header_size);
+	else
+	{
+		PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, 0);
+		capacity = PROLLY_CALL(env->node_format, free_space, page);
+	}
+	ch = PROLLY_CALL(env->chunker, begin, 0, capacity, CurrentMemoryContext);
 	initStringInfo(&vbuf);
 	for (int k = 0; k < MAX_KEY - 3 && found < 0; k++)
 	{
 		KeyBuf		kb;
 		ProllyKey	key = key_of(k, &kb);
 		ProllyValue value = value_of(k, 1, &vbuf);
-		Size		space = PROLLY_CALL(env->node_format, item_space, 0, &key, &value);
+		Size		space = env->chunk_store != NULL ?
+			PROLLY_CALL(env->chunk_format, item_space, 0, &key, &value) :
+			PROLLY_CALL(env->node_format, item_space, 0, &key, &value);
 
 		if (PROLLY_CALL(env->chunker, add, ch, &key, &value, space) ==
 			PROLLY_CHUNK_SPLIT_AFTER && k >= min_key)
@@ -1157,8 +1179,29 @@ static bool
 check_node_page(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	PageCheck  *pc = arg;
-	Buffer		buf = PROLLY_CALL(pc->env->node_store, read, pc->env->store, node);
+	Buffer		buf;
 	char	   *detail = NULL;
+
+	if (pc->env->chunk_store != NULL)
+	{
+		StringInfoData data;
+		ProllyChunkNode cn;
+
+		initStringInfo(&data);
+		if (!PROLLY_CALL(pc->env->chunk_store, get, pc->env->chunks, &node->hash,
+						 &data))
+			elog(ERROR, "node at level %u is not in the chunk store", level);
+		if (!PROLLY_CALL(pc->env->chunk_format, open, (const uint8 *) data.data,
+						 data.len, &cn))
+			elog(ERROR, "node at level %u is not a chunk node", level);
+		if (cn.level != level)
+			elog(ERROR, "node visited at level %u says it is at level %u",
+				 level, cn.level);
+		pfree(data.data);
+		pc->nodes++;
+		return true;
+	}
+	buf = PROLLY_CALL(pc->env->node_store, read, pc->env->store, node);
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	if (!PROLLY_CALL(pc->env->node_format, page_check, BufferGetPage(buf), &detail))
