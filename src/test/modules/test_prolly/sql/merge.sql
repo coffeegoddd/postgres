@@ -153,3 +153,26 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'mgd_side');
 DROP SCHEMA mgd CASCADE;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- A merge doesn't read the rows of a table whose collation differs now
+-- from what a version recorded.
+CREATE SCHEMA mgc VERSIONED;
+CREATE COLLATION mgc.c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE mgc.t (k text COLLATE mgc.c_utf8 PRIMARY KEY, v int);
+INSERT INTO mgc.t VALUES ('a', 1), ('b', 1);
+SELECT length(dolt_commit('-Am', 'collated')::text) AS committed;
+SELECT dolt_branch('mgc_side');
+SELECT dolt_checkout('mgc_side') IS NOT NULL AS on_side;
+UPDATE mgc.t SET v = 2 WHERE k = 'a';
+SELECT length(dolt_commit('-am', 'a is 2')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mgc.t SET v = 3 WHERE k = 'b';
+SELECT length(dolt_commit('-am', 'b is 3')::text) AS committed;
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+SELECT (dolt_merge('mgc_side'))[2:4];
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
+SELECT (dolt_merge('mgc_side'))[2:4];
+SELECT * FROM mgc.t ORDER BY k;
+SELECT dolt_branch('-D', 'mgc_side');
+DROP SCHEMA mgc CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;

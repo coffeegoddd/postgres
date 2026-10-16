@@ -528,3 +528,82 @@ SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
         66
 (1 row)
 
+-- A merge doesn't read the rows of a table whose collation differs now
+-- from what a version recorded.
+CREATE SCHEMA mgc VERSIONED;
+CREATE COLLATION mgc.c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE mgc.t (k text COLLATE mgc.c_utf8 PRIMARY KEY, v int);
+INSERT INTO mgc.t VALUES ('a', 1), ('b', 1);
+SELECT length(dolt_commit('-Am', 'collated')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mgc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('mgc_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE mgc.t SET v = 2 WHERE k = 'a';
+SELECT length(dolt_commit('-am', 'a is 2')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE mgc.t SET v = 3 WHERE k = 'b';
+SELECT length(dolt_commit('-am', 'b is 3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+SELECT (dolt_merge('mgc_side'))[2:4];
+ERROR:  the rows of table mgc.t in this version can't be read here
+DETAIL:  The collation "mgc.c_utf8" ordered its keys as provider b, locale 'C.UTF-8', deterministic, version '1'; the database has provider b, locale 'C.UTF-8', rules '&a<b', deterministic, version '1'.
+HINT:  A version's rows can only be read where the collations ordering their keys are as it recorded.
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
+SELECT (dolt_merge('mgc_side'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM mgc.t ORDER BY k;
+ k | v 
+---+---
+ a | 2
+ b | 3
+(2 rows)
+
+SELECT dolt_branch('-D', 'mgc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mgc CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to collation mgc.c_utf8
+drop cascades to table mgc.t
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

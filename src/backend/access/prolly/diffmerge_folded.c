@@ -607,6 +607,9 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	int			conflicts = 0;
 	bool		keyless;
 
+	require_readable(base);
+	require_readable(ours);
+	require_readable(theirs);
 	memset(&tc, 0, sizeof(tc));
 	tc.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
