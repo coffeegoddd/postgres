@@ -1064,6 +1064,8 @@ folded_cherry_pick(const char *ref, bool revert, ProllyHash *commit_id)
 	char	   *message;
 	const char *what = revert ? "dolt_revert" : "dolt_cherry_pick";
 
+	/* the head read under the refs held, as it is */
+	PROLLY_CALL(dc.refs, hold);
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
