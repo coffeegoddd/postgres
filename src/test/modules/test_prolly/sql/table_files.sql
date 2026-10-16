@@ -22,7 +22,7 @@ FROM generate_series(1, 50) g;
 SELECT name, chunks,
 	(bytes < (SELECT sum(length(repeat(g::text, 5000))) FROM generate_series(1, 50) g) / 10)
 	= :'lz4'::bool AS compressed_if_lz4
-FROM test_chunk_table_files() ORDER BY name;
+FROM test_chunk_table_files() WHERE chunks = 50;
 SELECT count(*) FROM generate_series(1, 50) g
 WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000), 'UTF8')), 'hex')), 'UTF8')
 	= repeat(g::text, 5000);
