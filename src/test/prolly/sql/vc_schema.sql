@@ -1,13 +1,21 @@
 --
--- Version control: schema is versioned with data (the catalogs are prolly
--- tables on the branch).  DDL on
--- a branch is invisible on other branches, including to cached plans and
--- functions, and checking out a branch shows its schema.
+-- Version control: schema is versioned with data (each branch has its own
+-- copy of a versioned schema's objects).  DDL on a branch is invisible on
+-- other branches, including to cached plans and functions, and checking
+-- out a branch shows its schema.
 --
 \set ECHO none
 \pset tuples_only on
 \pset format unaligned
 SET client_min_messages = warning;
+
+-- Branches hold the tables of versioned schemas: public is one.
+SELECT NOT nspversioned AS vc_make_versioned FROM pg_namespace
+WHERE nspname = 'public' \gset
+\if :vc_make_versioned
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public VERSIONED;
+\endif
 
 CREATE TABLE vs (id int PRIMARY KEY, v text);
 INSERT INTO vs VALUES (1, 'one');
@@ -18,9 +26,9 @@ BEGIN
 	RETURN r;
 END $$;
 PREPARE vs_all AS SELECT * FROM vs ORDER BY id;
-SELECT 'commit', prolly_commit('vs base') IS NOT NULL;
-SELECT 'branch', prolly_branch_create('vs_feature', NULL) IS NULL;
-SELECT 'checkout feature', prolly_checkout('vs_feature') IS NULL;
+SELECT 'commit', dolt_commit('-Am', 'vs base') IS NOT NULL;
+SELECT 'branch', dolt_branch('vs_feature') IS NOT NULL;
+SELECT 'checkout feature', dolt_checkout('vs_feature') IS NOT NULL;
 
 ALTER TABLE vs ADD COLUMN extra int DEFAULT 7;
 ALTER TABLE vs RENAME COLUMN v TO label;
@@ -29,10 +37,11 @@ INSERT INTO vs_only_feature VALUES (42);
 CREATE INDEX vs_label ON vs (label);
 SELECT 'feature row', vs::text FROM vs WHERE id = 1;
 SELECT 'feature function', vs_row();
+-- (as in Postgres: its result columns changed on this branch)
 EXECUTE vs_all;
 SELECT 'feature table', x FROM vs_only_feature;
 
-SELECT 'checkout main', prolly_checkout('main') IS NULL;
+SELECT 'checkout main', dolt_checkout('main') IS NOT NULL;
 SELECT 'main row', vs::text FROM vs WHERE id = 1;
 SELECT 'main function', vs_row();
 EXECUTE vs_all;
@@ -42,10 +51,10 @@ SELECT 'main columns', string_agg(attname, ',' ORDER BY attnum)
 FROM pg_attribute WHERE attrelid = 'vs'::regclass AND attnum > 0 AND NOT attisdropped;
 
 -- Dropping a table on one branch keeps it on the others.
-SELECT 'checkout feature again', prolly_checkout('vs_feature') IS NULL;
+SELECT 'checkout feature again', dolt_checkout('vs_feature') IS NOT NULL;
 DROP TABLE vs_only_feature;
 DROP TABLE vs;
 SELECT 'feature dropped vs', to_regclass('vs') IS NULL;
-SELECT 'checkout main again', prolly_checkout('main') IS NULL;
+SELECT 'checkout main again', dolt_checkout('main') IS NOT NULL;
 SELECT 'main still has vs', vs::text FROM vs WHERE id = 1;
 DEALLOCATE vs_all;

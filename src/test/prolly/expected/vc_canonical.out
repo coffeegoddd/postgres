@@ -8,11 +8,16 @@
 commit start|t
 branch latin1|t
 branch utf8|t
+branch other|t
 checkout latin1|t
 commit latin1|t
 checkout utf8|t
 commit utf8|t
 same root across client encodings|t
+checkout other|t
+commit other|t
+other content: different root|t
 back to main|t
 different oids|t
 same root across databases|t
+other content: different root|t

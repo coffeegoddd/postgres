@@ -30,6 +30,13 @@ prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
+# Commits of branches made by copying: only the page-based engine keeps
+# branches as copies, so these tests' tables are prolly's whatever
+# PROLLY_AM is.
+vc_commits.conf: FORCE
+	@{ echo "default_table_access_method = 'prolly'"; \
+	   echo "max_prepared_transactions = 10"; } > $@
+
 # Heap tables in block-mapped storage instead (debug_block_mapped_heap).
 bmap.conf: FORCE
 	@{ echo "debug_block_mapped_heap = on"; \
@@ -39,7 +46,7 @@ EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
-check: check-target check-semantics check-isolation check-vc check-vc-isolation check-tap
+check: check-target check-semantics check-isolation check-vc-commits check-vc check-vc-isolation check-tap
 
 check-target: PROVE_TESTS = t/003_target_guard.pl
 check-target: require-tap temp-install
@@ -59,6 +66,10 @@ check-semantics: require-tap temp-install
 
 check-vc: require-legacy-vc check-vc-target temp-install prolly_am.conf
 	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_schedule
+
+check-vc-commits: temp-install vc_commits.conf
+	$(pg_regress_check) --temp-config=$(CURDIR)/vc_commits.conf \
+		--schedule=$(srcdir)/vc_commits_schedule
 
 check-isolation: PROVE_TESTS = t/002_isolation.pl
 check-isolation: require-tap temp-install
@@ -115,8 +126,8 @@ require-legacy-vc:
 	@test '$(PROLLY_AM)' != prolly || { echo 'The VC requirements use the legacy tree-engine API; run semantics, isolation and durability for prolly'; exit 1; }
 
 clean distclean:
-	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf output_iso
+	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc_commits.conf output_iso
 
-.PHONY: check check-target check-vc-target check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
+.PHONY: check check-target check-vc-target check-vc-target-guard check-semantics check-vc check-vc-commits check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE

@@ -1,8 +1,8 @@
 --
--- Version control: schema is versioned with data (the catalogs are prolly
--- tables on the branch).  DDL on
--- a branch is invisible on other branches, including to cached plans and
--- functions, and checking out a branch shows its schema.
+-- Version control: schema is versioned with data (each branch has its own
+-- copy of a versioned schema's objects).  DDL on a branch is invisible on
+-- other branches, including to cached plans and functions, and checking
+-- out a branch shows its schema.
 --
 \set ECHO none
 commit|t
@@ -10,7 +10,7 @@ branch|t
 checkout feature|t
 feature row|(1,one,7)
 feature function|(1,one,7)
-1|one|7
+ERROR:  cached plan must not change result type
 feature table|42
 checkout main|t
 main row|(1,one)

@@ -1,0 +1,5 @@
+# Commits of branches made by copying: versioned schema, history
+# independence and canonical form
+test: vc_schema
+test: vc_history
+test: vc_canonical
