@@ -41,7 +41,9 @@ func SelfTest(ctx context.Context, dsn string, timeout time.Duration) ([]Result,
 	p, _ := NewPostgres(dsn, "prolly", timeout)
 	r := Run(ctx, s, claimedVC{p})
 	results = append(results, r)
-	if r.Status != "failed" || r.Phase != "target" || !strings.Contains(r.Error, "main-isolation") {
+	// Block-mapped prolly's branches are copies of other branches: it can't
+	// branch from a commit, the probe's first VC step it fails.
+	if r.Status != "failed" || r.Phase != "target" || !strings.Contains(r.Error, "VC canary: branch:") {
 		return results, fmt.Errorf("a false VC capability claim did not fail targeting: %+v", r)
 	}
 	p, _ = NewPostgres(dsn, "prolly", timeout)
