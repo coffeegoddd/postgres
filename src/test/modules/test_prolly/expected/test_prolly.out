@@ -312,6 +312,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  diff_merge      | rows             | complete                                | pass
  tree            | cow              | identity                                | pass
  tree            | cow              | build_and_get                           | pass
+ tree            | cow              | large_keys                              | pass
  tree            | cow              | cursor_scans                            | pass
  tree            | cow              | apply_matches_reference                 | pass
  tree            | cow              | apply_past_the_end                      | pass
@@ -328,6 +329,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  tree            | cow              | complete                                | pass
  tree            | stub             | identity                                | pass
  tree            | stub             | build_and_get                           | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree            | stub             | large_keys                              | not implemented (missing build_begin, build_add, build_finish, apply, get, count)
  tree            | stub             | cursor_scans                            | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
  tree            | stub             | apply_matches_reference                 | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
  tree            | stub             | apply_past_the_end                      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
@@ -392,7 +394,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  chunk_format    | basic            | items_round_trip                        | pass
  chunk_format    | basic            | rejects_other_bytes                     | pass
  chunk_format    | basic            | complete                                | pass
-(323 rows)
+(325 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

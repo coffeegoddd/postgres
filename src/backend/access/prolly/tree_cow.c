@@ -111,13 +111,20 @@ node_loaded(const TNode *node)
 	return BufferIsValid(node->buf) || node->chunk.data != NULL;
 }
 
-/* A chunk node by hash, from the chunk store. */
+/*
+ * A chunk node by hash, from the chunk store, its bytes allocated in cxt:
+ * the context of whatever keeps the node (an iterator, a cursor), which
+ * may outlive the one current at the read.
+ */
 static void
-chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
+chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+				MemoryContext cxt)
 {
 	StringInfoData data;
+	MemoryContext old = MemoryContextSwitchTo(cxt);
 
 	initStringInfo(&data);
+	MemoryContextSwitchTo(old);
 	if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -149,15 +156,17 @@ check_cached_hash(const ProllyTreeEnv *env, Page page, const ProllyHash *hash,
 		memcmp(special + 1, hash->bytes, hash->len) == 0;
 }
 
+/* Read a node, its chunk's bytes (if it is one) in cxt. */
 static void
-node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
+node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+			 MemoryContext cxt)
 {
 	ProllyNodeRef r = *ref;
 
 	node->chunk.data = NULL;
 	if (in_chunks(env))
 	{
-		chunk_node_read(env, ref, node);
+		chunk_node_read(env, ref, node, cxt);
 		return;
 	}
 	for (;;)
@@ -189,6 +198,13 @@ node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 		/* A stale hint: look the node up by hash instead. */
 		r.location.blkno = InvalidBlockNumber;
 	}
+}
+
+/* Read a node kept no longer than the current context. */
+static void
+node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
+{
+	node_read_in(env, ref, node, CurrentMemoryContext);
 }
 
 static void
@@ -736,6 +752,18 @@ levelbuf_add(LevelBuf *lb, const Item *item)
 				 errmsg("prolly item of %zu bytes does not fit in a node", space),
 				 errdetail("Items larger than a node are not supported yet.")));
 
+	/*
+	 * An internal node holds two items at least, or the levels above would
+	 * not narrow: a key too large for two of its internal items to fit is
+	 * refused.
+	 */
+	if (lb->level > 0 && space > lb->capacity / 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("prolly key of %u bytes is too large", item->key.len),
+				 errdetail("A key may take at most half a tree node (%zu bytes) with its child's reference.",
+						   lb->capacity / 2)));
+
 	d = PROLLY_CALL(lb->env->chunker, add, lb->chunker, &item->key, &item->value,
 					space);
 	if (d == PROLLY_CHUNK_SPLIT_BEFORE)
@@ -896,6 +924,7 @@ typedef struct Frame
 typedef struct Iter
 {
 	const ProllyTreeEnv *env;
+	MemoryContext cxt;			/* where the nodes it keeps are */
 	ProllyNodeRef root;
 	int			target;			/* frame index of the level iterated */
 	Frame		f[MAX_LEVELS];
@@ -914,10 +943,11 @@ iter_open(Iter *it, const ProllyTreeEnv *env, const ProllyNodeRef *root,
 {
 	memset(it, 0, sizeof(*it));
 	it->env = env;
+	it->cxt = CurrentMemoryContext;
 	it->root = *root;
 	for (int i = 0; i < MAX_LEVELS; i++)
 		it->f[i].node.buf = InvalidBuffer;
-	node_read(env, root, &it->f[0].node);
+	node_read_in(env, root, &it->f[0].node, it->cxt);
 	if (level > it->f[0].node.level)
 		elog(ERROR, "prolly tree has no level %u", level);
 	it->target = it->f[0].node.level - level;
@@ -945,7 +975,7 @@ iter_load_child(Iter *it, int d)
 			   ref.hash.len) == 0)
 		return;
 	node_release(&it->f[d + 1].node);
-	node_read(it->env, &ref, &it->f[d + 1].node);
+	node_read_in(it->env, &ref, &it->f[d + 1].node, it->cxt);
 }
 
 /*
@@ -1243,8 +1273,9 @@ cow_cursor_open(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 
 	initStringInfo(&c->value);
-	MemoryContextSwitchTo(old);
+	/* (the nodes the cursor keeps are read in its context) */
 	iter_open(&c->it, env, root, 0);
+	MemoryContextSwitchTo(old);
 	return c;
 }
 
@@ -1741,6 +1772,7 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 typedef struct DiffSide
 {
 	const ProllyTreeEnv *env;
+	MemoryContext cxt;			/* where the nodes it keeps are */
 	Frame		f[MAX_LEVELS];
 	int			depth;			/* -1 at the end */
 } DiffSide;
@@ -1749,8 +1781,9 @@ static void
 side_open(DiffSide *s, const ProllyTreeEnv *env, const ProllyNodeRef *root)
 {
 	s->env = env;
+	s->cxt = CurrentMemoryContext;
 	s->depth = 0;
-	node_read(env, root, &s->f[0].node);
+	node_read_in(env, root, &s->f[0].node, s->cxt);
 	s->f[0].idx = 0;
 	if (s->f[0].node.nitems == 0)
 	{
@@ -1793,7 +1826,7 @@ side_descend(DiffSide *s)
 		elog(ERROR, "prolly tree is more than %d levels high", MAX_LEVELS);
 	side_child(s, &ref);
 	child = &s->f[s->depth + 1];
-	node_read(s->env, &ref, &child->node);
+	node_read_in(s->env, &ref, &child->node, s->cxt);
 	if (child->node.nitems == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),

@@ -19,6 +19,12 @@
  * that the next item would push past capacity ends before it (a forced
  * split); if that item would also end a new node, it is alone in it.
  *
+ * Above the leaves, a node never ends after its first item: each level
+ * has at most half the nodes of the one below, so the tree has a root
+ * however large its keys (an internal item's is its key, and one of a
+ * few kilobytes would otherwise end every node it is in, level after
+ * level).  The tree keeps a key small enough for two to fit in a node.
+ *
  * The table, the target and the hash are part of the canonical format.
  *
  * IDENTIFICATION
@@ -148,11 +154,13 @@ bytes_add(ProllyChunker *c, const ProllyKey *key, const ProllyValue *value,
 	if (c->pending || (c->used > 0 && c->used + item_space > c->capacity))
 	{
 		c->used = item_space;
-		c->pending = ends_node(c->level, key, 0, item_space);
+		c->pending = c->level == 0 && ends_node(c->level, key, 0, item_space);
 		return PROLLY_CHUNK_SPLIT_BEFORE;
 	}
 
-	if (ends_node(c->level, key, c->used, c->used + item_space))
+	/* (above the leaves, not after a node's first item) */
+	if ((c->level == 0 || c->used > 0) &&
+		ends_node(c->level, key, c->used, c->used + item_space))
 	{
 		c->used = 0;
 		return PROLLY_CHUNK_SPLIT_AFTER;
