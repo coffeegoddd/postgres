@@ -40,6 +40,7 @@ typedef struct Table
 								 * orders them */
 	ProllyNodeRef data;
 	ProllyHash	description;	/* of its definition */
+	char	   *unreadable;		/* why its rows can't be read here, or NULL */
 } Table;
 
 typedef struct Tables
@@ -91,7 +92,7 @@ root_of(const char *ref, ProllyNodeRef *root)
 
 static void
 add_table(const char *name, const ProllyNodeRef *data,
-		  const ProllyValue *description, void *arg)
+		  const ProllyValue *description, const char *unreadable, void *arg)
 {
 	Tables	   *ts = arg;
 	Table	   *t = palloc(sizeof(Table));
@@ -101,6 +102,8 @@ add_table(const char *name, const ProllyNodeRef *data,
 	/* (the canonical tree's names are UTF-8; the catalogs' the server's) */
 	t->name = pstrdup(pg_any_to_server(name, strlen(name), PG_UTF8));
 	t->utf8 = pstrdup(name);
+	t->unreadable = unreadable ?
+		pstrdup(pg_any_to_server(unreadable, strlen(unreadable), PG_UTF8)) : NULL;
 	t->data = *data;
 	PROLLY_CALL(h, update, ctx, description->data, description->len);
 	PROLLY_CALL(h, finish, ctx, &t->description);
@@ -169,6 +172,18 @@ row_change(ProllyDiffKind kind, const ProllyKey *key,
 	rd->sink->change(rd->sink, rd->relid, kind, key, before, after);
 }
 
+/* Refuse to read the rows of a version of a table that can't be read here. */
+static void
+require_readable(const Table *t)
+{
+	if (t && t->unreadable)
+		ereport(ERROR,
+				(errcode(ERRCODE_COLLATION_MISMATCH),
+				 errmsg("the rows of table %s in this version can't be read here", t->name),
+				 errdetail("The %s.", t->unreadable),
+				 errhint("A version's rows can only be read where the collations ordering their keys are as it recorded.")));
+}
+
 /*
  * The rows of table relid that differ between two versions of it (NULL:
  * the version has no such table), in key order.
@@ -185,6 +200,8 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 
 	if (from && to && same_hash(&from->data.hash, &to->data.hash))
 		return;
+	require_readable(from);
+	require_readable(to);
 	rel = table_open(relid, AccessShareLock);
 	rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");

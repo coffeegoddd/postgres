@@ -1,5 +1,7 @@
--- A commit records the versions of the collations ordering its tables'
--- keys, and isn't read where they differ.
+-- A commit records the collations ordering its tables' keys: what decides
+-- their order, and their library's version.  A table whose keys are ordered
+-- by one that differs now can't have its rows read from that commit, while
+-- the commit is still listed and its other tables read.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -7,13 +9,15 @@ CREATE SCHEMA app VERSIONED;
 CREATE COLLATION app.c_utf8 (provider = builtin, locale = 'C.UTF-8');
 CREATE TABLE app.t (k text COLLATE app.c_utf8 PRIMARY KEY, v int);
 CREATE TABLE app.c (k text COLLATE "C" PRIMARY KEY);	-- no version
-CREATE TABLE app.n (k int PRIMARY KEY);				-- not collatable
+CREATE TABLE app.n (k int PRIMARY KEY, v int);			-- not collatable
 INSERT INTO app.t VALUES ('a', 1), ('b', 2);
+INSERT INTO app.n VALUES (1, 1);
+-- (provider, locale, rules, deterministic, version)
 SELECT key, replace(value, E'\n', ' | ') AS value
 FROM test_fold_items() WHERE key LIKE 'c:app.%' ORDER BY key;
-     key      |      value      
---------------+-----------------
- c:app.c_utf8 | b | C.UTF-8 | 1
+     key      |         value          
+--------------+------------------------
+ c:app.c_utf8 | b | C.UTF-8 |  | t | 1
 (1 row)
 
 SELECT length(dolt_commit('-m', 'first')::text) AS committed;
@@ -23,46 +27,82 @@ SELECT length(dolt_commit('-m', 'first')::text) AS committed;
 (1 row)
 
 UPDATE app.t SET v = 3 WHERE k = 'a';
-SELECT * FROM dolt_status();
+UPDATE app.n SET v = 2;
+SELECT * FROM dolt_status() ORDER BY table_name;
  table_name | staged |  status  
 ------------+--------+----------
+ app.n      | t      | modified
  app.t      | t      | modified
-(1 row)
+(2 rows)
 
--- The collation's version changes: the commit's keys may be in another
--- order now.
+-- What the catalog recorded of the version doesn't matter, the library's
+-- does (a library upgrade leaves the catalog's behind).
 SELECT collversion AS saved FROM pg_collation WHERE collname = 'c_utf8' \gset
 UPDATE pg_collation SET collversion = 'other' WHERE collname = 'c_utf8';
-SELECT * FROM dolt_status();
-ERROR:  collation "app.c_utf8" isn't what the commit's keys were ordered by
-DETAIL:  The commit recorded provider b, locale 'C.UTF-8', version '1'; the database has provider b, locale 'C.UTF-8', version 'other'.
-HINT:  A commit can only be read where its collations have the versions it recorded.
-SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
-ERROR:  collation "app.c_utf8" isn't what the commit's keys were ordered by
-DETAIL:  The commit recorded provider b, locale 'C.UTF-8', version '1'; the database has provider b, locale 'C.UTF-8', version 'other'.
-HINT:  A commit can only be read where its collations have the versions it recorded.
-UPDATE pg_collation SET collversion = :'saved' WHERE collname = 'c_utf8';
-SELECT * FROM dolt_status();
- table_name | staged |  status  
-------------+--------+----------
- app.t      | t      | modified
-(1 row)
-
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
  diff_type | from_row | to_row 
 -----------+----------+--------
  modified  | (a,1)    | (a,3)
 (1 row)
 
-SELECT length(dolt_commit('-m', 'second')::text) AS committed;
+UPDATE pg_collation SET collversion = :'saved' WHERE collname = 'c_utf8';
+-- The collation's rules change (as recreating it with rules would): the
+-- commit's keys of app.t may be in another order; app.n's aren't.
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+SELECT * FROM dolt_status() ORDER BY table_name;
+ table_name | staged |  status  
+------------+--------+----------
+ app.n      | t      | modified
+ app.t      | t      | modified
+(2 rows)
+
+SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+ERROR:  the rows of table app.t in this version can't be read here
+DETAIL:  The collation "app.c_utf8" ordered its keys as provider b, locale 'C.UTF-8', deterministic, version '1'; the database has provider b, locale 'C.UTF-8', rules '&a<b', deterministic, version '1'.
+HINT:  A version's rows can only be read where the collations ordering their keys are as it recorded.
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.n);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (1,1)    | (1,2)
+(1 row)
+
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (a,1)    | (a,3)
+(1 row)
+
+SELECT length(dolt_commit('-am', 'second')::text) AS committed;
  committed 
 -----------
         66
 (1 row)
 
+-- The collation dropped (with the table it keyed): the commits before are
+-- still read, but for that table.
+DROP TABLE app.t;
+DROP COLLATION app.c_utf8;
+UPDATE app.n SET v = 3;
+SELECT length(dolt_commit('-am', 'third')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::app.n);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (1,2)    | (1,3)
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', NULL::app.n);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (1,1)    | (1,3)
+(1 row)
+
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 4 other objects
-DETAIL:  drop cascades to collation app.c_utf8
-drop cascades to table app.t
-drop cascades to table app.c
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table app.c
 drop cascades to table app.n

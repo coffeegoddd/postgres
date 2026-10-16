@@ -46,13 +46,16 @@
  * a tree in the chunk store), and the canonical tree is kept there too.
  * Only objects in versioned schemas are described: ordinary schemas and
  * extensions are every branch's, not the commit's.  Each collation that
- * orders a table's keys is recorded too, as the database records it:
+ * orders a table's keys is recorded too:
  *
- *	"c:" collation		-> its provider, locale and version, a line each
- *						   ("default": the database's)
+ *	"c:" collation		-> its provider, locale, ICU rules, whether it is
+ *						   deterministic and its library's version, a line
+ *						   each ("default": the database's)
  *
- * and a root whose collations' versions differ from the database's can't
- * be read: its trees' keys may be in another order.
+ * and a table whose keys are ordered by a collation that differs now from
+ * what a root recorded can't have that root's rows read: its tree's keys
+ * may be in another order.  The root is still listed, and its other
+ * tables read.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/canon_catalogs.c
@@ -94,10 +97,11 @@
 #include "miscadmin.h"
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
-#include "utils/regproc.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_locale.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
@@ -302,6 +306,7 @@ fold_table(Canon *cn, Relation rel, ProllyNodeRef *root)
 	keyless = PROLLY_CALL(fs.kr, keyless, fs.k);
 	if (!keyless)
 	{
+		/* (the keying's key: the primary key, as it chooses it) */
 		Relation	pk = index_open(RelationGetPrimaryKeyIndex(rel, false),
 									AccessShareLock);
 
@@ -1011,8 +1016,11 @@ catalogs_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 }
 
 /*
- * A collation's name, and its provider, locale and version as the database
- * records them; false if it records no version (as for C and POSIX).
+ * A collation's name (if name isn't NULL), and what decides the order it gives: its provider,
+ * locale, ICU rules (empty if none) and whether it is deterministic, and
+ * the version its library reports now (not the one the catalog recorded,
+ * which a library upgrade leaves behind), a line each; false if the
+ * library reports no version (as for C and POSIX).
  */
 static bool
 collation_version(Oid coll, StringInfo name, StringInfo value)
@@ -1022,24 +1030,24 @@ collation_version(Oid coll, StringInfo name, StringInfo value)
 	Datum		d;
 	bool		isnull;
 	char	   *locale;
+	char	   *rules = NULL;
+	bool		deterministic = true;
+	char	   *version;
 
 	if (coll == DEFAULT_COLLATION_OID)
 	{
 		tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
-		d = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_datcollversion,
-							&isnull);
-		if (isnull)
-		{
-			ReleaseSysCache(tup);
-			return false;
-		}
 		provider = ((Form_pg_database) GETSTRUCT(tup))->datlocprovider;
-		appendStringInfoString(name, "default");
+		if (name)
+			appendStringInfoString(name, "default");
 		locale = TextDatumGetCString(provider == COLLPROVIDER_LIBC ?
 									 SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datcollate) :
 									 SysCacheGetAttrNotNull(DATABASEOID, tup, Anum_pg_database_datlocale));
+		d = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_daticurules, &isnull);
+		if (!isnull)
+			rules = TextDatumGetCString(d);
 	}
 	else
 	{
@@ -1048,25 +1056,29 @@ collation_version(Oid coll, StringInfo name, StringInfo value)
 		tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(coll));
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "cache lookup failed for collation %u", coll);
-		d = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collversion,
-							&isnull);
-		if (isnull)
-		{
-			ReleaseSysCache(tup);
-			return false;
-		}
 		form = (Form_pg_collation) GETSTRUCT(tup);
 		provider = form->collprovider;
-		append_utf8(name, qualified(form->collnamespace, NameStr(form->collname)));
+		deterministic = form->collisdeterministic;
+		if (name)
+			append_utf8(name, qualified(form->collnamespace, NameStr(form->collname)));
 		locale = TextDatumGetCString(provider == COLLPROVIDER_LIBC ?
 									 SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_collcollate) :
 									 SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_colllocale));
+		d = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collicurules, &isnull);
+		if (!isnull)
+			rules = TextDatumGetCString(d);
 	}
+	ReleaseSysCache(tup);
+	version = get_collation_actual_version(provider, locale);
+	if (version == NULL)
+		return false;
 	appendStringInfo(value, "%c\n", provider);
 	append_utf8(value, locale);
 	appendStringInfoChar(value, '\n');
-	append_utf8(value, TextDatumGetCString(d));
-	ReleaseSysCache(tup);
+	if (rules)
+		append_utf8(value, rules);
+	appendStringInfo(value, "\n%c\n", deterministic ? 't' : 'f');
+	append_utf8(value, version);
 	return true;
 }
 
@@ -1093,23 +1105,28 @@ add_collations(Canon *cn)
 			it->value = value;
 			cn->items = lappend(cn->items, it);
 		}
-	}
-}
+	}}
 
-/* A collation's provider, locale and version, for messages. */
+/* A collation's provider, locale, rules and version, for messages. */
 static char *
 describe_collation(const char *value, int len)
 {
-	char	   *copy = pnstrdup(value, len);
-	char	   *locale = strchr(copy, '\n');
-	char	   *version = locale ? strchr(locale + 1, '\n') : NULL;
+	char	   *f[5] = {0};
+	char	   *p = pnstrdup(value, len);
 
-	if (version == NULL)
-		return quote_literal_cstr(copy);
-	*locale++ = '\0';
-	*version++ = '\0';
-	return psprintf("provider %s, locale %s, version %s", copy,
-					quote_literal_cstr(locale), quote_literal_cstr(version));
+	for (int i = 0; i < 5 && p; i++)
+	{
+		f[i] = p;
+		p = strchr(p, '\n');
+		if (p)
+			*p++ = '\0';
+	}
+	if (f[4] == NULL)
+		return quote_literal_cstr(value);
+	return psprintf("provider %s, locale %s%s%s, %sdeterministic, version %s",
+					f[0], quote_literal_cstr(f[1]),
+					f[2][0] ? ", rules " : "", f[2][0] ? quote_literal_cstr(f[2]) : "",
+					f[3][0] == 't' ? "" : "not ", quote_literal_cstr(f[4]));
 }
 
 /* The collation a root's "c:" item names: "default", or a qualified name. */
@@ -1122,17 +1139,18 @@ collation_named(const char *name)
 }
 
 /*
- * Refuse a root whose collations' versions (or providers or locales)
- * differ from the database's: its keys may not be in the order the
- * database's collations give.
+ * The collations a root recorded that differ now (or are gone): a List of
+ * String pairs, the collation's name (as its item names it, in the
+ * server's encoding) then how it differs.
  */
-static void
-check_collations(Canon *cn, const ProllyNodeRef *root)
+static List *
+stale_collations(Canon *cn, const ProllyNodeRef *root)
 {
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
 	ProllyKey	from = {(const uint8 *) "c:", 2};
+	List	   *out = NIL;
 
 	c = PROLLY_CALL(cn->tree, cursor_open, &cn->env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn->tree, cursor_seek, c, &from, ForwardScanDirection);
@@ -1140,7 +1158,6 @@ check_collations(Canon *cn, const ProllyNodeRef *root)
 	{
 		char	   *name;
 		Oid			coll;
-		StringInfoData cur_name;
 		StringInfoData cur;
 
 		if (k.len < 2 || memcmp(k.data, "c:", 2) != 0)
@@ -1148,21 +1165,78 @@ check_collations(Canon *cn, const ProllyNodeRef *root)
 		name = pg_any_to_server(pnstrdup((const char *) k.data + 2, k.len - 2),
 								k.len - 2, PG_UTF8);
 		coll = collation_named(name);
-		initStringInfo(&cur_name);
 		initStringInfo(&cur);
-		if (!OidIsValid(coll) || !collation_version(coll, &cur_name, &cur) ||
+		if (!OidIsValid(coll) || !collation_version(coll, NULL, &cur) ||
 			cur.len != v.len || memcmp(cur.data, v.data, v.len) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_COLLATION_MISMATCH),
-					 errmsg("collation \"%s\" isn't what the commit's keys were ordered by",
-							name),
-					 errdetail("The commit recorded %s; the database has %s.",
-							   describe_collation((const char *) v.data, v.len),
-							   OidIsValid(coll) && cur.len > 0 ?
-							   describe_collation(cur.data, cur.len) : "none"),
-					 errhint("A commit can only be read where its collations have the versions it recorded.")));
+		{
+			out = lappend(out, makeString(name));
+			out = lappend(out, makeString(psprintf("collation \"%s\" ordered its keys as %s; the database has %s",
+												   name, describe_collation((const char *) v.data, v.len),
+												   OidIsValid(coll) && cur.len > 0 ?
+												   describe_collation(cur.data, cur.len) : "none")));
+		}
 	}
 	PROLLY_CALL(cn->tree, cursor_close, c);
+	return out;
+}
+
+/*
+ * Why the rows of the table the session branch has by this name can't be
+ * read from a root whose collations stale_collations() found differing
+ * now, or NULL: a collation ordering its keys (as the table has them now)
+ * is one of them.  A table the branch doesn't have isn't read.
+ */
+static const char *
+table_unreadable(const char *name, List *stale)
+{
+	Oid			relid;
+	Oid			pkoid;
+	Relation	pk;
+	const char *why = NULL;
+
+	if (stale == NIL)
+		return NULL;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		return NULL;
+	{
+		Relation	rel = table_open(relid, AccessShareLock);
+
+		pkoid = RelationGetPrimaryKeyIndex(rel, false);
+		table_close(rel, AccessShareLock);
+	}
+	if (!OidIsValid(pkoid))
+		return NULL;
+	pk = index_open(pkoid, AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(pk) && !why; i++)
+	{
+		Oid			coll = pk->rd_indcollation[i];
+		StringInfoData cname;
+
+		if (!OidIsValid(coll))
+			continue;
+		initStringInfo(&cname);
+		if (coll == DEFAULT_COLLATION_OID)
+			appendStringInfoString(&cname, "default");
+		else
+		{
+			HeapTuple	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(coll));
+			Form_pg_collation form;
+
+			if (!HeapTupleIsValid(tup))
+				elog(ERROR, "cache lookup failed for collation %u", coll);
+			form = (Form_pg_collation) GETSTRUCT(tup);
+			appendStringInfoString(&cname, qualified(form->collnamespace,
+													 NameStr(form->collname)));
+			ReleaseSysCache(tup);
+		}
+		for (int j = 0; j + 1 < list_length(stale); j += 2)
+			if (strcmp(strVal(list_nth(stale, j)), cname.data) == 0)
+				why = strVal(list_nth(stale, j + 1));
+	}
+	index_close(pk, AccessShareLock);
+	return why;
 }
 
 /* The canonical tree, built in the environment from the items collected. */
@@ -1179,8 +1253,7 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	collect(cn);
 	AtEOXact_GUC(false, save_nestlevel);
-	if (cn->folded)
-		add_collations(cn);
+	add_collations(cn);		/* (none unless folded) */
 
 	list_sort(cn->items, item_cmp);
 	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
@@ -1251,11 +1324,12 @@ folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 	ProllyKey	k;
 	ProllyValue v;
 	ProllyKey	from = {(const uint8 *) "t:", 2};
+	List	   *stale;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	canon_env(&cn);
-	check_collations(&cn, root);
+	stale = stale_collations(&cn, root);
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
@@ -1277,7 +1351,9 @@ folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 		description.data = v.data + 1 + data.hash.len;
 		description.len = v.len - 1 - data.hash.len;
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
-		visit(name, &data, &description, arg);
+		visit(name, &data, &description,
+			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
+			  arg);
 		pfree(name);
 	}
 	PROLLY_CALL(cn.tree, cursor_close, c);
@@ -1287,7 +1363,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
 		.impl_id = 2,
-		.format_version = 1,
+		.format_version = 2,		/* 2: collations' rules and flag, by library */
 		.name = "folded",
 		.description = "canonical form by name of the session branch's "
 		"versioned schemas, their tables' rows folded into trees",
