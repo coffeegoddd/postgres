@@ -274,7 +274,7 @@ UPDATE dm.b SET v = 'kept' WHERE id = 3;
 BEGIN;
 SELECT (dolt_merge('feature'))[2:4];
 ERROR:  cannot merge with uncommitted changes when the merge conflicts
-DETAIL:  The merge has 1 conflicting rows.
+DETAIL:  The merge has 1 conflicting rows and 0 constraint violations.
 HINT:  Commit the changes, or reset the branch, first.
 ROLLBACK;
 SELECT id, v FROM dm.b WHERE id = 3;

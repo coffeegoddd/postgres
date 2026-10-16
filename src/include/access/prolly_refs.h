@@ -56,6 +56,20 @@ typedef struct ProllyMergeState
 	char	   *message;		/* a pick's: the picked commit's message */
 } ProllyMergeState;
 
+/*
+ * A constraint violation a merge (or cherry-pick) left on a branch: a row
+ * of a table, as JSON, that breaks one of its constraints ("foreign key":
+ * the row is in the table; "unique index", "check constraint", "not null":
+ * the merge didn't write it), and what it breaks, as JSON.
+ */
+typedef struct ProllyViolation
+{
+	Oid			relid;
+	char	   *type;
+	char	   *row;
+	char	   *info;
+} ProllyViolation;
+
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
@@ -171,13 +185,24 @@ typedef struct ProllyRefsRoutine
 	 * whose rows the caller wrote).
 	 */
 	void		(*set_head) (const ProllyHash *commit_id);
+
+	/*
+	 * The session branch's constraint violations (ProllyViolation *), and
+	 * setting them (NIL: none), with the transaction.  A transaction can't
+	 * commit while its branch has some, unless
+	 * prolly_allow_commit_conflicts(), nor can a commit be made.  A reset
+	 * clears them.
+	 */
+	List	   *(*violations) (void);
+	void		(*set_violations) (List *violations);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
-	"set_merge_state", "hold", "walk", "checkpoint", "set_head"
+	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
+	"set_violations"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 /*

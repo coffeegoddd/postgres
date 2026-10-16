@@ -33,6 +33,13 @@
  * - move_to() makes the session branch hold what a canonical root holds,
  *   writing the rows that differ as changes (prolly_applier.h), with the
  *   calling transaction.
+ * - Rows a merge (or pick) would write that break a unique, check or
+ *   not-null constraint aren't written, and rows of tables it wrote that
+ *   break a foreign key are left: both are recorded as the branch's
+ *   constraint violations (prolly_refs.h), and stop it as conflicts do:
+ *   merge() and cherry_pick() count them with its conflicts.
+ * - verify() checks the session branch's tables of relids (NIL: every
+ *   one) against their foreign keys, and returns the violations found.
  * - cherry_pick() commits refs' changes (each from its parent) again on
  *   the current branch, or with revert undoes them, merging each three-way
  *   with the branch as the ones before left it, every ref resolved first,
@@ -54,6 +61,7 @@
 
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
+#include "nodes/pg_list.h"
 
 /* merge() flags */
 #define PROLLY_MERGE_NO_FF	0x01	/* a merge commit even if it could
@@ -89,11 +97,12 @@ typedef struct ProllyMergeRoutine
 	void		(*move_to) (const ProllyNodeRef *root);
 	int			(*cherry_pick) (const char *const *refs, int nrefs, bool revert,
 								bool allow_empty, ProllyHash *commit_id);
+	List	   *(*verify) (List *relids);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
 	"diff", "merge", "conflicts", "resolve", "tables", "move_to", \
-	"cherry_pick"
+	"cherry_pick", "verify"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 
 static inline const ProllyMergeRoutine *

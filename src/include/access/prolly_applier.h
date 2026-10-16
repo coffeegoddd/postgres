@@ -25,7 +25,8 @@
  *   logical replication's apply does.  A materialized view's rows are
  *   written with index maintenance, as its refresh writes them.  Nothing
  *   else in the session changes.
- * - Each write is visible to the next.
+ * - Each write is visible to the next, and holds nothing (no buffer pin)
+ *   once it returns, so writes may be made in subtransactions.
  *
  * Provisional (v0).
  *

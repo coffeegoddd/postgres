@@ -1086,6 +1086,22 @@ tree_set_head(const ProllyHash *commit_id)
 	bump_epoch();
 }
 
+/* A merge of trees records no constraint violations: it checks them. */
+static List *
+tree_violations(void)
+{
+	return NIL;
+}
+
+static void
+tree_set_violations(List *violations)
+{
+	if (violations != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("these refs keep no constraint violations")));
+}
+
 static void
 merge_key(ProllyBranchId branch, StringInfo key)
 {
@@ -1397,4 +1413,6 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.walk = tree_walk,
 	.checkpoint = tree_checkpoint,
 	.set_head = tree_set_head,
+	.violations = tree_violations,
+	.set_violations = tree_set_violations,
 };

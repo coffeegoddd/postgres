@@ -53,6 +53,17 @@
 #include "access/prolly_config.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "catalog/versioned.h"
+#include "access/htup_details.h"
+#include "access/genam.h"
+#include "utils/fmgrprotos.h"
+#include "utils/json.h"
+#include "utils/array.h"
+#include "executor/spi.h"
+#include "catalog/pg_constraint.h"
+#include "access/xact.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_sequence.h"
@@ -85,6 +96,10 @@ typedef struct Tables
 {
 	List	   *tables;			/* Table *, in name order */
 } Tables;
+
+static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
+						const char *what, const char *name, List **conflicted);
+static int	record_violations(void);
 
 static ProllyDatabaseComponents
 components(void)
@@ -437,6 +452,155 @@ decode(Changes *c, const StringInfoData *value, TupleTableSlot *slot)
 	return count;
 }
 
+/*
+ * While a merge (or pick) runs: the constraint violations it records, and
+ * the tables it wrote to, whose foreign keys are checked after.
+ */
+static bool recording = false;
+static List *recorded = NIL;	/* ProllyViolation * */
+static List *written = NIL;		/* OIDs */
+
+static void
+note_written(Oid relid)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+	written = list_append_unique_oid(written, relid);
+	MemoryContextSwitchTo(old);
+}
+
+/* Merge base to theirs into ours, recording the violations it leaves. */
+static int
+merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
+				const char *what, const char *name, List **conflicted,
+				int *nviolations)
+{
+	int			conflicts;
+
+	recording = true;
+	recorded = NIL;
+	written = NIL;
+	PG_TRY();
+	{
+		conflicts = merge_roots(roots, fail_on_conflict, what, name,
+								conflicted);
+	}
+	PG_CATCH();
+	{
+		recording = false;
+		recorded = NIL;
+		written = NIL;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*nviolations = record_violations();
+	return conflicts;
+}
+
+static char *
+quote_json(const char *s)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	escape_json(&buf, s);
+	return buf.data;
+}
+
+static char *
+row_json(TupleTableSlot *slot)
+{
+	Datum		row = ExecFetchSlotHeapTupleDatum(slot);
+
+	return TextDatumGetCString(DirectFunctionCall1(row_to_json, row));
+}
+
+static ProllyViolation *
+violation(Oid relid, const char *type, char *row, char *info)
+{
+	ProllyViolation *pv = palloc0(sizeof(ProllyViolation));
+
+	pv->relid = relid;
+	pv->type = pstrdup(type);
+	pv->row = row;
+	pv->info = info;
+	return pv;
+}
+
+/*
+ * Write a row as a merge does: insert it, or update old to it.  While a
+ * merge records violations, a row that breaks a unique, check or not-null
+ * (or exclusion) constraint isn't written, and is recorded instead.
+ * Returns false if old isn't there.
+ */
+static bool
+merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
+			TupleTableSlot *old, TupleTableSlot *row)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	volatile bool ok = true;
+
+	if (!recording)
+	{
+		if (old)
+			return PROLLY_CALL(ar, update, a, old, row);
+		PROLLY_CALL(ar, insert, a, row);
+		return true;
+	}
+	note_written(RelationGetRelid(rel));
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		if (old)
+			ok = PROLLY_CALL(ar, update, a, old, row);
+		else
+			PROLLY_CALL(ar, insert, a, row);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+		const char *type;
+		MemoryContext rec;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		switch (ed->sqlerrcode)
+		{
+			case ERRCODE_UNIQUE_VIOLATION:
+			case ERRCODE_EXCLUSION_VIOLATION:
+				type = "unique index";
+				break;
+			case ERRCODE_CHECK_VIOLATION:
+				type = "check constraint";
+				break;
+			case ERRCODE_NOT_NULL_VIOLATION:
+				type = "not null";
+				break;
+			default:
+				PG_RE_THROW();
+		}
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		rec = MemoryContextSwitchTo(TopTransactionContext);
+		recorded = lappend(recorded,
+						   violation(RelationGetRelid(rel), type, row_json(row),
+									 psprintf("{\"Name\": %s}",
+											  quote_json(ed->constraint_name ?
+														 ed->constraint_name : ""))));
+		MemoryContextSwitchTo(rec);
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
 /* One pass of apply_rows over the diff: its removals, or its inserts. */
 typedef struct Applying
 {
@@ -499,7 +663,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
 		for (uint64 i = 0; i < na; i++)
-			PROLLY_CALL(ap->ar, insert, ap->a, ap->slot);
+			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot);
 	}
 }
 
@@ -517,6 +681,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 
 	require_readable(from);
 	require_readable(to);
+	if (recording)
+		note_written(relid);
 	memset(&ap, 0, sizeof(ap));
 	ap.rel = table_open(relid, RowExclusiveLock);
 	ap.ar = prolly_applier_lookup("replication");
@@ -834,6 +1000,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	require_readable(base);
 	require_readable(ours);
 	require_readable(theirs);
+	if (recording && mode == WALK_MERGE)
+		note_written(relid);
 	memset(&tc, 0, sizeof(tc));
 	tc.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
@@ -960,12 +1128,23 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	foreach(lt, writes)
 	{
 		KeyWrite   *w = lfirst(lt);
+		int			nrecorded = list_length(recorded);
 
 		if (w->nrow == 0)
 			continue;
 		(void) decode(&tc, w->row, s2);
 		for (int64 i = 0; i < w->nrow; i++)
-			PROLLY_CALL(ar, insert, a, s2);
+			(void) merge_write(ar, a, rel, NULL, s2);
+
+		/*
+		 * A keyed row theirs changed, whose new version is recorded as a
+		 * violation instead of written: the row stays as it was.
+		 */
+		if (!keyless && w->nold == 1 && list_length(recorded) > nrecorded)
+		{
+			(void) decode(&tc, w->old, s1);
+			(void) merge_write(ar, a, rel, NULL, s1);
+		}
 	}
 	if (a)
 		PROLLY_CALL(ar, end, a);
@@ -1383,6 +1562,146 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 }
 
 /*
+ * The rows of the session branch's tables of relids (NIL: every one) that
+ * break a foreign key, theirs or one referencing them, as violations: a
+ * row whose key, all of it set (MATCH SIMPLE: any of it null passes), or,
+ * MATCH FULL, some of it set, has no referenced row.
+ */
+static List *
+foreign_key_violations(List *relids)
+{
+	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
+										  NULL, 0, NULL);
+	HeapTuple	tup;
+	List	   *found = NIL;
+	List	   *queries = NIL;
+	ListCell   *lc;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		d;
+		ArrayType  *ck;
+		ArrayType  *pk;
+		int16	   *cks;
+		int16	   *pks;
+		int			n;
+		StringInfoData q;
+		StringInfoData set;
+		StringInfoData any;
+		StringInfoData eq;
+		StringInfoData info;
+		char	   *child;
+		char	   *parent;
+
+		if (con->contype != CONSTRAINT_FOREIGN ||
+			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
+			(relids != NIL && !list_member_oid(relids, con->conrelid) &&
+			 !list_member_oid(relids, con->confrelid)))
+			continue;
+		d = heap_getattr(tup, Anum_pg_constraint_conkey,
+						 RelationGetDescr(pg_constraint), &isnull);
+		ck = DatumGetArrayTypeP(d);
+		d = heap_getattr(tup, Anum_pg_constraint_confkey,
+						 RelationGetDescr(pg_constraint), &isnull);
+		pk = DatumGetArrayTypeP(d);
+		n = ARR_DIMS(ck)[0];
+		cks = (int16 *) ARR_DATA_PTR(ck);
+		pks = (int16 *) ARR_DATA_PTR(pk);
+		child = table_name(con->conrelid);
+		parent = table_name(con->confrelid);
+		initStringInfo(&set);
+		initStringInfo(&any);
+		initStringInfo(&eq);
+		initStringInfo(&info);
+		appendStringInfo(&info, "{\"ForeignKey\": %s, \"Table\": %s, \"ReferencedTable\": %s, \"Columns\": [",
+						 quote_json(NameStr(con->conname)), quote_json(child),
+						 quote_json(parent));
+		for (int i = 0; i < n; i++)
+		{
+			const char *c = quote_identifier(get_attname(con->conrelid, cks[i], false));
+			const char *p = quote_identifier(get_attname(con->confrelid, pks[i], false));
+
+			appendStringInfo(&set, "%sc.%s IS NOT NULL", i ? " AND " : "", c);
+			appendStringInfo(&any, "%sc.%s IS NOT NULL", i ? " OR " : "", c);
+			appendStringInfo(&eq, "%sp.%s = c.%s", i ? " AND " : "", p, c);
+			appendStringInfo(&info, "%s%s", i ? ", " : "",
+							 quote_json(get_attname(con->conrelid, cks[i], false)));
+		}
+		appendStringInfoString(&info, "], \"ReferencedColumns\": [");
+		for (int i = 0; i < n; i++)
+			appendStringInfo(&info, "%s%s", i ? ", " : "",
+							 quote_json(get_attname(con->confrelid, pks[i], false)));
+		appendStringInfoString(&info, "]}");
+		initStringInfo(&q);
+		appendStringInfo(&q,
+						 "SELECT row_to_json(c)::text FROM ONLY %s c WHERE "
+						 "NOT EXISTS (SELECT 1 FROM ONLY %s p WHERE %s) AND ",
+						 child, parent, eq.data);
+		if (con->confmatchtype == FKCONSTR_MATCH_FULL)
+			appendStringInfo(&q, "(%s)", any.data);
+		else
+			appendStringInfo(&q, "(%s)", set.data);
+		queries = lappend(queries, list_make3(q.data, info.data,
+											  (void *) (uintptr_t) con->conrelid));
+	}
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+
+	if (queries == NIL)
+		return NIL;
+	/* (with a snapshot that sees the merge's writes) */
+	CommandCounterIncrement();
+	SPI_connect();
+	foreach(lc, queries)
+	{
+		List	   *qi = lfirst(lc);
+		Oid			relid = (Oid) (uintptr_t) lthird(qi);
+
+		if (SPI_execute(linitial(qi), false, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not check a foreign key: %s", (char *) linitial(qi));
+		for (uint64 r = 0; r < SPI_processed; r++)
+		{
+			char	   *row = SPI_getvalue(SPI_tuptable->vals[r],
+										   SPI_tuptable->tupdesc, 1);
+			MemoryContext spi = MemoryContextSwitchTo(cxt);
+
+			found = lappend(found, violation(relid, "foreign key", pstrdup(row),
+											 pstrdup(lsecond(qi))));
+			MemoryContextSwitchTo(spi);
+		}
+	}
+	SPI_finish();
+	return found;
+}
+
+static List *
+folded_verify(List *relids)
+{
+	return foreign_key_violations(relids);
+}
+
+/*
+ * Record what a merge (or pick) of the session branch left: the rows it
+ * didn't write, and those of the tables it wrote that break a foreign key.
+ * Returns how many.
+ */
+static int
+record_violations(void)
+{
+	List	   *all = list_concat(recorded, foreign_key_violations(written));
+
+	recording = false;
+	recorded = NIL;
+	written = NIL;
+	PROLLY_CALL(components().refs, set_violations, all);
+	return list_length(all);
+}
+
+/*
  * What the working set changed since the head: the canonical items that
  * differ, each with the head's value (to put back), and by kind the
  * tables, sequences and materialized views (refreshed) among them, by
@@ -1721,6 +2040,7 @@ merge_held(const char *branch, const char *message, int flags,
 	ProllyHash	parents[2];
 	ProllyNodeRef roots[3];
 	Local		local;
+	int			nviolations = 0;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -1771,25 +2091,27 @@ merge_held(const char *branch, const char *message, int flags,
 	}
 
 	/* Three-way. */
-	conflicts = merge_roots(roots, (flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
-							"merge", branch, &conflicted);
+	conflicts = merge_recording(roots,
+								(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
+								"merge", branch, &conflicted, &nviolations);
 
 	/*
-	 * Conflicts: a merge in progress, to resolve before its commit.  Not
-	 * over uncommitted changes, which its commit would take in, and its
-	 * abort (a reset) would lose.
+	 * Conflicts or constraint violations: a merge in progress, to resolve
+	 * before its commit.  Not over uncommitted changes, which its commit
+	 * would take in, and its abort (a reset) would lose.
 	 */
-	if (conflicts > 0 && has_local_changes(&local))
+	if (conflicts + nviolations > 0 && has_local_changes(&local))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot merge with uncommitted changes when the merge conflicts"),
-				 errdetail("The merge has %d conflicting rows.", conflicts),
+				 errdetail("The merge has %d conflicting rows and %d constraint violations.",
+						   conflicts, nviolations),
 				 errhint("Commit the changes, or reset the branch, first.")));
-	if (conflicts > 0)
+	if (conflicts + nviolations > 0)
 	{
 		record_merge_state(&theirs, &base, conflicted, NULL);
 		memset(commit_id, 0, sizeof(*commit_id));
-		return conflicts;
+		return conflicts + nviolations;
 	}
 	parents[0] = ours;
 	parents[1] = theirs;
@@ -1894,29 +2216,35 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 	for (int i = 0; i < nrefs; i++)
 	{
 		int			conflicts;
+		int			nviolations = 0;
 
 		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
 		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
-		conflicts = merge_roots(roots, revert, fn, NULL, &conflicted);
+		if (revert)
+			conflicts = merge_roots(roots, true, fn, NULL, &conflicted);
+		else
+			conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
+										&nviolations);
 
 		/*
 		 * A pick's (a revert's failed): the pick in progress.  Not over
 		 * uncommitted changes, which its commit would take in, and its
 		 * abort (a reset) would lose.
 		 */
-		if (conflicts > 0 && has_local_changes(&local))
+		if (conflicts + nviolations > 0 && has_local_changes(&local))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("cannot %s with uncommitted changes when the %s conflicts",
 							what, what),
-					 errdetail("The %s has %d conflicting rows.", what, conflicts),
+					 errdetail("The %s has %d conflicting rows and %d constraint violations.",
+							   what, conflicts, nviolations),
 					 errhint("Commit the changes, or reset the branch, first.")));
-		if (conflicts > 0)
+		if (conflicts + nviolations > 0)
 		{
 			record_merge_state(&picked[i], &info[i].parents[0], conflicted,
 							   info[i].message);
 			memset(commit_id, 0, sizeof(*commit_id));
-			return conflicts;
+			return conflicts + nviolations;
 		}
 		/* the next merges into the rows as this one left them */
 		root_of("WORKING", &roots[1]);
@@ -2044,4 +2372,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.tables = folded_tables,
 	.move_to = folded_move_to,
 	.cherry_pick = folded_cherry_pick,
+	.verify = folded_verify,
 };

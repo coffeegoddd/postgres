@@ -19,6 +19,10 @@
  *				   tables with unresolved conflicts and their OIDs (4 bytes
  *				   each, big-endian), then, if it is a cherry-pick, the
  *				   picked commit's message
+ *	'V' name	-> the branch's constraint violations: for each, its
+ *				   table's OID (4 bytes, big-endian), then its type, row and
+ *				   what it violates, each a length (4 bytes, big-endian) and
+ *				   UTF-8 text
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts it left, unless
@@ -70,6 +74,7 @@
 #define TAG_BRANCH		'B'
 #define TAG_MERGE		'M'
 #define TAG_BASELINE	'W'
+#define TAG_VIOLATIONS	'V'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
@@ -84,6 +89,10 @@ static List *merge_changed = NIL;
 static void refs_xact_callback(XactEvent event, void *arg);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_key(StringInfo key, const char *branch);
+static List *violations_of(const char *branch);
+static void violations_key(StringInfo key, const char *branch);
+static List *copies_violations(void);
+static void copies_set_violations(List *violations);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
@@ -120,7 +129,23 @@ name_listed(List *names, const char *name)
 	return false;
 }
 
-/* Unresolved conflicts of a merge the transaction made aren't committed. */
+/* The transaction set branch's merge state, or violations. */
+static void
+note_merge_changed(const char *branch)
+{
+	if (!name_listed(merge_changed, branch))
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		merge_changed = lappend(merge_changed, pstrdup(branch));
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/*
+ * Unresolved conflicts, or constraint violations, of a merge the
+ * transaction made aren't committed.
+ */
 static void
 check_merge_conflicts(const char *what)
 {
@@ -132,6 +157,8 @@ check_merge_conflicts(const char *what)
 	{
 		ProllyMergeState ms;
 
+		List	   *v;
+
 		if (merge_state_of(lfirst(lc), &ms) && ms.ntables > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -140,6 +167,16 @@ check_merge_conflicts(const char *what)
 							   get_rel_name(ms.tables[0]),
 							   (char *) lfirst(lc)),
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+		v = violations_of(lfirst(lc));
+		if (v != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot %s a transaction with constraint violations", what),
+					 errdetail("Table \"%s\" has a row that violates a %s constraint on branch \"%s\".",
+							   get_rel_name(((ProllyViolation *) linitial(v))->relid),
+							   ((ProllyViolation *) linitial(v))->type,
+							   (char *) lfirst(lc)),
+					 errhint("Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.")));
 	}
 }
 
@@ -825,7 +862,10 @@ copies_branch_delete(const char *name, bool force)
 	branch_set_head(name, NULL);
 	branch_set_baseline(name, NULL, NULL);
 
-	/* and the merge in progress on it, which a branch made later isn't in */
+	/*
+	 * and the merge in progress on it, and its violations, which a branch
+	 * made later isn't in
+	 */
 	{
 		StringInfoData key;
 		ProllyMergeState ms;
@@ -834,6 +874,12 @@ copies_branch_delete(const char *name, bool force)
 		merge_key(&key, name);
 		if (merge_state_of(name, &ms))
 			refs_put(key.data, key.len, NULL);
+		if (violations_of(name) != NIL)
+		{
+			resetStringInfo(&key);
+			violations_key(&key, name);
+			refs_put(key.data, key.len, NULL);
+		}
 		pfree(key.data);
 	}
 }
@@ -924,6 +970,11 @@ copies_commit(const char *message, ProllyHash *commit_id)
 	lock_refs();
 	if (branch_head(branch_ops()->current(), &parents[0]))
 		nparents++;
+	if (!prolly_allow_commit_conflicts() && copies_violations() != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit with constraint violations"),
+				 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
 	if (copies_merge_state(&ms))
 	{
 		if (ms.ntables > 0)
@@ -1062,6 +1113,7 @@ copies_reset(const char *ref)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
 	copies_set_merge_state(NULL);	/* a reset ends a merge */
+	copies_set_violations(NIL);
 }
 
 static void
@@ -1170,14 +1222,123 @@ copies_set_merge_state(const ProllyMergeState *state)
 		}
 		refs_put(key.data, key.len, &v);
 		pfree(v.data);
-		if (!name_listed(merge_changed, branch))
-		{
-			MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		note_merge_changed(branch);
+	}
+	pfree(key.data);
+}
 
-			merge_changed = lappend(merge_changed, pstrdup(branch));
-			MemoryContextSwitchTo(old);
+static void
+violations_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_VIOLATIONS);
+	appendStringInfoString(key, branch);
+}
+
+static void
+put_text(StringInfo out, const char *s)
+{
+	put_be32(out, (uint32) strlen(s));
+	appendStringInfoString(out, s);
+}
+
+static char *
+get_text(const char **p, const char *end)
+{
+	uint32		len;
+	char	   *s;
+
+	if (end - *p < 4)
+		goto corrupt;
+	len = get_be32(*p);
+	*p += 4;
+	if ((uint32) (end - *p) < len)
+		goto corrupt;
+	s = pnstrdup(*p, len);
+	*p += len;
+	return s;
+
+corrupt:
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("a branch's constraint violations are corrupt")));
+	return NULL;				/* keep compiler quiet */
+}
+
+/* The constraint violations a merge left on branch. */
+static List *
+violations_of(const char *branch)
+{
+	StringInfoData key;
+	StringInfoData v;
+	List	   *list = NIL;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	violations_key(&key, branch);
+	if (refs_get(key.data, key.len, &v))
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+
+		while (p < end)
+		{
+			ProllyViolation *pv = palloc0(sizeof(ProllyViolation));
+
+			if (end - p < 4)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a branch's constraint violations are corrupt")));
+			pv->relid = get_be32(p);
+			p += 4;
+			pv->type = get_text(&p, end);
+			pv->row = get_text(&p, end);
+			pv->info = get_text(&p, end);
+			list = lappend(list, pv);
 		}
 	}
+	pfree(key.data);
+	pfree(v.data);
+	return list;
+}
+
+static List *
+copies_violations(void)
+{
+	return violations_of(branch_ops()->current());
+}
+
+static void
+copies_set_violations(List *violations)
+{
+	StringInfoData key;
+	StringInfoData v;
+	ListCell   *lc;
+
+	refs_init();
+	initStringInfo(&key);
+	violations_key(&key, branch_ops()->current());
+	if (violations == NIL)
+	{
+		if (copies_violations() != NIL)
+			refs_put(key.data, key.len, NULL);
+	}
+	else
+	{
+		initStringInfo(&v);
+		foreach(lc, violations)
+		{
+			ProllyViolation *pv = lfirst(lc);
+
+			put_be32(&v, pv->relid);
+			put_text(&v, pv->type);
+			put_text(&v, pv->row);
+			put_text(&v, pv->info);
+		}
+		refs_put(key.data, key.len, &v);
+		pfree(v.data);
+	}
+	note_merge_changed(branch_ops()->current());
 	pfree(key.data);
 }
 
@@ -1307,4 +1468,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.walk = copies_walk,
 	.checkpoint = copies_checkpoint,
 	.set_head = copies_set_head,
+	.violations = copies_violations,
+	.set_violations = copies_set_violations,
 };

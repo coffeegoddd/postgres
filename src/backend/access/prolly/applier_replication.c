@@ -385,10 +385,15 @@ replication_begin(Relation rel)
 	return a;
 }
 
-/* The next write sees this one. */
+/*
+ * The next write sees this one.  The row found for it is let go, so no
+ * buffer stays pinned between writes (a caller may write each in a
+ * subtransaction of its own).
+ */
 static void
 advance(ProllyApplier *a)
 {
+	ExecClearTuple(a->found);
 	CommandCounterIncrement();
 	a->estate->es_output_cid = GetCurrentCommandId(true);
 }
@@ -438,7 +443,10 @@ static bool
 replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
 {
 	if (!find_row(a, old))
+	{
+		ExecClearTuple(a->found);
 		return false;
+	}
 	if (a->matview)
 	{
 		matview_delete(a);
@@ -454,7 +462,10 @@ static bool
 replication_remove(ProllyApplier *a, TupleTableSlot *old)
 {
 	if (!find_row(a, old))
+	{
+		ExecClearTuple(a->found);
 		return false;
+	}
 	if (a->matview)
 		matview_delete(a);
 	else
