@@ -410,9 +410,6 @@ fails without its fix), and Postgres's suites keep passing after each one.
   pages past the xmin horizon; VACUUM and freezing on shared pages
   (visibility-neutral changes in place; line pointers made unused only
   when no other branch shares the page).
-- Fold epochs, copy on first change after the fold, the changed-page
-  list and its counter (part 2), with pruning and freezing in place on
-  unshared pages.
 - `dolt_branch` and `dolt_checkout` on copies, no commits yet.
 - **Exit:** DDL and TRUNCATE on one branch leave the others alone, for
   tables and every other object kind (`vc_schema` passes); ordinary
@@ -439,6 +436,10 @@ fails without its fix), and Postgres's suites keep passing after each one.
   clone), commit and ancestry, refs and working-set roots; working-set checkpoints.
 - `dolt_commit`, `dolt_log`, `dolt_status`, `dolt_diff` and the views on
   the new store.
+- Fold epochs, copy on first change after the fold, the changed-page
+  list and its counter (part 2), with pruning and freezing in place on
+  unshared pages (moved from step 2, 2026-10-15: they serve the fold, and
+  the list's storage and what a fold keeps on it are decided with it).
 - The working-set diff (part 2) behind `dolt_diff`, `dolt_status` and
   the fold: baselines distinct from heads, candidates from old pages,
   old rows from trees, pages of transactions running at a fold kept.
@@ -743,13 +744,17 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
 - **Remapping** (part 5's rule): an exclusive content lock on a buffer
   whose page is shared first copies the page to a new physical block and
   logs the new entry, outside any critical section.
-- **Fold epochs and changed-page lists** (part 2): a page's first logical
-  change after its relation's fold epoch is copied even when not shared,
-  and listed; built here, used by step 4.
+- **Fold epochs and changed-page lists** (part 2) are built in step 4,
+  with the fold that uses them: nothing folds before then.
 - **Reference counts:** a physical block shared by several maps is freed
-  when the last map that holds it drops it; a per-block count in the
-  allocator's bitmap pages (one byte per block, saturating at 255, then
-  the block is never freed until reclamation in step 7 sweeps).
+  when the last map that holds it drops it.  The counts are a file of
+  their own per tablespace and database (relation file number 9419,
+  beside the allocator and the page store), one byte per physical block:
+  how many maps hold it besides the first, saturating at 255, after which
+  the block is never freed until reclamation in step 7 sweeps.  (Kept
+  apart from the allocator's bitmap pages, which hold one bit per block:
+  a byte there would cut the blocks a bitmap page covers, and so the page
+  store's size, eightfold.)
 
 ### 6.5 Making a branch
 
