@@ -57,6 +57,15 @@
  * may be in another order.  The root is still listed, and its other
  * tables read.
  *
+ * In the other direction, move_schema() turns the branch's definitions into
+ * a root's, with the statements Postgres's deparser printed for them:
+ * tables made, dropped or altered (columns added, dropped, retyped, given
+ * other defaults; constraints, indexes, triggers and rules by name),
+ * routines and views made, replaced or dropped, types and sequences made or
+ * dropped.  Primary keys, which name the rows, and NOT NULL come before
+ * the caller writes the rows; what else they must satisfy (constraints,
+ * indexes, triggers) after.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/canon_catalogs.c
  *
@@ -93,6 +102,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
+#include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -1493,6 +1503,816 @@ folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
 	return same;
 }
 
+/* ------------------------------------------------------------------------
+ * Moving definitions (folded)
+ * ------------------------------------------------------------------------
+ */
+
+/* An item of a folded root: its kind, name and definition (no rows). */
+typedef struct MoveItem
+{
+	char		kind;
+	char	   *name;			/* qualified, in the server's encoding */
+	char	   *def;			/* likewise */
+} MoveItem;
+
+/* A table's definition, as describe_table() lists it. */
+typedef struct TableDef
+{
+	List	   *columns;		/* lines: name, then tab-separated attributes */
+	List	   *constraints;	/* lines: name, a tab, the definition */
+	List	   *indexes;		/* statements */
+	List	   *triggers;		/* statements */
+	List	   *rules;			/* statements */
+} TableDef;
+
+typedef struct SchemaMove
+{
+	List	   *before;			/* statements before the rows are written */
+	List	   *after;			/* and after */
+	List	   *foreign_keys;	/* after, last */
+} SchemaMove;
+
+static char *
+from_utf8(const uint8 *data, int len)
+{
+	return pg_any_to_server(pnstrdup((const char *) data, len), len, PG_UTF8);
+}
+
+/* The items of a folded root, in key order; collations aren't objects. */
+static List *
+move_items(Canon *cn, const ProllyNodeRef *root)
+{
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *items = NIL;
+
+	c = PROLLY_CALL(cn->tree, cursor_open, &cn->env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn->tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn->tree, cursor_next, c, &k, &v))
+	{
+		MoveItem   *it;
+		ProllyValue def;
+
+		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c')
+			continue;
+		definition_of(&k, &v, &def);
+		it = palloc(sizeof(MoveItem));
+		it->kind = (char) k.data[0];
+		it->name = from_utf8(k.data + 2, k.len - 2);
+		it->def = from_utf8(def.data, def.len);
+		items = lappend(items, it);
+	}
+	PROLLY_CALL(cn->tree, cursor_close, c);
+	return items;
+}
+
+static MoveItem *
+find_item(List *items, char kind, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, items)
+	{
+		MoveItem   *it = lfirst(lc);
+
+		if (it->kind == kind && strcmp(it->name, name) == 0)
+			return it;
+	}
+	return NULL;
+}
+
+static void
+parse_table_def(const char *def, TableDef *td)
+{
+	char	   *copy = pstrdup(def);
+	List	  **section = NULL;
+	char	   *line;
+	char	   *next;
+
+	memset(td, 0, sizeof(*td));
+	for (line = copy; line && *line; line = next)
+	{
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		if (strcmp(line, "columns") == 0)
+			section = &td->columns;
+		else if (strcmp(line, "constraints") == 0)
+			section = &td->constraints;
+		else if (strcmp(line, "indexes") == 0)
+			section = &td->indexes;
+		else if (strcmp(line, "triggers") == 0)
+			section = &td->triggers;
+		else if (strcmp(line, "rules") == 0)
+			section = &td->rules;
+		else if (section)
+			*section = lappend(*section, pstrdup(line));
+	}
+}
+
+/* The first tab-separated field of a line: a column's or constraint's name. */
+static char *
+first_field(const char *line)
+{
+	return pnstrdup(line, strcspn(line, "\t"));
+}
+
+/* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
+static char *
+index_name(const char *stmt)
+{
+	const char *p = strstr(stmt, " INDEX ");
+
+	if (p == NULL)
+		elog(ERROR, "unexpected index definition \"%s\"", stmt);
+	p += strlen(" INDEX ");
+	return pnstrdup(p, strcspn(p, " "));
+}
+
+/* A trigger's or rule's name: CREATE [CONSTRAINT] TRIGGER name ..., CREATE RULE name ... */
+static char *
+object_name(const char *stmt, const char *word)
+{
+	const char *p = strstr(stmt, word);
+
+	if (p == NULL)
+		elog(ERROR, "unexpected definition \"%s\"", stmt);
+	p += strlen(word);
+	return pnstrdup(p, strcspn(p, " "));
+}
+
+/* Where s is in list, or -1. */
+static int
+list_member_index_string(List *list, const char *s)
+{
+	ListCell   *lc;
+
+	foreach(lc, list)
+		if (strcmp(lfirst(lc), s) == 0)
+			return foreach_current_index(lc);
+	return -1;
+}
+
+static bool
+list_has_string(List *list, const char *s)
+{
+	ListCell   *lc;
+
+	foreach(lc, list)
+		if (strcmp(lfirst(lc), s) == 0)
+			return true;
+	return false;
+}
+
+/* The schema of a qualified name, as written. */
+static char *
+schema_of(const char *qualified_name)
+{
+	List	   *names = stringToQualifiedNameList(qualified_name, NULL);
+
+	return list_length(names) > 1 ? pstrdup(quote_identifier(strVal(linitial(names)))) :
+		pstrdup("public");
+}
+
+/* A column, as CREATE TABLE and ADD COLUMN write it. */
+static char *
+column_sql(const char *line)
+{
+	char	   *copy = pstrdup(line);
+	char	   *name = strtok(copy, "\t");
+	char	   *type = strtok(NULL, "\t");
+	char	   *f;
+	char	   *collate = NULL;
+	char	   *def = NULL;
+	char	   *generated = NULL;
+	char		identity = 0;
+	char		stored = 's';
+	StringInfoData sql;
+
+	while ((f = strtok(NULL, "\t")) != NULL)
+	{
+		if (strncmp(f, "collate ", 8) == 0)
+			collate = f + 8;
+		else if (strncmp(f, "default ", 8) == 0)
+			def = f + 8;
+		else if (strncmp(f, "generated ", 10) == 0)
+			generated = f + 10;
+		else if (strncmp(f, "identity ", 9) == 0)
+			identity = f[9];
+		else if (strncmp(f, "stored ", 7) == 0)
+			stored = f[7];
+		/* "not null" comes with the constraints */
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "%s %s", name, type);
+	if (collate)
+		appendStringInfo(&sql, " COLLATE %s", collate);
+	if (generated)
+		appendStringInfo(&sql, " GENERATED ALWAYS AS (%s) %s", generated,
+						 stored == 'v' ? "VIRTUAL" : "STORED");
+	else if (def)
+		appendStringInfo(&sql, " DEFAULT %s", def);
+	if (identity)
+		appendStringInfo(&sql, " GENERATED %s AS IDENTITY",
+						 identity == 'a' ? "ALWAYS" : "BY DEFAULT");
+	return sql.data;
+}
+
+/* A column line's attribute, by its prefix ("default "); NULL if none. */
+static char *
+column_attr(const char *line, const char *prefix)
+{
+	char	   *copy = pstrdup(line);
+	char	   *f = strtok(copy, "\t");
+
+	while ((f = strtok(NULL, "\t")) != NULL)
+		if (strncmp(f, prefix, strlen(prefix)) == 0)
+			return f + strlen(prefix);
+	return NULL;
+}
+
+/* The column line (type and collation fields) as ALTER COLUMN TYPE writes it. */
+static char *
+column_type_sql(const char *line)
+{
+	char	   *copy = pstrdup(line);
+	char	   *type;
+	char	   *collate = column_attr(line, "collate ");
+
+	(void) strtok(copy, "\t");
+	type = strtok(NULL, "\t");
+	return collate ? psprintf("%s COLLATE %s", type, collate) : pstrdup(type);
+}
+
+static bool
+same_strings(const char *a, const char *b)
+{
+	return (a == NULL && b == NULL) || (a && b && strcmp(a, b) == 0);
+}
+
+/*
+ * The statements turning table name's definition from (NULL: none) into to
+ * (NULL: dropped): what must go before the rows are written, and what the
+ * rows must satisfy, after.  Columns are added and dropped, and changed in
+ * type or default, when that gives to's columns in to's order; else the
+ * table is made again (its rows written afresh).
+ */
+static bool
+move_table(SchemaMove *sm, const char *name, const TableDef *from,
+		   const TableDef *to)
+{
+	TableDef	none;
+	bool		remake = false;
+	List	   *from_names = NIL;
+	List	   *to_names = NIL;
+	ListCell   *lc;
+
+	memset(&none, 0, sizeof(none));
+	if (to == NULL)
+	{
+		/* (its foreign keys first, as other tables' may point at it) */
+		foreach(lc, from->constraints)
+			if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
+				sm->before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+											name, first_field(lfirst(lc))),
+								   sm->before);
+		sm->before = lappend(sm->before, psprintf("DROP TABLE %s", name));
+		return true;
+	}
+	if (from != NULL)
+	{
+		ListCell   *a;
+		ListCell   *b;
+		List	   *kept_from = NIL;
+		List	   *kept_to = NIL;
+		bool		adding = false;
+
+		foreach(lc, from->columns)
+			from_names = lappend(from_names, first_field(lfirst(lc)));
+		foreach(lc, to->columns)
+			to_names = lappend(to_names, first_field(lfirst(lc)));
+		foreach(lc, from_names)
+			if (list_has_string(to_names, lfirst(lc)))
+				kept_from = lappend(kept_from, lfirst(lc));
+		foreach(lc, to_names)
+		{
+			if (list_has_string(from_names, lfirst(lc)))
+			{
+				kept_to = lappend(kept_to, lfirst(lc));
+				if (adding)
+					remake = true;	/* an added column before a kept one */
+			}
+			else
+				adding = true;
+		}
+		forboth(a, kept_from, b, kept_to)
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				remake = true;	/* kept columns in another order */
+		foreach(lc, to->columns)
+		{
+			const char *line = lfirst(lc);
+			char	   *col = first_field(line);
+			int			i = list_member_index_string(from_names, col);
+
+			if (i < 0)
+				continue;
+			if (!same_strings(column_attr(line, "generated "),
+							  column_attr(list_nth(from->columns, i), "generated ")) ||
+				!same_strings(column_attr(line, "identity "),
+							  column_attr(list_nth(from->columns, i), "identity ")))
+				remake = true;
+		}
+	}
+	if (from == NULL || remake)
+	{
+		StringInfoData sql;
+
+		if (from != NULL)
+			(void) move_table(sm, name, from, NULL);
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "CREATE TABLE %s (", name);
+		foreach(lc, to->columns)
+			appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
+							 column_sql(lfirst(lc)));
+		appendStringInfoChar(&sql, ')');
+		sm->before = lappend(sm->before, sql.data);
+		from = &none;
+	}
+	else
+	{
+		/* Columns dropped, added, changed. */
+		foreach(lc, from_names)
+			if (!list_has_string(to_names, lfirst(lc)))
+				sm->before = lappend(sm->before,
+									 psprintf("ALTER TABLE %s DROP COLUMN %s",
+											  name, (char *) lfirst(lc)));
+		foreach(lc, to->columns)
+		{
+			const char *line = lfirst(lc);
+			char	   *col = first_field(line);
+			int			i = list_member_index_string(from_names, col);
+			const char *old;
+
+			if (i < 0)
+			{
+				sm->before = lappend(sm->before,
+									 psprintf("ALTER TABLE %s ADD COLUMN %s",
+											  name, column_sql(line)));
+				continue;
+			}
+			old = list_nth(from->columns, i);
+			if (strcmp(column_type_sql(old), column_type_sql(line)) != 0)
+				sm->before = lappend(sm->before,
+									 psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s",
+											  name, col, column_type_sql(line), col,
+											  column_type_sql(line)));
+			if (!same_strings(column_attr(old, "default "), column_attr(line, "default ")))
+				sm->before = lappend(sm->before,
+									 column_attr(line, "default ") ?
+									 psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+											  name, col, column_attr(line, "default ")) :
+									 psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
+											  name, col));
+		}
+	}
+
+	/* Triggers, rules, constraints and indexes going: before the rows. */
+	foreach(lc, from->triggers)
+		if (!list_has_string(to->triggers, lfirst(lc)))
+			sm->before = lappend(sm->before,
+								 psprintf("DROP TRIGGER %s ON %s",
+										  object_name(lfirst(lc), " TRIGGER "), name));
+	foreach(lc, from->rules)
+		if (!list_has_string(to->rules, lfirst(lc)))
+			sm->before = lappend(sm->before,
+								 psprintf("DROP RULE %s ON %s",
+										  object_name(lfirst(lc), "CREATE RULE "), name));
+	foreach(lc, from->constraints)
+	{
+		char	   *sql;
+
+		if (list_has_string(to->constraints, lfirst(lc)))
+			continue;
+		sql = psprintf("ALTER TABLE %s DROP CONSTRAINT %s", name,
+					   first_field(lfirst(lc)));
+		/* (foreign keys first: they may need others' keys) */
+		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
+			sm->before = lcons(sql, sm->before);
+		else
+			sm->before = lappend(sm->before, sql);
+	}
+	foreach(lc, from->indexes)
+	{
+		char	   *idx = index_name(lfirst(lc));
+		bool		owned = false;
+		ListCell   *c;
+
+		foreach(c, from->constraints)
+			if (strcmp(first_field(lfirst(c)), idx) == 0)
+				owned = true;	/* goes with its constraint */
+		if (!owned && !list_has_string(to->indexes, lfirst(lc)))
+			sm->before = lappend(sm->before, psprintf("DROP INDEX %s.%s",
+													  schema_of(name), idx));
+	}
+
+	/*
+	 * And coming: NOT NULL first, then the primary key, before the rows,
+	 * since the key names them (and both sides hold to them); the rest
+	 * after, foreign keys last.
+	 */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		foreach(lc, to->constraints)
+		{
+			const char *line = lfirst(lc);
+			bool		not_null = strstr(line, "\tNOT NULL ") != NULL;
+			bool		key = strstr(line, "\tPRIMARY KEY ") != NULL;
+			char	   *sql;
+
+			if (list_has_string(from->constraints, line) ||
+				(pass == 0) != not_null)
+				continue;
+			sql = psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", name,
+						   first_field(line), strchr(line, '\t') + 1);
+
+			/* (an identity column, or a key, may have made it already) */
+			if (not_null)
+				sql = psprintf("DO $move$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint "
+							   "WHERE conrelid = %s::pg_catalog.regclass AND "
+							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
+							   quote_literal_cstr(name), quote_literal_cstr(first_field(line)),
+							   quote_literal_cstr(sql));
+			if (not_null || key)
+				sm->before = lappend(sm->before, sql);
+			else if (strstr(line, "\tFOREIGN KEY ") != NULL)
+				sm->foreign_keys = lappend(sm->foreign_keys, sql);
+			else
+				sm->after = lappend(sm->after, sql);
+		}
+	}
+	foreach(lc, to->indexes)
+	{
+		char	   *idx = index_name(lfirst(lc));
+		bool		owned = false;
+		ListCell   *c;
+
+		foreach(c, to->constraints)
+			if (strcmp(first_field(lfirst(c)), idx) == 0)
+				owned = true;
+		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
+			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	}
+	foreach(lc, to->triggers)
+		if (!list_has_string(from->triggers, lfirst(lc)))
+			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	foreach(lc, to->rules)
+		if (!list_has_string(from->rules, lfirst(lc)))
+			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	return remake;
+}
+
+/* A type, as described ("enum", "domain" or "composite", then lines). */
+static char *
+create_type_sql(const char *name, const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *kind = strtok(copy, "\n");
+	char	   *line;
+	StringInfoData sql;
+	bool		first = true;
+
+	initStringInfo(&sql);
+	if (strcmp(kind, "enum") == 0)
+	{
+		appendStringInfo(&sql, "CREATE TYPE %s AS ENUM (", name);
+		while ((line = strtok(NULL, "\n")) != NULL)
+		{
+			appendStringInfo(&sql, "%s%s", first ? "" : ", ", line);
+			first = false;
+		}
+		appendStringInfoChar(&sql, ')');
+	}
+	else if (strcmp(kind, "composite") == 0)
+	{
+		appendStringInfo(&sql, "CREATE TYPE %s AS (", name);
+		while ((line = strtok(NULL, "\n")) != NULL)
+		{
+			char	   *tab = strchr(line, '\t');
+
+			*tab = ' ';
+			appendStringInfo(&sql, "%s%s", first ? "" : ", ", line);
+			first = false;
+		}
+		appendStringInfoChar(&sql, ')');
+	}
+	else
+	{
+		char	   *base = strtok(NULL, "\n");
+		char	   *tab = strchr(base, '\t');
+
+		if (tab)
+			*tab = '\0';
+		appendStringInfo(&sql, "CREATE DOMAIN %s AS %s%s", name, base,
+						 tab ? " NOT NULL" : "");
+		while ((line = strtok(NULL, "\n")) != NULL)
+		{
+			char	   *t = strchr(line, '\t');
+
+			*t = '\0';
+			appendStringInfo(&sql, " CONSTRAINT %s %s", line, t + 1);
+		}
+	}
+	return sql.data;
+}
+
+/* A sequence's options, as described (type, start, increment, max, min, cache, cycle). */
+static char *
+sequence_options(const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *type = strtok(copy, "\t");
+	char	   *start = strtok(NULL, "\t");
+	char	   *incr = strtok(NULL, "\t");
+	char	   *max = strtok(NULL, "\t");
+	char	   *min = strtok(NULL, "\t");
+	char	   *cache = strtok(NULL, "\t");
+	char	   *cycle = strtok(NULL, "\t\n");
+
+	return psprintf("AS %s START %s INCREMENT %s MAXVALUE %s MINVALUE %s CACHE %s %s",
+					type, start, incr, max, min, cache,
+					strcmp(cycle, "cycle") == 0 ? "CYCLE" : "NO CYCLE");
+}
+
+/* DROP FUNCTION or DROP PROCEDURE, as the definition says. */
+static char *
+drop_routine_sql(const MoveItem *it)
+{
+	return psprintf("DROP %s %s",
+					strstr(it->def, "CREATE OR REPLACE PROCEDURE") == it->def ?
+					"PROCEDURE" : "FUNCTION", it->name);
+}
+
+/*
+ * Make views, each after the views it uses: those that fail are tried
+ * again once others are made, until none can be.
+ */
+static void
+make_views(List *views)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+
+	while (views != NIL)
+	{
+		List	   *failed = NIL;
+		ErrorData  *last = NULL;
+		ListCell   *lc;
+
+		foreach(lc, views)
+		{
+			BeginInternalSubTransaction(NULL);
+			MemoryContextSwitchTo(mcxt);
+			PG_TRY();
+			{
+				int			rc = SPI_execute(lfirst(lc), false, 0);
+
+				if (rc < 0)
+					elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
+						 SPI_result_code_string(rc));
+				ReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(mcxt);
+				CurrentResourceOwner = owner;
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(mcxt);
+				last = CopyErrorData();
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(mcxt);
+				CurrentResourceOwner = owner;
+				failed = lappend(failed, lfirst(lc));
+			}
+			PG_END_TRY();
+		}
+		if (list_length(failed) == list_length(views))
+			ReThrowError(last);
+		views = failed;
+	}
+}
+
+static void
+run_statements(List *stmts)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+	{
+		int			rc = SPI_execute(lfirst(lc), false, 0);
+
+		if (rc < 0)
+			elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
+				 SPI_result_code_string(rc));
+	}
+}
+
+/*
+ * Make the session branch's objects defined as to has them, from as from
+ * has them (the branch folded now): the statements before the rows, then
+ * rows(arg), which writes them, then what they must satisfy.
+ */
+static void
+folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
+				   void (*rows) (void *arg), void *arg)
+{
+	Canon		cn;
+	List	   *from;
+	List	   *to;
+	SchemaMove	sm = {NIL, NIL, NIL};
+	List	   *views = NIL;
+	List	   *routines = NIL;
+	List	   *remade = NIL;
+	ListCell   *lc;
+	int			save_nestlevel;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	from = move_items(&cn, from_root);
+	to = move_items(&cn, to_root);
+
+	/* Going: views first, as they may use anything; then tables, routines, the rest. */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+
+		/* Views go, and come again: they may use what changes. */
+		if (f->kind == 'v')
+		{
+			sm.before = lcons(psprintf("DROP VIEW IF EXISTS %s CASCADE", f->name),
+							  sm.before);
+			continue;
+		}
+		if (t && strcmp(t->def, f->def) == 0)
+			continue;
+		switch (f->kind)
+		{
+			case 'f':
+				if (t == NULL)
+					routines = lappend(routines, drop_routine_sql(f));
+				break;
+			case 'y':
+				if (t != NULL)
+					goto unsupported;
+				break;
+			case 's':
+			case 't':
+				break;
+			default:
+				goto unsupported;
+		}
+	}
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+		TableDef	fd;
+		TableDef	td;
+
+		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+			continue;
+		parse_table_def(f->def, &fd);
+		if (t)
+			parse_table_def(t->def, &td);
+		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
+			remade = lappend(remade, f->name);
+	}
+
+	/*
+	 * Foreign keys both sides have, into a table made again or dropped: they
+	 * go first, and the ones kept come back last.
+	 */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+		TableDef	fd;
+		TableDef	td;
+		ListCell   *c;
+
+		if (f->kind != 't' || remade == NIL || list_has_string(remade, f->name))
+			continue;
+		parse_table_def(f->def, &fd);
+		if (t)
+			parse_table_def(t->def, &td);
+		foreach(c, fd.constraints)
+		{
+			const char *line = lfirst(c);
+			ListCell   *r;
+
+			if (strstr(line, "\tFOREIGN KEY ") == NULL ||
+				(t && !list_has_string(td.constraints, line)))
+				continue;		/* (changed ones are move_table()'s) */
+			foreach(r, remade)
+			{
+				if (strstr(line, psprintf(" REFERENCES %s(", (char *) lfirst(r))) == NULL)
+					continue;
+				sm.before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+										   f->name, first_field(line)), sm.before);
+				if (t)
+					sm.foreign_keys = lappend(sm.foreign_keys,
+											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
+													   f->name, first_field(line),
+													   strchr(line, '\t') + 1));
+				break;
+			}
+		}
+	}
+	sm.before = list_concat(sm.before, routines);
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+
+		if (find_item(to, f->kind, f->name) == NULL)
+		{
+			if (f->kind == 'y')
+				sm.before = lappend(sm.before, psprintf("DROP TYPE %s", f->name));
+			else if (f->kind == 's')
+				sm.before = lappend(sm.before, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
+		}
+	}
+
+	/* Coming: types, sequences, routines, tables; views after the rows. */
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		if (f && strcmp(t->def, f->def) == 0)
+			continue;
+		if (t->kind == 'y')
+			sm.before = lappend(sm.before, create_type_sql(t->name, t->def));
+		else if (t->kind == 's')
+			sm.before = lappend(sm.before,
+								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
+										 t->name, sequence_options(t->def)));
+		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
+			goto unsupported;
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		if (t->kind == 'f' && !(f && strcmp(t->def, f->def) == 0))
+			sm.before = lappend(sm.before, t->def);
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		TableDef	td;
+
+		if (t->kind != 't' || find_item(from, 't', t->name) != NULL)
+			continue;
+		parse_table_def(t->def, &td);
+		move_table(&sm, t->name, NULL, &td);
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		(void) f;
+		if (t->kind == 'v')
+			views = lappend(views, psprintf("CREATE VIEW %s AS %s", t->name, t->def));
+	}
+
+	/* Run them as deparsed: names qualified, routines' bodies unchecked. */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("check_function_bodies", "off", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	SPI_connect();
+	run_statements(sm.before);
+	CommandCounterIncrement();
+	rows(arg);
+	run_statements(sm.after);
+	run_statements(sm.foreign_keys);
+	make_views(views);
+	SPI_finish();
+	AtEOXact_GUC(true, save_nestlevel);
+	return;
+
+unsupported:
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("the branch can't be moved to a commit that defines types or materialized views differently yet")));
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -1507,6 +2327,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
+	.move_schema = folded_move_schema,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {

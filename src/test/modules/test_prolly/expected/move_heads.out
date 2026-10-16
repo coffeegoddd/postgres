@@ -220,7 +220,8 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
--- Not yet: other definitions.  (Diverged branches merge, three-way.)
+-- Other definitions: the branch moves to them too; diverged branches whose
+-- definitions differ don't merge yet.
 SELECT dolt_checkout('at_first');
             dolt_checkout            
 -------------------------------------
@@ -241,11 +242,17 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT (dolt_merge('at_first'))[2:4];
-ERROR:  the branch can't be moved to a commit that defines its objects differently yet
-DETAIL:  Its versioned schemas' tables or other objects are made, dropped or defined differently there.
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
 SELECT dolt_reset('--hard', 'at_first');
-ERROR:  the branch can't be moved to a commit that defines its objects differently yet
-DETAIL:  Its versioned schemas' tables or other objects are made, dropped or defined differently there.
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 UPDATE app.t SET v = 'diverged' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
  committed 
@@ -254,13 +261,11 @@ SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('at_second'))[2:4];
-ERROR:  merge conflict detected, transaction rolled back
-DETAIL:  1 row was changed differently on both branches.
-HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+ERROR:  commits whose objects are defined differently can't be merged yet
+DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined between them.
 SELECT (dolt_merge('--no-ff', 'at_second'))[2:4];
-ERROR:  merge conflict detected, transaction rolled back
-DETAIL:  1 row was changed differently on both branches.
-HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+ERROR:  commits whose objects are defined differently can't be merged yet
+DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined between them.
 SELECT dolt_branch('-D', 'at_first', 'at_second');
  dolt_branch 
 -------------

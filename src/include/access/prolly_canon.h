@@ -30,6 +30,10 @@
  *   qualified name, its data tree and its definition as described.
  * - same_schema() is whether two folded roots hold the same objects with
  *   the same definitions, whatever their tables' rows.
+ * - move_schema() makes the session branch's objects defined as a folded
+ *   root defines them, from as another (the branch folded now) does: it
+ *   changes the definitions, then calls rows(), which writes the tables'
+ *   rows, then adds what the rows must satisfy.
  *
  * Provisional (v0).
  *
@@ -72,11 +76,13 @@ typedef struct ProllyCanonRoutine
 	void		(*materialized_views) (const ProllyNodeRef *root,
 									   ProllyCanonTableVisit visit, void *arg);
 	bool		(*same_schema) (const ProllyNodeRef *a, const ProllyNodeRef *b);
+	void		(*move_schema) (const ProllyNodeRef *from, const ProllyNodeRef *to,
+								void (*rows) (void *arg), void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
-	"materialized_views", "same_schema"
+	"materialized_views", "same_schema", "move_schema"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *
