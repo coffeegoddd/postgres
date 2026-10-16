@@ -411,11 +411,20 @@ fails without its fix), and Postgres's suites keep passing after each one.
   (visibility-neutral changes in place; line pointers made unused only
   when no other branch shares the page).
 - `dolt_branch` and `dolt_checkout` on copies, no commits yet.
+- Locks on a versioned object's copy are the branch's: relation, tuple,
+  page and predicate locks carry the branch, so sessions on different
+  branches don't wait for each other (user, 2026-10-16).
+- Making a branch takes `CREATE` on the database; deleting one takes
+  owning it (user, 2026-10-16).
+- Known limit, accepted (user, 2026-10-16): a standby's sessions don't
+  hold up a branch deletion replayed there.
 - **Exit:** DDL and TRUNCATE on one branch leave the others alone, for
-  tables and every other object kind (`vc_schema` passes); ordinary
-  schemas are unaffected by branches; a shared object depending on a
-  versioned one is refused; branch creation reads no table's pages; the
-  S suite on a branch matches heap.
+  tables and every other object kind; ordinary schemas are unaffected by
+  branches; a shared object depending on a versioned one is refused;
+  branch creation reads no table's pages; sessions on different branches
+  don't block each other; the S suite on a branch matches heap.
+  (`vc_schema` moved to step 4's exit, user 2026-10-16: it needs
+  commits.)
 
 **Step 3. The chunk store, WAL-logged.**
 - The journal and its index, table files, the manifest and the refs map,
@@ -425,6 +434,11 @@ fails without its fix), and Postgres's suites keep passing after each one.
   table files, manifests, unlinks; redo and base-backup consistency.
 - Pageless nodes and the byte-based chunker; the tree, diff and merge
   code reading and writing through the new store.
+- Table files compress chunks with LZ4, or not at all where Postgres is
+  built without it (user, 2026-10-16).
+- Keys ordered by a collation record its version in the commit; reading
+  a commit whose collation version differs from the database's is
+  refused (user, 2026-10-16).
 - **Exit:** the tree tests of `test_prolly` pass on the new store; crash
   tests at every record boundary recover to the last committed root; a
   standby's store matches the primary's byte for byte.
@@ -443,9 +457,20 @@ fails without its fix), and Postgres's suites keep passing after each one.
 - The working-set diff (part 2) behind `dolt_diff`, `dolt_status` and
   the fold: baselines distinct from heads, candidates from old pages,
   old rows from trees, pages of transactions running at a fold kept.
+- Decided (user, 2026-10-16):
+  - `dolt_commit` in an open transaction folds that transaction's own
+    writes too, and the Dolt commit is part of the transaction: it is
+    gone if the transaction rolls back.
+  - Working-set checkpoints are taken when asked for and when a session
+    leaves a branch with changes, nothing automatic until measured.
+  - The canonical format (hash, keys, rows, nodes) freezes at the end of
+    this step; every chunk carries a format version byte.
+  - A keyless table's diff may fall back to comparing the table in full
+    (O(N)) where a candidate's key can't be read.
 - **Exit:** gate 6 (history independence) and the requirements suite's
-  commit and history tests pass; commit, diff and status cost track
-  changed pages (counted, as the tree diff's node reads are).
+  commit and history tests (`vc_schema` among them) pass; commit, diff
+  and status cost track changed pages (counted, as the tree diff's node
+  reads are).
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
@@ -453,6 +478,20 @@ fails without its fix), and Postgres's suites keep passing after each one.
   branch with no pages.
 - Three-way merge over trees into a working set with changes; conflicts
   as built; cherry-pick, revert.
+- Decided (user, 2026-10-16):
+  - Reset, merge and checkout of a commit on a branch other sessions
+    use behave as in Dolt: the branch's working set changes under them,
+    as a committed transaction's changes do.
+  - Rows written by merge, reset and fast-forward fire no user triggers
+    and recheck no foreign keys, as logical replication's apply does;
+    merge records constraint violations as `dolt_constraint_violations`
+    rows, as Dolt does.
+  - Schema merge follows Dolt: additive changes merge, the same object
+    changed differently on both sides is a schema conflict, and a
+    conflicting column type change fails the merge.
+  - Checking out a commit (not a branch) gives a detached, read-only
+    session; changing anything takes a branch made from it.
+  - A merge gives each sequence the larger of its two values.
 - **Exit:** `vc_branches`, `vc_diff_merge`, `vc_history` and the
   conflicts tests pass; V1–V3 run, V3 with background writes.
 
@@ -769,7 +808,9 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
 
 ### 6.6 Maintenance on shared pages
 
-- Hint bits are written in place on shared pages (they change no row).
+- Hint bits aren't written to a shared page: one may be true of one
+  branch only (an index entry dead there only), so it stays in the
+  branch's buffer and goes with the page when a change copies it.
 - Pruning and freezing remap a shared page first (they write WAL), so
   they never change a page another branch can see.
 - Opportunistic pruning (on a read) skips shared pages, so reads don't
