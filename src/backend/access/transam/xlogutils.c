@@ -654,6 +654,7 @@ CreateFakeRelcacheEntry(RelFileLocator rlocator)
 	 */
 	rel->rd_lockInfo.lockRelId.dbId = rlocator.dbOid;
 	rel->rd_lockInfo.lockRelId.relId = rlocator.relNumber;
+	rel->rd_lockInfo.lockRelId.branchId = InvalidOid;
 
 	/*
 	 * Set up a non-pinned SMgrRelation reference, so that we don't need to

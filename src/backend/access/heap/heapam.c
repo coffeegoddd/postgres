@@ -4434,18 +4434,24 @@ check_lock_if_inplace_updateable_rel(Relation relation,
 				else
 					dbid = MyDatabaseId;
 
+				/* an index's branch is its table's */
 				if (classForm->relkind == RELKIND_INDEX)
 				{
 					Relation	irel = index_open(relid, AccessShareLock);
 
-					SET_LOCKTAG_RELATION(tag, dbid, irel->rd_index->indrelid);
+					SET_LOCKTAG_BRANCH_RELATION(tag, dbid, irel->rd_index->indrelid,
+												classForm->relbranch);
 					index_close(irel, AccessShareLock);
 				}
 				else
-					SET_LOCKTAG_RELATION(tag, dbid, relid);
+					SET_LOCKTAG_BRANCH_RELATION(tag, dbid, relid, classForm->relbranch);
 
 				if (!LockHeldByMe(&tag, ShareUpdateExclusiveLock, false) &&
-					!LockHeldByMe(&tag, ShareRowExclusiveLock, true))
+					!LockHeldByMe(&tag, ShareRowExclusiveLock, true) &&
+					!CheckRelationOidLockedByMe(tag.locktag_field2,
+												ShareUpdateExclusiveLock, false) &&
+					!CheckRelationOidLockedByMe(tag.locktag_field2,
+												ShareRowExclusiveLock, true))
 					elog(WARNING,
 						 "missing lock for relation \"%s\" (OID %u, relkind %c) @ TID (%u,%u)",
 						 NameStr(classForm->relname),
@@ -4488,17 +4494,21 @@ check_inplace_rel_lock(HeapTuple oldtup)
 	else
 		dbid = MyDatabaseId;
 
+	/* an index's branch is its table's */
 	if (classForm->relkind == RELKIND_INDEX)
 	{
 		Relation	irel = index_open(relid, AccessShareLock);
 
-		SET_LOCKTAG_RELATION(tag, dbid, irel->rd_index->indrelid);
+		SET_LOCKTAG_BRANCH_RELATION(tag, dbid, irel->rd_index->indrelid,
+									classForm->relbranch);
 		index_close(irel, AccessShareLock);
 	}
 	else
-		SET_LOCKTAG_RELATION(tag, dbid, relid);
+		SET_LOCKTAG_BRANCH_RELATION(tag, dbid, relid, classForm->relbranch);
 
-	if (!LockHeldByMe(&tag, ShareUpdateExclusiveLock, true))
+	if (!LockHeldByMe(&tag, ShareUpdateExclusiveLock, true) &&
+		!CheckRelationOidLockedByMe(tag.locktag_field2, ShareUpdateExclusiveLock,
+									true))
 		elog(WARNING,
 			 "missing lock for relation \"%s\" (OID %u, relkind %c) @ TID (%u,%u)",
 			 NameStr(classForm->relname),

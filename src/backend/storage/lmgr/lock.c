@@ -267,16 +267,19 @@ int			FastPathLockGroupsPerBackend = 0;
  * self-conflicting, it can't use the fast-path mechanism; but it also does
  * not conflict with any of the locks that do, so we can ignore it completely.
  */
+/* (a fast-path lock records a relation's OID alone: no branch's copy) */
 #define EligibleForRelationFastPath(locktag, mode) \
 	((locktag)->locktag_lockmethodid == DEFAULT_LOCKMETHOD && \
 	(locktag)->locktag_type == LOCKTAG_RELATION && \
 	(locktag)->locktag_field1 == MyDatabaseId && \
+	(locktag)->locktag_field3 == 0 && \
 	MyDatabaseId != InvalidOid && \
 	(mode) < ShareUpdateExclusiveLock)
 #define ConflictsWithRelationFastPath(locktag, mode) \
 	((locktag)->locktag_lockmethodid == DEFAULT_LOCKMETHOD && \
 	(locktag)->locktag_type == LOCKTAG_RELATION && \
 	(locktag)->locktag_field1 != InvalidOid && \
+	(locktag)->locktag_field3 == 0 && \
 	(mode) > ShareUpdateExclusiveLock)
 
 static bool FastPathGrantRelationLock(Oid relid, LOCKMODE lockmode);
@@ -1314,7 +1317,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		 * locktag is defined for LOCKTAG_RELATION
 		 */
 		LogAccessExclusiveLock(locktag->locktag_field1,
-							   locktag->locktag_field2);
+							   locktag->locktag_field2,
+							   locktag->locktag_field3);
 	}
 
 	return LOCKACQUIRE_OK;
@@ -4229,6 +4233,7 @@ GetRunningTransactionLocks(int *nlocks)
 			accessExclusiveLocks[index].xid = xid;
 			accessExclusiveLocks[index].dbOid = lock->tag.locktag_field1;
 			accessExclusiveLocks[index].relOid = lock->tag.locktag_field2;
+			accessExclusiveLocks[index].branch = lock->tag.locktag_field3;
 
 			index++;
 		}
@@ -4556,7 +4561,8 @@ lock_twophase_standby_recover(FullTransactionId fxid, uint16 info,
 	{
 		StandbyAcquireAccessExclusiveLock(XidFromFullTransactionId(fxid),
 										  locktag->locktag_field1 /* dboid */ ,
-										  locktag->locktag_field2 /* reloid */ );
+										  locktag->locktag_field2 /* reloid */ ,
+										  locktag->locktag_field3 /* branch */ );
 	}
 }
 

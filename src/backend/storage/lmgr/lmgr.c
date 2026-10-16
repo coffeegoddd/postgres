@@ -16,7 +16,9 @@
 #include "postgres.h"
 
 #include "access/subtrans.h"
+#include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "commands/progress.h"
 #include "miscadmin.h"
@@ -78,11 +80,25 @@ RelationInitLockInfo(Relation relation)
 		relation->rd_lockInfo.lockRelId.dbId = InvalidOid;
 	else
 		relation->rd_lockInfo.lockRelId.dbId = MyDatabaseId;
+	relation->rd_lockInfo.lockRelId.branchId = relation->rd_rel->relbranch;
 }
+
+/* a relation's locktag from its LockRelId */
+#define SET_LOCKTAG_LOCKRELID(tag, lockrelid) \
+	SET_LOCKTAG_BRANCH_RELATION(tag, (lockrelid).dbId, (lockrelid).relId, \
+								(lockrelid).branchId)
+
+/* the database field of a relation's page and tuple locktags */
+#define LOCKRELID_DBOID(lockrelid) \
+	LOCKTAG_BRANCH_DBOID((lockrelid).dbId, (lockrelid).branchId)
 
 /*
  * SetLocktagRelationOid
  *		Set up a locktag for a relation, given only relation OID
+ *
+ * A versioned relation's locks are its copy's on the session's branch
+ * (see SET_LOCKTAG_BRANCH_RELATION): which a relation is, is looked up.
+ * A relation not in the catalogs yet (being made) is locked as unversioned.
  */
 static inline void
 SetLocktagRelationOid(LOCKTAG *tag, Oid relid)
@@ -94,7 +110,45 @@ SetLocktagRelationOid(LOCKTAG *tag, Oid relid)
 	else
 		dbid = MyDatabaseId;
 
-	SET_LOCKTAG_RELATION(*tag, dbid, relid);
+	SET_LOCKTAG_BRANCH_RELATION(*tag, dbid, relid,
+								OidIsValid(dbid) ? relation_lock_branch(relid) :
+								InvalidOid);
+}
+
+/*
+ * The locktag of a lock this transaction holds on a relation, from its
+ * LockRelId.  A relation this transaction is making was locked before its
+ * catalog rows said which branch it is on, as unversioned: no other session
+ * can see it before commit, so that lock is as good, and is the one held.
+ */
+static inline void
+SetLocktagHeldLockRelId(LOCKTAG *tag, const LockRelId *lockrelid,
+						LOCKMODE lockmode, bool orstronger)
+{
+	SET_LOCKTAG_LOCKRELID(*tag, *lockrelid);
+	if (lockrelid->branchId == InvalidOid ||
+		LockHeldByMe(tag, lockmode, orstronger))
+		return;
+	SET_LOCKTAG_RELATION(*tag, lockrelid->dbId, lockrelid->relId);
+	if (!LockHeldByMe(tag, lockmode, orstronger))
+		SET_LOCKTAG_LOCKRELID(*tag, *lockrelid);
+}
+
+/*
+ * The locktag of a lock this transaction holds on a relation, given only
+ * its OID, for releasing it: the relation may be gone from the catalogs
+ * since it was locked, so the copy on the session's branch is tried first.
+ */
+static inline void
+SetLocktagHeldRelationOid(LOCKTAG *tag, Oid relid, LOCKMODE lockmode)
+{
+	if (!IsSharedRelation(relid) && relid >= FirstNormalObjectId)
+	{
+		SET_LOCKTAG_BRANCH_RELATION(*tag, MyDatabaseId, relid, MyBranch);
+		if (LockHeldByMe(tag, lockmode, false))
+			return;
+	}
+	SetLocktagRelationOid(tag, relid);
 }
 
 /*
@@ -188,7 +242,7 @@ LockRelationId(LockRelId *relid, LOCKMODE lockmode)
 	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
-	SET_LOCKTAG_RELATION(tag, relid->dbId, relid->relId);
+	SET_LOCKTAG_LOCKRELID(tag, *relid);
 
 	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock,
 							  false);
@@ -215,7 +269,7 @@ UnlockRelationId(LockRelId *relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag, relid->dbId, relid->relId);
+	SetLocktagHeldLockRelId(&tag, relid, lockmode, false);
 
 	LockRelease(&tag, lockmode, false);
 }
@@ -230,7 +284,7 @@ UnlockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SetLocktagRelationOid(&tag, relid);
+	SetLocktagHeldRelationOid(&tag, relid, lockmode);
 
 	LockRelease(&tag, lockmode, false);
 }
@@ -249,9 +303,7 @@ LockRelation(Relation relation, LOCKMODE lockmode)
 	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
-	SET_LOCKTAG_RELATION(tag,
-						 relation->rd_lockInfo.lockRelId.dbId,
-						 relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_LOCKRELID(tag, relation->rd_lockInfo.lockRelId);
 
 	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock,
 							  false);
@@ -281,9 +333,7 @@ ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
-	SET_LOCKTAG_RELATION(tag,
-						 relation->rd_lockInfo.lockRelId.dbId,
-						 relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_LOCKRELID(tag, relation->rd_lockInfo.lockRelId);
 
 	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock,
 							  false);
@@ -315,9 +365,8 @@ UnlockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag,
-						 relation->rd_lockInfo.lockRelId.dbId,
-						 relation->rd_lockInfo.lockRelId.relId);
+	SetLocktagHeldLockRelId(&tag, &relation->rd_lockInfo.lockRelId, lockmode,
+							false);
 
 	LockRelease(&tag, lockmode, false);
 }
@@ -335,9 +384,8 @@ CheckRelationLockedByMe(Relation relation, LOCKMODE lockmode, bool orstronger)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag,
-						 relation->rd_lockInfo.lockRelId.dbId,
-						 relation->rd_lockInfo.lockRelId.relId);
+	SetLocktagHeldLockRelId(&tag, &relation->rd_lockInfo.lockRelId, lockmode,
+							orstronger);
 
 	return LockHeldByMe(&tag, lockmode, orstronger);
 }
@@ -352,6 +400,16 @@ CheckRelationOidLockedByMe(Oid relid, LOCKMODE lockmode, bool orstronger)
 {
 	LOCKTAG		tag;
 
+	/* the session branch's copy, or (made in this transaction) unversioned */
+	if (!IsSharedRelation(relid) && relid >= FirstNormalObjectId)
+	{
+		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, MyBranch);
+		if (LockHeldByMe(&tag, lockmode, orstronger))
+			return true;
+		SET_LOCKTAG_RELATION(tag, MyDatabaseId, relid);
+		if (LockHeldByMe(&tag, lockmode, orstronger))
+			return true;
+	}
 	SetLocktagRelationOid(&tag, relid);
 
 	return LockHeldByMe(&tag, lockmode, orstronger);
@@ -368,9 +426,7 @@ LockHasWaitersRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag,
-						 relation->rd_lockInfo.lockRelId.dbId,
-						 relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_LOCKRELID(tag, relation->rd_lockInfo.lockRelId);
 
 	return LockHasWaiters(&tag, lockmode, false);
 }
@@ -392,7 +448,7 @@ LockRelationIdForSession(LockRelId *relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag, relid->dbId, relid->relId);
+	SET_LOCKTAG_LOCKRELID(tag, *relid);
 
 	(void) LockAcquire(&tag, lockmode, true, false);
 }
@@ -405,7 +461,7 @@ UnlockRelationIdForSession(LockRelId *relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION(tag, relid->dbId, relid->relId);
+	SET_LOCKTAG_LOCKRELID(tag, *relid);
 
 	LockRelease(&tag, lockmode, true);
 }
@@ -425,9 +481,10 @@ LockRelationForExtension(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relation->rd_lockInfo.lockRelId.dbId,
-								relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_BRANCH_RELATION_EXTEND(tag,
+									   relation->rd_lockInfo.lockRelId.dbId,
+									   relation->rd_lockInfo.lockRelId.relId,
+									   relation->rd_lockInfo.lockRelId.branchId);
 
 	(void) LockAcquire(&tag, lockmode, false, false);
 }
@@ -443,9 +500,10 @@ ConditionalLockRelationForExtension(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relation->rd_lockInfo.lockRelId.dbId,
-								relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_BRANCH_RELATION_EXTEND(tag,
+									   relation->rd_lockInfo.lockRelId.dbId,
+									   relation->rd_lockInfo.lockRelId.relId,
+									   relation->rd_lockInfo.lockRelId.branchId);
 
 	return (LockAcquire(&tag, lockmode, false, true) != LOCKACQUIRE_NOT_AVAIL);
 }
@@ -460,9 +518,10 @@ RelationExtensionLockWaiterCount(Relation relation)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relation->rd_lockInfo.lockRelId.dbId,
-								relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_BRANCH_RELATION_EXTEND(tag,
+									   relation->rd_lockInfo.lockRelId.dbId,
+									   relation->rd_lockInfo.lockRelId.relId,
+									   relation->rd_lockInfo.lockRelId.branchId);
 
 	return LockWaiterCount(&tag);
 }
@@ -475,9 +534,10 @@ UnlockRelationForExtension(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relation->rd_lockInfo.lockRelId.dbId,
-								relation->rd_lockInfo.lockRelId.relId);
+	SET_LOCKTAG_BRANCH_RELATION_EXTEND(tag,
+									   relation->rd_lockInfo.lockRelId.dbId,
+									   relation->rd_lockInfo.lockRelId.relId,
+									   relation->rd_lockInfo.lockRelId.branchId);
 
 	LockRelease(&tag, lockmode, false);
 }
@@ -509,7 +569,7 @@ LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_PAGE(tag,
-					 relation->rd_lockInfo.lockRelId.dbId,
+					 LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					 relation->rd_lockInfo.lockRelId.relId,
 					 blkno);
 
@@ -528,7 +588,7 @@ ConditionalLockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_PAGE(tag,
-					 relation->rd_lockInfo.lockRelId.dbId,
+					 LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					 relation->rd_lockInfo.lockRelId.relId,
 					 blkno);
 
@@ -544,7 +604,7 @@ UnlockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_PAGE(tag,
-					 relation->rd_lockInfo.lockRelId.dbId,
+					 LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					 relation->rd_lockInfo.lockRelId.relId,
 					 blkno);
 
@@ -564,7 +624,7 @@ LockTuple(Relation relation, const ItemPointerData *tid, LOCKMODE lockmode)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_TUPLE(tag,
-					  relation->rd_lockInfo.lockRelId.dbId,
+					  LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					  relation->rd_lockInfo.lockRelId.relId,
 					  ItemPointerGetBlockNumber(tid),
 					  ItemPointerGetOffsetNumber(tid));
@@ -585,7 +645,7 @@ ConditionalLockTuple(Relation relation, const ItemPointerData *tid, LOCKMODE loc
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_TUPLE(tag,
-					  relation->rd_lockInfo.lockRelId.dbId,
+					  LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					  relation->rd_lockInfo.lockRelId.relId,
 					  ItemPointerGetBlockNumber(tid),
 					  ItemPointerGetOffsetNumber(tid));
@@ -603,7 +663,7 @@ UnlockTuple(Relation relation, const ItemPointerData *tid, LOCKMODE lockmode)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_TUPLE(tag,
-					  relation->rd_lockInfo.lockRelId.dbId,
+					  LOCKRELID_DBOID(relation->rd_lockInfo.lockRelId),
 					  relation->rd_lockInfo.lockRelId.relId,
 					  ItemPointerGetBlockNumber(tid),
 					  ItemPointerGetOffsetNumber(tid));

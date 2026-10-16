@@ -95,7 +95,8 @@ extern void LogRecoveryConflict(RecoveryConflictReason reason, TimestampTz wait_
  * to make hot standby work. That includes logging AccessExclusiveLocks taken
  * by transactions and running-xacts snapshots.
  */
-extern void StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid);
+extern void StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid,
+											  Oid branch);
 extern void StandbyReleaseLockTree(TransactionId xid,
 								   int nsubxids, TransactionId *subxids);
 extern void StandbyReleaseAllLocks(void);
@@ -140,7 +141,7 @@ typedef struct RunningTransactionsData
 
 typedef RunningTransactionsData *RunningTransactions;
 
-extern void LogAccessExclusiveLock(Oid dbOid, Oid relOid);
+extern void LogAccessExclusiveLock(Oid dbOid, Oid relOid, Oid branch);
 extern void LogAccessExclusiveLockPrepare(void);
 
 extern XLogRecPtr LogStandbySnapshot(void);

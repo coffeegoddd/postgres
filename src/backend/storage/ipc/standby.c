@@ -985,7 +985,8 @@ StandbyLockTimeoutHandler(void)
 
 
 void
-StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid)
+StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid,
+								  Oid branch)
 {
 	RecoveryLockXidEntry *xidentry;
 	RecoveryLockEntry *lockentry;
@@ -1016,11 +1017,12 @@ StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid)
 	key.xid = xid;
 	key.dbOid = dbOid;
 	key.relOid = relOid;
+	key.branch = branch;
 	lockentry = hash_search(RecoveryLockHash, &key, HASH_ENTER, &found);
 	if (!found)
 	{
 		/* First, acquire the lock ... */
-		SET_LOCKTAG_RELATION(locktag, dbOid, relOid);
+		SET_LOCKTAG_BRANCH_RELATION(locktag, dbOid, relOid, branch);
 
 		(void) LockAcquire(&locktag, AccessExclusiveLock, true, false);
 
@@ -1047,7 +1049,8 @@ StandbyReleaseXidEntryLocks(RecoveryLockXidEntry *xidentry)
 			 "releasing recovery lock: xid %u db %u rel %u",
 			 entry->key.xid, entry->key.dbOid, entry->key.relOid);
 		/* Release the lock ... */
-		SET_LOCKTAG_RELATION(locktag, entry->key.dbOid, entry->key.relOid);
+		SET_LOCKTAG_BRANCH_RELATION(locktag, entry->key.dbOid, entry->key.relOid,
+									entry->key.branch);
 		if (!LockRelease(&locktag, AccessExclusiveLock, true))
 		{
 			elog(LOG,
@@ -1181,7 +1184,8 @@ standby_redo(XLogReaderState *record)
 		for (i = 0; i < xlrec->nlocks; i++)
 			StandbyAcquireAccessExclusiveLock(xlrec->locks[i].xid,
 											  xlrec->locks[i].dbOid,
-											  xlrec->locks[i].relOid);
+											  xlrec->locks[i].relOid,
+											  xlrec->locks[i].branch);
 	}
 	else if (info == XLOG_RUNNING_XACTS)
 	{
@@ -1431,7 +1435,7 @@ LogAccessExclusiveLocks(int nlocks, xl_standby_lock *locks)
  * Individual logging of AccessExclusiveLocks for use during LockAcquire()
  */
 void
-LogAccessExclusiveLock(Oid dbOid, Oid relOid)
+LogAccessExclusiveLock(Oid dbOid, Oid relOid, Oid branch)
 {
 	xl_standby_lock xlrec;
 
@@ -1439,6 +1443,7 @@ LogAccessExclusiveLock(Oid dbOid, Oid relOid)
 
 	xlrec.dbOid = dbOid;
 	xlrec.relOid = relOid;
+	xlrec.branch = branch;
 
 	LogAccessExclusiveLocks(1, &xlrec);
 	MyXactFlags |= XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK;

@@ -184,6 +184,8 @@ CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid,
 	 */
 	srcrelid.dbId = src_dboid;
 	dstrelid.dbId = dst_dboid;
+	/* nobody uses either database: each branch's copy is locked as one */
+	srcrelid.branchId = dstrelid.branchId = InvalidOid;
 
 	/* Loop over our list of relfilelocators and copy each one. */
 	foreach(cell, rlocatorlist)
@@ -274,6 +276,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	/* Don't read data into shared_buffers without holding a relation lock. */
 	relid.dbId = dbid;
 	relid.relId = RelationRelationId;
+	relid.branchId = InvalidOid;
 	LockRelationId(&relid, AccessShareLock);
 
 	/* Prepare a RelFileLocator for the pg_class relation. */

@@ -89,6 +89,7 @@ tests += {
       't/034_bmap_share_limits.pl',
       't/035_bmap_replaced_blocks.pl',
       't/036_bmap_shared_changes.pl',
+      't/037_branch_locks.pl',
     ],
   },
 }

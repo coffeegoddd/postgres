@@ -2288,7 +2288,8 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 
 		/* save lockrelid and locktag for below, then close but keep locks */
 		heaprelid = userHeapRelation->rd_lockInfo.lockRelId;
-		SET_LOCKTAG_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId);
+		SET_LOCKTAG_BRANCH_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId,
+									heaprelid.branchId);
 		indexrelid = userIndexRelation->rd_lockInfo.lockRelId;
 
 		table_close(userHeapRelation, NoLock);

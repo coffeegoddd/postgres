@@ -21829,7 +21829,8 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		 * We don't need to concern ourselves with waiting for a lock on the
 		 * partition itself, since we will acquire AccessExclusiveLock below.
 		 */
-		SET_LOCKTAG_RELATION(tag, MyDatabaseId, parentrelid);
+		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, parentrelid,
+									relation_lock_branch(parentrelid));
 		WaitForLockersMultiple(list_make1(&tag), AccessExclusiveLock, false);
 
 		/*

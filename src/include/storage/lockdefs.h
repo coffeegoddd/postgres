@@ -56,6 +56,7 @@ typedef struct xl_standby_lock
 	TransactionId xid;			/* xid of holder of AccessExclusiveLock */
 	Oid			dbOid;			/* DB containing table */
 	Oid			relOid;			/* OID of table */
+	Oid			branch;			/* its copy's branch if versioned, else 0 */
 } xl_standby_lock;
 
 #endif							/* LOCKDEFS_H_ */
