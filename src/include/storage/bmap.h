@@ -33,6 +33,10 @@ extern void bmapopen(SMgrRelation reln);
 extern void bmapclose(SMgrRelation reln, ForkNumber forknum);
 extern void bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool bmapexists(SMgrRelation reln, ForkNumber forknum);
+extern void bmapshare(SMgrRelation src, SMgrRelation dst);
+extern bool bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum);
+extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber blocknum, XLogRecPtr lsn);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
@@ -75,6 +79,13 @@ extern bool bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate);
 
 /* remove a database's unused block map from a tablespace's directory */
 extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
+
+/* inspection, for tests */
+extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
+							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
+extern uint32 bmap_inspect_epoch(SMgrRelation reln);
+extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
+								   uint32 *nfree);
 
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);

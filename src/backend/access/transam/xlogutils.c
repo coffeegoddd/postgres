@@ -281,7 +281,8 @@ XLogCheckInvalidPages(void)
  *	BLK_RESTORED	- block was restored from a full-page image included in
  *					  the record
  *	BLK_NOTFOUND	- block was not found (because it was truncated away by
- *					  an operation later in the WAL stream)
+ *					  an operation later in the WAL stream, or given other
+ *					  storage by one: smgrreplacedafter())
  *
  * On return, the buffer is locked in exclusive-mode, and returned in *buf.
  * Note that the buffer is locked and returned even if it doesn't need
@@ -431,6 +432,19 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	}
 	else
 	{
+		/*
+		 * A block given other storage after this record has what the record
+		 * changed in the page the new storage began with; the storage may
+		 * hold another relation's page until then.
+		 */
+		if (!zeromode &&
+			smgrreplacedafter(smgropen(rlocator, INVALID_PROC_NUMBER),
+							  forknum, blkno, record->ReadRecPtr))
+		{
+			*buf = InvalidBuffer;
+			return BLK_NOTFOUND;
+		}
+
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
 		if (BufferIsValid(*buf))
 		{
@@ -517,9 +531,23 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	if (blkno < lastblock)
 	{
+		ReadBufferMode readmode = mode;
+
+		/*
+		 * Where a block's storage can be given to another relation, it may
+		 * hold that relation's page: one this block's replay hasn't reached
+		 * yet (smgrreplacedafter()) and which fails verification here.  It
+		 * reads as uninitialized, so it is logged as invalid, as a page past
+		 * the end would be, and is forgotten when replay reaches the change
+		 * of storage (or what made it possible: a truncation); a page truly
+		 * damaged is reported when recovery reaches consistency.
+		 */
+		if (mode == RBM_NORMAL && smgrreplacesblocks(smgr, forknum))
+			readmode = RBM_ZERO_ON_ERROR;
+
 		/* page exists in file */
 		buffer = ReadBufferWithoutRelcache(rlocator, forknum, blkno,
-										   mode, NULL, true);
+										   readmode, NULL, true);
 	}
 	else
 	{

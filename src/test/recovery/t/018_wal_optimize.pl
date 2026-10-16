@@ -41,9 +41,11 @@ sub check_orphan_relfilenodes
 		}
 	}
 	# A mapped relation's map replaces its main file.  The database also
-	# owns a shared allocator and page store (storage/bmap_files.h).
-	# Keep checking both missing and unreferenced relation/map files.
-	push @referenced, "${prefix}9420", "${prefix}9421" if $has_bmap;
+	# owns a shared allocator, page store and reference counts
+	# (storage/bmap_files.h).  Keep checking both missing and unreferenced
+	# relation/map files.
+	push @referenced, "${prefix}9419", "${prefix}9420", "${prefix}9421"
+	  if $has_bmap;
 	is_deeply(
 		[
 			sort(map { "$prefix$_" }

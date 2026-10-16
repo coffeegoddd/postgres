@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'bmap_checks.c',
   'branch_checks.c',
   'catalog_checks.c',
   'engine_checks.c',
@@ -42,9 +43,13 @@ tests += {
       'versioned_schemas',
       'catalog_branch_column',
       'branch_catalogs',
+      'bmap_sharing',
     ],
   },
   'tap': {
+    'env': {
+       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
     'tests': [
       't/001_store_recovery.pl',
       't/002_d1_heads.pl',
@@ -76,6 +81,9 @@ tests += {
       't/028_bmap_storage.pl',
       't/029_versioned_schema_dump.pl',
       't/030_branch_connect.pl',
+      't/031_bmap_share.pl',
+      't/034_bmap_share_limits.pl',
+      't/035_bmap_replaced_blocks.pl',
     ],
   },
 }

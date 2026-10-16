@@ -203,6 +203,52 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 }
 
 /*
+ * RelationCreateStorageShared
+ *		Create a permanent relation's storage as a copy of another's.
+ *
+ * The new main fork shares src's pages until either relation changes one
+ * (smgrshare()); its other forks start empty.  As RelationCreateStorage(),
+ * the storage is deleted if the transaction aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
+							bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/*
+	 * Registered first: a share that fails partway leaves the new storage
+	 * holding some of src's pages, which only dropping it gives back.
+	 */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrshare(src, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	/*
+	 * No pending sync, even when WAL is skipped for new relations: the share
+	 * is logged and synced, and syncing the new relation at commit could
+	 * log and write every page it shares.
+	 */
+	return srel;
+}
+
+/*
  * Perform XLogInsert of an XLOG_SMGR_CREATE record to WAL.
  */
 void

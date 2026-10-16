@@ -3,6 +3,7 @@
 MODULE_big = test_prolly
 OBJS = \
 	$(WIN32RES) \
+	bmap_checks.o \
 	branch_checks.o \
 	catalog_checks.o \
 	engine_checks.o \
@@ -16,9 +17,12 @@ PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
-REGRESS = test_prolly d1_tables d1_index d1_maintenance prolly_tables versioned_schemas catalog_branch_column branch_catalogs
+REGRESS = test_prolly d1_tables d1_index d1_maintenance prolly_tables versioned_schemas catalog_branch_column branch_catalogs bmap_sharing
 TAP_TESTS = 1
-EXTRA_INSTALL = contrib/tsm_system_rows
+EXTRA_INSTALL = contrib/tsm_system_rows contrib/pg_buffercache \
+	src/test/modules/injection_points
+
+export enable_injection_points
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

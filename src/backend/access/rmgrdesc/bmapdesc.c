@@ -46,6 +46,26 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->old_hw, xlrec->new_hw, xlrec->nreused);
 				break;
 			}
+		case XLOG_BMAP_SHARE:
+		case XLOG_BMAP_SHARED:
+			{
+				xl_bmap_share *xlrec = (xl_bmap_share *) rec;
+
+				appendStringInfo(buf, "rel %u/%u/%u; copy %u",
+								 xlrec->src.spcOid, xlrec->src.dbOid,
+								 xlrec->src.relNumber, xlrec->dst.relNumber);
+				break;
+			}
+		case XLOG_BMAP_UNREF:
+			{
+				xl_bmap_unref *xlrec = (xl_bmap_unref *) rec;
+
+				appendStringInfo(buf, "rel %u/%u/%u%s",
+								 xlrec->locator.spcOid, xlrec->locator.dbOid,
+								 xlrec->locator.relNumber,
+								 (xlrec->flags & BMAP_UNREF_MAP) ? "; map" : "");
+				break;
+			}
 		default:
 			break;
 	}
@@ -66,6 +86,12 @@ bmap_identify(uint8 info)
 			return "TRUNCATE";
 		case XLOG_BMAP_FREE:
 			return "FREE";
+		case XLOG_BMAP_SHARE:
+			return "SHARE";
+		case XLOG_BMAP_SHARED:
+			return "SHARED";
+		case XLOG_BMAP_UNREF:
+			return "UNREF";
 	}
 	return NULL;
 }

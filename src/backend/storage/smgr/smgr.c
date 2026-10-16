@@ -102,6 +102,26 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
+
+	/*
+	 * Create dst's main fork as a copy of src's that shares its pages until
+	 * either changes them; may be NULL.
+	 */
+	void		(*smgr_share) (SMgrRelation src, SMgrRelation dst);
+
+	/*
+	 * Can the fork's blocks be given other storage, which may have held
+	 * another relation's pages?  May be NULL (never).
+	 */
+	bool		(*smgr_replacesblocks) (SMgrRelation reln, ForkNumber forknum);
+
+	/*
+	 * In recovery: was the block given other storage after WAL position
+	 * lsn, so that a record from before then doesn't apply to what it has
+	 * now?  Required if smgr_replacesblocks is set.
+	 */
+	bool		(*smgr_replacedafter) (SMgrRelation reln, ForkNumber forknum,
+									   BlockNumber blocknum, XLogRecPtr lsn);
 	/* before a relation's buffers are dropped to unlink it; may be NULL */
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
@@ -176,6 +196,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = bmapclose,
 		.smgr_create = bmapcreate,
 		.smgr_exists = bmapexists,
+		.smgr_share = bmapshare,
+		.smgr_replacesblocks = bmapreplacesblocks,
+		.smgr_replacedafter = bmapreplacedafter,
 		.smgr_predrop = bmappredrop,
 		.smgr_unlink = bmapunlink,
 		.smgr_extend = bmapextend,
@@ -574,6 +597,78 @@ smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum, bool isRedo)
 	}
 	smgrsw[which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrshare() -- Create dst's main fork as a copy of src's, sharing its pages.
+ *
+ * dst is a new relation in the same tablespace and database, held by src's
+ * implementation from then on.  The pages stay shared until either relation
+ * changes one, which gives it its own copy of the page.
+ *
+ * The caller keeps src's pages from changing meanwhile, and arranges for dst
+ * to be dropped if the share fails partway, which may leave it holding some
+ * of src's pages.
+ */
+void
+smgrshare(SMgrRelation src, SMgrRelation dst)
+{
+	int			which = src->smgr_which;
+
+	if (smgrsw[which].smgr_share == NULL)
+		elog(ERROR, "storage of relation %s can't be shared",
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+
+	HOLD_INTERRUPTS();
+	if (dst->smgr_which != which)
+	{
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+		{
+			smgrsw[dst->smgr_which].smgr_close(dst, fork);
+			dst->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+		}
+		dst->smgr_which = which;
+		smgrsw[which].smgr_open(dst);
+	}
+	RESUME_INTERRUPTS();
+	smgrsw[which].smgr_share(src, dst);
+}
+
+/*
+ * smgrreplacedafter() -- In recovery, was the block given other storage
+ * after WAL position lsn?
+ *
+ * Redo skips reading a block for a record from before then: what the record
+ * changed is in the page the replacement began with, and the storage the
+ * block has now may still hold another relation's page.
+ */
+bool
+smgrreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				  XLogRecPtr lsn)
+{
+	if (!smgrreplacesblocks(reln, forknum))
+		return false;
+	return smgrsw[reln->smgr_which].smgr_replacedafter(reln, forknum,
+													   blocknum, lsn);
+}
+
+/*
+ * smgrreplacesblocks() -- Can the fork's blocks be given other storage
+ * (smgrreplacedafter()), which may have held another relation's pages?
+ */
+bool
+smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum)
+{
+	if (smgrsw[reln->smgr_which].smgr_replacesblocks == NULL)
+		return false;
+	return smgrsw[reln->smgr_which].smgr_replacesblocks(reln, forknum);
+}
+
+/* does this relation's storage implementation share pages (smgrshare())? */
+bool
+smgrcanshare(SMgrRelation reln)
+{
+	return smgrsw[reln->smgr_which].smgr_share != NULL;
 }
 
 /*

@@ -15,8 +15,10 @@
  *	BMAP_STORE_RELNUMBER	the page store.  Its pages carry checksums computed
  *							with their logical block numbers, so tools that
  *							verify checksums from files skip it
+ *	BMAP_REFS_RELNUMBER		reference counts: for each physical block, how many
+ *							maps hold it besides the first
  *
- * The two relation file numbers are reserved: below FirstGenbkiObjectId and
+ * The three relation file numbers are reserved: below FirstGenbkiObjectId and
  * used by no catalog object.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -31,5 +33,6 @@
 
 #define BMAP_ALLOC_RELNUMBER	9420
 #define BMAP_STORE_RELNUMBER	9421
+#define BMAP_REFS_RELNUMBER		9419
 
 #endif							/* BMAP_FILES_H */

@@ -36,7 +36,7 @@ jobs:
 
       - name: Build
         run: |
-          ./configure --enable-cassert --enable-debug --enable-tap-tests --with-openssl
+          ./configure --enable-cassert --enable-debug --enable-tap-tests --enable-injection-points --with-openssl
           make -s -j4
           make -s -j4 -C contrib
 

@@ -93,3 +93,40 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_branch_current()
 RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Block-mapped storage's sharing, below the catalogs: storage is named by
+-- relation file number in the database's default tablespace.  A copy
+-- made by test_bmap_share() lasts until test_bmap_unlink() drops it, or,
+-- if transactional, until the transaction aborts.
+CREATE FUNCTION test_bmap_share(relnumber oid, transactional bool DEFAULT false)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_digest(relnumber oid)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_map(relnumber oid,
+	OUT blkno int8, OUT phys int8, OUT epoch int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_epoch(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_free_blocks()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_unlink(relnumber oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_extend(relnumber oid, n int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
