@@ -76,6 +76,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "nodes/makefuncs.h"
+#include "catalog/pg_attribute.h"
+#include "parser/parse_type.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
@@ -1667,6 +1670,7 @@ typedef struct MoveItem
 	char		kind;
 	char	   *name;			/* qualified, in the server's encoding */
 	char	   *def;			/* likewise */
+	ProllyHash	data;			/* a table's or materialized view's rows */
 } MoveItem;
 
 /* A table's definition, as describe_table() lists it. */
@@ -1715,7 +1719,12 @@ move_items(Canon *cn, const ProllyNodeRef *root)
 		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c')
 			continue;
 		definition_of(&k, &v, &def);
-		it = palloc(sizeof(MoveItem));
+		it = palloc0(sizeof(MoveItem));
+		if ((k.data[0] == 't' || k.data[0] == 'm') && def.data != v.data)
+		{
+			it->data.len = v.data[0];
+			memcpy(it->data.bytes, v.data + 1, v.data[0]);
+		}
 		it->kind = (char) k.data[0];
 		it->name = from_utf8(k.data + 2, k.len - 2);
 		it->def = from_utf8(def.data, def.len);
@@ -2458,6 +2467,185 @@ identity_sequences(List *from, List *to, List *remade)
 	return names;
 }
 
+/* The attribute names of a composite type, as described. */
+static List *
+composite_attributes(const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *line = strtok(copy, "\n");	/* "composite" */
+	List	   *names = NIL;
+
+	while ((line = strtok(NULL, "\n")) != NULL)
+	{
+		char	   *tab = strchr(line, '\t');
+
+		if (tab)
+			*tab = '\0';
+		names = lappend(names, pstrdup(line));
+	}
+	return names;
+}
+
+/*
+ * A composite value of col as the new type has it: each attribute by name
+ * from the old, null where the old had none.
+ */
+static char *
+composite_conversion(const char *col, const char *from_def, const char *to_def,
+					 const char *type)
+{
+	List	   *from = composite_attributes(from_def);
+	List	   *to = composite_attributes(to_def);
+	StringInfoData e;
+	ListCell   *lc;
+	bool		first = true;
+
+	initStringInfo(&e);
+	appendStringInfo(&e, "CASE WHEN %s IS NULL THEN NULL ELSE ROW(", col);
+	foreach(lc, to)
+	{
+		appendStringInfo(&e, "%s", first ? "" : ", ");
+		if (list_has_string(from, lfirst(lc)))
+			appendStringInfo(&e, "(%s).%s", col, (char *) lfirst(lc));
+		else
+			appendStringInfoString(&e, "NULL");
+		first = false;
+	}
+	appendStringInfo(&e, ")::%s END", type);
+	return e.data;
+}
+
+/*
+ * The statements that make the types to defines otherwise than from, under
+ * their names: each one renamed out of the way, made anew, the columns of
+ * versioned tables using it (or arrays of it) converted through its text
+ * form (an enum's labels it no longer has becoming null), and the old one
+ * dropped.  Views and materialized views go first, as they may use them
+ * (*all_dropped says so); the move makes them again.
+ */
+static List *
+type_moves(List *from, List *to, bool *all_dropped)
+{
+	List	   *stmts = NIL;
+	List	   *drops = NIL;
+	ListCell   *lc;
+
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+
+		if (f->kind == 'm' && (t == NULL || strcmp(t->def, f->def) != 0))
+			drops = lappend(drops, psprintf("DROP MATERIALIZED VIEW IF EXISTS %s CASCADE",
+											f->name));
+	}
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+		List	   *names;
+		Oid			typid;
+		Oid			arrayid;
+		char	   *aside;
+		char	   *aside_q;
+		bool		is_enum;
+		Relation	pg_attribute;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		if (f->kind != 'y' || t == NULL || strcmp(t->def, f->def) == 0)
+			continue;
+		names = stringToQualifiedNameList(f->name, NULL);
+		typid = typenameTypeId(NULL, makeTypeNameFromNameList(names));
+		arrayid = get_array_type(typid);
+		is_enum = strncmp(t->def, "enum\n", 5) == 0;
+		aside = psprintf("prolly_moving_%u", typid);
+		aside_q = psprintf("%s.%s", schema_of(f->name), quote_identifier(aside));
+		stmts = lappend(stmts, psprintf("ALTER TYPE %s RENAME TO %s", f->name,
+										quote_identifier(aside)));
+		stmts = lappend(stmts, create_type_sql(t->name, t->def));
+
+		pg_attribute = table_open(AttributeRelationId, AccessShareLock);
+		scan = systable_beginscan(pg_attribute, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(tup);
+			char	   *rel;
+			const char *col;
+
+			if (att->attisdropped || att->attnum <= 0 ||
+				(att->atttypid != typid && att->atttypid != arrayid) ||
+				get_rel_relkind(att->attrelid) != RELKIND_RELATION ||
+				!namespace_is_versioned(get_rel_namespace(att->attrelid)))
+				continue;
+			rel = qualified(get_rel_namespace(att->attrelid), get_rel_name(att->attrelid));
+			col = quote_identifier(NameStr(att->attname));
+			if (att->atttypid == arrayid && is_enum)
+			{
+				/*
+				 * (an array's elements one by one, as a function: not a
+				 * subquery; beside the type, which a function elsewhere
+				 * can't use, and dropped after)
+				 */
+				char	   *fn = psprintf("%s.prolly_moving_%u_array",
+										  schema_of(t->name), typid);
+
+				stmts = lappend(stmts,
+								psprintf("CREATE OR REPLACE FUNCTION %s(a text[]) RETURNS %s[] "
+										 "LANGUAGE sql AS $f$ SELECT coalesce(array_agg("
+										 "CASE WHEN e = ANY (enum_range(NULL::%s)::text[]) "
+										 "THEN e::%s END ORDER BY i), '{}') "
+										 "FROM unnest(a) WITH ORDINALITY u(e, i) $f$",
+										 fn, t->name, t->name, t->name));
+				stmts = lappend(stmts,
+								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s[] USING "
+										 "CASE WHEN %s IS NOT NULL THEN %s(%s::text[]) END",
+										 rel, col, t->name, col, fn, col));
+				stmts = lappend(stmts, psprintf("DROP FUNCTION %s(text[])", fn));
+			}
+			else if (att->atttypid == arrayid)
+				stmts = lappend(stmts,
+								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s[] USING %s::text::%s[]",
+										 rel, col, t->name, col, t->name));
+			else if (strncmp(t->def, "composite\n", 10) == 0)
+				stmts = lappend(stmts,
+								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
+										 rel, col, t->name,
+										 composite_conversion(col, f->def, t->def, t->name)));
+			else if (is_enum)
+				stmts = lappend(stmts,
+								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING "
+										 "CASE WHEN %s::text = ANY (enum_range(NULL::%s)::text[]) "
+										 "THEN %s::text::%s END",
+										 rel, col, t->name, col, t->name, col, t->name));
+			else
+				stmts = lappend(stmts,
+								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::text::%s",
+										 rel, col, t->name, col, t->name));
+		}
+		systable_endscan(scan);
+		table_close(pg_attribute, AccessShareLock);
+		stmts = lappend(stmts, psprintf("DROP TYPE %s", aside_q));
+	}
+	*all_dropped = stmts != NIL;
+	if (stmts != NIL)
+	{
+		foreach(lc, from)
+		{
+			MoveItem   *f = lfirst(lc);
+
+			MoveItem   *t = find_item(to, f->kind, f->name);
+
+			if (f->kind == 'v')
+				drops = lappend(drops, psprintf("DROP VIEW IF EXISTS %s CASCADE", f->name));
+			else if (f->kind == 'm' && t != NULL && strcmp(t->def, f->def) == 0)
+				drops = lappend(drops, psprintf("DROP MATERIALIZED VIEW IF EXISTS %s CASCADE",
+												f->name));	/* (the others went above) */
+		}
+	}
+	return list_concat(drops, stmts);
+}
+
 /*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
@@ -2473,11 +2661,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL};
 	List	   *views = NIL;
 	List	   *view_drops = NIL;
+	List	   *matview_drops = NIL;
 	List	   *keyed;
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
 	List	   *remade = NIL;
+	List	   *moves;
+	bool		all_dropped;
 	ListCell   *lc;
 	int			save_nestlevel;
 	MemoryContext caller = CurrentMemoryContext;
@@ -2505,6 +2696,15 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 								 psprintf("DROP VIEW IF EXISTS %s", f->name));
 			continue;
 		}
+
+		/*
+		 * Materialized views go before them, as they may use them, and
+		 * come again with the rows the commit holds.
+		 */
+		if (f->kind == 'm')
+			matview_drops = lappend(matview_drops,
+									psprintf("DROP MATERIALIZED VIEW IF EXISTS %s",
+											 f->name));
 		if (t && strcmp(t->def, f->def) == 0)
 			continue;
 		switch (f->kind)
@@ -2514,9 +2714,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					routines = lappend(routines, drop_routine_sql(f));
 				break;
 			case 'y':
-				if (t != NULL)
-					goto unsupported;
-				break;
+			case 'm':
 			case 'n':
 			case 's':
 			case 't':
@@ -2629,12 +2827,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			continue;
 		if (t->kind == 'n')
 			continue;			/* (above) */
-		if (t->kind == 'y')
+		if (t->kind == 'y' && f == NULL)
 			sm.before = lappend(sm.before, create_type_sql(t->name, t->def));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
 										sequence_options_sql(t->def)));
+		else if (t->kind == 'y' || t->kind == 'm')
+			;					/* changed types first, materialized views last */
 		else if (t->kind == 's')
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
@@ -2664,15 +2864,32 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(t->def, &td);
 		move_table(&sm, t->name, NULL, &td);
 	}
+	moves = type_moves(from, to, &all_dropped);
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
 		MoveItem   *f = find_item(from, t->kind, t->name);
 
-		(void) f;
 		if (t->kind == 'v')
 			views = lappend(views, psprintf("CREATE VIEW %s AS %s", t->name, t->def));
+		/* materialized views made again, or refreshed, once the rows are in */
+		else if (t->kind == 'm' &&
+				 (f == NULL || all_dropped || view_drops != NIL ||
+				  strcmp(t->def, f->def) != 0))
+			views = lappend(views, psprintf("CREATE MATERIALIZED VIEW %s AS %s",
+											t->name, t->def));
+		else if (t->kind == 'm' &&
+				 (t->data.len != f->data.len ||
+				  memcmp(t->data.bytes, f->data.bytes, t->data.len) != 0))
+			views = lappend(views, psprintf("REFRESH MATERIALIZED VIEW %s", t->name));
 	}
+
+	/*
+	 * Changed types go first, before anything uses them anew: every view
+	 * and materialized view that may use one dropped, then each type made
+	 * again under its name and the columns using it moved to it.
+	 */
+	sm.before = list_concat(moves, sm.before);
 
 	/* Run them as deparsed: names qualified, routines' bodies unchecked. */
 	save_nestlevel = NewGUCNestLevel();
@@ -2684,7 +2901,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
-	make_views(view_drops);
+	make_views(view_drops != NIL ? list_concat(matview_drops, view_drops) :
+			   NIL);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
 	CommandCounterIncrement();
 	/* the rows in the caller's memory: what they keep outlives SPI's */
@@ -2704,7 +2922,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 unsupported:
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("the branch can't be moved to a commit that defines types or materialized views differently yet")));
+			 errmsg("the branch can't be moved to a commit that defines objects of this kind differently")));
 }
 
 /*

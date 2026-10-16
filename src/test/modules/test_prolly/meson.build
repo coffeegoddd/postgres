@@ -67,6 +67,7 @@ tests += {
       'dirty_merges',
       'constraint_violations',
       'redefined_merges',
+      'type_moves',
     ],
   },
   'tap': {
