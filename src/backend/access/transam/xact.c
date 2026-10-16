@@ -86,6 +86,12 @@ int			XactIsoLevel = XACT_READ_COMMITTED;
 bool		DefaultXactReadOnly = false;
 bool		XactReadOnly;
 
+/*
+ * Every transaction of the session is read-only, whatever is asked (a
+ * session on a commit rather than a branch); set and cleared by its owner.
+ */
+bool		XactReadOnlyForced = false;
+
 bool		DefaultXactDeferrable = false;
 bool		XactDeferrable;
 
@@ -2224,7 +2230,7 @@ StartTransaction(void)
 	else
 	{
 		s->startedInRecovery = false;
-		XactReadOnly = DefaultXactReadOnly;
+		XactReadOnly = DefaultXactReadOnly || XactReadOnlyForced;
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;
