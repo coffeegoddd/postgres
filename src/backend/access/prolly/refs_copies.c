@@ -46,9 +46,11 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 #define TAG_BRANCH		'B'
+#define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
 static const ProllyTreeRoutine *tree;
@@ -232,12 +234,16 @@ branch_head(const char *name, ProllyHash *head)
 	return found && head->len > 0;
 }
 
-/* Make head (NULL: none) branch name's head commit. */
+/*
+ * Make head (NULL: none) branch name's head commit, noting the transaction
+ * that moved it (head_moved_unseen()).
+ */
 static void
 branch_set_head(const char *name, const ProllyHash *head)
 {
 	StringInfoData key;
 	StringInfoData v;
+	TransactionId xid = head ? GetTopTransactionId() : InvalidTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -245,8 +251,60 @@ branch_set_head(const char *name, const ProllyHash *head)
 	if (head)
 		put_hash(&v, head);
 	refs_put(key.data, key.len, head ? &v : NULL);
+
+	resetStringInfo(&key);
+	resetStringInfo(&v);
+	appendStringInfoChar(&key, TAG_MOVER);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &xid, sizeof(xid));
+	refs_put(key.data, key.len, head ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
+}
+
+/*
+ * Did a transaction the active snapshot doesn't see move branch name's
+ * head?  (A committer that waited for the refs finds the head another
+ * moved, while its snapshot, taken before, lacks that one's rows.)
+ */
+static bool
+head_moved_unseen(const char *name)
+{
+	StringInfoData key;
+	StringInfoData v;
+	TransactionId xid = InvalidTransactionId;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_MOVER);
+	appendStringInfoString(&key, name);
+	if (refs_get(key.data, key.len, &v) && v.len == sizeof(xid))
+		memcpy(&xid, v.data, sizeof(xid));
+	pfree(key.data);
+	pfree(v.data);
+	return TransactionIdIsValid(xid) && !TransactionIdIsCurrentTransactionId(xid) &&
+		XidInMVCCSnapshot(xid, GetActiveSnapshot());
+}
+
+/*
+ * With the refs held, a snapshot that sees the head's commit: the active
+ * one, or (read committed) a newer one, pushed (true; the caller pops it).
+ * A transaction whose snapshot can't move fails instead, to be retried,
+ * as a commit on top of a head it can't see would undo that head's rows.
+ */
+static bool
+see_head(const char *name)
+{
+	if (!head_moved_unseen(name))
+		return false;
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+	PushActiveSnapshot(GetLatestSnapshot());
+	return true;
 }
 
 typedef struct FindBranch
@@ -534,9 +592,26 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 {
 	char	   *name = branch_ops()->current();
 	ProllyNodeRef root;
+	bool		pushed;
+	ProllyHash	head;
 
 	lock_refs();
+
+	/*
+	 * Parents read before the refs were held (a merge's, say) may no longer
+	 * have the head among them: committing would leave the commit another
+	 * made meanwhile off the branch.
+	 */
+	if (nparents > 0 && branch_head(name, &head) && !same_hash(&head, &parents[0]))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved while this was being committed",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+	pushed = see_head(name);
 	fold(&root);
+	if (pushed)
+		PopActiveSnapshot();
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);

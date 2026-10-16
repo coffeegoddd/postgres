@@ -54,6 +54,55 @@ is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('f')}), 'on f,first',
 $a->quit;
 $b->quit;
 
+# Two committers on one branch: the one that waited for the other builds on
+# its commit with its rows (read committed: a newer snapshot), or, if its
+# snapshot can't move (repeatable read), fails to be retried, never
+# committing a root without them on top of it.
+sql('CREATE EXTENSION test_prolly');
+sub waits_for
+{
+	my ($what) = @_;
+	return $node->poll_query_until('postgres', qq{
+		SELECT count(*) > 0 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+		WHERE NOT l.granted AND a.query LIKE '%$what%'});
+}
+my $first = $node->background_psql('postgres');
+my $second = $node->background_psql('postgres', on_error_stop => 0);
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (10, 'first');
+	SELECT dolt_commit('-m', 'first of two')});
+$second->query_until(qr/started/, q{
+	\echo started
+	INSERT INTO app.t VALUES (11, 'second');
+	SELECT dolt_commit('-m', 'second of two');
+	\echo committed
+});
+ok(waits_for('second of two'), 'a second committer on the branch waits');
+$first->query_safe('COMMIT');
+$second->query_until(qr/committed/, '');
+is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('main')}),
+	'second of two,first of two,on main,first', 'it builds on the first');
+is(sql(q{SELECT test_fold_root() = prolly_root_hash('main')}), 't',
+	'with the first one\'s rows');
+
+$second->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (12, 'first');
+	SELECT dolt_commit('-m', 'first again')});
+$second->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_commit('--allow-empty', '-m', 'second again');
+	\echo done
+});
+ok(waits_for('second again'), 'a repeatable read committer waits too');
+$first->query_safe('COMMIT');
+$second->query_until(qr/done/, '');
+like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
+	'and, its snapshot lacking the first one\'s commit, fails');
+$second->query('ROLLBACK');
+is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('main')}),
+	'first again,second of two,first of two,on main,first', 'committing nothing');
+$first->quit;
+$second->quit;
+
 # A crash keeps them, and a standby has them.
 my $heads = q{SELECT string_agg(name || ':' || coalesce(hash, '') || ':' ||
 	latest_commit_message, ',' ORDER BY name) FROM dolt_branches()};

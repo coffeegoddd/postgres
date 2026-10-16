@@ -66,4 +66,13 @@ SELECT dolt_hashof('nope');
 SELECT dolt_branch('k', dolt_hashof('main~1'));
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'h');
+
+-- Dropping the last versioned schema is a change to commit: the history
+-- stays the database's, and the next commit continues it.
+SELECT count(*) AS commits FROM dolt_log('HEAD') \gset
+SELECT dolt_hashof('HEAD') AS before_drop \gset
 DROP SCHEMA app CASCADE;
+SELECT count(*) = :commits AS history_kept FROM dolt_log('HEAD');
+SELECT dolt_hashof('HEAD') = :'before_drop' AS same_head;
+SELECT length(dolt_commit('-Am', 'drop the schema')::text) AS committed;
+SELECT dolt_hashof('HEAD~1') = :'before_drop' AS continues_it;

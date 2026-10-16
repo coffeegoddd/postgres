@@ -671,7 +671,7 @@ dolt_hashof(PG_FUNCTION_ARGS)
 Datum
 active_branch(PG_FUNCTION_ARGS)
 {
-	if (database_uses_branch_copies())
+	if (prolly_database_uses_copies())
 		PG_RETURN_TEXT_P(cstring_to_text(branch_ops()->current()));
 	PG_RETURN_TEXT_P(cstring_to_text(session_branch_name()));
 }

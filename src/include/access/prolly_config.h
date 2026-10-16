@@ -95,6 +95,7 @@ extern void prolly_components_for_engine(const ProllyImplInfo *engine,
 										 ProllyComponents *components);
 
 extern void prolly_database_components(ProllyDatabaseComponents *components);
+extern bool prolly_database_uses_copies(void);
 
 /* Is amname a prolly table access method? */
 extern bool prolly_is_table_am(const char *amname);
