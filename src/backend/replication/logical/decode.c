@@ -1140,6 +1140,7 @@ DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		change->data.truncate.cascade = true;
 	if (xlrec->flags & XLH_TRUNCATE_RESTART_SEQS)
 		change->data.truncate.restart_seqs = true;
+	change->data.truncate.branch = xlrec->branch;
 	change->data.truncate.nrelids = xlrec->nrelids;
 	change->data.truncate.relids = ReorderBufferAllocRelids(ctx->reorder,
 															xlrec->nrelids);

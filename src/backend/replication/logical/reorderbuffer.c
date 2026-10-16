@@ -95,6 +95,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "common/int.h"
 #include "lib/binaryheap.h"
@@ -2352,6 +2353,15 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 						change->data.tp.newtuple == NULL &&
 						change->data.tp.oldtuple == NULL)
 						goto change_done;
+
+					/*
+					 * A change to another branch's copy of a versioned table:
+					 * this session decodes its own branch's changes only.
+					 */
+					if (reloid == InvalidOid &&
+						relfilenumber_on_other_branch(change->data.tp.rlocator.spcOid,
+													  change->data.tp.rlocator.relNumber))
+						goto change_done;
 					else if (reloid == InvalidOid)
 						elog(ERROR, "could not map filenumber \"%s\" to relation OID",
 							 relpathperm(change->data.tp.rlocator,
@@ -2492,6 +2502,12 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 						int			nrelations = 0;
 						Relation   *relations;
 
+						/*
+						 * Truncated on another branch: its versioned relations
+						 * are that branch's copies, not this session's.
+						 */
+						bool		other_branch = change->data.truncate.branch != MyBranch;
+
 						relations = palloc0_array(Relation, nrelids);
 						for (i = 0; i < nrelids; i++)
 						{
@@ -2500,8 +2516,15 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 							rel = RelationIdGetRelation(relid);
 
+							if (!RelationIsValid(rel) && other_branch)
+								continue;
 							if (!RelationIsValid(rel))
 								elog(ERROR, "could not open relation with OID %u", relid);
+							if (other_branch && OidIsValid(rel->rd_rel->relbranch))
+							{
+								RelationClose(rel);
+								continue;
+							}
 
 							if (!RelationIsLogicallyLogged(rel))
 							{
@@ -2512,10 +2535,11 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							relations[nrelations++] = rel;
 						}
 
-						/* Apply the truncate. */
-						ReorderBufferApplyTruncate(rb, txn, nrelations,
-												   relations, change,
-												   streaming);
+						/* Apply the truncate (none, if all were another branch's) */
+						if (nrelations > 0)
+							ReorderBufferApplyTruncate(rb, txn, nrelations,
+													   relations, change,
+													   streaming);
 
 						for (i = 0; i < nrelations; i++)
 							RelationClose(relations[i]);

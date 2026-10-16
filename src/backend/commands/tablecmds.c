@@ -29,6 +29,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -2350,6 +2351,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 			logrelids[i++] = lfirst_oid(cell);
 
 		xlrec.dbId = MyDatabaseId;
+		xlrec.branch = MyBranch;
 		xlrec.nrelids = list_length(relids_logged);
 		xlrec.flags = 0;
 		if (behavior == DROP_CASCADE)

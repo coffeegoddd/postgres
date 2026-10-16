@@ -35,6 +35,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
@@ -1686,78 +1687,91 @@ vac_update_datfrozenxid(void)
 	 */
 	relation = table_open(RelationRelationId, AccessShareLock);
 
-	scan = systable_beginscan(relation, InvalidOid, false,
-							  NULL, 0, NULL);
-
-	while ((classTup = systable_getnext(scan)) != NULL)
+	/*
+	 * Every branch's relations count: a versioned table holds XIDs on each
+	 * branch it has a copy on.
+	 */
+	CatalogAllBranches = true;
+	PG_TRY();
 	{
-		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classTup);
-		volatile TransactionId *relfrozenxid_p = &classForm->relfrozenxid;
-		volatile TransactionId *relminmxid_p = &classForm->relminmxid;
-		TransactionId relfrozenxid = *relfrozenxid_p;
-		TransactionId relminmxid = *relminmxid_p;
+		scan = systable_beginscan(relation, InvalidOid, false,
+								  NULL, 0, NULL);
 
-		/*
-		 * Only consider relations able to hold unfrozen XIDs (anything else
-		 * should have InvalidTransactionId in relfrozenxid anyway).
-		 */
-		if (classForm->relkind != RELKIND_RELATION &&
-			classForm->relkind != RELKIND_MATVIEW &&
-			classForm->relkind != RELKIND_TOASTVALUE)
+		while ((classTup = systable_getnext(scan)) != NULL)
 		{
-			Assert(!TransactionIdIsValid(relfrozenxid));
-			Assert(!MultiXactIdIsValid(relminmxid));
-			continue;
-		}
+			Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classTup);
+			volatile TransactionId *relfrozenxid_p = &classForm->relfrozenxid;
+			volatile TransactionId *relminmxid_p = &classForm->relminmxid;
+			TransactionId relfrozenxid = *relfrozenxid_p;
+			TransactionId relminmxid = *relminmxid_p;
 
-		/*
-		 * Some table AMs might not need per-relation xid / multixid horizons.
-		 * It therefore seems reasonable to allow relfrozenxid and relminmxid
-		 * to not be set (i.e. set to their respective Invalid*Id)
-		 * independently. Thus validate and compute horizon for each only if
-		 * set.
-		 *
-		 * If things are working properly, no relation should have a
-		 * relfrozenxid or relminmxid that is "in the future".  However, such
-		 * cases have been known to arise due to bugs in pg_upgrade.  If we
-		 * see any entries that are "in the future", chicken out and don't do
-		 * anything.  This ensures we won't truncate clog & multixact SLRUs
-		 * before those relations have been scanned and cleaned up.
-		 */
-
-		if (TransactionIdIsValid(relfrozenxid))
-		{
-			Assert(TransactionIdIsNormal(relfrozenxid));
-
-			/* check for values in the future */
-			if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid))
+			/*
+			 * Only consider relations able to hold unfrozen XIDs (anything else
+			 * should have InvalidTransactionId in relfrozenxid anyway).
+			 */
+			if (classForm->relkind != RELKIND_RELATION &&
+				classForm->relkind != RELKIND_MATVIEW &&
+				classForm->relkind != RELKIND_TOASTVALUE)
 			{
-				bogus = true;
-				break;
+				Assert(!TransactionIdIsValid(relfrozenxid));
+				Assert(!MultiXactIdIsValid(relminmxid));
+				continue;
 			}
 
-			/* determine new horizon */
-			if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
-				newFrozenXid = relfrozenxid;
-		}
+			/*
+			 * Some table AMs might not need per-relation xid / multixid horizons.
+			 * It therefore seems reasonable to allow relfrozenxid and relminmxid
+			 * to not be set (i.e. set to their respective Invalid*Id)
+			 * independently. Thus validate and compute horizon for each only if
+			 * set.
+			 *
+			 * If things are working properly, no relation should have a
+			 * relfrozenxid or relminmxid that is "in the future".  However, such
+			 * cases have been known to arise due to bugs in pg_upgrade.  If we
+			 * see any entries that are "in the future", chicken out and don't do
+			 * anything.  This ensures we won't truncate clog & multixact SLRUs
+			 * before those relations have been scanned and cleaned up.
+			 */
 
-		if (MultiXactIdIsValid(relminmxid))
-		{
-			/* check for values in the future */
-			if (MultiXactIdPrecedes(lastSaneMinMulti, relminmxid))
+			if (TransactionIdIsValid(relfrozenxid))
 			{
-				bogus = true;
-				break;
+				Assert(TransactionIdIsNormal(relfrozenxid));
+
+				/* check for values in the future */
+				if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid))
+				{
+					bogus = true;
+					break;
+				}
+
+				/* determine new horizon */
+				if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
+					newFrozenXid = relfrozenxid;
 			}
 
-			/* determine new horizon */
-			if (MultiXactIdPrecedes(relminmxid, newMinMulti))
-				newMinMulti = relminmxid;
+			if (MultiXactIdIsValid(relminmxid))
+			{
+				/* check for values in the future */
+				if (MultiXactIdPrecedes(lastSaneMinMulti, relminmxid))
+				{
+					bogus = true;
+					break;
+				}
+
+				/* determine new horizon */
+				if (MultiXactIdPrecedes(relminmxid, newMinMulti))
+					newMinMulti = relminmxid;
+			}
 		}
+
+		/* we're done with pg_class */
+		systable_endscan(scan);
 	}
-
-	/* we're done with pg_class */
-	systable_endscan(scan);
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
 	table_close(relation, AccessShareLock);
 
 	/* chicken out if bogus data found */

@@ -53,6 +53,7 @@
 #include "catalog/storage_xlog.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
@@ -271,6 +272,7 @@ delete_rows(void)
 				if (RELKIND_HAS_STORAGE(c->relkind) &&
 					RelFileNumberIsValid(c->relfilenode))
 					RelationDropStorageByLocator(class_locator(c, c->relfilenode));
+				pgstat_drop_relation_by_id(c->relkind, c->oid, c->relbranch);
 			}
 			CatalogTupleDelete(rel, &tup->t_self);
 		}

@@ -115,6 +115,7 @@ typedef struct ReorderBufferChange
 			Size		nrelids;
 			bool		cascade;
 			bool		restart_seqs;
+			Oid			branch; /* the truncating session's */
 			Oid		   *relids;
 		}			truncate;
 

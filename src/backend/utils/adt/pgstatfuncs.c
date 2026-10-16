@@ -2140,7 +2140,7 @@ pg_stat_reset_single_table_counters(PG_FUNCTION_ARGS)
 	Oid			taboid = PG_GETARG_OID(0);
 	Oid			dboid = (IsSharedRelation(taboid) ? InvalidOid : MyDatabaseId);
 
-	pgstat_reset(PGSTAT_KIND_RELATION, dboid, taboid);
+	pgstat_reset(PGSTAT_KIND_RELATION, dboid, pgstat_relation_statsid_of(taboid));
 
 	PG_RETURN_VOID();
 }
@@ -2151,7 +2151,7 @@ pg_stat_reset_single_index_counters(PG_FUNCTION_ARGS)
 	Oid			idxoid = PG_GETARG_OID(0);
 	Oid			dboid = (IsSharedRelation(idxoid) ? InvalidOid : MyDatabaseId);
 
-	pgstat_reset(PGSTAT_KIND_INDEX, dboid, idxoid);
+	pgstat_reset(PGSTAT_KIND_INDEX, dboid, pgstat_relation_statsid_of(idxoid));
 
 	PG_RETURN_VOID();
 }

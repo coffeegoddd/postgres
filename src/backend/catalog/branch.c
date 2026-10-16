@@ -64,6 +64,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage.h"
 #include "catalog/versioned.h"
 #include "access/xact.h"
 #include "executor/tuptable.h"
@@ -74,12 +75,14 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 Oid			MyBranch = BRANCH_MAIN_OID;
 Oid			CatalogBranchIndexTable = InvalidOid;
 bool		CatalogKeepRowBranch = false;
+bool		CatalogAllBranches = false;
 
 static const CatalogBranchInfo branch_catalogs[] = {
 	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch},
@@ -155,7 +158,7 @@ catalog_tuple_on_branch(HeapTuple tup)
 	const CatalogBranchInfo *info = catalog_branch_info(tup->t_tableOid);
 	Oid			branch;
 
-	if (info == NULL)
+	if (info == NULL || CatalogAllBranches)
 		return true;
 	branch = catalog_row_branch(info, tup);
 	return branch == InvalidOid || branch == MyBranch;
@@ -431,6 +434,52 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 }
 
 /*
+ * Is relation file number 'relnumber' in tablespace 'spcoid' the storage of
+ * a relation on another branch than the session's?  For logical decoding,
+ * which decodes the session branch's changes: another branch's relation
+ * has no row the session sees.
+ */
+bool
+relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber)
+{
+	Relation	rel;
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		other = false;
+
+	if (spcoid == MyDatabaseTableSpace)
+		spcoid = InvalidOid;
+	ScanKeyInit(&keys[0], Anum_pg_class_reltablespace, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(spcoid));
+	ScanKeyInit(&keys[1], Anum_pg_class_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relnumber));
+
+	rel = table_open(RelationRelationId, AccessShareLock);
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, ClassTblspcRelfilenodeIndexId, true,
+								  NULL, 2, keys);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Oid			branch = ((Form_pg_class) GETSTRUCT(tup))->relbranch;
+
+			if (OidIsValid(branch) && branch != MyBranch)
+				other = true;
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return other;
+}
+
+/*
  * Check out the branch a connection named ("dbname/branch"), if the
  * database has one by that name; false if it has none.
  */
@@ -460,6 +509,7 @@ set_session_branch(Oid branch)
 		return;
 	MyBranch = branch;
 	InvalidateSystemCaches();
+	RelationCacheRebuildNew();
 }
 
 /*
@@ -642,6 +692,18 @@ check_out_branch(Oid branch)
 	ListCell   *lc;
 
 	register_branch_callbacks();
+
+	/*
+	 * A relation made in this transaction that skips WAL (wal_level
+	 * minimal) is synced at commit; its copies on other branches would be
+	 * neither logged nor synced.
+	 */
+	if (branch != MyBranch && AnyRelFileLocatorSkippingWAL())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change branches in a transaction whose new relations skip WAL"),
+				 errhint("Commit first, or set \"wal_level\" to \"replica\" or higher.")));
+
 	if (branch != BRANCH_MAIN_OID && !list_member_oid(locked_branches, branch))
 	{
 		LOCKTAG		tag;

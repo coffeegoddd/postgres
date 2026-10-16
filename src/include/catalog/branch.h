@@ -39,6 +39,13 @@ extern PGDLLIMPORT Oid CatalogBranchIndexTable;
 /* while set, catalog writes keep the branch a row carries: a branch's copy */
 extern PGDLLIMPORT bool CatalogKeepRowBranch;
 
+/*
+ * While set, catalog scans return every branch's rows: for scans that
+ * gather facts about all of them (oldest XIDs, what to vacuum) and build no
+ * cache, since an OID can name a row on each branch.
+ */
+extern PGDLLIMPORT bool CatalogAllBranches;
+
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
 
@@ -62,6 +69,9 @@ extern bool lock_branch_for_delete(Oid branch);
 
 /* note a branch the current subtransaction made */
 extern void note_new_branch(Oid branch);
+
+/* is this storage another branch's relation's (for logical decoding)? */
+extern bool relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber);
 
 /* the branch of the catalog row of object objid in catalog classid (0: shared) */
 extern Oid	catalog_object_branch(Oid classid, Oid objid);

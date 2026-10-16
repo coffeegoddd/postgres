@@ -151,7 +151,7 @@ END_CATALOG_STRUCT
 
 /* Size of fixed part of pg_class tuples, not counting var-length fields */
 #define CLASS_TUPLE_SIZE \
-	 (offsetof(FormData_pg_class,relminmxid) + sizeof(TransactionId))
+	 (offsetof(FormData_pg_class,relbranch) + sizeof(Oid))
 
 /* ----------------
  *		Form_pg_class corresponds to a pointer to a tuple with
