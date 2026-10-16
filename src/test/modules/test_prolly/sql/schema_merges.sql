@@ -79,5 +79,27 @@ SELECT length(dolt_commit('-Am', 'main changes u again')::text) AS committed;
 SELECT dolt_merge('feature');
 SELECT * FROM dolt_status();
 
+SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'feature');
+
+-- Versioned schemas merge as objects do: one side's new ones (empty too)
+-- come, and one it dropped goes.
+CREATE SCHEMA sg_gone VERSIONED;
+SELECT length(dolt_commit('-Am', 'a schema to drop')::text) AS committed;
+SELECT dolt_branch('sg_side');
+SELECT dolt_checkout('sg_side') IS NOT NULL AS on_side;
+CREATE SCHEMA sg_new VERSIONED;
+CREATE TABLE sg_new.u (id int PRIMARY KEY);
+CREATE SCHEMA sg_new_empty VERSIONED;
+DROP SCHEMA sg_gone;
+SELECT length(dolt_commit('-Am', 'schemas on the side')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE app.sg_main (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'a table on main')::text) AS committed;
+SELECT (dolt_merge('sg_side'))[2:4];
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sg\_%' ORDER BY 1;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT dolt_branch('-D', 'sg_side');
+DROP SCHEMA sg_new CASCADE;
+DROP SCHEMA sg_new_empty;
 DROP SCHEMA app CASCADE;
