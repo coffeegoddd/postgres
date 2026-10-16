@@ -128,11 +128,23 @@ struct ProllyChunkStore
 	HTAB	   *pending_index;
 	bool		moving;
 	ProllyHash	new_root;
+	List	   *saved;			/* MoveSave *, innermost last */
 	uint64		pad_offset;		/* 0: no PAD yet */
 	/* the ROOT record, made before the commit's critical section */
 	char		root_rec[RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN];
 	uint32		root_rec_len;
 };
+
+/*
+ * The move as it was before a subtransaction (at nesting level 'level')
+ * first moved the root, to go back to if it aborts.
+ */
+typedef struct MoveSave
+{
+	int			level;
+	bool		moving;
+	ProllyHash	new_root;
+} MoveSave;
 
 extern const ProllyChunkStoreRoutine prolly_chunkstore_journal;
 
@@ -536,11 +548,50 @@ journal_xact_callback(XactEvent event, void *arg)
 			/* a root moved was written by committed() */
 			s->moving = false;
 			s->pad_offset = 0;
+			s->saved = NIL;
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			discard_pending(s);
+			s->saved = NIL;
 			break;
+	}
+}
+
+/*
+ * A subtransaction's root moves go with it: an aborted one's are undone
+ * (its lock on the root, if it took it, is released with it); a committed
+ * one's are its parent's.  Its chunks may stay, unreachable.
+ */
+static void
+journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						 SubTransactionId parentSubid, void *arg)
+{
+	ProllyChunkStore *s = session_store;
+	int			level = GetCurrentTransactionNestLevel();
+	MoveSave   *last;
+
+	if (s == NULL || s->saved == NIL)
+		return;
+	last = llast(s->saved);
+	if (last->level < level)
+		return;
+	Assert(last->level == level);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		s->moving = last->moving;
+		s->new_root = last->new_root;
+		s->saved = list_delete_last(s->saved);
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		/* the parent's saved state, if it has one, is the older */
+		if (level - 1 <= 1 ||
+			(list_length(s->saved) > 1 &&
+			 ((MoveSave *) list_nth(s->saved, list_length(s->saved) - 2))->level == level - 1))
+			s->saved = list_delete_last(s->saved);
+		else
+			last->level = level - 1;
 	}
 }
 
@@ -630,6 +681,7 @@ journal_open(Oid dboid, Oid spcoid)
 	(void) ensure_journal(s, false);
 
 	RegisterXactCallback(journal_xact_callback, NULL);
+	RegisterSubXactCallback(journal_subxact_callback, NULL);
 	session_store = s;
 	return s;
 }
@@ -761,6 +813,20 @@ journal_move_root(ProllyChunkStore *s, const ProllyHash *expected,
 	if (current.len != expected->len ||
 		memcmp(current.bytes, expected->bytes, current.len) != 0)
 		return false;
+	if (GetCurrentTransactionNestLevel() > 1 &&
+		(s->saved == NIL ||
+		 ((MoveSave *) llast(s->saved))->level < GetCurrentTransactionNestLevel()))
+	{
+		MoveSave   *save = MemoryContextAlloc(TopTransactionContext,
+											  sizeof(MoveSave));
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		save->level = GetCurrentTransactionNestLevel();
+		save->moving = s->moving;
+		save->new_root = s->new_root;
+		s->saved = lappend(s->saved, save);
+		MemoryContextSwitchTo(old);
+	}
 	s->new_root = *root;
 	s->moving = true;
 	return true;

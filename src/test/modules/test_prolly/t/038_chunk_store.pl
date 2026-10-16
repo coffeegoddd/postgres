@@ -65,6 +65,27 @@ $a->query_safe("BEGIN; SELECT test_chunk_move_root('$h3', '$h2'); COMMIT");
 push @moves, $h2;
 is(sql('SELECT test_chunk_root()'), $h2, 'moves follow each other');
 
+# A subtransaction's move goes with it.
+$a->query_safe("BEGIN; SAVEPOINT s; SELECT test_chunk_move_root('$h2', '$h1')");
+$a->query_safe('ROLLBACK TO s');
+is($a->query_safe('SELECT test_chunk_root()'), $h2,
+	'a move rolled back to a savepoint is gone');
+is(sql("SET lock_timeout = '5s'; BEGIN; SELECT test_chunk_move_root('$h2', '$h2'); ROLLBACK"),
+	't', 'and so is its wait');
+$a->query_safe('COMMIT');
+is(sql('SELECT test_chunk_root()'), $h2, 'and stays gone after commit');
+$a->query_safe("BEGIN; SELECT test_chunk_move_root('$h2', '$h3'); SAVEPOINT s;
+	SELECT test_chunk_move_root('$h3', '$h1'); ROLLBACK TO s");
+is($a->query_safe('SELECT test_chunk_root()'), $h3,
+	'a move before the savepoint stays');
+$a->query_safe('COMMIT');
+push @moves, $h3;
+$a->query_safe("BEGIN; SAVEPOINT s; SELECT test_chunk_move_root('$h3', '$h2');
+	SAVEPOINT t; SELECT test_chunk_move_root('$h2', '$h1'); ROLLBACK TO t;
+	RELEASE s; COMMIT");
+push @moves, $h2;
+is(sql('SELECT test_chunk_root()'), $h2, 'a released savepoint\'s move commits');
+
 # Many chunks, more than one append's worth, with a move.
 my $big = sql(q{
 	BEGIN;
