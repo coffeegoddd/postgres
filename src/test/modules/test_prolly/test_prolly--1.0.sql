@@ -152,6 +152,26 @@ CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Folds: begin one (its changes list's lineage, its epoch, the length
+-- then); what changed since one began; let go of what changed before one
+-- began; a page as a fold kept it.
+CREATE FUNCTION test_bmap_fold_begin(relnumber oid, OUT lineage int8,
+	OUT epoch int8, OUT nblocks int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_fold_changes(relnumber oid, lineage int8, epoch int8,
+	OUT kind text, OUT blkno int8, OUT old_block int8, OUT made int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_fold_prune(relnumber oid, lineage int8, epoch int8)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_read_old(relnumber oid, blkno int8, old_block int8)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The server's chunk store, from SQL: chunks are named by their SHA-256,
 -- in hex.
 CREATE FUNCTION test_chunk_put(data bytea)

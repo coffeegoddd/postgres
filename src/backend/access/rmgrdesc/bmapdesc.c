@@ -28,6 +28,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 		case XLOG_BMAP_CREATE:
 		case XLOG_BMAP_TRUNCATE:
 		case XLOG_BMAP_FREE:
+		case XLOG_BMAP_FOLD:
+		case XLOG_BMAP_CHANGES:
 			{
 				xl_bmap_rel *xlrec = (xl_bmap_rel *) rec;
 
@@ -48,6 +50,7 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 			}
 		case XLOG_BMAP_SHARE:
 		case XLOG_BMAP_SHARED:
+		case XLOG_BMAP_SHARE_CHANGES:
 			{
 				xl_bmap_share *xlrec = (xl_bmap_share *) rec;
 
@@ -60,11 +63,12 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 			{
 				xl_bmap_remap *xlrec = (xl_bmap_remap *) rec;
 
-				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> %u%s; hw %u -> %u",
+				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> %u%s%s; hw %u -> %u",
 								 xlrec->locator.spcOid, xlrec->locator.dbOid,
 								 xlrec->locator.relNumber, xlrec->blkno,
 								 xlrec->old_block, xlrec->new_block,
 								 (xlrec->flags & BMAP_REMAP_ZERO) ? " (zeroed)" : "",
+								 (xlrec->flags & BMAP_REMAP_LISTED) ? " (listed)" : "",
 								 xlrec->old_hw, xlrec->new_hw);
 				break;
 			}
@@ -106,6 +110,12 @@ bmap_identify(uint8 info)
 			return "UNREF";
 		case XLOG_BMAP_REMAP:
 			return "REMAP";
+		case XLOG_BMAP_FOLD:
+			return "FOLD";
+		case XLOG_BMAP_CHANGES:
+			return "CHANGES";
+		case XLOG_BMAP_SHARE_CHANGES:
+			return "SHARE_CHANGES";
 	}
 	return NULL;
 }

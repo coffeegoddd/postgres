@@ -32,7 +32,9 @@
  * XLOG_BMAP_EXTEND		blocks are allocated: block 0 is the map's header,
  *						block 1 the map page, block 2 the allocator's metapage,
  *						then bitmap pages
- * XLOG_BMAP_TRUNCATE	the relation's length: block 0 is the map's header
+ * XLOG_BMAP_TRUNCATE	the relation's length: block 0 is the map's header,
+ *						then, if the relation was folded, its changes list's
+ *						header and page
  * XLOG_BMAP_FREE		blocks are freed: block 0 is the allocator's metapage,
  *						then bitmap pages
  * XLOG_BMAP_SHARE		part of a map copied into another relation's, sharing
@@ -45,7 +47,15 @@
  * XLOG_BMAP_REMAP		a shared page is copied before it changes: block 0 is
  *						the map page, then the allocator's metapage and bitmap
  *						pages, the old block's reference-count page if its
- *						count changes, and last the page itself, as an image
+ *						count changes, the changes list's header and page if
+ *						the old block is listed (BMAP_REMAP_LISTED), and last
+ *						the page itself, as an image
+ * XLOG_BMAP_FOLD		a fold begins: block 0 is the map's header (its epoch
+ *						raised), block 1 the changes list's header
+ * XLOG_BMAP_CHANGES	the changes list rewritten: its pages, then its header
+ * XLOG_BMAP_SHARE_CHANGES	a changes list copied into another relation's:
+ *						its pages or its header, then the reference-count
+ *						pages of the blocks it holds
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
@@ -56,6 +66,9 @@
 #define XLOG_BMAP_SHARED		0x70
 #define XLOG_BMAP_UNREF			0x80
 #define XLOG_BMAP_REMAP			0x90
+#define XLOG_BMAP_FOLD			0xA0
+#define XLOG_BMAP_CHANGES		0xB0
+#define XLOG_BMAP_SHARE_CHANGES	0xC0
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
@@ -87,9 +100,12 @@ typedef struct xl_bmap_unref
  * leaves and the one it takes, and the page store's high-water mark before
  * and after.  The page's image comes as its last block, unless it is all
  * zeroes (BMAP_REMAP_ZERO): then redo zeroes the new block, as extending
- * does.
+ * does.  A block left for the changes list (BMAP_REMAP_LISTED) gets the
+ * image (or zeroes) in redo too: it is the page as it was before the
+ * change, which a crash may have lost from the block.
  */
 #define BMAP_REMAP_ZERO		0x01
+#define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */
 
 typedef struct xl_bmap_remap
 {
@@ -132,6 +148,8 @@ typedef struct xl_bmap_extend
 #define BMAP_DELTA_BITS		3
 #define BMAP_DELTA_META		4
 #define BMAP_DELTA_REFS		5
+#define BMAP_DELTA_CHANGES_HEAD	6
+#define BMAP_DELTA_CHANGES	7
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
@@ -207,6 +225,47 @@ typedef struct xl_bmap_meta_delta
 	uint32		nbitmap_added;
 	/* BlockNumber bitmap_added[nbitmap_added] follow */
 } xl_bmap_meta_delta;
+
+/*
+ * Block data of a changes list's header: the epoch of the last fold, the
+ * list's lineage (made with the list, kept by its copies), the relation's
+ * length at the last fold, and the list's length.
+ */
+typedef struct xl_bmap_changes_head_delta
+{
+	uint16		kind;			/* BMAP_DELTA_CHANGES_HEAD */
+	uint16		flags;
+	uint32		fold_epoch;
+	uint64		lineage;
+	BlockNumber fold_nblocks;
+	uint32		nentries;
+} xl_bmap_changes_head_delta;
+
+/* Block data of a changes list's page: entries set from slot 'first'. */
+typedef struct xl_bmap_changes_delta
+{
+	uint16		kind;			/* BMAP_DELTA_CHANGES */
+	uint16		flags;
+	uint32		first;
+	uint32		n;
+	/* BmapChange entries[n] follow */
+} xl_bmap_changes_delta;
+
+/*
+ * An entry of a changes list: a logical block copied in an epoch, and the
+ * block its page had before, which the list holds (BMAP_CHANGE_COPY); or
+ * the relation's length cut to 'blkno' (BMAP_CHANGE_TRUNCATE).
+ */
+#define BMAP_CHANGE_COPY		1
+#define BMAP_CHANGE_TRUNCATE	2
+
+typedef struct BmapChange
+{
+	uint32		epoch;
+	BlockNumber blkno;
+	BlockNumber old_block;
+	uint32		kind;
+} BmapChange;
 
 extern void bmap_redo(XLogReaderState *record);
 extern void bmap_desc(StringInfo buf, XLogReaderState *record);

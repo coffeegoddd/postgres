@@ -8,7 +8,10 @@
  * in the page store of its tablespace and database, and its map, from
  * logical to physical block, is its map fork (BMAP_FORKNUM, "<relfilenumber>
  * _bmap"), an ordinary md.c file whose pages are WAL-logged.  The map
- * fork's existence is the relation's.  Per tablespace and database:
+ * fork's existence is the relation's.  A relation folded has a changes
+ * fork too (BMAP_CHANGES_FORKNUM, "<relfilenumber>_chg"): the pages changed
+ * since, and the page store's blocks holding them as they were.  Per
+ * tablespace and database:
  *
  *	BMAP_ALLOC_RELNUMBER	the allocator: a metapage and bitmap pages saying
  *							which physical blocks of the page store are used

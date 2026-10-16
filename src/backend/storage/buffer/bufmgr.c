@@ -684,7 +684,8 @@ static void CheckForBufferLeaks(void);
 #ifdef USE_ASSERT_CHECKING
 static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
 #endif
-static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr);
+static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr,
+								   bool neutral);
 static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
 static int	rlocator_comparator(const void *p1, const void *p2);
 static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
@@ -1220,7 +1221,7 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 
 			/* locked before it was valid, so not prepared then */
 			if (unlikely(pg_atomic_read_u64(&bufHdr->state) & BM_SMGR_PREPARE))
-				PrepareBufferForChange(buffer, bufHdr);
+				PrepareBufferForChange(buffer, bufHdr, false);
 		}
 	}
 	else if (!isLocalBuf)
@@ -6643,8 +6644,10 @@ UnlockBuffer(Buffer buffer)
  * that a page it shares with another relation is copied first.  The flag is
  * set when a page is loaded, and again when the storage manager begins
  * sharing the relation's pages (MarkBufferedRelationShared()).  It is
- * cleared once the page is prepared, or found not to be shared; a page
- * found shared keeps it, with BM_SMGR_SHARED, until a change copies it.
+ * cleared once the page is prepared, or found not to need it; a page found
+ * shared keeps it, with BM_SMGR_SHARED, until a change copies it, and one
+ * found not shared that preparing would still copy (for the storage
+ * manager's own reasons) keeps it with BM_SMGR_OWN.
  *
  * A check notes the marks made while it ran: marking sets BM_SMGR_REMARKED,
  * which a check clears as it begins, and a check that finds it set again
@@ -6660,26 +6663,30 @@ BufferSmgrCheckBegin(BufferDesc *buf_hdr)
 }
 
 static void
-BufferSmgrCheckEnd(BufferDesc *buf_hdr, bool shared)
+BufferSmgrCheckEnd(BufferDesc *buf_hdr, bool shared, bool copies)
 {
 	uint64		buf_state = LockBufHdr(buf_hdr);
 
 	if (buf_state & BM_SMGR_REMARKED)
 		UnlockBufHdr(buf_hdr);
 	else if (shared)
-		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_SHARED, 0, 0);
+		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_SHARED, BM_SMGR_OWN, 0);
+	else if (copies)
+		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_OWN, BM_SMGR_SHARED, 0);
 	else
 		UnlockBufHdrExt(buf_hdr, buf_state,
-						0, BM_SMGR_PREPARE | BM_SMGR_SHARED, 0);
+						0, BM_SMGR_PREPARE | BM_SMGR_SHARED | BM_SMGR_OWN, 0);
 }
 
 /*
  * Prepare a page, locked exclusively, before it changes.  Not in recovery,
  * which replays the primary's preparations, nor before the page is valid.
- * An error leaves the page to be prepared by a later change.
+ * An error leaves the page to be prepared by a later change.  A 'neutral'
+ * change (one that changes no row) may leave the page as it was for the
+ * storage manager, so it is prepared again before the next change.
  */
 static void
-PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr)
+PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr, bool neutral)
 {
 	if (!(pg_atomic_read_u64(&buf_hdr->state) & BM_VALID) ||
 		RecoveryInProgress())
@@ -6689,8 +6696,16 @@ PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr)
 	smgrprepareforchange(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 								  INVALID_PROC_NUMBER),
 						 BufTagGetForkNum(&buf_hdr->tag),
-						 buf_hdr->tag.blockNum, buffer);
-	BufferSmgrCheckEnd(buf_hdr, false);
+						 buf_hdr->tag.blockNum, buffer, neutral);
+	if (neutral)
+	{
+		/* not shared any more, but perhaps still to be copied */
+		uint64		buf_state = LockBufHdr(buf_hdr);
+
+		UnlockBufHdrExt(buf_hdr, buf_state, 0, BM_SMGR_SHARED | BM_SMGR_OWN, 0);
+	}
+	else
+		BufferSmgrCheckEnd(buf_hdr, false, false);
 }
 
 /*
@@ -6704,18 +6719,21 @@ BufferSmgrPageIsShared(BufferDesc *buf_hdr)
 {
 	uint64		buf_state = pg_atomic_read_u64(&buf_hdr->state);
 	bool		shared;
+	bool		copies;
 
 	if (!(buf_state & BM_SMGR_PREPARE))
 		return false;
 	if (buf_state & BM_SMGR_SHARED)
 		return true;
+	if (buf_state & BM_SMGR_OWN)
+		return false;
 
 	BufferSmgrCheckBegin(buf_hdr);
 	shared = smgrpageisshared(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 									   INVALID_PROC_NUMBER),
 							  BufTagGetForkNum(&buf_hdr->tag),
-							  buf_hdr->tag.blockNum);
-	BufferSmgrCheckEnd(buf_hdr, shared);
+							  buf_hdr->tag.blockNum, &copies);
+	BufferSmgrCheckEnd(buf_hdr, shared, copies);
 	return shared;
 }
 
@@ -6744,8 +6762,10 @@ HintMayReachSharedPage(BufferDesc *buf_hdr)
  *
  * For a page locked by LockBufferForCleanupUnprepared() or
  * ConditionalLockBufferForCleanupUnprepared(): called before the page
- * changes, outside any critical section.  It may copy the page (a page its
- * storage manager shares with another relation), which may error out.
+ * changes, outside any critical section, by maintenance that changes no
+ * row (pruning, freezing, removing dead items).  It may copy the page (a
+ * page its storage manager shares with another relation), which may error
+ * out.
  */
 void
 BufferPrepareForChange(Buffer buffer)
@@ -6761,7 +6781,7 @@ BufferPrepareForChange(Buffer buffer)
 	GetPrivateRefCountEntry(buffer, false)->data.unprepared = false;
 #endif
 	if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
-		PrepareBufferForChange(buffer, buf_hdr);
+		PrepareBufferForChange(buffer, buf_hdr, true);
 }
 
 /*
@@ -6807,7 +6827,7 @@ MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum)
 			(buf_state & BM_TAG_VALID))
 			UnlockBufHdrExt(buf_hdr, buf_state,
 							BM_SMGR_PREPARE | BM_SMGR_REMARKED,
-							BM_SMGR_SHARED, 0);
+							BM_SMGR_SHARED | BM_SMGR_OWN, 0);
 		else
 			UnlockBufHdr(buf_hdr);
 	}
@@ -6850,7 +6870,7 @@ LockBufferInternal(Buffer buffer, BufferLockMode mode)
 	{
 		BufferLockAcquire(buffer, buf_hdr, BUFFER_LOCK_EXCLUSIVE);
 		if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
-			PrepareBufferForChange(buffer, buf_hdr);
+			PrepareBufferForChange(buffer, buf_hdr, false);
 	}
 	else if (mode == BUFFER_LOCK_SHARE_EXCLUSIVE)
 		BufferLockAcquire(buffer, buf_hdr, BUFFER_LOCK_SHARE_EXCLUSIVE);
@@ -6885,7 +6905,7 @@ ConditionalLockBuffer(Buffer buffer)
 	 * SP-GiST insertion) loop for as long as the page is shared.
 	 */
 	if (unlikely(pg_atomic_read_u64(&buf->state) & BM_SMGR_PREPARE))
-		PrepareBufferForChange(buffer, buf);
+		PrepareBufferForChange(buffer, buf, false);
 	return true;
 }
 
@@ -6922,7 +6942,7 @@ CleanupLockPrepare(Buffer buffer, BufferDesc *buf_hdr, bool prepare)
 	if (likely(!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE)))
 		return;
 	if (prepare)
-		PrepareBufferForChange(buffer, buf_hdr);
+		PrepareBufferForChange(buffer, buf_hdr, false);
 #ifdef USE_ASSERT_CHECKING
 	else if (!RecoveryInProgress())
 		GetPrivateRefCountEntry(buffer, false)->data.unprepared = true;

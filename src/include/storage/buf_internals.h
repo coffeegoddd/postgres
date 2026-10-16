@@ -36,7 +36,7 @@
  * State of the buffer itself (in order):
  * - 18 bits refcount
  * - 4 bits usage count
- * - 14 bits of flags
+ * - 15 bits of flags
  * - 18 bits share-lock count
  * - 1 bit share-exclusive locked
  * - 1 bit exclusive locked
@@ -48,7 +48,7 @@
  */
 #define BUF_REFCOUNT_BITS 18
 #define BUF_USAGECOUNT_BITS 4
-#define BUF_FLAG_BITS 14
+#define BUF_FLAG_BITS 15
 #define BUF_LOCK_BITS (18+2)
 
 StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_LOCK_BITS <= 64,
@@ -130,6 +130,8 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_SMGR_SHARED				BUF_DEFINE_FLAG(12)
 /* BM_SMGR_PREPARE was set again since a check of the page began */
 #define BM_SMGR_REMARKED			BUF_DEFINE_FLAG(13)
+/* with BM_SMGR_PREPARE: the page isn't shared, but preparing it copies it */
+#define BM_SMGR_OWN					BUF_DEFINE_FLAG(14)
 
 
 StaticAssertDecl(MAX_BACKENDS_BITS <= BUF_REFCOUNT_BITS,

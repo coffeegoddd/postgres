@@ -311,3 +311,97 @@ test_bmap_cleanup_lock(PG_FUNCTION_ARGS)
 	ReleaseBuffer(buf);
 	PG_RETURN_BOOL(got);
 }
+
+/*
+ * test_bmap_fold_begin(relnumber): begin a fold; its list's lineage, its
+ * epoch and the relation's length then.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_fold_begin);
+
+Datum
+test_bmap_fold_begin(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	BmapFold	fold;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	bmap_fold_begin(bmap_smgr(PG_GETARG_OID(0)), &fold);
+	values[0] = Int64GetDatum((int64) fold.lineage);
+	values[1] = Int64GetDatum(fold.epoch);
+	values[2] = Int64GetDatum(fold.nblocks);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+static void
+fold_arg(FunctionCallInfo fcinfo, BmapFold *fold)
+{
+	fold->lineage = (uint64) PG_GETARG_INT64(1);
+	fold->epoch = (uint32) PG_GETARG_INT64(2);
+	fold->nblocks = InvalidBlockNumber;
+}
+
+static void
+change_row(const BmapChange *c, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	values[0] = CStringGetTextDatum(c->kind == BMAP_CHANGE_COPY ? "copy" : "truncate");
+	values[1] = Int64GetDatum(c->blkno);
+	values[2] = Int64GetDatum(c->old_block);
+	nulls[2] = !BlockNumberIsValid(c->old_block);
+	values[3] = Int64GetDatum(c->epoch);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * test_bmap_fold_changes(relnumber, lineage, epoch): what changed since
+ * that fold began, in order; no rows and a notice if the lineage is gone.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_fold_changes);
+
+Datum
+test_bmap_fold_changes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	BmapFold	since;
+
+	InitMaterializedSRF(fcinfo, 0);
+	fold_arg(fcinfo, &since);
+	if (!bmap_fold_changes(bmap_smgr(PG_GETARG_OID(0)), &since, change_row,
+						   rsinfo))
+		elog(NOTICE, "no changes list of that lineage");
+	return (Datum) 0;
+}
+
+/* test_bmap_fold_prune(relnumber, lineage, epoch) */
+PG_FUNCTION_INFO_V1(test_bmap_fold_prune);
+
+Datum
+test_bmap_fold_prune(PG_FUNCTION_ARGS)
+{
+	BmapFold	keep;
+
+	fold_arg(fcinfo, &keep);
+	bmap_fold_prune(bmap_smgr(PG_GETARG_OID(0)), &keep);
+	PG_RETURN_VOID();
+}
+
+/* test_bmap_read_old(relnumber, blkno, old_block): the page kept */
+PG_FUNCTION_INFO_V1(test_bmap_read_old);
+
+Datum
+test_bmap_read_old(PG_FUNCTION_ARGS)
+{
+	bytea	   *page = palloc(VARHDRSZ + BLCKSZ);
+
+	SET_VARSIZE(page, VARHDRSZ + BLCKSZ);
+	bmap_read_old(bmap_smgr(PG_GETARG_OID(0)), (BlockNumber) PG_GETARG_INT64(1),
+				  (BlockNumber) PG_GETARG_INT64(2), VARDATA(page));
+	PG_RETURN_BYTEA_P(page);
+}

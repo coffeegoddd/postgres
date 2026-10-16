@@ -17,6 +17,7 @@
 #define BMAP_H
 
 #include "storage/bmap_files.h"
+#include "storage/bmap_xlog.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
 
@@ -39,9 +40,10 @@ extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
 extern bool bmappreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber blocknum, Buffer buffer);
+								 BlockNumber blocknum, Buffer buffer,
+								 bool neutral);
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber blocknum);
+							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
@@ -84,6 +86,27 @@ extern bool bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate);
 
 /* remove a database's unused block map from a tablespace's directory */
 extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
+
+/*
+ * Folds: a fold of a relation is a moment its pages are kept as they are,
+ * each page as of then held by the relation's changes list once it first
+ * changes, so what changed since can be found without reading the rest.
+ */
+typedef struct BmapFold
+{
+	uint64		lineage;		/* the changes list's; its copies keep it */
+	uint32		epoch;			/* the fold's */
+	BlockNumber nblocks;		/* the relation's length then */
+} BmapFold;
+
+typedef void (*BmapChangeVisit) (const BmapChange *change, void *arg);
+
+extern void bmap_fold_begin(SMgrRelation reln, BmapFold *fold);
+extern bool bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
+							  BmapChangeVisit visit, void *arg);
+extern void bmap_fold_prune(SMgrRelation reln, const BmapFold *keep);
+extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
+						  BlockNumber old_block, char *page);
 
 /* inspection, for tests */
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,

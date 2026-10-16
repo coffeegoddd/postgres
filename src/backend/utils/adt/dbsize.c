@@ -332,7 +332,7 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	unsigned int segcount = 0;
 
 	/* the block map is storage's own, not the relation's data */
-	if (forknum == BMAP_FORKNUM)
+	if (forknum == BMAP_FORKNUM || forknum == BMAP_CHANGES_FORKNUM)
 		return 0;
 
 	/* a block-mapped main fork's pages are in its database's page store */

@@ -47,6 +47,7 @@ tests += {
       'branch_catalogs',
       'bmap_sharing',
       'bmap_copy_on_write',
+      'bmap_folds',
       'branches',
       'fold',
       'commits',
@@ -107,6 +108,8 @@ tests += {
       't/038_chunk_store.pl',
       't/039_branch_commits.pl',
       't/040_table_files.pl',
+      't/041_bmap_folds.pl',
+      't/043_bmap_drop_replay.pl',
     ],
   },
 }
