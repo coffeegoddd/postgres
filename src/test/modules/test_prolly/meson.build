@@ -64,6 +64,7 @@ tests += {
       'incremental_folds',
       'checkpoints',
       'format_freeze',
+      'dirty_merges',
     ],
   },
   'tap': {

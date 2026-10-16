@@ -30,8 +30,10 @@
  * the merge in progress in the refs.  Its conflicts are found again from
  * the three commits when they're listed or resolved.  A keyless table's
  * rows have no identity, so the two sides' changes in a row's copies add
- * up.  The branch must have no changes since its head.  Definitions
- * changed since the ancestor are merged first (the canonicalizer's
+ * up.  The branch may have uncommitted changes, as in Dolt, if the merge
+ * changes none of the tables and sequences they changed, and no
+ * definitions change: they stay uncommitted, left out of the merge's
+ * commit.  Definitions changed since the ancestor are merged first (the canonicalizer's
  * merge_schema(): an object both sides changed differently fails the
  * merge); then a table all three define alike merges its rows three-way,
  * and one defined otherwise takes the rows of the side that redefined,
@@ -325,12 +327,6 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 		if (OidIsValid(tid))
 			diff_rows(tid, find_table(from, name), find_table(to, name), sink);
 	}
-}
-
-static void
-note_change(const char *name, ProllyDiffKind kind, void *arg)
-{
-	*(bool *) arg = true;
 }
 
 static void
@@ -1408,32 +1404,222 @@ merge_commits(const ProllyHash *base, const ProllyHash *ours,
 	return merge_roots(roots, fail_on_conflict, what, name, conflicted);
 }
 
-/* Refuse a merge or pick over uncommitted changes, which it would lose. */
-static void
-check_clean(const char *what)
+/*
+ * What the working set changed since the head: the canonical items that
+ * differ, each with the head's value (to put back), and by kind the
+ * tables and sequences among them, by name.
+ */
+typedef struct Local
 {
-	bool		changed = false;
 	ProllyNodeRef head;
 	ProllyNodeRef working;
-	HTAB	   *now;
+	List	   *edits;			/* ProllyEdit *: the head's items, in order */
+	List	   *tables;			/* char * */
+	List	   *sequences;		/* char * */
+	bool		definitions;	/* something other than tables and sequences */
+} Local;
+
+static void
+local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
+		   const ProllyValue *after, void *arg)
+{
+	Local	   *l = arg;
+	ProllyEdit *e = palloc0(sizeof(ProllyEdit));
+	uint8	   *k = palloc(Max(key->len, 1));
+	char	   *name = key->len >= 2 ?
+		pnstrdup((const char *) key->data + 2, key->len - 2) : pstrdup("");
+
+	memcpy(k, key->data, key->len);
+	e->key.data = k;
+	e->key.len = key->len;
+	if (before)
+	{
+		uint8	   *v = palloc(Max(before->len, 1));
+
+		memcpy(v, before->data, before->len);
+		e->value.data = v;
+		e->value.len = before->len;
+	}
+	else
+		e->is_delete = true;
+	l->edits = lappend(l->edits, e);
+
+	if (key->len >= 2 && memcmp(key->data, "t:", 2) == 0)
+		l->tables = lappend(l->tables, name);
+	else if (key->len >= 2 && memcmp(key->data, "s:", 2) == 0)
+		l->sequences = lappend(l->sequences, name);
+	else
+		l->definitions = true;
+}
+
+static void
+local_changes(const ProllyHash *head, Local *l)
+{
+	ProllyTreeEnv env;
+
+	memset(l, 0, sizeof(*l));
+	commit_root(head, &l->head);
+	(void) PROLLY_CALL(components().refs, working_set, NULL, &l->working);
+	chunk_env(&env);
+	env.compare = canon_compare;
+	PROLLY_CALL(prolly_tree_lookup("cow"), diff, &env, &l->head, &l->working,
+				local_item, l);
+}
+
+static bool
+has_local_changes(const Local *l)
+{
+	return l->edits != NIL;
+}
+
+static bool
+list_has_name(List *list, const char *name)
+{
 	ListCell   *lc;
 
-	folded_tables("HEAD", "WORKING", note_change, &changed);
-	if (changed)
-		refuse_local_changes(what);
+	foreach(lc, list)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
 
-	/* sequences' values too: a merge would set them from the head's */
-	root_of("HEAD", &head);
-	root_of("WORKING", &working);
-	now = sequences_by_name(sequences_of(&working));
-	foreach(lc, sequences_of(&head))
+/*
+ * A merge (or pick, or fast-forward) of what changed from base to theirs
+ * into a working set with uncommitted changes, as in Dolt: refused if it
+ * would change what they changed (a table's rows, a sequence's value), and,
+ * for now, if definitions change on either side.
+ */
+static void
+check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
+			const ProllyNodeRef *theirs, const char *what)
+{
+	ProllyDatabaseComponents dc = components();
+	Tables		bt = {NIL};
+	Tables		tt = {NIL};
+	HTAB	   *bs;
+	List	   *ts;
+	ListCell   *lc;
+
+	if (!has_local_changes(l))
+		return;
+	if (l->definitions ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, &l->head, &l->working) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, ours) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, theirs))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot %s with uncommitted changes where definitions change", what),
+				 errhint("Commit the changes, or reset the branch, first.")));
+	PROLLY_CALL(dc.canonicalizer, tables, base, add_table, &bt);
+	PROLLY_CALL(dc.canonicalizer, tables, theirs, add_table, &tt);
+	foreach(lc, tt.tables)
 	{
-		Sequence   *h = lfirst(lc);
-		Sequence   *w = lookup_sequence(now, h->name);
+		Table	   *t = lfirst(lc);
+		Table	   *b = find_table(bt.tables, t->name);
 
-		if (w && !same_sequence(h, w))
-			refuse_local_changes(what);
+		if ((b == NULL || !same_hash(&b->data.hash, &t->data.hash)) &&
+			list_has_name(l->tables, t->name))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("local changes would be stomped by %s", what),
+					 errdetail("Table \"%s\" has uncommitted changes, and the %s changes it too.",
+							   t->name, what),
+					 errhint("Commit the changes, or reset the branch, first.")));
 	}
+	foreach(lc, bt.tables)
+	{
+		Table	   *b = lfirst(lc);
+
+		if (find_table(tt.tables, b->name) == NULL &&
+			list_has_name(l->tables, b->name))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("local changes would be stomped by %s", what),
+					 errdetail("Table \"%s\" has uncommitted changes, and the %s drops it.",
+							   b->name, what)));
+	}
+	bs = sequences_by_name(sequences_of(base));
+	ts = sequences_of(theirs);
+	foreach(lc, ts)
+	{
+		Sequence   *t = lfirst(lc);
+		Sequence   *b = lookup_sequence(bs, t->name);
+
+		if ((b == NULL || !same_sequence(b, t)) &&
+			list_has_name(l->sequences, t->name))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("local changes would be stomped by %s", what),
+					 errdetail("Sequence \"%s\" has uncommitted changes, and the %s changes it too.",
+							   t->name, what)));
+	}
+}
+
+/*
+ * The working set as it is, without the uncommitted changes it had before
+ * a merge: the commit the merge makes, which leaves them uncommitted.
+ */
+static void
+without_local(const Local *l, ProllyNodeRef *root)
+{
+	ProllyTreeEnv env;
+	ProllyNodeRef now;
+	ProllyEdit *edits;
+	int			n = 0;
+	ListCell   *lc;
+
+	(void) PROLLY_CALL(components().refs, working_set, NULL, &now);
+	if (!has_local_changes(l))
+	{
+		*root = now;
+		return;
+	}
+	edits = palloc_array(ProllyEdit, list_length(l->edits));
+	foreach(lc, l->edits)
+		edits[n++] = *(ProllyEdit *) lfirst(lc);
+	chunk_env(&env);
+	env.compare = canon_compare;
+	PROLLY_CALL(prolly_tree_lookup("cow"), apply, &env, &now, edits, n, root);
+}
+
+/*
+ * A fast-forward to theirs with uncommitted changes: the rows and sequence
+ * values theirs changed since the head written, the changes left as they
+ * are, and theirs made the head.
+ */
+static void
+fast_forward_local(const Local *l, const ProllyHash *theirs)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef target;
+	Tables		ht = {NIL};
+	Tables		tt = {NIL};
+	HTAB	   *hs;
+	List	   *ts;
+	ListCell   *lc;
+
+	commit_root(theirs, &target);
+	PROLLY_CALL(dc.canonicalizer, tables, &l->head, add_table, &ht);
+	PROLLY_CALL(dc.canonicalizer, tables, &target, add_table, &tt);
+	foreach(lc, tt.tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *h = find_table(ht.tables, t->name);
+
+		if (h && !same_hash(&h->data.hash, &t->data.hash))
+			apply_rows(table_named(t->name), h, t);
+	}
+	hs = sequences_by_name(sequences_of(&l->head));
+	ts = sequences_of(&target);
+	foreach(lc, ts)
+	{
+		Sequence   *t = lfirst(lc);
+		Sequence   *h = lookup_sequence(hs, t->name);
+
+		if (h && !same_sequence(h, t))
+			set_sequence(t);
+	}
+	PROLLY_CALL(dc.refs, set_head, theirs);
 }
 
 /*
@@ -1457,6 +1643,8 @@ merge_held(const char *branch, const char *message, int flags,
 	int			conflicts = 0;
 	ListCell   *lc;
 	ProllyHash	parents[2];
+	ProllyNodeRef roots[3];
+	Local		local;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -1491,11 +1679,17 @@ merge_held(const char *branch, const char *message, int flags,
 		*commit_id = ours;
 		return 0;
 	}
-
-	check_clean("merge");
+	commit_root(&base, &roots[0]);
+	commit_root(&ours, &roots[1]);
+	commit_root(&theirs, &roots[2]);
+	local_changes(&ours, &local);
+	check_local(&local, &roots[0], &roots[1], &roots[2], "merge");
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
-		reset_to(&theirs);
+		if (has_local_changes(&local))
+			fast_forward_local(&local, &theirs);
+		else
+			reset_to(&theirs);
 		*commit_id = theirs;
 		return 0;
 	}
@@ -1525,7 +1719,16 @@ merge_held(const char *branch, const char *message, int flags,
 	if (message == NULL)
 		message = psprintf("Merge branch '%s' into %s", branch,
 						   branch_ops()->current());
-	PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
+	/* the merge's commit leaves the uncommitted changes uncommitted */
+	if (has_local_changes(&local))
+	{
+		ProllyNodeRef merged;
+
+		without_local(&local, &merged);
+		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, &merged, commit_id);
+	}
+	else
+		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
 	return 0;
 }
 
@@ -1565,6 +1768,8 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 	ProllyMergeState ms;
 	List	   *conflicted = NIL;
 	StringInfoData message;
+	ProllyNodeRef before;
+	Local		local;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -1595,9 +1800,17 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no commit to apply changes to")));
-	check_clean(what);
-
+	/* every pick checked against the uncommitted changes first */
 	commit_root(&ours, &head);
+	local_changes(&ours, &local);
+	for (int i = 0; i < nrefs; i++)
+	{
+		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
+		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
+		check_local(&local, &roots[0], &head, &roots[2], what);
+	}
+	root_of("WORKING", &before);
+
 	roots[1] = head;
 	initStringInfo(&message);
 	for (int i = 0; i < nrefs; i++)
@@ -1613,7 +1826,7 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 			appendStringInfo(&message, i == 0 ? "Revert \"%s\"" : " and \"%s\"",
 							 info[i].message);
 	}
-	if (same_hash(&roots[1].hash, &head.hash) && !allow_empty)
+	if (same_hash(&roots[1].hash, &before.hash) && !allow_empty)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%s changes nothing on the branch", fn),
@@ -1623,7 +1836,18 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		prolly_set_commit_author(info[0].author);
 	PG_TRY();
 	{
-		PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1, NULL, commit_id);
+		/* the commit leaves the uncommitted changes uncommitted */
+		if (has_local_changes(&local))
+		{
+			ProllyNodeRef picked_root;
+
+			without_local(&local, &picked_root);
+			PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1,
+						&picked_root, commit_id);
+		}
+		else
+			PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1, NULL,
+						commit_id);
 	}
 	PG_FINALLY();
 	{
