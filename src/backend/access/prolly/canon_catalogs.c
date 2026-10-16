@@ -12,6 +12,8 @@
  *	"i:" index			-> a prolly index's tree (hash length, hash)
  *	"m:" materialized view -> its data tree (hash length, hash), then its
  *						   query
+ *	"n:" schema			-> nothing: a versioned schema (folded only), there
+ *						   whether or not anything is in it
  *	"s:" sequence		-> its definition
  *	"t:" table			-> its data tree (hash length, hash), then its schema
  *	"v:" view			-> its query
@@ -279,7 +281,13 @@ fold_table(Canon *cn, Relation rel, ProllyNodeRef *root)
 
 	fs.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	fs.k = PROLLY_CALL(fs.kr, open, rel, NULL, CurrentMemoryContext);
+
+	/*
+	 * Rows as a rewrite leaves them: a column added with a default is in
+	 * every row (the scan gives its missing value), so whether the table was
+	 * rewritten since doesn't change the encoding.
+	 */
+	fs.k = PROLLY_CALL(fs.kr, open_rewritten, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(fs.kr, keyless, fs.k);
 
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, 0);
@@ -793,6 +801,23 @@ collect(Canon *cn)
 	}
 	systable_endscan(scan);
 	table_close(pg_class, AccessShareLock);
+
+	/* Versioned schemas themselves, empty ones too. */
+	if (cn->folded)
+	{
+		Relation	pg_ns = table_open(NamespaceRelationId, AccessShareLock);
+
+		scan = systable_beginscan(pg_ns, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
+
+			if (canon_namespace(cn, ns->oid))
+				(void) add_item(cn, "n:", quote_identifier(NameStr(ns->nspname)));
+		}
+		systable_endscan(scan);
+		table_close(pg_ns, AccessShareLock);
+	}
 
 	/* Types. */
 	{
