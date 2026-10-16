@@ -1,5 +1,7 @@
-"""The V suite: version-control workloads, for prolly engines only.  They
-call the prolly_* SQL functions.
+"""The V suite: version-control workloads, for prolly engines only.  The
+tree engines (prolly_d1) are driven through the prolly_* SQL functions,
+page-based prolly through the dolt_* ones (its tables are in a versioned
+schema, committed with dolt_commit).
 
 Every V workload has a "background" variant dimension: "none", or "S1" to
 run pgbench TPC-B alongside the version-control operations, measuring how
@@ -15,12 +17,54 @@ from itertools import product
 from typing import Any
 
 from pbench.core import registry, targets
-from pbench.core.interfaces import Context, Outcome, Window, Workload
+from pbench.core.interfaces import Context, NotImplementedByEngine, Outcome, Window, Workload
 from pbench.workloads._common import BackgroundPgbench, pgbench_init, timed_session
 
 
 def _median(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
+
+
+class _TreeSQL:
+    """Version-control statements of the tree engines."""
+
+    def branch(self, name):
+        return f"SELECT prolly_branch_create('{name}', NULL)"
+
+    def checkout(self, name):
+        return f"SELECT prolly_checkout('{name}')"
+
+    def commit(self, message):
+        return f"SELECT prolly_commit('{message}')"
+
+    def diff_count(self, a, b, table):
+        return f"SELECT count(*) FROM prolly_diff('{a}', '{b}')"
+
+    def merge(self, name):
+        return f"SELECT prolly_merge('{name}')"
+
+
+class _DoltSQL:
+    """Version-control statements of page-based prolly."""
+
+    def branch(self, name):
+        return f"SELECT dolt_branch('{name}')"
+
+    def checkout(self, name):
+        return f"SELECT dolt_checkout('{name}')"
+
+    def commit(self, message):
+        return f"SELECT dolt_commit('-Am', '{message}')"
+
+    def diff_count(self, a, b, table):
+        return f"SELECT count(*) FROM dolt_diff('{a}', '{b}', NULL::{table})"
+
+    def merge(self, name):
+        return f"SELECT dolt_merge('{name}')"
+
+
+def vc_sql(ctx: Context):
+    return _DoltSQL() if ctx.table_am in targets.VERSIONED_ONLY else _TreeSQL()
 
 
 class VWorkload(Workload):
@@ -51,7 +95,7 @@ class VWorkload(Workload):
         """, dbname=ctx.dbname, options=ctx.session_options())
         if ctx.params["background"] == "S1":
             pgbench_init(ctx, int(ctx.size_params["pgbench_scale"]))
-        timed_session(ctx, ["SELECT prolly_commit('initial data')"], "prepare-commit")
+        timed_session(ctx, [vc_sql(ctx).commit("initial data")], "prepare-commit")
 
     def background(self, ctx: Context):
         if ctx.params["background"] == "S1":
@@ -82,11 +126,11 @@ class V1(VWorkload):
     id, title = "V1", "Branch create and checkout"
 
     def operations(self, ctx):
+        vc = vc_sql(ctx)
         stmts = []
         for i in range(self.iterations(ctx)):
-            stmts += [f"SELECT prolly_branch_create('v1_b{i}', NULL)",
-                      f"SELECT prolly_checkout('v1_b{i}')",
-                      "SELECT prolly_checkout('main')"]
+            stmts += [vc.branch(f"v1_b{i}"), vc.checkout(f"v1_b{i}"),
+                      vc.checkout("main")]
         t = timed_session(ctx, stmts, "v1")
         create, checkout = t[0::3], t[1::3] + t[2::3]
         return Outcome(metrics={"branch_create_ms": _median(create),
@@ -104,12 +148,15 @@ class V2(VWorkload):
 
     def operations(self, ctx):
         n = min(ctx.params["changes"], self.rows(ctx))
-        stmts = []
+        vc = vc_sql(ctx)
+        # on a branch of its own, so a background workload's writes (on
+        # main) aren't in its commits
+        stmts = [vc.branch("v2_work"), vc.checkout("v2_work")]
         for i in range(self.iterations(ctx)):
             stmts += [f"UPDATE vc_data SET payload = md5(payload || '{i}') "
                       f"WHERE id <= {n}",
-                      f"SELECT prolly_commit('v2 {i}')"]
-        t = timed_session(ctx, stmts, "v2")
+                      vc.commit(f"v2 {i}")]
+        t = timed_session(ctx, stmts, "v2")[2:]
         return Outcome(metrics={"change_ms": _median(t[0::2]),
                                 "commit_ms": _median(t[1::2])},
                        transactions=len(t) // 2, unit="commit")
@@ -146,19 +193,23 @@ class V3(VWorkload):
         return pred
 
     def operations(self, ctx):
+        # Both sides are branches of their own, so a background workload's
+        # writes (on main) are on neither and the merge doesn't touch them.
+        vc = vc_sql(ctx)
         stmts = [
-            "SELECT prolly_branch_create('v3_other', NULL)",
-            "SELECT prolly_checkout('v3_other')",
+            vc.branch("v3_ours"),
+            vc.branch("v3_other"),
+            vc.checkout("v3_other"),
             f"UPDATE vc_data SET payload = 'other' WHERE {self._ids(ctx, 1)}",
-            "SELECT prolly_commit('v3 other side')",
-            "SELECT prolly_checkout('main')",
-            f"UPDATE vc_data SET payload = 'main' WHERE {self._ids(ctx, 0)}",
-            "SELECT prolly_commit('v3 main side')",
-            "SELECT count(*) FROM prolly_diff('main', 'v3_other')",
-            "SELECT prolly_merge('v3_other')",
+            vc.commit("v3 other side"),
+            vc.checkout("v3_ours"),
+            f"UPDATE vc_data SET payload = 'ours' WHERE {self._ids(ctx, 0)}",
+            vc.commit("v3 our side"),
+            vc.diff_count("v3_ours", "v3_other", "vc_data"),
+            vc.merge("v3_other"),
         ]
         t = timed_session(ctx, stmts, "v3")
-        return Outcome(metrics={"diff_ms": t[7], "merge_ms": t[8]},
+        return Outcome(metrics={"diff_ms": t[8], "merge_ms": t[9]},
                        transactions=2, unit="operation")
 
 
@@ -170,6 +221,8 @@ class V4(VWorkload):
     id, title = "V4", "Clone, fetch and push between two instances"
 
     def operations(self, ctx):
+        if ctx.table_am in targets.VERSIONED_ONLY:
+            raise NotImplementedByEngine("prolly has no clone, fetch or push yet")
         assert ctx.make_cluster is not None
         remote = ctx.make_cluster("remote")
         try:
