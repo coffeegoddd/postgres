@@ -297,7 +297,7 @@ typedef struct FindTree
 
 static void
 find_tree(const char *name, const ProllyNodeRef *data,
-		  const ProllyValue *description, void *arg)
+		  const ProllyValue *description, const char *unreadable, void *arg)
 {
 	FindTree   *ft = arg;
 
