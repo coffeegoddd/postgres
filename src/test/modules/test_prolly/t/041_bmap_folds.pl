@@ -44,7 +44,9 @@ is(sql(sprintf($items, "test_bmap_read_old($rel, 0, $old0)")), $before,
 	'its block holds the page as of the fold');
 
 # The standby has the same list and the same kept page.
-$node->wait_for_replay_catchup($standby);
+# (to the WAL inserted: the changes come from transactions without an
+# xid, whose commits don't flush it)
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('postgres', $listed), $changes, 'a standby has the list');
 is($standby->safe_psql('postgres', sprintf($items, "test_bmap_read_old($rel, 0, $old0)")),
 	$before, 'and the kept page');
@@ -71,7 +73,7 @@ sql(q{UPDATE f.t SET b = 0 WHERE a = 3});
 sql(qq{SELECT test_bmap_fold_prune($rel, $lineage, $epoch2)});
 my $after = sql($listed);
 like($after, qr/^copy \d+ \d+$/, 'what changed before the second fold is let go');
-$node->wait_for_replay_catchup($standby);
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('postgres', $listed), $after, 'on the standby too');
 $node->stop('immediate');
 $node->start;
