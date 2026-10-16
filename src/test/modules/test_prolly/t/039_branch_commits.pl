@@ -160,6 +160,24 @@ $second->query('ROLLBACK');
 is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}),
 	'before the repeatable read merge', 'leaving the head');
 $second->query('SELECT dolt_reset(\'--hard\')');
+
+# So does a cherry-pick.
+$second->{stderr} = '';
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (32, 'first');
+	SELECT dolt_commit('-m', 'before the pick')});
+$second->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_cherry_pick('m');
+	\echo done
+});
+ok(waits_for('dolt_cherry_pick'), 'a cherry-pick waits for the committer');
+$first->query_safe('COMMIT');
+$second->query_until(qr/done/, '');
+like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
+	'and fails');
+is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}), 'before the pick',
+	'the commit it waited for stays the head');
+$second->query('SELECT dolt_reset(\'--hard\')');
 $first->quit;
 $second->quit;
 
