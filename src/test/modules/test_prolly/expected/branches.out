@@ -1,0 +1,527 @@
+-- Branches of versioned schemas: dolt_branch copies the session's branch,
+-- dolt_checkout switches to another, and each branch's changes, to rows
+-- and to schema, are its own.
+CREATE SCHEMA app VERSIONED;
+CREATE TYPE app.mood AS ENUM ('sad', 'ok');
+CREATE TABLE app.t (id serial PRIMARY KEY, m app.mood, v text);
+CREATE INDEX t_m ON app.t (m);
+CREATE VIEW app.v AS SELECT count(*) AS n FROM app.t;
+CREATE FUNCTION app.f() RETURNS text LANGUAGE sql AS 'SELECT ''main''';
+CREATE TABLE shared_t (x int);
+INSERT INTO shared_t VALUES (1);
+-- (rows long enough to be TOASTed; no checkpoint, so they are in buffers)
+INSERT INTO app.t (m, v) SELECT 'ok', repeat(g::text, 1000) FROM generate_series(1, 50) g;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+-- A branch starts as a copy of the session's branch.
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches() ORDER BY name;
+  name   
+---------
+ feature
+ main
+(2 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ feature
+(1 row)
+
+SELECT count(*), sum(length(v)) FROM app.t;
+ count |  sum  
+-------+-------
+    50 | 91000
+(1 row)
+
+SELECT n FROM app.v;
+ n  
+----
+ 50
+(1 row)
+
+SELECT app.f();
+  f   
+------
+ main
+(1 row)
+
+SELECT count(*) FROM app.t WHERE m = 'ok';
+ count 
+-------
+    50
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) FROM app.t WHERE m = 'ok';
+ count 
+-------
+    50
+(1 row)
+
+RESET enable_seqscan;
+-- Its changes are its own: rows, schema, sequences.
+INSERT INTO app.t (m, v) VALUES ('sad', 'feature');
+UPDATE app.t SET v = 'changed' WHERE id = 1;
+DELETE FROM app.t WHERE id = 2;
+ALTER TABLE app.t ADD COLUMN extra int DEFAULT 7;
+ALTER TYPE app.mood ADD VALUE 'happy';
+CREATE TABLE app.only_feature (x int);
+DROP VIEW app.v;
+CREATE OR REPLACE FUNCTION app.f() RETURNS text LANGUAGE sql AS 'SELECT ''feature''';
+SELECT count(*), count(*) FILTER (WHERE v = 'changed'), max(id) FROM app.t;
+ count | count | max 
+-------+-------+-----
+    50 |     1 |  51
+(1 row)
+
+SELECT app.f();
+    f    
+---------
+ feature
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE v = 'changed'), max(id) FROM app.t;
+ count | count | max 
+-------+-------+-----
+    50 |     0 |  50
+(1 row)
+
+SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
+  WHERE attrelid = 'app.t'::regclass AND attnum > 0 AND NOT attisdropped;
+ string_agg 
+------------
+ id,m,v
+(1 row)
+
+SELECT enum_range(NULL::app.mood);
+ enum_range 
+------------
+ {sad,ok}
+(1 row)
+
+SELECT to_regclass('app.only_feature') IS NULL AS no_feature_table;
+ no_feature_table 
+------------------
+ t
+(1 row)
+
+SELECT n FROM app.v;
+ n  
+----
+ 50
+(1 row)
+
+SELECT app.f();
+  f   
+------
+ main
+(1 row)
+
+SELECT nextval('app.t_id_seq');
+ nextval 
+---------
+      51
+(1 row)
+
+-- Main's changes are its own too.
+INSERT INTO app.t (m, v) VALUES ('ok', 'main');
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 'main') AS main_row_here FROM app.t;
+ main_row_here 
+---------------
+             0
+(1 row)
+
+SELECT nextval('app.t_id_seq');
+ nextval 
+---------
+      52
+(1 row)
+
+-- Shared objects are shared.
+INSERT INTO shared_t VALUES (2);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) FROM shared_t;
+ count 
+-------
+     2
+(1 row)
+
+-- A branch of another branch, by name.
+SELECT dolt_branch('feature2', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature2');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'feature2'"}
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE v = 'changed') FROM app.t;
+ count | count 
+-------+-------
+    50 |     1
+(1 row)
+
+SELECT to_regclass('app.only_feature') IS NOT NULL AS has_feature_table;
+ has_feature_table 
+-------------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- dolt_checkout -b makes and checks out.
+SELECT dolt_checkout('-b', 'quick');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'quick'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ quick
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- Making a branch is transactional.
+BEGIN;
+SELECT dolt_branch('rolled_back');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ROLLBACK;
+SELECT name FROM dolt_branches() ORDER BY name;
+   name   
+----------
+ feature
+ feature2
+ main
+ quick
+(4 rows)
+
+-- A checkout of a branch whose making rolls back goes back to the branch
+-- it left: at a rollback, a rollback to a savepoint, through a chain.
+BEGIN;
+SELECT dolt_checkout('-b', 'aborted');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'aborted'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ aborted
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT count(*) > 0 AS has_rows FROM app.t;
+ has_rows 
+----------
+ t
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'aborted_sub');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'aborted_sub'"}
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT count(*) > 0 AS has_rows FROM app.t;
+ has_rows 
+----------
+ t
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT dolt_checkout('-b', 'aborted1');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'aborted1'"}
+(1 row)
+
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'aborted2');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'aborted2'"}
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'kept');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'kept'"}
+(1 row)
+
+RELEASE s;
+COMMIT;
+SELECT active_branch();
+ active_branch 
+---------------
+ kept
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-d', 'kept');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches() ORDER BY name;
+   name   
+----------
+ feature
+ feature2
+ main
+ quick
+(4 rows)
+
+-- Making a branch takes CREATE on the database; deleting one, owning it.
+CREATE ROLE regress_branch_user;
+SET ROLE regress_branch_user;
+DO $$ BEGIN
+	PERFORM dolt_branch('by_user');
+EXCEPTION WHEN insufficient_privilege THEN
+	RAISE NOTICE 'making a branch was refused';
+END $$;
+NOTICE:  making a branch was refused
+RESET ROLE;
+DO $$ BEGIN
+	EXECUTE format('GRANT CREATE ON DATABASE %I TO regress_branch_user',
+				   current_database());
+END $$;
+SET ROLE regress_branch_user;
+SELECT dolt_branch('by_user');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+\set VERBOSITY terse
+SELECT dolt_branch('-d', 'by_user');
+ERROR:  permission denied to delete branch "by_user"
+\set VERBOSITY default
+RESET ROLE;
+SELECT dolt_branch('-d', 'by_user');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DO $$ BEGIN
+	EXECUTE format('REVOKE CREATE ON DATABASE %I FROM regress_branch_user',
+				   current_database());
+END $$;
+DROP ROLE regress_branch_user;
+-- A role a branch's copy references can't be dropped, even once no other
+-- branch's copy does; dropping what it owns there, or the branch, frees it.
+CREATE ROLE regress_branch_owner;
+CREATE TABLE app.owned (x int);
+ALTER TABLE app.owned OWNER TO regress_branch_owner;
+SELECT dolt_branch('keeps_owner');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('also_keeps_owner');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TABLE app.owned;
+DROP ROLE regress_branch_owner;
+ERROR:  role "regress_branch_owner" cannot be dropped because some objects depend on it
+DETAIL:  1 object on branch "keeps_owner"
+1 object on branch "also_keeps_owner"
+SELECT dolt_checkout('keeps_owner');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'keeps_owner'"}
+(1 row)
+
+SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'app.owned'::regclass;
+   pg_get_userbyid    
+----------------------
+ regress_branch_owner
+(1 row)
+
+DROP OWNED BY regress_branch_owner;
+SELECT to_regclass('app.owned') IS NULL AS dropped_here;
+ dropped_here 
+--------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP ROLE regress_branch_owner;
+ERROR:  role "regress_branch_owner" cannot be dropped because some objects depend on it
+DETAIL:  1 object on branch "also_keeps_owner"
+SELECT dolt_branch('-d', 'also_keeps_owner');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP ROLE regress_branch_owner;
+SELECT dolt_branch('-d', 'keeps_owner');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Deleting: not main, not the session's branch.  A branch of a deleted
+-- branch keeps the pages it shared.
+SELECT dolt_branch('-d', 'main');
+ERROR:  branch "main" can't be deleted
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_branch('-d', 'feature');
+ERROR:  branch "feature" is checked out
+HINT:  Check out another branch first.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-d', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+ERROR:  branch "feature" does not exist
+SELECT dolt_checkout('feature2');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'feature2'"}
+(1 row)
+
+SELECT count(*), sum(length(v)) FILTER (WHERE v <> 'changed') FROM app.t;
+ count |  sum  
+-------+-------
+    50 | 89007
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-d', 'feature2', 'quick');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches() ORDER BY name;
+ name 
+------
+ main
+(1 row)
+
+SELECT count(*), sum(length(v)) FROM app.t;
+ count |  sum  
+-------+-------
+    51 | 91004
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to type app.mood
+drop cascades to table app.t
+drop cascades to view app.v
+drop cascades to function app.f()
+DROP TABLE shared_t;

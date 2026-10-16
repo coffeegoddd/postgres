@@ -65,6 +65,13 @@ CATALOG(pg_shdepend,1214,SharedDependRelationId) BKI_SHARED_RELATION
 	 * field.  See SharedDependencyType in catalog/dependency.h.
 	 */
 	char		deptype;		/* see codes in dependency.h */
+
+	/*
+	 * For an object of a versioned schema, which has a copy on each branch
+	 * of its database (see catalog/branch.c), the branch whose copy this
+	 * entry is for; 0 for any other object.
+	 */
+	Oid			objbranch;
 } FormData_pg_shdepend;
 
 END_CATALOG_STRUCT

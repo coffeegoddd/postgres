@@ -236,6 +236,10 @@ extern void copyTemplateDependencies(Oid templateDbId, Oid newDbId);
 
 extern void dropDatabaseDependencies(Oid databaseId);
 
+extern void copyBranchSharedDependencies(Oid source, Oid target);
+
+extern void dropBranchSharedDependencies(Oid branch);
+
 extern void shdepDropOwned(List *roleids, DropBehavior behavior);
 
 extern void shdepReassignOwned(List *roleids, Oid newrole);

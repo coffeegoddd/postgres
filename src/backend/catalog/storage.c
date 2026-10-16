@@ -300,6 +300,28 @@ RelationDropStorage(Relation rel)
 }
 
 /*
+ * RelationDropStorageByLocator
+ *		Schedule a permanent relation's storage, named by its locator, to be
+ *		dropped when the transaction commits.
+ *
+ * As RelationDropStorage(), for a relation the caller hasn't opened.
+ */
+void
+RelationDropStorageByLocator(RelFileLocator rlocator)
+{
+	PendingRelDelete *pending;
+
+	pending = (PendingRelDelete *)
+		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+	pending->rlocator = rlocator;
+	pending->procNumber = INVALID_PROC_NUMBER;
+	pending->atCommit = true;	/* delete if commit */
+	pending->nestLevel = GetCurrentTransactionNestLevel();
+	pending->next = pendingDeletes;
+	pendingDeletes = pending;
+}
+
+/*
  * RelationPreserveStorage
  *		Mark a relation as not to be deleted after all.
  *

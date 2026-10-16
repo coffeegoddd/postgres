@@ -65,16 +65,21 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
+#include "access/xact.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 Oid			MyBranch = BRANCH_MAIN_OID;
 Oid			CatalogBranchIndexTable = InvalidOid;
+bool		CatalogKeepRowBranch = false;
 
 static const CatalogBranchInfo branch_catalogs[] = {
 	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch},
@@ -119,6 +124,13 @@ static const CatalogBranchInfo branch_catalogs[] = {
 
 static const CatalogBranchInfo *by_oid[BRANCH_CATALOG_OID_LIMIT];
 static bool by_oid_built = false;
+
+const CatalogBranchInfo *
+catalog_branch_catalogs(int *n)
+{
+	*n = lengthof(branch_catalogs);
+	return branch_catalogs;
+}
 
 const CatalogBranchInfo *
 catalog_branch_info(Oid relid)
@@ -373,6 +385,12 @@ catalog_row_with_branch(Relation rel, HeapTuple tup)
 
 	if (info == NULL)
 		return tup;
+
+	/* a branch's copy of a row carries its branch already */
+	if (CatalogKeepRowBranch &&
+		!heap_attisnull(tup, info->attnum, RelationGetDescr(rel)))
+		return tup;
+
 	branch = row_branch(rel, tup);
 
 	/*
@@ -427,8 +445,7 @@ branch_session_init(const char *branch)
 		return false;
 	oid = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 	ReleaseSysCache(tup);
-	set_session_branch(oid);
-	return true;
+	return check_out_branch(oid);
 }
 
 /*
@@ -443,4 +460,212 @@ set_session_branch(Oid branch)
 		return;
 	MyBranch = branch;
 	InvalidateSystemCaches();
+}
+
+/*
+ * Checking out.  A session holds a lock on its branch (AccessShareLock on
+ * the branch as an object of the database, session-level) for as long as
+ * it is on it, and deleting a branch takes AccessExclusiveLock until it
+ * commits: a branch isn't deleted under a session, and a session can't
+ * check out a branch being deleted.  main, which can't be deleted, isn't
+ * locked.  A branch left keeps its lock until the transaction ends.  The
+ * locks are of the user lock method, as advisory locks are: an aborted
+ * transaction releases a session's locks of the default one.
+ *
+ * A branch made in the transaction disappears if the transaction (or the
+ * subtransaction that made it) aborts: a session checked out on it goes
+ * back to the branch it came from.
+ */
+
+typedef struct NewBranch
+{
+	Oid			branch;
+	SubTransactionId subid;		/* the subtransaction that made it */
+	Oid			left;			/* the branch last left for it */
+} NewBranch;
+
+/* the branches this session holds locks on, in TopMemoryContext */
+static List *locked_branches = NIL;
+
+/* branches made by the transaction, oldest first, in TopMemoryContext */
+static List *new_branches = NIL;
+
+static bool branch_callbacks_registered = false;
+
+static void
+branch_locktag(LOCKTAG *tag, Oid branch)
+{
+	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, BranchRelationId, branch, 0);
+	tag->locktag_lockmethodid = USER_LOCKMETHOD;
+}
+
+/*
+ * Lock a branch to delete it, until the transaction ends; false if a
+ * session is on it (or another transaction is deleting it).
+ */
+bool
+lock_branch_for_delete(Oid branch)
+{
+	LOCKTAG		tag;
+
+	branch_locktag(&tag, branch);
+	return LockAcquire(&tag, AccessExclusiveLock, false, true) !=
+		LOCKACQUIRE_NOT_AVAIL;
+}
+
+/* go back from branches the (sub)transaction 'subid' made (all: invalid) */
+static void
+undo_new_branches(SubTransactionId subid)
+{
+	/* newest first: a branch left for a newer one may be undone too */
+	for (int i = list_length(new_branches) - 1; i >= 0; i--)
+	{
+		NewBranch  *nb = list_nth(new_branches, i);
+
+		if (subid != InvalidSubTransactionId && nb->subid != subid)
+			continue;
+		if (MyBranch == nb->branch)
+			set_session_branch(nb->left);
+		new_branches = list_delete_nth_cell(new_branches, i);
+		pfree(nb);
+	}
+}
+
+/* release the locks of branches the session has left */
+static void
+release_left_branches(void)
+{
+	List	   *keep = NIL;
+	ListCell   *lc;
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	foreach(lc, locked_branches)
+	{
+		Oid			branch = lfirst_oid(lc);
+		LOCKTAG		tag;
+
+		if (branch == MyBranch)
+		{
+			keep = lappend_oid(keep, branch);
+			continue;
+		}
+		branch_locktag(&tag, branch);
+		LockRelease(&tag, AccessShareLock, true);
+	}
+	list_free(locked_branches);
+	locked_branches = keep;
+	MemoryContextSwitchTo(old);
+}
+
+static void
+branch_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			undo_new_branches(InvalidSubTransactionId);
+			release_left_branches();
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PREPARE:
+			list_free_deep(new_branches);
+			new_branches = NIL;
+			release_left_branches();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						SubTransactionId parentSubid, void *arg)
+{
+	ListCell   *lc;
+
+	switch (event)
+	{
+		case SUBXACT_EVENT_ABORT_SUB:
+			undo_new_branches(mySubid);
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			foreach(lc, new_branches)
+			{
+				NewBranch  *nb = lfirst(lc);
+
+				if (nb->subid == mySubid)
+					nb->subid = parentSubid;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+register_branch_callbacks(void)
+{
+	if (branch_callbacks_registered)
+		return;
+	RegisterXactCallback(branch_xact_callback, NULL);
+	RegisterSubXactCallback(branch_subxact_callback, NULL);
+	branch_callbacks_registered = true;
+}
+
+/*
+ * Note a branch the current (sub)transaction has made, so that a session
+ * on it goes back if it aborts.
+ */
+void
+note_new_branch(Oid branch)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	NewBranch  *nb = palloc(sizeof(NewBranch));
+
+	register_branch_callbacks();
+	nb->branch = branch;
+	nb->subid = GetCurrentSubTransactionId();
+	nb->left = MyBranch;
+	new_branches = lappend(new_branches, nb);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Make branch the session's, locked for as long as the session is on it.
+ * Waits for a deletion of it to end; false if it no longer exists.
+ */
+bool
+check_out_branch(Oid branch)
+{
+	ListCell   *lc;
+
+	register_branch_callbacks();
+	if (branch != BRANCH_MAIN_OID && !list_member_oid(locked_branches, branch))
+	{
+		LOCKTAG		tag;
+		MemoryContext old;
+
+		branch_locktag(&tag, branch);
+		(void) LockAcquire(&tag, AccessShareLock, true, false);
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		locked_branches = lappend_oid(locked_branches, branch);
+		MemoryContextSwitchTo(old);
+
+		/* a deletion that held the lock has committed or not: see which */
+		AcceptInvalidationMessages();
+	}
+	if (!SearchSysCacheExists1(BRANCHOID, ObjectIdGetDatum(branch)))
+		return false;
+
+	foreach(lc, new_branches)
+	{
+		NewBranch  *nb = lfirst(lc);
+
+		if (nb->branch == branch && MyBranch != branch)
+			nb->left = MyBranch;
+	}
+	set_session_branch(branch);
+	return true;
 }
