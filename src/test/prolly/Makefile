@@ -7,6 +7,9 @@
 #
 #	make -C src/test/prolly check PROLLY_AM=prolly_d1
 #
+# (prolly_d1 is the default; PROLLY_AM=prolly runs the groups the page-based
+# engine supports, and check-vc-commits runs on it whatever PROLLY_AM is.)
+#
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
 # expected output is what stock Postgres produces.  See README.

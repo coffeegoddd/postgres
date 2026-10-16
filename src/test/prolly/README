@@ -29,7 +29,8 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	check-tap-durability  crash recovery, standby replay, prepared xacts
 	check-vc-commits      versioned schema, history independence and
 	                      canonical form of branches made by copying
-	                      (always on prolly, whatever PROLLY_AM is)
+	                      (always on prolly, whatever PROLLY_AM is; not
+	                      a claim of VC coverage, see check-vc-target)
 	check-vc              branches, diff and merge (tree engines only)
 	check-vc-isolation    sessions on different branches at once
 	check-tap-vc          history independence across clusters
@@ -51,14 +52,17 @@ and an older commit. It verifies full row contents, including large text,
 using new connections so SQL writes are committed before history snapshots.
 It uses a disposable cluster and leaves its fixtures there for diagnosis.
 An unsupported or disconnected VC path fails; a successful dolt_* call or
-an empty history is not evidence of coverage. D1 currently passes; heap and
-the page-based prolly engine do not yet satisfy this probe. This is a data
-targeting canary, not a claim of schema, merge or crash-recovery coverage.
+an empty history is not evidence of coverage. D1 passes. The page-based
+prolly engine commits a branch's rows and keeps its history
+(check-vc-commits), but can't restore a branch to a commit yet, so it
+doesn't pass this probe, and check-vc-commits isn't a claim of its VC
+coverage; heap doesn't pass either. This is a data targeting canary, not
+a claim of schema, merge or crash-recovery coverage.
 
 The legacy VC groups require check-vc-target before running their suites.
 CI runs the D1 probe and check-vc-target-guard. The latter proves that the
-same probe rejects heap and the currently disconnected prolly history
-path, plus deliberately ineffective commit, checkout and reset functions.
+same probe rejects heap and prolly (which can't restore a commit yet),
+plus deliberately ineffective commit, checkout and reset functions.
 It checks the specific failing invariant, not arbitrary SQL errors. These
 are negative controls for the harness, not functional VC passes for heap
 or prolly. When prolly gains history support, move it to a positive CI

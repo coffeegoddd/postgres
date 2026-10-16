@@ -11,6 +11,7 @@ checkout feature|t
 feature row|(1,one,7)
 feature function|(1,one,7)
 ERROR:  cached plan must not change result type
+1|one|7
 feature table|42
 checkout main|t
 main row|(1,one)
