@@ -86,7 +86,9 @@ SKIP:
 }
 
 # The standby's files are the primary's.
-$node->wait_for_replay_catchup($standby);
+# (to the WAL inserted: the files come from transactions without an xid,
+# whose commits don't flush it)
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('postgres', $files), sql($files),
 	'a standby\'s table files and manifest are the primary\'s, byte for byte');
 is($standby->safe_psql('postgres', $big), '40', 'and it reads them');
