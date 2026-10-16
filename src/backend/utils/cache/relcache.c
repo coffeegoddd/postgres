@@ -2649,6 +2649,7 @@ RelationRebuildRelation(Relation relation)
 		bool		keep_rules;
 		bool		keep_policies;
 		bool		keep_partkey;
+		Oid			branch_was;
 
 		/* Build temporary entry, but don't link it into hashtable */
 		newrel = RelationBuildDesc(save_relid, false);
@@ -2696,6 +2697,7 @@ RelationRebuildRelation(Relation relation)
 		keep_policies = equalRSDesc(relation->rd_rsdesc, newrel->rd_rsdesc);
 		/* partkey is immutable once set up, so we can always keep it */
 		keep_partkey = (relation->rd_partkey != NULL);
+		branch_was = relation->rd_rel->relbranch;
 
 		/*
 		 * Perform swapping of the relcache entry contents.  Within this
@@ -2753,6 +2755,9 @@ RelationRebuildRelation(Relation relation)
 		/* pgstat_info / enabled must be preserved */
 		SWAPFIELD(struct PgStat_RelationStatus *, pgstat_info);
 		SWAPFIELD(bool, pgstat_enabled);
+		/* ... unless the entry is now another branch's copy, counted apart */
+		if (relation->rd_rel->relbranch != branch_was)
+			pgstat_unlink_relation(relation);
 		/* preserve old partition key if we have one */
 		if (keep_partkey)
 		{
@@ -2949,6 +2954,57 @@ RelationCacheInvalidateEntry(Oid relationId)
 			if (in_progress_list[i].reloid == relationId)
 				in_progress_list[i].invalidated = true;
 	}
+}
+
+/*
+ * RelationCacheRebuildNew
+ *		Rebuild the entries of relations made, or given new storage, in this
+ *		transaction, after the session changes branch.
+ *
+ * A cache reset keeps such entries as they are (RelationCacheInvalidate()),
+ * since their "new" status must not be lost.  But on another branch their
+ * catalog rows are that branch's copy's, with storage of its own: the
+ * entries are rebuilt from them, keeping the status, or marked invalid if
+ * the branch has no copy.  Outside a transaction (its abort discards them)
+ * nothing is done.
+ */
+void
+RelationCacheRebuildNew(void)
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+	List	   *rebuild = NIL;
+	ListCell   *lc;
+
+	if (!IsTransactionState())
+		return;
+
+	hash_seq_init(&status, RelationIdCache);
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+
+		if ((relation->rd_createSubid != InvalidSubTransactionId ||
+			 relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId) &&
+			relation->rd_droppedSubid == InvalidSubTransactionId)
+			rebuild = lappend(rebuild, relation);
+	}
+
+	foreach(lc, rebuild)
+	{
+		Relation	relation = lfirst(lc);
+
+		if (!SearchSysCacheExists1(RELOID,
+								   ObjectIdGetDatum(RelationGetRelid(relation))))
+		{
+			RelationInvalidateRelation(relation);
+			continue;
+		}
+		RelationIncrementReferenceCount(relation);
+		RelationRebuildRelation(relation);
+		RelationDecrementReferenceCount(relation);
+	}
+	list_free(rebuild);
 }
 
 /*

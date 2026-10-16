@@ -135,10 +135,13 @@ typedef struct xl_heap_delete
  * For truncate we list all truncated relids in an array, followed by all
  * sequence relids that need to be restarted, if any.
  * All rels are always within the same database, so we just list dbid once.
+ * A versioned relation's relid names its copy on each branch: branch is the
+ * truncating session's.
  */
 typedef struct xl_heap_truncate
 {
 	Oid			dbId;
+	Oid			branch;
 	uint32		nrelids;
 	uint8		flags;
 	Oid			relids[FLEXIBLE_ARRAY_MEMBER];

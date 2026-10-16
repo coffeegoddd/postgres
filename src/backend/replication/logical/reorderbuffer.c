@@ -2502,6 +2502,12 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 						int			nrelations = 0;
 						Relation   *relations;
 
+						/*
+						 * Truncated on another branch: its versioned relations
+						 * are that branch's copies, not this session's.
+						 */
+						bool		other_branch = change->data.truncate.branch != MyBranch;
+
 						relations = palloc0_array(Relation, nrelids);
 						for (i = 0; i < nrelids; i++)
 						{
@@ -2510,8 +2516,15 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 							rel = RelationIdGetRelation(relid);
 
+							if (!RelationIsValid(rel) && other_branch)
+								continue;
 							if (!RelationIsValid(rel))
 								elog(ERROR, "could not open relation with OID %u", relid);
+							if (other_branch && OidIsValid(rel->rd_rel->relbranch))
+							{
+								RelationClose(rel);
+								continue;
+							}
 
 							if (!RelationIsLogicallyLogged(rel))
 							{
@@ -2522,10 +2535,11 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							relations[nrelations++] = rel;
 						}
 
-						/* Apply the truncate. */
-						ReorderBufferApplyTruncate(rb, txn, nrelations,
-												   relations, change,
-												   streaming);
+						/* Apply the truncate (none, if all were another branch's) */
+						if (nrelations > 0)
+							ReorderBufferApplyTruncate(rb, txn, nrelations,
+													   relations, change,
+													   streaming);
 
 						for (i = 0; i < nrelations; i++)
 							RelationClose(relations[i]);

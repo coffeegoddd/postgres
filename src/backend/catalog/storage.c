@@ -673,6 +673,16 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
 }
 
 /*
+ * AnyRelFileLocatorSkippingWAL
+ *		Does any relation's storage skip WAL in this transaction?
+ */
+bool
+AnyRelFileLocatorSkippingWAL(void)
+{
+	return pendingSyncHash != NULL && hash_get_num_entries(pendingSyncHash) > 0;
+}
+
+/*
  * EstimatePendingSyncsSpace
  *		Estimate space needed to pass syncs to parallel workers.
  */

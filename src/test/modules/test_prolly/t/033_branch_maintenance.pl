@@ -60,6 +60,54 @@ ok( $node->poll_query_until('postgres/feature',
 $node->append_conf('postgresql.conf', 'autovacuum = off');
 $node->reload;
 
+# Autovacuum holds the branch it is vacuuming: the branch can't be deleted
+# under it.  Its vacuum of the copy is slowed down to be caught at it.
+sql(q{SELECT dolt_branch('slow')});
+sql(q{
+	CREATE TABLE app.slow (id int, v text)
+	  WITH (autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1);
+	INSERT INTO app.slow SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+	DELETE FROM app.slow;
+}, 'postgres/slow');
+$node->append_conf('postgresql.conf', 'autovacuum = on');
+$node->reload;
+ok( $node->poll_query_until('postgres',
+		q{SELECT count(*) > 0 FROM pg_stat_activity WHERE query LIKE 'autovacuum: VACUUM%app.slow%'}),
+	'autovacuum is vacuuming the branch\'s table');
+my ($ret, $stdout, $stderr) = $node->psql('postgres', q{SELECT dolt_branch('-d', 'slow')});
+like($stderr, qr/branch "slow" is checked out in another session/,
+	'the branch can\'t be deleted meanwhile');
+$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->reload;
+sql(q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+	WHERE backend_type = 'autovacuum worker'});
+ok( $node->poll_query_until('postgres',
+		q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'}),
+	'the worker is gone');
+sql(q{SELECT dolt_branch('-d', 'slow')});
+is(sql(q{SELECT count(*) FROM dolt_branches() WHERE name = 'slow'}), '0',
+	'then it can be');
+
+# A relation made in a transaction that then checks out a copy of it: the
+# copy gets the rows inserted on it, and counts them apart from the
+# original's.
+sql(q{
+	BEGIN;
+	CREATE TABLE app.stats_test (id int);
+	INSERT INTO app.stats_test VALUES (1);
+	SELECT dolt_branch('stats_copy');
+	SELECT dolt_checkout('stats_copy');
+	INSERT INTO app.stats_test SELECT generate_series(1, 10);
+	COMMIT;
+});
+my $ins = q{SELECT n_tup_ins FROM pg_stat_user_tables WHERE relid = 'app.stats_test'::regclass};
+is(sql(q{SELECT count(*) FROM app.stats_test}, 'postgres/stats_copy'), '11',
+	'the rows inserted on the copy are in the copy');
+is(sql(q{SELECT count(*) FROM app.stats_test}), '1', 'not in the original');
+ok($node->poll_query_until('postgres/stats_copy', $ins, '10'),
+	'the copy counts the rows inserted on it');
+is(sql($ins), '1', 'the original, those inserted on main');
+
 # Logical decoding on main decodes main's changes and skips the branch's.
 sql(q{SELECT pg_create_logical_replication_slot('s', 'test_decoding')});
 sql(q{INSERT INTO app.t VALUES (2001, 'main')});
@@ -69,6 +117,23 @@ my $changes = sql(q{SELECT string_agg(data, E'\n') FROM pg_logical_slot_get_chan
 	WHERE data LIKE 'table app.t:%'});
 like($changes, qr/2001.*\n.*2002/, 'main\'s changes are decoded');
 unlike($changes, qr/3001/, 'the branch\'s are not');
+
+# A truncation too: of the branch's copy, and of a table only it has.
+sql(q{
+	CREATE TABLE app.tr (id int PRIMARY KEY);
+	INSERT INTO app.tr VALUES (1);
+	SELECT dolt_branch('truncating');
+});
+sql(q{SELECT pg_logical_slot_get_changes('s', NULL, NULL)});
+sql(q{
+	CREATE TABLE app.only_here (id int PRIMARY KEY);
+	TRUNCATE app.tr;
+	TRUNCATE app.only_here;
+}, 'postgres/truncating');
+sql(q{TRUNCATE app.tr});
+$changes = sql(q{SELECT string_agg(data, E'\n') FROM pg_logical_slot_get_changes('s', NULL, NULL)
+	WHERE data LIKE '%TRUNCATE%'});
+is($changes, 'table app.tr: TRUNCATE: (no-flags)', 'only main\'s truncation is decoded');
 sql(q{SELECT pg_drop_replication_slot('s')});
 
 # Copying the database copies every branch's relations.
@@ -80,4 +145,24 @@ is(sql($rows, 'copied'), $main_rows, 'the copied database has main');
 is(sql($rows, 'copied/feature'), $feature_rows, 'and the branch');
 
 $node->stop;
+
+# With wal_level minimal, a relation made in a transaction skips WAL and is
+# synced at commit; a copy of it would be neither, so the transaction can't
+# change branches.
+my $minimal = PostgreSQL::Test::Cluster->new('branch_minimal');
+$minimal->init;
+$minimal->append_conf('postgresql.conf', qq{
+wal_level = minimal
+max_wal_senders = 0
+});
+$minimal->start;
+my ($mret, $mout, $merr) = $minimal->psql('postgres', q{
+	CREATE SCHEMA app VERSIONED;
+	BEGIN;
+	CREATE TABLE app.new_here (id int);
+	SELECT dolt_checkout('-b', 'from_new');
+});
+like($merr, qr/cannot change branches in a transaction whose new relations skip WAL/,
+	'a transaction whose new relations skip WAL can\'t change branches');
+$minimal->stop;
 done_testing();

@@ -230,6 +230,7 @@ heap_desc(StringInfo buf, XLogReaderState *record)
 		xl_heap_truncate *xlrec = (xl_heap_truncate *) rec;
 
 		truncate_flags_desc(buf, xlrec->flags);
+		appendStringInfo(buf, ", branch: %u", xlrec->branch);
 		appendStringInfo(buf, ", nrelids: %u", xlrec->nrelids);
 		appendStringInfoString(buf, ", relids:");
 		array_desc(buf, xlrec->relids, sizeof(Oid), xlrec->nrelids,

@@ -2432,9 +2432,14 @@ do_autovacuum(void)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/* a table is processed on its branch */
-		if (table->branch != MyBranch)
-			set_session_branch(table->branch);
+		/*
+		 * A table is processed on its branch, checked out: locked, so it
+		 * can't be deleted under the worker, which holds the lock until it
+		 * moves on.  A branch deleted since the tables were gathered is
+		 * skipped.
+		 */
+		if (table->branch != MyBranch && !check_out_branch(table->branch))
+			continue;
 
 		/*
 		 * Check for config changes before processing each collected table.
@@ -2739,7 +2744,7 @@ deleted:
 	 * table due to concurrent autovacuum activity.  In that case, the other
 	 * worker has already done it, or will do so when it finishes.
 	 */
-	set_session_branch(BRANCH_MAIN_OID);
+	(void) check_out_branch(BRANCH_MAIN_OID);
 	if (did_vacuum || !found_concurrent_worker)
 		vac_update_datfrozenxid();
 

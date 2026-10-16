@@ -64,6 +64,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage.h"
 #include "catalog/versioned.h"
 #include "access/xact.h"
 #include "executor/tuptable.h"
@@ -74,6 +75,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -507,6 +509,7 @@ set_session_branch(Oid branch)
 		return;
 	MyBranch = branch;
 	InvalidateSystemCaches();
+	RelationCacheRebuildNew();
 }
 
 /*
@@ -689,6 +692,18 @@ check_out_branch(Oid branch)
 	ListCell   *lc;
 
 	register_branch_callbacks();
+
+	/*
+	 * A relation made in this transaction that skips WAL (wal_level
+	 * minimal) is synced at commit; its copies on other branches would be
+	 * neither logged nor synced.
+	 */
+	if (branch != MyBranch && AnyRelFileLocatorSkippingWAL())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change branches in a transaction whose new relations skip WAL"),
+				 errhint("Commit first, or set \"wal_level\" to \"replica\" or higher.")));
+
 	if (branch != BRANCH_MAIN_OID && !list_member_oid(locked_branches, branch))
 	{
 		LOCKTAG		tag;
