@@ -30,6 +30,8 @@
  *   qualified name, its data tree and its definition as described.
  * - same_schema() is whether two folded roots hold the same objects with
  *   the same definitions, whatever their tables' rows.
+ * - sequences() visits each sequence a folded root holds, in name order,
+ *   with its value: its last value, and whether it was given out.
  * - move_schema() makes the session branch's objects defined as a folded
  *   root defines them, from as another (the branch folded now) does: it
  *   changes the definitions, then calls rows(), which writes the tables'
@@ -47,6 +49,10 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+
+/* Visits one sequence of a canonical root. */
+typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
+										  bool called, void *arg);
 
 /*
  * Visits one table of a canonical root.  unreadable is NULL, or why its
@@ -78,11 +84,13 @@ typedef struct ProllyCanonRoutine
 	bool		(*same_schema) (const ProllyNodeRef *a, const ProllyNodeRef *b);
 	void		(*move_schema) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 								void (*rows) (void *arg), void *arg);
+	void		(*sequences) (const ProllyNodeRef *root,
+							  ProllyCanonSequenceVisit visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
-	"materialized_views", "same_schema", "move_schema"
+	"materialized_views", "same_schema", "move_schema", "sequences"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

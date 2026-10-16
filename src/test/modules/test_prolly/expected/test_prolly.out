@@ -399,11 +399,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (8 of 8 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (9 of 9 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | not implemented (5 of 8 callbacks missing)
+ canonicalizer   | catalogs         | complete                                | not implemented (6 of 9 callbacks missing)
  canonicalizer   | folded           | identity                                | pass
- canonicalizer   | folded           | complete                                | not implemented (2 of 8 callbacks missing)
+ canonicalizer   | folded           | complete                                | not implemented (2 of 9 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass

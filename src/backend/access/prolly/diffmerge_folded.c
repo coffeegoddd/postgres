@@ -18,7 +18,9 @@
  * the root's or of the branch's, and a unique constraint both satisfy
  * isn't violated on the way, as it could be by changing rows one at a
  * time (two rows swapping a value).  Definitions that differ are changed
- * first, by the canonicalizer.
+ * first, by the canonicalizer.  Sequences are set to the root's values.
+ * A merge gives each sequence the other side changed the larger of the
+ * two values.
  *
  * Merge is three-way, from the newest common ancestor of the session's
  * head and the other one, as in implementation "rows": for each table,
@@ -47,6 +49,7 @@
 #include "access/table.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
+#include "commands/sequence.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -527,6 +530,71 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	table_close(ap.rel, NoLock);
 }
 
+/* A sequence's value, as a canonical root has it. */
+typedef struct Sequence
+{
+	char	   *name;
+	int64		last;
+	bool		called;
+} Sequence;
+
+static void
+add_sequence(const char *name, int64 last, bool called, void *arg)
+{
+	List	  **list = arg;
+	Sequence   *sq = palloc(sizeof(Sequence));
+
+	sq->name = pstrdup(name);
+	sq->last = last;
+	sq->called = called;
+	*list = lappend(*list, sq);
+}
+
+static List *
+sequences_of(const ProllyNodeRef *root)
+{
+	List	   *list = NIL;
+
+	PROLLY_CALL(components().canonicalizer, sequences, root, add_sequence, &list);
+	return list;
+}
+
+static Sequence *
+find_sequence(List *list, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, list)
+		if (strcmp(((Sequence *) lfirst(lc))->name, name) == 0)
+			return lfirst(lc);
+	return NULL;
+}
+
+static bool
+same_sequence(const Sequence *a, const Sequence *b)
+{
+	return a->last == b->last && a->called == b->called;
+}
+
+/* How far a sequence has gone: the values it gave out, or none. */
+static bool
+further(const Sequence *a, const Sequence *b)
+{
+	if (a->called != b->called)
+		return a->called;
+	return a->last > b->last;
+}
+
+static void
+set_sequence(const Sequence *sq)
+{
+	List	   *names = stringToQualifiedNameList(sq->name, NULL);
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(names),
+										 RowExclusiveLock, false);
+
+	SetSequence(relid, sq->last, sq->called);
+}
+
 /*
  * Write every table's rows that differ from target's, the branch's as
  * working has them.
@@ -554,6 +622,20 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 		if (!same_hash(&f->data.hash, &t->data.hash))
 			apply_rows(table_named(t->name), f, t);
 	}
+
+	/* and every sequence's value */
+	{
+		List	   *now = sequences_of(working);
+
+		foreach(lc, sequences_of(target))
+		{
+			Sequence   *t = lfirst(lc);
+			Sequence   *f = find_sequence(now, t->name);
+
+			if (f == NULL || !same_sequence(f, t))
+				set_sequence(t);
+		}
+	}
 }
 
 /* The same after definitions changed: the branch folded as it is now. */
@@ -579,6 +661,31 @@ folded_move_to(const ProllyNodeRef *target)
 	else
 		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
 					(void *) target);
+}
+
+/*
+ * Each sequence theirs changed since base gets the larger of its value and
+ * ours.
+ */
+static void
+merge_sequences(const ProllyNodeRef *base, const ProllyNodeRef *ours,
+				const ProllyNodeRef *theirs)
+{
+	List	   *b = sequences_of(base);
+	List	   *o = sequences_of(ours);
+	ListCell   *lc;
+
+	foreach(lc, sequences_of(theirs))
+	{
+		Sequence   *t = lfirst(lc);
+		Sequence   *bs = find_sequence(b, t->name);
+		Sequence   *os = find_sequence(o, t->name);
+
+		if (bs && same_sequence(bs, t))
+			continue;
+		if (os == NULL || further(t, os))
+			set_sequence(t);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -916,6 +1023,7 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	base_tables = tables_in_root(&roots[0]);
 	ours_tables = tables_in_root(&roots[1]);
 	theirs_tables = tables_in_root(&roots[2]);
+	merge_sequences(&roots[0], &roots[1], &roots[2]);
 	foreach(lc, theirs_tables)
 	{
 		Table	   *t = lfirst(lc);
