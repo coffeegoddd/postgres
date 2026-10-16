@@ -38,6 +38,13 @@
  * canonical_root() fail: never a hash that might depend on history.  Heap
  * tables are not versioned and are left out.
  *
+ * Implementation "folded" builds the same form for the session branch's
+ * versioned schemas, the tables being block-mapped prolly tables: their
+ * rows are folded into data trees (keyed by the table keying, sorted, each
+ * a tree in the chunk store), and the canonical tree is kept there too.
+ * Only objects in versioned schemas are described: ordinary schemas and
+ * extensions are every branch's, not the commit's.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/canon_catalogs.c
  *
@@ -53,9 +60,11 @@
 #include "access/prolly_tableam.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_enum.h"
@@ -67,16 +76,19 @@
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "commands/defrem.h"
+#include "executor/tuptable.h"
 #include "mb/pg_wchar.h"
-#include "rewrite/rewriteSupport.h"
 #include "miscadmin.h"
+#include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 typedef struct CanonItem
@@ -91,7 +103,11 @@ typedef struct Canon
 	ProllyTreeEnv env;
 	ProllyRootSet *roots;
 	List	   *items;
+	bool		folded;			/* the session branch's versioned schemas */
+	const ProllyTreeRoutine *tree;
 } Canon;
+
+static void build_canonical(Canon *cn, ProllyNodeRef *root);
 
 static int
 memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
@@ -106,8 +122,20 @@ memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
 static void
 canon_env(Canon *cn)
 {
-	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
+	cn->tree = prolly_tree_lookup("cow");
 	memset(&cn->env, 0, sizeof(cn->env));
+	if (cn->folded)
+	{
+		cn->env.chunk_format = prolly_chunkformat_lookup("basic");
+		cn->env.chunker = prolly_chunker_lookup("bytes");
+		cn->env.hash = prolly_hash_lookup("sha256");
+		cn->env.chunk_store = prolly_chunk_store();
+		cn->env.chunks = PROLLY_CALL(cn->env.chunk_store, open, MyDatabaseId,
+									 MyDatabaseTableSpace);
+		cn->env.compare = memcmp_keys;
+		return;
+	}
+	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
 	cn->env.node_format = cn->c.node_format;
 	cn->env.chunker = cn->c.chunker;
 	cn->env.hash = cn->c.hash;
@@ -192,6 +220,151 @@ uncovered(const char *what, const char *name)
  * Tables
  * ------------------------------------------------------------------------
  */
+
+/* A row folded: its key and its canonical encoding. */
+typedef struct FoldRow
+{
+	StringInfoData key;
+	StringInfoData row;
+} FoldRow;
+
+typedef struct FoldSort
+{
+	const ProllyKeyingRoutine *kr;
+	ProllyKeying *k;
+} FoldSort;
+
+static int
+fold_row_cmp(const void *a, const void *b, void *arg)
+{
+	const FoldRow *ra = *(FoldRow *const *) a;
+	const FoldRow *rb = *(FoldRow *const *) b;
+	FoldSort   *fs = arg;
+	ProllyKey	ka = {(const uint8 *) ra->key.data, ra->key.len};
+	ProllyKey	kb = {(const uint8 *) rb->key.data, rb->key.len};
+	int			r = PROLLY_CALL(fs->kr, compare, fs->k, &ka, &kb);
+
+	/* equal keys of a keyless table: the same row; order by bytes anyway */
+	if (r == 0)
+		r = memcmp(ra->key.data, rb->key.data, Min(ra->key.len, rb->key.len));
+	return r != 0 ? r : (ra->key.len > rb->key.len) - (ra->key.len < rb->key.len);
+}
+
+static int
+keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	FoldSort   *fs = arg;
+
+	return PROLLY_CALL(fs->kr, compare, fs->k, a, b);
+}
+
+/*
+ * A table's rows, as the transaction sees them, folded into a data tree:
+ * each row's key and canonical encoding (the table keying's), in key
+ * order, identical rows of a keyless table counted once.  The same rows
+ * give the same tree whatever pages, order or history they come from.
+ */
+static void
+fold_table(Canon *cn, Relation rel, ProllyNodeRef *root)
+{
+	FoldSort	fs;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	FoldRow   **rows = NULL;
+	int			nrows = 0;
+	int			maxrows = 0;
+	ProllyTreeEnv env = cn->env;
+	ProllyTreeBuilder *b;
+	bool		keyless;
+
+	fs.kr = (const ProllyKeyingRoutine *)
+		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
+	fs.k = PROLLY_CALL(fs.kr, open, rel, NULL, CurrentMemoryContext);
+	keyless = PROLLY_CALL(fs.kr, keyless, fs.k);
+
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, 0);
+	slot = table_slot_create(rel, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		FoldRow    *r = palloc(sizeof(FoldRow));
+		ProllyHash	content;
+
+		initStringInfo(&r->key);
+		initStringInfo(&r->row);
+		PROLLY_CALL(fs.kr, encode_row, fs.k, slot, &r->key, &r->row, &content);
+		if (nrows == maxrows)
+		{
+			maxrows = Max(64, maxrows * 2);
+			rows = rows ? repalloc_array(rows, FoldRow *, maxrows) :
+				palloc_array(FoldRow *, maxrows);
+		}
+		rows[nrows++] = r;
+		CHECK_FOR_INTERRUPTS();
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+
+	if (nrows > 1)
+		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, &fs);
+
+	env.compare = keying_compare;
+	env.compare_arg = &fs;
+	b = PROLLY_CALL(cn->tree, build_begin, &env, CurrentMemoryContext);
+	for (int i = 0; i < nrows;)
+	{
+		int			j = i + 1;
+		ProllyKey	k = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
+		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
+		StringInfoData value;
+		ProllyValue v;
+
+		while (j < nrows && rows[j]->key.len == rows[i]->key.len &&
+			   memcmp(rows[j]->key.data, rows[i]->key.data, k.len) == 0)
+			j++;
+		if (!keyless && j > i + 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("table \"%s\" holds rows with the same primary key",
+							RelationGetRelationName(rel)),
+					 errdetail("A commit can't hold them until the key is unique again.")));
+		initStringInfo(&value);
+		PROLLY_CALL(fs.kr, make_value, fs.k, &row, (uint64) (j - i), &value);
+		v.data = (const uint8 *) value.data;
+		v.len = value.len;
+		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
+		pfree(value.data);
+		i = j;
+	}
+	PROLLY_CALL(cn->tree, build_finish, b, root);
+	PROLLY_CALL(fs.kr, close, fs.k);
+}
+
+/* A table's data tree: folded from its rows, or its working set's. */
+static void
+table_root(Canon *cn, Relation rel, ProllyNodeRef *root)
+{
+	if (cn->folded)
+		fold_table(cn, rel, root);
+	else
+		PROLLY_CALL(cn->c.engine, tree_root, cn->roots, rel, PROLLY_TREE_DATA,
+					root);
+}
+
+/* Is a relation of this access method's rows in the canonical form? */
+static bool
+versioned_am(Canon *cn, Oid amoid)
+{
+	return cn->folded ? amoid == PROLLY_TABLE_AM_OID : is_prolly_am(amoid);
+}
+
+/* Is an object in this namespace the canonical form's? */
+static bool
+canon_namespace(Canon *cn, Oid nsp)
+{
+	if (is_system_namespace(nsp))
+		return false;
+	return !cn->folded || namespace_is_versioned(nsp);
+}
 
 static int
 oid_name_cmp(const ListCell *a, const ListCell *b)
@@ -338,7 +511,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 		append_utf8(out, pg_get_indexdef_string(idx));
 		appendStringInfoChar(out, '\n');
-		if (is_prolly_am(get_rel_relam(idx)))
+		if (!cn->folded && is_prolly_am(get_rel_relam(idx)))
 		{
 			Relation	irel = index_open(idx, AccessShareLock);
 			CanonItem  *it = add_item(cn, "i:",
@@ -555,20 +728,19 @@ collect(Canon *cn)
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
 		char	   *name = NameStr(form->relname);
 
-		if (is_system_namespace(form->relnamespace) ||
+		if (!canon_namespace(cn, form->relnamespace) ||
 			in_extension(RelationRelationId, form->oid))
 			continue;
 		switch (form->relkind)
 		{
 			case RELKIND_RELATION:
-				if (is_prolly_am(form->relam))
+				if (versioned_am(cn, form->relam))
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
 					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					ProllyNodeRef root;
 
-					PROLLY_CALL(cn->c.engine, tree_root, cn->roots, rel,
-								PROLLY_TREE_DATA, &root);
+					table_root(cn, rel, &root);
 					put_hash(&it->value, &root.hash);
 					describe_table(cn, rel, &it->value);
 					table_close(rel, AccessShareLock);
@@ -595,13 +767,12 @@ collect(Canon *cn)
 				{
 					CanonItem  *it = add_item(cn, "m:", qualified(form->relnamespace, name));
 
-					if (is_prolly_am(form->relam))
+					if (versioned_am(cn, form->relam))
 					{
 						Relation	rel = table_open(form->oid, AccessShareLock);
 						ProllyNodeRef root;
 
-						PROLLY_CALL(cn->c.engine, tree_root, cn->roots, rel,
-									PROLLY_TREE_DATA, &root);
+						table_root(cn, rel, &root);
 						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
@@ -632,7 +803,7 @@ collect(Canon *cn)
 		{
 			Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
 
-			if (is_system_namespace(typ->typnamespace) ||
+			if (!canon_namespace(cn, typ->typnamespace) ||
 				in_extension(TypeRelationId, typ->oid))
 				continue;
 			/* Tables' row types come with their tables. */
@@ -658,7 +829,7 @@ collect(Canon *cn)
 			char	   *name;
 			CanonItem  *it;
 
-			if (is_system_namespace(proc->pronamespace) ||
+			if (!canon_namespace(cn, proc->pronamespace) ||
 				in_extension(ProcedureRelationId, proc->oid))
 				continue;
 			name = psprintf("%s(%s)",
@@ -680,13 +851,18 @@ collect(Canon *cn)
 		Relation	pg_policy = table_open(PolicyRelationId, AccessShareLock);
 
 		scan = systable_beginscan(pg_policy, InvalidOid, false, NULL, 0, NULL);
-		if ((tup = systable_getnext(scan)) != NULL)
-			uncovered("row security policies",
-					  NameStr(((Form_pg_policy) GETSTRUCT(tup))->polname));
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
+
+			if (canon_namespace(cn, get_rel_namespace(pol->polrelid)))
+				uncovered("row security policies", NameStr(pol->polname));
+		}
 		systable_endscan(scan);
 		table_close(pg_policy, AccessShareLock);
 	}
-	/* Extensions, by name and version. */
+	/* Extensions, by name and version (every branch's, if folded). */
+	if (!cn->folded)
 	{
 		Relation	pg_ext = table_open(ExtensionRelationId, AccessShareLock);
 
@@ -743,32 +919,11 @@ static void
 catalogs_canonical_root(const ProllyNodeRef *working_set, ProllyNodeRef *root)
 {
 	Canon		cn;
-	int			save_nestlevel;
-	ProllyTreeBuilder *b;
-	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
 	cn.roots = PROLLY_CALL(cn.c.engine, roots_at, working_set);
-
-	/* Deparse with every name qualified, whatever the session's settings. */
-	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	collect(&cn);
-	AtEOXact_GUC(false, save_nestlevel);
-
-	list_sort(cn.items, item_cmp);
-	b = PROLLY_CALL(cn.c.tree, build_begin, &cn.env, CurrentMemoryContext);
-	foreach(lc, cn.items)
-	{
-		CanonItem  *it = lfirst(lc);
-		ProllyKey	k = {(const uint8 *) it->key.data, it->key.len};
-		ProllyValue v = {(const uint8 *) it->value.data, it->value.len};
-
-		PROLLY_CALL(cn.c.tree, build_add, b, &k, &v);
-	}
-	PROLLY_CALL(cn.c.tree, build_finish, b, root);
+	build_canonical(&cn, root);
 	PROLLY_CALL(cn.c.engine, roots_release, cn.roots);
 }
 
@@ -785,10 +940,10 @@ catalogs_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	PROLLY_CALL(cn.c.tree, walk, &cn.env, root, visit, arg);
-	c = PROLLY_CALL(cn.c.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
-	PROLLY_CALL(cn.c.tree, cursor_seek, c, NULL, ForwardScanDirection);
-	while (PROLLY_CALL(cn.c.tree, cursor_next, c, &k, &v))
+	PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
 	{
 		ProllyNodeRef *ref;
 
@@ -801,10 +956,97 @@ catalogs_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 		ref->location.blkno = InvalidBlockNumber;
 		trees = lappend(trees, ref);
 	}
-	PROLLY_CALL(cn.c.tree, cursor_close, c);
+	PROLLY_CALL(cn.tree, cursor_close, c);
 	foreach(lc, trees)
-		PROLLY_CALL(cn.c.tree, walk, &cn.env, lfirst(lc), visit, arg);
+		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
 }
+
+/* The canonical tree, built in the environment from the items collected. */
+static void
+build_canonical(Canon *cn, ProllyNodeRef *root)
+{
+	int			save_nestlevel;
+	ProllyTreeBuilder *b;
+	ListCell   *lc;
+
+	/* Deparse with every name qualified, whatever the session's settings. */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	collect(cn);
+	AtEOXact_GUC(false, save_nestlevel);
+
+	list_sort(cn->items, item_cmp);
+	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
+	foreach(lc, cn->items)
+	{
+		CanonItem  *it = lfirst(lc);
+		ProllyKey	k = {(const uint8 *) it->key.data, it->key.len};
+		ProllyValue v = {(const uint8 *) it->value.data, it->value.len};
+
+		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
+	}
+	PROLLY_CALL(cn->tree, build_finish, b, root);
+}
+
+static void
+folded_fold(ProllyNodeRef *root)
+{
+	Canon		cn;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	build_canonical(&cn, root);
+}
+
+/* The canonical tree, and the data trees its tables name. */
+static void
+folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *trees = NIL;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		ProllyNodeRef *ref;
+
+		if (k.len < 2 || (k.data[0] != 't' && k.data[0] != 'm') || v.len < 1 ||
+			v.len < 1 + v.data[0])
+			continue;
+		ref = palloc0(sizeof(ProllyNodeRef));
+		ref->hash.len = v.data[0];
+		memcpy(ref->hash.bytes, v.data + 1, ref->hash.len);
+		ref->location.blkno = InvalidBlockNumber;
+		trees = lappend(trees, ref);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	foreach(lc, trees)
+		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
+}
+
+const ProllyCanonRoutine prolly_canon_folded = {
+	.info = {
+		.iface = PROLLY_IFACE_CANONICALIZER,
+		.impl_id = 2,
+		.format_version = 1,
+		.name = "folded",
+		.description = "canonical form by name of the session branch's "
+		"versioned schemas, their tables' rows folded into trees",
+	},
+	.walk = folded_walk,
+	.fold = folded_fold,
+};
 
 const ProllyCanonRoutine prolly_canon_catalogs = {
 	.info = {

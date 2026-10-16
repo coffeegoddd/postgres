@@ -80,6 +80,23 @@ static const ProllyProfile profiles[] = {
 	[PROLLY_IFACE_COORDINATION] = "k3", NOT_YET, FOUNDATION}},
 };
 
+/*
+ * Block-mapped prolly tables keep their rows in pages, and have no engine:
+ * these are the components their rows' history is folded with (keying,
+ * encoders, hash, and trees of chunks).  Not in profiles[]: the access
+ * method isn't one of the engines'.
+ */
+static const ProllyProfile history_profile =
+{"prolly", {
+		[PROLLY_IFACE_CHUNKER] = "bytes",
+		[PROLLY_IFACE_CONTENT_HASH] = "sha256",
+		[PROLLY_IFACE_KEY_ENCODER] = "ordered",
+		[PROLLY_IFACE_VALUE_ENCODER] = "canonical",
+		[PROLLY_IFACE_TABLE_KEYING] = "pk_or_content",
+		[PROLLY_IFACE_INDEX_KEYING] = "columns_then_row",
+		[PROLLY_IFACE_TREE] = "cow",
+}};
+
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "tree",
 	[PROLLY_IFACE_TRANSFER] = "stub",
@@ -87,10 +104,12 @@ static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_CANONICALIZER] = "catalogs",
 };
 
+/* NULL for an interface the profile has no implementation of */
 static const ProllyImplInfo *
 profile_impl(const char *const *impls, ProllyInterface iface)
 {
-	Assert(impls[iface] != NULL);
+	if (impls[iface] == NULL)
+		return NULL;
 	return prolly_get_impl(iface, impls[iface]);
 }
 
@@ -199,6 +218,9 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 			break;
 		}
 	}
+	if (profile == NULL && amname != NULL &&
+		strcmp(amname, history_profile.amname) == 0)
+		profile = &history_profile;
 	if (profile == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),

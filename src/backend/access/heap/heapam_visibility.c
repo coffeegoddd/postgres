@@ -1746,7 +1746,9 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		case SNAPSHOT_TOAST:
 			return HeapTupleSatisfiesToast(htup, snapshot, buffer);
 		case SNAPSHOT_DIRTY:
-			return HeapTupleSatisfiesDirty(htup, snapshot, buffer);
+			/* (another branch's rows are no conflict: names, keys) */
+			return HeapTupleSatisfiesDirty(htup, snapshot, buffer) &&
+				tuple_on_branch(htup);
 		case SNAPSHOT_HISTORIC_MVCC:
 			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer) &&
 				tuple_on_branch(htup);
