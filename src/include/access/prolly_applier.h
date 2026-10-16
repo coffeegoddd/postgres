@@ -13,7 +13,8 @@
  *   insert, update and delete its rows, row-level security doesn't apply
  *   to them, and they may update and delete the rows of each table whose
  *   foreign keys reference rel, without row-level security there either;
- *   end() finishes the writes.
+ *   or a materialized view, if the user may refresh it.  end() finishes
+ *   the writes.
  * - insert() adds a row.  update() replaces a row equal to old with new,
  *   and remove() deletes one; both find old by the table's primary key
  *   (deferrable or not), or, if it has none, a row whose every column has
@@ -21,8 +22,9 @@
  * - Rows are written with index maintenance and the checks of NOT NULL,
  *   CHECK and unique and exclusion constraints (deferrable ones when they
  *   are due), but fire no user triggers and check no foreign keys, as
- *   logical replication's apply does.  Nothing else in the session
- *   changes.
+ *   logical replication's apply does.  A materialized view's rows are
+ *   written with index maintenance, as its refresh writes them.  Nothing
+ *   else in the session changes.
  * - Each write is visible to the next.
  *
  * Provisional (v0).

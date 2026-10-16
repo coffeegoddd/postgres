@@ -117,6 +117,28 @@ $second->query_until(qr/done/, '');
 is($second->{stderr}, '', 'and resets');
 is(sql(q{SELECT test_fold_root() = prolly_root_hash('main')}), 't',
 	'to the head, its rows and nothing else');
+
+# A merge that waited for a committer (its parents read before) fails, to
+# be retried, rather than leave the other's commit off the branch.
+$first->query_safe(q{SELECT dolt_branch('m'); SELECT dolt_checkout('m');
+	INSERT INTO app.t VALUES (30, 'm'); SELECT dolt_commit('-am', 'on m');
+	SELECT dolt_checkout('main')});
+$second->{stderr} = '';
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (31, 'first');
+	SELECT dolt_commit('-m', 'before the merge')});
+$second->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_merge('m');
+	\echo done
+});
+ok(waits_for('dolt_merge'), 'a merge waits for the committer');
+$first->query_safe('COMMIT');
+$second->query_until(qr/done/, '');
+like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
+	'and fails');
+is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}), 'before the merge',
+	'the commit it waited for stays the head');
+$second->query('SELECT dolt_reset(\'--hard\')');
 $first->quit;
 $second->quit;
 

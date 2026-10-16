@@ -1279,7 +1279,38 @@ folded_fold(ProllyNodeRef *root)
 	build_canonical(&cn, root);
 }
 
-/* The canonical tree, and the data trees its tables name. */
+/*
+ * A folded item's data tree and the rest of its value (its definition):
+ * a table's or materialized view's value starts with the tree (hash
+ * length, hash).  False for other items, whose value is all definition.
+ */
+static bool
+tree_item(const ProllyKey *k, const ProllyValue *v, ProllyNodeRef *data,
+		  ProllyValue *def)
+{
+	*def = *v;
+	if (k->len < 2 || k->data[1] != ':' ||
+		(k->data[0] != 't' && k->data[0] != 'm'))
+		return false;
+	if (v->len < 1 || v->data[0] > PROLLY_HASH_MAX_LEN ||
+		v->len < 1 + v->data[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical tree holds an invalid entry for \"%s\"",
+						pnstrdup((const char *) k->data + 2, k->len - 2))));
+	if (data)
+	{
+		memset(data, 0, sizeof(*data));
+		data->hash.len = v->data[0];
+		memcpy(data->hash.bytes, v->data + 1, data->hash.len);
+		data->location.blkno = InvalidBlockNumber;
+	}
+	def->data = v->data + 1 + v->data[0];
+	def->len = v->len - 1 - v->data[0];
+	return true;
+}
+
+/* The canonical tree, and the data trees its tables and materialized views name. */
 static void
 folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 {
@@ -1298,38 +1329,41 @@ folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
 	{
-		ProllyNodeRef *ref;
+		ProllyNodeRef *ref = palloc0(sizeof(ProllyNodeRef));
+		ProllyValue def;
 
-		if (k.len < 2 || (k.data[0] != 't' && k.data[0] != 'm') || v.len < 1 ||
-			v.len < 1 + v.data[0])
-			continue;
-		ref = palloc0(sizeof(ProllyNodeRef));
-		ref->hash.len = v.data[0];
-		memcpy(ref->hash.bytes, v.data + 1, ref->hash.len);
-		ref->location.blkno = InvalidBlockNumber;
-		trees = lappend(trees, ref);
+		if (tree_item(&k, &v, ref, &def))
+			trees = lappend(trees, ref);
+		else
+			pfree(ref);
 	}
 	PROLLY_CALL(cn.tree, cursor_close, c);
 	foreach(lc, trees)
 		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
 }
 
-/* The tables of a folded root: its "t:" items. */
+/*
+ * The items of a folded root of one kind ("t:" or "m:"), each with its
+ * data tree and definition; tables' rows may be unreadable here (their
+ * keys ordered by a collation that differs now).
+ */
 static void
-folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
-			  void *arg)
+folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
+			 void *arg)
 {
 	Canon		cn;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
-	ProllyKey	from = {(const uint8 *) "t:", 2};
-	List	   *stale;
+	char		prefix[2] = {kind, ':'};
+	ProllyKey	from = {(const uint8 *) prefix, 2};
+	List	   *stale = NIL;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	canon_env(&cn);
-	stale = stale_collations(&cn, root);
+	if (kind == 't')
+		stale = stale_collations(&cn, root);
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
@@ -1338,38 +1372,41 @@ folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 		ProllyValue description;
 		char	   *name;
 
-		if (k.len < 2 || memcmp(k.data, "t:", 2) != 0)
+		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
 			break;
-		if (v.len < 1 || v.len < 1 + v.data[0] || v.data[0] > PROLLY_HASH_MAX_LEN)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical tree holds an invalid table entry")));
-		memset(&data, 0, sizeof(data));
-		data.hash.len = v.data[0];
-		memcpy(data.hash.bytes, v.data + 1, data.hash.len);
-		data.location.blkno = InvalidBlockNumber;
-		description.data = v.data + 1 + data.hash.len;
-		description.len = v.len - 1 - data.hash.len;
+		(void) tree_item(&k, &v, &data, &description);
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
 		visit(name, &data, &description,
-			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
+			  kind == 't' ?
+			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale) :
+			  NULL,
 			  arg);
 		pfree(name);
 	}
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+/* The tables of a folded root: its "t:" items. */
+static void
+folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
+			  void *arg)
+{
+	folded_trees(root, 't', visit, arg);
+}
+
+/* Its materialized views: its "m:" items. */
+static void
+folded_materialized_views(const ProllyNodeRef *root,
+						  ProllyCanonTableVisit visit, void *arg)
+{
+	folded_trees(root, 'm', visit, arg);
+}
+
 /* An item's value without the data tree a table's or view's starts with. */
 static void
 definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
 {
-	*def = *v;
-	if (k->len >= 2 && (k->data[0] == 't' || k->data[0] == 'm') &&
-		k->data[1] == ':' && v->len >= 1 && v->len >= 1 + v->data[0])
-	{
-		def->data = v->data + 1 + v->data[0];
-		def->len = v->len - 1 - v->data[0];
-	}
+	(void) tree_item(k, v, NULL, def);
 }
 
 /*
@@ -1445,6 +1482,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk = folded_walk,
 	.fold = folded_fold,
 	.tables = folded_tables,
+	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
 };
 

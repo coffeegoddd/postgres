@@ -1372,6 +1372,13 @@ refs_xact_callback(XactEvent event, void *arg)
 	}
 }
 
+/* (a transaction takes the refs branch's lock before it reads the refs) */
+static void
+tree_hold(void)
+{
+	lock_refs();
+}
+
 const ProllyRefsRoutine prolly_refs_tree = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -1397,5 +1404,6 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.reset = tree_reset,
 	.merge_state = tree_merge_state,
 	.set_merge_state = tree_set_merge_state,
+	.hold = tree_hold,
 	.walk = tree_walk,
 };

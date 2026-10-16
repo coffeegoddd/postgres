@@ -343,17 +343,9 @@ folded_tables(const char *from_ref, const char *to_ref,
  */
 
 /* One row changed, copied out of the trees. */
-typedef struct Change
-{
-	ProllyDiffKind kind;
-	StringInfoData before;		/* empty: none */
-	StringInfoData after;		/* empty: none */
-} Change;
-
 typedef struct Changes
 {
 	RowDiff		rd;				/* (for the keying's order) */
-	List	   *list;
 } Changes;
 
 static int
@@ -364,114 +356,109 @@ changes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return PROLLY_CALL(c->rd.kr, compare, c->rd.k, a, b);
 }
 
-static void
-collect_change(ProllyDiffKind kind, const ProllyKey *key,
-			   const ProllyValue *before, const ProllyValue *after, void *arg)
+/* One pass of apply_rows over the diff: its removals, or its inserts. */
+typedef struct Applying
 {
-	Changes    *c = arg;
-	Change	   *ch = palloc0(sizeof(Change));
+	Changes		c;				/* (for the keying) */
+	const ProllyApplierRoutine *ar;
+	ProllyApplier *a;
+	Relation	rel;
+	TupleTableSlot *slot;
+	bool		keyless;
+	bool		inserting;
+} Applying;
 
-	ch->kind = kind;
-	initStringInfo(&ch->before);
-	initStringInfo(&ch->after);
-	if (before)
-		appendBinaryStringInfo(&ch->before, before->data, before->len);
-	if (after)
-		appendBinaryStringInfo(&ch->after, after->data, after->len);
-	c->list = lappend(c->list, ch);
-}
-
-/* A tree value's row into slot; returns how many copies it stands for. */
+/* How many copies a tree value stands for (0: none), and its row. */
 static uint64
-decode(Changes *c, const StringInfoData *value, TupleTableSlot *slot)
+copies_of(Changes *c, const ProllyValue *value, ProllyValue *row)
 {
-	ProllyValue v = {(const uint8 *) value->data, value->len};
-	ProllyValue row;
 	uint64		count;
 
-	if (value->len == 0)
+	if (value == NULL || value->len == 0)
 		return 0;
-	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &row, &count);
-	ExecClearTuple(slot);
-	PROLLY_CALL(c->rd.kr, decode_row, c->rd.k, &row, slot);
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, value, row, &count);
 	return count;
 }
 
-/* Write the rows of table relid that differ between from and to. */
+static void
+apply_change(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	Applying   *ap = arg;
+	ProllyValue brow;
+	ProllyValue arow;
+	uint64		nb = copies_of(&ap->c, before, &brow);
+	uint64		na = copies_of(&ap->c, after, &arow);
+
+	/* a keyless row's copies change in number, a keyed row whole */
+	if (ap->keyless && na >= nb)
+	{
+		na -= nb;
+		nb = 0;
+	}
+	else if (ap->keyless)
+	{
+		nb -= na;
+		na = 0;
+	}
+	if (!ap->inserting && nb > 0)
+	{
+		ExecClearTuple(ap->slot);
+		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
+		for (uint64 i = 0; i < nb; i++)
+			if (!PROLLY_CALL(ap->ar, remove, ap->a, ap->slot))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("a row of \"%s\" changed while the branch was moved",
+								RelationGetRelationName(ap->rel)),
+						 errhint("Try again.")));
+	}
+	else if (ap->inserting && na > 0)
+	{
+		ExecClearTuple(ap->slot);
+		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
+		for (uint64 i = 0; i < na; i++)
+			PROLLY_CALL(ap->ar, insert, ap->a, ap->slot);
+	}
+}
+
+/*
+ * Write the rows of relation relid that differ between from and to: the
+ * removals, then the inserts (a row taking a unique value another gives
+ * up), each written as the trees' diff finds it, nothing held.
+ */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
-	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
-	Relation	rel = table_open(relid, RowExclusiveLock);
 	ProllyTreeEnv env;
-	Changes		c;
-	ProllyApplier *a;
-	TupleTableSlot *before;
-	TupleTableSlot *after;
-	ListCell   *lc;
-	bool		keyless;
+	Applying	ap;
 
 	require_readable(from);
 	require_readable(to);
-	memset(&c, 0, sizeof(c));
-	c.rd.kr = (const ProllyKeyingRoutine *)
+	memset(&ap, 0, sizeof(ap));
+	ap.rel = table_open(relid, RowExclusiveLock);
+	ap.ar = prolly_applier_lookup("replication");
+	ap.c.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	c.rd.k = PROLLY_CALL(c.rd.kr, open_rewritten, rel, CurrentMemoryContext);
-	keyless = PROLLY_CALL(c.rd.kr, keyless, c.rd.k);
+	ap.c.rd.k = PROLLY_CALL(ap.c.rd.kr, open_rewritten, ap.rel,
+							CurrentMemoryContext);
+	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	chunk_env(&env);
 	env.compare = changes_compare;
-	env.compare_arg = &c;
-	PROLLY_CALL(tree, diff, &env, &from->data, &to->data, collect_change, &c);
+	env.compare_arg = &ap.c;
 
-	before = table_slot_create(rel, NULL);
-	after = table_slot_create(rel, NULL);
-	a = PROLLY_CALL(ar, begin, rel);
+	ap.slot = table_slot_create(ap.rel, NULL);
+	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	for (int pass = 0; pass < 2; pass++)
 	{
-		foreach(lc, c.list)
-		{
-			Change	   *ch = lfirst(lc);
-			uint64		nb = decode(&c, &ch->before, before);
-			uint64		na = decode(&c, &ch->after, after);
-
-			/* a keyless row's copies change in number, a keyed row whole */
-			if (keyless && na >= nb)
-			{
-				na -= nb;
-				nb = 0;
-			}
-			else if (keyless)
-			{
-				nb -= na;
-				na = 0;
-			}
-			if (pass == 0)
-			{
-				for (uint64 i = 0; i < nb; i++)
-					if (!PROLLY_CALL(ar, remove, a, before))
-						goto missing;
-			}
-			else
-			{
-				for (uint64 i = 0; i < na; i++)
-					PROLLY_CALL(ar, insert, a, after);
-			}
-		}
+		ap.inserting = (pass == 1);
+		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
-	PROLLY_CALL(ar, end, a);
-	ExecDropSingleTupleTableSlot(before);
-	ExecDropSingleTupleTableSlot(after);
-	PROLLY_CALL(c.rd.kr, close, c.rd.k);
-	table_close(rel, NoLock);
-	return;
-
-missing:
-	ereport(ERROR,
-			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-			 errmsg("a row of \"%s\" changed while the branch was moved",
-					RelationGetRelationName(rel)),
-			 errhint("Try again.")));
+	PROLLY_CALL(ap.ar, end, ap.a);
+	ExecDropSingleTupleTableSlot(ap.slot);
+	PROLLY_CALL(ap.c.rd.kr, close, ap.c.rd.k);
+	table_close(ap.rel, NoLock);
 }
 
 static void
@@ -491,21 +478,82 @@ folded_move_to(const ProllyNodeRef *target)
 				 errdetail("Its versioned schemas' tables or other objects are made, dropped or defined differently there.")));
 	PROLLY_CALL(dc.canonicalizer, tables, &working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, tables, target, add_table, &to);
+	/* materialized views' rows too: a commit holds them as it was made */
+	PROLLY_CALL(dc.canonicalizer, materialized_views, &working, add_table, &from);
+	PROLLY_CALL(dc.canonicalizer, materialized_views, target, add_table, &to);
 	foreach(lc, to.tables)
 	{
 		Table	   *t = lfirst(lc);
 		Table	   *f = find_table(from.tables, t->name);
 
 		if (f == NULL)
-			elog(ERROR, "table \"%s\" is missing from the working set", t->name);
+			elog(ERROR, "relation \"%s\" is missing from the working set", t->name);
 		if (!same_hash(&f->data.hash, &t->data.hash))
 			apply_rows(table_named(t->name), f, t);
 	}
 }
 
+static int
+canon_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
+
+	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
+}
+
+/*
+ * The working set holds something of its own: an object other than a
+ * versioned schema (a branch with no commit has nothing else to lose).
+ */
+static bool
+working_has_objects(void)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef working;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		found = false;
+
+	root_of("WORKING", &working);
+	chunk_env(&env);
+	env.compare = canon_compare;
+	c = PROLLY_CALL(tree, cursor_open, &env, &working, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (!found && PROLLY_CALL(tree, cursor_next, c, &k, &v))
+		found = !(k.len >= 2 && memcmp(k.data, "n:", 2) == 0);
+	PROLLY_CALL(tree, cursor_close, c);
+	return found;
+}
+
+/* Move the session's branch to commit id (not to a name, which may move). */
+static void
+reset_to(const ProllyHash *id)
+{
+	ProllyDatabaseComponents dc = components();
+	char	   *hex = palloc(id->len * 2 + 1);
+
+	hex_encode((const char *) id->bytes, id->len, hex);
+	hex[id->len * 2] = '\0';
+	PROLLY_CALL(dc.refs, reset, hex);
+	pfree(hex);
+}
+
+static void
+refuse_local_changes(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("cannot merge with uncommitted changes"),
+			 errhint("Commit them, or reset the branch, first.")));
+}
+
 /*
  * Merge branch into the session's: nothing to do if it is merged already,
- * a fast-forward if the session's head is its ancestor.
+ * a fast-forward if the session's head is its ancestor.  The heads are
+ * read with the refs held, so they stay as read until the transaction
+ * ends, and the branch is moved to the commit that was checked.
  */
 static int
 folded_merge(const char *branch, const char *message, int flags,
@@ -515,43 +563,55 @@ folded_merge(const char *branch, const char *message, int flags,
 	ProllyHash	ours;
 	ProllyHash	theirs;
 	ProllyHash	base;
-	bool		have_ours;
+	bool		changed = false;
 
+	/* the heads read under the refs held, as they are */
+	PROLLY_CALL(dc.refs, hold);
 	if (!PROLLY_CALL(dc.refs, resolve, branch, &theirs))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", branch)));
-	have_ours = PROLLY_CALL(dc.refs, resolve, "HEAD", &ours);
-	if (have_ours && PROLLY_CALL(dc.refs, merge_base, &ours, &theirs, &base) &&
-		same_hash(&base, &theirs))
+	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
+	{
+		if (flags & PROLLY_MERGE_NO_FF)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the current branch has no commit to merge into")));
+		/* all it has is uncommitted */
+		if (working_has_objects())
+			refuse_local_changes();
+		reset_to(&theirs);
+		*commit_id = theirs;
+		return 0;
+	}
+	if (!PROLLY_CALL(dc.refs, merge_base, &ours, &theirs, &base))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" has no history in common with the current one",
+						branch)));
+	if (same_hash(&base, &theirs))
 	{
 		*commit_id = ours;
 		return 0;
 	}
-	if ((!have_ours ||
-		 (PROLLY_CALL(dc.refs, merge_base, &ours, &theirs, &base) &&
-		  same_hash(&base, &ours))) &&
-		!(flags & PROLLY_MERGE_NO_FF))
-	{
-		bool		changed = false;
+	if (!same_hash(&base, &ours))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("branches made by copying can only fast-forward so far"),
+				 errdetail("The branches have each changed since their common ancestor.")));
+	if (flags & PROLLY_MERGE_NO_FF)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("branches made by copying can only fast-forward so far"),
+				 errdetail("A merge commit where a fast-forward would do (--no-ff) isn't made yet.")));
 
-		/* uncommitted changes would be lost */
-		if (have_ours)
-			folded_tables("HEAD", "WORKING", note_change, &changed);
-		if (changed)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot merge with uncommitted changes"),
-					 errhint("Commit them, or reset the branch, first.")));
-		PROLLY_CALL(dc.refs, reset, branch);
-		*commit_id = theirs;
-		return 0;
-	}
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("branches made by copying can only fast-forward so far"),
-			 errdetail("The branches have each changed since their common ancestor.")));
-	return 0;					/* keep compiler quiet */
+	/* uncommitted changes would be lost */
+	folded_tables("HEAD", "WORKING", note_change, &changed);
+	if (changed)
+		refuse_local_changes();
+	reset_to(&theirs);
+	*commit_id = theirs;
+	return 0;
 }
 
 const ProllyMergeRoutine prolly_merge_folded = {
