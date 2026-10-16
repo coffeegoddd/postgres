@@ -73,8 +73,13 @@ check-semantics: require-tap temp-install
 
 # The VC tests on prolly claim its coverage only after the probe passes
 # on it.
+# (on prolly, the same target as check-vc-target, so make runs it once)
+ifeq ($(PROLLY_AM),prolly)
+check-vc-target-prolly: check-vc-target
+else
 check-vc-target-prolly: temp-install
 	$(MAKE) check-vc-target PROLLY_AM=prolly
+endif
 
 check-vc: temp-install check-vc-target-prolly vc.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
@@ -107,7 +112,7 @@ check-tap-durability: require-tap temp-install
 	$(prove_check)
 
 check-tap-vc: PROVE_TESTS = t/2*.pl
-check-tap-vc: require-legacy-vc check-vc-target require-tap temp-install
+check-tap-vc: check-vc-target require-tap temp-install
 	$(prove_check)
 
 # Upstream correctness checks: Postgres's own
@@ -140,13 +145,10 @@ check-heap: temp-install
 require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
 
-require-legacy-vc:
-	@test '$(PROLLY_AM)' != prolly || { echo 'The VC requirements use the legacy tree-engine API; run semantics, isolation and durability for prolly'; exit 1; }
-
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-vc-d1 check-vc-isolation-d1 \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE
+	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap FORCE

@@ -34,15 +34,15 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	check-vc-d1           branches, diff and merge on the tree engine,
 	                      through its prolly_* API (tree engines only)
 	check-vc-isolation-d1 sessions on different branches at once on it
-	check-tap-vc          history independence across clusters (tree
-	                      engines only)
+	check-tap-vc          history independence across clusters
 
 Semantics, isolation and TAP groups require --enable-tap-tests; a build
 without TAP support fails these targets instead of reporting success.
 For the page-based prolly AM, run check-semantics, check-isolation,
-check-tap-durability and check-vc-target with PROLLY_AM=prolly.  check-vc
-and check-vc-isolation run on it always; check-vc-d1, check-vc-isolation-d1
-and check-tap-vc use the legacy tree-engine API and reject that target.
+check-tap-durability, check-vc-target and check-tap-vc with
+PROLLY_AM=prolly.  check-vc and check-vc-isolation run on it always;
+check-vc-d1 and check-vc-isolation-d1 use the legacy tree-engine API and
+reject that target.
 
 Run check-vc-target before claiming version-control coverage for an AM:
 
