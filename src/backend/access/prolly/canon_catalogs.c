@@ -2168,6 +2168,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				if (t != NULL)
 					goto unsupported;
 				break;
+			case 'n':
 			case 's':
 			case 't':
 				break;
@@ -2244,8 +2245,25 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				sm.before = lappend(sm.before, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
 		}
 	}
+	/* Schemas going: last, what was in them gone already. */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
 
-	/* Coming: types, sequences, routines, tables; views after the rows. */
+		if (f->kind == 'n' && find_item(to, 'n', f->name) == NULL)
+			sm.before = lappend(sm.before,
+								psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
+	}
+
+	/* Coming: schemas, types, sequences, routines, tables; views after the rows. */
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+
+		if (t->kind == 'n' && find_item(from, 'n', t->name) == NULL)
+			sm.before = lappend(sm.before,
+								psprintf("CREATE SCHEMA %s VERSIONED", t->name));
+	}
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
@@ -2253,6 +2271,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 		if (f && strcmp(t->def, f->def) == 0)
 			continue;
+		if (t->kind == 'n')
+			continue;			/* (above) */
 		if (t->kind == 'y')
 			sm.before = lappend(sm.before, create_type_sql(t->name, t->def));
 		else if (t->kind == 's')

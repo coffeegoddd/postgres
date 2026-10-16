@@ -241,6 +241,59 @@ SELECT dolt_branch('-D', 'feature', 'at_feature');
  {0}
 (1 row)
 
+-- Versioned schemas come and go with a move, empty ones too.
+SELECT test_fold_root() AS no_schemas \gset
+SELECT dolt_hashof('HEAD') AS before_schemas \gset
+CREATE SCHEMA sm_full VERSIONED;
+CREATE TABLE sm_full.u (id int PRIMARY KEY);
+INSERT INTO sm_full.u VALUES (1);
+CREATE SCHEMA sm_empty VERSIONED;
+SELECT dolt_commit('-Am', 'schemas') AS with_schemas \gset
+SELECT dolt_reset('--hard', :'before_schemas');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sm\_%' ORDER BY 1;
+ nspname 
+---------
+(0 rows)
+
+SELECT test_fold_root() = :'no_schemas' AS schemas_gone;
+ schemas_gone 
+--------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', (:'with_schemas'::text[])[1]);
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sm\_%' ORDER BY 1;
+ nspname  
+----------
+ sm_empty
+ sm_full
+(2 rows)
+
+SELECT * FROM sm_full.u;
+ id 
+----
+  1
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS schemas_back;
+ schemas_back 
+--------------
+ t
+(1 row)
+
+DROP SCHEMA sm_full CASCADE;
+NOTICE:  drop cascades to table sm_full.u
+DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table app.t
