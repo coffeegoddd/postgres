@@ -32,6 +32,9 @@
  *   the same definitions, whatever their tables' rows.
  * - sequences() visits each sequence a folded root holds, in name order,
  *   with its value: its last value, and whether it was given out.
+ * - merge_schema() merges three folded roots' definitions: each object as
+ *   the side that changed it has it; one both changed differently is a
+ *   schema conflict, an error.
  * - move_schema() makes the session branch's objects defined as a folded
  *   root defines them, from as another (the branch folded now) does: it
  *   changes the definitions, then calls rows(), which writes the tables'
@@ -89,11 +92,16 @@ typedef struct ProllyCanonRoutine
 								void (*rows) (void *arg), void *arg);
 	void		(*sequences) (const ProllyNodeRef *root,
 							  ProllyCanonSequenceVisit visit, void *arg);
+	void		(*merge_schema) (const ProllyNodeRef *base,
+								 const ProllyNodeRef *ours,
+								 const ProllyNodeRef *theirs,
+								 ProllyNodeRef *merged);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
-	"materialized_views", "same_schema", "move_schema", "sequences"
+	"materialized_views", "same_schema", "move_schema", "sequences", \
+	"merge_schema"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

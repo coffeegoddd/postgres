@@ -58,6 +58,7 @@ tests += {
       'cherry_pick',
       'schema_moves',
       'sequences',
+      'schema_merges',
     ],
   },
   'tap': {

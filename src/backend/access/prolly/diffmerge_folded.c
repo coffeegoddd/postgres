@@ -30,8 +30,12 @@
  * the merge in progress in the refs.  Its conflicts are found again from
  * the three commits when they're listed or resolved.  A keyless table's
  * rows have no identity, so the two sides' changes in a row's copies add
- * up.  The branch must have no changes since its head, and the three
- * commits must define their objects alike, for now.
+ * up.  The branch must have no changes since its head.  Definitions
+ * changed since the ancestor are merged first (the canonicalizer's
+ * merge_schema(): an object both sides changed differently fails the
+ * merge); then a table all three define alike merges its rows three-way,
+ * and one defined otherwise takes the rows of the side that redefined,
+ * made or kept it, if the other side didn't change them.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/diffmerge_folded.c
@@ -980,6 +984,124 @@ missing:
 	return 0;					/* keep compiler quiet */
 }
 
+/* What a merge across definitions writes, once they're merged. */
+typedef struct MergeRows
+{
+	List	   *base;
+	List	   *ours;
+	List	   *theirs;
+	bool		fail_on_conflict;
+	const char *what;
+	const char *name;			/* the branch merged, or NULL */
+	List	  **conflicted;
+	int			conflicts;
+} MergeRows;
+
+static bool
+same_description(const Table *a, const Table *b)
+{
+	return same_hash(&a->description, &b->description);
+}
+
+/* What failed, for an error: a merge of branch name, or what (a pick). */
+static char *
+op_label(const char *what, const char *name)
+{
+	return name ? psprintf("%s of branch \"%s\"", what, name) : pstrdup(what);
+}
+
+static void
+cannot_merge_rows(const char *what, const char *name)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s can't combine the rows of table %s yet", what, name),
+			 errdetail("One side changed its definition, or dropped it, and the other its rows.")));
+}
+
+/*
+ * Each table's rows, after the definitions are merged: three-way where
+ * all three define it alike; else the rows of the side that redefined,
+ * made or kept it, if the other didn't change them.
+ */
+static void
+merge_rows(void *arg)
+{
+	MergeRows  *mr = arg;
+	ProllyNodeRef working;
+	List	   *now = NIL;
+	Tables		ts = {NIL};
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	PROLLY_CALL(components().canonicalizer, fold, &working);
+	PROLLY_CALL(components().canonicalizer, tables, &working, add_table, &ts);
+	now = ts.tables;
+	foreach(lc, mr->ours)
+		names = lappend(names, ((Table *) lfirst(lc))->name);
+	foreach(lc, mr->theirs)
+		if (!find_table(mr->ours, ((Table *) lfirst(lc))->name))
+			names = lappend(names, ((Table *) lfirst(lc))->name);
+	foreach(lc, names)
+	{
+		char	   *name = lfirst(lc);
+		Table	   *b = find_table(mr->base, name);
+		Table	   *o = find_table(mr->ours, name);
+		Table	   *t = find_table(mr->theirs, name);
+		Table	   *w = find_table(now, name);
+		bool		o_rows = b ? !o || !same_hash(&o->data.hash, &b->data.hash) : o != NULL;
+		bool		t_rows = b ? !t || !same_hash(&t->data.hash, &b->data.hash) : t != NULL;
+
+		if (t == NULL)
+		{
+			/* theirs dropped it (or never had it): ours, unless dropped */
+			if (b && o && o_rows)
+				cannot_merge_rows(op_label(mr->what, mr->name), name);
+			continue;
+		}
+		if (o == NULL)
+		{
+			/* ours dropped it; or theirs made it, rows and all */
+			if (b && t_rows)
+				cannot_merge_rows(op_label(mr->what, mr->name), name);
+			if (!b)
+				apply_rows(table_named(name), w, t);
+			continue;
+		}
+		if (!t_rows)
+			continue;
+		if (b && same_description(b, o) && same_description(b, t))
+		{
+			int			n;
+
+			if (!o_rows)
+			{
+				apply_rows(table_named(name), w, t);
+				continue;
+			}
+			n = merge_table(table_named(name), b, o, t, WALK_MERGE, NULL);
+			if (n > 0 && mr->fail_on_conflict)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("%s conflicts in table \"%s\"",
+								op_label(mr->what, mr->name), name),
+						 errdetail_plural("%d row was changed differently on both sides.",
+										  "%d rows were changed differently on both sides.",
+										  n, n)));
+			if (n > 0)
+			{
+				mr->conflicts += n;
+				*mr->conflicted = lappend_oid(*mr->conflicted, table_named(name));
+			}
+			continue;
+		}
+		/* defined otherwise somewhere: one side's rows, whole */
+		if (o_rows && !(same_hash(&o->data.hash, &t->data.hash)))
+			cannot_merge_rows(op_label(mr->what, mr->name), name);
+		apply_rows(table_named(name), w, t);
+	}
+}
+
 /* A commit's canonical root. */
 static void
 commit_root(const ProllyHash *id, ProllyNodeRef *root)
@@ -1086,15 +1208,25 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	ListCell   *lc;
 	int			conflicts = 0;
 
-	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
-		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("commits whose objects are defined differently can't be merged yet"),
-				 errdetail("A table or other object of the versioned schemas was made, dropped or redefined between them.")));
 	base_tables = tables_in_root(&roots[0]);
 	ours_tables = tables_in_root(&roots[1]);
 	theirs_tables = tables_in_root(&roots[2]);
+
+	/* Definitions changed: merged first, then the rows as they allow. */
+	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
+	{
+		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
+		fail_on_conflict, what, name, conflicted, 0};
+		ProllyNodeRef merged;
+
+		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
+					&roots[2], &merged);
+		PROLLY_CALL(dc.canonicalizer, move_schema, &roots[1], &merged,
+					merge_rows, &mr);
+		merge_sequences(&roots[0], &roots[1], &roots[2]);
+		return mr.conflicts;
+	}
 	merge_sequences(&roots[0], &roots[1], &roots[2]);
 	foreach(lc, theirs_tables)
 	{
@@ -1113,18 +1245,11 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 			continue;
 		}
 		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
-		if (n > 0 && fail_on_conflict && name)
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("%s of branch \"%s\" conflicts in table \"%s\"",
-							what, name, get_rel_name(relid)),
-					 errdetail_plural("%d row was changed differently on both sides.",
-									  "%d rows were changed differently on both sides.",
-									  n, n)));
 		if (n > 0 && fail_on_conflict)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("%s conflicts in table \"%s\"", what, get_rel_name(relid)),
+					 errmsg("%s conflicts in table \"%s\"", op_label(what, name),
+							get_rel_name(relid)),
 					 errdetail_plural("%d row was changed differently on both sides.",
 									  "%d rows were changed differently on both sides.",
 									  n, n)));

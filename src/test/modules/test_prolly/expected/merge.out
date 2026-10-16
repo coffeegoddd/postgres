@@ -415,7 +415,7 @@ SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
 (3 rows)
 
 ROLLBACK;
--- Not yet: different definitions.
+-- Definitions that differ: merged, then the rows (here, a keyless conflict).
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -443,8 +443,9 @@ SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
 (1 row)
 
 SELECT dolt_merge('feature');
-ERROR:  commits whose objects are defined differently can't be merged yet
-DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined between them.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

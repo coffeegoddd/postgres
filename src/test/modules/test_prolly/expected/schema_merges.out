@@ -1,0 +1,286 @@
+-- Merges of branches made by copying whose definitions changed: objects
+-- merged one by one, as the side that changed each has it; then rows.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+CREATE TABLE app.u (id int PRIMARY KEY, w text);
+CREATE TABLE app.d (x int);
+INSERT INTO app.t SELECT g, 'v' || g FROM generate_series(1, 5) g;
+INSERT INTO app.u SELECT g, 'w' || g FROM generate_series(1, 5) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- feature: a new table, routine and view, a column, a dropped table
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+CREATE TABLE app.n (id int PRIMARY KEY, t int REFERENCES app.t);
+INSERT INTO app.n VALUES (1, 1), (2, 2);
+CREATE FUNCTION app.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+ALTER TABLE app.t ADD COLUMN extra int DEFAULT 0;
+UPDATE app.t SET extra = id;
+CREATE VIEW app.tv AS SELECT id, app.twice(extra) AS e FROM app.t;
+DROP TABLE app.d;
+CREATE TABLE app.same (k int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'feature defines')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- main: rows of another table, and the same table made alike
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.u SET w = 'main' WHERE id = 1;
+INSERT INTO app.u VALUES (6, 'six');
+CREATE TABLE app.same (k int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'main rows')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT dolt_hashof('HEAD^2') = dolt_hashof('feature') AS merge_commit;
+ merge_commit 
+--------------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM app.t ORDER BY id;
+ id | v  | extra 
+----+----+-------
+  1 | v1 |     1
+  2 | v2 |     2
+  3 | v3 |     3
+  4 | v4 |     4
+  5 | v5 |     5
+(5 rows)
+
+SELECT * FROM app.tv ORDER BY id;
+ id | e  
+----+----
+  1 |  2
+  2 |  4
+  3 |  6
+  4 |  8
+  5 | 10
+(5 rows)
+
+SELECT * FROM app.n ORDER BY id;
+ id | t 
+----+---
+  1 | 1
+  2 | 2
+(2 rows)
+
+SELECT * FROM app.u ORDER BY id;
+ id |  w   
+----+------
+  1 | main
+  2 | w2
+  3 | w3
+  4 | w4
+  5 | w5
+  6 | six
+(6 rows)
+
+SELECT to_regclass('app.d') IS NULL AS d_dropped, to_regclass('app.same') IS NOT NULL AS same_made;
+ d_dropped | same_made 
+-----------+-----------
+ t         | t
+(1 row)
+
+INSERT INTO app.n VALUES (3, 99);		-- its foreign key came too
+ERROR:  insert or update on table "n" violates foreign key constraint "n_t_fkey"
+DETAIL:  Key (t)=(99) is not present in table "t".
+-- the merge's root is the branch folded
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- An object both sides changed differently: a schema conflict.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];		-- feature catches up first
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+SELECT length(dolt_commit('-Am', 'feature f')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 2';
+SELECT length(dolt_commit('-Am', 'main f')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('feature');
+ERROR:  schema conflict: app.f() was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT to_regprocedure('app.f()') IS NOT NULL AS ours_kept, app.f();
+ ours_kept | f 
+-----------+---
+ t         | 2
+(1 row)
+
+-- A table redefined on one side, its rows changed on the other: a column
+-- added empty leaves the rows as they were, so they merge.
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE app.u ADD COLUMN more int;
+SELECT length(dolt_commit('-Am', 'feature redefines u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.u SET w = 'main again' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 'main changes u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM app.u WHERE id <= 2 ORDER BY id;
+ id |     w      | more 
+----+------------+------
+  1 | main       |     
+  2 | main again |     
+(2 rows)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- One with a default changes every row: not yet.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+ALTER TABLE app.u ADD COLUMN most int DEFAULT 5;
+SELECT length(dolt_commit('-Am', 'feature fills u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.u SET w = 'main once more' WHERE id = 3;
+SELECT length(dolt_commit('-Am', 'main changes u again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('feature');
+ERROR:  merge of branch "feature" can't combine the rows of table app.u yet
+DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table app.t
+drop cascades to table app.u
+drop cascades to table app.same
+drop cascades to function app.twice(integer)
+drop cascades to table app.n
+drop cascades to view app.tv
