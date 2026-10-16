@@ -270,17 +270,96 @@ SELECT * FROM dolt_status();
 ------------+--------+--------
 (0 rows)
 
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
  {0}
 (1 row)
 
+-- Versioned schemas merge as objects do: one side's new ones (empty too)
+-- come, and one it dropped goes.
+CREATE SCHEMA sg_gone VERSIONED;
+SELECT length(dolt_commit('-Am', 'a schema to drop')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sg_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sg_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+CREATE SCHEMA sg_new VERSIONED;
+CREATE TABLE sg_new.u (id int PRIMARY KEY);
+CREATE SCHEMA sg_new_empty VERSIONED;
+DROP SCHEMA sg_gone;
+SELECT length(dolt_commit('-Am', 'schemas on the side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE app.sg_main (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'a table on main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('sg_side'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sg\_%' ORDER BY 1;
+   nspname    
+--------------
+ sg_new
+ sg_new_empty
+(2 rows)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'sg_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sg_new CASCADE;
+NOTICE:  drop cascades to table sg_new.u
+DROP SCHEMA sg_new_empty;
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 6 other objects
+NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.u
 drop cascades to table app.same
 drop cascades to function app.twice(integer)
 drop cascades to table app.n
+drop cascades to table app.sg_main
 drop cascades to view app.tv
