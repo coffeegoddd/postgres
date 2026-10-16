@@ -61,11 +61,11 @@ SELECT (dolt_merge('feature'))[2:4];
  {0,0,"merge successful"}
 (1 row)
 
-SELECT string_agg(message, ', ' ORDER BY message) FROM
+SELECT string_agg(message, ', ' ORDER BY message COLLATE "C") FROM
   (SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 4) s;
                          string_agg                          
 -------------------------------------------------------------
- base, Merge branch 'feature' into main, on feature, on main
+ Merge branch 'feature' into main, base, on feature, on main
 (1 row)
 
 SELECT dolt_hashof('HEAD^1') = (SELECT commit_hash FROM dolt_log('main') WHERE message = 'on main') AS first_parent,

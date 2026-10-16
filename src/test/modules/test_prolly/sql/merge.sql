@@ -29,7 +29,7 @@ SELECT length(dolt_commit('-Am', 'on feature')::text) AS committed;
 SELECT dolt_checkout('main');
 
 SELECT (dolt_merge('feature'))[2:4];
-SELECT string_agg(message, ', ' ORDER BY message) FROM
+SELECT string_agg(message, ', ' ORDER BY message COLLATE "C") FROM
   (SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 4) s;
 SELECT dolt_hashof('HEAD^1') = (SELECT commit_hash FROM dolt_log('main') WHERE message = 'on main') AS first_parent,
        dolt_hashof('HEAD^2') = dolt_hashof('feature') AS second_parent;
