@@ -1,3 +1,7 @@
-# Version control: branches, diff and merge of the tree engines (legacy)
+# Version control of branches made by copying: branches, versioned schema,
+# diff and merge, history independence and canonical form
 test: vc_branches
+test: vc_schema
 test: vc_diff_merge
+test: vc_history
+test: vc_canonical

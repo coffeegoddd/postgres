@@ -1,27 +1,27 @@
 Parsed test spec with 2 sessions
 
 starting permutation: s1_main s2_b s1_insert s2_insert s1_read s2_read
-step s1_main: SELECT prolly_checkout('main') IS NULL AS ok;
+step s1_main: SELECT dolt_checkout('main') IS NOT NULL AS ok;
 ok
 --
 t 
 (1 row)
 
-step s2_b: SELECT prolly_checkout('vbs_b') IS NULL AS ok;
+step s2_b: SELECT dolt_checkout('vbs_b') IS NOT NULL AS ok;
 ok
 --
 t 
 (1 row)
 
-step s1_insert: INSERT INTO vbs VALUES (2, 'main'), (5, 'main');
-step s2_insert: INSERT INTO vbs VALUES (3, 'b'), (5, 'b');
-step s1_read: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs;
+step s1_insert: INSERT INTO vbs.vbs VALUES (2, 'main'), (5, 'main');
+step s2_insert: INSERT INTO vbs.vbs VALUES (3, 'b'), (5, 'b');
+step s1_read: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs.vbs;
 rows                
 --------------------
 1:base,2:main,5:main
 (1 row)
 
-step s2_read: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs;
+step s2_read: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs.vbs;
 rows          
 --------------
 1:base,3:b,5:b

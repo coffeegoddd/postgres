@@ -1,2 +1,2 @@
-# Version control under concurrency: prolly engines only
+# Version control under concurrency, of branches made by copying
 test: vc_branch_sessions
