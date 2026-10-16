@@ -8,7 +8,8 @@
 #	make -C src/test/prolly check PROLLY_AM=prolly_d1
 #
 # (prolly_d1 is the default; PROLLY_AM=prolly runs the groups the page-based
-# engine supports, and check-vc-commits runs on it whatever PROLLY_AM is.)
+# engine supports, and check-vc-commits runs on it whatever PROLLY_AM is,
+# after check-vc-target passes on it.)
 #
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
@@ -70,7 +71,12 @@ check-semantics: require-tap temp-install
 check-vc: require-legacy-vc check-vc-target temp-install prolly_am.conf
 	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_schedule
 
-check-vc-commits: temp-install vc_commits.conf
+# The commit and history tests on prolly claim its VC coverage only after
+# the probe passes on it.
+check-vc-target-prolly: temp-install
+	$(MAKE) check-vc-target PROLLY_AM=prolly
+
+check-vc-commits: temp-install check-vc-target-prolly vc_commits.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc_commits.conf \
 		--schedule=$(srcdir)/vc_commits_schedule
 
@@ -131,6 +137,6 @@ require-legacy-vc:
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc_commits.conf output_iso
 
-.PHONY: check check-target check-vc-target check-vc-target-guard check-semantics check-vc check-vc-commits check-isolation check-vc-isolation \
+.PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-vc-commits check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE
