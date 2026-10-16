@@ -26,6 +26,10 @@
  *   branch and the merged branch have it (NULL where it doesn't exist).
  * - resolve() resolves them, keeping the current rows or taking the merged
  *   branch's.
+ * - tables() reports each table that differs between two refs (its rows or
+ *   its definition), by qualified name, in name order: added, removed or
+ *   modified.  diff() may leave out the rows of tables the session branch
+ *   doesn't have; tables() names them.
  *
  * Provisional (v0).
  *
@@ -53,6 +57,10 @@ struct ProllyConflictSink
 							 const ProllyValue *theirs);
 };
 
+/* Visits one table that differs between two refs. */
+typedef void (*ProllyTableChangeVisit) (const char *name, ProllyDiffKind kind,
+										void *arg);
+
 typedef struct ProllyMergeRoutine
 {
 	ProllyImplInfo info;
@@ -64,9 +72,12 @@ typedef struct ProllyMergeRoutine
 						  ProllyHash *commit_id);
 	void		(*conflicts) (Oid relid, ProllyConflictSink *sink);
 	void		(*resolve) (Oid relid, bool theirs);
+	void		(*tables) (const char *from_ref, const char *to_ref,
+						   ProllyTableChangeVisit visit, void *arg);
 } ProllyMergeRoutine;
 
-#define PROLLY_MERGE_CALLBACK_NAMES "diff", "merge", "conflicts", "resolve"
+#define PROLLY_MERGE_CALLBACK_NAMES \
+	"diff", "merge", "conflicts", "resolve", "tables"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 
 static inline const ProllyMergeRoutine *

@@ -1060,6 +1060,47 @@ folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
 }
 
+/* The tables of a folded root: its "t:" items. */
+static void
+folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
+			  void *arg)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	from = {(const uint8 *) "t:", 2};
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		ProllyNodeRef data;
+		ProllyValue description;
+		char	   *name;
+
+		if (k.len < 2 || memcmp(k.data, "t:", 2) != 0)
+			break;
+		if (v.len < 1 || v.len < 1 + v.data[0] || v.data[0] > PROLLY_HASH_MAX_LEN)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical tree holds an invalid table entry")));
+		memset(&data, 0, sizeof(data));
+		data.hash.len = v.data[0];
+		memcpy(data.hash.bytes, v.data + 1, data.hash.len);
+		data.location.blkno = InvalidBlockNumber;
+		description.data = v.data + 1 + data.hash.len;
+		description.len = v.len - 1 - data.hash.len;
+		name = pnstrdup((const char *) k.data + 2, k.len - 2);
+		visit(name, &data, &description, arg);
+		pfree(name);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -1071,6 +1112,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	},
 	.walk = folded_walk,
 	.fold = folded_fold,
+	.tables = folded_tables,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {
