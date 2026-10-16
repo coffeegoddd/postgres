@@ -30,3 +30,70 @@ catalog is a generated artifact.
 
 Upstream source and derived scenarios retain Dolthub's Apache-2.0 license;
 see LICENSE. This catalog does not confer test coverage by itself.
+
+## Reviewed executable ports
+
+`ports.json` lists each selected source by path, suite, array index, name and
+literal SHA-256, plus the reviewed scenario SHA-256. Exact upstream literals
+are retained in `sources/`; modified PostgreSQL scenarios live in `scenarios/`.
+See NOTICE for attribution. Every setup statement and assertion has a
+zero-based mapping to scenario step IDs and a review note. An empty mapping
+requires a note and makes the case partial, never fully ported. All scenario
+steps must appear in the mapping.
+
+The first tranche preserves all 25 assertion entries from four cases:
+
+| Source behavior | Scenario |
+| --- | --- |
+| Three independent committed working sets | dolt-checkout-working-set |
+| Create, leave and revisit a branch | dolt-checkout-new-branch |
+| Distinct commits, HEAD/parent/main references and invalid refs | dolt-hashof |
+| Hard reset discards rows but continues generated key allocation | dolt-reset-identity |
+
+These ports explicitly adapt MySQL CALL/staging flags to native commit-all
+operations, capture returned commit IDs instead of MySQL variables, use
+PostgreSQL identity columns, and check PostgreSQL SQLSTATEs. Upstream
+`SkipResultsCheck` on checkout becomes operation success plus active-branch
+verification; it is not propagated as a bypass.
+
+The manifest also records three deferred cases with concrete reasons.
+An active-transaction reset, mixed reset/staging, and merge-state reset cannot
+be represented by the current adapter without changing the behavior under
+test. Another 1,226 catalog cases remain unreviewed. No subset pass is a claim
+of full Dolt compatibility.
+
+Validate the mappings (omit `--catalog` for an offline excerpt check):
+
+```sh
+cd src/tools/prolly_bench/slt
+go run ./cmd/dolt-corpus --root ../corpus/dolt \
+  --catalog /tmp/dolt-catalog/catalog.json --out /tmp/dolt-port-review.json
+```
+
+Run the selected scenarios and join the execution evidence:
+
+```sh
+bash src/tools/prolly_bench/build_vc.sh
+src/tools/prolly_bench/prolly_bench vc --pg-bin /path/to/pgsql/bin \
+  --cases src/tools/prolly_bench/corpus/dolt/scenarios --out /tmp/dolt-d1
+cd src/tools/prolly_bench/slt
+go run ./cmd/dolt-corpus --root ../corpus/dolt \
+  --results /tmp/dolt-d1/results/summary.json --out /tmp/dolt-coverage.json
+```
+
+The report separates source inventory, fully/partially ported cases, deferred
+and unreviewed cases, and execution outcomes per engine. Passed mapped
+assertions are credited only for whole passing cases with the reviewed input
+hash and complete step trace. Unsupported, failed and not-run cases receive
+no assertion credit; missing/duplicate records or truncated passing traces
+are errors. A report containing incomplete executions is saved, then the CLI
+exits nonzero. Native adapter acceptance fixtures do not enter these counts.
+
+To add a port, review the pinned literal and its setup dependencies, retain
+its exact excerpt, implement the scenario, and map **every** source entry.
+Record each dialect or semantic adaptation. Preserve expected rows, errors
+and ordering; do not weaken assertions to fit current engine behavior.
+Update the scenario hash only after reviewing the mapping. A new upstream
+pin requires regenerating and reviewing the source lock and all affected
+excerpts/mappings. The tools deliberately do not perform generic SQL
+translation or execute arbitrary upstream Go.

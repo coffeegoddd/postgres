@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "id": "dolt-checkout-new-branch",
+  "description": "Reviewed Dolt port: dolt_checkout with new branch",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCheckoutScripts: dolt_checkout with new branch"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (a int primary key, b int);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 1);"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit-2"
+    },
+    {
+      "id": "setup-3-branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (2, 2);"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values on b2"
+      ],
+      "save": "commit-5"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "select active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "select active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t order by 1;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}
