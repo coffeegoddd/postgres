@@ -129,6 +129,8 @@ typedef struct CanonItem
 	StringInfoData value;
 } CanonItem;
 
+typedef struct BaseTable BaseTable;
+
 typedef struct Canon
 {
 	ProllyComponents c;
@@ -138,6 +140,14 @@ typedef struct Canon
 	bool		folded;			/* the session branch's versioned schemas */
 	const ProllyTreeRoutine *tree;
 	List	   *collations;		/* OIDs of the collations ordering keys */
+
+	/* folded: the branch's baseline, and the next one if it is made */
+	const ProllyChangeFinderRoutine *finder;
+	BaseTable  *base;			/* in key order */
+	int			nbase;
+	int			maxbase;
+	bool		advance;
+	List	   *next;			/* CanonItem *, the next baseline's */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
@@ -254,77 +264,127 @@ uncovered(const char *what, const char *name)
  * ------------------------------------------------------------------------
  */
 
-/* A row folded: its key and its canonical encoding. */
-typedef struct FoldRow
+/* A table's baseline: what its last fold for a commit left. */
+struct BaseTable
 {
-	StringInfoData key;
-	StringInfoData row;
-} FoldRow;
+	StringInfoData key;			/* its item's key */
+	ProllyNodeRef data;
+	ProllyHash	description;	/* of its definition */
+	StringInfoData state;		/* the change finder's */
+};
 
-typedef struct FoldSort
+static void
+sha256(const void *data, Size len, ProllyHash *h)
 {
-	const ProllyKeyingRoutine *kr;
-	ProllyKeying *k;
-} FoldSort;
+	const ProllyHashRoutine *r = prolly_hash_lookup("sha256");
+	ProllyHashCtx *ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
 
-static int
-fold_row_cmp(const void *a, const void *b, void *arg)
-{
-	const FoldRow *ra = *(FoldRow *const *) a;
-	const FoldRow *rb = *(FoldRow *const *) b;
-	FoldSort   *fs = arg;
-	ProllyKey	ka = {(const uint8 *) ra->key.data, ra->key.len};
-	ProllyKey	kb = {(const uint8 *) rb->key.data, rb->key.len};
-	int			r = PROLLY_CALL(fs->kr, compare, fs->k, &ka, &kb);
-
-	/* equal keys of a keyless table: the same row; order by bytes anyway */
-	if (r == 0)
-		r = memcmp(ra->key.data, rb->key.data, Min(ra->key.len, rb->key.len));
-	return r != 0 ? r : (ra->key.len > rb->key.len) - (ra->key.len < rb->key.len);
+	PROLLY_CALL(r, update, ctx, data, len);
+	PROLLY_CALL(r, finish, ctx, h);
 }
 
 static int
-keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+base_table_cmp(const void *a, const void *b)
 {
-	FoldSort   *fs = arg;
+	const BaseTable *x = a;
+	const BaseTable *y = b;
+	int			r = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
 
-	return PROLLY_CALL(fs->kr, compare, fs->k, a, b);
+	return r != 0 ? r : (x->key.len > y->key.len) - (x->key.len < y->key.len);
 }
 
 /*
- * A table's rows, as the transaction sees them, folded into a data tree:
- * each row's key and canonical encoding (the table keying's), in key
- * order, identical rows of a keyless table counted once.  The same rows
- * give the same tree whatever pages, order or history they come from.
+ * A baseline's value: the table's data tree and the hash of its
+ * definition (each a length byte, then the hash), then the finder's state.
+ */
+static bool
+parse_base_table(const ProllyValue *v, BaseTable *bt)
+{
+	const uint8 *p = v->data;
+	const uint8 *end = v->data + v->len;
+
+	memset(&bt->data, 0, sizeof(bt->data));
+	memset(&bt->description, 0, sizeof(bt->description));
+	if (p >= end || p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0] + 1)
+		return false;
+	bt->data.hash.len = p[0];
+	memcpy(bt->data.hash.bytes, p + 1, p[0]);
+	bt->data.location.blkno = InvalidBlockNumber;
+	p += 1 + p[0];
+	if (p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0])
+		return false;
+	bt->description.len = p[0];
+	memcpy(bt->description.bytes, p + 1, p[0]);
+	p += 1 + p[0];
+	initStringInfo(&bt->state);
+	appendBinaryStringInfo(&bt->state, p, end - p);
+	return true;
+}
+
+/* Read a baseline's tables, in key order. */
+static void
+load_baseline(Canon *cn, const ProllyNodeRef *baseline)
+{
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+
+	c = PROLLY_CALL(cn->tree, cursor_open, &cn->env, baseline, CurrentMemoryContext);
+	PROLLY_CALL(cn->tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn->tree, cursor_next, c, &k, &v))
+	{
+		BaseTable  *bt;
+
+		if (cn->nbase == cn->maxbase)
+		{
+			cn->maxbase = Max(16, cn->maxbase * 2);
+			cn->base = cn->base ? repalloc_array(cn->base, BaseTable, cn->maxbase) :
+				palloc_array(BaseTable, cn->maxbase);
+		}
+		bt = &cn->base[cn->nbase];
+		initStringInfo(&bt->key);
+		appendBinaryStringInfo(&bt->key, k.data, k.len);
+		if (!parse_base_table(&v, bt))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a branch's baseline holds an invalid table entry")));
+		cn->nbase++;
+	}
+	PROLLY_CALL(cn->tree, cursor_close, c);
+}
+
+static BaseTable *
+find_base_table(Canon *cn, const StringInfoData *key)
+{
+	BaseTable	probe;
+
+	if (cn->nbase == 0)
+		return NULL;
+	probe.key = *key;
+	return bsearch(&probe, cn->base, cn->nbase, sizeof(BaseTable), base_table_cmp);
+}
+
+/*
+ * A table's data tree, folded from its rows as the transaction sees them by
+ * the change finder: from its baseline if it has one for this definition
+ * (described in 'description'); with a next baseline being made, its entry
+ * there too.  The same rows give the same tree whatever pages, order or
+ * history they come from.
  */
 static void
-fold_table(Canon *cn, Relation rel, ProllyNodeRef *root)
+folded_table_root(Canon *cn, CanonItem *it, Relation rel,
+				  const StringInfoData *description, ProllyNodeRef *root)
 {
-	FoldSort	fs;
-	TableScanDesc scan;
-	TupleTableSlot *slot;
-	FoldRow   **rows = NULL;
-	int			nrows = 0;
-	int			maxrows = 0;
-	ProllyTreeEnv env = cn->env;
-	ProllyTreeBuilder *b;
-	bool		keyless;
+	ProllyHash	dh;
+	BaseTable  *bt;
+	ProllyTableFold tf;
+	StringInfoData state;
+	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
-	fs.kr = (const ProllyKeyingRoutine *)
-		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-
-	/*
-	 * Rows as a rewrite leaves them: a column added with a default is in
-	 * every row (the scan gives its missing value), so whether the table was
-	 * rewritten since doesn't change the encoding.
-	 */
-	fs.k = PROLLY_CALL(fs.kr, open_rewritten, rel, CurrentMemoryContext);
-	keyless = PROLLY_CALL(fs.kr, keyless, fs.k);
-	if (!keyless)
+	if (OidIsValid(pkoid))
 	{
 		/* (the keying's key: the primary key, as it chooses it) */
-		Relation	pk = index_open(RelationGetPrimaryKeyIndex(rel, false),
-									AccessShareLock);
+		Relation	pk = index_open(pkoid, AccessShareLock);
 
 		for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(pk); i++)
 		{
@@ -335,69 +395,42 @@ fold_table(Canon *cn, Relation rel, ProllyNodeRef *root)
 		index_close(pk, AccessShareLock);
 	}
 
-	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, 0);
-	slot = table_slot_create(rel, NULL);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	sha256(description->data, description->len, &dh);
+	bt = find_base_table(cn, &it->key);
+	if (bt && (bt->description.len != dh.len ||
+			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
+		bt = NULL;
+	if (bt)
 	{
-		FoldRow    *r = palloc(sizeof(FoldRow));
-		ProllyHash	content;
-
-		initStringInfo(&r->key);
-		initStringInfo(&r->row);
-		PROLLY_CALL(fs.kr, encode_row, fs.k, slot, &r->key, &r->row, &content);
-		if (nrows == maxrows)
-		{
-			maxrows = Max(64, maxrows * 2);
-			rows = rows ? repalloc_array(rows, FoldRow *, maxrows) :
-				palloc_array(FoldRow *, maxrows);
-		}
-		rows[nrows++] = r;
-		CHECK_FOR_INTERRUPTS();
+		tf.data = bt->data;
+		tf.state.data = (const uint8 *) bt->state.data;
+		tf.state.len = bt->state.len;
 	}
-	ExecDropSingleTupleTableSlot(slot);
-	table_endscan(scan);
-
-	if (nrows > 1)
-		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, &fs);
-
-	env.compare = keying_compare;
-	env.compare_arg = &fs;
-	b = PROLLY_CALL(cn->tree, build_begin, &env, CurrentMemoryContext);
-	for (int i = 0; i < nrows;)
+	initStringInfo(&state);
+	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, root,
+				cn->advance ? &state : NULL);
+	if (cn->advance)
 	{
-		int			j = i + 1;
-		ProllyKey	k = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
-		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
-		StringInfoData value;
-		ProllyValue v;
+		CanonItem  *next = palloc0(sizeof(CanonItem));
 
-		while (j < nrows && rows[j]->key.len == rows[i]->key.len &&
-			   memcmp(rows[j]->key.data, rows[i]->key.data, k.len) == 0)
-			j++;
-		if (!keyless && j > i + 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("table \"%s\" holds rows with the same primary key",
-							RelationGetRelationName(rel)),
-					 errdetail("A commit can't hold them until the key is unique again.")));
-		initStringInfo(&value);
-		PROLLY_CALL(fs.kr, make_value, fs.k, &row, (uint64) (j - i), &value);
-		v.data = (const uint8 *) value.data;
-		v.len = value.len;
-		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
-		pfree(value.data);
-		i = j;
+		initStringInfo(&next->key);
+		appendBinaryStringInfo(&next->key, it->key.data, it->key.len);
+		initStringInfo(&next->value);
+		put_hash(&next->value, &root->hash);
+		put_hash(&next->value, &dh);
+		appendBinaryStringInfo(&next->value, state.data, state.len);
+		cn->next = lappend(cn->next, next);
 	}
-	PROLLY_CALL(cn->tree, build_finish, b, root);
-	PROLLY_CALL(fs.kr, close, fs.k);
+	pfree(state.data);
 }
 
 /* A table's data tree: folded from its rows, or its working set's. */
 static void
-table_root(Canon *cn, Relation rel, ProllyNodeRef *root)
+table_root(Canon *cn, CanonItem *it, Relation rel,
+		   const StringInfoData *description, ProllyNodeRef *root)
 {
 	if (cn->folded)
-		fold_table(cn, rel, root);
+		folded_table_root(cn, it, rel, description, root);
 	else
 		PROLLY_CALL(cn->c.engine, tree_root, cn->roots, rel, PROLLY_TREE_DATA,
 					root);
@@ -807,10 +840,14 @@ collect(Canon *cn)
 					Relation	rel = table_open(form->oid, AccessShareLock);
 					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					ProllyNodeRef root;
+					StringInfoData desc;
 
-					table_root(cn, rel, &root);
+					initStringInfo(&desc);
+					describe_table(cn, rel, &desc);
+					table_root(cn, it, rel, &desc, &root);
 					put_hash(&it->value, &root.hash);
-					describe_table(cn, rel, &it->value);
+					appendBinaryStringInfo(&it->value, desc.data, desc.len);
+					pfree(desc.data);
 					table_close(rel, AccessShareLock);
 				}
 				break;
@@ -834,20 +871,24 @@ collect(Canon *cn)
 			case RELKIND_MATVIEW:
 				{
 					CanonItem  *it = add_item(cn, "m:", qualified(form->relnamespace, name));
+					StringInfoData query;
 
+					initStringInfo(&query);
+					append_utf8(&query,
+								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																		ObjectIdGetDatum(form->oid),
+																		BoolGetDatum(false))));
 					if (versioned_am(cn, form->relam))
 					{
 						Relation	rel = table_open(form->oid, AccessShareLock);
 						ProllyNodeRef root;
 
-						table_root(cn, rel, &root);
+						table_root(cn, it, rel, &query, &root);
 						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
-					append_utf8(&it->value,
-								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
-																		ObjectIdGetDatum(form->oid),
-																		BoolGetDatum(false))));
+					appendBinaryStringInfo(&it->value, query.data, query.len);
+					pfree(query.data);
 				}
 				break;
 			case RELKIND_FOREIGN_TABLE:
@@ -1299,14 +1340,39 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	PROLLY_CALL(cn->tree, build_finish, b, root);
 }
 
+/* The next baseline: each table's entry, as a tree by key. */
 static void
-folded_fold(ProllyNodeRef *root)
+build_baseline(Canon *cn, ProllyNodeRef *next)
+{
+	ProllyTreeBuilder *b;
+	ListCell   *lc;
+
+	list_sort(cn->next, item_cmp);
+	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
+	foreach(lc, cn->next)
+	{
+		CanonItem  *it = lfirst(lc);
+		ProllyKey	k = {(const uint8 *) it->key.data, it->key.len};
+		ProllyValue v = {(const uint8 *) it->value.data, it->value.len};
+
+		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
+	}
+	PROLLY_CALL(cn->tree, build_finish, b, next);
+}
+
+static void
+folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
+			ProllyNodeRef *next_baseline)
 {
 	Canon		cn;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	canon_env(&cn);
+	cn.finder = prolly_changes_lookup("pages");
+	cn.advance = next_baseline != NULL;
+	if (baseline)
+		load_baseline(&cn, baseline);
 
 	/*
 	 * Everything the transaction wrote, this statement's writes too: a
@@ -1330,6 +1396,31 @@ folded_fold(ProllyNodeRef *root)
 		PopActiveSnapshot();
 	}
 	PG_END_TRY();
+	if (next_baseline)
+		build_baseline(&cn, next_baseline);
+}
+
+/* A baseline's tree, its tables' data trees and the finder's states. */
+static void
+folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
+					 void *arg)
+{
+	Canon		cn;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	cn.finder = prolly_changes_lookup("pages");
+	PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg);
+	load_baseline(&cn, baseline);
+	for (int i = 0; i < cn.nbase; i++)
+	{
+		ProllyValue state = {(const uint8 *) cn.base[i].state.data,
+		cn.base[i].state.len};
+
+		PROLLY_CALL(cn.tree, walk, &cn.env, &cn.base[i].data, visit, arg);
+		PROLLY_CALL(cn.finder, walk, &cn.env, &state, visit, arg);
+	}
 }
 
 /*
@@ -2348,6 +2439,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *remade = NIL;
 	ListCell   *lc;
 	int			save_nestlevel;
+	MemoryContext caller = CurrentMemoryContext;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
@@ -2554,7 +2646,13 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	make_views(view_drops);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
 	CommandCounterIncrement();
-	rows(arg);
+	/* the rows in the caller's memory: what they keep outlives SPI's */
+	{
+		MemoryContext spi = MemoryContextSwitchTo(caller);
+
+		rows(arg);
+		MemoryContextSwitchTo(spi);
+	}
 	run_statements(sm.after);
 	run_statements(sm.foreign_keys);
 	make_views(views);
@@ -2683,6 +2781,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
 	.merge_schema = folded_merge_schema,
+	.walk_baseline = folded_walk_baseline,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {

@@ -21,6 +21,7 @@
 
 #include "access/prolly_alloc.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_changes.h"
 #include "access/prolly_chunker.h"
 #include "access/prolly_applier.h"
 #include "access/prolly_chunkformat.h"

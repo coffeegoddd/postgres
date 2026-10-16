@@ -212,14 +212,21 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The canonical root of the session branch's versioned schemas, folded
--- from their tables' rows.
-CREATE FUNCTION test_fold_root()
+-- from their tables' rows: from the branch's baseline, as commits fold, or
+-- (full) from every row.
+CREATE FUNCTION test_fold_root(full bool DEFAULT false)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Whether the refs' walk, what reclamation keeps, reaches a commit.
 CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- What the session's folds have read (pages, candidate rows, tables read
+-- in full) since the counters were last reset.
+CREATE FUNCTION test_fold_counters(reset bool DEFAULT false, OUT pages int8,
+	OUT candidates int8, OUT full_tables int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The folded canonical tree's items, for inspection.

@@ -61,6 +61,7 @@ tests += {
       'sequences',
       'schema_merges',
       'table_files',
+      'incremental_folds',
     ],
   },
   'tap': {
@@ -109,6 +110,7 @@ tests += {
       't/039_branch_commits.pl',
       't/040_table_files.pl',
       't/041_bmap_folds.pl',
+      't/042_fold_unseen.pl',
       't/043_bmap_drop_replay.pl',
     ],
   },

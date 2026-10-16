@@ -16,6 +16,8 @@ OBJS = \
 	alloc_stub.o \
 	canon_catalogs.o \
 	canon_stub.o \
+	changes_pages.o \
+	changes_stub.o \
 	chunker_bytes.o \
 	chunker_keyhash.o \
 	applier_replication.o \

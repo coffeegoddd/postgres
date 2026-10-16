@@ -6785,6 +6785,28 @@ BufferPrepareForChange(Buffer buffer)
 }
 
 /*
+ * LockBufferForNeutralChange -- lock a buffer exclusively for a change of
+ * no row
+ *
+ * As LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE), for maintenance that
+ * changes no row the page holds (removing dead items): the storage manager
+ * is told so as it prepares the page, as BufferPrepareForChange() does.
+ */
+void
+LockBufferForNeutralChange(Buffer buffer)
+{
+	BufferDesc *buf_hdr;
+
+	Assert(BufferIsPinned(buffer));
+	if (BufferIsLocal(buffer))
+		return;
+	buf_hdr = GetBufferDescriptor(buffer - 1);
+	BufferLockAcquire(buffer, buf_hdr, BUFFER_LOCK_EXCLUSIVE);
+	if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
+		PrepareBufferForChange(buffer, buf_hdr, true);
+}
+
+/*
  * BufferPageIsShared -- would preparing the page for a change copy it?
  *
  * For changes worth skipping rather than paying a copy for.  The page must

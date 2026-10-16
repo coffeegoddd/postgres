@@ -9,6 +9,9 @@
  * The chunk store's root is a tree keyed by memcmp:
  *
  *	'B' name	-> the branch's head commit (hash length, hash)
+ *	'W' name	-> the branch's baseline: what its last fold for a commit
+ *				   left, for the next fold to start from (the
+ *				   canonicalizer's tree; hash length, hash)
  *	'M' name	-> the branch's merge in progress: the merged head and the
  *				   common ancestor (hash length, hash each), then the OIDs
  *				   of tables with unresolved conflicts (4 bytes each,
@@ -62,6 +65,7 @@
 
 #define TAG_BRANCH		'B'
 #define TAG_MERGE		'M'
+#define TAG_BASELINE	'W'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
@@ -388,6 +392,46 @@ see_head(const char *name)
 	return true;
 }
 
+/* A branch's baseline; false if it has none. */
+static bool
+branch_baseline(const char *name, ProllyNodeRef *baseline)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+	ProllyHash	h;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_BASELINE);
+	appendStringInfoString(&key, name);
+	found = refs_get(key.data, key.len, &v) &&
+		get_hash(v.data, v.data + v.len, &h) && h.len > 0;
+	if (found)
+		ref_of(&h, baseline);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/* Make baseline (NULL: none) branch name's baseline. */
+static void
+branch_set_baseline(const char *name, const ProllyNodeRef *baseline)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_BASELINE);
+	appendStringInfoString(&key, name);
+	if (baseline)
+		put_hash(&v, &baseline->hash);
+	refs_put(key.data, key.len, baseline ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
 typedef struct FindBranch
 {
 	const char *name;
@@ -656,23 +700,38 @@ copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 	return false;
 }
 
-/* The session branch's versioned schemas, folded. */
+/*
+ * The session branch's versioned schemas, folded from its baseline; with
+ * next, a new baseline begun.
+ */
+static void
+fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	bool		have = branch_baseline(branch_ops()->current(), &baseline);
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, fold, have ? &baseline : NULL, root, next);
+}
+
 static void
 fold(ProllyNodeRef *root)
 {
-	ProllyDatabaseComponents dc;
-
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, fold, root);
+	fold_from_baseline(root, NULL);
 }
 
-/* Commit the session branch as it is, with these parents. */
+/*
+ * Commit the session branch as it is, with these parents; the fold is the
+ * branch's next baseline.
+ */
 static void
 commit_branch(const char *message, const ProllyHash *parents, int nparents,
 			  ProllyHash *commit_id)
 {
 	char	   *name = branch_ops()->current();
 	ProllyNodeRef root;
+	ProllyNodeRef next;
 	bool		pushed;
 	ProllyHash	head;
 
@@ -690,12 +749,13 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 						name),
 				 errhint("The transaction might succeed if retried.")));
 	pushed = see_head(name);
-	fold(&root);
+	fold_from_baseline(&root, &next);
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
+	branch_set_baseline(name, &next);
 }
 
 /* ------------------------------------------------------------------------
@@ -724,9 +784,13 @@ copies_branch_create(const char *name, const char *start_point)
 	lock_refs();
 	if (OidIsValid(branch_oid(from)))
 	{
+		ProllyNodeRef baseline;
+
 		branch_ops()->create(name, from);
 		/* (a branch of the same name deleted before left no entry) */
 		branch_set_head(name, branch_head(from, &head) ? &head : NULL);
+		/* its copies have the same changes since the same baseline */
+		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL);
 		return;
 	}
 
@@ -736,6 +800,13 @@ copies_branch_create(const char *name, const char *start_point)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch or commit \"%s\" does not exist", from)));
 	branch_ops()->create(name, NULL);
+	{
+		ProllyNodeRef baseline;
+
+		branch_set_baseline(name,
+							branch_baseline(branch_ops()->current(), &baseline) ?
+							&baseline : NULL);
+	}
 	branch_ops()->run_on(name, move_to, &info.root);
 	branch_set_head(name, &id);
 }
@@ -757,6 +828,7 @@ copies_branch_delete(const char *name, bool force)
 				 errhint("Delete it anyway with -D.")));
 	branch_ops()->drop(name);
 	branch_set_head(name, NULL);
+	branch_set_baseline(name, NULL);
 
 	/* and the merge in progress on it, which a branch made later isn't in */
 	{
@@ -1041,8 +1113,8 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 }
 
 /*
- * The refs tree, and every commit reachable from a head or a merge in
- * progress, with its root.
+ * The refs tree, every commit reachable from a head or a merge in
+ * progress, with its root, and every baseline.
  */
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
@@ -1052,7 +1124,9 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	ProllyKey	k;
 	ProllyValue v;
 	List	   *heads = NIL;
+	List	   *baselines = NIL;
 	ListCell   *lc;
+	ProllyDatabaseComponents dc;
 
 	refs_init();
 	PROLLY_CALL(tree, walk, &env, refs, visit, arg);
@@ -1064,11 +1138,15 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
-		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE))
+		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
+						  k.data[0] != TAG_BASELINE))
 			continue;
 		h = palloc(sizeof(ProllyHash));
 		p = get_hash(p, end, h);
-		heads = lappend(heads, h);
+		if (k.data[0] == TAG_BASELINE)
+			baselines = lappend(baselines, h);
+		else
+			heads = lappend(heads, h);
 
 		/* a merge in progress: theirs, then the base, both kept */
 		if (k.data[0] == TAG_MERGE)
@@ -1081,6 +1159,14 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	PROLLY_CALL(tree, cursor_close, c);
 	foreach(lc, heads)
 		walk_commit(&ws, lfirst(lc));
+	prolly_database_components(&dc);
+	foreach(lc, baselines)
+	{
+		ProllyNodeRef ref;
+
+		ref_of(lfirst(lc), &ref);
+		PROLLY_CALL(dc.canonicalizer, walk_baseline, &ref, visit, arg);
+	}
 }
 
 static bool

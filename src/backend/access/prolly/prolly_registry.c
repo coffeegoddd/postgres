@@ -71,6 +71,7 @@ static const char *const chunkstore_callbacks[] = {PROLLY_CHUNKSTORE_CALLBACK_NA
 static const char *const chunkformat_callbacks[] = {PROLLY_CHUNKFORMAT_CALLBACK_NAMES};
 static const char *const applier_callbacks[] = {PROLLY_APPLIER_CALLBACK_NAMES};
 static const char *const tablefile_callbacks[] = {PROLLY_TABLEFILE_CALLBACK_NAMES};
+static const char *const changes_callbacks[] = {PROLLY_CHANGES_CALLBACK_NAMES};
 
 #define CHECK_ROUTINE(type, first, names) \
 	static_assert(offsetof(type, info) == 0 && \
@@ -103,6 +104,7 @@ CHECK_ROUTINE(ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, chunkst
 CHECK_ROUTINE(ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, chunkformat_callbacks);
 CHECK_ROUTINE(ProllyApplierRoutine, PROLLY_APPLIER_FIRST_CALLBACK, applier_callbacks);
 CHECK_ROUTINE(ProllyTableFileRoutine, PROLLY_TABLEFILE_FIRST_CALLBACK, tablefile_callbacks);
+CHECK_ROUTINE(ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, changes_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -158,6 +160,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("row_applier", ProllyApplierRoutine, PROLLY_APPLIER_FIRST_CALLBACK, applier_callbacks),
 	[PROLLY_IFACE_TABLE_FILE] =
 	IFACE("table_file", ProllyTableFileRoutine, PROLLY_TABLEFILE_FIRST_CALLBACK, tablefile_callbacks),
+	[PROLLY_IFACE_CHANGE_FINDER] =
+	IFACE("change_finder", ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, changes_callbacks),
 };
 
 static const ProllyInterfaceDesc *
