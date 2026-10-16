@@ -1,6 +1,3 @@
-# Version control and canonical form: prolly engines only
+# Version control: branches, diff and merge of the tree engines (legacy)
 test: vc_branches
-test: vc_schema
 test: vc_diff_merge
-test: vc_history
-test: vc_canonical

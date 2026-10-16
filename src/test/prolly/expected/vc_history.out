@@ -12,7 +12,9 @@ branch a|t
 branch b|t
 branch c|t
 checkout a|t
+a: content|t
 checkout b|t
+b: content|t
 checkout c|t
 a and b: same content|t
 a and b: same root|t

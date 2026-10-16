@@ -27,16 +27,19 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	check-vc-target-guard rejects disconnected VC paths and no-op functions
 	check-isolation       concurrency behaves exactly as on heap
 	check-tap-durability  crash recovery, standby replay, prepared xacts
-	check-vc              branches, versioned schema, diff, merge,
-	                      history independence (prolly engines only)
+	check-vc-commits      versioned schema, history independence and
+	                      canonical form of branches made by copying
+	                      (always on prolly, whatever PROLLY_AM is)
+	check-vc              branches, diff and merge (tree engines only)
 	check-vc-isolation    sessions on different branches at once
 	check-tap-vc          history independence across clusters
 
 Semantics, isolation and TAP groups require --enable-tap-tests; a build
 without TAP support fails these targets instead of reporting success.
 For the page-based prolly AM, run check-semantics, check-isolation and
-check-tap-durability with PROLLY_AM=prolly.  The VC groups still describe
-the legacy tree-engine API and reject that target.
+check-tap-durability with PROLLY_AM=prolly.  check-vc-commits runs on it
+always; the other VC groups still describe the legacy tree-engine API and
+reject that target.
 
 Run check-vc-target before claiming version-control coverage for an AM:
 
