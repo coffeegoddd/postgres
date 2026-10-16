@@ -24,6 +24,7 @@
 #include "access/prolly_config.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -95,7 +96,8 @@ add_table(const char *name, const ProllyNodeRef *data,
 	const ProllyHashRoutine *h = prolly_hash_lookup("sha256");
 	ProllyHashCtx *ctx = PROLLY_CALL(h, begin, CurrentMemoryContext);
 
-	t->name = pstrdup(name);
+	/* (the canonical tree's names are UTF-8; the catalogs' the server's) */
+	t->name = pstrdup(pg_any_to_server(name, strlen(name), PG_UTF8));
 	t->data = *data;
 	PROLLY_CALL(h, update, ctx, description->data, description->len);
 	PROLLY_CALL(h, finish, ctx, &t->description);
@@ -183,7 +185,7 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 	rel = table_open(relid, AccessShareLock);
 	rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	rd.k = PROLLY_CALL(rd.kr, open, rel, NULL, CurrentMemoryContext);
+	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	rd.relid = relid;
 	rd.sink = sink;
 	chunk_env(&env);

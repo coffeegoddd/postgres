@@ -889,14 +889,7 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	s->relids = list_append_unique_oid(s->relids, relid);
 }
 
-/*
- * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
- *	  returns setof record
- *
- * The tables whose rows changed since the session branch's head commit
- * (until catalogs are versioned, schema changes don't show), and those
- * with merge conflicts (status "conflict", not staged).
- */
+/* A table changed, as dolt_status() reports it. */
 static void
 status_table(const char *name, ProllyDiffKind kind, void *arg)
 {
@@ -915,6 +908,14 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
+/*
+ * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
+ *	  returns setof record
+ *
+ * The tables changed since the session branch's head commit: rows changed
+ * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
+ * in progress, with conflicts ("conflict", not staged).
+ */
 Datum
 dolt_status(PG_FUNCTION_ARGS)
 {
@@ -992,7 +993,10 @@ static void
 rows_begin(Rows *r, Relation rel)
 {
 	prolly_components_for_relation(rel, &r->c);
-	r->keying = PROLLY_CALL(r->c.keying, open, rel, NULL, CurrentMemoryContext);
+	/* (a block-mapped table's trees are its folds, rows as a rewrite has them) */
+	r->keying = rel->rd_rel->relam == PROLLY_TABLE_AM_OID ?
+		PROLLY_CALL(r->c.keying, open_rewritten, rel, CurrentMemoryContext) :
+		PROLLY_CALL(r->c.keying, open, rel, NULL, CurrentMemoryContext);
 	r->keyless = PROLLY_CALL(r->c.keying, keyless, r->keying);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 }
