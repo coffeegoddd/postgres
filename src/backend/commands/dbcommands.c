@@ -1636,8 +1636,12 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
 										dst_deftablespace);
 
-		/* Prolly tables are found from branch heads outside the files. */
-		ProllyCopyDatabase(src_dboid, dboid);
+		/*
+		 * Prolly tables are found from branch heads outside the files, and
+		 * its chunk store is files no catalog lists.
+		 */
+		ProllyCopyDatabase(src_dboid, src_deftablespace, dboid,
+						   dst_deftablespace);
 
 		/*
 		 * Close pg_database, but keep lock till commit.

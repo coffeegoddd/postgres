@@ -17,7 +17,8 @@
 #ifndef PROLLY_DATABASE_H
 #define PROLLY_DATABASE_H
 
-extern void ProllyCopyDatabase(Oid src_dboid, Oid dst_dboid);
+extern void ProllyCopyDatabase(Oid src_dboid, Oid src_spcoid,
+							   Oid dst_dboid, Oid dst_spcoid);
 extern void ProllyDropDatabase(Oid dboid);
 
 #endif							/* PROLLY_DATABASE_H */

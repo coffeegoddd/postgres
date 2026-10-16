@@ -10,15 +10,27 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_commit.h"
 #include "access/prolly_database.h"
 #include "access/prolly_registry.h"
 
 void
-ProllyCopyDatabase(Oid src_dboid, Oid dst_dboid)
+ProllyCopyDatabase(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
+				   Oid dst_spcoid)
 {
-	List	   *impls = prolly_list_impls(PROLLY_IFACE_COMMIT_PIPELINE);
+	List	   *impls = prolly_list_impls(PROLLY_IFACE_CHUNK_STORE);
 	ListCell   *lc;
+
+	foreach(lc, impls)
+	{
+		const ProllyChunkStoreRoutine *r = lfirst(lc);
+
+		r->copy_database(src_dboid, src_spcoid, dst_dboid, dst_spcoid);
+	}
+	list_free(impls);
+
+	impls = prolly_list_impls(PROLLY_IFACE_COMMIT_PIPELINE);
 
 	foreach(lc, impls)
 	{

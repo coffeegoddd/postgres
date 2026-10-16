@@ -10,6 +10,8 @@
  *		uint32 CRC-32C of kind and payload
  *
  *		CHUNK	uint8 hash length, the hash, the chunk's bytes
+ *		XCHUNK	uint32 xid, then as CHUNK: a chunk of the transaction
+ *				xid, which others don't see while it is in progress
  *		ROOT	uint8 hash length, the hash: the store's root from here on
  *		PAD		room for a ROOT record, which its transaction's commit
  *				writes over it (a PAD left means the transaction aborted)
@@ -24,7 +26,13 @@
  * Reading.  Each backend indexes the records by hash in memory, scanning
  * the file from where it left off when a lookup misses or the root is
  * asked for.  A record not completely written yet ends the scan, until the
- * next one.
+ * next one.  A chunk appended before its transaction commits (a batch, or
+ * the rest at pre-commit) is an XCHUNK, and isn't found by others while the
+ * transaction is in progress: a chunk is others' once its transaction has
+ * committed (or aborted: its bytes are whole, and anyone may use them).
+ * Another transaction putting the same chunk meanwhile appends its own
+ * copy; the index keeps every copy of a chunk until one is known to be
+ * everyone's.
  *
  * The root.  A move locks the store until its transaction ends, so moves
  * are serialized, and they reach the file in commit order: at pre-commit a
@@ -46,6 +54,7 @@
 
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_xlog.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -57,6 +66,7 @@
 #include "storage/lock.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -69,6 +79,7 @@
 #define KIND_CHUNK			1
 #define KIND_ROOT			2
 #define KIND_PAD			3
+#define KIND_XCHUNK			4
 
 /* len, kind ... crc */
 #define RECORD_OVERHEAD		(sizeof(uint32) + 1 + sizeof(uint32))
@@ -108,6 +119,9 @@ typedef struct IndexEntry
 	ProllyHash	hash;			/* key; unused bytes zero */
 	uint64		offset;			/* of the record, or in pending */
 	uint32		len;			/* of the record */
+	TransactionId xid;			/* its transaction, while not known to have
+								 * ended; invalid: everyone's */
+	struct IndexEntry *other;	/* another copy, while this one isn't */
 } IndexEntry;
 
 struct ProllyChunkStore
@@ -228,21 +242,133 @@ record_valid(const char *rec, uint32 len)
 	return EQ_CRC32C(crc, stored);
 }
 
-/* The hash a CHUNK or ROOT record's payload starts with. */
+/*
+ * The hash a CHUNK, XCHUNK or ROOT record's payload has (after an XCHUNK's
+ * xid, which *xid gets; InvalidTransactionId for the others).
+ */
 static bool
-record_hash(const char *rec, uint32 len, ProllyHash *hash, Size *after)
+record_hash_xid(const char *rec, uint32 len, ProllyHash *hash, Size *after,
+				TransactionId *xid)
 {
-	const char *payload = rec + sizeof(uint32) + 1;
-	uint8		hlen = (uint8) payload[0];
+	Size		skip = 0;
+	const char *payload;
+	uint8		hlen;
 
+	*xid = InvalidTransactionId;
+	if (len > sizeof(uint32) && (uint8) rec[sizeof(uint32)] == KIND_XCHUNK)
+	{
+		if (len < RECORD_OVERHEAD + sizeof(TransactionId))
+			return false;
+		memcpy(xid, rec + sizeof(uint32) + 1, sizeof(TransactionId));
+		skip = sizeof(TransactionId);
+	}
+	payload = rec + sizeof(uint32) + 1 + skip;
+	hlen = (uint8) payload[0];
 	if (hlen == 0 || hlen > PROLLY_HASH_MAX_LEN ||
-		sizeof(uint32) + 1 + 1 + hlen + sizeof(uint32) > len)
+		sizeof(uint32) + 1 + skip + 1 + hlen + sizeof(uint32) > len)
 		return false;
 	memset(hash, 0, sizeof(ProllyHash));
 	hash->len = hlen;
 	memcpy(hash->bytes, payload + 1, hlen);
-	*after = sizeof(uint32) + 1 + 1 + hlen;
+	*after = sizeof(uint32) + 1 + skip + 1 + hlen;
 	return true;
+}
+
+static bool
+record_hash(const char *rec, uint32 len, ProllyHash *hash, Size *after)
+{
+	TransactionId xid;
+
+	return record_hash_xid(rec, len, hash, after, &xid);
+}
+
+/*
+ * Index a copy of a chunk: the first, or another while those before it
+ * aren't known to be everyone's.
+ */
+static void
+index_add(HTAB *index, const ProllyHash *key, uint64 offset, uint32 len,
+		  TransactionId xid)
+{
+	bool		found;
+	IndexEntry *e = hash_search(index, key, HASH_ENTER, &found);
+	IndexEntry *last;
+
+	if (!found)
+	{
+		e->offset = offset;
+		e->len = len;
+		e->xid = xid;
+		e->other = NULL;
+		return;
+	}
+	for (last = e; last != NULL; last = last->other)
+	{
+		if (!TransactionIdIsValid(last->xid))
+			return;				/* one is everyone's already */
+		if (last->other == NULL)
+			break;
+	}
+	last->other = MemoryContextAlloc(TopMemoryContext, sizeof(IndexEntry));
+	*last->other = *e;
+	last->other->offset = offset;
+	last->other->len = len;
+	last->other->xid = xid;
+	last->other->other = NULL;
+}
+
+/*
+ * May this backend read a copy?  Not one of a transaction in progress,
+ * unless it is its own; with wait, one whose transaction is in progress is
+ * waited for (a reader following a root may meet one being committed).
+ */
+static bool
+copy_visible(IndexEntry *e, bool wait)
+{
+	if (!TransactionIdIsValid(e->xid))
+		return true;
+	if (TransactionIdIsCurrentTransactionId(e->xid))
+		return true;
+	for (;;)
+	{
+		if (!TransactionIdIsInProgress(e->xid) || TransactionIdDidCommit(e->xid))
+		{
+			e->xid = InvalidTransactionId;	/* everyone's from now on */
+			return true;
+		}
+		if (!wait)
+			return false;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+	}
+}
+
+/* A copy of a chunk this backend may read, waiting only if it must. */
+static IndexEntry *
+index_find(HTAB *index, const ProllyHash *key)
+{
+	IndexEntry *first = hash_search(index, key, HASH_FIND, NULL);
+	IndexEntry *e;
+
+	for (e = first; e != NULL; e = e->other)
+		if (copy_visible(e, false))
+			return e;
+	for (e = first; e != NULL; e = e->other)
+		if (copy_visible(e, true))
+			return e;
+	return NULL;
+}
+
+/* Is there a copy this backend may read now?  Never waits. */
+static bool
+index_has(HTAB *index, const ProllyHash *key)
+{
+	IndexEntry *e;
+
+	for (e = hash_search(index, key, HASH_FIND, NULL); e != NULL; e = e->other)
+		if (copy_visible(e, false))
+			return true;
+	return false;
 }
 
 /* ----------------------------------------------------------------
@@ -407,6 +533,7 @@ scan_journal(ProllyChunkStore *s)
 		uint8		kind;
 		ProllyHash	h;
 		Size		after;
+		TransactionId xid;
 
 		read_exact(s, (char *) &len, sizeof(len), offset);
 		if (len < RECORD_OVERHEAD || offset + len > size)
@@ -422,19 +549,13 @@ scan_journal(ProllyChunkStore *s)
 		if (!record_valid(rec, len))
 			break;
 		kind = (uint8) rec[sizeof(uint32)];
-		if (kind == KIND_CHUNK && record_hash(rec, len, &h, &after))
+		if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
+			record_hash_xid(rec, len, &h, &after, &xid))
 		{
-			IndexEntry *e;
-			bool		found;
 			ProllyHash	key;
 
 			hash_key(&key, &h);
-			e = hash_search(s->index, &key, HASH_ENTER, &found);
-			if (!found)
-			{
-				e->offset = offset;
-				e->len = len;
-			}
+			index_add(s->index, &key, offset, len, xid);
 		}
 		else if (kind == KIND_ROOT && record_hash(rec, len, &h, &after))
 		{
@@ -479,15 +600,7 @@ flush_pending(ProllyChunkStore *s)
 	hash_seq_init(&status, s->pending_index);
 	while ((e = hash_seq_search(&status)) != NULL)
 	{
-		IndexEntry *f;
-		bool		found;
-
-		f = hash_search(s->index, &e->hash, HASH_ENTER, &found);
-		if (!found)
-		{
-			f->offset = base + e->offset;
-			f->len = e->len;
-		}
+		index_add(s->index, &e->hash, base + e->offset, e->len, e->xid);
 		hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
 	}
 	resetStringInfo(&s->pending);
@@ -693,9 +806,10 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	ProllyHash	key;
 	IndexEntry *e;
 	bool		found;
-	uint8		head[1 + PROLLY_HASH_MAX_LEN];
+	uint8		head[sizeof(TransactionId) + 1 + PROLLY_HASH_MAX_LEN];
 	Size		headlen;
 	uint64		at;
+	TransactionId xid;
 
 	if (hash->len == 0 || hash->len > PROLLY_HASH_MAX_LEN)
 		elog(ERROR, "invalid chunk hash length %u", hash->len);
@@ -708,15 +822,21 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		hash_search(s->index, &key, HASH_FIND, NULL) != NULL)
+		index_has(s->index, &key))
 		return;
 
-	hash_payload(hash, head, &headlen);
+	/* an XCHUNK: the transaction's until it ends */
+	xid = GetTopTransactionId();
+	memcpy(head, &xid, sizeof(xid));
+	hash_payload(hash, head + sizeof(xid), &headlen);
+	headlen += sizeof(xid);
 	at = s->pending.len;
-	record_append(&s->pending, KIND_CHUNK, head, headlen, data, len);
+	record_append(&s->pending, KIND_XCHUNK, head, headlen, data, len);
 	e = hash_search(s->pending_index, &key, HASH_ENTER, &found);
 	e->offset = at;
 	e->len = s->pending.len - at;
+	e->xid = xid;
+	e->other = NULL;
 
 	if (s->pending.len >= APPEND_BATCH)
 		flush_pending(s);
@@ -750,11 +870,11 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 		chunk_bytes(s, s->pending.data + e->offset, e->len, out);
 		return true;
 	}
-	e = hash_search(s->index, &key, HASH_FIND, NULL);
+	e = index_find(s->index, &key);
 	if (e == NULL)
 	{
 		scan_journal(s);
-		e = hash_search(s->index, &key, HASH_FIND, NULL);
+		e = index_find(s->index, &key);
 		if (e == NULL)
 			return false;
 	}
@@ -772,10 +892,10 @@ journal_has(ProllyChunkStore *s, const ProllyHash *hash)
 
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		hash_search(s->index, &key, HASH_FIND, NULL) != NULL)
+		index_has(s->index, &key))
 		return true;
 	scan_journal(s);
-	return hash_search(s->index, &key, HASH_FIND, NULL) != NULL;
+	return index_has(s->index, &key);
 }
 
 static void
@@ -965,6 +1085,86 @@ journal_checkpoint(void)
 	FreeDir(tsdir);
 }
 
+/*
+ * A new database's journal: the one of the database it was made from,
+ * copied a piece at a time as appends to the new one are (WAL-logged and
+ * flushed, then written), so redo, standbys and base backups make it too.
+ * One its files were copied with (the file-copy strategy) has it already.
+ * Nobody else uses the source meanwhile (CREATE DATABASE sees to that), so
+ * the file holds still.
+ */
+static void
+journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
+					  Oid dst_spcoid)
+{
+	char	   *src = journal_path(src_dboid, src_spcoid);
+	char	   *dst = journal_path(dst_dboid, dst_spcoid);
+	struct stat st;
+	int			fd;
+	int			dfd;
+	char	   *buf;
+	uint64		offset = 0;
+
+	if (stat(dst, &st) == 0 || stat(src, &st) != 0)
+	{
+		pfree(src);
+		pfree(dst);
+		return;
+	}
+	fd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", src)));
+	dfd = OpenTransientFile(dst, O_RDWR | O_CREAT | PG_BINARY);
+	if (dfd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", dst)));
+	buf = palloc(APPEND_BATCH);
+	while (offset < (uint64) st.st_size)
+	{
+		Size		len = Min((uint64) APPEND_BATCH, (uint64) st.st_size - offset);
+		xl_chunks_append xlrec;
+		XLogRecPtr	lsn;
+
+		if (pg_pread(fd, buf, len, offset) != len)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
+							len, (unsigned long long) offset, src)));
+		xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
+		xlrec.dboid = dst_dboid;
+		xlrec.spcoid = dst_spcoid;
+		xlrec.offset = offset;
+
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		START_CRIT_SECTION();
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfChunksAppend);
+		XLogRegisterData(buf, len);
+		lsn = XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_APPEND);
+		XLogFlush(lsn);
+		if (pg_pwrite(dfd, buf, len, offset) != len)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
+							len, (unsigned long long) offset, dst)));
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		END_CRIT_SECTION();
+		offset += len;
+	}
+	if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", src)));
+	fsync_fname(dst, false);
+	pfree(buf);
+	pfree(src);
+	pfree(dst);
+}
+
 const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.info = {
 		.iface = PROLLY_IFACE_CHUNK_STORE,
@@ -984,4 +1184,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.commit_redo = journal_commit_redo,
 	.checkpoint = journal_checkpoint,
 	.redo = journal_redo,
+	.copy_database = journal_copy_database,
 };
