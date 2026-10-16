@@ -505,6 +505,18 @@ static void ReleasePredicateLocksLocal(void);
 /*------------------------------------------------------------------------*/
 
 /*
+ * The database field of a relation's predicate lock targets.  A versioned
+ * relation has a copy on each branch with its OID: the branch is mixed in
+ * (as for tuple locks), so copies' locks don't conflict, except by chance.
+ */
+static inline Oid
+PredicateLockDbId(Relation relation)
+{
+	return LOCKTAG_BRANCH_DBOID(relation->rd_locator.dbOid,
+								relation->rd_lockInfo.lockRelId.branchId);
+}
+
+/*
  * Does this relation participate in predicate locking? Temporary and system
  * relations are exempt.
  */
@@ -1942,7 +1954,7 @@ PageIsPredicateLocked(Relation relation, BlockNumber blkno)
 	PREDICATELOCKTARGET *target;
 
 	SET_PREDICATELOCKTARGETTAG_PAGE(targettag,
-									relation->rd_locator.dbOid,
+									PredicateLockDbId(relation),
 									relation->rd_id,
 									blkno);
 
@@ -2510,7 +2522,7 @@ PredicateLockRelation(Relation relation, Snapshot snapshot)
 		return;
 
 	SET_PREDICATELOCKTARGETTAG_RELATION(tag,
-										relation->rd_locator.dbOid,
+										PredicateLockDbId(relation),
 										relation->rd_id);
 	PredicateLockAcquire(&tag);
 }
@@ -2533,7 +2545,7 @@ PredicateLockPage(Relation relation, BlockNumber blkno, Snapshot snapshot)
 		return;
 
 	SET_PREDICATELOCKTARGETTAG_PAGE(tag,
-									relation->rd_locator.dbOid,
+									PredicateLockDbId(relation),
 									relation->rd_id,
 									blkno);
 	PredicateLockAcquire(&tag);
@@ -2572,13 +2584,13 @@ PredicateLockTID(Relation relation, const ItemPointerData *tid, Snapshot snapsho
 	 * level lock.
 	 */
 	SET_PREDICATELOCKTARGETTAG_RELATION(tag,
-										relation->rd_locator.dbOid,
+										PredicateLockDbId(relation),
 										relation->rd_id);
 	if (PredicateLockExists(&tag))
 		return;
 
 	SET_PREDICATELOCKTARGETTAG_TUPLE(tag,
-									 relation->rd_locator.dbOid,
+									 PredicateLockDbId(relation),
 									 relation->rd_id,
 									 ItemPointerGetBlockNumber(tid),
 									 ItemPointerGetOffsetNumber(tid));
@@ -2888,7 +2900,7 @@ DropAllPredicateLocksFromTable(Relation relation, bool transfer)
 	if (!PredicateLockingNeededForRelation(relation))
 		return;
 
-	dbId = relation->rd_locator.dbOid;
+	dbId = PredicateLockDbId(relation);
 	relId = relation->rd_id;
 	if (relation->rd_index == NULL)
 	{
@@ -3098,11 +3110,11 @@ PredicateLockPageSplit(Relation relation, BlockNumber oldblkno,
 	Assert(BlockNumberIsValid(newblkno));
 
 	SET_PREDICATELOCKTARGETTAG_PAGE(oldtargettag,
-									relation->rd_locator.dbOid,
+									PredicateLockDbId(relation),
 									relation->rd_id,
 									oldblkno);
 	SET_PREDICATELOCKTARGETTAG_PAGE(newtargettag,
-									relation->rd_locator.dbOid,
+									PredicateLockDbId(relation),
 									relation->rd_id,
 									newblkno);
 
@@ -4295,7 +4307,7 @@ CheckForSerializableConflictIn(Relation relation, const ItemPointerData *tid, Bl
 	if (tid != NULL)
 	{
 		SET_PREDICATELOCKTARGETTAG_TUPLE(targettag,
-										 relation->rd_locator.dbOid,
+										 PredicateLockDbId(relation),
 										 relation->rd_id,
 										 ItemPointerGetBlockNumber(tid),
 										 ItemPointerGetOffsetNumber(tid));
@@ -4305,14 +4317,14 @@ CheckForSerializableConflictIn(Relation relation, const ItemPointerData *tid, Bl
 	if (blkno != InvalidBlockNumber)
 	{
 		SET_PREDICATELOCKTARGETTAG_PAGE(targettag,
-										relation->rd_locator.dbOid,
+										PredicateLockDbId(relation),
 										relation->rd_id,
 										blkno);
 		CheckTargetForConflictsIn(&targettag);
 	}
 
 	SET_PREDICATELOCKTARGETTAG_RELATION(targettag,
-										relation->rd_locator.dbOid,
+										PredicateLockDbId(relation),
 										relation->rd_id);
 	CheckTargetForConflictsIn(&targettag);
 }
@@ -4373,7 +4385,7 @@ CheckTableForSerializableConflictIn(Relation relation)
 
 	Assert(relation->rd_index == NULL); /* not an index relation */
 
-	dbId = relation->rd_locator.dbOid;
+	dbId = PredicateLockDbId(relation);
 	heapId = relation->rd_id;
 
 	LWLockAcquire(SerializablePredicateListLock, LW_EXCLUSIVE);

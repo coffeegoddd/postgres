@@ -55,9 +55,9 @@ standby_desc(StringInfo buf, XLogReaderState *record)
 		int			i;
 
 		for (i = 0; i < xlrec->nlocks; i++)
-			appendStringInfo(buf, "xid %u db %u rel %u ",
+			appendStringInfo(buf, "xid %u db %u rel %u branch %u ",
 							 xlrec->locks[i].xid, xlrec->locks[i].dbOid,
-							 xlrec->locks[i].relOid);
+							 xlrec->locks[i].relOid, xlrec->locks[i].branch);
 	}
 	else if (info == XLOG_RUNNING_XACTS)
 	{

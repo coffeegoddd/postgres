@@ -449,7 +449,8 @@ _bt_vacuum_cycleid(Relation rel)
 		BTOneVacInfo *vac = &btvacinfo->vacuums[i];
 
 		if (vac->relid.relId == rel->rd_lockInfo.lockRelId.relId &&
-			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId)
+			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId &&
+			vac->relid.branchId == rel->rd_lockInfo.lockRelId.branchId)
 		{
 			result = vac->cycleid;
 			break;
@@ -491,7 +492,8 @@ _bt_start_vacuum(Relation rel)
 	{
 		vac = &btvacinfo->vacuums[i];
 		if (vac->relid.relId == rel->rd_lockInfo.lockRelId.relId &&
-			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId)
+			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId &&
+			vac->relid.branchId == rel->rd_lockInfo.lockRelId.branchId)
 		{
 			/*
 			 * Unlike most places in the backend, we have to explicitly
@@ -539,7 +541,8 @@ _bt_end_vacuum(Relation rel)
 		BTOneVacInfo *vac = &btvacinfo->vacuums[i];
 
 		if (vac->relid.relId == rel->rd_lockInfo.lockRelId.relId &&
-			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId)
+			vac->relid.dbId == rel->rd_lockInfo.lockRelId.dbId &&
+			vac->relid.branchId == rel->rd_lockInfo.lockRelId.branchId)
 		{
 			/* Remove it by shifting down the last entry */
 			*vac = btvacinfo->vacuums[btvacinfo->num_vacuums - 1];

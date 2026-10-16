@@ -1653,7 +1653,8 @@ DefineIndex(ParseState *pstate,
 
 	/* save lockrelid and locktag for below, then close rel */
 	heaprelid = rel->rd_lockInfo.lockRelId;
-	SET_LOCKTAG_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId);
+	SET_LOCKTAG_BRANCH_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId,
+								heaprelid.branchId);
 	table_close(rel, NoLock);
 
 	/*
@@ -4234,7 +4235,8 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 		heaplocktag = palloc_object(LOCKTAG);
 
 		/* Save the LOCKTAG for this parent relation for the wait phase */
-		SET_LOCKTAG_RELATION(*heaplocktag, lockrelid->dbId, lockrelid->relId);
+		SET_LOCKTAG_BRANCH_RELATION(*heaplocktag, lockrelid->dbId, lockrelid->relId,
+									lockrelid->branchId);
 		lockTags = lappend(lockTags, heaplocktag);
 
 		MemoryContextSwitchTo(oldcontext);

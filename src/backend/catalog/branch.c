@@ -480,6 +480,29 @@ relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber)
 }
 
 /*
+ * The branch a relation's locks are for: the session's if the relation is
+ * versioned (its copy there is locked apart from other branches' copies),
+ * else 0.  From its catalog row as the session sees it; 0 if it has none
+ * (yet), or for a system catalog, never versioned.
+ */
+Oid
+relation_lock_branch(Oid relid)
+{
+	HeapTuple	tup;
+	Oid			branch;
+
+	if (relid < FirstNormalObjectId || !IsTransactionState() ||
+		!database_has_versioned_schemas())
+		return InvalidOid;
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	branch = ((Form_pg_class) GETSTRUCT(tup))->relbranch;
+	ReleaseSysCache(tup);
+	return branch;
+}
+
+/*
  * Check out the branch a connection named ("dbname/branch"), if the
  * database has one by that name; false if it has none.
  */

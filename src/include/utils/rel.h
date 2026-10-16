@@ -39,6 +39,7 @@ typedef struct LockRelId
 {
 	Oid			relId;			/* a relation identifier */
 	Oid			dbId;			/* a database identifier */
+	Oid			branchId;		/* a versioned relation's branch, else 0 */
 } LockRelId;
 
 typedef struct LockInfoData

@@ -58,6 +58,9 @@ extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
 /* check out the pg_branch row a connection named; false if there is none */
 extern bool branch_session_init(const char *branch);
 
+/* the branch a relation's locks are for (0: not versioned) */
+extern Oid	relation_lock_branch(Oid relid);
+
 /* switch the session to another branch */
 extern void set_session_branch(Oid branch);
 

@@ -82,19 +82,37 @@ typedef struct LOCKTAG
  */
 
 /* ID info for a relation is DB OID + REL OID; DB OID = 0 if shared */
-#define SET_LOCKTAG_RELATION(locktag,dboid,reloid) \
+/*
+ * A versioned relation has a copy on each branch of its database, all with
+ * its OID, and each copy is locked apart: a relation's lock (and its
+ * extension lock) carry the branch of the copy, 0 for any other relation.
+ * Tuple and page locks have no field to spare, and mix the branch into the
+ * database's: two copies' locks can then only collide, never be told apart
+ * wrongly, so at worst a session waits when it needn't.
+ */
+#define SET_LOCKTAG_BRANCH_RELATION(locktag,dboid,reloid,branch) \
 	((locktag).locktag_field1 = (dboid), \
 	 (locktag).locktag_field2 = (reloid), \
-	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field3 = (branch), \
 	 (locktag).locktag_field4 = 0, \
 	 (locktag).locktag_type = LOCKTAG_RELATION, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
+#define SET_LOCKTAG_RELATION(locktag,dboid,reloid) \
+	SET_LOCKTAG_BRANCH_RELATION(locktag,dboid,reloid,0)
+
+#define LOCKTAG_BRANCH_DBOID(dboid,branch) \
+	((branch) == 0 ? (uint32) (dboid) : \
+	 (uint32) (dboid) ^ ((uint32) (branch) * 0x9E3779B1u))
+
 /* same ID info as RELATION */
 #define SET_LOCKTAG_RELATION_EXTEND(locktag,dboid,reloid) \
+	SET_LOCKTAG_BRANCH_RELATION_EXTEND(locktag,dboid,reloid,0)
+
+#define SET_LOCKTAG_BRANCH_RELATION_EXTEND(locktag,dboid,reloid,branch) \
 	((locktag).locktag_field1 = (dboid), \
 	 (locktag).locktag_field2 = (reloid), \
-	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field3 = (branch), \
 	 (locktag).locktag_field4 = 0, \
 	 (locktag).locktag_type = LOCKTAG_RELATION_EXTEND, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
