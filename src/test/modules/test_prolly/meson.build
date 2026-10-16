@@ -70,6 +70,7 @@ tests += {
       'type_moves',
       'detached_checkout',
       'branch_start',
+      'keyless_moves',
     ],
   },
   'tap': {
