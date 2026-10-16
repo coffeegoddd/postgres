@@ -58,9 +58,10 @@ FROM prolly_implementations();
  index_keying    | stub             |       0 |              0
  canonicalizer   | stub             |       0 |              0
  canonicalizer   | catalogs         |       1 |              1
+ canonicalizer   | folded           |       2 |              1
  chunk_store     | journal          |       1 |              1
  chunk_format    | basic            |       1 |              1
-(51 rows)
+(52 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -385,16 +386,18 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (3 of 3 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (4 of 4 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | pass
+ canonicalizer   | catalogs         | complete                                | not implemented (1 of 4 callbacks missing)
+ canonicalizer   | folded           | identity                                | pass
+ canonicalizer   | folded           | complete                                | not implemented (2 of 4 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass
  chunk_format    | basic            | items_round_trip                        | pass
  chunk_format    | basic            | rejects_other_bytes                     | pass
  chunk_format    | basic            | complete                                | pass
-(325 rows)
+(327 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

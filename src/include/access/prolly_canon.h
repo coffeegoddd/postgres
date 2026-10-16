@@ -22,6 +22,10 @@
  *   history.
  * - walk() visits every node a canonical root keeps alive, for
  *   reclamation.
+ * - fold() builds the canonical root of the session branch's versioned
+ *   schemas as the calling transaction sees them, folding their tables'
+ *   rows into trees: the same for the same logical content, however the
+ *   rows and objects came to be.
  *
  * Provisional (v0).
  *
@@ -45,9 +49,10 @@ typedef struct ProllyCanonRoutine
 								   ProllyNodeRef *root);
 	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
 						 void *arg);
+	void		(*fold) (ProllyNodeRef *root);
 } ProllyCanonRoutine;
 
-#define PROLLY_CANON_CALLBACK_NAMES "prepare", "canonical_root", "walk"
+#define PROLLY_CANON_CALLBACK_NAMES "prepare", "canonical_root", "walk", "fold"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

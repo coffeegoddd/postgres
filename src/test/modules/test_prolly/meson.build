@@ -47,6 +47,7 @@ tests += {
       'bmap_sharing',
       'bmap_copy_on_write',
       'branches',
+      'fold',
     ],
   },
   'tap': {

@@ -13,9 +13,13 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_canon.h"
+#include "access/prolly_config.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
 #include "fmgr.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "varatt.h"
@@ -146,4 +150,76 @@ test_chunk_move_root(PG_FUNCTION_ARGS)
 	text_hash(PG_GETARG_TEXT_PP(1), &root);
 	PG_RETURN_BOOL(PROLLY_CALL(cs(), move_root, store(),
 							   &expected, &root));
+}
+
+/* The canonical root of the session branch's versioned schemas, folded. */
+PG_FUNCTION_INFO_V1(test_fold_root);
+Datum
+test_fold_root(PG_FUNCTION_ARGS)
+{
+	const ProllyCanonRoutine *canon = prolly_canon_lookup("folded");
+	ProllyNodeRef root;
+
+	PROLLY_CALL(canon, fold, &root);
+	PG_RETURN_TEXT_P(hash_text(&root.hash));
+}
+
+static int
+memcmp_order(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
+
+	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
+}
+
+/*
+ * The folded canonical tree's items: each key, and its value with bytes
+ * that aren't printable shown as \xNN.
+ */
+PG_FUNCTION_INFO_V1(test_fold_items);
+Datum
+test_fold_items(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyCanonRoutine *canon = prolly_canon_lookup("folded");
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyNodeRef root;
+	ProllyTreeEnv env;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(canon, fold, &root);
+	memset(&env, 0, sizeof(env));
+	env.chunk_format = prolly_chunkformat_lookup("basic");
+	env.chunker = prolly_chunker_lookup("bytes");
+	env.hash = prolly_hash_lookup("sha256");
+	env.chunk_store = cs();
+	env.chunks = store();
+	env.compare = memcmp_order;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+		StringInfoData vs;
+
+		initStringInfo(&vs);
+		for (uint32 i = 0; i < v.len; i++)
+		{
+			if (v.data[i] >= 32 && v.data[i] < 127)
+				appendStringInfoChar(&vs, (char) v.data[i]);
+			else if (v.data[i] == '\n')
+				appendStringInfoChar(&vs, '\n');
+			else
+				appendStringInfo(&vs, "\\x%02x", v.data[i]);
+		}
+		values[0] = PointerGetDatum(cstring_to_text_with_len((const char *) k.data, k.len));
+		values[1] = PointerGetDatum(cstring_to_text(vs.data));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	return (Datum) 0;
 }

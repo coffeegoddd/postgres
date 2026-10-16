@@ -175,3 +175,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_chunk_move_root(expected text, root text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The canonical root of the session branch's versioned schemas, folded
+-- from their tables' rows.
+CREATE FUNCTION test_fold_root()
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The folded canonical tree's items, for inspection.
+CREATE FUNCTION test_fold_items(OUT key text, OUT value text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
