@@ -13,8 +13,11 @@
  * The copy is a snapshot of the source as the making transaction sees it:
  * its versioned relations are locked against changes meanwhile (ShareLock,
  * which waits for writers to finish), so no change is in flight in a page
- * the copy shares.  Relation locks are by OID, so this also holds up writers
- * of the same objects on other branches for as long.
+ * the copy shares.  The locks are let go once the copy is made, not held
+ * to the end of the transaction: the copy shares no page a later change
+ * could be in (one changes its own), and whatever the making transaction
+ * does next with the new branch (moving it to a commit, say) needn't hold
+ * up the source's writers.
  *
  * Deleting a branch deletes its rows and drops its relations' storage when
  * the transaction commits; pages another branch still shares stay.  It
@@ -155,9 +158,10 @@ copy_storage(Form_pg_class c)
 
 /*
  * Lock the session branch's versioned relations against changes, so the
- * copy is of a state no writer is in the middle of.
+ * copy is of a state no writer is in the middle of.  Returns them, for
+ * unlock_relations().
  */
-static void
+static List *
 lock_versioned_relations(void)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
@@ -179,10 +183,21 @@ lock_versioned_relations(void)
 
 	foreach(lc, relids)
 		LockRelationOid(lfirst_oid(lc), ShareLock);
-	list_free(relids);
 
 	/* read the catalogs as the locks left them */
 	InvalidateCatalogSnapshot();
+	return relids;
+}
+
+/* Let go of the locks lock_versioned_relations() took (only those). */
+static void
+unlock_relations(List *relids)
+{
+	ListCell   *lc;
+
+	foreach(lc, relids)
+		UnlockRelationOid(lfirst_oid(lc), ShareLock);
+	list_free(relids);
 }
 
 /* Copy every row of the session branch into branch 'target'. */
@@ -305,9 +320,11 @@ on_branch(Oid branch, void (*fn) (void *arg), void *arg)
 static void
 copy_from_here(void *arg)
 {
-	lock_versioned_relations();
+	List	   *locked = lock_versioned_relations();
+
 	copy_rows(*(Oid *) arg);
 	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
+	unlock_relations(locked);
 }
 
 static void
