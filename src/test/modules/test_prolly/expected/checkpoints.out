@@ -1,0 +1,169 @@
+-- Working-set checkpoints: a branch's working set folded as a commit
+-- would fold it, without a commit, so later folds start from it.  One is
+-- taken when asked for, and when a session leaves a branch with changes.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.fold(OUT pages int8, OUT full_tables int8,
+	OUT same_as_full bool) AS $$
+DECLARE
+	inc text;
+BEGIN
+	PERFORM test_fold_counters(true);
+	inc := test_fold_root();
+	SELECT c.pages, c.full_tables INTO pages, full_tables
+	  FROM test_fold_counters(true) c;
+	same_as_full := inc = test_fold_root(true);
+END $$ LANGUAGE plpgsql;
+CREATE SCHEMA cp VERSIONED;
+CREATE TABLE cp.t (id int PRIMARY KEY, v text);
+INSERT INTO cp.t SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Changes, then a checkpoint: later folds read only what changed since.
+UPDATE cp.t SET v = 'one' WHERE id = 1;
+UPDATE cp.t SET v = 'two' WHERE id = 10000;
+SELECT pages > 0 AS reads_changes FROM pg_temp.fold();
+ reads_changes 
+---------------
+ t
+(1 row)
+
+SELECT prolly_checkpoint() = test_fold_root(true) AS checkpoint_is_working_set;
+ checkpoint_is_working_set 
+---------------------------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.fold();
+ pages | full_tables | same_as_full 
+-------+-------------+--------------
+     0 |           0 | t
+(1 row)
+
+-- The changes are still the working set's, against its head.
+SELECT table_name, status FROM dolt_status;
+ table_name |  status  
+------------+----------
+ cp.t       | modified
+(1 row)
+
+SELECT diff_type, (to_row).id FROM dolt_diff('HEAD', 'WORKING', NULL::cp.t) ORDER BY 2;
+ diff_type |  id   
+-----------+-------
+ modified  |     1
+ modified  | 10000
+(2 rows)
+
+-- More changes after it, then a commit of them all.
+UPDATE cp.t SET v = 'three' WHERE id = 20000;
+SELECT pages <= 3 AS reads_the_new_change, full_tables, same_as_full FROM pg_temp.fold();
+ reads_the_new_change | full_tables | same_as_full 
+----------------------+-------------+--------------
+ t                    |           0 | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'three changes')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT diff_type, (to_row).id FROM dolt_diff('HEAD~1', 'HEAD', NULL::cp.t) ORDER BY 2;
+ diff_type |  id   
+-----------+-------
+ modified  |     1
+ modified  | 10000
+ modified  | 20000
+(3 rows)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
+SELECT * FROM pg_temp.fold();
+ pages | full_tables | same_as_full 
+-------+-------------+--------------
+     0 |           0 | t
+(1 row)
+
+-- A checkpoint rolled back is gone.
+UPDATE cp.t SET v = 'four' WHERE id = 4;
+BEGIN;
+SELECT length(prolly_checkpoint()) AS checkpointed;
+ checkpointed 
+--------------
+           64
+(1 row)
+
+ROLLBACK;
+SELECT pages > 0 AS reads_since_the_commit, same_as_full FROM pg_temp.fold();
+ reads_since_the_commit | same_as_full 
+------------------------+--------------
+ t                      | t
+(1 row)
+
+-- Leaving a branch with changes takes a checkpoint of it.
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM pg_temp.fold();
+ pages | full_tables | same_as_full 
+-------+-------------+--------------
+     0 |           0 | t
+(1 row)
+
+SELECT diff_type, (to_row).id FROM dolt_diff('HEAD', 'WORKING', NULL::cp.t) ORDER BY 2;
+ diff_type | id 
+-----------+----
+ modified  |  4
+(1 row)
+
+-- Leaving one without changes takes none.
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT * FROM pg_temp.fold();
+ pages | full_tables | same_as_full 
+-------+-------------+--------------
+     0 |           0 | t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cp CASCADE;
+NOTICE:  drop cascades to table cp.t

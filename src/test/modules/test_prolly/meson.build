@@ -62,6 +62,7 @@ tests += {
       'schema_merges',
       'table_files',
       'incremental_folds',
+      'checkpoints',
     ],
   },
   'tap': {

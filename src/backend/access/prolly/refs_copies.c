@@ -10,8 +10,8 @@
  *
  *	'B' name	-> the branch's head commit (hash length, hash)
  *	'W' name	-> the branch's baseline: what its last fold for a commit
- *				   left, for the next fold to start from (the
- *				   canonicalizer's tree; hash length, hash)
+ *				   or a working-set checkpoint left, for the next fold to
+ *				   start from (the canonicalizer's tree; hash length, hash)
  *	'M' name	-> the branch's merge in progress: the merged head and the
  *				   common ancestor (hash length, hash each), then the OIDs
  *				   of tables with unresolved conflicts (4 bytes each,
@@ -852,9 +852,41 @@ copies_branch_lookup(const char *name, ProllyBranchId *branch)
 	return OidIsValid(oid);
 }
 
+/*
+ * A working-set checkpoint: the session branch folded as a commit would
+ * be, its fold the branch's baseline.
+ */
+static void
+copies_checkpoint(ProllyNodeRef *root)
+{
+	ProllyNodeRef next;
+
+	lock_refs();
+	fold_from_baseline(root, &next);
+	branch_set_baseline(branch_ops()->current(), &next);
+}
+
+/*
+ * Leaving a branch with changes takes a working-set checkpoint of it, so
+ * the pages it changed needn't be kept until its next commit.  (A session
+ * choosing its first branch, as it connects, leaves none.)
+ */
 static void
 copies_checkout(const char *name)
 {
+	char	   *current = branch_ops()->current();
+	ProllyNodeRef working;
+	ProllyHash	head;
+	ProllyCommitInfo info;
+
+	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
+		OidIsValid(branch_oid(name)))
+	{
+		fold(&working);
+		if (!branch_head(current, &head) || !copies_commit_get(&head, &info) ||
+			!same_hash(&info.root.hash, &working.hash))
+			copies_checkpoint(&working);
+	}
 	branch_ops()->checkout(name);
 }
 
@@ -1202,4 +1234,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_merge_state = copies_set_merge_state,
 	.hold = copies_hold,
 	.walk = copies_walk,
+	.checkpoint = copies_checkpoint,
 };
