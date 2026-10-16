@@ -11,8 +11,11 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from pbench import report
+from evidence_helpers import seal
+from unittest.mock import patch
 from pbench.core import config, registry, targets
 from pbench.core.interfaces import (CellKey, CellResult, Collector, NotImplementedByEngine,
                                     SqlResult, Status, Workload)
@@ -74,6 +77,21 @@ tps = 1234.567890 (without initial connection time)
             self.assertEqual((h.count, failed), (3, 1))
             self.assertFalse((p / "pgbench-measure.123").exists())
             self.assertTrue((p / "pgbench-measure.out").exists())
+
+    def test_missing_latency_logs_cannot_claim_complete_measurement(self):
+        from pbench.workloads import _common
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            ctx = SimpleNamespace(key=SimpleNamespace(clients=1), params={},
+                scratch_dir=p, raw_dir=p, dbname="test", session_options=lambda: {},
+                cluster=SimpleNamespace(bin=lambda name: name, client_env=lambda options: {}))
+            result = SimpleNamespace(returncode=0, stderr="", stdout=self.OUTPUT.replace("12345", "1")
+                                     .replace("transactions: 2", "transactions: 0"))
+            (p / "pgbench-measure.123").write_text("0 1 500 0 1700000000 1\n")
+            with patch.object(_common.process, "run", return_value=result):
+                self.assertEqual(_common.run_pgbench(ctx, seconds=1).latency.count, 1)
+                with self.assertRaisesRegex(RuntimeError, "latency records"):
+                    _common.run_pgbench(ctx, seconds=1)
 
     def test_not_implemented_from_client_output(self):
         with self.assertRaises(NotImplementedByEngine):
@@ -175,7 +193,7 @@ class RegistryTest(unittest.TestCase):
     def test_v_variants_include_background(self):
         registry.load_all()
         v2 = registry.workloads.get("V2")()
-        labels = [l for l, _ in v2.variants({"changes": [1]})]
+        labels = [label for label, _ in v2.variants({"changes": [1]})]
         self.assertEqual(labels, ["n1-bgnone", "n1-bgS1"])
         self.assertEqual(v2.client_counts([1, 4], {"background": "none"}), [1])
         self.assertEqual(v2.client_counts([1, 4], {"background": "S1"}), [1, 4])
@@ -198,6 +216,8 @@ class ReportTest(unittest.TestCase):
                         f.write(json.dumps(r) + "\n")
             table = report.summary_tables(report.load_results(base), "S")
             self.assertIn("| tiny | - | 4 | ok 3/3 | 102<br>101–103 |", table)
+            seal(base)
+            seal(other)
             cmp = report.compare(base, other)
             self.assertIn("0.51", cmp)
 
@@ -219,6 +239,7 @@ class TableTest(unittest.TestCase):
                             "clients": 4, "rep": rep},
                     "status": status, "message": "engine does not implement x",
                     "metrics": {"tps": tps, "latency_p99_ms": 2.0}}) + "\n")
+        seal(d)
         return d
 
     def test_engines_side_by_side(self):
@@ -228,23 +249,24 @@ class TableTest(unittest.TestCase):
             self._set(root, "B0", "heap", 1000.0)
             self._set(root, "prolly_d1", "prolly_d1", 800.0)
             self._set(root, "prolly_d2", "prolly_d2", None, "not_implemented")
-            sets = table.discover(root, "S")
+            self.assertEqual(len(table.discover(root, "S")), 3)
+            sets = [table.load_set(root / n) for n in ("B0", "prolly_d1", "prolly_d2")]
             md = table.to_markdown(sets, "S")
             self.assertIn("| B0 (heap) | prolly_d1 | prolly_d2 |", md)
-            self.assertIn("| 1,000 | 800 (0.80x) | not impl. |", md)
-            self.assertIn("| 2.00 | 2.00 (1.00x) | not impl. |", md)
+            self.assertIn("| 1,000 | 800 (0.80x) | INVALID |", md)
+            self.assertIn("| 2.00 | 2.00 (1.00x) | INVALID |", md)
             page = table.to_html(sets, "S")
-            self.assertIn("class='num bad'", page)   # 0.80x throughput is worse
-            self.assertIn("not impl.", page)
+            self.assertNotIn("class='num bad'", page)   # 0.80x throughput is worse
+            self.assertIn("INVALID", page)
 
     def test_write_metrics_na_when_read_only(self):
         from pbench import table
         rs = [{"status": "ok", "read_only": True,
-               "metrics": {"wal_bytes_per_txn": 0.01, "tps": 5.0}}]
-        self.assertEqual(table._cell(rs, "wal_bytes_per_txn", None).text, "n/a")
+               "metrics": {"wal_bytes_per_operation": 0.01, "tps": 5.0}}]
+        self.assertEqual(table._cell(rs, "wal_bytes_per_operation", None).text, "n/a")
         self.assertEqual(table._cell(rs, "throughput", None).text, "5.00")
         rs[0]["read_only"] = False
-        self.assertEqual(table._cell(rs, "wal_bytes_per_txn", None).text, "0.01")
+        self.assertEqual(table._cell(rs, "wal_bytes_per_operation", None).text, "0.01")
 
 
 class CSuiteTest(unittest.TestCase):
@@ -264,7 +286,7 @@ class CSuiteTest(unittest.TestCase):
             def scalar(self, sql, dbname):
                 return next(am for t, am in self.ams.items() if f"'{t}'" in sql)
         got = targets.for_am("prolly").wrong_am(FakeCluster(), "bench", ["t1", "t2", "gone"])
-        self.assertEqual(got, ["t2:heap"])
+        self.assertEqual(got, ["t2:heap", "gone:missing"])
 
     def test_sample_per_directory(self):
         from pbench.workloads.c_suite import C3
@@ -336,20 +358,21 @@ class CCompareTest(unittest.TestCase):
                                                "msg": "boom"}}) + "\n")
             md = ccompare.to_markdown([eng, base])
             self.assertIn("| C2 | 75.000% | 75.000% |", md)
-            self.assertIn("| C2 | 5 | 1 | FAIL |", md)
-            text = ccompare.cdiff(base, eng)
+            self.assertIn("| C2 | - | FAIL |", md)
+            with patch.object(ccompare, "compare", return_value={}):
+                text = ccompare.cdiff(base, eng)
             self.assertIn("## regression: 1", text)
             self.assertIn("SELECT 1\n    FROM t1", text)
             self.assertIn("prolly: not_ok, XX000, boom", text)
 
     def test_exceptions_for(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as f:
-            f.write('[[exception]]\nfile = "a.test"\nline = 3\nreason = "all"\n'
+            f.write('[[exception]]\nfile = "a.test"\nline = 3\nam = "prolly"\nreason = "all"\n'
                     '[[exception]]\nfile = "b.test"\nline = 4\nam = "prolly"\nreason = "p"\n')
             f.flush()
             from pbench import ccompare
             self.assertEqual(len(ccompare.exceptions_for("prolly", Path(f.name))), 2)
-            self.assertEqual(len(ccompare.exceptions_for("heap", Path(f.name))), 1)
+            self.assertEqual(len(ccompare.exceptions_for("heap", Path(f.name))), 0)
 
 
 class VSuiteSQLTest(unittest.TestCase):

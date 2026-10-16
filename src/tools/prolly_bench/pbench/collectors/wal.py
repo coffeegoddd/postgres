@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pbench.core import registry
 from pbench.core.interfaces import Collector
-from pbench.core.stats import per
+from pbench.core.stats import per, counter_delta
 
 
 @registry.collectors.register("wal")
@@ -29,12 +29,14 @@ class WalCollector(Collector):
         wal_bytes = float(ctx.cluster.scalar(
             f"SELECT pg_wal_lsn_diff('{self.after[0]}', '{self.before[0]}')"))
         n = outcome.transactions
+        delta = counter_delta(dict(enumerate(self.before[1:])), dict(enumerate(self.after[1:])))
+        counter_delta({"lsn": 0}, {"lsn": wal_bytes})
         return {
             "wal_bytes": wal_bytes,
-            "wal_bytes_per_txn": per(wal_bytes, n),
+            "wal_bytes_per_operation": per(wal_bytes, n),
             # pg_stat_wal is flushed by backends about once a second, so these
             # can lag slightly; WAL bytes come from WAL positions and don't.
-            "wal_records": self.after[1] - self.before[1],
-            "wal_fpi": self.after[2] - self.before[2],
-            "wal_fpi_bytes": self.after[3] - self.before[3],
+            "wal_records": delta[0],
+            "wal_fpi": delta[1],
+            "wal_fpi_bytes": delta[2],
         }

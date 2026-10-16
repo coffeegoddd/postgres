@@ -5,6 +5,26 @@ from __future__ import annotations
 
 from pbench.core import registry
 from pbench.core.interfaces import Collector, NotApplicable
+from pathlib import Path
+
+
+def physical_size(root: Path) -> tuple[int, int]:
+    """Apparent and allocated bytes, counted once per inode (including WAL)."""
+    apparent = allocated = 0
+    seen = set()
+    for p in root.rglob("*"):
+        if p.is_symlink():
+            raise RuntimeError(f"external storage requires explicit accounting: {p}")
+        try:
+            stat = p.stat()
+        except FileNotFoundError:
+            continue  # transient server files
+        key = (stat.st_dev, stat.st_ino)
+        if key not in seen:
+            seen.add(key)
+            apparent += stat.st_size
+            allocated += stat.st_blocks * 512
+    return apparent, allocated
 
 
 @registry.collectors.register("space")
@@ -22,7 +42,11 @@ class SpaceCollector(Collector):
         logical = sum(float(ctx.cluster.scalar(
             f"SELECT coalesce(sum(pg_column_size(t.*)), 0) FROM {t} t",
             dbname=ctx.dbname)) for t in tables)
-        return {"on_disk_bytes": disk, "logical_bytes": logical,
-                "space_amplification": disk / logical if logical else None,
+        apparent, allocated = physical_size(ctx.cluster.data_dir)
+        return {"relation_bytes": disk, "row_representation_bytes": logical,
+                # pg_total_relation_size omits D1's global nodestore. These
+                # scopes are explicit; neither is a cross-engine amplification.
+                "cluster_apparent_bytes_including_wal": apparent,
+                "cluster_allocated_bytes_including_wal": allocated,
                 "database_bytes": float(ctx.cluster.scalar(
                     "SELECT pg_database_size(current_database())", dbname=ctx.dbname))}

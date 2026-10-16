@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +31,8 @@ const (
 // record is one line of records.jsonl.gz: a test record's status, with the
 // actual result's digest when it ran.  Skipped records are only counted.
 type record struct {
+	Version  int    `json:"version"`
+	SortMode string `json:"sort_mode,omitempty"`
 	File     string `json:"file"`
 	Line     int    `json:"line"`
 	Status   string `json:"status"`
@@ -104,8 +107,12 @@ func isNotImplemented(sqlstate, msg string) bool {
 func resolve(e logEntry, d *digest) record {
 	r := record{File: e.File, Line: e.Line, Status: e.Result, Message: e.Message, Ms: e.Ms}
 	if d == nil {
+		if r.Status != stSkipped && r.Status != stTimeout && r.Status != stDidNotRun {
+			r.Status, r.Message = stDidNotRun, "missing execution digest"
+		}
 		return r
 	}
+	r.Version, r.SortMode = d.Version, d.SortMode
 	r.SQLState, r.Rows, r.Ordered, r.Sorted = d.SQLState, d.Rows, d.Ordered, d.Sorted
 	if d.Message != "" {
 		r.Message = d.Message
@@ -184,6 +191,7 @@ func eachDigest(path string, fn func(*digest)) error {
 // them in the order it runs records, the same order as its log; order
 // gives each file's position in the unit's list.
 type digestReader struct {
+	err   error
 	sc    *bufio.Scanner
 	order map[string]int
 	peek  *digest
@@ -202,9 +210,12 @@ func (dr *digestReader) advance() {
 	dr.peek = nil
 	if dr.sc.Scan() {
 		var d digest
-		if json.Unmarshal(dr.sc.Bytes(), &d) == nil {
+		dr.err = json.Unmarshal(dr.sc.Bytes(), &d)
+		if dr.err == nil {
 			dr.peek = &d
 		}
+	} else {
+		dr.err = dr.sc.Err()
 	}
 }
 
@@ -217,6 +228,10 @@ func (dr *digestReader) forFile(file string) map[int]*digest {
 	}
 	out := map[int]*digest{}
 	for dr.peek != nil && dr.peek.File == file {
+		if out[dr.peek.Line] != nil {
+			dr.err = fmt.Errorf("duplicate digest %s:%d", file, dr.peek.Line)
+			break
+		}
 		out[dr.peek.Line] = dr.peek
 		dr.advance()
 	}
@@ -258,6 +273,9 @@ func merge(cfg *config, units []string, rerun map[string]bool) (*summary, error)
 	}
 
 	var recs, fails, files bytes.Buffer
+	// Canonical order allows bounded-memory comparison against the pre-run
+	// plan even though workers execute largest files first.
+	sort.Slice(parts, func(i, j int) bool { return parts[i].firstFile < parts[j].firstFile })
 	for _, p := range parts {
 		recs.Write(p.records.Bytes())
 		fails.Write(p.failures.Bytes())
@@ -288,6 +306,7 @@ func merge(cfg *config, units []string, rerun map[string]bool) (*summary, error)
 // unitMerge is one unit's share of the outputs: its records and failure
 // lines as gzip members, its file lines, and its counts.
 type unitMerge struct {
+	firstFile                string
 	records, failures, files bytes.Buffer
 	sum                      summary
 }
@@ -296,6 +315,9 @@ func mergeUnit(cfg *config, u string) (*unitMerge, error) {
 	m := &unitMerge{sum: summary{Counts: map[string]int{}}}
 	sum := &m.sum
 	err := eachFileResult(filepath.Join(cfg.scratch, u+".files.jsonl"), func(fr fileResult, raw []byte) {
+		if m.firstFile == "" {
+			m.firstFile = fr.File
+		}
 		sum.Files++
 		if len(fr.WrongAM) > 0 {
 			sum.WrongAMFiles = append(sum.WrongAMFiles, fr.File)
@@ -346,6 +368,9 @@ func mergeUnit(cfg *config, u string) (*unitMerge, error) {
 			sum.UnmatchedDigests += len(digests)
 			file = e.File
 			digests = dr.forFile(file)
+			if dr.err != nil {
+				return nil, dr.err
+			}
 		}
 		d := digests[e.Line]
 		delete(digests, e.Line)
@@ -353,7 +378,7 @@ func mergeUnit(cfg *config, u string) (*unitMerge, error) {
 		sum.Total++
 		sum.Counts[r.Status]++
 		if r.Status == stSkipped {
-			continue
+			r.Version = 2
 		}
 		if r.Status != stOk {
 			io.WriteString(logOut, line+"\n")
@@ -362,6 +387,13 @@ func mergeUnit(cfg *config, u string) (*unitMerge, error) {
 		out.Write(append(b, '\n'))
 	}
 	sum.UnmatchedDigests += len(digests) + dr.skip
+	for dr.peek != nil && dr.err == nil {
+		sum.UnmatchedDigests++
+		dr.advance()
+	}
+	if dr.err != nil {
+		return nil, dr.err
+	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}

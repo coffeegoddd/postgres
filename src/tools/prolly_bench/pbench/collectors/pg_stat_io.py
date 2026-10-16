@@ -4,10 +4,9 @@ types and contexts."""
 
 from __future__ import annotations
 
-import time
-
 from pbench.core import registry
 from pbench.core.interfaces import Collector
+from pbench.core.stats import counter_delta
 
 _COLS = ["hits", "reads", "writes", "extends", "evictions", "fsyncs",
          "read_bytes", "write_bytes"]
@@ -27,12 +26,12 @@ class PgStatIoCollector(Collector):
         self.before = self._snap(ctx)
 
     def stop(self, ctx):
-        # Backends flush I/O statistics at most once a second.
-        time.sleep(1.1)
+        # Cumulative statistics may lag backend work. Never sleep here:
+        # doing so extends every collector stopped after this one.
         self.after = self._snap(ctx)
 
     def results(self, ctx, outcome):
-        d = {c: self.after[c] - self.before[c] for c in _COLS}
+        d = counter_delta(self.before, self.after)
         lookups = d["hits"] + d["reads"]
         return {
             "io_hit_ratio": d["hits"] / lookups if lookups else None,
@@ -41,4 +40,6 @@ class PgStatIoCollector(Collector):
             "io_extends": d["extends"],
             "io_evictions": d["evictions"],
             "io_fsyncs": d["fsyncs"],
+            "io_read_bytes": d["read_bytes"],
+            "io_write_bytes": d["write_bytes"],
         }

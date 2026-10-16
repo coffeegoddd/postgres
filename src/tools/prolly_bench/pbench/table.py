@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from pbench.core import registry
-from pbench.core.stats import summarize
+from pbench.core.stats import summarize, paired_ratio_interval
 from pbench.report import HIGHER_IS_BETTER, load_results
+from pbench.core.validation import cell_problems, compatible, validate_run
 
 # (metric, heading, unit) per suite, in display order.  "throughput" is
 # tps, or rows/s for row-oriented cells (S4, sysbench bulk_insert).
@@ -29,13 +30,19 @@ S_TABLES = [
     ("latency_p50_ms", "Latency p50", "ms"),
     ("latency_p99_ms", "Latency p99", "ms"),
     ("latency_p999_ms", "Latency p99.9", "ms"),
-    ("wal_bytes_per_txn", "WAL per transaction", "bytes"),
-    ("device_write_bytes_per_txn", "Device writes per transaction", "bytes"),
-    ("server_cpu_ms_per_txn", "Server CPU per transaction", "ms"),
+    ("wal_bytes_per_operation", "WAL per completed unit", "bytes"),
+    ("device_write_bytes_per_operation", "Whole-device writes per completed unit", "bytes"),
+    ("host_busy_cpu_seconds", "Host busy CPU", "seconds"),
+    ("latency_samples", "Latency observations", "samples"),
+    ("failed_transactions", "Failed transactions", "count"),
+    ("skipped_transactions", "Requests skipped under scheduled load", "count"),
+    ("hot_query_seconds", "TPC-H measured hot queries", "seconds for Q1–Q22"),
+    ("client_process_qps", "TPC-H process throughput including cold passes", "queries/s"),
     ("io_hit_ratio", "Buffer hit ratio", "fraction"),
-    ("space_amplification", "Space amplification", "on-disk / logical"),
+    ("cluster_allocated_bytes_including_wal", "Cluster allocated storage including WAL", "bytes"),
+    ("relation_bytes", "Relation storage (excludes engine-global stores)", "bytes"),
     ("vacuum_seconds", "VACUUM after the run", "seconds"),
-    ("recovery_seconds", "Crash recovery", "seconds"),
+    ("process_restart_seconds", "Restart after process crash, warm OS cache", "seconds"),
 ]
 V_TABLES = [
     ("branch_create_ms", "Branch create", "ms"),
@@ -50,7 +57,7 @@ V_TABLES = [
 ]
 _HIGHER = HIGHER_IS_BETTER | {"throughput"}
 # Metrics that measure write volume; not applicable to read-only cells.
-_WRITE_METRICS = {"wal_bytes_per_txn", "device_write_bytes_per_txn"}
+_WRITE_METRICS = {"wal_bytes_per_operation", "device_write_bytes_per_operation"}
 _STATUS_TEXT = {"not_implemented": "not impl.", "unavailable": "unavail.",
                 "error": "error", "not_applicable": "n/a"}
 
@@ -63,6 +70,7 @@ class ResultSet:
     table_am: str
     started: str
     results: list[dict]
+    problems: list[str] = field(default_factory=list)
 
     @property
     def is_baseline(self) -> bool:
@@ -71,16 +79,21 @@ class ResultSet:
 
 def load_set(path: Path) -> ResultSet:
     run = json.loads((path / "run.json").read_text())
+    problems = validate_run(path)
+    try:
+        results = load_results(path)
+    except (OSError, ValueError, KeyError):
+        results = []  # Keep incomplete evidence visible in discovery and reports.
     return ResultSet(path, run["suite"], run["label"], run["table_am"],
-                     run["started"], load_results(path))
+                     run["started"], results, problems)
 
 
 def discover(root: Path, suite: str) -> list[ResultSet]:
-    """The most recent complete result set per label for suite."""
+    """The most recent result per label, including failed/incomplete runs."""
     latest: dict[str, ResultSet] = {}
     for run_json in sorted(root.glob("*/run.json")):
         rs = load_set(run_json.parent)
-        if rs.suite != suite or not rs.results:
+        if rs.suite != suite:
             continue
         if rs.label not in latest or rs.started > latest[rs.label].started:
             latest[rs.label] = rs
@@ -89,6 +102,8 @@ def discover(root: Path, suite: str) -> list[ResultSet]:
 
 def _order(sets: list[ResultSet]) -> list[ResultSet]:
     """Baselines first, then by label."""
+    if len({s.label for s in sets}) != len(sets):
+        raise ValueError("result labels must be unique; refusing to combine distinct runs implicitly")
     return sorted(sets, key=lambda s: (not s.is_baseline, s.label))
 
 
@@ -112,6 +127,10 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
     if not rs:
         return Cell("", ok=False)
     ok = [r for r in rs if r["status"] == "ok"]
+    invalid = [r for r in rs if cell_problems(r)]
+    if invalid:
+        return Cell(f"invalid {len(invalid)}/{len(rs)}", ok=False,
+                    detail="; ".join(p for r in invalid for p in cell_problems(r)))
     if not ok:
         status = rs[0]["status"]
         return Cell(_STATUS_TEXT.get(status, status), ok=False,
@@ -120,16 +139,33 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
         return Cell(_STATUS_TEXT["not_applicable"], ok=False,
                     detail="read-only workload")
     s = summarize(_metric(r, metric) for r in ok)
+    if s["n"] != len(rs):
+        return Cell(f"missing {len(rs) - s['n']}/{len(rs)}", ok=False)
     if s["median"] is None:
         return Cell("-", ok=False)
     cell = Cell(_fmt(s["median"]),
                 detail=f"median of {s['n']}; min {_fmt(s['min'])}, max {_fmt(s['max'])}")
-    if base:
+    if base and not any(cell_problems(r) for r in base):
         b = summarize(_metric(r, metric) for r in base if r["status"] == "ok")
-        if b["median"]:
+        if b["median"] and b["n"] == len(base):
             cell.ratio = s["median"] / b["median"]
-            if abs(cell.ratio - 1.0) >= 0.05:
-                cell.better = (cell.ratio > 1.0) == (metric in _HIGHER)
+            # A point ratio is descriptive, not evidence of a performance
+            # difference. Do not color noisy or single-repetition results.
+            by_rep = {r.get("key", {}).get("rep"): r for r in base}
+            reps = [r.get("key", {}).get("rep") for r in rs]
+            if (len(set(reps)) == len(rs) == len(base) and set(reps) == by_rep.keys()
+                    and all(r.get("measurement", {}).get("quality") == "benchmark" for r in rs + base)
+                    and all(r["measurement"].get("seed") == by_rep[r["key"]["rep"]]["measurement"].get("seed") for r in rs)):
+                interval = paired_ratio_interval([(_metric(r, metric), _metric(by_rep[r["key"]["rep"]], metric)) for r in rs])
+                if interval:
+                    estimate, low, high = interval
+                    cell.ratio = estimate
+                    cell.detail += f"; paired median ratio 95% bootstrap CI [{low:.3f}, {high:.3f}]"
+                    cell.text += f" [95% CI {low:.2f}–{high:.2f}x]"
+                    if low > 1.05 or high < 0.95:
+                        cell.better = (low > 1.05) == (metric in _HIGHER)
+                    else:
+                        cell.detail += "; inconclusive at 5% practical effect threshold"
     return cell
 
 
@@ -161,12 +197,15 @@ def build(sets: list[ResultSet], suite: str):
             index.setdefault((s.label, k["workload"], k["variant"], k["size"],
                               k["clients"]), []).append(r)
     tables = []
+    comparability = {s.label: not compatible(base.path, s.path)
+                     for s in sets if base and s is not base}
     for metric, heading, unit in (S_TABLES if suite == "S" else V_TABLES):
         rows = []
         for key in _row_keys(sets):
             b = index.get((base.label, *key)) if base else None
-            cells = [_cell(index.get((s.label, *key), []), metric,
-                           None if s is base else b) for s in sets]
+            cells = [Cell("INVALID", ok=False, detail="; ".join(s.problems)) if s.problems else
+                     _cell(index.get((s.label, *key), []), metric,
+                           b if comparability.get(s.label) else None) for s in sets]
             if any(c.ok for c in cells) or metric == tables_first_metric(suite):
                 rows.append((key, cells))
         if rows:
@@ -202,6 +241,13 @@ def to_markdown(sets: list[ResultSet], suite: str) -> str:
     out = [f"# {suite} suite by engine\n"]
     out.append("Columns: " + "; ".join(
         f"**{s.label}** = `{s.table_am}` ({s.path.name})" for s in sets) + "\n")
+    for s in sets:
+        out.extend(f"- {s.label}: {p}" for p in s.problems)
+    base = next((s for s in sets if s.is_baseline), None)
+    if base:
+        for s in sets:
+            if s is not base:
+                out.extend(f"- {s.label}: comparison withheld: {p}" for p in compatible(base.path, s.path))
     if suite == "S" and any(s.is_baseline for s in sets):
         out.append("Each number is the median over repetitions; the ratio to B0 "
                    "follows it (for throughput and hit ratio higher is better, "
@@ -271,9 +317,16 @@ def to_html(sets: list[ResultSet], suite: str) -> str:
     parts.append("<p class='meta'>" + " · ".join(
         f"<b>{esc(s.label)}</b> = {esc(s.table_am)} ({esc(s.path.name)})" for s in sets)
         + ("<br>Median over repetitions; the ratio to B0 follows each number. "
-           "Green is better than B0, red worse (5% threshold). Hover a cell for "
-           "its spread." if suite == "S" and any(s.is_baseline for s in sets) else "")
+           "Ratios are descriptive; no statistical significance is implied. Hover a cell for "
+           "its spread or validation errors." if suite == "S" and any(s.is_baseline for s in sets) else "")
         + "</p>")
+    messages = [f"{s.label}: {p}" for s in sets for p in s.problems]
+    base = next((s for s in sets if s.is_baseline), None)
+    if base:
+        messages += [f"{s.label}: comparison withheld: {p}" for s in sets if s is not base
+                     for p in compatible(base.path, s.path)]
+    if messages:
+        parts.append("<ul>" + "".join(f"<li>{esc(m)}</li>" for m in messages) + "</ul>")
     parts.append("<nav>" + "".join(f"<a href='#{m}'>{esc(h)}</a>"
                                    for m, h, *_ in tables) + "</nav>")
     for metric, heading, unit, cols, rows in tables:

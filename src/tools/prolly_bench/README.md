@@ -1,9 +1,9 @@
 # prolly_bench
 
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
-compared with stock heap), the V suite (version control, prolly engines
+compared with the fork's heap), the V suite (version control, prolly engines
 only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
-with stock heap).
+with the fork's heap).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
 (S9 and S13), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
@@ -40,8 +40,9 @@ src/tools/prolly_bench/prolly_bench table            # S suite; --suite V for V
 percentiles, WAL and device bytes per transaction, CPU, hit ratio, space,
 VACUUM, recovery) with each S number's ratio to B0, and writes
 `specs/results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
-better than B0 are green and worse are red (beyond 5%), and hovering a cell
-shows its spread.  `compare BASELINE_DIR DIR` gives one result set's ratios
+are colored only for benchmark-quality paired repetitions whose 95% bootstrap
+interval clears a 5% practical effect threshold. Smoke ratios are descriptive.
+Hovering a cell shows its spread and validity details.  `compare BASELINE_DIR DIR` gives one result set's ratios
 to a baseline in a single wide table.
 
 ## BenchBase TPC workloads
@@ -92,8 +93,15 @@ and 100 for the in-memory and larger-than-RAM configurations respectively.
 
 Results retain BenchBase summaries and transaction outcome counts in
 `raw/.../benchbase-measure/`, plus TPC-H `queries.json` with each query's
-count, mean latency and total time. `qps` reports TPC-H query throughput;
-the common throughput column uses the same value. Logged loader errors,
+count, mean latency and total time. BenchBase `tps` and throughput-mode `qps`
+count successful operations over the full client process, matching the resource
+counter scope. Upstream active-phase attempts and reported rates are retained as
+`measured_requests`, `client_reported_tps` and `client_reported_goodput_tps`;
+upstream goodput combines different scopes and can exceed its throughput.
+Latency samples describe active-phase attempts, including failed attempts.
+Serial mode reports `hot_query_seconds` for Q1–Q22 and `client_process_qps`
+for both cold and hot passes including process overhead; resource counters
+use all 44 executions as their denominator. Logged loader errors,
 unexpected SQL errors, empty runs, or incomplete serial query coverage
 fail the cell rather than producing successful timing results. Engine
 features that are not implemented still receive the harness's explicit
@@ -129,9 +137,10 @@ An engine is judged by agreement with heap, not only by the corpus's
 expected answers: `table --suite C` gives the pass rate per engine, then
 each engine's records in classes against B0 (`agree`, `order_only`,
 `regression`, `postgres_semantics`, ...), and a gate that fails on
-`regression`, `hidden_regression`, `crashed` and `unmatched`.  `cdiff`
-lists the differences with the queries.  Records expected to differ go in
-`configs/c_exceptions.toml` with a reason.
+every class other than `agree`, `postgres_semantics`, or a precisely matched
+exception. `cdiff` lists differences with the queries. Exceptions in
+`configs/c_exceptions.toml` must name the engine, exact actual-answer signatures,
+corpus file hash, owner, issue and expiry. Changed or stale exceptions fail.
 
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
@@ -169,14 +178,16 @@ For each cell (workload x size x variant x client count x repetition):
    `default_table_access_method`, then `CHECKPOINT`;
 3. warm up (discarded);
 4. measure inside a window; collectors snapshot as it opens and closes;
-5. post-measurement collectors: space, `VACUUM`, crash recovery;
+5. check workload invariants and optional TPC-H answers, verify crash recovery
+   before maintenance, then measure space, `VACUUM` and optional GC;
 6. destroy the cluster.
 
 Before the cells it records the environment and runs an fio baseline on the
 device under `--work-dir`.
 
 A stub engine's "not implemented" error (SQLSTATE 0A000, read from psql or
-the server log) is reported as status `not_implemented`, not as a failure.
+the server log) is reported as status `not_implemented` and fails the execution
+gate for the requested plan. It does not count as tested.
 Missing tools are `unavailable`, and metrics that don't apply are
 `not_applicable`; each says why.
 
@@ -189,7 +200,8 @@ Missing tools are `unavailable`, and metrics that don't apply are
 | `README.md` | Command, config, environment, warnings, collector status, summary tables (median and min-max per cell) |
 | `config.json` | The resolved configuration |
 | `environment.json` | Machine, kernel, CPU settings, filesystem, device, build, git commits, fio baseline |
-| `results.jsonl` | One line per cell: status, message, every metric |
+| `run.json` | Versioned plan, completion state, comparison identity and artifact hashes |
+| `results.jsonl` | One line per cell: execution status, validation errors, metrics, completed unit/denominator, measurement scope |
 | `raw/` | Per cell: client program output, latency histograms (`latency-*.json`), compressed server log, BenchBase summaries, perf report |
 
 Large intermediate output (per-transaction latency logs, BenchBase samples,
@@ -227,12 +239,12 @@ CI runs the C smoke corpus on heap and `prolly`, then calls:
 src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR
 ```
 
-Unlike the reporting commands, this exits unsuccessfully for missing or
+All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,
 incorrect AMs, stale exceptions, or differing answers. It requires C1-C4
 by default (`--workloads C1,C2` selects a smaller explicit set). Order-only
-findings also fail this strict gate until reviewed: the reporting
-comparator does not know whether a query's result order was required.
+findings also fail until reviewed. The comparator preserves the corpus sort
+mode and exact typed answers, independently of rounded corpus formatting.
 Documented exceptions and matching PostgreSQL/corpus differences remain
 allowed.
 
@@ -247,7 +259,7 @@ The differential runner compares seeded transaction histories with heap:
 ```sh
 bash src/tools/prolly_bench/build_diff.sh
 src/tools/prolly_bench/prolly_bench differential \
-  --pg-bin build-rel/inst/bin --am prolly --seeds 10 --steps 28 \
+  --pg-bin build-rel/inst/bin --am prolly --seeds 10 --steps 36 \
   --self-test --out /tmp/prolly-differential
 ```
 
@@ -259,9 +271,11 @@ index and TOAST block-map forks. Unsupported engines fail; they do not
 count as tested. `--self-test` proves a deliberate answer difference is
 rejected (using `prolly` as the candidate when `--am heap` is selected).
 
-Every 14 groups covers upserts, updates, deletes, nested savepoints,
+Every 18 groups covers upserts, updates, deletes, nested savepoints,
 transaction aborts, DDL, expression indexes, rewrites, transactional
-truncate, vacuum/reindex, cursors, triggers, queries and NULL/empty values.
+truncate, vacuum/reindex, cursors, triggers, queries, NULL/empty values,
+prepared-plan reuse, duplicate-heavy keyless tables, typed edge values,
+and independent tables. Dataset cardinality also varies with the seed.
 Rows include exact numerics beyond 2^53 and large incompressible text.
 Results compare command tags, column types, SQLSTATEs, transaction state,
 row counts and ordered row digests. Only explicitly declared errors are
@@ -382,3 +396,112 @@ src/tools/prolly_bench/prolly_bench vc \
 
 CI runs both fixtures on D1 and the SQL fixture on heap/prolly. Logs and
 coverage artifacts are uploaded with the existing engine results.
+
+
+## Evidence and quality contract
+
+Use `--quality smoke` (the default) for functional integration work. Use
+`--quality benchmark` only on a prepared, idle host and a real data device.
+Benchmark mode requires at least five repetitions, warmup, runtime host
+monitoring, and matching build provenance. It rejects environment warnings,
+including tmpfs, uncontrolled CPU settings, assertion builds and dirty source.
+A profile is a set of necessary checks, not a guarantee that external noise
+or every engine defect has been eliminated.
+
+Build an attested release install from an unchanged checkout:
+
+```sh
+bash src/tools/prolly_bench/build_postgres.sh \
+  --build-dir "$PWD/build-bench/quality-server" -- --with-openssl
+```
+
+The build directory must be new. `inst/pbench-build.json` binds installed
+binaries to hashes of the actual source files and configure command. Runs
+also retain server/client/JAR hashes and effective `pg_settings`. B0 means
+the heap implementation in the selected build; it is not an independently
+built upstream PostgreSQL baseline.
+
+Before executing, the harness writes every planned cell. Completion is an
+atomic manifest containing hashes of config, environment, results and raw
+evidence. Paths to raw artifacts are relative so an artifact can be moved.
+Interrupted runs remain incomplete. Failures, missing repetitions, invalid
+numbers, mandatory collector failures and unavailable requested workloads
+cannot disappear from averages. Legacy artifacts remain readable but cannot
+establish valid comparisons; rerun them with this schema.
+
+```sh
+src/tools/prolly_bench/prolly_bench gate RESULT_DIR
+src/tools/prolly_bench/prolly_bench gate --baseline HEAP_DIR ENGINE_DIR
+```
+
+These validate execution evidence; C correctness additionally uses `cgate`.
+Comparisons require identical workload parameters, settings, harness/client
+versions, build mode and machine identity. Server binaries may differ and
+are recorded explicitly. Several engines run as adjacent matched cells,
+with seeded random pair and engine order recorded in `raw/experiment-order.json`.
+Repetitions have paired workload seeds. pgbench, sysbench and BenchBase all
+receive explicit seeds. Background traffic ramps up outside the timed window.
+
+TPC-H additionally runs Q1–Q22 in a separate untimed serial pass using the
+instrumented BenchBase build. `tpch-answers.jsonl` retains query-parameter,
+column-type, row-count, ordered-answer and row-multiset digests. Values are
+length-framed, distinguish NULL from empty bytes and retain numeric precision.
+Both passes of every query are required. Run/table/compare with a heap baseline
+reject differing answers or parameters. Rebuild BenchBase after updating the
+harness; the checked instrumentation hook fails if upstream source changes.
+TPC-C checks loaded scale and warehouse/district balance invariants. Neither
+these checks nor successful execution constitutes TPC certification.
+
+Metric scopes are explicit:
+
+- `window_seconds` spans client execution including startup/shutdown, with
+  per-collector snapshot timestamps retained. pgbench log parsing occurs
+  outside that window. `pg_stat_io` snapshots can lag backend flushes; no
+  collector sleeps and extends other counters' stop boundaries.
+- Resource `*_per_operation` fields use the cell's recorded `unit` and
+  `denominator`. COPY-only throughput is separate from total bulk-load
+  throughput including index construction and checkpoint.
+- CPU and perf summaries are labeled as host activity. Server CPU is withheld
+  until a reliable server-specific source is available. Device counters cover
+  the entire data device and may include unrelated or delayed writes.
+- Relation/database sizes are not complete D1 storage sizes. Cluster apparent
+  and allocated bytes include global engine stores and WAL. Representation
+  size is not advertised as cross-engine logical space amplification.
+  Optional collector `gc` records D1 node retention/reclamation and cluster
+  allocated bytes before/after GC, after the other measurements.
+- Restart timing describes a process crash with warm OS caches, not power loss.
+  Every workload table's typed contents are hashed before/after restart and
+  must match. Maintenance runs afterward. Existing durability TAP tests cover
+  committed/uncommitted work, prepared transactions and standby recovery.
+- Latency summaries retain observation counts and suppress p99 below 1,000
+  samples and p99.9 below 10,000. These are sample floors, not tail confidence
+  bounds. A pgbench workload can set `rate` and `latency_limit_ms` for scheduled
+  arrivals; skipped and failed transactions are separately reported.
+
+V benchmarks currently require D1 and a successful SQL-visible history-restore
+probe. Missing tables fail target checks. Prolly's table/index/TOAST canaries
+must have block-map forks. D1 operation-level node reads/writes are sampled in
+the same timed SQL session and stored in `*-counters.json`, not sampled from a
+separate backend. V3 verifies exact change-set and overlap cardinalities;
+impossible change sets and oversized V2 changes fail rather than being clamped.
+
+For a fixed V2 variant, configure at least four `v_rows` sizes spanning 8x and
+five repetitions per size, then inspect/gate empirical node-work growth:
+
+```sh
+src/tools/prolly_bench/prolly_bench complexity RESULT_DIR \
+  --workload V2 --operation prolly_commit --counter nodes_read --max-exponent 0.3
+```
+
+The report includes a bootstrap interval for the measured exponent. The bound
+is an explicit experiment requirement, not an inferred asymptotic guarantee.
+History depth, branch count, table/index count, concurrency and crash-fault
+coverage remain distinct dimensions; an N sweep cannot certify those claims.
+
+CI runs release-build client integrations (`configs/integration.toml`), runtime
+invariants and recovery checks; nightly jobs run the full pinned SQLLogicTest
+corpus, larger differential coverage and ASan/UBSan storage/durability tests.
+A manual controlled-performance job is available only when
+`PROLLY_BENCHMARK_RUNNER_ENABLED=true`, a `prolly-benchmark` self-hosted runner
+is provisioned, and `PROLLY_BENCHMARK_DATA_ROOT` names its data device directory.
+This job does not change host CPU or kernel settings automatically.

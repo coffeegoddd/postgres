@@ -19,12 +19,16 @@ import socket
 import subprocess
 import time
 import traceback
+import random
+import dataclasses
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pbench.core import config as config_mod
 from pbench.core import env as env_mod
 from pbench.core import registry, targets
+from pbench.core import correctness
+from pbench.core.validation import sha256
 from pbench.core.interfaces import (CellKey, CellResult, Cluster, Collector, Context,
                                     NotApplicable, NotImplementedByEngine, Outcome,
                                     RunInfo, Sink, Status, Unavailable, Window,
@@ -48,16 +52,21 @@ def free_port() -> int:
 
 class CollectorWindow(Window):
     """Starts collectors on entry and stops them (in reverse) on exit.
-    A collector that fails is recorded and dropped; the cell goes on."""
+    A collector that fails is recorded and dropped; validation rejects its
+    error after the remaining evidence has been collected."""
 
     def __init__(self, ctx: Context, collectors: list[Collector],
                  status: dict[str, tuple[str, str]]):
         self.ctx, self.collectors, self.status = ctx, collectors, status
         self.entered = self.exited = False
         self.seconds = 0.0
+        self.timings = {}
 
     def _guard(self, c: Collector, fn: Callable[[], Any]) -> bool:
-        return guard(c.name, fn, self.status)
+        start = time.monotonic()
+        ok = guard(c.name, fn, self.status)
+        self.timings.setdefault(c.name, []).append([start, time.monotonic()])
+        return ok
 
     def __enter__(self):
         self.entered = True
@@ -126,9 +135,12 @@ class Runner:
 
     def _make_cluster(self, instance: str) -> Cluster:
         cls = registry.clusters.get(self.cfg["run"]["cluster"])
-        return cls(self.bin_dir, self.work_dir, free_port(), instance)
+        return cls(self.bin_dir, self.work_dir / self.out_dir.name, free_port(), instance)
 
     def run(self) -> list[CellResult]:
+        return run_many([self])[0]
+
+    def _open(self, lock: bool):
         if not self.work_dir.exists():
             self.work_dir.mkdir(parents=True)
             # On btrfs, turn off copy-on-write (and with it compression) for
@@ -137,11 +149,14 @@ class Runner:
                            capture_output=True)
         # One run at a time per work directory: concurrent runs would share
         # cluster directories, and would disturb each other's measurements.
-        self._lock = open(self.work_dir / ".lock", "w")
-        try:
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit(f"another prolly_bench run is using {self.work_dir}")
+        if lock:
+            self._lock = open(self.work_dir / ".lock", "w")
+            self._host_lock = open(Path(tempfile.gettempdir()) / f"prolly-bench-{os.getuid()}.lock", "w")
+            try:
+                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(self._host_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit("another prolly_bench run is active on this host for this user")
         self.out_dir.mkdir(parents=True)
         raw_root = self.out_dir / "raw"
         raw_root.mkdir()
@@ -152,23 +167,22 @@ class Runner:
             environment["fio"] = env_mod.fio_baseline(
                 self.work_dir, int(self.cfg["run"]["fio_seconds"]), raw_root)
         warnings = env_mod.warnings(environment, self.suite)
+        if (self.cfg["run"]["quality"] == "benchmark" or self.suite == "C") and warnings:
+            raise RuntimeError("benchmark conditions failed: " + "; ".join(warnings))
+        cells = list(self._cells())
+        if not cells:
+            raise RuntimeError("empty benchmark plan")
+        random.Random(self.cfg["run"]["seed"]).shuffle(cells)
         info = RunInfo(suite=self.suite, label=self.label, table_am=self.table_am,
                        started=dt.datetime.now().isoformat(timespec="seconds"),
                        command=self.command, config=self.cfg, environment=environment,
-                       warnings=warnings, out_dir=self.out_dir)
+                       warnings=warnings, out_dir=self.out_dir,
+                       planned_cells=[key for key, _ in cells])
         for s in self.sinks:
             s.open(info)
 
-        results: list[CellResult] = []
-        for key, ctx_args in self._cells():
-            result = self._run_cell(key, **ctx_args)
-            results.append(result)
-            for s in self.sinks:
-                s.cell(result)
-
-        for s in self.sinks:
-            s.close(info, results)
-        return results
+        self.info = info
+        return cells
 
     def _cells(self):
         run = self.cfg["run"]
@@ -181,7 +195,9 @@ class Runner:
                         for rep in range(1, int(run["repetitions"]) + 1):
                             key = CellKey(self.suite, w.id, size, vlabel, c, rep)
                             merged = {"latency_sampling_rate":
-                                      run["latency_sampling_rate"], **params, **vparams}
+                                      run["latency_sampling_rate"], "seed": run["seed"] + rep,
+                                      "quality": run["quality"],
+                                      **params, **vparams}
                             yield key, {"workload": w, "params": merged}
 
     # -- one cell ---------------------------------------------------------
@@ -191,7 +207,7 @@ class Runner:
         raw = self.out_dir / "raw" / key.path()
         raw.mkdir(parents=True)
         scratch = Path(tempfile.mkdtemp(prefix="pbench-cell-", dir=_scratch_root()))
-        cluster = self._make_cluster("main")
+        cluster = self._make_cluster("main-" + "-".join(key.path().parts))
         ctx = Context(key=key, cluster=cluster, table_am=self.table_am,
                       size_params=self.cfg["sizes"][key.size], params=params,
                       warmup_seconds=int(params.get("warmup_seconds",
@@ -205,6 +221,9 @@ class Runner:
         log_pos = 0
         failed = False
         try:
+            for program, digest in self.info.environment["postgres"]["binary_hashes"].items():
+                if sha256(self.bin_dir / program) != digest:
+                    raise RuntimeError(f"{program} changed after the run was planned")
             cluster.create(config_mod.server_settings(self.cfg))
             cluster.start()
             cluster.sql(f"CREATE DATABASE {ctx.dbname}")
@@ -212,6 +231,7 @@ class Runner:
             if target.setup_sql(ctx.dbname):
                 cluster.sql(target.setup_sql(ctx.dbname), dbname=ctx.dbname)
             log_pos = cluster.log_position()
+            target.verify(cluster, ctx.dbname)
 
             workload.check(ctx)
             collectors: list[Collector] = []
@@ -221,11 +241,15 @@ class Runner:
                     collectors.append(c)
 
             workload.prepare(ctx)
+            (raw / "pg_settings.json").write_text(cluster.scalar(
+                "SELECT json_agg(s ORDER BY name) FROM (SELECT name, setting, unit, source "
+                "FROM pg_settings) s", dbname=ctx.dbname) + "\n")
             ctx.tables = workload.tables(ctx)
             wrong = target.wrong_am(cluster, ctx.dbname, ctx.tables)
             if wrong:
                 raise RuntimeError(f"tables not on {self.table_am}: {', '.join(wrong)}")
             cluster.sql("CHECKPOINT")
+            correctness.verify(ctx, "before")
             workload.warmup(ctx)
 
             window = CollectorWindow(ctx, collectors, result.collector_status)
@@ -236,15 +260,37 @@ class Runner:
             result.metrics["window_seconds"] = window.seconds
             result.notes += outcome.notes
             result.read_only = outcome.read_only
+            result.unit, result.denominator = outcome.unit, outcome.transactions
+            result.measurement = {"scope": "client process including startup and shutdown",
+                                  "collector_intervals_monotonic": window.timings,
+                                  "start_monotonic": window.t0,
+                                  "seconds": window.seconds,
+                                  "seed": params["seed"],
+                                  "offered_rate": params.get("rate"),
+                                  "load_model": "scheduled" if params.get("rate") else "closed_loop",
+                                  "cache_regime": "warmup; OS cache not flushed",
+                                  "pg_stat_io_scope": "cumulative snapshots, may lag backend flushes",
+                                  "device_scope": "whole data device including unrelated activity",
+                                  "quality": self.cfg["run"]["quality"]}
+            if not outcome.transactions or outcome.transactions <= 0:
+                result.validation_errors.append("no completed work")
+            wrong = target.wrong_am(cluster, ctx.dbname, ctx.tables)
+            if wrong:
+                result.validation_errors.append("post-run targeting failed: " + ", ".join(wrong))
             if outcome.unit != "transaction":
-                result.notes.append(f"per-txn metrics are per {outcome.unit}")
+                result.notes.append(f"per-operation metrics are per {outcome.unit}")
 
             for c in window.collectors:
                 guard(c.name, lambda c=c: result.metrics.update(c.results(ctx, outcome)),
                       result.collector_status)
+            correctness.verify(ctx, "after")
+            workload.verify(ctx)
             for c in sorted(window.collectors, key=lambda c: c.post_order):
                 guard(c.name, lambda c=c: result.metrics.update(c.post(ctx, outcome)),
                       result.collector_status)
+            for name, (status, reason) in result.collector_status.items():
+                if status == "error" or name in self.cfg["run"]["required_collectors"]:
+                    result.validation_errors.append(f"collector {name}: {status}: {reason}")
         except NotImplementedByEngine as e:
             result.status, result.message = Status.NOT_IMPLEMENTED, str(e)
         except Unavailable as e:
@@ -267,11 +313,14 @@ class Runner:
             except OSError:
                 pass
             shutil.rmtree(scratch, ignore_errors=True)
-            if failed and self.keep_failed:
-                cluster.stop("immediate")
-                result.notes.append(f"cluster kept at {cluster.data_dir}")
-            else:
-                cluster.destroy()
+            try:
+                if (failed or result.validation_errors or result.status != Status.OK) and self.keep_failed:
+                    cluster.stop("immediate")
+                    result.notes.append(f"cluster kept at {cluster.data_dir}")
+                else:
+                    cluster.destroy()
+            except Exception as e:
+                result.validation_errors.append(f"cluster cleanup failed: {e}")
         return result
 
     def _started_cluster(self, instance: str) -> Cluster:
@@ -290,3 +339,47 @@ class Runner:
 
 def write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, default=str) + "\n")
+
+
+def interleave(plans, seed):
+    """Pair identical cells across engines, randomizing pair and engine order."""
+    groups = {}
+    for index, cells in enumerate(plans):
+        for key, args in cells:
+            groups.setdefault(str(key.path()), []).append((index, key, args))
+    rng = random.Random(seed)
+    pairs = list(groups.values())
+    rng.shuffle(pairs)
+    for pair in pairs:
+        rng.shuffle(pair)
+    return [entry for pair in pairs for entry in pair]
+
+
+def run_many(runners):
+    if not runners:
+        raise ValueError("no engines requested")
+    results = [[] for _ in runners]
+    try:
+        plans = [runner._open(lock=i == 0) for i, runner in enumerate(runners)]
+        schedule = interleave(plans, runners[0].cfg["run"]["seed"])
+        evidence = [{"engine": runners[i].table_am, "key": dataclasses.asdict(key)}
+                    for i, key, _ in schedule]
+        for runner in runners:
+            write_json(runner.out_dir / "raw/experiment-order.json", evidence)
+        for order, (i, key, args) in enumerate(schedule):
+            runner = runners[i]
+            result = runner._run_cell(key, **args)
+            result.measurement["experiment_order"] = order
+            results[i].append(result)
+            for sink in runner.sinks:
+                sink.cell(result)
+        for runner, cells in zip(runners, results):
+            for sink in runner.sinks:
+                sink.close(runner.info, cells)
+        return results
+    finally:
+        for runner in runners:
+            for name in ("_host_lock", "_lock"):
+                lock = getattr(runner, name, None)
+                if lock is not None:
+                    lock.close()

@@ -27,6 +27,9 @@ class S13(Workload):
 
     def check(self, ctx):
         _benchbase.check(ctx)
+        marker = _benchbase._dist(ctx) / "PBENCH_ANSWERS_VERSION"
+        if not marker.exists() or marker.read_text().strip() != "1":
+            raise RuntimeError("TPC-H requires the answer-capture build; run build_benchbase.sh")
 
     def prepare(self, ctx):
         _benchbase.load(ctx, "tpch", scalefactor=self.scale(ctx))
@@ -50,6 +53,15 @@ class S13(Workload):
         out.unit = "query"
         out.metrics["qps"] = out.metrics["tps"]
         if serial:
+            # BenchBase runs each query cold, then hot: the hot runs are the
+            # samples, and collectors span both, so their denominator (the
+            # completed queries) must too.
+            out.metrics["hot_queries"] = out.metrics["measured_requests"]
+            out.metrics["hot_query_seconds"] = (out.metrics["latency_mean_ms"]
+                                                * out.metrics["measured_requests"] / 1000)
+            out.metrics["client_process_qps"] = out.transactions / window.seconds
+            out.metrics["qps"] = None
+            out.metrics["tps"] = None
             out.notes.append("Q1-Q22 in order, each with a cold run then one measured "
                              "run; per-query WAL, CPU and writes are over both; no time "
                              "limit (not a TPC-H certification run)")
@@ -58,3 +70,13 @@ class S13(Workload):
     def tables(self, ctx):
         return ["region", "nation", "supplier", "customer", "part", "partsupp",
                 "orders", "lineitem"]
+
+    def verify(self, ctx):
+        # Separate serial pass with fixed query parameters, outside every
+        # measurement window. Keep measured runs free of digest work.
+        config = _benchbase._config(ctx, "tpch", self.scale(ctx), 0, serial=True,
+                                    suffix="-correctness")
+        _benchbase._run(ctx, "tpch", config, ctx.raw_dir / "benchbase-correctness",
+                       create=False, load=False, execute=True, tag="correctness")
+        from pbench.core.validation import tpch_answers
+        tpch_answers(ctx.raw_dir)

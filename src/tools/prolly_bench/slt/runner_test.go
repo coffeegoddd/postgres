@@ -3,6 +3,8 @@ package main
 import (
 	"compress/gzip"
 	"encoding/json"
+	"github.com/jackc/pgx/v5/pgconn"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,7 +49,7 @@ func TestResolve(t *testing.T) {
 		d    *digest
 		want string
 	}{
-		{nil, stNotOk},
+		{nil, stDidNotRun},
 		{&digest{SQLState: "0A000", Message: `table access method "prolly_d2" does not implement scan yet`}, stNotImplemented},
 		{&digest{SQLState: "0A000", Message: "prolly indexes do not support INCLUDE columns yet"}, stNotImplemented},
 		{&digest{SQLState: "0A000", Message: "cannot use subquery in DEFAULT expression"}, stNotOk},
@@ -139,8 +141,8 @@ func TestHashSortedRows(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	ok := func(s string) *record { return &record{Status: stOk, Sorted: s, Rows: 1} }
-	bad := func(s string) *record { return &record{Status: stNotOk, Sorted: s, Rows: 1} }
+	ok := func(s string) *record { return &record{Status: stOk, Ordered: s, Sorted: s, Rows: 1} }
+	bad := func(s string) *record { return &record{Status: stNotOk, Ordered: s, Sorted: s, Rows: 1} }
 	errRec := func(st, code string) *record { return &record{Status: st, SQLState: code} }
 	cases := []struct {
 		b, e *record
@@ -156,7 +158,7 @@ func TestClassify(t *testing.T) {
 		{errRec(stNotOk, "42601"), errRec(stNotOk, "42601"), clPostgresSemantics},
 		{errRec(stNotOk, "42601"), errRec(stNotOk, "XX000"), clHiddenRegression},
 		{&record{Status: stNotOk, Message: "Expected error but didn't get one"},
-			&record{Status: stNotOk, Message: "Expected error but didn't get one"}, clPostgresSemantics},
+			&record{Status: stNotOk, Message: "Expected error but didn't get one"}, clHiddenRegression},
 		{bad("a"), ok("a"), clEngineOnlyPass},
 		{ok("a"), &record{Status: stCrashed}, clCrashed},
 		{ok("a"), &record{Status: stTimeout}, clTimeout},
@@ -178,6 +180,7 @@ func TestCompareDirs(t *testing.T) {
 		f, _ := os.Create(filepath.Join(d, "records.jsonl.gz"))
 		gz := gzip.NewWriter(f)
 		for _, r := range recs {
+			r.Version, r.Ordered = 2, r.Sorted
 			b, _ := json.Marshal(r)
 			gz.Write(append(b, '\n'))
 		}
@@ -194,8 +197,22 @@ func TestCompareDirs(t *testing.T) {
 		record{File: "a.test", Line: 2, Status: stNotOk, Sorted: "q", Rows: 2},
 		record{File: "a.test", Line: 3, Status: stNotOk, Sorted: "w", Rows: 1})
 	exc := filepath.Join(dir, "exc.json")
-	os.WriteFile(exc, []byte(`[{"file":"a.test","line":3,"reason":"known"},
-		{"file":"a.test","line":1,"reason":"stale"}]`), 0o644)
+	br, _ := loadRecords(base)
+	er, _ := loadRecords(eng)
+	corpusHash := strings.Repeat("a", 64)
+	for _, dir := range []string{base, eng} {
+		data, _ := json.Marshal(map[string]string{"a.test": corpusHash})
+		os.WriteFile(filepath.Join(dir, "corpus.json"), data, 0o644)
+	}
+	var exceptions []exception
+	for _, line := range []int{3, 1} {
+		k := recKey{"a.test", line}
+		exceptions = append(exceptions, exception{File: k.file, Line: line, Reason: "known",
+			Owner: "maintainer", Issue: "issue/1", Expires: "2999-01-01", Class: clRegression,
+			BaselineHash: recordHash(br[k]), EngineHash: recordHash(er[k]), CorpusHash: corpusHash})
+	}
+	data, _ := json.Marshal(exceptions)
+	os.WriteFile(exc, data, 0o644)
 	cmp, err := compareDirs(base, eng, filepath.Join(dir, "out"), exc)
 	if err != nil {
 		t.Fatal(err)
@@ -203,10 +220,85 @@ func TestCompareDirs(t *testing.T) {
 	if cmp.Counts[clAgree] != 1 || cmp.Counts[clRegression] != 1 || cmp.Counts[clException] != 1 {
 		t.Errorf("counts %v", cmp.Counts)
 	}
-	if cmp.GateFailures != 1 {
+	if cmp.GateFailures != 2 {
 		t.Errorf("gate failures %d", cmp.GateFailures)
 	}
 	if len(cmp.StaleExceptions) != 1 || cmp.StaleExceptions[0].Line != 1 {
 		t.Errorf("stale %v", cmp.StaleExceptions)
+	}
+}
+
+func TestExactEvidence(t *testing.T) {
+	makeResult := func(oid uint32, rows ...[][]byte) *pgconn.Result {
+		return &pgconn.Result{FieldDescriptions: []pgconn.FieldDescription{{DataTypeOID: oid}}, Rows: rows}
+	}
+	cases := [][2]*pgconn.Result{
+		{makeResult(25, [][]byte{nil}), makeResult(25, [][]byte{[]byte("NULL")})},
+		{makeResult(25, [][]byte{[]byte{}}), makeResult(25, [][]byte{nil})},
+		{makeResult(1700, [][]byte{[]byte("1.0001")}), makeResult(1700, [][]byte{[]byte("1.0002")})},
+		{makeResult(25, [][]byte{[]byte("1")}), makeResult(23, [][]byte{[]byte("1")})},
+		{makeResult(25, [][]byte{[]byte("a\nb")}), makeResult(25, [][]byte{[]byte("a")}, [][]byte{[]byte("b")})},
+	}
+	for _, pair := range cases {
+		a, as := exactResult(pair[0])
+		b, bs := exactResult(pair[1])
+		if a == b || as == bs {
+			t.Fatal("distinct exact results collided")
+		}
+	}
+	a := makeResult(25, [][]byte{[]byte("a")}, [][]byte{[]byte("b")})
+	b := makeResult(25, [][]byte{[]byte("b")}, [][]byte{[]byte("a")})
+	ao, as := exactResult(a)
+	bo, bs := exactResult(b)
+	if ao == bo || as != bs {
+		t.Fatal("row-order contract violated")
+	}
+	base := &record{Version: 2, Status: stOk, Ordered: ao, Sorted: as, Rows: 2, SortMode: "nosort"}
+	eng := &record{Version: 2, Status: stOk, Ordered: bo, Sorted: bs, Rows: 2, SortMode: "nosort"}
+	if classify(base, eng) != clOrderOnly {
+		t.Fatal("ordered query mismatch passed")
+	}
+	eng.Sorted = "different"
+	if classify(base, eng) != clRegression {
+		t.Fatal("both-ok mismatch passed")
+	}
+}
+
+func TestCorruptDigestStream(t *testing.T) {
+	for _, data := range []string{"not json\n", "{\"f\":\"a\",\"l\":1}\n{\"f\":\"a\",\"l\":1}\n"} {
+		dr := newDigestReader(strings.NewReader(data), map[string]int{"a": 0})
+		dr.forFile("a")
+		if dr.err == nil {
+			t.Fatal("corrupt or duplicate digest accepted")
+		}
+	}
+}
+
+func TestPlanConditionalHalt(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "conditional.test")
+	data := "onlyif mysql\nhalt\n\nquery I nosort\nSELECT 1\n----\n1\n\nonlyif postgresql\nhalt\n\nquery I nosort\nSELECT 2\n----\n2\n"
+	if err := os.WriteFile(file, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePlan(&config{out: dir}, []string{file}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(filepath.Join(dir, "planned.jsonl.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	b, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(b), "\n") != 1 || !strings.Contains(string(b), `"line":5`) {
+		t.Fatalf("conditional halt plan: %s", b)
 	}
 }

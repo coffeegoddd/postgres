@@ -38,6 +38,7 @@ def run(args) -> int:
         "postgres_version": subprocess.check_output(
             [str(args.pg_bin.resolve() / "postgres"), "--version"], text=True).strip(),
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+        "server_sha256": hashlib.sha256((args.pg_bin.resolve() / "postgres").read_bytes()).hexdigest(),
         "command": "prolly_bench " + shlex.join(sys.argv[1:]),
     }, indent=2) + "\n")
     with tempfile.TemporaryDirectory(prefix="engine-diff-") as work:

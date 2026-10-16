@@ -44,8 +44,7 @@ class PgbenchWorkload(Workload):
             self._run(ctx, ctx.warmup_seconds, "warmup", log_latency=False)
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
-        with window:
-            res = self._run(ctx, ctx.measure_seconds, "measure")
+        res = self._run(ctx, ctx.measure_seconds, "measure", window=window)
         return _outcome(res, self.read_only)
 
     def tables(self, ctx: Context) -> list[str]:
@@ -122,7 +121,8 @@ class S4(Workload):
         total = sum(timings.values())
         return Outcome(metrics={**timings, "total_seconds": total,
                                 "rows": rows,
-                                "rows_per_second": rows / timings["copy_seconds"]},
+                                "copy_rows_per_second": rows / timings["copy_seconds"],
+                                "rows_per_second": rows / total},
                        transactions=rows, unit="row")
 
     def tables(self, ctx):
@@ -175,8 +175,7 @@ class S6(PgbenchWorkload):
             check_client_error(out)
             raise RuntimeError(f"snapshot holder failed: {out}")
         try:
-            with window:
-                res = self._run(ctx, ctx.measure_seconds, "measure")
+            res = self._run(ctx, ctx.measure_seconds, "measure", window=window)
         finally:
             holder.stdin.write("COMMIT;\n\\q\n")
             holder.stdin.close()

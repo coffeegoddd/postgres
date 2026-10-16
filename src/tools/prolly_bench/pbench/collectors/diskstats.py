@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pbench.core import registry
 from pbench.core.interfaces import Collector, Unavailable
-from pbench.core.stats import per
+from pbench.core.stats import per, counter_delta
 
 
 def device_for(path: Path) -> str:
@@ -50,10 +50,10 @@ class DiskstatsCollector(Collector):
         self.after = read_diskstats(self.device)
 
     def results(self, ctx, outcome):
-        d = {k: self.after[k] - self.before[k] for k in self.after}
+        d = counter_delta(self.before, self.after)
         return {
             "device_write_bytes": d["write_bytes"],
-            "device_write_bytes_per_txn": per(d["write_bytes"], outcome.transactions),
+            "device_write_bytes_per_operation": per(d["write_bytes"], outcome.transactions),
             "device_read_bytes": d["read_bytes"],
             "device_writes": d["writes"],
             "device_flushes": d["flushes"],

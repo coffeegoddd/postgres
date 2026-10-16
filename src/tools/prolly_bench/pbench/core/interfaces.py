@@ -239,6 +239,9 @@ class Workload(abc.ABC):
         """Tables holding the workload's data, for space measurements."""
         return []
 
+    def verify(self, ctx: Context) -> None:
+        """Optional post-measurement answer verification; never timed."""
+
 
 # ---------------------------------------------------------------------------
 # Collector
@@ -290,6 +293,10 @@ class CellResult:
     raw_dir: str = ""
     read_only: bool = False
     notes: list[str] = field(default_factory=list)
+    validation_errors: list[str] = field(default_factory=list)
+    unit: str = "transaction"
+    denominator: Optional[float] = None
+    measurement: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -303,6 +310,7 @@ class RunInfo:
     environment: dict[str, Any]
     warnings: list[str]
     out_dir: Path
+    planned_cells: list[CellKey] = field(default_factory=list)
 
 
 class Sink(abc.ABC):
