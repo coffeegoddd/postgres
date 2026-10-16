@@ -100,6 +100,23 @@ like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
 $second->query('ROLLBACK');
 is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('main')}),
 	'first again,second of two,first of two,on main,first', 'committing nothing');
+
+# A reset that waited for a committer moves the rows as a snapshot that
+# sees its commit has them: here, already the head's.
+$second->{stderr} = '';
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (20, 'first');
+	SELECT dolt_commit('-m', 'before the reset')});
+$second->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_reset('--hard');
+	\echo done
+});
+ok(waits_for('dolt_reset'), 'a reset waits for the committer');
+$first->query_safe('COMMIT');
+$second->query_until(qr/done/, '');
+is($second->{stderr}, '', 'and resets');
+is(sql(q{SELECT test_fold_root() = prolly_root_hash('main')}), 't',
+	'to the head, its rows and nothing else');
 $first->quit;
 $second->quit;
 

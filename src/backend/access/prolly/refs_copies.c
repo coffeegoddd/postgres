@@ -788,13 +788,18 @@ copies_reset(const char *ref)
 {
 	ProllyHash	target;
 	ProllyCommitInfo info;
+	bool		pushed;
 
 	lock_refs();
 	if (!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	/* (the rows moved as a snapshot that sees the head has them) */
+	pushed = see_head(branch_ops()->current());
 	move_to(&info.root);
+	if (pushed)
+		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
 }
 
