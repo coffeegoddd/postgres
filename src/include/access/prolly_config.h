@@ -40,6 +40,7 @@
 #include "access/prolly_refs.h"
 #include "access/prolly_rootlayout.h"
 #include "access/prolly_rowid.h"
+#include "access/prolly_tablefile.h"
 #include "access/prolly_transfer.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_valenc.h"

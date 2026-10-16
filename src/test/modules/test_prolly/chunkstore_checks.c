@@ -17,10 +17,12 @@
 #include "access/prolly_config.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "varatt.h"
 
@@ -150,6 +152,77 @@ test_chunk_move_root(PG_FUNCTION_ARGS)
 	text_hash(PG_GETARG_TEXT_PP(1), &root);
 	PG_RETURN_BOOL(PROLLY_CALL(cs(), move_root, store(),
 							   &expected, &root));
+}
+
+/* test_chunk_table_file()'s source: an array's elements */
+typedef struct ArraySource
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int			i;
+} ArraySource;
+
+static bool
+array_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	ArraySource *as = arg;
+	bytea	   *b;
+
+	while (as->i < as->n && as->nulls[as->i])
+		as->i++;
+	if (as->i >= as->n)
+		return false;
+	b = DatumGetByteaPP(as->elems[as->i++]);
+	sha256(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), hash);
+	appendBinaryStringInfo(data, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+	return true;
+}
+
+/* Add a table file of the chunks in an array (each once). */
+PG_FUNCTION_INFO_V1(test_chunk_table_file);
+Datum
+test_chunk_table_file(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	ArraySource as = {0};
+
+	deconstruct_array(arr, BYTEAOID, -1, false, TYPALIGN_INT, &as.elems,
+					  &as.nulls, &as.n);
+	PROLLY_CALL(cs(), add_table_file, store(), array_next, &as);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_conjoin);
+Datum
+test_chunk_conjoin(PG_FUNCTION_ARGS)
+{
+	PROLLY_CALL(cs(), conjoin, store());
+	PG_RETURN_VOID();
+}
+
+static void
+file_row(const char *name, int nchunks, uint64 size, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = Int32GetDatum(nchunks);
+	values[2] = Int64GetDatum((int64) size);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_table_files);
+Datum
+test_chunk_table_files(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(cs(), table_files, store(), file_row, rsinfo);
+	return (Datum) 0;
 }
 
 /* The canonical root of the session branch's versioned schemas, folded. */

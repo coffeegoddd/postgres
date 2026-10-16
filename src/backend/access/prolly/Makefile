@@ -74,6 +74,8 @@ OBJS = \
 	rowid_counter.o \
 	rowid_stub.o \
 	transfer_stub.o \
+	tablefile_basic.o \
+	tablefile_stub.o \
 	tree_cow.o \
 	tree_stub.o \
 	valenc_canonical.o \

@@ -176,6 +176,21 @@ CREATE FUNCTION test_chunk_move_root(expected text, root text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Add a table file of these chunks; rewrite the table files as one; list
+-- the table files.
+CREATE FUNCTION test_chunk_table_file(chunks bytea[])
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_chunk_conjoin()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_chunk_table_files(OUT name text, OUT chunks int,
+	OUT bytes bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The canonical root of the session branch's versioned schemas, folded
 -- from their tables' rows.
 CREATE FUNCTION test_fold_root()

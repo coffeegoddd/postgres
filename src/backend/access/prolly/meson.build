@@ -62,6 +62,8 @@ backend_sources += files(
   'rowid_counter.c',
   'rowid_stub.c',
   'transfer_stub.c',
+  'tablefile_basic.c',
+  'tablefile_stub.c',
   'tree_cow.c',
   'tree_stub.c',
   'valenc_canonical.c',

@@ -53,10 +53,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_CHUNK_STORE = 22,
 	PROLLY_IFACE_CHUNK_FORMAT = 23,
 	PROLLY_IFACE_ROW_APPLIER = 24,
+	PROLLY_IFACE_TABLE_FILE = 25,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_ENGINE
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_ROW_APPLIER
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_TABLE_FILE
 
 /*
  * Identity of an implementation.  The first member of every routine struct.

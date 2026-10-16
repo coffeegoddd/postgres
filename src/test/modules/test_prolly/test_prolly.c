@@ -132,6 +132,14 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_CHUNK_FORMAT, "rejects_other_bytes", "encode open",
 	chunkformat_rejects_other_bytes},
 
+	/* table file format */
+	{PROLLY_IFACE_TABLE_FILE, "round_trip",
+	"write_begin write_add write_finish open find decode count entry close",
+	tablefile_round_trip},
+	{PROLLY_IFACE_TABLE_FILE, "rejects_other_bytes",
+	"write_begin write_add write_finish open entry decode close",
+	tablefile_rejects_other_bytes},
+
 	/* content hash */
 	{PROLLY_IFACE_CONTENT_HASH, "deterministic", "begin update finish",
 	hash_deterministic},
