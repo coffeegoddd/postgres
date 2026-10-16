@@ -1,0 +1,38 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_branch s2_write s1_commit s1_on_b s1_read s1_main s2_read
+step s1_begin: BEGIN;
+step s1_branch: SELECT dolt_branch('vbm_b');
+dolt_branch
+-----------
+{0}        
+(1 row)
+
+step s2_write: INSERT INTO vbm.t VALUES (2, 'main'); INSERT INTO vbm.k VALUES ('main');
+step s1_commit: COMMIT;
+step s1_on_b: SELECT dolt_checkout('vbm_b') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_read: SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM vbm.t) AS t,
+				  (SELECT string_agg(v, ',' ORDER BY v) FROM vbm.k) AS k;
+t     |k   
+------+----
+1:base|base
+(1 row)
+
+step s1_main: SELECT dolt_checkout('main') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s2_read: SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM vbm.t) AS t,
+				  (SELECT string_agg(v, ',' ORDER BY v) FROM vbm.k) AS k;
+t            |k        
+-------------+---------
+1:base,2:main|base,main
+(1 row)
+
