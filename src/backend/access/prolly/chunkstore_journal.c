@@ -1980,12 +1980,75 @@ journal_shmem_init(void *area)
 }
 
 /*
- * A new database's journal: the one of the database it was made from,
- * copied a piece at a time as appends to the new one are (WAL-logged and
- * flushed, then written), so redo, standbys and base backups make it too.
- * One its files were copied with (the file-copy strategy) has it already.
+ * A new database's table files and manifest: those of the database it was
+ * made from, each file copied as a table file is written (WAL-logged a
+ * piece at a time), then the manifest naming them.
+ */
+static void
+copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
+{
+	char	   *sdir = GetDatabasePath(src_dboid, src_spcoid);
+	char	   *ddir = GetDatabasePath(dst_dboid, dst_spcoid);
+	ProllyChunkStore *dst = palloc0(sizeof(ProllyChunkStore));
+	char	   *buf;
+	Manifest	m;
+
+	if (!read_manifest(sdir, &m))
+		return;
+	dst->dboid = dst_dboid;
+	dst->spcoid = dst_spcoid;
+	buf = palloc(APPEND_BATCH);
+	for (int i = 0; i < m.nfiles; i++)
+	{
+		char	   *spath = table_file_path(sdir, m.files[i].id);
+		char	   *dpath = table_file_path(ddir, m.files[i].id);
+		int			fd = OpenTransientFile(spath, O_RDONLY | PG_BINARY);
+		int			dfd;
+
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", spath)));
+		dfd = OpenTransientFile(dpath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+		if (dfd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", dpath)));
+		for (uint64 offset = 0; offset < m.files[i].size;)
+		{
+			Size		len = Min((uint64) APPEND_BATCH, m.files[i].size - offset);
+
+			if (pg_pread(fd, buf, len, offset) != len)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
+								len, (unsigned long long) offset, spath)));
+			table_file_write(dst, dfd, dpath, m.files[i].id, offset, buf, len);
+			offset += len;
+		}
+		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close file \"%s\": %m", dpath)));
+		fsync_fname(dpath, false);
+		pfree(spath);
+		pfree(dpath);
+	}
+	replace_manifest(dst, &m);
+	pfree(buf);
+	pfree(dst);
+	pfree(sdir);
+	pfree(ddir);
+}
+
+/*
+ * A new database's store: the files of the database it was made from.
+ * The journal is copied a piece at a time as appends to the new one are
+ * (WAL-logged and flushed, then written), and the table files and manifest
+ * as they are written, so redo, standbys and base backups make them too.
+ * One whose files were copied (the file-copy strategy) has them already.
  * Nobody else uses the source meanwhile (CREATE DATABASE sees to that), so
- * the file holds still.
+ * its files hold still.
  */
 static void
 journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
@@ -1993,13 +2056,25 @@ journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 {
 	char	   *src = journal_path(src_dboid, src_spcoid);
 	char	   *dst = journal_path(dst_dboid, dst_spcoid);
+	char	   *ddir = GetDatabasePath(dst_dboid, dst_spcoid);
+	char	   *dman = dir_file(ddir, MANIFEST_FILE);
 	struct stat st;
 	int			fd;
 	int			dfd;
 	char	   *buf;
 	uint64		offset = 0;
+	bool		copied = stat(dst, &st) == 0 || stat(dman, &st) == 0;
 
-	if (stat(dst, &st) == 0 || stat(src, &st) != 0)
+	pfree(ddir);
+	pfree(dman);
+	if (copied)
+	{
+		pfree(src);
+		pfree(dst);
+		return;
+	}
+	copy_table_files(src_dboid, src_spcoid, dst_dboid, dst_spcoid);
+	if (stat(src, &st) != 0)
 	{
 		pfree(src);
 		pfree(dst);
