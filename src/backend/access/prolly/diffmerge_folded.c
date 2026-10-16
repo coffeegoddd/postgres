@@ -412,6 +412,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ListCell   *lc;
 	bool		keyless;
 
+	require_readable(from);
+	require_readable(to);
 	memset(&c, 0, sizeof(c));
 	c.rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
