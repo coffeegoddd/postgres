@@ -1,0 +1,64 @@
+-- The row applier writes rows as logical replication's apply does: with
+-- index maintenance and constraint checks, without user triggers or
+-- foreign key checks.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.p (id int PRIMARY KEY);
+CREATE TABLE app.t (id int PRIMARY KEY, v text NOT NULL CHECK (v <> 'bad'),
+                    u int UNIQUE, p int REFERENCES app.p);
+CREATE INDEX t_v ON app.t (v);
+CREATE TABLE app.k (a text, b int);		-- keyless
+CREATE TABLE app.log (what text);
+CREATE FUNCTION app.no_writes() RETURNS trigger LANGUAGE plpgsql AS
+$$BEGIN INSERT INTO app.log VALUES (TG_OP); RETURN NEW; END$$;
+CREATE TRIGGER t_trig BEFORE INSERT OR UPDATE OR DELETE ON app.t
+  FOR EACH ROW EXECUTE FUNCTION app.no_writes();
+
+-- Rows by key.
+SELECT test_apply('insert', NULL, ROW(1, 'one', 10, NULL)::app.t);
+SELECT test_apply('insert', NULL, ROW(2, 'two', 20, NULL)::app.t);
+SELECT test_apply('update', ROW(1, 'ignored', NULL, NULL)::app.t, ROW(1, 'uno', 11, NULL)::app.t);
+SELECT test_apply('remove', ROW(2, NULL, NULL, NULL)::app.t, NULL::app.t);
+SELECT test_apply('update', ROW(9, NULL, NULL, NULL)::app.t, ROW(9, 'nine', 90, NULL)::app.t) AS found;
+SELECT test_apply('remove', ROW(9, NULL, NULL, NULL)::app.t, NULL::app.t) AS found;
+SELECT * FROM app.t ORDER BY id;
+-- indexes are kept
+SET enable_seqscan = off;
+SELECT id FROM app.t WHERE v = 'uno';
+RESET enable_seqscan;
+-- no user triggers fired, no foreign key checked
+SELECT count(*) AS triggered FROM app.log;
+SELECT test_apply('insert', NULL, ROW(3, 'three', 30, 999)::app.t);
+SELECT * FROM app.t WHERE id = 3;
+-- but NOT NULL, CHECK and unique constraints hold
+SELECT test_apply('insert', NULL, ROW(4, NULL, 40, NULL)::app.t);
+SELECT test_apply('insert', NULL, ROW(4, 'bad', 40, NULL)::app.t);
+SELECT test_apply('insert', NULL, ROW(4, 'four', 11, NULL)::app.t);
+SELECT test_apply('insert', NULL, ROW(1, 'dup', 41, NULL)::app.t);
+-- and triggers fire again afterwards
+INSERT INTO app.t VALUES (5, 'five', 50, NULL);
+SELECT count(*) AS triggered FROM app.log;
+
+-- A keyless table's rows: one copy at a time, matched by every column.
+SELECT test_apply('insert', NULL, ROW('x', 1)::app.k);
+SELECT test_apply('insert', NULL, ROW('x', 1)::app.k);
+SELECT test_apply('insert', NULL, ROW('y', NULL)::app.k);
+SELECT test_apply('remove', ROW('x', 1)::app.k, NULL::app.k);
+SELECT test_apply('update', ROW('y', NULL)::app.k, ROW('z', 2)::app.k);
+SELECT test_apply('remove', ROW('w', 1)::app.k, NULL::app.k) AS found;
+SELECT * FROM app.k ORDER BY a;
+
+-- Writing takes the privileges to insert, update and delete.
+CREATE ROLE applier_reader;
+GRANT USAGE ON SCHEMA app TO applier_reader;
+GRANT SELECT, INSERT ON app.k TO applier_reader;
+SET ROLE applier_reader;
+SELECT test_apply('insert', NULL, ROW('q', 1)::app.k);
+RESET ROLE;
+DROP OWNED BY applier_reader;
+DROP ROLE applier_reader;
+
+DROP SCHEMA app CASCADE;

@@ -63,7 +63,9 @@ FROM prolly_implementations();
  canonicalizer   | folded           |       2 |              2
  chunk_store     | journal          |       1 |              1
  chunk_format    | basic            |       1 |              1
-(54 rows)
+ row_applier     | replication      |       1 |              1
+ row_applier     | stub             |       0 |              0
+(56 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -408,7 +410,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  chunk_format    | basic            | items_round_trip                        | pass
  chunk_format    | basic            | rejects_other_bytes                     | pass
  chunk_format    | basic            | complete                                | pass
-(336 rows)
+ row_applier     | replication      | identity                                | pass
+ row_applier     | replication      | complete                                | pass
+ row_applier     | stub             | identity                                | pass
+ row_applier     | stub             | complete                                | not implemented (5 of 5 callbacks missing)
+(340 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

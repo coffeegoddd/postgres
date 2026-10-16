@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'applier_checks.c',
   'bmap_checks.c',
   'branch_checks.c',
   'chunkstore_checks.c',
@@ -51,6 +52,7 @@ tests += {
       'commits',
       'status_diff',
       'collations',
+      'applier',
     ],
   },
   'tap': {
