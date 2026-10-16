@@ -237,3 +237,36 @@ to separate suites.
 cd src/tools/prolly_bench && python3 -B -m unittest discover -s tests
 cd src/tools/prolly_bench/slt && go test ./...
 ```
+
+### Version-control scenario contract
+
+`slt/internal/vcscenario` defines version 1 of the shared scenario format
+and an engine-adapter interface. A scenario has an ID, description, required
+capabilities (`sql`, optionally `vc.core`), named persistent sessions, and
+ordered steps. Imported cases can record their source repository, pinned
+revision, file and original case name. Unknown fields, operations,
+capabilities, sessions and forward commit references are errors.
+
+SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
+VC steps are `commit` (message), `branch` (name and optional start ref),
+`checkout` (branch), and `reset` (hard-reset ref). Arguments are in `args`;
+SQL bind parameters are in `params`. Successful commits require a unique
+`save` name. A later `{"ref":"base"}` resolves to that engine's captured
+identifier, including in query parameters and expected rows. No cross-engine
+hash equality is assumed. SQL strings remain explicitly dialect-specific.
+
+Cells and parameters are strings, JSON null, or commit references. Numbers
+are strings so exact numerics do not pass through JSON floating point.
+Query expectations specify `order: "ordered"` or `"bag"`; bag comparison
+preserves duplicate multiplicity. Optional column names, command tags,
+SQLSTATEs and transaction statuses (`I`, `T`, `E`) strengthen assertions.
+Unexpected SQL errors always fail, including errors shared by engines.
+
+An adapter declares capabilities, verifies its target, opens fresh scenario
+state and named sessions, executes operations, checks storage targeting,
+and cleans up. Missing declared capabilities report `unsupported`, never
+`passed`. Failed targeting, SQL assertions, transport and cleanup report
+`failed`; runtime errors never become automatic capability exclusions.
+The result contains the failing phase and an ordered step trace, including
+actual rows and SQLSTATEs. The runner stops that case at its first failure.
+This format has no implicit skips or result-check bypasses.
