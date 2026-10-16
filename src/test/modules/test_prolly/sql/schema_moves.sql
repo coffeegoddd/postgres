@@ -85,4 +85,22 @@ SELECT count(*) FROM app.c;
 
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'feature', 'at_feature');
+
+-- Versioned schemas come and go with a move, empty ones too.
+SELECT test_fold_root() AS no_schemas \gset
+SELECT dolt_hashof('HEAD') AS before_schemas \gset
+CREATE SCHEMA sm_full VERSIONED;
+CREATE TABLE sm_full.u (id int PRIMARY KEY);
+INSERT INTO sm_full.u VALUES (1);
+CREATE SCHEMA sm_empty VERSIONED;
+SELECT dolt_commit('-Am', 'schemas') AS with_schemas \gset
+SELECT dolt_reset('--hard', :'before_schemas');
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sm\_%' ORDER BY 1;
+SELECT test_fold_root() = :'no_schemas' AS schemas_gone;
+SELECT dolt_reset('--hard', (:'with_schemas'::text[])[1]);
+SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sm\_%' ORDER BY 1;
+SELECT * FROM sm_full.u;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS schemas_back;
+DROP SCHEMA sm_full CASCADE;
+DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
