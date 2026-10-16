@@ -17,6 +17,7 @@
 
 #include "miscadmin.h"
 
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_am.h"
@@ -311,10 +312,32 @@ prolly_components_for_engine(const ProllyImplInfo *engine,
 	elog(ERROR, "no prolly profile uses engine \"%s\"", engine->name);
 }
 
+/*
+ * Are this database's branches copies of its versioned schemas?  Once the
+ * copies' refs hold its history (the chunk store has a root), they stay
+ * its refs, whatever is dropped later: the last versioned schema dropped is
+ * a change to commit, not a return to a database without history.
+ */
+bool
+prolly_database_uses_copies(void)
+{
+	ProllyHash	root;
+
+	if (database_uses_branch_copies())
+		return true;
+	if (MyDatabaseVersioned)
+		return false;
+	PROLLY_CALL(prolly_chunk_store(), root,
+				PROLLY_CALL(prolly_chunk_store(), open, MyDatabaseId,
+							MyDatabaseTableSpace),
+				&root);
+	return root.len > 0;
+}
+
 void
 prolly_database_components(ProllyDatabaseComponents *components)
 {
-	const char *const *impls = database_uses_branch_copies() ?
+	const char *const *impls = prolly_database_uses_copies() ?
 		copies_profile : database_profile;
 
 	components->refs = (const ProllyRefsRoutine *)
