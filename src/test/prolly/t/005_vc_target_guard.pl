@@ -21,13 +21,6 @@ my @controls = (
 		error => qr/VC target heap \[main isolated from feature rows\]: expected/,
 	},
 	{
-		# Branches copy block-mapped tables, and commits capture their rows,
-		# but a branch can't be reset to a commit yet.
-		name => 'block-mapped prolly is not restored to a commit yet',
-		am => 'prolly',
-		error => qr/VC target prolly \[restore feature HEAD\]: SQL failed: .*does not implement reset/,
-	},
-	{
 		name => 'successful no-op reset is rejected',
 		am => 'prolly_d1',
 		mock => q{
