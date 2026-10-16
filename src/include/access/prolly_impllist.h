@@ -35,7 +35,6 @@ PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_basic)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_keyhash)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_bytes)
 PG_PROLLY_IMPL(ProllyChunkFormatRoutine, prolly_chunkformat_basic)
-PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
 PG_PROLLY_IMPL(ProllyKeyEncoderRoutine, prolly_keyenc_ordered)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_heaptuple)
 PG_PROLLY_IMPL(ProllyValueEncoderRoutine, prolly_valenc_canonical)
@@ -57,6 +56,10 @@ PG_PROLLY_IMPL(ProllyRowIdRoutine, prolly_rowid_counter)
 /* root layouts */
 PG_PROLLY_IMPL(ProllyRootLayoutRoutine, prolly_rootlayout_subroots)
 
+/* row appliers; the stub is the interface's */
+PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
+PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_stub)
+
 /* stubs of the foundation and version-control interfaces */
 PG_PROLLY_IMPL(ProllyNodeFormatRoutine, prolly_nodeformat_stub)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_stub)
@@ -75,7 +78,6 @@ PG_PROLLY_IMPL(ProllyRefsRoutine, prolly_refs_tree)
 PG_PROLLY_IMPL(ProllyRefsRoutine, prolly_refs_copies)
 PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_stub)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_stub)
-PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_stub)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_rows)
 PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_folded)
 PG_PROLLY_IMPL(ProllyCanonRoutine, prolly_canon_stub)
