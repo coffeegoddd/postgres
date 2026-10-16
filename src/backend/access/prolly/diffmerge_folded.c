@@ -1375,7 +1375,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 
 	rd.kr = (const ProllyKeyingRoutine *)
 		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
-	rd.k = PROLLY_CALL(rd.kr, open, rel, NULL, CurrentMemoryContext);
+	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	cols = version_columns(x, &keyed);
 	if (keyed == PROLLY_CALL(rd.kr, keyless, rd.k))
 		ereport(ERROR,
