@@ -172,9 +172,9 @@ ALTER TABLE sdd.t ADD COLUMN c int DEFAULT 5;
 UPDATE sdd.t SET c = NULL WHERE id = 1;
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdd.t)
   ORDER BY to_row;
- diff_type | from_row |  to_row   
------------+----------+-----------
- modified  | (2,two,) | (2,two,5)
+ diff_type | from_row  |  to_row  
+-----------+-----------+----------
+ modified  | (1,one,5) | (1,one,)
 (1 row)
 
 DROP SCHEMA sdd CASCADE;
