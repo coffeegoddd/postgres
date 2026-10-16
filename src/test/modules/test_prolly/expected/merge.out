@@ -1,0 +1,458 @@
+-- Three-way merges of branches made by copying: each side's changes since
+-- their common ancestor, conflicts where both changed a row differently.
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+CREATE TABLE app.k (a text);
+CREATE TABLE app.untouched (x int PRIMARY KEY);
+INSERT INTO app.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+INSERT INTO app.k VALUES ('x'), ('y'), ('y');
+INSERT INTO app.untouched VALUES (1);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- main and feature change different rows, and one row alike
+UPDATE app.t SET v = 'main' WHERE id IN (1, 2);
+DELETE FROM app.t WHERE id = 3;
+INSERT INTO app.t VALUES (301, 'main');
+UPDATE app.t SET v = 'alike' WHERE id = 100;
+INSERT INTO app.k VALUES ('y');
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE app.t SET v = 'feature' WHERE id IN (10, 20);
+DELETE FROM app.t WHERE id = 30;
+INSERT INTO app.t VALUES (302, 'feature');
+UPDATE app.t SET v = 'alike' WHERE id = 100;
+DELETE FROM app.k WHERE ctid = (SELECT min(ctid) FROM app.k WHERE a = 'y');
+INSERT INTO app.k VALUES ('z');
+SELECT length(dolt_commit('-Am', 'on feature')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT string_agg(message, ', ' ORDER BY message) FROM
+  (SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 4) s;
+                         string_agg                          
+-------------------------------------------------------------
+ base, Merge branch 'feature' into main, on feature, on main
+(1 row)
+
+SELECT dolt_hashof('HEAD^1') = (SELECT commit_hash FROM dolt_log('main') WHERE message = 'on main') AS first_parent,
+       dolt_hashof('HEAD^2') = dolt_hashof('feature') AS second_parent;
+ first_parent | second_parent 
+--------------+---------------
+ t            | t
+(1 row)
+
+SELECT id, v FROM app.t WHERE id IN (1, 2, 3, 10, 20, 30, 100, 301, 302) ORDER BY id;
+ id  |    v    
+-----+---------
+   1 | main
+   2 | main
+  10 | feature
+  20 | feature
+ 100 | alike
+ 301 | main
+ 302 | feature
+(7 rows)
+
+SELECT count(*) FROM app.t;
+ count 
+-------
+   300
+(1 row)
+
+SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
+ a | count 
+---+-------
+ x |     1
+ y |     2
+ z |     1
+(3 rows)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT (dolt_merge('feature'))[2:4];		-- merged already
+          dolt_merge           
+-------------------------------
+ {0,0,"Everything up-to-date"}
+(1 row)
+
+-- Conflicts: both change row 5, differently; feature also changes row 6.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];			-- feature fast-forwards
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+UPDATE app.t SET v = 'feature 5' WHERE id = 5;
+UPDATE app.t SET v = 'feature 6' WHERE id = 6;
+SELECT length(dolt_commit('-Am', 'feature 5')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.t SET v = 'main 5' WHERE id = 5;
+SELECT length(dolt_commit('-Am', 'main 5')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- outside a transaction block, the merge fails and changes nothing
+SELECT dolt_merge('feature');
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both branches.
+HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+SELECT v FROM app.t WHERE id IN (5, 6) ORDER BY id;
+   v    
+--------
+ main 5
+ v6
+(2 rows)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged |  status  
+------------+--------+----------
+ app.t      | f      | conflict
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ app.t      |             1
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.t);
+ base_row |   our_row    |    their_row    
+----------+--------------+-----------------
+ (5,v5)   | (5,"main 5") | (5,"feature 5")
+(1 row)
+
+SELECT v FROM app.t WHERE id IN (5, 6) ORDER BY id;	-- ours kept; theirs merged
+     v     
+-----------
+ main 5
+ feature 6
+(2 rows)
+
+SAVEPOINT s;
+SELECT dolt_commit('-Am', 'too soon');
+ERROR:  cannot commit with unresolved merge conflicts
+DETAIL:  Table "t" has conflicts.
+HINT:  Resolve them with dolt_conflicts_resolve(), or abort the merge.
+ROLLBACK TO s;
+COMMIT;
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+DETAIL:  Table "t" has conflicts.
+HINT:  Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.
+-- (the transaction's commit was refused, so nothing of it stayed)
+SELECT v FROM app.t WHERE id IN (5, 6) ORDER BY id;
+   v    
+--------
+ main 5
+ v6
+(2 rows)
+
+-- Resolved with theirs, then committed: a merge commit.
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'app.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+SELECT v FROM app.t WHERE id IN (5, 6) ORDER BY id;
+     v     
+-----------
+ feature 5
+ feature 6
+(2 rows)
+
+SELECT length(dolt_commit('-Am', 'resolved')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT dolt_hashof('HEAD^2') = dolt_hashof('feature') AS merge_commit;
+ merge_commit 
+--------------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- Resolved with ours, then aborted.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE app.t SET v = 'feature again' WHERE id = 7;
+SELECT length(dolt_commit('-Am', 'feature 7')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.t SET v = 'main again' WHERE id = 7;
+SELECT length(dolt_commit('-Am', 'main 7')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', '.');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT v FROM app.t WHERE id = 7;
+     v      
+------------
+ main again
+(1 row)
+
+SELECT (dolt_merge('--abort'))[2:4];
+      dolt_merge       
+-----------------------
+ {0,0,"merge aborted"}
+(1 row)
+
+SELECT v FROM app.t WHERE id = 7;
+     v      
+------------
+ main again
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+COMMIT;
+-- with dolt.allow_commit_conflicts they can be kept
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ app.t      |             1
+(1 row)
+
+SELECT dolt_merge('feature');		-- one at a time
+ERROR:  a merge is in progress on the current branch
+HINT:  Resolve its conflicts and commit, or abort it.
+SELECT (dolt_merge('--abort'))[2:4];
+      dolt_merge       
+-----------------------
+ {0,0,"merge aborted"}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+-- A keyless table's copies: both sides removing the same copy is alike;
+-- removing more copies than there are, a conflict.
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DELETE FROM app.k WHERE a IN ('y', 'z');
+SELECT length(dolt_commit('-Am', 'main drops y and z')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+DELETE FROM app.k WHERE ctid = (SELECT min(ctid) FROM app.k WHERE a = 'y');
+DELETE FROM app.k WHERE a = 'z';
+INSERT INTO app.k VALUES ('w');
+SELECT length(dolt_commit('-Am', 'feature drops a y and z')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.k);
+ base_row | our_row | their_row 
+----------+---------+-----------
+ (y)      |         | (y)
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'app.k');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
+ a | count 
+---+-------
+ w |     1
+ x |     1
+ y |     1
+(3 rows)
+
+ROLLBACK;
+-- Not yet: different definitions.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE app.t ADD COLUMN w int;
+SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE app.t SET v = 'main 8' WHERE id = 8;
+SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('feature');
+ERROR:  branches whose objects are defined differently can't be merged yet
+DETAIL:  A table or other object of the versioned schemas was made, dropped or redefined since the common ancestor.
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table app.t
+drop cascades to table app.k
+drop cascades to table app.untouched

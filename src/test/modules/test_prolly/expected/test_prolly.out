@@ -307,7 +307,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | copies           | branch_lifecycle                        | no checks yet
  refs            | copies           | commit_then_resolve                     | no checks yet
  refs            | copies           | merge_base                              | no checks yet
- refs            | copies           | complete                                | not implemented (2 of 18 callbacks missing)
+ refs            | copies           | complete                                | not implemented (1 of 18 callbacks missing)
  transfer        | stub             | identity                                | pass
  transfer        | stub             | clone                                   | not implemented (missing clone)
  transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
@@ -323,7 +323,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  diff_merge      | folded           | identity                                | pass
  diff_merge      | folded           | diff_reports_each_change_once           | no checks yet
  diff_merge      | folded           | merge                                   | no checks yet
- diff_merge      | folded           | complete                                | not implemented (2 of 6 callbacks missing)
+ diff_merge      | folded           | complete                                | pass
  tree            | cow              | identity                                | pass
  tree            | cow              | build_and_get                           | pass
  tree            | cow              | large_keys                              | pass

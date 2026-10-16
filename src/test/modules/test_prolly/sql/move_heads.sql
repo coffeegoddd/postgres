@@ -72,7 +72,7 @@ UPDATE app.t SET v = 'mine' WHERE id = 1;
 SELECT (dolt_merge('at_second'))[2:4];
 SELECT dolt_reset('--hard');
 
--- Not yet: other definitions, three-way merges.
+-- Not yet: other definitions.  (Diverged branches merge, three-way.)
 SELECT dolt_checkout('at_first');
 ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;

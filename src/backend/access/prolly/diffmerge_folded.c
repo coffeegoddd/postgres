@@ -18,7 +18,18 @@
  * the root's or of the branch's, and a unique constraint both satisfy
  * isn't violated on the way, as it could be by changing rows one at a
  * time (two rows swapping a value).  Definitions must be the same on both
- * sides for now.  Merges only fast-forward so far.
+ * sides for now.
+ *
+ * Merge is three-way, from the newest common ancestor of the session's
+ * head and the other one, as in implementation "rows": for each table,
+ * the other side's changes since the ancestor are written to the branch
+ * (with the row applier) unless the branch changed the same key to
+ * another row since, a conflict, which keeps the branch's row and leaves
+ * the merge in progress in the refs.  Its conflicts are found again from
+ * the three commits when they're listed or resolved.  A keyless table's
+ * rows have no identity, so the two sides' changes in a row's copies add
+ * up.  The branch must have no changes since its head, and the three
+ * commits must define their objects alike, for now.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/diffmerge_folded.c
@@ -33,6 +44,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/table.h"
+#include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -344,9 +356,18 @@ folded_tables(const char *from_ref, const char *to_ref,
  */
 
 /* One row changed, copied out of the trees. */
+typedef struct Change
+{
+	ProllyDiffKind kind;
+	StringInfoData key;
+	StringInfoData before;		/* empty: none */
+	StringInfoData after;		/* empty: none */
+} Change;
+
 typedef struct Changes
 {
 	RowDiff		rd;				/* (for the keying's order) */
+	List	   *list;
 } Changes;
 
 static int
@@ -355,6 +376,41 @@ changes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 	Changes    *c = arg;
 
 	return PROLLY_CALL(c->rd.kr, compare, c->rd.k, a, b);
+}
+
+static void
+collect_change(ProllyDiffKind kind, const ProllyKey *key,
+			   const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	Changes    *c = arg;
+	Change	   *ch = palloc0(sizeof(Change));
+
+	ch->kind = kind;
+	initStringInfo(&ch->key);
+	appendBinaryStringInfo(&ch->key, key->data, key->len);
+	initStringInfo(&ch->before);
+	initStringInfo(&ch->after);
+	if (before)
+		appendBinaryStringInfo(&ch->before, before->data, before->len);
+	if (after)
+		appendBinaryStringInfo(&ch->after, after->data, after->len);
+	c->list = lappend(c->list, ch);
+}
+
+/* A tree value's row into slot; returns how many copies it stands for. */
+static uint64
+decode(Changes *c, const StringInfoData *value, TupleTableSlot *slot)
+{
+	ProllyValue v = {(const uint8 *) value->data, value->len};
+	ProllyValue row;
+	uint64		count;
+
+	if (value->len == 0)
+		return 0;
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &row, &count);
+	ExecClearTuple(slot);
+	PROLLY_CALL(c->rd.kr, decode_row, c->rd.k, &row, slot);
+	return count;
 }
 
 /* One pass of apply_rows over the diff: its removals, or its inserts. */
@@ -494,6 +550,205 @@ folded_move_to(const ProllyNodeRef *target)
 	}
 }
 
+/* ------------------------------------------------------------------------
+ * Merging
+ * ------------------------------------------------------------------------
+ */
+
+/* What merge_table() does with each change of theirs. */
+typedef enum WalkMode
+{
+	WALK_MERGE,					/* write it, unless it conflicts */
+	WALK_LIST,					/* report it if it conflicts */
+	WALK_TAKE_THEIRS			/* if it conflicts, make the row theirs */
+} WalkMode;
+
+static const ProllyValue *
+value_or_null(const StringInfoData *s, ProllyValue *v)
+{
+	if (s->len == 0)
+		return NULL;
+	v->data = (const uint8 *) s->data;
+	v->len = s->len;
+	return v;
+}
+
+static bool
+same_bytes(const StringInfoData *a, const StringInfoData *b)
+{
+	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+/*
+ * Walk theirs (table relid's changes from base to theirs) against ours
+ * (base to ours, the session's head, which the branch still is), both in
+ * key order, as mode says.  A key both sides changed to different rows is
+ * a conflict; one they changed alike isn't.  A keyless table's changes in
+ * a row's copies add up (unless both sides made it the same number), and
+ * conflict only when theirs removes more copies than ours has.  Returns
+ * how many keys conflict.
+ */
+static int
+merge_table(Oid relid, const Table *base, const Table *ours,
+			const Table *theirs, WalkMode mode, ProllyConflictSink *sink)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
+	Relation	rel = table_open(relid, mode == WALK_LIST ? AccessShareLock :
+								 RowExclusiveLock);
+	ProllyTreeEnv env;
+	Changes		oc;
+	Changes		tc;
+	ProllyApplier *a = NULL;
+	TupleTableSlot *s1;
+	TupleTableSlot *s2;
+	ListCell   *lo;
+	ListCell   *lt;
+	int			conflicts = 0;
+	bool		keyless;
+
+	memset(&tc, 0, sizeof(tc));
+	tc.rd.kr = (const ProllyKeyingRoutine *)
+		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
+	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, NULL, CurrentMemoryContext);
+	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
+	oc = tc;
+	chunk_env(&env);
+	env.compare = changes_compare;
+	env.compare_arg = &tc;
+	PROLLY_CALL(tree, diff, &env, &base->data, &theirs->data, collect_change,
+				&tc);
+	PROLLY_CALL(tree, diff, &env, &base->data, &ours->data, collect_change,
+				&oc);
+
+	s1 = table_slot_create(rel, NULL);
+	s2 = table_slot_create(rel, NULL);
+	if (mode != WALK_LIST)
+		a = PROLLY_CALL(ar, begin, rel);
+	lo = list_head(oc.list);
+	foreach(lt, tc.list)
+	{
+		Change	   *t = lfirst(lt);
+		Change	   *o = NULL;
+		ProllyKey	tk = {(const uint8 *) t->key.data, t->key.len};
+		const StringInfoData *now;
+		int64		have;
+		int64		want;
+		bool		conflict;
+
+		while (lo)
+		{
+			Change	   *cand = lfirst(lo);
+			ProllyKey	ok = {(const uint8 *) cand->key.data, cand->key.len};
+			int			r = PROLLY_CALL(tc.rd.kr, compare, tc.rd.k, &ok, &tk);
+
+			if (r < 0)
+				lo = lnext(oc.list, lo);
+			else
+			{
+				if (r == 0)
+					o = cand;
+				break;
+			}
+		}
+
+		/* the row as the branch has it, and as theirs has it */
+		now = o ? &o->after : &t->before;
+		have = (int64) decode(&tc, now, s1);
+		want = (int64) decode(&tc, &t->after, s2);
+		if (keyless)
+		{
+			int64		delta = want - (int64) decode(&tc, &t->before, s2);
+
+			want = have + delta;
+			conflict = want < 0 && !(o != NULL && same_bytes(&o->after, &t->after));
+			(void) decode(&tc, delta > 0 ? &t->after : &t->before, s2);
+		}
+		else
+			conflict = o != NULL && !same_bytes(&o->after, &t->after);
+
+		if (conflict)
+		{
+			ProllyValue bv,
+						ov,
+						tv;
+
+			conflicts++;
+			if (mode == WALK_LIST)
+				sink->conflict(sink, &tk, value_or_null(&t->before, &bv),
+							   value_or_null(now, &ov),
+							   value_or_null(&t->after, &tv));
+			if (mode != WALK_TAKE_THEIRS)
+				continue;
+			/* as theirs has it: one row or none, or its copies */
+			want = keyless ? (int64) decode(&tc, &t->after, s2) :
+				(t->after.len > 0);
+			if (keyless && want == 0)
+				(void) decode(&tc, now, s2);
+		}
+		else if (mode != WALK_MERGE || (o != NULL && (!keyless ||
+														same_bytes(&o->after, &t->after))))
+			continue;			/* listing; or both changed it alike */
+
+		/* the branch's row (s1, have copies) becomes theirs (s2, want) */
+		if (!keyless && have == 1 && want == 1)
+		{
+			if (!PROLLY_CALL(ar, update, a, s1, s2))
+				goto missing;
+		}
+		else if (want < have)
+		{
+			for (int64 i = 0; i < have - Max(want, 0); i++)
+				if (!PROLLY_CALL(ar, remove, a, keyless ? s2 : s1))
+					goto missing;
+		}
+		else
+		{
+			for (int64 i = 0; i < want - have; i++)
+				PROLLY_CALL(ar, insert, a, s2);
+		}
+	}
+	if (a)
+		PROLLY_CALL(ar, end, a);
+	ExecDropSingleTupleTableSlot(s1);
+	ExecDropSingleTupleTableSlot(s2);
+	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
+	table_close(rel, NoLock);
+	return conflicts;
+
+missing:
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("a row of \"%s\" changed while it was merged",
+					RelationGetRelationName(rel)),
+			 errhint("Try again.")));
+	return 0;					/* keep compiler quiet */
+}
+
+/* A commit's canonical root. */
+static void
+commit_root(const ProllyHash *id, ProllyNodeRef *root)
+{
+	ProllyCommitInfo info;
+
+	if (!PROLLY_CALL(components().refs, commit_get, id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit is missing")));
+	*root = info.root;
+}
+
+static List *
+tables_at(const ProllyHash *id)
+{
+	ProllyNodeRef root;
+	Tables		ts = {NIL};
+
+	commit_root(id, &root);
+	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
+	return ts.tables;
+}
+
 static int
 canon_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
@@ -552,9 +807,9 @@ refuse_local_changes(void)
 
 /*
  * Merge branch into the session's: nothing to do if it is merged already,
- * a fast-forward if the session's head is its ancestor.  The heads are
- * read with the refs held, so they stay as read until the transaction
- * ends, and the branch is moved to the commit that was checked.
+ * a fast-forward if the session's head is its ancestor, else three-way.
+ * The heads are read with the refs held, so they stay as read until the
+ * transaction ends, and a fast-forward moves to the commit checked.
  */
 static int
 merge_held(const char *branch, const char *message, int flags,
@@ -564,13 +819,29 @@ merge_held(const char *branch, const char *message, int flags,
 	ProllyHash	ours;
 	ProllyHash	theirs;
 	ProllyHash	base;
-	bool		changed = false;
+	bool		have_ours;
 
+	ProllyMergeState ms;
+	ProllyNodeRef roots[3];
+	List	   *base_tables;
+	List	   *ours_tables;
+	List	   *theirs_tables;
+	List	   *conflicted = NIL;
+	int			conflicts = 0;
+	ListCell   *lc;
+	ProllyHash	parents[2];
+
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a merge is in progress on the current branch"),
+				 errhint("Resolve its conflicts and commit, or abort it.")));
 	if (!PROLLY_CALL(dc.refs, resolve, branch, &theirs))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", branch)));
-	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
+	have_ours = PROLLY_CALL(dc.refs, resolve, "HEAD", &ours);
+	if (!have_ours)
 	{
 		if (flags & PROLLY_MERGE_NO_FF)
 			ereport(ERROR,
@@ -593,23 +864,88 @@ merge_held(const char *branch, const char *message, int flags,
 		*commit_id = ours;
 		return 0;
 	}
-	if (!same_hash(&base, &ours))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("branches made by copying can only fast-forward so far"),
-				 errdetail("The branches have each changed since their common ancestor.")));
-	if (flags & PROLLY_MERGE_NO_FF)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("branches made by copying can only fast-forward so far"),
-				 errdetail("A merge commit where a fast-forward would do (--no-ff) isn't made yet.")));
 
-	/* uncommitted changes would be lost */
-	folded_tables("HEAD", "WORKING", note_change, &changed);
-	if (changed)
-		refuse_local_changes();
-	reset_to(&theirs);
-	*commit_id = theirs;
+	/* uncommitted changes would be lost, or merged */
+	{
+		bool		changed = false;
+
+		folded_tables("HEAD", "WORKING", note_change, &changed);
+		if (changed)
+			refuse_local_changes();
+	}
+	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
+	{
+		reset_to(&theirs);
+		*commit_id = theirs;
+		return 0;
+	}
+
+	/* Three-way. */
+	commit_root(&base, &roots[0]);
+	commit_root(&ours, &roots[1]);
+	commit_root(&theirs, &roots[2]);
+	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("branches whose objects are defined differently can't be merged yet"),
+				 errdetail("A table or other object of the versioned schemas was made, dropped or redefined since the common ancestor.")));
+	base_tables = tables_at(&base);
+	ours_tables = tables_at(&ours);
+	theirs_tables = tables_at(&theirs);
+	foreach(lc, theirs_tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *b = find_table(base_tables, t->name);
+		Table	   *o = find_table(ours_tables, t->name);
+		Oid			relid;
+		int			n;
+
+		if (same_hash(&b->data.hash, &t->data.hash))
+			continue;
+		relid = table_named(t->name);
+		if (same_hash(&b->data.hash, &o->data.hash))
+		{
+			apply_rows(relid, o, t);
+			continue;
+		}
+		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
+		if (n > 0 && (flags & PROLLY_MERGE_FAIL_ON_CONFLICT))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("merge of branch \"%s\" conflicts in table \"%s\"",
+							branch, get_rel_name(relid)),
+					 errdetail_plural("%d row was changed differently on both branches.",
+									  "%d rows were changed differently on both branches.",
+									  n, n)));
+		if (n > 0)
+		{
+			conflicts += n;
+			conflicted = lappend_oid(conflicted, relid);
+		}
+	}
+
+	/* Conflicts: a merge in progress, to resolve before its commit. */
+	if (conflicts > 0)
+	{
+		int			i = 0;
+
+		ms.theirs = theirs;
+		ms.base = base;
+		ms.ntables = list_length(conflicted);
+		ms.tables = palloc(sizeof(Oid) * ms.ntables);
+		foreach(lc, conflicted)
+			ms.tables[i++] = lfirst_oid(lc);
+		PROLLY_CALL(dc.refs, set_merge_state, &ms);
+		memset(commit_id, 0, sizeof(*commit_id));
+		return conflicts;
+	}
+	parents[0] = ours;
+	parents[1] = theirs;
+	if (message == NULL)
+		message = psprintf("Merge branch '%s' into %s", branch,
+						   branch_ops()->current());
+	PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
 	return 0;
 }
 
@@ -626,6 +962,65 @@ folded_merge(const char *branch, const char *message, int flags,
 	return result;
 }
 
+/*
+ * The merge in progress, if relid has unresolved conflicts in it (its
+ * position in state->tables), else -1.
+ */
+static int
+conflicted_table(Oid relid, ProllyMergeState *state)
+{
+	if (!PROLLY_CALL(components().refs, merge_state, state))
+		return -1;
+	for (int i = 0; i < state->ntables; i++)
+		if (state->tables[i] == relid)
+			return i;
+	return -1;
+}
+
+/* Walk relid's changes in the merge in progress, as mode says. */
+static void
+walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
+			   ProllyConflictSink *sink)
+{
+	char	   *name = table_name(relid);
+	ProllyHash	ours;
+
+	/* The merge left the head where it was: ours is the head commit. */
+	if (!PROLLY_CALL(components().refs, resolve, "HEAD", &ours))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a merge is in progress on a branch with no commit")));
+	(void) merge_table(relid, find_table(tables_at(&ms->base), name),
+					   find_table(tables_at(&ours), name),
+					   find_table(tables_at(&ms->theirs), name), mode, sink);
+}
+
+static void
+folded_conflicts(Oid relid, ProllyConflictSink *sink)
+{
+	ProllyMergeState ms;
+
+	if (conflicted_table(relid, &ms) < 0)
+		return;
+	walk_conflicts(relid, &ms, WALK_LIST, sink);
+}
+
+static void
+folded_resolve(Oid relid, bool theirs)
+{
+	ProllyMergeState ms;
+	int			i = conflicted_table(relid, &ms);
+
+	if (i < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("table \"%s\" has no merge conflicts", get_rel_name(relid))));
+	if (theirs)
+		walk_conflicts(relid, &ms, WALK_TAKE_THEIRS, NULL);
+	ms.tables[i] = ms.tables[--ms.ntables];
+	PROLLY_CALL(components().refs, set_merge_state, &ms);
+}
+
 const ProllyMergeRoutine prolly_merge_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_DIFF_MERGE,
@@ -636,6 +1031,8 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	},
 	.diff = folded_diff,
 	.merge = folded_merge,
+	.conflicts = folded_conflicts,
+	.resolve = folded_resolve,
 	.tables = folded_tables,
 	.move_to = folded_move_to,
 };

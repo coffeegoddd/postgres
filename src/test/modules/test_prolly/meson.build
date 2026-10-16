@@ -54,6 +54,7 @@ tests += {
       'collations',
       'applier',
       'move_heads',
+      'merge',
     ],
   },
   'tap': {
