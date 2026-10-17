@@ -1,11 +1,11 @@
 # 11. Pages for the working set, Dolt-style history
 
-**Status: proposed (user direction, 2026-10-15); not built.** This
-replaces the design in which prolly trees are a table's primary storage
-(engines D1–D4, `04-candidate-designs.md`). The decisions below marked
-"user" were made on 2026-10-15; everything else is a recommendation to be
-settled before the step that needs it. Part 4 is the plan for getting from
-the code as it is today, open PRs included, to this design.
+**Status: steps 0–5 built and merged (2026-10-17); steps 6–8 not
+started.** This replaces the design in which prolly trees are a table's
+primary storage (engines D1–D4, `04-candidate-designs.md`). The decisions
+below marked "user" were made on the dates given; everything else is a
+recommendation to be settled before the step that needs it. Part 4 is the
+plan, with what each step built and where the build departed from it.
 
 ## 1. The design
 
@@ -351,6 +351,8 @@ are interfaces (hash, key and value encoders, chunker, node format).
 
 ### Where things are
 
+As this plan was written (2026-10-15):
+
 - **Merged on `master` (PRs #1–#11):** the interface stubs and registry,
   D1 tables and the prolly index AM, the copy-on-write tree, the
   cluster-wide node store, node counters and the subtree-skipping diff.
@@ -358,6 +360,9 @@ are interfaces (hash, key and value encoders, chunker, node format).
   locks, spill, SERIALIZABLE, large values, GC, VACUUM, branches, diff and
   merge, canonical commits, the `dolt_*` SQL interface, conflicts,
   versioned databases, and the 16 fixes from Postgres's own suites (4h).
+
+As of 2026-10-17, steps 0–5 below are built and merged; each step says
+with which PRs.
 
 ### What carries over
 
@@ -396,6 +401,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
 - No branches yet, so no sharing and no remapping.
 - **Exit:** with `default_table_access_method = prolly`, gates 1–3 match
   stock Postgres; crash, standby and base-backup tests of the map pass.
+- **Built 2026-10-15:** #50 (smgr per relation), #52 (block-mapped
+  storage), #53 (the `prolly` table AM); design in #49, part 5.
 
 **Step 2. Branches: per-branch copies of versioned schemas.**
 - `CREATE SCHEMA … VERSIONED`; prolly tables only there, and only prolly
@@ -425,6 +432,10 @@ fails without its fix), and Postgres's suites keep passing after each one.
   don't block each other; the S suite on a branch matches heap.
   (`vc_schema` moved to step 4's exit, user 2026-10-16: it needs
   commits.)
+- **Built 2026-10-15–16:** #59 (versioned schemas), #60–#61 (branch
+  columns, branch-aware catalogs), #69–#70 (shared pages, copy on first
+  write), #71 (branches as copies), #72 (maintenance across branches), #91
+  (locks per branch); design in #54, #56 and #58, part 6.
 
 **Step 3. The chunk store, WAL-logged.**
 - The journal and its index, table files, the manifest and the refs map,
@@ -442,6 +453,9 @@ fails without its fix), and Postgres's suites keep passing after each one.
 - **Exit:** the tree tests of `test_prolly` pass on the new store; crash
   tests at every record boundary recover to the last committed root; a
   standby's store matches the primary's byte for byte.
+- **Built 2026-10-16–17:** #92 (the chunk store and its resource
+  manager), #93 (trees as chunks), #110 (table files and the manifest).
+  Collation versions are recorded with #100 in step 4.
 
 **Step 4. Dolt commits from pages.**
 - The fold over the branch's versioned schemas: the change finder and
@@ -471,6 +485,18 @@ fails without its fix), and Postgres's suites keep passing after each one.
   commit and history tests (`vc_schema` among them) pass; commit, diff
   and status cost track changed pages (counted, as the tree diff's node
   reads are).
+- **Built 2026-10-16–17:** #95 (the fold), #96 (commits of branch
+  copies), #98 (status and diff), #99 (requirements), #100 (collation
+  versions), #111 (fold epochs and the changed-page list), #112 (folds of
+  only the rows changed), #113 (working-set checkpoints), #114 (the
+  format frozen).
+- **As built:**
+  - A table without a primary key was read in full on any change
+    (issue #126); its rows' copies are now counted from the changed pages
+    as well.
+  - `dolt_status` and `dolt_diff` failed on objects a commit can't hold
+    yet (partitioned and foreign tables, aggregates, policies); reads now
+    leave them out and only a commit refuses them (issue #130).
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
@@ -494,6 +520,25 @@ fails without its fix), and Postgres's suites keep passing after each one.
   - A merge gives each sequence the larger of its two values.
 - **Exit:** `vc_branches`, `vc_diff_merge`, `vc_history` and the
   conflicts tests pass; V1–V3 run, V3 with background writes.
+- **Built 2026-10-17:** #101 (the row applier), #102 (reset,
+  fast-forward, branches at commits), #104–#105 (three-way merge,
+  conflicts, requirements), #106 (cherry-pick, revert), #107 and #120
+  (moves across definitions, types and materialized views included),
+  #108 (sequence values), #109 and #119 (merges across definitions),
+  #116 (merges into uncommitted changes), #117 (cherry-pick conflicts),
+  #118 (`dolt_constraint_violations`), #121 (detached checkout), #122
+  (the cross-cluster history test), #123 (the V suite), #124 (head-only
+  branches).
+- **As built:**
+  - A detached checkout is a hidden branch at the commit, read-only for
+    the session on it, deleted once no session is on it.
+  - A branch made from a commit has only its head until first used; its
+    first use makes its copies. Making or deleting one takes what any
+    branch does (CREATE, ownership, a transaction that can write); its
+    first use takes neither, and a standby refuses it until the primary
+    has used it.
+  - A merge or cherry-pick that conflicts with uncommitted changes is
+    refused, as Dolt does.
 
 **Step 6. Remotes.**
 - File remotes first, then a network protocol of our own: fetch, push,
