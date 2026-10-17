@@ -33,6 +33,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "access/xlogwait.h"
+#include "catalog/branch.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
@@ -87,10 +88,10 @@ bool		DefaultXactReadOnly = false;
 bool		XactReadOnly;
 
 /*
- * Every transaction of the session is read-only, whatever is asked (a
- * session on a commit rather than a branch); set and cleared by its owner.
+ * Whether the transaction is read-only only for the branch it started on
+ * (MyBranchReadOnly), not by asking or by recovery.
  */
-bool		XactReadOnlyForced = false;
+bool		XactReadOnlyFromBranch = false;
 
 bool		DefaultXactDeferrable = false;
 bool		XactDeferrable;
@@ -2226,11 +2227,13 @@ StartTransaction(void)
 	{
 		s->startedInRecovery = true;
 		XactReadOnly = true;
+		XactReadOnlyFromBranch = false;
 	}
 	else
 	{
 		s->startedInRecovery = false;
-		XactReadOnly = DefaultXactReadOnly || XactReadOnlyForced;
+		XactReadOnly = DefaultXactReadOnly || MyBranchReadOnly;
+		XactReadOnlyFromBranch = MyBranchReadOnly && !DefaultXactReadOnly;
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;

@@ -23,6 +23,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogprefetcher.h"
+#include "catalog/branch.h"
 #include "catalog/pg_authid.h"
 #include "common/string.h"
 #include "mb/pg_wchar.h"
@@ -545,7 +546,7 @@ assign_timezone_abbreviations(const char *newval, void *extra)
 bool
 check_transaction_read_only(bool *newval, void **extra, GucSource source)
 {
-	if (*newval == false && XactReadOnlyForced && IsTransactionState() &&
+	if (*newval == false && MyBranchReadOnly && IsTransactionState() &&
 		!InitializingParallelWorker)
 	{
 		GUC_check_errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION);

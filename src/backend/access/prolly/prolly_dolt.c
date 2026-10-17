@@ -35,6 +35,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/tableam.h"
+#include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
@@ -394,30 +395,110 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
-/* The hidden branches of sessions on commits. */
-#define DETACHED_PREFIX		"detached/"
+static bool
+detached_branch(const char *name)
+{
+	return strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0;
+}
 
 static void
 reserved_branch_name(const char *name)
 {
-	if (strncmp(name, DETACHED_PREFIX, strlen(DETACHED_PREFIX)) == 0)
+	if (detached_branch(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
-				 errmsg("branch names beginning \"%s\" are reserved", DETACHED_PREFIX)));
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
+}
+
+/* Does what's checked out name a commit by its hash (a prefix of it)? */
+static bool
+names_commit(const char *ref)
+{
+	size_t		n = strlen(ref);
+
+	return n >= 4 && strspn(ref, "0123456789abcdef") == n;
 }
 
 /*
- * A session on a commit leaving it, for a branch: its transactions are no
- * longer read-only, this one included (a branch made from the commit is
- * written now).
+ * Make a branch, though the transaction is read-only for the branch it
+ * started on (a session on a commit makes branches there); not one that is
+ * read-only otherwise (asked so, or in recovery).
  */
 static void
-leave_detached(void)
+create_branch(const char *name, const char *from)
 {
-	if (!XactReadOnlyForced)
+	bool		was_read_only = XactReadOnly;
+
+	if (XactReadOnlyFromBranch)
+		XactReadOnly = false;
+	PG_TRY();
+	{
+		PROLLY_CALL(refs(), branch_create, name, from);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+}
+
+typedef struct DetachedBranches
+{
+	List	   *names;
+	char	   *current;
+} DetachedBranches;
+
+static void
+add_detached(const char *name, const ProllyHash *head, void *arg)
+{
+	DetachedBranches *db = arg;
+
+	if (detached_branch(name) && strcmp(name, db->current) != 0)
+		db->names = lappend(db->names, pstrdup(name));
+}
+
+/*
+ * The hidden branches no session is on any more (current is the session's
+ * branch), deleted, each in a subtransaction: one a session is on, or
+ * anything else that keeps it, is left.  Only in a transaction that can
+ * write, or that is read-only only for the branch it started on (one
+ * leaving a commit).
+ */
+static void
+sweep_detached(char *current)
+{
+	DetachedBranches db = {NIL, current};
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ListCell   *lc;
+	bool		was_read_only = XactReadOnly;
+
+	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
-	XactReadOnlyForced = false;
-	XactReadOnly = DefaultXactReadOnly;
+	PROLLY_CALL(refs(), branches, add_detached, &db);
+	XactReadOnly = false;
+	foreach(lc, db.names)
+	{
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
+		{
+			PROLLY_CALL(refs(), branch_delete, (char *) lfirst(lc), true);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cxt);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_END_TRY();
+	}
+	XactReadOnly = was_read_only;
 }
 
 /*
@@ -457,17 +538,21 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_checkout needs a branch")));
-	if (create)
-		reserved_branch_name(branch);
+	/* (the hidden branches are checked out by their commits) */
+	reserved_branch_name(branch);
 
 	/*
-	 * A commit that names no branch: a detached session on it, read-only,
-	 * on a hidden branch at the commit that every session detached there
-	 * shares.  Changing anything takes a branch made from it.
+	 * A commit's hash that names no branch: a detached session on it,
+	 * read-only, on a hidden branch at the commit that every session
+	 * detached there shares.  Changing anything takes a branch made from
+	 * it.  (Its transactions are read-only from the next one; this one from
+	 * now.)
 	 */
-	if (!create && !PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
+	if (!create && names_commit(branch) &&
+		!PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 	{
 		ProllyHash	id;
+		ProllyHash	head;
 		char	   *hidden;
 
 		if (!PROLLY_CALL(refs(), resolve, branch, &id))
@@ -475,21 +560,29 @@ dolt_checkout(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("branch or commit \"%s\" does not exist", branch)));
 		/* (a branch name has room for 40 of the hash's 64 digits) */
-		hidden = psprintf("%s%.40s", DETACHED_PREFIX, hash_hex(&id));
-		leave_detached();
+		hidden = psprintf("%s%.40s", PROLLY_DETACHED_PREFIX, hash_hex(&id));
 		if (!PROLLY_CALL(refs(), branch_lookup, hidden, &(ProllyBranchId) {0}))
-			PROLLY_CALL(refs(), branch_create, hidden, hash_hex(&id));
+			create_branch(hidden, hash_hex(&id));
+		else if (!PROLLY_CALL(refs(), resolve, hidden, &head) || !same_hash(&head, &id))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the hidden branch of commit %s has moved off it", hash_hex(&id))));
 		PROLLY_CALL(refs(), checkout, hidden);
-		XactReadOnlyForced = true;
+		MyBranchReadOnly = true;
 		XactReadOnly = true;
 		result[0] = "0";
 		result[1] = psprintf("HEAD is now at %s (detached, read-only)", hash_hex(&id));
 		PG_RETURN_DATUM(text_array(2, result));
 	}
-	leave_detached();
+
+	/*
+	 * A branch: writable from the next transaction (this one stays as it
+	 * began); the hidden branches nobody is on any more go.
+	 */
 	if (create)
-		PROLLY_CALL(refs(), branch_create, branch, start);
+		create_branch(branch, start);
 	PROLLY_CALL(refs(), checkout, branch);
+	sweep_detached(branch);
 	result[0] = "0";
 	result[1] = psprintf("Switched to branch '%s'", branch);
 	PG_RETURN_DATUM(text_array(2, result));
@@ -544,7 +637,6 @@ dolt_branch(PG_FUNCTION_ARGS)
 	{
 		char	   *name;
 		char	   *from;
-		bool		was_read_only = XactReadOnly;
 
 		if (copy && list_length(names) != 2)
 			ereport(ERROR,
@@ -556,19 +648,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 		from = copy ? linitial(names) :
 			list_length(names) > 1 ? (char *) lsecond(names) : NULL;
 		reserved_branch_name(name);
-
-		/* a session on a commit makes branches there, though read-only */
-		if (XactReadOnlyForced)
-			XactReadOnly = false;
-		PG_TRY();
-		{
-			PROLLY_CALL(refs(), branch_create, name, from);
-		}
-		PG_FINALLY();
-		{
-			XactReadOnly = was_read_only;
-		}
-		PG_END_TRY();
+		create_branch(name, from);
 	}
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -1100,6 +1180,9 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 	ProllyNodeRef ws;
 	ProllyNodeRef committed;
 
+	/* (the hidden branches of sessions checked out at commits) */
+	if (detached_branch(name))
+		return;
 	values[0] = CStringGetTextDatum(name);
 	if (head->len > 0 && PROLLY_CALL(refs(), commit_get, head, &info))
 	{

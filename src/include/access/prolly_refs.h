@@ -31,6 +31,13 @@
 
 #define PROLLY_MAX_PARENTS 2
 
+/*
+ * The prefix of the hidden branches sessions checked out at commits are on,
+ * one a commit (dolt_checkout() of a commit hash); no other branch's name
+ * may begin with it.
+ */
+#define PROLLY_DETACHED_PREFIX "detached/"
+
 typedef struct ProllyCommitInfo
 {
 	ProllyHash	id;

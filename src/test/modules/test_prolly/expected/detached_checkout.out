@@ -115,6 +115,76 @@ SELECT * FROM dc.t ORDER BY id;
 
 SELECT dolt_branch('detached/mine');
 ERROR:  branch names beginning "detached/" are reserved
+-- Read-only goes with the branch: a checkout of a commit rolled back
+-- leaves the session where it was, writable; a switch that fails leaves it
+-- detached, read-only; leaving inside a read-only transaction keeps the
+-- transaction read-only.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+BEGIN;
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+INSERT INTO dc.t VALUES (5, 'five');
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT active_branch() LIKE 'detached/%' AS on_a_hidden_branch;
+ on_a_hidden_branch 
+--------------------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'main');
+ERROR:  branch "main" already exists
+INSERT INTO dc.t VALUES (6, 'six');
+ERROR:  cannot execute INSERT in a read-only transaction
+BEGIN READ ONLY;
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+INSERT INTO dc.t VALUES (6, 'six');
+ERROR:  cannot execute INSERT in a read-only transaction
+ROLLBACK;
+INSERT INTO dc.t VALUES (6, 'six');
+-- (a hidden branch isn't checked out by name, nor HEAD as a commit)
+SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
+ERROR:  branch names beginning "detached/" are reserved
+SELECT dolt_checkout('HEAD');
+ERROR:  branch "HEAD" does not exist
+-- (and one nobody is on any more goes, with the next checkout that keeps)
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+SELECT count(*) AS hidden_left FROM pg_branch WHERE brname LIKE 'detached/%';
+ hidden_left 
+-------------
+           0
+(1 row)
+
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
