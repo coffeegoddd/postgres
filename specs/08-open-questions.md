@@ -4,25 +4,31 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 
 ## Status
 
+Since 2026-10-15 the design being built is `11-pages-and-dolt-snapshots.md`
+(Postgres pages for the working set, a chunk store for history). Rows
+marked **(D1)** are about the tree engine D1 and its components, kept as
+the record of what was decided for it: D1 stays built until step 8
+measures against it, then is removed.
+
 | Topic | Status |
 |---|---|
-| Overall concurrency design | Open. Option 8 (coordination in the tree) was the user's stated favorite on 2026-10-12; the current plan is to measure candidates instead of choosing up front |
-| Candidate set (D1–D5, K1–K3, pairings) | Proposed 2026-10-13; agreed as the working plan, not as final designs |
-| Engine per storage type | Open; hypotheses in `05-storage-targets.md` |
+| Overall concurrency design | **Superseded** by the direction (2026-10-15): the working set is Postgres pages, with Postgres's MVCC and locks (locks per branch, #91). Was: open. Option 8 (coordination in the tree) was the user's stated favorite on 2026-10-12; the current plan is to measure candidates instead of choosing up front |
+| Candidate set (D1–D5, K1–K3, pairings) | **(D1)** Superseded by the direction (2026-10-15); D1 kept until step 8. Was: Proposed 2026-10-13; agreed as the working plan, not as final designs |
+| Engine per storage type | **Superseded** by the direction (2026-10-15): one design, pages plus a chunk store. Was: open; hypotheses in `05-storage-targets.md` |
 | First engine and its version-control scope (13, 14) | Decided by the user 2026-10-13: D1+K1, V1–V3 |
-| Row identity (2) | Decided for the first engine 2026-10-13: synthetic TIDs with a map |
-| Node store (1) | Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints. Built (step 4b). 28–30 open |
+| Row identity (2) | **(D1)** Decided for the first engine 2026-10-13: synthetic TIDs with a map |
+| Node store (1) | **(D1)** Replaced for the page design by the chunk store (step 3, #92, #110). Decided by the user 2026-10-13: one cluster-wide store, hash → block map plus per-child hints. Built (step 4b). 28–30 open |
 | Chunk boundaries, content hash, own format (3, 4) | Starting choices for step 4 (user, 2026-10-13); built (4a); direction for the chunk rule and page packing set (user, 2026-10-14), settled by measurement in step 5 |
-| Versioned schema (5, 21) | Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
+| Versioned schema (5, 21) | **Superseded** by versioned schemas (user, 2026-10-16; row "What is versioned"). Was: Decided by the user 2026-10-13: every catalog, shared ones included, is a prolly table |
 | Canonical form, identity, value encoding (12, 5) | Decided by the user 2026-10-13: Postgres-native working set, canonical commits; identity by name; canonical schema derived from catalogs; canonical portable row encoding replaces `heaptuple` (question 12 changed). See `09-versioned-catalogs.md` part 1 |
-| Root layout (33) | Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
-| Table keying, TID maps (36, 37) | Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
+| Root layout (33) | **(D1)** Decided by the user 2026-10-13: catalog sub-root and user-data sub-root. Local layout built 2026-10-13; changed 2026-10-14 (user): local roots key relations by relfilenumber and add a third, local-only sub-root for TID maps. The canonical layout by name comes with 4g |
+| Table keying, TID maps (36, 37) | **(D1)** For the page design, keyless rows are keyed otherwise since #149 (row "Keyless keying"); no TID maps. Decided by the user 2026-10-14: primary key if present (an immediately checked one; deferrable ones key by content, 4d.2), else row content hash with a count; TID map as a per-relation tree in the local sub-root. Built in 4d.1 |
 | Caches, refs, schema merge, shared catalogs (23, 26, 27, 32, 34) | Proposals with agreed direction, `09-versioned-catalogs.md` part 2; open until built |
-| Row locks, update chains (38, 39) | Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2. The writer lock was a stopgap: K1's row-level locks replaced it in 4e.3 |
-| Prolly indexes (17, 42, 43) | Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. Built in 4d.3 |
-| ANALYZE sampling (44) | Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts; keyless tables and tables the transaction wrote are read whole. Built in 4d.4 |
-| Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
-| TID source, reuse, clone (37 changed, 40, 41) | Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
+| Row locks, update chains (38, 39) | **(D1)** Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2. The writer lock was a stopgap: K1's row-level locks replaced it in 4e.3 |
+| Prolly indexes (17, 42, 43) | **(D1)** Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. Built in 4d.3 |
+| ANALYZE sampling (44) | **(D1)** Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts; keyless tables and tables the transaction wrote are read whole. Built in 4d.4 |
+| Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | For the page design: the format frozen (#114) and changed once since, by a clean break (#149); transaction memory is Postgres's; reclamation is step 7. Was: Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
+| TID source, reuse, clone (37 changed, 40, 41) | **(D1)** Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Built in 4e.5 |
 | Step 4's remaining decisions (23, 25, 27, 29, 34, 35, 46–56) | Decided by the user 2026-10-14, as recommended: see each question |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
@@ -30,6 +36,10 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Branch copies' OIDs (2026-10-16) | Decided by the user: a branch's copy of a versioned object keeps its source's OIDs; catalog rows carry a branch, and a backend sees one branch (`11-pages-and-dolt-snapshots.md`, part 1) |
 | Spec 11, steps 0–5 (2026-10-17) | Built and merged, with the decisions recorded there (steps 2–5's in #90). Steps 6–8 (remotes, reclamation, measurement) not started; the remote protocol's design is open |
 | What is versioned (2026-10-16) | Decided by the user: versioned schemas (`CREATE SCHEMA … VERSIONED`), every object in them per branch, Doltgres's scope; prolly tables only there; dependencies only from versioned objects to shared ones (`11-pages-and-dolt-snapshots.md`, part 1) |
+| Keyless keying (2026-10-17) | Decided by the user: a keyless row is keyed by the first 32 bytes of its encoded values, then its hash (#149), a clean break of format: a folded root records its format ("!:format"), and an older root's tables' rows aren't read (`13-keyless-tables.md`) |
+| Keyless merge rule (2026-10-17) | Decided by the user: the same change on both sides is made once; otherwise copies added on either side add up and copies removed on both are removed once; a keyless row never conflicts (#150) |
+| Remotes (step 6) | Open: transport, clone, refs and auth; proposed in `11-pages-and-dolt-snapshots.md` part 7 |
+| Interfaces under the pages | Open (user, 2026-10-15, "not sure yet"): whether the Postgres facilities page-based tables rely on (checksums, the buffer manager, smgr, AIO and read streams, WAL, `pg_stat_io`) become interfaces with Postgres's as the default; smgr already is (step 1) |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 | Steps 2–5's remaining decisions (2026-10-16) | Decided by the user: branch-aware locks; branch privileges; LZ4 table files; collation versions refused on mismatch; `dolt_commit` inside its transaction; checkpoints on request and branch switch; format freeze at the end of step 4; keyless O(N) diff fallback; Dolt's working-set behavior for reset and merge; no triggers on applied rows; Dolt's schema merge; read-only detached commits; sequences merged to the larger value (`11-pages-and-dolt-snapshots.md`, steps 2–5) |
 | SQL correctness suite (C) | Decided by the user 2026-10-15: sqllogictest from `prolly_bench`, judged by agreement with heap; `prolly` runs it in a versioned schema; engines heap and `prolly` (`12-correctness-suite.md`, gate 8) |
