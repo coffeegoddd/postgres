@@ -12,6 +12,7 @@ SELECT current_database() AS db \gset
 SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/clone-' || txid_current() AS run \gset
 \set url :run '/a'
 \set url_dep :run '/dep'
+\set url_nomain :run '/nomain'
 
 CREATE SCHEMA cl VERSIONED;
 CREATE TABLE cl.t (id int PRIMARY KEY, v text);
@@ -42,6 +43,35 @@ SELECT v FROM cl.t WHERE id = 1;
 SELECT dolt_clone(:'url');
 \c :db
 DROP DATABASE regress_clone_b;
+
+-- what a clone would run into, named; a remote named as dolt_remote names
+-- one
+CREATE DATABASE regress_clone_e;
+\c regress_clone_e
+SELECT dolt_clone(:'url', '--remote', 'a/b');
+SELECT dolt_remote('add', 'origin', :'url');
+SELECT dolt_branch('side');
+SELECT dolt_clone(:'url');
+SELECT dolt_remote('remove', 'origin');
+SELECT dolt_clone(:'url');
+\c :db
+DROP DATABASE regress_clone_e;
+
+-- a remote without main: its master checked out; main, the database's,
+-- stays, empty
+SELECT dolt_remote('add', 'nomain', :'url_nomain');
+SELECT dolt_push('nomain', 'side') AS pushed;
+SELECT dolt_branch('master', 'side');
+SELECT dolt_push('nomain', 'master') AS pushed;
+SELECT dolt_branch('-D', 'master');
+CREATE DATABASE regress_clone_f;
+\c regress_clone_f
+SELECT dolt_clone(:'url_nomain');
+SELECT active_branch();
+SELECT name, hash IS NULL AS empty FROM dolt_branches ORDER BY name;
+\c :db
+DROP DATABASE regress_clone_f;
+SELECT dolt_remote('remove', 'nomain');
 
 -- --branch: another branch checked out
 CREATE DATABASE regress_clone_c;
