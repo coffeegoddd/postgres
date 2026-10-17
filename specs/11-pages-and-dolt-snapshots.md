@@ -557,7 +557,7 @@ fails without its fix), and Postgres's suites keep passing after each one.
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
 
-**Step 6. Remotes.**
+**Step 6. Remotes.** Proposed in part 7, not decided.
 - File remotes first, then a network protocol of our own: fetch, push,
   clone, pull; a cloned branch's copies made on first use from its head
   commit; the check for shared dependencies (part 1).
@@ -877,3 +877,177 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
   they never change a page another branch can see.
 - Opportunistic pruning (on a read) skips shared pages, so reads don't
   copy pages.
+
+## 7. Step 6 design: remotes (proposed)
+
+**Status: proposed, 2026-10-17; nothing here is decided.** Each decision
+below gives the options and a recommendation; the list at the end says
+what is the user's to decide before building.
+
+Remotes move history between databases: a database's commits, the trees
+they name, and its branches' heads. A working set, the pages, never moves
+(as in Dolt); a branch that arrives is head-only until first used, when
+its copies are made from its head commit (#124's path). Remotes come
+first as directories (file remotes), then over the network. The bounds
+are part 1's and `10-complexity-requirements.md`'s: fetch and push
+O(E + B) (chunk references examined, bytes moved), clone O(B) plus the
+first use's pages and index builds.
+
+### 7.1 What moves
+
+Chunks, by hash: commits, the canonical roots they name, and the trees
+under them. Content addressing makes the rest follow:
+
+- **Negotiation by walk.** The receiver walks from the heads it wants:
+  each commit, its parents, its root, the root's trees, down to chunks it
+  has (`has()`), and asks only for those it lacks. A chunk it has, it has
+  all under, so the walk stops there: O(E) chunk references examined.
+  Commits are walked first, then roots, so a fetch of a branch a few
+  commits ahead reads a few commits' changed paths, not whole trees.
+- **Batched as table files.** What one fetch or push receives is written
+  as one new table file (step 3's format, LZ4 or not, #110), WAL-logged
+  as table files are, then added to the manifest; not appended to the
+  journal chunk by chunk.
+- **Checked as received.** Each chunk's hash is recomputed and compared,
+  and its format version byte checked; a root's `"!:format"` item must be
+  this build's (#149's clean break): a root of another format refuses the
+  whole fetch, naming it. A fetch that fails part way leaves its table
+  file unreferenced, for step 7's GC.
+
+### 7.2 Remote refs
+
+- **Remotes** are named, per database, as Dolt's are:
+  `dolt_remote('add', name, url)`, `('remove', name)`, listed in a
+  `dolt_remotes` view; kept in the refs tree (a new tag), not in a catalog,
+  so they move with the refs' transactions.
+- **Remote-tracking branches** (`origin/main`): heads only, written by a
+  fetch, never with copies; `dolt_checkout('origin/main')` is refused with
+  a hint to make a branch from it, and `dolt_checkout('-b', 'x',
+  'origin/x')` makes one at its head (head-only, as any new branch).
+- **Upstreams**: a branch may name one (`dolt_push('--set-upstream', …)`,
+  `dolt_branch('--set-upstream-to', …)`), for `dolt_pull()` and
+  `dolt_push()` without arguments.
+
+### 7.3 Fetch, pull, push
+
+- **Fetch** (`dolt_fetch([remote[, refspec]])`): the walk, the chunks
+  received, then the remote-tracking heads moved, in one transaction.
+- **Pull** (`dolt_pull([remote[, branch]])`): fetch, then
+  `dolt_merge('origin/x')` into the session's branch, with merge's rules
+  (a fast-forward when it can, conflicts as merge has them, refused over
+  conflicting uncommitted changes).
+- **Push** (`dolt_push([remote[, branch]], ['--force'])`): the remote is
+  sent what it lacks, then asked to move its branch's head, which it
+  does as a compare-and-swap of the head it was told about (the chunk
+  store's `move_root` is already one), and only as a fast-forward unless
+  `--force`. A branch the remote has copies of is moved there as a
+  fast-forward is (`fast_forward_local`, #142): its rows written into its
+  pages, refused when that branch has uncommitted changes the move would
+  touch. Recommendation: refuse a push to a branch some session on the
+  remote has checked out with uncommitted changes at all, as git refuses
+  a push to a checked-out branch, rather than move a working set under a
+  session.
+
+### 7.4 Clone
+
+`dolt_clone(url)` in a database with no versioned schemas: every branch
+fetched, each a head-only branch at its remote's head, `origin` set, and
+the session checked out on the remote's default branch, which makes its
+copies (the one O(N) step: rows written to pages, indexes built).
+
+- **Shared dependencies** (part 1): before anything is written, the
+  head's canonical root is checked for what versioned objects need from
+  outside them: extensions (name and version), roles named as owners or
+  in grants, and objects of ordinary schemas. A clone missing any refuses,
+  naming each.
+- **Options for where:** (a) into an existing, empty database,
+  `CREATE DATABASE x; \c x; SELECT dolt_clone(url);`; (b) a new database
+  made by the clone, `SELECT dolt_clone(url, 'x')`, which needs a
+  connection to it (CREATE DATABASE can't run in a transaction block, so
+  not inside the function). **Recommendation: (a)**: it needs nothing new
+  of Postgres, and the empty database's settings (encoding, locale,
+  collation provider) are the user's choice. Canonical form is UTF-8
+  whatever the encoding, so encodings may differ (`status_diff.sql` reads
+  commits in LATIN1 and WIN1251 databases); a collation whose version
+  differs from the one a commit recorded makes that table's rows
+  unreadable there, as reading such a commit does now (step 3).
+
+### 7.5 Transport
+
+- **File remotes first** (`file:///path`): a directory holding a chunk
+  store's files, a manifest, table files and the refs, readable and
+  writable by the server's user. Fetch reads table files from it; push
+  writes a table file into it and moves its refs with a lock file. They
+  need no network code, test everything above, and back up history.
+- **Network: options.**
+  - **(A) SQL functions over a libpq connection.** The receiving backend
+    connects to the remote server, as `postgres_fdw` and logical
+    replication's workers do, and calls functions there: the remote's
+    heads, `has` for a batch of hashes, the chunks of a batch streamed
+    with `COPY … TO STDOUT (FORMAT binary)`, and a push's head move. It
+    reuses everything Postgres has: `pg_hba.conf`, roles and passwords,
+    TLS, connection strings (`postgresql://host/db`), no new port or
+    daemon.
+  - **(B) A protocol of our own, over its own port** (as Dolt's remotes
+    are: a gRPC service whose table files move over HTTP): faster for
+    bulk, and servable from object storage, but a new service to run,
+    secure and authenticate.
+  - **(C) Object storage** (`s3://`): a file remote's layout in a bucket;
+    later, as a file remote's variant.
+  - **Recommendation: (A)** after file remotes. It is the
+    Postgres-native choice (a remote is another Postgres database) and
+    has authentication and encryption already; COPY's binary stream is
+    near what (B) would move. (C) can follow without changing (A).
+
+### 7.6 Privileges
+
+History holds every row of every versioned table at every commit, so
+reading it is reading all of them, whatever SELECT privileges say now.
+
+- **Fetch and clone** from a database take its ownership, or EXECUTE on
+  the remote functions, which are revoked from PUBLIC: an owner grants
+  them to the roles that may copy the database's history.
+- **Push** to it takes its ownership, or EXECUTE on the push functions,
+  granted as separately; and making or moving a branch's head there
+  takes what doing it locally does (#124's checks).
+- **A file remote** is the server's files: only superusers, or roles
+  granted `pg_read_server_files` and `pg_write_server_files`, may use one,
+  as `COPY … FROM 'file'` asks.
+
+### 7.7 Durability and concurrency
+
+- Received table files and the refs they move are WAL-logged as any
+  chunk store change is (step 3): a crash leaves either the fetch done or
+  its table file unreferenced; a standby replays both.
+- Local commits during a fetch don't wait: a fetch moves only
+  remote-tracking refs. Two pushes to one remote branch: the second's
+  compare-and-swap fails, and it's refused with a hint to fetch first.
+
+### 7.8 Building it
+
+In order, each a PR with its tests:
+
+1. The transfer interface's implementation over a remote interface
+   (file, then network) with a walk, `has`, chunks in batches, and a head
+   move; remotes and remote-tracking refs in the refs.
+2. File remotes: fetch, push, pull, clone, with crash tests at each
+   record and the shared-dependency check.
+3. Network remotes over libpq (if (A)): the remote functions, their
+   privileges, TLS tested.
+4. V4 (`06-benchmarking.md`): clone, fetch and push between two local
+   instances, timed and counted (chunks examined and moved against E and
+   B).
+
+### 7.9 For the user to decide
+
+1. **Network transport:** (A) libpq and SQL functions, (B) our own
+   protocol and port, or both in time. Recommended: (A).
+2. **Clone target:** (a) into an existing empty database, or (b) a new
+   one the clone makes. Recommended: (a).
+3. **Push to a checked-out branch** on the remote: refuse when a session
+   there has it checked out with uncommitted changes, or move it as a
+   fast-forward over them when they don't conflict. Recommended: refuse.
+4. **Who may fetch:** the owner, plus roles granted EXECUTE on the
+   remote functions (revoked from PUBLIC). Recommended as stated.
+5. **Object storage remotes** now or later. Recommended: later, as a
+   file remote's variant.
