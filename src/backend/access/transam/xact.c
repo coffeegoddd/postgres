@@ -47,7 +47,6 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
-#include "access/prolly_xact.h"
 #include "pgstat.h"
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"
@@ -2774,7 +2773,6 @@ PrepareTransaction(void)
 	 */
 	StartPrepare(gxact);
 
-	AtPrepare_Prolly();
 	AtPrepare_Notify();
 	AtPrepare_Locks();
 	AtPrepare_PredicateLocks();

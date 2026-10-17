@@ -4,8 +4,7 @@
  *	  The prolly shared-memory subsystem and checkpoint hook.
  *
  * At postmaster startup this reserves a shared area for every registered
- * engine, coordination, commit pipeline and chunk store implementation
- * whose shmem_size() is non-zero, named after the implementation, and calls
+ * chunk store implementation whose shmem_size() is non-zero, named after the implementation, and calls
  * its shmem_init() with the area once.  Every process finds the area again
  * with prolly_shmem_area().
  *
@@ -17,16 +16,13 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
-#include "access/prolly_config.h"
+#include "access/prolly_registry.h"
 #include "access/prolly_shmem.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 
 /* Interfaces whose implementations may have shared state. */
 static const ProllyInterface shmem_interfaces[] = {
-	PROLLY_IFACE_ENGINE,
-	PROLLY_IFACE_COORDINATION,
-	PROLLY_IFACE_COMMIT_PIPELINE,
 	PROLLY_IFACE_CHUNK_STORE,
 };
 
@@ -48,24 +44,6 @@ impl_shmem_size(const ProllyImplInfo *impl)
 {
 	switch (impl->iface)
 	{
-		case PROLLY_IFACE_ENGINE:
-			{
-				const ProllyEngineRoutine *r = (const ProllyEngineRoutine *) impl;
-
-				return r->shmem_size ? r->shmem_size() : 0;
-			}
-		case PROLLY_IFACE_COORDINATION:
-			{
-				const ProllyCoordRoutine *r = (const ProllyCoordRoutine *) impl;
-
-				return r->shmem_size ? r->shmem_size() : 0;
-			}
-		case PROLLY_IFACE_COMMIT_PIPELINE:
-			{
-				const ProllyCommitRoutine *r = (const ProllyCommitRoutine *) impl;
-
-				return r->shmem_size ? r->shmem_size() : 0;
-			}
 		case PROLLY_IFACE_CHUNK_STORE:
 			{
 				const ProllyChunkStoreRoutine *r = (const ProllyChunkStoreRoutine *) impl;
@@ -82,15 +60,6 @@ impl_shmem_init(const ProllyImplInfo *impl, void *area)
 {
 	switch (impl->iface)
 	{
-		case PROLLY_IFACE_ENGINE:
-			PROLLY_CALL(((const ProllyEngineRoutine *) impl), shmem_init, area);
-			break;
-		case PROLLY_IFACE_COORDINATION:
-			PROLLY_CALL(((const ProllyCoordRoutine *) impl), shmem_init, area);
-			break;
-		case PROLLY_IFACE_COMMIT_PIPELINE:
-			PROLLY_CALL(((const ProllyCommitRoutine *) impl), shmem_init, area);
-			break;
 		case PROLLY_IFACE_CHUNK_STORE:
 			PROLLY_CALL(((const ProllyChunkStoreRoutine *) impl), shmem_init, area);
 			break;
@@ -157,35 +126,11 @@ prolly_shmem_area(const ProllyImplInfo *impl)
 }
 
 /*
- * Called by CheckPointGuts(), after the redo point is fixed: each
- * implementation makes its state as of that point durable.
+ * Called by CheckPointGuts(), after the redo point is fixed: the chunk
+ * stores make their appends before it durable.
  */
 void
 CheckPointProlly(int flags)
 {
-	List	   *impls;
-	ListCell   *lc;
-
-	impls = prolly_list_impls(PROLLY_IFACE_COMMIT_PIPELINE);
-	foreach(lc, impls)
-	{
-		const ProllyCommitRoutine *r = lfirst(lc);
-
-		if (PROLLY_HAS(r, checkpoint))
-			r->checkpoint(flags);
-	}
-
-	/* the chunk stores' appends before the redo point */
 	prolly_chunkstore_checkpoint();
-	list_free(impls);
-
-	impls = prolly_list_impls(PROLLY_IFACE_ENGINE);
-	foreach(lc, impls)
-	{
-		const ProllyEngineRoutine *r = lfirst(lc);
-
-		if (PROLLY_HAS(r, checkpoint))
-			r->checkpoint(flags);
-	}
-	list_free(impls);
 }

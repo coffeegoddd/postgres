@@ -757,7 +757,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	DefElem    *icurulesEl = NULL;
 	DefElem    *locproviderEl = NULL;
 	DefElem    *istemplateEl = NULL;
-	DefElem    *versionedEl = NULL;
 	DefElem    *allowconnectionsEl = NULL;
 	DefElem    *connlimitEl = NULL;
 	DefElem    *collversionEl = NULL;
@@ -776,7 +775,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	bool		dballowconnections = true;
 	int			dbconnlimit = DATCONNLIMIT_UNLIMITED;
 	char	   *dbcollversion = NULL;
-	bool		dbversioned;
 	int			notherbackends;
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
@@ -864,12 +862,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			if (istemplateEl)
 				errorConflictingDefElem(defel, pstate);
 			istemplateEl = defel;
-		}
-		else if (strcmp(defel->defname, "versioned") == 0)
-		{
-			if (versionedEl)
-				errorConflictingDefElem(defel, pstate);
-			versionedEl = defel;
 		}
 		else if (strcmp(defel->defname, "allow_connections") == 0)
 		{
@@ -1055,20 +1047,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("template database \"%s\" does not exist",
 						dbtemplate)));
-
-	/* Versioned if asked, else as the template is. */
-	if (versionedEl && versionedEl->arg)
-		dbversioned = defGetBoolean(versionedEl);
-	else
-	{
-		HeapTuple	srctup = SearchSysCache1(DATABASEOID,
-											 ObjectIdGetDatum(src_dboid));
-
-		if (!HeapTupleIsValid(srctup))
-			elog(ERROR, "cache lookup failed for database %u", src_dboid);
-		dbversioned = ((Form_pg_database) GETSTRUCT(srctup))->datversioned;
-		ReleaseSysCache(srctup);
-	}
 
 	/*
 	 * If the source database was in the process of being dropped, we can't
@@ -1547,7 +1525,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	new_record[Anum_pg_database_datistemplate - 1] = BoolGetDatum(dbistemplate);
 	new_record[Anum_pg_database_datallowconn - 1] = BoolGetDatum(dballowconnections);
 	new_record[Anum_pg_database_dathasloginevt - 1] = BoolGetDatum(src_hasloginevt);
-	new_record[Anum_pg_database_datversioned - 1] = BoolGetDatum(dbversioned);
 	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(dbconnlimit);
 	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
 	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
@@ -1636,10 +1613,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
 										dst_deftablespace);
 
-		/*
-		 * Prolly tables are found from branch heads outside the files, and
-		 * its chunk store is files no catalog lists.
-		 */
+		/* The chunk store is files no catalog lists. */
 		ProllyCopyDatabase(src_dboid, src_deftablespace, dboid,
 						   dst_deftablespace);
 
@@ -1973,9 +1947,6 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Remove all tablespace subdirs belonging to the database.
 	 */
 	remove_dbtablespaces(db_id);
-
-	/* And the branch heads its prolly tables are found from. */
-	ProllyDropDatabase(db_id);
 
 	/*
 	 * Close pg_database, but keep lock till commit.

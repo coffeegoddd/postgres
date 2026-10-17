@@ -12940,25 +12940,6 @@ dynamic_library_path = '/usr/local/lib/postgresql:$libdir'
        </para>
       </listitem>
      </varlistentry>
-     <varlistentry id="guc-debug-prolly-max-branch-heads" xreflabel="debug_prolly_max_branch_heads">
-      <term><varname>debug_prolly_max_branch_heads</varname> (<type>integer</type>)
-      <indexterm>
-       <primary><varname>debug_prolly_max_branch_heads</varname> configuration parameter</primary>
-      </indexterm>
-      </term>
-      <listitem>
-       <para>
-        If set to a positive value, the cluster holds at most that many
-        prolly branch heads (one per branch with prolly data in each
-        database), when that is below the commit pipeline's own limit.  A
-        transaction that would need another one fails before it commits.
-        This is meant for testing what happens at the limit.  The default,
-        <literal>0</literal>, leaves the pipeline's limit in place.  This
-        parameter can only be set in the <filename>postgresql.conf</filename>
-        file or on the server command line.
-       </para>
-      </listitem>
-     </varlistentry>
 
      <varlistentry id="guc-debug-raw-expression-coverage-test" xreflabel="debug_raw_expression_coverage_test">
       <term><varname>debug_raw_expression_coverage_test</varname> (<type>boolean</type>)

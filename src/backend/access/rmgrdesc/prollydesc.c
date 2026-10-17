@@ -25,7 +25,7 @@ static const char *const type_names[] = {
 };
 
 static void
-generic_desc(StringInfo buf, XLogReaderState *record)
+chunks_desc(StringInfo buf, XLogReaderState *record)
 {
 	xl_prolly_header hdr;
 
@@ -40,55 +40,19 @@ generic_desc(StringInfo buf, XLogReaderState *record)
 }
 
 static const char *
-generic_identify(uint8 info)
+chunks_identify(uint8 info)
 {
 	return type_names[(info & PROLLY_XLOG_TYPE_MASK) >> 4];
 }
 
 void
-prolly_desc(StringInfo buf, XLogReaderState *record)
-{
-	generic_desc(buf, record);
-}
-
-const char *
-prolly_identify(uint8 info)
-{
-	return generic_identify(info);
-}
-
-void
-prolly_store_desc(StringInfo buf, XLogReaderState *record)
-{
-	generic_desc(buf, record);
-}
-
-const char *
-prolly_store_identify(uint8 info)
-{
-	return generic_identify(info);
-}
-
-void
-prolly_commit_desc(StringInfo buf, XLogReaderState *record)
-{
-	generic_desc(buf, record);
-}
-
-const char *
-prolly_commit_identify(uint8 info)
-{
-	return generic_identify(info);
-}
-
-void
 prolly_chunks_desc(StringInfo buf, XLogReaderState *record)
 {
-	generic_desc(buf, record);
+	chunks_desc(buf, record);
 }
 
 const char *
 prolly_chunks_identify(uint8 info)
 {
-	return generic_identify(info);
+	return chunks_identify(info);
 }

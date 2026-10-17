@@ -2029,12 +2029,4 @@
 { amprocfamily => 'brin/box_inclusion_ops', amproclefttype => 'box',
   amprocrighttype => 'box', amprocnum => '13', amproc => 'box_contain' },
 
-# prolly index support functions (same as btree)
-{ amprocfamily => 'prolly_d1_index/int4_ops', amproclefttype => 'int4',
-  amprocrighttype => 'int4', amprocnum => '1', amproc => 'btint4cmp' },
-{ amprocfamily => 'prolly_d1_index/int8_ops', amproclefttype => 'int8',
-  amprocrighttype => 'int8', amprocnum => '1', amproc => 'btint8cmp' },
-{ amprocfamily => 'prolly_d1_index/text_ops', amproclefttype => 'text',
-  amprocrighttype => 'text', amprocnum => '1', amproc => 'bttextcmp' },
-
 ]

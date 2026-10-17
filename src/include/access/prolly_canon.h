@@ -12,14 +12,6 @@
  * trees (which are canonical as written).
  *
  * Contract:
- * - prepare() makes every table's rows canonical, as writes of the current
- *   transaction: rows stored before a column was dropped, or added with a
- *   default, are rewritten.  The caller then takes the working set the
- *   transaction will commit (the engine's pending_root).
- * - canonical_root() builds the canonical root of a working set: the same
- *   for the same logical content in any database or cluster.  An object
- *   it doesn't cover yet is an error, never a hash that might depend on
- *   history.
  * - walk() visits every node a canonical root keeps alive, for
  *   reclamation and transfer; a root the visitor declines isn't looked
  *   into (the trees it names are taken as seen), as a tree's node isn't.
@@ -90,9 +82,6 @@ typedef struct ProllyCanonRoutine
 {
 	ProllyImplInfo info;
 
-	void		(*prepare) (void);
-	void		(*canonical_root) (const ProllyNodeRef *working_set,
-								   ProllyNodeRef *root);
 	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
 						 void *arg);
 	void		(*fold) (const ProllyNodeRef *baseline, ProllyNodeRef *root,
@@ -145,11 +134,11 @@ typedef struct ProllyCanonRoutine
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
-	"prepare", "canonical_root", "walk", "fold", "tables", \
+	"walk", "fold", "tables", \
 	"materialized_views", "same_schema", "move_schema", "sequences", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
 	"in_format", "format"
-#define PROLLY_CANON_FIRST_CALLBACK prepare
+#define PROLLY_CANON_FIRST_CALLBACK walk
 #define PROLLY_CANON_LAST_CALLBACK format
 
 /*

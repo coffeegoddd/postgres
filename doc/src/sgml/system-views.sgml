@@ -1829,12 +1829,8 @@ AND c1.path[c2.level] = c2.path[c2.level];
        <literal>spectoken</literal>,
        <literal>object</literal>,
        <literal>userlock</literal>,
-       <literal>advisory</literal>,
-       <literal>applytransaction</literal>,
-       <literal>prollybranch</literal>,
-       <literal>prollytable</literal>,
-       <literal>prollyrow</literal>, or
-       <literal>prollystore</literal>.
+       <literal>advisory</literal>, or
+       <literal>applytransaction</literal>.
        (See also <xref linkend="wait-event-lock-table"/>.)
       </para></entry>
      </row>

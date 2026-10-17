@@ -5,12 +5,13 @@
  *
  * A tree is an immutable, sorted map from keys to values, identified by its
  * root node.  Operations never change a tree; apply() returns a new root
- * that shares every unchanged node with the old one.  Engines build their
- * tables, indexes and root sets from trees; diff and merge work on them.
+ * that shares every unchanged node with the old one.  A commit's tables
+ * are folded into trees, and its canonical root is one; diff and merge work
+ * on them.
  *
- * A tree is made of the foundation components in a ProllyTreeEnv, which the
- * caller (an engine) fills in from its configuration: node format, chunker,
- * content hash, node store and log, plus the key order.
+ * A tree is made of the components in a ProllyTreeEnv, which the caller
+ * fills in: chunk format, chunker, content hash and chunk store, plus the
+ * key order.
  *
  * Contract:
  * - History independence: the root hash depends only on the tree's items
@@ -23,18 +24,14 @@
  *   strictly increasing order; apply() takes edits sorted by key with no
  *   duplicate keys.  Deleting an absent key does nothing; putting an
  *   existing key replaces its value.
- * - Nodes are pages in a node store, or chunks in a chunk store (when
- *   env->chunk_store is set).  New pages are WAL-logged through env->log
- *   before they are published in env->node_store; new chunks are put in
- *   the chunk store, which logs them.  Either way a published node
- *   survives a crash.
+ * - Nodes are chunks in a chunk store, which logs new ones, so a node put
+ *   there survives a crash.
  * - Keys and values returned by a cursor stay valid until the next call on
- *   it, or until it is closed.  Cursors and other operations hold buffer
- *   pins only while they run; nodes are immutable, so they take no locks
- *   beyond the buffer content locks needed to read a page.
+ *   it, or until it is closed.  Nodes are immutable, so reading them takes
+ *   no locks.
  * - Errors are raised with ereport(); an item too large for a node is an
  *   error (large values go out of line, in a later step).
- * - If env->counters is set, every node an operation reads from the node
+ * - If env->counters is set, every node an operation reads from the chunk
  *   store adds one to nodes_read, and every node it writes (not one the
  *   store already had) one to nodes_written, so callers can check an
  *   operation's cost by counting.
@@ -52,9 +49,6 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
-#include "access/prolly_log.h"
-#include "access/prolly_nodeformat.h"
-#include "access/prolly_nodestore.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "access/sdir.h"
@@ -80,21 +74,11 @@ prolly_bytes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 /* What a tree is made of; filled in by the caller. */
 typedef struct ProllyTreeEnv
 {
-	const ProllyNodeFormatRoutine *node_format;
 	const ProllyChunkerRoutine *chunker;
 	const ProllyHashRoutine *hash;
-	const ProllyNodeStoreRoutine *node_store;
-	ProllyNodeStore *store;		/* opened by the caller */
-	const ProllyLogRoutine *log;
 	ProllyKeyCompare compare;
 	void	   *compare_arg;
 	ProllyNodeCounters *counters;	/* optional */
-
-	/*
-	 * Nodes kept as chunks of their own length in a chunk store, instead of
-	 * pages: then these are set, and node_format, node_store, store and log
-	 * are unused.
-	 */
 	const ProllyChunkFormatRoutine *chunk_format;
 	const ProllyChunkStoreRoutine *chunk_store;
 	ProllyChunkStore *chunks;	/* opened by the caller */

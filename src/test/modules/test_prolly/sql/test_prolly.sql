@@ -16,7 +16,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
-SELECT * FROM prolly_conformance('engine', 'd1');
+SELECT * FROM prolly_conformance('tree', 'cow');
 SELECT * FROM prolly_conformance('content_hash');
 SELECT * FROM prolly_conformance('no_such_interface');
 

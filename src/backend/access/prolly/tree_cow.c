@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * tree_cow.c
- *	  Tree implementation "cow": copy-on-write prolly trees in a node store.
+ *	  Tree implementation "cow": copy-on-write prolly trees in a chunk store.
  *
  * Layout.  Leaves (level 0) hold the tree's items.  An internal item's key
  * is the largest key in its child's subtree, and its value is the child's
@@ -9,16 +9,9 @@
  *
  *	uint8 hash length, hash, varint item count of the subtree
  *
- * The child's block number is the node format's unhashed hint.  Each node's
- * special space caches its own hash (length byte, then the hash), so a read
- * through a hint can check that it found the right node and fall back to
- * the node store's hash lookup if not.
- *
- * Storage.  Nodes are pages in a node store, or, in a tree whose
- * environment names a chunk store, chunks of their own length there
- * (prolly_chunkformat.h): all of a chunk is canonical, so it has no hints
- * or cached hash, and a node is found by its hash alone.  Only the node
- * layer below (reading, items, children, writing, capacity) knows which.
+ * Storage.  Nodes are chunks of their own length in a chunk store
+ * (prolly_chunkformat.h): all of a chunk is canonical, and a node is found
+ * by its hash alone.
  *
  * Shape.  Each level's items are cut into nodes by the chunker.  The root
  * is the first level, counting up from the leaves, that has exactly one
@@ -50,7 +43,7 @@
  *
  *	uint8 hash length, hash of the value tree's root, varint value length
  *
- * with the node format's PROLLY_ITEM_VALUE_REF flag.  Every read (get,
+ * with the chunk format's PROLLY_ITEM_VALUE_REF flag.  Every read (get,
  * cursors, diff) returns the bytes; walks visit the value trees too.  The
  * limits and the rolling hash are part of the canonical format.
  *
@@ -74,7 +67,6 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "utils/memutils.h"
 
 #define COW_IMPL_ID		1
@@ -90,25 +82,17 @@
 
 typedef struct TNode
 {
-	Buffer		buf;			/* pinned; InvalidBuffer if none */
-	Page		page;
-	ProllyChunkNode chunk;		/* a chunk node: its bytes (ours) */
+	ProllyChunkNode chunk;		/* its bytes (ours); data NULL if none */
 	uint16		level;
 	int			nitems;
 	ProllyNodeRef ref;
 } TNode;
 
-static inline bool
-in_chunks(const ProllyTreeEnv *env)
-{
-	return env->chunk_store != NULL;
-}
-
-/* Does the node hold a node read (a page pinned, or a chunk's bytes)? */
+/* Does the node hold a node read? */
 static inline bool
 node_loaded(const TNode *node)
 {
-	return BufferIsValid(node->buf) || node->chunk.data != NULL;
+	return node->chunk.data != NULL;
 }
 
 /*
@@ -136,68 +120,18 @@ chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("prolly chunk is not a tree node")));
-	node->buf = InvalidBuffer;
-	node->page = NULL;
 	node->level = node->chunk.level;
 	node->nitems = node->chunk.nitems;
 	node->ref = *ref;
-	node->ref.location.blkno = InvalidBlockNumber;
 }
 
-static void
-check_cached_hash(const ProllyTreeEnv *env, Page page, const ProllyHash *hash,
-				  bool *ok)
-{
-	Size		len;
-	const uint8 *special = (const uint8 *)
-		PROLLY_CALL(env->node_format, special_space, page, &len);
-
-	*ok = len > hash->len && special[0] == hash->len &&
-		memcmp(special + 1, hash->bytes, hash->len) == 0;
-}
-
-/* Read a node, its chunk's bytes (if it is one) in cxt. */
+/* Read a node, its chunk's bytes in cxt. */
 static void
 node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 			 MemoryContext cxt)
 {
-	ProllyNodeRef r = *ref;
-
 	node->chunk.data = NULL;
-	if (in_chunks(env))
-	{
-		chunk_node_read(env, ref, node, cxt);
-		return;
-	}
-	for (;;)
-	{
-		Buffer		buf = PROLLY_CALL(env->node_store, read, env->store, &r);
-		bool		ok;
-
-		if (env->counters)
-			env->counters->nodes_read++;
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		check_cached_hash(env, BufferGetPage(buf), &r.hash, &ok);
-		if (ok)
-		{
-			/* Published nodes never change: keep the pin, drop the lock. */
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			node->buf = buf;
-			node->page = BufferGetPage(buf);
-			node->level = PROLLY_CALL(env->node_format, page_level, node->page);
-			node->nitems = PROLLY_CALL(env->node_format, item_count, node->page);
-			node->ref = r;
-			node->ref.location.blkno = BufferGetBlockNumber(buf);
-			return;
-		}
-		UnlockReleaseBuffer(buf);
-		if (!BlockNumberIsValid(r.location.blkno))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly node read by hash does not have that hash")));
-		/* A stale hint: look the node up by hash instead. */
-		r.location.blkno = InvalidBlockNumber;
-	}
+	chunk_node_read(env, ref, node, cxt);
 }
 
 /* Read a node kept no longer than the current context. */
@@ -210,9 +144,6 @@ node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 static void
 node_release(TNode *node)
 {
-	if (BufferIsValid(node->buf))
-		ReleaseBuffer(node->buf);
-	node->buf = InvalidBuffer;
 	if (node->chunk.data != NULL)
 		pfree((void *) node->chunk.data);
 	node->chunk.data = NULL;
@@ -222,12 +153,8 @@ static void
 node_item(const ProllyTreeEnv *env, const TNode *node, int i, ProllyKey *key,
 		  ProllyValue *value, uint8 *flags)
 {
-	if (in_chunks(env))
-		PROLLY_CALL(env->chunk_format, item_get, &node->chunk, i, key, value,
-					flags);
-	else
-		PROLLY_CALL(env->node_format, item_get, node->page, i, key, value,
-					flags);
+	PROLLY_CALL(env->chunk_format, item_get, &node->chunk, i, key, value,
+				flags);
 }
 
 static void
@@ -256,7 +183,7 @@ decode_child(const ProllyValue *value, ProllyHash *hash, uint64 *count)
 	*count = prolly_get_varint(&p, end);
 }
 
-/* The reference (with hint) and item count of internal item i's child. */
+/* The reference and item count of internal item i's child. */
 static void
 node_child(const ProllyTreeEnv *env, const TNode *node, int i,
 		   ProllyNodeRef *ref, uint64 *count)
@@ -268,8 +195,6 @@ node_child(const ProllyTreeEnv *env, const TNode *node, int i,
 	node_item(env, node, i, &key, &value, NULL);
 	memset(ref, 0, sizeof(*ref));
 	decode_child(&value, &ref->hash, count);
-	ref->location.blkno = in_chunks(env) ? InvalidBlockNumber :
-		PROLLY_CALL(env->node_format, item_hint, node->page, i);
 }
 
 static int
@@ -330,15 +255,13 @@ typedef struct Item
 {
 	ProllyKey	key;
 	ProllyValue value;
-	BlockNumber hint;			/* internal items: child's block */
 	uint64		count;			/* internal items: child's item count */
 	bool		ref;			/* leaf items: the value is a value tree's */
 } Item;
 
-/* A chunk node, put in the chunk store unless it has it. */
 static void
-write_chunk_node(const ProllyTreeEnv *env, uint16 level, const Item *items,
-				 int n, ProllyNodeRef *ref, uint64 *count)
+write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
+		   ProllyNodeRef *ref, uint64 *count)
 {
 	ProllyKey  *keys = palloc(sizeof(ProllyKey) * Max(n, 1));
 	ProllyValue *values = palloc(sizeof(ProllyValue) * Max(n, 1));
@@ -358,7 +281,6 @@ write_chunk_node(const ProllyTreeEnv *env, uint16 level, const Item *items,
 	PROLLY_CALL(env->chunk_format, encode, level, n, keys, values, flags, &chunk);
 
 	memset(ref, 0, sizeof(*ref));
-	ref->location.blkno = InvalidBlockNumber;
 	hctx = PROLLY_CALL(env->hash, begin, CurrentMemoryContext);
 	PROLLY_CALL(env->hash, update, hctx, (const uint8 *) chunk.data, chunk.len);
 	PROLLY_CALL(env->hash, finish, hctx, &ref->hash);
@@ -375,86 +297,10 @@ write_chunk_node(const ProllyTreeEnv *env, uint16 level, const Item *items,
 	pfree(flags);
 }
 
-static void
-write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
-		   ProllyNodeRef *ref, uint64 *count)
-{
-	Page		page;
-	const uint8 *canon;
-	Size		canon_len;
-	ProllyHashCtx *hctx;
-	ProllyHash	hash;
-	uint8	   *special;
-	Size		special_len;
-
-	if (in_chunks(env))
-	{
-		write_chunk_node(env, level, items, n, ref, count);
-		return;
-	}
-	page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
-
-	PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, level);
-	*count = 0;
-	for (int i = 0; i < n; i++)
-	{
-		if (!PROLLY_CALL(env->node_format, item_append, page, &items[i].key,
-						 &items[i].value, items[i].hint,
-						 items[i].ref ? PROLLY_ITEM_VALUE_REF : 0))
-			elog(ERROR, "prolly node overflow at level %u (item %d of %d)",
-				 level, i, n);
-		*count += level == 0 ? 1 : items[i].count;
-	}
-
-	PROLLY_CALL(env->node_format, canonical_bytes, page, &canon, &canon_len);
-	hctx = PROLLY_CALL(env->hash, begin, CurrentMemoryContext);
-	PROLLY_CALL(env->hash, update, hctx, canon, canon_len);
-	PROLLY_CALL(env->hash, finish, hctx, &hash);
-
-	special = (uint8 *) PROLLY_CALL(env->node_format, special_space, page,
-									&special_len);
-	if (special_len <= hash.len)
-		elog(ERROR, "prolly node special space too small for its hash");
-	special[0] = hash.len;
-	memcpy(special + 1, hash.bytes, hash.len);
-
-	memset(ref, 0, sizeof(*ref));
-	ref->hash = hash;
-	/* A node the store already has is reused where it is, unread. */
-	if (!PROLLY_CALL(env->node_store, contains, env->store, &hash,
-					 &ref->location))
-	{
-		ProllyNodeRef newref;
-		Buffer		buf = PROLLY_CALL(env->node_store, new_node, env->store, &newref);
-
-		if (env->counters)
-			env->counters->nodes_written++;
-		START_CRIT_SECTION();
-		memcpy(BufferGetPage(buf), page, BLCKSZ);
-		MarkBufferDirty(buf);
-		PROLLY_CALL(env->log, log_node, NULL, buf, true);
-		END_CRIT_SECTION();
-		PROLLY_CALL(env->node_store, publish, env->store, buf, &hash, &newref);
-		UnlockReleaseBuffer(buf);
-		*ref = newref;
-	}
-	pfree(page);
-}
-
 static Size
 level_capacity(const ProllyTreeEnv *env, uint16 level)
 {
-	Page		page;
-	Size		capacity;
-
-	if (in_chunks(env))
-		return CHUNK_NODE_MAX - PROLLY_CALL(env->chunk_format, header_size);
-	page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
-
-	PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, level);
-	capacity = PROLLY_CALL(env->node_format, free_space, page);
-	pfree(page);
-	return capacity;
+	return CHUNK_NODE_MAX - PROLLY_CALL(env->chunk_format, header_size);
 }
 
 /* ------------------------------------------------------------------------
@@ -540,7 +386,6 @@ decode_value_ref(const ProllyValue *value, ProllyNodeRef *root, uint64 *len)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid prolly value reference")));
 	memset(root, 0, sizeof(*root));
-	root->location.blkno = InvalidBlockNumber;
 	root->hash.len = (uint8) p[0];
 	memcpy(root->hash.bytes, p + 1, root->hash.len);
 	p += 1 + root->hash.len;
@@ -594,7 +439,6 @@ write_value_tree(const ProllyTreeEnv *env, const ProllyValue *value,
 			item.key.len = 8;
 			item.value.data = value->data + start;
 			item.value.len = n;
-			item.hint = InvalidBlockNumber;
 			item.count = 1;
 			item.ref = false;
 			builder_add_at(b, 0, &item);
@@ -640,7 +484,6 @@ leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
 		  const ProllyValue *value, Item *item, StringInfo refbuf)
 {
 	item->key = *key;
-	item->hint = InvalidBlockNumber;
 	item->count = 1;
 	item->ref = value->len > VALUE_INLINE_MAX;
 	if (item->ref)
@@ -739,11 +582,8 @@ levelbuf_append(LevelBuf *lb, const Item *item)
 static void
 levelbuf_add(LevelBuf *lb, const Item *item)
 {
-	Size		space = in_chunks(lb->env) ?
-		PROLLY_CALL(lb->env->chunk_format, item_space, lb->level, &item->key,
-					&item->value) :
-		PROLLY_CALL(lb->env->node_format, item_space, lb->level, &item->key,
-					&item->value);
+	Size		space = PROLLY_CALL(lb->env->chunk_format, item_space, lb->level,
+									&item->key, &item->value);
 	ProllyChunkDecision d;
 
 	if (space > lb->capacity)
@@ -808,7 +648,6 @@ builder_emit(void *arg, uint16 level, const ProllyKey *maxkey,
 	parent.key = *maxkey;
 	parent.value.data = (const uint8 *) child.data;
 	parent.value.len = child.len;
-	parent.hint = ref->location.blkno;
 	parent.count = count;
 	parent.ref = false;
 	builder_add_at(b, level + 1, &parent);
@@ -945,8 +784,6 @@ iter_open(Iter *it, const ProllyTreeEnv *env, const ProllyNodeRef *root,
 	it->env = env;
 	it->cxt = CurrentMemoryContext;
 	it->root = *root;
-	for (int i = 0; i < MAX_LEVELS; i++)
-		it->f[i].node.buf = InvalidBuffer;
 	node_read_in(env, root, &it->f[0].node, it->cxt);
 	if (level > it->f[0].node.level)
 		elog(ERROR, "prolly tree has no level %u", level);
@@ -1064,7 +901,7 @@ iter_frame(Iter *it)
 	return &it->f[it->target];
 }
 
-/* The current target-level item, as an Item (hint and count filled in). */
+/* The current target-level item, as an Item (count filled in). */
 static void
 iter_item(Iter *it, Item *item)
 {
@@ -1075,16 +912,12 @@ iter_item(Iter *it, Item *item)
 	node_item(it->env, &fr->node, fr->idx, &item->key, &item->value, &flags);
 	item->ref = (flags & PROLLY_ITEM_VALUE_REF) != 0;
 	if (fr->node.level == 0)
-	{
-		item->hint = InvalidBlockNumber;
 		item->count = 1;
-	}
 	else
 	{
 		ProllyNodeRef ref;
 
 		node_child(it->env, &fr->node, fr->idx, &ref, &item->count);
-		item->hint = ref.location.blkno;
 	}
 }
 
@@ -1383,7 +1216,7 @@ cow_cursor_close(ProllyTreeCursor *c)
  * ------------------------------------------------------------------------
  */
 
-/* An edit at some level: a put (with hint and count at internal levels). */
+/* An edit at some level: a put (with count at internal levels). */
 typedef struct LevelEdit
 {
 	Item		item;
@@ -1478,7 +1311,6 @@ parent_put(EditList *out, const WindowNode *n)
 	e.item.key = n->maxkey;
 	e.item.value.data = (const uint8 *) child.data;
 	e.item.value.len = child.len;
-	e.item.hint = n->ref.location.blkno;
 	e.item.count = n->count;
 	e.item.ref = false;
 	e.is_delete = false;

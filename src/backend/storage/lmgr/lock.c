@@ -1139,13 +1139,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	 * If lock requested conflicts with locks requested by waiters, must join
 	 * wait queue.  Otherwise, check for conflict with already-held locks.
 	 * (That's last because most complex check.)
-	 *
-	 * A prolly row lock behaves as heap's tuple locks do: a locker waits only
-	 * for the holders it conflicts with, not behind other waiters (FOR KEY
-	 * SHARE gets a row a FOR UPDATE is waiting for, if its holders allow).
 	 */
-	if ((lockMethodTable->conflictTab[lockmode] & lock->waitMask) &&
-		locktag->locktag_type != LOCKTAG_PROLLY_ROW)
+	if (lockMethodTable->conflictTab[lockmode] & lock->waitMask)
 		found_conflict = true;
 	else
 		found_conflict = LockCheckConflicts(lockMethodTable, lockmode,

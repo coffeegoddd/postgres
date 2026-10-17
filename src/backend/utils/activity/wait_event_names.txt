@@ -372,7 +372,6 @@ LogicalDecodingControl	"Waiting to read or update logical decoding status inform
 DataChecksumsWorker	"Waiting for data checksums worker."
 AioWorkerControl	"Waiting to update AIO worker information."
 DataChecksumTransition	"Waiting for a data checksum state transition to be written to WAL."
-ProllyHeads	"Waiting to read or update prolly branch heads."
 ProllyJournal	"Waiting to append to a prolly chunk journal."
 
 #
@@ -445,9 +444,5 @@ object	"Waiting to acquire a lock on a non-relation database object."
 userlock	"Waiting to acquire a user lock."
 advisory	"Waiting to acquire an advisory user lock."
 applytransaction	"Waiting to acquire a lock on a remote transaction being applied by a logical replication subscriber."
-prollybranch	"Waiting to commit to a prolly branch."
-prollytable	"Waiting to write to a prolly table."
-prollyrow	"Waiting to lock a row of a prolly table."
-prollystore	"Waiting to write to, or reclaim, the prolly node store."
 
 # No "ABI_compatibility" region here as WaitEventLock has its own C code.

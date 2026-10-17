@@ -43,7 +43,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
-
+#include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"

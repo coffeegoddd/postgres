@@ -11697,7 +11697,6 @@ createdb_opt_name:
 			| OWNER							{ $$ = pstrdup($1); }
 			| TABLESPACE					{ $$ = pstrdup($1); }
 			| TEMPLATE						{ $$ = pstrdup($1); }
-			| VERSIONED						{ $$ = pstrdup($1); }
 		;
 
 /*

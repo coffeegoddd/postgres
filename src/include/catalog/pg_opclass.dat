@@ -493,12 +493,4 @@
 
 # no brin opclass for the geometric types except box
 
-# prolly index operator classes
-{ opcmethod => 'prolly_d1_index', opcname => 'int4_ops', opcfamily => 'prolly_d1_index/int4_ops',
-  opcintype => 'int4' },
-{ opcmethod => 'prolly_d1_index', opcname => 'int8_ops', opcfamily => 'prolly_d1_index/int8_ops',
-  opcintype => 'int8' },
-{ opcmethod => 'prolly_d1_index', opcname => 'text_ops', opcfamily => 'prolly_d1_index/text_ops',
-  opcintype => 'text' },
-
 ]

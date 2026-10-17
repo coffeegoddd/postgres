@@ -187,7 +187,7 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 	HTAB	   *seen;
 	HASHCTL		ctl;
 
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
@@ -262,7 +262,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	rv.received = hash_create("prolly chunks received", 1024, &ctl,
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	rv.spool = BufFileCreateTemp(false);
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 
 	/* (one the store has is taken as checked, and all it reaches) */
 	walk = palloc0(sizeof(bool) * Max(ncommits, 1));
@@ -358,7 +358,7 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	ctl.hcxt = CurrentMemoryContext;
 	sd.seen = hash_create("prolly chunks sent", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	for (int i = 0; i < ncommits; i++)
 		PROLLY_CALL(dc.refs, walk_commit, &commits[i], send_visit, &sd);
 	sd.next = list_head(sd.order);

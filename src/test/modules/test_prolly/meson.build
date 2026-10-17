@@ -6,11 +6,9 @@ test_prolly_sources = files(
   'branch_checks.c',
   'chunkstore_checks.c',
   'catalog_checks.c',
-  'engine_checks.c',
   'foundation_checks.c',
-  'storage_checks.c',
+  'keying_checks.c',
   'tree_checks.c',
-  'rootlayout_checks.c',
   'test_prolly.c',
 )
 

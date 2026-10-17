@@ -23,7 +23,6 @@
 
 #include <unistd.h>
 
-#include "access/prolly_tableam.h"
 #include "access/amapi.h"
 #include "access/attmap.h"
 #include "access/heapam.h"
@@ -2377,10 +2376,7 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 * Schedule physical removal of the files (if any)
 	 */
 	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind))
-	{
-		prolly_drop_relation(userIndexRelation);
 		RelationDropStorage(userIndexRelation);
-	}
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(userIndexRelation);

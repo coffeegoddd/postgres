@@ -52,9 +52,9 @@ typedef struct ProllyReclaimRoutine
 						BufferAccessStrategy bstrategy);
 
 	/*
-	 * Reclaim every node of the cluster's node store that no live root
-	 * reaches (prolly_gc()).  Waits for, and holds off, every transaction
-	 * that writes nodes, until the current transaction ends.
+	 * Reclaim every node of the store that no live root reaches.  Waits
+	 * for, and holds off, every transaction that writes nodes, until the
+	 * current transaction ends.
 	 */
 	void		(*collect) (ProllyGcResult *result);
 } ProllyReclaimRoutine;

@@ -294,7 +294,6 @@ test_refs_walk_reaches(PG_FUNCTION_ARGS)
 	text_hash(PG_GETARG_TEXT_PP(0), &r.target);
 	memset(&refs, 0, sizeof(refs));
 	PROLLY_CALL(cs(), root, store(), &refs.hash);
-	refs.location.blkno = InvalidBlockNumber;
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.refs, walk, &refs, reaches_node, &r);
 	PG_RETURN_BOOL(r.found);
@@ -334,7 +333,6 @@ test_refs_walk_count(PG_FUNCTION_ARGS)
 		text_hash(PG_GETARG_TEXT_PP(0), &d.declined);
 	memset(&refs, 0, sizeof(refs));
 	PROLLY_CALL(cs(), root, store(), &refs.hash);
-	refs.location.blkno = InvalidBlockNumber;
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.refs, walk, &refs, count_node, &d);
 	PG_RETURN_INT64(d.visited);
@@ -490,17 +488,6 @@ test_commit_with(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&id));
 }
 
-/* test_refs_epoch(): the session's refs' epoch */
-PG_FUNCTION_INFO_V1(test_refs_epoch);
-Datum
-test_refs_epoch(PG_FUNCTION_ARGS)
-{
-	ProllyDatabaseComponents dc;
-
-	prolly_database_components(&dc);
-	PG_RETURN_INT64((int64) PROLLY_CALL(dc.refs, epoch));
-}
-
 /* test_refs_set_head(ref): make ref's commit the session branch's head */
 PG_FUNCTION_INFO_V1(test_refs_set_head);
 Datum
@@ -534,7 +521,6 @@ test_refs_value(PG_FUNCTION_ARGS)
 	prolly_folded_tree_env(&env);
 	memset(&refs, 0, sizeof(refs));
 	PROLLY_CALL(cs(), root, store(), &refs.hash);
-	refs.location.blkno = InvalidBlockNumber;
 	initStringInfo(&v);
 	if (refs.hash.len == 0 || !PROLLY_CALL(tree, get, &env, &refs, &k, &v))
 		PG_RETURN_NULL();
@@ -625,7 +611,6 @@ test_root_without_format(PG_FUNCTION_ARGS)
 	prolly_folded_tree_env(&env);
 	memset(&root, 0, sizeof(root));
 	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
-	root.location.blkno = InvalidBlockNumber;
 	memset(&e, 0, sizeof(e));
 	e.key.data = (const uint8 *) "!:format";
 	e.key.len = 8;

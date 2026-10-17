@@ -1164,7 +1164,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 		MyDatabaseTableSpace = datform->dattablespace;
 		MyDatabaseHasLoginEventTriggers = datform->dathasloginevt;
-		MyDatabaseVersioned = datform->datversioned;
 		/* pass the database name back to the caller */
 		if (out_dbname)
 			strcpy(out_dbname, dbname);
@@ -1297,12 +1296,12 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/*
 	 * Prolly's session state, and the branch the connection asked for: a
-	 * row of pg_branch if there is one by that name, else a branch of the
-	 * database's prolly_d1 tables.
+	 * row of pg_branch if there is one by that name, else a branch with
+	 * only a head, checked out once the backend is ready.
 	 */
 	if (!bootstrap)
 	{
-		if (connect_branch != NULL && !MyDatabaseVersioned &&
+		if (connect_branch != NULL &&
 			branch_session_init(connect_branch))
 			connect_branch = NULL;
 		prolly_session_init(connect_branch);

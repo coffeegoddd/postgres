@@ -535,32 +535,3 @@ branch_ops(void)
 {
 	return &branch_copies;
 }
-
-bool
-database_uses_branch_copies(void)
-{
-	Relation	brel;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	bool		more = false;
-
-	if (MyDatabaseVersioned)
-		return false;
-	if (database_has_versioned_schemas())
-		return true;
-
-	/* a branch besides main, even if the session's has no versioned schema */
-	brel = table_open(BranchRelationId, AccessShareLock);
-	scan = systable_beginscan(brel, InvalidOid, false, NULL, 0, NULL);
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		if (((Form_pg_branch) GETSTRUCT(tup))->oid != BRANCH_MAIN_OID)
-		{
-			more = true;
-			break;
-		}
-	}
-	systable_endscan(scan);
-	table_close(brel, AccessShareLock);
-	return more;
-}

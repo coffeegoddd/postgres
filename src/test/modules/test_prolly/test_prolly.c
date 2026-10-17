@@ -29,17 +29,11 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
-#include "access/prolly_commit.h"
-#include "access/xact.h"
-#include "utils/snapmgr.h"
 #include "access/prolly_config.h"
-#include "common/hashfn.h"
-#include "access/relation.h"
+#include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
-#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -70,55 +64,6 @@ static void hash_incremental(const ProllyImplInfo *impl);
  * the interface headers' contracts.
  */
 static const ConformanceCase cases[] = {
-	/* engine */
-	{PROLLY_IFACE_ENGINE, "create_and_truncate",
-	"tree_create tree_truncate put cursor_open cursor_seek cursor_next cursor_close",
-	engine_create_and_truncate},
-	{PROLLY_IFACE_ENGINE, "read_empty_tree",
-	"tree_create roots_acquire roots_release cursor_open cursor_seek cursor_next cursor_close get",
-	engine_read_empty_tree},
-	{PROLLY_IFACE_ENGINE, "read_own_writes",
-	"tree_create put remove get cursor_open cursor_seek cursor_next cursor_close",
-	engine_read_own_writes},
-	{PROLLY_IFACE_ENGINE, "seek_sees_later_writes",
-	"tree_create put tree_reset cursor_open cursor_seek cursor_next cursor_close",
-	engine_seek_sees_later_writes},
-	{PROLLY_IFACE_ENGINE, "subxact_abort_discards_writes",
-	"tree_create put remove subxact_abort xact_abort cursor_open cursor_next",
-	engine_subxact_abort_discards_writes},
-	{PROLLY_IFACE_ENGINE, "commit_publishes_roots",
-	"put xact_precommit xact_commit roots_acquire", NULL},
-	{PROLLY_IFACE_ENGINE, "count_range_matches_scan",
-	"tree_create put count_range cursor_next", engine_count_range_matches_scan},
-	{PROLLY_IFACE_ENGINE, "canonical_root_independent_of_history",
-	"put remove xact_precommit canonical_root", NULL},
-	{PROLLY_IFACE_ENGINE, "export_chunks_closed_under_reachability",
-	"canonical_root export_chunks", NULL},
-
-	/* coordination */
-	{PROLLY_IFACE_COORDINATION, "lock_conflict_matrix", "lock_row", NULL},
-	{PROLLY_IFACE_COORDINATION, "wait_policies", "lock_row", NULL},
-	{PROLLY_IFACE_COORDINATION, "speculative_insertion",
-	"insert_intent insert_intent_complete", NULL},
-	{PROLLY_IFACE_COORDINATION, "commit_markers_until_horizon",
-	"lock_row xact_commit written_since prune_markers", NULL},
-	{PROLLY_IFACE_COORDINATION, "abort_releases_locks",
-	"lock_row xact_abort subxact_abort", NULL},
-	{PROLLY_IFACE_COORDINATION, "predicate_locks", "predicate_lock_range", NULL},
-
-	/* node format */
-	{PROLLY_IFACE_NODE_FORMAT, "items_round_trip",
-	"page_init item_append item_hint item_count item_get",
-	nodeformat_items_round_trip},
-	{PROLLY_IFACE_NODE_FORMAT, "level_round_trip", "page_init page_level item_count", nodeformat_level_round_trip},
-	{PROLLY_IFACE_NODE_FORMAT, "space_accounting",
-	"page_init item_space free_space item_append", nodeformat_space_accounting},
-	{PROLLY_IFACE_NODE_FORMAT, "canonical_bytes_depend_only_on_items",
-	"page_init item_append canonical_bytes special_space",
-	nodeformat_canonical_bytes},
-	{PROLLY_IFACE_NODE_FORMAT, "page_check_detects_corruption",
-	"page_init item_append page_check", nodeformat_page_check},
-
 	/* chunker */
 	{PROLLY_IFACE_CHUNKER, "deterministic", "begin add end", chunker_deterministic},
 	{PROLLY_IFACE_CHUNKER, "forced_split_respects_capacity", "begin add end",
@@ -173,56 +118,11 @@ static const ConformanceCase cases[] = {
 	"begin layout begin_layout reads_layout encode decode end",
 	valenc_decodes_earlier_layouts},
 
-	/* node store */
-	{PROLLY_IFACE_NODE_STORE, "new_publish_read",
-	"create open new_node publish read contains close",
-	nodestore_new_publish_read},
-	{PROLLY_IFACE_NODE_STORE, "many_nodes_findable",
-	"create open new_node publish read contains close", nodestore_many_nodes},
-	{PROLLY_IFACE_NODE_STORE, "release_frees",
-	"create open new_node publish release contains close",
-	nodestore_release_frees},
-
-	/* allocator */
-	{PROLLY_IFACE_ALLOCATOR, "no_overlapping_extents",
-	"open allocate free close", NULL},
-
 	/* reclamation */
 	{PROLLY_IFACE_RECLAMATION, "reachable_never_freed",
 	"node_created node_dropped root_retired run", NULL},
 	{PROLLY_IFACE_RECLAMATION, "in_place_only_when_private",
 	"may_modify_in_place", NULL},
-
-	/* log */
-	{PROLLY_IFACE_LOG, "commit_record", "log_commit", NULL},
-	{PROLLY_IFACE_LOG, "redo_restores_committed_root",
-	"log_node log_mutation log_commit redo startup cleanup", NULL},
-	{PROLLY_IFACE_LOG, "describes_records", "desc identify", NULL},
-
-	/* commit pipeline */
-	{PROLLY_IFACE_COMMIT_PIPELINE, "publishes_in_enqueue_order",
-	"branch_lock tip enqueue branch_unlock publish abandon head snapshot_head",
-	commit_publishes_in_enqueue_order},
-	{PROLLY_IFACE_COMMIT_PIPELINE, "survives_crash_and_replays",
-	"enqueue publish checkpoint redo", NULL},
-	{PROLLY_IFACE_COMMIT_PIPELINE, "copies_and_drops_databases",
-	"copy_database drop_database usage head checkpoint redo", NULL},
-
-	/* row identity */
-	{PROLLY_IFACE_ROW_IDENTITY, "assign_then_resolve",
-	"tid_assign scan_begin tid_find scan_end tid_resolve", rowid_assign_then_resolve},
-	{PROLLY_IFACE_ROW_IDENTITY, "rename_keeps_tid",
-	"tid_assign tid_rename tid_resolve scan_begin tid_find scan_end",
-	rowid_rename_keeps_tid},
-	{PROLLY_IFACE_ROW_IDENTITY, "find_sees_later_assign",
-	"scan_begin tid_find tid_assign scan_end", rowid_find_sees_later_assign},
-	{PROLLY_IFACE_ROW_IDENTITY, "renew_makes_new_version",
-	"tid_assign tid_renew tid_resolve scan_begin tid_find scan_end",
-	rowid_renew},
-	{PROLLY_IFACE_ROW_IDENTITY, "never_reused",
-	"tid_assign tid_retire tid_resolve scan_begin tid_find scan_end",
-	rowid_never_reused},
-	{PROLLY_IFACE_ROW_IDENTITY, "forget", "tid_assign tid_resolve tid_forget", NULL},
 
 	/* table keying */
 	{PROLLY_IFACE_TABLE_KEYING, "round_trip",
@@ -238,11 +138,6 @@ static const ConformanceCase cases[] = {
 	"open encode_row decode_row close", keying_owns_its_memory},
 	{PROLLY_IFACE_TABLE_KEYING, "cannot_compare_after_key_type_dropped",
 	"open describe can_compare close", keying_compare_after_type_dropped},
-
-	/* index keying */
-	{PROLLY_IFACE_INDEX_KEYING, "entries_and_bounds",
-	"open describe nkeys encode_entry decode_entry encode_bound compare columns_equal close",
-	ixkeying_entries},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",
@@ -300,22 +195,6 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_TREE, "large_values",
 	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff",
 	tree_large_values},
-
-	/* root layout */
-	{PROLLY_IFACE_ROOT_LAYOUT, "empty", "empty subroot lookup scan apply",
-	rootlayout_empty},
-	{PROLLY_IFACE_ROOT_LAYOUT, "apply_matches_reference",
-	"empty apply lookup scan", rootlayout_apply_matches_reference},
-	{PROLLY_IFACE_ROOT_LAYOUT, "history_independent",
-	"empty apply lookup scan", rootlayout_history_independent},
-	{PROLLY_IFACE_ROOT_LAYOUT, "subroots_independent",
-	"empty apply subroot", rootlayout_subroots_independent},
-	{PROLLY_IFACE_ROOT_LAYOUT, "diff_reports_changes",
-	"empty apply diff", rootlayout_diff_reports_changes},
-	{PROLLY_IFACE_ROOT_LAYOUT, "apply_rejects_invalid_refs",
-	"empty apply lookup", rootlayout_apply_rejects_invalid_refs},
-	{PROLLY_IFACE_ROOT_LAYOUT, "walk_reaches_trees",
-	"empty apply subroot walk", rootlayout_walk_reaches_trees},
 };
 
 /* ------------------------------------------------------------------------
@@ -531,15 +410,7 @@ run_body(ConformanceBody body, const ProllyImplInfo *impl)
 
 	PG_TRY();
 	{
-		/* tree checks run over pages, then over chunks */
-		tree_checks_in_chunks = false;
 		body(impl);
-		if (impl->iface == PROLLY_IFACE_TREE)
-		{
-			tree_checks_in_chunks = true;
-			body(impl);
-			tree_checks_in_chunks = false;
-		}
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
@@ -559,10 +430,7 @@ run_body(ConformanceBody body, const ProllyImplInfo *impl)
 		if (edata->sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED)
 			result = psprintf("not implemented (%s)", edata->message);
 		else
-			result = psprintf("fail%s: %s",
-							  tree_checks_in_chunks ? " (in chunks)" : "",
-							  edata->message);
-		tree_checks_in_chunks = false;
+			result = psprintf("fail: %s", edata->message);
 	}
 	PG_END_TRY();
 
@@ -636,6 +504,8 @@ prolly_implementations(PG_FUNCTION_ARGS)
 	{
 		ListCell   *lc;
 
+		if (!prolly_interface_valid(iface))
+			continue;
 		foreach(lc, prolly_list_impls((ProllyInterface) iface))
 		{
 			const ProllyImplInfo *impl = lfirst(lc);
@@ -675,7 +545,8 @@ prolly_conformance(PG_FUNCTION_ARGS)
 	{
 		ListCell   *lc;
 
-		if (only_iface != NULL && iface != wanted)
+		if (!prolly_interface_valid(iface) ||
+			(only_iface != NULL && iface != wanted))
 			continue;
 
 		foreach(lc, prolly_list_impls((ProllyInterface) iface))
@@ -687,180 +558,4 @@ prolly_conformance(PG_FUNCTION_ARGS)
 		}
 	}
 	return (Datum) 0;
-}
-
-/*
- * prolly_commit_usage(implementation): how many heads and pending roots a
- * commit pipeline holds.
- */
-PG_FUNCTION_INFO_V1(prolly_commit_usage);
-
-Datum
-prolly_commit_usage(PG_FUNCTION_ARGS)
-{
-	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	const ProllyCommitRoutine *r = prolly_commit_lookup(name);
-	TupleDesc	tupdesc;
-	Datum		values[2];
-	bool		nulls[2] = {0};
-	int			nheads;
-	int			npending;
-
-	if (r == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("no commit pipeline implementation \"%s\"", name)));
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-	PROLLY_CALL(r, usage, &nheads, &npending);
-	values[0] = Int32GetDatum(nheads);
-	values[1] = Int32GetDatum(npending);
-	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
-}
-
-/*
- * prolly_fail_next_commit(): the backend's next transaction (not the one
- * calling this) raises an error just before it commits, for tests of what
- * an aborted statement that can't run in a transaction block leaves behind.
- */
-PG_FUNCTION_INFO_V1(prolly_fail_next_commit);
-
-static LocalTransactionId fail_after_lxid = InvalidLocalTransactionId;
-static bool fail_callback_registered = false;
-
-static void
-fail_commit_callback(XactEvent event, void *arg)
-{
-	if (event != XACT_EVENT_PRE_COMMIT ||
-		fail_after_lxid == InvalidLocalTransactionId ||
-		MyProc->vxid.lxid == fail_after_lxid)
-		return;
-	fail_after_lxid = InvalidLocalTransactionId;
-	ereport(ERROR,
-			(errmsg("commit failed by prolly_fail_next_commit()")));
-}
-
-Datum
-prolly_fail_next_commit(PG_FUNCTION_ARGS)
-{
-	if (!fail_callback_registered)
-	{
-		RegisterXactCallback(fail_commit_callback, NULL);
-		fail_callback_registered = true;
-	}
-	fail_after_lxid = MyProc->vxid.lxid;
-	PG_RETURN_VOID();
-}
-
-/*
- * prolly_commit_test_enqueue(implementation, branch): commit a made-up
- * root to a branch of the current database through a commit pipeline, as
- * part of the current transaction: published if it commits, abandoned if
- * it aborts.  For filling a pipeline's tables in tests; nothing reads the
- * branches it writes, so use branches other than the main one.
- */
-PG_FUNCTION_INFO_V1(prolly_commit_test_enqueue);
-
-#define MAX_TEST_TICKETS 4096
-
-static const ProllyCommitRoutine *test_tickets_routine = NULL;
-static ProllyCommitTicket test_tickets[MAX_TEST_TICKETS];
-static int	ntest_tickets = 0;
-static bool test_tickets_registered = false;
-
-static void
-test_tickets_callback(XactEvent event, void *arg)
-{
-	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
-		return;
-	for (int i = 0; i < ntest_tickets; i++)
-	{
-		if (event == XACT_EVENT_COMMIT)
-			PROLLY_CALL(test_tickets_routine, publish, test_tickets[i]);
-		else
-			PROLLY_CALL(test_tickets_routine, abandon, test_tickets[i]);
-	}
-	ntest_tickets = 0;
-}
-
-Datum
-prolly_commit_test_enqueue(PG_FUNCTION_ARGS)
-{
-	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int64		branch = PG_GETARG_INT64(1);
-	const ProllyCommitRoutine *r = prolly_commit_lookup(name);
-	ProllyNodeRef base;
-	ProllyNodeRef root;
-
-	if (r == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("no commit pipeline implementation \"%s\"", name)));
-	if (branch <= PROLLY_MAIN_BRANCH || branch > PG_UINT32_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("test commits go to branches after the main one")));
-	if (ntest_tickets > 0 && test_tickets_routine != r)
-		elog(ERROR, "test commits to two pipelines in one transaction");
-	if (ntest_tickets >= MAX_TEST_TICKETS)
-		elog(ERROR, "too many test commits in one transaction");
-	if (!test_tickets_registered)
-	{
-		RegisterXactCallback(test_tickets_callback, NULL);
-		test_tickets_registered = true;
-	}
-
-	memset(&root, 0, sizeof(root));
-	root.location.blkno = InvalidBlockNumber;
-	root.hash.len = 32;
-	for (int i = 0; i < 32; i++)
-		root.hash.bytes[i] = (uint8) ((branch >> ((i % 8) * 8)) ^ (i * 37) ^
-									  MyProc->vxid.lxid);
-
-	PROLLY_CALL(r, branch_lock, (ProllyBranchId) branch);
-	(void) PROLLY_CALL(r, tip, (ProllyBranchId) branch, &base);
-	test_tickets_routine = r;
-	test_tickets[ntest_tickets++] = PROLLY_CALL(r, enqueue,
-												(ProllyBranchId) branch, &root,
-												GetCurrentTransactionId());
-	PROLLY_CALL(r, branch_unlock, (ProllyBranchId) branch);
-	PG_RETURN_VOID();
-}
-
-/*
- * prolly_tree_digest(rel): the number of items in rel's tree (a prolly
- * table's data tree, or a prolly index's), and a digest of them, as the
- * current transaction sees it.  Two trees with the same items have the
- * same digest, however they were written.
- */
-PG_FUNCTION_INFO_V1(prolly_tree_digest);
-
-Datum
-prolly_tree_digest(PG_FUNCTION_ARGS)
-{
-	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = relation_open(relid, AccessShareLock);
-	ProllyComponents c;
-	ProllyRootSet *roots;
-	ProllyCursor *cur;
-	ProllyKey	key;
-	ProllyValue value;
-	uint64		n = 0;
-	uint64		h = 0;
-
-	prolly_components_for_relation(rel, &c);
-	roots = PROLLY_CALL(c.engine, roots_acquire, GetActiveSnapshot());
-	cur = PROLLY_CALL(c.engine, cursor_open, roots, rel, PROLLY_TREE_DATA,
-					  InvalidCommandId);
-	PROLLY_CALL(c.engine, cursor_seek, cur, NULL, ForwardScanDirection);
-	while (PROLLY_CALL(c.engine, cursor_next, cur, &key, &value))
-	{
-		h = hash_combine64(h, hash_bytes_extended(key.data, key.len, n));
-		h = hash_combine64(h, hash_bytes_extended(value.data, value.len, n));
-		n++;
-	}
-	PROLLY_CALL(c.engine, cursor_close, cur);
-	PROLLY_CALL(c.engine, roots_release, roots);
-	relation_close(rel, AccessShareLock);
-	PG_RETURN_TEXT_P(cstring_to_text(psprintf(UINT64_FORMAT ":%016" PRIx64, n, h)));
 }

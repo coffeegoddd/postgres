@@ -31,9 +31,6 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
-#include "access/prolly_commit.h"
-#include "access/prolly_coord.h"
-#include "access/prolly_engine.h"
 #include "access/slru.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"

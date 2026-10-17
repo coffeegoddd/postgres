@@ -8,11 +8,9 @@ OBJS = \
 	branch_checks.o \
 	chunkstore_checks.o \
 	catalog_checks.o \
-	engine_checks.o \
 	foundation_checks.o \
-	storage_checks.o \
+	keying_checks.o \
 	tree_checks.o \
-	rootlayout_checks.o \
 	test_prolly.o
 PGFILEDESC = "test_prolly - conformance suites for prolly interfaces"
 
