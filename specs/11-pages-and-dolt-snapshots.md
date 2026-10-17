@@ -490,10 +490,12 @@ fails without its fix), and Postgres's suites keep passing after each one.
   versions), #111 (fold epochs and the changed-page list), #112 (folds of
   only the rows changed), #113 (working-set checkpoints), #114 (the
   format frozen).
+- **As built:** a table without a primary key was read in full on any
+  change (issue #126); since #136 its rows' copies are counted from the
+  changed pages too, and it is read in full only where that can't be told
+  (a fold in the transaction that wrote its rows leaves the next fold to
+  read it in full, among others).
 - **Gaps, open:**
-  - A table without a primary key is read in full on any change: its
-    commit, diff and status costs don't yet track changed pages (issue
-    #126, fixed by #136).
   - `dolt_status` and `dolt_diff` fail on objects a commit can't hold yet
     (partitioned and foreign tables, aggregates, policies), as a commit
     does; and a diff of one table folds every changed table (issue #130,
