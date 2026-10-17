@@ -4,7 +4,8 @@
 # it received leaves nothing found and nothing tracked, and the next one
 # succeeds; a fetch survives a crash; a standby reads what was fetched; a
 # push that fails before the remote names what it sent leaves the remote
-# as it was, and the next one succeeds.
+# as it was, and the next one succeeds; a remote of more table files than
+# a backend may hold open is read.
 
 use strict;
 use warnings FATAL => 'all';
@@ -14,7 +15,9 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('remotes');
 $node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+# (few open files allowed: a remote of more table files than that is read)
+$node->append_conf('postgresql.conf', qq{autovacuum = off
+max_files_per_process = 64});
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 $node->backup('base');
@@ -107,5 +110,15 @@ SKIP:
 	is(sql('postgres', q{SELECT dolt_hashof('origin/work')}),
 		sql('b', q{SELECT dolt_hashof('work')}), 'the next push succeeds');
 }
+
+# A remote of more table files than a backend may hold open: each push
+# adds one, and a fetch from a database that has none of them reads them
+# all.
+sql('postgres', join("\n", map { qq{UPDATE r.t SET v = 'p$_' WHERE id = 300;
+	SELECT dolt_commit('-am', 'push $_'); SELECT dolt_push('origin', 'main');} } 1 .. 40));
+sql('postgres', 'CREATE DATABASE c');
+sql('c', qq{SELECT dolt_remote('add', 'origin', '$url'); SELECT dolt_fetch('origin', 'main')});
+is(sql('c', q{SELECT dolt_hashof('origin/main')}), sql('postgres', q{SELECT dolt_hashof('main')}),
+	'a remote of more table files than may be open is read');
 
 done_testing();
