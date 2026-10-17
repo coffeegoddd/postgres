@@ -619,6 +619,56 @@ test_root_without_format(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&out.hash));
 }
 
+/*
+ * test_root_without_sequence_values(root): a folded root whose sequences
+ * have no values recorded, as before the fold recorded them (and as a fold
+ * that couldn't read one leaves it).
+ */
+PG_FUNCTION_INFO_V1(test_root_without_sequence_values);
+Datum
+test_root_without_sequence_values(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef root;
+	ProllyNodeRef out;
+	ProllyTreeCursor *c;
+	ProllyKey	from = {(const uint8 *) "s:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyEdit *edits = NULL;
+	int			nedits = 0;
+
+	prolly_folded_tree_env(&env);
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 2 && memcmp(k.data, "s:", 2) == 0)
+	{
+		const uint8 *nl = memchr(v.data, '\n', v.len);
+		ProllyEdit *e;
+
+		if (nl == NULL || nl + 1 == v.data + v.len)
+			continue;
+		edits = edits ? repalloc(edits, sizeof(ProllyEdit) * (nedits + 1)) :
+			palloc(sizeof(ProllyEdit));
+		e = &edits[nedits++];
+		memset(e, 0, sizeof(*e));
+		e->key.data = (const uint8 *) pnstrdup((const char *) k.data, k.len);
+		e->key.len = k.len;
+		e->value.data = (const uint8 *) pnstrdup((const char *) v.data, nl + 1 - v.data);
+		e->value.len = nl + 1 - v.data;
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	if (nedits == 0)
+		out = root;
+	else
+		PROLLY_CALL(tree, apply, &env, &root, edits, nedits, &out);
+	PG_RETURN_TEXT_P(hash_text(&out.hash));
+}
+
 static void
 commit_item(const ProllyTreeRoutine *tree, ProllyTreeBuilder *b,
 			const char *key, const char *value, int len)

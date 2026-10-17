@@ -1597,77 +1597,44 @@ next_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
 	return false;
 }
 
-/* The same objects, the same values but for tables' and views' rows. */
-static bool
-folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
-{
-	Canon		cn;
-	ProllyTreeCursor *ca;
-	ProllyTreeCursor *cb;
-	bool		same = true;
-
-	memset(&cn, 0, sizeof(cn));
-	canon_env(&cn);
-	ca = PROLLY_CALL(cn.tree, cursor_open, &cn.env, a, CurrentMemoryContext);
-	cb = PROLLY_CALL(cn.tree, cursor_open, &cn.env, b, CurrentMemoryContext);
-	PROLLY_CALL(cn.tree, cursor_seek, ca, NULL, ForwardScanDirection);
-	PROLLY_CALL(cn.tree, cursor_seek, cb, NULL, ForwardScanDirection);
-	for (;;)
-	{
-		ProllyKey	ka,
-					kb;
-		ProllyValue va,
-					vb,
-					da,
-					db;
-		bool		more_a = next_object(&cn, ca, &ka, &va);
-		bool		more_b = next_object(&cn, cb, &kb, &vb);
-
-		if (more_a != more_b)
-		{
-			same = false;
-			break;
-		}
-		if (!more_a)
-			break;
-		definition_of(&ka, &va, &da);
-		definition_of(&kb, &vb, &db);
-		if (ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0 ||
-			da.len != db.len || memcmp(da.data, db.data, da.len) != 0)
-		{
-			same = false;
-			break;
-		}
-	}
-	PROLLY_CALL(cn.tree, cursor_close, ca);
-	PROLLY_CALL(cn.tree, cursor_close, cb);
-	return same;
-}
+/*
+ * Visits a pair of items in a merge of two folded roots' items, in key
+ * order: one side's item is NULL where only the other root holds it.
+ * Returns false to end the walk.
+ */
+typedef bool (*ItemPairVisit) (const ProllyKey *ka, const ProllyValue *va,
+							   const ProllyKey *kb, const ProllyValue *vb,
+							   void *arg);
 
 /*
- * The next item that defines an object other than a table: tables, and the
- * root's format, are what tables() and the format check are for.
+ * The next item that defines an object: with others_only, not a table
+ * (seeking past the tables' items, which tables() is for) nor the root's
+ * format.
  */
 static bool
-next_other_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
+next_item(Canon *cn, ProllyTreeCursor *c, bool others_only, ProllyKey *k,
+		  ProllyValue *v)
 {
+	static const ProllyKey after_tables = {(const uint8 *) "u", 1};
+
 	while (next_object(cn, c, k, v))
-		if (!(k->len >= 2 && (k->data[0] == 't' || k->data[0] == '!') &&
-			  k->data[1] == ':'))
+	{
+		if (!others_only || k->len < 2 || k->data[1] != ':')
 			return true;
+		if (k->data[0] == 't')
+			PROLLY_CALL(cn->tree, cursor_seek, c, &after_tables,
+						ForwardScanDirection);
+		else if (k->data[0] != '!')
+			return true;
+	}
 	return false;
 }
 
-/*
- * The objects other than tables that differ: both roots' items merged in
- * the tree's key order, each compared by its whole value (a sequence's
- * value and a materialized view's rows with its definition).
- */
+/* Merge two folded roots' items in key order, visiting each pair. */
 static void
-folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
-			   ProllyCanonObjectVisit visit, void *arg)
+merge_items(Canon *cn, const ProllyNodeRef *a, const ProllyNodeRef *b,
+			bool others_only, ItemPairVisit visit, void *arg)
 {
-	Canon		cn;
 	ProllyTreeCursor *ca;
 	ProllyTreeCursor *cb;
 	ProllyKey	ka,
@@ -1677,32 +1644,154 @@ folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	bool		more_a,
 				more_b;
 
-	memset(&cn, 0, sizeof(cn));
-	canon_env(&cn);
-	ca = PROLLY_CALL(cn.tree, cursor_open, &cn.env, from, CurrentMemoryContext);
-	cb = PROLLY_CALL(cn.tree, cursor_open, &cn.env, to, CurrentMemoryContext);
-	PROLLY_CALL(cn.tree, cursor_seek, ca, NULL, ForwardScanDirection);
-	PROLLY_CALL(cn.tree, cursor_seek, cb, NULL, ForwardScanDirection);
-	more_a = next_other_object(&cn, ca, &ka, &va);
-	more_b = next_other_object(&cn, cb, &kb, &vb);
+	ca = PROLLY_CALL(cn->tree, cursor_open, &cn->env, a, CurrentMemoryContext);
+	cb = PROLLY_CALL(cn->tree, cursor_open, &cn->env, b, CurrentMemoryContext);
+	PROLLY_CALL(cn->tree, cursor_seek, ca, NULL, ForwardScanDirection);
+	PROLLY_CALL(cn->tree, cursor_seek, cb, NULL, ForwardScanDirection);
+	more_a = next_item(cn, ca, others_only, &ka, &va);
+	more_b = next_item(cn, cb, others_only, &kb, &vb);
 	while (more_a || more_b)
 	{
 		int			c = !more_a ? 1 : !more_b ? -1 :
 			prolly_bytes_compare(&ka, &kb, NULL);
 
-		if (c < 0)
-			visit(from_utf8(ka.data + 2, ka.len - 2), PROLLY_DIFF_REMOVED, arg);
-		else if (c > 0)
-			visit(from_utf8(kb.data + 2, kb.len - 2), PROLLY_DIFF_ADDED, arg);
-		else if (va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0)
-			visit(from_utf8(ka.data + 2, ka.len - 2), PROLLY_DIFF_MODIFIED, arg);
+		if (!visit(c <= 0 ? &ka : NULL, c <= 0 ? &va : NULL,
+				   c >= 0 ? &kb : NULL, c >= 0 ? &vb : NULL, arg))
+			break;
 		if (c <= 0)
-			more_a = next_other_object(&cn, ca, &ka, &va);
+			more_a = next_item(cn, ca, others_only, &ka, &va);
 		if (c >= 0)
-			more_b = next_other_object(&cn, cb, &kb, &vb);
+			more_b = next_item(cn, cb, others_only, &kb, &vb);
 	}
-	PROLLY_CALL(cn.tree, cursor_close, ca);
-	PROLLY_CALL(cn.tree, cursor_close, cb);
+	PROLLY_CALL(cn->tree, cursor_close, ca);
+	PROLLY_CALL(cn->tree, cursor_close, cb);
+}
+
+static bool
+same_values(const ProllyValue *a, const ProllyValue *b)
+{
+	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+static bool
+same_definition_pair(const ProllyKey *ka, const ProllyValue *va,
+					 const ProllyKey *kb, const ProllyValue *vb, void *arg)
+{
+	bool	   *same = arg;
+	ProllyValue da,
+				db;
+
+	if (ka == NULL || kb == NULL)
+		*same = false;
+	else
+	{
+		definition_of(ka, va, &da);
+		definition_of(kb, vb, &db);
+		*same = same_values(&da, &db);
+	}
+	return *same;
+}
+
+/* The same objects, the same values but for tables' and views' rows. */
+static bool
+folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
+{
+	Canon		cn;
+	bool		same = true;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	merge_items(&cn, a, b, false, same_definition_pair, &same);
+	return same;
+}
+
+typedef struct ObjectsWalk
+{
+	ProllyCanonObjectVisit visit;
+	void	   *arg;
+	bool		same_format;	/* both roots' data trees in one format */
+} ObjectsWalk;
+
+/*
+ * A sequence's value: the line after its definition, if the fold could
+ * read it (and the root's format records it).
+ */
+static bool
+sequence_value(const ProllyKey *k, const ProllyValue *v, ProllyValue *value)
+{
+	ProllyValue def;
+
+	definition_of(k, v, &def);
+	value->data = v->data + def.len;
+	value->len = v->len - def.len;
+	return value->len > 0;
+}
+
+/*
+ * Whether an object differs: by its definition; a sequence by its value
+ * too, where both roots have it (an older root's, or one the fold couldn't
+ * read, isn't a change); a materialized view by its rows too, where both
+ * roots' data trees are in one format.
+ */
+static bool
+object_differs(const ObjectsWalk *w, const ProllyKey *ka, const ProllyValue *va,
+			   const ProllyKey *kb, const ProllyValue *vb)
+{
+	ProllyValue da,
+				db;
+
+	definition_of(ka, va, &da);
+	definition_of(kb, vb, &db);
+	if (!same_values(&da, &db))
+		return true;
+	if (ka->data[0] == 's')
+	{
+		ProllyValue sa,
+					sb;
+
+		return sequence_value(ka, va, &sa) && sequence_value(kb, vb, &sb) &&
+			!same_values(&sa, &sb);
+	}
+	if (ka->data[0] == 'm' && w->same_format)
+		return !same_values(va, vb);
+	return false;
+}
+
+static bool
+object_pair(const ProllyKey *ka, const ProllyValue *va,
+			const ProllyKey *kb, const ProllyValue *vb, void *arg)
+{
+	ObjectsWalk *w = arg;
+	const ProllyKey *k = ka ? ka : kb;
+	ProllyDiffKind kind;
+	char	   *name;
+
+	if (ka == NULL)
+		kind = PROLLY_DIFF_ADDED;
+	else if (kb == NULL)
+		kind = PROLLY_DIFF_REMOVED;
+	else if (object_differs(w, ka, va, kb, vb))
+		kind = PROLLY_DIFF_MODIFIED;
+	else
+		return true;
+	name = from_utf8(k->data + 2, k->len - 2);
+	w->visit(name, kind, w->arg);
+	pfree(name);
+	return true;
+}
+
+/* The objects other than tables that differ: both roots' items merged. */
+static void
+folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
+			   ProllyCanonObjectVisit visit, void *arg)
+{
+	Canon		cn;
+	ObjectsWalk w = {visit, arg};
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
+	merge_items(&cn, from, to, true, object_pair, &w);
 }
 
 /* ------------------------------------------------------------------------

@@ -1266,7 +1266,10 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	s->relids = list_append_unique_oid(s->relids, relid);
 }
 
-/* A table changed: its name, a tab, and its status. */
+/*
+ * A table, or another object, changed: its name, a tab, and its status.
+ * Other objects take the tables' statuses, as in Doltgres.
+ */
 static void
 status_table(const char *name, ProllyDiffKind kind, void *arg)
 {
@@ -1287,8 +1290,10 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
  *
  * The tables changed since the session branch's head commit: rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
- * in progress, with conflicts ("conflict", not staged); and objects a
- * commit doesn't cover yet ("not covered", not staged).
+ * in progress, with conflicts ("conflict", not staged); the other objects
+ * changed (schemas, routines with their argument types, views, types,
+ * sequences), with the tables' statuses, as Doltgres lists them; and
+ * objects a commit doesn't cover yet ("not covered", not staged).
  */
 Datum
 dolt_status(PG_FUNCTION_ARGS)

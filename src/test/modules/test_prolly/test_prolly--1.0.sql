@@ -241,6 +241,11 @@ CREATE FUNCTION test_root_without_format(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A folded root whose sequences have no values recorded.
+CREATE FUNCTION test_root_without_sequence_values(root text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A commit with no parents naming root.
 CREATE FUNCTION test_commit_of(root text, message text)
 RETURNS text
