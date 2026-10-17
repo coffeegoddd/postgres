@@ -28,8 +28,10 @@
  *   branch's.
  * - tables() reports each table that differs between two refs (its rows or
  *   its definition), by qualified name, in name order: added, removed or
- *   modified.  diff() may leave out the rows of tables the session branch
- *   doesn't have; tables() names them.
+ *   modified; then each other object that differs (the canonicalizer's
+ *   objects()), as Doltgres's dolt_status lists them.  diff() may leave
+ *   out the rows of tables the session branch doesn't have; tables() names
+ *   them.
  * - move_to() makes the session branch hold what a canonical root holds,
  *   writing the rows that differ as changes (prolly_applier.h), with the
  *   calling transaction.

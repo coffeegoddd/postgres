@@ -162,3 +162,25 @@ CREATE POLICY sdt_pol ON sdt.t USING (true);
 SELECT dolt_commit('-Am', 'policy');
 DROP SCHEMA sdt CASCADE;
 SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;
+
+-- dolt_status lists objects other than tables that changed, by qualified
+-- name, as Doltgres does: views, functions (with their argument types),
+-- sequences (their definitions and their values) and schemas.
+SELECT * FROM dolt_status;
+CREATE SCHEMA sdv VERSIONED;
+CREATE TABLE sdv.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'sdv')::text) AS committed;
+SELECT * FROM dolt_status;
+CREATE VIEW sdv.v AS SELECT id FROM sdv.t;
+CREATE FUNCTION sdv.f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE SEQUENCE sdv.s;
+SELECT * FROM dolt_status ORDER BY table_name;
+SELECT length(dolt_commit('-Am', 'sdv objects')::text) AS committed;
+SELECT * FROM dolt_status;
+CREATE OR REPLACE VIEW sdv.v AS SELECT id, 1 AS one FROM sdv.t;
+DROP FUNCTION sdv.f(int);
+SELECT nextval('sdv.s');
+SELECT * FROM dolt_status ORDER BY table_name;
+DROP SCHEMA sdv CASCADE;
+SELECT * FROM dolt_status ORDER BY table_name;
+SELECT length(dolt_commit('-Am', 'sdv gone')::text) AS committed;

@@ -91,7 +91,8 @@ SELECT table_name, status FROM dolt_status ORDER BY 1;
  table_name |  status  
 ------------+----------
  dm.b       | modified
-(1 row)
+ dm.s2      | modified
+(2 rows)
 
 -- Over changes to the same table, it is refused.
 SELECT dolt_reset('--hard', 'HEAD~1');

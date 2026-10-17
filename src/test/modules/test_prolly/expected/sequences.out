@@ -389,8 +389,9 @@ INSERT INTO app.t (v) VALUES ('by seq_user');
 SELECT * FROM dolt_status();
  table_name | staged |  status  
 ------------+--------+----------
+ app.s      | t      | modified
  app.t      | t      | modified
-(1 row)
+(2 rows)
 
 SELECT dolt_reset('--hard', :'granted');
  dolt_reset 

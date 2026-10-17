@@ -1644,6 +1644,67 @@ folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
 	return same;
 }
 
+/*
+ * The next item that defines an object other than a table: tables, and the
+ * root's format, are what tables() and the format check are for.
+ */
+static bool
+next_other_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
+{
+	while (next_object(cn, c, k, v))
+		if (!(k->len >= 2 && (k->data[0] == 't' || k->data[0] == '!') &&
+			  k->data[1] == ':'))
+			return true;
+	return false;
+}
+
+/*
+ * The objects other than tables that differ: both roots' items merged in
+ * the tree's key order, each compared by its whole value (a sequence's
+ * value and a materialized view's rows with its definition).
+ */
+static void
+folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
+			   ProllyCanonObjectVisit visit, void *arg)
+{
+	Canon		cn;
+	ProllyTreeCursor *ca;
+	ProllyTreeCursor *cb;
+	ProllyKey	ka,
+				kb;
+	ProllyValue va,
+				vb;
+	bool		more_a,
+				more_b;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	ca = PROLLY_CALL(cn.tree, cursor_open, &cn.env, from, CurrentMemoryContext);
+	cb = PROLLY_CALL(cn.tree, cursor_open, &cn.env, to, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, ca, NULL, ForwardScanDirection);
+	PROLLY_CALL(cn.tree, cursor_seek, cb, NULL, ForwardScanDirection);
+	more_a = next_other_object(&cn, ca, &ka, &va);
+	more_b = next_other_object(&cn, cb, &kb, &vb);
+	while (more_a || more_b)
+	{
+		int			c = !more_a ? 1 : !more_b ? -1 :
+			prolly_bytes_compare(&ka, &kb, NULL);
+
+		if (c < 0)
+			visit(from_utf8(ka.data + 2, ka.len - 2), PROLLY_DIFF_REMOVED, arg);
+		else if (c > 0)
+			visit(from_utf8(kb.data + 2, kb.len - 2), PROLLY_DIFF_ADDED, arg);
+		else if (va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0)
+			visit(from_utf8(ka.data + 2, ka.len - 2), PROLLY_DIFF_MODIFIED, arg);
+		if (c <= 0)
+			more_a = next_other_object(&cn, ca, &ka, &va);
+		if (c >= 0)
+			more_b = next_other_object(&cn, cb, &kb, &vb);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, ca);
+	PROLLY_CALL(cn.tree, cursor_close, cb);
+}
+
 /* ------------------------------------------------------------------------
  * Moving definitions (folded)
  * ------------------------------------------------------------------------
@@ -3336,6 +3397,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
+	.objects = folded_objects,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
 	.merge_schema = folded_merge_schema,
