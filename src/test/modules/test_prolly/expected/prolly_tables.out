@@ -178,14 +178,27 @@ drop cascades to table app.parted
 drop cascades to materialized view app.mv
 drop cascades to table app.ctas
 DROP TABLE h, d, u2;
--- Page-based prolly keeps no node store, so no node counters: asking for
--- them is refused, not a crash.
+-- Page-based prolly has no tree engine, so no node counters: asking for
+-- them is refused (as for heap), not a crash.  A tree engine's still count.
+\set VERBOSITY sqlstate
 SELECT * FROM prolly_node_counters('prolly');
-ERROR:  access method "prolly" keeps no node counters
-DETAIL:  Its tables are pages; their history is chunks, which no node store counts.
-SELECT nodes_read >= 0 AS d1_counts FROM prolly_node_counters('prolly_d1');
- d1_counts 
------------
+ERROR:  42809
+SELECT * FROM prolly_node_counters('heap');
+ERROR:  42809
+\set VERBOSITY default
+CREATE TABLE d1n (id int PRIMARY KEY, v text) USING prolly_d1;
+INSERT INTO d1n SELECT g, 'v' FROM generate_series(1, 200) g;
+SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
+SELECT count(*) FROM d1n;
+ count 
+-------
+   200
+(1 row)
+
+SELECT nodes_read > :r0 AS d1_counts_reads FROM prolly_node_counters('prolly_d1');
+ d1_counts_reads 
+-----------------
  t
 (1 row)
 
+DROP TABLE d1n;

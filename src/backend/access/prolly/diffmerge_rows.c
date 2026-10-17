@@ -190,12 +190,9 @@ rows_diff(const char *from_ref, const char *to_ref, Oid relid,
 		SinkArg		s = {sink, RelationGetRelid(rel)};
 
 		prolly_components_for_relation(rel, &rc);
-		if (rc.engine == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" is not a table of this database's prolly engine",
-							RelationGetRelationName(rel))));
-		PROLLY_CALL(rc.engine, diff, from, to, rel, to_sink, &s);
+		PROLLY_CALL(prolly_engine_of(&rc, get_am_name(rel->rd_rel->relam),
+									 RelationGetRelationName(rel)),
+					diff, from, to, rel, to_sink, &s);
 		table_close(rel, AccessShareLock);
 	}
 	PROLLY_CALL(c.engine, roots_release, from);
