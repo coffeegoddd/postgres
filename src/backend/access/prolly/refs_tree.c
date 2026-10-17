@@ -863,66 +863,18 @@ tree_commit_working_set(const ProllyHash *commit_id, ProllyNodeRef *root)
 	return true;
 }
 
-/* The newest common ancestor of a and b: breadth first from both. */
+static bool
+tree_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	return tree_commit_get(id, info);
+}
+
+/* The newest common ancestor of a and b, each commit visited once. */
 static bool
 tree_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 {
-	List	   *seen = NIL;
-	List	   *queue = NIL;
-	ListCell   *lc;
-	ProllyHash *h;
-
 	refs_init();
-	h = palloc(sizeof(ProllyHash));
-	*h = *a;
-	queue = lappend(queue, h);
-	while (queue != NIL)
-	{
-		ProllyCommitInfo info;
-
-		h = linitial(queue);
-		queue = list_delete_first(queue);
-		seen = lappend(seen, h);
-		if (!tree_commit_get(h, &info))
-			continue;
-		for (int i = 0; i < info.nparents; i++)
-		{
-			ProllyHash *p = palloc(sizeof(ProllyHash));
-
-			*p = info.parents[i];
-			queue = lappend(queue, p);
-		}
-	}
-	h = palloc(sizeof(ProllyHash));
-	*h = *b;
-	queue = lappend(queue, h);
-	while (queue != NIL)
-	{
-		ProllyCommitInfo info;
-
-		h = linitial(queue);
-		queue = list_delete_first(queue);
-		foreach(lc, seen)
-		{
-			ProllyHash *s = lfirst(lc);
-
-			if (s->len == h->len && memcmp(s->bytes, h->bytes, h->len) == 0)
-			{
-				*base = *h;
-				return true;
-			}
-		}
-		if (!tree_commit_get(h, &info))
-			continue;
-		for (int i = 0; i < info.nparents; i++)
-		{
-			ProllyHash *p = palloc(sizeof(ProllyHash));
-
-			*p = info.parents[i];
-			queue = lappend(queue, p);
-		}
-	}
-	return false;
+	return prolly_history_merge_base(a, b, tree_lookup_commit, NULL, base);
 }
 
 /*

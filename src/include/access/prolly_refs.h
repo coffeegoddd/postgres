@@ -178,6 +178,18 @@ typedef struct ProllyRefsRoutine
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
+/*
+ * For refs implementations: a commit's info by its id (false if there is
+ * no such commit), and the newest common ancestor of two commits, found
+ * with it, each commit visited once.
+ */
+typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
+									ProllyCommitInfo *info, void *arg);
+
+extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
+									  ProllyCommitLookup lookup, void *lookup_arg,
+									  ProllyHash *base);
+
 static inline const ProllyRefsRoutine *
 prolly_refs_lookup(const char *name)
 {

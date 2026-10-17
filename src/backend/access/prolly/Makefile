@@ -69,6 +69,7 @@ OBJS = \
 	reclaim_marksweep.o \
 	reclaim_stub.o \
 	refs_copies.o \
+	refs_history.o \
 	refs_tree.o \
 	refs_stub.o \
 	rootlayout_stub.o \
