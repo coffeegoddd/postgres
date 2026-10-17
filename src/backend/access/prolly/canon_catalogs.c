@@ -166,6 +166,7 @@ typedef struct Canon
 	List	   *next;			/* CanonItem *, the next baseline's */
 	bool		reading;		/* objects not described are left out */
 	List	   *left_out;		/* (reading) their names */
+	List	   *refused;		/* (committing) Refused *: the same */
 	Oid			only;			/* valid: only this table's rows folded */
 } Canon;
 
@@ -266,21 +267,60 @@ is_prolly_am(Oid amoid)
 	return prolly;
 }
 
+/* An object a commit can't hold: what kind, and its name. */
+typedef struct Refused
+{
+	const char *what;
+	char	   *name;
+} Refused;
+
 /*
- * An object the canonical form doesn't describe: refused, or, when only
- * reading, left out (true).
+ * An object the canonical form doesn't describe: left out (true).  When
+ * reading, its name is noted; when committing, it is refused once every
+ * object has been read (check_refused()).
  */
 static bool
 uncovered(Canon *cn, const char *what, const char *name)
 {
 	if (cn->reading)
-	{
 		cn->left_out = lappend(cn->left_out, pstrdup(name));
-		return true;
+	else
+	{
+		Refused    *r = palloc(sizeof(Refused));
+
+		r->what = what;
+		r->name = pstrdup(name);
+		cn->refused = lappend(cn->refused, r);
 	}
+	return true;
+}
+
+static int
+refused_cmp(const ListCell *a, const ListCell *b)
+{
+	const Refused *x = lfirst(a);
+	const Refused *y = lfirst(b);
+	int			c = strcmp(x->name, y->name);
+
+	return c != 0 ? c : strcmp(x->what, y->what);
+}
+
+/*
+ * Refuse a commit of objects the canonical form doesn't describe, naming
+ * the first by name: the same one whatever order the catalogs were read in.
+ */
+static void
+check_refused(Canon *cn)
+{
+	Refused    *r;
+
+	if (cn->refused == NIL)
+		return;
+	list_sort(cn->refused, refused_cmp);
+	r = linitial(cn->refused);
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("prolly commits don't cover %s yet: %s", what, name),
+			 errmsg("prolly commits don't cover %s yet: %s", r->what, r->name),
 			 errdetail("A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.")));
 }
 
@@ -1380,6 +1420,7 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	collect(cn);
 	AtEOXact_GUC(false, save_nestlevel);
 	add_collations(cn);		/* (none unless folded) */
+	check_refused(cn);
 	if (cn->folded)
 		appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
 
