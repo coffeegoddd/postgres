@@ -1118,7 +1118,9 @@ catalogs_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg);
+	/* (a root the visitor declines: it has seen the trees the root names) */
+	if (!PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg))
+		return;
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
@@ -1487,7 +1489,9 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 	cn.folded = true;
 	canon_env(&cn);
 	cn.finder = prolly_changes_lookup("pages");
-	PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg);
+	/* (a baseline the visitor declines: it has seen the trees it names) */
+	if (!PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg))
+		return;
 	load_baseline(&cn, baseline);
 	for (int i = 0; i < cn.nbase; i++)
 	{

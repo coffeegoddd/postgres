@@ -18,6 +18,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_tree.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -509,4 +510,33 @@ test_refs_set_head(PG_FUNCTION_ARGS)
 	resolve_ref(&dc, PG_GETARG_TEXT_PP(0), &id);
 	PROLLY_CALL(dc.refs, set_head, &id);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_refs_value(key): the value of the refs' entry key (a tag, then a
+ * name), from the chunk store's root; NULL if there is none.
+ */
+PG_FUNCTION_INFO_V1(test_refs_value);
+Datum
+test_refs_value(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef refs;
+	text	   *key = PG_GETARG_TEXT_PP(0);
+	ProllyKey	k = {(const uint8 *) VARDATA_ANY(key), VARSIZE_ANY_EXHDR(key)};
+	StringInfoData v;
+	bytea	   *out;
+
+	prolly_folded_tree_env(&env);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	refs.location.blkno = InvalidBlockNumber;
+	initStringInfo(&v);
+	if (refs.hash.len == 0 || !PROLLY_CALL(tree, get, &env, &refs, &k, &v))
+		PG_RETURN_NULL();
+	out = palloc(VARHDRSZ + v.len);
+	SET_VARSIZE(out, VARHDRSZ + v.len);
+	memcpy(VARDATA(out), v.data, v.len);
+	PG_RETURN_BYTEA_P(out);
 }

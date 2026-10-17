@@ -25,5 +25,12 @@ SELECT test_refs_walk_count(:'c1') AS without_c1 \gset
 SELECT :without_c1 < :all_nodes AS declined_c1_saves,
 	:without_c2 < :without_c1 AS declined_c2_saves_more;
 
+-- declining a branch's baseline saves the trees it names, not only its
+-- own node ('W' main: a hash length, then the hash)
+SELECT encode(substr(v, 2, get_byte(v, 0)), 'hex') AS baseline
+  FROM test_refs_value('Wmain') v \gset
+SELECT test_refs_walk_count(:'baseline') AS without_baseline \gset
+SELECT :all_nodes - :without_baseline > 1 AS declined_baseline_saves;
+
 DROP SCHEMA wk CASCADE;
 SELECT length(dolt_commit('-Am', 'wk gone')::text) AS committed;

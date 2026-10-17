@@ -31,7 +31,8 @@
  *   starting point, and only what changed since is read.  With
  *   'next_baseline', the fold begins a new one, which holds once the
  *   transaction commits it as the branch's baseline.
- * - walk_baseline() visits every node a baseline keeps alive.
+ * - walk_baseline() visits every node a baseline keeps alive; a baseline
+ *   the visitor declines isn't looked into, as a root isn't.
  * - tables() visits each table a folded root holds, in name order: its
  *   qualified name, its data tree and its definition as described.
  * - same_schema() is whether two folded roots hold the same objects with

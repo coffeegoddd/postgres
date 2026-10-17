@@ -123,7 +123,9 @@ typedef struct ProllyRootLayoutRoutine
 	/*
 	 * Visit every node reachable from root, including every node of every
 	 * relation's tree (what reclamation must keep), parents before children.
-	 * A node shared by several trees may be visited more than once.
+	 * A node shared by several trees may be visited more than once.  A root
+	 * or sub-root the visitor declines isn't looked into (the trees it
+	 * names are taken as seen), as a tree's node isn't.
 	 */
 	void		(*walk) (const ProllyRootEnv *env, const ProllyNodeRef *root,
 						 ProllyTreeVisitNode visit, void *arg);
