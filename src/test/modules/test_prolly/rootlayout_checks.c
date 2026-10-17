@@ -551,6 +551,10 @@ check_change(ProllyDiffKind kind, ProllySubRoot sub, Oid relid,
 				!same_hash(after, &d->f->trees[tt]))
 				elog(ERROR, "diff: relnumber %u wrongly reported modified", relid);
 			break;
+		case PROLLY_DIFF_NOT_COVERED:
+			/* (a kind of table a read leaves out, never a root's) */
+			elog(ERROR, "diff: relnumber %u reported as not covered", relid);
+			break;
 	}
 }
 
