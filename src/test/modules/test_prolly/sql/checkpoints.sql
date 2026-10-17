@@ -49,16 +49,36 @@ SELECT length(prolly_checkpoint()) AS checkpointed;
 ROLLBACK;
 SELECT pages > 0 AS reads_since_the_commit, same_as_full FROM pg_temp.fold();
 
--- Leaving a branch with changes takes a checkpoint of it.
+-- Leaving a branch with changes takes a checkpoint of it.  (A checkpoint
+-- begins the table's fold anew, raising its map's epoch.)
+SELECT pg_relation_filenode('cp.t') AS t \gset
 SELECT dolt_branch('other');
+SELECT test_bmap_epoch(:t) AS e0 \gset
 SELECT dolt_checkout('other');
+SELECT test_bmap_epoch(:t) > :e0 AS checkpointed;
 SELECT dolt_checkout('main');
 SELECT * FROM pg_temp.fold();
 SELECT diff_type, (to_row).id FROM dolt_diff('HEAD', 'WORKING', NULL::cp.t) ORDER BY 2;
 
--- Leaving one without changes takes none.
+-- Leaving it again, nothing changed since: none.
+SELECT test_bmap_epoch(:t) AS e1 \gset
 SELECT dolt_checkout('other');
-SELECT * FROM pg_temp.fold();
+SELECT test_bmap_epoch(:t) = :e1 AS not_again;
+SELECT dolt_checkout('main');
+
+-- Nor in a transaction block, which may be read only.
+UPDATE cp.t SET v = 'five' WHERE id = 5;
+BEGIN READ ONLY;
+SELECT dolt_checkout('other');
+SELECT dolt_checkout('main');
+COMMIT;
+SELECT test_bmap_epoch(:t) = :e1 AS none_in_a_block;
+
+-- Leaving one without changes takes none.
+SELECT length(dolt_commit('-am', 'four and five')::text) AS committed;
+SELECT test_bmap_epoch(:t) AS e2 \gset
+SELECT dolt_checkout('other');
+SELECT test_bmap_epoch(:t) = :e2 AS clean_takes_none;
 SELECT dolt_checkout('main');
 
 SELECT dolt_branch('-D', 'other');
