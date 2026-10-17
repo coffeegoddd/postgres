@@ -2,7 +2,8 @@
 -- to each page copies it and lists the block it leaves, which keeps the
 -- page as it was; truncations are listed too.  A copy of the relation
 -- gets its list; pruning lets go of what changed before a later fold;
--- dropping the relation frees what the list holds.
+-- dropping the relation frees what the list holds.  Extending a truncated
+-- relation again lists the pages it reuses.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -61,10 +62,28 @@ SELECT count(*) FILTER (WHERE kind = 'copy') AS copies_before_second
 FROM test_bmap_fold_changes(:rel, :lineage, :e1) WHERE made < :e2 \gset
 SELECT test_bmap_free_blocks() AS free_before_prune \gset
 SELECT test_bmap_fold_prune(:rel, :lineage, :e2);
-SELECT count(*) AS left_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+-- (what changed since the first isn't known any more)
+SELECT count(*) AS since_first_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+SELECT count(*) AS since_second_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e2);
 SELECT test_bmap_free_blocks() - :free_before_prune = :copies_before_second
 	AS freed_what_was_let_go;
 SELECT count(*), sum(b) FROM folds.t;
+
+-- Extending a truncated relation again reuses the blocks past its length,
+-- which are as of the fold when nothing changed them since: each is
+-- listed, holding the page as it was.  (The storage is cut and extended
+-- by itself, below the table, which is dropped after.)
+CREATE TABLE folds.x (a int8 PRIMARY KEY, b int8);
+INSERT INTO folds.x SELECT g, g FROM generate_series(1, 3000) g;
+SELECT pg_relation_filenode('folds.x') AS x \gset
+SELECT lineage AS xl, epoch AS xe, nblocks AS xn FROM test_bmap_fold_begin(:x) \gset
+SELECT test_bmap_truncate(:x, 14);
+SELECT test_bmap_extend(:x, :xn - 14);
+SELECT count(DISTINCT blkno) = :xn - 14 AS reused_listed,
+	bool_and((SELECT count(*) FROM heap_page_items(test_bmap_read_old(:x, blkno, old_block))) > 0)
+		AS as_of_fold
+FROM test_bmap_fold_changes(:x, :xl, :xe) WHERE kind = 'copy';
+DROP TABLE folds.x;
 
 -- Another lineage knows nothing of it.
 SELECT count(*) FROM test_bmap_fold_changes(:rel, :lineage + 1, :e1);

@@ -54,8 +54,9 @@
  *						raised), block 1 the changes list's header
  * XLOG_BMAP_CHANGES	the changes list rewritten: its pages, then its header
  * XLOG_BMAP_SHARE_CHANGES	a changes list copied into another relation's:
- *						its pages or its header, then the reference-count
- *						pages of the blocks it holds
+ *						one of its pages, or its header, then the
+ *						reference-count pages of the blocks the entries it
+ *						takes in hold
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
@@ -100,12 +101,16 @@ typedef struct xl_bmap_unref
  * leaves and the one it takes, and the page store's high-water mark before
  * and after.  The page's image comes as its last block, unless it is all
  * zeroes (BMAP_REMAP_ZERO): then redo zeroes the new block, as extending
- * does.  A block left for the changes list (BMAP_REMAP_LISTED) gets the
- * image (or zeroes) in redo too: it is the page as it was before the
- * change, which a crash may have lost from the block.
+ * does.  A block left for the changes list (BMAP_REMAP_LISTED) and no
+ * other map's (BMAP_REMAP_OWN) gets the image (or zeroes) in redo too: it
+ * is the page as it was before the change, which a crash may have lost
+ * from the block.  One another map shares keeps what it has: the primary
+ * doesn't write there (the image may have hints only this map's buffer
+ * had).
  */
 #define BMAP_REMAP_ZERO		0x01
 #define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */
+#define BMAP_REMAP_OWN		0x04	/* and no other map holds it */
 
 typedef struct xl_bmap_remap
 {
@@ -163,6 +168,7 @@ typedef struct xl_bmap_header_delta
 	uint16		flags;
 	BlockNumber nblocks;
 	uint32		epoch;
+	uint32		fold_epoch;		/* the last fold's (0: never folded) */
 } xl_bmap_header_delta;
 
 /*
@@ -239,6 +245,7 @@ typedef struct xl_bmap_changes_head_delta
 	uint64		lineage;
 	BlockNumber fold_nblocks;
 	uint32		nentries;
+	uint32		pruned_epoch;	/* changes before it let go of */
 } xl_bmap_changes_head_delta;
 
 /* Block data of a changes list's page: entries set from slot 'first'. */

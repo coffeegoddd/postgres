@@ -361,7 +361,8 @@ change_row(const BmapChange *c, void *arg)
 
 /*
  * test_bmap_fold_changes(relnumber, lineage, epoch): what changed since
- * that fold began, in order; no rows and a notice if the lineage is gone.
+ * that fold began, in order; no rows and a notice if that isn't known (the
+ * lineage is gone, or the list was pruned past it).
  */
 PG_FUNCTION_INFO_V1(test_bmap_fold_changes);
 
@@ -375,7 +376,7 @@ test_bmap_fold_changes(PG_FUNCTION_ARGS)
 	fold_arg(fcinfo, &since);
 	if (!bmap_fold_changes(bmap_smgr(PG_GETARG_OID(0)), &since, change_row,
 						   rsinfo))
-		elog(NOTICE, "no changes list of that lineage");
+		elog(NOTICE, "what changed since that fold isn't known");
 	return (Datum) 0;
 }
 
