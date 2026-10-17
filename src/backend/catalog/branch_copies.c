@@ -124,10 +124,9 @@ static RelFileNumber
 copy_storage(Form_pg_class c)
 {
 	RelFileLocator src = class_locator(c, c->relfilenode);
-	SMgrRelation ssrc = smgropen(src, INVALID_PROC_NUMBER);
-	RelFileNumber relnumber = GetNewRelFileNumber(c->reltablespace, NULL,
-												  c->relpersistence);
-	RelFileLocator dst = class_locator(c, relnumber);
+	SMgrRelation ssrc;
+	RelFileNumber relnumber;
+	RelFileLocator dst;
 	SMgrRelation sdst;
 
 	if (c->relpersistence != RELPERSISTENCE_PERMANENT)
@@ -135,17 +134,21 @@ copy_storage(Form_pg_class c)
 			 NameStr(c->relname));
 
 	/*
-	 * A relation made in this transaction whose storage skips WAL
-	 * (wal_level minimal) is synced at commit; a copy of it would be
-	 * neither logged nor synced.
+	 * Storage made in this transaction that skips WAL (wal_level minimal; a
+	 * new relation, or one truncated or rewritten) is synced at commit; a
+	 * copy of it would be neither logged nor synced.
 	 */
 	if (RelFileLocatorSkippingWAL(src))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot copy relation \"%s\" to a branch in the transaction that made it",
+				 errmsg("cannot copy relation \"%s\" to a branch in the transaction that gave it its storage",
 						NameStr(c->relname)),
 				 errdetail("Its storage skips WAL until the transaction commits."),
 				 errhint("Commit first, or set \"wal_level\" to \"replica\" or higher.")));
+
+	ssrc = smgropen(src, INVALID_PROC_NUMBER);
+	relnumber = GetNewRelFileNumber(c->reltablespace, NULL, c->relpersistence);
+	dst = class_locator(c, relnumber);
 
 	if (smgrcanshare(ssrc))
 	{

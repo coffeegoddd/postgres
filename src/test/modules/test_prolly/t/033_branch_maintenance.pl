@@ -146,9 +146,12 @@ is(sql($rows, 'copied/feature'), $feature_rows, 'and the branch');
 
 $node->stop;
 
-# With wal_level minimal, a relation made in a transaction skips WAL and is
-# synced at commit; a copy of it would be neither, so making a branch from
-# it is refused.  Changing branches copies nothing, and is allowed.
+# With wal_level minimal, storage made in a transaction (a new relation,
+# or one truncated or rewritten) skips WAL and is synced at commit; a copy
+# of it would be neither, so making a branch from it is refused.  Changing
+# branches copies nothing: each branch's copy keeps its own record of what
+# the transaction did to it, and writes to a copy whose storage is older
+# are logged.
 my $minimal = PostgreSQL::Test::Cluster->new('branch_minimal');
 $minimal->init;
 $minimal->append_conf('postgresql.conf', qq{
@@ -169,41 +172,75 @@ my ($mret, $mout, $merr) = $minimal->psql('postgres', q{
 	SELECT dolt_checkout('-b', 'from_new');
 });
 like($merr,
-	qr/cannot copy relation "new_here" to a branch in the transaction that made it/,
+	qr/cannot copy relation "new_here" to a branch in the transaction that gave it its storage/,
 	'a relation that skips WAL isn\'t copied to a new branch');
+($mret, $mout, $merr) = $minimal->psql('postgres', q{
+	BEGIN;
+	TRUNCATE app.t;
+	SELECT dolt_checkout('-b', 'from_truncated');
+});
+like($merr,
+	qr/cannot copy relation "t" to a branch in the transaction that gave it its storage/,
+	'nor one truncated in the transaction');
 
 # (other's copies exist already: the checkouts copy nothing)
 $minimal->safe_psql('postgres', q{
 	BEGIN;
 	CREATE TABLE app.made_here (id int);
 	INSERT INTO app.made_here VALUES (7);
+	TRUNCATE app.t;
+	INSERT INTO app.t VALUES (10);
 	SELECT dolt_checkout('other');
+	INSERT INTO app.t VALUES (2);
+	SELECT dolt_checkout('main');
+	INSERT INTO app.t VALUES (11);
+	SAVEPOINT s;
+	SELECT dolt_checkout('other');
+	TRUNCATE app.t;
+	INSERT INTO app.t VALUES (3);
+	ROLLBACK TO s;
+	INSERT INTO app.t VALUES (12);	-- (on other: a checkout isn't undone)
 	SELECT dolt_checkout('main');
 	COMMIT;
 });
 
+# (the remote gets the branches' heads, holding only the first commit's row)
 # A branch first used here, whose copies are made from its head rather than
-# shared with another branch's (a clone's): its new relations skip WAL too.
+# shared with another branch's (a clone's): its new relations skip WAL too,
+# and switching back out of it writes the other branch's copies with WAL.
 my $remote = $minimal->basedir . '/remote';
 mkdir $remote or die "mkdir $remote: $!";
 $minimal->safe_psql('postgres', qq{
 	SELECT dolt_remote('add', 'origin', 'file://$remote');
+	SELECT dolt_push('origin', 'main');
 	SELECT dolt_push('origin', 'other');
 });
 $minimal->safe_psql('postgres', 'CREATE DATABASE cloned');
 $minimal->safe_psql('cloned', qq{SELECT dolt_clone('file://$remote')});
 is($minimal->safe_psql('cloned', q{
+	BEGIN;
+	SELECT dolt_checkout('other');
+	INSERT INTO app.t VALUES (4);
+	SELECT dolt_checkout('main');
+	INSERT INTO app.t VALUES (5);
+	COMMIT;
 	SELECT dolt_checkout('other');
 	SELECT active_branch(), count(*) FROM app.t;
-}), "{0,\"Switched to branch 'other'\"}\nother|1",
-	'a cloned branch is checked out under wal_level minimal');
+}), "{0,\"Switched to branch 'other'\"}\n{0,\"Switched to branch 'main'\"}\n{0,\"Switched to branch 'other'\"}\nother|2",
+	'a cloned branch is checked out, and left, under wal_level minimal');
 
-# Their storage was synced at commit: a crash loses none of it.
+# What was synced at commit, and what was logged: a crash loses none of it.
 $minimal->stop('immediate');
 $minimal->start;
 is($minimal->safe_psql('postgres', 'SELECT id FROM app.made_here'), '7',
 	'a relation made before a branch change survives a crash');
-is($minimal->safe_psql('cloned/other', 'SELECT count(*) FROM app.t'), '1',
-	'a cloned branch\'s copies survive a crash');
+is($minimal->safe_psql('postgres', 'SELECT array_agg(id ORDER BY id) FROM app.t'),
+	'{10,11}', 'so does a copy truncated before a branch change');
+is($minimal->safe_psql('postgres/other', 'SELECT array_agg(id ORDER BY id) FROM app.t'),
+	'{1,2,12}', 'and the other branch\'s copy, written after it');
+is($minimal->safe_psql('cloned/other', 'SELECT array_agg(id ORDER BY id) FROM app.t'),
+	'{1,4}', 'a cloned branch\'s copies survive a crash');
+is($minimal->safe_psql('cloned', 'SELECT array_agg(id ORDER BY id) FROM app.t'),
+	'{1,5}', 'and the copies written after leaving it');
 $minimal->stop;
 done_testing();

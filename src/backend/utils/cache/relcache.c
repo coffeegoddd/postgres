@@ -40,6 +40,7 @@
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -189,6 +190,10 @@ static int	in_progress_list_maxlen;
 static Oid	eoxact_list[MAX_EOXACT_LIST];
 static int	eoxact_list_len = 0;
 static bool eoxact_list_overflowed = false;
+
+/* records of relations' copies on branches the session left (below) */
+static List *branch_new_states = NIL;
+static void restore_branch_new_state(Relation relation);
 
 #define EOXactListAdd(rel) \
 	do { \
@@ -2136,7 +2141,12 @@ RelationIdGetRelation(Oid relationId)
 	 */
 	rd = RelationBuildDesc(relationId, true);
 	if (RelationIsValid(rd))
+	{
+		/* (one made or given storage on this branch before a branch change) */
+		if (branch_new_states != NIL)
+			restore_branch_new_state(rd);
 		RelationIncrementReferenceCount(rd);
+	}
 	return rd;
 }
 
@@ -2959,19 +2969,109 @@ RelationCacheInvalidateEntry(Oid relationId)
 }
 
 /*
+ * What a relation's entry records of this transaction ("made in it", "given
+ * new storage in it", dropped), on a branch the session has left: a
+ * branch's copy of a relation is its own, with its own storage, so each
+ * copy's record is kept apart, and given back to the entry when the session
+ * returns to the branch.  Kept in TopTransactionContext, and maintained at
+ * subtransaction end as the entries are.
+ */
+typedef struct BranchNewState
+{
+	Oid			relid;
+	Oid			branch;
+	SubTransactionId createSubid;
+	SubTransactionId newRelfilelocatorSubid;
+	SubTransactionId firstRelfilelocatorSubid;
+	SubTransactionId droppedSubid;
+} BranchNewState;
+
+
+static BranchNewState *
+find_branch_new_state(Oid relid, Oid branch)
+{
+	ListCell   *lc;
+
+	foreach(lc, branch_new_states)
+	{
+		BranchNewState *st = lfirst(lc);
+
+		if (st->relid == relid && st->branch == branch)
+			return st;
+	}
+	return NULL;
+}
+
+static bool
+relation_is_new(Relation relation)
+{
+	return relation->rd_createSubid != InvalidSubTransactionId ||
+		relation->rd_newRelfilelocatorSubid != InvalidSubTransactionId ||
+		relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId ||
+		relation->rd_droppedSubid != InvalidSubTransactionId;
+}
+
+/* Keep relation's record as branch's, its copy's. */
+static void
+save_branch_new_state(Relation relation, Oid branch)
+{
+	BranchNewState *st = find_branch_new_state(RelationGetRelid(relation),
+											   branch);
+
+	if (st == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		st = palloc(sizeof(BranchNewState));
+		st->relid = RelationGetRelid(relation);
+		st->branch = branch;
+		branch_new_states = lappend(branch_new_states, st);
+		MemoryContextSwitchTo(old);
+	}
+	st->createSubid = relation->rd_createSubid;
+	st->newRelfilelocatorSubid = relation->rd_newRelfilelocatorSubid;
+	st->firstRelfilelocatorSubid = relation->rd_firstRelfilelocatorSubid;
+	st->droppedSubid = relation->rd_droppedSubid;
+}
+
+/*
+ * Give relation, now the session's branch's copy, that copy's record: none
+ * if it has none kept.
+ */
+static void
+restore_branch_new_state(Relation relation)
+{
+	BranchNewState *st = find_branch_new_state(RelationGetRelid(relation),
+											   MyBranch);
+
+	relation->rd_createSubid = st ? st->createSubid : InvalidSubTransactionId;
+	relation->rd_newRelfilelocatorSubid =
+		st ? st->newRelfilelocatorSubid : InvalidSubTransactionId;
+	relation->rd_firstRelfilelocatorSubid =
+		st ? st->firstRelfilelocatorSubid : InvalidSubTransactionId;
+	relation->rd_droppedSubid = st ? st->droppedSubid : InvalidSubTransactionId;
+	if (st)
+		EOXactListAdd(relation);
+}
+
+/*
  * RelationCacheRebuildNew
- *		Rebuild the entries of relations made, or given new storage, in this
- *		transaction, after the session changes branch.
+ *		After the session changes branch (from from_branch), give each
+ *		entry the record of this transaction its new branch's copy has.
  *
- * A cache reset keeps such entries as they are (RelationCacheInvalidate()),
- * since their "new" status must not be lost.  But on another branch their
- * catalog rows are that branch's copy's, with storage of its own: the
- * entries are rebuilt from them, keeping the status, or marked invalid if
- * the branch has no copy.  Outside a transaction (its abort discards them)
- * nothing is done.
+ * A cache reset keeps entries of relations made, or given new storage, in
+ * this transaction as they are (RelationCacheInvalidate()), since that
+ * status must not be lost.  But on another branch their catalog rows are
+ * that branch's copy's, with storage of its own, and their record is that
+ * copy's: a copy made or given storage in this transaction on the branch
+ * left is not the one written now.  So each such entry's record is kept as
+ * from_branch's, and the entries of relations with a record on either
+ * branch are rebuilt from the new branch's rows with its copy's record, or
+ * marked invalid if the branch has no copy.  Outside a transaction (its
+ * abort discards them) nothing is done.
  */
 void
-RelationCacheRebuildNew(void)
+RelationCacheRebuildNew(Oid from_branch)
 {
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
@@ -2986,9 +3086,12 @@ RelationCacheRebuildNew(void)
 	{
 		Relation	relation = idhentry->reldesc;
 
-		if ((relation->rd_createSubid != InvalidSubTransactionId ||
-			 relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId) &&
-			relation->rd_droppedSubid == InvalidSubTransactionId)
+		if (relation_is_new(relation))
+		{
+			save_branch_new_state(relation, from_branch);
+			rebuild = lappend(rebuild, relation);
+		}
+		else if (find_branch_new_state(RelationGetRelid(relation), MyBranch))
 			rebuild = lappend(rebuild, relation);
 	}
 
@@ -2996,6 +3099,7 @@ RelationCacheRebuildNew(void)
 	{
 		Relation	relation = lfirst(lc);
 
+		restore_branch_new_state(relation);
 		if (!SearchSysCacheExists1(RELOID,
 								   ObjectIdGetDatum(RelationGetRelid(relation))))
 		{
@@ -3288,6 +3392,9 @@ AtEOXact_RelationCache(bool isCommit)
 	Assert(in_progress_list_len == 0 || !isCommit);
 	in_progress_list_len = 0;
 
+	/* (kept in TopTransactionContext, which goes with the transaction) */
+	branch_new_states = NIL;
+
 	/*
 	 * Unless the eoxact_list[] overflowed, we only need to examine the rels
 	 * listed in it.  Otherwise fall back on a hash_seq_search scan.
@@ -3433,6 +3540,7 @@ AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
 	int			i;
+	ListCell   *lc;
 
 	/*
 	 * Forget in_progress_list.  This is relevant when we're aborting due to
@@ -3471,6 +3579,30 @@ AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 	}
 
 	/* Don't reset the list; we still need more cleanup later */
+
+	/* the records kept for branches left, as the entries' are */
+	foreach(lc, branch_new_states)
+	{
+		BranchNewState *st = lfirst(lc);
+
+		if (st->createSubid == mySubid)
+		{
+			if (isCommit && st->droppedSubid == InvalidSubTransactionId)
+				st->createSubid = parentSubid;
+			else
+			{
+				branch_new_states = foreach_delete_current(branch_new_states, lc);
+				pfree(st);
+				continue;
+			}
+		}
+		if (st->newRelfilelocatorSubid == mySubid)
+			st->newRelfilelocatorSubid = isCommit ? parentSubid : InvalidSubTransactionId;
+		if (st->firstRelfilelocatorSubid == mySubid)
+			st->firstRelfilelocatorSubid = isCommit ? parentSubid : InvalidSubTransactionId;
+		if (st->droppedSubid == mySubid)
+			st->droppedSubid = isCommit ? parentSubid : InvalidSubTransactionId;
+	}
 }
 
 /*
