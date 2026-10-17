@@ -67,7 +67,7 @@ FROM prolly_implementations();
  row_applier     | stub             |       0 |              0
  table_file      | basic            |       1 |              1
  table_file      | stub             |       0 |              0
- change_finder   | pages            |       1 |              1
+ change_finder   | pages            |       1 |              2
  change_finder   | stub             |       0 |              0
 (60 rows)
 

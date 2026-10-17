@@ -274,9 +274,9 @@ struct BaseTable
 };
 
 static void
-sha256(const void *data, Size len, ProllyHash *h)
+sha256(Canon *cn, const void *data, Size len, ProllyHash *h)
 {
-	const ProllyHashRoutine *r = prolly_hash_lookup("sha256");
+	const ProllyHashRoutine *r = cn->env.hash;
 	ProllyHashCtx *ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
 
 	PROLLY_CALL(r, update, ctx, data, len);
@@ -288,9 +288,10 @@ base_table_cmp(const void *a, const void *b)
 {
 	const BaseTable *x = a;
 	const BaseTable *y = b;
-	int			r = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
 
-	return r != 0 ? r : (x->key.len > y->key.len) - (x->key.len < y->key.len);
+	return memcmp_keys(&kx, &ky, NULL);
 }
 
 /*
@@ -395,7 +396,7 @@ folded_table_root(Canon *cn, CanonItem *it, Relation rel,
 		index_close(pk, AccessShareLock);
 	}
 
-	sha256(description->data, description->len, &dh);
+	sha256(cn, description->data, description->len, &dh);
 	bt = find_base_table(cn, &it->key);
 	if (bt && (bt->description.len != dh.len ||
 			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
