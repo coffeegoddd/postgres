@@ -77,6 +77,13 @@ typedef void (*ProllyCanonTableVisit) (const char *name,
 									   const char *unreadable,
 									   void *arg);
 
+/* A table's column, as its description names it. */
+typedef struct ProllyTableColumn
+{
+	char	   *name;
+	char	   *type;			/* as format_type() writes it */
+} ProllyTableColumn;
+
 typedef struct ProllyCanonRoutine
 {
 	ProllyImplInfo info;
@@ -104,12 +111,19 @@ typedef struct ProllyCanonRoutine
 								 ProllyNodeRef *merged);
 	void		(*walk_baseline) (const ProllyNodeRef *baseline,
 								  ProllyTreeVisitNode visit, void *arg);
+
+	/*
+	 * A table's description, as tables() gives it, read back: its live
+	 * columns in order (ProllyTableColumn *, in the server's encoding), and
+	 * whether a primary key keys its rows.
+	 */
+	List	   *(*table_columns) (const ProllyValue *description, bool *keyed);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
 	"materialized_views", "same_schema", "move_schema", "sequences", \
-	"merge_schema", "walk_baseline"
+	"merge_schema", "walk_baseline", "table_columns"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
 
 static inline const ProllyCanonRoutine *

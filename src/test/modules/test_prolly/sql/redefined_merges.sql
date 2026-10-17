@@ -59,5 +59,76 @@ SELECT id, v, z FROM rm.t WHERE id = 5;
 SELECT length(dolt_commit('-am', 'resolved')::text) AS committed;
 COMMIT;
 
+-- A conflict in a table neither base nor ours had (both made it): its
+-- versions are listed, the base's as none.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+CREATE TABLE rm.both (id int PRIMARY KEY, v text);
+INSERT INTO rm.both VALUES (1, 'theirs');
+SELECT length(dolt_commit('-Am', 'feature: both')::text) AS committed;
+SELECT dolt_checkout('main');
+CREATE TABLE rm.both (id int PRIMARY KEY, v text);
+INSERT INTO rm.both VALUES (1, 'ours');
+SELECT length(dolt_commit('-Am', 'main: both')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rm.both);
+ROLLBACK;
+DROP TABLE rm.both;
+SELECT length(dolt_commit('-am', 'main: not both')::text) AS committed;
+
+-- Theirs keys a keyless table and ours leaves its rows: theirs' rows,
+-- whole, as before (ours' can't be read keyed).
+ALTER TABLE rm.t ADD COLUMN u int;
+CREATE TABLE rm.k (id int, v text);
+INSERT INTO rm.k VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 'main: a column, a keyless table')::text) AS committed;
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+ALTER TABLE rm.k ADD PRIMARY KEY (id);
+UPDATE rm.k SET v = 'uno' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: rm.k keyed')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT length(dolt_commit('--allow-empty', '-m', 'main: nothing')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged a key'))[3:4];
+SELECT id, v FROM rm.k ORDER BY id;
+
+-- A column renamed on one side while the other changed it isn't matched by
+-- name: refused, not lost.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+ALTER TABLE rm.t RENAME COLUMN n TO n2;
+SELECT length(dolt_commit('-am', 'feature: n renamed')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE rm.t SET n = 100 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'main: n of 1')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged a rename'))[3:4];
+SELECT dolt_reset('--hard');
+
+-- A serial column one side added: its rows' values can't be told from the
+-- other side's rows, which don't have it: refused, not a false conflict.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+UPDATE rm.t SET u = 3 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: u of 3')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE rm.t ADD COLUMN s serial;
+SELECT length(dolt_commit('-am', 'main: a serial')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged a serial'))[3:4];
+ALTER TABLE rm.t DROP COLUMN s;
+SELECT length(dolt_commit('-am', 'main: no serial')::text) AS committed;
+
+-- A default with a newline in it doesn't hide the columns after it.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+ALTER TABLE rm.t ADD COLUMN note text DEFAULT E'a\nb', ADD COLUMN after_note int DEFAULT 9;
+UPDATE rm.t SET after_note = 10 WHERE id = 2;
+SELECT length(dolt_commit('-am', 'feature: a default with a newline')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE rm.t SET u = 4 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'main: u of 4')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'merged past a newline'))[3:4];
+SELECT id, u, note = E'a\nb' AS note_kept, after_note FROM rm.t ORDER BY id;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA rm CASCADE;
