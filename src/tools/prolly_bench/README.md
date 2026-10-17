@@ -492,7 +492,7 @@ empirical node-work growth:
 
 ```sh
 src/tools/prolly_bench/prolly_bench complexity RESULT_DIR \
-  --workload V2 --operation prolly_commit --counter nodes_read --max-exponent 0.3
+  --workload V2 --operation dolt_commit --counter nodes_read --max-exponent 0.3
 ```
 
 The report includes a bootstrap interval for the measured exponent. The bound
