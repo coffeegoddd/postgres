@@ -963,7 +963,22 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 
 	PROLLY_CALL(dc.canonicalizer, tables, working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, tables, target, add_table, &to);
-	/* materialized views' rows too: a commit holds them as it was made */
+	foreach(lc, to.tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *f = find_table(from.tables, t->name);
+
+		if (f == NULL)
+			elog(ERROR, "table \"%s\" is missing from the working set", t->name);
+		if (!same_hash(&f->data.hash, &t->data.hash))
+			apply_rows(table_named(t->name), f, t);
+	}
+
+	/*
+	 * Materialized views' rows too, as the commit holds them: those there
+	 * are (one being made again is written once it is).
+	 */
+	from.tables = to.tables = NIL;
 	PROLLY_CALL(dc.canonicalizer, materialized_views, working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, materialized_views, target, add_table, &to);
 	foreach(lc, to.tables)
@@ -971,9 +986,7 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 		Table	   *t = lfirst(lc);
 		Table	   *f = find_table(from.tables, t->name);
 
-		if (f == NULL)
-			elog(ERROR, "relation \"%s\" is missing from the working set", t->name);
-		if (!same_hash(&f->data.hash, &t->data.hash))
+		if (f != NULL && !same_hash(&f->data.hash, &t->data.hash))
 			apply_rows(table_named(t->name), f, t);
 	}
 

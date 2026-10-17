@@ -2649,12 +2649,14 @@ type_moves(List *from, List *to, bool *all_dropped)
 /*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
- * rows(arg), which writes them, then what they must satisfy.
+ * rows(arg), which writes them, then what they must satisfy; and, if
+ * materialized views were made again, rows(arg) once more, for theirs.
  */
 static void
 folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				   void (*rows) (void *arg), void *arg)
 {
+	bool		matviews_made = false;
 	Canon		cn;
 	List	   *from;
 	List	   *to;
@@ -2872,16 +2874,19 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 		if (t->kind == 'v')
 			views = lappend(views, psprintf("CREATE VIEW %s AS %s", t->name, t->def));
-		/* materialized views made again, or refreshed, once the rows are in */
+		/*
+		 * materialized views made again once the rows are in; their rows,
+		 * as to holds them, written after (those of the others are written
+		 * with the tables')
+		 */
 		else if (t->kind == 'm' &&
 				 (f == NULL || all_dropped || view_drops != NIL ||
 				  strcmp(t->def, f->def) != 0))
+		{
 			views = lappend(views, psprintf("CREATE MATERIALIZED VIEW %s AS %s",
 											t->name, t->def));
-		else if (t->kind == 'm' &&
-				 (t->data.len != f->data.len ||
-				  memcmp(t->data.bytes, f->data.bytes, t->data.len) != 0))
-			views = lappend(views, psprintf("REFRESH MATERIALIZED VIEW %s", t->name));
+			matviews_made = true;
+		}
 	}
 
 	/*
@@ -2915,6 +2920,15 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(sm.after);
 	run_statements(sm.foreign_keys);
 	make_views(views);
+	if (matviews_made)
+	{
+		MemoryContext spi;
+
+		CommandCounterIncrement();
+		spi = MemoryContextSwitchTo(caller);
+		rows(arg);
+		MemoryContextSwitchTo(spi);
+	}
 	SPI_finish();
 	AtEOXact_GUC(true, save_nestlevel);
 	return;
