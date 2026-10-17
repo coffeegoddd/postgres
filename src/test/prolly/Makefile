@@ -9,9 +9,10 @@
 #
 # (prolly_d1 is the default; PROLLY_AM=prolly runs the groups the page-based
 # engine supports.  check-vc and check-vc-isolation run on prolly whatever
-# PROLLY_AM is, after check-vc-target passes on it; check-vc-d1 and
-# check-vc-isolation-d1 run the tree engine's own version control tests
-# on PROLLY_AM, which can't be prolly.)
+# PROLLY_AM is, after check-vc-target passes on it; check-tap-vc runs the
+# version control TAP tests on PROLLY_AM, prolly or a tree engine;
+# check-vc-d1 and check-vc-isolation-d1 run the tree engine's own version
+# control tests on PROLLY_AM, which can't be prolly.)
 #
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
