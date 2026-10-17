@@ -1,24 +1,25 @@
 /*-------------------------------------------------------------------------
  *
  * canon_catalogs.c
- *	  Canonicalizer implementation "catalogs": a working set's canonical
- *	  form, derived from the database's catalogs, by name.
+ *	  Canonicalizer implementation "folded": the canonical form of the
+ *	  session branch's versioned schemas, derived from the catalogs, by
+ *	  name, their tables' rows folded into trees.
  *
  * The canonical root is a tree keyed (by memcmp) by kind and qualified
  * name, every string in UTF-8:
  *
- *	"!:format"			-> (folded only) the format its data trees are in,
- *						   FOLDED_FORMAT
- *	"e:" extension		-> its version
+ *	"!:format"			-> the format its data trees are in, FOLDED_FORMAT
+ *	"c:" collation		-> its provider, locale, ICU rules, whether it is
+ *						   deterministic and its library's version, a line
+ *						   each ("default": the database's)
  *	"f:" function(args)	-> its definition
- *	"i:" index			-> a prolly index's tree (hash length, hash)
  *	"m:" materialized view -> its data tree (hash length, hash), then its
  *						   query
- *	"n:" schema			-> nothing: a versioned schema (folded only), there
- *						   whether or not anything is in it
- *	"s:" sequence		-> its definition; in folded roots then, a line of
- *						   its own, its value: the last value, and whether it
- *						   was given out ("t" or "f")
+ *	"n:" schema			-> nothing: a versioned schema, there whether or not
+ *						   anything is in it
+ *	"s:" sequence		-> its definition, then a line of its own, its
+ *						   value: the last value, and whether it was given
+ *						   out ("t" or "f")
  *	"t:" table			-> its data tree (hash length, hash), then its schema
  *	"v:" view			-> its query
  *	"y:" type			-> an enum's labels, a domain's or a composite
@@ -27,39 +28,25 @@
  * A table's schema lists its live columns in order (name, type, nullness,
  * collation if not the type's, default, identity, generation), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
- * prints them.
- * Names are qualified whatever the session's search path (it is set to
- * pg_catalog while deparsing), so nothing local, no OID or relfilenumber,
- * and nothing about how the objects came to be (their order, dropped
- * columns) reaches the hash.  Data trees and prolly index trees are
- * canonical as written; prepare() rewrites the rows of tables whose rows
- * aren't (prolly_canonicalize_table).
+ * prints them.  Names are qualified whatever the session's search path (it
+ * is set to pg_catalog while deparsing), so nothing local, no OID or
+ * relfilenumber, and nothing about how the objects came to be (their
+ * order, dropped columns) reaches the hash.  A table's rows are folded
+ * into its data tree (keyed by the table keying, sorted, a tree in the
+ * chunk store), and the canonical tree is kept there too.
  *
- * Covered: prolly tables, their columns, constraints, indexes (prolly
- * index trees and other index AMs' definitions), triggers and rules;
- * views and materialized views; functions and procedures; enum, domain and
- * composite types; sequences; and extensions (by name and version; their
- * members aren't listed).  Anything else in the database's own schemas
- * (aggregates, policies, partitioned or foreign tables, other types) makes
- * canonical_root() fail: never a hash that might depend on history.  Heap
- * tables are not versioned and are left out.
+ * Covered, in versioned schemas: prolly tables, their columns,
+ * constraints, indexes, triggers and rules; views and materialized views;
+ * functions and procedures; enum, domain and composite types; sequences.
+ * Ordinary schemas and extensions are every branch's, not the commit's.
+ * Anything else in versioned schemas (aggregates, policies, partitioned or
+ * foreign tables, other types) makes a commit fail: never a hash that
+ * might depend on history.
  *
- * Implementation "folded" builds the same form for the session branch's
- * versioned schemas, the tables being block-mapped prolly tables: their
- * rows are folded into data trees (keyed by the table keying, sorted, each
- * a tree in the chunk store), and the canonical tree is kept there too.
- * Only objects in versioned schemas are described: ordinary schemas and
- * extensions are every branch's, not the commit's.  Each collation that
- * orders a table's keys is recorded too:
- *
- *	"c:" collation		-> its provider, locale, ICU rules, whether it is
- *						   deterministic and its library's version, a line
- *						   each ("default": the database's)
- *
- * and a table whose keys are ordered by a collation that differs now from
- * what a root recorded can't have that root's rows read: its tree's keys
- * may be in another order.  The root is still listed, and its other
- * tables read.
+ * Each collation that orders a table's keys is recorded, and a table whose
+ * keys are ordered by a collation that differs now from what a root
+ * recorded can't have that root's rows read: its tree's keys may be in
+ * another order.  The root is still listed, and its other tables read.
  *
  * In the other direction, move_schema() turns the branch's definitions into
  * a root's, with the statements Postgres's deparser printed for them:
@@ -84,8 +71,6 @@
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
-#include "access/prolly_indexam.h"
-#include "access/prolly_tableam.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -149,15 +134,12 @@ typedef struct BaseTable BaseTable;
 
 typedef struct Canon
 {
-	ProllyComponents c;
 	ProllyTreeEnv env;
-	ProllyRootSet *roots;
 	List	   *items;
-	bool		folded;			/* the session branch's versioned schemas */
 	const ProllyTreeRoutine *tree;
 	List	   *collations;		/* OIDs of the collations ordering keys */
 
-	/* folded: the branch's baseline, and the next one if it is made */
+	/* the branch's baseline, and the next one if it is made */
 	const ProllyChangeFinderRoutine *finder;
 	BaseTable  *base;			/* in key order */
 	int			nbase;
@@ -189,20 +171,7 @@ static void
 canon_env(Canon *cn)
 {
 	cn->tree = prolly_tree_lookup("cow");
-	if (cn->folded)
-	{
-		prolly_folded_tree_env(&cn->env);
-		return;
-	}
-	memset(&cn->env, 0, sizeof(cn->env));
-	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
-	cn->env.node_format = cn->c.node_format;
-	cn->env.chunker = cn->c.chunker;
-	cn->env.hash = cn->c.hash;
-	cn->env.node_store = cn->c.node_store;
-	cn->env.store = PROLLY_CALL(cn->c.node_store, open, NULL);
-	cn->env.log = cn->c.log;
-	cn->env.compare = prolly_bytes_compare;
+	prolly_folded_tree_env(&cn->env);
 }
 
 /* Append s in UTF-8. */
@@ -254,17 +223,6 @@ static char *
 qualified(Oid nsp, const char *name)
 {
 	return quote_qualified_identifier(get_namespace_name(nsp), name);
-}
-
-static bool
-is_prolly_am(Oid amoid)
-{
-	char	   *amname = OidIsValid(amoid) ? get_am_name(amoid) : NULL;
-	bool		prolly = prolly_is_table_am(amname);
-
-	if (amname)
-		pfree(amname);
-	return prolly;
 }
 
 /* An object a commit can't hold: what kind, and its name. */
@@ -375,7 +333,6 @@ parse_base_table(const ProllyValue *v, BaseTable *bt)
 		return false;
 	bt->data.hash.len = p[0];
 	memcpy(bt->data.hash.bytes, p + 1, p[0]);
-	bt->data.location.blkno = InvalidBlockNumber;
 	p += 1 + p[0];
 	if (p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0])
 		return false;
@@ -504,23 +461,19 @@ folded_table_root(Canon *cn, CanonItem *it, Relation rel,
 	pfree(state.data);
 }
 
-/* A table's data tree: folded from its rows, or its working set's. */
+/* A table's data tree: folded from its rows. */
 static void
 table_root(Canon *cn, CanonItem *it, Relation rel,
 		   const StringInfoData *description, ProllyNodeRef *root)
 {
-	if (cn->folded)
-		folded_table_root(cn, it, rel, description, root);
-	else
-		PROLLY_CALL(cn->c.engine, tree_root, cn->roots, rel, PROLLY_TREE_DATA,
-					root);
+	folded_table_root(cn, it, rel, description, root);
 }
 
 /* Is a relation of this access method's rows in the canonical form? */
 static bool
 versioned_am(Canon *cn, Oid amoid)
 {
-	return cn->folded ? amoid == PROLLY_TABLE_AM_OID : is_prolly_am(amoid);
+	return amoid == PROLLY_TABLE_AM_OID;
 }
 
 /* Is an object in this namespace the canonical form's? */
@@ -529,7 +482,7 @@ canon_namespace(Canon *cn, Oid nsp)
 {
 	if (is_system_namespace(nsp))
 		return false;
-	return !cn->folded || namespace_is_versioned(nsp);
+	return namespace_is_versioned(nsp);
 }
 
 static int
@@ -677,19 +630,6 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 		append_utf8(out, pg_get_indexdef_string(idx));
 		appendStringInfoChar(out, '\n');
-		if (!cn->folded && is_prolly_am(get_rel_relam(idx)))
-		{
-			Relation	irel = index_open(idx, AccessShareLock);
-			CanonItem  *it = add_item(cn, "i:",
-									  qualified(RelationGetNamespace(irel),
-												RelationGetRelationName(irel)));
-			ProllyNodeRef root;
-
-			PROLLY_CALL(cn->c.engine, tree_root, cn->roots, irel,
-						PROLLY_TREE_DATA, &root);
-			put_hash(&it->value, &root.hash);
-			index_close(irel, AccessShareLock);
-		}
 	}
 
 	/* Triggers and rules, by name. */
@@ -843,6 +783,8 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 	HeapTuple	tup = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seqid));
 	Form_pg_sequence seq;
 	CanonItem  *it;
+	int64		last;
+	bool		called;
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for sequence %u", seqid);
@@ -859,15 +801,9 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 	 * whatever the session may read.  One that can't be read here has no
 	 * value recorded (and a move leaves it as it is).
 	 */
-	if (cn->folded)
-	{
-		int64		last;
-		bool		called;
-
-		if (ReadSequenceState(seqid, &last, &called))
-			appendStringInfo(&it->value, INT64_FORMAT "\t%s\n", last,
-							 called ? "t" : "f");
-	}
+	if (ReadSequenceState(seqid, &last, &called))
+		appendStringInfo(&it->value, INT64_FORMAT "\t%s\n", last,
+						 called ? "t" : "f");
 	ReleaseSysCache(tup);
 }
 
@@ -991,7 +927,6 @@ collect(Canon *cn)
 	table_close(pg_class, AccessShareLock);
 
 	/* Versioned schemas themselves, empty ones too. */
-	if (cn->folded)
 	{
 		Relation	pg_ns = table_open(NamespaceRelationId, AccessShareLock);
 
@@ -1079,106 +1014,6 @@ collect(Canon *cn)
 		systable_endscan(scan);
 		table_close(pg_policy, AccessShareLock);
 	}
-	/* Extensions, by name and version (every branch's, if folded). */
-	if (!cn->folded)
-	{
-		Relation	pg_ext = table_open(ExtensionRelationId, AccessShareLock);
-
-		scan = systable_beginscan(pg_ext, InvalidOid, false, NULL, 0, NULL);
-		while ((tup = systable_getnext(scan)) != NULL)
-		{
-			Form_pg_extension ext = (Form_pg_extension) GETSTRUCT(tup);
-			bool		isnull;
-			Datum		ver = heap_getattr(tup, Anum_pg_extension_extversion,
-										   RelationGetDescr(pg_ext), &isnull);
-			CanonItem  *it;
-
-			if (strcmp(NameStr(ext->extname), "plpgsql") == 0)
-				continue;		/* every database has it */
-			it = add_item(cn, "e:", NameStr(ext->extname));
-			if (!isnull)
-				append_utf8(&it->value, TextDatumGetCString(ver));
-		}
-		systable_endscan(scan);
-		table_close(pg_ext, AccessShareLock);
-	}
-}
-
-static void
-catalogs_prepare(void)
-{
-	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false, NULL,
-										  0, NULL);
-	HeapTuple	tup;
-	List	   *tables = NIL;
-	ListCell   *lc;
-
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
-
-		if (form->relkind == RELKIND_RELATION && is_prolly_am(form->relam) &&
-			!is_system_namespace(form->relnamespace))
-			tables = lappend_oid(tables, form->oid);
-	}
-	systable_endscan(scan);
-	table_close(pg_class, AccessShareLock);
-	foreach(lc, tables)
-	{
-		Relation	rel = table_open(lfirst_oid(lc), RowExclusiveLock);
-
-		prolly_canonicalize_table(rel);
-		table_close(rel, NoLock);
-	}
-}
-
-static void
-catalogs_canonical_root(const ProllyNodeRef *working_set, ProllyNodeRef *root)
-{
-	Canon		cn;
-
-	memset(&cn, 0, sizeof(cn));
-	canon_env(&cn);
-	cn.roots = PROLLY_CALL(cn.c.engine, roots_at, working_set);
-	build_canonical(&cn, root);
-	PROLLY_CALL(cn.c.engine, roots_release, cn.roots);
-}
-
-/* The canonical tree, and the data and index trees its items name. */
-static void
-catalogs_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
-{
-	Canon		cn;
-	ProllyTreeCursor *c;
-	ProllyKey	k;
-	ProllyValue v;
-	List	   *trees = NIL;
-	ListCell   *lc;
-
-	memset(&cn, 0, sizeof(cn));
-	canon_env(&cn);
-	/* (a root the visitor declines: it has seen the trees the root names) */
-	if (!PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg))
-		return;
-	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
-	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
-	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
-	{
-		ProllyNodeRef *ref;
-
-		if (k.len < 2 || (k.data[0] != 't' && k.data[0] != 'i') || v.len < 1 ||
-			v.len < 1 + v.data[0])
-			continue;
-		ref = palloc0(sizeof(ProllyNodeRef));
-		ref->hash.len = v.data[0];
-		memcpy(ref->hash.bytes, v.data + 1, ref->hash.len);
-		ref->location.blkno = InvalidBlockNumber;
-		trees = lappend(trees, ref);
-	}
-	PROLLY_CALL(cn.tree, cursor_close, c);
-	foreach(lc, trees)
-		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
 }
 
 /*
@@ -1419,10 +1254,9 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	collect(cn);
 	AtEOXact_GUC(false, save_nestlevel);
-	add_collations(cn);		/* (none unless folded) */
+	add_collations(cn);
 	check_refused(cn);
-	if (cn->folded)
-		appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
+	appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
 
 	list_sort(cn->items, item_cmp);
 	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
@@ -1466,7 +1300,6 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	/* (a baseline holds every table's state: never made from one alone) */
 	Assert(!OidIsValid(only) || next_baseline == NULL);
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	cn.reading = reading;
 	cn.only = only;
 	canon_env(&cn);
@@ -1527,7 +1360,6 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 	Canon		cn;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	cn.finder = prolly_changes_lookup("pages");
 	/* (a baseline the visitor declines: it has seen the trees it names) */
@@ -1568,7 +1400,6 @@ tree_item(const ProllyKey *k, const ProllyValue *v, ProllyNodeRef *data,
 		memset(data, 0, sizeof(*data));
 		data->hash.len = v->data[0];
 		memcpy(data->hash.bytes, v->data + 1, data->hash.len);
-		data->location.blkno = InvalidBlockNumber;
 	}
 	def->data = v->data + 1 + v->data[0];
 	def->len = v->len - 1 - v->data[0];
@@ -1587,7 +1418,6 @@ folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	/* (a root the visitor declines: it has seen the trees the root names) */
 	if (!PROLLY_CALL(cn.tree, walk, &cn.env, root, visit, arg))
@@ -1640,7 +1470,6 @@ folded_in_format(const ProllyNodeRef *root)
 	Canon		cn;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	return root_in_format(&cn, root);
 }
@@ -1666,7 +1495,6 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 	bool		current;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	if (kind == 't')
 		stale = stale_collations(&cn, root);
@@ -1744,7 +1572,6 @@ folded_sequences(const ProllyNodeRef *root, ProllyCanonSequenceVisit visit,
 	ProllyKey	from = {(const uint8 *) "s:", 2};
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
@@ -1795,7 +1622,6 @@ folded_same_schema(const ProllyNodeRef *a, const ProllyNodeRef *b)
 	bool		same = true;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	ca = PROLLY_CALL(cn.tree, cursor_open, &cn.env, a, CurrentMemoryContext);
 	cb = PROLLY_CALL(cn.tree, cursor_open, &cn.env, b, CurrentMemoryContext);
@@ -3124,7 +2950,6 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	MemoryContext caller = CurrentMemoryContext;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	from = move_items(&cn, from_root);
 	to = move_items(&cn, to_root);
@@ -3440,7 +3265,6 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
-	cn.folded = true;
 	canon_env(&cn);
 	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, base_root, CurrentMemoryContext);
 	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, ours_root, CurrentMemoryContext);
@@ -3534,18 +3358,4 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.table_columns = folded_table_columns,
 	.in_format = folded_in_format,
 	.format = folded_format,
-};
-
-const ProllyCanonRoutine prolly_canon_catalogs = {
-	.info = {
-		.iface = PROLLY_IFACE_CANONICALIZER,
-		.impl_id = 1,
-		.format_version = 1,
-		.name = "catalogs",
-		.description = "canonical form by name, from the catalogs and the "
-		"working set's trees",
-	},
-	.prepare = catalogs_prepare,
-	.canonical_root = catalogs_canonical_root,
-	.walk = catalogs_walk,
 };

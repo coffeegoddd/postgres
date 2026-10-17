@@ -13,7 +13,6 @@
 #ifndef PROLLY_TYPES_H
 #define PROLLY_TYPES_H
 
-#include "storage/block.h"
 
 /*
  * A content hash.  The length is decided by the content-hash implementation
@@ -48,88 +47,28 @@ typedef struct ProllyValue
 	uint32		len;
 } ProllyValue;
 
-/*
- * A physical location inside a relation's storage: a whole block, or a run
- * of bytes within one (prolly_alloc.h).
- */
-typedef struct ProllyExtent
-{
-	BlockNumber blkno;			/* InvalidBlockNumber if none */
-	uint16		offset;			/* byte offset within the block */
-	uint16		length;			/* 0 means the whole block */
-} ProllyExtent;
-
-/*
- * A reference to a node.  Hash-addressed stores identify nodes by hash;
- * location-addressed stores by extent, with the hash computed on demand
- * (lazy hashing).  Either may be absent; at least one must be present.  The
- * location may also be a read hint for a hash-addressed store.
- */
+/* A reference to a node: the hash it is found by. */
 typedef struct ProllyNodeRef
 {
 	ProllyHash	hash;			/* hash.len == 0 if not (yet) known */
-	ProllyExtent location;		/* location.blkno invalid if not known */
 } ProllyNodeRef;
 
 /* A branch, as numbered by the refs implementation (prolly_refs.h). */
 typedef uint32 ProllyBranchId;
 
-#define InvalidProllyBranchId	((ProllyBranchId) 0)
-
-/*
- * Every database's default branch.  Until refs exist, it is the only one.
- */
-#define PROLLY_MAIN_BRANCH		((ProllyBranchId) 1)
-
-/*
- * The branch whose head is a database's refs (branch names, commits), not
- * a working set: the refs implementation keeps them there.
- */
-#define PROLLY_REFS_BRANCH		((ProllyBranchId) 0xFFFFFFFE)
-
-/*
- * Which of a relation's trees is meant.  DATA is the relation's own rows
- * (or index entries); the others are local metadata, never part of a
- * version-control commit.  These numbers are persisted; never renumber.
- */
-typedef enum ProllyTreeKind
-{
-	PROLLY_TREE_DATA = 0,
-	PROLLY_TREE_ROWID = 1,		/* row identity: TIDs <-> rows */
-	PROLLY_TREE_META = 2,		/* facts about the data tree, such as its keying */
-	PROLLY_TREE_ROWKEY = 3,		/* local metadata by row, in the data tree's order */
-} ProllyTreeKind;
-
-#define PROLLY_TREE_KIND_LAST	PROLLY_TREE_ROWKEY
-
-/* Bytes that follow the data key in each key of a PROLLY_TREE_ROWKEY tree. */
-#define PROLLY_ROWKEY_SUFFIX_LEN	8
-
 /*
  * Opaque handles.  Each is defined privately by the implementation that
  * creates it; callers only pass them back to the same implementation.
  */
-typedef struct ProllyRootSet ProllyRootSet;		/* engine */
-typedef struct ProllyCursor ProllyCursor;		/* engine */
 typedef struct ProllyChunker ProllyChunker;		/* chunker */
 typedef struct ProllyHashCtx ProllyHashCtx;		/* content hash */
 typedef struct ProllyKeyEncoder ProllyKeyEncoder;	/* key encoder */
 typedef struct ProllyValueEncoder ProllyValueEncoder;	/* value encoder */
-typedef struct ProllyNodeStore ProllyNodeStore; /* node store */
-typedef struct ProllyAllocator ProllyAllocator; /* allocator */
 
 /*
- * Receives canonical chunks (engine export, transfer).  Callers embed this
- * as the first member of their own struct to carry state.
+ * Receives row differences (diff/merge).  Callers embed this as the first
+ * member of their own struct to carry state.
  */
-typedef struct ProllyChunkSink ProllyChunkSink;
-struct ProllyChunkSink
-{
-	void		(*put) (ProllyChunkSink *self, const ProllyHash *hash,
-						const uint8 *data, Size len);
-};
-
-/* Receives row differences (diff/merge).  Same embedding convention. */
 typedef enum ProllyDiffKind
 {
 	PROLLY_DIFF_ADDED,
@@ -148,7 +87,7 @@ struct ProllyDiffSink
 						   const ProllyValue *after);	/* NULL if removed */
 };
 
-/* Nodes read from and written to a node store, for counting work. */
+/* Tree nodes read from and written to a chunk store, for counting work. */
 typedef struct ProllyNodeCounters
 {
 	uint64		nodes_read;

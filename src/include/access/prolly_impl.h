@@ -24,31 +24,24 @@
 #define PROLLY_IMPL_H
 
 /*
- * The interfaces.  These numbers are persisted in format stamps, so
- * never renumber or reuse one; add new interfaces at the end.
+ * The interfaces.  Never renumber or reuse one; add new interfaces at the
+ * end.  1-3, 8, 9, 11-13, 18 and 20 were the tree engines' (engine,
+ * coordination, node format, node store, allocator, log, commit pipeline,
+ * row identity, root layout, index keying), removed with them: the
+ * registry has no interface by those numbers.
  */
 typedef enum ProllyInterface
 {
-	PROLLY_IFACE_ENGINE = 1,
-	PROLLY_IFACE_COORDINATION = 2,
-	PROLLY_IFACE_NODE_FORMAT = 3,
 	PROLLY_IFACE_CHUNKER = 4,
 	PROLLY_IFACE_CONTENT_HASH = 5,
 	PROLLY_IFACE_KEY_ENCODER = 6,
 	PROLLY_IFACE_VALUE_ENCODER = 7,
-	PROLLY_IFACE_NODE_STORE = 8,
-	PROLLY_IFACE_ALLOCATOR = 9,
 	PROLLY_IFACE_RECLAMATION = 10,
-	PROLLY_IFACE_LOG = 11,
-	PROLLY_IFACE_COMMIT_PIPELINE = 12,
-	PROLLY_IFACE_ROW_IDENTITY = 13,
 	PROLLY_IFACE_REFS = 14,
 	PROLLY_IFACE_TRANSFER = 15,
 	PROLLY_IFACE_DIFF_MERGE = 16,
 	PROLLY_IFACE_TREE = 17,
-	PROLLY_IFACE_ROOT_LAYOUT = 18,
 	PROLLY_IFACE_TABLE_KEYING = 19,
-	PROLLY_IFACE_INDEX_KEYING = 20,
 	PROLLY_IFACE_CANONICALIZER = 21,
 	PROLLY_IFACE_CHUNK_STORE = 22,
 	PROLLY_IFACE_CHUNK_FORMAT = 23,
@@ -58,7 +51,7 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_REMOTE = 27,
 } ProllyInterface;
 
-#define PROLLY_IFACE_FIRST	PROLLY_IFACE_ENGINE
+#define PROLLY_IFACE_FIRST	PROLLY_IFACE_CHUNKER
 #define PROLLY_IFACE_LAST	PROLLY_IFACE_REMOTE
 
 /*

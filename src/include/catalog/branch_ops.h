@@ -73,10 +73,4 @@ typedef struct BranchOpsRoutine
 /* the branch operations of this database */
 extern const BranchOpsRoutine *branch_ops(void);
 
-/*
- * Does this database keep branches as copies of its versioned schemas, so
- * the dolt_* functions act on them?  (Otherwise they act on prolly_d1's.)
- */
-extern bool database_uses_branch_copies(void);
-
 #endif							/* BRANCH_OPS_H */

@@ -1281,56 +1281,6 @@ LockApplyTransactionForSession(Oid suboid, TransactionId xid, uint16 objid,
 }
 
 /*
- *		LockProllyBranch
- *
- * Obtain the right to commit to a prolly branch of the current database.
- * Held until the end of the transaction.
- */
-void
-LockProllyBranch(uint32 branch, LOCKMODE lockmode)
-{
-	LOCKTAG		tag;
-
-	SET_LOCKTAG_PROLLY_BRANCH(tag, MyDatabaseId, branch);
-
-	(void) LockAcquire(&tag, lockmode, false, false);
-}
-
-/*
- *		LockProllyTable
- *
- * Obtain the right to write a prolly table of the current database.  Held
- * until the end of the (sub)transaction.  With dontWait, returns false
- * instead of waiting if the lock isn't free.
- */
-bool
-LockProllyTable(Oid relid, LOCKMODE lockmode, bool dontWait)
-{
-	LOCKTAG		tag;
-
-	SET_LOCKTAG_PROLLY_TABLE(tag, MyDatabaseId, relid);
-
-	return LockAcquire(&tag, lockmode, false, dontWait) != LOCKACQUIRE_NOT_AVAIL;
-}
-
-/*
- *		LockProllyStore
- *
- * Obtain the right to write to the prolly node store (or to keep nodes it
- * holds), or to reclaim it.  Held until the end of the transaction.  With
- * dontWait, returns false instead of waiting if the lock isn't free.
- */
-bool
-LockProllyStore(LOCKMODE lockmode, bool dontWait)
-{
-	LOCKTAG		tag;
-
-	SET_LOCKTAG_PROLLY_STORE(tag);
-
-	return LockAcquire(&tag, lockmode, false, dontWait) != LOCKACQUIRE_NOT_AVAIL;
-}
-
-/*
  *		UnlockApplyTransactionForSession
  */
 void
@@ -1436,29 +1386,6 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 			appendStringInfo(buf,
 							 _("remote transaction %u of subscription %u of database %u"),
 							 tag->locktag_field3,
-							 tag->locktag_field2,
-							 tag->locktag_field1);
-			break;
-		case LOCKTAG_PROLLY_BRANCH:
-			appendStringInfo(buf,
-							 _("prolly branch %u of database %u"),
-							 tag->locktag_field2,
-							 tag->locktag_field1);
-			break;
-		case LOCKTAG_PROLLY_TABLE:
-			appendStringInfo(buf,
-							 _("writing prolly table %u of database %u"),
-							 tag->locktag_field2,
-							 tag->locktag_field1);
-			break;
-		case LOCKTAG_PROLLY_STORE:
-			appendStringInfoString(buf, _("the prolly node store"));
-			break;
-		case LOCKTAG_PROLLY_ROW:
-			appendStringInfo(buf,
-							 _("row %08x%04x of prolly table %u of database %u"),
-							 tag->locktag_field3,
-							 tag->locktag_field4,
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;

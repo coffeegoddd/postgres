@@ -6,13 +6,13 @@
  * A table's data tree is a sorted map, but a Postgres table needn't have a
  * key, and the table AM never sees one at insert.  A keying decides what a
  * row's key is and how its value is laid out.  Implementation
- * "pk_or_content": a table with a primary key is keyed by its encoded key
+ * "pk_or_prefix": a table with a primary key is keyed by its encoded key
  * columns; a table without one (or whose primary key is deferrable, so may
- * briefly hold duplicates) by the row's content hash, with a count of
- * identical rows in the value.
+ * briefly hold duplicates) by the row's first bytes and its content hash,
+ * with a count of identical rows in the value.
  *
  * Every row also has a content hash: the hash of its canonical encoding,
- * which names one version of the row (row identity uses it for TIDs).
+ * which names one version of the row.
  *
  * Contract:
  * - Keys and values depend only on the row's logical content (they are
@@ -62,13 +62,6 @@
 #include "utils/relcache.h"
 
 typedef struct ProllyKeying ProllyKeying;
-
-/*
- * The key, in a table's PROLLY_TREE_META tree, of the description of the
- * keying its data tree was written with.
- */
-#define PROLLY_META_KEYING		"keying"
-#define PROLLY_META_KEYING_LEN	6
 
 typedef struct ProllyKeyingRoutine
 {

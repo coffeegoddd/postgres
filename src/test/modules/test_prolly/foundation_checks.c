@@ -1,8 +1,8 @@
 /*--------------------------------------------------------------------------
  *
  * foundation_checks.c
- *		Conformance checks for the foundation interfaces: node format,
- *		chunker, key encoder and value encoder.
+ *		Conformance checks for the foundation interfaces: chunker, key
+ *		encoder, value encoder, chunk format and table file format.
  *
  * Each check is written against the interface's contract in its header,
  * not against any one implementation, so every implementation registered
@@ -38,268 +38,6 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
-
-/* ------------------------------------------------------------------------
- * Node format
- * ------------------------------------------------------------------------
- */
-
-#define TEST_PAGE_SIZE BLCKSZ
-
-static Page
-new_page(void)
-{
-	return (Page) palloc_aligned(TEST_PAGE_SIZE, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
-}
-
-/* Item i of a test sequence: keys ascend, value lengths vary. */
-static void
-test_item(int i, uint8 *keybuf, uint8 *valbuf, ProllyKey *key, ProllyValue *value)
-{
-	int			vlen = (i * 37) % 120;
-
-	keybuf[0] = (uint8) (i >> 24);
-	keybuf[1] = (uint8) (i >> 16);
-	keybuf[2] = (uint8) (i >> 8);
-	keybuf[3] = (uint8) i;
-	for (int j = 0; j < vlen; j++)
-		valbuf[j] = (uint8) (i + j);
-	key->data = keybuf;
-	key->len = 4;
-	value->data = valbuf;
-	value->len = vlen;
-}
-
-/* Block hint stored with item i in internal nodes. */
-static BlockNumber
-test_hint(int i)
-{
-	return (BlockNumber) (i * 2654435761u) % MaxBlockNumber;
-}
-
-static void
-fill_page(const ProllyNodeFormatRoutine *nf, Page page, uint16 level,
-		  int first, int n)
-{
-	uint8		keybuf[4];
-	uint8		valbuf[128];
-	ProllyKey	key;
-	ProllyValue value;
-
-	PROLLY_CALL(nf, page_init, page, TEST_PAGE_SIZE, level);
-	for (int i = first; i < first + n; i++)
-	{
-		test_item(i, keybuf, valbuf, &key, &value);
-		if (!PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i), 0))
-			elog(ERROR, "item %d did not fit in an empty-enough page", i);
-	}
-}
-
-void
-nodeformat_items_round_trip(const ProllyImplInfo *impl)
-{
-	const ProllyNodeFormatRoutine *nf = (const ProllyNodeFormatRoutine *) impl;
-	Page		page = new_page();
-	const int	n = 40;
-
-	for (uint16 level = 0; level < 2; level++)
-	{
-		fill_page(nf, page, level, 0, n);
-		if (PROLLY_CALL(nf, item_count, page) != n)
-			elog(ERROR, "item_count is %d, expected %d",
-				 PROLLY_CALL(nf, item_count, page), n);
-
-		for (int i = n - 1; i >= 0; i--)
-		{
-			uint8		keybuf[4];
-			uint8		valbuf[128];
-			ProllyKey	want_key,
-						key;
-			ProllyValue want_value,
-						value;
-			BlockNumber hint = PROLLY_CALL(nf, item_hint, page, i);
-
-			test_item(i, keybuf, valbuf, &want_key, &want_value);
-			PROLLY_CALL(nf, item_get, page, i, &key, &value, NULL);
-			if (key.len != want_key.len ||
-				memcmp(key.data, want_key.data, key.len) != 0)
-				elog(ERROR, "level %u item %d has the wrong key", level, i);
-			if (value.len != want_value.len ||
-				memcmp(value.data, want_value.data, value.len) != 0)
-				elog(ERROR, "level %u item %d has the wrong value", level, i);
-			if (hint != (level == 0 ? InvalidBlockNumber : test_hint(i)))
-				elog(ERROR, "level %u item %d has block hint %u", level, i, hint);
-		}
-	}
-}
-
-void
-nodeformat_level_round_trip(const ProllyImplInfo *impl)
-{
-	const ProllyNodeFormatRoutine *nf = (const ProllyNodeFormatRoutine *) impl;
-	Page		page = new_page();
-	static const uint16 levels[] = {0, 1, 2, 300, PG_UINT16_MAX};
-
-	for (int i = 0; i < lengthof(levels); i++)
-	{
-		PROLLY_CALL(nf, page_init, page, TEST_PAGE_SIZE, levels[i]);
-		if (PROLLY_CALL(nf, page_level, page) != levels[i])
-			elog(ERROR, "level %u read back as %u", levels[i],
-				 PROLLY_CALL(nf, page_level, page));
-		if (PROLLY_CALL(nf, item_count, page) != 0)
-			elog(ERROR, "a new page at level %u is not empty", levels[i]);
-	}
-}
-
-void
-nodeformat_space_accounting(const ProllyImplInfo *impl)
-{
-	const ProllyNodeFormatRoutine *nf = (const ProllyNodeFormatRoutine *) impl;
-	Page		page = new_page();
-	bool		filled = false;
-
-	PROLLY_CALL(nf, page_init, page, TEST_PAGE_SIZE, 1);
-	for (int i = 0; i < TEST_PAGE_SIZE; i++)
-	{
-		uint8		keybuf[4];
-		uint8		valbuf[128];
-		ProllyKey	key;
-		ProllyValue value;
-		Size		need;
-		Size		before;
-		bool		ok;
-
-		test_item(i, keybuf, valbuf, &key, &value);
-		need = PROLLY_CALL(nf, item_space, 1, &key, &value);
-		before = PROLLY_CALL(nf, free_space, page);
-		ok = PROLLY_CALL(nf, item_append, page, &key, &value, test_hint(i), 0);
-
-		if (ok != (need <= before))
-			elog(ERROR, "item %d of %zu bytes %s with %zu bytes free",
-				 i, need, ok ? "was appended" : "was refused", before);
-		if (ok && PROLLY_CALL(nf, free_space, page) != before - need)
-			elog(ERROR, "appending %zu bytes changed free space from %zu to %zu",
-				 need, before, PROLLY_CALL(nf, free_space, page));
-		if (!ok)
-		{
-			if (PROLLY_CALL(nf, free_space, page) != before)
-				elog(ERROR, "a refused item changed free space");
-			filled = true;
-			break;
-		}
-	}
-	if (!filled)
-		elog(ERROR, "page never filled");
-}
-
-static void
-canonical_copy(const ProllyNodeFormatRoutine *nf, Page page, StringInfo out)
-{
-	const uint8 *data;
-	Size		len;
-
-	PROLLY_CALL(nf, canonical_bytes, page, &data, &len);
-	resetStringInfo(out);
-	appendBinaryStringInfo(out, data, len);
-}
-
-void
-nodeformat_canonical_bytes(const ProllyImplInfo *impl)
-{
-	const ProllyNodeFormatRoutine *nf = (const ProllyNodeFormatRoutine *) impl;
-	Page		a = new_page();
-	Page		b = new_page();
-	StringInfoData ca,
-				cb;
-	char	   *special;
-	Size		special_len;
-
-	initStringInfo(&ca);
-	initStringInfo(&cb);
-
-	/* Same items, but b starts as garbage and has a scribbled special space. */
-	fill_page(nf, a, 0, 0, 30);
-	memset(b, 0x5a, TEST_PAGE_SIZE);
-	fill_page(nf, b, 0, 0, 30);
-	special = PROLLY_CALL(nf, special_space, b, &special_len);
-	memset(special, 0xa5, special_len);
-
-	canonical_copy(nf, a, &ca);
-	canonical_copy(nf, b, &cb);
-	if (ca.len != cb.len || memcmp(ca.data, cb.data, ca.len) != 0)
-		elog(ERROR, "same items gave different canonical bytes");
-
-	/* Block hints are not canonical: different hints, same bytes. */
-	fill_page(nf, a, 1, 0, 30);
-	canonical_copy(nf, a, &ca);
-	PROLLY_CALL(nf, page_init, b, TEST_PAGE_SIZE, 1);
-	for (int i = 0; i < 30; i++)
-	{
-		uint8		keybuf[4];
-		uint8		valbuf[128];
-		ProllyKey	key;
-		ProllyValue value;
-
-		test_item(i, keybuf, valbuf, &key, &value);
-		PROLLY_CALL(nf, item_append, b, &key, &value, InvalidBlockNumber, 0);
-	}
-	canonical_copy(nf, b, &cb);
-	if (ca.len != cb.len || memcmp(ca.data, cb.data, ca.len) != 0)
-		elog(ERROR, "block hints changed the canonical bytes");
-	fill_page(nf, a, 0, 0, 30);
-	canonical_copy(nf, a, &ca);
-
-	/* A different item, or a different level, must change them. */
-	fill_page(nf, b, 0, 1, 30);
-	canonical_copy(nf, b, &cb);
-	if (ca.len == cb.len && memcmp(ca.data, cb.data, ca.len) == 0)
-		elog(ERROR, "different items gave the same canonical bytes");
-
-	fill_page(nf, b, 1, 0, 30);
-	canonical_copy(nf, b, &cb);
-	if (ca.len == cb.len && memcmp(ca.data, cb.data, ca.len) == 0)
-		elog(ERROR, "different levels gave the same canonical bytes");
-}
-
-void
-nodeformat_page_check(const ProllyImplInfo *impl)
-{
-	const ProllyNodeFormatRoutine *nf = (const ProllyNodeFormatRoutine *) impl;
-	Page		page = new_page();
-	Page		bad = new_page();
-	char	   *detail = NULL;
-	int			caught = 0;
-
-	fill_page(nf, page, 0, 0, 30);
-	if (!PROLLY_CALL(nf, page_check, page, &detail))
-		elog(ERROR, "a valid page failed the check: %s", detail);
-
-	/*
-	 * Flip single bytes in the page header and the start of the content.  The
-	 * check need not catch every flip (some land in item data), but it must
-	 * catch flips in the structural fields.
-	 */
-	for (int off = 0; off < SizeOfPageHeaderData + 16; off++)
-	{
-		memcpy(bad, page, TEST_PAGE_SIZE);
-		((uint8 *) bad)[off] ^= 0x40;
-		if (!PROLLY_CALL(nf, page_check, bad, &detail))
-			caught++;
-	}
-
-	/* pd_lower and pd_upper must be checked */
-	memcpy(bad, page, TEST_PAGE_SIZE);
-	((PageHeader) bad)->pd_lower += 1;
-	if (PROLLY_CALL(nf, page_check, bad, &detail))
-		elog(ERROR, "page_check missed a corrupted pd_lower");
-	memcpy(bad, page, TEST_PAGE_SIZE);
-	((PageHeader) bad)->pd_upper -= 2;
-	if (PROLLY_CALL(nf, page_check, bad, &detail))
-		elog(ERROR, "page_check missed a corrupted pd_upper");
-
-	if (caught == 0)
-		elog(ERROR, "page_check caught none of the corrupted bytes");
-}
 
 /* ------------------------------------------------------------------------
  * Chunker
@@ -453,7 +191,6 @@ typedef struct KeyColSpec
 	Oid			type;
 	Oid			collation;
 	int16		options;		/* INDOPTION_* */
-	Oid			am;				/* whose default opclass; btree if invalid */
 } KeyColSpec;
 
 typedef struct KeyRow
@@ -480,8 +217,7 @@ key_case_init(KeyCase *kc)
 	for (int i = 0; i < kc->ncols; i++)
 	{
 		KeyColSpec *spec = &kc->cols[i];
-		Oid			am = OidIsValid(spec->am) ? spec->am : BTREE_AM_OID;
-		Oid			opclass = GetDefaultOpClass(spec->type, am);
+		Oid			opclass = GetDefaultOpClass(spec->type, BTREE_AM_OID);
 		Oid			opfamily = get_opclass_family(opclass);
 
 		kc->types[i] = spec->type;
@@ -759,7 +495,6 @@ void
 keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 {
 	const ProllyKeyEncoderRoutine *ke = (const ProllyKeyEncoderRoutine *) impl;
-	Oid			prolly_am = get_index_am_oid("prolly_d1_index", false);
 	KeyCase		cases[] = {
 		{1, {{INT2OID}}},
 		{1, {{INT4OID}}},
@@ -768,8 +503,6 @@ keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 		{1, {{TEXTOID, C_COLLATION_OID}}},
 		{1, {{TEXTOID, non_c_collation()}}},
 		{1, {{NUMERICOID}}},
-		{1, {{INT4OID, InvalidOid, 0, prolly_am}}},
-		{1, {{TEXTOID, C_COLLATION_OID, 0, prolly_am}}},
 		{2, {{INT4OID}, {TEXTOID, C_COLLATION_OID}}},
 		{2, {{TEXTOID, non_c_collation()}, {INT8OID}}},
 		{2, {{NUMERICOID}, {BOOLOID}}},

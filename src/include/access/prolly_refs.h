@@ -136,13 +136,6 @@ typedef struct ProllyRefsRoutine
 								int nparents, const ProllyNodeRef *working_set,
 								ProllyHash *commit_id);
 
-	/*
-	 * A number that grows (as the current transaction sees the refs)
-	 * whenever a commit or a branch is made: a root that may share the rows
-	 * of a branch's working set.  0: none ever was.
-	 */
-	uint64		(*epoch) (void);
-
 	/* Visit every branch, by name. */
 	void		(*branches) (ProllyBranchVisit visit, void *arg);
 
@@ -183,7 +176,7 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Visit every node the refs keep alive, from the root of their own
-	 * store (the head of PROLLY_REFS_BRANCH): for reclamation and
+	 * store: for reclamation and
 	 * transfer.  A commit whose node the visitor declines isn't looked
 	 * into (its root and parents are taken as seen), as a tree's node
 	 * isn't.
@@ -264,7 +257,7 @@ typedef struct ProllyRefsRoutine
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
-	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
+	"commit_with", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream"

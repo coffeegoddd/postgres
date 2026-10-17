@@ -76,9 +76,3 @@ SELECT count(*) FROM app.ctas;
 DROP SCHEMA app CASCADE;
 DROP TABLE h, d, u2;
 
--- Page-based prolly has no tree engine, so no node counters: asking for
--- them is refused (as for heap), not a crash.
-\set VERBOSITY sqlstate
-SELECT * FROM prolly_node_counters('prolly');
-SELECT * FROM prolly_node_counters('heap');
-\set VERBOSITY default

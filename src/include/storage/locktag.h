@@ -47,13 +47,9 @@ typedef enum LockTagType
 	LOCKTAG_ADVISORY,			/* advisory user locks */
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
-	LOCKTAG_PROLLY_BRANCH,		/* the right to commit to a prolly branch */
-	LOCKTAG_PROLLY_TABLE,		/* the right to write a prolly table */
-	LOCKTAG_PROLLY_ROW,			/* a row of a prolly table, by key hash */
-	LOCKTAG_PROLLY_STORE,		/* writing to the prolly node store */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_PROLLY_STORE
+#define LOCKTAG_LAST_TYPE	LOCKTAG_APPLY_TRANSACTION
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -207,57 +203,6 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field3 = (xid), \
 	 (locktag).locktag_field4 = (objid), \
 	 (locktag).locktag_type = LOCKTAG_APPLY_TRANSACTION, \
-	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
-
-/*
- * ID info for a prolly branch is DB OID + branch number (as numbered by
- * the database's refs).
- */
-#define SET_LOCKTAG_PROLLY_BRANCH(locktag,dboid,branch) \
-	((locktag).locktag_field1 = (dboid), \
-	 (locktag).locktag_field2 = (branch), \
-	 (locktag).locktag_field3 = 0, \
-	 (locktag).locktag_field4 = 0, \
-	 (locktag).locktag_type = LOCKTAG_PROLLY_BRANCH, \
-	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
-
-/*
- * ID info for the right to write a prolly table is DB OID + REL OID, as
- * for a relation lock, but a separate lock: it conflicts only with other
- * holders of it, never with the relation's own locks.
- */
-#define SET_LOCKTAG_PROLLY_TABLE(locktag,dboid,reloid) \
-	((locktag).locktag_field1 = (dboid), \
-	 (locktag).locktag_field2 = (reloid), \
-	 (locktag).locktag_field3 = 0, \
-	 (locktag).locktag_field4 = 0, \
-	 (locktag).locktag_type = LOCKTAG_PROLLY_TABLE, \
-	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
-
-/*
- * ID info for a row of a prolly table is DB OID + REL OID + 48 bits of a
- * hash of the row's key: two keys with the same 48 bits share a lock,
- * which can make a writer wait needlessly but never lets two through.
- */
-/*
- * The right to write nodes to the cluster's prolly node store, or to refer
- * to nodes it holds: writers share it, reclamation takes it exclusively.
- * No ID info.
- */
-#define SET_LOCKTAG_PROLLY_STORE(locktag) \
-	((locktag).locktag_field1 = 0, \
-	 (locktag).locktag_field2 = 0, \
-	 (locktag).locktag_field3 = 0, \
-	 (locktag).locktag_field4 = 0, \
-	 (locktag).locktag_type = LOCKTAG_PROLLY_STORE, \
-	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
-
-#define SET_LOCKTAG_PROLLY_ROW(locktag,dboid,reloid,keyhash) \
-	((locktag).locktag_field1 = (dboid), \
-	 (locktag).locktag_field2 = (reloid), \
-	 (locktag).locktag_field3 = (uint32) ((keyhash) >> 32), \
-	 (locktag).locktag_field4 = (uint16) ((keyhash) >> 16), \
-	 (locktag).locktag_type = LOCKTAG_PROLLY_ROW, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 #endif							/* _PG_LOCKTAG_H_ */

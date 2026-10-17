@@ -46,26 +46,16 @@ typedef struct ProllyInterfaceDesc
 	const char *const *callback_names;
 } ProllyInterfaceDesc;
 
-static const char *const engine_callbacks[] = {PROLLY_ENGINE_CALLBACK_NAMES};
-static const char *const coord_callbacks[] = {PROLLY_COORD_CALLBACK_NAMES};
-static const char *const nodeformat_callbacks[] = {PROLLY_NODEFORMAT_CALLBACK_NAMES};
 static const char *const chunker_callbacks[] = {PROLLY_CHUNKER_CALLBACK_NAMES};
 static const char *const hash_callbacks[] = {PROLLY_HASH_CALLBACK_NAMES};
 static const char *const keyenc_callbacks[] = {PROLLY_KEYENC_CALLBACK_NAMES};
 static const char *const valenc_callbacks[] = {PROLLY_VALENC_CALLBACK_NAMES};
-static const char *const nodestore_callbacks[] = {PROLLY_NODESTORE_CALLBACK_NAMES};
-static const char *const alloc_callbacks[] = {PROLLY_ALLOC_CALLBACK_NAMES};
 static const char *const reclaim_callbacks[] = {PROLLY_RECLAIM_CALLBACK_NAMES};
-static const char *const log_callbacks[] = {PROLLY_LOG_CALLBACK_NAMES};
-static const char *const commit_callbacks[] = {PROLLY_COMMIT_CALLBACK_NAMES};
-static const char *const rowid_callbacks[] = {PROLLY_ROWID_CALLBACK_NAMES};
 static const char *const refs_callbacks[] = {PROLLY_REFS_CALLBACK_NAMES};
 static const char *const transfer_callbacks[] = {PROLLY_TRANSFER_CALLBACK_NAMES};
 static const char *const merge_callbacks[] = {PROLLY_MERGE_CALLBACK_NAMES};
 static const char *const tree_callbacks[] = {PROLLY_TREE_CALLBACK_NAMES};
-static const char *const rootlayout_callbacks[] = {PROLLY_ROOTLAYOUT_CALLBACK_NAMES};
 static const char *const keying_callbacks[] = {PROLLY_KEYING_CALLBACK_NAMES};
-static const char *const ixkeying_callbacks[] = {PROLLY_IXKEYING_CALLBACK_NAMES};
 static const char *const canon_callbacks[] = {PROLLY_CANON_CALLBACK_NAMES};
 static const char *const chunkstore_callbacks[] = {PROLLY_CHUNKSTORE_CALLBACK_NAMES};
 static const char *const chunkformat_callbacks[] = {PROLLY_CHUNKFORMAT_CALLBACK_NAMES};
@@ -86,26 +76,16 @@ static const char *const remote_callbacks[] = {PROLLY_REMOTE_CALLBACK_NAMES};
 				  offsetof(type, last) == sizeof(type) - sizeof(pg_funcptr_t), \
 				  "callback name list does not match " #type)
 
-CHECK_ROUTINE(ProllyEngineRoutine, PROLLY_ENGINE_FIRST_CALLBACK, PROLLY_ENGINE_LAST_CALLBACK, engine_callbacks);
-CHECK_ROUTINE(ProllyCoordRoutine, PROLLY_COORD_FIRST_CALLBACK, PROLLY_COORD_LAST_CALLBACK, coord_callbacks);
-CHECK_ROUTINE(ProllyNodeFormatRoutine, PROLLY_NODEFORMAT_FIRST_CALLBACK, PROLLY_NODEFORMAT_LAST_CALLBACK, nodeformat_callbacks);
 CHECK_ROUTINE(ProllyChunkerRoutine, PROLLY_CHUNKER_FIRST_CALLBACK, PROLLY_CHUNKER_LAST_CALLBACK, chunker_callbacks);
 CHECK_ROUTINE(ProllyHashRoutine, PROLLY_HASH_FIRST_CALLBACK, PROLLY_HASH_LAST_CALLBACK, hash_callbacks);
 CHECK_ROUTINE(ProllyKeyEncoderRoutine, PROLLY_KEYENC_FIRST_CALLBACK, PROLLY_KEYENC_LAST_CALLBACK, keyenc_callbacks);
 CHECK_ROUTINE(ProllyValueEncoderRoutine, PROLLY_VALENC_FIRST_CALLBACK, PROLLY_VALENC_LAST_CALLBACK, valenc_callbacks);
-CHECK_ROUTINE(ProllyNodeStoreRoutine, PROLLY_NODESTORE_FIRST_CALLBACK, PROLLY_NODESTORE_LAST_CALLBACK, nodestore_callbacks);
-CHECK_ROUTINE(ProllyAllocatorRoutine, PROLLY_ALLOC_FIRST_CALLBACK, PROLLY_ALLOC_LAST_CALLBACK, alloc_callbacks);
 CHECK_ROUTINE(ProllyReclaimRoutine, PROLLY_RECLAIM_FIRST_CALLBACK, PROLLY_RECLAIM_LAST_CALLBACK, reclaim_callbacks);
-CHECK_ROUTINE(ProllyLogRoutine, PROLLY_LOG_FIRST_CALLBACK, PROLLY_LOG_LAST_CALLBACK, log_callbacks);
-CHECK_ROUTINE(ProllyCommitRoutine, PROLLY_COMMIT_FIRST_CALLBACK, PROLLY_COMMIT_LAST_CALLBACK, commit_callbacks);
-CHECK_ROUTINE(ProllyRowIdRoutine, PROLLY_ROWID_FIRST_CALLBACK, PROLLY_ROWID_LAST_CALLBACK, rowid_callbacks);
 CHECK_ROUTINE(ProllyRefsRoutine, PROLLY_REFS_FIRST_CALLBACK, PROLLY_REFS_LAST_CALLBACK, refs_callbacks);
 CHECK_ROUTINE(ProllyTransferRoutine, PROLLY_TRANSFER_FIRST_CALLBACK, PROLLY_TRANSFER_LAST_CALLBACK, transfer_callbacks);
 CHECK_ROUTINE(ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, PROLLY_MERGE_LAST_CALLBACK, merge_callbacks);
 CHECK_ROUTINE(ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, PROLLY_TREE_LAST_CALLBACK, tree_callbacks);
-CHECK_ROUTINE(ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, PROLLY_ROOTLAYOUT_LAST_CALLBACK, rootlayout_callbacks);
 CHECK_ROUTINE(ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, PROLLY_KEYING_LAST_CALLBACK, keying_callbacks);
-CHECK_ROUTINE(ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, PROLLY_IXKEYING_LAST_CALLBACK, ixkeying_callbacks);
 CHECK_ROUTINE(ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, PROLLY_CANON_LAST_CALLBACK, canon_callbacks);
 CHECK_ROUTINE(ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, PROLLY_CHUNKSTORE_LAST_CALLBACK, chunkstore_callbacks);
 CHECK_ROUTINE(ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, PROLLY_CHUNKFORMAT_LAST_CALLBACK, chunkformat_callbacks);
@@ -118,12 +98,6 @@ CHECK_ROUTINE(ProllyRemoteRoutine, PROLLY_REMOTE_FIRST_CALLBACK, PROLLY_REMOTE_L
 	{name, offsetof(type, first), lengthof(names), names}
 
 static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
-	[PROLLY_IFACE_ENGINE] =
-	IFACE("engine", ProllyEngineRoutine, PROLLY_ENGINE_FIRST_CALLBACK, engine_callbacks),
-	[PROLLY_IFACE_COORDINATION] =
-	IFACE("coordination", ProllyCoordRoutine, PROLLY_COORD_FIRST_CALLBACK, coord_callbacks),
-	[PROLLY_IFACE_NODE_FORMAT] =
-	IFACE("node_format", ProllyNodeFormatRoutine, PROLLY_NODEFORMAT_FIRST_CALLBACK, nodeformat_callbacks),
 	[PROLLY_IFACE_CHUNKER] =
 	IFACE("chunker", ProllyChunkerRoutine, PROLLY_CHUNKER_FIRST_CALLBACK, chunker_callbacks),
 	[PROLLY_IFACE_CONTENT_HASH] =
@@ -132,18 +106,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("key_encoder", ProllyKeyEncoderRoutine, PROLLY_KEYENC_FIRST_CALLBACK, keyenc_callbacks),
 	[PROLLY_IFACE_VALUE_ENCODER] =
 	IFACE("value_encoder", ProllyValueEncoderRoutine, PROLLY_VALENC_FIRST_CALLBACK, valenc_callbacks),
-	[PROLLY_IFACE_NODE_STORE] =
-	IFACE("node_store", ProllyNodeStoreRoutine, PROLLY_NODESTORE_FIRST_CALLBACK, nodestore_callbacks),
-	[PROLLY_IFACE_ALLOCATOR] =
-	IFACE("allocator", ProllyAllocatorRoutine, PROLLY_ALLOC_FIRST_CALLBACK, alloc_callbacks),
 	[PROLLY_IFACE_RECLAMATION] =
 	IFACE("reclamation", ProllyReclaimRoutine, PROLLY_RECLAIM_FIRST_CALLBACK, reclaim_callbacks),
-	[PROLLY_IFACE_LOG] =
-	IFACE("log", ProllyLogRoutine, PROLLY_LOG_FIRST_CALLBACK, log_callbacks),
-	[PROLLY_IFACE_COMMIT_PIPELINE] =
-	IFACE("commit_pipeline", ProllyCommitRoutine, PROLLY_COMMIT_FIRST_CALLBACK, commit_callbacks),
-	[PROLLY_IFACE_ROW_IDENTITY] =
-	IFACE("row_identity", ProllyRowIdRoutine, PROLLY_ROWID_FIRST_CALLBACK, rowid_callbacks),
 	[PROLLY_IFACE_REFS] =
 	IFACE("refs", ProllyRefsRoutine, PROLLY_REFS_FIRST_CALLBACK, refs_callbacks),
 	[PROLLY_IFACE_TRANSFER] =
@@ -152,12 +116,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("diff_merge", ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, merge_callbacks),
 	[PROLLY_IFACE_TREE] =
 	IFACE("tree", ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, tree_callbacks),
-	[PROLLY_IFACE_ROOT_LAYOUT] =
-	IFACE("root_layout", ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, rootlayout_callbacks),
 	[PROLLY_IFACE_TABLE_KEYING] =
 	IFACE("table_keying", ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, keying_callbacks),
-	[PROLLY_IFACE_INDEX_KEYING] =
-	IFACE("index_keying", ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, ixkeying_callbacks),
 	[PROLLY_IFACE_CANONICALIZER] =
 	IFACE("canonicalizer", ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, canon_callbacks),
 	[PROLLY_IFACE_CHUNK_STORE] =
@@ -177,9 +137,17 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 static const ProllyInterfaceDesc *
 get_interface(ProllyInterface iface)
 {
-	if (iface < PROLLY_IFACE_FIRST || iface > PROLLY_IFACE_LAST)
+	if (!prolly_interface_valid(iface))
 		elog(ERROR, "invalid prolly interface %d", (int) iface);
 	return &interfaces[iface];
+}
+
+/* Is there an interface by this number?  (Removed ones leave gaps.) */
+bool
+prolly_interface_valid(int iface)
+{
+	return iface >= PROLLY_IFACE_FIRST && iface <= PROLLY_IFACE_LAST &&
+		interfaces[iface].name != NULL;
 }
 
 /*
@@ -334,7 +302,7 @@ prolly_interface_from_name(const char *name, ProllyInterface *iface)
 {
 	for (int i = PROLLY_IFACE_FIRST; i <= PROLLY_IFACE_LAST; i++)
 	{
-		if (strcmp(interfaces[i].name, name) == 0)
+		if (prolly_interface_valid(i) && strcmp(interfaces[i].name, name) == 0)
 		{
 			*iface = (ProllyInterface) i;
 			return true;

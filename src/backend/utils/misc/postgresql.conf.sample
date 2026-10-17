@@ -147,7 +147,6 @@
 #work_mem = 4MB                         # min 64kB
 #hash_mem_multiplier = 2.0              # 1-1000.0 multiplier on hash table work_mem
 #maintenance_work_mem = 64MB            # min 64kB
-#prolly_write_set_memory = 64MB         # min 64kB
 #autovacuum_work_mem = -1               # min 64kB, or -1 to use maintenance_work_mem
 #logical_decoding_work_mem = 64MB       # min 64kB
 #max_stack_depth = 2MB                  # min 100kB
@@ -885,7 +884,6 @@
                                         # (max_pred_locks_per_transaction
                                         #  / -max_pred_locks_per_relation) - 1
 #max_pred_locks_per_page = 2            # min 0
-#prolly_max_row_locks_per_table = 64    # min 1
 
 
 #------------------------------------------------------------------------------

@@ -241,7 +241,6 @@ ref_of(const ProllyHash *h, ProllyNodeRef *ref)
 {
 	memset(ref, 0, sizeof(*ref));
 	ref->hash = *h;
-	ref->location.blkno = InvalidBlockNumber;
 }
 
 static bool
@@ -1886,7 +1885,7 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		ws->seen = hash_create("prolly commits walked", 256, &ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	while (todo != NIL)
 	{
 		ProllyHash *next = llast(todo);
@@ -1980,7 +1979,7 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	PROLLY_CALL(tree, cursor_close, c);
 	foreach(lc, heads)
 		walk_commit(&ws, lfirst(lc));
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	foreach(lc, baselines)
 	{
 		ProllyNodeRef ref;

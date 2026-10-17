@@ -95,22 +95,8 @@ prolly_session_init(const char *branch)
 								 NULL, NULL, NULL);
 		defined = true;
 	}
-	/*
-	 * A versioned database's tables are prolly tables by default: below any
-	 * setting made for the server, database, role or session.
-	 */
-	if (MyDatabaseVersioned)
-		SetConfigOption("default_table_access_method", "prolly_d1",
-						PGC_USERSET, PGC_S_DYNAMIC_DEFAULT);
-	if (branch && prolly_database_uses_copies())
+	if (branch)
 		connect_branch = MemoryContextStrdup(TopMemoryContext, branch);
-	else if (branch)
-	{
-		ProllyDatabaseComponents dc;
-
-		prolly_database_components(&dc);
-		PROLLY_CALL(dc.refs, checkout, branch);
-	}
 }
 
 /*
@@ -299,37 +285,6 @@ qualified_name(Oid relid)
 {
 	return quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
 									  get_rel_name(relid));
-}
-
-/* The session branch's name. */
-typedef struct FindBranch
-{
-	ProllyBranchId id;
-	char	   *name;
-} FindBranch;
-
-static void
-find_branch(const char *name, const ProllyHash *head, void *arg)
-{
-	FindBranch *f = arg;
-	ProllyBranchId id;
-
-	if (f->name == NULL && PROLLY_CALL(refs(), branch_lookup, name, &id) &&
-		id == f->id)
-		f->name = pstrdup(name);
-}
-
-static char *
-session_branch_name(void)
-{
-	FindBranch	f = {prolly_session_branch(), NULL};
-
-	PROLLY_CALL(refs(), branches, find_branch, &f);
-	if (f.name == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("the session's prolly branch no longer exists")));
-	return f.name;
 }
 
 /* ------------------------------------------------------------------------
@@ -716,20 +671,13 @@ dolt_branch(PG_FUNCTION_ARGS)
 
 /*
  * End the merge (what: "merge", or "cherry-pick") in progress on the
- * session's branch: the branch as its head has it.  (Branch copies reset
- * their working set's rows, the transaction's writes as any others; the
- * rows engine can't undo its own.)  A merge isn't begun over uncommitted
- * changes, so none are lost.
+ * session's branch: the branch as its head has it.  (The working set's
+ * rows are reset, the transaction's writes as any others.)  A merge isn't
+ * begun over uncommitted changes, so none are lost.
  */
 static void
 abort_in_progress(const char *what)
 {
-	if (!prolly_database_uses_copies() && prolly_xact_has_writes())
-		ereport(ERROR,
-				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-				 errmsg("cannot abort a %s in a transaction that has written to prolly tables",
-						what),
-				 errhint("Roll the transaction back instead.")));
 	PROLLY_CALL(refs(), reset, "HEAD");
 }
 
@@ -1093,9 +1041,7 @@ dolt_hashof(PG_FUNCTION_ARGS)
 Datum
 active_branch(PG_FUNCTION_ARGS)
 {
-	if (prolly_database_uses_copies())
-		PG_RETURN_TEXT_P(cstring_to_text(branch_ops()->current()));
-	PG_RETURN_TEXT_P(cstring_to_text(session_branch_name()));
+	PG_RETURN_TEXT_P(cstring_to_text(branch_ops()->current()));
 }
 
 /* ------------------------------------------------------------------------
@@ -1445,10 +1391,8 @@ static void
 rows_begin(Rows *r, Relation rel)
 {
 	prolly_components_for_relation(rel, &r->c);
-	/* (a block-mapped table's trees are its folds, rows as a rewrite has them) */
-	r->keying = rel->rd_rel->relam == PROLLY_TABLE_AM_OID ?
-		PROLLY_CALL(r->c.keying, open_rewritten, rel, CurrentMemoryContext) :
-		PROLLY_CALL(r->c.keying, open, rel, NULL, CurrentMemoryContext);
+	/* (a table's trees are its folds, rows as a rewrite has them) */
+	r->keying = PROLLY_CALL(r->c.keying, open_rewritten, rel, CurrentMemoryContext);
 	r->keyless = PROLLY_CALL(r->c.keying, keyless, r->keying);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 }
@@ -1490,8 +1434,7 @@ open_row_type_table(Oid relid, const char *fn, AclMode mode)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 	rel = table_open(relid, AccessShareLock);
-	if (!prolly_is_table_am(get_am_name(rel->rd_rel->relam)) &&
-		rel->rd_rel->relam != PROLLY_TABLE_AM_OID)
+	if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a prolly table", RelationGetRelationName(rel))));
@@ -1895,7 +1838,7 @@ remote_refs(void)
 {
 	ProllyDatabaseComponents dc;
 
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	return dc.refs;
 }
 
@@ -2034,7 +1977,7 @@ build_format(void)
 	ProllyDatabaseComponents dc;
 	StringInfoData f;
 
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	initStringInfo(&f);
 	PROLLY_CALL(dc.canonicalizer, format, &f);
 	return f.data;
@@ -2075,7 +2018,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got)
 	ListCell   *b;
 	ListCell   *c;
 
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	r = PROLLY_CALL(rr, open, url, false);
 	PG_TRY();
 	{
@@ -2251,7 +2194,7 @@ dolt_push(PG_FUNCTION_ARGS)
 				 errmsg("branch \"%s\" has no commits to push", branch)));
 	url = need_remote(remote);
 	rr = prolly_remote_for_url(url);
-	prolly_copies_components(&dc);
+	prolly_database_components(&dc);
 	r = PROLLY_CALL(rr, open, url, true);
 	PG_TRY();
 	{

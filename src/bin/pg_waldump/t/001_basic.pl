@@ -97,9 +97,6 @@ ReplicationOrigin
 Generic
 LogicalMessage
 XLOG2
-Prolly
-ProllyStore
-ProllyCommit
 BlockMap
 ProllyChunks$/,
 	'rmgr list');

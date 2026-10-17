@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * keying_pkcontent.c
- *	  Table keying implementation "pk_or_content": keyed by the primary
- *	  key if the table has one, else by row content.
+ *	  Table keying implementation "pk_or_prefix": keyed by the primary
+ *	  key if the table has one, else by row content's first bytes and hash.
  *
  * A table with a primary key (checked immediately; a deferrable one may
  * hold duplicates until commit, so its table is keyed like one without):
@@ -13,10 +13,9 @@
  *
  * A table without one (as in Dolt's keyless tables):
  *
- *	key		"pk_or_content": the row's content hash; "pk_or_prefix": the
- *			first KEY_PREFIX bytes of the encoded row's values (after its
- *			column count and NULL bitmap; all of them if shorter), then
- *			its content hash
+ *	key		the first KEY_PREFIX bytes of the encoded row's values (after
+ *			its column count and NULL bitmap; all of them if shorter),
+ *			then its content hash
  *	value	varint count of identical rows, then the row
  *
  * so identical rows are one item, and the tree depends only on which rows
@@ -27,8 +26,9 @@
  * not one each; the hash makes the key the row's alone.  Keys are compared
  * as bytes, so the order depends on no collation.
  *
- * A description is 'C' for content-hash keying, 'Q' for prefix-and-hash
- * keying, or 'P' for a primary key, the
+ * A description is 'Q' for prefix-and-hash keying ('C', for the
+ * content-hash keying of commits before it, is read but never made), or
+ * 'P' for a primary key, the
  * length and bytes of the value encoder's row layout, and for 'P' the
  * number of key columns and per column its attribute number, options,
  * opfamily, collation and type, in native byte order (descriptions are
@@ -308,18 +308,6 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 }
 
 static ProllyKeying *
-pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
-{
-	return open_keying(rel, description, false, false, mcxt);
-}
-
-static ProllyKeying *
-pkcontent_open_rewritten(Relation rel, MemoryContext mcxt)
-{
-	return open_keying(rel, NULL, true, false, mcxt);
-}
-
-static ProllyKeying *
 pkprefix_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 {
 	return open_keying(rel, description, false, true, mcxt);
@@ -565,31 +553,6 @@ pkcontent_close(ProllyKeying *k)
 	pfree(k->layout.data);
 	pfree(k);
 }
-
-const ProllyKeyingRoutine prolly_keying_pk_or_content = {
-	.info = {
-		.iface = PROLLY_IFACE_TABLE_KEYING,
-		.impl_id = 1,
-		.format_version = 2,
-		.name = "pk_or_content",
-		.description = "keyed by the primary key, or by row content hash with "
-		"a count for tables without one",
-	},
-	.open = pkcontent_open,
-	.describe = pkcontent_describe,
-	.open_rewritten = pkcontent_open_rewritten,
-	.can_read = pkcontent_can_read,
-	.keyless = pkcontent_keyless,
-	.encode_row = pkcontent_encode_row,
-	.make_value = pkcontent_make_value,
-	.parse_value = pkcontent_parse_value,
-	.content_hash = pkcontent_content_hash,
-	.decode_row = pkcontent_decode_row,
-	.compare = pkcontent_compare,
-	.can_compare = pkcontent_can_compare,
-	.equal_bytes = pkcontent_equal_bytes,
-	.close = pkcontent_close,
-};
 
 const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.info = {

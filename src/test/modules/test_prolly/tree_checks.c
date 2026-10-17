@@ -3,10 +3,8 @@
  * tree_checks.c
  *		Conformance checks for the tree interface.
  *
- * Trees are built from the prolly_d1 profile's foundation components (node
- * format, chunker, hash, node store, log), or, when tree_checks_in_chunks
- * is set, as chunks in the database's chunk store (basic chunk format,
- * byte chunker, SHA-256), and compared against an in-memory
+ * Trees are built as chunks in the database's chunk store (basic chunk
+ * format, byte chunker, SHA-256), and compared against an in-memory
  * reference map: keys are 0 .. MAX_KEY-1 as 4-byte big-endian integers, and
  * each key's value is derived from a version number, so any state of the
  * map is (key -> version or absent).
@@ -24,8 +22,8 @@
 #include "catalog/pg_class.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "test_prolly.h"
 
 #define MAX_KEY		20000
@@ -51,34 +49,17 @@ memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return (a->len > b->len) - (a->len < b->len);
 }
 
-bool		tree_checks_in_chunks = false;
-
 static void
 make_env(const ProllyTreeRoutine *tree, ProllyTreeEnv *env)
 {
-	ProllyComponents c;
-
 	(void) tree;
 	memset(env, 0, sizeof(*env));
-	if (tree_checks_in_chunks)
-	{
-		env->chunk_format = prolly_chunkformat_lookup("basic");
-		env->chunker = prolly_chunker_lookup("bytes");
-		env->hash = prolly_hash_lookup("sha256");
-		env->chunk_store = prolly_chunk_store();
-		env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
-								  MyDatabaseTableSpace);
-		env->compare = memcmp_keys;
-		return;
-	}
-	prolly_components_for_am("prolly_d1", &c);
-	env->node_format = c.node_format;
-	env->chunker = c.chunker;
-	env->hash = c.hash;
-	env->node_store = c.node_store;
-	env->log = c.log;
-	PROLLY_CALL(env->node_store, create, NULL, NULL, RELPERSISTENCE_PERMANENT);
-	env->store = PROLLY_CALL(env->node_store, open, NULL);
+	env->chunk_format = prolly_chunkformat_lookup("basic");
+	env->chunker = prolly_chunker_lookup("bytes");
+	env->hash = prolly_hash_lookup("sha256");
+	env->chunk_store = prolly_chunk_store();
+	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
+							  MyDatabaseTableSpace);
 	env->compare = memcmp_keys;
 }
 
@@ -465,19 +446,11 @@ tree_apply_matches_reference(const ProllyImplInfo *impl)
 static int
 leaf_boundary_key(const ProllyTreeEnv *env, int min_key)
 {
-	Page		page = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, MCXT_ALLOC_ZERO);
 	ProllyChunker *ch;
 	StringInfoData vbuf;
 	int			found = -1;
-	Size		capacity;
+	Size		capacity = 64 * 1024 - PROLLY_CALL(env->chunk_format, header_size);
 
-	if (env->chunk_store != NULL)
-		capacity = 64 * 1024 - PROLLY_CALL(env->chunk_format, header_size);
-	else
-	{
-		PROLLY_CALL(env->node_format, page_init, page, BLCKSZ, 0);
-		capacity = PROLLY_CALL(env->node_format, free_space, page);
-	}
 	ch = PROLLY_CALL(env->chunker, begin, 0, capacity, CurrentMemoryContext);
 	initStringInfo(&vbuf);
 	for (int k = 0; k < MAX_KEY - 3 && found < 0; k++)
@@ -485,9 +458,8 @@ leaf_boundary_key(const ProllyTreeEnv *env, int min_key)
 		KeyBuf		kb;
 		ProllyKey	key = key_of(k, &kb);
 		ProllyValue value = value_of(k, 1, &vbuf);
-		Size		space = env->chunk_store != NULL ?
-			PROLLY_CALL(env->chunk_format, item_space, 0, &key, &value) :
-			PROLLY_CALL(env->node_format, item_space, 0, &key, &value);
+		Size		space = PROLLY_CALL(env->chunk_format, item_space, 0, &key,
+										&value);
 
 		if (PROLLY_CALL(env->chunker, add, ch, &key, &value, space) ==
 			PROLLY_CHUNK_SPLIT_AFTER && k >= min_key)
@@ -495,7 +467,6 @@ leaf_boundary_key(const ProllyTreeEnv *env, int min_key)
 	}
 	PROLLY_CALL(env->chunker, end, ch);
 	pfree(vbuf.data);
-	pfree(page);
 	if (found < 0)
 		elog(ERROR, "no leaf boundary at or after key %d", min_key);
 	return found;
@@ -1191,48 +1162,31 @@ tree_equal_keys_take_new_bytes(const ProllyImplInfo *impl)
 			 seen.changes, seen.right ? "as modified" : "not as a modification to it");
 }
 
-/* Every node a tree is made of passes the node format's structure check. */
-typedef struct PageCheck
+/* Every node a tree is made of is a chunk node at its level. */
+typedef struct NodeCheck
 {
 	const ProllyTreeEnv *env;
 	int			nodes;
-} PageCheck;
+} NodeCheck;
 
 static bool
-check_node_page(const ProllyNodeRef *node, uint16 level, void *arg)
+check_node(const ProllyNodeRef *node, uint16 level, void *arg)
 {
-	PageCheck  *pc = arg;
-	Buffer		buf;
-	char	   *detail = NULL;
+	NodeCheck  *pc = arg;
+	StringInfoData data;
+	ProllyChunkNode cn;
 
-	if (pc->env->chunk_store != NULL)
-	{
-		StringInfoData data;
-		ProllyChunkNode cn;
-
-		initStringInfo(&data);
-		if (!PROLLY_CALL(pc->env->chunk_store, get, pc->env->chunks, &node->hash,
-						 &data))
-			elog(ERROR, "node at level %u is not in the chunk store", level);
-		if (!PROLLY_CALL(pc->env->chunk_format, open, (const uint8 *) data.data,
-						 data.len, &cn))
-			elog(ERROR, "node at level %u is not a chunk node", level);
-		if (cn.level != level)
-			elog(ERROR, "node visited at level %u says it is at level %u",
-				 level, cn.level);
-		pfree(data.data);
-		pc->nodes++;
-		return true;
-	}
-	buf = PROLLY_CALL(pc->env->node_store, read, pc->env->store, node);
-
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (!PROLLY_CALL(pc->env->node_format, page_check, BufferGetPage(buf), &detail))
-		elog(ERROR, "node at level %u fails the page check: %s", level, detail);
-	if (PROLLY_CALL(pc->env->node_format, page_level, BufferGetPage(buf)) != level)
-		elog(ERROR, "node visited at level %u says it is at level %u", level,
-			 PROLLY_CALL(pc->env->node_format, page_level, BufferGetPage(buf)));
-	UnlockReleaseBuffer(buf);
+	initStringInfo(&data);
+	if (!PROLLY_CALL(pc->env->chunk_store, get, pc->env->chunks, &node->hash,
+					 &data))
+		elog(ERROR, "node at level %u is not in the chunk store", level);
+	if (!PROLLY_CALL(pc->env->chunk_format, open, (const uint8 *) data.data,
+					 data.len, &cn))
+		elog(ERROR, "node at level %u is not a chunk node", level);
+	if (cn.level != level)
+		elog(ERROR, "node visited at level %u says it is at level %u",
+			 level, cn.level);
+	pfree(data.data);
 	pc->nodes++;
 	return true;
 }
@@ -1244,12 +1198,12 @@ tree_nodes_are_valid(const ProllyImplInfo *impl)
 	ProllyTreeEnv env;
 	Ref		   *ref = palloc(sizeof(Ref));
 	ProllyNodeRef root;
-	PageCheck	pc = {&env, 0};
+	NodeCheck	pc = {&env, 0};
 
 	make_env(tr, &env);
 	fill_ref(ref, 1, 4);			/* every key, longer values */
 	build_ref(tr, &env, ref, &root);
-	PROLLY_CALL(tr, walk, &env, &root, check_node_page, &pc);
+	PROLLY_CALL(tr, walk, &env, &root, check_node, &pc);
 	if (pc.nodes < 10)
 		elog(ERROR, "tree has only %d nodes", pc.nodes);
 }
@@ -1467,8 +1421,6 @@ tree_large_keys(const ProllyImplInfo *impl)
 	ResourceOwner owner = CurrentResourceOwner;
 	bool		refused = false;
 
-	if (!tree_checks_in_chunks)
-		return;
 	make_env(tr, &env);
 	initStringInfo(&kbuf);
 

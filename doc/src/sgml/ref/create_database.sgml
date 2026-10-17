@@ -38,7 +38,6 @@ CREATE DATABASE <replaceable class="parameter">name</replaceable>
            [ ALLOW_CONNECTIONS [=] <replaceable class="parameter">allowconn</replaceable> ]
            [ CONNECTION LIMIT [=] <replaceable class="parameter">connlimit</replaceable> ]
            [ IS_TEMPLATE [=] <replaceable class="parameter">istemplate</replaceable> ]
-           [ VERSIONED [=] <replaceable class="parameter">versioned</replaceable> ]
            [ OID [=] <replaceable class="parameter">oid</replaceable> ]
 </synopsis>
  </refsynopsisdiv>
@@ -347,20 +346,6 @@ CREATE DATABASE <replaceable class="parameter">name</replaceable>
          If true, then this database can be cloned by any user with <literal>CREATEDB</literal>
          privileges; if false (the default), then only superusers or the owner
          of the database can clone it.
-        </para>
-       </listitem>
-      </varlistentry>
-
-      <varlistentry id="create-database-versioned">
-       <term><replaceable class="parameter">versioned</replaceable></term>
-       <listitem>
-        <para>
-         If true, the database is version-controlled: its permanent tables
-         are prolly tables (<literal>prolly_d1</literal> is the default table
-         access method, and permanent tables stored by any other table access
-         method can't be created), branched and committed with the
-         <function>dolt_</function> functions.  Temporary and unlogged tables
-         are not versioned.  The default is the template's setting.
         </para>
        </listitem>
       </varlistentry>

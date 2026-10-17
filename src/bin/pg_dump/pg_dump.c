@@ -3432,23 +3432,6 @@ dumpDatabase(Archive *fout)
 	}
 
 	/*
-	 * A version-controlled database (a column servers of this version may
-	 * lack, so read through to_jsonb).
-	 */
-	if (fout->remoteVersion >= 200000)
-	{
-		PGresult   *vres;
-
-		vres = ExecuteSqlQueryForSingleRow(fout,
-										   "SELECT coalesce((pg_catalog.to_jsonb(d) ->> 'datversioned')::pg_catalog.bool, false) "
-										   "FROM pg_catalog.pg_database d "
-										   "WHERE datname = pg_catalog.current_database()");
-		if (strcmp(PQgetvalue(vres, 0, 0), "t") == 0)
-			appendPQExpBufferStr(creaQry, " VERSIONED = true");
-		PQclear(vres);
-	}
-
-	/*
 	 * For binary upgrade, carry over the collation version.  For normal
 	 * dump/restore, omit the version, so that it is computed upon restore.
 	 */

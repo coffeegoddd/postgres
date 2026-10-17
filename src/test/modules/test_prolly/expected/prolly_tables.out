@@ -178,11 +178,3 @@ drop cascades to table app.parted
 drop cascades to materialized view app.mv
 drop cascades to table app.ctas
 DROP TABLE h, d, u2;
--- Page-based prolly has no tree engine, so no node counters: asking for
--- them is refused (as for heap), not a crash.
-\set VERBOSITY sqlstate
-SELECT * FROM prolly_node_counters('prolly');
-ERROR:  42809
-SELECT * FROM prolly_node_counters('heap');
-ERROR:  42809
-\set VERBOSITY default

@@ -45,6 +45,7 @@ extern List *prolly_list_impls(ProllyInterface iface);
 extern void prolly_register_impl(const ProllyImplInfo *impl);
 
 /* Interface metadata, for messages, configuration and the conformance suite. */
+extern bool prolly_interface_valid(int iface);
 extern const char *prolly_interface_name(ProllyInterface iface);
 extern bool prolly_interface_from_name(const char *name,
 									   ProllyInterface *iface);

@@ -1,14 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_database.h
- *	  Keeping prolly state in step with CREATE DATABASE and DROP DATABASE.
+ *	  Keeping prolly state in step with CREATE DATABASE.
  *
- * A database's prolly tables are found from its branch heads, which live
- * outside its directory, so copying or removing the directory alone would
- * lose them or leave them behind.  createdb() calls ProllyCopyDatabase()
- * once the template's files are copied; dropdb() calls
- * ProllyDropDatabase() as it removes the database's files.  Each passes the
- * call to every registered commit pipeline.
+ * A database's chunk store is files no catalog lists, so copying the
+ * template's relations alone would leave its history behind.  createdb()
+ * calls ProllyCopyDatabase() once the template's files are copied, which
+ * passes the call to every registered chunk store.  (DROP DATABASE needs
+ * nothing: the chunk store is in the database's directory.)
  *
  * src/include/access/prolly_database.h
  *
@@ -19,6 +18,5 @@
 
 extern void ProllyCopyDatabase(Oid src_dboid, Oid src_spcoid,
 							   Oid dst_dboid, Oid dst_spcoid);
-extern void ProllyDropDatabase(Oid dboid);
 
 #endif							/* PROLLY_DATABASE_H */

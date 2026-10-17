@@ -129,17 +129,12 @@ ERROR:  function int4in(internal) does not exist
 CREATE ACCESS METHOD bogus TYPE TABLE HANDLER bthandler;
 ERROR:  function bthandler must return type table_am_handler
 SELECT amname, amhandler, amtype FROM pg_am where amtype = 't' ORDER BY 1, 2;
-   amname   |         amhandler          | amtype 
-------------+----------------------------+--------
- heap       | heap_tableam_handler       | t
- heap2      | heap_tableam_handler       | t
- prolly     | prolly_tableam_handler     | t
- prolly_d1  | prolly_d1_tableam_handler  | t
- prolly_d2  | prolly_d2_tableam_handler  | t
- prolly_d3a | prolly_d3a_tableam_handler | t
- prolly_d3b | prolly_d3b_tableam_handler | t
- prolly_d4  | prolly_d4_tableam_handler  | t
-(8 rows)
+ amname |       amhandler        | amtype 
+--------+------------------------+--------
+ heap   | heap_tableam_handler   | t
+ heap2  | heap_tableam_handler   | t
+ prolly | prolly_tableam_handler | t
+(3 rows)
 
 -- First create tables employing the new AM using USING
 -- plain CREATE TABLE

@@ -50,7 +50,7 @@ func TestResolve(t *testing.T) {
 		want string
 	}{
 		{nil, stDidNotRun},
-		{&digest{SQLState: "0A000", Message: `table access method "prolly_d2" does not implement scan yet`}, stNotImplemented},
+		{&digest{SQLState: "0A000", Message: `table access method "prolly" does not implement scan yet`}, stNotImplemented},
 		{&digest{SQLState: "0A000", Message: "prolly indexes do not support INCLUDE columns yet"}, stNotImplemented},
 		{&digest{SQLState: "0A000", Message: "cannot use subquery in DEFAULT expression"}, stNotOk},
 		{&digest{Event: evCrash}, stCrashed},
