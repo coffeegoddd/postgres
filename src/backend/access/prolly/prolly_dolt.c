@@ -37,10 +37,10 @@
 #include "access/tableam.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
-#include "catalog/versioned.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -1909,6 +1909,23 @@ need_remote(const char *name)
 	return url;
 }
 
+/* Add a remote: its name valid and not taken, its URL one a remote serves. */
+static void
+add_remote(const char *name, const char *url)
+{
+	if (name[0] == '\0' || strchr(name, '/') != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid remote name \"%s\"", name),
+				 errdetail("A remote's name is not empty and has no \"/\".")));
+	(void) prolly_remote_for_url(url);
+	if (remote_url_of(name) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("remote \"%s\" already exists", name)));
+	PROLLY_CALL(remote_refs(), remote_set, name, url);
+}
+
 /*
  * dolt_remote(VARIADIC args text[]) returns text[]: {status}
  *
@@ -1928,17 +1945,7 @@ dolt_remote(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_remote add needs a name and a URL")));
-		if (args[1][0] == '\0' || strchr(args[1], '/') != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid remote name \"%s\"", args[1]),
-					 errdetail("A remote's name is not empty and has no \"/\".")));
-		(void) prolly_remote_for_url(args[2]);
-		if (remote_url_of(args[1]) != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("remote \"%s\" already exists", args[1])));
-		PROLLY_CALL(remote_refs(), remote_set, args[1], args[2]);
+		add_remote(args[1], args[2]);
 	}
 	else if (nargs >= 1 && (strcmp(args[0], "remove") == 0 ||
 							strcmp(args[0], "rm") == 0))
@@ -2025,10 +2032,12 @@ check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
 
 /*
  * Fetch remote name's branches (NIL: all of them) into its remote-tracking
- * branches.
+ * branches, the remote opened and its heads read once; with need, refuse
+ * before receiving anything if the remote hasn't that branch.  *got (if
+ * not NULL) is what was fetched: the branches and their commits.
  */
 static void
-fetch_remote(const char *name, List *only)
+fetch_remote(const char *name, List *only, const char *need, Heads *got)
 {
 	ProllyDatabaseComponents dc;
 	char	   *url = need_remote(name);
@@ -2064,6 +2073,17 @@ fetch_remote(const char *name, List *only)
 				want.commits = lappend(want.commits, lfirst(c));
 			}
 		}
+		if (need)
+		{
+			bool		has = false;
+
+			foreach(b, all.branches)
+				has |= (strcmp(lfirst(b), need) == 0);
+			if (!has)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("the remote has no branch \"%s\"", need)));
+		}
 		foreach(b, only)
 		{
 			ListCell   *w;
@@ -2093,6 +2113,8 @@ fetch_remote(const char *name, List *only)
 
 	forboth(b, want.branches, c, want.commits)
 		PROLLY_CALL(dc.refs, tracking_set, name, lfirst(b), lfirst(c));
+	if (got)
+		*got = want;
 }
 
 /*
@@ -2120,7 +2142,7 @@ dolt_fetch(PG_FUNCTION_ARGS)
 		else
 			branches = lappend(branches, args[i]);
 	}
-	fetch_remote(remote ? remote : "origin", branches);
+	fetch_remote(remote ? remote : "origin", branches, NULL, NULL);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -2299,7 +2321,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 		need_upstream("dolt_pull", &remote, &branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
-	fetch_remote(remote, list_make1(branch));
+	fetch_remote(remote, list_make1(branch), NULL, NULL);
 
 	merge_args = lappend(merge_args, psprintf("%s/%s", remote, branch));
 	d = palloc(sizeof(Datum) * list_length(merge_args));
@@ -2374,29 +2396,91 @@ dolt_remote_branches(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-typedef struct AnyHead
+/* What a database has that a clone would run into, one string a kind. */
+typedef struct InTheWay
 {
-	bool		found;
-} AnyHead;
+	const char *current;
+	StringInfoData branches;
+	StringInfoData remotes;
+	StringInfoData upstreams;
+} InTheWay;
 
 static void
-note_head(const char *name, const ProllyHash *head, void *arg)
+list_name(StringInfo list, const char *name)
 {
-	if (head->len > 0)
-		((AnyHead *) arg)->found = true;
+	if (list->len > 0)
+		appendStringInfoString(list, ", ");
+	appendStringInfoString(list, name);
+}
+
+static void
+note_branch(const char *name, const ProllyHash *head, void *arg)
+{
+	InTheWay   *w = arg;
+	char	   *remote;
+	char	   *remote_branch;
+
+	/* (the session's own branch is in the way only once it has commits) */
+	if (head->len > 0 || strcmp(name, w->current) != 0)
+		list_name(&w->branches, name);
+	if (PROLLY_CALL(remote_refs(), upstream, name, &remote, &remote_branch))
+		list_name(&w->upstreams, name);
+}
+
+static void
+note_remote(const char *name, const char *url, void *arg)
+{
+	list_name(&((InTheWay *) arg)->remotes, name);
+}
+
+/*
+ * Refuse a clone into a database that isn't empty: no versioned schemas,
+ * no branch but the session's (with no commits), no remotes, no upstreams;
+ * naming what is there.
+ */
+static void
+check_clone_target(const char *current)
+{
+	InTheWay	w;
+	StringInfoData what;
+
+	w.current = current;
+	initStringInfo(&w.branches);
+	initStringInfo(&w.remotes);
+	initStringInfo(&w.upstreams);
+	initStringInfo(&what);
+	PROLLY_CALL(remote_refs(), branches, note_branch, &w);
+	PROLLY_CALL(remote_refs(), remotes, note_remote, &w);
+	if (database_has_versioned_schemas())
+		appendStringInfoString(&what, "versioned schemas");
+	if (w.branches.len > 0)
+		appendStringInfo(&what, "%sbranches %s", what.len ? "; " : "", w.branches.data);
+	if (w.remotes.len > 0)
+		appendStringInfo(&what, "%sremotes %s", what.len ? "; " : "", w.remotes.data);
+	if (w.upstreams.len > 0)
+		appendStringInfo(&what, "%supstreams of %s", what.len ? "; " : "", w.upstreams.data);
+	if (what.len > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("dolt_clone needs an empty database"),
+				 errdetail("This one has %s.", what.data),
+				 errhint("Clone into a new database.")));
 }
 
 /*
  * dolt_clone(VARIADIC args text[]) returns text[]: {status}
  *
- * url, [--remote name] (origin), [--branch branch]: in a database with no
- * versioned schemas and no commits, the remote added and fetched, each of
- * its branches made a branch here (head-only until first used) with the
+ * url, [--remote name] (origin), [--branch branch]: in an empty database
+ * (no versioned schemas, no branch but the session's, which has no
+ * commits, no remotes), the remote added and fetched, its heads read once,
+ * each of its branches made a branch here (head-only until used) with the
  * remote's as its upstream, and the session checked out on branch (else
- * the remote's main, master, or first branch by name), which makes its
- * copies.  All in the transaction: a clone that fails (the remote's
- * objects depending on something this database lacks: an extension, a
- * type or function of an ordinary schema, a role) leaves nothing.
+ * the remote's main, master, or first by name), which makes its copies.
+ * The session's own branch, if the remote has one of its name, is moved to
+ * it; if not, it stays, empty (main, the database's, can't be deleted).
+ * All in the transaction: a clone that fails (the remote's objects
+ * depending on something this database lacks: an extension, a type or
+ * function of an ordinary schema, a role) leaves nothing.
  */
 Datum
 dolt_clone(PG_FUNCTION_ARGS)
@@ -2406,10 +2490,8 @@ dolt_clone(PG_FUNCTION_ARGS)
 	char	   *url = NULL;
 	char	   *remote = "origin";
 	char	   *branch = NULL;
-	const ProllyRemoteRoutine *rr;
-	ProllyRemote *r;
+	const char *current = branch_ops()->current();
 	Heads		h = {NIL, NIL};
-	AnyHead		any = {false};
 	ListCell   *lc;
 	const char *result[1] = {"0"};
 
@@ -2432,25 +2514,16 @@ dolt_clone(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_clone needs a remote's URL")));
-	PROLLY_CALL(remote_refs(), branches, note_head, &any);
-	if (database_has_versioned_schemas() || any.found)
+	if (current == NULL ||
+		strncmp(current, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("dolt_clone needs a database without versioned schemas or commits"),
-				 errhint("Clone into a new, empty database.")));
+				 errmsg("dolt_clone needs the session on a branch")));
+	check_clone_target(current);
 
-	/* the remote's branches, and which to check out */
-	rr = prolly_remote_for_url(url);
-	r = PROLLY_CALL(rr, open, url, false);
-	PG_TRY();
-	{
-		PROLLY_CALL(rr, heads, r, collect_head, &h);
-	}
-	PG_FINALLY();
-	{
-		PROLLY_CALL(rr, close, r);
-	}
-	PG_END_TRY();
+	/* the remote added as dolt_remote() adds one, and fetched */
+	add_remote(remote, url);
+	fetch_remote(remote, NIL, branch, &h);
 	if (h.branches == NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2467,39 +2540,20 @@ dolt_clone(PG_FUNCTION_ARGS)
 		if (branch == NULL)
 			branch = linitial(h.branches);
 	}
-	else
-	{
-		bool		found = false;
 
-		foreach(lc, h.branches)
-			found |= (strcmp(lfirst(lc), branch) == 0);
-		if (!found)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("the remote has no branch \"%s\"", branch)));
-	}
-
-	PROLLY_CALL(remote_refs(), remote_set, remote, url);
-	fetch_remote(remote, NIL);
 	foreach(lc, h.branches)
 	{
 		char	   *b = lfirst(lc);
 		char	   *tracking = psprintf("%s/%s", remote, b);
 
-		if (strcmp(b, branch_ops()->current()) == 0)
-		{
-			/* the session's branch (main, empty): moved to the remote's */
-			Datum		d[2] = {CStringGetTextDatum("--hard"),
-			CStringGetTextDatum(tracking)};
-
-			(void) DirectFunctionCall1(dolt_reset,
-									   PointerGetDatum(construct_array_builtin(d, 2, TEXTOID)));
-		}
+		/* (the session's branch, empty, moved to the remote's) */
+		if (strcmp(b, current) == 0)
+			PROLLY_CALL(remote_refs(), reset, tracking);
 		else
 			create_branch(b, tracking);
 		PROLLY_CALL(remote_refs(), upstream_set, b, remote, b);
 	}
-	if (strcmp(branch, branch_ops()->current()) != 0)
+	if (strcmp(branch, current) != 0)
 		checkout_branch(branch);
 	PG_RETURN_DATUM(text_array(1, result));
 }

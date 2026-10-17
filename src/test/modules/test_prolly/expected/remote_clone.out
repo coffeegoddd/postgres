@@ -10,6 +10,7 @@ SELECT current_database() AS db \gset
 SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/clone-' || txid_current() AS run \gset
 \set url :run '/a'
 \set url_dep :run '/dep'
+\set url_nomain :run '/nomain'
 CREATE SCHEMA cl VERSIONED;
 CREATE TABLE cl.t (id int PRIMARY KEY, v text);
 INSERT INTO cl.t SELECT g, 'v' || g FROM generate_series(1, 200) g;
@@ -117,10 +118,108 @@ SELECT v FROM cl.t WHERE id = 1;
 
 -- a database with commits can't take a clone
 SELECT dolt_clone(:'url');
-ERROR:  dolt_clone needs a database without versioned schemas or commits
-HINT:  Clone into a new, empty database.
+ERROR:  dolt_clone needs an empty database
+DETAIL:  This one has versioned schemas; branches main, side; remotes origin; upstreams of main, side.
+HINT:  Clone into a new database.
 \c :db
 DROP DATABASE regress_clone_b;
+-- what a clone would run into, named; a remote named as dolt_remote names
+-- one
+CREATE DATABASE regress_clone_e;
+\c regress_clone_e
+SELECT dolt_clone(:'url', '--remote', 'a/b');
+ERROR:  invalid remote name "a/b"
+DETAIL:  A remote's name is not empty and has no "/".
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_clone(:'url');
+ERROR:  dolt_clone needs an empty database
+DETAIL:  This one has branches side; remotes origin.
+HINT:  Clone into a new database.
+SELECT dolt_remote('remove', 'origin');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_clone(:'url');
+ERROR:  dolt_clone needs an empty database
+DETAIL:  This one has branches side.
+HINT:  Clone into a new database.
+\c :db
+DROP DATABASE regress_clone_e;
+-- a remote without main: its master checked out; main, the database's,
+-- stays, empty
+SELECT dolt_remote('add', 'nomain', :'url_nomain');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('nomain', 'side') AS pushed;
+          pushed           
+---------------------------
+ {0,"side -> nomain/side"}
+(1 row)
+
+SELECT dolt_branch('master', 'side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('nomain', 'master') AS pushed;
+            pushed             
+-------------------------------
+ {0,"master -> nomain/master"}
+(1 row)
+
+SELECT dolt_branch('-D', 'master');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE DATABASE regress_clone_f;
+\c regress_clone_f
+SELECT dolt_clone(:'url_nomain');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ master
+(1 row)
+
+SELECT name, hash IS NULL AS empty FROM dolt_branches ORDER BY name;
+  name  | empty 
+--------+-------
+ main   | t
+ master | f
+ side   | f
+(3 rows)
+
+\c :db
+DROP DATABASE regress_clone_f;
+SELECT dolt_remote('remove', 'nomain');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
 -- --branch: another branch checked out
 CREATE DATABASE regress_clone_c;
 \c regress_clone_c
