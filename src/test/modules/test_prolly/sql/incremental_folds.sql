@@ -117,6 +117,23 @@ ROLLBACK;
 UPDATE inc.keyless SET b = 'kept' WHERE a = 16;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'kept')::text) AS committed;
+-- a commit in a savepoint rolled back: the baseline it made goes with it,
+-- and the writes it saw as settled with them
+BEGIN;
+SAVEPOINT s;
+UPDATE inc.keyless SET b = 'in the savepoint' WHERE a = 19;
+UPDATE inc.big SET v = 'in the savepoint' WHERE id BETWEEN 2000 AND 2099;
+SELECT length(dolt_commit('-am', 'in the savepoint')::text) AS committed;
+ROLLBACK TO s;
+UPDATE inc.keyless SET b = 'after the savepoint' WHERE a = 20;
+UPDATE inc.big SET v = 'after the savepoint' WHERE id BETWEEN 2100 AND 2199;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'after the savepoint')::text) AS committed;
+COMMIT;
+UPDATE inc.keyless SET b = 'later' WHERE a = 21;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'later still')::text) AS committed;
+SELECT count(*) AS rows_from_the_savepoint FROM inc.keyless WHERE b = 'in the savepoint';
 -- a cherry-pick commits in the transaction applying its rows: the next
 -- fold reads only its pages, keyless and keyed
 SELECT dolt_branch('pick');

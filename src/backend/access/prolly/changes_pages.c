@@ -241,8 +241,9 @@ xid_cmp(const void *a, const void *b)
  * Does the snapshot see every transaction the baseline's fold saw as
  * committed?  Each the fold saw finished (below its xmax, not running
  * then) must be below the snapshot's xmax and not running for it; and the
- * fold's own transaction, whose writes it saw, must be this one or one
- * the snapshot sees committed.
+ * fold's own transaction, whose writes it saw, must be this one or one the
+ * snapshot sees finished.  (Aborted, it took the baseline with it: so
+ * finished is committed, and no transaction's status need be read.)
  */
 static bool
 sees_fold(Snapshot snap, const State *st)
@@ -252,7 +253,7 @@ sees_fold(Snapshot snap, const State *st)
 		return false;
 	if (TransactionIdIsNormal(st->own) &&
 		!TransactionIdIsCurrentTransactionId(st->own) &&
-		(XidInMVCCSnapshot(st->own, snap) || !TransactionIdDidCommit(st->own)))
+		XidInMVCCSnapshot(st->own, snap))
 		return false;
 	for (uint32 i = 0; i < snap->xcnt; i++)
 		if (TransactionIdPrecedes(snap->xip[i], st->xmax) &&
@@ -340,27 +341,37 @@ finder_close(Finder *f)
 
 /*
  * Is xid's transaction one the snapshot doesn't see as committed or not?
- * The fold's own transaction's writes are settled for it: what it wrote
- * before the fold goes with the fold if it rolls back, and what it writes
- * after changes pages since.  So are an aborted transaction's.
+ * The fold's own transaction's writes the snapshot sees (cid, the write's
+ * command, before the snapshot's) are settled for it: they go with the
+ * fold if the transaction (or a subtransaction both are in) rolls back,
+ * and what it writes after changes pages since.  Writes the snapshot
+ * doesn't see yet aren't.
  */
 static bool
-xid_unsettled(Finder *f, TransactionId xid)
+xid_unsettled(Finder *f, HeapTupleHeader t, bool updater)
 {
-	if (!TransactionIdIsNormal(xid) || TransactionIdIsCurrentTransactionId(xid))
+	TransactionId xid = updater ? HeapTupleHeaderGetUpdateXid(t) :
+		HeapTupleHeaderGetRawXmin(t);
+
+	if (!TransactionIdIsNormal(xid))
 		return false;
-	return XidInMVCCSnapshot(xid, f->snap) && !TransactionIdDidAbort(xid);
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return (updater ? HeapTupleHeaderGetCmax(t) :
+				HeapTupleHeaderGetCmin(t)) >= f->snap->curcid;
+	return XidInMVCCSnapshot(xid, f->snap);
 }
 
 static bool
 tuple_unsettled(Finder *f, HeapTupleHeader t)
 {
-	if (!HeapTupleHeaderXminFrozen(t) &&
-		xid_unsettled(f, HeapTupleHeaderGetRawXmin(t)))
+	uint16		mask = t->t_infomask;
+
+	/* (one hinted as aborted is settled, without asking) */
+	if (!HeapTupleHeaderXminFrozen(t) && !(mask & HEAP_XMIN_INVALID) &&
+		xid_unsettled(f, t, false))
 		return true;
-	if (!(t->t_infomask & HEAP_XMAX_INVALID) &&
-		!HEAP_XMAX_IS_LOCKED_ONLY(t->t_infomask))
-		return xid_unsettled(f, HeapTupleHeaderGetUpdateXid(t));
+	if (!(mask & HEAP_XMAX_INVALID) && !HEAP_XMAX_IS_LOCKED_ONLY(mask))
+		return xid_unsettled(f, t, true);
 	return false;
 }
 
