@@ -761,6 +761,10 @@ check_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 				!same_value(before, k, fv) || !same_value(after, k, tv))
 				elog(ERROR, "diff: key %d wrongly reported modified", k);
 			break;
+		case PROLLY_DIFF_NOT_COVERED:
+			/* (a kind of table a read leaves out, never a tree's) */
+			elog(ERROR, "diff: key %d reported as not covered", k);
+			break;
 	}
 }
 
