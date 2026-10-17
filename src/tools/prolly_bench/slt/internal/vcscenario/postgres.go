@@ -24,8 +24,8 @@ func EngineProfile(am string) (Profile, error) {
 		p.Supported = []string{"sql", "vc.core"}
 		p.Limitations = "Data commit/branch/hard-reset only; no schema-merge or concurrency claim."
 	case "prolly":
-		p.Supported = []string{"sql"}
-		p.Limitations = "Legacy refs do not capture block-mapped tables; VC is not supported by this adapter."
+		p.Supported = []string{"sql", "vc.core"}
+		p.Limitations = "Versioned public schema: data commit/branch/hard-reset; no schema-merge or concurrency claim."
 	case "heap":
 		p.Supported = []string{"sql"}
 		p.Limitations = "Ordinary heap has no version-control capability."

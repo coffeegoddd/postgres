@@ -46,7 +46,8 @@ func SelfTest(ctx context.Context, dsn string, timeout time.Duration) ([]Result,
 	if r.Status != "failed" || r.Phase != "target" || !strings.Contains(r.Error, "VC canary: main-isolation:") {
 		return results, fmt.Errorf("a false VC capability claim did not fail targeting: %+v", r)
 	}
-	p, _ = NewPostgres(dsn, "prolly", timeout)
+	// (heap declares no VC capability, and must report the probe unsupported)
+	p, _ = NewPostgres(dsn, "heap", timeout)
 	r = Run(ctx, s, p)
 	results = append(results, r)
 	if r.Status != "unsupported" || len(r.Missing) != 1 || r.Missing[0] != "vc.core" || len(r.Steps) != 0 {

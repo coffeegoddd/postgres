@@ -44,7 +44,7 @@ func TestReviewedCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != 4 || r.MappedAssertions != 25 || r.DeferredCases != 3 || r.UnreviewedCases != 1226 || len(r.Engines) != 0 {
+	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != 3 || r.MappedAssertions != 23 || r.DeferredCases != 4 || r.UnreviewedCases != 1226 || len(r.Engines) != 0 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -121,7 +121,7 @@ func TestExplicitOmissionIsPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.PortedCases != 3 || r.PartialCases != 1 || r.MappedAssertions != 24 || r.OmittedAssertions != 1 {
+	if r.PortedCases != 2 || r.PartialCases != 1 || r.MappedAssertions != 22 || r.OmittedAssertions != 1 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -161,9 +161,9 @@ func TestExecutionAccounting(t *testing.T) {
 		wantErr                     bool
 		passed, credit, unsupported int
 	}{
-		{"all pass", func(*execution) {}, false, 4, 25, 0},
-		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, 3, 14, 1},
-		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, 3, 14, 0},
+		{"all pass", func(*execution) {}, false, 3, 23, 0},
+		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, 2, 12, 1},
+		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, 2, 12, 0},
 		{"missing case", func(e *execution) { e.Results = e.Results[1:] }, true, 0, 0, 0},
 		{"duplicate case", func(e *execution) { e.Results = append(e.Results, e.Results[0]) }, true, 0, 0, 0},
 		{"truncated pass", func(e *execution) { e.Results[0].Steps = nil }, true, 0, 0, 0},
