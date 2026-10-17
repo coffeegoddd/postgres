@@ -165,31 +165,38 @@ branch and one on `main`, then `dolt_merge` into `main`:
 
 | Case (base → ours, theirs) | Prolly, as measured | Prolly, since #150 | Dolt |
 |---|---|---|---|
-| Both add a copy of an existing row (1 → 2, 2) | 2 copies | 3 copies | Conflict (base 1, ours 2, theirs 2) |
-| Both add the same new row | 1 copy | 2 copies | Conflict |
+| Both add a copy of an existing row (1 → 2, 2) | 2 copies | 2 copies | Conflict (base 1, ours 2, theirs 2) |
+| Both add the same new row | 1 copy | 1 copy | Conflict |
 | Each adds a different row | Both | Both | Both |
 | Both delete the same row | Deleted | Deleted | Conflict |
 | Both update the same row differently | Both new rows, old one gone | The same | Conflict on the shared delete; both new rows in the working set |
 | Base has 2 copies; ours deletes one, theirs adds one | 2 copies | 2 copies | Conflict |
+| Base has 2 copies; ours deletes them both, theirs one | Conflict | Deleted | Conflict |
+| Both update the same row alike | The new row once | The same | Conflict |
 
 Prolly's rule as measured (`merge_table`, `diffmerge_folded.c`): changes
 in a row's copies add up, unless both sides made it the same number,
 which converges as a keyed row's identical change does; a conflict only
-when theirs removes more copies than ours has.  Since #150: a row has the
-base's copies, those each side added, less the most either removed, and
-never conflicts. Dolt's: any key both sides changed is a
+when theirs removes more copies than ours has.  Since #150: a row both
+sides changed by the same number of copies is changed once; otherwise it
+has the base's copies, those each side added, less the most either
+removed; it never conflicts. Dolt's: any key both sides changed is a
 conflict, identical changes too (`valueMerger.TryMerge` returns at once for
 keyless; `merge_rows.go:424`, "For keyless tables, this counts as a
 conflict"). Dolt's own tests skip the update case as resolving incorrectly
 (`integration-tests/bats/keyless.bats:685`).
 
-The convergence rule gave 2 copies, not 3, when both sides add a copy of
-the same row: two people each adding a row was read as both making the
-same change, the keyed rule carried over. #150 counts them as the two
-rows they are (a log's two entries), and deletes once what both deleted.
-Two different updates of the same row still keep both new rows: a
-keyless row has no identity to tell an update from a delete and an
-insert.
+Converging identical changes gives 2 copies, not 3, when both sides add
+a copy of the same row: two people each adding a row is read as both
+making the same change. #150 first summed them, as the two rows they
+might be, but that made every identical change twice: the same update on
+both sides turned one row into two, and a hotfix picked onto a branch
+and then merged from its own came twice (the user chose convergence, for
+those ordinary cases over two branches inserting byte-identical rows).
+What #150 keeps: removals on both sides count once, and a keyless row
+never conflicts. Two different updates of the same row still keep both
+new rows: a keyless row has no identity to tell an update from a delete
+and an insert.
 
 ## 5. What to change in prolly
 
@@ -207,8 +214,9 @@ In order of what the numbers say matters:
    a branch's first use does, and a clean checkout reads nothing (0 pages,
    counted, in `clean_checkouts`): 0.45 ms keyless, 0.60 ms keyed.
 3. **Decide the keyless merge rule.** Decided (user, 2026-10-17) and done
-   in #150: copies added on either side add up, copies removed on both
-   are removed once, and a keyless row never conflicts (part 4).
+   in #150: the same change on both sides is made once; otherwise copies
+   added on either side add up and copies removed on both are removed
+   once; a keyless row never conflicts (part 4).
 4. **Key keyless rows by their content, not its hash.** Decided (user,
    2026-10-17) and done in #149, as proposed below; part 7 measures it.
    Changes to a range of rows would then touch a few chunks, as a keyed
