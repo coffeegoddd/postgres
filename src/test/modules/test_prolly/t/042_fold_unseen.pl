@@ -85,6 +85,18 @@ is($rr->query_safe(q{SELECT string_agg(table_name, ', ') FROM dolt_status}), 'c.
 	'and sees the working set as it was');
 $rr->query_safe('COMMIT');
 
+# A checkpoint, as a commit, won't fold by a snapshot that doesn't see its
+# branch's head.
+my $cp = $node->background_psql('postgres', on_error_stop => 0);
+$cp->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1});
+sql(q{UPDATE c.t SET v = 'moved' WHERE id = 9; SELECT dolt_commit('-am', 'moved')});
+$cp->query('SELECT prolly_checkpoint()');
+like($cp->{stderr}, qr/could not serialize access: branch "main" moved/,
+	'a checkpoint whose snapshot misses the head fails');
+$cp->{stderr} = '';
+$cp->query_safe('ROLLBACK');
+$cp->quit;
+
 # A standby folds, though it can't take the lock (nor begin a fold).
 $node->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('unseen_standby');

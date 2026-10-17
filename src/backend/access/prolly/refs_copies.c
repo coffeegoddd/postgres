@@ -11,7 +11,9 @@
  *	'B' name	-> the branch's head commit (hash length, hash)
  *	'W' name	-> the branch's baseline: what its last fold for a commit
  *				   or a working-set checkpoint left, for the next fold to
- *				   start from (the canonicalizer's tree; hash length, hash)
+ *				   start from (the canonicalizer's tree; hash length, hash),
+ *				   then, if known, the working set's root that fold made
+ *				   (hash length, hash)
  *	'M' name	-> the branch's merge in progress: the merged head and the
  *				   common ancestor (hash length, hash each), then the OIDs
  *				   of tables with unresolved conflicts (4 bytes each,
@@ -55,6 +57,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/branch_ops.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -82,6 +85,8 @@ static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_key(StringInfo key, const char *branch);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
+static bool copies_commit_working_set(const ProllyHash *commit_id,
+									  ProllyNodeRef *root);
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
@@ -414,9 +419,43 @@ branch_baseline(const char *name, ProllyNodeRef *baseline)
 	return found;
 }
 
-/* Make baseline (NULL: none) branch name's baseline. */
+/* The working set's root branch name's baseline's fold made, if known. */
+static bool
+branch_baseline_root(const char *name, ProllyNodeRef *root)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found = false;
+	ProllyHash	h;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_BASELINE);
+	appendStringInfoString(&key, name);
+	if (refs_get(key.data, key.len, &v))
+	{
+		const char *p = get_hash(v.data, v.data + v.len, &h);
+
+		if (p < v.data + v.len)
+		{
+			get_hash(p, v.data + v.len, &h);
+			found = h.len > 0;
+			if (found)
+				ref_of(&h, root);
+		}
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * Make baseline (NULL: none) branch name's baseline; 'root' (NULL: not
+ * known) is the working set's root its fold made.
+ */
 static void
-branch_set_baseline(const char *name, const ProllyNodeRef *baseline)
+branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
+					const ProllyNodeRef *root)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -427,6 +466,8 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline)
 	appendStringInfoString(&key, name);
 	if (baseline)
 		put_hash(&v, &baseline->hash);
+	if (baseline && root)
+		put_hash(&v, &root->hash);
 	refs_put(key.data, key.len, baseline ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
@@ -755,7 +796,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
-	branch_set_baseline(name, &next);
+	branch_set_baseline(name, &next, &root);
 }
 
 /* ------------------------------------------------------------------------
@@ -790,7 +831,8 @@ copies_branch_create(const char *name, const char *start_point)
 		/* (a branch of the same name deleted before left no entry) */
 		branch_set_head(name, branch_head(from, &head) ? &head : NULL);
 		/* its copies have the same changes since the same baseline */
-		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL);
+		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL,
+							NULL);
 		return;
 	}
 
@@ -805,7 +847,7 @@ copies_branch_create(const char *name, const char *start_point)
 
 		branch_set_baseline(name,
 							branch_baseline(branch_ops()->current(), &baseline) ?
-							&baseline : NULL);
+							&baseline : NULL, NULL);
 	}
 	branch_ops()->run_on(name, move_to, &info.root);
 	branch_set_head(name, &id);
@@ -828,7 +870,7 @@ copies_branch_delete(const char *name, bool force)
 				 errhint("Delete it anyway with -D.")));
 	branch_ops()->drop(name);
 	branch_set_head(name, NULL);
-	branch_set_baseline(name, NULL);
+	branch_set_baseline(name, NULL, NULL);
 
 	/* and the merge in progress on it, which a branch made later isn't in */
 	{
@@ -854,38 +896,63 @@ copies_branch_lookup(const char *name, ProllyBranchId *branch)
 
 /*
  * A working-set checkpoint: the session branch folded as a commit would
- * be, its fold the branch's baseline.
+ * be, its fold the branch's baseline.  As a commit, it folds by the latest
+ * snapshot if the branch moved since the transaction's (an error if the
+ * transaction keeps one).
  */
 static void
 copies_checkpoint(ProllyNodeRef *root)
 {
+	char	   *name = branch_ops()->current();
 	ProllyNodeRef next;
+	bool		pushed;
 
 	lock_refs();
+	pushed = see_head(name);
 	fold_from_baseline(root, &next);
-	branch_set_baseline(branch_ops()->current(), &next);
+	if (pushed)
+		PopActiveSnapshot();
+	branch_set_baseline(name, &next, root);
 }
 
 /*
  * Leaving a branch with changes takes a working-set checkpoint of it, so
- * the pages it changed needn't be kept until its next commit.  (A session
- * choosing its first branch, as it connects, leaves none.)
+ * the pages it changed needn't be kept until its next commit: if its
+ * working set isn't its head's, nor what its baseline's fold made already.
+ * Not in a transaction that can't write, nor in a transaction block (the
+ * refs, held to the transaction's end, would hold up others' commits), nor
+ * if the branch moved unseen by the snapshot (its fold wouldn't be the
+ * branch's).  (A session choosing its first branch, as it connects, leaves
+ * none.)
  */
 static void
 copies_checkout(const char *name)
 {
 	char	   *current = branch_ops()->current();
-	ProllyNodeRef working;
-	ProllyHash	head;
-	ProllyCommitInfo info;
 
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
+		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(branch_oid(name)))
 	{
+		ProllyNodeRef working;
+		ProllyNodeRef kept;
+		ProllyNodeRef next;
+		ProllyHash	head;
+
 		fold(&working);
-		if (!branch_head(current, &head) || !copies_commit_get(&head, &info) ||
-			!same_hash(&info.root.hash, &working.hash))
-			copies_checkpoint(&working);
+		if (!(branch_head(current, &head) &&
+			  copies_commit_working_set(&head, &kept) &&
+			  same_hash(&kept.hash, &working.hash)) &&
+			!(branch_baseline_root(current, &kept) &&
+			  same_hash(&kept.hash, &working.hash)))
+		{
+			lock_refs();
+			if (!head_moved_unseen(current))
+			{
+				fold_from_baseline(&working, &next);
+				branch_set_baseline(current, &next, &working);
+			}
+		}
 	}
 	branch_ops()->checkout(name);
 }

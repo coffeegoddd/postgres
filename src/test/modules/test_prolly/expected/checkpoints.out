@@ -109,17 +109,26 @@ SELECT pages > 0 AS reads_since_the_commit, same_as_full FROM pg_temp.fold();
  t                      | t
 (1 row)
 
--- Leaving a branch with changes takes a checkpoint of it.
+-- Leaving a branch with changes takes a checkpoint of it.  (A checkpoint
+-- begins the table's fold anew, raising its map's epoch.)
+SELECT pg_relation_filenode('cp.t') AS t \gset
 SELECT dolt_branch('other');
  dolt_branch 
 -------------
  {0}
 (1 row)
 
+SELECT test_bmap_epoch(:t) AS e0 \gset
 SELECT dolt_checkout('other');
           dolt_checkout           
 ----------------------------------
  {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT test_bmap_epoch(:t) > :e0 AS checkpointed;
+ checkpointed 
+--------------
+ t
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -140,17 +149,66 @@ SELECT diff_type, (to_row).id FROM dolt_diff('HEAD', 'WORKING', NULL::cp.t) ORDE
  modified  |  4
 (1 row)
 
--- Leaving one without changes takes none.
+-- Leaving it again, nothing changed since: none.
+SELECT test_bmap_epoch(:t) AS e1 \gset
 SELECT dolt_checkout('other');
           dolt_checkout           
 ----------------------------------
  {0,"Switched to branch 'other'"}
 (1 row)
 
-SELECT * FROM pg_temp.fold();
- pages | full_tables | same_as_full 
--------+-------------+--------------
-     0 |           0 | t
+SELECT test_bmap_epoch(:t) = :e1 AS not_again;
+ not_again 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- Nor in a transaction block, which may be read only.
+UPDATE cp.t SET v = 'five' WHERE id = 5;
+BEGIN READ ONLY;
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+COMMIT;
+SELECT test_bmap_epoch(:t) = :e1 AS none_in_a_block;
+ none_in_a_block 
+-----------------
+ t
+(1 row)
+
+-- Leaving one without changes takes none.
+SELECT length(dolt_commit('-am', 'four and five')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT test_bmap_epoch(:t) AS e2 \gset
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT test_bmap_epoch(:t) = :e2 AS clean_takes_none;
+ clean_takes_none 
+------------------
+ t
 (1 row)
 
 SELECT dolt_checkout('main');
