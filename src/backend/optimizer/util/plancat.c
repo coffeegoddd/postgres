@@ -560,15 +560,6 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 		rel->amflags |= AMFLAG_HAS_TID_RANGE;
 
 	/*
-	 * A table AM without parallel scans may keep a transaction's changes
-	 * where workers can't see them, so its tables are scanned only in the
-	 * leader.
-	 */
-	if (relation->rd_tableam &&
-		relation->rd_tableam->parallelscan_estimate == NULL)
-		rel->amflags |= AMFLAG_NO_PARALLEL_SCAN;
-
-	/*
 	 * Collect info about relation's partitioning scheme, if any. Only
 	 * inheritance parents may be partitioned.
 	 */

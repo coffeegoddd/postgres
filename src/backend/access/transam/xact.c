@@ -828,31 +828,6 @@ SubTransactionIsActive(SubTransactionId subxid)
 }
 
 /*
- *	GetOpenSubTransactionIds
- *
- * The IDs of the subtransactions open now (not aborted), innermost first,
- * without the top level.  Stores at most max of them in ids; returns how
- * many there are.
- */
-int
-GetOpenSubTransactionIds(SubTransactionId *ids, int max)
-{
-	TransactionState s;
-	int			n = 0;
-
-	for (s = CurrentTransactionState; s != NULL && s->parent != NULL;
-		 s = s->parent)
-	{
-		if (s->state == TRANS_ABORT)
-			continue;
-		if (n < max)
-			ids[n] = s->subTransactionId;
-		n++;
-	}
-	return n;
-}
-
-/*
  *	GetCurrentCommandId
  *
  * "used" must be true if the caller intends to use the command ID to mark

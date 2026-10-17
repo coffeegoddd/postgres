@@ -416,10 +416,6 @@ typedef struct TableAmRoutine
 
 	/* ------------------------------------------------------------------------
 	 * Parallel table scan related functions.
-	 *
-	 * Optional: an AM that can't share a scan between processes leaves all
-	 * three NULL, and the planner then keeps every scan of its tables in
-	 * the leader (they are parallel restricted, as temporary tables are).
 	 * ------------------------------------------------------------------------
 	 */
 
@@ -728,20 +724,6 @@ typedef struct TableAmRoutine
 											double *liverows,
 											double *deadrows,
 											TupleTableSlot *slot);
-
-	/*
-	 * Optional: sample rows for ANALYZE, with the signature and contract of
-	 * an FDW's AcquireSampleRowsFunc (foreign/fdwapi.h).  An AM whose rows
-	 * aren't laid out in the blocks of its main fork samples them this way;
-	 * the size in pages recorded in pg_class (by ANALYZE, CLUSTER and index
-	 * builds) is then relation_estimate_size's (table_relation_stats_pages).
-	 * NULL: ANALYZE samples blocks of the main fork through
-	 * scan_analyze_next_block and scan_analyze_next_tuple.
-	 */
-	int			(*relation_acquire_sample_rows) (Relation rel, int elevel,
-												 HeapTuple *rows, int targrows,
-												 double *totalrows,
-												 double *totaldeadrows);
 
 	/* see table_index_build_range_scan for reference about parameters */
 	double		(*index_build_range_scan) (Relation table_rel,
@@ -2157,7 +2139,6 @@ extern void table_block_parallelscan_startblock_init(Relation rel,
  * ----------------------------------------------------------------------------
  */
 
-extern BlockNumber table_relation_stats_pages(Relation rel);
 extern uint64 table_block_relation_size(Relation rel, ForkNumber forkNumber);
 extern void table_block_relation_estimate_size(Relation rel,
 											   int32 *attr_widths,
