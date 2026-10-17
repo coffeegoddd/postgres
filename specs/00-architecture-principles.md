@@ -85,14 +85,14 @@ provisional.
 The working set has no interface of its own here: it is heap's pages, in
 block-mapped storage (`11-pages-and-dolt-snapshots.md`, part 5).
 
-**Removed with D1 (2026-10-17, #183).** These were the tree engines'
-interfaces; no component of the page design used them. Their code is at
-the tag `prolly-d1`, and `04-candidate-designs.md` describes them.
+**Removed with D1 (#183).** These were the tree engines' interfaces; no
+component of the page design used them. Their last code is at
+`cff08be5c3`, and `04-candidate-designs.md` describes them.
 
 | Interface | Responsibility | Implementations built |
 |---|---|---|
 | Engine | The tree as primary storage: cursors, private writes, commit, checkpoint, redo | D1 (D2–D4 stubs) |
-| Coordination | Row locks, insert intents, range locks, commit markers | single_writer, K1 |
+| Coordination | Row locks, insert intents, range locks, commit markers | single_writer, K1 (K2, K3 stubs) |
 | Node page format | A node in a page, with per-child block hints | basic |
 | Node store | Finding and reading or writing nodes: hash → block map | global |
 | Root layout | How a branch's root finds every relation's tree | subroots |
@@ -122,7 +122,7 @@ collector and result sink interfaces belong to the harness and are defined in
 step 2.
 
 The Postgres-facing adapters (the table AM handler, the WAL resource
-manager and the core-patch hooks) are thin: they translate Postgres calls
+managers BlockMap and ProllyChunks, and the core-patch hooks) are thin: they translate Postgres calls
 into calls on these interfaces and contain no storage logic.
 
 ## Performance

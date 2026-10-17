@@ -3,8 +3,7 @@
 **Status: history.** These were the candidates for prolly trees as primary
 storage. The direction changed on 2026-10-15 to Postgres pages with a chunk
 store for history (`11-pages-and-dolt-snapshots.md`); D1+K1, the one pairing
-built, was removed on 2026-10-17 (#177, #178, #183) and is at the tag
-`prolly-d1`. The shared foundation's hash, key and value encoders, trees and
+built, is removed by #177, #178 and #183; its last state is `cff08be5c3`. The shared foundation's hash, key and value encoders, trees and
 canonical form carried over (`00-architecture-principles.md`).
 
 The axes in `03-design-space.md` multiply into dozens of combinations. Most

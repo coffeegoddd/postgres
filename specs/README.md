@@ -19,9 +19,12 @@ control; this project's premise is that we should not have to.
   direction, 2026-10-15): Postgres pages for the working set and a chunk
   store shaped like Dolt's, in our own formats, for history. Read it
   before the rest; its step plan (part 4) supersedes the roadmap from step
-  4 on. D1, the earlier design with prolly trees as primary storage, was
-  removed on 2026-10-17 (#177, #178, #183); its code is at the tag
-  `prolly-d1`, which step 8 builds to measure against.
+  4 on. D1, the earlier design with prolly trees as primary storage, is
+  removed by #177, #178 and #183 (stack #179, with these notes last). Its
+  last state is master at `cff08be5c3`, just before the removal, which
+  step 8 builds to measure against. The tag `prolly-d1` (#46, 2026-10-15)
+  marks an earlier state, before the index AM's rename (#53) and three
+  later fixes.
 - **Only what is marked decided is decided.** Decisions are recorded in
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
@@ -30,7 +33,7 @@ control; this project's premise is that we should not have to.
   copy-on-write copies of versioned schemas, the WAL-logged chunk store,
   Dolt commits folded from pages, and moving heads (reset, merge,
   cherry-pick, revert, detached checkout). Step 6's file remotes are
-  built (#171–#176); next are its network remotes, then reclamation (7)
+  built (#171, #172, #174, #175); next are its network remotes, then reclamation (7)
   and measurement (8). Each step's PRs are listed in spec 11, part 4.
   `07-roadmap.md`, `04-candidate-designs.md` and the rows of
   `08-open-questions.md` marked (D1) are D1's history.
@@ -103,7 +106,7 @@ detail.
 | **Content plane** | The hashed, persisted part of a node |
 | **Coordination plane** | Unhashed state attached to a node: row locks, insert intents, commit markers |
 | **Canonical chunk** | The exact byte form of a node that the hash covers and that push/pull exchange |
-| **Engine (D1–D5)** | A candidate physical implementation of the tree, from the earlier design (D1 built, then removed; tag `prolly-d1`). See 04 |
+| **Engine (D1–D5)** | A candidate physical implementation of the tree, from the earlier design (D1 built, then removed; its last state `cff08be5c3`). See 04 |
 | **Coordination module (K1–K3)** | Where row locks and intents lived in the earlier design. See 04 |
 | **Table AM / Index AM** | Postgres's pluggable table and index access-method APIs (`tableam.h`, `amapi.h`) |
 | **TID** | Postgres's 6-byte row identifier (block, offset) |

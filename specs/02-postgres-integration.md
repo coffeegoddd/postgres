@@ -3,8 +3,9 @@
 **Status: largely history.** This was written for engines that keep rows in
 prolly trees. The page design (`11-pages-and-dolt-snapshots.md`) keeps rows
 in heap's pages, so the engine-specific rows below and section C describe
-D1, removed on 2026-10-17 (tag `prolly-d1`). Section B records what the
-fork patched for D1; the page design's core changes are in spec 11.
+D1, removed by #183 (its last state `cff08be5c3`). Section B's patches
+are not all D1's: the list after its table says which are still in the
+tree and used by the page design, and which went with D1.
 
 Every engine in `04-candidate-designs.md` must satisfy these interfaces. They
 are written in terms of the coordination-in-the-tree candidate (option 8 in
@@ -120,6 +121,21 @@ in each record (`src/include/access/prolly_xlog.h`).
 | B9 | Branches | `namespace.c` (schema lookup and search path), `InitPostgres` | `public@branch` schema names, `dbname=db/branch` connection strings (one option; not decided) |
 | B10 | Versioned catalogs | `catalog/indexing.c` (`CatalogTuple*` through the table AM), in-place updates (`genam.c`), `heap_getnext` catalog loops, bootstrap (`bootparse.y`, `bootstrap.c`), `relcache.c` (`formrdesc`, nailed relations, init files), relation mapper, cache reset on checkout | Every catalog is a prolly table (decided 2026-10-13). Inventory and proposals in `09-versioned-catalogs.md` |
 | B11 | Client encoding override | `src/backend/utils/mb/mbutils.c` (`SetClientEncodingOverride`) | Built 2026-10-13. Binary send/receive of text-like types converts through the client encoding; canonical values must not depend on a session setting, so prolly storage runs them with the encoding fixed to UTF-8 |
+
+**After D1's removal (#183)**, for the page design:
+
+- **Live:** B11 (`prolly_datum.c` encodes canonical values with it); B6,
+  as the key encoder `ordered` (no core patch); B1 and B3 in another
+  form: a chunk store root a transaction moves goes with its commit
+  record (`xact.c`) and is replayed from it; B9, as `dbname/branch`
+  connections and `pg_branch` (spec 11, part 1).
+- **Superseded:** B10, by branch-aware catalogs of versioned schemas
+  (spec 11, part 1); B2 needed no patch.
+- **Removed with D1:** B5 (`TWOPHASE_RM_PROLLY_ID`, `AtPrepare_Prolly`,
+  the pre-commit callbacks), B12 (`GetOpenSubTransactionIds`), B8's
+  answer (optional parallel scans, `AMFLAG_NO_PARALLEL_SCAN`), B4's node
+  store, B7's TID maps, and the table AM row sampler for ANALYZE (4d.4,
+  not listed above).
 
 ## C. Sketch of the tree's internal API
 

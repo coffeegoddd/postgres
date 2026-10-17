@@ -7,13 +7,13 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 Since 2026-10-15 the design being built is `11-pages-and-dolt-snapshots.md`
 (Postgres pages for the working set, a chunk store for history). Rows
 marked **(D1)** are about the tree engine D1 and its components, kept as
-the record of what was decided for it. D1 was removed on 2026-10-17
-(#177, #178, #183); its code is at the tag `prolly-d1`.
+the record of what was decided for it. D1 is removed by #177, #178 and
+#183; its last state is `cff08be5c3`.
 
 | Topic | Status |
 |---|---|
 | Overall concurrency design | **Superseded** by the direction (2026-10-15): the working set is Postgres pages, with Postgres's MVCC and locks (locks per branch, #91). Was: open. Option 8 (coordination in the tree) was the user's stated favorite on 2026-10-12; the current plan is to measure candidates instead of choosing up front |
-| Candidate set (D1–D5, K1–K3, pairings) | **(D1)** Superseded by the direction (2026-10-15); D1 removed 2026-10-17 (row "D1's removal"). Was: Proposed 2026-10-13; agreed as the working plan, not as final designs |
+| Candidate set (D1–D5, K1–K3, pairings) | **(D1)** Superseded by the direction (2026-10-15); D1 removed by #183 (row "Retiring D1"). Was: Proposed 2026-10-13; agreed as the working plan, not as final designs |
 | Engine per storage type | **Superseded** by the direction (2026-10-15): one design, pages plus a chunk store. Was: open; hypotheses in `05-storage-targets.md` |
 | First engine and its version-control scope (13, 14) | Decided by the user 2026-10-13: D1+K1, V1–V3 |
 | Row identity (2) | **(D1)** Decided for the first engine 2026-10-13: synthetic TIDs with a map |
@@ -34,14 +34,13 @@ the record of what was decided for it. D1 was removed on 2026-10-17
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
 | Direction (2026-10-15) | Decided by the user 2026-10-15: Postgres pages for the working set, copy-on-write page sets per branch, a Dolt-shaped chunk store for history (`11-pages-and-dolt-snapshots.md`). Supersedes prolly trees as primary storage; D1 tagged `prolly-d1`. Steps 0–5 built 2026-10-17 (below) |
 | Branch copies' OIDs (2026-10-16) | Decided by the user: a branch's copy of a versioned object keeps its source's OIDs; catalog rows carry a branch, and a backend sees one branch (`11-pages-and-dolt-snapshots.md`, part 1) |
-| Spec 11, steps 0–5 (2026-10-17) | Built and merged, with the decisions recorded there (steps 2–5's in #90). Step 6's file remotes built (#171–#176); its network remotes, and steps 7–8, are next, with their decisions recorded in spec 11 |
-| D1's removal (2026-10-17) | Decided by the user: D1 removed before step 6's network remotes rather than after step 8, with every interface only it used (`11-pages-and-dolt-snapshots.md`, part 4). Done: #177 (coverage ported to versioned schemas), #178 (tests and harness), #183 (code). Step 8 builds D1 from the tag `prolly-d1` |
+| Spec 11, steps 0–5 (2026-10-17) | Built and merged, with the decisions recorded there (steps 2–5's in #90). Step 6's file remotes built (#171, #172, #174, #175); its network remotes, and steps 7–8, are next, with their decisions recorded in spec 11 |
 | What is versioned (2026-10-16) | Decided by the user: versioned schemas (`CREATE SCHEMA … VERSIONED`), every object in them per branch, Doltgres's scope; prolly tables only there; dependencies only from versioned objects to shared ones (`11-pages-and-dolt-snapshots.md`, part 1) |
 | Keyless keying (2026-10-17) | Decided by the user: a keyless row is keyed by the first 32 bytes of its encoded values, then its hash (#149), a clean break of format: a folded root records its format ("!:format"), and an older root's tables' rows aren't read (`13-keyless-tables.md`) |
 | Keyless merge rule (2026-10-17) | Decided by the user: the same change on both sides is made once; otherwise copies added on either side add up and copies removed on both are removed once; a keyless row never conflicts (#150) |
 | Remotes (step 6) | Decided by the user 2026-10-17, as recommended: libpq transport, clone into an empty database, a push refused over uncommitted changes, predefined roles for fetch and push, object storage later, the transfer from known heads with the first network remote (`11-pages-and-dolt-snapshots.md` part 7). File remotes built (#171, #172, #174, #175); network remotes not yet |
 | Clone's shared-dependency check (2026-10-17) | Decided by the user: folded roots record outside dependencies ("d:" items: extensions with versions, roles, ordinary-schema objects), a new format; clone checks every branch's dependencies before creating anything, naming all missing, then creates the extensions the database lacks at the newest version any branch recorded; moves never change extensions, refusing instead; extensions are not versioned per branch (an upgrade is tested in a clone) (`11-pages-and-dolt-snapshots.md` 7.4). Not built |
-| Retiring D1 (2026-10-17) | Decided by the user: D1 is removed after file remotes merge, before network remotes, not after step 8 (which builds D1 from the tag `prolly-d1`); D1-only test coverage ported first; interfaces no remaining component uses deleted with D1, every one this design uses kept (`11-pages-and-dolt-snapshots.md` part 4). Not done |
+| Retiring D1 (2026-10-17) | Decided by the user: D1 is removed after file remotes merge, before network remotes, not after step 8 (which builds D1 from its last state, `cff08be5c3`); D1-only test coverage ported first; interfaces no remaining component uses deleted with D1, every one this design uses kept (`11-pages-and-dolt-snapshots.md` part 4). Done in #177 (coverage ported to versioned schemas), #178 (tests and harness) and #183 (code) |
 | Reclamation (step 7) | Decided by the user 2026-10-17, as recommended: online GC by seal, horizon and an append check on every batch; default and full generations; automatic by autovacuum, on; unreachable commits collected; the page sweep holds off branch creation (`11-pages-and-dolt-snapshots.md` part 8). Not built |
 | Interfaces under the pages | Open (user, 2026-10-15, "not sure yet"): whether the Postgres facilities page-based tables rely on (checksums, the buffer manager, smgr, AIO and read streams, WAL, `pg_stat_io`) become interfaces with Postgres's as the default; smgr already is (step 1) |
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
