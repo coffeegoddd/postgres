@@ -178,3 +178,14 @@ drop cascades to table app.parted
 drop cascades to materialized view app.mv
 drop cascades to table app.ctas
 DROP TABLE h, d, u2;
+-- Page-based prolly keeps no node store, so no node counters: asking for
+-- them is refused, not a crash.
+SELECT * FROM prolly_node_counters('prolly');
+ERROR:  access method "prolly" keeps no node counters
+DETAIL:  Its tables are pages; their history is chunks, which no node store counts.
+SELECT nodes_read >= 0 AS d1_counts FROM prolly_node_counters('prolly_d1');
+ d1_counts 
+-----------
+ t
+(1 row)
+

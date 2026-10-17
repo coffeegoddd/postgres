@@ -75,3 +75,8 @@ SELECT count(*) FROM app.ctas;
 
 DROP SCHEMA app CASCADE;
 DROP TABLE h, d, u2;
+
+-- Page-based prolly keeps no node store, so no node counters: asking for
+-- them is refused, not a crash.
+SELECT * FROM prolly_node_counters('prolly');
+SELECT nodes_read >= 0 AS d1_counts FROM prolly_node_counters('prolly_d1');
