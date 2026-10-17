@@ -12,6 +12,10 @@
  *	"c:" collation		-> its provider, locale, ICU rules, whether it is
  *						   deterministic and its library's version, a line
  *						   each ("default": the database's)
+ *	"d:" dependency		-> nothing; an extension's version: what the
+ *						   versioned objects need from outside them, by kind
+ *						   and identity ("extension hstore",
+ *						   "type public.money2")
  *	"f:" function(args)	-> its definition
  *	"m:" materialized view -> its data tree (hash length, hash), then its
  *						   query
@@ -42,6 +46,18 @@
  * Anything else in versioned schemas (aggregates, policies, partitioned or
  * foreign tables, other types) makes a commit fail: never a hash that
  * might depend on history.
+ *
+ * What the versioned objects depend on outside the versioned schemas is
+ * recorded too, from pg_depend: each object of an ordinary schema, as the
+ * extension with its version if an extension's; not what every database
+ * has (objects made by initdb).  Not roles: owners and grants aren't part
+ * of the canonical form (a move or clone doesn't restore them, as Dolt's
+ * and Doltgres's commits don't hold users or privileges), so a role isn't
+ * one of its dependencies either.  Each is described
+ * afresh at every fold, so an extension's update or a role's rename shows
+ * in the next commit.  A function's body is text, and what it names isn't
+ * in pg_depend: the list can't be complete.  Dependencies aren't objects:
+ * a move doesn't make them, and same_schema() leaves them out.
  *
  * Each collation that orders a table's keys is recorded, and a table whose
  * keys are ordered by a collation that differs now from what a root
@@ -815,6 +831,106 @@ item_cmp(const ListCell *a, const ListCell *b)
 	return prolly_bytes_compare(&ka, &kb, NULL);
 }
 
+/* An extension's version, from its catalog row. */
+static char *
+extension_version(Oid extoid)
+{
+	Relation	rel = table_open(ExtensionRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	char	   *version = NULL;
+
+	ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(extoid));
+	scan = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, &key);
+	if ((tup = systable_getnext(scan)) != NULL)
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tup, Anum_pg_extension_extversion,
+									 RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+			version = TextDatumGetCString(d);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return version;
+}
+
+/*
+ * A dependency outside the versioned schemas: an extension's member is the
+ * extension, with its version.  Kept as "kind identity", a tab, and the
+ * value, to be sorted and made items once each.
+ */
+static void
+note_dependency(List **deps, const ObjectAddress *object)
+{
+	ObjectAddress addr = *object;
+	Oid			ext = getExtensionOfObject(addr.classId, addr.objectId);
+	char	   *version = NULL;
+
+	if (OidIsValid(ext))
+		ObjectAddressSet(addr, ExtensionRelationId, ext);
+	addr.objectSubId = 0;
+	if (addr.classId == ExtensionRelationId)
+		version = extension_version(addr.objectId);
+	*deps = lappend(*deps, psprintf("%s %s\t%s",
+									getObjectTypeDescription(&addr, false),
+									getObjectIdentity(&addr, false),
+									version ? version : ""));
+}
+
+/*
+ * What the versioned objects depend on outside the versioned schemas, as
+ * "d:" items.  What initdb made (OIDs below FirstNormalObjectId) every
+ * database has, and isn't recorded.
+ */
+static void
+collect_dependencies(Canon *cn)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *deps = NIL;
+	ListCell   *lc;
+	char	   *last = NULL;
+
+	rel = table_open(DependRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+		ObjectAddress depender;
+		ObjectAddress referenced;
+
+		if (d->deptype == DEPENDENCY_EXTENSION ||
+			d->deptype == DEPENDENCY_AUTO_EXTENSION ||
+			d->objid < FirstNormalObjectId || d->refobjid < FirstNormalObjectId)
+			continue;
+		ObjectAddressSet(depender, d->classid, d->objid);
+		ObjectAddressSet(referenced, d->refclassid, d->refobjid);
+		if (object_is_versioned(&depender) && !object_is_versioned(&referenced))
+			note_dependency(&deps, &referenced);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	list_sort(deps, cstring_cmp);
+	foreach(lc, deps)
+	{
+		char	   *dep = lfirst(lc);
+		char	   *tab = strchr(dep, '\t');
+
+		if (last && strcmp(last, dep) == 0)
+			continue;
+		last = dep;
+		*tab = '\0';
+		append_utf8(&add_item(cn, "d:", dep)->value, tab + 1);
+		*tab = '\t';
+	}
+}
+
 static void
 collect(Canon *cn)
 {
@@ -999,6 +1115,8 @@ collect(Canon *cn)
 		systable_endscan(scan);
 		table_close(pg_policy, AccessShareLock);
 	}
+
+	collect_dependencies(cn);
 }
 
 /*
@@ -1585,8 +1703,9 @@ folded_sequences(const ProllyNodeRef *root, ProllyCanonSequenceVisit visit,
 }
 
 /*
- * The next item that defines an object: collations' items are left out,
- * as what the fold notes of the tables (checked when rows are read).
+ * The next item that defines an object, or a dependency: collations'
+ * items are left out, as what the fold notes of the tables (checked when
+ * rows are read).
  */
 static bool
 next_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
@@ -1607,9 +1726,10 @@ typedef bool (*ItemPairVisit) (const ProllyKey *ka, const ProllyValue *va,
 							   void *arg);
 
 /*
- * The next item that defines an object: with others_only, not a table
- * (seeking past the tables' items, which tables() is for) nor the root's
- * format.
+ * The next item that defines an object (dependencies aren't objects), or,
+ * with others_only, the next other than a table (seeking past the tables'
+ * items, which tables() is for) or the root's format, dependencies among
+ * them.
  */
 static bool
 next_item(Canon *cn, ProllyTreeCursor *c, bool others_only, ProllyKey *k,
@@ -1619,9 +1739,14 @@ next_item(Canon *cn, ProllyTreeCursor *c, bool others_only, ProllyKey *k,
 
 	while (next_object(cn, c, k, v))
 	{
-		if (!others_only || k->len < 2 || k->data[1] != ':')
+		if (k->len < 2 || k->data[1] != ':')
 			return true;
-		if (k->data[0] == 't')
+		if (!others_only)
+		{
+			if (k->data[0] != 'd')
+				return true;
+		}
+		else if (k->data[0] == 't')
 			PROLLY_CALL(cn->tree, cursor_seek, c, &after_tables,
 						ForwardScanDirection);
 		else if (k->data[0] != '!')
@@ -1835,7 +1960,10 @@ from_utf8(const uint8 *data, int len)
 	return pg_any_to_server(pnstrdup((const char *) data, len), len, PG_UTF8);
 }
 
-/* The items of a folded root, in key order; collations aren't objects. */
+/*
+ * The items of a folded root, in key order; collations and dependencies
+ * aren't objects.
+ */
 static List *
 move_items(Canon *cn, const ProllyNodeRef *root)
 {
@@ -1851,7 +1979,8 @@ move_items(Canon *cn, const ProllyNodeRef *root)
 		MoveItem   *it;
 		ProllyValue def;
 
-		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c')
+		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c' ||
+			k.data[0] == 'd')
 			continue;
 		definition_of(&k, &v, &def);
 		it = palloc0(sizeof(MoveItem));
@@ -3433,8 +3562,14 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
 		else if (SAME(0, 1) || SAME(1, 2))
 			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
-		else if (least->data[0] == 'c')
-			take = has[1] ? &v[1] : &v[2];	/* (collations: as recorded) */
+		else if (least->data[0] == 'c' || least->data[0] == 'd')
+		{
+			/*
+			 * (collations and dependencies: as recorded; the next fold
+			 * describes them afresh)
+			 */
+			take = has[1] ? &v[1] : has[2] ? &v[2] : NULL;
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -3446,7 +3581,8 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			PROLLY_CALL(cn.tree, build_add, b, least, take);
 		if (least->data[0] == 'n' && has[0] && !take)
 			dropped = lappend(dropped, from_utf8(least->data + 2, least->len - 2));
-		else if (take && least->data[0] != 'n' && least->data[0] != 'c')
+		else if (take && least->data[0] != 'n' && least->data[0] != 'c' &&
+				 least->data[0] != 'd')
 			kept = lappend(kept, from_utf8(least->data + 2, least->len - 2));
 
 		/* (the least key last: the others point into its cursor's node) */

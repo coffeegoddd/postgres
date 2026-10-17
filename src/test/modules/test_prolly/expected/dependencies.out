@@ -1,0 +1,156 @@
+-- What versioned objects need from outside the versioned schemas, recorded
+-- at each commit as "d:" items of the folded root: an extension (with its
+-- version) for its members, an object of an ordinary schema.  Not what
+-- initdb made (built-in types and functions), and not roles: owners and
+-- grants aren't versioned, so a role isn't a dependency (a grant changes
+-- nothing below).
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.deps() RETURNS TABLE (key text, value text)
+  LANGUAGE sql AS $$
+	SELECT key, value FROM test_fold_items() WHERE key LIKE 'd:%' ORDER BY key
+  $$;
+CREATE ROLE regress_dep_reader;
+CREATE EXTENSION citext VERSION '1.6';
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+CREATE SCHEMA dep VERSIONED;
+CREATE TABLE dep.plain (id int PRIMARY KEY, n numeric, t text);
+SELECT * FROM pg_temp.deps();			-- nothing outside (built-ins only)
+ key | value 
+-----+-------
+(0 rows)
+
+CREATE TABLE dep.t (id int PRIMARY KEY, m dep_util.mood,
+					c citext DEFAULT dep_util.twice(1)::text);
+GRANT SELECT ON dep.t TO regress_dep_reader;
+SELECT * FROM pg_temp.deps();
+                key                 | value 
+------------------------------------+-------
+ d:extension citext                 | 1.6
+ d:function dep_util.twice(integer) | 
+ d:type dep_util.mood               | 
+(3 rows)
+
+SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- described afresh at each fold: an update, a rename outside
+ALTER EXTENSION citext UPDATE TO '1.8';
+ALTER FUNCTION dep_util.twice(int) RENAME TO double_it;
+SELECT * FROM pg_temp.deps();
+                  key                   | value 
+----------------------------------------+-------
+ d:extension citext                     | 1.8
+ d:function dep_util.double_it(integer) | 
+ d:type dep_util.mood                   | 
+(3 rows)
+
+SELECT * FROM dolt_status ORDER BY table_name;	-- shown as changes
+              table_name              | staged |  status   
+--------------------------------------+--------+-----------
+ dep.t                                | t      | modified
+ extension citext                     | t      | modified
+ function dep_util.double_it(integer) | t      | new table
+ function dep_util.twice(integer)     | t      | deleted
+(4 rows)
+
+SELECT length(dolt_commit('-Am', 'deps changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- a merge of branches whose dependencies differ: no schema conflict, and
+-- the merged commit's are described afresh
+SELECT dolt_branch('dep_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+REVOKE SELECT ON dep.t FROM regress_dep_reader;
+SELECT length(dolt_commit('-Am', 'no grant')::text) AS committed;
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+SELECT dolt_checkout('dep_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'dep_side'"}
+(1 row)
+
+CREATE TABLE dep.u (id int PRIMARY KEY, m dep_util.mood);
+SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.deps();
+                  key                   | value 
+----------------------------------------+-------
+ d:extension citext                     | 1.8
+ d:function dep_util.double_it(integer) | 
+ d:type dep_util.mood                   | 
+(3 rows)
+
+SELECT dolt_checkout('dep_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'dep_side'"}
+(1 row)
+
+SELECT * FROM pg_temp.deps();
+                  key                   | value 
+----------------------------------------+-------
+ d:extension citext                     | 1.8
+ d:function dep_util.double_it(integer) | 
+ d:type dep_util.mood                   | 
+(3 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP SCHEMA dep CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table dep.plain
+drop cascades to table dep.t
+drop cascades to table dep.u
+SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('-D', 'dep_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dep_util CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to type dep_util.mood
+drop cascades to function dep_util.double_it(integer)
+DROP EXTENSION citext;
+DROP ROLE regress_dep_reader;

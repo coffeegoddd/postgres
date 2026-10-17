@@ -72,6 +72,7 @@ tests += {
       'walks',
       'remotes',
       'remote_clone',
+      'dependencies',
     ],
   },
   'tap': {
