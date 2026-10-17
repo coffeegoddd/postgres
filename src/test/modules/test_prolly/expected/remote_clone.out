@@ -11,6 +11,7 @@ SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/clone-' || txid_curre
 \set url :run '/a'
 \set url_dep :run '/dep'
 \set url_nomain :run '/nomain'
+\set url_odd :run '/odd'
 CREATE SCHEMA cl VERSIONED;
 CREATE TABLE cl.t (id int PRIMARY KEY, v text);
 INSERT INTO cl.t SELECT g, 'v' || g FROM generate_series(1, 200) g;
@@ -245,6 +246,39 @@ SELECT name FROM dolt_remotes;
 
 \c :db
 DROP DATABASE regress_clone_c;
+-- a remote's branch whose name isn't one here (beginning "-") is refused,
+-- by the rule every branch made is checked by
+SELECT dolt_remote('add', 'oddname', :'url_odd');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('oddname', 'main') AS pushed;
+           pushed           
+----------------------------
+ {0,"main -> oddname/main"}
+(1 row)
+
+SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), '2');
+ test_remote_set_head 
+----------------------
+ t
+(1 row)
+
+CREATE DATABASE regress_clone_g;
+\c regress_clone_g
+SELECT dolt_clone(:'url_odd');
+ERROR:  invalid branch name "-flag"
+DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+\c :db
+DROP DATABASE regress_clone_g;
+SELECT dolt_remote('remove', 'oddname');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
 -- a commit needing a type of an ordinary schema the clone lacks
 CREATE TYPE public.cl_mood AS ENUM ('sad', 'ok');
 CREATE TABLE cl.m (id int PRIMARY KEY, mood public.cl_mood);

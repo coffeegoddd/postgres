@@ -344,12 +344,23 @@ branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
 
-	if (strcmp(name, "HEAD") == 0 || name[0] == '-' || name[0] == '.' ||
-		name[0] == '/' || name[len - 1] == '/' || name[len - 1] == '.' ||
-		(len >= 5 && strcmp(name + len - 5, ".lock") == 0) ||
-		strstr(name, "..") != NULL || strstr(name, "@{") != NULL ||
-		strstr(name, "//") != NULL || strstr(name, "/.") != NULL)
+	if (strcmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
+		name[0] == '-' || name[0] == '/' || name[len - 1] == '/' ||
+		name[len - 1] == '.' || strstr(name, "..") != NULL ||
+		strstr(name, "@{") != NULL || strstr(name, "//") != NULL)
 		return false;
+
+	/* each "/"-separated part: not beginning with ".", nor ending ".lock" */
+	for (const char *part = name; part != NULL;)
+	{
+		const char *end = strchr(part, '/');
+		size_t		plen = end ? (size_t) (end - part) : strlen(part);
+
+		if (part[0] == '.' ||
+			(plen >= 5 && strncmp(part + plen - 5, ".lock", 5) == 0))
+			return false;
+		part = end ? end + 1 : NULL;
+	}
 	for (const char *p = name; *p; p++)
 	{
 		unsigned char c = (unsigned char) *p;
@@ -369,7 +380,7 @@ copies_check_create(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\, no \"..\" or \"@{\", not \"HEAD\", not beginning with \"-\" or \".\", not ending with \"/\", \".\" or \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" or \"@\"; not beginning with \"-\" or \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
 								ACL_CREATE);

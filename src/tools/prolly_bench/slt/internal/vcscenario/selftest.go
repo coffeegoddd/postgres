@@ -11,15 +11,22 @@ type claimedVC struct{ *Postgres }
 
 func (p claimedVC) Capabilities() []string { return []string{"sql", "vc.core"} }
 
-// SelfTest proves that native adapter failures cannot be reported as passes or
-// silently excluded as unsupported. These are separate from corpus coverage.
-func SelfTest(ctx context.Context, dsn string, timeout time.Duration) ([]Result, error) {
+// SelfTest proves that native adapter failures on engine am cannot be
+// reported as passes or silently excluded as unsupported. These are separate
+// from corpus coverage.
+func SelfTest(ctx context.Context, dsn, am string, timeout time.Duration) ([]Result, error) {
 	var results []Result
-	for _, tc := range []struct{ id, sql, match string }{
+	controls := []struct{ id, sql, match string }{
 		{"wrong-result", "SELECT 'wrong'::text", "rows differ"},
 		{"unexpected-error", "SELECT missing_column", "SQLSTATE"},
-		{"wrong-am", "CREATE TABLE rogue (id int) USING heap", "wrong AM"},
-	} {
+	}
+	// (only where public may hold a table of another AM: a versioned public,
+	// prolly's, refuses heap tables itself)
+	if am != "prolly" {
+		controls = append(controls, struct{ id, sql, match string }{
+			"wrong-am", "CREATE TABLE rogue (id int) USING heap", "wrong AM"})
+	}
+	for _, tc := range controls {
 		rows := [][]Value{{{Text: func() *string { s := "expected"; return &s }()}}}
 		st := Step{ID: tc.id, Session: "a", Op: "query", SQL: tc.sql, Expect: &Expected{Rows: &rows, Order: "ordered"}}
 		if tc.id == "wrong-am" {
@@ -27,7 +34,10 @@ func SelfTest(ctx context.Context, dsn string, timeout time.Duration) ([]Result,
 			st.Expect = nil
 		}
 		s := Scenario{Version: 1, ID: tc.id, Description: "negative control", Requires: []string{"sql"}, Sessions: []string{"a"}, Steps: []Step{st}}
-		a, _ := NewPostgres(dsn, "prolly_d1", timeout)
+		a, err := NewPostgres(dsn, am, timeout)
+		if err != nil {
+			return results, err
+		}
 		r := Run(ctx, s, a)
 		results = append(results, r)
 		if r.Status != "failed" || r.Phase != "step" || !strings.Contains(r.Error, tc.match) {
