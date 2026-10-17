@@ -176,7 +176,14 @@ jobs:
       - name: Version-control targeting on D1 and negative controls
         run: |
           make -C src/test/prolly check-vc-target check-vc-target-guard \
-            check-tap-vc PROLLY_AM=prolly_d1
+            check-tap-vc check-vc-d1 check-vc-isolation-d1 PROLLY_AM=prolly_d1
+
+      # The steps above run check's groups one by one; this catches a group
+      # check names but can't make (a missing prerequisite stops it partway).
+      - name: The requirements suite's check resolves for each engine
+        run: |
+          make -n -C src/test/prolly check PROLLY_AM=prolly > /dev/null
+          make -n -C src/test/prolly check PROLLY_AM=prolly_d1 > /dev/null
 
       - name: Upstream suites on block-mapped storage (nightly)
         if: github.event_name == 'schedule'

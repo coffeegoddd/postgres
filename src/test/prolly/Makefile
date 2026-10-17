@@ -7,12 +7,12 @@
 #
 #	make -C src/test/prolly check PROLLY_AM=prolly_d1
 #
-# (prolly_d1 is the default; PROLLY_AM=prolly runs the groups the page-based
-# engine supports.  check-vc and check-vc-isolation run on prolly whatever
-# PROLLY_AM is, after check-vc-target passes on it; check-tap-vc runs the
-# version control TAP tests on PROLLY_AM, prolly or a tree engine;
-# check-vc-d1 and check-vc-isolation-d1 run the tree engine's own version
-# control tests on PROLLY_AM, which can't be prolly.)
+# (prolly_d1 is the default.  check runs the groups the engine supports:
+# check-vc and check-vc-isolation run on prolly whatever PROLLY_AM is, after
+# check-vc-target passes on it; check-tap-vc runs the version control TAP
+# tests on PROLLY_AM, prolly or a tree engine; check-vc-d1 and
+# check-vc-isolation-d1, a tree engine's own version control tests through
+# its prolly_* API, run only for a tree engine, prolly_*.)
 #
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
@@ -28,6 +28,22 @@ include $(top_builddir)/src/Makefile.global
 
 PROLLY_AM ?= prolly_d1
 export PROLLY_AM
+
+# The engine's kind: page-based prolly ("pages"), a tree engine, prolly_*
+# ("tree"), or another table AM, heap say ("other").  What runs, and what
+# is refused, follows from it.
+ifeq ($(PROLLY_AM),prolly)
+ENGINE_KIND = pages
+else ifneq ($(filter prolly_%,$(PROLLY_AM)),)
+ENGINE_KIND = tree
+else
+ENGINE_KIND = other
+endif
+
+# $(call require_engine,KIND,WHY) and $(call refuse_engine,KIND,WHY): a
+# recipe line that fails, saying why, unless (or if) the engine is of KIND.
+require_engine = @test '$(ENGINE_KIND)' = '$(1)' || { echo '$(2)'; exit 1; }
+refuse_engine = @test '$(ENGINE_KIND)' != '$(1)' || { echo '$(2)'; exit 1; }
 
 # TAP groups share tmp_check and the temporary installation.
 .NOTPARALLEL:
@@ -53,8 +69,14 @@ EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
-check: check-target check-semantics check-isolation check-vc check-vc-isolation \
-	check-vc-d1 check-vc-isolation-d1 check-tap
+CHECK_TARGETS = check-target check-semantics check-isolation check-vc \
+	check-vc-isolation
+ifeq ($(ENGINE_KIND),tree)
+CHECK_TARGETS += check-vc-d1 check-vc-isolation-d1
+endif
+CHECK_TARGETS += check-tap
+
+check: $(CHECK_TARGETS)
 
 check-target: PROVE_TESTS = t/003_target_guard.pl
 check-target: require-tap temp-install
@@ -121,11 +143,11 @@ check-tap-vc: check-vc-target require-tap temp-install
 # Not part of "check": some upstream tests print heap-specific details
 # (ctid values, page counts), and those exceptions aren't documented yet.
 check-upstream-regress: prolly_am.conf
-	@test '$(PROLLY_AM)' != prolly || { echo 'Use check-upstream-bmap for upstream tests of block-mapped storage'; exit 1; }
+	$(call refuse_engine,pages,Use check-upstream-bmap for upstream tests of block-mapped storage)
 	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
 check-upstream-isolation: prolly_am.conf
-	@test '$(PROLLY_AM)' != prolly || { echo 'Use check-upstream-bmap for upstream tests of block-mapped storage'; exit 1; }
+	$(call refuse_engine,pages,Use check-upstream-bmap for upstream tests of block-mapped storage)
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
 # Postgres's regression, isolation and recovery suites with every user
@@ -147,7 +169,7 @@ require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
 
 require-tree-engine:
-	@test '$(PROLLY_AM)' != prolly || { echo 'check-vc-d1 and check-vc-isolation-d1 test a tree engine'"'"'s prolly_* API; the page-based engine'"'"'s version control is check-vc'"'"'s'; exit 1; }
+	$(call require_engine,tree,check-vc-d1 and check-vc-isolation-d1 test a tree engine (prolly_*) through its prolly_* API: use check-vc for page-based prolly)
 
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
