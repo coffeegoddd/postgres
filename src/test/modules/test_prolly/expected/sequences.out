@@ -368,8 +368,8 @@ SELECT nextval('app.s') > 0 AS taken;
 (1 row)
 
 SELECT dolt_merge('feature');
-ERROR:  cannot merge with uncommitted changes
-HINT:  Commit them, or reset the branch, first.
+ERROR:  local changes would be stomped by merge
+DETAIL:  Sequence "app.s" has uncommitted changes, and the merge changes it too.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
