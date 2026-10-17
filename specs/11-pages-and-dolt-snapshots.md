@@ -557,8 +557,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
 
-**Step 6. Remotes.** Proposed in part 7, not decided.
-- File remotes first, then a network protocol of our own: fetch, push,
+**Step 6. Remotes.** Designed in part 7 (decided 2026-10-17).
+- File remotes first, then network remotes over libpq: fetch, push,
   clone, pull; a cloned branch's copies made on first use from its head
   commit; the check for shared dependencies (part 1).
 - **Exit:** V4.
@@ -878,11 +878,10 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
 - Opportunistic pruning (on a read) skips shared pages, so reads don't
   copy pages.
 
-## 7. Step 6 design: remotes (proposed)
+## 7. Step 6 design: remotes
 
-**Status: proposed, 2026-10-17; nothing here is decided.** Each decision
-below gives the options and a recommendation; the list at the end says
-what is the user's to decide before building.
+**Status: decided by the user, 2026-10-17, as recommended** (7.9 lists
+the decisions); not built.
 
 Remotes move history between databases: a database's commits, the trees
 they name, and its branches' heads. A working set, the pages, never moves
@@ -1008,7 +1007,9 @@ step 7's GC to remove; none are read.
   (its changed pages differ from its head: the change finder's "anything
   changed?"), whoever made them, as Dolt's sql-server does
   (`ErrDirtyWorkspace` under `PUSH_CONCURRENCY_CONTROL_ASSERT_WORKING_SET`);
-  `--force` moves it anyway, resetting them.
+  `--force` moves it anyway, resetting them. **Decided: refuse.** The
+  check is the change finder's, which reads no pages on a clean branch
+  (#142); a test shows it stays so.
 
 ### 7.4 Clone
 
@@ -1041,7 +1042,10 @@ copies (the one O(N) step: rows written to pages, indexes built).
   connection to it (CREATE DATABASE can't run in a transaction block, so
   not inside the function). **Recommendation: (a)**: it needs nothing new
   of Postgres, and the empty database's settings (encoding, locale,
-  collation provider) are the user's choice. Canonical form is UTF-8
+  collation provider) are the user's choice. **Decided: (a).** A
+  one-step clone, if wanted, is a client tool that runs `createdb` and
+  then `dolt_clone`, as `pg_basebackup` is a client; not the server.
+  Canonical form is UTF-8
   whatever the encoding, so encodings may differ (`status_diff.sql` reads
   commits in LATIN1 and WIN1251 databases); a collation whose version
   differs from the one a commit recorded makes that table's rows
@@ -1069,7 +1073,8 @@ copies (the one O(N) step: rows written to pages, indexes built).
     secure and authenticate.
   - **(C) Object storage** (`s3://`): a file remote's layout in a bucket;
     later, as a file remote's variant.
-  - **Recommendation: (A)** after file remotes. It is the
+  - **Decided: (A)** after file remotes, behind the remote interface so
+    (B) or (C) can be added without changing fetch's logic. It is the
     Postgres-native choice (a remote is another Postgres database) and
     has authentication and encryption already; COPY's binary stream is
     near what (B) would move. And since the remote runs this code, (A)
@@ -1078,21 +1083,33 @@ copies (the one O(N) step: rows written to pages, indexes built).
     without changing (A); then Dolt's download machinery applies
     (concurrency raised and halved by success and failure, a throughput
     watchdog, URLs refreshed), which over one libpq stream doesn't.
+  - **On the remote,** a transfer holds a backend and a connection; its
+    functions stream in bounded batches and read the chunk store, not
+    tables, so they hold no snapshot that keeps back the remote's VACUUM.
+  - **File remotes' layout** is a bucket's too: immutable table files
+    named by content, and one manifest moved by compare-and-swap, so (C)
+    is a transport, not a format.
 
 ### 7.6 Privileges
 
 History holds every row of every versioned table at every commit, so
-reading it is reading all of them, whatever SELECT privileges say now.
+reading it is reading all of them, whatever SELECT and column privileges
+say now or said when the rows were written: fetching a database is, for
+its versioned schemas, what `pg_read_all_data` is. **Decided:**
+predefined roles, as Postgres grants capabilities that bypass object
+privileges.
 
-- **Fetch and clone** from a database take its ownership, or EXECUTE on
-  the remote functions, which are revoked from PUBLIC: an owner grants
-  them to the roles that may copy the database's history.
-- **Push** to it takes its ownership, or EXECUTE on the push functions,
-  granted as separately; and making or moving a branch's head there
-  takes what doing it locally does (#124's checks).
+- **Fetch and clone** from a database take its ownership or membership
+  in `pg_prolly_fetch`, which the remote functions check (their EXECUTE
+  revoked from PUBLIC as well).
+- **Push** to it takes its ownership or membership in `pg_prolly_push`;
+  and making or moving a branch's head there takes what doing it locally
+  does (#124's checks).
 - **A file remote** is the server's files: only superusers, or roles
   granted `pg_read_server_files` and `pg_write_server_files`, may use one,
   as `COPY … FROM 'file'` asks.
+- Row security is no gap: a commit refuses row security policies on
+  versioned tables, so none relies on them.
 
 ### 7.7 Durability and concurrency
 
@@ -1130,8 +1147,8 @@ In order, each a PR with its tests:
 3. File remotes: fetch, push, pull, clone (whole files, then checked),
    with crash tests at each record and the shared-dependency check.
 4. Network remotes over libpq (if (A)): the remote functions, their
-   privileges, TLS tested; the transfer from known heads, with its
-   fallback to the walk tested.
+   predefined roles, TLS tested; the transfer from known heads, with its
+   fallback to the walk tested (decision 6).
 5. V4 (`06-benchmarking.md`): clone, fetch and push between two local
    instances, timed and counted (chunks examined and moved against E and
    B; round trips against new commits).
@@ -1140,18 +1157,22 @@ Step 7 then pins chunks a transfer was told are present (7.1).
 
 ### 7.9 For the user to decide
 
-1. **Network transport:** (A) libpq and SQL functions, (B) our own
-   protocol and port, or both in time. Recommended: (A).
-2. **Clone target:** (a) into an existing empty database, or (b) a new
-   one the clone makes. Recommended: (a).
-3. **Push to a branch with uncommitted changes** on the remote: refuse
-   (unless `--force`, which resets them), or move it as a fast-forward
-   over them when they don't conflict. Recommended: refuse, as Dolt's
-   sql-server does.
-4. **Who may fetch:** the owner, plus roles granted EXECUTE on the
-   remote functions (revoked from PUBLIC). Recommended as stated.
-5. **Object storage remotes** now or later. Recommended: later, as a
-   file remote's variant.
+Decided by the user on 2026-10-17, each as recommended:
+
+1. **Network transport:** (A), SQL functions over libpq, behind the
+   remote interface (7.5).
+2. **Clone target:** (a), an existing empty database; a one-step clone is
+   a client tool's (7.4).
+3. **Push to a branch with uncommitted changes** on the remote: refused,
+   unless `--force`, which resets them (7.3).
+4. **Who may fetch or push:** the owner, or members of the predefined
+   roles `pg_prolly_fetch` and `pg_prolly_push` (7.6).
+5. **Object storage remotes:** later, as a transport over file remotes'
+   layout (7.5).
+6. **The transfer from known heads** (7.1) is built with the first
+   network remote, not after: over a wide-area link round trips dominate
+   a fetch of many commits (a thousand at 50 ms, 50 s), and the walk it
+   falls back to is built anyway.
 
 ### 7.10 From Dolt
 
