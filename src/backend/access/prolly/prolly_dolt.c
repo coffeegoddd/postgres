@@ -143,11 +143,7 @@ prolly_set_commit_author(const char *author)
 static char *
 hash_hex(const ProllyHash *hash)
 {
-	char	   *hex = palloc(hash->len * 2 + 1);
-
-	hex_encode((const char *) hash->bytes, hash->len, hex);
-	hex[hash->len * 2] = '\0';
-	return hex;
+	return prolly_hash_hex(hash);
 }
 
 static ProllyHash *
@@ -2137,17 +2133,19 @@ need_upstream(const char *fn, char **remote, char **branch)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch %s has no upstream branch", current),
-				 errhint("Name the remote, or set an upstream with dolt_push('--set-upstream', 'origin', '%s').",
-						 current)));
+				 errhint("Name the remote, as %s('origin', '%s'), or set an upstream with dolt_push('--set-upstream', 'origin', '%s').",
+						 fn, current, current)));
 }
 
 /*
  * dolt_push(VARIADIC args text[]) returns text[]: {status, message}
  *
- * [remote [branch]] (the session branch's upstream if none; the session
- * branch if only the remote), -f/--force, -u/--set-upstream: the chunks the
- * branch's head reaches that the remote lacks, then the remote's branch
- * moved to it, only as a fast-forward unless forced.  The remote's branch
+ * [remote [branch]], -f/--force, -u/--set-upstream: branch (the session's
+ * if not named) pushed to the remote's branch of the same name; with no
+ * remote, the session branch to its upstream (which names the remote and
+ * the remote's branch).  The chunks the branch's head reaches that the
+ * remote lacks are sent, then the remote's branch moved to it, only as a
+ * fast-forward unless forced.  The remote's branch
  * is moved as it is reached, not with the transaction: the remote-tracking
  * branch is, and a fetch finds the remote as it is.
  */
@@ -2159,6 +2157,7 @@ dolt_push(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	char	   *remote = NULL;
 	char	   *branch = NULL;
+	char	   *remote_branch = NULL;
 	bool		force = false;
 	bool		set_upstream = false;
 	char	   *url;
@@ -2187,14 +2186,11 @@ dolt_push(PG_FUNCTION_ARGS)
 			unexpected("dolt_push", a);
 	}
 	if (remote == NULL)
-	{
-		char	   *upstream_branch;
-
-		need_upstream("dolt_push", &remote, &upstream_branch);
-		branch = upstream_branch;
-	}
+		need_upstream("dolt_push", &remote, &remote_branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
+	if (remote_branch == NULL)
+		remote_branch = branch;
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -2210,7 +2206,7 @@ dolt_push(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		check_remote_format(rr, r, remote);
-		had = remote_head(rr, r, branch, &theirs);
+		had = remote_head(rr, r, remote_branch, &theirs);
 		if (had && same_hash(&theirs, &local))
 			result[1] = "Everything up-to-date";
 		else
@@ -2226,25 +2222,25 @@ dolt_push(PG_FUNCTION_ARGS)
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							 errmsg("the push to %s/%s was rejected: the remote has commits this database lacks",
-									remote, branch),
+									remote, remote_branch),
 							 errhint("Fetch and merge them first, or push with --force.")));
 				if (!PROLLY_CALL(remote_refs(), merge_base, &theirs, &local, &base) ||
 					!same_hash(&base, &theirs))
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							 errmsg("the push to %s/%s was rejected: it isn't a fast-forward",
-									remote, branch),
+									remote, remote_branch),
 							 errhint("Merge the remote's branch first, or push with --force.")));
 			}
 			(void) PROLLY_CALL(dc.transfer, send, rr, r, &local, 1);
-			if (!PROLLY_CALL(rr, move_head, r, branch, &theirs, &local,
+			if (!PROLLY_CALL(rr, move_head, r, remote_branch, &theirs, &local,
 							 build_format()))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("the push to %s/%s was rejected: the remote's branch moved meanwhile",
-								remote, branch),
+								remote, remote_branch),
 						 errhint("Fetch and try again.")));
-			result[1] = psprintf("%s -> %s/%s", branch, remote, branch);
+			result[1] = psprintf("%s -> %s/%s", branch, remote, remote_branch);
 		}
 	}
 	PG_FINALLY();
@@ -2252,9 +2248,9 @@ dolt_push(PG_FUNCTION_ARGS)
 		PROLLY_CALL(rr, close, r);
 	}
 	PG_END_TRY();
-	PROLLY_CALL(dc.refs, tracking_set, remote, branch, &local);
+	PROLLY_CALL(dc.refs, tracking_set, remote, remote_branch, &local);
 	if (set_upstream)
-		PROLLY_CALL(dc.refs, upstream_set, branch, remote, branch);
+		PROLLY_CALL(dc.refs, upstream_set, branch, remote, remote_branch);
 	PG_RETURN_DATUM(text_array(2, result));
 }
 

@@ -802,19 +802,7 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 static bool
 parse_commit_id(const char *refname, ProllyHash *id)
 {
-	size_t		len = strlen(refname);
-
-	if (len == 0 || len % 2 != 0 || len / 2 > PROLLY_HASH_MAX_LEN)
-		return false;
-	for (size_t i = 0; i < len; i++)
-	{
-		if (!isxdigit((unsigned char) refname[i]))
-			return false;
-	}
-	memset(id, 0, sizeof(*id));
-	id->len = len / 2;
-	(void) hex_decode(refname, len, (char *) id->bytes);
-	return true;
+	return prolly_hash_from_hex(refname, strlen(refname), id);
 }
 
 static bool
@@ -1872,36 +1860,63 @@ typedef struct WalkState
 {
 	ProllyTreeVisitNode visit;
 	void	   *arg;
-	List	   *seen;			/* commit ids walked */
+	HTAB	   *seen;			/* ProllyHash: commit ids walked */
 } WalkState;
 
+/*
+ * Walk the commit id and its ancestors, each once: a work list, not
+ * recursion (a history may be as long as it likes), and a hash set of the
+ * commits seen.
+ */
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
 {
-	ProllyCommitInfo info;
-	ProllyNodeRef ref;
 	ProllyDatabaseComponents dc;
-	ListCell   *lc;
-	ProllyHash *copy;
+	List	   *todo = list_make1(palloc(sizeof(ProllyHash)));
 
-	foreach(lc, ws->seen)
+	*(ProllyHash *) linitial(todo) = *id;
+	if (ws->seen == NULL)
 	{
-		if (same_hash(lfirst(lc), id))
-			return;
-	}
-	copy = palloc(sizeof(ProllyHash));
-	*copy = *id;
-	ws->seen = lappend(ws->seen, copy);
+		HASHCTL		ctl;
 
-	/* (a commit the visitor declines: it has seen its root and parents) */
-	ref_of(id, &ref);
-	if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg) ||
-		!copies_commit_get(id, &info))
-		return;
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
-	for (int i = 0; i < info.nparents; i++)
-		walk_commit(ws, &info.parents[i]);
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = CurrentMemoryContext;
+		ws->seen = hash_create("prolly commits walked", 256, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	prolly_copies_components(&dc);
+	while (todo != NIL)
+	{
+		ProllyHash *next = llast(todo);
+		ProllyHash	key;
+		ProllyCommitInfo info;
+		ProllyNodeRef ref;
+		bool		found;
+
+		todo = list_delete_last(todo);
+		memset(&key, 0, sizeof(key));
+		key.len = next->len;
+		memcpy(key.bytes, next->bytes, next->len);
+		(void) hash_search(ws->seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+
+		/* (a commit the visitor declines: it has seen its root and parents) */
+		ref_of(next, &ref);
+		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg) ||
+			!copies_commit_get(next, &info))
+			continue;
+		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
+		for (int i = info.nparents - 1; i >= 0; i--)
+		{
+			ProllyHash *p = palloc(sizeof(ProllyHash));
+
+			*p = info.parents[i];
+			todo = lappend(todo, p);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
 }
 
 /*
@@ -1911,7 +1926,7 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 {
-	WalkState	ws = {visit, arg, NIL};
+	WalkState	ws = {visit, arg, NULL};
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
@@ -1951,7 +1966,7 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	PROLLY_CALL(tree, cursor_close, c);
 	foreach(lc, heads)
 		walk_commit(&ws, lfirst(lc));
-	prolly_database_components(&dc);
+	prolly_copies_components(&dc);
 	foreach(lc, baselines)
 	{
 		ProllyNodeRef ref;
@@ -1965,7 +1980,7 @@ static void
 copies_walk_commit(const ProllyHash *commit_id, ProllyTreeVisitNode visit,
 				   void *arg)
 {
-	WalkState	ws = {visit, arg, NIL};
+	WalkState	ws = {visit, arg, NULL};
 
 	refs_init();
 	walk_commit(&ws, commit_id);

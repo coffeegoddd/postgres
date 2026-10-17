@@ -43,6 +43,7 @@ backend_sources += files(
   'nodestore_stub.c',
   'prolly_chunkstore.c',
   'prolly_config.c',
+  'prolly_hashtext.c',
   'prolly_database.c',
   'prolly_datum.c',
   'prolly_indexam.c',

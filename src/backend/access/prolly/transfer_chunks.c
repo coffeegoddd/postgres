@@ -70,17 +70,6 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
 	memcpy(key->bytes, hash->bytes, hash->len);
 }
 
-static char *
-hash_hex(const ProllyHash *h)
-{
-	StringInfoData s;
-
-	initStringInfo(&s);
-	for (int i = 0; i < h->len; i++)
-		appendStringInfo(&s, "%02x", h->bytes[i]);
-	return s.data;
-}
-
 static void
 spool_read(Receiving *rv, const Received *r, StringInfo out)
 {
@@ -124,7 +113,7 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the remote lacks chunk %s, which it references",
-						hash_hex(hash))));
+						prolly_hash_hex(hash))));
 	ctx = PROLLY_CALL(rv->hash, begin, CurrentMemoryContext);
 	PROLLY_CALL(rv->hash, update, ctx, (const uint8 *) data.data, data.len);
 	PROLLY_CALL(rv->hash, finish, ctx, &actual);
@@ -133,8 +122,8 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the remote's chunk %s doesn't match its hash",
-						hash_hex(hash)),
-				 errdetail("Its bytes hash to %s.", hash_hex(&actual))));
+						prolly_hash_hex(hash)),
+				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
 
 	r = hash_search(rv->received, &key, HASH_ENTER, &found);
 	Assert(!found);
@@ -213,7 +202,7 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the remote's head %s isn't a commit",
-							hash_hex(&commits[i]))));
+							prolly_hash_hex(&commits[i]))));
 		queue = lappend(queue, (void *) &commits[i]);
 	}
 	while (queue != NIL)
@@ -233,12 +222,12 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("the remote's commit %s can't be read", hash_hex(id))));
+					 errmsg("the remote's commit %s can't be read", prolly_hash_hex(id))));
 		if (!PROLLY_CALL(dc.canonicalizer, in_format, &info.root))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("the remote's commit %s is of another canonical format",
-							hash_hex(id)),
+							prolly_hash_hex(id)),
 					 errdetail("A database takes only commits of the format it makes.")));
 		for (int i = 0; i < info.nparents; i++)
 		{
@@ -347,7 +336,7 @@ sent_next(void *arg, ProllyHash *hash, StringInfo data)
 	if (!PROLLY_CALL(sd->cs, get, sd->store, h, data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("chunk %s is missing from the chunk store", hash_hex(h))));
+				 errmsg("chunk %s is missing from the chunk store", prolly_hash_hex(h))));
 	return true;
 }
 
