@@ -197,6 +197,257 @@ SELECT length(dolt_commit('-am', 'resolved')::text) AS committed;
 (1 row)
 
 COMMIT;
+-- A conflict in a table neither base nor ours had (both made it): its
+-- versions are listed, the base's as none.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE rm.both (id int PRIMARY KEY, v text);
+INSERT INTO rm.both VALUES (1, 'theirs');
+SELECT length(dolt_commit('-Am', 'feature: both')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TABLE rm.both (id int PRIMARY KEY, v text);
+INSERT INTO rm.both VALUES (1, 'ours');
+SELECT length(dolt_commit('-Am', 'main: both')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rm.both);
+ base_row | our_row  | their_row  
+----------+----------+------------
+          | (1,ours) | (1,theirs)
+(1 row)
+
+ROLLBACK;
+DROP TABLE rm.both;
+SELECT length(dolt_commit('-am', 'main: not both')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Theirs keys a keyless table and ours leaves its rows: theirs' rows,
+-- whole, as before (ours' can't be read keyed).
+ALTER TABLE rm.t ADD COLUMN u int;
+CREATE TABLE rm.k (id int, v text);
+INSERT INTO rm.k VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 'main: a column, a keyless table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE rm.k ADD PRIMARY KEY (id);
+UPDATE rm.k SET v = 'uno' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: rm.k keyed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'main: nothing')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged a key'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT id, v FROM rm.k ORDER BY id;
+ id |  v  
+----+-----
+  1 | uno
+  2 | two
+(2 rows)
+
+-- A column renamed on one side while the other changed it isn't matched by
+-- name: refused, not lost.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE rm.t RENAME COLUMN n TO n2;
+SELECT length(dolt_commit('-am', 'feature: n renamed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE rm.t SET n = 100 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'main: n of 1')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged a rename'))[3:4];
+ERROR:  rows of table "t" can't be merged across column "n2" being renamed or replaced
+DETAIL:  One version has a column the table hasn't now, and the table has "n2", which that version hasn't.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A serial column one side added: its rows' values can't be told from the
+-- other side's rows, which don't have it: refused, not a false conflict.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE rm.t SET u = 3 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: u of 3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE rm.t ADD COLUMN s serial;
+SELECT length(dolt_commit('-am', 'main: a serial')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged a serial'))[3:4];
+ERROR:  rows of table "t" can't be merged across column "s" being added
+DETAIL:  Each row was given its own value as the column was added (an identity, a generated column, or a default such as a serial's), which rows from before it don't have.
+ALTER TABLE rm.t DROP COLUMN s;
+SELECT length(dolt_commit('-am', 'main: no serial')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A default with a newline in it doesn't hide the columns after it.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE rm.t ADD COLUMN note text DEFAULT E'a\nb', ADD COLUMN after_note int DEFAULT 9;
+UPDATE rm.t SET after_note = 10 WHERE id = 2;
+SELECT length(dolt_commit('-am', 'feature: a default with a newline')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE rm.t SET u = 4 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'main: u of 4')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged past a newline'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT id, u, note = E'a\nb' AS note_kept, after_note FROM rm.t ORDER BY id;
+ id | u | note_kept | after_note 
+----+---+-----------+------------
+  1 |   | t         |          9
+  2 |   | t         |         10
+  3 |   | t         |          9
+  4 | 4 | t         |          9
+  5 |   | t         |          9
+  6 |   | t         |          9
+(6 rows)
+
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -204,4 +455,6 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 DROP SCHEMA rm CASCADE;
-NOTICE:  drop cascades to table rm.t
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table rm.t
+drop cascades to table rm.k

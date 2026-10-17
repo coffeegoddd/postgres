@@ -1764,9 +1764,59 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
+		else if (section && *section != NIL && strchr(line, '\t') == NULL &&
+				 (section == &td->columns || section == &td->constraints))
+		{
+			/*
+			 * A column's or constraint's line is its name, a tab and the
+			 * rest: one without a tab goes on the one before (an
+			 * expression's literal with a newline in it).
+			 */
+			ListCell   *last = list_last_cell(*section);
+
+			lfirst(last) = psprintf("%s\n%s", (char *) lfirst(last), line);
+		}
 		else if (section)
 			*section = lappend(*section, pstrdup(line));
 	}
+}
+
+static char *first_field(const char *line);
+static char *unquoted(const char *ident);
+
+/*
+ * A table's description read back: its columns (each line's first field,
+ * its name, and second, its type), and whether a primary key, not
+ * deferrable, is among its constraints.
+ */
+static List *
+folded_table_columns(const ProllyValue *description, bool *keyed)
+{
+	TableDef	td;
+	List	   *cols = NIL;
+	ListCell   *lc;
+
+	parse_table_def(from_utf8(description->data, description->len), &td);
+	foreach(lc, td.columns)
+	{
+		const char *line = lfirst(lc);
+		const char *type = strchr(line, '\t');
+		ProllyTableColumn *c = palloc0(sizeof(ProllyTableColumn));
+
+		c->name = unquoted(first_field(line));
+		c->type = type ? first_field(type + 1) : pstrdup("");
+		cols = lappend(cols, c);
+	}
+	*keyed = false;
+	foreach(lc, td.constraints)
+	{
+		const char *def = strchr(lfirst(lc), '\t');
+
+		if (def && strncmp(def + 1, "PRIMARY KEY", 11) == 0 &&
+			strstr(def, "DEFERRABLE") == NULL)
+			*keyed = true;
+	}
+	return cols;
 }
 
 /* The first tab-separated field of a line: a column's or constraint's name. */
@@ -2773,6 +2823,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.sequences = folded_sequences,
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
+	.table_columns = folded_table_columns,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {

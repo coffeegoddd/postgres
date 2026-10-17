@@ -103,6 +103,7 @@ typedef struct Tables
 
 static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 						const char *what, const char *name, List **conflicted);
+static bool same_description(const Table *a, const Table *b);
 static int	keep_violations(List *found);
 static List *foreign_key_violations(List *relids);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
@@ -318,6 +319,38 @@ name_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
+ * Does any table (relid's, if it's valid) differ between versions from and
+ * to, in its rows or its definition, or is in one alone?
+ */
+static bool
+tables_differ(List *from, List *to, Oid relid)
+{
+	char	   *only = OidIsValid(relid) ? table_name(relid) : NULL;
+	ListCell   *lc;
+
+	foreach(lc, from)
+	{
+		Table	   *f = lfirst(lc);
+		Table	   *t = find_table(to, f->name);
+
+		if (only && strcmp(only, f->name) != 0)
+			continue;
+		if (t == NULL || !same_hash(&f->data.hash, &t->data.hash) ||
+			!same_description(f, t))
+			return true;
+	}
+	foreach(lc, to)
+	{
+		Table	   *t = lfirst(lc);
+
+		if ((only == NULL || strcmp(only, t->name) == 0) &&
+			find_table(from, t->name) == NULL)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Every table the session branch has: tables only in other versions can't
  * be read as rows here (tables() names them).
  */
@@ -329,8 +362,20 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	List	   *to = tables_of(to_ref);
 	List	   *names = NIL;
 	ListCell   *lc;
+	List	   *now;
 
-	List	   *now = tables_of("WORKING");
+	/*
+	 * Rows are read as the tables are defined now: the working set's
+	 * definitions, folded only if a version may define one otherwise.
+	 */
+	if (strcmp(to_ref, "WORKING") == 0)
+		now = to;
+	else if (strcmp(from_ref, "WORKING") == 0)
+		now = from;
+	else if (!tables_differ(from, to, relid))
+		return;
+	else
+		now = tables_of("WORKING");
 
 	if (OidIsValid(relid))
 	{
@@ -1247,80 +1292,34 @@ typedef struct VersionColumn
 	int32		typmod;
 } VersionColumn;
 
-static char *
-unquote_identifier(const char *s, int len)
-{
-	StringInfoData out;
-
-	initStringInfo(&out);
-	if (len >= 2 && s[0] == '"')
-	{
-		for (int i = 1; i < len - 1; i++)
-		{
-			appendStringInfoChar(&out, s[i]);
-			if (s[i] == '"' && i + 1 < len - 1 && s[i + 1] == '"')
-				i++;
-		}
-	}
-	else
-		appendBinaryStringInfo(&out, s, len);
-	return out.data;
-}
-
 /*
- * A version's live columns, in order, from its definition as described;
- * and whether it has a primary key.
+ * A version's live columns, in order, from its definition as described
+ * (the canonicalizer reads its own descriptions back); and whether it has
+ * a primary key.
  */
 static List *
 version_columns(const Table *x, bool *keyed)
 {
-	const char *p = strstr(x->text, "columns\n");
-	const char *cons = strstr(x->text, "\nconstraints\n");
+	ProllyValue d = {(const uint8 *) x->text, x->textlen};
 	List	   *cols = NIL;
+	ListCell   *lc;
 
-	*keyed = false;
-	if (p == NULL || cons == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("table \"%s\" is described without its columns", x->name)));
-	p += strlen("columns\n");
-	while (p < cons + 1)
+	foreach(lc, PROLLY_CALL(components().canonicalizer, table_columns, &d, keyed))
 	{
-		const char *eol = strchr(p, '\n');
-		const char *tab1 = memchr(p, '\t', eol - p);
-		const char *tab2;
-		char	   *type;
+		ProllyTableColumn *tc = lfirst(lc);
 		VersionColumn *c = palloc0(sizeof(VersionColumn));
 
-		if (tab1 == NULL)
-			break;
-		tab2 = memchr(tab1 + 1, '\t', eol - tab1 - 1);
-		c->name = unquote_identifier(p, tab1 - p);
-		type = pnstrdup(tab1 + 1, (tab2 ? tab2 : eol) - tab1 - 1);
-		(void) parseTypeString(type, &c->type, &c->typmod, NULL);
+		c->name = tc->name;
+		(void) parseTypeString(tc->type, &c->type, &c->typmod, NULL);
 		cols = lappend(cols, c);
-		p = eol + 1;
-	}
-	/* a primary key among the constraints keys the rows */
-	for (p = cons + strlen("\nconstraints\n"); *p; )
-	{
-		const char *eol = strchr(p, '\n');
-		const char *tab = eol ? memchr(p, '\t', eol - p) : NULL;
-
-		if (eol == NULL || strncmp(p, "indexes\n", 8) == 0)
-			break;
-		if (tab && strncmp(tab + 1, "PRIMARY KEY", 11) == 0 &&
-			strstr(pnstrdup(tab + 1, eol - tab - 1), "DEFERRABLE") == NULL)
-			*keyed = true;
-		p = eol + 1;
 	}
 	return cols;
 }
 
 typedef struct ConvRow
 {
-	StringInfoData key;
-	StringInfoData row;
+	ProllyKey	key;
+	ProllyValue row;
 	uint64		count;
 } ConvRow;
 
@@ -1329,22 +1328,39 @@ conv_row_cmp(const void *a, const void *b, void *arg)
 {
 	const ConvRow *x = *(ConvRow *const *) a;
 	const ConvRow *y = *(ConvRow *const *) b;
-	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
-	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
 
-	return keying_compare(&kx, &ky, arg);
+	return keying_compare(&x->key, &y->key, arg);
+}
+
+/* A copy of len bytes, exactly. */
+static const uint8 *
+dup_bytes(const char *data, int len)
+{
+	uint8	   *p = palloc(Max(len, 1));
+
+	memcpy(p, data, len);
+	return p;
 }
 
 /*
- * A version x of table rel's rows as rel defines them now: each row decoded
- * with x's definition and made a row of rel's by column name, a column x
- * hasn't taking its missing value (or null), one of another type converted
- * through its text form.  The same as x if x defines it so already.
+ * A version x of table rel's rows as rel defines them now (now: the
+ * version that defines it so), into *out: each row decoded with x's
+ * definition and made a row of rel's by column name, a column x hasn't
+ * taking its missing value (or null), one of another type converted
+ * through its text form.  x itself if it defines the table so already, or
+ * if now is NULL (the working set has no such table); NULL if x is.
+ *
+ * For a merge ('strict'), refused where rel's rows can't faithfully come
+ * from x's: when x lacks a column whose values each row was given as it
+ * was added (an identity, a generated column, a default such as a
+ * serial's), or when x has a column rel hasn't while rel has one x hasn't
+ * (a column renamed reads, by name, as one dropped and one added).  A diff
+ * shows those as null.
  */
-static Table
-as_defined_now(Relation rel, const Table *x, const Table *now)
+static Table *
+as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
+			   Table *out)
 {
-	Table		out = *x;
 	RowDiff		rd;
 	bool		keyed;
 	List	   *cols;
@@ -1369,8 +1385,16 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 	int			i;
 	ProllyTreeBuilder *b;
 	ListCell   *lc;
+	bool		x_has_more = false;
+	bool		keys_kept;
+	Bitmapset  *pk;
+	MemoryContext rowcxt;
+	MemoryContext outer;
 
-	if (x == NULL || same_hash(&x->description, &now->description))
+	if (x == NULL)
+		return NULL;
+	*out = *x;
+	if (now == NULL || same_hash(&x->description, &now->description))
 		return out;
 	require_readable(x);
 
@@ -1402,6 +1426,16 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 	out_fn = palloc0_array(FmgrInfo, md->natts);
 	in_fn = palloc0_array(Oid, md->natts);
 	in_param = palloc0_array(Oid, md->natts);
+	for (int j = 0; j < xd->natts; j++)
+	{
+		bool		has = false;
+
+		for (int a = 0; a < md->natts; a++)
+			has |= !TupleDescAttr(md, a)->attisdropped &&
+				strcmp(NameStr(TupleDescAttr(xd, j)->attname),
+					   NameStr(TupleDescAttr(md, a)->attname)) == 0;
+		x_has_more |= !has;
+	}
 	for (int a = 0; a < md->natts; a++)
 	{
 		Form_pg_attribute att = TupleDescAttr(md, a);
@@ -1412,6 +1446,21 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 		for (int j = 0; j < xd->natts; j++)
 			if (strcmp(NameStr(TupleDescAttr(xd, j)->attname), NameStr(att->attname)) == 0)
 				from[a] = j;
+		if (from[a] < 0 && strict &&
+			(att->attidentity || att->attgenerated ||
+			 (att->atthasdef && !att->atthasmissing)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being added",
+							RelationGetRelationName(rel), NameStr(att->attname)),
+					 errdetail("Each row was given its own value as the column was added (an identity, a generated column, or a default such as a serial's), which rows from before it don't have.")));
+		if (from[a] < 0 && strict && x_has_more && !att->atthasmissing)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being renamed or replaced",
+							RelationGetRelationName(rel), NameStr(att->attname)),
+					 errdetail("One version has a column the table hasn't now, and the table has \"%s\", which that version hasn't.",
+							   NameStr(att->attname))));
 		if (from[a] >= 0 && TupleDescAttr(xd, from[a])->atttypid != att->atttypid)
 		{
 			Oid			outf;
@@ -1423,18 +1472,34 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 		}
 	}
 
+	/*
+	 * Keys made of columns x has, as x has them, come out as x's did, in its
+	 * order: the rows go straight into the tree.  Otherwise they're sorted
+	 * first.
+	 */
+	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	keys_kept = keyed;
+	for (int a = 0; a < md->natts && keys_kept; a++)
+		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
+			keys_kept = from[a] >= 0 && !OidIsValid(in_fn[a]);
+
 	chunk_env(&env);
 	env.compare = keying_compare;
 	env.compare_arg = &rd;
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
+								   ALLOCSET_DEFAULT_SIZES);
 	cur = PROLLY_CALL(tree, cursor_open, &env, &x->data, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, cur, NULL, ForwardScanDirection);
 	while (PROLLY_CALL(tree, cursor_next, cur, &k, &v))
 	{
 		ProllyValue row;
 		uint64		count;
-		ConvRow    *r = palloc(sizeof(ConvRow));
 		ProllyHash	content;
+		StringInfoData key;
+		StringInfoData crow;
 
+		outer = MemoryContextSwitchTo(rowcxt);
 		PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
 		ExecClearTuple(xs);
 		PROLLY_CALL(ve, decode, enc, &row, xs);
@@ -1465,30 +1530,53 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 				ms->tts_values[a] = xs->tts_values[from[a]];
 		}
 		ExecStoreVirtualTuple(ms);
-		initStringInfo(&r->key);
-		initStringInfo(&r->row);
-		PROLLY_CALL(rd.kr, encode_row, rd.k, ms, &r->key, &r->row, &content);
-		r->count = count;
-		if (n == max)
+		initStringInfo(&key);
+		initStringInfo(&crow);
+		PROLLY_CALL(rd.kr, encode_row, rd.k, ms, &key, &crow, &content);
+		if (keys_kept)
 		{
-			max = Max(64, max * 2);
-			rows = rows ? repalloc_array(rows, ConvRow *, max) :
-				palloc_array(ConvRow *, max);
+			StringInfoData value;
+			ProllyKey	ck = {(const uint8 *) key.data, key.len};
+			ProllyValue cr = {(const uint8 *) crow.data, crow.len};
+			ProllyValue val;
+
+			initStringInfo(&value);
+			PROLLY_CALL(rd.kr, make_value, rd.k, &cr, count, &value);
+			val.data = (const uint8 *) value.data;
+			val.len = value.len;
+			PROLLY_CALL(tree, build_add, b, &ck, &val);
+			MemoryContextSwitchTo(outer);
 		}
-		rows[n++] = r;
+		else
+		{
+			ConvRow    *r;
+
+			MemoryContextSwitchTo(outer);
+			r = palloc(sizeof(ConvRow));
+			r->key.data = dup_bytes(key.data, key.len);
+			r->key.len = key.len;
+			r->row.data = dup_bytes(crow.data, crow.len);
+			r->row.len = crow.len;
+			r->count = count;
+			if (n == max)
+			{
+				max = Max(64, max * 2);
+				rows = rows ? repalloc_array(rows, ConvRow *, max) :
+					palloc_array(ConvRow *, max);
+			}
+			rows[n++] = r;
+		}
+		MemoryContextReset(rowcxt);
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(tree, cursor_close, cur);
 	if (n > 1)
 		qsort_arg(rows, n, sizeof(ConvRow *), conv_row_cmp, &rd);
 
-	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	for (i = 0; i < n;)
 	{
 		int			j = i + 1;
 		uint64		count = rows[i]->count;
-		ProllyKey	key = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
-		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
 		StringInfoData value;
 		ProllyValue val;
 
@@ -1503,16 +1591,18 @@ as_defined_now(Relation rel, const Table *x, const Table *now)
 			count += rows[j++]->count;
 		}
 		initStringInfo(&value);
-		PROLLY_CALL(rd.kr, make_value, rd.k, &row, count, &value);
+		PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->row, count, &value);
 		val.data = (const uint8 *) value.data;
 		val.len = value.len;
-		PROLLY_CALL(tree, build_add, b, &key, &val);
+		PROLLY_CALL(tree, build_add, b, &rows[i]->key, &val);
+		pfree(value.data);
 		i = j;
 	}
-	PROLLY_CALL(tree, build_finish, b, &out.data);
-	out.description = now->description;
-	out.text = now->text;
-	out.textlen = now->textlen;
+	PROLLY_CALL(tree, build_finish, b, &out->data);
+	MemoryContextDelete(rowcxt);
+	out->description = now->description;
+	out->text = now->text;
+	out->textlen = now->textlen;
 	PROLLY_CALL(ve, end, enc);
 	ExecDropSingleTupleTableSlot(xs);
 	ExecDropSingleTupleTableSlot(ms);
@@ -1532,7 +1622,13 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	Relation	rel;
 	Table		f;
 	Table		t;
+	const Table *fp;
+	const Table *tp;
 
+	/* (nothing changed: nothing to convert) */
+	if (from && to && same_hash(&from->data.hash, &to->data.hash) &&
+		same_description(from, to))
+		return;
 	if (now == NULL || ((from == NULL || same_hash(&from->description, &now->description)) &&
 						(to == NULL || same_hash(&to->description, &now->description))))
 	{
@@ -1540,12 +1636,10 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	if (from)
-		f = as_defined_now(rel, from, now);
-	if (to)
-		t = as_defined_now(rel, to, now);
+	fp = as_defined_now(rel, from, now, false, &f);
+	tp = as_defined_now(rel, to, now, false, &t);
 	table_close(rel, AccessShareLock);
-	diff_rows(relid, from ? &f : NULL, to ? &t : NULL, sink);
+	diff_rows(relid, fp, tp, sink);
 }
 
 /* What a merge across definitions writes, once they're merged. */
@@ -1704,11 +1798,31 @@ merge_rows(void *arg)
 			 * merged definition has them, merged three-way (the branch's
 			 * made ours' first: a table made again has none).
 			 */
-			Relation	rel = table_open(relid, AccessShareLock);
-			Table		bn = as_defined_now(rel, b, w);
-			Table		on = as_defined_now(rel, o, w);
-			Table		tn = as_defined_now(rel, t, w);
+			Relation	rel;
+			Table		bn;
+			Table		on;
+			Table		tn;
 
+			/*
+			 * (one side's rows alone, defined as merged already: they're
+			 * the rows, as they'd be had it changed nothing else)
+			 */
+			if (!o_rows && same_description(t, w))
+			{
+				if (!same_hash(&w->data.hash, &t->data.hash))
+					apply_rows(relid, w, t);
+				continue;
+			}
+			if (!t_rows && same_description(o, w))
+			{
+				if (!same_hash(&w->data.hash, &o->data.hash))
+					apply_rows(relid, w, o);
+				continue;
+			}
+			rel = table_open(relid, AccessShareLock);
+			(void) as_defined_now(rel, b, w, true, &bn);
+			(void) as_defined_now(rel, o, w, true, &on);
+			(void) as_defined_now(rel, t, w, true, &tn);
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
 				apply_rows(relid, w, &on);
@@ -2716,6 +2830,12 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	Table		b;
 	Table		o;
 	Table		t;
+	const Table *bp;
+	const Table *op;
+	const Table *tp;
+	Table		nb;
+	Table		no;
+	Table		nt;
 	Relation	rel;
 
 	/* The merge left the head where it was: ours is the head commit. */
@@ -2725,11 +2845,27 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 				 errmsg("a merge is in progress on a branch with no commit")));
 	/* (each as the table is defined now, if one defines it otherwise) */
 	rel = table_open(relid, AccessShareLock);
-	b = as_defined_now(rel, find_table(tables_at(&ms->base), name), now);
-	o = as_defined_now(rel, find_table(tables_at(&ours), name), now);
-	t = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now);
+	bp = as_defined_now(rel, find_table(tables_at(&ms->base), name), now, false, &b);
+	op = as_defined_now(rel, find_table(tables_at(&ours), name), now, false, &o);
+	tp = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now, false, &t);
 	table_close(rel, AccessShareLock);
-	(void) merge_table(relid, &b, &o, &t, mode, sink);
+	/* (a version without the table has none of its rows) */
+	if (bp == NULL)
+	{
+		no_rows(op ? op : tp, &nb);
+		bp = &nb;
+	}
+	if (op == NULL)
+	{
+		no_rows(bp, &no);
+		op = &no;
+	}
+	if (tp == NULL)
+	{
+		no_rows(bp, &nt);
+		tp = &nt;
+	}
+	(void) merge_table(relid, bp, op, tp, mode, sink);
 }
 
 static void
