@@ -26,7 +26,7 @@ Nothing below is decided unless its entry says so. Update this file when somethi
 | Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Built in 4e.5 |
 | Step 4's remaining decisions (23, 25, 27, 29, 34, 35, 46–56) | Decided by the user 2026-10-14, as recommended: see each question |
 | Logical decoding (31) | Deferred by the user 2026-10-13 |
-| Direction (2026-10-15) | Proposed by the user: Postgres pages for the working set, copy-on-write page sets per branch, a Dolt-shaped chunk store for history (`11-pages-and-dolt-snapshots.md`). Supersedes prolly trees as primary storage; D1 tagged `prolly-d1` |
+| Direction (2026-10-15) | Decided by the user 2026-10-15: Postgres pages for the working set, copy-on-write page sets per branch, a Dolt-shaped chunk store for history (`11-pages-and-dolt-snapshots.md`). Supersedes prolly trees as primary storage; D1 tagged `prolly-d1`. Steps 0–5 built 2026-10-17 (below) |
 | Branch copies' OIDs (2026-10-16) | Decided by the user: a branch's copy of a versioned object keeps its source's OIDs; catalog rows carry a branch, and a backend sees one branch (`11-pages-and-dolt-snapshots.md`, part 1) |
 | Spec 11, steps 0–5 (2026-10-17) | Built and merged, with the decisions recorded there (steps 2–5's in #90). Steps 6–8 (remotes, reclamation, measurement) not started; the remote protocol's design is open |
 | What is versioned (2026-10-16) | Decided by the user: versioned schemas (`CREATE SCHEMA … VERSIONED`), every object in them per branch, Doltgres's scope; prolly tables only there; dependencies only from versioned objects to shared ones (`11-pages-and-dolt-snapshots.md`, part 1) |
