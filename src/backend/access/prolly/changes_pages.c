@@ -21,16 +21,22 @@
  * to be candidates again.  (A table without a primary key notes only that
  * it has some.)
  *
+ * A table without a primary key keys a row by its content and counts its
+ * copies: of each row on a listed page, the copies the fold saw on the
+ * page's old version are taken from the baseline's count, and those the
+ * snapshot sees on its version now added.
+ *
  * A table is folded in full instead, every row read, when the baseline
  * isn't of its changes list's lineage (it was never folded, or rewritten
- * since, or the list was pruned past it), when it has no primary key (its
- * rows are keyed by content, and the count of a row's copies can't be
- * known from some of them) and anything changed, when a candidate's key
- * column is stored out of line (its old version may be gone), when the
- * baseline's fold left rows unsettled whose keys it couldn't carry, when
- * the snapshot is older than the baseline's fold's (which may have seen
- * transactions the snapshot doesn't), and during recovery (a standby
- * replays prunes without waiting for its readers).
+ * since, or the list was pruned past it), when a candidate's key column
+ * (any column, without a primary key) is stored out of line on a page's
+ * old version (its value may be gone), when whether the fold saw a tuple
+ * of an old version can't be told (its transaction's status is gone, or
+ * it was deleted by a multixact), when the baseline's fold left rows
+ * unsettled whose keys it couldn't carry, when the snapshot is older than
+ * the baseline's fold's (which may have seen transactions the snapshot
+ * doesn't), and during recovery (a standby replays prunes without waiting
+ * for its readers).
  *
  * A baseline's state: a version byte, the list's lineage, the fold's epoch,
  * the table's length then, the fold's snapshot's xmax and the transactions
@@ -53,6 +59,7 @@
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "access/tableam.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_am_d.h"
@@ -564,6 +571,323 @@ block_cmp(const void *a, const void *b)
 	return pg_cmp_u32(*(const BlockNumber *) a, *(const BlockNumber *) b);
 }
 
+/* ----------------------------------------------------------------
+ * Tables without a primary key
+ *
+ * Every tuple on a page the baseline's fold saw was settled for it (else
+ * the baseline is marked unsettled), so a tuple of a listed page's old
+ * version was visible to the fold exactly when its transactions committed
+ * as they did; a page not listed holds what it held.
+ * ----------------------------------------------------------------
+ */
+
+/* A row's copies counted on some page versions: its key, row and count. */
+typedef struct Copy
+{
+	char	   *key;
+	uint32		keylen;
+	char	   *row;
+	uint32		rowlen;
+	int64		delta;
+} Copy;
+
+typedef struct Copies
+{
+	Copy	   *c;
+	int			n;
+	int			max;
+} Copies;
+
+/*
+ * Did xid commit?  *known set false if its status may be gone (older than
+ * the oldest transaction whose status is kept).
+ */
+static bool
+xid_committed(TransactionId xid, bool *known)
+{
+	if (!TransactionIdIsNormal(xid))
+		return xid == FrozenTransactionId || xid == BootstrapTransactionId;
+	if (TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
+	{
+		*known = false;
+		return false;
+	}
+	return TransactionIdDidCommit(xid);
+}
+
+/*
+ * Was this tuple of an old page version, settled for the fold, visible to
+ * it?  *known set false if that can't be told.
+ */
+static bool
+fold_saw(HeapTupleHeader t, bool *known)
+{
+	uint16		mask = t->t_infomask;
+
+	if (!HeapTupleHeaderXminFrozen(t))
+	{
+		if (mask & HEAP_XMIN_INVALID)
+			return false;
+		if (!(mask & HEAP_XMIN_COMMITTED) &&
+			!xid_committed(HeapTupleHeaderGetRawXmin(t), known))
+			return false;
+	}
+	if ((mask & HEAP_XMAX_INVALID) || HEAP_XMAX_IS_LOCKED_ONLY(mask))
+		return true;
+	if (mask & HEAP_XMAX_IS_MULTI)
+	{
+		/* (its members' statuses may be gone; rare without a key) */
+		*known = false;
+		return false;
+	}
+	if (mask & HEAP_XMAX_COMMITTED)
+		return false;
+	return !xid_committed(HeapTupleHeaderGetRawXmax(t), known);
+}
+
+/* Count a copy of the tuple's row; false if its row can't be read. */
+static bool
+add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
+{
+	StringInfoData key;
+	StringInfoData row;
+	ProllyHash	content;
+	Copy	   *c;
+
+	/* (an old version's values out of line may be gone) */
+	if (delta < 0)
+	{
+		heap_deform_tuple(tup, f->desc, f->values, f->isnull);
+		for (int i = 0; i < f->desc->natts; i++)
+			if (!f->isnull[i] && TupleDescAttr(f->desc, i)->attlen == -1 &&
+				VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(f->values[i])))
+				return false;
+	}
+	ExecForceStoreHeapTuple(tup, f->rowslot, false);
+	initStringInfo(&key);
+	initStringInfo(&row);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &key, &row, &content);
+	ExecClearTuple(f->rowslot);
+	if (cs->n == cs->max)
+	{
+		cs->max = Max(64, cs->max * 2);
+		cs->c = cs->c ? repalloc_array(cs->c, Copy, cs->max) :
+			palloc_array(Copy, cs->max);
+	}
+	c = &cs->c[cs->n++];
+	c->key = key.data;
+	c->keylen = key.len;
+	c->row = row.data;
+	c->rowlen = row.len;
+	c->delta = delta;
+	return true;
+}
+
+/*
+ * The copies on a version of page blkno: on an old one (buf invalid),
+ * those the fold saw, counted -1; on the one now (in buf, share-locked),
+ * those the snapshot sees, counted +1, noting tuples it doesn't see as
+ * settled.  False to fold in full instead.
+ */
+static bool
+page_copies(Finder *f, Copies *cs, Page page, BlockNumber blkno, Buffer buf)
+{
+	OffsetNumber maxoff;
+
+	counters.pages++;
+	if (PageIsNew(page))
+		return true;
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+		HeapTupleData tup;
+		bool		known = true;
+		bool		counted;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(f->rel);
+		ItemPointerSet(&tup.t_self, blkno, off);
+		if (!BufferIsValid(buf))
+		{
+			counted = fold_saw(tup.t_data, &known);
+			if (!known)
+				return false;
+		}
+		else
+		{
+			f->unsettled |= tuple_unsettled(f, tup.t_data);
+			counted = HeapTupleSatisfiesVisibility(&tup, f->snap, buf);
+		}
+		if (counted && !add_copy(f, cs, &tup, BufferIsValid(buf) ? 1 : -1))
+			return false;
+	}
+	return true;
+}
+
+static bool
+current_copies(Finder *f, Copies *cs, BlockNumber blkno)
+{
+	Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
+										 RBM_NORMAL, NULL);
+	bool		ok;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	ok = page_copies(f, cs, BufferGetPage(buf), blkno, buf);
+	UnlockReleaseBuffer(buf);
+	return ok;
+}
+
+static bool
+same_bytes(const char *a, uint32 alen, const uint8 *b, uint32 blen)
+{
+	return alen == blen && memcmp(a, b, alen) == 0;
+}
+
+/* By the keying's order, then by bytes (as a full fold orders rows). */
+static int
+copy_cmp(const void *a, const void *b, void *arg)
+{
+	const Copy *x = a;
+	const Copy *y = b;
+	ProllyKey	kx = {(const uint8 *) x->key, x->keylen};
+	ProllyKey	ky = {(const uint8 *) y->key, y->keylen};
+	int			r = keying_compare(&kx, &ky, arg);
+
+	if (r == 0)
+		r = memcmp(x->key, y->key, Min(x->keylen, y->keylen));
+	return r != 0 ? r : (x->keylen > y->keylen) - (x->keylen < y->keylen);
+}
+
+/*
+ * Fold a table without a key from the baseline: of each row on a listed
+ * page, the copies the fold saw on the page's old version taken from the
+ * baseline's count, those the snapshot sees on its version now added.
+ * False if it must be read in full instead.
+ */
+static bool
+fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
+			 BlockNumber low, BlockNumber nblocks, ProllyNodeRef *data)
+{
+	Copies		cs = {0};
+	PGIOAlignedBlock old;
+	BlockNumber *current = palloc_array(BlockNumber, Max(l->n, 1));
+	int			ncurrent = 0;
+	ProllyEdit *edits;
+	int			nedits = 0;
+	ProllyTreeCursor *cur;
+	bool		ok = true;
+
+	/* the old versions, while the statuses of their transactions are kept */
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	for (int i = 0; i < l->n && ok; i++)
+	{
+		const BmapChange *c = &l->changes[i];
+
+		if (c->kind != BMAP_CHANGE_COPY)
+			continue;
+		bmap_read_old(RelationGetSmgr(f->rel), c->blkno, c->old_block, old.data);
+		ok = page_copies(f, &cs, (Page) old.data, c->blkno, InvalidBuffer);
+		if (c->blkno < Min(low, nblocks))
+			current[ncurrent++] = c->blkno;
+	}
+	LWLockRelease(XactTruncationLock);
+
+	/* the versions now: the listed pages, and those past the shortest length */
+	if (ncurrent > 1)
+		qsort(current, ncurrent, sizeof(BlockNumber), block_cmp);
+	for (int i = 0; i < ncurrent && ok; i++)
+		if (i == 0 || current[i] != current[i - 1])
+			ok = current_copies(f, &cs, current[i]);
+	for (BlockNumber blk = low; blk < nblocks && ok; blk++)
+	{
+		ok = current_copies(f, &cs, blk);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (!ok)
+		return false;
+
+	/* each row's count, the baseline's changed by its copies' */
+	if (cs.n > 1)
+		qsort_arg(cs.c, cs.n, sizeof(Copy), copy_cmp, f);
+	edits = palloc_array(ProllyEdit, Max(cs.n, 1));
+	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
+					  CurrentMemoryContext);
+	for (int i = 0; i < cs.n && ok;)
+	{
+		Copy	   *c = &cs.c[i];
+		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
+		ProllyKey	k;
+		ProllyValue v;
+		int64		count = 0;
+		int64		delta = 0;
+
+		while (i < cs.n && same_bytes(cs.c[i].key, cs.c[i].keylen, ck.data, ck.len))
+			delta += cs.c[i++].delta;
+
+		/* (rows the keying can't tell apart, but the bytes can: in full) */
+		if (i < cs.n)
+		{
+			ProllyKey	nk = {(const uint8 *) cs.c[i].key, cs.c[i].keylen};
+
+			if (keying_compare(&ck, &nk, f) == 0)
+				ok = false;
+		}
+		if (!ok || delta == 0)
+			continue;
+		counters.candidates++;
+		PROLLY_CALL(f->tree, cursor_seek, cur, &ck, ForwardScanDirection);
+		if (PROLLY_CALL(f->tree, cursor_next, cur, &k, &v) &&
+			keying_compare(&k, &ck, f) == 0)
+		{
+			ProllyValue row;
+			uint64		had;
+
+			if (!same_bytes(c->key, c->keylen, k.data, k.len))
+			{
+				ok = false;
+				continue;
+			}
+			PROLLY_CALL(f->kr, parse_value, f->k, &v, &row, &had);
+			count = (int64) had;
+		}
+		count += delta;
+
+		/* (fewer copies than none: not what the fold saw, so in full) */
+		if (count < 0)
+			ok = false;
+		else
+		{
+			ProllyEdit *e = &edits[nedits++];
+
+			e->key = ck;
+			e->is_delete = count == 0;
+			if (count > 0)
+			{
+				ProllyValue r = {(const uint8 *) c->row, c->rowlen};
+				StringInfoData value;
+
+				initStringInfo(&value);
+				PROLLY_CALL(f->kr, make_value, f->k, &r, (uint64) count, &value);
+				e->value.data = (const uint8 *) value.data;
+				e->value.len = value.len;
+			}
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(f->tree, cursor_close, cur);
+	if (!ok)
+		return false;
+	if (nedits > 0)
+		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
+	else
+		*data = baseline->data;
+	return true;
+}
+
 /*
  * Fold from the baseline, its state 'st': false if the table must be read
  * in full instead.  With 'carry', keys to look at again next time are
@@ -601,13 +925,15 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 			low = Min(low, l.changes[i].blkno);
 	nblocks = RelationGetNumberOfBlocks(f->rel);
 
-	/* a table without a key: unchanged, or read in full */
+	/* a table without a key: unchanged, or its rows' copies counted again */
 	if (f->keyless)
 	{
-		if (l.n > 0 || low < nblocks)
-			return false;
-		*data = baseline->data;
-		return true;
+		if (l.n == 0 && low >= nblocks)
+		{
+			*data = baseline->data;
+			return true;
+		}
+		return fold_keyless(f, baseline, &l, low, nblocks, data);
 	}
 
 	/* the pages listed, as they were and as they are */
