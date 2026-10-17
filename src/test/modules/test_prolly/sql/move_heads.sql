@@ -141,7 +141,7 @@ SELECT dolt_merge('other');
 \c contrib_regression
 DROP DATABASE mh_fresh;
 
--- --no-ff where a fast-forward would do: no merge commit is made yet
+-- --no-ff where a fast-forward would do: a merge commit
 CREATE SCHEMA mhf VERSIONED;
 CREATE TABLE mhf.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'mhf')::text) AS committed;
