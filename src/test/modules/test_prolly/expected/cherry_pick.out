@@ -209,6 +209,44 @@ SELECT dolt_reset('--hard', 'HEAD~1');
  {0}
 (1 row)
 
+-- (--continue after ours kept: nothing to commit, unless allowed)
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {1,0,0}
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', 'app.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SAVEPOINT s;
+SELECT dolt_cherry_pick('--continue');
+ERROR:  dolt_cherry_pick changes nothing on the branch
+HINT:  Pass --allow-empty to commit it anyway.
+ROLLBACK TO s;
+SELECT length((dolt_cherry_pick('--allow-empty', '--continue'))[1]) AS picked;
+ picked 
+--------
+     64
+(1 row)
+
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+   message   
+-------------
+ feature one
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 -- one kept with its conflicts is aborted
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_cherry_pick('feature~1'))[2:4];
@@ -232,6 +270,29 @@ SELECT id, v FROM app.t WHERE id = 1;
 
 SELECT dolt_cherry_pick('--continue');
 ERROR:  there is no cherry-pick to continue
+SELECT dolt_cherry_pick('--continue', '--abort');
+ERROR:  dolt_cherry_pick can't --abort and --continue at once
+-- (a pick that conflicts isn't made over uncommitted changes, which its
+-- commit would take in and its abort lose)
+UPDATE app.k SET a = 'uncommitted';
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ERROR:  cannot cherry-pick with uncommitted changes when the cherry-pick conflicts
+DETAIL:  The cherry-pick has 1 conflicting rows.
+HINT:  Commit the changes, or reset the branch, first.
+ROLLBACK;
+SELECT a FROM app.k;
+      a      
+-------------
+ uncommitted
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_cherry_pick(:'two');
 ERROR:  local changes would be stomped by cherry-pick

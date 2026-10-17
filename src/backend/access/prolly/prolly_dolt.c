@@ -503,6 +503,39 @@ dolt_branch(PG_FUNCTION_ARGS)
 }
 
 /*
+ * End the merge (what: "merge", or "cherry-pick") in progress on the
+ * session's branch: the branch as its head has it.  (Branch copies reset
+ * their working set's rows, the transaction's writes as any others; the
+ * rows engine can't undo its own.)  A merge isn't begun over uncommitted
+ * changes, so none are lost.
+ */
+static void
+abort_in_progress(const char *what)
+{
+	if (!prolly_database_uses_copies() && prolly_xact_has_writes())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot abort a %s in a transaction that has written to prolly tables",
+						what),
+				 errhint("Roll the transaction back instead.")));
+	PROLLY_CALL(refs(), reset, "HEAD");
+}
+
+/* Is the session branch's working set its head's? */
+static bool
+working_is_head(void)
+{
+	ProllyHash	head;
+	ProllyNodeRef working;
+	ProllyNodeRef committed;
+
+	return PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+		PROLLY_CALL(refs(), working_set, NULL, &working) &&
+		PROLLY_CALL(refs(), commit_working_set, &head, &committed) &&
+		same_hash(&working.hash, &committed.hash);
+}
+
+/*
  * dolt_merge(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward, conflicts, message}
  *
@@ -556,16 +589,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no merge to abort")));
-		/*
-		 * (Branch copies reset their working set's rows, the transaction's
-		 * writes as any others; the rows engine can't undo its own.)
-		 */
-		if (!prolly_database_uses_copies() && prolly_xact_has_writes())
-			ereport(ERROR,
-					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-					 errmsg("cannot abort a merge in a transaction that has written to prolly tables"),
-					 errhint("Roll the transaction back instead.")));
-		PROLLY_CALL(refs(), reset, "HEAD");
+		abort_in_progress("merge");
 		result[0] = "";
 		result[1] = "0";
 		result[2] = "0";
@@ -649,8 +673,8 @@ dolt_reset(PG_FUNCTION_ARGS)
  * [--allow-empty] commit: its changes, committed again on the current
  * branch, with its author.  Rows changed differently on both sides leave
  * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
- * (or --continue, with the picked commit's message) makes its commit,
- * with one parent; --abort ends it.
+ * (or [--allow-empty] --continue, with the picked commit's message) makes
+ * its commit, with one parent; --abort ends it.
  */
 Datum
 dolt_cherry_pick(PG_FUNCTION_ARGS)
@@ -680,6 +704,10 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		else
 			unexpected("dolt_cherry_pick", args[i]);
 	}
+	if (abort_pick && continue_pick)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_cherry_pick can't --abort and --continue at once")));
 	if (abort_pick || continue_pick)
 	{
 		ProllyMergeState ms;
@@ -693,16 +721,16 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 							abort_pick ? "abort" : "continue")));
 		if (abort_pick)
 		{
-			/* (as for a merge: branch copies reset their own writes) */
-			if (!prolly_database_uses_copies() && prolly_xact_has_writes())
-				ereport(ERROR,
-						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-						 errmsg("cannot abort a cherry-pick in a transaction that has written to prolly tables"),
-						 errhint("Roll the transaction back instead.")));
-			PROLLY_CALL(refs(), reset, "HEAD");
+			abort_in_progress("cherry-pick");
 			result[0] = "";
 			PG_RETURN_DATUM(text_array(4, result));
 		}
+		/* a pick resolved to nothing: as a pick of nothing is */
+		if (!allow_empty && working_is_head())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("dolt_cherry_pick changes nothing on the branch"),
+					 errhint("Pass --allow-empty to commit it anyway.")));
 		PROLLY_CALL(refs(), commit, ms.message, &id);
 		result[0] = hash_hex(&id);
 		PG_RETURN_DATUM(text_array(4, result));
