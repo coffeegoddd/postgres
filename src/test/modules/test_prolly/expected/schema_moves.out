@@ -450,8 +450,8 @@ SELECT length(dolt_commit('-Am', 'without sm7')::text) AS committed;
         66
 (1 row)
 
--- A view's unchanged dependents aren't dropped with it: a move that would
--- fails instead.
+-- A view's unchanged dependents aren't lost with it: a materialized view
+-- over it is made again, with the rows the commit holds.
 CREATE SCHEMA sm8 VERSIONED;
 CREATE TABLE sm8.t (id int PRIMARY KEY);
 CREATE VIEW sm8.v AS SELECT id FROM sm8.t;
@@ -465,22 +465,28 @@ SELECT length(dolt_commit('-Am', 'sm8 more')::text) AS committed;
 (1 row)
 
 SELECT dolt_reset('--hard', :'sm8_base');
-ERROR:  cannot drop view sm8.v because other objects depend on it
-DETAIL:  materialized view sm8.mv depends on view sm8.v
-HINT:  Use DROP ... CASCADE to drop the dependent objects too.
-CONTEXT:  SQL statement "DROP VIEW IF EXISTS sm8.v"
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 SELECT to_regclass('sm8.mv') IS NOT NULL AS mv_kept;
  mv_kept 
 ---------
  t
 (1 row)
 
+SELECT test_fold_root() = prolly_root_hash(:'sm8_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
 DROP SCHEMA sm8 CASCADE;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table sm8.t
 drop cascades to view sm8.v
 drop cascades to materialized view sm8.mv
-drop cascades to table sm8.u
 SELECT length(dolt_commit('-Am', 'without sm8')::text) AS committed;
  committed 
 -----------
