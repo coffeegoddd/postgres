@@ -84,9 +84,6 @@ typedef struct ProllyDatabaseComponents
 extern void prolly_components_for_am(const char *amname,
 									 ProllyComponents *components);
 
-/* How the history of page-based prolly tables keys their rows. */
-extern const ProllyKeyingRoutine *prolly_history_keying(void);
-
 /*
  * Components for rel: a table using a prolly table AM, or an index on one.
  */

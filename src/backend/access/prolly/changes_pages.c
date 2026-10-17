@@ -78,7 +78,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		3
+#define STATE_VERSION		4
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -203,8 +203,11 @@ parse_state(const ProllyValue *state, State *st)
 	uint8		version = state->len > 0 ? p[0] : 0;
 
 	memset(st, 0, sizeof(*st));
-	/* (version 2 is version 3 without the fold's own transaction) */
-	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || (version != 2 && version != STATE_VERSION))
+	/*
+	 * (a baseline of another version, keyless rows keyed as they were then,
+	 * is folded again in full)
+	 */
+	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || version != STATE_VERSION)
 		return false;
 	st->fold.lineage = get_u64(p + 1);
 	st->fold.epoch = get_u32(p + 9);
@@ -212,17 +215,14 @@ parse_state(const ProllyValue *state, State *st)
 	st->xmax = get_u32(p + 17);
 	st->nxip = get_u32(p + 21);
 	p += 25;
-	if ((uint64) (end - p) < (uint64) st->nxip * 4 + 2 + (version >= 3 ? 4 : 0))
+	if ((uint64) (end - p) < (uint64) st->nxip * 4 + 2 + 4)
 		return false;
 	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
 	for (uint32 i = 0; i < st->nxip; i++, p += 4)
 		st->xip[i] = get_u32(p);
 	st->flags = *p++;
-	if (version >= 3)
-	{
-		st->own = get_u32(p);
-		p += 4;
-	}
+	st->own = get_u32(p);
+	p += 4;
 	hlen = *p++;
 	if (hlen > PROLLY_HASH_MAX_LEN || end - p != hlen)
 		return false;
@@ -283,7 +283,12 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->rel = rel;
 	f->snap = GetActiveSnapshot();
 	f->tree = prolly_tree_lookup("cow");
-	f->kr = prolly_history_keying();
+	{
+		ProllyComponents c;
+
+		prolly_components_for_relation(rel, &c);
+		f->kr = c.keying;
+	}
 	/*
 	 * Rows as a rewrite leaves them: a column added with a default is in
 	 * every row (the scan gives its missing value), so whether the table was

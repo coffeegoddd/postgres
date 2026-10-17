@@ -130,6 +130,16 @@ chunk_env(ProllyTreeEnv *env)
 	env->compare = NULL;
 }
 
+/* How rel's rows are keyed in history: its access method's keying. */
+static const ProllyKeyingRoutine *
+keying_of(Relation rel)
+{
+	ProllyComponents c;
+
+	prolly_components_for_relation(rel, &c);
+	return c.keying;
+}
+
 static bool
 is_working(const char *ref)
 {
@@ -304,7 +314,7 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 	require_readable(from);
 	require_readable(to);
 	rel = table_open(relid, AccessShareLock);
-	rd.kr = prolly_history_keying();
+	rd.kr = keying_of(rel);
 	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	rd.relid = relid;
 	rd.sink = sink;
@@ -892,7 +902,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	memset(&ap, 0, sizeof(ap));
 	ap.rel = table_open(relid, RowExclusiveLock);
 	ap.ar = prolly_applier_lookup("replication");
-	ap.c.rd.kr = prolly_history_keying();
+	ap.c.rd.kr = keying_of(ap.rel);
 	ap.c.rd.k = PROLLY_CALL(ap.c.rd.kr, open_rewritten, ap.rel,
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
@@ -1224,7 +1234,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	if (recording && mode == WALK_MERGE)
 		note_written(relid);
 	memset(&tc, 0, sizeof(tc));
-	tc.rd.kr = prolly_history_keying();
+	tc.rd.kr = keying_of(rel);
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	oc = tc;
@@ -1502,7 +1512,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 		return out;
 	require_readable(x);
 
-	rd.kr = prolly_history_keying();
+	rd.kr = keying_of(rel);
 	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
 	cols = version_columns(x, &keyed);
 	if (keyed == PROLLY_CALL(rd.kr, keyless, rd.k))

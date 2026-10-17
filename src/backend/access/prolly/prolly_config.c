@@ -99,8 +99,6 @@ static const ProllyProfile history_profile =
 		[PROLLY_IFACE_TREE] = "cow",
 }};
 
-
-
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "tree",
 	[PROLLY_IFACE_TRANSFER] = "stub",
@@ -219,13 +217,6 @@ prolly_note_tablespace(Oid amoid, const char *tablespacename)
 		pfree(amname);
 }
 
-/* How the history of page-based prolly tables keys their rows. */
-const ProllyKeyingRoutine *
-prolly_history_keying(void)
-{
-	return (const ProllyKeyingRoutine *)
-		profile_impl(history_profile.impls, PROLLY_IFACE_TABLE_KEYING);
-}
 
 void
 prolly_components_for_am(const char *amname, ProllyComponents *components)

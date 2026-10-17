@@ -14,8 +14,9 @@
  * A table without one (as in Dolt's keyless tables):
  *
  *	key		"pk_or_content": the row's content hash; "pk_or_prefix": the
- *			first KEY_PREFIX bytes of the encoded row (all of it if
- *			shorter), then its content hash
+ *			first KEY_PREFIX bytes of the encoded row's values (after its
+ *			column count and NULL bitmap; all of them if shorter), then
+ *			its content hash
  *	value	varint count of identical rows, then the row
  *
  * so identical rows are one item, and the tree depends only on which rows
@@ -404,8 +405,19 @@ pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 	if (k->keyless)
 	{
 		if (k->prefixed)
-			appendBinaryStringInfo(key, row->data + start,
-								   Min(row->len - start, KEY_PREFIX));
+		{
+			/*
+			 * (from after the row's header, its column count and NULLs, so
+			 * rows that begin alike stay together whatever their later
+			 * columns' NULLs)
+			 */
+			const char *p = row->data + start;
+			const char *end = row->data + row->len;
+			uint64		n = prolly_get_varint(&p, end);
+
+			p += Min((uint64) (end - p), (n + 7) / 8);
+			appendBinaryStringInfo(key, p, Min(end - p, KEY_PREFIX));
+		}
 		appendBinaryStringInfo(key, content->bytes, content->len);
 		return;
 	}
@@ -549,6 +561,8 @@ pkcontent_close(ProllyKeying *k)
 		PROLLY_CALL(k->valenc_routine, end, k->alt_valenc);
 	if (k->keyenc)
 		PROLLY_CALL(k->keyenc_routine, end, k->keyenc);
+	FreeTupleDesc(k->desc);
+	pfree(k->layout.data);
 	pfree(k);
 }
 
