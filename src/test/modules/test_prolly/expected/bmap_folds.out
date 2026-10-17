@@ -2,7 +2,8 @@
 -- to each page copies it and lists the block it leaves, which keeps the
 -- page as it was; truncations are listed too.  A copy of the relation
 -- gets its list; pruning lets go of what changed before a later fold;
--- dropping the relation frees what the list holds.
+-- dropping the relation frees what the list holds.  Extending a truncated
+-- relation again lists the pages it reuses.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 CREATE EXTENSION IF NOT EXISTS pageinspect;
@@ -125,10 +126,18 @@ SELECT test_bmap_fold_prune(:rel, :lineage, :e2);
  
 (1 row)
 
-SELECT count(*) AS left_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e1);
- left_after_prune 
-------------------
-                1
+-- (what changed since the first isn't known any more)
+SELECT count(*) AS since_first_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e1);
+NOTICE:  what changed since that fold isn't known
+ since_first_after_prune 
+-------------------------
+                       0
+(1 row)
+
+SELECT count(*) AS since_second_after_prune FROM test_bmap_fold_changes(:rel, :lineage, :e2);
+ since_second_after_prune 
+--------------------------
+                        1
 (1 row)
 
 SELECT test_bmap_free_blocks() - :free_before_prune = :copies_before_second
@@ -144,9 +153,39 @@ SELECT count(*), sum(b) FROM folds.t;
   2588 | 3353337
 (1 row)
 
+-- Extending a truncated relation again reuses the blocks past its length,
+-- which are as of the fold when nothing changed them since: each is
+-- listed, holding the page as it was.  (The storage is cut and extended
+-- by itself, below the table, which is dropped after.)
+CREATE TABLE folds.x (a int8 PRIMARY KEY, b int8);
+INSERT INTO folds.x SELECT g, g FROM generate_series(1, 3000) g;
+SELECT pg_relation_filenode('folds.x') AS x \gset
+SELECT lineage AS xl, epoch AS xe, nblocks AS xn FROM test_bmap_fold_begin(:x) \gset
+SELECT test_bmap_truncate(:x, 14);
+ test_bmap_truncate 
+--------------------
+ 
+(1 row)
+
+SELECT test_bmap_extend(:x, :xn - 14);
+ test_bmap_extend 
+------------------
+ 
+(1 row)
+
+SELECT count(DISTINCT blkno) = :xn - 14 AS reused_listed,
+	bool_and((SELECT count(*) FROM heap_page_items(test_bmap_read_old(:x, blkno, old_block))) > 0)
+		AS as_of_fold
+FROM test_bmap_fold_changes(:x, :xl, :xe) WHERE kind = 'copy';
+ reused_listed | as_of_fold 
+---------------+------------
+ t             | t
+(1 row)
+
+DROP TABLE folds.x;
 -- Another lineage knows nothing of it.
 SELECT count(*) FROM test_bmap_fold_changes(:rel, :lineage + 1, :e1);
-NOTICE:  no changes list of that lineage
+NOTICE:  what changed since that fold isn't known
  count 
 -------
      0
@@ -156,7 +195,7 @@ NOTICE:  no changes list of that lineage
 TRUNCATE folds.t;
 SELECT pg_relation_filenode('folds.t') AS rel2 \gset
 SELECT count(*) FROM test_bmap_fold_changes(:rel2, :lineage, :e1);
-NOTICE:  no changes list of that lineage
+NOTICE:  what changed since that fold isn't known
  count 
 -------
      0

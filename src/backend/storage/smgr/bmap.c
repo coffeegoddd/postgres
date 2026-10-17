@@ -131,6 +131,10 @@ typedef struct BmapHeader
 	uint32		version;
 	BlockNumber nblocks;		/* the relation's logical length */
 	uint32		epoch;			/* entries born before it may be shared */
+	uint32		fold_epoch;		/* entries born before it are as of a fold
+								 * (0: never folded), as the changes list's
+								 * header says, here where each change
+								 * reads it */
 } BmapHeader;
 
 /*
@@ -145,6 +149,7 @@ typedef struct BmapChangesHead
 	uint64		lineage;
 	BlockNumber fold_nblocks;
 	uint32		nentries;
+	uint32		pruned_epoch;	/* changes before it let go of (0: none) */
 } BmapChangesHead;
 
 typedef struct BmapMeta
@@ -207,7 +212,10 @@ typedef struct BmapMeta
 
 static const PGIOAlignedBlock zero_block;
 
-static void unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from,
+static void list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
+					   uint32 epoch);
+static void unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
+						  BlockNumber from,
 						  BlockNumber to);
 static void share_changes(SMgrRelation src, SMgrRelation dst);
 
@@ -404,6 +412,7 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 		init_header(page);
 	PageGetBmapHeader(page)->nblocks = delta->nblocks;
 	PageGetBmapHeader(page)->epoch = delta->epoch;
+	PageGetBmapHeader(page)->fold_epoch = delta->fold_epoch;
 }
 
 static void
@@ -1180,6 +1189,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	hdelta.flags = 0;
 	hdelta.nblocks = to;
 	hdelta.epoch = epoch;
+	hdelta.fold_epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + n * sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
 	if (mapnew)
@@ -1274,6 +1284,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 		/* a map never shared has no entry born before its epoch */
 		if (PageGetBmapHeader(BufferGetPage(headerbuf))->epoch > 0)
 			unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
+						  PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch,
 						  nblocks, end);
 		extend_piece(reln, headerbuf, nblocks, end,
 					 end == to ? content : NULL, skipFsync);
@@ -1647,7 +1658,8 @@ cmp_slot_entry(const void *a, const void *b)
  * and cleared, to be allocated anew.  The header is locked exclusively.
  */
 static void
-unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from, BlockNumber to)
+unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
+			  BlockNumber from, BlockNumber to)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BlockNumber mapblk = MAP_PAGE(from);
@@ -1674,6 +1686,12 @@ unshare_stale(SMgrRelation reln, uint32 epoch, BlockNumber from, BlockNumber to)
 	{
 		BmapEntry  *e = &entries[MAP_SLOT(blk)];
 
+		/*
+		 * A page as of the relation's fold goes on its changes list, which
+		 * takes the map's reference: the fold's state still has it.
+		 */
+		if (BlockNumberIsValid(e->block) && e->epoch < fold_epoch)
+			list_stale(reln, mapbuf, blk, epoch);
 		if (BlockNumberIsValid(e->block) && e->epoch < epoch)
 		{
 			items[nitems].slot = MAP_SLOT(blk);
@@ -1815,6 +1833,7 @@ apply_changes_head_delta(Page page, const xl_bmap_changes_head_delta *delta)
 	head->lineage = delta->lineage;
 	head->fold_nblocks = delta->fold_nblocks;
 	head->nentries = delta->nentries;
+	head->pruned_epoch = delta->pruned_epoch;
 }
 
 static void
@@ -1836,29 +1855,19 @@ changes_delta_size(const xl_bmap_changes_delta *d)
 }
 
 /*
- * The epoch of the relation's last fold (0: none), read under a share
- * lock.  The caller holds the map's header, which a fold's beginning takes
- * exclusively, so the answer holds while it does.
+ * The epoch of the relation's last fold (0: none), from the map's header,
+ * a buffer each change reads anyway.
  */
 static uint32
 changes_fold_epoch(SMgrRelation reln)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
+	Buffer		buf = map_read(rel, 0);
 	uint32		epoch;
 
-	if (!chg_exists(reln) || mdnblocks(reln, BMAP_CHANGES_FORKNUM) == 0)
-		return 0;
-	buf = chg_read(rel, 0);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (PageIsNew(BufferGetPage(buf)))
-		epoch = 0;
-	else
-	{
-		check_page(BufferGetPage(buf), BMAP_PAGE_CHANGES_HEAD, rel,
-				   BMAP_CHANGES_FORKNUM, 0);
-		epoch = PageGetBmapChangesHead(BufferGetPage(buf))->fold_epoch;
-	}
+	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	epoch = PageGetBmapHeader(BufferGetPage(buf))->fold_epoch;
 	UnlockReleaseBuffer(buf);
 	return epoch;
 }
@@ -1885,6 +1894,29 @@ static void set_length_listed(SMgrRelation reln, RelFileLocator rel,
 							  ChangesAppend *ca);
 
 /*
+ * Page 'pageno' of reln's changes list, where its next entry goes, locked
+ * exclusively: the list's fork is extended to it if it isn't there yet.
+ */
+static Buffer
+changes_next_page(SMgrRelation reln, BlockNumber pageno)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+
+	if (pageno < mdnblocks(reln, BMAP_CHANGES_FORKNUM))
+	{
+		buf = chg_read(rel, pageno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		return buf;
+	}
+	buf = chg_new_page(reln);
+	if (BufferGetBlockNumber(buf) != pageno)
+		elog(ERROR, "changes list of \"%s\" extended to block %u, expected %u",
+			 relpathperm(rel, MAIN_FORKNUM).str, BufferGetBlockNumber(buf), pageno);
+	return buf;
+}
+
+/*
  * Lock the list's header and the page entry number 'n' goes on, which the
  * header says is next: the page is added to the fork if it hasn't been, and
  * made anew if the entry is its first.  'headbuf' and 'pagebuf' may be
@@ -1908,21 +1940,7 @@ changes_append_lock(SMgrRelation reln, ChangesAppend *ca, const BmapChange *c)
 		elog(PANIC, "changes list of \"%s\" grew while its truncation was prepared",
 			 relpathperm(rel, MAIN_FORKNUM).str);
 	if (!BufferIsValid(ca->pagebuf))
-	{
-		if (pageno >= mdnblocks(reln, BMAP_CHANGES_FORKNUM))
-		{
-			ca->pagebuf = chg_new_page(reln);
-			if (BufferGetBlockNumber(ca->pagebuf) != pageno)
-				elog(ERROR, "changes list of \"%s\" extended to block %u, expected %u",
-					 relpathperm(rel, MAIN_FORKNUM).str,
-					 BufferGetBlockNumber(ca->pagebuf), pageno);
-		}
-		else
-		{
-			ca->pagebuf = chg_read(rel, pageno);
-			LockBuffer(ca->pagebuf, BUFFER_LOCK_EXCLUSIVE);
-		}
-	}
+		ca->pagebuf = changes_next_page(reln, pageno);
 	else
 		LockBuffer(ca->pagebuf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -1932,6 +1950,7 @@ changes_append_lock(SMgrRelation reln, ChangesAppend *ca, const BmapChange *c)
 	ca->hdelta.lineage = head->lineage;
 	ca->hdelta.fold_nblocks = head->fold_nblocks;
 	ca->hdelta.nentries = head->nentries + 1;
+	ca->hdelta.pruned_epoch = head->pruned_epoch;
 	ca->pdelta.d.kind = BMAP_DELTA_CHANGES;
 	ca->pdelta.d.flags = CHANGE_SLOT(head->nentries) == 0 ? BMAP_DELTA_INIT : 0;
 	ca->pdelta.d.first = CHANGE_SLOT(head->nentries);
@@ -1963,6 +1982,56 @@ changes_append_finish(ChangesAppend *ca, XLogRecPtr lsn)
 	UnlockReleaseBuffer(ca->pagebuf);
 	UnlockReleaseBuffer(ca->headbuf);
 	ca->headbuf = ca->pagebuf = InvalidBuffer;
+}
+
+/*
+ * Move logical block 'blkno''s entry, in map page 'mapbuf' (locked
+ * exclusively), to reln's changes list: a copy of the page, which the
+ * list holds as it was.  The map's entry is left empty.
+ */
+static void
+list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno, uint32 epoch)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry  *e = &PageGetBmapEntries(BufferGetPage(mapbuf))[MAP_SLOT(blkno)];
+	ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
+	BmapChange	c;
+	xl_bmap_node_delta *ndelta;
+	xl_bmap_entry_delta *ent;
+	xl_bmap_unref xlrec;
+	XLogRecPtr	lsn;
+
+	c.epoch = epoch;
+	c.blkno = blkno;
+	c.old_block = e->block;
+	c.kind = BMAP_CHANGE_COPY;
+	changes_append_lock(reln, &ca, &c);
+
+	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
+	ndelta->kind = BMAP_DELTA_NODE;
+	ndelta->nentries = 1;
+	ent = (xl_bmap_entry_delta *) (ndelta + 1);
+	ent->slot = MAP_SLOT(blkno);
+	ent->block = InvalidBlockNumber;
+	ent->epoch = 0;
+	xlrec.locator = rel;
+	xlrec.flags = BMAP_UNREF_MAP;
+
+	XLogEnsureRecordSpace(3, 0);
+	ndelta->since = GetXLogInsertRecPtr();
+	START_CRIT_SECTION();
+	apply_node_delta(BufferGetPage(mapbuf), ndelta);
+	MarkBufferDirty(mapbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
+	(void) changes_append_register(&ca, 1);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
+	PageSetLSN(BufferGetPage(mapbuf), lsn);
+	END_CRIT_SECTION();
+	changes_append_finish(&ca, lsn);
+	pfree(ndelta);
 }
 
 /*
@@ -2089,6 +2158,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 	{
 		cdelta.flags = BMAP_DELTA_INIT;
 		cdelta.nentries = 0;
+		cdelta.pruned_epoch = 0;
 		if (!pg_strong_random(&cdelta.lineage, sizeof(cdelta.lineage)))
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
@@ -2104,6 +2174,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 		cdelta.flags = 0;
 		cdelta.nentries = head->nentries;
 		cdelta.lineage = head->lineage;
+		cdelta.pruned_epoch = head->pruned_epoch;
 	}
 	cdelta.kind = BMAP_DELTA_CHANGES_HEAD;
 	cdelta.fold_epoch = header->epoch + 1;
@@ -2113,6 +2184,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 	hdelta.flags = 0;
 	hdelta.nblocks = header->nblocks;
 	hdelta.epoch = header->epoch + 1;
+	hdelta.fold_epoch = header->epoch + 1;
 
 	START_CRIT_SECTION();
 	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
@@ -2140,12 +2212,46 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 }
 
 /*
+ * Write 'k' entries into 'buf', a page of a changes list, locked
+ * exclusively, as a page of them alone: one record 'info' with main data
+ * 'xlrec'.  The buffer is unlocked and released.
+ */
+static void
+write_changes_page(Buffer buf, const BmapChange *entries, uint32 k,
+				   uint8 info, const void *xlrec, uint32 xlrec_size)
+{
+	xl_bmap_changes_delta *delta;
+	XLogRecPtr	lsn;
+
+	delta = palloc(sizeof(xl_bmap_changes_delta) + k * sizeof(BmapChange));
+	delta->kind = BMAP_DELTA_CHANGES;
+	delta->flags = BMAP_DELTA_INIT;
+	delta->first = 0;
+	delta->n = k;
+	memcpy(delta + 1, entries, k * sizeof(BmapChange));
+
+	START_CRIT_SECTION();
+	apply_changes_delta(BufferGetPage(buf), delta);
+	MarkBufferDirty(buf);
+	XLogBeginInsert();
+	XLogRegisterData(xlrec, xlrec_size);
+	XLogRegisterBuffer(0, buf, REGBUF_STANDARD | REGBUF_WILL_INIT);
+	XLogRegisterBufData(0, delta, changes_delta_size(delta));
+	lsn = XLogInsert(RM_BMAP_ID, info);
+	PageSetLSN(BufferGetPage(buf), lsn);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	pfree(delta);
+}
+
+/*
  * Visit what changed in the relation's pages since the fold 'since' began:
  * each page copied (its logical block, and the block holding it as it was
  * before), and each truncation (the length it cut to), in the order made.
  * A page may be listed more than once.  False if the relation's list isn't
- * of since's lineage (the relation was rewritten, or never folded): then
- * nothing is known.
+ * of since's lineage (the relation was rewritten, or never folded), or if
+ * changes made since it were let go of (bmap_fold_prune()): then nothing
+ * is known.
  */
 bool
 bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
@@ -2156,7 +2262,7 @@ bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
 	BmapChange *all = changes_read(reln, InvalidBuffer, &head, &n);
 
 	if (all == NULL || head.lineage != since->lineage ||
-		head.fold_epoch < since->epoch)
+		head.fold_epoch < since->epoch || head.pruned_epoch > since->epoch)
 	{
 		if (all)
 			pfree(all);
@@ -2189,6 +2295,7 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 	BmapChange *dropped;
 	uint32		nkept = 0;
 	uint32		ndropped = 0;
+	Buffer		headerbuf;
 	Buffer		headbuf;
 	BlockNumber *blocks;
 	BlockNumber *keptblocks;
@@ -2197,16 +2304,29 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 	uint32		nk;
 	uint32		u = 0;
 
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot prune a relation's changes during recovery")));
 	if (!chg_exists(reln) || mdnblocks(reln, BMAP_CHANGES_FORKNUM) == 0)
 		return;
 
-	/* the header, held while the list is rewritten: no entry is added */
+	/*
+	 * The map's header, held until the blocks are let go of: no copy of the
+	 * relation is made meanwhile (one counts each listed block once more,
+	 * as bmapshare() holds the header), and no fold begins or truncation is
+	 * listed.  Then the list's: no entry is added.
+	 */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	headbuf = chg_read(rel, 0);
 	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
 	all = changes_read(reln, headbuf, &head, &n);
 	if (all == NULL || head.lineage != keep->lineage)
 	{
 		UnlockReleaseBuffer(headbuf);
+		UnlockReleaseBuffer(headerbuf);
 		if (all)
 			pfree(all);
 		return;
@@ -2225,6 +2345,7 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 	if (ndropped == 0 && nkept == n)
 	{
 		UnlockReleaseBuffer(headbuf);
+		UnlockReleaseBuffer(headerbuf);
 		pfree(all);
 		pfree(kept);
 		pfree(dropped);
@@ -2233,33 +2354,13 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 
 	for (uint32 i = 0; i < nkept; i += BMAP_CHANGES_PER_PAGE)
 	{
-		uint32		k = Min(BMAP_CHANGES_PER_PAGE, nkept - i);
-		Buffer		buf = chg_read(rel, CHANGE_PAGE(i));
-		xl_bmap_changes_delta *delta;
 		xl_bmap_rel xlrec;
-		XLogRecPtr	lsn;
+		Buffer		buf = chg_read(rel, CHANGE_PAGE(i));
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		delta = palloc(sizeof(xl_bmap_changes_delta) + k * sizeof(BmapChange));
-		delta->kind = BMAP_DELTA_CHANGES;
-		delta->flags = BMAP_DELTA_INIT;
-		delta->first = 0;
-		delta->n = k;
-		memcpy(delta + 1, kept + i, k * sizeof(BmapChange));
 		xlrec.locator = rel;
-
-		START_CRIT_SECTION();
-		apply_changes_delta(BufferGetPage(buf), delta);
-		MarkBufferDirty(buf);
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
-		XLogRegisterBuffer(0, buf, REGBUF_STANDARD | REGBUF_WILL_INIT);
-		XLogRegisterBufData(0, delta, changes_delta_size(delta));
-		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_CHANGES);
-		PageSetLSN(BufferGetPage(buf), lsn);
-		END_CRIT_SECTION();
-		UnlockReleaseBuffer(buf);
-		pfree(delta);
+		write_changes_page(buf, kept + i, Min(BMAP_CHANGES_PER_PAGE, nkept - i),
+						   XLOG_BMAP_CHANGES, &xlrec, sizeof(xlrec));
 	}
 
 	{
@@ -2273,6 +2374,8 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 		hdelta.lineage = head.lineage;
 		hdelta.fold_nblocks = head.fold_nblocks;
 		hdelta.nentries = nkept;
+		/* (what changed since an earlier fold isn't all here now) */
+		hdelta.pruned_epoch = Max(head.pruned_epoch, keep->epoch);
 		xlrec.locator = rel;
 
 		START_CRIT_SECTION();
@@ -2300,6 +2403,7 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 			blocks[u++] = blocks[i];
 	nblocks = unref_blocks(rel, blocks, u, tofree);
 	free_blocks(rel, tofree, nblocks);
+	UnlockReleaseBuffer(headerbuf);
 
 	pfree(blocks);
 	pfree(keptblocks);
@@ -2335,6 +2439,11 @@ bmap_read_old(SMgrRelation reln, BlockNumber blkno, BlockNumber old_block,
  * Copy src's changes list into dst, a copy of src being made: dst holds
  * each listed block too, so each block's count grows by one.  src's map
  * header is held exclusively, so its list gets no entry meanwhile.
+ *
+ * dst's list is made empty first; its entries' pages follow, and then its
+ * entries are taken in, a run at a time, each run's blocks counted in the
+ * same record.  A crash partway leaves dst holding just the blocks it
+ * counted, which dropping it gives back.
  */
 static void
 share_changes(SMgrRelation src, SMgrRelation dst)
@@ -2345,6 +2454,8 @@ share_changes(SMgrRelation src, SMgrRelation dst)
 	uint32		n;
 	BmapChange *all = changes_read(src, InvalidBuffer, &head, &n);
 	BlockNumber *blocks;
+	bool	   *counted;
+	BlockNumber *run;
 	uint32		nblocks;
 	uint32		i;
 	xl_bmap_share xlrec;
@@ -2358,75 +2469,18 @@ share_changes(SMgrRelation src, SMgrRelation dst)
 	xlrec.dst = drel;
 	mdcreate(dst, BMAP_CHANGES_FORKNUM, false);
 
-	/* the header's page first, made last; then the entries' pages */
+	/* the header, of no entries yet */
 	headbuf = chg_new_page(dst);
 	if (BufferGetBlockNumber(headbuf) != 0)
 		elog(ERROR, "changes list of \"%s\" begins at block %u",
 			 relpathperm(drel, MAIN_FORKNUM).str, BufferGetBlockNumber(headbuf));
-	for (i = 0; i < n; i += BMAP_CHANGES_PER_PAGE)
-	{
-		uint32		k = Min(BMAP_CHANGES_PER_PAGE, n - i);
-		Buffer		buf = chg_new_page(dst);
-		xl_bmap_changes_delta *delta;
-
-		if (BufferGetBlockNumber(buf) != CHANGE_PAGE(i))
-			elog(ERROR, "changes list of \"%s\" extended to block %u, expected %u",
-				 relpathperm(drel, MAIN_FORKNUM).str,
-				 BufferGetBlockNumber(buf), CHANGE_PAGE(i));
-		delta = palloc(sizeof(xl_bmap_changes_delta) + k * sizeof(BmapChange));
-		delta->kind = BMAP_DELTA_CHANGES;
-		delta->flags = BMAP_DELTA_INIT;
-		delta->first = 0;
-		delta->n = k;
-		memcpy(delta + 1, all + i, k * sizeof(BmapChange));
-
-		START_CRIT_SECTION();
-		apply_changes_delta(BufferGetPage(buf), delta);
-		MarkBufferDirty(buf);
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, sizeof(xlrec));
-		XLogRegisterBuffer(0, buf, REGBUF_STANDARD | REGBUF_WILL_INIT);
-		XLogRegisterBufData(0, delta, changes_delta_size(delta));
-		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_SHARE_CHANGES);
-		PageSetLSN(BufferGetPage(buf), lsn);
-		END_CRIT_SECTION();
-		UnlockReleaseBuffer(buf);
-		pfree(delta);
-	}
-
-	/* each block the list holds gains a holder */
-	blocks = palloc_array(BlockNumber, Max(n, 1));
-	nblocks = changes_blocks(all, n, blocks);
-	for (i = 0; i < nblocks; i++)
-		if (REF_PAGE(blocks[i]) >= refs_nblocks(srel))
-			elog(ERROR, "block %u of the page store of database %u has no reference count",
-				 blocks[i], srel.dbOid);
-	i = 0;
-	while (i < nblocks)
-	{
-		RefsPages	rp;
-		uint32		covered = refs_lock(srel, blocks + i, nblocks - i, &rp);
-
-		for (uint32 k = i; k < i + covered; k++)
-		{
-			uint8		c = refs_get(&rp, blocks[k]);
-
-			if (c != BMAP_REFS_STUCK)
-				refs_set(&rp, blocks[k], c + 1);
-		}
-		log_refs_record(XLOG_BMAP_SHARE_CHANGES, &xlrec, sizeof(xlrec),
-						InvalidBuffer, NULL, 0, &rp);
-		refs_release(&rp);
-		i += covered;
-	}
-
 	hdelta.kind = BMAP_DELTA_CHANGES_HEAD;
 	hdelta.flags = BMAP_DELTA_INIT;
 	hdelta.fold_epoch = head.fold_epoch;
 	hdelta.lineage = head.lineage;
 	hdelta.fold_nblocks = head.fold_nblocks;
-	hdelta.nentries = n;
-
+	hdelta.nentries = 0;
+	hdelta.pruned_epoch = head.pruned_epoch;
 	START_CRIT_SECTION();
 	apply_changes_head_delta(BufferGetPage(headbuf), &hdelta);
 	MarkBufferDirty(headbuf);
@@ -2437,8 +2491,102 @@ share_changes(SMgrRelation src, SMgrRelation dst)
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_SHARE_CHANGES);
 	PageSetLSN(BufferGetPage(headbuf), lsn);
 	END_CRIT_SECTION();
+
+	/* the entries' pages, which the header doesn't reach yet */
+	for (i = 0; i < n; i += BMAP_CHANGES_PER_PAGE)
+		write_changes_page(changes_next_page(dst, CHANGE_PAGE(i)), all + i,
+						   Min(BMAP_CHANGES_PER_PAGE, n - i),
+						   XLOG_BMAP_SHARE_CHANGES, &xlrec, sizeof(xlrec));
+
+	/* the blocks the list holds, each counted once */
+	blocks = palloc_array(BlockNumber, Max(n, 1));
+	counted = palloc0_array(bool, Max(n, 1));
+	run = palloc_array(BlockNumber, Max(n, 1));
+	nblocks = changes_blocks(all, n, blocks);
+	for (i = 0; i < nblocks; i++)
+		if (REF_PAGE(blocks[i]) >= refs_nblocks(srel))
+			elog(ERROR, "block %u of the page store of database %u has no reference count",
+				 blocks[i], srel.dbOid);
+
+	/*
+	 * Runs of entries whose blocks not counted yet lie on few enough count
+	 * pages for one record; the header takes each run in as its blocks are
+	 * counted.
+	 */
+	i = 0;
+	while (i < n)
+	{
+		BlockNumber pages[BMAP_REFS_PER_RECORD];
+		int			npages = 0;
+		uint32		nrun = 0;
+		uint32		end = i;
+		RefsPages	rp;
+
+		for (; end < n; end++)
+		{
+			BlockNumber *at;
+			bool		known = false;
+
+			if (all[end].kind != BMAP_CHANGE_COPY ||
+				!BlockNumberIsValid(all[end].old_block))
+				continue;
+			at = bsearch(&all[end].old_block, blocks, nblocks,
+						 sizeof(BlockNumber), cmp_block);
+			Assert(at != NULL);
+			if (counted[at - blocks])
+				continue;
+			for (int p = 0; p < npages; p++)
+				known |= pages[p] == REF_PAGE(*at);
+			if (!known)
+			{
+				if (npages == BMAP_REFS_PER_RECORD)
+					break;
+				pages[npages++] = REF_PAGE(*at);
+			}
+			counted[at - blocks] = true;
+			run[nrun++] = *at;
+		}
+
+		rp.n = 0;
+		if (nrun > 0)
+		{
+			qsort(run, nrun, sizeof(BlockNumber), cmp_block);
+			if (refs_lock(srel, run, nrun, &rp) != nrun)
+				elog(ERROR, "blocks of a changes list of \"%s\" span too many count pages",
+					 relpathperm(drel, MAIN_FORKNUM).str);
+			for (uint32 k = 0; k < nrun; k++)
+			{
+				uint8		c = refs_get(&rp, run[k]);
+
+				if (c != BMAP_REFS_STUCK)
+					refs_set(&rp, run[k], c + 1);
+			}
+		}
+
+		hdelta.flags = 0;
+		hdelta.nentries = end;
+		XLogEnsureRecordSpace(1 + BMAP_REFS_PER_RECORD, 2 + BMAP_REFS_PER_RECORD);
+		START_CRIT_SECTION();
+		apply_changes_head_delta(BufferGetPage(headbuf), &hdelta);
+		MarkBufferDirty(headbuf);
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, headbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(0, &hdelta, sizeof(hdelta));
+		refs_apply_register(&rp, 1);
+		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_SHARE_CHANGES);
+		PageSetLSN(BufferGetPage(headbuf), lsn);
+		refs_set_lsn(&rp, lsn);
+		END_CRIT_SECTION();
+		refs_release(&rp);
+		i = end;
+		INJECTION_POINT("bmap-share-changes-counted", NULL);
+	}
+
 	UnlockReleaseBuffer(headbuf);
 	pfree(blocks);
+	pfree(counted);
+	pfree(run);
 	pfree(all);
 }
 
@@ -2608,6 +2756,9 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	sdelta.flags = ddelta.flags = 0;
 	sdelta.nblocks = ddelta.nblocks = nblocks;
 	sdelta.epoch = ddelta.epoch = epoch + 1;
+	/* (the copy has src's list, as of src's fold) */
+	sdelta.fold_epoch = ddelta.fold_epoch =
+		PageGetBmapHeader(BufferGetPage(sheader))->fold_epoch;
 	xlrec.src = srel;
 	xlrec.dst = drel;
 
@@ -2761,7 +2912,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		return;
 	}
 	old_block = entry.block;
-	as_of_fold = entry.epoch < changes_fold_epoch(reln);
+	as_of_fold = entry.epoch <
+		PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
 	listed = as_of_fold && !neutral;
 
 	if (REF_PAGE(old_block) < refs_nblocks(rel))
@@ -2880,7 +3032,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xlrec.old_hw = alloc.old_hw;
 		xlrec.new_hw = alloc.new_hw;
 		xlrec.flags = (zeroed ? BMAP_REMAP_ZERO : 0) |
-			(listed ? BMAP_REMAP_LISTED : 0);
+			(listed ? BMAP_REMAP_LISTED : 0) |
+			(listed && count == 0 ? BMAP_REMAP_OWN : 0);
 
 		XLogEnsureRecordSpace(5 + BMAP_ALLOC_MAX_PAGES, 0);
 		ndelta->since = GetXLogInsertRecPtr();
@@ -2933,7 +3086,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	pfree(ndelta);
 }
 
-/* Set a relation's length; the header is pinned and not locked. */
+/* Set a relation's length; the header is locked exclusively. */
 static void
 set_length(RelFileLocator rel, Buffer headerbuf, BlockNumber nblocks)
 {
@@ -2954,9 +3107,8 @@ set_length_listed(SMgrRelation reln, RelFileLocator rel, Buffer headerbuf,
 	delta.kind = BMAP_DELTA_HEADER;
 	delta.flags = 0;
 	delta.nblocks = nblocks;
-
-	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	delta.epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+	delta.fold_epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
 	if (ca)
 	{
 		BmapChange	c;
@@ -2987,7 +3139,6 @@ set_length_listed(SMgrRelation reln, RelFileLocator rel, Buffer headerbuf,
 		LockBuffer(ca->pagebuf, BUFFER_LOCK_UNLOCK);
 		LockBuffer(ca->headbuf, BUFFER_LOCK_UNLOCK);
 	}
-	LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 }
 
 /*
@@ -3275,6 +3426,7 @@ bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	delta.flags = BMAP_DELTA_INIT;
 	delta.nblocks = 0;
 	delta.epoch = 0;
+	delta.fold_epoch = 0;
 
 	START_CRIT_SECTION();
 	apply_header_delta(page, &delta);
@@ -3624,53 +3776,69 @@ bmapnblocks(SMgrRelation reln, ForkNumber forknum)
 
 /*
  * Truncation happens inside a critical section, where reading a buffer
- * isn't safe, so the header is pinned beforehand.
+ * isn't safe, so the header is read beforehand, and held exclusively until
+ * the truncation: no fold begins, and the changes list isn't pruned,
+ * meanwhile.
  */
 void
 bmappretruncate(SMgrRelation reln, ForkNumber forknum)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		chg[2] = {InvalidBuffer, InvalidBuffer};
+	bool		flushed = false;
 
 	if (forknum != MAIN_FORKNUM || InRecovery)
 		return;
-	if (BufferIsValid(reln->bmap_pretrunc))
-		ReleaseBuffer(reln->bmap_pretrunc);
-	reln->bmap_pretrunc = map_read(rel, 0);
+
+	/* (pins a failed truncation left are gone with its resource owner) */
+	reln->bmap_pretrunc = InvalidBuffer;
+	reln->bmap_pretrunc_chg[0] = reln->bmap_pretrunc_chg[1] = InvalidBuffer;
+
+	/*
+	 * A folded relation's pages past the new length stay as of the fold
+	 * until it is extended again (which lists them), but truncating drops
+	 * their buffers, written or not: the pages are written first.  (Writes
+	 * read the header, so before it is held.)
+	 */
+	for (;;)
+	{
+		if (!flushed && changes_fold_epoch(reln) > 0)
+		{
+			FlushRelationsAllBuffers(&reln, 1);
+			flushed = true;
+		}
+		headerbuf = map_read(rel, 0);
+		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+		/* (a fold that began meanwhile) */
+		if (flushed || PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch == 0)
+			break;
+		UnlockReleaseBuffer(headerbuf);
+	}
 
 	/*
 	 * A relation folded lists its truncations: its changes list's header and
-	 * the page its next entry goes on, which stays next (the caller keeps
-	 * the relation from changing meanwhile).
+	 * the page its next entry goes on, which stays next while the header is
+	 * held.
 	 */
-	for (int i = 0; i < 2; i++)
+	if (PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch > 0)
 	{
-		if (BufferIsValid(reln->bmap_pretrunc_chg[i]))
-			ReleaseBuffer(reln->bmap_pretrunc_chg[i]);
-		reln->bmap_pretrunc_chg[i] = InvalidBuffer;
-	}
-	if (changes_fold_epoch(reln) > 0)
-	{
-		Buffer		head = chg_read(rel, 0);
 		BlockNumber pageno;
 
-		LockBuffer(head, BUFFER_LOCK_SHARE);
-		pageno = CHANGE_PAGE(PageGetBmapChangesHead(BufferGetPage(head))->nentries);
-		LockBuffer(head, BUFFER_LOCK_UNLOCK);
-		reln->bmap_pretrunc_chg[0] = head;
-		if (pageno >= mdnblocks(reln, BMAP_CHANGES_FORKNUM))
-		{
-			Buffer		page = chg_new_page(reln);
-
-			if (BufferGetBlockNumber(page) != pageno)
-				elog(ERROR, "changes list of \"%s\" extended to block %u, expected %u",
-					 relpathperm(rel, MAIN_FORKNUM).str,
-					 BufferGetBlockNumber(page), pageno);
-			LockBuffer(page, BUFFER_LOCK_UNLOCK);
-			reln->bmap_pretrunc_chg[1] = page;
-		}
-		else
-			reln->bmap_pretrunc_chg[1] = chg_read(rel, pageno);
+		chg[0] = chg_read(rel, 0);
+		LockBuffer(chg[0], BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(chg[0]), BMAP_PAGE_CHANGES_HEAD, rel,
+				   BMAP_CHANGES_FORKNUM, 0);
+		pageno = CHANGE_PAGE(PageGetBmapChangesHead(BufferGetPage(chg[0]))->nentries);
+		LockBuffer(chg[0], BUFFER_LOCK_UNLOCK);
+		chg[1] = changes_next_page(reln, pageno);
+		LockBuffer(chg[1], BUFFER_LOCK_UNLOCK);
 	}
+	reln->bmap_pretrunc = headerbuf;
+	reln->bmap_pretrunc_chg[0] = chg[0];
+	reln->bmap_pretrunc_chg[1] = chg[1];
+	INJECTION_POINT("bmap-pretruncated", NULL);
 }
 
 void
@@ -3713,7 +3881,7 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 		else
 			set_length(reln->smgr_rlocator.locator, headerbuf, nblocks);
 	}
-	ReleaseBuffer(headerbuf);
+	UnlockReleaseBuffer(headerbuf);
 	for (int i = 0; i < 2; i++)
 	{
 		if (BufferIsValid(reln->bmap_pretrunc_chg[i]))
@@ -3981,11 +4149,19 @@ bmap_redo(XLogReaderState *record)
 					redo_block(record, last);
 
 				/*
-				 * A listed block keeps the page as it was before the change:
-				 * the image, or zeroes.  What the primary wrote there before
-				 * the change may not have reached it before a crash.
+				 * A listed block no other map holds keeps the page as it was
+				 * before the change: the image, or zeroes.  What the primary
+				 * wrote there before the change may not have reached it
+				 * before a crash.  One another map holds keeps what it has,
+				 * as on the primary: the image may have hints only this
+				 * map's buffer had.
+				 *
+				 * Nothing written since can be lost here: a block let go of
+				 * later is taken again only by a relation whose writes are
+				 * logged (alloc_take()), and those records follow this one.
 				 */
-				if (xlrec->flags & BMAP_REMAP_LISTED)
+				if ((xlrec->flags & (BMAP_REMAP_LISTED | BMAP_REMAP_OWN)) ==
+					(BMAP_REMAP_LISTED | BMAP_REMAP_OWN))
 				{
 					PGIOAlignedBlock old;
 
