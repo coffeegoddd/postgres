@@ -650,6 +650,22 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	appendStringInfoString(out, "rules\n");
 	append_sorted_defs(out, RewriteRelationId, Anum_pg_rewrite_ev_class,
 					   RewriteRelRulenameIndexId, RelationGetRelid(rel));
+
+	/*
+	 * How a table without a primary key keys its rows, which its data tree
+	 * depends on: a table described otherwise (keyed by its rows' hash
+	 * alone) has its rows read and keyed again, as across any change of
+	 * definition.
+	 */
+	if (cn->folded)
+	{
+		const ProllyKeyingRoutine *kr = prolly_history_keying();
+		ProllyKeying *k = PROLLY_CALL(kr, open_rewritten, rel, CurrentMemoryContext);
+
+		if (PROLLY_CALL(kr, keyless, k))
+			appendStringInfoString(out, "keys\ncontent prefix and hash\n");
+		PROLLY_CALL(kr, close, k);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -1752,6 +1768,7 @@ typedef struct TableDef
 	List	   *indexes;		/* statements */
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
+	List	   *keys;			/* how rows are keyed (none: as always) */
 } TableDef;
 
 typedef struct SchemaMove
@@ -1844,6 +1861,8 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
+		else if (strcmp(line, "keys") == 0)
+			section = &td->keys;
 		else if (section && *section != NIL && strchr(line, '\t') == NULL &&
 				 (section == &td->columns || section == &td->constraints))
 		{

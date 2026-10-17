@@ -42,6 +42,9 @@ CREATE TABLE frozen.composite (id int PRIMARY KEY, p frozen.pair, a int[], ta te
 INSERT INTO frozen.composite
 SELECT g, ROW(g, 'p' || g)::frozen.pair, ARRAY[g, g + 1, NULL], ARRAY['a', NULL, 'c' || g]
 FROM generate_series(1, 300) g;
+-- A table without a primary key: its rows keyed by their first 32 encoded
+-- bytes, then their content's hash ("keys: content prefix and hash" in its
+-- definition, which a table keyed by the hash alone, as before, lacks).
 CREATE TABLE frozen.keyless (a int, b text);
 INSERT INTO frozen.keyless SELECT g % 10, 'same' FROM generate_series(1, 500) g;
 -- Keys sent in binary (numeric, float, timestamps, uuid, bytea, date) and
@@ -80,7 +83,7 @@ WHERE name LIKE 'frozen.%' ORDER BY name;
 ------------------+------------------------------------------------------------------+------------
  frozen.bool_keys | d04d885b23f1fc97cb3a0b562d78b9e06e3dc27d40f6912859590c77017d37c8 | 
  frozen.composite | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
- frozen.keyless   | a24bcaadca0d3cdf6ec27aa9221e101a0d8dad786431c35a41820e4a17b322f8 | 
+ frozen.keyless   | dc00499293d665179fc07a44d9e5abf2c2ff53c915725ec155d96b3958caddaf | 
  frozen.non_ascii | efa7d18e1a1a60c9fdce43ac8557fe6cd9226777440ee27d9c6a635259e1decd | 
  frozen.scalars   | d528770538ba46b234fd863614f1ff5936ca642802030d74bc138b6c8f59e4ab | 
  frozen.sent_keys | 8bb2334d74f996b153d6c002289e2504480ced23f8d7efd0589ff1e0a53a0c7c | 

@@ -1,0 +1,46 @@
+-- A table without a primary key keys a row by its first bytes, then its
+-- content's hash: rows that begin alike (on their first columns) stay
+-- together in the tree, so a change to a run of them writes a few chunks,
+-- not one each, as a keyed table's does.  Its definition says so ("keys"),
+-- so a version keyed otherwise reads as a change of definition.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE SCHEMA kk VERSIONED;
+CREATE TABLE kk.n (a int, b text);
+CREATE TABLE kk.k (a int PRIMARY KEY, b text);
+INSERT INTO kk.n SELECT g, 'v' || g FROM generate_series(1, 50000) g;
+INSERT INTO kk.k SELECT g, 'v' || g FROM generate_series(1, 50000) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+
+-- journal(): the chunk journal's size, to see what a commit wrote.
+CREATE FUNCTION pg_temp.journal() RETURNS int8 AS $$
+	SELECT size FROM pg_stat_file(format('base/%s/prolly_journal',
+		(SELECT oid FROM pg_database WHERE datname = current_database())))
+$$ LANGUAGE sql;
+
+-- a run of 1,000 rows changed: a few chunks, keyless as keyed
+SELECT pg_temp.journal() AS j0 \gset
+UPDATE kk.n SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
+SELECT length(dolt_commit('-am', 'keyless run')::text) AS committed;
+SELECT pg_temp.journal() AS j1 \gset
+UPDATE kk.k SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
+SELECT length(dolt_commit('-am', 'keyed run')::text) AS committed;
+SELECT pg_temp.journal() AS j2 \gset
+SELECT :j1 - :j0 < 4 * (:j2 - :j1) AS keyless_writes_like_keyed,
+	:j1 - :j0 < 512 * 1024 AS a_few_chunks;
+
+-- the rows read back as written, copies counted
+INSERT INTO kk.n SELECT a, b FROM kk.n WHERE a <= 3;
+SELECT a, b, count(*) FROM kk.n WHERE a <= 4 OR a BETWEEN 20000 AND 20001
+ GROUP BY a, b ORDER BY a;
+SELECT test_fold_root() = test_fold_root(true) AS folds_agree;
+
+-- the definition says how the rows are keyed: keyless only
+SELECT key, position('content prefix and hash' IN value) > 0 AS keyed_by_prefix
+  FROM test_fold_items() WHERE key LIKE 't:kk.%' ORDER BY key;
+
+DROP SCHEMA kk CASCADE;
+SELECT length(dolt_commit('-Am', 'kk gone')::text) AS committed;
