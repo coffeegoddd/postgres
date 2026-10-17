@@ -94,7 +94,12 @@ typedef struct ProllyMergeRoutine
 	void		(*resolve) (Oid relid, bool theirs);
 	void		(*tables) (const char *from_ref, const char *to_ref,
 						   ProllyTableChangeVisit visit, void *arg);
-	void		(*move_to) (const ProllyNodeRef *root);
+	/*
+	 * Move the session's branch to a canonical root: its rows (and
+	 * definitions) written.  working is its working set folded already, or
+	 * NULL to fold it here.
+	 */
+	void		(*move_to) (const ProllyNodeRef *root, const ProllyNodeRef *working);
 	int			(*cherry_pick) (const char *const *refs, int nrefs, bool revert,
 								bool allow_empty, ProllyHash *commit_id);
 	List	   *(*verify) (List *relids);

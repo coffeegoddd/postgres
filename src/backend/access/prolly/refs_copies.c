@@ -545,14 +545,28 @@ branch_exists(const char *name)
 	return OidIsValid(branch_oid(name)) || branch_head(name, &head);
 }
 
-/* Move the session's branch to a commit's root: its rows written. */
-static void
-move_to(void *arg)
-{
-	ProllyDatabaseComponents dc;
+static void fold(ProllyNodeRef *root);
+static void fold_as_baseline(void *arg);
 
+/*
+ * Move the session's branch to a commit's root, every move (a reset, a
+ * fast-forward, a branch's first use): its rows written, unless its
+ * working set is the root already; then folded from there, so no fold
+ * after reads the pages the move wrote again and again.
+ */
+static void
+move_settled(void *arg)
+{
+	const ProllyNodeRef *target = arg;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef working;
+
+	fold(&working);
+	if (same_hash(&working.hash, &target->hash))
+		return;
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.diff_merge, move_to, (const ProllyNodeRef *) arg);
+	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
+	fold_as_baseline(NULL);
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
@@ -579,7 +593,6 @@ materialize(const char *name)
 	ProllyHash	head;
 	ProllyCommitInfo info;
 	ProllyNodeRef baseline;
-	ProllyNodeRef working;
 	bool		was_read_only = XactReadOnly;
 
 	if (RecoveryInProgress())
@@ -610,17 +623,8 @@ materialize(const char *name)
 							branch_baseline(branch_ops()->current(), &baseline) ?
 							&baseline : NULL, NULL);
 
-		/*
-		 * Moved to the head, unless the copies are there already (the
-		 * session's branch has nothing else); then folded from the head, so
-		 * its folds don't read the pages the move wrote again and again.
-		 */
-		if (!(copies_working_set(name, &working) &&
-			  same_hash(&working.hash, &info.root.hash)))
-		{
-			branch_ops()->run_on(name, move_to, &info.root);
-			branch_ops()->run_on(name, fold_as_baseline, NULL);
-		}
+		/* (moved to the head, unless the copies are there already) */
+		branch_ops()->run_on(name, move_settled, &info.root);
 done:
 		;
 	}
@@ -1342,14 +1346,7 @@ copies_reset(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
-	move_to(&info.root);
-
-	/*
-	 * Then folded from the head, as a branch's first use is: else the pages
-	 * the move wrote stay changed since the baseline, and each fold after
-	 * (a checkout's, to see whether the branch is clean) reads them again.
-	 */
-	fold_as_baseline(NULL);
+	move_settled(&info.root);
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);

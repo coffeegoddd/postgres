@@ -22,25 +22,31 @@ SELECT dolt_branch('other');
  {0}
 (1 row)
 
--- checkouts(): to the other branch and back, and what their folds read.
-CREATE FUNCTION pg_temp.checkouts(OUT pages int8, OUT candidates int8, OUT full_tables int8) AS $$
+-- checkouts(): to the other branch and back, and what their folds read;
+-- and that the branch is as it should be: clean (nothing in dolt_status)
+-- unless changes were left, and folded from its baseline as a full fold
+-- has it.
+CREATE FUNCTION pg_temp.checkouts(OUT pages int8, OUT candidates int8,
+	OUT full_tables int8, OUT changed int8, OUT folds_agree bool) AS $$
 BEGIN
 	PERFORM test_fold_counters(true);
 	PERFORM dolt_checkout('other');
 	PERFORM dolt_checkout('main');
 	SELECT c.pages, c.candidates, c.full_tables INTO pages, candidates, full_tables
 	  FROM test_fold_counters(true) c;
+	SELECT count(*) INTO changed FROM dolt_status;
+	folds_agree := test_fold_root() = test_fold_root(true);
 END $$ LANGUAGE plpgsql;
 SELECT 'plain' AS after, * FROM pg_temp.checkouts();
- after | pages | candidates | full_tables 
--------+-------+------------+-------------
- plain |     0 |          0 |           0
+ after | pages | candidates | full_tables | changed | folds_agree 
+-------+-------+------------+-------------+---------+-------------
+ plain |     0 |          0 |           0 |       0 | t
 (1 row)
 
 SELECT 'again' AS after, * FROM pg_temp.checkouts();
- after | pages | candidates | full_tables 
--------+-------+------------+-------------
- again |     0 |          0 |           0
+ after | pages | candidates | full_tables | changed | folds_agree 
+-------+-------+------------+-------------+---------+-------------
+ again |     0 |          0 |           0 |       0 | t
 (1 row)
 
 -- a fast-forward
@@ -77,15 +83,15 @@ SELECT (dolt_merge('f'))[2] AS ff;
 (1 row)
 
 SELECT 'ff' AS after, * FROM pg_temp.checkouts();
- after | pages | candidates | full_tables 
--------+-------+------------+-------------
- ff    |     0 |          0 |           0
+ after | pages | candidates | full_tables | changed | folds_agree 
+-------+-------+------------+-------------+---------+-------------
+ ff    |     0 |          0 |           0 |       0 | t
 (1 row)
 
 SELECT 'ff again' AS after, * FROM pg_temp.checkouts();
-  after   | pages | candidates | full_tables 
-----------+-------+------------+-------------
- ff again |     0 |          0 |           0
+  after   | pages | candidates | full_tables | changed | folds_agree 
+----------+-------+------------+-------------+---------+-------------
+ ff again |     0 |          0 |           0 |       0 | t
 (1 row)
 
 -- a hard reset of changes
@@ -97,15 +103,15 @@ SELECT dolt_reset('--hard');
 (1 row)
 
 SELECT 'reset' AS after, * FROM pg_temp.checkouts();
- after | pages | candidates | full_tables 
--------+-------+------------+-------------
- reset |     0 |          0 |           0
+ after | pages | candidates | full_tables | changed | folds_agree 
+-------+-------+------------+-------------+---------+-------------
+ reset |     0 |          0 |           0 |       0 | t
 (1 row)
 
 SELECT 'reset again' AS after, * FROM pg_temp.checkouts();
-    after    | pages | candidates | full_tables 
--------------+-------+------------+-------------
- reset again |     0 |          0 |           0
+    after    | pages | candidates | full_tables | changed | folds_agree 
+-------------+-------+------------+-------------+---------+-------------
+ reset again |     0 |          0 |           0 |       0 | t
 (1 row)
 
 -- a cherry-pick
@@ -136,15 +142,160 @@ SELECT length(dolt_cherry_pick('f')::text) > 0 AS picked;
 (1 row)
 
 SELECT 'pick' AS after, * FROM pg_temp.checkouts();
- after | pages | candidates | full_tables 
--------+-------+------------+-------------
- pick  |     0 |          0 |           0
+ after | pages | candidates | full_tables | changed | folds_agree 
+-------+-------+------------+-------------+---------+-------------
+ pick  |     0 |          0 |           0 |       0 | t
 (1 row)
 
 SELECT 'pick again' AS after, * FROM pg_temp.checkouts();
-   after    | pages | candidates | full_tables 
-------------+-------+------------+-------------
- pick again |     0 |          0 |           0
+   after    | pages | candidates | full_tables | changed | folds_agree 
+------------+-------+------------+-------------+---------+-------------
+ pick again |     0 |          0 |           0 |       0 | t
+(1 row)
+
+-- a reset to an older commit, its definitions other (a column dropped)
+ALTER TABLE co.k ADD COLUMN w int;
+SELECT length(dolt_commit('-am', 'w')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE co.k SET v = 'before the reset' WHERE id <= 500;
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT 'reset back' AS after, * FROM pg_temp.checkouts();
+   after    | pages | candidates | full_tables | changed | folds_agree 
+------------+-------+------------+-------------+---------+-------------
+ reset back |     0 |          0 |           0 |       0 | t
+(1 row)
+
+SELECT 'reset back again' AS after, * FROM pg_temp.checkouts();
+      after       | pages | candidates | full_tables | changed | folds_agree 
+------------------+-------+------------+-------------+---------+-------------
+ reset back again |     0 |          0 |           0 |       0 | t
+(1 row)
+
+SELECT count(*) AS columns FROM information_schema.columns
+ WHERE table_schema = 'co' AND table_name = 'k';
+ columns 
+---------
+       2
+(1 row)
+
+-- a merge aborted (a reset to the head, over the merge's rows)
+SELECT dolt_checkout('f') IS NOT NULL AS on_f;
+ on_f 
+------
+ t
+(1 row)
+
+UPDATE co.k SET v = 'theirs' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE co.k SET v = 'ours' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('f'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT (dolt_merge('--abort'))[2:4];
+      dolt_merge       
+-----------------------
+ {0,0,"merge aborted"}
+(1 row)
+
+COMMIT;
+SELECT 'merge aborted' AS after, * FROM pg_temp.checkouts();
+     after     | pages | candidates | full_tables | changed | folds_agree 
+---------------+-------+------------+-------------+---------+-------------
+ merge aborted |     0 |          0 |           0 |       0 | t
+(1 row)
+
+-- a fast-forward over local changes (to another table than it moves)
+SELECT dolt_branch('-D', 'f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('f') IS NOT NULL AS on_f;
+ on_f 
+------
+ t
+(1 row)
+
+UPDATE co.k SET v = 'g' WHERE id <= 2000;
+SELECT length(dolt_commit('-am', 'g')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE co.n SET b = 'local' WHERE a <= 10;
+SELECT (dolt_merge('f'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT 'ff over local changes' AS after, * FROM pg_temp.checkouts();
+         after         | pages | candidates | full_tables | changed | folds_agree 
+-----------------------+-------+------------+-------------+---------+-------------
+ ff over local changes |    86 |       4040 |           0 |       1 | t
+(1 row)
+
+SELECT 'ff over local again' AS after, * FROM pg_temp.checkouts();
+        after        | pages | candidates | full_tables | changed | folds_agree 
+---------------------+-------+------------+-------------+---------+-------------
+ ff over local again |     0 |          0 |           0 |       1 | t
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 'g') AS moved, (SELECT count(*) FROM co.n WHERE b = 'local') AS local
+  FROM co.k;
+ moved | local 
+-------+-------
+  2000 |    10
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
 (1 row)
 
 DROP SCHEMA co CASCADE;

@@ -1108,12 +1108,15 @@ move_rows(void *arg)
 
 /* The definitions first, if they differ, then the rows. */
 static void
-folded_move_to(const ProllyNodeRef *target)
+folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef working;
 
-	(void) PROLLY_CALL(dc.refs, working_set, NULL, &working);
+	if (folded)
+		working = *folded;
+	else
+		(void) PROLLY_CALL(dc.refs, working_set, NULL, &working);
 	if (PROLLY_CALL(dc.canonicalizer, same_schema, &working, target))
 		rows_from(&working, target);	/* (folded already) */
 	else
@@ -2605,6 +2608,16 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 			set_sequence(t);
 	}
 	PROLLY_CALL(dc.refs, set_head, theirs);
+
+	/*
+	 * Then a checkpoint, as after any move: else the pages its rows were
+	 * written to stay changed since the baseline, and each fold reads them.
+	 */
+	{
+		ProllyNodeRef root;
+
+		PROLLY_CALL(dc.refs, checkpoint, &root);
+	}
 }
 
 /*
