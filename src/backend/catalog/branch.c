@@ -80,6 +80,13 @@
 #include "utils/syscache.h"
 
 Oid			MyBranch = BRANCH_MAIN_OID;
+
+/*
+ * Whether the session's branch is one it may only read (a session checked
+ * out at a commit): its transactions start read-only.  Kept with MyBranch,
+ * and put back with it when a transaction that left a branch aborts.
+ */
+bool		MyBranchReadOnly = false;
 Oid			CatalogBranchIndexTable = InvalidOid;
 bool		CatalogKeepRowBranch = false;
 bool		CatalogAllBranches = false;
@@ -555,6 +562,7 @@ typedef struct NewBranch
 	Oid			branch;
 	SubTransactionId subid;		/* the subtransaction that made it */
 	Oid			left;			/* the branch last left for it */
+	bool		left_read_only; /* and whether the session only read it */
 } NewBranch;
 
 /* the branches this session holds locks on, in TopMemoryContext */
@@ -598,7 +606,10 @@ undo_new_branches(SubTransactionId subid)
 		if (subid != InvalidSubTransactionId && nb->subid != subid)
 			continue;
 		if (MyBranch == nb->branch)
+		{
 			set_session_branch(nb->left);
+			MyBranchReadOnly = nb->left_read_only;
+		}
 		new_branches = list_delete_nth_cell(new_branches, i);
 		pfree(nb);
 	}
@@ -701,6 +712,7 @@ note_new_branch(Oid branch)
 	nb->branch = branch;
 	nb->subid = GetCurrentSubTransactionId();
 	nb->left = MyBranch;
+	nb->left_read_only = MyBranchReadOnly;
 	new_branches = lappend(new_branches, nb);
 	MemoryContextSwitchTo(old);
 }
@@ -749,8 +761,13 @@ check_out_branch(Oid branch)
 		NewBranch  *nb = lfirst(lc);
 
 		if (nb->branch == branch && MyBranch != branch)
+		{
 			nb->left = MyBranch;
+			nb->left_read_only = MyBranchReadOnly;
+		}
 	}
+	if (branch != MyBranch)
+		MyBranchReadOnly = false;	/* (its owner says otherwise, if not) */
 	set_session_branch(branch);
 	return true;
 }

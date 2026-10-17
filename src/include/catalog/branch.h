@@ -29,6 +29,7 @@ typedef struct CatalogBranchInfo
 
 /* the session's branch: a versioned object's rows on it are the ones seen */
 extern PGDLLIMPORT Oid MyBranch;
+extern PGDLLIMPORT bool MyBranchReadOnly;
 
 /*
  * While set, index_create() is making an index of this table: its pg_class
