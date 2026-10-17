@@ -378,6 +378,19 @@ changes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return PROLLY_CALL(c->rd.kr, compare, c->rd.k, a, b);
 }
 
+/* A copy of len bytes, sized to them (none: empty). */
+static void
+copy_bytes(StringInfo s, const uint8 *data, int len)
+{
+	s->data = palloc(len + 1);
+	if (len > 0)
+		memcpy(s->data, data, len);
+	s->data[len] = '\0';
+	s->len = len;
+	s->maxlen = len + 1;
+	s->cursor = 0;
+}
+
 static void
 collect_change(ProllyDiffKind kind, const ProllyKey *key,
 			   const ProllyValue *before, const ProllyValue *after, void *arg)
@@ -386,14 +399,9 @@ collect_change(ProllyDiffKind kind, const ProllyKey *key,
 	Change	   *ch = palloc0(sizeof(Change));
 
 	ch->kind = kind;
-	initStringInfo(&ch->key);
-	appendBinaryStringInfo(&ch->key, key->data, key->len);
-	initStringInfo(&ch->before);
-	initStringInfo(&ch->after);
-	if (before)
-		appendBinaryStringInfo(&ch->before, before->data, before->len);
-	if (after)
-		appendBinaryStringInfo(&ch->after, after->data, after->len);
+	copy_bytes(&ch->key, key->data, key->len);
+	copy_bytes(&ch->before, before ? before->data : NULL, before ? before->len : 0);
+	copy_bytes(&ch->after, after ? after->data : NULL, after ? after->len : 0);
 	c->list = lappend(c->list, ch);
 }
 
@@ -579,6 +587,15 @@ same_bytes(const StringInfoData *a, const StringInfoData *b)
 	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
 }
 
+/* What a merge writes for one key: copies of a row removed, then added. */
+typedef struct KeyWrite
+{
+	const StringInfoData *old;	/* the row removed, nold times */
+	int64		nold;
+	const StringInfoData *row;	/* the row inserted, nrow times */
+	int64		nrow;
+} KeyWrite;
+
 /*
  * Walk theirs (table relid's changes from base to theirs) against ours
  * (base to ours, the session's head, which the branch still is), both in
@@ -606,6 +623,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	ListCell   *lt;
 	int			conflicts = 0;
 	bool		keyless;
+	List	   *writes = NIL;
 
 	require_readable(base);
 	require_readable(ours);
@@ -635,9 +653,11 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		Change	   *o = NULL;
 		ProllyKey	tk = {(const uint8 *) t->key.data, t->key.len};
 		const StringInfoData *now;
+		const StringInfoData *row;	/* what s2 holds */
 		int64		have;
 		int64		want;
 		bool		conflict;
+		KeyWrite   *w;
 
 		while (lo)
 		{
@@ -659,13 +679,14 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		now = o ? &o->after : &t->before;
 		have = (int64) decode(&tc, now, s1);
 		want = (int64) decode(&tc, &t->after, s2);
+		row = &t->after;
 		if (keyless)
 		{
 			int64		delta = want - (int64) decode(&tc, &t->before, s2);
 
 			want = have + delta;
 			conflict = want < 0 && !(o != NULL && same_bytes(&o->after, &t->after));
-			(void) decode(&tc, delta > 0 ? &t->after : &t->before, s2);
+			row = delta > 0 ? &t->after : &t->before;
 		}
 		else
 			conflict = o != NULL && !same_bytes(&o->after, &t->after);
@@ -686,30 +707,59 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			/* as theirs has it: one row or none, or its copies */
 			want = keyless ? (int64) decode(&tc, &t->after, s2) :
 				(t->after.len > 0);
-			if (keyless && want == 0)
-				(void) decode(&tc, now, s2);
+			if (keyless)
+				row = want == 0 ? now : &t->after;
 		}
 		else if (mode != WALK_MERGE || (o != NULL && (!keyless ||
 														same_bytes(&o->after, &t->after))))
 			continue;			/* listing; or both changed it alike */
 
-		/* the branch's row (s1, have copies) becomes theirs (s2, want) */
+		/* the branch's row (now, have copies) becomes theirs (row, want) */
+		w = palloc0(sizeof(KeyWrite));
 		if (!keyless && have == 1 && want == 1)
 		{
-			if (!PROLLY_CALL(ar, update, a, s1, s2))
-				goto missing;
+			w->old = now;
+			w->nold = 1;
+			w->row = row;
+			w->nrow = 1;
 		}
 		else if (want < have)
 		{
-			for (int64 i = 0; i < have - Max(want, 0); i++)
-				if (!PROLLY_CALL(ar, remove, a, keyless ? s2 : s1))
-					goto missing;
+			w->old = keyless ? row : now;
+			w->nold = have - Max(want, 0);
 		}
 		else
 		{
-			for (int64 i = 0; i < want - have; i++)
-				PROLLY_CALL(ar, insert, a, s2);
+			w->row = row;
+			w->nrow = want - have;
 		}
+		writes = lappend(writes, w);
+	}
+
+	/*
+	 * The rows written: those going first, then those coming, so a row may
+	 * take a unique value another gives up (theirs swapping two, say).
+	 */
+	foreach(lt, writes)
+	{
+		KeyWrite   *w = lfirst(lt);
+
+		if (w->nold == 0)
+			continue;
+		(void) decode(&tc, w->old, s1);
+		for (int64 i = 0; i < w->nold; i++)
+			if (!PROLLY_CALL(ar, remove, a, s1))
+				goto missing;
+	}
+	foreach(lt, writes)
+	{
+		KeyWrite   *w = lfirst(lt);
+
+		if (w->nrow == 0)
+			continue;
+		(void) decode(&tc, w->row, s2);
+		for (int64 i = 0; i < w->nrow; i++)
+			PROLLY_CALL(ar, insert, a, s2);
 	}
 	if (a)
 		PROLLY_CALL(ar, end, a);
@@ -742,14 +792,21 @@ commit_root(const ProllyHash *id, ProllyNodeRef *root)
 }
 
 static List *
+tables_in_root(const ProllyNodeRef *root)
+{
+	Tables		ts = {NIL};
+
+	PROLLY_CALL(components().canonicalizer, tables, root, add_table, &ts);
+	return ts.tables;
+}
+
+static List *
 tables_at(const ProllyHash *id)
 {
 	ProllyNodeRef root;
-	Tables		ts = {NIL};
 
 	commit_root(id, &root);
-	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
-	return ts.tables;
+	return tables_in_root(&root);
 }
 
 static int
@@ -893,9 +950,9 @@ merge_held(const char *branch, const char *message, int flags,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("branches whose objects are defined differently can't be merged yet"),
 				 errdetail("A table or other object of the versioned schemas was made, dropped or redefined since the common ancestor.")));
-	base_tables = tables_at(&base);
-	ours_tables = tables_at(&ours);
-	theirs_tables = tables_at(&theirs);
+	base_tables = tables_in_root(&roots[0]);
+	ours_tables = tables_in_root(&roots[1]);
+	theirs_tables = tables_in_root(&roots[2]);
 	foreach(lc, theirs_tables)
 	{
 		Table	   *t = lfirst(lc);

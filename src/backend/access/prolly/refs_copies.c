@@ -66,10 +66,16 @@
 
 static bool ready = false;
 
-/* the transaction changed a merge state (checked at its commit) */
-static bool merge_changed = false;
+/*
+ * The branches whose merge states the transaction set (names, in
+ * TopTransactionContext): checked when it commits or prepares, whichever
+ * branch it is on then.
+ */
+static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
+static bool merge_state_of(const char *branch, ProllyMergeState *state);
+static void merge_key(StringInfo key, const char *branch);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
 static const ProllyTreeRoutine *tree;
@@ -103,27 +109,55 @@ refs_init(void)
 	ready = true;
 }
 
+static bool
+name_listed(List *names, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/* Unresolved conflicts of a merge the transaction made aren't committed. */
+static void
+check_merge_conflicts(const char *what)
+{
+	ListCell   *lc;
+
+	if (prolly_allow_commit_conflicts())
+		return;
+	foreach(lc, merge_changed)
+	{
+		ProllyMergeState ms;
+
+		if (merge_state_of(lfirst(lc), &ms) && ms.ntables > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
+					 errdetail("Table \"%s\" has conflicts on branch \"%s\".",
+							   get_rel_name(ms.tables[0]),
+							   (char *) lfirst(lc)),
+					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+	}
+}
+
 static void
 refs_xact_callback(XactEvent event, void *arg)
 {
-	ProllyMergeState ms;
-
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
-			if (merge_changed && !prolly_allow_commit_conflicts() &&
-				copies_merge_state(&ms) && ms.ntables > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("cannot commit a transaction with unresolved merge conflicts"),
-						 errdetail("Table \"%s\" has conflicts.",
-								   get_rel_name(ms.tables[0])),
-						 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+			check_merge_conflicts("commit");
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+			check_merge_conflicts("prepare");
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PREPARE:
-			merge_changed = false;
+			merge_changed = NIL;
 			break;
 		default:
 			break;
@@ -723,6 +757,18 @@ copies_branch_delete(const char *name, bool force)
 				 errhint("Delete it anyway with -D.")));
 	branch_ops()->drop(name);
 	branch_set_head(name, NULL);
+
+	/* and the merge in progress on it, which a branch made later isn't in */
+	{
+		StringInfoData key;
+		ProllyMergeState ms;
+
+		initStringInfo(&key);
+		merge_key(&key, name);
+		if (merge_state_of(name, &ms))
+			refs_put(key.data, key.len, NULL);
+		pfree(key.data);
+	}
 }
 
 static bool
@@ -881,14 +927,15 @@ get_be32(const char *p)
 }
 
 static void
-merge_key(StringInfo key)
+merge_key(StringInfo key, const char *branch)
 {
 	appendStringInfoChar(key, TAG_MERGE);
-	appendStringInfoString(key, branch_ops()->current());
+	appendStringInfoString(key, branch);
 }
 
+/* The merge in progress on branch, if there is one. */
 static bool
-copies_merge_state(ProllyMergeState *state)
+merge_state_of(const char *branch, ProllyMergeState *state)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -897,7 +944,7 @@ copies_merge_state(ProllyMergeState *state)
 	refs_init();
 	initStringInfo(&key);
 	initStringInfo(&v);
-	merge_key(&key);
+	merge_key(&key, branch);
 	found = refs_get(key.data, key.len, &v);
 	if (found)
 	{
@@ -916,6 +963,12 @@ copies_merge_state(ProllyMergeState *state)
 	return found;
 }
 
+static bool
+copies_merge_state(ProllyMergeState *state)
+{
+	return merge_state_of(branch_ops()->current(), state);
+}
+
 /* (NULL: none) */
 static void
 copies_set_merge_state(const ProllyMergeState *state)
@@ -923,10 +976,11 @@ copies_set_merge_state(const ProllyMergeState *state)
 	StringInfoData key;
 	StringInfoData v;
 	ProllyMergeState cur;
+	char	   *branch = branch_ops()->current();
 
 	refs_init();
 	initStringInfo(&key);
-	merge_key(&key);
+	merge_key(&key, branch);
 	if (state == NULL)
 	{
 		if (copies_merge_state(&cur))
@@ -941,7 +995,13 @@ copies_set_merge_state(const ProllyMergeState *state)
 			put_be32(&v, state->tables[i]);
 		refs_put(key.data, key.len, &v);
 		pfree(v.data);
-		merge_changed = true;
+		if (!name_listed(merge_changed, branch))
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+			merge_changed = lappend(merge_changed, pstrdup(branch));
+			MemoryContextSwitchTo(old);
+		}
 	}
 	pfree(key.data);
 }
@@ -980,7 +1040,10 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		walk_commit(ws, &info.parents[i]);
 }
 
-/* The refs tree, and every commit reachable from a head, with its root. */
+/*
+ * The refs tree, and every commit reachable from a head or a merge in
+ * progress, with its root.
+ */
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 {
@@ -997,13 +1060,23 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
 	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
+		const char *p = (const char *) v.data;
+		const char *end = p + v.len;
 		ProllyHash *h;
 
-		if (k.len < 1 || k.data[0] != TAG_BRANCH)
+		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE))
 			continue;
 		h = palloc(sizeof(ProllyHash));
-		(void) get_hash((const char *) v.data, (const char *) v.data + v.len, h);
+		p = get_hash(p, end, h);
 		heads = lappend(heads, h);
+
+		/* a merge in progress: theirs, then the base, both kept */
+		if (k.data[0] == TAG_MERGE)
+		{
+			h = palloc(sizeof(ProllyHash));
+			(void) get_hash(p, end, h);
+			heads = lappend(heads, h);
+		}
 	}
 	PROLLY_CALL(tree, cursor_close, c);
 	foreach(lc, heads)

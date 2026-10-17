@@ -1278,10 +1278,19 @@ folded_fold(ProllyNodeRef *root)
 	cn.folded = true;
 	canon_env(&cn);
 
-	/* Everything the transaction wrote, this statement's writes too. */
-	CommandCounterIncrement();
-	PushCopiedSnapshot(GetActiveSnapshot());
-	UpdateActiveSnapshotCommandId();
+	/*
+	 * Everything the transaction wrote, this statement's writes too: a
+	 * snapshot that sees them.  (In parallel mode nothing was written, and
+	 * the active snapshot is it; without one, the transaction's.)
+	 */
+	if (!IsInParallelMode())
+		CommandCounterIncrement();
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	if (!IsInParallelMode())
+		UpdateActiveSnapshotCommandId();
 	PG_TRY();
 	{
 		build_canonical(&cn, root);

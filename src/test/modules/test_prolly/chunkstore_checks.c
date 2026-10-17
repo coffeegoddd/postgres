@@ -164,6 +164,45 @@ test_fold_root(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&root.hash));
 }
 
+typedef struct Reaches
+{
+	ProllyHash	target;
+	bool		found;
+} Reaches;
+
+static bool
+reaches_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Reaches    *r = arg;
+
+	if (node->hash.len == r->target.len &&
+		memcmp(node->hash.bytes, r->target.bytes, node->hash.len) == 0)
+		r->found = true;
+	return !r->found;
+}
+
+/*
+ * Whether the refs' walk (what reclamation keeps) reaches the commit whose
+ * id is given, from the chunk store's root.
+ */
+PG_FUNCTION_INFO_V1(test_refs_walk_reaches);
+Datum
+test_refs_walk_reaches(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef refs;
+	Reaches		r;
+
+	memset(&r, 0, sizeof(r));
+	text_hash(PG_GETARG_TEXT_PP(0), &r.target);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	refs.location.blkno = InvalidBlockNumber;
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk, &refs, reaches_node, &r);
+	PG_RETURN_BOOL(r.found);
+}
+
 static int
 memcmp_order(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
