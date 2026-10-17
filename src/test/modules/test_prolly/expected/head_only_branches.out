@@ -187,5 +187,90 @@ SELECT name FROM dolt_branches ORDER BY name;
 
 SELECT dolt_branch('-d', 'nope');
 ERROR:  branch "nope" does not exist
+-- Making or deleting one takes what a branch with copies takes: the
+-- privilege, and a transaction that can write.  Its first use doesn't:
+-- its copies are the branch's as much as its head.
+CREATE ROLE regress_ho_user;
+GRANT USAGE ON SCHEMA ho TO regress_ho_user;
+GRANT SELECT ON ho.t TO regress_ho_user;
+SELECT dolt_branch('ho_mine');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET ROLE regress_ho_user;
+SELECT dolt_branch('ho_theirs');
+ERROR:  permission denied for database contrib_regression
+SELECT dolt_branch('-D', 'ho_mine');
+ERROR:  permission denied to delete branch "ho_mine"
+DETAIL:  Only the owner of database "contrib_regression" can delete its branches.
+SELECT pg_temp.copied('ho_mine') AS copied;
+ copied 
+--------
+ f
+(1 row)
+
+SELECT (dolt_checkout('ho_mine'))[2];
+        dolt_checkout         
+------------------------------
+ Switched to branch 'ho_mine'
+(1 row)
+
+SELECT count(*) FROM ho.t;
+ count 
+-------
+     2
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+BEGIN READ ONLY;
+SELECT dolt_branch('ho_ro');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('-D', 'ho_mine');
+ERROR:  cannot execute moving a chunk store's root in a read-only transaction
+ROLLBACK;
+SELECT dolt_branch('ho_later');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+BEGIN READ ONLY;
+SELECT (dolt_checkout('ho_later'))[2];
+         dolt_checkout         
+-------------------------------
+ Switched to branch 'ho_later'
+(1 row)
+
+SELECT count(*) FROM ho.t;
+ count 
+-------
+     2
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+COMMIT;
+SELECT dolt_branch('-D', 'ho_mine', 'ho_later');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP OWNED BY regress_ho_user;
+DROP ROLE regress_ho_user;
 DROP SCHEMA ho CASCADE;
 NOTICE:  drop cascades to table ho.t

@@ -39,6 +39,21 @@ typedef struct BranchOpsRoutine
 	/* Delete a branch with its copies. */
 	void		(*drop) (const char *name);
 
+	/*
+	 * What create and drop check of the session, alone (a branch's name,
+	 * the privileges they need, a transaction that can write): refused if
+	 * the session may not make, or delete, a branch called name.
+	 */
+	void		(*check_create) (const char *name);
+	void		(*check_drop) (const char *name);
+
+	/*
+	 * Make a branch as create does, without its checks of the session: the
+	 * copies of one that exists already in all but them, which its first
+	 * use makes.
+	 */
+	Oid			(*make) (const char *name, const char *start_point);
+
 	/* Make name the session's branch. */
 	void		(*checkout) (const char *name);
 

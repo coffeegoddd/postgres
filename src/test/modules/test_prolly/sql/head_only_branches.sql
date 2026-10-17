@@ -59,4 +59,35 @@ SELECT dolt_branch('-d', 'h4', 'h2');
 SELECT name FROM dolt_branches ORDER BY name;
 SELECT dolt_branch('-d', 'nope');
 
+-- Making or deleting one takes what a branch with copies takes: the
+-- privilege, and a transaction that can write.  Its first use doesn't:
+-- its copies are the branch's as much as its head.
+CREATE ROLE regress_ho_user;
+GRANT USAGE ON SCHEMA ho TO regress_ho_user;
+GRANT SELECT ON ho.t TO regress_ho_user;
+SELECT dolt_branch('ho_mine');
+SET ROLE regress_ho_user;
+SELECT dolt_branch('ho_theirs');
+SELECT dolt_branch('-D', 'ho_mine');
+SELECT pg_temp.copied('ho_mine') AS copied;
+SELECT (dolt_checkout('ho_mine'))[2];
+SELECT count(*) FROM ho.t;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+RESET ROLE;
+BEGIN READ ONLY;
+SELECT dolt_branch('ho_ro');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('-D', 'ho_mine');
+ROLLBACK;
+SELECT dolt_branch('ho_later');
+BEGIN READ ONLY;
+SELECT (dolt_checkout('ho_later'))[2];
+SELECT count(*) FROM ho.t;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+COMMIT;
+SELECT dolt_branch('-D', 'ho_mine', 'ho_later');
+DROP OWNED BY regress_ho_user;
+DROP ROLE regress_ho_user;
+
 DROP SCHEMA ho CASCADE;

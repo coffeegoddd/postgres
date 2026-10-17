@@ -334,16 +334,9 @@ delete_here(void *arg)
 	dropBranchSharedDependencies(MyBranch);
 }
 
-static Oid
-copies_create(const char *name, const char *start_point)
+static void
+copies_check_create(const char *name)
 {
-	Relation	brel;
-	Oid			source;
-	Oid			branch;
-	Datum		values[Natts_pg_branch];
-	bool		nulls[Natts_pg_branch] = {0};
-	NameData	brname;
-	HeapTuple	tup;
 	AclResult	aclresult;
 
 	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
@@ -356,6 +349,18 @@ copies_create(const char *name, const char *start_point)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
+}
+
+static Oid
+copies_make(const char *name, const char *start_point)
+{
+	Relation	brel;
+	Oid			source;
+	Oid			branch;
+	Datum		values[Natts_pg_branch];
+	bool		nulls[Natts_pg_branch] = {0};
+	NameData	brname;
+	HeapTuple	tup;
 
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	if (OidIsValid(branch_oid(name, true)))
@@ -381,13 +386,16 @@ copies_create(const char *name, const char *start_point)
 	return branch;
 }
 
-static void
-copies_drop(const char *name)
+static Oid
+copies_create(const char *name, const char *start_point)
 {
-	Relation	brel;
-	Oid			branch;
-	HeapTuple	tup;
+	copies_check_create(name);
+	return copies_make(name, start_point);
+}
 
+static void
+copies_check_drop(const char *name)
+{
 	PreventCommandIfReadOnly("dolt_branch()");
 	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 		ereport(ERROR,
@@ -395,6 +403,16 @@ copies_drop(const char *name)
 				 errmsg("permission denied to delete branch \"%s\"", name),
 				 errdetail("Only the owner of database \"%s\" can delete its branches.",
 						   get_database_name(MyDatabaseId))));
+}
+
+static void
+copies_drop(const char *name)
+{
+	Relation	brel;
+	Oid			branch;
+	HeapTuple	tup;
+
+	copies_check_drop(name);
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)
@@ -465,6 +483,9 @@ static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
 	.drop = copies_drop,
+	.check_create = copies_check_create,
+	.check_drop = copies_check_drop,
+	.make = copies_make,
 	.checkout = copies_checkout,
 	.current = copies_current,
 	.branches = copies_branches,
