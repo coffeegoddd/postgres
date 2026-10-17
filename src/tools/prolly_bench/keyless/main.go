@@ -29,6 +29,12 @@ type step struct {
 	setup bool
 }
 
+// fail reports a malformed script and exits.
+func fail(path string, line int, format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s:%d: %s\n", path, line, fmt.Sprintf(format, args...))
+	os.Exit(2)
+}
+
 func parse(path string) []step {
 	f, err := os.Open(path)
 	if err != nil {
@@ -41,9 +47,10 @@ func parse(path string) []step {
 	var buf strings.Builder
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	n := 0
 	flush := func(s string) {
 		if cur == nil {
-			return
+			fail(path, n, "SQL before the first @step or @setup")
 		}
 		if inPre {
 			cur.pre = append(cur.pre, s)
@@ -52,6 +59,7 @@ func parse(path string) []step {
 		}
 	}
 	for sc.Scan() {
+		n++
 		line := sc.Text()
 		t := strings.TrimSpace(line)
 		switch {
@@ -59,7 +67,10 @@ func parse(path string) []step {
 			f := strings.Fields(t)
 			reps := 1
 			if len(f) > 2 {
-				reps, _ = strconv.Atoi(f[2])
+				var err error
+				if reps, err = strconv.Atoi(f[2]); err != nil || reps < 1 {
+					fail(path, n, "repetitions must be a whole number above 0: %q", f[2])
+				}
 			}
 			steps = append(steps, step{name: f[1], reps: reps})
 			cur, inPre = &steps[len(steps)-1], false
@@ -80,7 +91,22 @@ func parse(path string) []step {
 			}
 		}
 	}
+	if err := sc.Err(); err != nil {
+		fail(path, n, "%v", err)
+	}
+	if strings.TrimSpace(buf.String()) != "" {
+		fail(path, n, "a statement doesn't end with \";\" at the end of a line")
+	}
 	return steps
+}
+
+// median of sorted values: the middle one, or the mean of the middle two.
+func median(sorted []float64) float64 {
+	m := len(sorted) / 2
+	if len(sorted)%2 == 0 {
+		return (sorted[m-1] + sorted[m]) / 2
+	}
+	return sorted[m]
 }
 
 func run(ctx context.Context, c *sql.Conn, q string) error {
@@ -97,6 +123,7 @@ func run(ctx context.Context, c *sql.Conn, q string) error {
 
 func main() {
 	driver, dsn, script := os.Args[1], os.Args[2], os.Args[3]
+	steps := parse(script) // (all of it first: a bad script runs nothing)
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		panic(err)
@@ -106,7 +133,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	for _, s := range parse(script) {
+	for _, s := range steps {
 		var ms []float64
 		for i := 0; i < s.reps; i++ {
 			sub := func(q string) string { return strings.ReplaceAll(q, "{i}", strconv.Itoa(i)) }
@@ -134,6 +161,6 @@ func main() {
 		for i, v := range ms {
 			parts[i] = strconv.FormatFloat(v, 'f', 2, 64)
 		}
-		fmt.Printf("%s\t%.2f\t%s\n", s.name, sorted[len(sorted)/2], strings.Join(parts, ","))
+		fmt.Printf("%s\t%.2f\t%s\n", s.name, median(sorted), strings.Join(parts, ","))
 	}
 }

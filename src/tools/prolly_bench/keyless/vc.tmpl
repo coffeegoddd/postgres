@@ -28,10 +28,11 @@ UPDATE t SET c = c + 1 WHERE a BETWEEN 700000 + {i} * 10000 AND 709999 + {i} * 1
 SELECT count(*) FROM %DIFF_COMMITS%;
 @step status_10k_update 3
 @pre
+%CALL% dolt_reset('--hard');
 UPDATE t SET c = c + 1 WHERE a BETWEEN 730000 + {i} * 10000 AND 739999 + {i} * 10000;
 @body
 SELECT count(*) FROM dolt_status;
-@step reset_hard_30k 1
+@step reset_hard_10k 1
 %CALL% dolt_reset('--hard');
 @step branch_create 5
 %CALL% dolt_branch('b{i}');
@@ -40,15 +41,15 @@ SELECT count(*) FROM dolt_status;
 %CALL% dolt_checkout('b{i}');
 @pre
 %CALL% dolt_checkout('main');
-@step checkout_back_and_forth 5
+@step checkout_clean 5
 @pre
 %CALL% dolt_checkout('main');
 @body
 %CALL% dolt_checkout('b0');
-%CALL% dolt_checkout('main');
 @step checkout_dirty_10k 3
 @pre
 %CALL% dolt_checkout('main');
+%CALL% dolt_reset('--hard');
 UPDATE t SET c = c + 1 WHERE a BETWEEN 760000 + {i} * 10000 AND 769999 + {i} * 10000;
 @body
 %CALL% dolt_checkout('b0');

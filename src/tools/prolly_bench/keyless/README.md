@@ -22,14 +22,16 @@ W=/some/work/dir
 
 Each run starts a fresh server with its own data directory under the work
 directory, and writes `out-SCRIPT.tsv`: each step, the median of its
-repetitions in ms, then every repetition. Run one at a time: they share
+repetitions in ms (the mean of the middle two for an even count), then
+every repetition. Run one at a time: they share
 ports, and each should have the machine to itself.
 
-The merge cases print each case's rows after the merge and any conflicts:
+The merge cases aren't timed: each prints the rows after each case's merge
+and its conflicts, into `out-merge_pg.txt` or `out-merge_dolt.txt`:
 
 ```sh
-psql -h /tmp -p 5594 -U postgres -d postgres -f $W/merge_pg.sql   # a running prolly server
-(mkdir -p $W/km && cd $W/km && dolt init && dolt sql --continue < $W/merge_dolt.sql)
+./run.sh $W prolly merge_pg /path/to/prolly/bin
+./run.sh $W dolt merge_dolt
 ```
 
 ## The runner

@@ -1,6 +1,7 @@
 # 13. Tables without a primary key: prolly, heap and Dolt
 
-**Status: measured 2026-10-17, on master plus stack #138 (#135–#139).**
+**Status: measured 2026-10-17, on master plus stack #138 (#135–#139,
+with their reviews' fixes).**
 This compares how stock Postgres (heap), page-based prolly and Dolt store
 tables without a primary key ("keyless" tables), what their operations
 cost, and how their merges treat them. Where prolly falls short, the
@@ -36,7 +37,8 @@ cost nothing: the numbers are CPU and design costs, not durability costs.
 Release builds: stock Postgres at upstream `a999971331` (the commit this
 fork last synced), prolly at the top of stack #138, Dolt 2.4.0. Each step
 is one statement or call through one connection (Go `database/sql`,
-pgx and go-sql-driver/mysql); the median of its repetitions is shown. The
+pgx and go-sql-driver/mysql); the median of its repetitions is shown (the
+mean of the middle two for an even count). The
 harness is `src/tools/prolly_bench/keyless/` (its README says how to run
 it); the merge cases in part 4 are its `merge_pg.sql` and
 `merge_dolt.sql`.
@@ -45,54 +47,60 @@ it); the merge cases in part 4 are its `merge_pg.sql` and
 
 | Operation | Heap | Prolly keyless | Dolt keyless | Prolly keyed | Dolt keyed |
 |---|---|---|---|---|---|
-| Load 1M rows (COPY / LOAD DATA) | 173 | 171 | 6,215 | 713 | 3,601 |
-| Create the index on `a` | 134 | 142 | 830 | 133 | 595 |
-| Update one row (by `a`) | 0.06 | 0.09 | 0.65 | 0.07 | 0.38 |
-| Update a row with two copies | 0.07 | 0.07 | 0.55 | 0.07 | 0.44 |
-| Insert one row | 0.04 | 0.04 | 0.41 | 0.04 | 0.46 |
-| Delete one row | 0.05 | 0.05 | 0.44 | 0.05 | 0.61 |
-| Update 10,000 rows (range of `a`) | 16 | 16 | 1,405 | 25 | 1,155 |
-| Delete 10,000 rows | 2.2 | 2.1 | 1,215 | 2.1 | 1,085 |
-| Insert 10,000 rows (INSERT … SELECT) | 7.0 | 7.4 | 215 | 13 | 58 |
-| `count(*), sum(c)` over every row | 15 | 16 | 68 | 16 | 73 |
-| `DISTINCT` over every row | 132 | 131 | 264 | 164 | 283 |
+| Load 1M rows (COPY / LOAD DATA) | 168 | 183 | 5,749 | 701 | 3,258 |
+| Create the index on `a` | 133 | 136 | 742 | 132 | 572 |
+| Update one row (by `a`) | 0.10 | 0.09 | 0.60 | 0.06 | 0.39 |
+| Update a row with two copies | 0.07 | 0.07 | 0.50 | 0.06 | 0.44 |
+| Insert one row | 0.07 | 0.04 | 0.41 | 0.05 | 0.40 |
+| Delete one row | 0.05 | 0.06 | 0.57 | 0.05 | 0.54 |
+| Update 10,000 rows (range of `a`) | 15 | 16 | 1,313 | 24 | 1,075 |
+| Delete 10,000 rows | 2.2 | 2.2 | 1,160 | 2.2 | 1,006 |
+| Insert 10,000 rows (INSERT … SELECT) | 7.3 | 7.4 | 210 | 13 | 50 |
+| `count(*), sum(c)` over every row | 16 | 17 | 65 | 17 | 68 |
+| `DISTINCT` over every row | 130 | 132 | 262 | 156 | 268 |
 
 Prolly's working set is heap's pages, and it writes and reads as heap
 does, keyless or not. Dolt writes into its tree at once, so each row costs
-a tree lookup and put (and, keyless, a second one for an update): 50–500
-times heap's cost for writes.
+a tree lookup and put (and, keyless, a second one for an update). Against
+heap, keyless: 6–11 times for a one-row write, 29 times for inserting
+10,000 rows, 34 for the load, 85 for updating 10,000 and about 520 for
+deleting 10,000.
 
 ### Version control (ms)
 
 | Operation | Prolly keyless | Dolt keyless | Prolly keyed | Dolt keyed |
 |---|---|---|---|---|
-| First commit of the 1M rows | 1,579 | 0.9 | 1,411 | 1.3 |
-| Commit after one row changed | 0.70 | 0.30 | 0.54 | 0.35 |
-| `dolt_status` after one row | 0.84 | 0.43 | 0.38 | 0.27 |
-| `dolt_diff` HEAD–WORKING after one row | 0.80 | 0.50 | 0.47 | 0.25 |
-| Commit after 10,000 rows updated | 223 | 0.9 | 37 | 1.1 |
-| `dolt_diff` of two commits 10,000 rows apart | 51 | 47 | 2.8 | 7.6 |
-| `dolt_status` after 10,000 rows updated | 249 | 0.5 | 65 | 0.5 |
-| Hard reset of 30,000 changed rows | 444 | 0.4 | 203 | 0.8 |
-| Make a branch | 0.12 | 0.41 | 0.11 | 0.35 |
-| Check out a new branch (first use) | 115 | 0.13 | 217 | 0.15 |
-| Check out another branch and back, nothing changed | 95 | 0.21 | 197 | 0.23 |
-| Check out with 10,000 rows changed | 357 | 0.53 | 70 | 0.53 |
-| Fast-forward merge of 10,000 changed rows | 459 | 0.49 | 111 | 0.54 |
-| Three-way merge, 10,000 rows changed on each side | 357 | 204 | 77 | 15 |
-| Three-way merge, one row changed on each side | 2.0 | 0.8 | 1.9 | 0.7 |
-| Cherry-pick of 10,000 changed rows | 5,156 | 140 | 181 | 15 |
-| `count(*)` of `dolt_log` | 0.35 | 0.32 | 0.28 | 0.21 |
+| First commit of the 1M rows | 1,446 | 1.1 | 1,320 | 1.2 |
+| Commit after one row changed | 0.45 | 0.27 | 0.61 | 0.34 |
+| `dolt_status` after one row | 0.56 | 0.16 | 0.37 | 0.17 |
+| `dolt_diff` HEAD–WORKING after one row | 0.47 | 0.27 | 0.39 | 0.24 |
+| Commit after 10,000 rows updated | 217 | 0.95 | 36 | 0.69 |
+| `dolt_diff` of two commits 10,000 rows apart | 55 | 41 | 2.8 | 7.3 |
+| `dolt_status` after 10,000 rows updated | 211 | 0.62 | 68 | 0.62 |
+| Hard reset of 10,000 changed rows | 297 | 0.39 | 120 | 0.54 |
+| Make a branch | 0.19 | 0.28 | 0.18 | 0.34 |
+| Check out a new branch (its first use) | 78 | 0.12 | 183 | 0.13 |
+| Check out another branch, nothing changed | 35 | 0.09 | 86 | 0.12 |
+| Check out another branch, 10,000 rows changed | 404 | 0.54 | 130 | 0.58 |
+| Fast-forward merge of 10,000 changed rows | 404 | 0.55 | 108 | 0.38 |
+| Three-way merge, 10,000 rows changed on each side | 316 | 194 | 76 | 13 |
+| Three-way merge, one row changed on each side | 1.7 | 0.84 | 1.7 | 0.86 |
+| Cherry-pick of 10,000 changed rows | 4,850 | 143 | 181 | 14 |
+| `count(*)` of `dolt_log` | 0.28 | 0.29 | 0.30 | 0.41 |
+
+Each row is one statement or call, repeated: the 10,000-row status and
+the dirty checkout reset the branch before each repetition, so each saw
+10,000 changed rows; a checkout is one switch, the way back untimed.
 
 ### Space after the run (bytes)
 
 | | Heap | Prolly keyless | Dolt keyless | Prolly keyed | Dolt keyed |
 |---|---|---|---|---|---|
-| Database on disk | 94 M | 1,304 M | 1,248 M | 247 M | 46 M |
+| Database on disk | 94 M | 1,303 M | 1,248 M | 248 M | 46 M |
 
 Neither history store had been garbage-collected (prolly has no GC yet,
-step 7; Dolt's `dolt gc` wasn't run). Prolly's keyless total is 1,132 M of
-chunk journal and 143 M of pages.
+step 7; Dolt's `dolt gc` wasn't run). In the first run of this comparison
+prolly's keyless total was 1,132 M of chunk journal and 143 M of pages.
 
 ## 3. What the numbers say
 
@@ -100,16 +108,23 @@ chunk journal and 143 M of pages.
 Dolt's working set is its tree, so a commit, a status, a branch switch, a
 reset or a fast-forward only names a root: under a millisecond whatever
 changed. Prolly writes as heap does and folds the changes into a tree when
-it commits: updating 10,000 rows and committing them costs prolly 25 + 37 =
-62 ms keyed, Dolt 1,155 + 1 = 1,156 ms. Moving a branch's pages to another
-commit (reset, fast-forward, checking out a dirty branch) applies the
-difference as rows, about 7–11 µs a row keyed; Dolt only moves a pointer.
+it commits: updating 10,000 rows and committing them costs prolly 24 + 36 =
+60 ms keyed, Dolt 1,075 + 1 = 1,076 ms. Moving a branch's pages to another
+commit (a reset, a fast-forward) applies the difference as rows, about
+11–12 µs a row keyed; Dolt only moves a pointer.
+
+**A dirty checkout costs prolly a fold, not a move.** In both, a checkout
+leaves the uncommitted changes on the branch left (each branch has its
+own working set: checked in Dolt's SQL session, where the other branch
+doesn't see them). Dolt only switches roots; prolly checkpoints the
+branch left, folding its changes (130 ms keyed for 10,000 rows, 404 ms
+keyless, which the next finding inflates).
 
 **Keyless tables hurt Dolt's history.** Their hashes put rows in random
 order, so a range of changed rows touches as many leaf chunks as rows,
 where the same range keyed touches a few: keyless, Dolt's journal grew to
 27 times the keyed run's, a 10,000-row diff took 6 times as long, and
-merges and cherry-picks of 10,000 rows 13 and 10 times as long. Its
+merges and cherry-picks of 10,000 rows 14 and 10 times as long. Its
 merges of keyless tables also never use the subtree-splicing fast path
 (`canFastMergeProllyTrees := !keyless && …`,
 `libraries/doltcore/merge/merge_prolly_rows.go`).
@@ -120,20 +135,20 @@ transaction that wrote the rows leaves the table marked unsettled, and
 the next fold reads it in full. Every merge, cherry-pick and revert
 commits in the transaction that applied its rows, so after each one the
 next fold of a keyless table is a full one: in this run the cherry-pick
-(5.2 s, of which most is `fold_all`'s sort and tree build) and every
-checkout (95 ms) folded the whole table. The cherry-pick alone, after
-plain commits, folds only its pages (counted: 38 pages, no full table).
+(4.8 s, of which most is `fold_all`'s sort and tree build) and the
+checkouts folded the whole table. The cherry-pick alone, after plain
+commits, folds only its pages (counted: 38 pages, no full table).
 
 **Checkouts fold even when nothing changed.** Leaving a branch checks
 whether its working set equals its head by folding it; a branch with
 nothing changed takes no checkpoint, so its baseline never advances and
 every checkout folds every change since the branch's last commit's
-baseline again: 95 ms keyless (full folds), 197 ms keyed (lookups of the
-carried and changed keys). "Has anything changed?" should be O(1) a table
-(`10-complexity-requirements.md`).
+baseline again: 35 ms keyless (full folds), 86 ms keyed (lookups of the
+carried and changed keys), for one checkout with nothing changed. "Has
+anything changed?" should be O(1) a table (`10-complexity-requirements.md`).
 
-**The first commit folds every row** (1.4–1.6 s for a million), once; Dolt
-had paid that cost while loading (6.2 s against prolly's 0.17 s).
+**The first commit folds every row** (1.3–1.4 s for a million), once; Dolt
+had paid that cost while loading (5.7 s against prolly's 0.18 s).
 
 ## 4. Merges of keyless rows
 
@@ -182,7 +197,7 @@ In order of what the numbers say matters:
    conflicts), or sum always (both adding a copy gives 3).
 4. **Moves are O(rows changed), Dolt's O(1).** That follows from keeping
    the working set in pages; worth measuring again after 1 and 2, since a
-   fast-forward and a dirty checkout here also paid for folds.
+   fast-forward here also paid for folds, and a dirty checkout is a fold.
 5. **The journal grows with every full fold** (1.1 G here, keyless): likely
    the trees rebuilt by full folds written again, unverified; step 7's GC
    reclaims them, and 1 removes most of them.
