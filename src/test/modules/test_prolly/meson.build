@@ -129,6 +129,7 @@ tests += {
       't/043_bmap_drop_replay.pl',
       't/044_merge_violations.pl',
       't/045_remotes.pl',
+      't/046_branch_crash.pl',
     ],
   },
 }

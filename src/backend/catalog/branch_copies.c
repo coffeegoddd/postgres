@@ -334,15 +334,42 @@ delete_here(void *arg)
 	dropBranchSharedDependencies(MyBranch);
 }
 
+/*
+ * Is name a branch's name by git's rules (git check-ref-format, as Dolt
+ * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
+ * refspec, and so on: a branch so named couldn't be named again.
+ */
+static bool
+branch_name_ok(const char *name)
+{
+	size_t		len = strlen(name);
+
+	if (strcmp(name, "HEAD") == 0 || name[0] == '-' || name[0] == '.' ||
+		name[0] == '/' || name[len - 1] == '/' || name[len - 1] == '.' ||
+		(len >= 5 && strcmp(name + len - 5, ".lock") == 0) ||
+		strstr(name, "..") != NULL || strstr(name, "@{") != NULL ||
+		strstr(name, "//") != NULL || strstr(name, "/.") != NULL)
+		return false;
+	for (const char *p = name; *p; p++)
+	{
+		unsigned char c = (unsigned char) *p;
+
+		if (c <= ' ' || c == 0x7f || strchr("~^:?*[\\", c) != NULL)
+			return false;
+	}
+	return true;
+}
+
 static void
 copies_check_create(const char *name)
 {
 	AclResult	aclresult;
 
-	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
+	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN || !branch_name_ok(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("invalid branch name \"%s\"", name)));
+				 errmsg("invalid branch name \"%s\"", name),
+				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\, no \"..\" or \"@{\", not \"HEAD\", not beginning with \"-\" or \".\", not ending with \"/\", \".\" or \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
 								ACL_CREATE);

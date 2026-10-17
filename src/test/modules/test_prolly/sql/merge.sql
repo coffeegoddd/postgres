@@ -349,3 +349,48 @@ SELECT count(*) AS merges FROM dolt_log('main') WHERE message LIKE 'merge %';
 SELECT dolt_branch('-D', 'mb_side');
 DROP SCHEMA mb CASCADE;
 SELECT length(dolt_commit('-Am', 'without mb')::text) AS committed;
+
+-- Merges of large values and indexed columns: the merged value whole, and
+-- the index right after the merge and after a resolution.
+CREATE SCHEMA mt VERSIONED;
+CREATE TABLE mt.t (id int PRIMARY KEY, k int, big text);
+CREATE INDEX mt_k ON mt.t (k);
+INSERT INTO mt.t SELECT g, g, repeat('a', 3000) || g FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'mt base')::text) AS committed;
+SELECT dolt_branch('mt_side');
+SELECT dolt_checkout('mt_side') IS NOT NULL AS on_side;
+UPDATE mt.t SET big = repeat('b', 5000) WHERE id = 1;
+UPDATE mt.t SET k = 1000 WHERE id = 2;
+UPDATE mt.t SET k = 4000 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'mt side')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mt.t SET k = 3000 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'mt main')::text) AS committed;
+SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
+SELECT length(big), left(big, 1) FROM mt.t WHERE id = 1;
+SET enable_seqscan = off;
+SELECT id FROM mt.t WHERE k = 1000;
+SELECT id FROM mt.t WHERE k = 3000;
+RESET enable_seqscan;
+
+-- (a conflict resolved with theirs: the index finds their value)
+SELECT dolt_checkout('mt_side') IS NOT NULL AS on_side;
+UPDATE mt.t SET k = 5000 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'mt side 5')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mt.t SET k = 5555 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'mt main 5')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('mt_side'))[3] AS conflicts;
+SELECT dolt_conflicts_resolve('--theirs', 'mt.t');
+SET LOCAL enable_seqscan = off;
+SELECT id FROM mt.t WHERE k = 5000;
+SELECT count(*) AS stale FROM mt.t WHERE k = 5555;
+SELECT length(dolt_commit('-m', 'mt resolved')::text) AS committed;
+COMMIT;
+
+-- resolving a table without conflicts is an error
+SELECT dolt_conflicts_resolve('--ours', 'mt.t');
+SELECT dolt_branch('-D', 'mt_side');
+DROP SCHEMA mt CASCADE;
+SELECT length(dolt_commit('-Am', 'without mt')::text) AS committed;

@@ -76,3 +76,35 @@ SELECT count(*) = :commits AS history_kept FROM dolt_log('HEAD');
 SELECT dolt_hashof('HEAD') = :'before_drop' AS same_head;
 SELECT length(dolt_commit('-Am', 'drop the schema')::text) AS committed;
 SELECT dolt_hashof('HEAD~1') = :'before_drop' AS continues_it;
+
+-- A commit needs a message, and --amend isn't one of its options; its
+-- author is dolt.author, else the session user with no email.
+CREATE SCHEMA ca VERSIONED;
+CREATE TABLE ca.t (id int PRIMARY KEY);
+INSERT INTO ca.t VALUES (1);
+SELECT dolt_commit('-A');
+SELECT dolt_commit('-Am', 'ca', '--amend');
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+SELECT length(dolt_commit('-Am', 'by ada')::text) AS committed;
+RESET dolt.author;
+INSERT INTO ca.t VALUES (2);
+SELECT length(dolt_commit('-am', 'by default')::text) AS committed;
+SELECT message, committer = current_user AS session_user,
+	CASE WHEN message = 'by ada' THEN committer END AS committer, email
+  FROM dolt_log WHERE message IN ('by ada', 'by default') ORDER BY message;
+
+-- A branch's name follows git's rules: one that ancestry steps, refspecs
+-- or options would read otherwise is refused.
+SELECT dolt_branch('bad~name');
+SELECT dolt_branch('bad^name');
+SELECT dolt_branch('bad:name');
+SELECT dolt_branch('two words');
+SELECT dolt_branch('a..b');
+SELECT dolt_branch('-flag');
+SELECT dolt_branch('HEAD');
+SELECT dolt_branch('ends.lock');
+SELECT dolt_branch('feature/ok-name_1.2');
+SELECT dolt_hashof('feature/ok-name_1.2') = dolt_hashof('HEAD') AS resolves;
+SELECT dolt_branch('-d', 'feature/ok-name_1.2');
+DROP SCHEMA ca CASCADE;
+SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;

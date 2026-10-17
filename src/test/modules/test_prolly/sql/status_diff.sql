@@ -137,3 +137,24 @@ SELECT count(*) FROM dolt_diff('WORKING', 'WORKING', NULL::sdo.one);
 SELECT pages < 10 AS only_its_pages FROM test_fold_counters(true);
 DROP SCHEMA sdo CASCADE;
 SELECT length(dolt_commit('-Am', 'sdo gone')::text) AS committed;
+
+-- dolt_diff takes a table's row type; a large value diffs whole.
+SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::int);
+CREATE SCHEMA sdt VERSIONED;
+CREATE TABLE sdt.t (id int PRIMARY KEY, big text);
+INSERT INTO sdt.t VALUES (1, repeat('a', 6000));
+SELECT length(dolt_commit('-Am', 'sdt')::text) AS committed;
+UPDATE sdt.t SET big = repeat('b', 7000);
+SELECT diff_type, length((from_row).big), left((from_row).big, 1),
+	length((to_row).big), left((to_row).big, 1)
+  FROM dolt_diff('HEAD', 'WORKING', NULL::sdt.t);
+
+-- an aggregate, or a row security policy, makes a commit fail, each alone
+CREATE AGGREGATE sdt.mysum(int) (SFUNC = int4pl, STYPE = int);
+SELECT dolt_commit('-Am', 'aggregate');
+DROP AGGREGATE sdt.mysum(int);
+ALTER TABLE sdt.t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY sdt_pol ON sdt.t USING (true);
+SELECT dolt_commit('-Am', 'policy');
+DROP SCHEMA sdt CASCADE;
+SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;

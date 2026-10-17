@@ -362,3 +362,43 @@ SELECT length(dolt_commit('-Am', 'sdo gone')::text) AS committed;
         66
 (1 row)
 
+-- dolt_diff takes a table's row type; a large value diffs whole.
+SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::int);
+ERROR:  dolt_diff needs a table's row type, as in NULL::tablename
+CREATE SCHEMA sdt VERSIONED;
+CREATE TABLE sdt.t (id int PRIMARY KEY, big text);
+INSERT INTO sdt.t VALUES (1, repeat('a', 6000));
+SELECT length(dolt_commit('-Am', 'sdt')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE sdt.t SET big = repeat('b', 7000);
+SELECT diff_type, length((from_row).big), left((from_row).big, 1),
+	length((to_row).big), left((to_row).big, 1)
+  FROM dolt_diff('HEAD', 'WORKING', NULL::sdt.t);
+ diff_type | length | left | length | left 
+-----------+--------+------+--------+------
+ modified  |   6000 | a    |   7000 | b
+(1 row)
+
+-- an aggregate, or a row security policy, makes a commit fail, each alone
+CREATE AGGREGATE sdt.mysum(int) (SFUNC = int4pl, STYPE = int);
+SELECT dolt_commit('-Am', 'aggregate');
+ERROR:  prolly commits don't cover aggregates and window functions yet: sdt.mysum(integer)
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP AGGREGATE sdt.mysum(int);
+ALTER TABLE sdt.t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY sdt_pol ON sdt.t USING (true);
+SELECT dolt_commit('-Am', 'policy');
+ERROR:  prolly commits don't cover row security policies yet: sdt_pol on sdt.t
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP SCHEMA sdt CASCADE;
+NOTICE:  drop cascades to table sdt.t
+SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
