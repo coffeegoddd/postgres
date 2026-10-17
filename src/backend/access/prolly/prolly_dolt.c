@@ -126,6 +126,12 @@ prolly_commit_author(void)
 	return GetUserNameFromId(GetUserId(), false);
 }
 
+void
+prolly_set_commit_author(const char *author)
+{
+	author_override = author;
+}
+
 /* ------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------
@@ -637,28 +643,27 @@ dolt_reset(PG_FUNCTION_ARGS)
 }
 
 /*
- * dolt_add(VARIADIC args text[]) returns text[]: {status}
- *
- * Tables or -A/--all/.: every change is staged already.
- */
-/*
  * dolt_cherry_pick(VARIADIC args text[]) returns text[]:
  *	  {commit id, data conflicts, schema conflicts, constraint violations}
  *
- * commit: its changes, committed again on the current branch.
+ * [--allow-empty] commit: its changes, committed again on the current
+ * branch, with its author.
  */
 Datum
 dolt_cherry_pick(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	char	   *ref = NULL;
+	const char *ref = NULL;
+	bool		allow_empty = false;
 	ProllyHash	id;
 	const char *result[4] = {NULL, "0", "0", "0"};
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (args[i][0] == '-')
+		if (strcmp(args[i], "--allow-empty") == 0)
+			allow_empty = true;
+		else if (args[i][0] == '-')
 			unsupported("dolt_cherry_pick", args[i]);
 		else if (ref == NULL)
 			ref = args[i];
@@ -669,7 +674,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
-	PROLLY_CALL(diff_merge(), cherry_pick, ref, false, &id);
+	PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1, false, allow_empty, &id);
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(4, result));
 }
@@ -677,7 +682,8 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 /*
  * dolt_revert(VARIADIC args text[]) returns text[]: {status}
  *
- * commit...: each one's changes undone, newest given first, a commit each.
+ * commit...: their changes undone, in one commit; each named as the branch
+ * was before any is.
  */
 Datum
 dolt_revert(PG_FUNCTION_ARGS)
@@ -685,24 +691,25 @@ dolt_revert(PG_FUNCTION_ARGS)
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
 	const char *result[1] = {"0"};
-	int			n = 0;
 	ProllyHash	id;
 
 	for (int i = 0; i < nargs; i++)
-	{
 		if (args[i][0] == '-')
 			unsupported("dolt_revert", args[i]);
-		n++;
-	}
-	if (n == 0)
+	if (nargs == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_revert needs a commit")));
-	for (int i = 0; i < nargs; i++)
-		PROLLY_CALL(diff_merge(), cherry_pick, args[i], true, &id);
+	PROLLY_CALL(diff_merge(), cherry_pick, (const char *const *) args, nargs,
+				true, false, &id);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
+/*
+ * dolt_add(VARIADIC args text[]) returns text[]: {status}
+ *
+ * Tables or -A/--all/.: every change is staged already.
+ */
 Datum
 dolt_add(PG_FUNCTION_ARGS)
 {
