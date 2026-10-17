@@ -102,16 +102,15 @@ class ConditionsTest(unittest.TestCase):
                 self.assertEqual(envmod._cpu_boost(), boost, values)
 
     def test_v_suite_needs_an_engine_with_history(self):
-        for am in ("heap", "prolly_d2"):
-            with self.assertRaisesRegex(SystemExit, "only prolly, prolly_d1 have"):
+        for am in ("heap",):
+            with self.assertRaisesRegex(SystemExit, "only prolly has"):
                 Runner(suite="V", cfg={}, table_am=am, label="x", repo=self.path,
                        bin_dir=self.path, work_dir=self.path, out_root=self.path,
                        command="run")
 
     def test_v_suite_probes_each_engine_in_its_own_sql(self):
         # (page-based prolly: dolt_* functions, in a versioned schema)
-        for am, setup, commit in (("prolly", "VERSIONED", "dolt_commit"),
-                                  ("prolly_d1", None, "prolly_commit")):
+        for am, setup, commit in (("prolly", "VERSIONED", "dolt_commit"),):
             sql = []
             cluster = SimpleNamespace(sql=lambda q, **kw: sql.append(q))
             ctx = SimpleNamespace(table_am=am, cluster=cluster,

@@ -16,7 +16,7 @@ our @EXPORT = qw(setup_target check_target run_requirements);
 sub setup_target
 {
 	my ($node, $db, $am) = @_;
-	$am =~ /\A(?:heap|prolly|prolly_d1|prolly_d2|prolly_d3a|prolly_d3b|prolly_d4)\z/
+	$am =~ /\A(?:heap|prolly)\z/
 	  or BAIL_OUT("unknown requirements target: $am");
 	$node->safe_psql($db,
 		"ALTER DATABASE \"$db\" SET default_table_access_method = '$am'");
@@ -63,7 +63,7 @@ sub check_target
 sub run_requirements
 {
 	my ($kind) = @_;
-	my $am = $ENV{PROLLY_AM} // 'prolly_d1';
+	my $am = $ENV{PROLLY_AM} // 'prolly';
 	my $node = PostgreSQL::Test::Cluster->new($kind);
 	$node->init;
 	$node->append_conf('postgresql.conf', 'max_prepared_transactions = 10');

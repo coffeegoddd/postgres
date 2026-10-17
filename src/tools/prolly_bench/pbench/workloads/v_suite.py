@@ -1,7 +1,6 @@
-"""The V suite: version-control workloads, for prolly engines only.  The
-tree engines (prolly_d1) are driven through the prolly_* SQL functions,
-page-based prolly through the dolt_* ones (its tables are in a versioned
-schema, committed with dolt_commit).
+"""The V suite: version-control workloads, for prolly, driven through the
+dolt_* SQL functions (its tables are in a versioned schema, committed with
+dolt_commit).
 
 Every V workload has a "background" variant dimension: "none", or "S1" to
 run pgbench TPC-B alongside the version-control operations, measuring how
@@ -26,25 +25,6 @@ def _median(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
 
-class _TreeSQL:
-    """Version-control statements of the tree engines."""
-
-    def branch(self, name):
-        return f"SELECT prolly_branch_create('{name}', NULL)"
-
-    def checkout(self, name):
-        return f"SELECT prolly_checkout('{name}')"
-
-    def commit(self, message):
-        return f"SELECT prolly_commit('{message}')"
-
-    def diff_count(self, a, b, table):
-        return f"SELECT count(*) FROM prolly_diff('{a}', '{b}')"
-
-    def merge(self, name):
-        return f"SELECT prolly_merge('{name}')"
-
-
 class _DoltSQL:
     """Version-control statements of page-based prolly."""
 
@@ -65,7 +45,7 @@ class _DoltSQL:
 
 
 def vc_sql(ctx: Context):
-    return _DoltSQL() if ctx.table_am in targets.VERSIONED_ONLY else _TreeSQL()
+    return _DoltSQL()
 
 
 class VWorkload(Workload):
@@ -271,28 +251,5 @@ class V4(VWorkload):
     id, title = "V4", "Clone, fetch and push between two instances"
 
     def operations(self, ctx):
-        if ctx.table_am in targets.VERSIONED_ONLY:
-            raise NotImplementedByEngine("prolly has no clone, fetch or push yet")
-        assert ctx.make_cluster is not None
-        remote = ctx.make_cluster("remote")
-        try:
-            remote.sql(f"CREATE DATABASE {ctx.dbname}")
-            setup = targets.for_am(ctx.table_am).setup_sql(ctx.dbname)
-            if setup:
-                remote.sql(setup, dbname=ctx.dbname)
-            local_url = ctx.cluster.libpq_url(ctx.dbname)
-            clone = timed_session(ctx, [f"SELECT prolly_clone('{local_url}')"],
-                                  "v4-clone", cluster=remote)
-            timed_session(ctx, [
-                "UPDATE vc_data SET payload = 'local' WHERE id <= 1000",
-                "SELECT prolly_commit('v4 local change')"], "v4-local-change")
-            fetch = timed_session(ctx, [f"SELECT prolly_fetch('{local_url}', 'main')"],
-                                  "v4-fetch", cluster=remote)
-            remote_url = remote.libpq_url(ctx.dbname)
-            push = timed_session(ctx, [f"SELECT prolly_push('{remote_url}', 'main')"],
-                                 "v4-push")
-        finally:
-            remote.destroy()
-        return Outcome(metrics={"clone_ms": clone[0], "fetch_ms": fetch[0],
-                                "push_ms": push[0]},
-                       transactions=3, unit="operation")
+        # (file remotes are built; between two instances, network remotes)
+        raise NotImplementedByEngine("prolly has no network remotes yet")

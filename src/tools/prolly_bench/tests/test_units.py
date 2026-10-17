@@ -247,12 +247,12 @@ class TableTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             self._set(root, "B0", "heap", 1000.0)
-            self._set(root, "prolly_d1", "prolly_d1", 800.0)
-            self._set(root, "prolly_d2", "prolly_d2", None, "not_implemented")
+            self._set(root, "prolly", "prolly", 800.0)
+            self._set(root, "prolly_x", "prolly", None, "not_implemented")
             self.assertEqual(len(table.discover(root, "S")), 3)
-            sets = [table.load_set(root / n) for n in ("B0", "prolly_d1", "prolly_d2")]
+            sets = [table.load_set(root / n) for n in ("B0", "prolly", "prolly_x")]
             md = table.to_markdown(sets, "S")
-            self.assertIn("| B0 (heap) | prolly_d1 | prolly_d2 |", md)
+            self.assertIn("| B0 (heap) | prolly | prolly_x (prolly) |", md)
             self.assertIn("| 1,000 | 800 (0.80x) | INVALID |", md)
             self.assertIn("| 2.00 | 2.00 (1.00x) | INVALID |", md)
             page = table.to_html(sets, "S")
@@ -272,7 +272,6 @@ class TableTest(unittest.TestCase):
 class CSuiteTest(unittest.TestCase):
     def test_targets(self):
         self.assertIsNone(targets.for_am("heap").schema)
-        self.assertIsNone(targets.for_am("prolly_d1").schema)
         self.assertEqual(targets.for_am("prolly").schema, targets.VERSIONED_SCHEMA)
         self.assertEqual(targets.for_am("heap").setup_sql("bench"), "")
         sql = targets.for_am("prolly").setup_sql("bench")
@@ -390,9 +389,3 @@ class VSuiteSQLTest(unittest.TestCase):
                  vc.diff_count("main", "b", "vc_data"), vc.merge("b")]
         self.assertTrue(all("dolt_" in s and "prolly_" not in s for s in stmts), stmts)
         self.assertEqual(vc.commit("m"), "SELECT dolt_commit('-Am', 'm')")
-
-    def test_tree_engines_use_prolly_functions(self):
-        from pbench.workloads.v_suite import vc_sql
-        vc = vc_sql(self.ctx("prolly_d1"))
-        self.assertEqual(vc.branch("b"), "SELECT prolly_branch_create('b', NULL)")
-        self.assertEqual(vc.merge("b"), "SELECT prolly_merge('b')")

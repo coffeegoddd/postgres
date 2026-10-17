@@ -12,7 +12,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use ProllyTest;
 
-my $am = $ENV{PROLLY_AM} // 'prolly_d1';
+my $am = $ENV{PROLLY_AM} // 'prolly';
 my $conf = "default_table_access_method = '$am'\n"
   . "wal_consistency_checking = 'all'\n";
 

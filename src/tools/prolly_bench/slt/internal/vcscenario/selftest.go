@@ -16,23 +16,15 @@ func (p claimedVC) Capabilities() []string { return []string{"sql", "vc.core"} }
 // from corpus coverage.
 func SelfTest(ctx context.Context, dsn, am string, timeout time.Duration) ([]Result, error) {
 	var results []Result
-	controls := []struct{ id, sql, match string }{
+	// (No wrong-AM control: a table of another AM can't be made where the
+	// adapter looks, a versioned public refusing heap and an ordinary one
+	// prolly; the adapter checks for one still.)
+	for _, tc := range []struct{ id, sql, match string }{
 		{"wrong-result", "SELECT 'wrong'::text", "rows differ"},
 		{"unexpected-error", "SELECT missing_column", "SQLSTATE"},
-	}
-	// (only where public may hold a table of another AM: a versioned public,
-	// prolly's, refuses heap tables itself)
-	if am != "prolly" {
-		controls = append(controls, struct{ id, sql, match string }{
-			"wrong-am", "CREATE TABLE rogue (id int) USING heap", "wrong AM"})
-	}
-	for _, tc := range controls {
+	} {
 		rows := [][]Value{{{Text: func() *string { s := "expected"; return &s }()}}}
 		st := Step{ID: tc.id, Session: "a", Op: "query", SQL: tc.sql, Expect: &Expected{Rows: &rows, Order: "ordered"}}
-		if tc.id == "wrong-am" {
-			st.Op = "exec"
-			st.Expect = nil
-		}
 		s := Scenario{Version: 1, ID: tc.id, Description: "negative control", Requires: []string{"sql"}, Sessions: []string{"a"}, Steps: []Step{st}}
 		a, err := NewPostgres(dsn, am, timeout)
 		if err != nil {

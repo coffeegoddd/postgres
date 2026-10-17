@@ -25,8 +25,8 @@ src/tools/prolly_bench/system/system_prepare.sh
 
 src/tools/prolly_bench/prolly_bench run S --am heap          # B0 baseline
 src/tools/prolly_bench/prolly_bench run S --am heap --set full_page_writes=off
-src/tools/prolly_bench/prolly_bench run S --am prolly_d1
-src/tools/prolly_bench/prolly_bench run V --am prolly_d1
+src/tools/prolly_bench/prolly_bench run S --am prolly
+src/tools/prolly_bench/prolly_bench run V --am prolly
 
 # after: put the machine back
 src/tools/prolly_bench/system/system_restore.sh
@@ -67,7 +67,7 @@ bash src/tools/prolly_bench/build_benchbase.sh
 src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
   --workloads S9,S13 --config src/tools/prolly_bench/configs/smoke.toml
 
-# Standard procedure; select an experimental engine with --am prolly_d1, etc.
+# Standard procedure.
 src/tools/prolly_bench/prolly_bench run S --am heap,prolly --workloads S9,S13
 src/tools/prolly_bench/prolly_bench table
 ```
@@ -249,7 +249,7 @@ Documented exceptions and matching PostgreSQL/corpus differences remain
 allowed.
 
 PR CI also runs the requirements suites against versioned `prolly`
-storage and five differential seeds on heap, `prolly`, and D1. The nightly
+storage and five differential seeds on heap and `prolly`. The nightly
 run increases the seed budget and runs upstream regression, isolation and
 recovery against block-mapped storage. Logs, replay programs and summary
 records are uploaded on success and failure.
@@ -265,7 +265,7 @@ src/tools/prolly_bench/prolly_bench differential \
 
 Each seed gets two fresh databases in an isolated local cluster, with
 durability enabled. `--am heap` validates the generator against heap on
-both sides; `prolly_d1` and the other experimental AMs use the same runner.
+both sides.
 The target canary checks the actual AM, and for `prolly` checks the table,
 index and TOAST block-map forks. Unsupported engines fail; they do not
 count as tested. `--self-test` proves a deliberate answer difference is
@@ -348,14 +348,14 @@ Run the PostgreSQL adapters with:
 ```sh
 bash src/tools/prolly_bench/build_vc.sh
 src/tools/prolly_bench/prolly_bench vc \
-  --pg-bin build-rel/inst/bin --am prolly_d1 --self-test \
-  --out /tmp/vc-d1
+  --pg-bin build-rel/inst/bin --am prolly --self-test \
+  --out /tmp/vc-prolly
 ```
 
 The bundled fixtures are native harness acceptance cases, not imported Dolt
 coverage: one checks core history, the other checks SQL values, persistent
-sessions, transaction rollback and expected errors. D1 declares `sql` and
-`vc.core`; heap and prolly declare only `sql`; D2-D4 declare neither. Each
+sessions, transaction rollback and expected errors. Prolly (a versioned
+public schema) declares `sql` and `vc.core`; heap declares only `sql`. Each
 case gets a new database and one persistent connection per named session.
 Operations run sequentially; these schedules do not exercise concurrent
 blocking queries. VC operations require an idle SQL transaction, since this
@@ -373,12 +373,13 @@ history. The adapter also checks public tables' AMs after steps, deferring
 that check until rollback if a SQL error aborted the transaction. Scenario
 tables belong in public; arbitrary other schemas are outside this check.
 
-To see coverage gaps, run `--am heap,prolly,prolly_d1,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4`.
+To see coverage gaps, run `--am heap,prolly`.
 Any unsupported case makes the command fail, with an explicit `unsupported`
 result. An engine's claim of support must also pass the live preflight;
 failure there is a failed target, not an automatic exclusion. `--self-test`
-checks wrong rows, unexpected SQL errors, wrong AMs, a deliberately false
-prolly VC claim, and explicit unsupported reporting. These controls are
+checks wrong rows, unexpected SQL errors, a deliberately false VC claim
+(on heap), and explicit unsupported reporting.  (No wrong-AM control: a
+table of another AM can't be made in public, versioned or not.) These controls are
 recorded separately and never added to corpus passes.
 
 Artifacts include the source revision/dirty flag, binary hash, server
@@ -390,11 +391,11 @@ after each result. Replay the saved input with `--cases`:
 
 ```sh
 src/tools/prolly_bench/prolly_bench vc \
-  --pg-bin build-rel/inst/bin --am prolly_d1 \
-  --cases /tmp/vc-d1/results/scenarios/core-history.json --out /tmp/vc-replay
+  --pg-bin build-rel/inst/bin --am prolly \
+  --cases /tmp/vc-prolly/results/scenarios/core-history.json --out /tmp/vc-replay
 ```
 
-CI runs both fixtures on D1 and the SQL fixture on heap/prolly. Logs and
+CI runs both fixtures on prolly and the SQL fixture on heap. Logs and
 coverage artifacts are uploaded with the existing engine results.
 
 
@@ -464,11 +465,10 @@ Metric scopes are explicit:
 - CPU and perf summaries are labeled as host activity. Server CPU is withheld
   until a reliable server-specific source is available. Device counters cover
   the entire data device and may include unrelated or delayed writes.
-- Relation/database sizes are not complete D1 storage sizes. Cluster apparent
-  and allocated bytes include global engine stores and WAL. Representation
-  size is not advertised as cross-engine logical space amplification.
-  Optional collector `gc` records D1 node retention/reclamation and cluster
-  allocated bytes before/after GC, after the other measurements.
+- Relation/database sizes don't include the chunk store's history. Cluster
+  apparent and allocated bytes include it and WAL. Representation size is not
+  advertised as cross-engine logical space amplification. Optional collector
+  `gc` reports not implemented until prolly's chunk-store GC is built.
 - Restart timing describes a process crash with warm OS caches, not power loss.
   Every workload table's typed contents are hashed before/after restart and
   must match. Maintenance runs afterward. Existing durability TAP tests cover
@@ -478,15 +478,17 @@ Metric scopes are explicit:
   bounds. A pgbench workload can set `rate` and `latency_limit_ms` for scheduled
   arrivals; skipped and failed transactions are separately reported.
 
-V benchmarks currently require D1 and a successful SQL-visible history-restore
+V benchmarks require prolly and a successful SQL-visible history-restore
 probe. Missing tables fail target checks. Prolly's table/index/TOAST canaries
-must have block-map forks. D1 operation-level node reads/writes are sampled in
-the same timed SQL session and stored in `*-counters.json`, not sampled from a
-separate backend. V3 verifies exact change-set and overlap cardinalities;
+must have block-map forks. V3 verifies exact change-set and overlap cardinalities;
 impossible change sets and oversized V2 changes fail rather than being clamped.
 
-For a fixed V2 variant, configure at least four `v_rows` sizes spanning 8x and
-five repetitions per size, then inspect/gate empirical node-work growth:
+The gate below reads per-operation node work from `*-counters.json`, which
+only the tree engine D1 recorded (from its node counters); no engine records
+it since D1's removal, so the gate is inconclusive until prolly's folds
+report theirs. For a fixed V2 variant, configure at least four `v_rows`
+sizes spanning 8x and five repetitions per size, then inspect/gate
+empirical node-work growth:
 
 ```sh
 src/tools/prolly_bench/prolly_bench complexity RESULT_DIR \

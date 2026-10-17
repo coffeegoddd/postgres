@@ -108,7 +108,7 @@ class Runner:
         self.command, self.keep_failed = command, keep_failed
         if suite == "V" and table_am not in targets.VERSIONED_HISTORY:
             raise SystemExit("The V suite measures version control, which only "
-                             f"{', '.join(sorted(targets.VERSIONED_HISTORY))} have.")
+                             f"{', '.join(sorted(targets.VERSIONED_HISTORY))} has.")
         date = dt.date.today().isoformat()
         out = out_root / f"{date}-{suite}-{label}"
         n = 2

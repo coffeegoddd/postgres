@@ -20,18 +20,12 @@ type Profile struct {
 func EngineProfile(am string) (Profile, error) {
 	p := Profile{Engine: am}
 	switch am {
-	case "prolly_d1":
-		p.Supported = []string{"sql", "vc.core"}
-		p.Limitations = "Data commit/branch/hard-reset only; no schema-merge or concurrency claim."
 	case "prolly":
 		p.Supported = []string{"sql", "vc.core"}
 		p.Limitations = "Versioned public schema: data commit/branch/hard-reset; no schema-merge or concurrency claim."
 	case "heap":
 		p.Supported = []string{"sql"}
 		p.Limitations = "Ordinary heap has no version-control capability."
-	case "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4":
-		p.Supported = []string{}
-		p.Limitations = "Unimplemented engine; no functional capabilities declared."
 	default:
 		return p, fmt.Errorf("unknown engine %q", am)
 	}

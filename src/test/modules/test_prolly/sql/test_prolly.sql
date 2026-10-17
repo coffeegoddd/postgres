@@ -1,6 +1,6 @@
 --
--- Prolly storage: registered implementations, conformance suites, and the
--- stub table AMs, index AM and version-control functions reached from SQL.
+-- Prolly storage: registered implementations, conformance suites, and
+-- canonical values.
 --
 CREATE EXTENSION test_prolly;
 \set VERBOSITY terse
@@ -19,58 +19,6 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
 SELECT * FROM prolly_conformance('engine', 'd1');
 SELECT * FROM prolly_conformance('content_hash');
 SELECT * FROM prolly_conformance('no_such_interface');
-
---
--- Table access methods: creating storage dispatches to the engine interface.
--- Engine d1 creates its trees (its tables are tested in d1_tables); the
--- others are stubs.
---
-CREATE TABLE prolly_t1 (a int) USING prolly_d1;
-CREATE TABLE prolly_t2 (a int) USING prolly_d2;
-CREATE TABLE prolly_t3a (a int) USING prolly_d3a;
-CREATE TABLE prolly_t3b (a int) USING prolly_d3b;
-CREATE TABLE prolly_t4 (a int) USING prolly_d4;
-
-SET default_table_access_method = prolly_d1;
-CREATE TABLE prolly_default (a int);
-RESET default_table_access_method;
-
-CREATE TABLE prolly_heap (a int, b bigint, c text);
-INSERT INTO prolly_heap VALUES (1, 2, 'three');
-ALTER TABLE prolly_heap SET ACCESS METHOD prolly_d2;
-SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
-WHERE c.relname = 'prolly_heap';
-
---
--- Index access method: operator classes follow the btree contract, and
--- building an index reaches the stub.
---
-SELECT opcname, opcintype::regtype
-FROM pg_opclass WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly_d1_index')
-ORDER BY opcname;
-SELECT amvalidate(oid) FROM pg_opclass
-WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'prolly_d1_index');
-CREATE INDEX ON prolly_heap USING prolly_d1_index (a);
-CREATE INDEX ON prolly_heap USING prolly_d1_index (b);
-CREATE INDEX ON prolly_heap USING prolly_d1_index (c);
-CREATE INDEX ON prolly_heap USING prolly_d1_index (a, c);
-DROP TABLE prolly_heap;
-
---
--- Version-control functions dispatch to the refs, diff/merge and transfer
--- interfaces.
---
-SELECT prolly_branch_create('feature', NULL) IS NULL AS created;
-SELECT prolly_branch_create(NULL, NULL);
-SELECT prolly_checkout('feature') IS NULL AS checked_out;
-SELECT prolly_commit('first commit') IS NOT NULL AS committed;
--- (a head moved alone, as a fast-forward moves it, is a change of the refs)
-SELECT test_refs_epoch() AS refs_epoch \gset
-SELECT test_refs_set_head('HEAD');
-SELECT test_refs_epoch() > :refs_epoch AS epoch_moved;
-SELECT * FROM prolly_diff('main', 'feature');
-SELECT prolly_merge('feature') IS NOT NULL AS merged;
-SELECT prolly_checkout('main') IS NULL AS back_on_main;
 
 --
 -- Canonical value bytes carry no local OIDs and no DDL history: the same

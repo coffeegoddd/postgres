@@ -16,9 +16,9 @@ from typing import Optional
 # Table AMs whose tables must be in a versioned schema.
 VERSIONED_ONLY = {"prolly"}
 
-# Table AMs with version control (data history): the V suite's engines.
-# Page-based prolly's is its versioned schemas'; prolly_d1's, its trees'.
-VERSIONED_HISTORY = VERSIONED_ONLY | {"prolly_d1"}
+# Table AMs with version control (data history): the V suite's engines,
+# prolly's being its versioned schemas'.
+VERSIONED_HISTORY = VERSIONED_ONLY
 
 # The versioned schema a target creates its tables in.
 VERSIONED_SCHEMA = "versioned"

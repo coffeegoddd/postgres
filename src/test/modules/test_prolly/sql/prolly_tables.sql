@@ -77,14 +77,8 @@ DROP SCHEMA app CASCADE;
 DROP TABLE h, d, u2;
 
 -- Page-based prolly has no tree engine, so no node counters: asking for
--- them is refused (as for heap), not a crash.  A tree engine's still count.
+-- them is refused (as for heap), not a crash.
 \set VERBOSITY sqlstate
 SELECT * FROM prolly_node_counters('prolly');
 SELECT * FROM prolly_node_counters('heap');
 \set VERBOSITY default
-CREATE TABLE d1n (id int PRIMARY KEY, v text) USING prolly_d1;
-INSERT INTO d1n SELECT g, 'v' FROM generate_series(1, 200) g;
-SELECT nodes_read AS r0 FROM prolly_node_counters('prolly_d1') \gset
-SELECT count(*) FROM d1n;
-SELECT nodes_read > :r0 AS d1_counts_reads FROM prolly_node_counters('prolly_d1');
-DROP TABLE d1n;
