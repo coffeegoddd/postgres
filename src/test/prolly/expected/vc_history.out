@@ -23,3 +23,15 @@ c: different root|t
 root by commit id|t
 stable|t
 back to main|t
+branch p1|t
+branch p2|t
+branch p3|t
+checkout p1|t
+commit p1|t
+checkout p2|t
+commit p2|t
+checkout p3|t
+commit p3|t
+p1 and p2: same root|t
+p3 without the view: another|t
+back to main again|t

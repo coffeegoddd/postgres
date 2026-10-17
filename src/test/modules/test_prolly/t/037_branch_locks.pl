@@ -150,6 +150,15 @@ $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $conflicts), '1', 'one on its own branch\'s does');
 $reader->quit;
 
+# A transaction prepared on a branch commits there, whatever branch the
+# session that commits it is on.
+sql(q{BEGIN; INSERT INTO app.t VALUES (900001, 1); PREPARE TRANSACTION 'on_b1'},
+	'postgres/b1');
+sql(q{COMMIT PREPARED 'on_b1'});
+is(sql(q{SELECT count(*) FROM app.t WHERE id = 900001}, 'postgres/b1'), '1',
+	'a transaction prepared on a branch commits to it from another\'s session');
+is(sql(q{SELECT count(*) FROM app.t WHERE id = 900001}), '0', 'not to the committer\'s');
+
 $standby->stop;
 $primary->stop;
 done_testing();

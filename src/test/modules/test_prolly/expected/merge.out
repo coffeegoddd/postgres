@@ -1148,3 +1148,152 @@ SELECT length(dolt_commit('-Am', 'without mb')::text) AS committed;
         66
 (1 row)
 
+-- Merges of large values and indexed columns: the merged value whole, and
+-- the index right after the merge and after a resolution.
+CREATE SCHEMA mt VERSIONED;
+CREATE TABLE mt.t (id int PRIMARY KEY, k int, big text);
+CREATE INDEX mt_k ON mt.t (k);
+INSERT INTO mt.t SELECT g, g, repeat('a', 3000) || g FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'mt base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mt_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('mt_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE mt.t SET big = repeat('b', 5000) WHERE id = 1;
+UPDATE mt.t SET k = 1000 WHERE id = 2;
+UPDATE mt.t SET k = 4000 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'mt side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE mt.t SET k = 3000 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'mt main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 0
+(1 row)
+
+SELECT length(big), left(big, 1) FROM mt.t WHERE id = 1;
+ length | left 
+--------+------
+   5000 | b
+(1 row)
+
+SET enable_seqscan = off;
+SELECT id FROM mt.t WHERE k = 1000;
+ id 
+----
+  2
+(1 row)
+
+SELECT id FROM mt.t WHERE k = 3000;
+ id 
+----
+  3
+(1 row)
+
+RESET enable_seqscan;
+-- (a conflict resolved with theirs: the index finds their value)
+SELECT dolt_checkout('mt_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE mt.t SET k = 5000 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'mt side 5')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE mt.t SET k = 5555 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'mt main 5')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('mt_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'mt.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SET LOCAL enable_seqscan = off;
+SELECT id FROM mt.t WHERE k = 5000;
+ id 
+----
+  5
+(1 row)
+
+SELECT count(*) AS stale FROM mt.t WHERE k = 5555;
+ stale 
+-------
+     0
+(1 row)
+
+SELECT length(dolt_commit('-m', 'mt resolved')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+-- resolving a table without conflicts is an error
+SELECT dolt_conflicts_resolve('--ours', 'mt.t');
+ERROR:  table "t" has no merge conflicts
+SELECT dolt_branch('-D', 'mt_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mt CASCADE;
+NOTICE:  drop cascades to table mt.t
+SELECT length(dolt_commit('-Am', 'without mt')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
