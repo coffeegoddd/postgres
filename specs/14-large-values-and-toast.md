@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`. Nothing here is built.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Nothing here is built.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with
@@ -98,7 +98,13 @@ The whole-row reference in `tree_cow.c:645` stays as the fallback for a
 row of many medium columns that is still over the node limit.
 
 The canonical format version goes up; history written by the old format
-stays readable.
+stays readable. Across the boundary the same rows hash differently, so a
+diff or merge between roots of different formats can't skip equal subtrees
+by hash: it compares those tables row by row by decoded content, at a cost
+proportional to the table once, and a merge whose base is in the old format
+refolds the base in the new one first. (The alternative is #149's: a clean
+break, older roots' tables not read. It is simpler, and right only while
+nobody has history worth keeping.)
 
 ### B2. Value trees addressed by byte counts
 
@@ -131,6 +137,23 @@ against decoding and hashing the value.
 The memo is per database in shared memory, bounded, and may be lost at a
 restart: a miss is only slower. Persisting it is a later choice.
 
+The memo names chunks a fold wrote, so it is filled only with chunks that
+are durable and visible:
+
+- **Filled at commit.** A fold's new entries are kept in backend-local
+  memory and published to the shared memo when its transaction commits
+  (after the chunk store's root moves); an abort discards them. Otherwise a
+  rolled-back `dolt_commit` would leave entries naming chunks no one can
+  read, and the next fold that hits one would write a dangling reference.
+- **Checked on a hit.** A hit also asks the chunk store whether it has the
+  root hash, which is cheap against decoding and catches anything else
+  that removed the chunks (reclamation, part 6).
+- **Never across a wraparound.** The key's xmin is the raw xmin of chunk 0
+  (kept by freezing), which repeats after 2^32 transactions; each entry
+  records the full transaction ID it was filled in, and entries filled more
+  than 2^31 transactions ago are dropped, so a reused value ID with a
+  reused xmin can't match an old entry.
+
 ### B4. Apply keeps a row's own pointer
 
 When the applier updates a row and a large column's new reference equals
@@ -139,7 +162,12 @@ baseline tree), it passes the current row's datum through. `toast_tuple_init`
 then sees identical pointer bytes and keeps the value (`toast_helper.c:78-101`):
 no decode, no compression, no new OID.
 
-This works for the same row only. Stock TOAST gives each value one owner:
+This works for an UPDATE of the same row only. Apply paths that insert a
+row rather than update one still re-toast: reset or merge into a table
+that doesn't hold the row, branch-at-commit (which writes every row), and
+the materialized-view path, which deletes and reinserts (the delete
+schedules the old value's chunks for removal, so the new row can't keep
+its pointer). Stock TOAST gives each value one owner:
 deleting a row deletes its TOAST chunks (`heap_toast_delete`), so giving
 another live row the same pointer would leave that row dangling when the
 first is deleted. Sharing across rows needs C.
@@ -158,15 +186,33 @@ first is deleted. Sharing across rows needs C.
 
 ### C1. The pointer
 
-A new on-disk tag, `VARTAG_ONDISK_HASH` (5), next to `VARTAG_ONDISK_OID`
-(18) and `VARTAG_ONDISK_OID8` (4), added the way `6e58d6356f` added oid8:
+A new on-disk tag per hash algorithm, `VARTAG_ONDISK_SHA256` (5), next to
+`VARTAG_ONDISK_OID` (18) and `VARTAG_ONDISK_OID8` (4), added the way
+`6e58d6356f` added oid8 (`VARTAG_SIZE` gets a pointer's size from its tag
+alone, so a tag has one fixed size):
 
     int32  va_rawsize    -- as now: original size, header included
     uint32 va_extinfo    -- as now: stored size and compression method
     uint8  va_hash[32]   -- the value tree's root, the store's hash
 
-42 bytes as a datum. `VARATT_IS_EXTERNAL_ONDISK` includes it. It names no
-relation: a value is the same value on every branch and in every table.
+42 bytes as a datum. It names no relation: a value is the same value on
+every branch and in every table.
+
+`VARATT_IS_EXTERNAL_ONDISK` does **not** include it: its 27 uses in 16
+files assume a value ID and a TOAST relation. A separate predicate,
+`VARATT_IS_EXTERNAL_ONDISK_HASH` (true for every hash tag), is tested where a hash pointer is
+meant, and every `_ONDISK` use is audited before C is built. Known ones
+that must learn the new tag or refuse it:
+
+- `pg_column_toast_chunk_id` (`varlena.c`): no chunk ID; returns NULL.
+- `reorderbuffer.c`: reassembles values from TOAST chunks; a hash pointer
+  is fetched from the chunk store instead (C4).
+- `toast_compression.c`, pageinspect, test_decoding, and
+  `changes_pages.c`'s out-of-line key checks.
+- `toast_tuple_find_biggest_attribute` (`toast_helper.c`): it sizes the
+  pointer a value would become from the TOAST relation's ID type (18 bytes
+  for OID); with a chunk-store destination it must use 42, or values of
+  24–48 bytes are moved out into a pointer bigger than themselves.
 
 ### C2. Saving and fetching
 
@@ -174,26 +220,61 @@ Saving: `toast_save_datum` asks the table AM for a TOAST destination. A new
 optional table AM callback, `relation_toast_save(rel, value) -> pointer`,
 used when present, builds the value tree as B2 does (from the uncompressed
 bytes, so the hash is B1's reference) and writes its chunks to the chunk
-store. The prolly AM stops returning `GetHeapamTableAmRoutine()` as it is
-and returns a copy with this callback set (the same wrapper the heap
-recovery work wants for its storage manager choice). Stock heap tables
-never take the new path; their only cost is a tag check in `detoast.c`.
+store. Stock heap tables never take the new path; their only cost is a
+tag check in `detoast.c`.
+
+Where the callback lives is open. Returning a copy of
+`GetHeapamTableAmRoutine()` with it set breaks the code that recognizes
+heap by its routine's address: `heap_getnext` (`heapam.c:1451`, "only heap
+AM is supported") and `REPACK (CONCURRENTLY)` (`repack.c:995`), both of
+which prolly tables (and their TOAST tables) pass today. Either those two
+checks learn to accept the prolly routine (they check the routine, not the
+OID, precisely so that AMs reusing heap's handler work), or the
+destination is chosen outside `TableAmRoutine`, by a toaster hook that
+looks at the relation's access method, as block-mapped storage is chosen.
+Recommended: the hook, which keeps prolly's routine heap's own.
 
 Fetching: `detoast.c` dispatches the new tag to a registered fetch hook,
 whole or by slice. Slices descend B2's byte counts and read only the
 chunks they need, for compressed and uncompressed values alike, since the
 tree holds uncompressed bytes.
 
-The toaster's passes are unchanged. Pass 1 still compresses EXTENDED
-values; a value moved out to the chunk store is stored uncompressed, and
-one that stays inline stays compressed. Pass 2 needs "has a TOAST
-destination" in place of `reltoastrelid != InvalidOid`.
+The toaster's passes keep their order and thresholds, with these changes
+for a relation with a chunk-store destination:
+
+- **Every check for a TOAST relation.** Passes 1, 2 and 4 test
+  `reltoastrelid != InvalidOid` (`heaptoast.c`), and `toast_save_datum`
+  opens `reltoastrelid` directly; all of them ask "has a TOAST destination"
+  instead, and `toast_save_datum` doesn't open a TOAST relation for a
+  chunk-store save. A prolly table needs no TOAST relation then (C6), and
+  without these, pass 1 never moves out an EXTENDED value still too big
+  after compression, and pass 4 never moves out MAIN values: "row is too
+  big".
+- **No compress-then-decompress.** A value moved out is stored
+  uncompressed (the tree is built from uncompressed bytes), and one that
+  stays inline stays compressed. So the toaster keeps an EXTENDED value's
+  uncompressed datum beside the compressed one until the column is settled,
+  and `relation_toast_save` gets the uncompressed bytes: one compression for
+  a value moved out, not a compression and a decompression.
+- **Hash pointers pass through.** `toast_tuple_init` fetches back and saves
+  again any external value the row doesn't own: every external value of an
+  INSERT, and of an UPDATE any that differs from the old row's
+  (`toast_helper.c:105-145`). A hash pointer has no owner, so it is kept as
+  it is: written into a row it costs nothing, whichever row it came from.
+  Without this, C3's apply would detoast, compress, decompress and rehash
+  every value it writes.
 
 ### C3. What it gives
 
 - **Fold without decoding.** A hash pointer's hash is B1's reference for
-  every type whose on-disk bytes are its canonical bytes (text, varchar,
-  bpchar, bytea): the fold copies it. A small value TOAST moved out (the
+  every type whose on-disk bytes are its canonical bytes: bytea anywhere,
+  and text, varchar and bpchar in a UTF-8 database only. In other
+  encodings those types' canonical bytes are UTF-8, converted through their
+  send functions (`prolly_datum.c:254-259`), so their trees are built over
+  the canonical bytes, not the on-disk ones: the toaster converts before
+  building the tree, and the pointer's hash is then still B1's reference.
+  (Otherwise the same rows would hash differently in a LATIN1 and a UTF-8
+  database.) A small value TOAST moved out (the
   row was big) is read and stored inline, which is cheap. A large value
   that stayed inline compressed is built into a tree.
 - **Apply without re-toasting.** The applier writes the reference as a
@@ -209,11 +290,29 @@ destination" in place of `reltoastrelid != InvalidOid`.
   does nothing for hash pointers. The chunk store has no reclamation today
   (`chunkstore_journal.c` conjoins table files; `prolly_gc()` is the D1 node
   store's, `reclaim_marksweep.c`). C needs one, marking from every commit
-  root, every branch's working-set heap (scanning versioned heaps and their
-  indexes' heap tuples for hash pointers), and every chunk newer than the
-  collection's start. Working-set churn (a 1 MB document updated a
-  thousand times between dolt commits) is garbage until then. Dolt has the
-  same property.
+  root, every branch's working-set heap (scanning versioned heaps for hash
+  pointers), and every chunk newer than the collection's start. Working-set
+  churn (a 1 MB document updated a thousand times between dolt commits) is
+  garbage until then. Dolt has the same property. Two things the roots
+  alone miss:
+  - **Chunks a writer starts using again.** Content dedup means a writer
+    can reference an old chunk set without appending anything: a value
+    whose tree already exists, or an apply copying a reference. If marking
+    has already passed every tuple that held it, the sweep frees it under
+    the new row. So while a collection runs, every hash a writer puts or
+    references (a save that finds the tree present, an apply writing a
+    hash pointer, a fold) is added to the collection's keep set, as Dolt's
+    GC safepoint does, and the sweep keeps the keep set's closure.
+  - **Standby queries.** Heap TOAST is protected on a standby by recovery
+    conflicts: pruning a tuple conflicts with snapshots that could still
+    see it, or is held back by `hot_standby_feedback`. Chunk-store
+    reclamation has no such conflict of its own. So marking reads every
+    tuple still on a page, dead or alive, not just visible ones: a chunk
+    set is freed only after VACUUM has pruned every tuple that named it,
+    and that pruning's WAL, replayed before the collection's, already
+    conflicted with (or was held back for) every standby snapshot that
+    could read those tuples. Reclaiming history's own chunks (unreachable
+    commits) needs a horizon of its own, part 8 of spec 11.
 - **Compression moves below the hash.** Values out of line lose TOAST's
   compression unless the chunk store compresses chunks (question 48 left
   "compressing pages" as a later storage choice). Compressing chunks keeps
@@ -251,10 +350,12 @@ kept while it holds OID pointers.
    version-tagged, so C folds it without decoding) or its text, as now
    (portable, so C rehashes jsonb). Recommended: on-disk, with the version
    byte in the canonical encoding.
-2. **The hash in the pointer.** The profile's hash (sha256, 32 bytes) or a
-   fixed one. A profile change would make old pointers name trees in an
-   older hash; recommended: the pointer records the hash's length, as
-   `encode_value_ref` does.
+2. **The hash in the pointer.** A tag per hash algorithm (C1). A profile
+   change to another hash adds a tag; old pointers keep theirs and still
+   name trees in the old hash. Recording only the hash's length would not
+   do: two 32-byte hashes have the same length, and a variable-length
+   pointer under one tag would break `VARTAG_SIZE` and `VARSIZE_EXTERNAL`
+   for every tuple walker.
 3. **Gates before building.** Per-value save cost against heap TOAST at 2
    KB, 64 KB and 1 MB, single and concurrent writers; and a reclamation
    design for the chunk store.
