@@ -55,6 +55,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/multixact.h"
 #include "access/prolly_builtins.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
@@ -138,6 +139,7 @@ typedef struct Finder
 	bool		unsettled;		/* some rows weren't, and their keys aren't
 								 * carried */
 	bool		give_up;
+	ProllyChangeCounters work;	/* what this fold read, counted once it's done */
 } Finder;
 
 /* ----------------------------------------------------------------
@@ -363,6 +365,44 @@ add_candidate(Candidate **arr, int *n, int *max, const StringInfoData *key,
 	memcpy(c->keyrow, keyrow->data, keyrow->len);
 }
 
+/* Is the value of column i (0-based) stored out of line? */
+static bool
+out_of_line(TupleDesc desc, int i, Datum value, bool isnull)
+{
+	return !isnull && TupleDescAttr(desc, i)->attlen == -1 &&
+		VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value));
+}
+
+/* Visits a tuple of a page version; false stops the walk. */
+typedef bool (*TupleVisit) (Finder *f, HeapTuple tup, void *arg);
+
+/* Visit each tuple of a version of page blkno; false if a visit stopped. */
+static bool
+walk_page(Finder *f, Page page, BlockNumber blkno, TupleVisit visit, void *arg)
+{
+	OffsetNumber maxoff;
+
+	f->work.pages++;
+	if (PageIsNew(page))
+		return true;
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+		HeapTupleData tup;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(f->rel);
+		ItemPointerSet(&tup.t_self, blkno, off);
+		if (!visit(f, &tup, arg))
+			return false;
+	}
+	return true;
+}
+
 /*
  * A tuple's key and its key columns' encoded row; false if a key column is
  * stored out of line, which an old version may no longer have.
@@ -380,8 +420,7 @@ tuple_key(Finder *f, HeapTuple tup, StringInfo key, StringInfo keyrow)
 	{
 		int			a = f->keyattrs[i] - 1;
 
-		if (!f->isnull[a] && TupleDescAttr(f->desc, a)->attlen == -1 &&
-			VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(f->values[a])))
+		if (out_of_line(f->desc, a, f->values[a], f->isnull[a]))
 			return false;
 		f->keyslot->tts_values[a] = f->values[a];
 		f->keyslot->tts_isnull[a] = f->isnull[a];
@@ -390,6 +429,44 @@ tuple_key(Finder *f, HeapTuple tup, StringInfo key, StringInfo keyrow)
 	resetStringInfo(key);
 	resetStringInfo(keyrow);
 	PROLLY_CALL(f->kr, encode_row, f->k, f->keyslot, key, keyrow, &content);
+	return true;
+}
+
+typedef struct PageVisit
+{
+	bool		current;
+	bool		candidates;
+	StringInfoData key;
+	StringInfoData keyrow;
+} PageVisit;
+
+static bool
+page_tuple(Finder *f, HeapTuple tup, void *arg)
+{
+	PageVisit  *pv = arg;
+	bool		unsettled = pv->current && tuple_unsettled(f, tup->t_data);
+
+	if (!pv->candidates && !unsettled)
+		return true;
+	if (f->keyless)
+	{
+		f->unsettled |= unsettled;
+		return true;
+	}
+	if (!tuple_key(f, tup, &pv->key, &pv->keyrow))
+	{
+		if (pv->candidates)
+		{
+			f->give_up = true;
+			return false;
+		}
+		f->unsettled = true;
+		return true;
+	}
+	if (pv->candidates)
+		add_candidate(&f->cands, &f->ncands, &f->maxcands, &pv->key, &pv->keyrow);
+	if (unsettled)
+		add_candidate(&f->carried, &f->ncarried, &f->maxcarried, &pv->key, &pv->keyrow);
 	return true;
 }
 
@@ -404,53 +481,13 @@ static void
 page_tuples(Finder *f, Page page, BlockNumber blkno, bool current,
 			bool candidates)
 {
-	OffsetNumber maxoff;
-	StringInfoData key;
-	StringInfoData keyrow;
+	PageVisit	pv = {current, candidates};
 
-	counters.pages++;
-	if (PageIsNew(page))
-		return;
-	initStringInfo(&key);
-	initStringInfo(&keyrow);
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-	{
-		ItemId		lp = PageGetItemId(page, off);
-		HeapTupleData tup;
-		bool		unsettled;
-
-		if (!ItemIdIsNormal(lp))
-			continue;
-		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-		tup.t_len = ItemIdGetLength(lp);
-		tup.t_tableOid = RelationGetRelid(f->rel);
-		ItemPointerSet(&tup.t_self, blkno, off);
-		unsettled = current && tuple_unsettled(f, tup.t_data);
-		if (!candidates && !unsettled)
-			continue;
-		if (f->keyless)
-		{
-			f->unsettled |= unsettled;
-			continue;
-		}
-		if (!tuple_key(f, &tup, &key, &keyrow))
-		{
-			if (candidates)
-			{
-				f->give_up = true;
-				break;
-			}
-			f->unsettled = true;
-			continue;
-		}
-		if (candidates)
-			add_candidate(&f->cands, &f->ncands, &f->maxcands, &key, &keyrow);
-		if (unsettled)
-			add_candidate(&f->carried, &f->ncarried, &f->maxcarried, &key, &keyrow);
-	}
-	pfree(key.data);
-	pfree(keyrow.data);
+	initStringInfo(&pv.key);
+	initStringInfo(&pv.keyrow);
+	(void) walk_page(f, page, blkno, page_tuple, &pv);
+	pfree(pv.key.data);
+	pfree(pv.keyrow.data);
 }
 
 /* The current version of page blkno, read under a share lock. */
@@ -577,8 +614,12 @@ block_cmp(const void *a, const void *b)
  * Every tuple on a page the baseline's fold saw was settled for it (else
  * the baseline is marked unsettled), so a tuple of a listed page's old
  * version was visible to the fold exactly when its transactions committed
- * as they did; a page not listed holds what it held.
- * ----------------------------------------------------------------
+ * as they did; a page not listed holds what it held.  A page's first
+ * listed old version is the page as the fold saw it: it was copied at the
+ * page's first change since, and nothing changed it before.  (A later one,
+ * from a fold that began an epoch and never became a baseline, can hold
+ * rows written since.)
+ * ----------------------------------------------------------------------
  */
 
 /* A row's copies counted on some page versions: its key, row and count. */
@@ -596,11 +637,31 @@ typedef struct Copies
 	Copy	   *c;
 	int			n;
 	int			max;
+	MemoryContext cxt;			/* holds the keys and rows */
+	StringInfoData key;			/* reused for each encoding */
+	StringInfoData row;
 } Copies;
+
+/* A page version's tuples to count: copies, or pointers into the page. */
+typedef struct Counted
+{
+	HeapTupleData *t;
+	int			n;
+} Counted;
+
+/* What block_copies() reuses from block to block. */
+typedef struct BlockScratch
+{
+	PGIOAlignedBlock oldpage;
+	Counted		was;
+	Counted		is;
+	MemoryContext cxt;			/* the version now's tuples, copied */
+} BlockScratch;
 
 /*
  * Did xid commit?  *known set false if its status may be gone (older than
- * the oldest transaction whose status is kept).
+ * the oldest transaction whose status is kept).  The caller holds
+ * XactTruncationLock.
  */
 static bool
 xid_committed(TransactionId xid, bool *known)
@@ -617,12 +678,14 @@ xid_committed(TransactionId xid, bool *known)
 
 /*
  * Was this tuple of an old page version, settled for the fold, visible to
- * it?  *known set false if that can't be told.
+ * it?  *known set false if that can't be told.  The caller holds
+ * XactTruncationLock and MultiXactTruncationLock.
  */
 static bool
 fold_saw(HeapTupleHeader t, bool *known)
 {
 	uint16		mask = t->t_infomask;
+	TransactionId updater;
 
 	if (!HeapTupleHeaderXminFrozen(t))
 	{
@@ -636,38 +699,58 @@ fold_saw(HeapTupleHeader t, bool *known)
 		return true;
 	if (mask & HEAP_XMAX_IS_MULTI)
 	{
-		/* (its members' statuses may be gone; rare without a key) */
-		*known = false;
-		return false;
+		MultiXactId oldest;
+		MultiXactId next;
+
+		/* (its members, while they are kept) */
+		ReadMultiXactIdRange(&oldest, &next);
+		if (MultiXactIdPrecedes(HeapTupleHeaderGetRawXmax(t), oldest))
+		{
+			*known = false;
+			return false;
+		}
+		updater = HeapTupleHeaderGetUpdateXid(t);
+		if (!TransactionIdIsValid(updater))
+			return true;		/* (lockers alone) */
 	}
-	if (mask & HEAP_XMAX_COMMITTED)
-		return false;
-	return !xid_committed(HeapTupleHeaderGetRawXmax(t), known);
+	else
+	{
+		if (mask & HEAP_XMAX_COMMITTED)
+			return false;
+		updater = HeapTupleHeaderGetRawXmax(t);
+	}
+	return !xid_committed(updater, known);
 }
 
-/* Count a copy of the tuple's row; false if its row can't be read. */
+/*
+ * Count a copy of the tuple's row, delta; false if its row can't be read
+ * (an old version's value out of line may be gone).
+ */
 static bool
 add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
 {
-	StringInfoData key;
-	StringInfoData row;
 	ProllyHash	content;
+	MemoryContext old;
 	Copy	   *c;
 
-	/* (an old version's values out of line may be gone) */
+	ExecForceStoreHeapTuple(tup, f->rowslot, false);
+	slot_getallattrs(f->rowslot);
 	if (delta < 0)
 	{
-		heap_deform_tuple(tup, f->desc, f->values, f->isnull);
 		for (int i = 0; i < f->desc->natts; i++)
-			if (!f->isnull[i] && TupleDescAttr(f->desc, i)->attlen == -1 &&
-				VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(f->values[i])))
+			if (out_of_line(f->desc, i, f->rowslot->tts_values[i],
+							f->rowslot->tts_isnull[i]))
+			{
+				ExecClearTuple(f->rowslot);
 				return false;
+			}
 	}
-	ExecForceStoreHeapTuple(tup, f->rowslot, false);
-	initStringInfo(&key);
-	initStringInfo(&row);
-	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &key, &row, &content);
+	resetStringInfo(&cs->key);
+	resetStringInfo(&cs->row);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &cs->key, &cs->row, &content);
 	ExecClearTuple(f->rowslot);
+
+	old = MemoryContextSwitchTo(cs->cxt);
 	if (cs->n == cs->max)
 	{
 		cs->max = Max(64, cs->max * 2);
@@ -675,69 +758,134 @@ add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
 			palloc_array(Copy, cs->max);
 	}
 	c = &cs->c[cs->n++];
-	c->key = key.data;
-	c->keylen = key.len;
-	c->row = row.data;
-	c->rowlen = row.len;
+	c->keylen = cs->key.len;
+	c->key = palloc(Max(c->keylen, 1));
+	memcpy(c->key, cs->key.data, c->keylen);
+	c->rowlen = cs->row.len;
+	c->row = palloc(Max(c->rowlen, 1));
+	memcpy(c->row, cs->row.data, c->rowlen);
 	c->delta = delta;
+	MemoryContextSwitchTo(old);
 	return true;
+}
+
+typedef struct OldVisit
+{
+	Counted    *ct;
+	bool		known;
+} OldVisit;
+
+/* An old version's tuple: noted (in the page) if the fold saw it. */
+static bool
+old_tuple(Finder *f, HeapTuple tup, void *arg)
+{
+	OldVisit   *ov = arg;
+
+	if (fold_saw(tup->t_data, &ov->known))
+		ov->ct->t[ov->ct->n++] = *tup;
+	return ov->known;
+}
+
+typedef struct NowVisit
+{
+	Counted    *ct;
+	Buffer		buf;
+} NowVisit;
+
+/*
+ * The version now's tuple (its page share-locked): copied if the snapshot
+ * sees it, so it is read after the page is let go of; its settledness
+ * noted.
+ */
+static bool
+now_tuple(Finder *f, HeapTuple tup, void *arg)
+{
+	NowVisit   *nv = arg;
+
+	f->unsettled |= tuple_unsettled(f, tup->t_data);
+	if (HeapTupleSatisfiesVisibility(tup, f->snap, nv->buf))
+		nv->ct->t[nv->ct->n++] = *heap_copytuple(tup);
+	return true;
+}
+
+/* The same row data, as stored? */
+static bool
+same_data(const HeapTupleData *a, const HeapTupleData *b)
+{
+	return a->t_len == b->t_len && a->t_data->t_hoff == b->t_data->t_hoff &&
+		HeapTupleHeaderGetNatts(a->t_data) == HeapTupleHeaderGetNatts(b->t_data) &&
+		(a->t_data->t_infomask & HEAP_HASNULL) == (b->t_data->t_infomask & HEAP_HASNULL) &&
+		memcmp((char *) a->t_data + offsetof(HeapTupleHeaderData, t_bits),
+			   (char *) b->t_data + offsetof(HeapTupleHeaderData, t_bits),
+			   a->t_len - offsetof(HeapTupleHeaderData, t_bits)) == 0;
 }
 
 /*
- * The copies on a version of page blkno: on an old one (buf invalid),
- * those the fold saw, counted -1; on the one now (in buf, share-locked),
- * those the snapshot sees, counted +1, noting tuples it doesn't see as
- * settled.  False to fold in full instead.
+ * The copies on page blkno: those the fold saw on its old version (if
+ * old_block is valid), counted -1, and those the snapshot sees on its
+ * version now (if 'now'), counted +1.  A tuple on both, the same row,
+ * cancels unread.  False to fold in full instead.
  */
 static bool
-page_copies(Finder *f, Copies *cs, Page page, BlockNumber blkno, Buffer buf)
+block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
+			 BlockNumber old_block, bool now)
 {
-	OffsetNumber maxoff;
+	Counted    *was = &bs->was;
+	Counted    *is = &bs->is;
+	bool		ok = true;
+	MemoryContext old;
 
-	counters.pages++;
-	if (PageIsNew(page))
-		return true;
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	was->n = is->n = 0;
+	MemoryContextReset(bs->cxt);
+	if (BlockNumberIsValid(old_block))
 	{
-		ItemId		lp = PageGetItemId(page, off);
-		HeapTupleData tup;
-		bool		known = true;
-		bool		counted;
+		OldVisit	ov = {was, true};
 
-		if (!ItemIdIsNormal(lp))
-			continue;
-		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-		tup.t_len = ItemIdGetLength(lp);
-		tup.t_tableOid = RelationGetRelid(f->rel);
-		ItemPointerSet(&tup.t_self, blkno, off);
-		if (!BufferIsValid(buf))
-		{
-			counted = fold_saw(tup.t_data, &known);
-			if (!known)
-				return false;
-		}
-		else
-		{
-			f->unsettled |= tuple_unsettled(f, tup.t_data);
-			counted = HeapTupleSatisfiesVisibility(&tup, f->snap, buf);
-		}
-		if (counted && !add_copy(f, cs, &tup, BufferIsValid(buf) ? 1 : -1))
-			return false;
+		bmap_read_old(RelationGetSmgr(f->rel), blkno, old_block, bs->oldpage.data);
+
+		/* (the statuses of its transactions, while they are kept) */
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		LWLockAcquire(MultiXactTruncationLock, LW_SHARED);
+		(void) walk_page(f, (Page) bs->oldpage.data, blkno, old_tuple, &ov);
+		LWLockRelease(MultiXactTruncationLock);
+		LWLockRelease(XactTruncationLock);
+		ok = ov.known;
 	}
-	return true;
-}
+	if (ok && now)
+	{
+		Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
+											 RBM_NORMAL, NULL);
+		NowVisit	nv = {is, buf};
 
-static bool
-current_copies(Finder *f, Copies *cs, BlockNumber blkno)
-{
-	Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
-										 RBM_NORMAL, NULL);
-	bool		ok;
+		old = MemoryContextSwitchTo(bs->cxt);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		(void) walk_page(f, BufferGetPage(buf), blkno, now_tuple, &nv);
+		UnlockReleaseBuffer(buf);
+		MemoryContextSwitchTo(old);
+	}
 
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	ok = page_copies(f, cs, BufferGetPage(buf), blkno, buf);
-	UnlockReleaseBuffer(buf);
+	/* rows on both versions, as they were, cancel (most of a page) */
+	for (int i = 0, j = 0; ok && i < was->n; i++)
+	{
+		bool		kept = false;
+
+		/* (both in line pointer order) */
+		while (j < is->n &&
+			   ItemPointerGetOffsetNumber(&is->t[j].t_self) <
+			   ItemPointerGetOffsetNumber(&was->t[i].t_self))
+			j++;
+		if (j < is->n && ItemPointerEquals(&was->t[i].t_self, &is->t[j].t_self) &&
+			same_data(&was->t[i], &is->t[j]))
+		{
+			is->t[j].t_data = NULL;
+			kept = true;
+		}
+		if (!kept)
+			ok = add_copy(f, cs, &was->t[i], -1);
+	}
+	for (int j = 0; ok && j < is->n; j++)
+		if (is->t[j].t_data != NULL)
+			ok = add_copy(f, cs, &is->t[j], 1);
 	return ok;
 }
 
@@ -762,6 +910,24 @@ copy_cmp(const void *a, const void *b, void *arg)
 	return r != 0 ? r : (x->keylen > y->keylen) - (x->keylen < y->keylen);
 }
 
+typedef struct OldPage
+{
+	BlockNumber blkno;
+	BlockNumber old_block;
+	int			listed;			/* its place on the list */
+} OldPage;
+
+/* By block, then by when listed. */
+static int
+old_page_cmp(const void *a, const void *b)
+{
+	const OldPage *x = a;
+	const OldPage *y = b;
+
+	return x->blkno != y->blkno ? pg_cmp_u32(x->blkno, y->blkno) :
+		pg_cmp_s32(x->listed, y->listed);
+}
+
 /*
  * Fold a table without a key from the baseline: of each row on a listed
  * page, the copies the fold saw on the page's old version taken from the
@@ -773,38 +939,62 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 			 BlockNumber low, BlockNumber nblocks, ProllyNodeRef *data)
 {
 	Copies		cs = {0};
-	PGIOAlignedBlock old;
-	BlockNumber *current = palloc_array(BlockNumber, Max(l->n, 1));
-	int			ncurrent = 0;
+	BlockScratch *bs = palloc_aligned(sizeof(BlockScratch), PG_IO_ALIGN_SIZE, 0);
+	OldPage    *pages = palloc_array(OldPage, Max(l->n, 1));
+	int			npages = 0;
 	ProllyEdit *edits;
 	int			nedits = 0;
 	ProllyTreeCursor *cur;
 	bool		ok = true;
+	int			p = 0;
 
-	/* the old versions, while the statuses of their transactions are kept */
-	LWLockAcquire(XactTruncationLock, LW_SHARED);
-	for (int i = 0; i < l->n && ok; i++)
+	cs.cxt = AllocSetContextCreate(CurrentMemoryContext, "keyless copies",
+								   ALLOCSET_DEFAULT_SIZES);
+	initStringInfo(&cs.key);
+	initStringInfo(&cs.row);
+	bs->was.t = palloc_array(HeapTupleData, MaxHeapTuplesPerPage);
+	bs->is.t = palloc_array(HeapTupleData, MaxHeapTuplesPerPage);
+	bs->cxt = AllocSetContextCreate(CurrentMemoryContext, "keyless page",
+									ALLOCSET_DEFAULT_SIZES);
+
+	/* each listed page's first old version (the page as the fold saw it) */
+	for (int i = 0; i < l->n; i++)
+		if (l->changes[i].kind == BMAP_CHANGE_COPY)
+		{
+			pages[npages].blkno = l->changes[i].blkno;
+			pages[npages].old_block = l->changes[i].old_block;
+			pages[npages].listed = i;
+			npages++;
+		}
+	if (npages > 1)
 	{
-		const BmapChange *c = &l->changes[i];
+		int			u = 1;
 
-		if (c->kind != BMAP_CHANGE_COPY)
-			continue;
-		bmap_read_old(RelationGetSmgr(f->rel), c->blkno, c->old_block, old.data);
-		ok = page_copies(f, &cs, (Page) old.data, c->blkno, InvalidBuffer);
-		if (c->blkno < Min(low, nblocks))
-			current[ncurrent++] = c->blkno;
+		qsort(pages, npages, sizeof(OldPage), old_page_cmp);
+		for (int i = 1; i < npages; i++)
+			if (pages[i].blkno != pages[u - 1].blkno)
+				pages[u++] = pages[i];
+		npages = u;
 	}
-	LWLockRelease(XactTruncationLock);
 
-	/* the versions now: the listed pages, and those past the shortest length */
-	if (ncurrent > 1)
-		qsort(current, ncurrent, sizeof(BlockNumber), block_cmp);
-	for (int i = 0; i < ncurrent && ok; i++)
-		if (i == 0 || current[i] != current[i - 1])
-			ok = current_copies(f, &cs, current[i]);
-	for (BlockNumber blk = low; blk < nblocks && ok; blk++)
+	/*
+	 * Those pages as they were, and as they are if the table still has
+	 * them; then the pages past its shortest length since not listed, as
+	 * they are.
+	 */
+	for (int i = 0; ok && i < npages; i++)
 	{
-		ok = current_copies(f, &cs, blk);
+		ok = block_copies(f, &cs, bs, pages[i].blkno, pages[i].old_block,
+						  pages[i].blkno < nblocks);
+		CHECK_FOR_INTERRUPTS();
+	}
+	for (BlockNumber blk = low; ok && blk < nblocks; blk++)
+	{
+		while (p < npages && pages[p].blkno < blk)
+			p++;
+		if (p < npages && pages[p].blkno == blk)
+			continue;
+		ok = block_copies(f, &cs, bs, blk, InvalidBlockNumber, true);
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (!ok)
@@ -838,7 +1028,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 		}
 		if (!ok || delta == 0)
 			continue;
-		counters.candidates++;
+		f->work.candidates++;
 		PROLLY_CALL(f->tree, cursor_seek, cur, &ck, ForwardScanDirection);
 		if (PROLLY_CALL(f->tree, cursor_next, cur, &k, &v) &&
 			keying_compare(&k, &ck, f) == 0)
@@ -879,13 +1069,12 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(f->tree, cursor_close, cur);
-	if (!ok)
-		return false;
-	if (nedits > 0)
+	if (ok && nedits > 0)
 		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
-	else
+	else if (ok)
 		*data = baseline->data;
-	return true;
+	MemoryContextDelete(cs.cxt);
+	return ok;
 }
 
 /*
@@ -984,7 +1173,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 
 	/* each candidate's old and new rows; the pairs that differ are edits */
 	f->ncands = unique_candidates(f, f->cands, f->ncands);
-	counters.candidates += f->ncands;
+	f->work.candidates += f->ncands;
 	edits = palloc_array(ProllyEdit, Max(f->ncands, 1));
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
 					  CurrentMemoryContext);
@@ -1097,7 +1286,7 @@ fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 	int			maxrows = 0;
 	ProllyTreeBuilder *b;
 
-	counters.full++;
+	f->work.full++;
 	scan = table_beginscan(f->rel, f->snap, 0, NULL, SO_NONE);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, f->rowslot))
 	{
@@ -1249,10 +1438,15 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 		}
 		if (!have || !fold_changed(&f, baseline, &st, next != NULL, data))
 		{
+			/* (what the fold from the baseline read is thrown away) */
+			memset(&f.work, 0, sizeof(f.work));
 			f.ncarried = 0;
 			f.unsettled = false;
 			fold_all(&f, data, next != NULL);
 		}
+		counters.pages += f.work.pages;
+		counters.candidates += f.work.candidates;
+		counters.full += f.work.full;
 		if (next)
 		{
 			State		ns = {0};

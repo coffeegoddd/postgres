@@ -232,6 +232,93 @@ SELECT length(dolt_commit('-am', 'keyless later')::text) AS committed;
         66
 (1 row)
 
+-- A fold that began an epoch and was rolled back leaves a page changed
+-- in both epochs listed twice: only its first old version is the page as
+-- the baseline's fold saw it.  (Counting both took every row on the page
+-- off twice; with ten copies of each, the counts stayed above none, and
+-- the tree was wrong.)
+CREATE FUNCTION pg_temp.on_page(blk int, first bool) RETURNS tid AS $$
+	SELECT CASE WHEN first THEN min(ctid) ELSE max(ctid) END FROM inc.keyless
+	 WHERE ctid >= format('(%s,0)', blk)::tid AND ctid < format('(%s,0)', blk + 1)::tid
+$$ LANGUAGE sql;
+DELETE FROM inc.keyless WHERE ctid = (SELECT pg_temp.on_page(1, true));
+BEGIN;
+SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ROLLBACK;
+DELETE FROM inc.keyless WHERE ctid = (SELECT pg_temp.on_page(1, false));
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     2 |          2 |           0 | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'two epochs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A row an update deleted before the baseline, its xmax a multixact (a
+-- key share lock, then the update in a subtransaction): its old version
+-- is told apart without reading the table in full.
+BEGIN;
+SELECT a FROM inc.keyless WHERE ctid = (SELECT pg_temp.on_page(2, true)) FOR KEY SHARE;
+ a  
+----
+ 53
+(1 row)
+
+SAVEPOINT s;
+UPDATE inc.keyless SET b = 'multixact' WHERE ctid = (SELECT pg_temp.on_page(2, true));
+RELEASE s;
+COMMIT;
+SELECT length(dolt_commit('-am', 'multixact')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE inc.keyless SET b = 'after the multixact' WHERE ctid = (SELECT pg_temp.on_page(2, false));
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     2 |          2 |           0 | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'after multixact')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A fold that gives up (a deleted row's value out of line may be gone)
+-- counts only the full read.
+INSERT INTO inc.keyless
+  SELECT 5000, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
+SELECT length(dolt_commit('-am', 'out of line')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DELETE FROM inc.keyless WHERE a = 5000;
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     0 |          0 |           1 | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'out of line gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 -- A table redefined, or rewritten, is read in full once.
 ALTER TABLE inc.big ADD COLUMN w int;
 SELECT * FROM pg_temp.fold();
