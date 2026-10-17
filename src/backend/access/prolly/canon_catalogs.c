@@ -89,6 +89,10 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/objectaddress.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
@@ -2317,7 +2321,7 @@ sequence_options_sql(const char *def)
 static char *
 drop_routine_sql(const MoveItem *it)
 {
-	return psprintf("DROP %s %s",
+	return psprintf("DROP %s IF EXISTS %s",
 					strstr(it->def, "CREATE OR REPLACE PROCEDURE") == it->def ?
 					"PROCEDURE" : "FUNCTION", it->name);
 }
@@ -2486,164 +2490,429 @@ composite_attributes(const char *def)
 	return names;
 }
 
+/* A composite type's definition: its attributes' types, in order. */
+static List *
+composite_attribute_types(const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *line = strtok(copy, "\n");	/* "composite" */
+	List	   *types = NIL;
+
+	while ((line = strtok(NULL, "\n")) != NULL)
+	{
+		char	   *tab = strchr(line, '\t');
+		char	   *end = tab ? strchr(tab + 1, '\t') : NULL;
+
+		types = lappend(types, tab ? (end ? pnstrdup(tab + 1, end - tab - 1) : pstrdup(tab + 1)) :
+						pstrdup(""));
+	}
+	return types;
+}
+
 /*
- * A composite value of col as the new type has it: each attribute by name
- * from the old, null where the old had none.
+ * A value expr of a type (its definition old_def, renamed aside) as the
+ * type made again as new_def under name has it, for rows the move is about
+ * to write as the commit holds them anyway: what can't be had becomes what
+ * can, so no conversion fails on rows about to be replaced.  An enum's
+ * label it no longer has becomes its first; a composite's attributes come
+ * by name (null where the old had none); anything else comes through its
+ * text form, or null where that doesn't read as the new type (a domain's
+ * check that fails).
  */
 static char *
-composite_conversion(const char *col, const char *from_def, const char *to_def,
-					 const char *type)
+converted_value(const char *expr, const char *old_def, const char *new_def,
+				const char *name)
 {
-	List	   *from = composite_attributes(from_def);
-	List	   *to = composite_attributes(to_def);
 	StringInfoData e;
-	ListCell   *lc;
-	bool		first = true;
 
 	initStringInfo(&e);
-	appendStringInfo(&e, "CASE WHEN %s IS NULL THEN NULL ELSE ROW(", col);
-	foreach(lc, to)
+	if (strncmp(new_def, "enum\n", 5) == 0)
+		appendStringInfo(&e,
+						 "CASE WHEN %s IS NULL THEN NULL "
+						 "WHEN %s::pg_catalog.text = ANY (pg_catalog.enum_range(NULL::%s)::pg_catalog.text[]) "
+						 "THEN %s::pg_catalog.text::%s ELSE pg_catalog.enum_first(NULL::%s) END",
+						 expr, expr, name, expr, name, name);
+	else if (strncmp(new_def, "composite\n", 10) == 0 &&
+			 strncmp(old_def, "composite\n", 10) == 0)
 	{
-		appendStringInfo(&e, "%s", first ? "" : ", ");
-		if (list_has_string(from, lfirst(lc)))
-			appendStringInfo(&e, "(%s).%s", col, (char *) lfirst(lc));
-		else
-			appendStringInfoString(&e, "NULL");
-		first = false;
+		List	   *from = composite_attributes(old_def);
+		List	   *to = composite_attributes(new_def);
+		List	   *types = composite_attribute_types(new_def);
+		ListCell   *lc;
+		ListCell   *lt;
+		bool		first = true;
+
+		appendStringInfo(&e, "CASE WHEN %s IS NULL THEN NULL ELSE ROW(", expr);
+		forboth(lc, to, lt, types)
+		{
+			char	   *attr = psprintf("(%s).%s", expr, (char *) lfirst(lc));
+
+			appendStringInfoString(&e, first ? "" : ", ");
+			if (list_has_string(from, lfirst(lc)))
+				appendStringInfo(&e,
+								 "CASE WHEN pg_catalog.pg_input_is_valid(%s::pg_catalog.text, %s) "
+								 "THEN %s::pg_catalog.text::%s END",
+								 attr, quote_literal_cstr(lfirst(lt)), attr,
+								 (char *) lfirst(lt));
+			else
+				appendStringInfo(&e, "NULL::%s", (char *) lfirst(lt));
+			first = false;
+		}
+		appendStringInfo(&e, ")::%s END", name);
 	}
-	appendStringInfo(&e, ")::%s END", type);
+	else
+		appendStringInfo(&e,
+						 "CASE WHEN pg_catalog.pg_input_is_valid(%s::pg_catalog.text, %s) "
+						 "THEN %s::pg_catalog.text::%s END",
+						 expr, quote_literal_cstr(name), expr, name);
 	return e.data;
+}
+
+/* What a move does about the types the commit defines otherwise, in turn. */
+typedef struct TypeMoves
+{
+	List	   *before;			/* what uses them dropped; then each renamed
+								 * aside */
+	List	   *creates;		/* the types made (these and new ones), in any
+								 * order */
+	List	   *converts;		/* the columns using them moved to the new */
+	List	   *drops;			/* the old ones, in any order */
+	List	   *after;			/* what used them, made again */
+	bool		any;
+} TypeMoves;
+
+/* A type moved: its definitions, and its oid as the branch has it now. */
+typedef struct MovedType
+{
+	MoveItem   *from;
+	MoveItem   *to;
+	Oid			typid;
+	char	   *aside;			/* qualified, once renamed */
+} MovedType;
+
+static MovedType *
+moved_type(List *moved, Oid typid)
+{
+	ListCell   *lc;
+
+	foreach(lc, moved)
+		if (((MovedType *) lfirst(lc))->typid == typid)
+			return lfirst(lc);
+	return NULL;
+}
+
+/* A type of the branch's, as from and to name it: added to moved. */
+static MovedType *
+move_type(List **moved, List *from, List *to, Oid typid, const char *user)
+{
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	Form_pg_type typ;
+	char	   *name;
+	MovedType  *mt;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+	name = qualified(typ->typnamespace, NameStr(typ->typname));
+	ReleaseSysCache(tup);
+	mt = palloc0(sizeof(MovedType));
+	mt->from = find_item(from, 'y', name);
+	mt->to = find_item(to, 'y', name);
+	mt->typid = typid;
+	if (mt->from == NULL || mt->to == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+						user),
+				 errdetail("Type %s, which isn't the branch's to move, uses it.", name)));
+	*moved = lappend(*moved, mt);
+	return mt;
+}
+
+/* The line of item def's table definition, of a section, named name. */
+static const char *
+table_def_line(const MoveItem *t, int section, const char *name)
+{
+	TableDef	td;
+	List	   *lines;
+	ListCell   *lc;
+
+	if (t == NULL)
+		return NULL;
+	parse_table_def(t->def, &td);
+	lines = section == 'c' ? td.columns : section == 'k' ? td.constraints : td.indexes;
+	foreach(lc, lines)
+	{
+		const char *line = lfirst(lc);
+
+		if (strcmp(section == 'i' ? index_name(line) : first_field(line), name) == 0)
+			return line;
+	}
+	return NULL;
+}
+
+/* Whether a line both definitions of a table have alike, named name. */
+static bool
+same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *name)
+{
+	const char *a = table_def_line(f, section, name);
+	const char *b = table_def_line(t, section, name);
+
+	return a && b && strcmp(a, b) == 0;
 }
 
 /*
  * The statements that make the types to defines otherwise than from, under
- * their names: each one renamed out of the way, made anew, the columns of
- * versioned tables using it (or arrays of it) converted through its text
- * form (an enum's labels it no longer has becoming null), and the old one
- * dropped.  Views and materialized views go first, as they may use them
- * (*all_dropped says so); the move makes them again.
+ * their names, and those that use them, in turn: each renamed aside, made
+ * anew, the columns of versioned tables using it (or arrays of it)
+ * converted, and the old dropped.  What uses one is found through what
+ * depends on it: a composite type or a domain the branch has is moved
+ * with it (as to defines it); a check constraint, an index or a default of
+ * a versioned table, or a routine, is dropped first and made again after
+ * (as to defines it, if alike; the table's or routine's own move does the
+ * rest).  Anything else using it (a column of another schema's table, an
+ * operator) can't be moved with it: refused.  Views and materialized views
+ * using them go and come back with the others (folded_move_schema()).
  */
-static List *
-type_moves(List *from, List *to, bool *all_dropped)
+static TypeMoves
+type_moves(List *from, List *to)
 {
-	List	   *stmts = NIL;
-	List	   *drops = NIL;
+	TypeMoves	tm = {0};
+	List	   *moved = NIL;
 	ListCell   *lc;
+	int			i;
 
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
 		MoveItem   *t = find_item(to, f->kind, f->name);
 
-		if (f->kind == 'm' && (t == NULL || strcmp(t->def, f->def) != 0))
-			drops = lappend(drops, psprintf("DROP MATERIALIZED VIEW IF EXISTS %s CASCADE",
-											f->name));
+		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0)
+			(void) move_type(&moved, from, to,
+							 typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL))),
+							 f->name);
 	}
-	foreach(lc, from)
+	tm.any = moved != NIL;
+
+	/* each one, and what uses it or arrays of it (more types, found as it goes) */
+	for (i = 0; i < list_length(moved); i++)
 	{
-		MoveItem   *f = lfirst(lc);
-		MoveItem   *t = find_item(to, f->kind, f->name);
-		List	   *names;
-		Oid			typid;
-		Oid			arrayid;
-		char	   *aside;
-		char	   *aside_q;
-		bool		is_enum;
-		Relation	pg_attribute;
-		SysScanDesc scan;
-		HeapTuple	tup;
+		MovedType  *mt = list_nth(moved, i);
+		Oid			ids[2] = {mt->typid, get_array_type(mt->typid)};
 
-		if (f->kind != 'y' || t == NULL || strcmp(t->def, f->def) == 0)
-			continue;
-		names = stringToQualifiedNameList(f->name, NULL);
-		typid = typenameTypeId(NULL, makeTypeNameFromNameList(names));
-		arrayid = get_array_type(typid);
-		is_enum = strncmp(t->def, "enum\n", 5) == 0;
-		aside = psprintf("prolly_moving_%u", typid);
-		aside_q = psprintf("%s.%s", schema_of(f->name), quote_identifier(aside));
-		stmts = lappend(stmts, psprintf("ALTER TYPE %s RENAME TO %s", f->name,
-										quote_identifier(aside)));
-		stmts = lappend(stmts, create_type_sql(t->name, t->def));
-
-		pg_attribute = table_open(AttributeRelationId, AccessShareLock);
-		scan = systable_beginscan(pg_attribute, InvalidOid, false, NULL, 0, NULL);
-		while ((tup = systable_getnext(scan)) != NULL)
+		mt->aside = psprintf("%s.%s", schema_of(mt->from->name),
+							 quote_identifier(psprintf("prolly_moving_%u", mt->typid)));
+		for (int a = 0; a < 2; a++)
 		{
-			Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(tup);
-			char	   *rel;
-			const char *col;
+			Relation	pg_depend = table_open(DependRelationId, AccessShareLock);
+			ScanKeyData key[2];
+			SysScanDesc scan;
+			HeapTuple	tup;
+			bool		array = a == 1;
 
-			if (att->attisdropped || att->attnum <= 0 ||
-				(att->atttypid != typid && att->atttypid != arrayid) ||
-				get_rel_relkind(att->attrelid) != RELKIND_RELATION ||
-				!namespace_is_versioned(get_rel_namespace(att->attrelid)))
-				continue;
-			rel = qualified(get_rel_namespace(att->attrelid), get_rel_name(att->attrelid));
-			col = quote_identifier(NameStr(att->attname));
-			if (att->atttypid == arrayid && is_enum)
+			if (!OidIsValid(ids[a]))
 			{
-				/*
-				 * (an array's elements one by one, as a function: not a
-				 * subquery; beside the type, which a function elsewhere
-				 * can't use, and dropped after)
-				 */
-				char	   *fn = psprintf("%s.prolly_moving_%u_array",
-										  schema_of(t->name), typid);
-
-				stmts = lappend(stmts,
-								psprintf("CREATE OR REPLACE FUNCTION %s(a text[]) RETURNS %s[] "
-										 "LANGUAGE sql AS $f$ SELECT coalesce(array_agg("
-										 "CASE WHEN e = ANY (enum_range(NULL::%s)::text[]) "
-										 "THEN e::%s END ORDER BY i), '{}') "
-										 "FROM unnest(a) WITH ORDINALITY u(e, i) $f$",
-										 fn, t->name, t->name, t->name));
-				stmts = lappend(stmts,
-								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s[] USING "
-										 "CASE WHEN %s IS NOT NULL THEN %s(%s::text[]) END",
-										 rel, col, t->name, col, fn, col));
-				stmts = lappend(stmts, psprintf("DROP FUNCTION %s(text[])", fn));
+				table_close(pg_depend, AccessShareLock);
+				continue;
 			}
-			else if (att->atttypid == arrayid)
-				stmts = lappend(stmts,
-								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s[] USING %s::text::%s[]",
-										 rel, col, t->name, col, t->name));
-			else if (strncmp(t->def, "composite\n", 10) == 0)
-				stmts = lappend(stmts,
-								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
-										 rel, col, t->name,
-										 composite_conversion(col, f->def, t->def, t->name)));
-			else if (is_enum)
-				stmts = lappend(stmts,
-								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING "
-										 "CASE WHEN %s::text = ANY (enum_range(NULL::%s)::text[]) "
-										 "THEN %s::text::%s END",
-										 rel, col, t->name, col, t->name, col, t->name));
-			else
-				stmts = lappend(stmts,
-								psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::text::%s",
-										 rel, col, t->name, col, t->name));
+			ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+						F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+			ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+						F_OIDEQ, ObjectIdGetDatum(ids[a]));
+			scan = systable_beginscan(pg_depend, DependReferenceIndexId, true,
+									  NULL, 2, key);
+			while ((tup = systable_getnext(scan)) != NULL)
+			{
+				Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+				ObjectAddress obj = {d->classid, d->objid, d->objsubid};
+				bool		handled = false;
+
+				if (d->deptype == DEPENDENCY_INTERNAL)
+					continue;	/* (its array type) */
+				if (d->classid == RelationRelationId)
+				{
+					char		kind = get_rel_relkind(d->objid);
+					bool		versioned = namespace_is_versioned(get_rel_namespace(d->objid));
+
+					if (kind == RELKIND_VIEW || kind == RELKIND_MATVIEW)
+						handled = true; /* (they go, and come again) */
+					else if (kind == RELKIND_COMPOSITE_TYPE)
+					{
+						Oid			ct = get_rel_type_id(d->objid);
+
+						if (moved_type(moved, ct) == NULL)
+							(void) move_type(&moved, from, to, ct, mt->from->name);
+						handled = true;
+					}
+					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
+					{
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+						const char *col = quote_identifier(get_attname(d->objid, d->objsubid, false));
+						char	   *conv;
+
+						if (array)
+						{
+							/*
+							 * (an array's elements one by one, as a function:
+							 * not a subquery; beside the type, and dropped
+							 * after)
+							 */
+							char	   *fn = psprintf("%s.prolly_moving_%u_array",
+													  schema_of(mt->to->name), mt->typid);
+
+							tm.converts = lappend(tm.converts,
+												  psprintf("CREATE FUNCTION %s(a %s[]) RETURNS %s[] "
+														   "LANGUAGE sql AS $f$ SELECT COALESCE(pg_catalog.array_agg(%s ORDER BY i), '{}') "
+														   "FROM pg_catalog.generate_subscripts(a, 1) i $f$",
+														   fn, mt->aside, mt->to->name,
+														   converted_value("a[i]", mt->from->def, mt->to->def, mt->to->name)));
+							conv = psprintf("CASE WHEN %s IS NOT NULL THEN %s(%s) END", col, fn, col);
+							tm.converts = lappend(tm.converts,
+												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s[] USING %s",
+														   rel, col, mt->to->name, conv));
+							tm.converts = lappend(tm.converts,
+												  psprintf("DROP FUNCTION %s(%s[])", fn, mt->aside));
+						}
+						else
+							tm.converts = lappend(tm.converts,
+												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
+														   rel, col, mt->to->name,
+														   converted_value(col, mt->from->def, mt->to->def,
+																		   mt->to->name)));
+						handled = true;
+					}
+					else if (kind == RELKIND_INDEX && versioned)
+					{
+						Oid			table = IndexGetRelation(d->objid, false);
+						char	   *tname = qualified(get_rel_namespace(table), get_rel_name(table));
+						const char *idx = quote_identifier(get_rel_name(d->objid));
+						MoveItem   *ft = find_item(from, 't', tname);
+						MoveItem   *tt = find_item(to, 't', tname);
+
+						tm.before = lcons(psprintf("DROP INDEX IF EXISTS %s.%s",
+												   schema_of(tname), idx), tm.before);
+						if (same_table_line(ft, tt, 'i', idx))
+							tm.after = lappend(tm.after, pstrdup(table_def_line(tt, 'i', idx)));
+						handled = true;
+					}
+				}
+				else if (d->classid == TypeRelationId)
+				{
+					if (moved_type(moved, d->objid) == NULL)
+						(void) move_type(&moved, from, to, d->objid, mt->from->name);
+					handled = true;
+				}
+				else if (d->classid == ConstraintRelationId)
+				{
+					HeapTuple	ct = SearchSysCache1(CONSTROID, ObjectIdGetDatum(d->objid));
+					Form_pg_constraint con;
+
+					if (!HeapTupleIsValid(ct))
+						elog(ERROR, "cache lookup failed for constraint %u", d->objid);
+					con = (Form_pg_constraint) GETSTRUCT(ct);
+					if (OidIsValid(con->contypid))
+					{
+						/* (a domain's: it moves with it) */
+						if (moved_type(moved, con->contypid) == NULL)
+							(void) move_type(&moved, from, to, con->contypid, mt->from->name);
+						handled = true;
+					}
+					else if (OidIsValid(con->conrelid) &&
+							 namespace_is_versioned(get_rel_namespace(con->conrelid)))
+					{
+						char	   *tname = qualified(get_rel_namespace(con->conrelid),
+													  get_rel_name(con->conrelid));
+						const char *cname = quote_identifier(NameStr(con->conname));
+						MoveItem   *ft = find_item(from, 't', tname);
+						MoveItem   *tt = find_item(to, 't', tname);
+
+						tm.before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s",
+												   tname, cname), tm.before);
+						if (same_table_line(ft, tt, 'k', cname))
+							tm.after = lappend(tm.after,
+											   psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", tname, cname,
+														strchr(table_def_line(tt, 'k', cname), '\t') + 1));
+						handled = true;
+					}
+					ReleaseSysCache(ct);
+				}
+				else if (d->classid == AttrDefaultRelationId)
+				{
+					ObjectAddress col = GetAttrDefaultColumnAddress(d->objid);
+
+					if (OidIsValid(col.objectId) &&
+						namespace_is_versioned(get_rel_namespace(col.objectId)))
+					{
+						char	   *tname = qualified(get_rel_namespace(col.objectId),
+													  get_rel_name(col.objectId));
+						const char *cname = quote_identifier(get_attname(col.objectId, col.objectSubId, false));
+						MoveItem   *ft = find_item(from, 't', tname);
+						MoveItem   *tt = find_item(to, 't', tname);
+
+						tm.before = lappend(tm.before,
+											psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
+													 tname, cname));
+						if (same_table_line(ft, tt, 'c', cname) &&
+							column_attr(table_def_line(tt, 'c', cname), "default "))
+							tm.after = lappend(tm.after,
+											   psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+														tname, cname,
+														column_attr(table_def_line(tt, 'c', cname), "default ")));
+						handled = true;
+					}
+				}
+				else if (d->classid == ProcedureRelationId)
+				{
+					HeapTuple	pt = SearchSysCache1(PROCOID, ObjectIdGetDatum(d->objid));
+					Form_pg_proc proc;
+					char	   *name;
+					MoveItem   *fp;
+					MoveItem   *tp;
+
+					if (!HeapTupleIsValid(pt))
+						elog(ERROR, "cache lookup failed for function %u", d->objid);
+					proc = (Form_pg_proc) GETSTRUCT(pt);
+					name = psprintf("%s(%s)",
+									qualified(proc->pronamespace, NameStr(proc->proname)),
+									TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
+																			ObjectIdGetDatum(d->objid))));
+					ReleaseSysCache(pt);
+					fp = find_item(from, 'f', name);
+					tp = find_item(to, 'f', name);
+					if (fp)
+					{
+						tm.before = lcons(drop_routine_sql(fp), tm.before);
+						if (tp && strcmp(tp->def, fp->def) == 0)
+							tm.after = lappend(tm.after, tp->def);
+						handled = true;
+					}
+				}
+				else if (d->classid == RewriteRelationId)
+					handled = true; /* (a view's: it goes, and comes again) */
+				if (!handled)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+									mt->from->name),
+							 errdetail("%s uses it, and isn't the branch's to move.",
+									   getObjectDescription(&obj, false))));
+			}
+			systable_endscan(scan);
+			table_close(pg_depend, AccessShareLock);
 		}
-		systable_endscan(scan);
-		table_close(pg_attribute, AccessShareLock);
-		stmts = lappend(stmts, psprintf("DROP TYPE %s", aside_q));
 	}
-	*all_dropped = stmts != NIL;
-	if (stmts != NIL)
+
+	foreach(lc, moved)
 	{
-		foreach(lc, from)
-		{
-			MoveItem   *f = lfirst(lc);
+		MovedType  *mt = lfirst(lc);
 
-			MoveItem   *t = find_item(to, f->kind, f->name);
-
-			if (f->kind == 'v')
-				drops = lappend(drops, psprintf("DROP VIEW IF EXISTS %s CASCADE", f->name));
-			else if (f->kind == 'm' && t != NULL && strcmp(t->def, f->def) == 0)
-				drops = lappend(drops, psprintf("DROP MATERIALIZED VIEW IF EXISTS %s CASCADE",
-												f->name));	/* (the others went above) */
-		}
+		tm.before = lappend(tm.before,
+							psprintf("ALTER TYPE %s RENAME TO %s", mt->from->name,
+									 strrchr(mt->aside, '.') + 1));
+		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def));
+		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
 	}
-	return list_concat(drops, stmts);
+	return tm;
 }
 
 /*
@@ -2669,8 +2938,11 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
 	List	   *remade = NIL;
-	List	   *moves;
-	bool		all_dropped;
+	List	   *schemas = NIL;
+	List	   *type_drops = NIL;
+	List	   *schema_drops = NIL;
+	TypeMoves	tm;
+	bool		matviews_change;
 	ListCell   *lc;
 	int			save_nestlevel;
 	MemoryContext caller = CurrentMemoryContext;
@@ -2680,6 +2952,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	canon_env(&cn);
 	from = move_items(&cn, from_root);
 	to = move_items(&cn, to_root);
+	tm = type_moves(from, to);
 
 	/* Going: views first, as they may use anything; then tables, routines, the rest. */
 	foreach(lc, from)
@@ -2782,7 +3055,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			}
 		}
 	}
-	/* routines, types and sequences going: once the tables don't use them */
+	/*
+	 * Routines and sequences going: once the tables don't use them; then
+	 * types, each after those using it.
+	 */
 	late = list_concat(late, routines);
 	foreach(lc, from)
 	{
@@ -2791,7 +3067,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (find_item(to, f->kind, f->name) == NULL)
 		{
 			if (f->kind == 'y')
-				late = lappend(late, psprintf("DROP TYPE %s", f->name));
+				type_drops = lappend(type_drops, psprintf("DROP TYPE %s", f->name));
 			else if (f->kind == 's')
 				late = lappend(late, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
 		}
@@ -2802,8 +3078,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *f = lfirst(lc);
 
 		if (f->kind == 'n' && find_item(to, 'n', f->name) == NULL)
-			late = lappend(late,
-						   psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
+			schema_drops = lappend(schema_drops,
+								   psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
 	}
 
 	/*
@@ -2817,8 +3093,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'n' && find_item(from, 'n', t->name) == NULL)
-			sm.before = lappend(sm.before,
-								psprintf("CREATE SCHEMA %s VERSIONED", t->name));
+			schemas = lappend(schemas,
+							  psprintf("CREATE SCHEMA %s VERSIONED", t->name));
 	}
 	foreach(lc, to)
 	{
@@ -2830,7 +3106,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (t->kind == 'n')
 			continue;			/* (above) */
 		if (t->kind == 'y' && f == NULL)
-			sm.before = lappend(sm.before, create_type_sql(t->name, t->def));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
@@ -2866,11 +3142,30 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(t->def, &td);
 		move_table(&sm, t->name, NULL, &td);
 	}
-	moves = type_moves(from, to, &all_dropped);
+	/*
+	 * Materialized views go and come again, with the rows the commit holds,
+	 * if any changes, or a view or a type they may use does: all of them,
+	 * each after those it uses (one going takes no other with it).
+	 */
+	matviews_change = tm.any || view_drops != NIL;
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t = find_item(to, f->kind, f->name);
+
+		if (f->kind == 'm' && (t == NULL || strcmp(t->def, f->def) != 0))
+			matviews_change = true;
+	}
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
-		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		if (t->kind == 'm' && find_item(from, 'm', t->name) == NULL)
+			matviews_change = true;
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'v')
 			views = lappend(views, psprintf("CREATE VIEW %s AS %s", t->name, t->def));
@@ -2879,22 +3174,13 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		 * as to holds them, written after (those of the others are written
 		 * with the tables')
 		 */
-		else if (t->kind == 'm' &&
-				 (f == NULL || all_dropped || view_drops != NIL ||
-				  strcmp(t->def, f->def) != 0))
+		else if (t->kind == 'm' && matviews_change)
 		{
 			views = lappend(views, psprintf("CREATE MATERIALIZED VIEW %s AS %s",
 											t->name, t->def));
 			matviews_made = true;
 		}
 	}
-
-	/*
-	 * Changed types go first, before anything uses them anew: every view
-	 * and materialized view that may use one dropped, then each type made
-	 * again under its name and the columns using it moved to it.
-	 */
-	sm.before = list_concat(moves, sm.before);
 
 	/* Run them as deparsed: names qualified, routines' bodies unchecked. */
 	save_nestlevel = NewGUCNestLevel();
@@ -2906,9 +3192,22 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
-	make_views(view_drops != NIL ? list_concat(matview_drops, view_drops) :
-			   NIL);
+	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
+
+	/*
+	 * Types first, in turn (type_moves()): new schemas made once the types
+	 * changed are aside, all the types made (each after those it uses), the
+	 * columns using the changed ones moved, the old ones dropped.
+	 */
+	run_statements(tm.before);
+	run_statements(schemas);
+	make_views(tm.creates);
+	run_statements(tm.converts);
+	make_views(tm.drops);
+	run_statements(tm.after);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
+	make_views(type_drops);
+	run_statements(schema_drops);
 	CommandCounterIncrement();
 	/* the rows in the caller's memory: what they keep outlives SPI's */
 	{
