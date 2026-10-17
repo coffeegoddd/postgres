@@ -87,7 +87,7 @@ check-vc: temp-install check-vc-target-prolly vc.conf
 		--schedule=$(srcdir)/vc_schedule
 
 # The tree engine's version control, through its prolly_* API.
-check-vc-d1: require-legacy-vc check-vc-target temp-install prolly_am.conf
+check-vc-d1: require-tree-engine check-vc-target temp-install prolly_am.conf
 	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_d1_schedule
 
 check-isolation: PROVE_TESTS = t/002_isolation.pl
@@ -100,7 +100,7 @@ check-vc-isolation: temp-install check-vc-target-prolly vc.conf
 	$(pg_isolation_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_isolation_schedule
 
-check-vc-isolation-d1: require-legacy-vc check-vc-target temp-install prolly_am.conf
+check-vc-isolation-d1: require-tree-engine check-vc-target temp-install prolly_am.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
 		--schedule=$(srcdir)/vc_d1_isolation_schedule
@@ -146,10 +146,13 @@ check-heap: temp-install
 require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
 
+require-tree-engine:
+	@test '$(PROLLY_AM)' != prolly || { echo 'check-vc-d1 and check-vc-isolation-d1 test a tree engine'"'"'s prolly_* API; the page-based engine'"'"'s version control is check-vc'"'"'s'; exit 1; }
+
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-vc-d1 check-vc-isolation-d1 \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap FORCE
+	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-tree-engine FORCE
