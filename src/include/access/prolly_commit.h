@@ -138,6 +138,7 @@ typedef struct ProllyCommitRoutine
 	"copy_database", \
 	"drop_database", "live_roots", "usage", "checkpoint", "redo"
 #define PROLLY_COMMIT_FIRST_CALLBACK shmem_size
+#define PROLLY_COMMIT_LAST_CALLBACK redo
 
 /* For tests: if positive, fewer branch heads than an implementation's limit. */
 extern PGDLLIMPORT int debug_prolly_max_branch_heads;

@@ -1069,7 +1069,8 @@ tree_working_set(const char *branch, ProllyNodeRef *root)
  * all of it is as cheap as one table's.
  */
 static bool
-tree_read_working_set(const char *branch, Oid only, ProllyNodeRef *root)
+tree_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
+					  List **left_out)
 {
 	return tree_working_set(branch, root);
 }

@@ -250,15 +250,36 @@ SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
         66
 (1 row)
 
+-- They are changes a commit can't hold: listed as not covered (a
+-- partition with its partitioned table, not as a table of its own), and
+-- the branch is dirty with them alone.
 CREATE TABLE sdu.p (id int) PARTITION BY RANGE (id);
+CREATE TABLE sdu.p1 PARTITION OF sdu.p FOR VALUES FROM (1) TO (10);
+SELECT name, dirty FROM dolt_branches WHERE name = 'main';
+ name | dirty 
+------+-------
+ main | t
+(1 row)
+
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
+ table_name | staged |   status    
+------------+--------+-------------
+ sdu.p      | f      | not covered
+ sdu.p1     | f      | not covered
+(2 rows)
+
 CREATE AGGREGATE sdu.total (int) (sfunc = int4pl, stype = int);
 CREATE POLICY sdu_own ON sdu.t USING (true);
 INSERT INTO sdu.t VALUES (1, 'one');
-SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
- table_name | staged |  status  
-------------+--------+----------
- sdu.t      | t      | modified
-(1 row)
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%' OR table_name LIKE 'sdu_own%';
+     table_name     | staged |   status    
+--------------------+--------+-------------
+ sdu.p              | f      | not covered
+ sdu.p1             | f      | not covered
+ sdu.t              | t      | modified
+ sdu.total(integer) | f      | not covered
+ sdu_own on sdu.t   | f      | not covered
+(5 rows)
 
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
  diff_type | to_row  
@@ -273,7 +294,7 @@ SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 (1 row)
 
 SELECT dolt_commit('-am', 'refused');
-ERROR:  prolly commits don't cover partitioned tables yet: sdu.p
+ERROR:  prolly commits don't cover partitions of partitioned tables yet: sdu.p1
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP SCHEMA sdu CASCADE;
 NOTICE:  drop cascades to 3 other objects

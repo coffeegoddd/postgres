@@ -37,6 +37,7 @@ typedef struct ProllyHashRoutine
 
 #define PROLLY_HASH_CALLBACK_NAMES "begin", "update", "finish"
 #define PROLLY_HASH_FIRST_CALLBACK begin
+#define PROLLY_HASH_LAST_CALLBACK finish
 
 static inline const ProllyHashRoutine *
 prolly_hash_lookup(const char *name)

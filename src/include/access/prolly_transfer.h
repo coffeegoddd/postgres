@@ -40,6 +40,7 @@ typedef struct ProllyTransferRoutine
 
 #define PROLLY_TRANSFER_CALLBACK_NAMES "clone", "fetch", "push"
 #define PROLLY_TRANSFER_FIRST_CALLBACK clone
+#define PROLLY_TRANSFER_LAST_CALLBACK push
 
 static inline const ProllyTransferRoutine *
 prolly_transfer_lookup(const char *name)

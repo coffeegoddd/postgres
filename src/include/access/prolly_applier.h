@@ -58,6 +58,7 @@ typedef struct ProllyApplierRoutine
 #define PROLLY_APPLIER_CALLBACK_NAMES \
 	"begin", "insert", "update", "remove", "end"
 #define PROLLY_APPLIER_FIRST_CALLBACK begin
+#define PROLLY_APPLIER_LAST_CALLBACK end
 
 static inline const ProllyApplierRoutine *
 prolly_applier_lookup(const char *name)

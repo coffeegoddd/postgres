@@ -40,6 +40,7 @@ typedef struct ProllyAllocatorRoutine
 
 #define PROLLY_ALLOC_CALLBACK_NAMES "open", "close", "allocate", "free"
 #define PROLLY_ALLOC_FIRST_CALLBACK open
+#define PROLLY_ALLOC_LAST_CALLBACK free
 
 static inline const ProllyAllocatorRoutine *
 prolly_alloc_lookup(const char *name)

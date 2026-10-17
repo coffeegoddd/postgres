@@ -141,6 +141,7 @@ typedef struct ProllyRootLayoutRoutine
 #define PROLLY_ROOTLAYOUT_CALLBACK_NAMES \
 	"empty", "lookup", "apply", "subroot", "scan", "walk", "diff"
 #define PROLLY_ROOTLAYOUT_FIRST_CALLBACK empty
+#define PROLLY_ROOTLAYOUT_LAST_CALLBACK diff
 
 static inline const ProllyRootLayoutRoutine *
 prolly_rootlayout_lookup(const char *name)

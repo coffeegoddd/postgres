@@ -75,6 +75,7 @@ typedef struct ProllyChangeFinderRoutine
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
+#define PROLLY_CHANGES_LAST_CALLBACK counters
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

@@ -135,6 +135,8 @@ typedef enum ProllyDiffKind
 	PROLLY_DIFF_ADDED,
 	PROLLY_DIFF_REMOVED,
 	PROLLY_DIFF_MODIFIED,
+	PROLLY_DIFF_NOT_COVERED,	/* (tables only) an object a read left out,
+								 * which a commit refuses */
 } ProllyDiffKind;
 
 typedef struct ProllyDiffSink ProllyDiffSink;

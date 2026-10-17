@@ -79,6 +79,7 @@ typedef struct ProllyKeyEncoderRoutine
 	"supports", "begin", "encode", "decode", "compare", "equal_bytes", \
 	"prefix_length", "end"
 #define PROLLY_KEYENC_FIRST_CALLBACK supports
+#define PROLLY_KEYENC_LAST_CALLBACK end
 
 static inline const ProllyKeyEncoderRoutine *
 prolly_keyenc_lookup(const char *name)

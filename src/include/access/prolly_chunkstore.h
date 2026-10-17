@@ -119,6 +119,7 @@ typedef struct ProllyChunkStoreRoutine
 	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK copy_database
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

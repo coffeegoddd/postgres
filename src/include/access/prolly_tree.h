@@ -199,6 +199,7 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", "key_at", \
 	"walk", "diff"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
+#define PROLLY_TREE_LAST_CALLBACK diff
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

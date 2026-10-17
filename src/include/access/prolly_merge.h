@@ -104,6 +104,7 @@ typedef struct ProllyMergeRoutine
 	"diff", "merge", "conflicts", "resolve", "tables", "move_to", \
 	"cherry_pick", "verify"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
+#define PROLLY_MERGE_LAST_CALLBACK verify
 
 static inline const ProllyMergeRoutine *
 prolly_merge_lookup(const char *name)
