@@ -57,6 +57,7 @@ backend_sources += files(
   'reclaim_marksweep.c',
   'reclaim_stub.c',
   'refs_copies.c',
+  'refs_history.c',
   'refs_tree.c',
   'refs_stub.c',
   'rootlayout_stub.c',

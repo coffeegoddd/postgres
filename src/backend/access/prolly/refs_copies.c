@@ -671,64 +671,18 @@ copies_resolve(const char *refname, ProllyHash *commit_id)
 	return found;
 }
 
-/* The newest common ancestor of a and b: breadth first from both. */
+static bool
+copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	return copies_commit_get(id, info);
+}
+
+/* The newest common ancestor of a and b, each commit visited once. */
 static bool
 copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 {
-	List	   *seen = NIL;
-	List	   *queue = NIL;
-	ProllyHash *h;
-
 	refs_init();
-	h = palloc(sizeof(ProllyHash));
-	*h = *a;
-	queue = lappend(queue, h);
-	while (queue != NIL)
-	{
-		ProllyCommitInfo info;
-
-		h = linitial(queue);
-		queue = list_delete_first(queue);
-		seen = lappend(seen, h);
-		if (!copies_commit_get(h, &info))
-			continue;
-		for (int i = 0; i < info.nparents; i++)
-		{
-			ProllyHash *p = palloc(sizeof(ProllyHash));
-
-			*p = info.parents[i];
-			queue = lappend(queue, p);
-		}
-	}
-	h = palloc(sizeof(ProllyHash));
-	*h = *b;
-	queue = lappend(queue, h);
-	while (queue != NIL)
-	{
-		ProllyCommitInfo info;
-		ListCell   *lc;
-
-		h = linitial(queue);
-		queue = list_delete_first(queue);
-		foreach(lc, seen)
-		{
-			if (same_hash(lfirst(lc), h))
-			{
-				*base = *h;
-				return true;
-			}
-		}
-		if (!copies_commit_get(h, &info))
-			continue;
-		for (int i = 0; i < info.nparents; i++)
-		{
-			ProllyHash *p = palloc(sizeof(ProllyHash));
-
-			*p = info.parents[i];
-			queue = lappend(queue, p);
-		}
-	}
-	return false;
+	return prolly_history_merge_base(a, b, copies_lookup_commit, NULL, base);
 }
 
 /*

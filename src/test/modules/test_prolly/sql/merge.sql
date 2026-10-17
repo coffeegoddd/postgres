@@ -259,3 +259,31 @@ SELECT dolt_branch('-D', 'mgu_k');
 SELECT dolt_branch('-D', 'mgu_side');
 DROP SCHEMA mgu CASCADE;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- A history of merges reaches its commits along many paths (each round
+-- here doubles them); finding a merge base visits each commit once.
+CREATE SCHEMA mb VERSIONED;
+CREATE TABLE mb.t (id int PRIMARY KEY, v int);
+INSERT INTO mb.t VALUES (0, 0);
+SELECT length(dolt_commit('-Am', 'mb base')::text) AS committed;
+SELECT dolt_branch('mb_side');
+SET statement_timeout = '60s';
+DO $$
+BEGIN
+	FOR i IN 1..24 LOOP
+		PERFORM dolt_checkout('mb_side');
+		PERFORM dolt_merge('main');
+		INSERT INTO mb.t VALUES (2 * i, i);
+		PERFORM dolt_commit('-am', 'side ' || i);
+		PERFORM dolt_checkout('main');
+		INSERT INTO mb.t VALUES (2 * i + 1, i);
+		PERFORM dolt_commit('-am', 'main ' || i);
+		PERFORM dolt_merge('mb_side', '-m', 'merge ' || i);
+	END LOOP;
+END $$;
+RESET statement_timeout;
+SELECT count(*) AS rows FROM mb.t;
+SELECT count(*) AS merges FROM dolt_log('main') WHERE message LIKE 'merge %';
+SELECT dolt_branch('-D', 'mb_side');
+DROP SCHEMA mb CASCADE;
+SELECT length(dolt_commit('-Am', 'without mb')::text) AS committed;
