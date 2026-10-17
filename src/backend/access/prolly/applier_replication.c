@@ -398,6 +398,17 @@ advance(ProllyApplier *a)
 	a->estate->es_output_cid = GetCurrentCommandId(true);
 }
 
+/*
+ * A write failed: the row found for it is let go before the error reaches
+ * the caller, whose subtransaction (if it wrote in one) pinned its buffer
+ * and lets the pin go as it rolls back.
+ */
+static void
+let_go(ProllyApplier *a)
+{
+	ExecClearTuple(a->found);
+}
+
 /* A row equal to old (by the key, or every column) into a->found. */
 static bool
 find_row(ProllyApplier *a, TupleTableSlot *old)
@@ -447,13 +458,22 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
 		ExecClearTuple(a->found);
 		return false;
 	}
-	if (a->matview)
+	PG_TRY();
 	{
-		matview_delete(a);
-		matview_insert(a, row);
+		if (a->matview)
+		{
+			matview_delete(a);
+			matview_insert(a, row);
+		}
+		else
+			ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found, row);
 	}
-	else
-		ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found, row);
+	PG_CATCH();
+	{
+		let_go(a);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	advance(a);
 	return true;
 }
@@ -466,10 +486,19 @@ replication_remove(ProllyApplier *a, TupleTableSlot *old)
 		ExecClearTuple(a->found);
 		return false;
 	}
-	if (a->matview)
-		matview_delete(a);
-	else
-		ExecSimpleRelationDelete(a->rri, a->estate, &a->epq, a->found);
+	PG_TRY();
+	{
+		if (a->matview)
+			matview_delete(a);
+		else
+			ExecSimpleRelationDelete(a->rri, a->estate, &a->epq, a->found);
+	}
+	PG_CATCH();
+	{
+		let_go(a);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	advance(a);
 	return true;
 }

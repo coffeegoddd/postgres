@@ -186,6 +186,279 @@ SELECT count(*) FROM dolt_constraint_violations();
      0
 (1 row)
 
+-- A row a merge updates that breaks a unique constraint is recorded too.
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE cv.child SET code = 'z' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature recodes 1')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO cv.child VALUES (7, 1, 'z');
+SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+            dolt_merge             
+-----------------------------------
+ {1,"constraint violations found"}
+(1 row)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
+ violation_type |          violating_row           
+----------------+----------------------------------
+ unique index   | {"id": 1, "pid": 1, "code": "z"}
+(1 row)
+
+-- (a table dropped since has none to fix)
+SAVEPOINT s;
+DROP TABLE cv.child;
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+(0 rows)
+
+ROLLBACK TO s;
+SELECT count(*) AS still_listed FROM dolt_constraint_violations();
+ still_listed 
+--------------
+            1
+(1 row)
+
+ROLLBACK;
+-- Violations kept stay through later merges that find none of their own.
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('feature'))[3:4];
+            dolt_merge             
+-----------------------------------
+ {1,"constraint violations found"}
+(1 row)
+
+SELECT length(dolt_commit('-am', 'merged, a violation kept')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+INSERT INTO cv.parent VALUES (3);
+SELECT length(dolt_commit('-am', 'other adds a parent')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+INSERT INTO cv.parent VALUES (4);
+SELECT length(dolt_commit('-am', 'main adds a parent')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('other', '-m', 'merged other'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT table_name, num_violations FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ cv.child   |              1
+(1 row)
+
+-- A branch deleted takes its violations with it.
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SET session_replication_role = replica;	-- (no foreign key checks)
+INSERT INTO cv.child VALUES (8, 98, 'orphan on other');
+RESET session_replication_role;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints('cv.child');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT count(*) AS on_other FROM dolt_constraint_violations();
+ on_other 
+----------
+        1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT count(*) AS on_a_new_other FROM dolt_constraint_violations();
+ on_a_new_other 
+----------------
+              0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+DELETE FROM cv.child WHERE id = 7;
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A revert that leaves a child without its parent records it.
+INSERT INTO cv.parent VALUES (10);
+SELECT (dolt_commit('-am', 'parent 10'))[1] AS parent10 \gset
+INSERT INTO cv.child VALUES (10, 10, 'ten');
+SELECT length(dolt_commit('-am', 'child of 10')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_revert(:'parent10');
+ERROR:  revert constraint violations detected, transaction rolled back
+DETAIL:  1 row violates a constraint.
+HINT:  Revert in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.
+BEGIN;
+SELECT dolt_revert(:'parent10');
+ dolt_revert 
+-------------
+ {1}
+(1 row)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
+ violation_type |            violating_row             
+----------------+--------------------------------------
+ foreign key    | {"id": 10, "pid": 10, "code": "ten"}
+(1 row)
+
+ROLLBACK;
+-- Rows a parent's row security hides from its owner are seen anyway, as
+-- the foreign key's own checks see them.
+CREATE ROLE regress_cv_owner;
+GRANT USAGE ON SCHEMA cv TO regress_cv_owner;
+ALTER TABLE cv.parent OWNER TO regress_cv_owner;
+ALTER TABLE cv.child OWNER TO regress_cv_owner;
+ALTER TABLE cv.parent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cv.parent FORCE ROW LEVEL SECURITY;
+CREATE POLICY hide ON cv.parent USING (false);
+SET ROLE regress_cv_owner;
+SELECT count(*) AS hidden FROM cv.parent;
+ hidden 
+--------
+      0
+(1 row)
+
+SELECT dolt_verify_constraints('cv.child');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT count(*) AS none FROM dolt_constraint_violations();
+ none 
+------
+    0
+(1 row)
+
+RESET ROLE;
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -196,3 +469,4 @@ DROP SCHEMA cv CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table cv.parent
 drop cascades to table cv.child
+DROP ROLE regress_cv_owner;

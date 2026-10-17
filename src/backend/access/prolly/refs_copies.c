@@ -69,6 +69,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #define TAG_BRANCH		'B'
@@ -1264,7 +1265,10 @@ corrupt:
 	return NULL;				/* keep compiler quiet */
 }
 
-/* The constraint violations a merge left on branch. */
+/*
+ * The constraint violations a merge left on branch: those of tables since
+ * dropped left out (a dropped table has no rows to fix).
+ */
 static List *
 violations_of(const char *branch)
 {
@@ -1294,7 +1298,8 @@ violations_of(const char *branch)
 			pv->type = get_text(&p, end);
 			pv->row = get_text(&p, end);
 			pv->info = get_text(&p, end);
-			list = lappend(list, pv);
+			if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(pv->relid)))
+				list = lappend(list, pv);
 		}
 	}
 	pfree(key.data);
@@ -1320,8 +1325,12 @@ copies_set_violations(List *violations)
 	violations_key(&key, branch_ops()->current());
 	if (violations == NIL)
 	{
-		if (copies_violations() != NIL)
+		StringInfoData had;
+
+		initStringInfo(&had);
+		if (refs_get(key.data, key.len, &had))
 			refs_put(key.data, key.len, NULL);
+		pfree(had.data);
 	}
 	else
 	{
