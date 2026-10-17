@@ -7,7 +7,9 @@
 # 5594) or dolt (dolt sql-server on port 3399, dolt from PATH).  SCRIPT is
 # a script gen.py wrote into WORKDIR, without ".sql".  Each run makes its
 # own data directory under WORKDIR and refuses one that exists.  Results go
-# to WORKDIR/out-SCRIPT.tsv: step, median ms, each repetition's ms.
+# to WORKDIR/out-SCRIPT.tsv: step, median ms, each repetition's ms.  The
+# merge cases (merge_pg with heap or prolly, merge_dolt with dolt) aren't
+# timed: their output goes to WORKDIR/out-SCRIPT.txt.
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
@@ -35,6 +37,12 @@ heap|prolly)
 	"$BIN/pg_ctl" -D "$DATA" -l "$WORK/server-$SCRIPT.log" -w \
 		-o "-p $PORT -k /tmp -c shared_buffers=1GB -c max_wal_size=8GB" start > /dev/null
 	trap '"$BIN/pg_ctl" -D "$DATA" -m fast -w stop > /dev/null' EXIT
+	if [[ $SCRIPT == merge_* ]]; then
+		"$BIN/psql" -X -h /tmp -p "$PORT" -U postgres -d postgres \
+			-f "$WORK/$SCRIPT.sql" > "$WORK/out-$SCRIPT.txt" 2>&1
+		echo "$WORK/out-$SCRIPT.txt"
+		exit 0
+	fi
 	"$WORK/kbench" pgx "host=/tmp port=$PORT user=postgres dbname=postgres" \
 		"$WORK/$SCRIPT.sql" | tee "$OUT"
 	echo "database_bytes	$(du -sb "$DATA/base" | cut -f1)" | tee -a "$OUT"
@@ -54,6 +62,12 @@ dolt)
 		mysql -h 127.0.0.1 -P 3399 -u root -e 'select 1' > /dev/null 2>&1 && break
 		sleep 0.2
 	done
+	if [[ $SCRIPT == merge_* ]]; then
+		mysql -h 127.0.0.1 -P 3399 -u root --force -t kb \
+			< "$WORK/$SCRIPT.sql" > "$WORK/out-$SCRIPT.txt" 2>&1 || true
+		echo "$WORK/out-$SCRIPT.txt"
+		exit 0
+	fi
 	"$WORK/kbench" mysql "root@tcp(127.0.0.1:3399)/kb" "$WORK/$SCRIPT.sql" | tee "$OUT"
 	echo "database_bytes	$(du -sb "$DIR/kb/.dolt" | cut -f1)" | tee -a "$OUT"
 	;;
