@@ -324,6 +324,76 @@ ResetSequence(Oid seq_relid)
 }
 
 /*
+ * A sequence's last value and whether it was called, read without the
+ * privilege a session's read needs: for prolly, which keeps a branch's
+ * sequences as its data.  False where it can't be read here (another
+ * session's temporary sequence, an unlogged one during recovery).
+ */
+bool
+ReadSequenceState(Oid relid, int64 *last, bool *called)
+{
+	Relation	seqrel = try_relation_open(relid, AccessShareLock);
+	Buffer		buf;
+	HeapTupleData seqtuple;
+	Form_pg_sequence_data seq;
+
+	if (seqrel == NULL)
+		return false;
+	if (seqrel->rd_rel->relkind != RELKIND_SEQUENCE ||
+		RELATION_IS_OTHER_TEMP(seqrel) ||
+		(!RelationIsPermanent(seqrel) && RecoveryInProgress()))
+	{
+		relation_close(seqrel, AccessShareLock);
+		return false;
+	}
+	seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+	*last = seq->last_value;
+	*called = seq->is_called;
+	UnlockReleaseBuffer(buf);
+	relation_close(seqrel, AccessShareLock);
+	return true;
+}
+
+/*
+ * Set a sequence's state, as ResetSequence restarts it: in new storage, so
+ * the transaction's rollback undoes it (setval's change is kept), and
+ * without setval's privilege check, for prolly moving a branch's data,
+ * its sequences among them, to a commit's.
+ */
+void
+RestoreSequenceState(Oid relid, int64 last, bool called)
+{
+	Relation	seq_rel;
+	SeqTable	elm;
+	Form_pg_sequence_data seq;
+	Buffer		buf;
+	HeapTupleData seqdatatuple;
+	HeapTuple	tuple;
+
+	/* (new storage takes what TRUNCATE ... RESTART IDENTITY takes) */
+	LockRelationOid(relid, AccessExclusiveLock);
+	init_sequence(relid, &elm, &seq_rel);
+	(void) read_seq_tuple(seq_rel, &buf, &seqdatatuple);
+	tuple = heap_copytuple(&seqdatatuple);
+	UnlockReleaseBuffer(buf);
+
+	seq = (Form_pg_sequence_data) GETSTRUCT(tuple);
+	seq->last_value = last;
+	seq->is_called = called;
+	seq->log_cnt = 0;
+
+	RelationSetNewRelfilenumber(seq_rel, seq_rel->rd_rel->relpersistence);
+	Assert(seq_rel->rd_rel->relfrozenxid == InvalidTransactionId);
+	Assert(seq_rel->rd_rel->relminmxid == InvalidMultiXactId);
+	fill_seq_with_data(seq_rel, tuple);
+
+	/* Clear local cache so that we don't think we have cached numbers */
+	elm->cached = elm->last;
+
+	sequence_close(seq_rel, NoLock);
+}
+
+/*
  * Initialize a sequence's relation with the specified tuple as content
  *
  * This handles unlogged sequences by writing to both the main and the init

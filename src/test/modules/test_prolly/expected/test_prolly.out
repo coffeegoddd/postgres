@@ -60,7 +60,7 @@ FROM prolly_implementations();
  index_keying    | stub             |       0 |              0
  canonicalizer   | stub             |       0 |              0
  canonicalizer   | catalogs         |       1 |              1
- canonicalizer   | folded           |       2 |              2
+ canonicalizer   | folded           |       2 |              3
  chunk_store     | journal          |       1 |              1
  chunk_format    | basic            |       1 |              1
  row_applier     | replication      |       1 |              1

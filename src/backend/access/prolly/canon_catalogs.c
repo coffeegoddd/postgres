@@ -104,6 +104,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
+#include "commands/sequence.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -740,25 +741,19 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 					 seq->seqstart, seq->seqincrement, seq->seqmax, seq->seqmin,
 					 seq->seqcache, seq->seqcycle ? "cycle" : "no cycle");
 
-	/* A branch's sequences are its data too. */
+	/*
+	 * A branch's sequences are its data too: read as the fold reads rows,
+	 * whatever the session may read.  One that can't be read here has no
+	 * value recorded (and a move leaves it as it is).
+	 */
 	if (cn->folded)
 	{
-		HeapTupleHeader data;
-		bool		isnull;
 		int64		last;
 		bool		called;
 
-		/* (without the privilege, the data reads as NULLs) */
-		if (pg_class_aclcheck(seqid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied for sequence %s", name)));
-		data = DatumGetHeapTupleHeader(DirectFunctionCall1(pg_get_sequence_data,
-														   ObjectIdGetDatum(seqid)));
-		last = DatumGetInt64(GetAttributeByNum(data, 1, &isnull));
-		called = DatumGetBool(GetAttributeByNum(data, 2, &isnull));
-		appendStringInfo(&it->value, INT64_FORMAT "\t%s\n", last,
-						 called ? "t" : "f");
+		if (ReadSequenceState(seqid, &last, &called))
+			appendStringInfo(&it->value, INT64_FORMAT "\t%s\n", last,
+							 called ? "t" : "f");
 	}
 	ReleaseSysCache(tup);
 }
@@ -1505,11 +1500,13 @@ folded_sequences(const ProllyNodeRef *root, ProllyCanonSequenceVisit visit,
 			break;
 		value = pnstrdup((const char *) v.data, v.len);
 		nl = strchr(value, '\n');
-		tab = nl ? strchr(nl + 1, '\t') : NULL;
+		if (nl == NULL || nl[1] == '\0')
+			continue;			/* no value: unreadable, or an older commit */
+		tab = strchr(nl + 1, '\t');
 		if (tab == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical tree holds a sequence without its value")));
+					 errmsg("canonical tree holds a sequence with an invalid value")));
 		name = from_utf8(k.data + 2, k.len - 2);
 		visit(name, strtoi64(nl + 1, NULL, 10), tab[1] == 't', arg);
 	}
@@ -2159,7 +2156,7 @@ create_type_sql(const char *name, const char *def)
 
 /* A sequence's options, as described (type, start, increment, max, min, cache, cycle). */
 static char *
-sequence_options(const char *def)
+sequence_options_sql(const char *def)
 {
 	char	   *copy = pstrdup(def);
 	char	   *type = strtok(copy, "\t");
@@ -2504,11 +2501,11 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
-										sequence_options(t->def)));
+										sequence_options_sql(t->def)));
 		else if (t->kind == 's')
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
-										 t->name, sequence_options(t->def)));
+										 t->name, sequence_options_sql(t->def)));
 		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
 			goto unsupported;
 	}
@@ -2575,7 +2572,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
 		.impl_id = 2,
-		.format_version = 2,		/* 2: collations' rules and flag, by library */
+		.format_version = 3,		/* 3: sequences' values */
 		.name = "folded",
 		.description = "canonical form by name of the session branch's "
 		"versioned schemas, their tables' rows folded into trees",

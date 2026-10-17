@@ -48,6 +48,8 @@ extern void SequenceChangePersistence(Oid relid, char newrelpersistence);
 extern void DeleteSequenceTuple(Oid relid);
 extern void ResetSequence(Oid seq_relid);
 extern void SetSequence(Oid relid, int64 next, bool iscalled);
+extern bool ReadSequenceState(Oid relid, int64 *last, bool *called);
+extern void RestoreSequenceState(Oid relid, int64 last, bool called);
 extern void ResetSequenceCaches(void);
 
 #endif							/* SEQUENCE_H */

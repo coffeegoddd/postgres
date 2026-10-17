@@ -50,7 +50,10 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 
-/* Visits one sequence of a canonical root. */
+/*
+ * Visits one sequence of a canonical root, with its value (one recorded
+ * without one, unreadable where it was folded, isn't visited).
+ */
 typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 										  bool called, void *arg);
 
