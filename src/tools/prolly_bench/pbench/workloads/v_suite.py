@@ -146,17 +146,23 @@ class V2(VWorkload):
         return [(f"n{n}", {"changes": int(n)})
                 for n in params.get("changes", [1, 100, 10000])]
 
+    def prepare(self, ctx):
+        super().prepare(ctx)
+        # on a branch of its own, so a background workload's writes (on
+        # main) aren't in its commits; made before the measured window
+        timed_session(ctx, [vc_sql(ctx).branch("v2_work")], "v2-prepare")
+
     def operations(self, ctx):
         n = min(ctx.params["changes"], self.rows(ctx))
         vc = vc_sql(ctx)
-        # on a branch of its own, so a background workload's writes (on
-        # main) aren't in its commits
-        stmts = [vc.branch("v2_work"), vc.checkout("v2_work")]
+        # (a checkout is the session's own, so it is this session's first
+        # statement; the timings leave it out)
+        stmts = [vc.checkout("v2_work")]
         for i in range(self.iterations(ctx)):
             stmts += [f"UPDATE vc_data SET payload = md5(payload || '{i}') "
                       f"WHERE id <= {n}",
                       vc.commit(f"v2 {i}")]
-        t = timed_session(ctx, stmts, "v2")[2:]
+        t = timed_session(ctx, stmts, "v2")[1:]
         return Outcome(metrics={"change_ms": _median(t[0::2]),
                                 "commit_ms": _median(t[1::2])},
                        transactions=len(t) // 2, unit="commit")

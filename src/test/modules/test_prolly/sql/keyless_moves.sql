@@ -17,9 +17,10 @@ INSERT INTO km.t SELECT g, 'new ' || g, 1.5 FROM generate_series(1, 300) g;
 DELETE FROM km.t WHERE ctid IN (SELECT ctid FROM km.t WHERE a < 20 LIMIT 200);
 UPDATE km.t SET b = b || '!' WHERE a BETWEEN 30 AND 39;
 
+-- (a few scans, the first lookups' and the index's; not one a row, 600)
 BEGIN;
 SELECT dolt_reset('--hard');
-SELECT seq_scan < 20 AS scanned_once FROM pg_stat_xact_user_tables
+SELECT seq_scan < 40 AS scanned_once FROM pg_stat_xact_user_tables
   WHERE relid = 'km.t'::regclass;
 COMMIT;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
@@ -30,9 +31,24 @@ INSERT INTO km.t SELECT g, 'more', 2 FROM generate_series(1, 400) g;
 SELECT dolt_branch('kb');
 SELECT dolt_checkout('kb') IS NOT NULL AS on_kb;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+
 SELECT count(*) FROM km.t;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT count(*) FROM km.t;
+
+-- A branch made while a keyed table has changes is folded from its head:
+-- its folds read no page the move to the head wrote.
+CREATE TABLE km.k (id int PRIMARY KEY, v text);
+INSERT INTO km.k SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+SELECT length(dolt_commit('-Am', 'keyed')::text) AS committed;
+UPDATE km.k SET v = 'changed' WHERE id % 100 = 0;
+SELECT dolt_branch('kk');
+SELECT dolt_checkout('kk') IS NOT NULL AS on_kk;
+SELECT count(*) AS reset FROM test_fold_counters(true);
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT pages AS pages_read, full_tables FROM test_fold_counters(true);
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'kk');
 
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'kb');

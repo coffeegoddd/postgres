@@ -66,6 +66,7 @@ struct ProllyApplier
 	bool		matview;		/* rows written as REFRESH writes them */
 	/* without a key or match_index: its rows by the hash of their values */
 	HTAB	   *rows;
+	int			lookups;		/* of a keyless table's rows, so far */
 };
 
 /* The rows of a hash: where they are (some perhaps gone since). */
@@ -488,8 +489,10 @@ rows_build(ProllyApplier *a)
 	ctl.keysize = sizeof(uint32);
 	ctl.entrysize = sizeof(RowsEntry);
 	ctl.hcxt = a->estate->es_query_cxt;
-	a->rows = hash_create("prolly applier rows", 1024, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	/* (as many as the table is thought to have) */
+	a->rows = hash_create("prolly applier rows",
+						  (long) Min(Max(a->rel->rd_rel->reltuples, 1024), 1 << 24),
+						  &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	scan = table_beginscan(a->rel, snap, 0, NULL, SO_NONE);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 		rows_add(a, slot);
@@ -500,42 +503,50 @@ rows_build(ProllyApplier *a)
 
 /*
  * A row of a table without a key, alike to old, found through the index and
- * locked, into a->found; it leaves the index (it is about to change).
- * False if none is: the index may have missed it (a row whose values are
- * equal but not alike, or one written by another session), so the caller
- * scans for it.
+ * locked, into a->found; it leaves the index (it is about to change), as
+ * does a row gone since.  False if none is: the index may have missed it (a
+ * row whose values are equal but not alike, or one written by another
+ * session), so the caller scans for it.  The index is made only once a
+ * few rows were looked for: a move that changes few rows scans for each,
+ * rather than reading the whole table into the index.
  */
+#define ROWS_INDEX_AFTER	8
+
 static bool
 rows_find(ProllyApplier *a, TupleTableSlot *old)
 {
 	uint32		h;
 	RowsEntry  *e;
+	bool		found = false;
 
+	if (a->rows == NULL && ++a->lookups <= ROWS_INDEX_AFTER)
+		return false;
 	if (a->rows == NULL)
 		rows_build(a);
 	h = row_hash(old);
 	e = hash_search(a->rows, &h, HASH_FIND, NULL);
-	for (int i = e ? e->n - 1 : -1; i >= 0; i--)
+	PushActiveSnapshot(GetLatestSnapshot());
+	for (int i = e ? e->n - 1 : -1; i >= 0 && !found; i--)
 	{
 		ItemPointerData tid = e->tids[i];
-		bool		visible;
 		TM_FailureData tmfd;
-		TM_Result	res = TM_Invisible;
 
-		e->tids[i] = e->tids[--e->n];
-		PushActiveSnapshot(GetLatestSnapshot());
-		visible = table_tuple_fetch_row_version(a->rel, &tid, GetActiveSnapshot(),
-												a->found);
-		if (visible && same_row(a->found, old))
-			res = table_tuple_lock(a->rel, &tid, GetActiveSnapshot(), a->found,
-								   GetCurrentCommandId(false), LockTupleExclusive,
-								   LockWaitBlock, 0, &tmfd);
-		PopActiveSnapshot();
-		if (res == TM_Ok)
-			return true;
+		if (!table_tuple_fetch_row_version(a->rel, &tid, GetActiveSnapshot(),
+										   a->found))
+			e->tids[i] = e->tids[--e->n];	/* (gone) */
+		else if (same_row(a->found, old) &&
+				 table_tuple_lock(a->rel, &tid, GetActiveSnapshot(), a->found,
+								  GetCurrentCommandId(false), LockTupleExclusive,
+								  LockWaitBlock, 0, &tmfd) == TM_Ok)
+		{
+			e->tids[i] = e->tids[--e->n];
+			found = true;
+		}
 	}
-	ExecClearTuple(a->found);
-	return false;
+	PopActiveSnapshot();
+	if (!found)
+		ExecClearTuple(a->found);
+	return found;
 }
 
 /* A row equal to old (by the key, or every column) into a->found. */

@@ -18,6 +18,7 @@ SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
 INSERT INTO km.t SELECT g, 'new ' || g, 1.5 FROM generate_series(1, 300) g;
 DELETE FROM km.t WHERE ctid IN (SELECT ctid FROM km.t WHERE a < 20 LIMIT 200);
 UPDATE km.t SET b = b || '!' WHERE a BETWEEN 30 AND 39;
+-- (a few scans, the first lookups' and the index's; not one a row, 600)
 BEGIN;
 SELECT dolt_reset('--hard');
  dolt_reset 
@@ -25,7 +26,7 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
-SELECT seq_scan < 20 AS scanned_once FROM pg_stat_xact_user_tables
+SELECT seq_scan < 40 AS scanned_once FROM pg_stat_xact_user_tables
   WHERE relid = 'km.t'::regclass;
  scanned_once 
 --------------
@@ -83,6 +84,59 @@ SELECT count(*) FROM km.t;
    900
 (1 row)
 
+-- A branch made while a keyed table has changes is folded from its head:
+-- its folds read no page the move to the head wrote.
+CREATE TABLE km.k (id int PRIMARY KEY, v text);
+INSERT INTO km.k SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+SELECT length(dolt_commit('-Am', 'keyed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE km.k SET v = 'changed' WHERE id % 100 = 0;
+SELECT dolt_branch('kk');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('kk') IS NOT NULL AS on_kk;
+ on_kk 
+-------
+ t
+(1 row)
+
+SELECT count(*) AS reset FROM test_fold_counters(true);
+ reset 
+-------
+     1
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+SELECT pages AS pages_read, full_tables FROM test_fold_counters(true);
+ pages_read | full_tables 
+------------+-------------
+          0 |           0
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'kk');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -96,4 +150,6 @@ SELECT dolt_branch('-D', 'kb');
 (1 row)
 
 DROP SCHEMA km CASCADE;
-NOTICE:  drop cascades to table km.t
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table km.t
+drop cascades to table km.k
