@@ -495,11 +495,11 @@ fails without its fix), and Postgres's suites keep passing after each one.
   changed pages too, and it is read in full only where that can't be told
   (a fold in the transaction that wrote its rows leaves the next fold to
   read it in full, among others).
-- **Gaps, open:**
-  - `dolt_status` and `dolt_diff` fail on objects a commit can't hold yet
-    (partitioned and foreign tables, aggregates, policies), as a commit
-    does; and a diff of one table folds every changed table (issue #130,
-    fixed by #137).
+- **As built:** `dolt_status` and `dolt_diff` failed on objects a commit
+  can't hold yet (partitioned and foreign tables, aggregates, policies),
+  and a diff of one table folded every changed table (issue #130); since
+  #137 reads leave such objects out, only a commit refuses them, and a
+  diff of one table folds that table alone.
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
