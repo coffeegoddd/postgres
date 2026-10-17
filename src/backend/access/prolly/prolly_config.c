@@ -218,6 +218,23 @@ prolly_note_tablespace(Oid amoid, const char *tablespacename)
 }
 
 
+/*
+ * The tree engine of components (those of access method amname, or of
+ * table relname's): an error if there is none, as for page-based prolly,
+ * whose rows aren't in trees.
+ */
+const ProllyEngineRoutine *
+prolly_engine_of(const ProllyComponents *components, const char *amname,
+				 const char *relname)
+{
+	if (components->engine == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("access method \"%s\" has no prolly tree engine", amname),
+				 relname ? errdetail("Table \"%s\" is of it.", relname) : 0));
+	return components->engine;
+}
+
 void
 prolly_components_for_am(const char *amname, ProllyComponents *components)
 {

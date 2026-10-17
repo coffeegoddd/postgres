@@ -84,6 +84,11 @@ typedef struct ProllyDatabaseComponents
 extern void prolly_components_for_am(const char *amname,
 									 ProllyComponents *components);
 
+/* components' tree engine; an error naming amname (and relname) if none */
+extern const ProllyEngineRoutine *prolly_engine_of(const ProllyComponents *components,
+													const char *amname,
+													const char *relname);
+
 /*
  * Components for rel: a table using a prolly table AM, or an index on one.
  */
