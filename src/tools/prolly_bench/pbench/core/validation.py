@@ -110,8 +110,8 @@ def validate_run(path: Path) -> list[str]:
 
 
 def comparison_identity(cfg: dict, env: dict) -> str:
-    # AM, source revision and server binary may differ: these are the
-    # independent variables. Their exact hashes are retained as provenance.
+    # AM, source revision and server build (with its psql and pgbench) may
+    # differ: these are the independent variables. Their exact hashes are retained as provenance.
     # All workload, durability, build-mode and machine conditions must match.
     return fingerprint({
         "config": {k: v for k, v in cfg.items() if k not in ("source", "tools")},
@@ -128,7 +128,10 @@ def comparison_identity(cfg: dict, env: dict) -> str:
         "cpu": {r["field"]: r["data"] for r in env.get("cpu", {}).get("lscpu", [])
                 if "MHz" not in r["field"]},
         "harness": env.get("harness_hash"),
-        "clients": env.get("client_hashes"),
+        # (psql and pgbench come with the server build, so their hashes
+        # differ between builds; kept as provenance)
+        "clients": {k: v for k, v in (env.get("client_hashes") or {}).items()
+                    if k not in ("psql", "pgbench")},
     })
 
 

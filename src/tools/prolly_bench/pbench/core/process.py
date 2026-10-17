@@ -7,7 +7,7 @@ import tempfile
 import threading
 
 
-def run(args, *, timeout=7200, capture_output=False, input=None, check=False, **kwargs):
+def run(args, *, timeout=None, capture_output=False, input=None, check=False, **kwargs):
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if input is not None:
@@ -30,7 +30,7 @@ def run(args, *, timeout=7200, capture_output=False, input=None, check=False, **
         return result
 
 
-def hash_output(args, *, env=None, timeout=7200):
+def hash_output(args, *, env=None, timeout=None):
     """Hash arbitrarily large output without keeping it in RAM or on disk."""
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=errors, env=env, start_new_session=True) as proc:

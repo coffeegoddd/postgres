@@ -228,6 +228,48 @@ func TestCompareDirs(t *testing.T) {
 	}
 }
 
+// A client-side error (a decode or protocol failure) has only its message:
+// the record compares as a regression, and the rest of the corpus still
+// compares.
+func TestClientSideErrorIsARecord(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, recs ...record) string {
+		d := filepath.Join(dir, name)
+		os.MkdirAll(d, 0o755)
+		f, _ := os.Create(filepath.Join(d, "records.jsonl.gz"))
+		gz := gzip.NewWriter(f)
+		for _, r := range recs {
+			b, _ := json.Marshal(r)
+			gz.Write(append(b, '\n'))
+		}
+		gz.Close()
+		f.Close()
+		data, _ := json.Marshal(map[string]string{"a.test": strings.Repeat("a", 64)})
+		os.WriteFile(filepath.Join(d, "corpus.json"), data, 0o644)
+		return d
+	}
+	ok := func(line int) record {
+		return record{Version: 2, File: "a.test", Line: line, Status: stOk, Ordered: "x", Sorted: "x", Rows: 1}
+	}
+	base := write("base", ok(1), ok(2))
+	eng := write("eng", ok(1),
+		record{Version: 2, File: "a.test", Line: 2, Status: stNotOk, Message: "cannot decode row"})
+	exc := filepath.Join(dir, "exc.json")
+	os.WriteFile(exc, []byte("[]"), 0o644)
+	cmp, err := compareDirs(base, eng, filepath.Join(dir, "out"), exc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmp.Counts[clAgree] != 1 || cmp.Counts[clRegression] != 1 {
+		t.Errorf("counts %v", cmp.Counts)
+	}
+	// (an ok record still needs its answer)
+	bad := write("bad", ok(1), record{Version: 2, File: "a.test", Line: 2, Status: stOk})
+	if _, err := compareDirs(base, bad, filepath.Join(dir, "out2"), exc); err == nil {
+		t.Error("ok record without evidence accepted")
+	}
+}
+
 func TestExactEvidence(t *testing.T) {
 	makeResult := func(oid uint32, rows ...[][]byte) *pgconn.Result {
 		return &pgconn.Result{FieldDescriptions: []pgconn.FieldDescription{{DataTypeOID: oid}}, Rows: rows}

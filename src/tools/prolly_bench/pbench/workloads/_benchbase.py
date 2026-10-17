@@ -94,7 +94,7 @@ def _run(ctx: Context, bench: str, cfg: Path, out_dir: Path, *, create: bool,
         out_dir.mkdir(parents=True, exist_ok=True)
         args += ["--json-histograms", str((out_dir / "transactions.json").resolve())]
     r = process.run(args, cwd=_dist(ctx), capture_output=True, text=True,
-                    timeout=int(ctx.params.get("timeout_seconds", 7200)))
+                    timeout=ctx.params.get("timeout_seconds"))
     logged = r.stdout + r.stderr
     out = " ".join(args) + "\n\n" + logged
     (ctx.raw_dir / f"benchbase-{tag}.out").write_text(out)

@@ -101,14 +101,14 @@ def guard(name: str, fn: Callable[[], Any], status: dict[str, tuple[str, str]]) 
 class Runner:
     def __init__(self, *, suite: str, cfg: dict[str, Any], table_am: str, label: str,
                  repo: Path, bin_dir: Path, work_dir: Path, out_root: Path,
-                 command: str, allow_heap_v: bool = False, keep_failed: bool = False):
+                 command: str, keep_failed: bool = False):
         registry.load_all()
         self.suite, self.cfg, self.table_am, self.label = suite, cfg, table_am, label
         self.repo, self.bin_dir, self.work_dir = repo, bin_dir, work_dir
         self.command, self.keep_failed = command, keep_failed
-        if suite == "V" and table_am == "heap" and not allow_heap_v:
-            raise SystemExit("The V suite measures version control, which heap "
-                             "does not have.  Use a prolly table AM.")
+        if suite == "V" and table_am not in targets.VERSIONED_HISTORY:
+            raise SystemExit("The V suite measures version control, which only "
+                             f"{', '.join(sorted(targets.VERSIONED_HISTORY))} have.")
         date = dt.date.today().isoformat()
         out = out_root / f"{date}-{suite}-{label}"
         n = 2

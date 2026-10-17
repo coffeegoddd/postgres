@@ -1,8 +1,10 @@
+import datetime
 import json
 import gzip
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pbench import ccompare
@@ -94,6 +96,46 @@ class GateTest(unittest.TestCase):
         self.assertTrue(self.gate())
         self.comparison.clear()
         self.assertTrue(self.gate())
+
+
+    def test_cached_comparison_expires_with_the_day(self):
+        # (an exception expires by date: yesterday's result isn't today's)
+        runs = []
+
+        def run(args, **kwargs):
+            dest = Path(args[4])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "compare.json").write_text("{}")
+            with gzip.open(dest / "diffs.jsonl.gz", "wt"):
+                pass
+            runs.append(args)
+            return SimpleNamespace(returncode=0, stderr="")
+
+        def on(day):
+            return SimpleNamespace(date=SimpleNamespace(
+                today=lambda: datetime.date(2026, 10, day)))
+        with patch.object(ccompare, "runner_path", return_value=Path("/nonexistent")), \
+                patch.object(ccompare.subprocess, "run", side_effect=run):
+            for day in (30, 30, 31):
+                with patch.object(ccompare, "dt", on(day)):
+                    ccompare.compare(self.base, self.engine)
+        self.assertEqual(len(runs), 2)
+
+    def test_client_side_error_is_a_result_not_missing_evidence(self):
+        raw = self.engine.path / "raw" / "slt"
+        with gzip.open(raw / "records.jsonl.gz", "rt") as f:
+            records = [json.loads(line) for line in f]
+        records[-1] = {"file": "a.test", "line": 14, "version": 2, "status": "not_ok",
+                       "msg": "cannot decode row"}
+        with gzip.open(raw / "records.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps(r) + "\n" for r in records)
+        errors, _ = ccompare.evidence(raw, "prolly")
+        self.assertEqual(errors, [])
+        records[-1].pop("msg")
+        with gzip.open(raw / "records.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps(r) + "\n" for r in records)
+        errors, _ = ccompare.evidence(raw, "prolly")
+        self.assertTrue(errors)
 
 
 if __name__ == "__main__":

@@ -185,6 +185,9 @@ def save_histogram(ctx: Context, tag: str, hist: LatencyHistogram,
     (ctx.raw_dir / f"latency-{tag}.json").write_text(json.dumps(d) + "\n")
 
 
+_PROGRESS_RE = re.compile(r"^progress: [\d.]+ s, ([\d.]+) tps(?:.*?, (\d+) failed)?", re.M)
+
+
 class BackgroundPgbench:
     """pgbench running alongside a measurement, reporting progress each
     second, so its throughput during the window can be computed."""
@@ -220,11 +223,19 @@ class BackgroundPgbench:
         self.out.close()
         if self.proc.returncode not in (0, -signal.SIGINT):
             raise RuntimeError(f"background pgbench failed: exit {self.proc.returncode}")
-        parsed = parse_pgbench_output(self.out_path.read_text())
-        if not parsed.get("transactions") or not parsed.get("tps"):
+        text = self.out_path.read_text()
+        parsed = parse_pgbench_output(text)
+        # pgbench handles SIGINT only while initializing: stopped mid-run
+        # it ends without its final report, so its progress lines (each
+        # second's rate and failures) are what it did.
+        progress = _PROGRESS_RE.findall(text)
+        worked = (parsed.get("transactions") and parsed.get("tps")) or \
+            any(float(tps) > 0 for tps, _ in progress)
+        if not worked:
             raise RuntimeError("background pgbench completed no useful work")
-        if parsed.get("failed"):
-            raise RuntimeError(f"background pgbench failed transactions: {parsed['failed']}")
+        failed = parsed.get("failed") or sum(int(f or 0) for _, f in progress)
+        if failed:
+            raise RuntimeError(f"background pgbench failed transactions: {failed}")
 
     def tps(self) -> Optional[float]:
         rates = [float(m.group(1)) for m in re.finditer(

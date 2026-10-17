@@ -129,6 +129,23 @@ func sameAnswer(b, e *record) bool {
 	return false // missing evidence cannot establish agreement
 }
 
+// hasEvidence: a record that ran has what it gave, an answer's hashes or
+// an error's SQLSTATE.  A client-side error (a decode or protocol failure)
+// has only its message: it is the record's result, which agrees with
+// nothing, not a broken stream.
+func hasEvidence(r *record) bool {
+	if r.Status != stOk && r.Status != stNotOk {
+		return true
+	}
+	if r.Version != 2 {
+		return false
+	}
+	if r.SQLState != "" || (r.Ordered != "" && r.Sorted != "") {
+		return true
+	}
+	return r.Status == stNotOk && r.Message != ""
+}
+
 func loadRecords(dir string) (map[recKey]*record, error) {
 	f, err := os.Open(filepath.Join(dir, "records.jsonl.gz"))
 	if err != nil {
@@ -151,8 +168,7 @@ func loadRecords(dir string) (map[recKey]*record, error) {
 		if r.File == "" || r.Line <= 0 || out[k] != nil {
 			return nil, fmt.Errorf("invalid or duplicate record %s:%d", r.File, r.Line)
 		}
-		if (r.Status == stOk || r.Status == stNotOk) && (r.Version != 2 ||
-			(r.SQLState == "" && (r.Ordered == "" || r.Sorted == ""))) {
+		if !hasEvidence(r) {
 			return nil, fmt.Errorf("legacy or missing execution evidence %s:%d", r.File, r.Line)
 		}
 		out[k] = r
@@ -384,8 +400,7 @@ func (s *recordStream) next() *record {
 		s.err = fmt.Errorf("duplicate, unordered or invalid record %s:%d", r.File, r.Line)
 		return nil
 	}
-	if (r.Status == stOk || r.Status == stNotOk) && (r.Version != 2 ||
-		(r.SQLState == "" && (r.Ordered == "" || r.Sorted == ""))) {
+	if !hasEvidence(r) {
 		s.err = fmt.Errorf("legacy or missing execution evidence %s:%d", r.File, r.Line)
 		return nil
 	}
