@@ -276,11 +276,4 @@ extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 									  ProllyCommitLookup lookup, void *lookup_arg,
 									  ProllyHash *base);
 
-static inline const ProllyRefsRoutine *
-prolly_refs_lookup(const char *name)
-{
-	return (const ProllyRefsRoutine *)
-		prolly_get_impl(PROLLY_IFACE_REFS, name);
-}
-
 #endif							/* PROLLY_REFS_H */

@@ -13,15 +13,14 @@
  *   hold no local OIDs.  The one allowed exception: rows of a table with a
  *   column added with a default (atthasmissing) until the table is
  *   rewritten.
- * - Storing large values out of line is the engine's job.
+ * - Storing large values out of line is the tree's job (value trees,
+ *   prolly_tree.h).
  * - Postgres doesn't rewrite a table for every DDL change (DROP COLUMN,
  *   ADD COLUMN), so rows encoded under an earlier layout of the table
  *   remain.  layout() describes the layout rows are encoded with now (as
  *   bytes local to the implementation); begin_layout() makes an encoder
  *   that decodes rows encoded under an earlier layout into the table's
- *   current shape (encode() is an error with it); reads_layout() says
- *   whether rows encoded under a layout decode correctly with this
- *   encoder as it is.
+ *   current shape (encode() is an error with it).
  *
  * Provisional (v0).
  *
@@ -52,9 +51,6 @@ typedef struct ProllyValueEncoderRoutine
 										 const ProllyValue *layout,
 										 MemoryContext mcxt);
 
-	bool		(*reads_layout) (ProllyValueEncoder *enc,
-								 const ProllyValue *layout);
-
 	/* Append the encoding of slot's row to out. */
 	void		(*encode) (ProllyValueEncoder *enc, TupleTableSlot *slot,
 						   StringInfo out);
@@ -67,8 +63,7 @@ typedef struct ProllyValueEncoderRoutine
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
-	"begin", "layout", "begin_layout", "reads_layout", "encode", "decode", \
-	"end"
+	"begin", "layout", "begin_layout", "encode", "decode", "end"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
 #define PROLLY_VALENC_LAST_CALLBACK end
 

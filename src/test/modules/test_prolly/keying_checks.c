@@ -172,7 +172,7 @@ keying_round_trip_body(const ProllyImplInfo *impl)
 	for (int r = 0; r < 2; r++)
 	{
 		Relation	rel = tables[r];
-		ProllyKeying *k = PROLLY_CALL(kr, open, rel, NULL, CurrentMemoryContext);
+		ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
 		EncodedRow	er;
 		StringInfoData value;
 		ProllyValue v;
@@ -222,13 +222,11 @@ keying_keys_and_content_body(const ProllyImplInfo *impl)
 										   "id int PRIMARY KEY, t text, n int");
 	Relation	none = make_table("conf_kc_none",
 											 "id int, t text, n int");
-	ProllyKeying *kp = PROLLY_CALL(kr, open, pk, NULL, CurrentMemoryContext);
-	ProllyKeying *kn = PROLLY_CALL(kr, open, none, NULL, CurrentMemoryContext);
+	ProllyKeying *kp = PROLLY_CALL(kr, open, pk, CurrentMemoryContext);
+	ProllyKeying *kn = PROLLY_CALL(kr, open, none, CurrentMemoryContext);
 	EncodedRow	a,
 				b,
 				c;
-	ProllyValue row;
-	ProllyHash	h;
 	int			ids[] = {-1000, -1, 0, 1, 2, 255, 256, 70000};
 
 	/* Primary key: same key, different content. */
@@ -247,11 +245,6 @@ keying_keys_and_content_body(const ProllyImplInfo *impl)
 		elog(ERROR, "identical keyless rows got different keys");
 	if (same_bytes(&a.key, &c.key))
 		elog(ERROR, "different keyless rows got the same key");
-	row.data = (const uint8 *) a.row.data;
-	row.len = a.row.len;
-	PROLLY_CALL(kr, content_hash, kn, &row, &h);
-	if (!same_hash(&h, &a.content))
-		elog(ERROR, "content_hash disagrees with encode_row");
 
 	/* Primary keys sort like the key column. */
 	for (int i = 1; i < lengthof(ids); i++)
@@ -274,129 +267,6 @@ keying_keys_and_content_body(const ProllyImplInfo *impl)
 	PROLLY_CALL(kr, close, kn);
 	table_close(pk, AccessShareLock);
 	table_close(none, AccessShareLock);
-}
-
-/*
- * A keying reopened from its description keys rows the same way, even on
- * a table whose own keying is now different (its primary key dropped).
- */
-static void
-keying_description_reopens_body(const ProllyImplInfo *impl)
-{
-	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
-	Relation	pk = make_table("conf_kd_pk",
-										   "id int PRIMARY KEY, t text, n int");
-	Relation	none = make_table("conf_kd_none",
-											 "id int, t text, n int");
-	Relation	tables[2] = {pk, none};
-
-	for (int from = 0; from < 2; from++)
-	{
-		ProllyKeying *k = PROLLY_CALL(kr, open, tables[from], NULL,
-									  CurrentMemoryContext);
-		StringInfoData desc;
-		ProllyValue d;
-
-		initStringInfo(&desc);
-		PROLLY_CALL(kr, describe, k, &desc);
-		d.data = (const uint8 *) desc.data;
-		d.len = desc.len;
-
-		/* On either table: same keyless flag, same keys and rows. */
-		for (int on = 0; on < 2; on++)
-		{
-			ProllyKeying *k2 = PROLLY_CALL(kr, open, tables[on], &d,
-										   CurrentMemoryContext);
-			EncodedRow	a;
-			EncodedRow	b;
-			StringInfoData desc2;
-
-			if (PROLLY_CALL(kr, keyless, k2) != PROLLY_CALL(kr, keyless, k))
-				elog(ERROR, "a reopened keying changed keyless()");
-			encode(kr, k, tables[from], 3, "three", 3, &a);
-			encode(kr, k2, tables[on], 3, "three", 3, &b);
-			if (!same_bytes(&a.key, &b.key) || !same_bytes(&a.row, &b.row))
-				elog(ERROR, "a reopened keying keys rows differently");
-			initStringInfo(&desc2);
-			PROLLY_CALL(kr, describe, k2, &desc2);
-			if (!same_bytes(&desc, &desc2))
-				elog(ERROR, "a reopened keying describes itself differently");
-			PROLLY_CALL(kr, close, k2);
-		}
-		PROLLY_CALL(kr, close, k);
-	}
-
-	{
-		ProllyKeying *a = PROLLY_CALL(kr, open, pk, NULL, CurrentMemoryContext);
-		ProllyKeying *b = PROLLY_CALL(kr, open, none, NULL, CurrentMemoryContext);
-		StringInfoData da;
-		StringInfoData db;
-
-		initStringInfo(&da);
-		initStringInfo(&db);
-		PROLLY_CALL(kr, describe, a, &da);
-		PROLLY_CALL(kr, describe, b, &db);
-		if (same_bytes(&da, &db))
-			elog(ERROR, "different keyings have the same description");
-	}
-	table_close(pk, AccessShareLock);
-	table_close(none, AccessShareLock);
-}
-
-/*
- * A keying reopened from its description after its key column was
- * dropped still orders the old keys and decodes the old rows.
- */
-static void
-keying_reads_dropped_key_body(const ProllyImplInfo *impl)
-{
-	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
-	Relation	rel = make_table("conf_kdrop",
-											"id int PRIMARY KEY, t text, n int");
-	Oid			relid = RelationGetRelid(rel);
-	ProllyKeying *k = PROLLY_CALL(kr, open, rel, NULL, CurrentMemoryContext);
-	StringInfoData desc;
-	ProllyValue d;
-	EncodedRow	a;
-	EncodedRow	b;
-	ProllyKey	ka;
-	ProllyKey	kb;
-	ProllyValue row;
-	TupleTableSlot *slot;
-
-	initStringInfo(&desc);
-	PROLLY_CALL(kr, describe, k, &desc);
-	d.data = (const uint8 *) desc.data;
-	d.len = desc.len;
-	encode(kr, k, rel, 1, "one", 1, &a);
-	encode(kr, k, rel, 2, "two", 2, &b);
-	PROLLY_CALL(kr, close, k);
-	table_close(rel, AccessShareLock);
-
-	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_kdrop DROP COLUMN id CASCADE");
-	rel = table_open(relid, AccessShareLock);
-	k = PROLLY_CALL(kr, open, rel, &d, CurrentMemoryContext);
-	ka.data = (const uint8 *) a.key.data;
-	ka.len = a.key.len;
-	kb.data = (const uint8 *) b.key.data;
-	kb.len = b.key.len;
-	if (PROLLY_CALL(kr, compare, k, &ka, &kb) >= 0 ||
-		PROLLY_CALL(kr, compare, k, &kb, &ka) <= 0 ||
-		PROLLY_CALL(kr, compare, k, &ka, &ka) != 0)
-		elog(ERROR, "a keying reopened after its key column was dropped misorders keys");
-
-	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
-	row.data = (const uint8 *) b.row.data;
-	row.len = b.row.len;
-	PROLLY_CALL(kr, decode_row, k, &row, slot);
-	slot_getallattrs(slot);
-	if (slot->tts_isnull[1] || slot->tts_isnull[2] ||
-		strcmp(TextDatumGetCString(slot->tts_values[1]), "two") != 0 ||
-		DatumGetInt32(slot->tts_values[2]) != 2)
-		elog(ERROR, "a keying reopened after its key column was dropped misreads rows");
-	ExecDropSingleTupleTableSlot(slot);
-	PROLLY_CALL(kr, close, k);
-	table_close(rel, AccessShareLock);
 }
 
 /*
@@ -428,7 +298,7 @@ keying_owns_its_memory_body(const ProllyImplInfo *impl)
 	memset(&after, 0, sizeof(after));
 	MemoryContextMemConsumed(caller, &before);
 	old = MemoryContextSwitchTo(caller);
-	k = PROLLY_CALL(kr, open, rel, NULL, owner);
+	k = PROLLY_CALL(kr, open, rel, owner);
 	MemoryContextSwitchTo(old);
 	MemoryContextMemConsumed(caller, &after);
 	if (after.totalspace - after.freespace != before.totalspace - before.freespace)
@@ -452,53 +322,6 @@ keying_owns_its_memory_body(const ProllyImplInfo *impl)
 	table_close(rel, AccessShareLock);
 }
 
-/*
- * can_compare() holds while the key's type exists, and fails for a keying
- * reopened from its description after the type was dropped.
- */
-static void
-keying_compare_after_type_dropped_body(const ProllyImplInfo *impl)
-{
-	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
-	Relation	rel;
-	Relation	none;
-	Oid			relid;
-	ProllyKeying *k;
-	StringInfoData desc;
-	ProllyValue d;
-
-	keying_schema();
-	run_sql("CREATE TYPE " KEYING_SCHEMA ".conf_kt_mood AS ENUM ('sad', 'happy')");
-	rel = make_table("conf_kt",
-								"m " KEYING_SCHEMA ".conf_kt_mood PRIMARY KEY, t text");
-	none = make_table("conf_kt_none", "id int, t text");
-	relid = RelationGetRelid(rel);
-
-	k = PROLLY_CALL(kr, open, none, NULL, CurrentMemoryContext);
-	if (!PROLLY_CALL(kr, can_compare, k))
-		elog(ERROR, "a keying without a primary key can't compare");
-	PROLLY_CALL(kr, close, k);
-	table_close(none, AccessShareLock);
-
-	k = PROLLY_CALL(kr, open, rel, NULL, CurrentMemoryContext);
-	if (!PROLLY_CALL(kr, can_compare, k))
-		elog(ERROR, "a keying can't compare while its key's type exists");
-	initStringInfo(&desc);
-	PROLLY_CALL(kr, describe, k, &desc);
-	d.data = (const uint8 *) desc.data;
-	d.len = desc.len;
-	PROLLY_CALL(kr, close, k);
-	table_close(rel, AccessShareLock);
-
-	run_sql("DROP TYPE " KEYING_SCHEMA ".conf_kt_mood CASCADE");
-	rel = table_open(relid, AccessShareLock);
-	k = PROLLY_CALL(kr, open, rel, &d, CurrentMemoryContext);
-	if (PROLLY_CALL(kr, can_compare, k))
-		elog(ERROR, "a keying claims to compare keys of a dropped type");
-	PROLLY_CALL(kr, close, k);
-	table_close(rel, AccessShareLock);
-}
-
 /* ------------------------------------------------------------------------
  * Value encoder: rows from earlier layouts
  * ------------------------------------------------------------------------
@@ -507,7 +330,7 @@ keying_compare_after_type_dropped_body(const ProllyImplInfo *impl)
 /*
  * Rows encoded before DROP COLUMN decode, with begin_layout(), into the
  * table's new shape; rows from before ADD COLUMN decode with the current
- * encoder whenever reads_layout() says so.
+ * encoder.
  */
 static void
 valenc_decodes_earlier_layouts_body(const ProllyImplInfo *impl)
@@ -562,34 +385,19 @@ valenc_decodes_earlier_layouts_body(const ProllyImplInfo *impl)
 		elog(ERROR, "a row encoded before DROP COLUMN decodes wrongly");
 	PROLLY_CALL(ve, end, enc);
 
-	/* If the current encoder claims to read the old layout, it must. */
-	enc = PROLLY_CALL(ve, begin, RelationGetDescr(rel), CurrentMemoryContext);
-	if (PROLLY_CALL(ve, reads_layout, enc, &l))
-	{
-		PROLLY_CALL(ve, decode, enc, &v, slot);
-		slot_getallattrs(slot);
-		if (slot->tts_isnull[2] || DatumGetInt32(slot->tts_values[2]) != 3)
-			elog(ERROR, "reads_layout() is true, but the row decodes wrongly");
-	}
-
 	/* Re-encode under the new layout; then add a column with a default. */
+	enc = PROLLY_CALL(ve, begin, RelationGetDescr(rel), CurrentMemoryContext);
 	resetStringInfo(&row);
-	resetStringInfo(&layout);
 	PROLLY_CALL(ve, encode, enc, slot, &row);
-	PROLLY_CALL(ve, layout, enc, &layout);
 	PROLLY_CALL(ve, end, enc);
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, AccessShareLock);
 	v.data = (const uint8 *) row.data;
 	v.len = row.len;
-	l.data = (const uint8 *) layout.data;
-	l.len = layout.len;
 
 	run_sql("ALTER TABLE conf_layout ADD COLUMN d int DEFAULT 5");
 	rel = table_open(relid, AccessShareLock);
 	enc = PROLLY_CALL(ve, begin, RelationGetDescr(rel), CurrentMemoryContext);
-	if (!PROLLY_CALL(ve, reads_layout, enc, &l))
-		elog(ERROR, "adding a column made earlier rows unreadable");
 	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 	PROLLY_CALL(ve, decode, enc, &v, slot);
 	slot_getallattrs(slot);
@@ -620,27 +428,9 @@ keying_keys_and_content(const ProllyImplInfo *impl)
 }
 
 void
-keying_description_reopens(const ProllyImplInfo *impl)
-{
-	rolled_back(keying_description_reopens_body, impl);
-}
-
-void
-keying_reads_dropped_key(const ProllyImplInfo *impl)
-{
-	rolled_back(keying_reads_dropped_key_body, impl);
-}
-
-void
 keying_owns_its_memory(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_owns_its_memory_body, impl);
-}
-
-void
-keying_compare_after_type_dropped(const ProllyImplInfo *impl)
-{
-	rolled_back(keying_compare_after_type_dropped_body, impl);
 }
 
 void

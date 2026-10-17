@@ -44,7 +44,7 @@ class SpaceCollector(Collector):
             dbname=ctx.dbname)) for t in tables)
         apparent, allocated = physical_size(ctx.cluster.data_dir)
         return {"relation_bytes": disk, "row_representation_bytes": logical,
-                # pg_total_relation_size omits D1's global nodestore. These
+                # pg_total_relation_size omits the chunk store's files. These
                 # scopes are explicit; neither is a cross-engine amplification.
                 "cluster_apparent_bytes_including_wal": apparent,
                 "cluster_allocated_bytes_including_wal": allocated,

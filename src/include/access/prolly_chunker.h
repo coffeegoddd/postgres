@@ -6,12 +6,12 @@
  * The chunker sees the items of one tree level in key order and decides
  * where each node ends.  Its algorithm and parameters are part of the
  * canonical format: the same items must give the same boundaries in every
- * engine, on every machine.  Which rule is best is still to be measured.
+ * database, on every machine.  Which rule is best is still to be measured.
  *
  * Contract:
- * - Decisions depend only on the items fed since begin/reset (and level),
- *   never on timing, memory or history.
- * - Forced split: because a node must fit in a page, the chunker returns
+ * - Decisions depend only on the items fed since begin (and level), never
+ *   on timing, memory or history.
+ * - Forced split: because a node has a size limit, the chunker returns
  *   PROLLY_CHUNK_SPLIT_BEFORE when the item would not fit in capacity.  That
  *   too is deterministic from content.
  *
@@ -41,21 +41,18 @@ typedef struct ProllyChunkerRoutine
 
 	/*
 	 * Start chunking a level.  capacity is the space available for items in
-	 * a node, as measured by the node format's item_space().
+	 * a node, as measured by the chunk format's item_space().
 	 */
 	ProllyChunker *(*begin) (uint16 level, Size capacity, MemoryContext mcxt);
 
-	/* Feed the next item; item_space is the node format's item_space(). */
+	/* Feed the next item; item_space is the chunk format's item_space(). */
 	ProllyChunkDecision (*add) (ProllyChunker *chunker, const ProllyKey *key,
 								const ProllyValue *value, Size item_space);
-
-	/* Forget all state, as if just begun (e.g. to re-chunk from a boundary). */
-	void		(*reset) (ProllyChunker *chunker);
 
 	void		(*end) (ProllyChunker *chunker);
 } ProllyChunkerRoutine;
 
-#define PROLLY_CHUNKER_CALLBACK_NAMES "begin", "add", "reset", "end"
+#define PROLLY_CHUNKER_CALLBACK_NAMES "begin", "add", "end"
 #define PROLLY_CHUNKER_FIRST_CALLBACK begin
 #define PROLLY_CHUNKER_LAST_CALLBACK end
 

@@ -1392,7 +1392,7 @@ rows_begin(Rows *r, Relation rel)
 {
 	prolly_components_for_relation(rel, &r->c);
 	/* (a table's trees are its folds, rows as a rewrite has them) */
-	r->keying = PROLLY_CALL(r->c.keying, open_rewritten, rel, CurrentMemoryContext);
+	r->keying = PROLLY_CALL(r->c.keying, open, rel, CurrentMemoryContext);
 	r->keyless = PROLLY_CALL(r->c.keying, keyless, r->keying);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 }

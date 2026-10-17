@@ -1,7 +1,7 @@
 --
--- Semantics: every index access method works on engine tables (which
--- needs a row identity that indexes can point at), and index scans, bitmap
--- scans and index-only scans give the same rows as a sequential scan.
+-- Semantics: every index access method works on the engine's tables, and
+-- index scans, bitmap scans and index-only scans give the same rows as a
+-- sequential scan.
 --
 CREATE TABLE idx (
 	id int PRIMARY KEY,

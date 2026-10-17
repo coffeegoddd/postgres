@@ -170,13 +170,6 @@ bytes_add(ProllyChunker *c, const ProllyKey *key, const ProllyValue *value,
 }
 
 static void
-bytes_reset(ProllyChunker *c)
-{
-	c->used = 0;
-	c->pending = false;
-}
-
-static void
 bytes_end(ProllyChunker *c)
 {
 	pfree(c);
@@ -193,6 +186,5 @@ const ProllyChunkerRoutine prolly_chunker_bytes = {
 	},
 	.begin = bytes_begin,
 	.add = bytes_add,
-	.reset = bytes_reset,
 	.end = bytes_end,
 };
