@@ -1343,6 +1343,13 @@ copies_reset(const char *ref)
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
 	move_to(&info.root);
+
+	/*
+	 * Then folded from the head, as a branch's first use is: else the pages
+	 * the move wrote stay changed since the baseline, and each fold after
+	 * (a checkout's, to see whether the branch is clean) reads them again.
+	 */
+	fold_as_baseline(NULL);
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
