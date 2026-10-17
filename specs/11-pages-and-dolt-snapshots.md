@@ -1082,23 +1082,35 @@ copies (the one O(N) step: rows written to pages, indexes built).
   anything is written:
   - **Recorded at each commit:** a "d:" item per dependency outside the
     versioned schemas, by kind and qualified name: an extension with its
-    version, a role (an owner, or named in a grant or policy), a type,
-    function, operator, collation or other object of an ordinary schema.
-    Which objects each versioned object depends on is found through
-    `pg_depend` and `pg_shdepend`, and only the changed objects' are looked
+    version, a type, function, operator, collation or other object of an
+    ordinary schema. Which objects each versioned object depends on is
+    found through `pg_depend`, and only the changed objects' are looked
     up again; but every commit describes each dependency in the set
-    afresh (an extension's version, a role's or object's name, by OID), so
+    afresh (an extension's version, an object's name, by OID), so
     an `ALTER EXTENSION … UPDATE` or a rename outside the versioned schemas
     shows in the next commit, and in its diff, though no versioned object
     changed. A dependency that no longer exists is reported by the commit,
     as an object it can't describe is. A new canonical format (a clean
     break, as #149's), which the user accepted at this stage for the
     better feature.
+  - **Not roles (user, 2026-10-17).** Owners and grants aren't part of
+    the canonical form: a commit doesn't record them, and a move or clone
+    doesn't restore them (objects are made by whoever runs it). A role
+    recorded as a dependency would make a branch read as changed after
+    its own checkout, or a clone by another user, though nothing changed.
+    As Postgres: roles are the cluster's, not a database's (`pg_authid`
+    is shared), and `pg_dump` of a database never writes `CREATE ROLE`
+    (roles come from `pg_dumpall --roles-only`). Dolt and Doltgres agree:
+    users and grants are in the server's `privileges.db` and `auth.db`,
+    shared by every branch and never in a commit. So no role is recorded
+    at commit or checked at clone. Roles would become dependencies only
+    if owners and grants (columns of a branch's copies' catalog rows)
+    were ever versioned, as `pg_dump` writes them.
   - **At clone, checked before anything is created:** the dependencies of
     every branch's head, not only the default one's, against the
     database: each extension against `pg_available_extension_versions`
-    and `pg_extension`, each role and object by name. A clone missing any
-    refuses once, naming all of them (each role, object and extension,
+    and `pg_extension`, each object by name. A clone missing any
+    refuses once, naming all of them (each object and extension,
     with why: not installed on this server, not this version), before
     creating anything; only then are extensions created.
   - **An extension's version, across branches:** one version serves a
