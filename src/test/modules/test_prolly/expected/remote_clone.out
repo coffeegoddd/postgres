@@ -1,0 +1,227 @@
+-- dolt_clone: an empty database made a copy of a remote's history, every
+-- branch a branch here (head-only until used), the default one checked
+-- out.  A clone whose objects need something the database lacks (here, a
+-- type of an ordinary schema) leaves nothing.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/clone-' || txid_current() AS run \gset
+\set url :run '/a'
+\set url_dep :run '/dep'
+CREATE SCHEMA cl VERSIONED;
+CREATE TABLE cl.t (id int PRIMARY KEY, v text);
+INSERT INTO cl.t SELECT g, 'v' || g FROM generate_series(1, 200) g;
+SELECT length(dolt_commit('-Am', 'cl 1')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') AS pushed;
+          pushed           
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+SELECT dolt_checkout('side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE cl.t SET v = 'side' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'on side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_push('origin', 'side') AS pushed;
+          pushed           
+---------------------------
+ {0,"side -> origin/side"}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- a clone: main checked out at the remote's, side a branch at its
+CREATE DATABASE regress_clone_b;
+\c regress_clone_b
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT count(*), max(v) FROM cl.t;
+ count | max 
+-------+-----
+   200 | v99
+(1 row)
+
+SELECT name FROM dolt_branches ORDER BY name;
+ name 
+------
+ main
+ side
+(2 rows)
+
+SELECT name FROM dolt_remote_branches ORDER BY name;
+        name         
+---------------------
+ remotes/origin/main
+ remotes/origin/side
+(2 rows)
+
+SELECT name, url = :'url' AS url_given FROM dolt_remotes;
+  name  | url_given 
+--------+-----------
+ origin | t
+(1 row)
+
+SELECT dolt_pull() IS NOT NULL AS pulled_from_upstream;
+ pulled_from_upstream 
+----------------------
+ t
+(1 row)
+
+SELECT dolt_checkout('side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SELECT v FROM cl.t WHERE id = 1;
+  v   
+------
+ side
+(1 row)
+
+-- a database with commits can't take a clone
+SELECT dolt_clone(:'url');
+ERROR:  dolt_clone needs a database without versioned schemas or commits
+HINT:  Clone into a new, empty database.
+\c :db
+DROP DATABASE regress_clone_b;
+-- --branch: another branch checked out
+CREATE DATABASE regress_clone_c;
+\c regress_clone_c
+SELECT dolt_clone(:'url', '--branch', 'nowhere');
+ERROR:  the remote has no branch "nowhere"
+SELECT dolt_clone(:'url', '--branch', 'side', '--remote', 'upstream');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ side
+(1 row)
+
+SELECT name FROM dolt_remotes;
+   name   
+----------
+ upstream
+(1 row)
+
+\c :db
+DROP DATABASE regress_clone_c;
+-- a commit needing a type of an ordinary schema the clone lacks
+CREATE TYPE public.cl_mood AS ENUM ('sad', 'ok');
+CREATE TABLE cl.m (id int PRIMARY KEY, mood public.cl_mood);
+INSERT INTO cl.m VALUES (1, 'ok');
+SELECT length(dolt_commit('-Am', 'moods')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_remote('add', 'dep', :'url_dep');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('dep', 'main') AS pushed;
+         pushed         
+------------------------
+ {0,"main -> dep/main"}
+(1 row)
+
+CREATE DATABASE regress_clone_d;
+\c regress_clone_d
+SELECT dolt_clone(:'url_dep');
+ERROR:  type "public.cl_mood" does not exist
+LINE 1: CREATE TABLE cl.m (id integer, mood public.cl_mood)
+                                            ^
+QUERY:  CREATE TABLE cl.m (id integer, mood public.cl_mood)
+SELECT count(*) AS remotes FROM dolt_remotes;
+ remotes 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS branches_with_commits FROM dolt_branches WHERE hash <> '';
+ branches_with_commits 
+-----------------------
+                     0
+(1 row)
+
+CREATE TYPE public.cl_mood AS ENUM ('sad', 'ok');
+SELECT dolt_clone(:'url_dep');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT mood FROM cl.m;
+ mood 
+------
+ ok
+(1 row)
+
+\c :db
+DROP DATABASE regress_clone_d;
+SELECT dolt_remote('remove', 'origin'), dolt_remote('remove', 'dep');
+ dolt_remote | dolt_remote 
+-------------+-------------
+ {0}         | {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cl CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table cl.t
+drop cascades to table cl.m
+SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP TYPE public.cl_mood;
