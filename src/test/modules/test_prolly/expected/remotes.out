@@ -279,6 +279,23 @@ SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
  t
 (1 row)
 
+-- a walk from a commit: a chunk that isn't a commit visits nothing, one
+-- the store hasn't is an error (its store isn't whole)
+SELECT test_walk_commit_count(dolt_hashof('main')) > 0 AS walks_a_commit;
+ walks_a_commit 
+----------------
+ t
+(1 row)
+
+SELECT test_walk_commit_count(tree) AS not_a_commit
+  FROM test_fold_trees() WHERE name = 'rm.t';
+ not_a_commit 
+--------------
+            0
+(1 row)
+
+SELECT test_walk_commit_count(encode(sha256('no such commit'::bytea), 'hex'));
+ERROR:  commit d1d6fb404b878c9e51f2af8853bdf14de7ffd4df255923322c70be9cee4097d8 is missing from the chunk store
 -- a long history pushed and fetched: walked a commit at a time, each
 -- once, however long
 SELECT dolt_checkout('-b', 'long') IS NOT NULL AS on_long;

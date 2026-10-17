@@ -1866,7 +1866,8 @@ typedef struct WalkState
 /*
  * Walk the commit id and its ancestors, each once: a work list, not
  * recursion (a history may be as long as it likes), and a hash set of the
- * commits seen.
+ * commits seen.  A commit missing from the store is an error; a chunk that
+ * isn't a commit is passed over, nothing of it visited.
  */
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
@@ -1899,13 +1900,26 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		key.len = next->len;
 		memcpy(key.bytes, next->bytes, next->len);
 		(void) hash_search(ws->seen, &key, HASH_ENTER, &found);
-		if (found)
+		if (found || next->len == 0)
+			continue;
+
+		/*
+		 * A commit named that the store hasn't: the store isn't whole (a
+		 * transfer's walk must not take it as present, nor reclamation go on
+		 * as if it were).  A chunk that isn't a commit: nothing of it is
+		 * visited.
+		 */
+		if (!PROLLY_CALL(env.chunk_store, has, env.chunks, next))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("commit %s is missing from the chunk store",
+							prolly_hash_hex(next))));
+		if (!copies_commit_get(next, &info))
 			continue;
 
 		/* (a commit the visitor declines: it has seen its root and parents) */
 		ref_of(next, &ref);
-		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg) ||
-			!copies_commit_get(next, &info))
+		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
 			continue;
 		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
 		for (int i = info.nparents - 1; i >= 0; i--)
