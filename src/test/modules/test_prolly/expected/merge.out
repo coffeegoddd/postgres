@@ -447,12 +447,16 @@ NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.k
 drop cascades to table app.untouched
--- Keyless rows changed on both sides, case by case: copies added on each
--- are each a row, copies removed on both are removed once.
+-- Keyless rows changed on both sides, case by case: the same change on
+-- both is made once (the same update, a pick the branch has); otherwise
+-- copies added on each are each a row, copies removed on both are removed
+-- once.  None conflicts (each merge's own conflicts are shown).
 CREATE SCHEMA mk VERSIONED;
 CREATE TABLE mk.t (a int, b text);
 CREATE FUNCTION pg_temp.merged(base text[], ours text, theirs text,
-	OUT a int, OUT b text, OUT copies int8) RETURNS SETOF record AS $$
+	OUT a int, OUT b text, OUT copies int8, OUT conflicts text) RETURNS SETOF record AS $$
+DECLARE
+	m text[];
 BEGIN
 	TRUNCATE mk.t;
 	EXECUTE 'INSERT INTO mk.t VALUES ' || array_to_string(base, ', ');
@@ -463,72 +467,141 @@ BEGIN
 	PERFORM dolt_commit('-am', 'theirs');
 	PERFORM dolt_checkout('main');
 	EXECUTE ours;
-	PERFORM dolt_commit('-am', 'ours');
-	PERFORM dolt_merge('mk_side');
+	PERFORM dolt_commit('--allow-empty', '-am', 'ours');
+	m := dolt_merge('mk_side');
 	PERFORM dolt_branch('-D', 'mk_side');
-	RETURN QUERY SELECT t.a, t.b, count(*) FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
+	RETURN QUERY SELECT t.a, t.b, count(*), m[3] FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
 END $$ LANGUAGE plpgsql;
 SELECT 'both add a copy' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
 	$s$INSERT INTO mk.t VALUES (1, 'x')$s$, $s$INSERT INTO mk.t VALUES (1, 'x')$s$);
-      case       | a | b | copies 
------------------+---+---+--------
- both add a copy | 1 | x |      3
+      case       | a | b | copies | conflicts 
+-----------------+---+---+--------+-----------
+ both add a copy | 1 | x |      2 | 0
 (1 row)
 
 SELECT 'both add the same new row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
 	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (2, 'y')$s$);
-           case            | a | b | copies 
----------------------------+---+---+--------
- both add the same new row | 1 | x |      1
- both add the same new row | 2 | y |      2
+           case            | a | b | copies | conflicts 
+---------------------------+---+---+--------+-----------
+ both add the same new row | 1 | x |      1 | 0
+ both add the same new row | 2 | y |      1 | 0
 (2 rows)
 
 SELECT 'each adds a different row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
 	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (3, 'z')$s$);
-           case            | a | b | copies 
----------------------------+---+---+--------
- each adds a different row | 1 | x |      1
- each adds a different row | 2 | y |      1
- each adds a different row | 3 | z |      1
+           case            | a | b | copies | conflicts 
+---------------------------+---+---+--------+-----------
+ each adds a different row | 1 | x |      1 | 0
+ each adds a different row | 2 | y |      1 | 0
+ each adds a different row | 3 | z |      1 | 0
 (3 rows)
 
 SELECT 'both delete it' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(2, 'y')$s$],
 	$s$DELETE FROM mk.t WHERE a = 1$s$, $s$DELETE FROM mk.t WHERE a = 1$s$);
-      case      | a | b | copies 
-----------------+---+---+--------
- both delete it | 2 | y |      1
+      case      | a | b | copies | conflicts 
+----------------+---+---+--------+-----------
+ both delete it | 2 | y |      1 | 0
 (1 row)
 
 SELECT 'both update it differently' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
 	$s$UPDATE mk.t SET b = 'ours'$s$, $s$UPDATE mk.t SET b = 'theirs'$s$);
-            case            | a |   b    | copies 
-----------------------------+---+--------+--------
- both update it differently | 1 | ours   |      1
- both update it differently | 1 | theirs |      1
+            case            | a |   b    | copies | conflicts 
+----------------------------+---+--------+--------+-----------
+ both update it differently | 1 | ours   |      1 | 0
+ both update it differently | 1 | theirs |      1 | 0
 (2 rows)
 
 SELECT 'one deletes a copy of two, one adds one' AS "case", *
   FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$],
 	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
 	$s$INSERT INTO mk.t VALUES (1, 'x')$s$);
-                  case                   | a | b | copies 
------------------------------------------+---+---+--------
- one deletes a copy of two, one adds one | 1 | x |      2
+                  case                   | a | b | copies | conflicts 
+-----------------------------------------+---+---+--------+-----------
+ one deletes a copy of two, one adds one | 1 | x |      2 | 0
 (1 row)
 
 SELECT 'both delete a copy of three' AS "case", *
   FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$, $s$(1, 'x')$s$],
 	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
 	$s$DELETE FROM mk.t WHERE ctid = (SELECT max(ctid) FROM mk.t)$s$);
-            case             | a | b | copies 
------------------------------+---+---+--------
- both delete a copy of three | 1 | x |      2
+            case             | a | b | copies | conflicts 
+-----------------------------+---+---+--------+-----------
+ both delete a copy of three | 1 | x |      2 | 0
 (1 row)
 
-SELECT * FROM dolt_conflicts;
- table_name | num_conflicts 
-------------+---------------
-(0 rows)
+SELECT 'both update it alike' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$UPDATE mk.t SET b = 'y'$s$, $s$UPDATE mk.t SET b = 'y'$s$);
+         case         | a | b | copies | conflicts 
+----------------------+---+---+--------+-----------
+ both update it alike | 1 | y |      1 | 0
+(1 row)
+
+-- a hotfix picked onto main, then its branch merged: made once
+TRUNCATE mk.t;
+INSERT INTO mk.t VALUES (1, 'x');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mk_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('mk_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+INSERT INTO mk.t VALUES (9, 'hotfix');
+SELECT length(dolt_commit('-am', 'hotfix')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_cherry_pick('mk_side'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {0,0,0}
+(1 row)
+
+INSERT INTO mk.t VALUES (2, 'ours');
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mk_side'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT a, b, count(*) AS copies FROM mk.t GROUP BY a, b ORDER BY a;
+ a |   b    | copies 
+---+--------+--------
+ 1 | x      |      1
+ 2 | ours   |      1
+ 9 | hotfix |      1
+(3 rows)
+
+SELECT dolt_branch('-D', 'mk_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
 
 DROP SCHEMA mk CASCADE;
 NOTICE:  drop cascades to table mk.t

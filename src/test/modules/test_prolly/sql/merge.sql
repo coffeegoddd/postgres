@@ -131,12 +131,16 @@ SELECT (dolt_merge('feature'))[2:4];
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA app CASCADE;
 
--- Keyless rows changed on both sides, case by case: copies added on each
--- are each a row, copies removed on both are removed once.
+-- Keyless rows changed on both sides, case by case: the same change on
+-- both is made once (the same update, a pick the branch has); otherwise
+-- copies added on each are each a row, copies removed on both are removed
+-- once.  None conflicts (each merge's own conflicts are shown).
 CREATE SCHEMA mk VERSIONED;
 CREATE TABLE mk.t (a int, b text);
 CREATE FUNCTION pg_temp.merged(base text[], ours text, theirs text,
-	OUT a int, OUT b text, OUT copies int8) RETURNS SETOF record AS $$
+	OUT a int, OUT b text, OUT copies int8, OUT conflicts text) RETURNS SETOF record AS $$
+DECLARE
+	m text[];
 BEGIN
 	TRUNCATE mk.t;
 	EXECUTE 'INSERT INTO mk.t VALUES ' || array_to_string(base, ', ');
@@ -147,10 +151,10 @@ BEGIN
 	PERFORM dolt_commit('-am', 'theirs');
 	PERFORM dolt_checkout('main');
 	EXECUTE ours;
-	PERFORM dolt_commit('-am', 'ours');
-	PERFORM dolt_merge('mk_side');
+	PERFORM dolt_commit('--allow-empty', '-am', 'ours');
+	m := dolt_merge('mk_side');
 	PERFORM dolt_branch('-D', 'mk_side');
-	RETURN QUERY SELECT t.a, t.b, count(*) FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
+	RETURN QUERY SELECT t.a, t.b, count(*), m[3] FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
 END $$ LANGUAGE plpgsql;
 SELECT 'both add a copy' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
 	$s$INSERT INTO mk.t VALUES (1, 'x')$s$, $s$INSERT INTO mk.t VALUES (1, 'x')$s$);
@@ -170,7 +174,23 @@ SELECT 'both delete a copy of three' AS "case", *
   FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$, $s$(1, 'x')$s$],
 	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
 	$s$DELETE FROM mk.t WHERE ctid = (SELECT max(ctid) FROM mk.t)$s$);
-SELECT * FROM dolt_conflicts;
+SELECT 'both update it alike' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$UPDATE mk.t SET b = 'y'$s$, $s$UPDATE mk.t SET b = 'y'$s$);
+-- a hotfix picked onto main, then its branch merged: made once
+TRUNCATE mk.t;
+INSERT INTO mk.t VALUES (1, 'x');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT dolt_branch('mk_side');
+SELECT dolt_checkout('mk_side') IS NOT NULL AS on_side;
+INSERT INTO mk.t VALUES (9, 'hotfix');
+SELECT length(dolt_commit('-am', 'hotfix')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_cherry_pick('mk_side'))[2:4];
+INSERT INTO mk.t VALUES (2, 'ours');
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+SELECT (dolt_merge('mk_side'))[2:4];
+SELECT a, b, count(*) AS copies FROM mk.t GROUP BY a, b ORDER BY a;
+SELECT dolt_branch('-D', 'mk_side');
 DROP SCHEMA mk CASCADE;
 SELECT length(dolt_commit('-Am', 'mk gone')::text) AS committed;
 

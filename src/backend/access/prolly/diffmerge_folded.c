@@ -29,8 +29,9 @@
  * another row since, a conflict, which keeps the branch's row and leaves
  * the merge in progress in the refs.  Its conflicts are found again from
  * the three commits when they're listed or resolved.  A keyless table's
- * rows have no identity, so the two sides' changes in a row's copies add
- * up.  The branch may have uncommitted changes, as in Dolt, if the merge
+ * rows have no identity: a row's copies merge as merge_table() says,
+ * without conflicts (implementation "rows", the tree engine's, adds the
+ * two sides' changes up, and conflicts below none).  The branch may have uncommitted changes, as in Dolt, if the merge
  * changes none of the tables and sequences they changed, and no
  * definitions change: they stay uncommitted, left out of the merge's
  * commit.  Definitions changed since the ancestor are merged first (the canonicalizer's
@@ -1203,9 +1204,11 @@ typedef struct KeyWrite
  * Walk theirs (table relid's changes from base to theirs) against ours
  * (base to ours, the session's head, which the branch still is), both in
  * key order, as mode says.  A key both sides changed to different rows is
- * a conflict; one they changed alike isn't.  A keyless table's row has
- * the copies its base had, those either side added, less the most either
- * removed: it never conflicts.  Returns how many keys conflict.
+ * a conflict; one they changed alike isn't.  A keyless table's row
+ * changed alike on both sides (by the same number of copies) is changed
+ * once; otherwise it has the copies its base had, those either side
+ * added, less the most either removed; it never conflicts.  Returns how
+ * many keys conflict.
  */
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
@@ -1290,17 +1293,23 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			int64		by_theirs = want - had;
 
 			/*
-			 * Copies added on either side are each a row (two sessions each
-			 * inserting the same row inserted two); copies removed on both
-			 * are removed once (two deleting it deleted it).  Each side
-			 * removes no more than the base had, so the count isn't below
-			 * none.
+			 * The same change on both sides is made once (the same update,
+			 * or a pick the branch has already); otherwise copies added on
+			 * either side are each a row, and copies removed on both are
+			 * removed once (two deleting it deleted it).  Each side removes
+			 * no more than the base had, so the count isn't below none, and
+			 * a keyless row never conflicts.
 			 */
-			want = had + Max(by_ours, 0) + Max(by_theirs, 0) -
-				Max(Max(-by_ours, 0), Max(-by_theirs, 0));
-			conflict = want < 0;
-			row = t->after.len > 0 ? &t->after :
-				t->before.len > 0 ? &t->before : now;
+			if (by_ours == by_theirs)
+				want = have;
+			else
+				want = had + Max(by_ours, 0) + Max(by_theirs, 0) -
+					Max(Max(-by_ours, 0), Max(-by_theirs, 0));
+			Assert(want >= 0);
+			conflict = false;
+			/* (theirs changed the key: a row before or after) */
+			Assert(t->after.len > 0 || t->before.len > 0);
+			row = t->after.len > 0 ? &t->after : &t->before;
 		}
 		else
 			conflict = o != NULL && !same_bytes(&o->after, &t->after);
@@ -1318,11 +1327,9 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 							   value_or_null(&t->after, &tv));
 			if (mode != WALK_TAKE_THEIRS)
 				continue;
-			/* as theirs has it: one row or none, or its copies */
-			want = keyless ? (int64) decode(&tc, &t->after, s2) :
-				(t->after.len > 0);
-			if (keyless)
-				row = want == 0 ? now : &t->after;
+			/* as theirs has it: one row or none (keyed: keyless never conflict) */
+			Assert(!keyless);
+			want = (t->after.len > 0);
 		}
 		else if (mode != WALK_MERGE ||
 				 (!keyless && o != NULL && same_bytes(&o->after, &t->after)) ||
