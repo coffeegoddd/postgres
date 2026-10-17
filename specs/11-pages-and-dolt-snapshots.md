@@ -882,7 +882,7 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
 ## 7. Step 6 design: remotes
 
 **Status: decided by the user, 2026-10-17, as recommended** (7.9 lists
-the decisions); not built.
+the decisions); file remotes built (7.11), network remotes not yet.
 
 Remotes move history between databases: a database's commits, the trees
 they name, and its branches' heads. A working set, the pages, never moves
@@ -1040,18 +1040,37 @@ copies (the one O(N) step: rows written to pages, indexes built).
     versioned schemas, by kind and qualified name: an extension with its
     version, a role (an owner, or named in a grant or policy), a type,
     function, operator, collation or other object of an ordinary schema.
-    Found through `pg_depend` and `pg_shdepend` for the objects the fold
-    describes, and only the changed objects' are looked up again. A new
-    canonical format (a clean break, as #149's), which the user accepted
-    at this stage for the better feature.
-  - **At clone:** for every branch's head, not only the default one's, the
-    recorded extensions are created at their recorded versions where the
-    server has their files (`CREATE EXTENSION … VERSION`); then every
-    other dependency is checked. A clone missing any refuses once,
-    before writing, naming all of them (each role, object and extension,
-    with why: not installed on this server, another version). Clone is
-    the only operation that installs an extension: its database is empty
-    and its own.
+    Which objects each versioned object depends on is found through
+    `pg_depend` and `pg_shdepend`, and only the changed objects' are looked
+    up again; but every commit describes each dependency in the set
+    afresh (an extension's version, a role's or object's name, by OID), so
+    an `ALTER EXTENSION … UPDATE` or a rename outside the versioned schemas
+    shows in the next commit, and in its diff, though no versioned object
+    changed. A dependency that no longer exists is reported by the commit,
+    as an object it can't describe is. A new canonical format (a clean
+    break, as #149's), which the user accepted at this stage for the
+    better feature.
+  - **At clone, checked before anything is created:** the dependencies of
+    every branch's head, not only the default one's, against the
+    database: each extension against `pg_available_extension_versions`
+    and `pg_extension`, each role and object by name. A clone missing any
+    refuses once, naming all of them (each role, object and extension,
+    with why: not installed on this server, not this version), before
+    creating anything; only then are extensions created.
+  - **An extension's version, across branches:** one version serves a
+    database, and branches may have recorded different ones (one branch's
+    head made before an update, another's after). A clone installs the
+    newest version any branch recorded, newest by the extension's update
+    paths (`pg_extension_update_paths`): a move to a branch that recorded
+    an older one needs no change (an update keeps what older versions
+    made). Versions no update path orders refuse the clone, naming them.
+  - **An extension the database has already** (an empty database for a
+    clone has no versioned schemas, commits, other branches, remotes or
+    upstreams, but may have ordinary schemas, roles and extensions, the
+    dependencies themselves): at the version the clone needs, or a newer
+    one, it is used as it is; at an older one, the clone refuses, with a
+    hint to update it. A clone creates only extensions the database
+    lacks, and never alters one there.
   - **At a move** (checkout, merge, reset, cherry-pick, pull): an
     extension is every branch's, so a move never creates or alters one. A
     move to a commit needing an extension the database lacks, or a newer
@@ -1232,11 +1251,12 @@ receive and send ("chunks"), remotes, remote-tracking branches and
 upstreams in the refs (7.2), `dolt_remote`, `dolt_fetch`, `dolt_push`,
 `dolt_pull` and `dolt_clone`, the views `dolt_remotes` and
 `dolt_remote_branches`, and file remotes' privileges (7.6). The receive
-check is 7.1's: each chunk re-hashed before anything reads it, a chunk the
-remote lacks an error, each received commit's root of this build's
-format, and only then one table file added. The typed walks stop at a
-commit or root the visitor declines (#171), so a fetch or push reads what
-changed, not the history.
+check: each chunk re-hashed before anything reads it, a chunk the remote
+lacks an error (so every reference resolves, in what was received or in
+the store), each received commit's root of this build's format, and only
+then one table file added. The typed walks stop at a commit or root the
+visitor declines (#171), so a fetch or push reads what changed, not the
+history.
 
 Not as designed, or not yet:
 
@@ -1246,12 +1266,25 @@ Not as designed, or not yet:
 - **Clone walks** rather than copying the remote's files whole and then
   checking them (7.4): the same bound, O(B); the whole-file copy waits for
   V4 to say what it saves.
-- **Shared dependencies.** A clone whose objects need something the
-  database lacks fails where its copies are made, naming that object,
-  and leaves nothing (one transaction). The recorded dependencies 7.4
-  decides (2026-10-17: "d:" items, a new format; extensions created at
-  clone, everything checked for every branch before writing; moves refuse
-  rather than change extensions) are the next layer.
+- **The store's own chunks are trusted.** A commit or chunk the store
+  has is declined without reading what it references: the receive check
+  resolves references through the store's closure, which it assumes, as
+  7.1 does. A store whose closure broke (a GC that removed a chunk a
+  transfer was told it had) would be admitted unchecked: step 7 must keep
+  the closure (8.2, 8.3), and the receive doesn't verify it.
+- **The seen sets aren't bounded.** What a receive has seen (each chunk
+  received, its hash in memory, its bytes in a temporary file) and what a
+  send has seen are hash tables in memory, growing with the chunks moved;
+  7.1 bounds them by `maintenance_work_mem`, spilling past it.
+- **Shared dependencies.** Only the default branch's copies are made at
+  clone, so only its dependencies are met there: a clone whose default
+  branch needs something the database lacks fails where its copies are
+  made, naming that object, and leaves nothing (one transaction); one
+  whose other branch does succeeds, and that branch fails at its first
+  checkout. The recorded dependencies 7.4 decides (2026-10-17: "d:" items,
+  a new format; every branch's checked at clone before anything is
+  created, extensions created at the newest version recorded; moves
+  refuse rather than change extensions) are the next layer.
 - **A push moves the remote's head as it is reached,** not with the
   transaction: the remote-tracking branch moves with the transaction, so a
   push whose transaction aborts leaves it behind the remote until the
