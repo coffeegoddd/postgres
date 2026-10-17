@@ -1593,6 +1593,23 @@ root_in_format(Canon *cn, const ProllyNodeRef *root)
 	return current;
 }
 
+static bool
+folded_in_format(const ProllyNodeRef *root)
+{
+	Canon		cn;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.folded = true;
+	canon_env(&cn);
+	return root_in_format(&cn, root);
+}
+
+static void
+folded_format(StringInfo out)
+{
+	appendStringInfoString(out, FOLDED_FORMAT);
+}
+
 static void
 folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 			 void *arg)
@@ -3474,6 +3491,8 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
 	.table_columns = folded_table_columns,
+	.in_format = folded_in_format,
+	.format = folded_format,
 };
 
 const ProllyCanonRoutine prolly_canon_catalogs = {

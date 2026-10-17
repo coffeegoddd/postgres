@@ -1,16 +1,16 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_transfer.h
- *	  Transfer interface: clone, fetch and push between databases.
- *
- * Transfer moves canonical chunks (engine export_chunks) and refs between
- * this database and a remote.  Implementations differ in transport: a local
- * copy between two instances, or a network protocol.
+ *	  Transfer interface: moving commits between this database's chunk
+ *	  store and a remote (prolly_remote.h).
  *
  * Contract:
- * - Only canonical chunks cross, so the remote may use any engine.
- * - Chunks the other side already has are not sent.
- * - A failed transfer leaves refs unchanged on both sides.
+ * - A store that has a chunk has every chunk it references: so what the
+ *   other side has, and all below it, isn't sent, and what is received is
+ *   checked to hold before the store takes it.
+ * - Only chunks move: refs (this database's remote-tracking branches, the
+ *   remote's heads) are the caller's to move afterwards.  A receive that
+ *   fails adds nothing; a send that fails adds nothing the remote reads.
  *
  * Provisional (v0).
  *
@@ -22,25 +22,34 @@
 #define PROLLY_TRANSFER_H
 
 #include "access/prolly_registry.h"
+#include "access/prolly_remote.h"
 #include "access/prolly_types.h"
 
 typedef struct ProllyTransferRoutine
 {
 	ProllyImplInfo info;
 
-	/* Copy every branch and commit of remote_url into this (empty) database. */
-	void		(*clone) (const char *remote_url);
+	/*
+	 * Receive from remote what the commits reach that this database's
+	 * store lacks, and add it to the store, at once: every chunk re-hashed
+	 * against its address, every reference resolved (in the store or what
+	 * was received), every commit's root of this build's format, before
+	 * any is added.  The count of chunks received.
+	 */
+	uint64		(*receive) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+							const ProllyHash *commits, int ncommits);
 
-	/* Bring refname and the chunks it needs from remote_url. */
-	void		(*fetch) (const char *remote_url, const char *refname);
-
-	/* Send branch and the chunks it needs to remote_url. */
-	void		(*push) (const char *remote_url, const char *branch);
+	/*
+	 * Send remote what the commits reach that it lacks, at once.  The count
+	 * of chunks sent.
+	 */
+	uint64		(*send) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+						 const ProllyHash *commits, int ncommits);
 } ProllyTransferRoutine;
 
-#define PROLLY_TRANSFER_CALLBACK_NAMES "clone", "fetch", "push"
-#define PROLLY_TRANSFER_FIRST_CALLBACK clone
-#define PROLLY_TRANSFER_LAST_CALLBACK push
+#define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send"
+#define PROLLY_TRANSFER_FIRST_CALLBACK receive
+#define PROLLY_TRANSFER_LAST_CALLBACK send
 
 static inline const ProllyTransferRoutine *
 prolly_transfer_lookup(const char *name)

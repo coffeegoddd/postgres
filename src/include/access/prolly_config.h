@@ -42,6 +42,7 @@
 #include "access/prolly_rootlayout.h"
 #include "access/prolly_rowid.h"
 #include "access/prolly_tablefile.h"
+#include "access/prolly_remote.h"
 #include "access/prolly_transfer.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_valenc.h"
@@ -103,6 +104,7 @@ extern void prolly_components_for_engine(const ProllyImplInfo *engine,
 										 ProllyComponents *components);
 
 extern void prolly_database_components(ProllyDatabaseComponents *components);
+extern void prolly_copies_components(ProllyDatabaseComponents *components);
 extern bool prolly_database_uses_copies(void);
 
 /* Is amname a prolly table access method? */

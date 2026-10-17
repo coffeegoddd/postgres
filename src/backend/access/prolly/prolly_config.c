@@ -113,7 +113,7 @@ static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
  */
 static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "copies",
-	[PROLLY_IFACE_TRANSFER] = "stub",
+	[PROLLY_IFACE_TRANSFER] = "chunks",
 	[PROLLY_IFACE_DIFF_MERGE] = "folded",
 	[PROLLY_IFACE_CANONICALIZER] = "folded",
 };
@@ -352,12 +352,9 @@ prolly_database_uses_copies(void)
 	return root.len > 0;
 }
 
-void
-prolly_database_components(ProllyDatabaseComponents *components)
+static void
+components_of(const char *const *impls, ProllyDatabaseComponents *components)
 {
-	const char *const *impls = prolly_database_uses_copies() ?
-		copies_profile : database_profile;
-
 	components->refs = (const ProllyRefsRoutine *)
 		profile_impl(impls, PROLLY_IFACE_REFS);
 	components->transfer = (const ProllyTransferRoutine *)
@@ -366,4 +363,27 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(impls, PROLLY_IFACE_DIFF_MERGE);
 	components->canonicalizer = (const ProllyCanonRoutine *)
 		profile_impl(impls, PROLLY_IFACE_CANONICALIZER);
+}
+
+void
+prolly_database_components(ProllyDatabaseComponents *components)
+{
+	components_of(prolly_database_uses_copies() ? copies_profile : database_profile,
+				  components);
+}
+
+/*
+ * The components of a database whose branches are copies of its versioned
+ * schemas, whether it has any yet or not: for what makes its first commits
+ * (a fetch or clone into an empty database).  Not for a versioned database,
+ * whose history is the tree engine's.
+ */
+void
+prolly_copies_components(ProllyDatabaseComponents *components)
+{
+	if (MyDatabaseVersioned)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("remotes need a database of versioned schemas, not a versioned database")));
+	components_of(copies_profile, components);
 }

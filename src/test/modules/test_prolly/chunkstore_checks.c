@@ -18,6 +18,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_remote.h"
 #include "access/prolly_tree.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
@@ -539,4 +540,135 @@ test_refs_value(PG_FUNCTION_ARGS)
 	SET_VARSIZE(out, VARHDRSZ + v.len);
 	memcpy(VARDATA(out), v.data, v.len);
 	PG_RETURN_BYTEA_P(out);
+}
+
+typedef struct OneChunk
+{
+	ProllyHash	hash;
+	bytea	   *data;
+	bool		given;
+} OneChunk;
+
+static bool
+one_chunk(void *arg, ProllyHash *hash, StringInfo data)
+{
+	OneChunk   *c = arg;
+
+	if (c->given)
+		return false;
+	c->given = true;
+	*hash = c->hash;
+	appendBinaryStringInfo(data, VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data));
+	return true;
+}
+
+/*
+ * test_remote_put(url, hash, data): add a chunk to a remote under the hash
+ * given, whatever its bytes hash to, as a remote that lies would.
+ */
+PG_FUNCTION_INFO_V1(test_remote_put);
+Datum
+test_remote_put(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, true);
+	OneChunk	c;
+
+	memset(&c, 0, sizeof(c));
+	text_hash(PG_GETARG_TEXT_PP(1), &c.hash);
+	c.data = PG_GETARG_BYTEA_PP(2);
+	PROLLY_CALL(rr, add_chunks, r, one_chunk, &c);
+	PROLLY_CALL(rr, close, r);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_remote_set_head(url, branch, commit, format): a remote's branch set
+ * to commit (whatever it is), its format recorded as given if it has none.
+ */
+PG_FUNCTION_INFO_V1(test_remote_set_head);
+Datum
+test_remote_set_head(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, true);
+	ProllyHash	head;
+	ProllyHash	none = {0};
+	bool		moved;
+
+	text_hash(PG_GETARG_TEXT_PP(2), &head);
+	moved = PROLLY_CALL(rr, move_head, r, branch, &none, &head,
+						text_to_cstring(PG_GETARG_TEXT_PP(3)));
+	PROLLY_CALL(rr, close, r);
+	PG_RETURN_BOOL(moved);
+}
+
+/*
+ * test_root_without_format(root): a folded root as the format before
+ * "!:format" made it, the item removed: what an older build committed.
+ */
+PG_FUNCTION_INFO_V1(test_root_without_format);
+Datum
+test_root_without_format(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef root;
+	ProllyNodeRef out;
+	ProllyEdit	e;
+
+	prolly_folded_tree_env(&env);
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	root.location.blkno = InvalidBlockNumber;
+	memset(&e, 0, sizeof(e));
+	e.key.data = (const uint8 *) "!:format";
+	e.key.len = 8;
+	e.is_delete = true;
+	PROLLY_CALL(tree, apply, &env, &root, &e, 1, &out);
+	PG_RETURN_TEXT_P(hash_text(&out.hash));
+}
+
+static void
+commit_item(const ProllyTreeRoutine *tree, ProllyTreeBuilder *b,
+			const char *key, const char *value, int len)
+{
+	ProllyKey	k = {(const uint8 *) key, strlen(key)};
+	ProllyValue v = {(const uint8 *) value, len};
+
+	PROLLY_CALL(tree, build_add, b, &k, &v);
+}
+
+/*
+ * test_commit_of(root, message): a commit with no parents naming root, as
+ * the refs write one; its id.
+ */
+PG_FUNCTION_INFO_V1(test_commit_of);
+Datum
+test_commit_of(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyHash	root;
+	ProllyNodeRef ref;
+	char	   *message = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char		hashed[1 + PROLLY_HASH_MAX_LEN];
+	char		time[8] = {0};
+
+	prolly_folded_tree_env(&env);
+	text_hash(PG_GETARG_TEXT_PP(0), &root);
+	hashed[0] = (char) root.len;
+	memcpy(hashed + 1, root.bytes, root.len);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	commit_item(tree, b, "author", "test", 4);
+	commit_item(tree, b, "message", message, strlen(message));
+	commit_item(tree, b, "parents", "", 0);
+	commit_item(tree, b, "root", hashed, 1 + root.len);
+	commit_item(tree, b, "time", time, 8);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
 }

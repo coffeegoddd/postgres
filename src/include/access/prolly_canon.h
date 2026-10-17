@@ -132,14 +132,25 @@ typedef struct ProllyCanonRoutine
 	 */
 	void		(*read_fold) (const ProllyNodeRef *baseline, Oid only,
 							  ProllyNodeRef *root, List **left_out);
+
+	/*
+	 * Whether a root is of the format this build folds: one of another is
+	 * read as tables() says (its rows not read), and never received from
+	 * another store.
+	 */
+	bool		(*in_format) (const ProllyNodeRef *root);
+
+	/* The format this build folds, as a root's "!:format" item says it. */
+	void		(*format) (StringInfo out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
 	"materialized_views", "same_schema", "move_schema", "sequences", \
-	"merge_schema", "walk_baseline", "table_columns", "read_fold"
+	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
+	"in_format", "format"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
-#define PROLLY_CANON_LAST_CALLBACK read_fold
+#define PROLLY_CANON_LAST_CALLBACK format
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

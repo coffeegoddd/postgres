@@ -23,6 +23,11 @@
  *				   table's OID (4 bytes, big-endian), then its type, row and
  *				   what it violates, each a length (4 bytes, big-endian) and
  *				   UTF-8 text
+ *	'O' name	-> a remote: its URL
+ *	'R' remote NUL branch
+ *				-> a remote-tracking branch: the commit a fetch last found
+ *				   the remote's branch at (hash length, hash)
+ *	'U' name	-> the branch's upstream: a remote, NUL, its branch
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts it left, unless
@@ -78,6 +83,9 @@
 #define TAG_MERGE		'M'
 #define TAG_BASELINE	'W'
 #define TAG_VIOLATIONS	'V'
+#define TAG_REMOTE		'O'
+#define TAG_TRACKING	'R'
+#define TAG_UPSTREAM	'U'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 
 static bool ready = false;
@@ -95,6 +103,7 @@ static void merge_key(StringInfo key, const char *branch);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
+static bool tracking_head(const char *refname, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
@@ -818,6 +827,8 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 		refname = branch_ops()->current();
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
+	if (tracking_head(refname, commit_id))
+		return true;
 	return parse_commit_id(refname, commit_id) &&
 		copies_commit_get(commit_id, &info);
 }
@@ -1588,6 +1599,275 @@ copies_set_violations(List *violations)
 	pfree(key.data);
 }
 
+/* ------------------------------------------------------------------------
+ * Remotes
+ * ------------------------------------------------------------------------
+ */
+
+/* Visit every entry whose key starts with prefix, in key order. */
+static void
+visit_prefix(const char *prefix, int prefixlen,
+			 void (*visit) (const ProllyKey *k, const ProllyValue *v, void *arg),
+			 void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	from = {(const uint8 *) prefix, prefixlen};
+	ProllyKey	k;
+	ProllyValue v;
+
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= prefixlen && memcmp(k.data, prefix, prefixlen) == 0)
+		visit(&k, &v, arg);
+	PROLLY_CALL(tree, cursor_close, c);
+}
+
+static void
+tracking_key(StringInfo key, const char *remote, const char *branch)
+{
+	appendStringInfoChar(key, TAG_TRACKING);
+	appendStringInfoString(key, remote);
+	appendStringInfoChar(key, '\0');
+	if (branch)
+		appendStringInfoString(key, branch);
+}
+
+/*
+ * refname as a remote-tracking branch, "remote/branch" or
+ * "remotes/remote/branch": its commit; false if it is none.
+ */
+static bool
+tracking_head(const char *refname, ProllyHash *commit_id)
+{
+	const char *name = refname;
+	const char *slash;
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	if (strncmp(name, "remotes/", 8) == 0)
+		name += 8;
+	slash = strchr(name, '/');
+	if (slash == NULL || slash == name || slash[1] == '\0')
+		return false;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_TRACKING);
+	appendBinaryStringInfo(&key, name, slash - name);
+	appendStringInfoChar(&key, '\0');
+	appendStringInfoString(&key, slash + 1);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+		(void) get_hash(v.data, v.data + v.len, commit_id);
+	pfree(key.data);
+	pfree(v.data);
+	return found && commit_id->len > 0;
+}
+
+typedef struct RemoteVisit
+{
+	ProllyRemoteVisit visit;
+	void	   *arg;
+} RemoteVisit;
+
+static void
+visit_remote_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	RemoteVisit *rv = arg;
+	char	   *name = pnstrdup((const char *) k->data + 1, k->len - 1);
+	char	   *url = pnstrdup((const char *) v->data, v->len);
+
+	rv->visit(name, url, rv->arg);
+	pfree(name);
+	pfree(url);
+}
+
+static void
+copies_remotes(ProllyRemoteVisit visit, void *arg)
+{
+	RemoteVisit rv = {visit, arg};
+	char		tag = TAG_REMOTE;
+
+	refs_init();
+	visit_prefix(&tag, 1, visit_remote_entry, &rv);
+}
+
+typedef struct TrackingVisit
+{
+	ProllyTrackingVisit visit;
+	void	   *arg;
+} TrackingVisit;
+
+static void
+visit_tracking_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	TrackingVisit *tv = arg;
+	const char *p = (const char *) k->data + 1;
+	int			rlen = strnlen(p, k->len - 1);
+	char	   *remote = pnstrdup(p, rlen);
+	char	   *branch = pnstrdup(p + rlen + 1, k->len - 2 - rlen);
+	ProllyHash	h;
+
+	(void) get_hash((const char *) v->data, (const char *) v->data + v->len, &h);
+	tv->visit(remote, branch, &h, tv->arg);
+	pfree(remote);
+	pfree(branch);
+}
+
+static void
+copies_trackings(const char *remote, ProllyTrackingVisit visit, void *arg)
+{
+	TrackingVisit tv = {visit, arg};
+	StringInfoData prefix;
+
+	refs_init();
+	initStringInfo(&prefix);
+	if (remote)
+		tracking_key(&prefix, remote, NULL);
+	else
+		appendStringInfoChar(&prefix, TAG_TRACKING);
+	visit_prefix(prefix.data, prefix.len, visit_tracking_entry, &tv);
+	pfree(prefix.data);
+}
+
+static void
+copies_tracking_set(const char *remote, const char *branch,
+					const ProllyHash *commit_id)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tracking_key(&key, remote, branch);
+	if (commit_id)
+		put_hash(&v, commit_id);
+	refs_put(key.data, key.len, commit_id ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static void
+collect_key(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	List	  **keys = arg;
+	StringInfo	key = makeStringInfo();
+
+	appendBinaryStringInfo(key, k->data, k->len);
+	*keys = lappend(*keys, key);
+}
+
+typedef struct UpstreamsOf
+{
+	const char *remote;
+	List	   *keys;
+} UpstreamsOf;
+
+static void
+collect_upstream_of(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	UpstreamsOf *u = arg;
+
+	if (strnlen((const char *) v->data, v->len) == strlen(u->remote) &&
+		memcmp(v->data, u->remote, strlen(u->remote)) == 0)
+		collect_key(k, v, &u->keys);
+}
+
+static void
+copies_remote_set(const char *name, const char *url)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	appendStringInfoChar(&key, TAG_REMOTE);
+	appendStringInfoString(&key, name);
+	if (url)
+	{
+		initStringInfo(&v);
+		appendStringInfoString(&v, url);
+		refs_put(key.data, key.len, &v);
+		pfree(v.data);
+	}
+	else
+	{
+		List	   *keys = NIL;
+		UpstreamsOf u = {name, NIL};
+		StringInfoData prefix;
+		char		tag = TAG_UPSTREAM;
+		ListCell   *lc;
+
+		/* its remote-tracking branches and the upstreams naming it go too */
+		initStringInfo(&prefix);
+		tracking_key(&prefix, name, NULL);
+		visit_prefix(prefix.data, prefix.len, collect_key, &keys);
+		visit_prefix(&tag, 1, collect_upstream_of, &u);
+		keys = list_concat(keys, u.keys);
+		foreach(lc, keys)
+		{
+			StringInfo	k = lfirst(lc);
+
+			refs_put(k->data, k->len, NULL);
+		}
+		refs_put(key.data, key.len, NULL);
+		pfree(prefix.data);
+	}
+	pfree(key.data);
+}
+
+static void
+copies_upstream_set(const char *branch, const char *remote,
+					const char *remote_branch)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_UPSTREAM);
+	appendStringInfoString(&key, branch);
+	if (remote)
+	{
+		appendStringInfoString(&v, remote);
+		appendStringInfoChar(&v, '\0');
+		appendStringInfoString(&v, remote_branch);
+	}
+	refs_put(key.data, key.len, remote ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static bool
+copies_upstream(const char *branch, char **remote, char **remote_branch)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_UPSTREAM);
+	appendStringInfoString(&key, branch);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		int			rlen = strnlen(v.data, v.len);
+
+		*remote = pnstrdup(v.data, rlen);
+		*remote_branch = pnstrdup(v.data + rlen + 1, v.len - rlen - 1);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
 typedef struct WalkState
 {
 	ProllyTreeVisitNode visit;
@@ -1625,8 +1905,8 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 }
 
 /*
- * The refs tree, every commit reachable from a head or a merge in
- * progress, with its root, and every baseline.
+ * The refs tree, every commit reachable from a head, a remote-tracking
+ * branch or a merge in progress, with its root, and every baseline.
  */
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
@@ -1651,7 +1931,7 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		ProllyHash *h;
 
 		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
-						  k.data[0] != TAG_BASELINE))
+						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING))
 			continue;
 		h = palloc(sizeof(ProllyHash));
 		p = get_hash(p, end, h);
@@ -1679,6 +1959,16 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		ref_of(lfirst(lc), &ref);
 		PROLLY_CALL(dc.canonicalizer, walk_baseline, &ref, visit, arg);
 	}
+}
+
+static void
+copies_walk_commit(const ProllyHash *commit_id, ProllyTreeVisitNode visit,
+				   void *arg)
+{
+	WalkState	ws = {visit, arg, NIL};
+
+	refs_init();
+	walk_commit(&ws, commit_id);
 }
 
 static bool
@@ -1719,4 +2009,11 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_head = copies_set_head,
 	.violations = copies_violations,
 	.set_violations = copies_set_violations,
+	.walk_commit = copies_walk_commit,
+	.remote_set = copies_remote_set,
+	.remotes = copies_remotes,
+	.tracking_set = copies_tracking_set,
+	.trackings = copies_trackings,
+	.upstream_set = copies_upstream_set,
+	.upstream = copies_upstream,
 };

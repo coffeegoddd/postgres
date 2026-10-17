@@ -70,9 +70,6 @@ SELECT test_refs_set_head('HEAD');
 SELECT test_refs_epoch() > :refs_epoch AS epoch_moved;
 SELECT * FROM prolly_diff('main', 'feature');
 SELECT prolly_merge('feature') IS NOT NULL AS merged;
-SELECT prolly_clone('file:///nowhere');
-SELECT prolly_fetch('file:///nowhere', 'main');
-SELECT prolly_push('file:///nowhere', 'main');
 SELECT prolly_checkout('main') IS NULL AS back_on_main;
 
 --

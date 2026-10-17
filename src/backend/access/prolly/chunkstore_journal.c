@@ -218,6 +218,10 @@ struct ProllyChunkStore
 	List	   *tables;			/* TableFile *, as the manifest last read named */
 	uint64		manifests_seen; /* the shared count when it was read */
 
+	/* chunks the store hasn't, read from elsewhere (read_through()) */
+	ProllyChunkGet through;
+	void	   *through_arg;
+
 	/* this transaction's */
 	StringInfoData pending;		/* records not appended yet */
 	HTAB	   *pending_index;
@@ -744,11 +748,13 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->moving = false;
 			s->pad_offset = 0;
 			s->saved = NIL;
+			s->through = NULL;
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			discard_pending(s);
 			s->saved = NIL;
+			s->through = NULL;
 			break;
 	}
 }
@@ -1694,7 +1700,9 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 		if (e == NULL)
 		{
 			load_tables(s, false);
-			return tables_get(s, &key, out);
+			if (tables_get(s, &key, out))
+				return true;
+			return s->through != NULL && s->through(s->through_arg, hash, out);
 		}
 	}
 	rec = palloc(e->len);
@@ -1718,7 +1726,9 @@ journal_has(ProllyChunkStore *s, const ProllyHash *hash)
 	if (index_has(s->index, &key))
 		return true;
 	load_tables(s, false);
-	return tables_get(s, &key, NULL);
+	if (tables_get(s, &key, NULL))
+		return true;
+	return s->through != NULL && s->through(s->through_arg, hash, NULL);
 }
 
 static void
@@ -2004,6 +2014,13 @@ journal_checkpoint(void)
 		pfree(sub);
 	}
 	FreeDir(tsdir);
+}
+
+static void
+journal_read_through(ProllyChunkStore *s, ProllyChunkGet source, void *arg)
+{
+	s->through = source;
+	s->through_arg = arg;
 }
 
 static void
@@ -2340,4 +2357,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.shmem_size = journal_shmem_size,
 	.shmem_init = journal_shmem_init,
 	.copy_database = journal_copy_database,
+	.read_through = journal_read_through,
 };

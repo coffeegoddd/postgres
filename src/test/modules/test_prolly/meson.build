@@ -75,6 +75,7 @@ tests += {
       'clean_checkouts',
       'keyless_keys',
       'walks',
+      'remotes',
     ],
   },
   'tap': {

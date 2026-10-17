@@ -81,6 +81,14 @@ typedef struct ProllyViolation
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
 
+/* Visits a remote: its name and URL. */
+typedef void (*ProllyRemoteVisit) (const char *name, const char *url,
+								   void *arg);
+
+/* Visits a remote-tracking branch: the remote, its branch, the commit. */
+typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
+									 const ProllyHash *commit, void *arg);
+
 typedef struct ProllyRefsRoutine
 {
 	ProllyImplInfo info;
@@ -215,6 +223,42 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*read_working_set) (const char *branch, Oid only,
 									 ProllyNodeRef *root, List **left_out);
+
+	/*
+	 * Visit every node a commit keeps alive: its own, its root's and its
+	 * ancestors' (walk()'s, from one commit).
+	 */
+	void		(*walk_commit) (const ProllyHash *commit_id,
+								ProllyTreeVisitNode visit, void *arg);
+
+	/*
+	 * Remotes: set one's URL (NULL: remove it, with its remote-tracking
+	 * branches and the upstreams naming it), and visit them by name, with
+	 * the transaction as any change to the refs.
+	 */
+	void		(*remote_set) (const char *name, const char *url);
+	void		(*remotes) (ProllyRemoteVisit visit, void *arg);
+
+	/*
+	 * Remote-tracking branches (remote/branch: where a fetch last found a
+	 * remote's branch): set one (commit NULL: delete it), and visit those of
+	 * a remote (NULL: every remote's), by remote and branch.  resolve()
+	 * finds them as "remote/branch" (after any branch of that name) and
+	 * "remotes/remote/branch".
+	 */
+	void		(*tracking_set) (const char *remote, const char *branch,
+								 const ProllyHash *commit_id);
+	void		(*trackings) (const char *remote, ProllyTrackingVisit visit,
+							  void *arg);
+
+	/*
+	 * A branch's upstream (the remote and its branch a pull or push without
+	 * them uses): set it (remote NULL: none), and read it (false if none).
+	 */
+	void		(*upstream_set) (const char *branch, const char *remote,
+								 const char *remote_branch);
+	bool		(*upstream) (const char *branch, char **remote,
+							 char **remote_branch);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
@@ -222,9 +266,10 @@ typedef struct ProllyRefsRoutine
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
-	"set_violations", "read_working_set"
+	"set_violations", "read_working_set", "walk_commit", "remote_set", \
+	"remotes", "tracking_set", "trackings", "upstream_set", "upstream"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK read_working_set
+#define PROLLY_REFS_LAST_CALLBACK upstream
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
