@@ -98,6 +98,7 @@ static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
 									  ProllyNodeRef *root);
+static bool copies_working_set(const char *branch, ProllyNodeRef *root);
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
@@ -795,6 +796,17 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
  * ------------------------------------------------------------------------
  */
 
+/* The session's branch folded, as a commit's fold would be: its baseline. */
+static void
+fold_as_baseline(void *arg)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef next;
+
+	fold_from_baseline(&root, &next);
+	branch_set_baseline(branch_ops()->current(), &next, &root);
+}
+
 /* Move the session's branch to a commit's root: its rows written. */
 static void
 move_to(void *arg)
@@ -817,21 +829,34 @@ copies_branch_create(const char *name, const char *start_point)
 	if (OidIsValid(branch_oid(from)))
 	{
 		ProllyNodeRef baseline;
+		ProllyNodeRef working;
 		bool		has_head = branch_head(from, &head);
+
+		if (has_head && !copies_commit_get(&head, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the head commit of branch \"%s\" is missing", from)));
 
 		/*
 		 * A branch starts at the other's head commit, as in Dolt: the
 		 * other's uncommitted changes stay its own.  Its copies are the
 		 * other's (they have the same changes since the same baseline),
-		 * then moved to the head, undoing the changes.
+		 * then moved to the head, undoing the changes, unless the other has
+		 * none; then folded from the head, so its folds don't read the
+		 * pages the move wrote again and again.
 		 */
 		branch_ops()->create(name, from);
 		/* (a branch of the same name deleted before left no entry) */
 		branch_set_head(name, has_head ? &head : NULL);
 		branch_set_baseline(name, branch_baseline(from, &baseline) ? &baseline : NULL,
 							NULL);
-		if (has_head && copies_commit_get(&head, &info))
+		if (has_head &&
+			!(copies_working_set(from, &working) &&
+			  same_hash(&working.hash, &info.root.hash)))
+		{
 			branch_ops()->run_on(name, move_to, &info.root);
+			branch_ops()->run_on(name, fold_as_baseline, NULL);
+		}
 		return;
 	}
 
