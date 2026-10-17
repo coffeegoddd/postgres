@@ -2,6 +2,11 @@
 
 This measures an empirical exponent over the sampled range, not a proof
 of an asymptotic bound. Missing or undersized sweeps are inconclusive/fail.
+
+Node work comes from `*-counters.json` files beside a result's raw output.
+No engine writes them now (D1, which did, is removed), so a run with none
+at all is reported inconclusive (exit 2), not as a failed gate (exit 1); a
+run with some results' counters missing is incomplete evidence, and fails.
 """
 import json
 import math
@@ -42,21 +47,31 @@ def run(args):
         return 1
     cfg = json.loads((args.dir / "config.json").read_text())
     groups = defaultdict(lambda: defaultdict(list))
+    missing = 0
+    rows = 0
     for line in (args.dir / "results.jsonl").read_text().splitlines():
         r = json.loads(line)
         k = r["key"]
         if k["workload"] != args.workload:
             continue
+        rows += 1
         work = []
         for path in (args.dir / r["raw_dir"]).glob(f"{args.workload.lower()}*-counters.json"):
             for op in json.loads(path.read_text()):
                 if op["sql"].startswith("SELECT " + args.operation + "("):
                     work.append(op[args.counter])
         if not work:
-            print(json.dumps({"passed": False, "reason": f"missing {args.operation} backend counters"}))
-            return 1
+            missing += 1
+            continue
         n = cfg["sizes"][k["size"]]["v_rows"]
         groups[(k["variant"], k["clients"])][n].append(statistics.median(work))
+    if rows and missing == rows:
+        print(json.dumps({"passed": False, "inconclusive": True,
+                          "reason": f"no {args.operation} backend counters recorded; the engine records no node work"}))
+        return 2
+    if missing:
+        print(json.dumps({"passed": False, "reason": f"missing {args.operation} backend counters for {missing} of {rows} results"}))
+        return 1
     reports = [{"variant": variant, "clients": clients, **analyze(samples, args.max_exponent)}
                for (variant, clients), samples in sorted(groups.items())]
     passed = bool(reports) and all(r["passed"] for r in reports)

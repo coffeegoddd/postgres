@@ -16,9 +16,6 @@ func (p claimedVC) Capabilities() []string { return []string{"sql", "vc.core"} }
 // from corpus coverage.
 func SelfTest(ctx context.Context, dsn, am string, timeout time.Duration) ([]Result, error) {
 	var results []Result
-	// (No wrong-AM control: a table of another AM can't be made where the
-	// adapter looks, a versioned public refusing heap and an ordinary one
-	// prolly; the adapter checks for one still.)
 	for _, tc := range []struct{ id, sql, match string }{
 		{"wrong-result", "SELECT 'wrong'::text", "rows differ"},
 		{"unexpected-error", "SELECT missing_column", "SQLSTATE"},
@@ -36,12 +33,31 @@ func SelfTest(ctx context.Context, dsn, am string, timeout time.Duration) ([]Res
 			return results, fmt.Errorf("negative control %s did not fail as intended: %+v", tc.id, r)
 		}
 	}
+	// A table of another AM where the adapter looks fails targeting. Only a
+	// heap adapter can have one (a versioned public holds prolly tables
+	// alone), so the control runs on heap whatever am is: the AM is heap's
+	// under another name.
+	wrong := []Step{
+		{ID: "rogue-am", Session: "a", Op: "exec", SQL: "CREATE ACCESS METHOD vc_rogue_am TYPE TABLE HANDLER heap_tableam_handler"},
+		{ID: "wrong-am", Session: "a", Op: "exec", SQL: "CREATE TABLE rogue (id int) USING vc_rogue_am"},
+	}
+	ws := Scenario{Version: 1, ID: "wrong-am", Description: "negative control", Requires: []string{"sql"}, Sessions: []string{"a"}, Steps: wrong}
+	wa, err := NewPostgres(dsn, "heap", timeout)
+	if err != nil {
+		return results, err
+	}
+	r := Run(ctx, ws, wa)
+	results = append(results, r)
+	if r.Status != "failed" || r.Phase != "step" || !strings.HasPrefix(r.Error, "wrong-am: ") ||
+		!strings.Contains(r.Error, "wrong AM") {
+		return results, fmt.Errorf("negative control wrong-am did not fail as intended: %+v", r)
+	}
 	s, err := Parse(targetScenario)
 	if err != nil {
 		return results, err
 	}
 	p, _ := NewPostgres(dsn, "heap", timeout)
-	r := Run(ctx, s, claimedVC{p})
+	r = Run(ctx, s, claimedVC{p})
 	results = append(results, r)
 	// Heap tables aren't branched: one branch's edits show on another, the
 	// probe's isolation step failing.

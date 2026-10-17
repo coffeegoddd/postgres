@@ -169,6 +169,37 @@ class ExperimentTest(unittest.TestCase):
         self.assertFalse(complexity.analyze({n: [5] for n in (100, 200, 400, 800)}, .3)["passed"])
         self.assertFalse(complexity.analyze({n: [0] * 5 for n in (100, 200, 400, 800)}, .3)["passed"])
 
+    def test_gate_without_counters_is_inconclusive(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "config.json").write_text(json.dumps({"sizes": {"s": {"v_rows": 100}}}))
+            results = []
+            for rep in (1, 2):
+                raw = path / f"raw{rep}"
+                raw.mkdir()
+                results.append({"key": {"suite": "V", "workload": "V2", "size": "s", "variant": "",
+                                        "clients": 1, "rep": rep},
+                                "status": "ok", "raw_dir": f"raw{rep}", "metrics": {}})
+            (path / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results))
+            seal(path)
+            args = SimpleNamespace(dir=path, workload="V2", operation="dolt_commit",
+                                   counter="nodes_read", max_exponent=.3)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(complexity.run(args), 2)
+            self.assertTrue(json.loads(out.getvalue())["inconclusive"])
+
+            # Some results with counters and some without: incomplete, a failure.
+            (path / "raw1" / "v2-counters.json").write_text(json.dumps(
+                [{"sql": "SELECT dolt_commit('-m', 'x')", "nodes_read": 3}]))
+            seal(path)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(complexity.run(args), 1)
+            self.assertNotIn("inconclusive", json.loads(out.getvalue()))
+
     def test_paired_intervals_and_small_samples(self):
         self.assertEqual(paired_ratio_interval([(2, 1)] * 5), (2, 2, 2))
         self.assertIsNone(paired_ratio_interval([(2, 1)] * 4))

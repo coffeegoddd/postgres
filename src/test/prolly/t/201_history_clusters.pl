@@ -4,10 +4,9 @@
 # schema and data by different histories (the rows inserted in opposite
 # orders, one cluster creating and dropping objects first, so the OIDs
 # differ), and their commits have the same root hash; a row changed
-# changes it.  On the tree engines objects are committed where they are;
-# on prolly they are in a versioned schema, committed with dolt_commit,
-# and the second cluster's history also goes through branches and a
-# three-way merge.
+# changes it.  The objects are in a versioned schema, committed with
+# dolt_commit, and the second cluster's history also goes through branches
+# and a three-way merge.
 
 use strict;
 use warnings FATAL => 'all';

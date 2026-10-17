@@ -50,6 +50,21 @@ my @controls = (
 		# commit hasn't the canary's table at all, which is the specific
 		# invariant failing, a stage before its rows)
 		error => qr/VC target prolly \[branch copy\]: SQL failed: .*relation "vc_canary" does not exist/s,
+	},
+	{
+		name => 'an old commit with the canary\'s table cannot substitute for its rows',
+		am => 'prolly',
+		mock => q{
+			CREATE TABLE vc_canary (id int PRIMARY KEY, payload text);
+			INSERT INTO vc_canary VALUES (1, 'stale');
+			SELECT dolt_commit('-m', 'stale canary before fixture');
+			DROP TABLE vc_canary;
+			CREATE FUNCTION public.dolt_commit(VARIADIC text[]) RETURNS text[]
+			LANGUAGE sql AS 'SELECT ARRAY[dolt_hashof(''HEAD'')]::text[]';
+		},
+		# (the branch made at the old commit has the table, so the probe
+		# reaches its rows, which are the old commit's)
+		error => qr/VC target prolly \[branch copy rows\]: expected/,
 	});
 
 my $i = 0;
