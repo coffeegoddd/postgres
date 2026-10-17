@@ -39,12 +39,12 @@ def check(ctx: Context) -> None:
         raise Unavailable(f"no benchbase.jar under [tools] benchbase = {_dist(ctx)}")
 
 
-def _config(ctx: Context, bench: str, scalefactor: float, seconds: int) -> Path:
+def _config(ctx: Context, bench: str, scalefactor: float, seconds: int,
+            serial: bool = False) -> Path:
     if bench not in {"tpcc", "tpch"}:
         raise ValueError(f"no BenchBase config template for {bench}")
     if not math.isfinite(scalefactor) or scalefactor <= 0:
         raise ValueError("BenchBase scale factor must be finite and positive")
-    serial = bench == "tpch" and ctx.params.get("mode", "serial") == "serial"
     names = _TPCC_TYPES if bench == "tpcc" else _TPCH_TYPES
     weights = ctx.params.get("weights", "45,43,4,4,4" if bench == "tpcc"
                              else ",".join("1" for _ in names))
@@ -62,7 +62,7 @@ def _config(ctx: Context, bench: str, scalefactor: float, seconds: int) -> Path:
   <isolation>{escape(isolation)}</isolation>
   <batchsize>128</batchsize>
   <scalefactor>{scalefactor}</scalefactor>
-  <terminals>{1 if serial else ctx.key.clients}</terminals>
+  <terminals>{ctx.key.clients}</terminals>
   <works>
     <work>
       <serial>{str(serial).lower()}</serial>
@@ -90,17 +90,21 @@ def _run(ctx: Context, bench: str, cfg: Path, out_dir: Path, *, create: bool,
         out_dir.mkdir(parents=True, exist_ok=True)
         args += ["--json-histograms", str((out_dir / "transactions.json").resolve())]
     r = subprocess.run(args, cwd=_dist(ctx), capture_output=True, text=True)
-    out = " ".join(args) + "\n\n" + r.stdout + r.stderr
+    logged = r.stdout + r.stderr
+    out = " ".join(args) + "\n\n" + logged
     (ctx.raw_dir / f"benchbase-{tag}.out").write_text(out)
     check_client_error(out)
     if r.returncode != 0:
         raise RuntimeError(f"BenchBase {tag} failed (exit {r.returncode}): {out[-2000:]}")
-    # Some loaders catch SQL exceptions, log them and still exit zero.
-    errors = [line for line in out.splitlines()
-              if re.search(r"\bERROR\b", line)]
-    if load and errors:
-        raise RuntimeError(f"BenchBase {tag} logged errors: {'; '.join(errors)[:2000]}")
-    return out
+    if load:
+        # Some loaders catch SQL exceptions, log them and still exit zero.
+        # Only BenchBase's own ERROR level counts, not the word elsewhere
+        # (the command line's paths, a driver's message).
+        errors = [line for line in logged.splitlines()
+                  if re.match(r"\s*\[ERROR\s*\]", line)]
+        if errors:
+            raise RuntimeError(f"BenchBase {tag} logged errors: {'; '.join(errors)[:2000]}")
+    return logged
 
 
 def load(ctx: Context, bench: str, *, scalefactor: float) -> None:
@@ -110,14 +114,19 @@ def load(ctx: Context, bench: str, *, scalefactor: float) -> None:
 
 
 def execute(ctx: Context, bench: str, window: Optional[Window], *,
-            scalefactor: float, seconds: Optional[int] = None) -> Outcome:
-    """Run the benchmark; inside window if one is given."""
+            scalefactor: float, seconds: Optional[int] = None,
+            serial: bool = False) -> Outcome:
+    """Run the benchmark; inside window if one is given.
+
+    serial (TPC-H only): Q1-Q22 once each in order, untimed, instead of for
+    seconds.
+    """
     seconds = ctx.measure_seconds if seconds is None else seconds
     tag = "measure" if window else "warmup"
     # BenchBase writes per-transaction samples during the run: keep them in
     # RAM, and copy only the small summary files to the results.
     out_dir = ctx.scratch_dir / f"benchbase-{tag}"
-    cfg = _config(ctx, bench, scalefactor, seconds)
+    cfg = _config(ctx, bench, scalefactor, seconds, serial)
     cpu0 = children_cpu_seconds()
     with window or nullcontext():
         output = _run(ctx, bench, cfg, out_dir, create=False, load=False, execute=True,
@@ -164,21 +173,28 @@ def execute(ctx: Context, bench: str, window: Optional[Window], *,
     # This BenchBase revision treats PostgreSQL deadlocks as unexpected,
     # not retryable. They are ordinary contention failures in TPC-C; keep
     # them in failed_transactions, but reject any other unexpected error.
-    deadlocks = len(re.findall(r"will not be retried\.\.\. sql state \[40P01\]", output)) \
-        if bench == "tpcc" else 0
-    if unexpected != deadlocks:
-        raise RuntimeError(f"BenchBase {tag} had {unexpected} unexpected SQL errors")
+    # (BenchBase counts in the histogram only errors while measuring, but
+    # logs every one, and may log one twice: the log can have more.)
+    executions = requests
+    failed = re.findall(r"will not be retried\.\.\. sql state \[(\w*)\]", output)
+    deadlocks = failed.count("40P01") if bench == "tpcc" else 0
+    others = len(failed) - deadlocks
+    if others or unexpected > deadlocks:
+        raise RuntimeError(f"BenchBase {tag} had {max(others, unexpected - deadlocks)} "
+                           "unexpected SQL errors")
     if bench == "tpch":
         if counts["aborted"]["NUM_SAMPLES"] or counts["rejected"]["NUM_SAMPLES"]:
             raise RuntimeError(f"TPC-H {tag} had aborted or rejected queries")
-        if ctx.params.get("mode", "serial") == "serial":
-            # BenchBase's untimed serial mode executes each query cold,
-            # then hot. Raw samples contain only the hot run; the success
-            # histogram includes both executions.
+        if serial:
+            # Raw samples have each query's measured run; anything else
+            # isn't the serial run of Q1-Q22.
             if (set(queries) != set(_TPCH_TYPES)
-                    or any(query["count"] != 1 for query in queries.values())
-                    or counts["completed"]["NUM_SAMPLES"] != 44):
-                raise RuntimeError(f"TPC-H {tag} did not complete one cold and one measured run of Q1-Q22")
+                    or any(query["count"] != 1 for query in queries.values())):
+                raise RuntimeError(f"TPC-H {tag} did not complete one measured run of Q1-Q22")
+            # BenchBase's serial mode runs each query cold first, unrecorded
+            # in the samples but counted as completed: the window's work
+            # (WAL, CPU, writes per query) is every execution's.
+            executions = max(requests, float(counts["completed"]["NUM_SAMPLES"]))
     metrics = {
         "tps": summary.get("Throughput (requests/second)"),
         "goodput_tps": summary.get("Goodput (requests/second)"),
@@ -190,6 +206,6 @@ def execute(ctx: Context, bench: str, window: Optional[Window], *,
         "latency_p999_ms": ms(hist.percentile(99.9)),
         "latency_max_ms": ms(hist.max_us or None),
     }
-    return Outcome(metrics=metrics, transactions=requests,
+    return Outcome(metrics=metrics, transactions=executions,
                    client_cpu_seconds=client_cpu,
                    notes=[f"BenchBase final state: {summary.get('Final State')}"])

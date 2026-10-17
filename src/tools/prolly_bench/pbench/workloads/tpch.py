@@ -35,21 +35,24 @@ class S13(Workload):
                         options=ctx.session_options())
 
     def warmup(self, ctx):
+        # (in either mode, queries for warmup_seconds: a serial pass at a
+        # large scale could take hours)
         if ctx.warmup_seconds > 0:
             _benchbase.execute(ctx, "tpch", None, scalefactor=self.scale(ctx),
                                seconds=ctx.warmup_seconds)
 
     def measure(self, ctx, window):
-        out = _benchbase.execute(ctx, "tpch", window, scalefactor=self.scale(ctx))
+        serial = ctx.params.get("mode", "serial") == "serial"
+        out = _benchbase.execute(ctx, "tpch", window, scalefactor=self.scale(ctx),
+                                 serial=serial)
         # Q15 writes catalogs when creating/dropping its view, so WAL and
         # device-write metrics still apply even though user data is read-only.
         out.unit = "query"
         out.metrics["qps"] = out.metrics["tps"]
-        if ctx.params.get("mode", "serial") == "serial":
-            if out.transactions != 22:
-                raise RuntimeError(f"TPC-H serial run completed {out.transactions} queries, expected 22")
-            out.notes.append("Q1-Q22 in order, each with an unrecorded cold run then "
-                             "one measured run; no time limit (not a TPC-H certification run)")
+        if serial:
+            out.notes.append("Q1-Q22 in order, each with a cold run then one measured "
+                             "run; per-query WAL, CPU and writes are over both; no time "
+                             "limit (not a TPC-H certification run)")
         return out
 
     def tables(self, ctx):

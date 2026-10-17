@@ -32,7 +32,7 @@ class BenchBaseTest(unittest.TestCase):
                            1, 5, raw, scratch, {})
 
     def test_tpch_config_keeps_fractional_scale_and_all_queries(self):
-        xml = ET.parse(bb._config(self.ctx, "tpch", 0.01, 5))
+        xml = ET.parse(bb._config(self.ctx, "tpch", 0.01, 5, serial=True))
         self.assertEqual(xml.findtext("scalefactor"), "0.01")
         self.assertEqual(xml.findtext("works/work/time"), "0")
         self.assertEqual(xml.findtext("works/work/serial"), "true")
@@ -40,7 +40,6 @@ class BenchBaseTest(unittest.TestCase):
                          [f"Q{i}" for i in range(1, 23)])
         self.assertEqual(len(xml.findtext("works/work/weights").split(",")), 22)
         self.assertIn("default_table_access_method=prolly", xml.findtext("url"))
-        self.ctx.params["mode"] = "throughput"
         xml = ET.parse(bb._config(self.ctx, "tpch", 0.01, 5))
         self.assertEqual(xml.findtext("works/work/time"), "5")
         self.assertEqual(xml.findtext("works/work/serial"), "false")
@@ -88,7 +87,9 @@ class BenchBaseTest(unittest.TestCase):
         with patch.object(bb, "_run", side_effect=self.write_results):
             out = S13().measure(self.ctx, nullcontext())
         self.assertEqual(out.unit, "query")
-        self.assertEqual(out.transactions, 22)
+        # (the window's work is the cold and the measured runs')
+        self.assertEqual(out.transactions, 44)
+        self.assertEqual(out.metrics["transactions"], 22)
         self.assertEqual(out.metrics["qps"], 11)
         self.assertFalse(out.read_only)  # Q15 writes catalogs
         timings = json.loads((self.ctx.raw_dir / "benchbase-measure/queries.json").read_text())
@@ -114,9 +115,38 @@ class BenchBaseTest(unittest.TestCase):
         result = SimpleNamespace(returncode=0,
             stdout="[WARN] Retrying transaction\nPSQLException: ERROR: deadlock detected", stderr="")
         with patch.object(bb.subprocess, "run", return_value=result):
-            bb._run(self.ctx, "tpcc", self.ctx.raw_dir / "config.xml",
-                    self.ctx.scratch_dir, create=False, load=False,
-                    execute=True, tag="measure")
+            out = bb._run(self.ctx, "tpcc", self.ctx.raw_dir / "config.xml",
+                          self.ctx.scratch_dir, create=False, load=False,
+                          execute=True, tag="measure")
+        self.assertIn("deadlock detected", out)
+
+    def test_error_outside_log_level_does_not_fail_load(self):
+        # (the word in a path on the command line, or in a driver's message)
+        self.ctx.tools["benchbase"] = str(self.ctx.raw_dir / "ERROR-repro")
+        result = SimpleNamespace(returncode=0,
+            stdout="[INFO ] retrying after PSQLException: ERROR: could not serialize", stderr="")
+        with patch.object(bb.subprocess, "run", return_value=result):
+            bb.load(self.ctx, "tpch", scalefactor=0.01)
+
+    def test_serial_warmup_is_bounded_by_warmup_seconds(self):
+        seen = []
+
+        def run(ctx, bench, cfg, out_dir, **kwargs):
+            seen.append(cfg.read_text())
+            raise RuntimeError("stop")
+        with patch.object(bb, "_run", side_effect=run):
+            with self.assertRaises(RuntimeError):
+                S13().warmup(self.ctx)
+        self.assertIn("<serial>false</serial>", seen[0])
+        self.assertIn(f"<time>{self.ctx.warmup_seconds}</time>", seen[0])
+
+    def test_logged_deadlocks_may_outnumber_counted_ones(self):
+        # (one after the measurement ended, or logged twice)
+        self.names, self.errors = ["NewOrder"], 1
+        self.output = "will not be retried... sql state [40P01], error code [0].\n" * 3
+        with patch.object(bb, "_run", side_effect=self.write_results):
+            out = bb.execute(self.ctx, "tpcc", nullcontext(), scalefactor=1)
+        self.assertEqual(out.metrics["failed_transactions"], 1)
 
     def test_tpcc_deadlocks_count_as_failures_but_other_sql_errors_fail_cell(self):
         self.names, self.errors = ["NewOrder"], 1
@@ -127,6 +157,12 @@ class BenchBaseTest(unittest.TestCase):
             self.output = "will not be retried... sql state [XX000], error code [0]."
             with self.assertRaisesRegex(RuntimeError, "unexpected SQL errors"):
                 bb.execute(self.ctx, "tpcc", nullcontext(), scalefactor=1)
+
+
+    def test_more_queries_per_second_is_better(self):
+        # (S13's headline metric: a comparison colors more as better)
+        from pbench import report
+        self.assertIn("qps", report.HIGHER_IS_BETTER)
 
 
 if __name__ == "__main__":
