@@ -208,7 +208,7 @@ SELECT dolt_reset('--hard', :'ahead');
 -- upstreams: a push or pull without a remote uses the branch's
 SELECT dolt_push();
 ERROR:  the current branch main has no upstream branch
-HINT:  Name the remote, or set an upstream with dolt_push('--set-upstream', 'origin', 'main').
+HINT:  Name the remote, as dolt_push('origin', 'main'), or set an upstream with dolt_push('--set-upstream', 'origin', 'main').
 SELECT dolt_push('--set-upstream', 'origin', 'main') AS pushed;
           pushed           
 ---------------------------
@@ -227,6 +227,105 @@ SELECT dolt_pull() IS NOT NULL AS pulled_upstream;
  t
 (1 row)
 
+-- a push to an upstream of another name: the session's branch, to it
+SELECT dolt_checkout('-b', 'feature') IS NOT NULL AS on_feature;
+ on_feature 
+------------
+ t
+(1 row)
+
+UPDATE rm.t SET v = 'f' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'feature')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT test_refs_set_upstream('feature', 'origin', 'feat');
+ test_refs_set_upstream 
+------------------------
+ 
+(1 row)
+
+SELECT dolt_push() AS pushed;
+            pushed            
+------------------------------
+ {0,"feature -> origin/feat"}
+(1 row)
+
+SELECT dolt_hashof('origin/feat') = dolt_hashof('feature') AS to_feat;
+ to_feat 
+---------
+ t
+(1 row)
+
+SELECT dolt_pull('origin', 'nowhere');
+ERROR:  remote "origin" has no branch "nowhere"
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
+ pulled 
+--------
+ t
+(1 row)
+
+-- a long history pushed and fetched: walked a commit at a time, each
+-- once, however long
+SELECT dolt_checkout('-b', 'long') IS NOT NULL AS on_long;
+ on_long 
+---------
+ t
+(1 row)
+
+SELECT test_commit_chain(dolt_hashof('HEAD'), 50000) AS long_head \gset
+SELECT test_refs_set_head(:'long_head');
+ test_refs_set_head 
+--------------------
+ 
+(1 row)
+
+SELECT dolt_push('origin', 'long') AS pushed;
+          pushed           
+---------------------------
+ {0,"long -> origin/long"}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'long');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+\c regress_remotes_b
+SELECT dolt_fetch('origin', 'long');
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('origin/long') = :'long_head' AS fetched_long;
+ fetched_long 
+--------------
+ t
+(1 row)
+
+\c :db
 -- a commit whose root is of an older format (no "!:format"): refused
 SELECT test_root_without_format(test_fold_root()) AS oldroot \gset
 SELECT test_commit_of(:'oldroot', 'old format') AS oldcommit \gset
@@ -376,7 +475,8 @@ SELECT test_remote_set_head(:'url_old', 'main', :'fake', '1');
 SELECT dolt_fetch('old');
 ERROR:  remote "old" holds commits of canonical format 1, not 2
 \c :db
--- a role without the privileges of pg_read_server_files can't read one
+-- a role without the privileges of pg_read_server_files can't read one,
+-- nor push to one (a push reads it), whatever it may write
 CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
 	EXECUTE q;
@@ -395,8 +495,58 @@ SELECT pg_temp.err($$SELECT dolt_fetch('origin')$$);
 (1 row)
 
 RESET ROLE;
+GRANT pg_write_server_files TO regress_remote_user;
+SET ROLE regress_remote_user;
+SELECT pg_temp.err($$SELECT dolt_push('origin', 'main')$$);
+                      err                      
+-----------------------------------------------
+ permission denied to read file remote "<dir>"
+(1 row)
+
+RESET ROLE;
 DROP OWNED BY regress_remote_user;
 DROP ROLE regress_remote_user;
+-- a remote's branch of any name's length
+SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), '2');
+ test_remote_set_head 
+----------------------
+ t
+(1 row)
+
+SELECT dolt_fetch();
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT length(name) AS long_name FROM dolt_remote_branches WHERE name LIKE '%xxxx%';
+ long_name 
+-----------
+      1515
+(1 row)
+
+-- pull with no upstream names pull in its hint
+SELECT dolt_checkout('-b', 'loose') IS NOT NULL AS on_loose;
+ on_loose 
+----------
+ t
+(1 row)
+
+SELECT dolt_pull();
+ERROR:  the current branch loose has no upstream branch
+HINT:  Name the remote, as dolt_pull('origin', 'loose'), or set an upstream with dolt_push('--set-upstream', 'origin', 'loose').
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'loose');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- removing a remote removes its remote-tracking branches and upstreams
 SELECT dolt_remote('remove', 'origin');
  dolt_remote 
@@ -412,7 +562,7 @@ SELECT count(*) AS tracking FROM dolt_remote_branches;
 
 SELECT dolt_push();
 ERROR:  the current branch main has no upstream branch
-HINT:  Name the remote, or set an upstream with dolt_push('--set-upstream', 'origin', 'main').
+HINT:  Name the remote, as dolt_push('origin', 'main'), or set an upstream with dolt_push('--set-upstream', 'origin', 'main').
 SELECT dolt_remote('remove', 'bad');
  dolt_remote 
 -------------

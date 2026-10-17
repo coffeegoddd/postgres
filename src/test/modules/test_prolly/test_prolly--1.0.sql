@@ -292,3 +292,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_commit_of(root text, message text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- n commits in a line after parent, each naming its root; the last one.
+CREATE FUNCTION test_commit_chain(parent text, n int)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A branch's upstream: a remote and its branch.
+CREATE FUNCTION test_refs_set_upstream(branch text, remote text,
+	remote_branch text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

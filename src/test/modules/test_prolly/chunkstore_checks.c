@@ -19,6 +19,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_remote.h"
+#include "access/prolly_refs.h"
 #include "access/prolly_tree.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
@@ -28,6 +29,7 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "varatt.h"
 
 /* (a plain function: PROLLY_CALL evaluates its routine more than once) */
@@ -642,6 +644,34 @@ commit_item(const ProllyTreeRoutine *tree, ProllyTreeBuilder *b,
 	PROLLY_CALL(tree, build_add, b, &k, &v);
 }
 
+/* A commit naming root, with parent (none if its len is 0), as the refs write one. */
+static void
+make_commit(const ProllyHash *root, const ProllyHash *parent,
+			const char *message, ProllyHash *id)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	char		hashed[1 + PROLLY_HASH_MAX_LEN];
+	char		parents[1 + PROLLY_HASH_MAX_LEN];
+	char		time[8] = {0};
+
+	prolly_folded_tree_env(&env);
+	hashed[0] = (char) root->len;
+	memcpy(hashed + 1, root->bytes, root->len);
+	parents[0] = (char) parent->len;
+	memcpy(parents + 1, parent->bytes, parent->len);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	commit_item(tree, b, "author", "test", 4);
+	commit_item(tree, b, "message", message, strlen(message));
+	commit_item(tree, b, "parents", parents, parent->len ? 1 + parent->len : 0);
+	commit_item(tree, b, "root", hashed, 1 + root->len);
+	commit_item(tree, b, "time", time, 8);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	*id = ref.hash;
+}
+
 /*
  * test_commit_of(root, message): a commit with no parents naming root, as
  * the refs write one; its id.
@@ -650,25 +680,59 @@ PG_FUNCTION_INFO_V1(test_commit_of);
 Datum
 test_commit_of(PG_FUNCTION_ARGS)
 {
-	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
-	ProllyTreeEnv env;
-	ProllyTreeBuilder *b;
 	ProllyHash	root;
-	ProllyNodeRef ref;
-	char	   *message = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char		hashed[1 + PROLLY_HASH_MAX_LEN];
-	char		time[8] = {0};
+	ProllyHash	none = {0};
+	ProllyHash	id;
 
-	prolly_folded_tree_env(&env);
 	text_hash(PG_GETARG_TEXT_PP(0), &root);
-	hashed[0] = (char) root.len;
-	memcpy(hashed + 1, root.bytes, root.len);
-	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
-	commit_item(tree, b, "author", "test", 4);
-	commit_item(tree, b, "message", message, strlen(message));
-	commit_item(tree, b, "parents", "", 0);
-	commit_item(tree, b, "root", hashed, 1 + root.len);
-	commit_item(tree, b, "time", time, 8);
-	PROLLY_CALL(tree, build_finish, b, &ref);
-	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+	make_commit(&root, &none, text_to_cstring(PG_GETARG_TEXT_PP(1)), &id);
+	PG_RETURN_TEXT_P(hash_text(&id));
+}
+
+/*
+ * test_commit_chain(parent, n): n commits in a line after parent, each
+ * naming parent's root; the last one's id.
+ */
+PG_FUNCTION_INFO_V1(test_commit_chain);
+Datum
+test_commit_chain(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyCommitInfo info;
+	ProllyHash	head;
+	int32		n = PG_GETARG_INT32(1);
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "test commit chain",
+											  ALLOCSET_DEFAULT_SIZES);
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &head);
+	if (!PROLLY_CALL(dc.refs, commit_get, &head, &info))
+		elog(ERROR, "no such commit");
+	for (int32 i = 0; i < n; i++)
+	{
+		MemoryContext old = MemoryContextSwitchTo(cxt);
+		ProllyHash	next;
+
+		make_commit(&info.root.hash, &head, "chained", &next);
+		MemoryContextSwitchTo(old);
+		head = next;
+		MemoryContextReset(cxt);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PG_RETURN_TEXT_P(hash_text(&head));
+}
+
+/* test_refs_set_upstream(branch, remote, remote_branch) */
+PG_FUNCTION_INFO_V1(test_refs_set_upstream);
+Datum
+test_refs_set_upstream(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, upstream_set, text_to_cstring(PG_GETARG_TEXT_PP(0)),
+				text_to_cstring(PG_GETARG_TEXT_PP(1)),
+				text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	PG_RETURN_VOID();
 }

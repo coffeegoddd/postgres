@@ -55,6 +55,7 @@ OBJS = \
 	nodestore_stub.o \
 	prolly_chunkstore.o \
 	prolly_config.o \
+	prolly_hashtext.o \
 	prolly_database.o \
 	prolly_datum.o \
 	prolly_indexam.o \

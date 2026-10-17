@@ -92,6 +92,31 @@ SELECT dolt_push('--set-upstream', 'origin', 'main') AS pushed;
 SELECT dolt_push() AS pushed_upstream;
 SELECT dolt_pull() IS NOT NULL AS pulled_upstream;
 
+-- a push to an upstream of another name: the session's branch, to it
+SELECT dolt_checkout('-b', 'feature') IS NOT NULL AS on_feature;
+UPDATE rm.t SET v = 'f' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'feature')::text) AS committed;
+SELECT test_refs_set_upstream('feature', 'origin', 'feat');
+SELECT dolt_push() AS pushed;
+SELECT dolt_hashof('origin/feat') = dolt_hashof('feature') AS to_feat;
+SELECT dolt_pull('origin', 'nowhere');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'feature');
+SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
+
+-- a long history pushed and fetched: walked a commit at a time, each
+-- once, however long
+SELECT dolt_checkout('-b', 'long') IS NOT NULL AS on_long;
+SELECT test_commit_chain(dolt_hashof('HEAD'), 50000) AS long_head \gset
+SELECT test_refs_set_head(:'long_head');
+SELECT dolt_push('origin', 'long') AS pushed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'long');
+\c regress_remotes_b
+SELECT dolt_fetch('origin', 'long');
+SELECT dolt_hashof('origin/long') = :'long_head' AS fetched_long;
+\c :db
+
 -- a commit whose root is of an older format (no "!:format"): refused
 SELECT test_root_without_format(test_fold_root()) AS oldroot \gset
 SELECT test_commit_of(:'oldroot', 'old format') AS oldcommit \gset
@@ -150,7 +175,8 @@ SELECT test_remote_set_head(:'url_old', 'main', :'fake', '1');
 SELECT dolt_fetch('old');
 \c :db
 
--- a role without the privileges of pg_read_server_files can't read one
+-- a role without the privileges of pg_read_server_files can't read one,
+-- nor push to one (a push reads it), whatever it may write
 CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
 	EXECUTE q;
@@ -164,8 +190,23 @@ GRANT ALL ON SCHEMA rm TO regress_remote_user;
 SET ROLE regress_remote_user;
 SELECT pg_temp.err($$SELECT dolt_fetch('origin')$$);
 RESET ROLE;
+GRANT pg_write_server_files TO regress_remote_user;
+SET ROLE regress_remote_user;
+SELECT pg_temp.err($$SELECT dolt_push('origin', 'main')$$);
+RESET ROLE;
 DROP OWNED BY regress_remote_user;
 DROP ROLE regress_remote_user;
+
+-- a remote's branch of any name's length
+SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), '2');
+SELECT dolt_fetch();
+SELECT length(name) AS long_name FROM dolt_remote_branches WHERE name LIKE '%xxxx%';
+
+-- pull with no upstream names pull in its hint
+SELECT dolt_checkout('-b', 'loose') IS NOT NULL AS on_loose;
+SELECT dolt_pull();
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'loose');
 
 -- removing a remote removes its remote-tracking branches and upstreams
 SELECT dolt_remote('remove', 'origin');

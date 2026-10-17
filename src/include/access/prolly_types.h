@@ -155,4 +155,11 @@ typedef struct ProllyNodeCounters
 	uint64		nodes_written;		/* new nodes, not ones already stored */
 } ProllyNodeCounters;
 
+/*
+ * A hash as text (lowercase hex), and read back from len characters of hex
+ * (false if they aren't a hash's): prolly_hashtext.c.
+ */
+extern char *prolly_hash_hex(const ProllyHash *hash);
+extern bool prolly_hash_from_hex(const char *hex, size_t len, ProllyHash *hash);
+
 #endif							/* PROLLY_TYPES_H */

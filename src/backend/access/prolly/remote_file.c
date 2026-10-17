@@ -22,9 +22,14 @@
  * the old manifest or the new, and a file a crash left unnamed is never
  * read.  The lock serializes changes; reads take none.
  *
+ * Reading.  The first lookup reads every table file's index into one hash
+ * table, so each later lookup is one probe however many files the remote
+ * has; the files are opened as virtual file descriptors, which fd.c keeps
+ * within its limit however many there are.
+ *
  * A file remote is the server's files: reading one takes the privileges
- * of pg_read_server_files, changing one those of pg_write_server_files,
- * as COPY with a file name does.
+ * of pg_read_server_files, changing one those of pg_write_server_files as
+ * well (a change reads it first), as COPY with a file name does.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/remote_file.c
@@ -44,10 +49,13 @@
 #include "access/prolly_tablefile.h"
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
+#include "common/string.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 #define MANIFEST_NAME	"prolly_remote"
 #define LOCK_NAME		"prolly_remote.lock"
@@ -58,10 +66,19 @@ typedef struct RemoteTable
 {
 	uint64		id;
 	uint64		size;
-	int			fd;				/* -1: not opened yet */
+	File		file;			/* -1: not opened yet */
 	char	   *path;
 	ProllyTableFile *tf;
 } RemoteTable;
+
+/* where a chunk is: its file and its bytes there */
+typedef struct ChunkAt
+{
+	ProllyHash	hash;			/* the key: zero-padded */
+	RemoteTable *table;
+	uint64		offset;
+	uint32		len;
+} ChunkAt;
 
 typedef struct RemoteHead
 {
@@ -82,6 +99,7 @@ struct ProllyRemote
 	MemoryContext cxt;
 	char	   *dir;
 	Manifest	m;
+	HTAB	   *chunks;			/* ChunkAt, every table file's, or NULL */
 	bool		read_checked;
 	bool		write_checked;
 };
@@ -94,6 +112,14 @@ table_format(void)
 	if (fmt == NULL)
 		fmt = prolly_tablefile_lookup("basic");
 	return fmt;
+}
+
+/* A hash zero-padded past its length, as a hash table's key. */
+static void
+hash_key(ProllyHash *h)
+{
+	if (h->len < PROLLY_HASH_MAX_LEN)
+		memset(h->bytes + h->len, 0, PROLLY_HASH_MAX_LEN - h->len);
 }
 
 static void
@@ -130,41 +156,6 @@ table_name(uint64 id)
 }
 
 static void
-hex_of(const ProllyHash *h, StringInfo out)
-{
-	for (int i = 0; i < h->len; i++)
-		appendStringInfo(out, "%02x", h->bytes[i]);
-}
-
-static bool
-hash_of_hex(const char *s, int len, ProllyHash *h)
-{
-	if (len % 2 != 0 || len / 2 > PROLLY_HASH_MAX_LEN)
-		return false;
-	memset(h, 0, sizeof(*h));
-	for (int i = 0; i < len / 2; i++)
-	{
-		int			v = 0;
-
-		for (int j = 0; j < 2; j++)
-		{
-			char		c = s[2 * i + j];
-
-			v <<= 4;
-			if (c >= '0' && c <= '9')
-				v |= c - '0';
-			else if (c >= 'a' && c <= 'f')
-				v |= c - 'a' + 10;
-			else
-				return false;
-		}
-		h->bytes[i] = (uint8) v;
-	}
-	h->len = len / 2;
-	return true;
-}
-
-static void
 corrupt(ProllyRemote *r, const char *what)
 {
 	ereport(ERROR,
@@ -178,7 +169,8 @@ read_manifest(ProllyRemote *r)
 {
 	char	   *path = remote_path(r, MANIFEST_NAME);
 	FILE	   *f;
-	char		line[MAXPGPATH + 2 * PROLLY_HASH_MAX_LEN + 64];
+	StringInfoData buf;
+	char	   *line;
 	int			n = 0;
 	MemoryContext old = MemoryContextSwitchTo(r->cxt);
 
@@ -194,13 +186,13 @@ read_manifest(ProllyRemote *r)
 		MemoryContextSwitchTo(old);
 		return false;
 	}
-	while (fgets(line, sizeof(line), f) != NULL)
+	initStringInfo(&buf);
+	while (pg_get_line_buf(f, &buf))
 	{
-		size_t		len = strlen(line);
-
-		if (len == 0 || line[len - 1] != '\n')
-			corrupt(r, "a line is too long or unterminated");
-		line[--len] = '\0';
+		line = buf.data;
+		if (buf.len == 0 || line[buf.len - 1] != '\n')
+			corrupt(r, "a line is unterminated");
+		line[--buf.len] = '\0';
 		if (n++ == 0)
 		{
 			if (strcmp(line, MANIFEST_MAGIC) != 0)
@@ -219,7 +211,7 @@ read_manifest(ProllyRemote *r)
 			if (*end != ' ')
 				corrupt(r, "a file line is malformed");
 			t->size = strtou64(end + 1, NULL, 10);
-			t->fd = -1;
+			t->file = -1;
 			r->m.tables = lappend(r->m.tables, t);
 		}
 		else if (strncmp(line, "head ", 5) == 0)
@@ -227,7 +219,7 @@ read_manifest(ProllyRemote *r)
 			RemoteHead *h = palloc0(sizeof(RemoteHead));
 			char	   *sp = strchr(line + 5, ' ');
 
-			if (sp == NULL || !hash_of_hex(line + 5, sp - (line + 5), &h->commit))
+			if (sp == NULL || !prolly_hash_from_hex(line + 5, sp - (line + 5), &h->commit))
 				corrupt(r, "a head line is malformed");
 			h->branch = pstrdup(sp + 1);
 			r->m.heads = lappend(r->m.heads, h);
@@ -251,6 +243,21 @@ head_cmp(const ListCell *a, const ListCell *b)
 {
 	return strcmp(((RemoteHead *) lfirst(a))->branch,
 				  ((RemoteHead *) lfirst(b))->branch);
+}
+
+/* Write buf at the file's end; a short write is the disk being full. */
+static void
+write_all(int fd, const char *path, StringInfo buf)
+{
+	errno = 0;
+	if (write(fd, buf->data, buf->len) != buf->len)
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
+	}
 }
 
 /* Write m as the manifest, durably: aside, synced, renamed over it. */
@@ -279,19 +286,14 @@ write_manifest(ProllyRemote *r, Manifest *m)
 	{
 		RemoteHead *h = lfirst(lc);
 
-		appendStringInfoString(&buf, "head ");
-		hex_of(&h->commit, &buf);
-		appendStringInfo(&buf, " %s\n", h->branch);
+		appendStringInfo(&buf, "head %s %s\n", prolly_hash_hex(&h->commit), h->branch);
 	}
 	fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m", tmp)));
-	if (write(fd, buf.data, buf.len) != buf.len)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m", tmp)));
+	write_all(fd, tmp, &buf);
 	if (pg_fsync(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -328,6 +330,7 @@ lock_remote(ProllyRemote *r)
 			 errmsg("file remotes can't be changed on this platform")));
 #endif
 	close_tables(&r->m);
+	r->chunks = NULL;
 	(void) read_manifest(r);
 	return fd;
 }
@@ -369,7 +372,9 @@ file_open(const char *url, bool create)
 	r->cxt = cxt;
 	r->dir = MemoryContextStrdup(cxt, path);
 	canonicalize_path(r->dir);
-	check_privilege(r, create);
+	check_privilege(r, false);
+	if (create)
+		check_privilege(r, true);
 
 	if (stat(r->dir, &st) != 0)
 	{
@@ -405,10 +410,10 @@ close_tables(Manifest *m)
 
 		if (t->tf)
 			PROLLY_CALL(table_format(), close, t->tf);
-		if (t->fd >= 0)
-			(void) CloseTransientFile(t->fd);
+		if (t->file >= 0)
+			FileClose(t->file);
 		t->tf = NULL;
-		t->fd = -1;
+		t->file = -1;
 	}
 }
 
@@ -443,7 +448,7 @@ table_read(void *arg, uint64 offset, char *buf, Size len)
 {
 	RemoteTable *t = arg;
 
-	return pg_pread(t->fd, buf, len, offset) == len;
+	return FileRead(t->file, buf, len, offset, WAIT_EVENT_DATA_FILE_READ) == len;
 }
 
 /* A table file, opened (its index read) if it wasn't. */
@@ -456,8 +461,8 @@ open_table(ProllyRemote *r, RemoteTable *t)
 		return t->tf;
 	old = MemoryContextSwitchTo(r->cxt);
 	t->path = remote_path(r, table_name(t->id));
-	t->fd = OpenTransientFile(t->path, O_RDONLY | PG_BINARY);
-	if (t->fd < 0)
+	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
+	if (t->file < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", t->path)));
@@ -470,23 +475,66 @@ open_table(ProllyRemote *r, RemoteTable *t)
 	return t->tf;
 }
 
+/* Every table file's index, in one hash table: read once. */
+static HTAB *
+chunk_index(ProllyRemote *r)
+{
+	HASHCTL		ctl;
+	ListCell   *lc;
+
+	if (r->chunks)
+		return r->chunks;
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ChunkAt);
+	ctl.hcxt = r->cxt;
+	r->chunks = hash_create("prolly file remote chunks", 1024, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* (newest first: a chunk in several files is found in the newest) */
+	foreach(lc, r->m.tables)
+	{
+		RemoteTable *t = lfirst(lc);
+		ProllyTableFile *tf = open_table(r, t);
+		int			n = PROLLY_CALL(table_format(), count, tf);
+
+		for (int i = 0; i < n; i++)
+		{
+			ProllyHash	h;
+			ChunkAt    *at;
+			uint64		offset;
+			uint32		len;
+			bool		found;
+
+			PROLLY_CALL(table_format(), entry, tf, i, &h, &offset, &len);
+			hash_key(&h);
+			at = hash_search(r->chunks, &h, HASH_ENTER, &found);
+			if (found)
+				continue;
+			at->table = t;
+			at->offset = offset;
+			at->len = len;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	return r->chunks;
+}
+
 static bool
 file_find(ProllyRemote *r, const ProllyHash *hash, RemoteTable **found,
 		  uint64 *offset, uint32 *len)
 {
-	ListCell   *lc;
+	ProllyHash	key = *hash;
+	ChunkAt    *at;
 
-	foreach(lc, r->m.tables)
-	{
-		RemoteTable *t = lfirst(lc);
-
-		if (PROLLY_CALL(table_format(), find, open_table(r, t), hash, offset, len))
-		{
-			*found = t;
-			return true;
-		}
-	}
-	return false;
+	hash_key(&key);
+	at = hash_search(chunk_index(r), &key, HASH_FIND, NULL);
+	if (at == NULL)
+		return false;
+	*found = at->table;
+	*offset = at->offset;
+	*len = at->len;
+	(void) open_table(r, at->table);
+	return true;
 }
 
 static bool
@@ -555,20 +603,14 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 		resetStringInfo(&data);
 		if (buf.len >= 1024 * 1024)
 		{
-			if (write(fd, buf.data, buf.len) != buf.len)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not write file \"%s\": %m", path)));
+			write_all(fd, path, &buf);
 			size += buf.len;
 			resetStringInfo(&buf);
 		}
 		CHECK_FOR_INTERRUPTS();
 	} while (next(arg, &hash, &data));
 	PROLLY_CALL(fmt, write_finish, w, &buf);
-	if (write(fd, buf.data, buf.len) != buf.len)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m", path)));
+	write_all(fd, path, &buf);
 	size += buf.len;
 	if (pg_fsync(fd) != 0)
 		ereport(ERROR,
@@ -583,11 +625,12 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 	t = MemoryContextAllocZero(r->cxt, sizeof(RemoteTable));
 	t->id = m.last + 1;
 	t->size = size;
-	t->fd = -1;
+	t->file = -1;
 	m.last = t->id;
 	m.tables = lcons(t, list_copy(m.tables));
 	write_manifest(r, &m);
 	r->m = m;
+	r->chunks = NULL;
 	unlock_remote(lock);
 }
 
