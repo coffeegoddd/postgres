@@ -1,7 +1,7 @@
 # 13. Tables without a primary key: prolly, heap and Dolt
 
 **Status: measured 2026-10-17, on master plus stack #138 (#135–#139,
-with their reviews' fixes).**
+with their reviews' fixes); prolly again after #141 and #142 (part 6).**
 This compares how stock Postgres (heap), page-based prolly and Dolt store
 tables without a primary key ("keyless" tables), what their operations
 cost, and how their merges treat them. Where prolly falls short, the
@@ -12,8 +12,8 @@ findings at the end say what to change. Nothing here is decided.
 | | Heap | Prolly (pages + history) | Dolt |
 |---|---|---|---|
 | Working set | Heap pages; a row is a tuple at a TID | Heap pages, the same as heap | A prolly tree, the same as history |
-| Row identity in history | None | The row's canonical encoding is its key; the value is the row plus a count of copies | A 16-byte xxh3-128 hash of the row's encoded columns is its key; the value is a count of copies plus the columns |
-| Order of the history tree | — | By content, in the columns' order (the keying's compare) | By hash: effectively random |
+| Row identity in history | None | The SHA-256 hash of the row's canonical encoding is its key; the value is the row plus a count of copies | A 16-byte xxh3-128 hash of the row's encoded columns is its key; the value is a count of copies plus the columns |
+| Order of the history tree | — | By hash: effectively random | By hash: effectively random |
 | Duplicate rows | One tuple each | One tree entry, its count | One tree entry, its count |
 | UPDATE | A new tuple version | A new tuple version; in history, the old content's count drops and the new content's rises | Delete of the old hash, insert of the new: two tree edits per row, at unrelated places in the tree |
 | Secondary index | Points at TIDs | Points at TIDs (they are heap indexes) | Indexed columns plus the row's hash; every lookup goes back to the clustered tree for the count |
@@ -120,14 +120,16 @@ doesn't see them). Dolt only switches roots; prolly checkpoints the
 branch left, folding its changes (130 ms keyed for 10,000 rows, 404 ms
 keyless, which the next finding inflates).
 
-**Keyless tables hurt Dolt's history.** Their hashes put rows in random
-order, so a range of changed rows touches as many leaf chunks as rows,
+**Keyless tables hurt both histories.** In both, their hashes put rows in
+random order (prolly's keying, `keying_pkcontent.c`, keys a row by its
+content's hash, as Dolt does: a first draft of this said otherwise), so a range of changed rows touches as many leaf chunks as rows,
 where the same range keyed touches a few: keyless, Dolt's journal grew to
 27 times the keyed run's, a 10,000-row diff took 6 times as long, and
 merges and cherry-picks of 10,000 rows 14 and 10 times as long. Its
 merges of keyless tables also never use the subtree-splicing fast path
 (`canFastMergeProllyTrees := !keyless && …`,
-`libraries/doltcore/merge/merge_prolly_rows.go`).
+`libraries/doltcore/merge/merge_prolly_rows.go`). Prolly's journal shows
+the same: 1,129 M keyless against 53 M keyed after the same run (part 6).
 
 **Keyless tables hurt prolly's folds, through one gap.** With #136 a
 keyless table folds from its changed pages, but a fold made in the
@@ -183,21 +185,52 @@ not an accident; summing would give 3.
 In order of what the numbers say matters:
 
 1. **A fold in the writing transaction shouldn't mark a keyless table
-   unsettled.** Its own writes are settled once it commits, and its Dolt
-   commit rolls back with it if it doesn't. A second fold in the same
-   transaction has to tell its own earlier writes apart by command id,
-   which the baseline state doesn't record yet. This removes the full fold
-   after every merge, cherry-pick and revert.
-2. **Checkouts shouldn't fold to see whether a branch is clean.** Each
-   table's changed-page list and its baseline say whether anything changed
-   since the head, in O(1) a table; fold only when something did, and then
-   advance the baseline.
+   unsettled.** Done in #141: its own writes are settled for it (they go
+   with it if it rolls back, and what it writes after changes pages
+   since), so no command id is needed after all; a baseline records the
+   fold's transaction, which a later fold must see committed.
+2. **Checkouts shouldn't fold to see whether a branch is clean.** Done
+   differently, in #142: what a clean checkout's fold read was what moves
+   (a reset, a fast-forward) left changed since a baseline they didn't
+   advance, and what #141 now settles. A move folds from the head once, as
+   a branch's first use does, and a clean checkout reads nothing (0 pages,
+   counted, in `clean_checkouts`): 0.45 ms keyless, 0.60 ms keyed.
 3. **Decide the keyless merge rule:** keep prolly's (counts add up,
    identical changes converge), take Dolt's (any change on both sides
    conflicts), or sum always (both adding a copy gives 3).
-4. **Moves are O(rows changed), Dolt's O(1).** That follows from keeping
-   the working set in pages; worth measuring again after 1 and 2, since a
-   fast-forward here also paid for folds, and a dirty checkout is a fold.
-5. **The journal grows with every full fold** (1.1 G here, keyless): likely
-   the trees rebuilt by full folds written again, unverified; step 7's GC
-   reclaims them, and 1 removes most of them.
+4. **Key keyless rows by their content, not its hash.** Changes to a range
+   of rows would then touch a few chunks, as a keyed table's do, not one
+   each: the history grows 21 times as fast keyless as keyed now, and a
+   fold of 10,000 changed rows costs 4–5 times a keyed one. The canonical
+   format is frozen, so this needs a new keying, its rows hashed as before
+   for identity; decided before step 6, since remotes carry the format.
+5. **Moves are O(rows changed), Dolt's O(1).** That follows from keeping
+   the working set in pages: after 1 and 2, a fast-forward of 10,000 rows
+   is 68 ms keyed (260 keyless), a reset 102 (270).
+6. **The journal doesn't rewrite chunks it has** (`journal_put` skips
+   one already held): its growth is new chunks, mostly 4's scattered
+   keyless edits, which step 7's GC reclaims.
+
+## 6. After #141 and #142
+
+Prolly again, the same runs on a release build with both (Heap and Dolt
+as in part 2; ms):
+
+| Operation | Prolly keyless (part 2) | Now | Prolly keyed (part 2) | Now |
+|---|---|---|---|---|
+| Commit after 10,000 rows updated | 217 | 188 | 36 | 40 |
+| `dolt_diff` of two commits 10,000 rows apart | 55 | 45 | 2.8 | 2.9 |
+| `dolt_status` after 10,000 rows updated | 211 | 185 | 68 | 36 |
+| Hard reset of 10,000 changed rows | 297 | 270 | 120 | 102 |
+| Check out a new branch (its first use) | 78 | 3.5 | 183 | 4.7 |
+| Check out another branch, nothing changed | 35 | 0.45 | 86 | 0.60 |
+| Check out another branch, 10,000 rows changed | 404 | 345 | 130 | 63 |
+| Fast-forward merge of 10,000 changed rows | 404 | 260 | 108 | 68 |
+| Three-way merge, 10,000 rows changed on each side | 316 | 307 | 76 | 71 |
+| Three-way merge, one row changed on each side | 1.7 | 1.1 | 1.7 | 1.6 |
+| Cherry-pick of 10,000 changed rows | 4,850 | 394 | 181 | 102 |
+| Database on disk (bytes) | 1,303 M | 1,269 M | 248 M | 245 M |
+
+The full folds after merges and picks and the clean checkouts' folds are
+gone. What a keyless table still pays over a keyed one is its history's
+order (part 5, item 4).
