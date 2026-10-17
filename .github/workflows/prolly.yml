@@ -207,6 +207,9 @@ jobs:
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
             --self-test --out "$PWD/engine-results/vc-d1"
           src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly \
+            --self-test --out "$PWD/engine-results/vc-prolly"
+          src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am heap,prolly \
             --cases src/tools/prolly_bench/slt/internal/vcscenario/cases/sql-values.json \
             --out "$PWD/engine-results/vc-sql-adapters"
@@ -232,8 +235,12 @@ jobs:
             --out "$GITHUB_WORKSPACE/engine-results/dolt-port-review.json"
           go build -o "$GITHUB_WORKSPACE/build-bench/vc/dolt-corpus" ./cmd/dolt-corpus
 
-      - name: Imported Dolt scenarios on D1
+      - name: Imported Dolt scenarios on D1 and prolly
         run: |
+          src/tools/prolly_bench/prolly_bench vc \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly \
+            --cases src/tools/prolly_bench/corpus/dolt/scenarios \
+            --out "$PWD/engine-results/dolt-prolly"
           src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
             --cases src/tools/prolly_bench/corpus/dolt/scenarios \
@@ -248,7 +255,7 @@ jobs:
           status=0
           src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
-            --am heap,prolly,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4 \
+            --am heap,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4 \
             --cases src/tools/prolly_bench/corpus/dolt/scenarios \
             --out "$PWD/engine-results/dolt-unsupported" || status=$?
           test "$status" -eq 1
@@ -263,7 +270,7 @@ jobs:
           from pathlib import Path
           report = json.loads(Path("engine-results/dolt-unsupported-coverage.json").read_text())
           engines = {e["engine"]: e for e in report["engines"]}
-          assert set(engines) == {"heap", "prolly", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"}
+          assert set(engines) == {"heap", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"}
           planned = report["ported_cases"] + report["partial_cases"]
           assert planned > 0
           for engine in engines.values():

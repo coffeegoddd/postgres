@@ -41,14 +41,13 @@ zero-based mapping to scenario step IDs and a review note. An empty mapping
 requires a note and makes the case partial, never fully ported. All scenario
 steps must appear in the mapping.
 
-The first tranche preserves all 25 assertion entries from four cases:
+The first tranche preserves all 23 assertion entries from three cases:
 
 | Source behavior | Scenario |
 | --- | --- |
 | Three independent committed working sets | dolt-checkout-working-set |
 | Create, leave and revisit a branch | dolt-checkout-new-branch |
 | Distinct commits, HEAD/parent/main references and invalid refs | dolt-hashof |
-| Hard reset discards rows but continues generated key allocation | dolt-reset-identity |
 
 These ports explicitly adapt MySQL CALL/staging flags to native commit-all
 operations, capture returned commit IDs instead of MySQL variables, use
@@ -56,7 +55,10 @@ PostgreSQL identity columns, and check PostgreSQL SQLSTATEs. Upstream
 `SkipResultsCheck` on checkout becomes operation success plus active-branch
 verification; it is not propagated as a bypass.
 
-The manifest also records three deferred cases with concrete reasons.
+The manifest also records four deferred cases with concrete reasons. One is
+an intended divergence: a hard reset restores a versioned schema's
+sequences to the commit's values (they are per branch and in each commit),
+where Dolt continues its auto-increment counter.
 An active-transaction reset, mixed reset/staging, and merge-state reset cannot
 be represented by the current adapter without changing the behavior under
 test. Another 1,226 catalog cases remain unreviewed. No subset pass is a claim
