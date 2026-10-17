@@ -67,5 +67,92 @@ SELECT count(*) FROM dolt_constraint_violations();
 SELECT dolt_reset('--hard');
 SELECT count(*) FROM dolt_constraint_violations();
 
+-- A row a merge updates that breaks a unique constraint is recorded too.
+SELECT dolt_branch('-D', 'feature');
+SELECT dolt_branch('feature');
+SELECT dolt_checkout('feature');
+UPDATE cv.child SET code = 'z' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature recodes 1')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO cv.child VALUES (7, 1, 'z');
+SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('feature'))[3:4];
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
+-- (a table dropped since has none to fix)
+SAVEPOINT s;
+DROP TABLE cv.child;
+SELECT * FROM dolt_constraint_violations();
+ROLLBACK TO s;
+SELECT count(*) AS still_listed FROM dolt_constraint_violations();
+ROLLBACK;
+
+-- Violations kept stay through later merges that find none of their own.
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('feature'))[3:4];
+SELECT length(dolt_commit('-am', 'merged, a violation kept')::text) AS committed;
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('other');
+SELECT dolt_checkout('other');
+INSERT INTO cv.parent VALUES (3);
+SELECT length(dolt_commit('-am', 'other adds a parent')::text) AS committed;
+SELECT dolt_checkout('main');
+SET dolt.allow_commit_conflicts = on;
+INSERT INTO cv.parent VALUES (4);
+SELECT length(dolt_commit('-am', 'main adds a parent')::text) AS committed;
+SELECT (dolt_merge('other', '-m', 'merged other'))[3:4];
+RESET dolt.allow_commit_conflicts;
+SELECT table_name, num_violations FROM dolt_constraint_violations();
+
+-- A branch deleted takes its violations with it.
+SELECT dolt_checkout('other');
+SET session_replication_role = replica;	-- (no foreign key checks)
+INSERT INTO cv.child VALUES (8, 98, 'orphan on other');
+RESET session_replication_role;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints('cv.child');
+RESET dolt.allow_commit_conflicts;
+SELECT count(*) AS on_other FROM dolt_constraint_violations();
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'other');
+SELECT dolt_branch('other');
+SELECT dolt_checkout('other');
+SELECT count(*) AS on_a_new_other FROM dolt_constraint_violations();
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'other');
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints();
+RESET dolt.allow_commit_conflicts;
+DELETE FROM cv.child WHERE id = 7;
+SELECT dolt_verify_constraints();
+SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
+
+-- A revert that leaves a child without its parent records it.
+INSERT INTO cv.parent VALUES (10);
+SELECT (dolt_commit('-am', 'parent 10'))[1] AS parent10 \gset
+INSERT INTO cv.child VALUES (10, 10, 'ten');
+SELECT length(dolt_commit('-am', 'child of 10')::text) AS committed;
+SELECT dolt_revert(:'parent10');
+BEGIN;
+SELECT dolt_revert(:'parent10');
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
+ROLLBACK;
+
+-- Rows a parent's row security hides from its owner are seen anyway, as
+-- the foreign key's own checks see them.
+CREATE ROLE regress_cv_owner;
+GRANT USAGE ON SCHEMA cv TO regress_cv_owner;
+ALTER TABLE cv.parent OWNER TO regress_cv_owner;
+ALTER TABLE cv.child OWNER TO regress_cv_owner;
+ALTER TABLE cv.parent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cv.parent FORCE ROW LEVEL SECURITY;
+CREATE POLICY hide ON cv.parent USING (false);
+SET ROLE regress_cv_owner;
+SELECT count(*) AS hidden FROM cv.parent;
+SELECT dolt_verify_constraints('cv.child');
+SELECT count(*) AS none FROM dolt_constraint_violations();
+RESET ROLE;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
+DROP ROLE regress_cv_owner;

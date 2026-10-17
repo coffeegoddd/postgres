@@ -561,6 +561,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	bool		had_head;
 	bool		abort_merge = false;
 	int			conflicts;
+	int			known;
 	const char *result[4];
 
 	for (int i = 0; i < nargs; i++)
@@ -603,10 +604,12 @@ dolt_merge(PG_FUNCTION_ARGS)
 				 errmsg("dolt_merge needs a branch")));
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
+	known = list_length(PROLLY_CALL(refs(), violations));
 	conflicts = PROLLY_CALL(diff_merge(), merge, branch, message, flags, &id);
 	if (conflicts > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		/* (the violations it found, besides those the branch had) */
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
 
 		conflicts -= nviolations;
 		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
@@ -702,6 +705,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	bool		abort_pick = false;
 	bool		continue_pick = false;
 	int			conflicts;
+	int			known;
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -753,11 +757,12 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
+	known = list_length(PROLLY_CALL(refs(), violations));
 	conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1, false, allow_empty,
 							&id);
 	if (conflicts > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
 
 		conflicts -= nviolations;
 		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
@@ -791,7 +796,9 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
  * dolt_revert(VARIADIC args text[]) returns text[]: {status}
  *
  * commit...: their changes undone, in one commit; each named as the branch
- * was before any is.
+ * was before any is.  A row the undoing can't write (or leaves breaking a
+ * foreign key) is a constraint violation, as for a cherry-pick: status 1,
+ * the revert in progress until they're fixed and it's committed.
  */
 Datum
 dolt_revert(PG_FUNCTION_ARGS)
@@ -800,6 +807,8 @@ dolt_revert(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	const char *result[1] = {"0"};
 	ProllyHash	id;
+	int			known;
+	int			nviolations;
 
 	for (int i = 0; i < nargs; i++)
 		if (args[i][0] == '-')
@@ -808,8 +817,28 @@ dolt_revert(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_revert needs a commit")));
-	PROLLY_CALL(diff_merge(), cherry_pick, (const char *const *) args, nargs,
-				true, false, &id);
+	known = list_length(PROLLY_CALL(refs(), violations));
+	nviolations = PROLLY_CALL(diff_merge(), cherry_pick,
+							  (const char *const *) args, nargs, true, false, &id);
+
+	/*
+	 * Rows it couldn't write, or left breaking a foreign key: the revert in
+	 * progress, as a cherry-pick's, until they're fixed and committed (its
+	 * conflicts are an error).
+	 */
+	if (nviolations > 0)
+	{
+		nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("revert constraint violations detected, transaction rolled back"),
+					 errdetail_plural("%d row violates a constraint.",
+									  "%d rows violate constraints.",
+									  nviolations, nviolations),
+					 errhint("Revert in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
+		result[0] = "1";
+	}
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
