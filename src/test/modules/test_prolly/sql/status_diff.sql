@@ -184,3 +184,26 @@ SELECT * FROM dolt_status ORDER BY table_name;
 DROP SCHEMA sdv CASCADE;
 SELECT * FROM dolt_status ORDER BY table_name;
 SELECT length(dolt_commit('-Am', 'sdv gone')::text) AS committed;
+
+-- A head whose sequences have no values recorded (an older build's, or a
+-- fold that couldn't read them) isn't a change of their values.
+CREATE SCHEMA sdq VERSIONED;
+CREATE SEQUENCE sdq.s;
+SELECT nextval('sdq.s');
+SELECT length(dolt_commit('-Am', 'sdq')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS sdq_head \gset
+SELECT test_commit_of(test_root_without_sequence_values(test_fold_root()),
+					  'no values') AS novalues \gset
+SELECT test_refs_set_head(:'novalues');
+SELECT * FROM dolt_status;
+SELECT test_refs_set_head(:'sdq_head');
+
+-- A function recreated as an aggregate, which a commit doesn't cover, is
+-- listed once, as not covered (not also as deleted).
+CREATE FUNCTION sdq.f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+SELECT length(dolt_commit('-Am', 'sdq f')::text) AS committed;
+DROP FUNCTION sdq.f(int);
+CREATE AGGREGATE sdq.f(int) (SFUNC = int4pl, STYPE = int);
+SELECT * FROM dolt_status ORDER BY table_name;
+DROP SCHEMA sdq CASCADE;
+SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;

@@ -495,6 +495,25 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	}
 }
 
+typedef struct ObjectChanges
+{
+	ProllyTableChangeVisit visit;
+	void	   *arg;
+	List	   *left_out;		/* reported as not covered instead */
+} ObjectChanges;
+
+static void
+object_change(const char *name, ProllyDiffKind kind, void *arg)
+{
+	ObjectChanges *oc = arg;
+	ListCell   *lc;
+
+	foreach(lc, oc->left_out)
+		if (strcmp(lfirst(lc), name) == 0)
+			return;
+	oc->visit(name, kind, oc->arg);
+}
+
 static void
 folded_tables(const char *from_ref, const char *to_ref,
 			  ProllyTableChangeVisit visit, void *arg)
@@ -546,9 +565,15 @@ folded_tables(const char *from_ref, const char *to_ref,
 		}
 	}
 
-	/* the other objects */
-	PROLLY_CALL(components().canonicalizer, objects, &from_root, &to_root,
-				visit, arg);
+	/* the other objects, but those the reads left out (named below) */
+	if (PROLLY_HAS(components().canonicalizer, objects) &&
+		!same_hash(&from_root.hash, &to_root.hash))
+	{
+		ObjectChanges oc = {visit, arg, left_out};
+
+		PROLLY_CALL(components().canonicalizer, objects, &from_root, &to_root,
+					object_change, &oc);
+	}
 
 	/* (what the reads left out, once each) */
 	list_sort(left_out, string_cmp);
