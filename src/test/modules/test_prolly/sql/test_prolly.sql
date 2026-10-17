@@ -64,6 +64,10 @@ SELECT prolly_branch_create('feature', NULL) IS NULL AS created;
 SELECT prolly_branch_create(NULL, NULL);
 SELECT prolly_checkout('feature') IS NULL AS checked_out;
 SELECT prolly_commit('first commit') IS NOT NULL AS committed;
+-- (a head moved alone, as a fast-forward moves it, is a change of the refs)
+SELECT test_refs_epoch() AS refs_epoch \gset
+SELECT test_refs_set_head('HEAD');
+SELECT test_refs_epoch() > :refs_epoch AS epoch_moved;
 SELECT * FROM prolly_diff('main', 'feature');
 SELECT prolly_merge('feature') IS NOT NULL AS merged;
 SELECT prolly_clone('file:///nowhere');

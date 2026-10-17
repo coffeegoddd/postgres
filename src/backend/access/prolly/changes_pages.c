@@ -250,14 +250,6 @@ keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return PROLLY_CALL(f->kr, compare, f->k, a, b);
 }
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
-}
-
 static void
 finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 {
@@ -278,7 +270,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->env.compare = keying_compare;
 	f->env.compare_arg = f;
 	f->memenv = *env;
-	f->memenv.compare = memcmp_keys;
+	f->memenv.compare = prolly_bytes_compare;
 	f->memenv.compare_arg = NULL;
 	f->desc = RelationGetDescr(rel);
 	f->values = palloc_array(Datum, f->desc->natts);
@@ -852,7 +844,7 @@ carried_cmp(const void *a, const void *b)
 	ProllyKey	kx = {(const uint8 *) x->key, x->keylen};
 	ProllyKey	ky = {(const uint8 *) y->key, y->keylen};
 
-	return memcmp_keys(&kx, &ky, NULL);
+	return prolly_bytes_compare(&kx, &ky, NULL);
 }
 
 /* The carried keys as a tree (by bytes); an empty hash for none. */
@@ -973,7 +965,7 @@ pages_walk(const ProllyTreeEnv *env, const ProllyValue *state,
 
 	if (!parse_state(state, &st) || st.carried.hash.len == 0)
 		return;
-	memenv.compare = memcmp_keys;
+	memenv.compare = prolly_bytes_compare;
 	PROLLY_CALL(prolly_tree_lookup("cow"), walk, &memenv, &st.carried, visit, arg);
 }
 

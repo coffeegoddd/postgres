@@ -413,3 +413,60 @@ test_fold_items(PG_FUNCTION_ARGS)
 	PROLLY_CALL(tree, cursor_close, c);
 	return (Datum) 0;
 }
+
+/* The session's refs resolve ref, or error. */
+static void
+resolve_ref(const ProllyDatabaseComponents *dc, text *ref, ProllyHash *id)
+{
+	char	   *name = text_to_cstring(ref);
+
+	if (!PROLLY_CALL(dc->refs, resolve, name, id))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", name)));
+}
+
+/*
+ * test_commit_with(parent): commit the working set's root, as a merge's
+ * commit is made (the refs' commit_with), with parent as its one parent.
+ */
+PG_FUNCTION_INFO_V1(test_commit_with);
+Datum
+test_commit_with(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	parent;
+	ProllyNodeRef root;
+	ProllyHash	id;
+
+	prolly_database_components(&dc);
+	resolve_ref(&dc, PG_GETARG_TEXT_PP(0), &parent);
+	(void) PROLLY_CALL(dc.refs, working_set, NULL, &root);
+	PROLLY_CALL(dc.refs, commit_with, "committed with", &parent, 1, &root, &id);
+	PG_RETURN_TEXT_P(hash_text(&id));
+}
+
+/* test_refs_epoch(): the session's refs' epoch */
+PG_FUNCTION_INFO_V1(test_refs_epoch);
+Datum
+test_refs_epoch(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PG_RETURN_INT64((int64) PROLLY_CALL(dc.refs, epoch));
+}
+
+/* test_refs_set_head(ref): make ref's commit the session branch's head */
+PG_FUNCTION_INFO_V1(test_refs_set_head);
+Datum
+test_refs_set_head(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+
+	prolly_database_components(&dc);
+	resolve_ref(&dc, PG_GETARG_TEXT_PP(0), &id);
+	PROLLY_CALL(dc.refs, set_head, &id);
+	PG_RETURN_VOID();
+}

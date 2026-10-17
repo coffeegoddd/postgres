@@ -236,6 +236,21 @@ CREATE FUNCTION test_fold_counters(reset bool DEFAULT false, OUT pages int8,
 	OUT candidates int8, OUT full_tables int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The refs, below the version-control functions: a commit of the working
+-- set with a parent given (as a merge's commit is made), the refs' epoch,
+-- and a head moved with nothing else (as a fast-forward's).
+CREATE FUNCTION test_commit_with(parent text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_refs_epoch()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_refs_set_head(ref text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The folded canonical tree's items, for inspection.
 CREATE FUNCTION test_fold_items(OUT key text, OUT value text)
 RETURNS SETOF record

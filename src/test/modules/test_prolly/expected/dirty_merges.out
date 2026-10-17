@@ -128,6 +128,7 @@ SELECT nextval('dm.s1');
 SELECT (dolt_merge('feature'))[2:4];
 ERROR:  local changes would be stomped by merge
 DETAIL:  Sequence "dm.s1" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -241,6 +242,237 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- A merge that conflicts isn't made over uncommitted changes: its commit
+-- would take them in, and its abort (a reset) would lose them.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE dm.a SET v = 'theirs' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'feature changes 4')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE dm.a SET v = 'ours' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'main changes 4')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE dm.b SET v = 'kept' WHERE id = 3;
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+ERROR:  cannot merge with uncommitted changes when the merge conflicts
+DETAIL:  The merge has 1 conflicting rows.
+HINT:  Commit the changes, or reset the branch, first.
+ROLLBACK;
+SELECT id, v FROM dm.b WHERE id = 3;
+ id |  v   
+----+------
+  3 | kept
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dm.b       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A commit made as a merge's is (with a parent given) checks the parent
+-- is still the head, as any commit does.
+SELECT test_commit_with('HEAD~1');
+ERROR:  could not serialize access: branch "main" moved while this was being committed
+HINT:  The transaction might succeed if retried.
+SELECT test_commit_with('HEAD') IS NOT NULL AS committed_on_the_head;
+ committed_on_the_head 
+-----------------------
+ t
+(1 row)
+
+-- A materialized view refreshed is a change of its rows, not of its
+-- definition: a merge that doesn't refresh it goes ahead and leaves it
+-- uncommitted; one that does is refused.
+CREATE MATERIALIZED VIEW dm.mv AS SELECT count(*) AS n FROM dm.a;
+SELECT length(dolt_commit('-Am', 'a view')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE dm.b SET v = 'feature' WHERE id = 5;
+SELECT length(dolt_commit('-am', 'feature changes b')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO dm.a VALUES (6, 'a6');
+SELECT length(dolt_commit('-am', 'main adds a row')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT md5(value) AS mv_head FROM test_fold_items() WHERE key = 'm:dm.mv' \gset
+REFRESH MATERIALIZED VIEW dm.mv;
+SELECT md5(value) <> :'mv_head' AS refreshed FROM test_fold_items() WHERE key = 'm:dm.mv';
+ refreshed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged over a refresh'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+        message        
+-----------------------
+ merged over a refresh
+(1 row)
+
+SELECT n FROM dm.mv;
+ n 
+---
+ 6
+(1 row)
+
+SELECT md5(value) <> :'mv_head' AS still_refreshed FROM test_fold_items() WHERE key = 'm:dm.mv';
+ still_refreshed 
+-----------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (the merge's commit has the view as the head had it)
+SELECT md5(value) = :'mv_head' AS refresh_left_out FROM test_fold_items() WHERE key = 'm:dm.mv';
+ refresh_left_out 
+------------------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+INSERT INTO dm.a VALUES (7, 'a7');
+REFRESH MATERIALIZED VIEW dm.mv;
+SELECT length(dolt_commit('-am', 'feature refreshes it')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+REFRESH MATERIALIZED VIEW dm.mv;
+SELECT (dolt_merge('feature'))[2:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Materialized view "dm.mv" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A collation that orders otherwise now isn't an uncommitted change the
+-- merge must leave out: its commit records the collation as it is.
+CREATE COLLATION dm.c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE dm.k (k text COLLATE dm.c_utf8 PRIMARY KEY);
+INSERT INTO dm.k VALUES ('a'), ('b');
+SELECT length(dolt_commit('-Am', 'a collated table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE dm.b SET v = 'again' WHERE id = 5;
+SELECT length(dolt_commit('-am', 'feature changes b again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+SELECT (dolt_merge('feature', '-m', 'merged with a collation changed'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name | status 
+------------+--------
+(0 rows)
+
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -248,8 +480,11 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 DROP SCHEMA dm CASCADE;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table dm.a
 drop cascades to table dm.b
 drop cascades to sequence dm.s1
 drop cascades to sequence dm.s2
+drop cascades to materialized view dm.mv
+drop cascades to collation dm.c_utf8
+drop cascades to table dm.k

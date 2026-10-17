@@ -44,22 +44,12 @@ typedef struct RelKey
 	uint8		bytes[4];
 } RelKey;
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 /* The tree environment with this layout's key order. */
 static void
 layout_env(const ProllyRootEnv *env, ProllyTreeEnv *tenv)
 {
 	*tenv = *env->tree_env;
-	tenv->compare = memcmp_keys;
+	tenv->compare = prolly_bytes_compare;
 	tenv->compare_arg = NULL;
 }
 

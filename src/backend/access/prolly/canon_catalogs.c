@@ -152,16 +152,6 @@ typedef struct Canon
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 static void
 canon_env(Canon *cn)
 {
@@ -175,7 +165,7 @@ canon_env(Canon *cn)
 		cn->env.chunk_store = prolly_chunk_store();
 		cn->env.chunks = PROLLY_CALL(cn->env.chunk_store, open, MyDatabaseId,
 									 MyDatabaseTableSpace);
-		cn->env.compare = memcmp_keys;
+		cn->env.compare = prolly_bytes_compare;
 		return;
 	}
 	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
@@ -185,7 +175,7 @@ canon_env(Canon *cn)
 	cn->env.node_store = cn->c.node_store;
 	cn->env.store = PROLLY_CALL(cn->c.node_store, open, NULL);
 	cn->env.log = cn->c.log;
-	cn->env.compare = memcmp_keys;
+	cn->env.compare = prolly_bytes_compare;
 }
 
 /* Append s in UTF-8. */
@@ -291,7 +281,7 @@ base_table_cmp(const void *a, const void *b)
 	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
 	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
 
-	return memcmp_keys(&kx, &ky, NULL);
+	return prolly_bytes_compare(&kx, &ky, NULL);
 }
 
 /*
@@ -812,7 +802,7 @@ item_cmp(const ListCell *a, const ListCell *b)
 	ProllyKey	ka = {(const uint8 *) ia->key.data, ia->key.len};
 	ProllyKey	kb = {(const uint8 *) ib->key.data, ib->key.len};
 
-	return memcmp_keys(&ka, &kb, NULL);
+	return prolly_bytes_compare(&ka, &kb, NULL);
 }
 
 static void
@@ -2713,11 +2703,11 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 
 		/* the least key of the three, and which have it */
 		for (int i = 0; i < 3; i++)
-			if (more[i] && (least == NULL || memcmp_keys(&k[i], least, NULL) < 0))
+			if (more[i] && (least == NULL || prolly_bytes_compare(&k[i], least, NULL) < 0))
 				least = &k[i];
 		for (int i = 0; i < 3; i++)
 		{
-			has[i] = more[i] && memcmp_keys(&k[i], least, NULL) == 0;
+			has[i] = more[i] && prolly_bytes_compare(&k[i], least, NULL) == 0;
 			if (has[i])
 				definition_of(&k[i], &v[i], &def[i]);
 		}

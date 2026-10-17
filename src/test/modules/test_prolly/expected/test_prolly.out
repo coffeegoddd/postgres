@@ -557,6 +557,20 @@ SELECT prolly_commit('first commit') IS NOT NULL AS committed;
  t
 (1 row)
 
+-- (a head moved alone, as a fast-forward moves it, is a change of the refs)
+SELECT test_refs_epoch() AS refs_epoch \gset
+SELECT test_refs_set_head('HEAD');
+ test_refs_set_head 
+--------------------
+ 
+(1 row)
+
+SELECT test_refs_epoch() > :refs_epoch AS epoch_moved;
+ epoch_moved 
+-------------
+ t
+(1 row)
+
 SELECT * FROM prolly_diff('main', 'feature');
 ERROR:  prolly ref "main" does not exist
 SELECT prolly_merge('feature') IS NOT NULL AS merged;

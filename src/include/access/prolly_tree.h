@@ -64,6 +64,19 @@
 typedef int (*ProllyKeyCompare) (const ProllyKey *a, const ProllyKey *b,
 								 void *arg);
 
+/*
+ * Keys ordered by their bytes, a key before the longer ones it begins: the
+ * order of trees keyed by encoded names or hashes, the canonical root's
+ * among them.  A ProllyKeyCompare.
+ */
+static inline int
+prolly_bytes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
+
+	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
+}
+
 /* What a tree is made of; filled in by the caller. */
 typedef struct ProllyTreeEnv
 {
