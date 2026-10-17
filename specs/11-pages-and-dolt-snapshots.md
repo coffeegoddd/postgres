@@ -1,7 +1,7 @@
 # 11. Pages for the working set, Dolt-style history
 
-**Status: steps 0–5 built and merged (2026-10-17); steps 6–8 not
-started.** This replaces the design in which prolly trees are a table's
+**Status: steps 0–5 built and merged (2026-10-17), with the gaps each
+step's notes list; steps 6–8 not started.** This replaces the design in which prolly trees are a table's
 primary storage (engines D1–D4, `04-candidate-designs.md`). The decisions
 below marked "user" were made on the dates given; everything else is a
 recommendation to be settled before the step that needs it. Part 4 is the
@@ -490,13 +490,14 @@ fails without its fix), and Postgres's suites keep passing after each one.
   versions), #111 (fold epochs and the changed-page list), #112 (folds of
   only the rows changed), #113 (working-set checkpoints), #114 (the
   format frozen).
-- **As built:**
-  - A table without a primary key was read in full on any change
-    (issue #126); its rows' copies are now counted from the changed pages
-    as well.
-  - `dolt_status` and `dolt_diff` failed on objects a commit can't hold
-    yet (partitioned and foreign tables, aggregates, policies); reads now
-    leave them out and only a commit refuses them (issue #130).
+- **Gaps, open:**
+  - A table without a primary key is read in full on any change: its
+    commit, diff and status costs don't yet track changed pages (issue
+    #126, fixed by #136).
+  - `dolt_status` and `dolt_diff` fail on objects a commit can't hold yet
+    (partitioned and foreign tables, aggregates, policies), as a commit
+    does; and a diff of one table folds every changed table (issue #130,
+    fixed by #137).
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
@@ -531,14 +532,26 @@ fails without its fix), and Postgres's suites keep passing after each one.
   branches).
 - **As built:**
   - A detached checkout is a hidden branch at the commit, read-only for
-    the session on it, deleted once no session is on it.
-  - A branch made from a commit has only its head until first used; its
-    first use makes its copies. Making or deleting one takes what any
-    branch does (CREATE, ownership, a transaction that can write); its
-    first use takes neither, and a standby refuses it until the primary
-    has used it.
-  - A merge or cherry-pick that conflicts with uncommitted changes is
-    refused, as Dolt does.
+    the session on it. A checkout that leaves one deletes every hidden
+    branch no session is on, but only those the session may delete
+    (deleting a branch takes owning the database): one left by a session
+    that may not stays until one that may checks out.
+  - Every new branch has only its head until first used, whether made
+    from a branch (`dolt_branch`, `dolt_checkout -b`) or at a commit; only
+    one made from a branch with no commits is copied at once. Its first
+    use makes its copies.
+  - Making a branch takes what it always did: a valid name, CREATE on the
+    database and a transaction that can write; deleting one, owning the
+    database and a transaction that can write, head-only or not. The
+    first use takes none of these: a role without CREATE, or a read-only
+    transaction, can check out or connect to a branch someone else made.
+    A standby refuses a branch's first use until the primary has made it.
+  - With uncommitted changes, a merge (a fast-forward too), cherry-pick or
+    revert is refused, as Dolt refuses it, when it would change a table,
+    sequence or materialized view that has uncommitted changes. Unlike
+    Dolt, it is also refused whenever definitions change, whether
+    uncommitted or on either side of the merge, even without a conflict
+    ("cannot merge with uncommitted changes where definitions change").
 
 **Step 6. Remotes.**
 - File remotes first, then a network protocol of our own: fetch, push,
