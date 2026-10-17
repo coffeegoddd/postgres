@@ -354,6 +354,7 @@ SELECT length(dolt_commit('-Am', 'without mb')::text) AS committed;
 -- the index right after the merge and after a resolution.
 CREATE SCHEMA mt VERSIONED;
 CREATE TABLE mt.t (id int PRIMARY KEY, k int, big text);
+ALTER TABLE mt.t ALTER COLUMN big SET STORAGE EXTERNAL;
 CREATE INDEX mt_k ON mt.t (k);
 INSERT INTO mt.t SELECT g, g, repeat('a', 3000) || g FROM generate_series(1, 100) g;
 SELECT length(dolt_commit('-Am', 'mt base')::text) AS committed;
@@ -367,10 +368,13 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 UPDATE mt.t SET k = 3000 WHERE id = 3;
 SELECT length(dolt_commit('-am', 'mt main')::text) AS committed;
 SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
-SELECT length(big), left(big, 1) FROM mt.t WHERE id = 1;
+SELECT length(big), left(big, 1), pg_column_toast_chunk_id(big) IS NOT NULL AS out_of_line
+  FROM mt.t WHERE id = 1;
 SET enable_seqscan = off;
 SELECT id FROM mt.t WHERE k = 1000;
 SELECT id FROM mt.t WHERE k = 3000;
+SELECT id FROM mt.t WHERE k = 4000;
+SELECT count(*) AS stale FROM mt.t WHERE k IN (2, 3, 4);
 RESET enable_seqscan;
 
 -- (a conflict resolved with theirs: the index finds their value)

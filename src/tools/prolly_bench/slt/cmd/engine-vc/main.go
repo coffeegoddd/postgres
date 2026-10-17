@@ -114,14 +114,23 @@ func run() error {
 		return err
 	}
 	if *selfTest {
-		results, e := vcscenario.SelfTest(context.Background(), *dsn, *timeout)
+		var results []vcscenario.Result
+		var e error
+		for _, am := range strings.Split(*ams, ",") {
+			var r []vcscenario.Result
+			r, e = vcscenario.SelfTest(context.Background(), *dsn, am, *timeout)
+			results = append(results, r...)
+			if e != nil {
+				break
+			}
+		}
 		if err = writeJSON(filepath.Join(*out, "self-test.json"), map[string]any{"passed": e == nil, "controls": results}); err != nil {
 			return err
 		}
 		if e != nil {
 			return e
 		}
-		fmt.Println("adapter self-test: all five negative controls verified (not corpus passes)")
+		fmt.Printf("adapter self-test: all %d negative controls verified on %s (not corpus passes)\n", len(results), *ams)
 	}
 	n := 0
 	for _, p := range sum.Profiles {
