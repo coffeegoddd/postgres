@@ -32,8 +32,9 @@ distributions.
 do better than Dolt. The Status column is D1's, as of 2026-10-14. For the
 page design (`11-pages-and-dolt-snapshots.md`), built through its step 5 on
 2026-10-17: status, diff and commit fold only the pages changed since the
-branch's last fold (counted by the change finder), except that a table
-without a primary key is still read in full on any change (issue #126);
+branch's last fold (counted by the change finder), tables without a
+primary key included (#136; a fold in the transaction that wrote a keyless
+table's rows still leaves the next fold to read it in full);
 creating a branch writes only its head until it is first used; merges,
 cherry-picks and reverts apply the tree diff as rows; fetch, push, clone
 and pull are not built (step 6). Step 8 rechecks every row here against
