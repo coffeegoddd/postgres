@@ -29,6 +29,11 @@
  *   qualified name, its data tree and its definition as described.
  * - same_schema() is whether two folded roots hold the same objects with
  *   the same definitions, whatever their tables' rows.
+ * - objects() visits each object other than a table (a schema, function,
+ *   procedure, view, materialized view, type or sequence) that two folded
+ *   roots hold differently, in the canonical tree's order: by kind, then
+ *   qualified name (a routine's with its argument types).  A sequence
+ *   whose value differs, or a materialized view whose rows do, differs.
  * - sequences() visits each sequence a folded root holds, in name order,
  *   with its value: its last value, and whether it was given out.
  * - merge_schema() merges three folded roots' definitions: each object as
@@ -58,6 +63,10 @@
  */
 typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 										  bool called, void *arg);
+
+/* Visits one object (not a table) two canonical roots hold differently. */
+typedef void (*ProllyCanonObjectVisit) (const char *name, ProllyDiffKind kind,
+										void *arg);
 
 /*
  * Visits one table of a canonical root.  unreadable is NULL, or why its
@@ -93,6 +102,8 @@ typedef struct ProllyCanonRoutine
 	void		(*materialized_views) (const ProllyNodeRef *root,
 									   ProllyCanonTableVisit visit, void *arg);
 	bool		(*same_schema) (const ProllyNodeRef *a, const ProllyNodeRef *b);
+	void		(*objects) (const ProllyNodeRef *from, const ProllyNodeRef *to,
+							ProllyCanonObjectVisit visit, void *arg);
 	void		(*move_schema) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 								void (*rows) (void *arg), void *arg);
 	void		(*sequences) (const ProllyNodeRef *root,
@@ -135,7 +146,7 @@ typedef struct ProllyCanonRoutine
 
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"walk", "fold", "tables", \
-	"materialized_views", "same_schema", "move_schema", "sequences", \
+	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
 	"in_format", "format"
 #define PROLLY_CANON_FIRST_CALLBACK walk

@@ -416,3 +416,83 @@ SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;
         66
 (1 row)
 
+-- dolt_status lists objects other than tables that changed, by qualified
+-- name, as Doltgres does: views, functions (with their argument types),
+-- sequences (their definitions and their values) and schemas.
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE SCHEMA sdv VERSIONED;
+CREATE TABLE sdv.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'sdv')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE VIEW sdv.v AS SELECT id FROM sdv.t;
+CREATE FUNCTION sdv.f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE SEQUENCE sdv.s;
+SELECT * FROM dolt_status ORDER BY table_name;
+   table_name   | staged |  status   
+----------------+--------+-----------
+ sdv.f(integer) | t      | new table
+ sdv.s          | t      | new table
+ sdv.v          | t      | new table
+(3 rows)
+
+SELECT length(dolt_commit('-Am', 'sdv objects')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE OR REPLACE VIEW sdv.v AS SELECT id, 1 AS one FROM sdv.t;
+DROP FUNCTION sdv.f(int);
+SELECT nextval('sdv.s');
+ nextval 
+---------
+       1
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY table_name;
+   table_name   | staged |  status  
+----------------+--------+----------
+ sdv.f(integer) | t      | deleted
+ sdv.s          | t      | modified
+ sdv.v          | t      | modified
+(3 rows)
+
+DROP SCHEMA sdv CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table sdv.t
+drop cascades to view sdv.v
+drop cascades to sequence sdv.s
+SELECT * FROM dolt_status ORDER BY table_name;
+   table_name   | staged | status  
+----------------+--------+---------
+ sdv            | t      | deleted
+ sdv.f(integer) | t      | deleted
+ sdv.s          | t      | deleted
+ sdv.t          | t      | deleted
+ sdv.v          | t      | deleted
+(5 rows)
+
+SELECT length(dolt_commit('-Am', 'sdv gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

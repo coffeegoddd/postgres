@@ -199,7 +199,8 @@ string_cmp(const ListCell *a, const ListCell *b)
 }
 
 static List *
-tables_of_reading(const char *ref, Oid relid, List **left_out)
+tables_of_reading(const char *ref, Oid relid, List **left_out,
+				  ProllyNodeRef *root_out)
 {
 	ProllyNodeRef root;
 	Tables		ts = {NIL};
@@ -209,6 +210,8 @@ tables_of_reading(const char *ref, Oid relid, List **left_out)
 						   &root, left_out);
 	else
 		root_of(ref, &root);
+	if (root_out)
+		*root_out = root;
 	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
 	if (OidIsValid(relid))
 	{
@@ -222,7 +225,7 @@ tables_of_reading(const char *ref, Oid relid, List **left_out)
 static List *
 tables_of(const char *ref, Oid relid)
 {
-	return tables_of_reading(ref, relid, NULL);
+	return tables_of_reading(ref, relid, NULL, NULL);
 }
 
 static bool
@@ -498,11 +501,23 @@ folded_tables(const char *from_ref, const char *to_ref,
 {
 	List	   *left_out = NIL;
 	ListCell   *lc;
-	List	   *from = tables_of_reading(from_ref, InvalidOid, &left_out);
-	List	   *to = is_working(to_ref) && is_working(from_ref) ? from :
-		tables_of_reading(to_ref, InvalidOid, &left_out);
-	ListCell   *a = list_head(from);
-	ListCell   *b = list_head(to);
+	ProllyNodeRef from_root;
+	ProllyNodeRef to_root;
+	List	   *from = tables_of_reading(from_ref, InvalidOid, &left_out,
+										 &from_root);
+	List	   *to;
+	ListCell   *a;
+	ListCell   *b;
+
+	if (is_working(to_ref) && is_working(from_ref))
+	{
+		to = from;
+		to_root = from_root;
+	}
+	else
+		to = tables_of_reading(to_ref, InvalidOid, &left_out, &to_root);
+	a = list_head(from);
+	b = list_head(to);
 
 	/* both in the canonical tree's order (UTF-8 bytes): a merge */
 	while (a || b)
@@ -530,6 +545,10 @@ folded_tables(const char *from_ref, const char *to_ref,
 			b = lnext(to, b);
 		}
 	}
+
+	/* the other objects */
+	PROLLY_CALL(components().canonicalizer, objects, &from_root, &to_root,
+				visit, arg);
 
 	/* (what the reads left out, once each) */
 	list_sort(left_out, string_cmp);
