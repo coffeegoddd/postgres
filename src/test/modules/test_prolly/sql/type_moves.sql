@@ -52,3 +52,52 @@ SELECT * FROM tm.counts ORDER BY m;
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA tm CASCADE;
+
+-- What uses a changed type moves with it: a composite type and a domain
+-- over it, a routine, a default, a check and a partial index; an array of
+-- a composite that gains an attribute of a type new to it; a domain's
+-- check that rows about to go would fail; a materialized view over one
+-- that changes, committed stale; and back, a NOT NULL column's label going.
+CREATE SCHEMA tm2 VERSIONED;
+CREATE TYPE tm2.mood AS ENUM ('sad', 'ok');
+CREATE TYPE tm2.wrap AS (m tm2.mood);
+CREATE DOMAIN tm2.calm AS tm2.mood CHECK (VALUE <> 'sad');
+CREATE FUNCTION tm2.f(m tm2.mood) RETURNS text LANGUAGE sql AS $$ SELECT m::text $$;
+CREATE DOMAIN tm2.pos AS int CHECK (VALUE > 0);
+CREATE TYPE tm2.pair AS (x int, y int);
+CREATE TABLE tm2.t (id int PRIMARY KEY, m tm2.mood NOT NULL DEFAULT 'ok',
+	w tm2.wrap, c tm2.calm, p tm2.pos, prs tm2.pair[],
+	CONSTRAINT not_sad CHECK (m <> 'sad' OR id > 0));
+CREATE INDEX t_ok ON tm2.t (id) WHERE m = 'ok';
+INSERT INTO tm2.t VALUES (1, 'ok', ROW('ok'), 'ok', 50, '{"(1,2)"}'),
+	(2, 'sad', ROW('sad'), NULL, 500, '{}');
+CREATE MATERIALIZED VIEW tm2.mv1 AS SELECT id FROM tm2.t;
+CREATE MATERIALIZED VIEW tm2.mv2 AS SELECT count(*) AS n FROM tm2.mv1;
+SELECT length(dolt_commit('-Am', 'tm2 base')::text) AS committed;
+SELECT dolt_branch('feature2');
+SELECT dolt_checkout('feature2');
+ALTER TYPE tm2.mood ADD VALUE 'happy';
+CREATE TYPE tm2.color AS ENUM ('red', 'blue');
+ALTER TYPE tm2.pair ADD ATTRIBUTE c tm2.color;
+DELETE FROM tm2.t WHERE id = 2;
+ALTER DOMAIN tm2.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN tm2.pos ADD CONSTRAINT pos_check CHECK (VALUE > 0 AND VALUE < 100);
+INSERT INTO tm2.t VALUES (3, 'happy', ROW('happy'), 'happy', 3, '{"(5,6,red)"}');
+DROP MATERIALIZED VIEW tm2.mv2;
+DROP MATERIALIZED VIEW tm2.mv1;
+CREATE MATERIALIZED VIEW tm2.mv1 AS SELECT id, m FROM tm2.t;
+CREATE MATERIALIZED VIEW tm2.mv2 AS SELECT count(*) AS n FROM tm2.mv1;
+INSERT INTO tm2.t VALUES (4, 'ok', NULL, NULL, 4, NULL);	-- (the views stale)
+SELECT length(dolt_commit('-Am', 'tm2 feature')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('feature2'))[2:4];
+SELECT test_fold_root() = prolly_root_hash('feature2') AS same_root;
+SELECT id, m, w, c, p, prs FROM tm2.t ORDER BY id;
+SELECT tm2.f('happy'), (SELECT count(*) FROM tm2.mv1) AS mv1_stale, (SELECT n FROM tm2.mv2) AS mv2;
+SELECT count(*) AS no_leftovers FROM pg_type WHERE typname LIKE 'prolly_moving_%';
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+SELECT id, m, w, c, p, prs FROM tm2.t ORDER BY id;
+
+SELECT dolt_branch('-D', 'feature2');
+DROP SCHEMA tm2 CASCADE;
