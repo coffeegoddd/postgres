@@ -177,9 +177,9 @@ typedef struct ProllyTreeRoutine
 	/*
 	 * Visit every node reachable from root (value trees too), parents
 	 * before children, skipping what lies below a node the visitor
-	 * declines.
+	 * declines.  Returns whether the visitor took root.
 	 */
-	void		(*walk) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+	bool		(*walk) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						 ProllyTreeVisitNode visit, void *arg);
 
 	/*

@@ -223,6 +223,11 @@ CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- How many nodes the refs' walk visits, one node (by hash) declined.
+CREATE FUNCTION test_refs_walk_count(declined text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- Each table's data tree in the session branch's working set, folded
 -- once: its qualified name, the tree's hash, and why its tree can't be
 -- read as ordered now, if it can't.

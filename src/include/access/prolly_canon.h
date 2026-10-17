@@ -21,7 +21,8 @@
  *   it doesn't cover yet is an error, never a hash that might depend on
  *   history.
  * - walk() visits every node a canonical root keeps alive, for
- *   reclamation.
+ *   reclamation and transfer; a root the visitor declines isn't looked
+ *   into (the trees it names are taken as seen), as a tree's node isn't.
  * - fold() builds the canonical root of the session branch's versioned
  *   schemas as the calling transaction sees them, folding their tables'
  *   rows into trees: the same for the same logical content, however the

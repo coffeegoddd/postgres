@@ -1,0 +1,29 @@
+-- A walk of what the refs keep alive doesn't look below a commit the
+-- visitor declines: neither its root's trees nor its parents.  A store
+-- that has a commit has all it reaches, so a transfer's walk stops there.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE SCHEMA wk VERSIONED;
+CREATE TABLE wk.t (id int PRIMARY KEY, v text);
+INSERT INTO wk.t SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+SELECT length(dolt_commit('-Am', 'wk 1')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS c1 \gset
+UPDATE wk.t SET v = 'w' WHERE id <= 10;
+SELECT length(dolt_commit('-am', 'wk 2')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS c2 \gset
+UPDATE wk.t SET v = 'x' WHERE id > 1990;
+SELECT length(dolt_commit('-am', 'wk 3')::text) AS committed;
+
+-- declining a node below the head commits saves nothing above it; declining
+-- the head's parent saves its root, its parent's commit and their trees
+SELECT test_refs_walk_count(NULL) AS all_nodes \gset
+SELECT test_refs_walk_count(:'c2') AS without_c2 \gset
+SELECT test_refs_walk_count(:'c1') AS without_c1 \gset
+SELECT :without_c1 < :all_nodes AS declined_c1_saves,
+	:without_c2 < :without_c1 AS declined_c2_saves_more;
+
+DROP SCHEMA wk CASCADE;
+SELECT length(dolt_commit('-Am', 'wk gone')::text) AS committed;

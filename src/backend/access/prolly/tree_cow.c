@@ -1198,15 +1198,18 @@ cow_key_at(const ProllyTreeEnv *env, const ProllyNodeRef *root, uint64 ordinal,
 	}
 }
 
-static void
+/* Whether the visitor took the node. */
+static bool
 walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 		  ProllyTreeVisitNode visit, void *arg)
 {
 	TNode		node;
+	bool		took;
 
 	CHECK_FOR_INTERRUPTS();
 	node_read(env, ref, &node);
-	if (!visit(&node.ref, node.level, arg))
+	took = visit(&node.ref, node.level, arg);
+	if (!took)
 		;						/* the visitor has seen what is below */
 	else if (node.level == 0)
 	{
@@ -1226,7 +1229,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 
 				value_env(env, &venv);
 				decode_value_ref(&v, &vroot, &len);
-				walk_node(&venv, &vroot, visit, arg);
+				(void) walk_node(&venv, &vroot, visit, arg);
 			}
 		}
 	}
@@ -1238,17 +1241,18 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 			uint64		count;
 
 			node_child(env, &node, i, &child, &count);
-			walk_node(env, &child, visit, arg);
+			(void) walk_node(env, &child, visit, arg);
 		}
 	}
 	node_release(&node);
+	return took;
 }
 
-static void
+static bool
 cow_walk(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		 ProllyTreeVisitNode visit, void *arg)
 {
-	walk_node(env, root, visit, arg);
+	return walk_node(env, root, visit, arg);
 }
 
 /* ------------------------------------------------------------------------

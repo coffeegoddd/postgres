@@ -1612,10 +1612,12 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 	copy = palloc(sizeof(ProllyHash));
 	*copy = *id;
 	ws->seen = lappend(ws->seen, copy);
-	if (!copies_commit_get(id, &info))
-		return;
+
+	/* (a commit the visitor declines: it has seen its root and parents) */
 	ref_of(id, &ref);
-	PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg);
+	if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg) ||
+		!copies_commit_get(id, &info))
+		return;
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
 	for (int i = 0; i < info.nparents; i++)
