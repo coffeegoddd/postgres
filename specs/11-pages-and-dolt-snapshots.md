@@ -380,7 +380,7 @@ last state.
 | Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests went with D1 (#178), what only they covered ported first (#177) |
 | The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC; removed with D1 (#183) |
 | D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Removed by #177, #178 and #183, ahead of step 8, which builds them from `cff08be5c3`, D1's last state |
-| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of versioned schemas; #34 stays harmless |
+| `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of versioned schemas; #34 reverted with D1 (#183) |
 
 ### Steps
 
