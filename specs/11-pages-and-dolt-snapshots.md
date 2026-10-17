@@ -362,21 +362,22 @@ As this plan was written (2026-10-15):
   versioned databases, and the 16 fixes from Postgres's own suites (4h).
 
 As of 2026-10-17, steps 0–5 below are built and merged; each step says
-with which PRs.
+with which PRs. D1 has been removed (#177, #178, #183): the "Today" column
+below is its history, at the tag `prolly-d1`.
 
 ### What carries over
 
 | Today | In the new design |
 |---|---|
 | `dolt_*` functions, views, `dolt.author`, `db/branch` connections, conflicts as in Dolt (#25, #26) | Kept; their backend changes to per-branch copies and the chunk store |
-| `CREATE DATABASE … VERSIONED` and its refusal of heap tables (#27) | Superseded: version control is per schema (versioned schemas), so any database can hold both. Removed with D1 |
+| `CREATE DATABASE … VERSIONED` and its refusal of heap tables (#27) | Superseded: version control is per schema (versioned schemas), so any database can hold both. Removed with D1 (#178, #183) |
 | Hash, key encoding, canonical rows, value trees, canonicalizer (4a, #18, #23) | Kept: the chunk store's contents |
 | Copy-on-write trees, subtree-skipping diff, three-way merge, merge conflicts, refs, commits (4c, #9, #21, #22, #26) | Kept; they operate on chunks from the new store instead of node-store pages |
 | Chunker, node format | Reworked: the byte-based rule (step 5's plan) and pageless nodes |
 | Interface registry and stub pattern (`prolly_registry.c`) | Kept; the new interfaces register there |
-| Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests go with D1 |
-| The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC |
-| D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Kept building until the new design is measured against them (step 8), then removed |
+| Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests went with D1 (#178), what only they covered ported first (#177) |
+| The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC; removed with D1 (#183) |
+| D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Removed on 2026-10-17 (#177, #178, #183), ahead of step 8, which builds them from the tag `prolly-d1` |
 | `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of versioned schemas; #34 stays harmless |
 
 ### Steps
@@ -397,7 +398,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
   checkpoints, and AIO reads.
 - The `prolly` table access method: heap's implementation on block-mapped
   storage, with its indexes and TOAST tables block-mapped too. D1's index
-  AM, which holds the name `prolly`, becomes `prolly_d1_index`.
+  AM, which holds the name `prolly`, becomes `prolly_d1_index` (removed
+  with D1, #183).
 - No branches yet, so no sharing and no remapping.
 - **Exit:** with `default_table_access_method = prolly`, gates 1–3 match
   stock Postgres; crash, standby and base-backup tests of the map pass.
@@ -584,10 +586,14 @@ order, each a PR:
    their resolution, branches and merges across crashes and standbys:
    `t/019`–`t/023`); and whether `src/test/prolly`'s run of the core
    regression suite with prolly as the default table AM (`prolly_am.conf`)
-   runs on D1 is checked, and if so replaced for this design.
+   runs on D1 is checked, and if so replaced for this design. **Done
+   (#177):** the behaviors are tested on versioned schemas, and
+   `src/test/prolly` defaults to `prolly`.
 2. **D1's SQL surface:** the `prolly_*` version-control functions,
    `CREATE DATABASE … VERSIONED`, the `prolly_d1` table AM and the prolly
-   index AM, `prolly_gc()`.
+   index AM, `prolly_gc()`. **Done (#178, #183):** D1's tests, harness
+   targets and tool adapters went first (#178), its SQL surface with its
+   code (#183).
 3. **D1's implementations:** the engines (`d1`; `d2`–`d4`, stubs),
    coordination, the node store, root layout, row identity, the commit
    pipeline, the log, reclamation's `mark_sweep`, refs `tree`, diff-merge
@@ -597,8 +603,13 @@ order, each a PR:
    (engine, coordination, node store, root layout, row identity, commit
    pipeline, log, and any other left with only a stub); every interface
    this design uses stays, reclamation's among them (step 7 implements it
-   again).
+   again). **Done (#183):** the interfaces kept and removed are listed in
+   `00-architecture-principles.md`; their numbers are kept, with gaps.
+   Removing D1 also removed its WAL resource managers (Prolly,
+   ProllyStore, ProllyCommit; ProllyChunks stays), lock tags, settings,
+   two-phase-commit hooks and `pg_database.datversioned`.
 4. **The specs:** D1's columns and rows become pointers to history.
+   **Done:** specs 00, 04, 07, 08, 10, 12 and this part point to the tag.
 
 ### Risks to retire early
 
@@ -760,7 +771,8 @@ indexes, which follow their table) in block-mapped storage. Prolly tables
 are permanent: with `prolly` as the default, temporary and unlogged tables
 get heap; `USING prolly` on one, `SET UNLOGGED` on a prolly table and
 `SET ACCESS METHOD prolly` on an unlogged one are refused. D1's index
-access method, which held the name, is now `prolly_d1_index`.
+access method, which held the name, became `prolly_d1_index` (removed with
+D1, #183).
 
 With `default_table_access_method = prolly`: isolation 134 of 134;
 regression 236 of 239, the three others (`identity`, `alter_table`,
@@ -831,8 +843,7 @@ Proposed 2026-10-16; built as a stack, one PR per part, in this order.
   later its head and baseline. `main` is a bootstrap row with a fixed OID.
   Branch id 0 means "shared": no branch.
 - A session's branch, `MyBranch`, is `main` unless the connection named
-  another (`dbname/branch`, as D1 sessions do; a database D1 versions
-  keeps D1's meaning). `dolt_checkout()` changes it and resets the
+  another (`dbname/branch`). `dolt_checkout()` changes it and resets the
   backend's caches as an invalidation overflow does.
 
 ### 6.3 Branch-aware catalogs

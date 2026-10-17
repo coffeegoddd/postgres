@@ -59,67 +59,71 @@ AMs (`IndexAmRoutine`), storage managers (`smgrsw`) and WAL resource managers
 Each of these is an interface with the implementations listed. Names are
 provisional.
 
-| Interface | Responsibility | Implementations planned (built so far in bold) |
+| Interface | Responsibility | Implementations (built in bold) |
 |---|---|---|
-| **Engine** | The tree as a whole: cursors, private writes, commit, checkpoint, redo, reclamation (`02-postgres-integration.md` section C) | D1, D2, D3a, D3b, D4, (D5), stub |
-| **Coordination** | Row locks, insert intents, range locks, commit markers, SSI mapping | One writer per table (**single_writer**, until 4e), K1, K2, K3, stub |
-| **Node page format** | Layout of a node in a page: canonical region, unhashed special space, item access, per-child block hints | One per engine family (**basic**) |
-| **Chunker / boundary rule** | Where node boundaries fall; forced splits | Key-only (**keyhash**), key + bytes |
-| **Content hash** | Hashing the canonical region | SHA-256 (**sha256**), others if measured |
+| **Chunker / boundary rule** | Where node boundaries fall; forced splits | By the bytes a node holds (**bytes**, step 5; replaced key-only **keyhash**) |
+| **Content hash** | Hashing a chunk's bytes | SHA-256 (**sha256**), others if measured |
 | **Key encoder** | memcmp-comparable keys from btree opclasses and collations; no local OIDs | Per opclass, plus a comparator fallback (**ordered**) |
-| **Value encoder** | Row encoding and deforming into slots | Canonical portable format (**canonical**, the default since 2026-10-13), Postgres tuple format (**heaptuple**, kept for comparison) |
-| **Node store** | Finding and reading or writing nodes: hash → block map, physical location, object store | Cluster-wide hash-addressed (**global**), location-addressed |
-| **Root layout** | How a branch's root finds every relation's tree: catalog, user-data and (working set only) local sub-roots | Sub-roots keyed by relfilenumber for the working set (**subroots**); by name for canonical roots (4g) |
-| **Tree** | Persistent prolly-tree operations over the foundation: build, get, cursors, batched apply, count, walk, diff | Copy-on-write in a hash-addressed store (**cow**); location-addressed engines (D3, D4) to be decided when they are built |
-| **Allocator** | Space management for in-place engines | Fixed-size blocks; variable-size |
-| **Reclamation** | Deciding what is garbage and freeing it | Root-reachability GC, birth epoch, lazy refcounts, in-page vacuum |
-| **Log** | What the WAL records contain and how they are replayed | Full chunk (**chunks**), delta, logical |
-| **Commit pipeline** | Branch heads; ordering and publishing roots at commit; their WAL and checkpoint | One committer per branch (**serial**), ordered pipeline |
-| **Row identity** | TIDs ↔ row versions | TIDs from a per-table counter with a map both ways (**counter**, since 4d.2; replaced content-derived **hashed**, question 37), wide row ids |
-| **Table keying** | How a table's rows become tree items: key, value layout, content hash | Primary key, else row content with a count (**pk_or_content**) |
-| **Index keying** | How a prolly index's entries are made: index columns, then the row's key and ordinal; bounds for seeking | **columns_then_row** (4d.3) |
-| **Refs and commit graph** | Branches, commits, history storage | A refs file per database (proposed; catalogs can't hold refs now that they are versioned), others |
-| **Canonical export / transfer** | Producing canonical chunks; clone/push/fetch transport | Local copy, network protocol |
-| **Diff / merge** | Row diff and three-way merge between refs, over canonical trees | Structural diff (added in step 1; see below) |
-| **Schema canonicalizer** | Deriving the canonical, OID-free schema from catalog rows, and rebuilding local catalogs from it | Catalog-driven, using `BKI_LOOKUP` metadata and the deparser (decided 2026-10-13, `09-versioned-catalogs.md`; to be defined in step 4g) |
+| **Value encoder** | Row encoding and deforming into slots | Canonical portable format (**canonical**) |
+| **Chunk format** | Layout of a tree node as a chunk of its own length | **basic** |
+| **Tree** | Persistent prolly-tree operations: build, get, cursors, batched apply, count, walk, diff | Copy-on-write in the chunk store (**cow**) |
+| **Table keying** | How a folded table's rows become tree items: key, value layout, content hash | Primary key, else the row's leading bytes and hash with a count (**pk_or_prefix**, #149; replaced **pk_or_content**) |
+| **Chunk store** | A database's chunks and root: appends, root moves, WAL, checkpoints | Append-only journal, conjoined into table files (**journal**) |
+| **Table file** | The format of a file of chunks with its index | **basic** |
+| **Change finder** | Which rows changed since a fold | From the pages block-mapped storage lists as changed (**pages**) |
+| **Row applier** | Writing rows into a branch's tables when a head moves | As logical replication's apply worker writes them (**replication**) |
+| **Refs and commit graph** | Branches, commits, tags, remotes, merge state | In the chunk store's root (**copies**) |
+| **Transfer** | Moving commits between stores: what to send, checking what is received | The chunks a commit reaches that the other side lacks (**chunks**) |
+| **Remote** | Where a remote's chunks and heads live | A directory (**file**); network and object storage later |
+| **Diff / merge** | Row diff and three-way merge between commits, over canonical trees | **folded** |
+| **Schema canonicalizer** | Deriving the canonical, OID-free schema from catalog rows, folding tables' rows, and moving definitions back | **folded** (`09-versioned-catalogs.md`, `11-pages-and-dolt-snapshots.md`) |
+| **Reclamation** | Deciding what is garbage and freeing it | Online GC of the chunk store (step 7) |
 | **Benchmark workload** | One S or V workload | S1–S9, V1–V4 |
 | **Metric collector** | One metric source | WAL, diskstats, `pg_stat_io`, perf, engine counters |
 | **Result sink** | Where results go | Files under `specs/results/`, others |
 
-**Diff / merge** was added while building step 1: the `prolly_diff` and
-`prolly_merge` SQL functions needed an interface to call, and diff and merge
-work on canonical trees independently of the engine. Canonical export lives on
-the Engine interface (`canonical_root`, `export_chunks`); the transfer
-interface covers clone, fetch and push.
+The working set has no interface of its own here: it is heap's pages, in
+block-mapped storage (`11-pages-and-dolt-snapshots.md`, part 5).
 
-**Tree** was added in step 4c. Engines build tables, indexes and root sets
-from trees, and two engines that share a node store (D1, D2) share tree
-code, so the tree operations are their own interface rather than part of
-each engine. A tree is an immutable map identified by its root; the
-foundation components it uses come from the engine (`prolly_tree.h`).
+**Removed with D1 (2026-10-17, #183).** These were the tree engines'
+interfaces; no component of the page design used them. Their code is at
+the tag `prolly-d1`, and `04-candidate-designs.md` describes them.
 
-**Root layout** was added after step 4c (question 33): the two-sub-root
-shape of a branch's root is the same for every engine that keeps
-hash-addressed trees, and the canonical root will reuse it, so it is an
-interface over Tree rather than part of an engine (`prolly_rootlayout.h`).
+| Interface | Responsibility | Implementations built |
+|---|---|---|
+| Engine | The tree as primary storage: cursors, private writes, commit, checkpoint, redo | D1 (D2–D4 stubs) |
+| Coordination | Row locks, insert intents, range locks, commit markers | single_writer, K1 |
+| Node page format | A node in a page, with per-child block hints | basic |
+| Node store | Finding and reading or writing nodes: hash → block map | global |
+| Root layout | How a branch's root finds every relation's tree | subroots |
+| Allocator | Space management for in-place engines | none |
+| Log | What the WAL records contain and how they are replayed | chunks |
+| Commit pipeline | Branch heads; ordering and publishing roots at commit | serial |
+| Row identity | TIDs ↔ row versions | counter |
+| Index keying | A prolly index's entries | columns_then_row |
+
+**Diff / merge** was added while building step 1: the version-control SQL
+functions needed an interface to call, and diff and merge work on canonical
+trees independently of how the working set is stored.
+
+**Tree** was added in step 4c, and is kept: trees are where commits'
+canonical form lives (`prolly_tree.h`).
 
 **Table keying** was added in step 4d.1 (question 36): how rows become
-tree items is independent of the engine, and other rules (always by
-content, by a synthetic id) stay possible (`prolly_keying.h`).
+tree items is independent of the rest, and other rules stay possible
+(`prolly_keying.h`).
 
-**Index keying** was added in step 4d.3 (question 42): a prolly index's
-entries hold the row's key, never a TID, and how they are laid out is its
-own interface (`prolly_ixkeying.h`).
+The page design's interfaces (chunk store, chunk format, table file, change
+finder, row applier, remote) were added with its steps 3–6.
 
-The C interfaces (everything above the benchmark rows) were defined in step 1:
-headers `src/include/access/prolly_*.h`, except the schema canonicalizer,
-added to the design on 2026-10-13 and to be defined when step 4g needs it. The benchmark workload, metric
+The C interfaces (everything above the benchmark rows) are headers
+`src/include/access/prolly_*.h`. The benchmark workload, metric
 collector and result sink interfaces belong to the harness and are defined in
 step 2.
 
-The Postgres-facing adapters (the table AM and index AM handlers, the WAL
-resource managers and the core-patch hooks) are thin: they translate Postgres
-calls into calls on these interfaces and contain no engine logic.
+The Postgres-facing adapters (the table AM handler, the WAL resource
+manager and the core-patch hooks) are thin: they translate Postgres calls
+into calls on these interfaces and contain no storage logic.
 
 ## Performance
 
