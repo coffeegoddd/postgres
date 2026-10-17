@@ -1859,3 +1859,501 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		PROLLY_CALL(diff_merge(), resolve, lfirst_oid(lc), side == 2);
 	PG_RETURN_DATUM(text_array(1, result));
 }
+
+/* ----------------------------------------------------------------
+ * Remotes
+ * ----------------------------------------------------------------
+ */
+
+/* The refs remotes are kept in. */
+static const ProllyRefsRoutine *
+remote_refs(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_copies_components(&dc);
+	return dc.refs;
+}
+
+typedef struct RemoteFind
+{
+	const char *name;
+	char	   *url;
+} RemoteFind;
+
+static void
+find_remote(const char *name, const char *url, void *arg)
+{
+	RemoteFind *rf = arg;
+
+	if (strcmp(name, rf->name) == 0)
+		rf->url = pstrdup(url);
+}
+
+/* A remote's URL; NULL if there is no remote of that name. */
+static char *
+remote_url_of(const char *name)
+{
+	RemoteFind	rf = {name, NULL};
+
+	PROLLY_CALL(remote_refs(), remotes, find_remote, &rf);
+	return rf.url;
+}
+
+static char *
+need_remote(const char *name)
+{
+	char	   *url = remote_url_of(name);
+
+	if (url == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("remote \"%s\" not found", name)));
+	return url;
+}
+
+/*
+ * dolt_remote(VARIADIC args text[]) returns text[]: {status}
+ *
+ * add name url; remove (or rm) name: the remote, its remote-tracking
+ * branches and the upstreams naming it.
+ */
+Datum
+dolt_remote(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	const char *result[1] = {"0"};
+
+	if (nargs >= 1 && strcmp(args[0], "add") == 0)
+	{
+		if (nargs != 3)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_remote add needs a name and a URL")));
+		if (args[1][0] == '\0' || strchr(args[1], '/') != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid remote name \"%s\"", args[1]),
+					 errdetail("A remote's name is not empty and has no \"/\".")));
+		(void) prolly_remote_for_url(args[2]);
+		if (remote_url_of(args[1]) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("remote \"%s\" already exists", args[1])));
+		PROLLY_CALL(remote_refs(), remote_set, args[1], args[2]);
+	}
+	else if (nargs >= 1 && (strcmp(args[0], "remove") == 0 ||
+							strcmp(args[0], "rm") == 0))
+	{
+		if (nargs != 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_remote remove needs a name")));
+		(void) need_remote(args[1]);
+		PROLLY_CALL(remote_refs(), remote_set, args[1], NULL);
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_remote needs add or remove")));
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+typedef struct Heads
+{
+	List	   *branches;		/* char * */
+	List	   *commits;		/* ProllyHash * */
+} Heads;
+
+static void
+collect_head(const char *branch, const ProllyHash *commit, void *arg)
+{
+	Heads	   *h = arg;
+
+	h->branches = lappend(h->branches, pstrdup(branch));
+	h->commits = lappend(h->commits, copy_hash(commit));
+}
+
+/* A remote's head of branch: false if it hasn't the branch. */
+static bool
+remote_head(const ProllyRemoteRoutine *rr, ProllyRemote *r, const char *branch,
+			ProllyHash *head)
+{
+	Heads		h = {NIL, NIL};
+	ListCell   *b;
+	ListCell   *c;
+
+	PROLLY_CALL(rr, heads, r, collect_head, &h);
+	forboth(b, h.branches, c, h.commits)
+	{
+		if (strcmp(lfirst(b), branch) == 0)
+		{
+			*head = *(ProllyHash *) lfirst(c);
+			return true;
+		}
+	}
+	memset(head, 0, sizeof(*head));
+	return false;
+}
+
+static char *
+build_format(void)
+{
+	ProllyDatabaseComponents dc;
+	StringInfoData f;
+
+	prolly_copies_components(&dc);
+	initStringInfo(&f);
+	PROLLY_CALL(dc.canonicalizer, format, &f);
+	return f.data;
+}
+
+/* Refuse a remote whose commits are of another format than this build's. */
+static void
+check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
+					const char *name)
+{
+	StringInfoData f;
+	char	   *mine = build_format();
+
+	initStringInfo(&f);
+	PROLLY_CALL(rr, format, r, &f);
+	if (f.len > 0 && strcmp(f.data, mine) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("remote \"%s\" holds commits of canonical format %s, not %s",
+						name, f.data, mine)));
+}
+
+/*
+ * Fetch remote name's branches (NIL: all of them) into its remote-tracking
+ * branches.
+ */
+static void
+fetch_remote(const char *name, List *only)
+{
+	ProllyDatabaseComponents dc;
+	char	   *url = need_remote(name);
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r;
+	Heads		all = {NIL, NIL};
+	Heads		want = {NIL, NIL};
+	ListCell   *b;
+	ListCell   *c;
+
+	prolly_copies_components(&dc);
+	r = PROLLY_CALL(rr, open, url, false);
+	PG_TRY();
+	{
+		ProllyHash *commits;
+		int			n = 0;
+
+		check_remote_format(rr, r, name);
+		PROLLY_CALL(rr, heads, r, collect_head, &all);
+		forboth(b, all.branches, c, all.commits)
+		{
+			ListCell   *o;
+			bool		wanted = (only == NIL);
+
+			foreach(o, only)
+			{
+				if (strcmp(lfirst(o), lfirst(b)) == 0)
+					wanted = true;
+			}
+			if (wanted)
+			{
+				want.branches = lappend(want.branches, lfirst(b));
+				want.commits = lappend(want.commits, lfirst(c));
+			}
+		}
+		foreach(b, only)
+		{
+			ListCell   *w;
+			bool		found = false;
+
+			foreach(w, want.branches)
+			{
+				if (strcmp(lfirst(w), lfirst(b)) == 0)
+					found = true;
+			}
+			if (!found)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("remote \"%s\" has no branch \"%s\"", name,
+								(char *) lfirst(b))));
+		}
+		commits = palloc(sizeof(ProllyHash) * Max(list_length(want.commits), 1));
+		foreach(c, want.commits)
+			commits[n++] = *(ProllyHash *) lfirst(c);
+		(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(rr, close, r);
+	}
+	PG_END_TRY();
+
+	forboth(b, want.branches, c, want.commits)
+		PROLLY_CALL(dc.refs, tracking_set, name, lfirst(b), lfirst(c));
+}
+
+/*
+ * dolt_fetch(VARIADIC args text[]) returns text[]: {status}
+ *
+ * [remote [branch...]] (origin if none): the remote's branches into its
+ * remote-tracking branches (remote/branch), with the chunks they reach that
+ * the database lacks.
+ */
+Datum
+dolt_fetch(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	char	   *remote = NULL;
+	List	   *branches = NIL;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (args[i][0] == '-')
+			unsupported("dolt_fetch", args[i]);
+		else if (remote == NULL)
+			remote = args[i];
+		else
+			branches = lappend(branches, args[i]);
+	}
+	fetch_remote(remote ? remote : "origin", branches);
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* The session branch's upstream, or an error naming how to set one. */
+static void
+need_upstream(const char *fn, char **remote, char **branch)
+{
+	const char *current = branch_ops()->current();
+
+	if (!PROLLY_CALL(remote_refs(), upstream, current, remote, branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch %s has no upstream branch", current),
+				 errhint("Name the remote, or set an upstream with dolt_push('--set-upstream', 'origin', '%s').",
+						 current)));
+}
+
+/*
+ * dolt_push(VARIADIC args text[]) returns text[]: {status, message}
+ *
+ * [remote [branch]] (the session branch's upstream if none; the session
+ * branch if only the remote), -f/--force, -u/--set-upstream: the chunks the
+ * branch's head reaches that the remote lacks, then the remote's branch
+ * moved to it, only as a fast-forward unless forced.  The remote's branch
+ * is moved as it is reached, not with the transaction: the remote-tracking
+ * branch is, and a fetch finds the remote as it is.
+ */
+Datum
+dolt_push(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	char	   *remote = NULL;
+	char	   *branch = NULL;
+	bool		force = false;
+	bool		set_upstream = false;
+	char	   *url;
+	const ProllyRemoteRoutine *rr;
+	ProllyRemote *r;
+	ProllyHash	local;
+	ProllyHash	theirs;
+	bool		had;
+	const char *result[2] = {"0", NULL};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (strcmp(a, "-f") == 0 || strcmp(a, "--force") == 0)
+			force = true;
+		else if (strcmp(a, "-u") == 0 || strcmp(a, "--set-upstream") == 0)
+			set_upstream = true;
+		else if (a[0] == '-')
+			unsupported("dolt_push", a);
+		else if (remote == NULL)
+			remote = a;
+		else if (branch == NULL)
+			branch = a;
+		else
+			unexpected("dolt_push", a);
+	}
+	if (remote == NULL)
+	{
+		char	   *upstream_branch;
+
+		need_upstream("dolt_push", &remote, &upstream_branch);
+		branch = upstream_branch;
+	}
+	if (branch == NULL)
+		branch = pstrdup(branch_ops()->current());
+	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", branch)));
+	if (!PROLLY_CALL(remote_refs(), resolve, branch, &local))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" has no commits to push", branch)));
+	url = need_remote(remote);
+	rr = prolly_remote_for_url(url);
+	prolly_copies_components(&dc);
+	r = PROLLY_CALL(rr, open, url, true);
+	PG_TRY();
+	{
+		check_remote_format(rr, r, remote);
+		had = remote_head(rr, r, branch, &theirs);
+		if (had && same_hash(&theirs, &local))
+			result[1] = "Everything up-to-date";
+		else
+		{
+			if (had && !force)
+			{
+				ProllyHash	base;
+
+				if (!PROLLY_CALL(prolly_chunk_store(), has,
+								 PROLLY_CALL(prolly_chunk_store(), open,
+											 MyDatabaseId, MyDatabaseTableSpace),
+								 &theirs))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("the push to %s/%s was rejected: the remote has commits this database lacks",
+									remote, branch),
+							 errhint("Fetch and merge them first, or push with --force.")));
+				if (!PROLLY_CALL(remote_refs(), merge_base, &theirs, &local, &base) ||
+					!same_hash(&base, &theirs))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("the push to %s/%s was rejected: it isn't a fast-forward",
+									remote, branch),
+							 errhint("Merge the remote's branch first, or push with --force.")));
+			}
+			(void) PROLLY_CALL(dc.transfer, send, rr, r, &local, 1);
+			if (!PROLLY_CALL(rr, move_head, r, branch, &theirs, &local,
+							 build_format()))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the push to %s/%s was rejected: the remote's branch moved meanwhile",
+								remote, branch),
+						 errhint("Fetch and try again.")));
+			result[1] = psprintf("%s -> %s/%s", branch, remote, branch);
+		}
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(rr, close, r);
+	}
+	PG_END_TRY();
+	PROLLY_CALL(dc.refs, tracking_set, remote, branch, &local);
+	if (set_upstream)
+		PROLLY_CALL(dc.refs, upstream_set, branch, remote, branch);
+	PG_RETURN_DATUM(text_array(2, result));
+}
+
+/*
+ * dolt_pull(VARIADIC args text[]) returns text[]: as dolt_merge()
+ *
+ * [remote [branch]] (the session branch's upstream if none; the session
+ * branch's name if only the remote): the remote's branch fetched, then
+ * merged into the session branch as dolt_merge() merges, with its options
+ * (--no-ff, -m).
+ */
+Datum
+dolt_pull(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	char	   *remote = NULL;
+	char	   *branch = NULL;
+	List	   *merge_args = NIL;
+	Datum	   *d;
+	int			n = 0;
+	ListCell   *lc;
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (strcmp(a, "--no-ff") == 0)
+			merge_args = lappend(merge_args, a);
+		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
+		{
+			merge_args = lappend(merge_args, a);
+			merge_args = lappend(merge_args, option_value(args, nargs, &i, "dolt_pull"));
+		}
+		else if (a[0] == '-')
+			unsupported("dolt_pull", a);
+		else if (remote == NULL)
+			remote = a;
+		else if (branch == NULL)
+			branch = a;
+		else
+			unexpected("dolt_pull", a);
+	}
+	if (remote == NULL)
+		need_upstream("dolt_pull", &remote, &branch);
+	if (branch == NULL)
+		branch = pstrdup(branch_ops()->current());
+	fetch_remote(remote, list_make1(branch));
+
+	merge_args = lappend(merge_args, psprintf("%s/%s", remote, branch));
+	d = palloc(sizeof(Datum) * list_length(merge_args));
+	foreach(lc, merge_args)
+		d[n++] = CStringGetTextDatum(lfirst(lc));
+	return DirectFunctionCall1(dolt_merge,
+							   PointerGetDatum(construct_array_builtin(d, n, TEXTOID)));
+}
+
+static void
+remote_row(const char *name, const char *url, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = CStringGetTextDatum(url);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/* dolt_remotes(OUT name text, OUT url text) returns setof record */
+Datum
+dolt_remotes(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(remote_refs(), remotes, remote_row, fcinfo->resultinfo);
+	return (Datum) 0;
+}
+
+static void
+tracking_row(const char *remote, const char *branch, const ProllyHash *commit,
+			 void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = CStringGetTextDatum(psprintf("remotes/%s/%s", remote, branch));
+	values[1] = CStringGetTextDatum(hash_hex(commit));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_remote_branches(OUT name text, OUT hash text) returns setof record:
+ * the remote-tracking branches, as remotes/remote/branch.
+ */
+Datum
+dolt_remote_branches(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(remote_refs(), trackings, NULL, tracking_row, fcinfo->resultinfo);
+	return (Datum) 0;
+}

@@ -68,6 +68,7 @@ OBJS = \
 	prolly_xact.o \
 	reclaim_marksweep.o \
 	reclaim_stub.o \
+	remote_file.o \
 	refs_copies.o \
 	refs_history.o \
 	refs_tree.o \
@@ -76,6 +77,7 @@ OBJS = \
 	rootlayout_subroots.o \
 	rowid_counter.o \
 	rowid_stub.o \
+	transfer_chunks.o \
 	transfer_stub.o \
 	tablefile_basic.o \
 	tablefile_stub.o \

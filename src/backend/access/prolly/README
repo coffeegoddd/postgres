@@ -43,7 +43,8 @@ design choice can be changed later by writing a new implementation:
 	commit_pipeline   prolly_commit.h         serial, stub
 	row_identity      prolly_rowid.h          counter, stub
 	refs              prolly_refs.h           stub
-	transfer          prolly_transfer.h       stub
+	transfer          prolly_transfer.h       chunks, stub
+	remote            prolly_remote.h         file
 	diff_merge        prolly_merge.h          stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,

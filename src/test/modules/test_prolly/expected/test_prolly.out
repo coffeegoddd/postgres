@@ -47,6 +47,7 @@ FROM prolly_implementations();
  refs            | tree             |       1 |              1
  refs            | copies           |       2 |              1
  transfer        | stub             |       0 |              0
+ transfer        | chunks           |       1 |              1
  diff_merge      | stub             |       0 |              0
  diff_merge      | rows             |       1 |              1
  diff_merge      | folded           |       3 |              1
@@ -70,7 +71,8 @@ FROM prolly_implementations();
  table_file      | stub             |       0 |              0
  change_finder   | pages            |       1 |              4
  change_finder   | stub             |       0 |              0
-(61 rows)
+ remote          | file             |       1 |              1
+(63 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -303,21 +305,23 @@ NOTICE:  drop cascades to column m of table conf_kt
  refs            | stub             | branch_lifecycle                        | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs            | stub             | commit_then_resolve                     | not implemented (missing commit, resolve, commit_get)
  refs            | stub             | merge_base                              | not implemented (missing commit, merge_base)
- refs            | stub             | complete                                | not implemented (23 of 23 callbacks missing)
+ refs            | stub             | complete                                | not implemented (30 of 30 callbacks missing)
  refs            | tree             | identity                                | pass
  refs            | tree             | branch_lifecycle                        | no checks yet
  refs            | tree             | commit_then_resolve                     | no checks yet
  refs            | tree             | merge_base                              | no checks yet
- refs            | tree             | complete                                | pass
+ refs            | tree             | complete                                | not implemented (7 of 30 callbacks missing)
  refs            | copies           | identity                                | pass
  refs            | copies           | branch_lifecycle                        | no checks yet
  refs            | copies           | commit_then_resolve                     | no checks yet
  refs            | copies           | merge_base                              | no checks yet
- refs            | copies           | complete                                | not implemented (1 of 23 callbacks missing)
+ refs            | copies           | complete                                | not implemented (1 of 30 callbacks missing)
  transfer        | stub             | identity                                | pass
- transfer        | stub             | clone                                   | not implemented (missing clone)
- transfer        | stub             | fetch_then_push                         | not implemented (missing fetch, push)
- transfer        | stub             | complete                                | not implemented (3 of 3 callbacks missing)
+ transfer        | stub             | receive_then_send                       | not implemented (missing receive, send)
+ transfer        | stub             | complete                                | not implemented (2 of 2 callbacks missing)
+ transfer        | chunks           | identity                                | pass
+ transfer        | chunks           | receive_then_send                       | no checks yet
+ transfer        | chunks           | complete                                | pass
  diff_merge      | stub             | identity                                | pass
  diff_merge      | stub             | diff_reports_each_change_once           | not implemented (missing diff)
  diff_merge      | stub             | merge                                   | not implemented (missing merge)
@@ -413,11 +417,11 @@ NOTICE:  drop cascades to column m of table conf_kt
  index_keying    | stub             | entries_and_bounds                      | not implemented (missing open, describe, nkeys, encode_entry, decode_entry, encode_bound, compare, columns_equal, close)
  index_keying    | stub             | complete                                | not implemented (10 of 10 callbacks missing)
  canonicalizer   | stub             | identity                                | pass
- canonicalizer   | stub             | complete                                | not implemented (13 of 13 callbacks missing)
+ canonicalizer   | stub             | complete                                | not implemented (15 of 15 callbacks missing)
  canonicalizer   | catalogs         | identity                                | pass
- canonicalizer   | catalogs         | complete                                | not implemented (10 of 13 callbacks missing)
+ canonicalizer   | catalogs         | complete                                | not implemented (12 of 15 callbacks missing)
  canonicalizer   | folded           | identity                                | pass
- canonicalizer   | folded           | complete                                | not implemented (2 of 13 callbacks missing)
+ canonicalizer   | folded           | complete                                | not implemented (2 of 15 callbacks missing)
  chunk_store     | journal          | identity                                | pass
  chunk_store     | journal          | complete                                | pass
  chunk_format    | basic            | identity                                | pass
@@ -440,7 +444,10 @@ NOTICE:  drop cascades to column m of table conf_kt
  change_finder   | pages            | complete                                | pass
  change_finder   | stub             | identity                                | pass
  change_finder   | stub             | complete                                | not implemented (3 of 3 callbacks missing)
-(360 rows)
+ remote          | file             | identity                                | pass
+ remote          | file             | heads_and_chunks                        | no checks yet
+ remote          | file             | complete                                | pass
+(365 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -589,12 +596,6 @@ SELECT prolly_merge('feature') IS NOT NULL AS merged;
  t
 (1 row)
 
-SELECT prolly_clone('file:///nowhere');
-ERROR:  transfer implementation "stub" does not implement clone
-SELECT prolly_fetch('file:///nowhere', 'main');
-ERROR:  transfer implementation "stub" does not implement fetch
-SELECT prolly_push('file:///nowhere', 'main');
-ERROR:  transfer implementation "stub" does not implement push
 SELECT prolly_checkout('main') IS NULL AS back_on_main;
  back_on_main 
 --------------

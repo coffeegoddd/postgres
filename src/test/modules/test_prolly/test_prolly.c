@@ -250,9 +250,10 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_REFS, "commit_then_resolve", "commit resolve commit_get", NULL},
 	{PROLLY_IFACE_REFS, "merge_base", "commit merge_base", NULL},
 
-	/* transfer */
-	{PROLLY_IFACE_TRANSFER, "clone", "clone", NULL},
-	{PROLLY_IFACE_TRANSFER, "fetch_then_push", "fetch push", NULL},
+	/* transfer and remotes */
+	{PROLLY_IFACE_TRANSFER, "receive_then_send", "receive send", NULL},
+	{PROLLY_IFACE_REMOTE, "heads_and_chunks",
+	"check_url open close format heads get has add_chunks move_head", NULL},
 
 	/* diff and merge */
 	{PROLLY_IFACE_DIFF_MERGE, "diff_reports_each_change_once", "diff", NULL},

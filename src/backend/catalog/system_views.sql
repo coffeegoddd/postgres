@@ -1584,6 +1584,12 @@ CREATE VIEW dolt_log AS
 CREATE VIEW dolt_branches AS
     SELECT * FROM dolt_branches();
 
+CREATE VIEW dolt_remotes AS
+    SELECT * FROM dolt_remotes();
+
+CREATE VIEW dolt_remote_branches AS
+    SELECT * FROM dolt_remote_branches();
+
 CREATE VIEW dolt_status AS
     SELECT * FROM dolt_status();
 

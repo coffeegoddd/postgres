@@ -271,3 +271,24 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_apply(op text, old anyelement, new anyelement)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Add a chunk to a remote under the hash given, whatever its bytes hash to.
+CREATE FUNCTION test_remote_put(url text, hash text, data bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Make a new branch of a remote's at commit, recording format if it has none.
+CREATE FUNCTION test_remote_set_head(url text, branch text, commit_id text,
+	format text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A folded root without its "!:format" item, as an older build made it.
+CREATE FUNCTION test_root_without_format(root text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A commit with no parents naming root.
+CREATE FUNCTION test_commit_of(root text, message text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

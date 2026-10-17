@@ -35,6 +35,10 @@
  *   the store's table files.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
+ * - read_through() makes this backend's get() and has() ask source for a
+ *   chunk the store hasn't, until it is cleared (source NULL) or the
+ *   transaction ends: so walks that know what chunks hold can read another
+ *   store's (a transfer's) as if it were this one's.
  *
  * Provisional (v0).
  *
@@ -54,6 +58,12 @@ typedef struct ProllyChunkStore ProllyChunkStore;
 
 /* The next chunk to add, in hash and data; false when there are no more. */
 typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
+
+/*
+ * Reads a chunk from elsewhere into out (NULL: only whether it has it);
+ * false if it has none by that hash.
+ */
+typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo out);
 
 /* Visits a table file: its name, its chunk count and its size in bytes. */
 typedef void (*ProllyChunkFileVisit) (const char *name, int nchunks,
@@ -112,14 +122,19 @@ typedef struct ProllyChunkStoreRoutine
 	 */
 	void		(*copy_database) (Oid src_dboid, Oid src_spcoid,
 								  Oid dst_dboid, Oid dst_spcoid);
+
+	/* Chunks the store hasn't, read from source (NULL: no longer). */
+	void		(*read_through) (ProllyChunkStore *store, ProllyChunkGet source,
+								 void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
 	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
-	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database"
+	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
+	"read_through"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK copy_database
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK read_through
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
