@@ -40,6 +40,7 @@
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/varlena.h"
 
 /* A table as one version has it. */
@@ -556,8 +557,8 @@ refuse_local_changes(void)
  * ends, and the branch is moved to the commit that was checked.
  */
 static int
-folded_merge(const char *branch, const char *message, int flags,
-			 ProllyHash *commit_id)
+merge_held(const char *branch, const char *message, int flags,
+		   ProllyHash *commit_id)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyHash	ours;
@@ -565,8 +566,6 @@ folded_merge(const char *branch, const char *message, int flags,
 	ProllyHash	base;
 	bool		changed = false;
 
-	/* the heads read under the refs held, as they are */
-	PROLLY_CALL(dc.refs, hold);
 	if (!PROLLY_CALL(dc.refs, resolve, branch, &theirs))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -612,6 +611,19 @@ folded_merge(const char *branch, const char *message, int flags,
 	reset_to(&theirs);
 	*commit_id = theirs;
 	return 0;
+}
+
+static int
+folded_merge(const char *branch, const char *message, int flags,
+			 ProllyHash *commit_id)
+{
+	/* the heads read under the refs held, as they are */
+	bool		pushed = PROLLY_CALL(components().refs, hold);
+	int			result = merge_held(branch, message, flags, commit_id);
+
+	if (pushed)
+		PopActiveSnapshot();
+	return result;
 }
 
 const ProllyMergeRoutine prolly_merge_folded = {

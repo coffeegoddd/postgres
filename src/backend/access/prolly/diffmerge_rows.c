@@ -570,7 +570,7 @@ rows_merge(const char *branch, const char *message, int flags,
 
 	prolly_database_components(&dc);
 	prolly_components_for_engine(&prolly_engine_d1.info, &c);
-	PROLLY_CALL(dc.refs, hold);	/* the heads read under the refs held */
+	(void) PROLLY_CALL(dc.refs, hold);	/* the heads read under the refs held */
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

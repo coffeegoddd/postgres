@@ -1373,10 +1373,11 @@ refs_xact_callback(XactEvent event, void *arg)
 }
 
 /* (a transaction takes the refs branch's lock before it reads the refs) */
-static void
+static bool
 tree_hold(void)
 {
 	lock_refs();
+	return false;
 }
 
 const ProllyRefsRoutine prolly_refs_tree = {

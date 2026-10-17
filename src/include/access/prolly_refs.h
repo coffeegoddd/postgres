@@ -141,10 +141,12 @@ typedef struct ProllyRefsRoutine
 	 * Hold the refs until the transaction ends, before reading heads to
 	 * move one by (a merge's): other movers wait, and it waits for one
 	 * moving them now.  If the session's branch was moved by a transaction
-	 * the snapshot doesn't see, it fails to be retried instead (what it
-	 * would read of the branch's rows isn't the head's).
+	 * the snapshot doesn't see (what it would read of the branch's rows
+	 * isn't the head's), it pushes a newer snapshot, which sees it, and
+	 * returns true, the caller popping it when done (read committed); or
+	 * fails, to be retried, where the snapshot can't move.
 	 */
-	void		(*hold) (void);
+	bool		(*hold) (void);
 
 	/*
 	 * Visit every node the refs keep alive, from the root of their own

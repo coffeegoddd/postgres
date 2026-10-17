@@ -118,8 +118,10 @@ is($second->{stderr}, '', 'and resets');
 is(sql(q{SELECT test_fold_root() = prolly_root_hash('main')}), 't',
 	'to the head, its rows and nothing else');
 
-# A merge that waited for a committer (its parents read before) fails, to
-# be retried, rather than leave the other's commit off the branch.
+# A merge that waited for a committer reads the heads after it: read
+# committed, as a newer snapshot sees them (here, branches that have both
+# changed, which only fast-forward so far); where the snapshot can't move,
+# it fails to be retried.  Either way the commit it waited for stays.
 $first->query_safe(q{SELECT dolt_branch('m'); SELECT dolt_checkout('m');
 	INSERT INTO app.t VALUES (30, 'm'); SELECT dolt_commit('-am', 'on m');
 	SELECT dolt_checkout('main')});
@@ -134,10 +136,28 @@ $second->query_until(qr/started/, q{
 ok(waits_for('dolt_merge'), 'a merge waits for the committer');
 $first->query_safe('COMMIT');
 $second->query_until(qr/done/, '');
-like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
-	'and fails');
+like($second->{stderr}, qr/can only fast-forward so far/,
+	'and, read committed, merges the heads as they are now');
 is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}), 'before the merge',
 	'the commit it waited for stays the head');
+
+$second->{stderr} = '';
+$second->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (32, 'first');
+	SELECT dolt_commit('-m', 'before the repeatable read merge')});
+$second->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_merge('m');
+	\echo done
+});
+ok(waits_for('dolt_merge'), 'a repeatable read merge waits too');
+$first->query_safe('COMMIT');
+$second->query_until(qr/done/, '');
+like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
+	'and fails');
+$second->query('ROLLBACK');
+is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}),
+	'before the repeatable read merge', 'leaving the head');
 $second->query('SELECT dolt_reset(\'--hard\')');
 $first->quit;
 $second->quit;
