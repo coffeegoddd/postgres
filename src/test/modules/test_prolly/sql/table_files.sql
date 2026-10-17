@@ -7,6 +7,10 @@ SELECT convert_from(test_chunk_get(encode(sha256('tf one'::bytea), 'hex')), 'UTF
 SELECT test_chunk_has(encode(sha256('tf two'::bytea), 'hex')) AS two,
 	test_chunk_has(encode(sha256('tf three'::bytea), 'hex')) AS three;
 
+-- A chunk given twice is written once.
+SELECT test_chunk_table_file(ARRAY['tf dup'::bytea, 'tf dup'::bytea]);
+SELECT chunks FROM test_chunk_table_files() ORDER BY name DESC LIMIT 1;
+
 -- A table file isn't undone by its transaction's abort.
 BEGIN;
 SELECT test_chunk_table_file(ARRAY['tf three'::bytea]);

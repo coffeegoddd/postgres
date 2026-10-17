@@ -846,7 +846,11 @@ ensure_journal(ProllyChunkStore *s, bool create)
 static const ProllyTableFileRoutine *
 table_format(void)
 {
-	return prolly_tablefile_lookup(TABLE_FILE_FORMAT);
+	static const ProllyTableFileRoutine *fmt = NULL;
+
+	if (fmt == NULL)
+		fmt = prolly_tablefile_lookup(TABLE_FILE_FORMAT);
+	return fmt;
 }
 
 static JournalShared *
@@ -881,31 +885,46 @@ table_file_path(const char *dir, uint64 id)
 	return path;
 }
 
+/* n bytes of v, little-endian, as table files' numbers are */
+static void
+append_le(StringInfo out, uint64 v, int n)
+{
+	for (int i = 0; i < n; i++)
+		appendStringInfoChar(out, (char) ((v >> (8 * i)) & 0xff));
+}
+
+static uint64
+read_le(const char *p, int n)
+{
+	uint64		v = 0;
+
+	for (int i = n - 1; i >= 0; i--)
+		v = (v << 8) | (uint8) p[i];
+	return v;
+}
+
 static void
 manifest_bytes(const Manifest *m, StringInfo out)
 {
-	uint32		version = MANIFEST_VERSION;
-	uint8		rootlen = m->root.len;
-	uint32		nfiles = m->nfiles;
 	pg_crc32c	crc;
 
 	appendBinaryStringInfo(out, MANIFEST_MAGIC, 8);
-	appendBinaryStringInfo(out, &version, sizeof(version));
-	appendBinaryStringInfo(out, &m->gc_generation, sizeof(uint32));
-	appendBinaryStringInfo(out, &m->last_id, sizeof(uint64));
-	appendBinaryStringInfo(out, &rootlen, 1);
-	appendBinaryStringInfo(out, m->root.bytes, rootlen);
-	appendBinaryStringInfo(out, &nfiles, sizeof(nfiles));
+	append_le(out, MANIFEST_VERSION, 4);
+	append_le(out, m->gc_generation, 4);
+	append_le(out, m->last_id, 8);
+	append_le(out, m->root.len, 1);
+	appendBinaryStringInfo(out, m->root.bytes, m->root.len);
+	append_le(out, m->nfiles, 4);
 	for (int i = 0; i < m->nfiles; i++)
 	{
-		appendBinaryStringInfo(out, &m->files[i].id, sizeof(uint64));
-		appendBinaryStringInfo(out, &m->files[i].nchunks, sizeof(uint32));
-		appendBinaryStringInfo(out, &m->files[i].size, sizeof(uint64));
+		append_le(out, m->files[i].id, 8);
+		append_le(out, m->files[i].nchunks, 4);
+		append_le(out, m->files[i].size, 8);
 	}
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, out->data, out->len);
 	FIN_CRC32C(crc);
-	appendBinaryStringInfo(out, &crc, sizeof(crc));
+	append_le(out, crc, 4);
 }
 
 static bool read_manifest_at(const char *path, Manifest *m);
@@ -967,17 +986,17 @@ read_manifest_at(const char *path, Manifest *m)
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, buf, st.st_size - sizeof(crc));
 	FIN_CRC32C(crc);
-	if (memcmp(&crc, end - sizeof(crc), sizeof(crc)) != 0)
+	if (crc != (pg_crc32c) read_le(end - sizeof(crc), 4))
 		goto corrupt;
 	end -= sizeof(crc);
 	p += 8;
-	memcpy(&version, p, 4);
+	version = (uint32) read_le(p, 4);
 	p += 4;
 	if (version != MANIFEST_VERSION)
 		goto corrupt;
-	memcpy(&m->gc_generation, p, 4);
+	m->gc_generation = (uint32) read_le(p, 4);
 	p += 4;
-	memcpy(&m->last_id, p, 8);
+	m->last_id = read_le(p, 8);
 	p += 8;
 	rootlen = (uint8) *p++;
 	if (rootlen > PROLLY_HASH_MAX_LEN || end - p < rootlen + 4)
@@ -985,7 +1004,7 @@ read_manifest_at(const char *path, Manifest *m)
 	m->root.len = rootlen;
 	memcpy(m->root.bytes, p, rootlen);
 	p += rootlen;
-	memcpy(&nfiles, p, 4);
+	nfiles = (uint32) read_le(p, 4);
 	p += 4;
 	if ((Size) (end - p) != (Size) nfiles * 20)
 		goto corrupt;
@@ -993,9 +1012,9 @@ read_manifest_at(const char *path, Manifest *m)
 	m->files = palloc(sizeof(ManifestFile) * Max(nfiles, 1));
 	for (uint32 i = 0; i < nfiles; i++)
 	{
-		memcpy(&m->files[i].id, p, 8);
-		memcpy(&m->files[i].nchunks, p + 8, 4);
-		memcpy(&m->files[i].size, p + 12, 8);
+		m->files[i].id = read_le(p, 8);
+		m->files[i].nchunks = (uint32) read_le(p + 8, 4);
+		m->files[i].size = read_le(p + 12, 8);
 		p += 20;
 	}
 	pfree(buf);
@@ -1008,14 +1027,30 @@ corrupt:
 	return false;				/* keep the compiler quiet */
 }
 
-/* fsync a file of dir, if it exists */
+/*
+ * fsync a file of dir, if it exists: opened first, so one removed after
+ * (a table file a conjoin replaced) is still synced, or, already gone,
+ * skipped, never failed on.
+ */
 static void
 sync_if_exists(const char *path)
 {
-	struct stat st;
+	int			fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
 
-	if (stat(path, &st) == 0)
-		fsync_fname(path, false);
+	if (fd < 0)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+		return;
+	}
+	if (pg_fsync(fd) != 0)
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", path)));
+	CloseTransientFile(fd);
 }
 
 /* Write a new manifest aside, durably, to be renamed over the old one. */
@@ -1168,67 +1203,142 @@ close_table(TableFile *t)
 }
 
 /*
+ * Open the table file f of database directory dir, in cxt: NULL if it is
+ * gone (a conjoin replaced it since its manifest was read).
+ */
+static TableFile *
+open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	TableFile  *t = palloc0(sizeof(TableFile));
+
+	t->id = f->id;
+	t->path = table_file_path(dir, t->id);
+	t->size = f->size;
+	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
+	MemoryContextSwitchTo(old);
+	if (t->file < 0)
+	{
+		if (errno == ENOENT)
+		{
+			pfree(t->path);
+			pfree(t);
+			return NULL;
+		}
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", t->path)));
+	}
+	t->tf = PROLLY_CALL(table_format(), open, table_file_read, t, t->size, cxt);
+	if (t->tf == NULL)
+	{
+		FileClose(t->file);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("file \"%s\" is not a table file", t->path)));
+	}
+	return t;
+}
+
+static void
+close_tables(List *tables)
+{
+	ListCell   *lc;
+
+	foreach(lc, tables)
+		close_table(lfirst(lc));
+	list_free(tables);
+}
+
+/*
  * Read the manifest again, if one was written since it was last read: open
- * the table files it names and close those it no longer does.
+ * the table files it names and close those it no longer does.  The files
+ * are opened before any is closed, and the store's list changed only once
+ * all are; one gone meanwhile (a conjoin replaced it) sends us to the
+ * newer manifest.
  */
 static void
 load_tables(ProllyChunkStore *s, bool force)
 {
-	uint64		count = pg_atomic_read_u64(&shared()->manifests);
 	char	   *dir;
-	Manifest	m;
-	List	   *kept = NIL;
-	ListCell   *lc;
-	MemoryContext old;
 
-	if (!force && count == s->manifests_seen)
+	if (!force && pg_atomic_read_u64(&shared()->manifests) == s->manifests_seen)
 		return;
 	dir = GetDatabasePath(s->dboid, s->spcoid);
-	(void) read_manifest(dir, &m);
-
-	old = MemoryContextSwitchTo(TopMemoryContext);
-	for (int i = 0; i < m.nfiles; i++)
+	for (int attempt = 0;; attempt++)
 	{
-		TableFile  *t = NULL;
+		uint64		count = pg_atomic_read_u64(&shared()->manifests);
+		Manifest	m;
+		List	   *opened = NIL;
+		List	   *kept = NIL;
+		List	   *dropped = NIL;
+		bool		gone = false;
+		ListCell   *lc;
 
-		foreach(lc, s->tables)
+		(void) read_manifest(dir, &m);
+		if (attempt == 0)
+			INJECTION_POINT("prolly-manifest-read", NULL);
+		PG_TRY();
 		{
-			if (((TableFile *) lfirst(lc))->id == m.files[i].id)
+			for (int i = 0; i < m.nfiles && !gone; i++)
 			{
-				t = lfirst(lc);
-				break;
+				TableFile  *t = NULL;
+
+				foreach(lc, s->tables)
+					if (((TableFile *) lfirst(lc))->id == m.files[i].id)
+						t = lfirst(lc);
+				if (t == NULL)
+				{
+					t = open_table(dir, &m.files[i], TopMemoryContext);
+					if (t == NULL)
+						gone = true;
+					else
+						opened = lappend(opened, t);
+				}
 			}
 		}
-		if (t != NULL)
+		PG_CATCH();
 		{
-			s->tables = list_delete_ptr(s->tables, t);
-			kept = lappend(kept, t);
+			close_tables(opened);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (gone)
+		{
+			close_tables(opened);
+			if (attempt >= 10)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("the chunk store's table files keep changing while they are read"),
+						 errhint("Try again.")));
 			continue;
 		}
-		t = palloc0(sizeof(TableFile));
-		t->id = m.files[i].id;
-		t->path = table_file_path(dir, t->id);
-		t->size = m.files[i].size;
-		t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
-		if (t->file < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", t->path)));
-		t->tf = PROLLY_CALL(table_format(), open, table_file_read, t, t->size,
-							TopMemoryContext);
-		if (t->tf == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("file \"%s\" is not a table file", t->path)));
-		kept = lappend(kept, t);
-	}
-	MemoryContextSwitchTo(old);
 
-	foreach(lc, s->tables)
-		close_table(lfirst(lc));
-	list_free(s->tables);
-	s->tables = kept;
-	s->manifests_seen = count;
+		/* the files the manifest names, opened before or now */
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			foreach(lc, s->tables)
+			{
+				TableFile  *t = lfirst(lc);
+				bool		named = false;
+
+				for (int i = 0; i < m.nfiles; i++)
+					named |= m.files[i].id == t->id;
+				if (named)
+					kept = lappend(kept, t);
+				else
+					dropped = lappend(dropped, t);
+			}
+			kept = list_concat(kept, opened);
+			MemoryContextSwitchTo(old);
+		}
+		list_free(s->tables);
+		s->tables = kept;
+		close_tables(dropped);
+		s->manifests_seen = count;
+		break;
+	}
 	pfree(dir);
 }
 
@@ -1305,6 +1415,9 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	int			fd;
 	Manifest	nm;
 
+	HASHCTL		ctl;
+	HTAB	   *seen;
+
 	initStringInfo(&data);
 	if (!next(arg, &hash, &data))
 	{
@@ -1313,6 +1426,11 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 		pfree(dir);
 		return;
 	}
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly table file chunks", 1024, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
@@ -1323,6 +1441,17 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	initStringInfo(&buf);
 	do
 	{
+		ProllyHash	key;
+		bool		found;
+
+		/* a chunk given twice is written once */
+		hash_key(&key, &hash);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+		{
+			resetStringInfo(&data);
+			continue;
+		}
 		PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
 		nchunks++;
 		if (buf.len >= APPEND_BATCH)
@@ -1350,7 +1479,9 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	memset(&nm, 0, sizeof(nm));
 	nm.last_id = id;
 	nm.gc_generation = m->gc_generation;
-	journal_root(s, &nm.root);
+	/* (the committed root: one the transaction moves to may roll back) */
+	scan_journal(s);
+	nm.root = s->root;
 	nm.files = palloc(sizeof(ManifestFile) * (m->nfiles + 1));
 	for (int i = 0; i < m->nfiles; i++)
 	{
@@ -1362,6 +1493,7 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	nm.files[nm.nfiles].size = offset;
 	nm.nfiles++;
 	replace_manifest(s, &nm);
+	INJECTION_POINT("prolly-manifest-replaced", NULL);
 
 	for (int i = 0; i < m->nfiles; i++)
 	{
@@ -1374,6 +1506,47 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	pfree(data.data);
 	pfree(path);
 	pfree(dir);
+}
+
+/*
+ * Remove the table files of dir its manifest m doesn't name: those a
+ * writer replaced but didn't get to remove (it failed, or the server
+ * stopped, in between), or one it was writing.  With the manifest's lock
+ * held, no writer is writing one now.
+ */
+static void
+remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+{
+	DIR		   *d = AllocateDir(dir);
+	struct dirent *de;
+	List	   *ids = NIL;
+	ListCell   *lc;
+
+	while ((de = ReadDir(d, dir)) != NULL)
+	{
+		uint64		id;
+		char	   *end;
+		bool		named = false;
+
+		if (strncmp(de->d_name, "prolly_table_", 13) != 0)
+			continue;
+		id = strtou64(de->d_name + 13, &end, 16);
+		if (*end != '\0')
+			continue;
+		for (int i = 0; i < m->nfiles; i++)
+			named |= m->files[i].id == id;
+		if (!named)
+		{
+			uint64	   *p = palloc(sizeof(uint64));
+
+			*p = id;
+			ids = lappend(ids, p);
+		}
+	}
+	FreeDir(d);
+	foreach(lc, ids)
+		table_file_unlink(s, dir, *(uint64 *) lfirst(lc));
+	list_free_deep(ids);
 }
 
 /* Take the table file writers' lock, and read the manifest it protects. */
@@ -1392,6 +1565,7 @@ lock_manifest(ProllyChunkStore *s, Manifest *m)
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	(void) read_manifest(dir, m);
+	remove_unnamed(s, dir, m);
 	pfree(dir);
 }
 
@@ -1751,25 +1925,33 @@ journal_redo(XLogReaderState *record)
 }
 
 /*
- * fsync the journal in database directory dir, if it has one, and its
- * table files: those the manifest names (written by replay, unsynced) and
- * the next one, which may be being written.
+ * fsync the journal in database directory dir, if it has one, and every
+ * table file there: those the manifest names (written by replay, unsynced),
+ * one being written, and those a new database is being given, which no
+ * manifest names yet.
  */
 static void
 sync_journal_in(const char *dir)
 {
 	char	   *path = psprintf("%s/%s", dir, JOURNAL_FILE);
-	Manifest	m;
+	DIR		   *d;
+	struct dirent *de;
 
 	sync_if_exists(path);
 	pfree(path);
-	(void) read_manifest(dir, &m);
-	for (int i = 0; i <= m.nfiles; i++)
+	d = AllocateDir(dir);
+	if (d == NULL)
+		return;
+	while ((de = ReadDir(d, dir)) != NULL)
 	{
-		path = table_file_path(dir, i < m.nfiles ? m.files[i].id : m.last_id + 1);
+		if (strncmp(de->d_name, "prolly_table_", 13) != 0)
+			continue;
+		INJECTION_POINT("prolly-checkpoint-table-file", NULL);
+		path = dir_file(dir, de->d_name);
 		sync_if_exists(path);
 		pfree(path);
 	}
+	FreeDir(d);
 }
 
 /* fsync the journals of every database directory under parent */
@@ -1906,43 +2088,41 @@ journal_conjoin(ProllyChunkStore *s)
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	memset(&cs, 0, sizeof(cs));
 	cs.s = s;
-	for (int i = 0; i < m.nfiles; i++)
-	{
-		TableFile  *t = palloc0(sizeof(TableFile));
-
-		t->id = m.files[i].id;
-		t->path = table_file_path(dir, t->id);
-		t->size = m.files[i].size;
-		t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
-		if (t->file < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", t->path)));
-		t->tf = PROLLY_CALL(table_format(), open, table_file_read, t, t->size,
-							CurrentMemoryContext);
-		if (t->tf == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("file \"%s\" is not a table file", t->path)));
-		cs.tables = lappend(cs.tables, t);
-	}
-	cs.cur = list_head(cs.tables);
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
 	keep = palloc0(sizeof(bool) * m.nfiles);
-	write_table_file(s, &m, keep, conjoin_next, &cs);
 
-	foreach(lc, cs.tables)
+	/* (closed whatever happens: a file kept open is never given back) */
+	PG_TRY();
 	{
-		TableFile  *t = lfirst(lc);
+		for (int i = 0; i < m.nfiles; i++)
+		{
+			TableFile  *t = open_table(dir, &m.files[i], CurrentMemoryContext);
 
-		PROLLY_CALL(table_format(), close, t->tf);
-		FileClose(t->file);
+			if (t == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("table file %llu of the manifest is missing",
+								(unsigned long long) m.files[i].id)));
+			cs.tables = lappend(cs.tables, t);
+		}
+		cs.cur = list_head(cs.tables);
+		write_table_file(s, &m, keep, conjoin_next, &cs);
 	}
+	PG_FINALLY();
+	{
+		foreach(lc, cs.tables)
+		{
+			TableFile  *t = lfirst(lc);
+
+			PROLLY_CALL(table_format(), close, t->tf);
+			FileClose(t->file);
+		}
+	}
+	PG_END_TRY();
 	hash_destroy(cs.seen);
 	pfree(keep);
 	pfree(dir);

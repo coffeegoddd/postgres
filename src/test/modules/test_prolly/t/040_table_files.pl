@@ -85,6 +85,81 @@ SKIP:
 		'the next writer writes over what it left');
 }
 
+# Conjoins and checkpoints, readers and failures, at their awkward moments.
+SKIP:
+{
+	skip 'injection points not supported by this build', 6
+	  if $ENV{enable_injection_points} ne 'yes';
+
+	my $on_disk = q{SELECT count(*) FROM
+		(SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'postgres') db,
+		pg_ls_dir(d) f WHERE f LIKE 'prolly\_table\_%'};
+
+	# A conjoin stopped between its manifest and removing the files it
+	# replaced leaves them; the next writer removes them.
+	sql(q{SELECT test_chunk_table_file(ARRAY['o1'::bytea])});
+	sql(q{SELECT injection_points_attach('prolly-manifest-replaced', 'error')});
+	$node->psql('postgres', 'SELECT test_chunk_conjoin()');
+	sql(q{SELECT injection_points_detach('prolly-manifest-replaced')});
+	cmp_ok(sql($on_disk), '>', 1, 'a conjoin stopped early leaves the replaced files');
+	sql(q{SELECT test_chunk_table_file(ARRAY['o2'::bytea])});
+	is(sql($on_disk), '2', 'the next writer removes them');
+
+	# A reader whose manifest is replaced (and its files removed) while it
+	# opens them reads the newer one.  (It reads the manifest again for a
+	# chunk it hasn't the file of.)
+	my $r = $node->background_psql('postgres');
+	$r->query_safe(q{SELECT test_chunk_has(encode(sha256('o1'::bytea), 'hex'))});
+	sql(q{SELECT test_chunk_table_file(ARRAY['o3'::bytea])});
+	$r->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-manifest-read', 'wait')});
+	$r->query_until(qr/started/, q{
+		\echo started
+		SELECT convert_from(test_chunk_get(encode(sha256('o3'::bytea), 'hex')), 'UTF8') AS got;
+		\echo done
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-manifest-read'}) or die 'the reader did not wait';
+	sql('SELECT test_chunk_conjoin()');
+	sql(q{SELECT injection_points_wakeup('prolly-manifest-read')});
+	my $out = $r->query_until(qr/done/, '');
+	like($out, qr/o3/, 'a reader whose files went meanwhile reads the newer ones');
+	$r->quit;
+
+	# A checkpoint syncing a table file a conjoin removes meanwhile carries on.
+	sql(q{SELECT test_chunk_table_file(ARRAY['o4'::bytea])});
+	sql(q{SELECT injection_points_attach('prolly-checkpoint-table-file', 'wait')});
+	my $c = $node->background_psql('postgres');
+	$c->query_until(qr/started/, q{
+		\echo started
+		CHECKPOINT;
+		\echo done
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-checkpoint-table-file'}) or die 'the checkpoint did not wait';
+	sql('SELECT test_chunk_conjoin()');
+	sql(q{SELECT injection_points_detach('prolly-checkpoint-table-file')});
+	sql(q{SELECT injection_points_wakeup('prolly-checkpoint-table-file')});
+	$c->query_until(qr/done/, '');
+	$c->quit;
+	is(sql('SELECT 1'), '1', 'a checkpoint racing a conjoin completes');
+
+	# A conjoin that fails gives its files back.
+	my $fds = q{SELECT count(*) FROM pg_ls_dir('/proc/self/fd')};
+	my $s = $node->background_psql('postgres', on_error_stop => 0);
+	sql(q{SELECT test_chunk_table_file(ARRAY['o5'::bytea])});
+	sql(q{SELECT injection_points_attach('prolly-table-file-written', 'error')});
+	$s->query(q{SELECT test_chunk_conjoin()});	# (the store's own files opened)
+	$s->{stderr} = '';
+	my $before = $s->query_safe($fds);
+	$s->query(q{SELECT test_chunk_conjoin()}) for 1 .. 5;
+	sql(q{SELECT injection_points_detach('prolly-table-file-written')});
+	$s->{stderr} = '';
+	is($s->query_safe($fds), $before, 'failed conjoins leave no file open');
+	$s->quit;
+	is(sql($big), '40', 'every chunk still reads back');
+}
+
 # The standby's files are the primary's.
 # (to the WAL inserted: the files come from transactions without an xid,
 # whose commits don't flush it)
