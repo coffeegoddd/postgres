@@ -57,6 +57,7 @@ typedef struct ProllyChunkerRoutine
 
 #define PROLLY_CHUNKER_CALLBACK_NAMES "begin", "add", "reset", "end"
 #define PROLLY_CHUNKER_FIRST_CALLBACK begin
+#define PROLLY_CHUNKER_LAST_CALLBACK end
 
 static inline const ProllyChunkerRoutine *
 prolly_chunker_lookup(const char *name)

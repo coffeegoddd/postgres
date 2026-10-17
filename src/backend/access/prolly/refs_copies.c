@@ -1263,6 +1263,7 @@ typedef struct ReadFold
 {
 	Oid			only;
 	ProllyNodeRef *root;
+	List	  **left_out;
 } ReadFold;
 
 static void
@@ -1275,7 +1276,7 @@ read_fold_into(void *arg)
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, read_fold, have ? &baseline : NULL, rf->only,
-				rf->root);
+				rf->root, rf->left_out);
 }
 
 /* A branch's working set as a head-only one has it: false if none. */
@@ -1292,9 +1293,10 @@ head_working_set(const char *branch, ProllyNodeRef *root)
 }
 
 static bool
-copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root)
+copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
+						List **left_out)
 {
-	ReadFold	rf = {only, root};
+	ReadFold	rf = {only, root, left_out};
 
 	if (branch == NULL)
 	{

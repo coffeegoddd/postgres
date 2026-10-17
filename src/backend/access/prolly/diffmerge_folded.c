@@ -103,6 +103,8 @@ typedef struct Tables
 static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 						const char *what, const char *name, List **conflicted);
 static bool same_description(const Table *a, const Table *b);
+static Table *find_table(List *tables, const char *name);
+static char *table_name(Oid relid);
 static int	keep_violations(List *found);
 static List *foreign_key_violations(List *relids);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
@@ -117,6 +119,10 @@ components(void)
 	return dc;
 }
 
+/*
+ * The folded trees' environment, without an order: a diff of rows sets the
+ * keying's, and callers that walk canonical roots set bytes' themselves.
+ */
 static void
 chunk_env(ProllyTreeEnv *env)
 {
@@ -173,20 +179,40 @@ add_table(const char *name, const ProllyNodeRef *data,
 
 /*
  * A ref's tables, to read: WORKING's read (objects a commit would refuse
- * left out), only relid's rows if it is valid.
+ * left out, and their names appended to *left_out if it isn't NULL); with
+ * relid valid, relid's table alone (the others' rows aren't read).
  */
+static int
+string_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(lfirst(a), lfirst(b));
+}
+
 static List *
-tables_of(const char *ref, Oid relid)
+tables_of_reading(const char *ref, Oid relid, List **left_out)
 {
 	ProllyNodeRef root;
 	Tables		ts = {NIL};
 
 	if (is_working(ref))
-		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid, &root);
+		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid,
+						   &root, left_out);
 	else
 		root_of(ref, &root);
 	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
+	if (OidIsValid(relid))
+	{
+		Table	   *t = find_table(ts.tables, table_name(relid));
+
+		return t ? list_make1(t) : NIL;
+	}
 	return ts.tables;
+}
+
+static List *
+tables_of(const char *ref, Oid relid)
+{
+	return tables_of_reading(ref, relid, NULL);
 }
 
 static bool
@@ -354,10 +380,6 @@ tables_differ(List *from, List *to, Oid relid)
 	return false;
 }
 
-/*
- * Every table the session branch has: tables only in other versions can't
- * be read as rows here (tables() names them).
- */
 /* A table of either side of a diff, with its versions. */
 typedef struct DiffTable
 {
@@ -465,9 +487,11 @@ static void
 folded_tables(const char *from_ref, const char *to_ref,
 			  ProllyTableChangeVisit visit, void *arg)
 {
-	List	   *from = tables_of(from_ref, InvalidOid);
-	List	   *to = strcmp(to_ref, from_ref) == 0 ? from :
-		tables_of(to_ref, InvalidOid);
+	List	   *left_out = NIL;
+	ListCell   *lc;
+	List	   *from = tables_of_reading(from_ref, InvalidOid, &left_out);
+	List	   *to = is_working(to_ref) && is_working(from_ref) ? from :
+		tables_of_reading(to_ref, InvalidOid, &left_out);
 	ListCell   *a = list_head(from);
 	ListCell   *b = list_head(to);
 
@@ -496,6 +520,15 @@ folded_tables(const char *from_ref, const char *to_ref,
 			a = lnext(from, a);
 			b = lnext(to, b);
 		}
+	}
+
+	/* (what the reads left out, once each) */
+	list_sort(left_out, string_cmp);
+	foreach(lc, left_out)
+	{
+		if (foreach_current_index(lc) == 0 ||
+			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
+			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, arg);
 	}
 }
 

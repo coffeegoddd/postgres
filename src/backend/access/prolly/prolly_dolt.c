@@ -1232,11 +1232,17 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 		values[3] = CStringGetTextDatum(email);
 		values[4] = TimestampTzGetDatum(info.committed_at);
 		values[5] = CStringGetTextDatum(info.message);
-		values[6] = BoolGetDatum(PROLLY_CALL(refs(), read_working_set, name,
-											 InvalidOid, &ws) &&
-								 PROLLY_CALL(refs(), commit_working_set, head,
-											 &committed) &&
-								 !same_hash(&ws.hash, &committed.hash));
+		{
+			List	   *left_out = NIL;
+
+			/* (objects a commit refuses are changes it can't hold) */
+			values[6] = BoolGetDatum(PROLLY_CALL(refs(), read_working_set, name,
+												 InvalidOid, &ws, &left_out) &&
+									 (left_out != NIL ||
+									  !(PROLLY_CALL(refs(), commit_working_set, head,
+													&committed) &&
+										same_hash(&ws.hash, &committed.hash))));
+		}
 	}
 	else
 	{
@@ -1298,6 +1304,7 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 	static const char *const statuses[] = {
 		[PROLLY_DIFF_ADDED] = "new table",
 		[PROLLY_DIFF_REMOVED] = "deleted",
+		[PROLLY_DIFF_NOT_COVERED] = "not covered",
 		[PROLLY_DIFF_MODIFIED] = "modified",
 	};
 
@@ -1310,7 +1317,8 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
  *
  * The tables changed since the session branch's head commit: rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
- * in progress, with conflicts ("conflict", not staged).
+ * in progress, with conflicts ("conflict", not staged); and objects a
+ * commit doesn't cover yet ("not covered", not staged).
  */
 Datum
 dolt_status(PG_FUNCTION_ARGS)
@@ -1386,7 +1394,9 @@ dolt_status(PG_FUNCTION_ARGS)
 
 		*tab = '\0';
 		values[0] = CStringGetTextDatum(lfirst(lc));
-		values[1] = BoolGetDatum(strcmp(tab + 1, "conflict") != 0);
+		/* (a conflict, or an object a commit refuses, isn't committed) */
+		values[1] = BoolGetDatum(strcmp(tab + 1, "conflict") != 0 &&
+								 strcmp(tab + 1, "not covered") != 0);
 		values[2] = CStringGetTextDatum(tab + 1);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

@@ -73,38 +73,44 @@ static const char *const applier_callbacks[] = {PROLLY_APPLIER_CALLBACK_NAMES};
 static const char *const tablefile_callbacks[] = {PROLLY_TABLEFILE_CALLBACK_NAMES};
 static const char *const changes_callbacks[] = {PROLLY_CHANGES_CALLBACK_NAMES};
 
-#define CHECK_ROUTINE(type, first, names) \
+/*
+ * A routine's callbacks follow its info, one per name, in the names' order:
+ * as many as there are names, from the first named to the last named (so a
+ * name added at the end of the list for a field added elsewhere fails).
+ */
+#define CHECK_ROUTINE(type, first, last, names) \
 	static_assert(offsetof(type, info) == 0 && \
 				  sizeof(type) == offsetof(type, first) + \
-				  lengthof(names) * sizeof(pg_funcptr_t), \
+				  lengthof(names) * sizeof(pg_funcptr_t) && \
+				  offsetof(type, last) == sizeof(type) - sizeof(pg_funcptr_t), \
 				  "callback name list does not match " #type)
 
-CHECK_ROUTINE(ProllyEngineRoutine, PROLLY_ENGINE_FIRST_CALLBACK, engine_callbacks);
-CHECK_ROUTINE(ProllyCoordRoutine, PROLLY_COORD_FIRST_CALLBACK, coord_callbacks);
-CHECK_ROUTINE(ProllyNodeFormatRoutine, PROLLY_NODEFORMAT_FIRST_CALLBACK, nodeformat_callbacks);
-CHECK_ROUTINE(ProllyChunkerRoutine, PROLLY_CHUNKER_FIRST_CALLBACK, chunker_callbacks);
-CHECK_ROUTINE(ProllyHashRoutine, PROLLY_HASH_FIRST_CALLBACK, hash_callbacks);
-CHECK_ROUTINE(ProllyKeyEncoderRoutine, PROLLY_KEYENC_FIRST_CALLBACK, keyenc_callbacks);
-CHECK_ROUTINE(ProllyValueEncoderRoutine, PROLLY_VALENC_FIRST_CALLBACK, valenc_callbacks);
-CHECK_ROUTINE(ProllyNodeStoreRoutine, PROLLY_NODESTORE_FIRST_CALLBACK, nodestore_callbacks);
-CHECK_ROUTINE(ProllyAllocatorRoutine, PROLLY_ALLOC_FIRST_CALLBACK, alloc_callbacks);
-CHECK_ROUTINE(ProllyReclaimRoutine, PROLLY_RECLAIM_FIRST_CALLBACK, reclaim_callbacks);
-CHECK_ROUTINE(ProllyLogRoutine, PROLLY_LOG_FIRST_CALLBACK, log_callbacks);
-CHECK_ROUTINE(ProllyCommitRoutine, PROLLY_COMMIT_FIRST_CALLBACK, commit_callbacks);
-CHECK_ROUTINE(ProllyRowIdRoutine, PROLLY_ROWID_FIRST_CALLBACK, rowid_callbacks);
-CHECK_ROUTINE(ProllyRefsRoutine, PROLLY_REFS_FIRST_CALLBACK, refs_callbacks);
-CHECK_ROUTINE(ProllyTransferRoutine, PROLLY_TRANSFER_FIRST_CALLBACK, transfer_callbacks);
-CHECK_ROUTINE(ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, merge_callbacks);
-CHECK_ROUTINE(ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, tree_callbacks);
-CHECK_ROUTINE(ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, rootlayout_callbacks);
-CHECK_ROUTINE(ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, keying_callbacks);
-CHECK_ROUTINE(ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, ixkeying_callbacks);
-CHECK_ROUTINE(ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, canon_callbacks);
-CHECK_ROUTINE(ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, chunkstore_callbacks);
-CHECK_ROUTINE(ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, chunkformat_callbacks);
-CHECK_ROUTINE(ProllyApplierRoutine, PROLLY_APPLIER_FIRST_CALLBACK, applier_callbacks);
-CHECK_ROUTINE(ProllyTableFileRoutine, PROLLY_TABLEFILE_FIRST_CALLBACK, tablefile_callbacks);
-CHECK_ROUTINE(ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, changes_callbacks);
+CHECK_ROUTINE(ProllyEngineRoutine, PROLLY_ENGINE_FIRST_CALLBACK, PROLLY_ENGINE_LAST_CALLBACK, engine_callbacks);
+CHECK_ROUTINE(ProllyCoordRoutine, PROLLY_COORD_FIRST_CALLBACK, PROLLY_COORD_LAST_CALLBACK, coord_callbacks);
+CHECK_ROUTINE(ProllyNodeFormatRoutine, PROLLY_NODEFORMAT_FIRST_CALLBACK, PROLLY_NODEFORMAT_LAST_CALLBACK, nodeformat_callbacks);
+CHECK_ROUTINE(ProllyChunkerRoutine, PROLLY_CHUNKER_FIRST_CALLBACK, PROLLY_CHUNKER_LAST_CALLBACK, chunker_callbacks);
+CHECK_ROUTINE(ProllyHashRoutine, PROLLY_HASH_FIRST_CALLBACK, PROLLY_HASH_LAST_CALLBACK, hash_callbacks);
+CHECK_ROUTINE(ProllyKeyEncoderRoutine, PROLLY_KEYENC_FIRST_CALLBACK, PROLLY_KEYENC_LAST_CALLBACK, keyenc_callbacks);
+CHECK_ROUTINE(ProllyValueEncoderRoutine, PROLLY_VALENC_FIRST_CALLBACK, PROLLY_VALENC_LAST_CALLBACK, valenc_callbacks);
+CHECK_ROUTINE(ProllyNodeStoreRoutine, PROLLY_NODESTORE_FIRST_CALLBACK, PROLLY_NODESTORE_LAST_CALLBACK, nodestore_callbacks);
+CHECK_ROUTINE(ProllyAllocatorRoutine, PROLLY_ALLOC_FIRST_CALLBACK, PROLLY_ALLOC_LAST_CALLBACK, alloc_callbacks);
+CHECK_ROUTINE(ProllyReclaimRoutine, PROLLY_RECLAIM_FIRST_CALLBACK, PROLLY_RECLAIM_LAST_CALLBACK, reclaim_callbacks);
+CHECK_ROUTINE(ProllyLogRoutine, PROLLY_LOG_FIRST_CALLBACK, PROLLY_LOG_LAST_CALLBACK, log_callbacks);
+CHECK_ROUTINE(ProllyCommitRoutine, PROLLY_COMMIT_FIRST_CALLBACK, PROLLY_COMMIT_LAST_CALLBACK, commit_callbacks);
+CHECK_ROUTINE(ProllyRowIdRoutine, PROLLY_ROWID_FIRST_CALLBACK, PROLLY_ROWID_LAST_CALLBACK, rowid_callbacks);
+CHECK_ROUTINE(ProllyRefsRoutine, PROLLY_REFS_FIRST_CALLBACK, PROLLY_REFS_LAST_CALLBACK, refs_callbacks);
+CHECK_ROUTINE(ProllyTransferRoutine, PROLLY_TRANSFER_FIRST_CALLBACK, PROLLY_TRANSFER_LAST_CALLBACK, transfer_callbacks);
+CHECK_ROUTINE(ProllyMergeRoutine, PROLLY_MERGE_FIRST_CALLBACK, PROLLY_MERGE_LAST_CALLBACK, merge_callbacks);
+CHECK_ROUTINE(ProllyTreeRoutine, PROLLY_TREE_FIRST_CALLBACK, PROLLY_TREE_LAST_CALLBACK, tree_callbacks);
+CHECK_ROUTINE(ProllyRootLayoutRoutine, PROLLY_ROOTLAYOUT_FIRST_CALLBACK, PROLLY_ROOTLAYOUT_LAST_CALLBACK, rootlayout_callbacks);
+CHECK_ROUTINE(ProllyKeyingRoutine, PROLLY_KEYING_FIRST_CALLBACK, PROLLY_KEYING_LAST_CALLBACK, keying_callbacks);
+CHECK_ROUTINE(ProllyIndexKeyingRoutine, PROLLY_IXKEYING_FIRST_CALLBACK, PROLLY_IXKEYING_LAST_CALLBACK, ixkeying_callbacks);
+CHECK_ROUTINE(ProllyCanonRoutine, PROLLY_CANON_FIRST_CALLBACK, PROLLY_CANON_LAST_CALLBACK, canon_callbacks);
+CHECK_ROUTINE(ProllyChunkStoreRoutine, PROLLY_CHUNKSTORE_FIRST_CALLBACK, PROLLY_CHUNKSTORE_LAST_CALLBACK, chunkstore_callbacks);
+CHECK_ROUTINE(ProllyChunkFormatRoutine, PROLLY_CHUNKFORMAT_FIRST_CALLBACK, PROLLY_CHUNKFORMAT_LAST_CALLBACK, chunkformat_callbacks);
+CHECK_ROUTINE(ProllyApplierRoutine, PROLLY_APPLIER_FIRST_CALLBACK, PROLLY_APPLIER_LAST_CALLBACK, applier_callbacks);
+CHECK_ROUTINE(ProllyTableFileRoutine, PROLLY_TABLEFILE_FIRST_CALLBACK, PROLLY_TABLEFILE_LAST_CALLBACK, tablefile_callbacks);
+CHECK_ROUTINE(ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, PROLLY_CHANGES_LAST_CALLBACK, changes_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}

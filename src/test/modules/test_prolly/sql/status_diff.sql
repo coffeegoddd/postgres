@@ -103,11 +103,17 @@ DROP DATABASE sd_win1251;
 CREATE SCHEMA sdu VERSIONED;
 CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
+-- They are changes a commit can't hold: listed as not covered (a
+-- partition with its partitioned table, not as a table of its own), and
+-- the branch is dirty with them alone.
 CREATE TABLE sdu.p (id int) PARTITION BY RANGE (id);
+CREATE TABLE sdu.p1 PARTITION OF sdu.p FOR VALUES FROM (1) TO (10);
+SELECT name, dirty FROM dolt_branches WHERE name = 'main';
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 CREATE AGGREGATE sdu.total (int) (sfunc = int4pl, stype = int);
 CREATE POLICY sdu_own ON sdu.t USING (true);
 INSERT INTO sdu.t VALUES (1, 'one');
-SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%' OR table_name LIKE 'sdu_own%';
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 SELECT dolt_commit('-am', 'refused');

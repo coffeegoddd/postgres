@@ -281,6 +281,7 @@ typedef struct ProllyEngineRoutine
 	"canonical_root", \
 	"export_chunks", "node_counters"
 #define PROLLY_ENGINE_FIRST_CALLBACK shmem_size
+#define PROLLY_ENGINE_LAST_CALLBACK node_counters
 
 /* Memory a transaction's private writes may use before spilling (kB). */
 extern PGDLLIMPORT int prolly_write_set_memory;

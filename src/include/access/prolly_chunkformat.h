@@ -58,6 +58,7 @@ typedef struct ProllyChunkFormatRoutine
 #define PROLLY_CHUNKFORMAT_CALLBACK_NAMES \
 	"encode", "open", "item_get", "item_space", "header_size"
 #define PROLLY_CHUNKFORMAT_FIRST_CALLBACK encode
+#define PROLLY_CHUNKFORMAT_LAST_CALLBACK header_size
 
 static inline const ProllyChunkFormatRoutine *
 prolly_chunkformat_lookup(const char *name)

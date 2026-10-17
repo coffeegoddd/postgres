@@ -80,6 +80,7 @@ typedef struct ProllyIndexKeyingRoutine
 	"open", "describe", "nkeys", "encode_entry", "decode_entry", \
 	"encode_bound", "compare", "columns_equal", "equal_bytes", "close"
 #define PROLLY_IXKEYING_FIRST_CALLBACK open
+#define PROLLY_IXKEYING_LAST_CALLBACK close
 
 static inline const ProllyIndexKeyingRoutine *
 prolly_ixkeying_lookup(const char *name)

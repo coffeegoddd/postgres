@@ -90,6 +90,7 @@ typedef struct ProllyNodeFormatRoutine
 	"item_hint", "item_space", "free_space", "canonical_bytes", \
 	"special_space", "page_check"
 #define PROLLY_NODEFORMAT_FIRST_CALLBACK page_init
+#define PROLLY_NODEFORMAT_LAST_CALLBACK page_check
 
 static inline const ProllyNodeFormatRoutine *
 prolly_nodeformat_lookup(const char *name)

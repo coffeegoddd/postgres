@@ -150,6 +150,7 @@ typedef struct ProllyRowIdRoutine
 	"tid_retire", "tid_renew", "tid_rename", "dead_tids", "tid_forget", \
 	"counter_carry"
 #define PROLLY_ROWID_FIRST_CALLBACK tid_assign
+#define PROLLY_ROWID_LAST_CALLBACK counter_carry
 
 static inline const ProllyRowIdRoutine *
 prolly_rowid_lookup(const char *name)

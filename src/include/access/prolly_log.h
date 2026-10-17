@@ -62,6 +62,7 @@ typedef struct ProllyLogRoutine
 	"log_node", "log_mutation", "log_commit", "redo", "desc", "identify", \
 	"startup", "cleanup", "mask"
 #define PROLLY_LOG_FIRST_CALLBACK log_node
+#define PROLLY_LOG_LAST_CALLBACK mask
 
 static inline const ProllyLogRoutine *
 prolly_log_lookup(const char *name)

@@ -133,6 +133,7 @@ typedef struct ProllyKeyingRoutine
 	"parse_value", "content_hash", "decode_row", "compare", "can_compare", \
 	"equal_bytes", "close"
 #define PROLLY_KEYING_FIRST_CALLBACK open
+#define PROLLY_KEYING_LAST_CALLBACK close
 
 static inline const ProllyKeyingRoutine *
 prolly_keying_lookup(const char *name)

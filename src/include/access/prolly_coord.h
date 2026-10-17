@@ -104,6 +104,7 @@ typedef struct ProllyCoordRoutine
 	"insert_intent_complete", "current_writers", "predicate_lock_range", "written_since", \
 	"xact_commit", "xact_abort", "subxact_abort", "prune_markers"
 #define PROLLY_COORD_FIRST_CALLBACK shmem_size
+#define PROLLY_COORD_LAST_CALLBACK prune_markers
 
 /* Row locks a transaction takes on one table before locking all of it. */
 extern PGDLLIMPORT int prolly_max_row_locks_per_table;

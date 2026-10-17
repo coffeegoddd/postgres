@@ -156,6 +156,7 @@ typedef struct Canon
 	bool		advance;
 	List	   *next;			/* CanonItem *, the next baseline's */
 	bool		reading;		/* objects not described are left out */
+	List	   *left_out;		/* (reading) their names */
 	Oid			only;			/* valid: only this table's rows folded */
 } Canon;
 
@@ -178,12 +179,12 @@ static void
 canon_env(Canon *cn)
 {
 	cn->tree = prolly_tree_lookup("cow");
-	memset(&cn->env, 0, sizeof(cn->env));
 	if (cn->folded)
 	{
 		prolly_folded_tree_env(&cn->env);
 		return;
 	}
+	memset(&cn->env, 0, sizeof(cn->env));
 	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
 	cn->env.node_format = cn->c.node_format;
 	cn->env.chunker = cn->c.chunker;
@@ -264,7 +265,10 @@ static bool
 uncovered(Canon *cn, const char *what, const char *name)
 {
 	if (cn->reading)
+	{
+		cn->left_out = lappend(cn->left_out, pstrdup(name));
 		return true;
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("prolly commits don't cover %s yet: %s", what, name),
@@ -862,6 +866,13 @@ collect(Canon *cn)
 		switch (form->relkind)
 		{
 			case RELKIND_RELATION:
+				/* (a partition goes with its partitioned table) */
+				if (form->relispartition)
+				{
+					(void) uncovered(cn, "partitions of partitioned tables",
+									 qualified(form->relnamespace, name));
+					break;
+				}
 				if (versioned_am(cn, form->relam))
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
@@ -1010,7 +1021,11 @@ collect(Canon *cn)
 			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
 
 			if (canon_namespace(cn, get_rel_namespace(pol->polrelid)))
-				(void) uncovered(cn, "row security policies", NameStr(pol->polname));
+				(void) uncovered(cn, "row security policies",
+								 psprintf("%s on %s",
+										  quote_identifier(NameStr(pol->polname)),
+										  qualified(get_rel_namespace(pol->polrelid),
+													get_rel_name(pol->polrelid))));
 		}
 		systable_endscan(scan);
 		table_close(pg_policy, AccessShareLock);
@@ -1388,12 +1403,14 @@ build_baseline(Canon *cn, ProllyNodeRef *next)
 	PROLLY_CALL(cn->tree, build_finish, b, next);
 }
 
-static void
+static List *
 fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 		   ProllyNodeRef *next_baseline, bool reading, Oid only)
 {
 	Canon		cn;
 
+	/* (a baseline holds every table's state: never made from one alone) */
+	Assert(!OidIsValid(only) || next_baseline == NULL);
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	cn.reading = reading;
@@ -1428,19 +1445,24 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	PG_END_TRY();
 	if (next_baseline)
 		build_baseline(&cn, next_baseline);
+	return cn.left_out;
 }
 
 static void
 folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 			ProllyNodeRef *next_baseline)
 {
-	fold_canon(baseline, root, next_baseline, false, InvalidOid);
+	(void) fold_canon(baseline, root, next_baseline, false, InvalidOid);
 }
 
 static void
-folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root)
+folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root,
+				 List **left_out)
 {
-	fold_canon(baseline, root, NULL, true, only);
+	List	   *l = fold_canon(baseline, root, NULL, true, only);
+
+	if (left_out)
+		*left_out = list_concat(*left_out, l);
 }
 
 /* A baseline's tree, its tables' data trees and the finder's states. */

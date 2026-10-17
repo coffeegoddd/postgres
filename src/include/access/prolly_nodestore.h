@@ -85,6 +85,7 @@ typedef struct ProllyNodeStoreRoutine
 	"create", "open", "close", "read", "new_node", "publish", "contains", \
 	"release", "scan", "reclaim", "redo"
 #define PROLLY_NODESTORE_FIRST_CALLBACK create
+#define PROLLY_NODESTORE_LAST_CALLBACK redo
 
 static inline const ProllyNodeStoreRoutine *
 prolly_nodestore_lookup(const char *name)

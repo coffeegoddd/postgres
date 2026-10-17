@@ -498,8 +498,10 @@ fails without its fix), and Postgres's suites keep passing after each one.
 - **As built:** `dolt_status` and `dolt_diff` failed on objects a commit
   can't hold yet (partitioned and foreign tables, aggregates, policies),
   and a diff of one table folded every changed table (issue #130); since
-  #137 reads leave such objects out, only a commit refuses them, and a
-  diff of one table folds that table alone.
+  #137 reads leave such objects out (partitions with their partitioned
+  tables), `dolt_status` lists them as "not covered" and unstaged, a branch
+  with them is dirty, only a commit refuses them, and a diff of one table
+  folds that table alone.
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and

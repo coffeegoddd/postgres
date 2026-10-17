@@ -68,6 +68,7 @@ typedef struct ProllyTableFileRoutine
 	"write_begin", "write_add", "write_finish", "open", "find", "decode", \
 	"count", "entry", "close"
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
+#define PROLLY_TABLEFILE_LAST_CALLBACK close
 
 static inline const ProllyTableFileRoutine *
 prolly_tablefile_lookup(const char *name)

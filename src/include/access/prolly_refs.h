@@ -144,13 +144,6 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*working_set) (const char *branch, ProllyNodeRef *root);
 
-	/*
-	 * working_set() for reading what changed, never to commit or move from:
-	 * objects a commit would refuse are left out, and with only valid, only
-	 * that table's rows are read (the canonicalizer's read_fold()).
-	 */
-	bool		(*read_working_set) (const char *branch, Oid only,
-									 ProllyNodeRef *root);
 
 	/*
 	 * Make the commit ref names the session branch's head commit, and its
@@ -210,6 +203,15 @@ typedef struct ProllyRefsRoutine
 	 */
 	List	   *(*violations) (void);
 	void		(*set_violations) (List *violations);
+
+	/*
+	 * working_set() for reading what changed, never to commit or move from:
+	 * objects a commit would refuse are left out, their names appended to
+	 * *left_out (if not NULL), and with only valid, only that table's rows
+	 * are read (the canonicalizer's read_fold()).
+	 */
+	bool		(*read_working_set) (const char *branch, Oid only,
+									 ProllyNodeRef *root, List **left_out);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
@@ -219,6 +221,7 @@ typedef struct ProllyRefsRoutine
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
+#define PROLLY_REFS_LAST_CALLBACK read_working_set
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

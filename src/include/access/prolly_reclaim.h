@@ -63,6 +63,7 @@ typedef struct ProllyReclaimRoutine
 	"may_modify_in_place", "node_created", "node_dropped", "root_retired", \
 	"run", "collect"
 #define PROLLY_RECLAIM_FIRST_CALLBACK may_modify_in_place
+#define PROLLY_RECLAIM_LAST_CALLBACK collect
 
 static inline const ProllyReclaimRoutine *
 prolly_reclaim_lookup(const char *name)

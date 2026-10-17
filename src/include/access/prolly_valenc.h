@@ -70,6 +70,7 @@ typedef struct ProllyValueEncoderRoutine
 	"begin", "layout", "begin_layout", "reads_layout", "encode", "decode", \
 	"end"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
+#define PROLLY_VALENC_LAST_CALLBACK end
 
 static inline const ProllyValueEncoderRoutine *
 prolly_valenc_lookup(const char *name)
