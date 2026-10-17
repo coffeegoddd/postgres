@@ -37,7 +37,9 @@ Release builds: stock Postgres at upstream `a999971331` (the commit this
 fork last synced), prolly at the top of stack #138, Dolt 2.4.0. Each step
 is one statement or call through one connection (Go `database/sql`,
 pgx and go-sql-driver/mysql); the median of its repetitions is shown. The
-harness and scripts were in the session's scratch space, not committed.
+harness is `src/tools/prolly_bench/keyless/` (its README says how to run
+it); the merge cases in part 4 are its `merge_pg.sql` and
+`merge_dolt.sql`.
 
 ### Writes and reads (ms)
 

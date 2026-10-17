@@ -1,0 +1,99 @@
+@step commit_all 1
+%CALL% dolt_commit('-Am', 'base');
+@step commit_one_row 10
+@pre
+INSERT INTO t VALUES (5000000 + {i}, 'c', 1);
+@body
+%CALL% dolt_commit('-am', 'one');
+@step status_one_row 10
+@pre
+INSERT INTO t VALUES (6000000 + {i}, 's', 1);
+@body
+SELECT count(*) FROM dolt_status;
+@setup
+%CALL% dolt_commit('-am', 'status rows');
+@step diff_one_row 10
+@pre
+INSERT INTO t VALUES (7000000 + {i}, 'd', 1);
+@body
+SELECT count(*) FROM %DIFF_WORKING%;
+@setup
+%CALL% dolt_commit('-am', 'diff rows');
+@step commit_10k_update 3
+@pre
+UPDATE t SET c = c + 1 WHERE a BETWEEN 700000 + {i} * 10000 AND 709999 + {i} * 10000;
+@body
+%CALL% dolt_commit('-am', 'ten thousand');
+@step diff_commits_10k 3
+SELECT count(*) FROM %DIFF_COMMITS%;
+@step status_10k_update 3
+@pre
+UPDATE t SET c = c + 1 WHERE a BETWEEN 730000 + {i} * 10000 AND 739999 + {i} * 10000;
+@body
+SELECT count(*) FROM dolt_status;
+@step reset_hard_30k 1
+%CALL% dolt_reset('--hard');
+@step branch_create 5
+%CALL% dolt_branch('b{i}');
+@step checkout_new_branch 5
+@body
+%CALL% dolt_checkout('b{i}');
+@pre
+%CALL% dolt_checkout('main');
+@step checkout_back_and_forth 5
+@pre
+%CALL% dolt_checkout('main');
+@body
+%CALL% dolt_checkout('b0');
+%CALL% dolt_checkout('main');
+@step checkout_dirty_10k 3
+@pre
+%CALL% dolt_checkout('main');
+UPDATE t SET c = c + 1 WHERE a BETWEEN 760000 + {i} * 10000 AND 769999 + {i} * 10000;
+@body
+%CALL% dolt_checkout('b0');
+@setup
+%CALL% dolt_checkout('main');
+%CALL% dolt_commit('-am', 'dirty ones');
+@step merge_ff_10k 3
+@pre
+%CALL% dolt_branch('f{i}');
+%CALL% dolt_checkout('f{i}');
+UPDATE t SET c = c + 3 WHERE a BETWEEN 800000 + {i} * 10000 AND 809999 + {i} * 10000;
+%CALL% dolt_commit('-am', 'ff');
+%CALL% dolt_checkout('main');
+@body
+%CALL% dolt_merge('f{i}');
+@step merge_3way_10k_each 3
+@pre
+%CALL% dolt_branch('m{i}');
+%CALL% dolt_checkout('m{i}');
+UPDATE t SET c = c + 5 WHERE a BETWEEN 840000 + {i} * 20000 AND 849999 + {i} * 20000;
+%CALL% dolt_commit('-am', 'theirs');
+%CALL% dolt_checkout('main');
+UPDATE t SET c = c + 7 WHERE a BETWEEN 850000 + {i} * 20000 AND 859999 + {i} * 20000;
+%CALL% dolt_commit('-am', 'ours');
+@body
+%CALL% dolt_merge('m{i}');
+@step merge_3way_1row_each 5
+@pre
+%CALL% dolt_branch('s{i}');
+%CALL% dolt_checkout('s{i}');
+UPDATE t SET c = c + 5 WHERE a = 150000 + {i};
+%CALL% dolt_commit('-am', 'theirs');
+%CALL% dolt_checkout('main');
+UPDATE t SET c = c + 7 WHERE a = 160000 + {i};
+%CALL% dolt_commit('-am', 'ours');
+@body
+%CALL% dolt_merge('s{i}');
+@step cherry_pick_10k 3
+@pre
+%CALL% dolt_branch('p{i}');
+%CALL% dolt_checkout('p{i}');
+UPDATE t SET c = c + 9 WHERE a BETWEEN 120000 + {i} * 10000 AND 129999 + {i} * 10000;
+%CALL% dolt_commit('-am', 'pick');
+%CALL% dolt_checkout('main');
+@body
+%CALL% dolt_cherry_pick('p{i}');
+@step log_count 3
+SELECT count(*) FROM dolt_log;
