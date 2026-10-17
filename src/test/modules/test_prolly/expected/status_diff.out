@@ -294,7 +294,7 @@ SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 (1 row)
 
 SELECT dolt_commit('-am', 'refused');
-ERROR:  prolly commits don't cover partitions of partitioned tables yet: sdu.p1
+ERROR:  prolly commits don't cover partitioned tables yet: sdu.p
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP SCHEMA sdu CASCADE;
 NOTICE:  drop cascades to 3 other objects
