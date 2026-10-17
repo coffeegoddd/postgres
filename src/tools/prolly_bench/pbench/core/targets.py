@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 # Table AMs whose tables must be in a versioned schema.
-VERSIONED_ONLY = {"prolly"}
+VERSIONED_ONLY = frozenset({"prolly"})
 
 # Table AMs with version control (data history): the V suite's engines,
 # prolly's being its versioned schemas'.
-VERSIONED_HISTORY = VERSIONED_ONLY
+VERSIONED_HISTORY = frozenset({"prolly"})
 
 # The versioned schema a target creates its tables in.
 VERSIONED_SCHEMA = "versioned"

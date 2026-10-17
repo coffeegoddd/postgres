@@ -77,10 +77,10 @@ Run the selected scenarios and join the execution evidence:
 ```sh
 bash src/tools/prolly_bench/build_vc.sh
 src/tools/prolly_bench/prolly_bench vc --pg-bin /path/to/pgsql/bin \
-  --cases src/tools/prolly_bench/corpus/dolt/scenarios --out /tmp/dolt-d1
+  --cases src/tools/prolly_bench/corpus/dolt/scenarios --out /tmp/dolt-prolly
 cd src/tools/prolly_bench/slt
 go run ./cmd/dolt-corpus --root ../corpus/dolt \
-  --results /tmp/dolt-d1/results/summary.json --out /tmp/dolt-coverage.json
+  --results /tmp/dolt-prolly/results/summary.json --out /tmp/dolt-coverage.json
 ```
 
 The report separates source inventory, fully/partially ported cases, deferred

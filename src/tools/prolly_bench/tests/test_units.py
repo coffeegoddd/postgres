@@ -383,8 +383,7 @@ class VSuiteSQLTest(unittest.TestCase):
         return SimpleNamespace(table_am=am)
 
     def test_prolly_uses_dolt_functions(self):
-        from pbench.workloads.v_suite import vc_sql
-        vc = vc_sql(self.ctx("prolly"))
+        from pbench.workloads.v_suite import VC_SQL as vc
         stmts = [vc.branch("b"), vc.checkout("b"), vc.commit("m"),
                  vc.diff_count("main", "b", "vc_data"), vc.merge("b")]
         self.assertTrue(all("dolt_" in s and "prolly_" not in s for s in stmts), stmts)

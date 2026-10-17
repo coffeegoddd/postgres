@@ -44,8 +44,8 @@ class _DoltSQL:
         return f"SELECT dolt_merge('{name}')"
 
 
-def vc_sql(ctx: Context):
-    return _DoltSQL()
+# The version-control statements every V workload uses.
+VC_SQL = _DoltSQL()
 
 
 class VWorkload(Workload):
@@ -66,7 +66,7 @@ class VWorkload(Workload):
             ctx.cluster.sql(f"""
                 CREATE TABLE target (id int PRIMARY KEY, v text);
                 INSERT INTO target VALUES (1, 'base');
-                {vc_sql(ctx).commit('probe base')};
+                {VC_SQL.commit('probe base')};
                 UPDATE target SET v = 'dirty';
                 SELECT dolt_reset('--hard', 'HEAD');
                 DO $$ BEGIN
@@ -103,7 +103,7 @@ class VWorkload(Workload):
         """, dbname=ctx.dbname, options=ctx.session_options())
         if ctx.params["background"] == "S1":
             pgbench_init(ctx, int(ctx.size_params["pgbench_scale"]))
-        timed_session(ctx, [vc_sql(ctx).commit("initial data")], "prepare-commit")
+        timed_session(ctx, [VC_SQL.commit("initial data")], "prepare-commit")
 
     def background(self, ctx: Context):
         if ctx.params["background"] == "S1":
@@ -136,7 +136,7 @@ class V1(VWorkload):
     id, title = "V1", "Branch create and checkout"
 
     def operations(self, ctx):
-        vc = vc_sql(ctx)
+        vc = VC_SQL
         stmts = []
         for i in range(self.iterations(ctx)):
             stmts += [vc.branch(f"v1_b{i}"), vc.checkout(f"v1_b{i}"),
@@ -160,13 +160,13 @@ class V2(VWorkload):
         super().prepare(ctx)
         # on a branch of its own, so a background workload's writes (on
         # main) aren't in its commits; made before the measured window
-        timed_session(ctx, [vc_sql(ctx).branch("v2_work")], "v2-prepare")
+        timed_session(ctx, [VC_SQL.branch("v2_work")], "v2-prepare")
 
     def operations(self, ctx):
         n = ctx.params["changes"]
         if n > self.rows(ctx):
             raise ValueError("V2 changes exceed the dataset; refusing to clamp the workload")
-        vc = vc_sql(ctx)
+        vc = VC_SQL
         # (a checkout is the session's own, so it is this session's first
         # statement; the timings leave it out)
         stmts = [vc.checkout("v2_work")]
@@ -225,7 +225,7 @@ class V3(VWorkload):
             raise RuntimeError(f"V3 change-set cardinalities differ: {observed}")
         # Both sides are branches of their own, so a background workload's
         # writes (on main) are on neither and the merge doesn't touch them.
-        vc = vc_sql(ctx)
+        vc = VC_SQL
         stmts = [
             vc.branch("v3_ours"),
             vc.branch("v3_other"),

@@ -485,8 +485,8 @@ impossible change sets and oversized V2 changes fail rather than being clamped.
 
 The gate below reads per-operation node work from `*-counters.json`, which
 only the tree engine D1 recorded (from its node counters); no engine records
-it since D1's removal, so the gate is inconclusive until prolly's folds
-report theirs. For a fixed V2 variant, configure at least four `v_rows`
+it since D1's removal, so until prolly's folds report theirs the gate
+reports `"inconclusive": true` and exits 2 (a failed gate exits 1). For a fixed V2 variant, configure at least four `v_rows`
 sizes spanning 8x and five repetitions per size, then inspect/gate
 empirical node-work growth:
 

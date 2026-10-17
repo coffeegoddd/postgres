@@ -102,23 +102,21 @@ class ConditionsTest(unittest.TestCase):
                 self.assertEqual(envmod._cpu_boost(), boost, values)
 
     def test_v_suite_needs_an_engine_with_history(self):
-        for am in ("heap",):
-            with self.assertRaisesRegex(SystemExit, "only prolly has"):
-                Runner(suite="V", cfg={}, table_am=am, label="x", repo=self.path,
-                       bin_dir=self.path, work_dir=self.path, out_root=self.path,
-                       command="run")
+        with self.assertRaisesRegex(SystemExit, "only prolly has"):
+            Runner(suite="V", cfg={}, table_am="heap", label="x", repo=self.path,
+                   bin_dir=self.path, work_dir=self.path, out_root=self.path,
+                   command="run")
 
-    def test_v_suite_probes_each_engine_in_its_own_sql(self):
-        # (page-based prolly: dolt_* functions, in a versioned schema)
-        for am, setup, commit in (("prolly", "VERSIONED", "dolt_commit"),):
-            sql = []
-            cluster = SimpleNamespace(sql=lambda q, **kw: sql.append(q))
-            ctx = SimpleNamespace(table_am=am, cluster=cluster,
-                                  session_options=lambda: {})
-            V1().check(ctx)
-            probe = next(q for q in sql if "CREATE TABLE target" in q)
-            self.assertIn(commit, probe, am)
-            self.assertEqual(any(setup and setup in q for q in sql), bool(setup), am)
+    def test_v_suite_probes_prolly_in_a_versioned_schema(self):
+        # (dolt_* functions, in a versioned schema)
+        sql = []
+        cluster = SimpleNamespace(sql=lambda q, **kw: sql.append(q))
+        ctx = SimpleNamespace(table_am="prolly", cluster=cluster,
+                              session_options=lambda: {})
+        V1().check(ctx)
+        probe = next(q for q in sql if "CREATE TABLE target" in q)
+        self.assertIn("dolt_commit", probe)
+        self.assertTrue(any("VERSIONED" in q for q in sql))
         with self.assertRaises(NotImplementedByEngine):
             V1().check(SimpleNamespace(table_am="heap"))
 
