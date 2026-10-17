@@ -58,6 +58,7 @@
 #include "common/int.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
@@ -749,6 +750,7 @@ merge_sequences(const ProllyNodeRef *base, const ProllyNodeRef *ours,
 	HTAB	   *b = sequences_by_name(sequences_of(base));
 	HTAB	   *o = sequences_by_name(sequences_of(ours));
 	ListCell   *lc;
+	Oid			relid;
 
 	foreach(lc, sequences_of(theirs))
 	{
@@ -758,8 +760,10 @@ merge_sequences(const ProllyNodeRef *base, const ProllyNodeRef *ours,
 
 		if (bs && same_sequence(bs, t))
 			continue;
-		if (os == NULL ||
-			further(t, os, sequence_increment(rel_named(t->name, NoLock, false))))
+		relid = rel_named(t->name, NoLock, true);
+		if (!OidIsValid(relid))
+			continue;			/* the merged definitions dropped it */
+		if (os == NULL || further(t, os, sequence_increment(relid)))
 			set_sequence(t);
 	}
 }
@@ -995,6 +999,8 @@ typedef struct MergeRows
 	const char *name;			/* the branch merged, or NULL */
 	List	  **conflicted;
 	int			conflicts;
+	List	   *now;			/* the tables as the branch has them, if
+								 * known (NIL: folded when needed) */
 } MergeRows;
 
 static bool
@@ -1020,23 +1026,111 @@ cannot_merge_rows(const char *what, const char *name)
 }
 
 /*
- * Each table's rows, after the definitions are merged: three-way where
- * all three define it alike; else the rows of the side that redefined,
- * made or kept it, if the other didn't change them.
+ * Every row of relid fits its columns' types as they are now (a length or
+ * precision): checked as an assignment would, which fails if not.
+ */
+static void
+check_fits(Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	Oid		   *coerce = palloc0(sizeof(Oid) * desc->natts);
+	bool		any = false;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->atttypmod >= 0 &&
+			find_typmod_coercion_function(att->atttypid, &coerce[i]) ==
+			COERCION_PATH_FUNC)
+			any = true;
+		else
+			coerce[i] = InvalidOid;
+	}
+	if (any)
+	{
+		Snapshot	snap;
+
+		CommandCounterIncrement();
+		snap = RegisterSnapshot(GetLatestSnapshot());
+		slot = table_slot_create(rel, NULL);
+		scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			slot_getallattrs(slot);
+			for (int i = 0; i < desc->natts; i++)
+				if (OidIsValid(coerce[i]) && !slot->tts_isnull[i])
+					(void) OidFunctionCall3(coerce[i], slot->tts_values[i],
+											Int32GetDatum(TupleDescAttr(desc, i)->atttypmod),
+											BoolGetDatum(false));
+		}
+		table_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+		UnregisterSnapshot(snap);
+	}
+	table_close(rel, AccessShareLock);
+}
+
+/* A table's data tree with no rows, defined as like. */
+static void
+no_rows(const Table *like, Table *out)
+{
+	ProllyTreeEnv env;
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeBuilder *b;
+
+	*out = *like;
+	chunk_env(&env);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tree, build_finish, b, &out->data);
+}
+
+static void
+row_conflicts(MergeRows *mr, Oid relid, int n)
+{
+	if (n > 0 && mr->fail_on_conflict)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflicts in table \"%s\"",
+						op_label(mr->what, mr->name), get_rel_name(relid)),
+				 errdetail_plural("%d row was changed differently on both sides.",
+								  "%d rows were changed differently on both sides.",
+								  n, n)));
+	if (n > 0)
+	{
+		mr->conflicts += n;
+		*mr->conflicted = lappend_oid(*mr->conflicted, relid);
+	}
+}
+
+/*
+ * Each table's rows, after the definitions are merged (or alike): three-way
+ * where both sides define it alike (against no rows, for a table both
+ * made); else the rows of the side whose definition is the merged one, if
+ * the other didn't change them.  The rows each table has now (mr->now, or
+ * the branch folded) are made the rows it should have, whatever the
+ * definitions' merge did to it (a table made again is empty).
  */
 static void
 merge_rows(void *arg)
 {
 	MergeRows  *mr = arg;
-	ProllyNodeRef working;
-	List	   *now = NIL;
-	Tables		ts = {NIL};
+	List	   *now = mr->now;
 	List	   *names = NIL;
 	ListCell   *lc;
 
-	PROLLY_CALL(components().canonicalizer, fold, &working);
-	PROLLY_CALL(components().canonicalizer, tables, &working, add_table, &ts);
-	now = ts.tables;
+	if (now == NIL)
+	{
+		ProllyNodeRef working;
+		Tables		ts = {NIL};
+
+		PROLLY_CALL(components().canonicalizer, fold, &working);
+		PROLLY_CALL(components().canonicalizer, tables, &working, add_table, &ts);
+		now = ts.tables;
+	}
 	foreach(lc, mr->ours)
 		names = lappend(names, ((Table *) lfirst(lc))->name);
 	foreach(lc, mr->theirs)
@@ -1051,54 +1145,73 @@ merge_rows(void *arg)
 		Table	   *w = find_table(now, name);
 		bool		o_rows = b ? !o || !same_hash(&o->data.hash, &b->data.hash) : o != NULL;
 		bool		t_rows = b ? !t || !same_hash(&t->data.hash, &b->data.hash) : t != NULL;
+		const Table *want;
+		Oid			relid;
 
-		if (t == NULL)
+		if (w == NULL)
 		{
-			/* theirs dropped it (or never had it): ours, unless dropped */
-			if (b && o && o_rows)
+			/* the merged definitions drop it: unless its rows changed */
+			if ((o && o_rows && b) || (t && t_rows && b))
 				cannot_merge_rows(op_label(mr->what, mr->name), name);
 			continue;
 		}
-		if (o == NULL)
+		relid = table_named(name);
+		if (t == NULL || o == NULL)
 		{
-			/* ours dropped it; or theirs made it, rows and all */
-			if (b && t_rows)
+			/* one side dropped it (its rows changed: the other's stay) */
+			if (b && ((t == NULL && o_rows) || (o == NULL && t_rows)))
 				cannot_merge_rows(op_label(mr->what, mr->name), name);
-			if (!b)
-				apply_rows(table_named(name), w, t);
-			continue;
+			want = t ? t : o;
 		}
-		if (!t_rows)
-			continue;
-		if (b && same_description(b, o) && same_description(b, t))
+		else if (same_description(o, t) && (b == NULL || same_description(b, o)))
 		{
-			int			n;
+			Table		none;
 
-			if (!o_rows)
+			if (b == NULL)
 			{
-				apply_rows(table_named(name), w, t);
+				no_rows(o, &none);
+				b = &none;
+			}
+			if (!t_rows)
+				want = o;
+			else if (!o_rows)
+				want = t;
+			else
+			{
+				/* (the branch has ours' rows: same definitions, unmoved) */
+				if (!same_hash(&w->data.hash, &o->data.hash))
+					apply_rows(relid, w, o);
+				row_conflicts(mr, relid,
+							  merge_table(relid, b, o, t, WALK_MERGE, NULL));
 				continue;
 			}
-			n = merge_table(table_named(name), b, o, t, WALK_MERGE, NULL);
-			if (n > 0 && mr->fail_on_conflict)
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("%s conflicts in table \"%s\"",
-								op_label(mr->what, mr->name), name),
-						 errdetail_plural("%d row was changed differently on both sides.",
-										  "%d rows were changed differently on both sides.",
-										  n, n)));
-			if (n > 0)
-			{
-				mr->conflicts += n;
-				*mr->conflicted = lappend_oid(*mr->conflicted, table_named(name));
-			}
+		}
+		else
+		{
+			/*
+			 * Defined otherwise: the side that redefined it, whose definition
+			 * is taken, and the other.  The other's rows are taken only if
+			 * the redefinition left the rows as they were (a column added,
+			 * say: they read alike either way), and must fit the columns'
+			 * types as they are now (a column narrowed, say); both sides'
+			 * rows changed would need the other's read as the table is
+			 * defined now.
+			 */
+			bool		ours_def = b == NULL || !same_description(b, o);
+			bool		def_rows = ours_def ? o_rows : t_rows;
+			bool		other_rows = ours_def ? t_rows : o_rows;
+
+			if (other_rows && (def_rows || b == NULL))
+				cannot_merge_rows(op_label(mr->what, mr->name), name);
+			want = other_rows ? (ours_def ? t : o) : (ours_def ? o : t);
+			if (!same_hash(&w->data.hash, &want->data.hash))
+				apply_rows(relid, w, want);
+			if (other_rows)
+				check_fits(relid);
 			continue;
 		}
-		/* defined otherwise somewhere: one side's rows, whole */
-		if (o_rows && !(same_hash(&o->data.hash, &t->data.hash)))
-			cannot_merge_rows(op_label(mr->what, mr->name), name);
-		apply_rows(table_named(name), w, t);
+		if (!same_hash(&w->data.hash, &want->data.hash))
+			apply_rows(relid, w, want);
 	}
 }
 
@@ -1191,6 +1304,51 @@ refuse_local_changes(const char *what)
 }
 
 /*
+ * The branch's definitions made the merged ones, its rows merged as mr
+ * says.  What one side dropped that the other's new objects use (a
+ * function a view calls, a table a foreign key points at) fails there: a
+ * schema conflict, as is an object both changed.
+ */
+static void
+move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
+					MergeRows *mr)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		PROLLY_CALL(components().canonicalizer, move_schema, ours, merged,
+					merge_rows, mr);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		switch (ed->sqlerrcode)
+		{
+			case ERRCODE_UNDEFINED_FUNCTION:
+			case ERRCODE_UNDEFINED_TABLE:
+			case ERRCODE_UNDEFINED_OBJECT:
+			case ERRCODE_UNDEFINED_COLUMN:
+			case ERRCODE_UNDEFINED_SCHEMA:
+			case ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST:
+				break;
+			default:
+				PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("schema conflict: the merged definitions don't fit together"),
+				 errdetail("Merged, one side's objects use what the other dropped: %s",
+						   ed->message)));
+	}
+	PG_END_TRY();
+}
+
+/*
  * Write to the session's branch (its rows as roots[1] has them) what
  * changed from roots[0] to roots[2], three-way: what (a merge of branch
  * name, a cherry-pick) fails if a row conflicts and fail_on_conflict, else
@@ -1205,8 +1363,6 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	List	   *base_tables;
 	List	   *ours_tables;
 	List	   *theirs_tables;
-	ListCell   *lc;
-	int			conflicts = 0;
 
 	base_tables = tables_in_root(&roots[0]);
 	ours_tables = tables_in_root(&roots[1]);
@@ -1217,49 +1373,25 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0};
+		fail_on_conflict, what, name, conflicted, 0, NIL};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
 					&roots[2], &merged);
-		PROLLY_CALL(dc.canonicalizer, move_schema, &roots[1], &merged,
-					merge_rows, &mr);
+		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;
 	}
-	merge_sequences(&roots[0], &roots[1], &roots[2]);
-	foreach(lc, theirs_tables)
+	else
 	{
-		Table	   *t = lfirst(lc);
-		Table	   *b = find_table(base_tables, t->name);
-		Table	   *o = find_table(ours_tables, t->name);
-		Oid			relid;
-		int			n;
+		/* (the branch has ours' rows, every table defined alike) */
+		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
+		fail_on_conflict, what, name, conflicted, 0, ours_tables};
 
-		if (same_hash(&b->data.hash, &t->data.hash))
-			continue;
-		relid = table_named(t->name);
-		if (same_hash(&b->data.hash, &o->data.hash))
-		{
-			apply_rows(relid, o, t);
-			continue;
-		}
-		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
-		if (n > 0 && fail_on_conflict)
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("%s conflicts in table \"%s\"", op_label(what, name),
-							get_rel_name(relid)),
-					 errdetail_plural("%d row was changed differently on both sides.",
-									  "%d rows were changed differently on both sides.",
-									  n, n)));
-		if (n > 0)
-		{
-			conflicts += n;
-			*conflicted = lappend_oid(*conflicted, relid);
-		}
+		merge_sequences(&roots[0], &roots[1], &roots[2]);
+		merge_rows(&mr);
+		return mr.conflicts;
 	}
-	return conflicts;
 }
 
 /* The same, of three commits. */
