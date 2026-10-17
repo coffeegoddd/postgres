@@ -138,7 +138,7 @@ extern void RelationCacheInvalidateEntry(Oid relationId);
 
 extern void RelationCacheInvalidate(bool debug_discard);
 
-extern void RelationCacheRebuildNew(void);
+extern void RelationCacheRebuildNew(Oid from_branch);
 
 #ifdef USE_ASSERT_CHECKING
 extern void AssertPendingSyncs_RelationCache(void);

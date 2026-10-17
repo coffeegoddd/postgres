@@ -534,11 +534,13 @@ branch_session_init(const char *branch)
 void
 set_session_branch(Oid branch)
 {
+	Oid			from = MyBranch;
+
 	if (branch == MyBranch)
 		return;
 	MyBranch = branch;
 	InvalidateSystemCaches();
-	RelationCacheRebuildNew();
+	RelationCacheRebuildNew(from);
 }
 
 /*
