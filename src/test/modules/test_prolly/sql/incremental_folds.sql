@@ -91,12 +91,17 @@ DELETE FROM inc.keyless WHERE ctid >= '(4,0)';
 VACUUM inc.keyless;
 SELECT pg_relation_size('inc.keyless') / 8192 AS keyless_pages;
 SELECT * FROM pg_temp.fold();
--- in the transaction writing: its own writes are counted; its commit's
--- fold saw rows not yet settled, so the next fold reads in full once
+-- in the transaction writing: its own writes are counted, and settled for
+-- its commit's fold (they go with it if it rolls back), so the next fold
+-- reads only the pages changed since; a second fold in the transaction
+-- too, its first commit's rows seen on the old versions
 BEGIN;
 UPDATE inc.keyless SET b = 'mine' WHERE a = 11;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless again')::text) AS committed;
+UPDATE inc.keyless SET b = 'mine too' WHERE a = 14;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'keyless twice')::text) AS committed;
 COMMIT;
 UPDATE inc.keyless SET b = 'after' WHERE a = 12;
 SELECT * FROM pg_temp.fold();
@@ -104,6 +109,27 @@ SELECT length(dolt_commit('-am', 'keyless after')::text) AS committed;
 UPDATE inc.keyless SET b = 'later' WHERE a = 13;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless later')::text) AS committed;
+-- a commit rolled back with its transaction: the baseline before it holds
+BEGIN;
+UPDATE inc.keyless SET b = 'rolled back' WHERE a = 15;
+SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
+ROLLBACK;
+UPDATE inc.keyless SET b = 'kept' WHERE a = 16;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'kept')::text) AS committed;
+-- a cherry-pick commits in the transaction applying its rows: the next
+-- fold reads only its pages, keyless and keyed
+SELECT dolt_branch('pick');
+SELECT dolt_checkout('pick') IS NOT NULL AS on_pick;
+UPDATE inc.keyless SET b = 'picked' WHERE a = 17;
+UPDATE inc.big SET v = 'picked' WHERE id BETWEEN 100 AND 1099;
+SELECT length(dolt_commit('-am', 'to pick')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT length(dolt_cherry_pick('pick')::text) > 0 AS picked;
+UPDATE inc.keyless SET b = 'after the pick' WHERE a = 18;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'after the pick')::text) AS committed;
+SELECT dolt_branch('-D', 'pick');
 
 -- A fold that began an epoch and was rolled back leaves a page changed
 -- in both epochs listed twice: only its first old version is the page as

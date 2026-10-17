@@ -40,7 +40,8 @@
  *
  * A baseline's state: a version byte, the list's lineage, the fold's epoch,
  * the table's length then, the fold's snapshot's xmax and the transactions
- * it saw running (a count, then each), flags, and the tree of carried keys
+ * it saw running (a count, then each), flags, the fold's own transaction
+ * (if it had written), and the tree of carried keys
  * (each key with the key columns' encoded row, to look it up by; an empty
  * hash for none).
  *
@@ -77,7 +78,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		2
+#define STATE_VERSION		3
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -96,6 +97,7 @@ typedef struct State
 	uint32		nxip;			/* the transactions it saw running, sorted */
 	TransactionId *xip;
 	uint8		flags;
+	TransactionId own;			/* the fold's transaction, if it wrote */
 	ProllyNodeRef carried;
 } State;
 
@@ -186,6 +188,7 @@ put_state(StringInfo out, const State *st)
 	for (uint32 i = 0; i < st->nxip; i++)
 		put_u32(out, st->xip[i]);
 	appendStringInfoChar(out, (char) st->flags);
+	put_u32(out, st->own);
 	appendStringInfoChar(out, (char) st->carried.hash.len);
 	appendBinaryStringInfo(out, st->carried.hash.bytes, st->carried.hash.len);
 }
@@ -197,8 +200,11 @@ parse_state(const ProllyValue *state, State *st)
 	const uint8 *end = p + state->len;
 	uint8		hlen;
 
+	uint8		version = state->len > 0 ? p[0] : 0;
+
 	memset(st, 0, sizeof(*st));
-	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || p[0] != STATE_VERSION)
+	/* (version 2 is version 3 without the fold's own transaction) */
+	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || (version != 2 && version != STATE_VERSION))
 		return false;
 	st->fold.lineage = get_u64(p + 1);
 	st->fold.epoch = get_u32(p + 9);
@@ -206,14 +212,18 @@ parse_state(const ProllyValue *state, State *st)
 	st->xmax = get_u32(p + 17);
 	st->nxip = get_u32(p + 21);
 	p += 25;
-	if ((uint64) (end - p) < (uint64) st->nxip * 4 + 2)
+	if ((uint64) (end - p) < (uint64) st->nxip * 4 + 2 + (version >= 3 ? 4 : 0))
 		return false;
 	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
 	for (uint32 i = 0; i < st->nxip; i++, p += 4)
 		st->xip[i] = get_u32(p);
-	st->flags = p[0];
-	hlen = p[1];
-	p += 2;
+	st->flags = *p++;
+	if (version >= 3)
+	{
+		st->own = get_u32(p);
+		p += 4;
+	}
+	hlen = *p++;
 	if (hlen > PROLLY_HASH_MAX_LEN || end - p != hlen)
 		return false;
 	st->carried.hash.len = hlen;
@@ -230,13 +240,19 @@ xid_cmp(const void *a, const void *b)
 /*
  * Does the snapshot see every transaction the baseline's fold saw as
  * committed?  Each the fold saw finished (below its xmax, not running
- * then) must be below the snapshot's xmax and not running for it.
+ * then) must be below the snapshot's xmax and not running for it; and the
+ * fold's own transaction, whose writes it saw, must be this one or one
+ * the snapshot sees committed.
  */
 static bool
 sees_fold(Snapshot snap, const State *st)
 {
 	if (snap->takenDuringRecovery || !TransactionIdIsNormal(st->xmax) ||
 		TransactionIdPrecedes(snap->xmax, st->xmax))
+		return false;
+	if (TransactionIdIsNormal(st->own) &&
+		!TransactionIdIsCurrentTransactionId(st->own) &&
+		(XidInMVCCSnapshot(st->own, snap) || !TransactionIdDidCommit(st->own)))
 		return false;
 	for (uint32 i = 0; i < snap->xcnt; i++)
 		if (TransactionIdPrecedes(snap->xip[i], st->xmax) &&
@@ -322,14 +338,18 @@ finder_close(Finder *f)
 	PROLLY_CALL(f->kr, close, f->k);
 }
 
-/* Is xid's transaction one the snapshot doesn't see as committed or not? */
+/*
+ * Is xid's transaction one the snapshot doesn't see as committed or not?
+ * The fold's own transaction's writes are settled for it: what it wrote
+ * before the fold goes with the fold if it rolls back, and what it writes
+ * after changes pages since.  So are an aborted transaction's.
+ */
 static bool
 xid_unsettled(Finder *f, TransactionId xid)
 {
-	if (!TransactionIdIsNormal(xid))
+	if (!TransactionIdIsNormal(xid) || TransactionIdIsCurrentTransactionId(xid))
 		return false;
-	return TransactionIdIsCurrentTransactionId(xid) ||
-		XidInMVCCSnapshot(xid, f->snap);
+	return XidInMVCCSnapshot(xid, f->snap) && !TransactionIdDidAbort(xid);
 }
 
 static bool
@@ -668,6 +688,9 @@ xid_committed(TransactionId xid, bool *known)
 {
 	if (!TransactionIdIsNormal(xid))
 		return xid == FrozenTransactionId || xid == BootstrapTransactionId;
+	/* (the fold's transaction, again: what it wrote then, it saw) */
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return true;
 	if (TransactionIdPrecedes(xid, TransamVariables->oldestClogXid))
 	{
 		*known = false;
@@ -1459,6 +1482,7 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
 			qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
 			ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
+			ns.own = GetTopTransactionIdIfAny();
 			carried_tree(&f, &ns.carried);
 			MemoryContextSwitchTo(old);
 			put_state(next, &ns);
