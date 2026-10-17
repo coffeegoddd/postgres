@@ -1,5 +1,9 @@
 # 07. Roadmap
 
+**Status: history.** This was the roadmap for the tree engines (D1–D4)
+until the direction changed on 2026-10-15; its status notes are D1's. The
+plan being followed is `11-pages-and-dolt-snapshots.md`, part 4.
+
 The roadmap is these six steps and ends at step 6. Nothing is planned beyond
 it; what comes next is decided in step 6's discussion. Do the steps in order,
 and don't start a step until a human asks for it.
