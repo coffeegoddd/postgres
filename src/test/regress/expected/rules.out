@@ -1304,6 +1304,12 @@ dolt_log| SELECT commit_hash,
     message,
     commit_order
    FROM dolt_log('HEAD'::text) dolt_log(commit_hash, committer, email, date, message, commit_order);
+dolt_remote_branches| SELECT name,
+    hash
+   FROM dolt_remote_branches() dolt_remote_branches(name, hash);
+dolt_remotes| SELECT name,
+    url
+   FROM dolt_remotes() dolt_remotes(name, url);
 dolt_status| SELECT table_name,
     staged,
     status

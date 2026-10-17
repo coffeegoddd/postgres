@@ -2312,6 +2312,25 @@ dolt_pull(PG_FUNCTION_ARGS)
 							   PointerGetDatum(construct_array_builtin(d, n, TEXTOID)));
 }
 
+/* dolt_fetch(), dolt_push(), dolt_pull(): with no arguments */
+Datum
+dolt_fetch_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_fetch(fcinfo);
+}
+
+Datum
+dolt_push_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_push(fcinfo);
+}
+
+Datum
+dolt_pull_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_pull(fcinfo);
+}
+
 static void
 remote_row(const char *name, const char *url, void *arg)
 {
