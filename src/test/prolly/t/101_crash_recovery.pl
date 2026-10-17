@@ -12,7 +12,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use ProllyTest;
 
-my $am = $ENV{PROLLY_AM} // 'prolly_d1';
+my $am = $ENV{PROLLY_AM} // 'prolly';
 
 my $node = PostgreSQL::Test::Cluster->new('crash');
 $node->init;

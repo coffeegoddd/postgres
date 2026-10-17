@@ -22,31 +22,34 @@ my @controls = (
 	},
 	{
 		name => 'successful no-op reset is rejected',
-		am => 'prolly_d1',
+		am => 'prolly',
 		mock => q{
 			CREATE FUNCTION public.dolt_reset(VARIADIC text[]) RETURNS text[]
 			LANGUAGE sql AS 'SELECT ARRAY[''0'']::text[]';
 		},
-		error => qr/VC target prolly_d1 \[restored feature HEAD rows\]: expected/,
+		error => qr/VC target prolly \[restored feature HEAD rows\]: expected/,
 	},
 	{
 		name => 'successful no-op checkout is rejected',
-		am => 'prolly_d1',
+		am => 'prolly',
 		mock => q{
 			CREATE FUNCTION public.dolt_checkout(VARIADIC text[]) RETURNS text[]
 			LANGUAGE sql AS 'SELECT ARRAY[''0'', ''success'']::text[]';
 		},
-		error => qr/VC target prolly_d1 \[branch copy branch\]: expected/,
+		error => qr/VC target prolly \[branch copy branch\]: expected/,
 	},
 	{
 		name => 'a real old commit id cannot substitute for a data snapshot',
-		am => 'prolly_d1',
+		am => 'prolly',
 		mock => q{
 			SELECT dolt_commit('--allow-empty', '-m', 'empty before fixture');
 			CREATE FUNCTION public.dolt_commit(VARIADIC text[]) RETURNS text[]
 			LANGUAGE sql AS 'SELECT ARRAY[dolt_hashof(''HEAD'')]::text[]';
 		},
-		error => qr/VC target prolly_d1 \[branch copy rows\]: expected/,
+		# (definitions are versioned: the branch made at the old, empty
+		# commit hasn't the canary's table at all, which is the specific
+		# invariant failing, a stage before its rows)
+		error => qr/VC target prolly \[branch copy\]: SQL failed: .*relation "vc_canary" does not exist/s,
 	});
 
 my $i = 0;

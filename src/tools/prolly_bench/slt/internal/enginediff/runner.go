@@ -177,7 +177,7 @@ var snapshots = []string{
 // comparable; lost connections, timeouts and target failures always fail the run.
 func Compare(dsn, am string, p Program, timeout time.Duration) (*Failure, error) {
 	switch am {
-	case "heap", "prolly", "prolly_d1", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4":
+	case "heap", "prolly":
 	default:
 		return nil, fmt.Errorf("unknown engine %q", am)
 	}

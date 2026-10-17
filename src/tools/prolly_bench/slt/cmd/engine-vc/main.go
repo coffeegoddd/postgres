@@ -41,7 +41,7 @@ func (s *summary) write(dir string) error {
 
 func run() error {
 	dsn := flag.String("dsn", "", "server connection string; only fresh randomly named databases are used")
-	ams := flag.String("am", "prolly_d1", "comma-separated engine names")
+	ams := flag.String("am", "prolly", "comma-separated engine names")
 	cases := flag.String("cases", "", "scenario JSON file or directory")
 	out := flag.String("out", "", "new artifact directory")
 	timeout := flag.Duration("timeout", 30*time.Second, "timeout per SQL operation")

@@ -16,8 +16,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use ProllyTest;
 
-my $am = $ENV{PROLLY_AM} // 'prolly_d1';
-my $copies = $am eq 'prolly';
+my $am = $ENV{PROLLY_AM} // 'prolly';
 
 my @nodes;
 for my $name ('one', 'two')
@@ -29,7 +28,7 @@ for my $name ('one', 'two')
 	push @nodes, $node;
 }
 my ($one, $two) = @nodes;
-my $commit = $copies ? "SELECT dolt_commit('-Am', 'commit')" : "SELECT prolly_commit('commit')";
+my $commit = "SELECT dolt_commit('-Am', 'commit')";
 my $root = "SELECT prolly_root_hash('main')";
 sub rows
 {
@@ -62,27 +61,17 @@ $two->safe_psql('postgres', qq(
 	CREATE INDEX people_name ON people (name);
 	$commit;
 ));
-if ($copies)
-{
-	$two->safe_psql('postgres', qq(
-		SELECT dolt_branch('rest');
-		SELECT dolt_checkout('rest');
-		@{[rows(150, 1)]};
-		SELECT dolt_commit('-am', 'the low rows');
-		SELECT dolt_checkout('main');
-		@{[rows(200, 151)]};
-		SELECT dolt_commit('-am', 'the middle rows');
-	));
-	is($two->safe_psql('postgres', q{SELECT (dolt_merge('rest', '-m', 'merged'))[2]}),
-		'0', 'the merge is three-way, not a fast-forward');
-}
-else
-{
-	$two->safe_psql('postgres', qq(
-		@{[rows(200, 1)]};
-		SELECT prolly_commit('the rest');
-	));
-}
+$two->safe_psql('postgres', qq(
+	SELECT dolt_branch('rest');
+	SELECT dolt_checkout('rest');
+	@{[rows(150, 1)]};
+	SELECT dolt_commit('-am', 'the low rows');
+	SELECT dolt_checkout('main');
+	@{[rows(200, 151)]};
+	SELECT dolt_commit('-am', 'the middle rows');
+));
+is($two->safe_psql('postgres', q{SELECT (dolt_merge('rest', '-m', 'merged'))[2]}),
+	'0', 'the merge is three-way, not a fast-forward');
 
 isnt($one->safe_psql('postgres', "SELECT 'mood'::regtype::oid"),
 	$two->safe_psql('postgres', "SELECT 'mood'::regtype::oid"),

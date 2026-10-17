@@ -7,7 +7,7 @@ use ProllyTest;
 use ProllyVC;
 use Test::More;
 
-my $am = $ENV{PROLLY_AM} // 'prolly_d1';
+my $am = $ENV{PROLLY_AM} // 'prolly';
 my $node = PostgreSQL::Test::Cluster->new('vc_target');
 $node->init;
 $node->start;

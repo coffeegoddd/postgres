@@ -1,7 +1,7 @@
 """prolly_bench: benchmark harness for prolly storage.
 
   prolly_bench run S --am heap                  S suite against stock heap (B0)
-  prolly_bench run V --am prolly_d1             V suite against an engine
+  prolly_bench run V --am prolly                V suite against an engine
   prolly_bench run C --am heap,prolly           C suite (SQL correctness), heap first
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
@@ -294,7 +294,7 @@ def main(argv=None) -> int:
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")
     diff.add_argument("--am", default="prolly",
-                      choices=["heap", "prolly", "prolly_d1", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"])
+                      choices=["heap", "prolly"])
     diff.add_argument("--pg-bin", type=Path, required=True)
     diff.add_argument("--out", type=Path, required=True, help="new artifact directory")
     diff.add_argument("--runner", type=Path, default=REPO / "build-bench/differential/engine-diff")
@@ -308,7 +308,7 @@ def main(argv=None) -> int:
 
     from pbench import vc
     scenario = sub.add_parser("vc", help="version-control scenarios with explicit engine capabilities")
-    scenario.add_argument("--am", default="prolly_d1", help="comma-separated engine names")
+    scenario.add_argument("--am", default="prolly", help="comma-separated engine names")
     scenario.add_argument("--pg-bin", type=Path, required=True)
     scenario.add_argument("--out", type=Path, required=True, help="new artifact directory")
     scenario.add_argument("--runner", type=Path, default=REPO / "build-bench/vc/engine-vc")

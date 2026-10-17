@@ -125,7 +125,7 @@ jobs:
             --workloads S1,S4,S9,S10,S13 --config src/tools/prolly_bench/configs/integration.toml \
             --work-dir "$RUNNER_TEMP/benchmark-smoke" --out "$PWD/engine-results/benchmark-smoke"
           src/tools/prolly_bench/prolly_bench table --results "$PWD/engine-results/benchmark-smoke"
-          src/tools/prolly_bench/prolly_bench run V --am prolly_d1 \
+          src/tools/prolly_bench/prolly_bench run V --am prolly \
             --workloads V1,V2 --config src/tools/prolly_bench/configs/integration.toml \
             --work-dir "$RUNNER_TEMP/v-smoke" --out "$PWD/engine-results/v-smoke"
 
@@ -171,19 +171,12 @@ jobs:
         run: |
           make -C src/test/prolly check-target check-semantics check-isolation \
             check-tap-durability check-vc check-vc-isolation check-tap-vc \
-            PROLLY_AM=prolly
-
-      - name: Version-control targeting on D1 and negative controls
-        run: |
-          make -C src/test/prolly check-vc-target check-vc-target-guard \
-            check-tap-vc check-vc-d1 check-vc-isolation-d1 PROLLY_AM=prolly_d1
+            check-vc-target check-vc-target-guard PROLLY_AM=prolly
 
       # The steps above run check's groups one by one; this catches a group
       # check names but can't make (a missing prerequisite stops it partway).
-      - name: The requirements suite's check resolves for each engine
-        run: |
-          make -n -C src/test/prolly check PROLLY_AM=prolly > /dev/null
-          make -n -C src/test/prolly check PROLLY_AM=prolly_d1 > /dev/null
+      - name: The requirements suite's check resolves
+        run: make -n -C src/test/prolly check PROLLY_AM=prolly > /dev/null
 
       - name: Upstream suites on block-mapped storage (nightly)
         if: github.event_name == 'schedule'
@@ -203,9 +196,6 @@ jobs:
 
       - name: Version-control scenario adapters
         run: |
-          src/tools/prolly_bench/prolly_bench vc \
-            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
-            --self-test --out "$PWD/engine-results/vc-d1"
           src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly \
             --self-test --out "$PWD/engine-results/vc-prolly"
@@ -235,27 +225,23 @@ jobs:
             --out "$GITHUB_WORKSPACE/engine-results/dolt-port-review.json"
           go build -o "$GITHUB_WORKSPACE/build-bench/vc/dolt-corpus" ./cmd/dolt-corpus
 
-      - name: Imported Dolt scenarios on D1 and prolly
+      - name: Imported Dolt scenarios
         run: |
           src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly \
             --cases src/tools/prolly_bench/corpus/dolt/scenarios \
             --out "$PWD/engine-results/dolt-prolly"
-          src/tools/prolly_bench/prolly_bench vc \
-            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am prolly_d1 \
-            --cases src/tools/prolly_bench/corpus/dolt/scenarios \
-            --out "$PWD/engine-results/dolt-d1"
           build-bench/vc/dolt-corpus --root src/tools/prolly_bench/corpus/dolt \
             --catalog engine-results/dolt-catalog/catalog.json \
-            --results engine-results/dolt-d1/results/summary.json \
-            --out engine-results/dolt-d1-coverage.json
+            --results engine-results/dolt-prolly/results/summary.json \
+            --out engine-results/dolt-prolly-coverage.json
 
-      - name: Verify explicit unsupported ledger for other engines
+      - name: Verify explicit unsupported ledger for engines without version control
         run: |
           status=0
           src/tools/prolly_bench/prolly_bench vc \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
-            --am heap,prolly_d2,prolly_d3a,prolly_d3b,prolly_d4 \
+            --am heap \
             --cases src/tools/prolly_bench/corpus/dolt/scenarios \
             --out "$PWD/engine-results/dolt-unsupported" || status=$?
           test "$status" -eq 1
@@ -270,7 +256,7 @@ jobs:
           from pathlib import Path
           report = json.loads(Path("engine-results/dolt-unsupported-coverage.json").read_text())
           engines = {e["engine"]: e for e in report["engines"]}
-          assert set(engines) == {"heap", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"}
+          assert set(engines) == {"heap"}
           planned = report["ported_cases"] + report["partial_cases"]
           assert planned > 0
           for engine in engines.values():
@@ -291,7 +277,7 @@ jobs:
             seed="$GITHUB_RUN_NUMBER"
           fi
           failed=0
-          for am in heap prolly prolly_d1; do
+          for am in heap prolly; do
             src/tools/prolly_bench/prolly_bench differential \
               --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" --am "$am" \
               --seed "$seed" --seeds "$seeds" --steps "$steps" --self-test \

@@ -135,7 +135,7 @@ type execution struct {
 func passing(t *testing.T) execution {
 	t.Helper()
 	m := manifestAt(t, fixture)
-	e := execution{Profiles: []vcscenario.Profile{{Engine: "prolly_d1", Supported: []string{"sql", "vc.core"}}}, Hashes: map[string]string{}}
+	e := execution{Profiles: []vcscenario.Profile{{Engine: "prolly", Supported: []string{"sql", "vc.core"}}}, Hashes: map[string]string{}}
 	for _, p := range m.Ports {
 		b, err := os.ReadFile(filepath.Join(fixture, "scenarios", p.ID+".json"))
 		if err != nil {
@@ -145,7 +145,7 @@ func passing(t *testing.T) execution {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r := vcscenario.Result{ID: p.ID, Engine: "prolly_d1", Status: "passed", Requires: s.Requires, PlannedSteps: len(s.Steps)}
+		r := vcscenario.Result{ID: p.ID, Engine: "prolly", Status: "passed", Requires: s.Requires, PlannedSteps: len(s.Steps)}
 		for _, st := range s.Steps {
 			r.Steps = append(r.Steps, vcscenario.StepResult{ID: st.ID, Op: st.Op, Session: st.Session})
 		}

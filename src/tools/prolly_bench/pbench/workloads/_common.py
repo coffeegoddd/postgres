@@ -259,16 +259,8 @@ def timed_session(ctx: Context, statements: list[str], tag: str,
     branch belongs to the session.
     """
     cluster = cluster or ctx.cluster
-    if ctx.table_am == "prolly_d1":
-        def snap(i, phase):
-            return ("\\timing off\nSELECT 'PBENCH_COUNTER|" + str(i) + "|" + phase +
-                    "|' || nodes_read || '|' || nodes_written "
-                    "FROM prolly_node_counters('prolly_d1');\n")
-        script = "".join(snap(i, "before") + "\\timing on\n" + sql.rstrip().rstrip(";") + ";\n" +
-                         snap(i, "after") for i, sql in enumerate(statements))
-    else:
-        script = "\\timing on\n" + "\n".join(s.rstrip().rstrip(";") + ";"
-                                             for s in statements) + "\n"
+    script = "\\timing on\n" + "\n".join(s.rstrip().rstrip(";") + ";"
+                                         for s in statements) + "\n"
     (ctx.raw_dir / f"{tag}.sql").write_text(script)
     res = cluster.sql(script, dbname=ctx.dbname, options=ctx.session_options(),
                       check=False)
@@ -277,21 +269,4 @@ def timed_session(ctx: Context, statements: list[str], tag: str,
     times = [float(t) for t in _TIME_RE.findall(res.stdout + res.stderr)]
     if len(times) != len(statements):
         raise RuntimeError(f"expected {len(statements)} timings, got {len(times)}")
-    if ctx.table_am == "prolly_d1":
-        snapshots = {}
-        for i, phase, reads, writes in re.findall(r"^PBENCH_COUNTER\|(\d+)\|(before|after)\|(\d+)\|(\d+)$", res.stdout, re.M):
-            key = (int(i), phase)
-            if key in snapshots:
-                raise RuntimeError("duplicate backend counter snapshot")
-            snapshots[key] = (int(reads), int(writes))
-        if len(snapshots) != 2 * len(statements):
-            raise RuntimeError("missing backend counter snapshots")
-        counters = []
-        for i, sql in enumerate(statements):
-            delta = [a - b for a, b in zip(snapshots[i, "after"], snapshots[i, "before"])]
-            if min(delta) < 0:
-                raise RuntimeError("backend counters reset during an operation")
-            counters.append({"sql": sql, "milliseconds": times[i],
-                             "nodes_read": delta[0], "nodes_written": delta[1]})
-        (ctx.raw_dir / f"{tag}-counters.json").write_text(json.dumps(counters, indent=2) + "\n")
     return times

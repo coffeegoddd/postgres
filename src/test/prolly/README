@@ -1,21 +1,23 @@
 src/test/prolly/README
 
-Requirements suite for prolly storage engines
-=============================================
+Requirements suite for prolly storage
+=====================================
 
-These tests encode what a prolly engine must do: be true to Postgres (SQL,
+These tests encode what prolly storage must do: be true to Postgres (SQL,
 concurrency and durability behave exactly as on heap) and true to Dolt
 (branches, versioned schema, diff, merge, and commits whose root hash
-depends only on their content).  An engine meets its requirements when this suite passes against it.  The suite
+depends only on their content).  Prolly meets its requirements when this
+suite passes against it.  The suite
 is not part of "make check" or "make check-world"; stock Postgres doesn't
 run it.
 
 Running
 -------
 
-	make -C src/test/prolly check PROLLY_AM=prolly_d1
+	make -C src/test/prolly check
 
-PROLLY_AM is the table access method under test (default prolly_d1).
+PROLLY_AM is the table access method under test (default prolly; heap
+validates the tests, below).
 Semantics, isolation and durability use a shared target setup and verify a
 canary's AM before testing.  For prolly, public is a versioned schema, and
 the canary's table, index and TOAST storage must have block-map forks.
@@ -31,22 +33,14 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	                      independence and canonical form of branches made
 	                      by copying (always on prolly, whatever PROLLY_AM is)
 	check-vc-isolation    sessions on different branches at once (likewise)
-	check-vc-d1           branches, diff and merge on the tree engine,
-	                      through its prolly_* API (tree engines only)
-	check-vc-isolation-d1 sessions on different branches at once on it
 	check-tap-vc          history independence across clusters
 
 Semantics, isolation and TAP groups require --enable-tap-tests; a build
 without TAP support fails these targets instead of reporting success.
-For the page-based prolly AM, run check-semantics, check-isolation,
-check-tap-durability, check-vc-target and check-tap-vc with
-PROLLY_AM=prolly.  check-vc and check-vc-isolation run on it always;
-check-vc-d1 and check-vc-isolation-d1 use the legacy tree-engine API and
-reject that target.
 
 Run check-vc-target before claiming version-control coverage for an AM:
 
-	make -C src/test/prolly check-vc-target PROLLY_AM=prolly_d1
+	make -C src/test/prolly check-vc-target
 
 This strict probe checks actual table AMs, branch heads and commit parents,
 insert/update/delete isolation in both directions, and hard reset to HEAD
@@ -54,28 +48,26 @@ and an older commit. It verifies full row contents, including large text,
 using new connections so SQL writes are committed before history snapshots.
 It uses a disposable cluster and leaves its fixtures there for diagnosis.
 An unsupported or disconnected VC path fails; a successful dolt_* call or
-an empty history is not evidence of coverage. D1 and the page-based prolly
-engine pass; heap does not. check-vc and check-vc-isolation run the probe
+an empty history is not evidence of coverage. Prolly passes; heap does
+not. check-vc and check-vc-isolation run the probe
 on prolly before their tests. This is a data targeting canary, not a claim
 of schema, merge or crash-recovery coverage.
 
 check-tap-vc requires check-vc-target before running. CI runs the probe
-on D1 and on prolly, and check-vc-target-guard. The latter proves that the
+on prolly, and check-vc-target-guard. The latter proves that the
 same probe rejects heap, plus deliberately ineffective commit, checkout
 and reset functions. It checks the specific failing invariant, not
 arbitrary SQL errors. These are negative controls for the harness, not
 functional VC passes.
 
-Postgres's own regression and isolation suites, run with the engine as
-the default table AM, are separate targets, not part of "check":
+Postgres's own regression, isolation and recovery suites, run with every
+user table in block-mapped storage (the storage under prolly's tables),
+are a separate target, not part of "check":
 
-	check-upstream-regress
-	check-upstream-isolation
+	check-upstream-bmap
 
-Some upstream tests print heap-specific details (ctid values, page counts);
-those exceptions are still to be documented.
-For block-mapped storage use check-upstream-bmap.  The default-AM upstream
-targets reject prolly, since they don't create versioned schemas.
+(prolly tables exist only in versioned schemas, which the upstream suites
+don't make, so they run on block-mapped heap instead.)
 
 Validating the tests themselves
 -------------------------------
@@ -116,8 +108,7 @@ Covered: requirements that are decided.
 	                versioned, including cached plans and functions
 	                (vc_schema); diff and non-conflicting merge
 	                (vc_diff_merge); sessions on different branches
-	                (vc_branch_sessions); the same on the tree engine
-	                (d1_vc_*)
+	                (vc_branch_sessions)
 	Canonical form  history independence within a database (vc_history),
 	                across client encodings and databases (vc_canonical)
 	                and across clusters (201)

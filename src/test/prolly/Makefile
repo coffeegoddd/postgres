@@ -2,17 +2,14 @@
 #
 # Makefile for src/test/prolly
 #
-# Requirements suite for prolly storage engines.  Not part of "make check"
-# or "make check-world": run it against an engine with
+# Requirements suite for prolly storage.  Not part of "make check" or
+# "make check-world": run it with
 #
-#	make -C src/test/prolly check PROLLY_AM=prolly_d1
+#	make -C src/test/prolly check
 #
-# (prolly_d1 is the default.  check runs the groups the engine supports:
-# check-vc and check-vc-isolation run on prolly whatever PROLLY_AM is, after
-# check-vc-target passes on it; check-tap-vc runs the version control TAP
-# tests on PROLLY_AM, prolly or a tree engine; check-vc-d1 and
-# check-vc-isolation-d1, a tree engine's own version control tests through
-# its prolly_* API, run only for a tree engine, prolly_*.)
+# (PROLLY_AM is the table AM under test, prolly by default.  check-vc and
+# check-vc-isolation run on prolly whatever PROLLY_AM is, after
+# check-vc-target passes on it.)
 #
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
@@ -26,24 +23,8 @@ subdir = src/test/prolly
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-PROLLY_AM ?= prolly_d1
+PROLLY_AM ?= prolly
 export PROLLY_AM
-
-# The engine's kind: page-based prolly ("pages"), a tree engine, prolly_*
-# ("tree"), or another table AM, heap say ("other").  What runs, and what
-# is refused, follows from it.
-ifeq ($(PROLLY_AM),prolly)
-ENGINE_KIND = pages
-else ifneq ($(filter prolly_%,$(PROLLY_AM)),)
-ENGINE_KIND = tree
-else
-ENGINE_KIND = other
-endif
-
-# $(call require_engine,KIND,WHY) and $(call refuse_engine,KIND,WHY): a
-# recipe line that fails, saying why, unless (or if) the engine is of KIND.
-require_engine = @test '$(ENGINE_KIND)' = '$(1)' || { echo '$(2)'; exit 1; }
-refuse_engine = @test '$(ENGINE_KIND)' != '$(1)' || { echo '$(2)'; exit 1; }
 
 # TAP groups share tmp_check and the temporary installation.
 .NOTPARALLEL:
@@ -70,11 +51,7 @@ EXTRA_INSTALL = contrib/btree_gist
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
 CHECK_TARGETS = check-target check-semantics check-isolation check-vc \
-	check-vc-isolation
-ifeq ($(ENGINE_KIND),tree)
-CHECK_TARGETS += check-vc-d1 check-vc-isolation-d1
-endif
-CHECK_TARGETS += check-tap
+	check-vc-isolation check-tap
 
 check: $(CHECK_TARGETS)
 
@@ -108,10 +85,6 @@ check-vc: temp-install check-vc-target-prolly vc.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_schedule
 
-# The tree engine's version control, through its prolly_* API.
-check-vc-d1: require-tree-engine check-vc-target temp-install prolly_am.conf
-	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_d1_schedule
-
 check-isolation: PROVE_TESTS = t/002_isolation.pl
 check-isolation: require-tap temp-install
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
@@ -121,11 +94,6 @@ check-vc-isolation: temp-install check-vc-target-prolly vc.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(pg_isolation_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_isolation_schedule
-
-check-vc-isolation-d1: require-tree-engine check-vc-target temp-install prolly_am.conf
-	$(MAKE) -C $(top_builddir)/src/test/isolation all
-	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
-		--schedule=$(srcdir)/vc_d1_isolation_schedule
 
 # TAP tests: 1xx are durability (also run against heap), 2xx version control.
 check-tap: check-tap-durability check-tap-vc
@@ -137,18 +105,6 @@ check-tap-durability: require-tap temp-install
 check-tap-vc: PROVE_TESTS = t/2*.pl
 check-tap-vc: check-vc-target require-tap temp-install
 	$(prove_check)
-
-# Upstream correctness checks: Postgres's own
-# regression and isolation suites with the engine as the default table AM.
-# Not part of "check": some upstream tests print heap-specific details
-# (ctid values, page counts), and those exceptions aren't documented yet.
-check-upstream-regress: prolly_am.conf
-	$(call refuse_engine,pages,Use check-upstream-bmap for upstream tests of block-mapped storage)
-	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
-
-check-upstream-isolation: prolly_am.conf
-	$(call refuse_engine,pages,Use check-upstream-bmap for upstream tests of block-mapped storage)
-	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/prolly_am.conf
 
 # Postgres's regression, isolation and recovery suites with every user
 # table, index and TOAST table in block-mapped storage.  These pass in
@@ -168,13 +124,9 @@ check-heap: temp-install
 require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
 
-require-tree-engine:
-	$(call require_engine,tree,check-vc-d1 and check-vc-isolation-d1 test a tree engine (prolly_*) through its prolly_* API: use check-vc for page-based prolly)
-
 clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
-	check-vc-d1 check-vc-isolation-d1 \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-tree-engine FORCE
+	check-upstream-bmap require-tap FORCE

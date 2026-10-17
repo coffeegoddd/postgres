@@ -26,7 +26,7 @@ func TestBundledScenariosAndCapabilityExclusions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, am := range []string{"heap", "prolly_d2", "prolly_d3a", "prolly_d3b", "prolly_d4"} {
+	for _, am := range []string{"heap"} {
 		// A deliberately invalid DSN proves capability reporting requires no
 		// connection and cannot run SQL on a fallback engine.
 		a, err := NewPostgres("invalid dsn", am, time.Second)
@@ -36,9 +36,6 @@ func TestBundledScenariosAndCapabilityExclusions(t *testing.T) {
 		r := Run(context.Background(), core, a)
 		if r.Status != "unsupported" || len(r.Steps) != 0 {
 			t.Fatalf("%s: %+v", am, r)
-		}
-		if am != "heap" && len(r.Missing) != 2 {
-			t.Fatalf("stub claimed a capability: %+v", r)
 		}
 	}
 	if _, err := NewPostgres("", "typo", time.Second); err == nil {
