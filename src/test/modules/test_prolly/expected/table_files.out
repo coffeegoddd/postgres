@@ -31,6 +31,19 @@ SELECT test_chunk_has(encode(sha256('tf two'::bytea), 'hex')) AS two,
  t   | f
 (1 row)
 
+-- A chunk given twice is written once.
+SELECT test_chunk_table_file(ARRAY['tf dup'::bytea, 'tf dup'::bytea]);
+ test_chunk_table_file 
+-----------------------
+ 
+(1 row)
+
+SELECT chunks FROM test_chunk_table_files() ORDER BY name DESC LIMIT 1;
+ chunks 
+--------
+      1
+(1 row)
+
 -- A table file isn't undone by its transaction's abort.
 BEGIN;
 SELECT test_chunk_table_file(ARRAY['tf three'::bytea]);
@@ -51,7 +64,8 @@ SELECT name, chunks FROM test_chunk_table_files() ORDER BY name;
 -------------------------------+--------
  prolly_table_0000000000000001 |      2
  prolly_table_0000000000000002 |      1
-(2 rows)
+ prolly_table_0000000000000003 |      1
+(3 rows)
 
 -- Chunks are compressed with LZ4 where the server has it.
 SELECT 'lz4' = ANY(enumvals) AS lz4 FROM pg_settings
@@ -69,7 +83,7 @@ SELECT name, chunks,
 FROM test_chunk_table_files() WHERE chunks = 50;
              name              | chunks | compressed_if_lz4 
 -------------------------------+--------+-------------------
- prolly_table_0000000000000003 |     50 | t
+ prolly_table_0000000000000004 |     50 | t
 (1 row)
 
 SELECT count(*) FROM generate_series(1, 50) g
@@ -90,7 +104,7 @@ SELECT test_chunk_conjoin();
 SELECT name, chunks FROM test_chunk_table_files();
              name              | chunks 
 -------------------------------+--------
- prolly_table_0000000000000004 |     53
+ prolly_table_0000000000000005 |     54
 (1 row)
 
 SELECT count(*) FROM generate_series(1, 50) g
@@ -105,7 +119,7 @@ WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000)
 SELECT name, chunks FROM test_chunk_table_files();
              name              | chunks 
 -------------------------------+--------
- prolly_table_0000000000000004 |     53
+ prolly_table_0000000000000005 |     54
 (1 row)
 
 SELECT convert_from(test_chunk_get(encode(sha256('tf three'::bytea), 'hex')), 'UTF8');
@@ -123,7 +137,7 @@ SELECT test_chunk_conjoin();	-- one file: nothing to do
 SELECT name, chunks FROM test_chunk_table_files();
              name              | chunks 
 -------------------------------+--------
- prolly_table_0000000000000004 |     53
+ prolly_table_0000000000000005 |     54
 (1 row)
 
 -- Not in a read-only transaction.
