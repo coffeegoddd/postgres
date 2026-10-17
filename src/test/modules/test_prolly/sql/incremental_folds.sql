@@ -67,12 +67,43 @@ INSERT INTO inc.big SELECT g, 'again', g FROM generate_series(19001, 19100) g;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'tail')::text) AS committed;
 
--- A table without a primary key: unchanged, its tree is kept; changed, it
--- is read in full.
+-- A table without a primary key keys a row by its content and counts its
+-- copies (each row here has ten): they are counted again from the pages
+-- changed, as they were and as they are, not read in full.
 UPDATE inc.keyless SET b = 'changed' WHERE a = 5;
+SELECT * FROM pg_temp.fold();
+-- one copy of ten deleted, one more added, a new row, and an aborted
+-- insert and delete
+DELETE FROM inc.keyless
+ WHERE ctid = (SELECT min(ctid) FROM inc.keyless WHERE a = 6);
+INSERT INTO inc.keyless VALUES (7, 'k'), (1000, 'new');
+BEGIN;
+INSERT INTO inc.keyless VALUES (8, 'aborted');
+DELETE FROM inc.keyless WHERE a = 9;
+ROLLBACK;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless')::text) AS committed;
 SELECT * FROM pg_temp.fold();
+-- every copy of a row deleted, and the table's last pages emptied and
+-- truncated
+DELETE FROM inc.keyless WHERE a = 10;
+DELETE FROM inc.keyless WHERE ctid >= '(4,0)';
+VACUUM inc.keyless;
+SELECT pg_relation_size('inc.keyless') / 8192 AS keyless_pages;
+SELECT * FROM pg_temp.fold();
+-- in the transaction writing: its own writes are counted; its commit's
+-- fold saw rows not yet settled, so the next fold reads in full once
+BEGIN;
+UPDATE inc.keyless SET b = 'mine' WHERE a = 11;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'keyless again')::text) AS committed;
+COMMIT;
+UPDATE inc.keyless SET b = 'after' WHERE a = 12;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'keyless after')::text) AS committed;
+UPDATE inc.keyless SET b = 'later' WHERE a = 13;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'keyless later')::text) AS committed;
 
 -- A table redefined, or rewritten, is read in full once.
 ALTER TABLE inc.big ADD COLUMN w int;
