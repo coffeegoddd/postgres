@@ -73,7 +73,7 @@ that design.
 | One-parent commit | O(log H + log R) new nodes; row trees shared | O(log H + log R + d log T) new nodes | d log T: the canonical directory's changed paths; row trees shared | Built: changed chunks only; the journal keeps every commit's (no GC until step 7) |
 | Sparse merge | O((I + 1)(Δ + 1) log N) new nodes, plus conflict records | The same | | Built |
 | History traversal | O(h) | O(h) | | Built |
-| Fetch, push | O(E) seen addresses | O(E) | Plus buffers; disk growth follows missing chunks | Built: a seen set in memory and a temporary file of what was received |
+| Fetch, push | O(E) seen addresses | O(E) | Plus buffers; disk growth follows missing chunks | Built, not bounded: the seen sets in memory, growing with the chunks moved, and a temporary file of what was received (`11-pages-and-dolt-snapshots.md` 7.11) |
 | SQL transaction (pending writes) | Bounded by flushing (about 64K entries) | Bounded (question 47) | **Not met:** D1 holds a transaction's writes in memory without a limit. Fixed in 4e | Met: writes are heap-like pages, bounded as heap's are |
 | Per-branch local state | None | O(rows written on the branch) of TID-map entries | Postgres-only: TID maps are local and per working set; clone avoids building them (question 41) | Pages a branch changed (copy-on-write) and their changed-page lists; no TID maps |
 
