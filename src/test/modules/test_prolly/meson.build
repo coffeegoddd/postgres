@@ -72,6 +72,7 @@ tests += {
       'branch_start',
       'keyless_moves',
       'head_only_branches',
+      'clean_checkouts',
     ],
   },
   'tap': {
