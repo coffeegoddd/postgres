@@ -15,20 +15,23 @@ control; this project's premise is that we should not have to.
 
 ## Status (read this before anything else)
 
-- **Direction change proposed 2026-10-15:** `11-pages-and-dolt-snapshots.md`
-  replaces prolly trees as primary storage with Postgres pages for the
-  working set and a chunk store shaped like Dolt's, in our own formats,
-  for history. Read it
-  before the rest; the step plan there supersedes the roadmap from step 4
-  on once agreed.
+- **The design being built is `11-pages-and-dolt-snapshots.md`** (user
+  direction, 2026-10-15): Postgres pages for the working set and a chunk
+  store shaped like Dolt's, in our own formats, for history. Read it
+  before the rest; its step plan (part 4) supersedes the roadmap from step
+  4 on. D1, the earlier design with prolly trees as primary storage, is
+  tagged `prolly-d1` and stays built until step 8 measures against it.
 - **Only what is marked decided is decided.** Decisions are recorded in
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
-- **Where the work is:** roadmap step 4, building the first engine (D1+K1).
-  Steps 4a (hash, node format, chunker, canonical key and value encoders),
-  4b (cluster-wide node store, WAL resource managers) and 4c (copy-on-write
-  tree operations) are built, and so is the root layout (question 33); 4d
-  (tables and indexes on trees) is in progress as four PRs, 4d.1 first. See the status notes in `07-roadmap.md`.
+- **Where the work is (2026-10-17):** steps 0–5 of spec 11 are built and
+  merged: block-mapped storage and the `prolly` table AM, branches as
+  copy-on-write copies of versioned schemas, the WAL-logged chunk store,
+  Dolt commits folded from pages, and moving heads (reset, merge,
+  cherry-pick, revert, detached checkout). Next is step 6, remotes; then
+  reclamation (7) and the measurement that retires D1 (8). Each step's
+  PRs are listed in spec 11, part 4. `07-roadmap.md`'s status notes are
+  D1's and no longer current.
 - **Code never refers to these specs** (user rule, 2026-10-13): no paths,
   question numbers, step numbers or shorthand such as "B2" in code or
   comments. Specs may point at code.
@@ -60,7 +63,7 @@ control; this project's premise is that we should not have to.
 | `src/test/prolly/README` | The requirements suite: what an engine must pass, and how to run it |
 | [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
 | [10-complexity-requirements.md](10-complexity-requirements.md) | **Requirement:** every version-control operation at worst matches Dolt's time and space bounds, ideally beats them; per-operation bounds, how the design meets them, and status |
-| [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **Proposed direction (2026-10-15):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); and the steps from today's code and open PRs to it |
+| [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **The design being built (user direction, 2026-10-15; steps 0–5 built 2026-10-17):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); the steps, what each built, and where the build departed from the plan |
 | [12-correctness-suite.md](12-correctness-suite.md) | **Decided (2026-10-15):** the C suite, sqllogictest against heap and every engine from `prolly_bench`, judged by agreement with heap; runner, comparison classes, gate, plan |
 
 ## Related local repositories
