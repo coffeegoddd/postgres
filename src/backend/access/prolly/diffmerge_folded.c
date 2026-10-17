@@ -1203,10 +1203,9 @@ typedef struct KeyWrite
  * Walk theirs (table relid's changes from base to theirs) against ours
  * (base to ours, the session's head, which the branch still is), both in
  * key order, as mode says.  A key both sides changed to different rows is
- * a conflict; one they changed alike isn't.  A keyless table's changes in
- * a row's copies add up (unless both sides made it the same number), and
- * conflict only when theirs removes more copies than ours has.  Returns
- * how many keys conflict.
+ * a conflict; one they changed alike isn't.  A keyless table's row has
+ * the copies its base had, those either side added, less the most either
+ * removed: it never conflicts.  Returns how many keys conflict.
  */
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
@@ -1286,11 +1285,22 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		row = &t->after;
 		if (keyless)
 		{
-			int64		delta = want - (int64) decode(&tc, &t->before, s2);
+			int64		had = (int64) decode(&tc, &t->before, s2);
+			int64		by_ours = have - had;
+			int64		by_theirs = want - had;
 
-			want = have + delta;
-			conflict = want < 0 && !(o != NULL && same_bytes(&o->after, &t->after));
-			row = delta > 0 ? &t->after : &t->before;
+			/*
+			 * Copies added on either side are each a row (two sessions each
+			 * inserting the same row inserted two); copies removed on both
+			 * are removed once (two deleting it deleted it).  Each side
+			 * removes no more than the base had, so the count isn't below
+			 * none.
+			 */
+			want = had + Max(by_ours, 0) + Max(by_theirs, 0) -
+				Max(Max(-by_ours, 0), Max(-by_theirs, 0));
+			conflict = want < 0;
+			row = t->after.len > 0 ? &t->after :
+				t->before.len > 0 ? &t->before : now;
 		}
 		else
 			conflict = o != NULL && !same_bytes(&o->after, &t->after);
@@ -1314,9 +1324,10 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			if (keyless)
 				row = want == 0 ? now : &t->after;
 		}
-		else if (mode != WALK_MERGE || (o != NULL && (!keyless ||
-														same_bytes(&o->after, &t->after))))
-			continue;			/* listing; or both changed it alike */
+		else if (mode != WALK_MERGE ||
+				 (!keyless && o != NULL && same_bytes(&o->after, &t->after)) ||
+				 (keyless && want == have))
+			continue;			/* listing; or the branch has it so already */
 
 		/* the branch's row (now, have copies) becomes theirs (row, want) */
 		w = palloc0(sizeof(KeyWrite));

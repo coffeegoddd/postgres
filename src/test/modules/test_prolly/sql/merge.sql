@@ -101,8 +101,9 @@ SELECT dolt_merge('feature');		-- one at a time
 SELECT (dolt_merge('--abort'))[2:4];
 RESET dolt.allow_commit_conflicts;
 
--- A keyless table's copies: both sides removing the same copy is alike;
--- removing more copies than there are, a conflict.
+-- A keyless table's copies: a row has the base's, those either side added,
+-- less the most either removed, and never conflicts.  Here main removes
+-- every y and z, feature a y and the z, and adds a w: no y, no z, a w.
 SELECT dolt_branch('-D', 'feature');
 SELECT dolt_branch('feature');
 DELETE FROM app.k WHERE a IN ('y', 'z');
@@ -115,22 +116,63 @@ SELECT length(dolt_commit('-Am', 'feature drops a y and z')::text) AS committed;
 SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('feature'))[2:4];
-SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.k);
-SELECT dolt_conflicts_resolve('--theirs', 'app.k');
 SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
 ROLLBACK;
 
--- Definitions that differ: merged, then the rows (here, a keyless conflict).
+-- Definitions that differ: merged, then the rows (app.k's as above).
 SELECT dolt_checkout('feature');
 ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
 SELECT dolt_checkout('main');
 UPDATE app.t SET v = 'main 8' WHERE id = 8;
 SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
-SELECT dolt_merge('feature');
+SELECT (dolt_merge('feature'))[2:4];
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA app CASCADE;
+
+-- Keyless rows changed on both sides, case by case: copies added on each
+-- are each a row, copies removed on both are removed once.
+CREATE SCHEMA mk VERSIONED;
+CREATE TABLE mk.t (a int, b text);
+CREATE FUNCTION pg_temp.merged(base text[], ours text, theirs text,
+	OUT a int, OUT b text, OUT copies int8) RETURNS SETOF record AS $$
+BEGIN
+	TRUNCATE mk.t;
+	EXECUTE 'INSERT INTO mk.t VALUES ' || array_to_string(base, ', ');
+	PERFORM dolt_commit('-Am', 'base');
+	PERFORM dolt_branch('mk_side');
+	PERFORM dolt_checkout('mk_side');
+	EXECUTE theirs;
+	PERFORM dolt_commit('-am', 'theirs');
+	PERFORM dolt_checkout('main');
+	EXECUTE ours;
+	PERFORM dolt_commit('-am', 'ours');
+	PERFORM dolt_merge('mk_side');
+	PERFORM dolt_branch('-D', 'mk_side');
+	RETURN QUERY SELECT t.a, t.b, count(*) FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
+END $$ LANGUAGE plpgsql;
+SELECT 'both add a copy' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (1, 'x')$s$, $s$INSERT INTO mk.t VALUES (1, 'x')$s$);
+SELECT 'both add the same new row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (2, 'y')$s$);
+SELECT 'each adds a different row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (3, 'z')$s$);
+SELECT 'both delete it' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(2, 'y')$s$],
+	$s$DELETE FROM mk.t WHERE a = 1$s$, $s$DELETE FROM mk.t WHERE a = 1$s$);
+SELECT 'both update it differently' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$UPDATE mk.t SET b = 'ours'$s$, $s$UPDATE mk.t SET b = 'theirs'$s$);
+SELECT 'one deletes a copy of two, one adds one' AS "case", *
+  FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$],
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
+	$s$INSERT INTO mk.t VALUES (1, 'x')$s$);
+SELECT 'both delete a copy of three' AS "case", *
+  FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$, $s$(1, 'x')$s$],
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT max(ctid) FROM mk.t)$s$);
+SELECT * FROM dolt_conflicts;
+DROP SCHEMA mk CASCADE;
+SELECT length(dolt_commit('-Am', 'mk gone')::text) AS committed;
 
 -- A merge reads rows as they were folded: a NULL in a column added with a
 -- default is NULL in the conflict's rows, not the default.

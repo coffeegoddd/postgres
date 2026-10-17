@@ -345,8 +345,9 @@ SELECT (dolt_merge('--abort'))[2:4];
 (1 row)
 
 RESET dolt.allow_commit_conflicts;
--- A keyless table's copies: both sides removing the same copy is alike;
--- removing more copies than there are, a conflict.
+-- A keyless table's copies: a row has the base's, those either side added,
+-- less the most either removed, and never conflicts.  Here main removes
+-- every y and z, feature a y and the z, and adds a w: no y, no z, a w.
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -389,21 +390,9 @@ SELECT dolt_checkout('main');
 
 BEGIN;
 SELECT (dolt_merge('feature'))[2:4];
-       dolt_merge        
--------------------------
- {0,1,"conflicts found"}
-(1 row)
-
-SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::app.k);
- base_row | our_row | their_row 
-----------+---------+-----------
- (y)      |         | (y)
-(1 row)
-
-SELECT dolt_conflicts_resolve('--theirs', 'app.k');
- dolt_conflicts_resolve 
-------------------------
- {0}
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
 (1 row)
 
 SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
@@ -411,11 +400,10 @@ SELECT a, count(*) FROM app.k GROUP BY a ORDER BY a;
 ---+-------
  w |     1
  x |     1
- y |     1
-(3 rows)
+(2 rows)
 
 ROLLBACK;
--- Definitions that differ: merged, then the rows (here, a keyless conflict).
+-- Definitions that differ: merged, then the rows (app.k's as above).
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -442,10 +430,12 @@ SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
         66
 (1 row)
 
-SELECT dolt_merge('feature');
-ERROR:  merge conflict detected, transaction rolled back
-DETAIL:  1 row was changed differently on both branches.
-HINT:  Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -457,6 +447,97 @@ NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.k
 drop cascades to table app.untouched
+-- Keyless rows changed on both sides, case by case: copies added on each
+-- are each a row, copies removed on both are removed once.
+CREATE SCHEMA mk VERSIONED;
+CREATE TABLE mk.t (a int, b text);
+CREATE FUNCTION pg_temp.merged(base text[], ours text, theirs text,
+	OUT a int, OUT b text, OUT copies int8) RETURNS SETOF record AS $$
+BEGIN
+	TRUNCATE mk.t;
+	EXECUTE 'INSERT INTO mk.t VALUES ' || array_to_string(base, ', ');
+	PERFORM dolt_commit('-Am', 'base');
+	PERFORM dolt_branch('mk_side');
+	PERFORM dolt_checkout('mk_side');
+	EXECUTE theirs;
+	PERFORM dolt_commit('-am', 'theirs');
+	PERFORM dolt_checkout('main');
+	EXECUTE ours;
+	PERFORM dolt_commit('-am', 'ours');
+	PERFORM dolt_merge('mk_side');
+	PERFORM dolt_branch('-D', 'mk_side');
+	RETURN QUERY SELECT t.a, t.b, count(*) FROM mk.t t GROUP BY t.a, t.b ORDER BY 1, 2;
+END $$ LANGUAGE plpgsql;
+SELECT 'both add a copy' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (1, 'x')$s$, $s$INSERT INTO mk.t VALUES (1, 'x')$s$);
+      case       | a | b | copies 
+-----------------+---+---+--------
+ both add a copy | 1 | x |      3
+(1 row)
+
+SELECT 'both add the same new row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (2, 'y')$s$);
+           case            | a | b | copies 
+---------------------------+---+---+--------
+ both add the same new row | 1 | x |      1
+ both add the same new row | 2 | y |      2
+(2 rows)
+
+SELECT 'each adds a different row' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$INSERT INTO mk.t VALUES (2, 'y')$s$, $s$INSERT INTO mk.t VALUES (3, 'z')$s$);
+           case            | a | b | copies 
+---------------------------+---+---+--------
+ each adds a different row | 1 | x |      1
+ each adds a different row | 2 | y |      1
+ each adds a different row | 3 | z |      1
+(3 rows)
+
+SELECT 'both delete it' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(2, 'y')$s$],
+	$s$DELETE FROM mk.t WHERE a = 1$s$, $s$DELETE FROM mk.t WHERE a = 1$s$);
+      case      | a | b | copies 
+----------------+---+---+--------
+ both delete it | 2 | y |      1
+(1 row)
+
+SELECT 'both update it differently' AS "case", * FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$],
+	$s$UPDATE mk.t SET b = 'ours'$s$, $s$UPDATE mk.t SET b = 'theirs'$s$);
+            case            | a |   b    | copies 
+----------------------------+---+--------+--------
+ both update it differently | 1 | ours   |      1
+ both update it differently | 1 | theirs |      1
+(2 rows)
+
+SELECT 'one deletes a copy of two, one adds one' AS "case", *
+  FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$],
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
+	$s$INSERT INTO mk.t VALUES (1, 'x')$s$);
+                  case                   | a | b | copies 
+-----------------------------------------+---+---+--------
+ one deletes a copy of two, one adds one | 1 | x |      2
+(1 row)
+
+SELECT 'both delete a copy of three' AS "case", *
+  FROM pg_temp.merged(ARRAY[$s$(1, 'x')$s$, $s$(1, 'x')$s$, $s$(1, 'x')$s$],
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT min(ctid) FROM mk.t)$s$,
+	$s$DELETE FROM mk.t WHERE ctid = (SELECT max(ctid) FROM mk.t)$s$);
+            case             | a | b | copies 
+-----------------------------+---+---+--------
+ both delete a copy of three | 1 | x |      2
+(1 row)
+
+SELECT * FROM dolt_conflicts;
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+DROP SCHEMA mk CASCADE;
+NOTICE:  drop cascades to table mk.t
+SELECT length(dolt_commit('-Am', 'mk gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 -- A merge reads rows as they were folded: a NULL in a column added with a
 -- default is NULL in the conflict's rows, not the default.
 CREATE SCHEMA mgd VERSIONED;
