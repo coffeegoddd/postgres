@@ -3,7 +3,8 @@
 # A commit's fold doesn't see transactions running when its snapshot was
 # taken, or committed since.  Their rows stay out of the commit, and the
 # next fold, which starts from the commit's, still finds them, though
-# their transactions' commits changed no page.
+# their transactions' commits changed no page.  A fold never starts from
+# a baseline its snapshot is older than, and a standby folds too.
 
 use strict;
 use warnings FATAL => 'all';
@@ -12,7 +13,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('unseen');
-$node->init;
+$node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf', 'autovacuum = off');
 $node->start;
 
@@ -62,6 +63,39 @@ $a->query_safe('ROLLBACK');
 is(sql($same), 't', 'an aborted one\'s rows are as they were');
 is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'and nothing changed');
 
+# A running transaction's row whose key is stored out of line: the
+# commit's fold can't carry its key, so the next fold reads the table.
+sql(q{CREATE TABLE c.x (id text PRIMARY KEY, v int);
+	ALTER TABLE c.x ALTER COLUMN id SET STORAGE EXTERNAL;
+	INSERT INTO c.x VALUES ('a', 1);
+	SELECT dolt_commit('-Am', 'x')});
+$a->query_safe(q{BEGIN; INSERT INTO c.x VALUES (repeat('k', 2500), 2)});
+sql(q{UPDATE c.x SET v = 0 WHERE id = 'a'; SELECT dolt_commit('-am', 'while the long key runs')});
+$a->query_safe('COMMIT');
+is(sql($same), 't', 'a row whose key wasn\'t carried is found');
+is(sql(q{SELECT string_agg(table_name, ', ') FROM dolt_status}), 'c.x', 'as a change');
+sql(q{SELECT dolt_commit('-am', 'long key')});
+
+# A snapshot older than the baseline's fold: the baseline has what the
+# snapshot doesn't see, so the table is read in full.
+$rr->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1});
+sql(q{UPDATE c.t SET v = 'newer' WHERE id = 7; SELECT dolt_commit('-am', 'newer')});
+is($rr->query_safe($same), 't', 'an older snapshot doesn\'t fold from a newer baseline');
+is($rr->query_safe(q{SELECT string_agg(table_name, ', ') FROM dolt_status}), 'c.t',
+	'and sees the working set as it was');
+$rr->query_safe('COMMIT');
+
+# A standby folds, though it can't take the lock (nor begin a fold).
+$node->backup('base');
+my $standby = PostgreSQL::Test::Cluster->new('unseen_standby');
+$standby->init_from_backup($node, 'base', has_streaming => 1);
+$standby->start;
+sql(q{UPDATE c.t SET v = 'standby' WHERE id = 8; SELECT dolt_commit('-am', 'standby')});
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM dolt_status}), '0',
+	'a standby folds the working set');
+
+$standby->stop;
 $a->quit;
 $rr->quit;
 $node->stop;

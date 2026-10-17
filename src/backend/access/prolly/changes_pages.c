@@ -23,15 +23,20 @@
  *
  * A table is folded in full instead, every row read, when the baseline
  * isn't of its changes list's lineage (it was never folded, or rewritten
- * since), when it has no primary key (its rows are keyed by content, and
- * the count of a row's copies can't be known from some of them) and
- * anything changed, and when a candidate's key column is stored out of
- * line (its old version may be gone).
+ * since, or the list was pruned past it), when it has no primary key (its
+ * rows are keyed by content, and the count of a row's copies can't be
+ * known from some of them) and anything changed, when a candidate's key
+ * column is stored out of line (its old version may be gone), when the
+ * baseline's fold left rows unsettled whose keys it couldn't carry, when
+ * the snapshot is older than the baseline's fold's (which may have seen
+ * transactions the snapshot doesn't), and during recovery (a standby
+ * replays prunes without waiting for its readers).
  *
  * A baseline's state: a version byte, the list's lineage, the fold's epoch,
- * the table's length then, flags, and the tree of carried keys (each key
- * with the key columns' encoded row, to look it up by; an empty hash for
- * none).
+ * the table's length then, the fold's snapshot's xmax and the transactions
+ * it saw running (a count, then each), flags, and the tree of carried keys
+ * (each key with the key columns' encoded row, to look it up by; an empty
+ * hash for none).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/changes_pages.c
@@ -49,6 +54,7 @@
 #include "access/stratnum.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_am_d.h"
 #include "common/int.h"
 #include "executor/tuptable.h"
@@ -63,11 +69,27 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		1
-#define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled */
+#define STATE_VERSION		2
+#define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
+									 * whose keys it couldn't carry */
 
-/* a lock per relation file number: folds exclusive, readers shared */
-#define FOLD_LOCK_CLASSID	((Oid) 0x50464C44)
+/*
+ * A lock per relation file: folds that begin one exclusive, readers of the
+ * changes list shared.  An object lock's tag, its class the tablespace and
+ * its sub-ID one no column has.
+ */
+#define FOLD_LOCK_SUBID		0xFFFF
+
+/* A baseline's state, parsed. */
+typedef struct State
+{
+	BmapFold	fold;
+	TransactionId xmax;			/* the fold's snapshot's */
+	uint32		nxip;			/* the transactions it saw running, sorted */
+	TransactionId *xip;
+	uint8		flags;
+	ProllyNodeRef carried;
+} State;
 
 static ProllyChangeCounters counters;
 
@@ -106,7 +128,8 @@ typedef struct Finder
 	Candidate  *carried;
 	int			ncarried;
 	int			maxcarried;
-	bool		unsettled;		/* a keyless table's: some rows weren't */
+	bool		unsettled;		/* some rows weren't, and their keys aren't
+								 * carried */
 	bool		give_up;
 } Finder;
 
@@ -143,37 +166,74 @@ get_u64(const uint8 *p)
 }
 
 static void
-put_state(StringInfo out, const BmapFold *fold, uint8 flags,
-		  const ProllyNodeRef *carried)
+put_state(StringInfo out, const State *st)
 {
 	appendStringInfoChar(out, (char) STATE_VERSION);
-	put_u64(out, fold->lineage);
-	put_u32(out, fold->epoch);
-	put_u32(out, fold->nblocks);
-	appendStringInfoChar(out, (char) flags);
-	appendStringInfoChar(out, (char) carried->hash.len);
-	appendBinaryStringInfo(out, carried->hash.bytes, carried->hash.len);
+	put_u64(out, st->fold.lineage);
+	put_u32(out, st->fold.epoch);
+	put_u32(out, st->fold.nblocks);
+	put_u32(out, st->xmax);
+	put_u32(out, st->nxip);
+	for (uint32 i = 0; i < st->nxip; i++)
+		put_u32(out, st->xip[i]);
+	appendStringInfoChar(out, (char) st->flags);
+	appendStringInfoChar(out, (char) st->carried.hash.len);
+	appendBinaryStringInfo(out, st->carried.hash.bytes, st->carried.hash.len);
 }
 
 static bool
-parse_state(const ProllyValue *state, BmapFold *fold, uint8 *flags,
-			ProllyNodeRef *carried)
+parse_state(const ProllyValue *state, State *st)
 {
 	const uint8 *p = state->data;
+	const uint8 *end = p + state->len;
 	uint8		hlen;
 
-	if (state->len < 1 + 8 + 4 + 4 + 1 + 1 || p[0] != STATE_VERSION)
+	memset(st, 0, sizeof(*st));
+	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || p[0] != STATE_VERSION)
 		return false;
-	fold->lineage = get_u64(p + 1);
-	fold->epoch = get_u32(p + 9);
-	fold->nblocks = get_u32(p + 13);
-	*flags = p[17];
-	hlen = p[18];
-	if (hlen > PROLLY_HASH_MAX_LEN || state->len != 19 + hlen)
+	st->fold.lineage = get_u64(p + 1);
+	st->fold.epoch = get_u32(p + 9);
+	st->fold.nblocks = get_u32(p + 13);
+	st->xmax = get_u32(p + 17);
+	st->nxip = get_u32(p + 21);
+	p += 25;
+	if ((uint64) (end - p) < (uint64) st->nxip * 4 + 2)
 		return false;
-	memset(carried, 0, sizeof(*carried));
-	carried->hash.len = hlen;
-	memcpy(carried->hash.bytes, p + 19, hlen);
+	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
+	for (uint32 i = 0; i < st->nxip; i++, p += 4)
+		st->xip[i] = get_u32(p);
+	st->flags = p[0];
+	hlen = p[1];
+	p += 2;
+	if (hlen > PROLLY_HASH_MAX_LEN || end - p != hlen)
+		return false;
+	st->carried.hash.len = hlen;
+	memcpy(st->carried.hash.bytes, p, hlen);
+	return true;
+}
+
+static int
+xid_cmp(const void *a, const void *b)
+{
+	return pg_cmp_u32(*(const TransactionId *) a, *(const TransactionId *) b);
+}
+
+/*
+ * Does the snapshot see every transaction the baseline's fold saw as
+ * committed?  Each the fold saw finished (below its xmax, not running
+ * then) must be below the snapshot's xmax and not running for it.
+ */
+static bool
+sees_fold(Snapshot snap, const State *st)
+{
+	if (snap->takenDuringRecovery || !TransactionIdIsNormal(st->xmax) ||
+		TransactionIdPrecedes(snap->xmax, st->xmax))
+		return false;
+	for (uint32 i = 0; i < snap->xcnt; i++)
+		if (TransactionIdPrecedes(snap->xip[i], st->xmax) &&
+			bsearch(&snap->xip[i], st->xip, st->nxip, sizeof(TransactionId),
+					xid_cmp) == NULL)
+			return false;
 	return true;
 }
 
@@ -335,12 +395,15 @@ tuple_key(Finder *f, HeapTuple tup, StringInfo key, StringInfo keyrow)
 }
 
 /*
- * The candidates on a version of page blkno: every tuple, visible or not.
- * Of the version the table has now ('current'), keys of tuples the
- * snapshot doesn't see as settled are carried.
+ * The tuples on a version of page blkno.  With 'candidates', each names a
+ * candidate, visible or not (a key out of line gives up).  Of the version
+ * the table has now ('current'), keys of tuples the snapshot doesn't see
+ * as settled are carried (a key out of line, or a keyless table's tuple,
+ * marks the table unsettled instead).
  */
 static void
-page_candidates(Finder *f, Page page, BlockNumber blkno, bool current)
+page_tuples(Finder *f, Page page, BlockNumber blkno, bool current,
+			bool candidates)
 {
 	OffsetNumber maxoff;
 	StringInfoData key;
@@ -356,6 +419,7 @@ page_candidates(Finder *f, Page page, BlockNumber blkno, bool current)
 	{
 		ItemId		lp = PageGetItemId(page, off);
 		HeapTupleData tup;
+		bool		unsettled;
 
 		if (!ItemIdIsNormal(lp))
 			continue;
@@ -363,19 +427,27 @@ page_candidates(Finder *f, Page page, BlockNumber blkno, bool current)
 		tup.t_len = ItemIdGetLength(lp);
 		tup.t_tableOid = RelationGetRelid(f->rel);
 		ItemPointerSet(&tup.t_self, blkno, off);
+		unsettled = current && tuple_unsettled(f, tup.t_data);
+		if (!candidates && !unsettled)
+			continue;
 		if (f->keyless)
 		{
-			if (current && tuple_unsettled(f, tup.t_data))
-				f->unsettled = true;
+			f->unsettled |= unsettled;
 			continue;
 		}
 		if (!tuple_key(f, &tup, &key, &keyrow))
 		{
-			f->give_up = true;
-			break;
+			if (candidates)
+			{
+				f->give_up = true;
+				break;
+			}
+			f->unsettled = true;
+			continue;
 		}
-		add_candidate(&f->cands, &f->ncands, &f->maxcands, &key, &keyrow);
-		if (current && tuple_unsettled(f, tup.t_data))
+		if (candidates)
+			add_candidate(&f->cands, &f->ncands, &f->maxcands, &key, &keyrow);
+		if (unsettled)
 			add_candidate(&f->carried, &f->ncarried, &f->maxcarried, &key, &keyrow);
 	}
 	pfree(key.data);
@@ -384,28 +456,31 @@ page_candidates(Finder *f, Page page, BlockNumber blkno, bool current)
 
 /* The current version of page blkno, read under a share lock. */
 static void
-current_page(Finder *f, BlockNumber blkno)
+current_page(Finder *f, BlockNumber blkno, bool candidates)
 {
 	Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
 										 RBM_NORMAL, NULL);
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page_candidates(f, BufferGetPage(buf), blkno, true);
+	page_tuples(f, BufferGetPage(buf), blkno, true, candidates);
 	UnlockReleaseBuffer(buf);
 }
 
 /*
- * Look a candidate up by its key columns with 'snap', into f->rowslot;
- * with SnapshotAny, every version is visited and true returned if one is
- * unsettled.
+ * Look a candidate up by its key columns, with 'scan' (of the primary key,
+ * by f->snap, or by SnapshotAny with 'carry'): the row the snapshot sees,
+ * if any, encoded into 'key' and 'row'.  With 'carry', every version is
+ * visited, and *unsettled set if one is of a transaction the snapshot
+ * doesn't see as settled.
  */
 static bool
-lookup(Finder *f, const Candidate *c, Snapshot snap)
+lookup(Finder *f, IndexScanDesc scan, const Candidate *c, bool carry,
+	   StringInfo key, StringInfo row, bool *unsettled)
 {
 	ProllyValue kr = {(const uint8 *) c->keyrow, c->keyrowlen};
 	ScanKeyData skey[INDEX_MAX_KEYS];
-	IndexScanDesc scan;
 	bool		found = false;
+	ProllyHash	content;
 
 	PROLLY_CALL(f->kr, decode_row, f->k, &kr, f->keyslot);
 	slot_getallattrs(f->keyslot);
@@ -419,23 +494,24 @@ lookup(Finder *f, const Candidate *c, Snapshot snap)
 		if (f->keyslot->tts_isnull[a])
 			skey[i].sk_flags |= (SK_ISNULL | SK_SEARCHNULL);
 	}
-	scan = index_beginscan(f->rel, f->pk, false, snap, NULL, f->nkeys, 0,
-						   SO_NONE);
+	*unsettled = false;
 	index_rescan(scan, skey, f->nkeys, NULL, 0);
 	while (table_index_getnext_slot(scan, ForwardScanDirection, f->rowslot))
 	{
-		if (snap != SnapshotAny)
+		if (carry && !*unsettled &&
+			tuple_unsettled(f, ((HeapTupleTableSlot *) f->rowslot)->tuple->t_data))
+			*unsettled = true;
+		if (!found &&
+			(!carry || table_tuple_satisfies_snapshot(f->rel, f->rowslot, f->snap)))
 		{
 			found = true;
-			break;
+			resetStringInfo(key);
+			resetStringInfo(row);
+			PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, key, row, &content);
 		}
-		if (tuple_unsettled(f, ((HeapTupleTableSlot *) f->rowslot)->tuple->t_data))
-		{
-			found = true;
+		if (found && (!carry || *unsettled))
 			break;
-		}
 	}
-	index_endscan(scan);
 	return found;
 }
 
@@ -497,14 +573,16 @@ block_cmp(const void *a, const void *b)
 }
 
 /*
- * Fold from the baseline: false if the table must be read in full instead.
+ * Fold from the baseline, its state 'st': false if the table must be read
+ * in full instead.  With 'carry', keys to look at again next time are
+ * carried.
  */
 static bool
-fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
-			 uint8 flags, const ProllyNodeRef *carried, ProllyNodeRef *data)
+fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
+			 bool carry, ProllyNodeRef *data)
 {
 	Listed		l = {0};
-	BlockNumber low = since->nblocks;
+	BlockNumber low = st->fold.nblocks;
 	BlockNumber nblocks;
 	BlockNumber *current;
 	int			ncurrent = 0;
@@ -515,9 +593,16 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 	StringInfoData key;
 	StringInfoData row;
 	StringInfoData value;
+	IndexScanDesc scan;
 
-	if (f->give_up ||
-		!bmap_fold_changes(RelationGetSmgr(f->rel), since, listed_change, &l))
+	/*
+	 * Rows the baseline's fold left unsettled without carrying their keys
+	 * may be anywhere; a snapshot older than the fold's may not see all it
+	 * saw.
+	 */
+	if (f->give_up || (st->flags & STATE_UNSETTLED) || !sees_fold(f->snap, st))
+		return false;
+	if (!bmap_fold_changes(RelationGetSmgr(f->rel), &st->fold, listed_change, &l))
 		return false;
 	for (int i = 0; i < l.n; i++)
 		if (l.changes[i].kind == BMAP_CHANGE_TRUNCATE)
@@ -527,7 +612,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 	/* a table without a key: unchanged, or read in full */
 	if (f->keyless)
 	{
-		if (l.n > 0 || low < nblocks || (flags & STATE_UNSETTLED))
+		if (l.n > 0 || low < nblocks)
 			return false;
 		*data = baseline->data;
 		return true;
@@ -542,7 +627,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 		if (c->kind != BMAP_CHANGE_COPY)
 			continue;
 		bmap_read_old(RelationGetSmgr(f->rel), c->blkno, c->old_block, old.data);
-		page_candidates(f, (Page) old.data, c->blkno, false);
+		page_tuples(f, (Page) old.data, c->blkno, false, true);
 		if (c->blkno < Min(low, nblocks))
 			current[ncurrent++] = c->blkno;
 	}
@@ -550,20 +635,20 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 		qsort(current, ncurrent, sizeof(BlockNumber), block_cmp);
 	for (int i = 0; i < ncurrent && !f->give_up; i++)
 		if (i == 0 || current[i] != current[i - 1])
-			current_page(f, current[i]);
+			current_page(f, current[i], true);
 	/* and those past the shortest length since, as they are */
 	for (BlockNumber blk = low; blk < nblocks && !f->give_up; blk++)
-		current_page(f, blk);
+		current_page(f, blk, true);
 	if (f->give_up)
 		return false;
 
 	/* the keys carried from the last fold */
-	if (carried->hash.len > 0)
+	if (st->carried.hash.len > 0)
 	{
 		ProllyKey	k;
 		ProllyValue v;
 
-		cur = PROLLY_CALL(f->tree, cursor_open, &f->memenv, carried,
+		cur = PROLLY_CALL(f->tree, cursor_open, &f->memenv, &st->carried,
 						  CurrentMemoryContext);
 		PROLLY_CALL(f->tree, cursor_seek, cur, NULL, ForwardScanDirection);
 		initStringInfo(&key);
@@ -585,6 +670,9 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 	edits = palloc_array(ProllyEdit, Max(f->ncands, 1));
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
 					  CurrentMemoryContext);
+	/* one scan, every version if keys are carried */
+	scan = index_beginscan(f->rel, f->pk, false, carry ? SnapshotAny : f->snap,
+						   NULL, f->nkeys, 0, SO_NONE);
 	initStringInfo(&key);
 	initStringInfo(&row);
 	initStringInfo(&value);
@@ -596,20 +684,17 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 		ProllyValue v;
 		bool		had;
 		bool		has;
+		bool		unsettled;
 
 		PROLLY_CALL(f->tree, cursor_seek, cur, &ck, ForwardScanDirection);
 		had = PROLLY_CALL(f->tree, cursor_next, cur, &k, &v) &&
 			keying_compare(&k, &ck, f) == 0;
-		has = lookup(f, c, f->snap);
+		has = lookup(f, scan, c, carry, &key, &row, &unsettled);
 		if (has)
 		{
-			ProllyHash	content;
 			ProllyValue r;
 
-			resetStringInfo(&key);
-			resetStringInfo(&row);
 			resetStringInfo(&value);
-			PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &key, &row, &content);
 			r.data = (const uint8 *) row.data;
 			r.len = row.len;
 			PROLLY_CALL(f->kr, make_value, f->k, &r, 1, &value);
@@ -640,7 +725,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 			e->key.len = c->keylen;
 			e->is_delete = true;
 		}
-		if (lookup(f, c, SnapshotAny))
+		if (unsettled)
 		{
 			StringInfoData ks = {c->key, (int) c->keylen, (int) c->keylen, 0};
 			StringInfoData rs = {c->keyrow, (int) c->keyrowlen, (int) c->keyrowlen, 0};
@@ -649,6 +734,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const BmapFold *since,
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
+	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
 	if (nedits > 0)
 		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
@@ -750,44 +836,9 @@ fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 	{
 		BlockNumber nblocks = RelationGetNumberOfBlocks(f->rel);
 
-		f->give_up = false;
 		for (BlockNumber blk = 0; blk < nblocks; blk++)
 		{
-			Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blk,
-												 RBM_NORMAL, NULL);
-			Page		page;
-			OffsetNumber maxoff;
-			StringInfoData key;
-			StringInfoData keyrow;
-
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			initStringInfo(&key);
-			initStringInfo(&keyrow);
-			maxoff = PageIsNew(page) ? InvalidOffsetNumber : PageGetMaxOffsetNumber(page);
-			for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-			{
-				ItemId		lp = PageGetItemId(page, off);
-				HeapTupleData tup;
-
-				if (!ItemIdIsNormal(lp))
-					continue;
-				tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-				tup.t_len = ItemIdGetLength(lp);
-				tup.t_tableOid = RelationGetRelid(f->rel);
-				ItemPointerSet(&tup.t_self, blk, off);
-				if (!tuple_unsettled(f, tup.t_data))
-					continue;
-				/* (an unreadable key: the next fold reads everything too) */
-				if (f->keyless || !tuple_key(f, &tup, &key, &keyrow))
-					f->unsettled = true;
-				else
-					add_candidate(&f->carried, &f->ncarried, &f->maxcarried,
-								  &key, &keyrow);
-			}
-			UnlockReleaseBuffer(buf);
-			pfree(key.data);
-			pfree(keyrow.data);
+			current_page(f, blk, false);
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
@@ -798,9 +849,10 @@ carried_cmp(const void *a, const void *b)
 {
 	const Candidate *x = a;
 	const Candidate *y = b;
-	int			r = memcmp(x->key, y->key, Min(x->keylen, y->keylen));
+	ProllyKey	kx = {(const uint8 *) x->key, x->keylen};
+	ProllyKey	ky = {(const uint8 *) y->key, y->keylen};
 
-	return r != 0 ? r : (x->keylen > y->keylen) - (x->keylen < y->keylen);
+	return memcmp_keys(&kx, &ky, NULL);
 }
 
 /* The carried keys as a tree (by bytes); an empty hash for none. */
@@ -839,36 +891,45 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 		   StringInfo next)
 {
 	Finder		f;
-	BmapFold	since;
+	State		st;
 	BmapFold	fold;
-	uint8		flags = 0;
-	ProllyNodeRef carried;
 	bool		have;
 	bool		mapped;
+	bool		locked;
 	LOCKTAG		tag;
 	LOCKMODE	mode = next ? ExclusiveLock : ShareLock;
+	MemoryContext cxt;
+	MemoryContext old;
 
+	/* what a table's fold makes is let go of when it's done */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "pages fold",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
 	finder_open(&f, rel, env);
-	mapped = RelationGetSmgr(rel)->smgr_which == SMGR_BMAP;
-	have = mapped && baseline != NULL &&
-		parse_state(&baseline->state, &since, &flags, &carried);
+	mapped = RelationGetSmgr(rel)->smgr_which == SMGR_BMAP &&
+		!RecoveryInProgress();
+	have = mapped && baseline != NULL && parse_state(&baseline->state, &st);
 
 	/*
 	 * A fold's beginning lets go of what changed before the baseline, which
 	 * readers of it don't need; it waits for those reading the blocks.
 	 */
-	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, FOLD_LOCK_CLASSID,
-					   rel->rd_locator.relNumber, 0);
-	(void) LockAcquire(&tag, mode, false, false);
+	locked = mapped && (next != NULL || have);
+	if (locked)
+	{
+		SET_LOCKTAG_OBJECT(tag, MyDatabaseId, rel->rd_locator.spcOid,
+						   rel->rd_locator.relNumber, FOLD_LOCK_SUBID);
+		(void) LockAcquire(&tag, mode, false, false);
+	}
 	PG_TRY();
 	{
 		if (next && mapped)
 		{
 			if (have)
-				bmap_fold_prune(RelationGetSmgr(rel), &since);
+				bmap_fold_prune(RelationGetSmgr(rel), &st.fold);
 			bmap_fold_begin(RelationGetSmgr(rel), &fold);
 		}
-		if (!have || !fold_changed(&f, baseline, &since, flags, &carried, data))
+		if (!have || !fold_changed(&f, baseline, &st, next != NULL, data))
 		{
 			f.ncarried = 0;
 			f.unsettled = false;
@@ -876,35 +937,44 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 		}
 		if (next)
 		{
-			ProllyNodeRef ct;
+			State		ns = {0};
 
-			if (!mapped)
-				memset(&fold, 0, sizeof(fold));
-			carried_tree(&f, &ct);
-			put_state(next, &fold, f.unsettled ? STATE_UNSETTLED : 0, &ct);
+			if (mapped)
+				ns.fold = fold;
+			ns.xmax = f.snap->xmax;
+			ns.nxip = f.snap->xcnt;
+			ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
+			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
+			qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
+			ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
+			carried_tree(&f, &ns.carried);
+			MemoryContextSwitchTo(old);
+			put_state(next, &ns);
+			MemoryContextSwitchTo(cxt);
 		}
 	}
 	PG_FINALLY();
 	{
-		LockRelease(&tag, mode, false);
+		if (locked)
+			LockRelease(&tag, mode, false);
 	}
 	PG_END_TRY();
 	finder_close(&f);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 static void
 pages_walk(const ProllyTreeEnv *env, const ProllyValue *state,
 		   ProllyTreeVisitNode visit, void *arg)
 {
-	BmapFold	fold;
-	uint8		flags;
-	ProllyNodeRef carried;
+	State		st;
 	ProllyTreeEnv memenv = *env;
 
-	if (!parse_state(state, &fold, &flags, &carried) || carried.hash.len == 0)
+	if (!parse_state(state, &st) || st.carried.hash.len == 0)
 		return;
 	memenv.compare = memcmp_keys;
-	PROLLY_CALL(prolly_tree_lookup("cow"), walk, &memenv, &carried, visit, arg);
+	PROLLY_CALL(prolly_tree_lookup("cow"), walk, &memenv, &st.carried, visit, arg);
 }
 
 static void
