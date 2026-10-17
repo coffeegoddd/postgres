@@ -1032,11 +1032,44 @@ copies (the one O(N) step: rows written to pages, indexes built).
   is refused; it never overwrites a root (Dolt's clone and backup set
   the root over whatever is there, after ten tries).
 
-- **Shared dependencies** (part 1): before anything is written, the
-  head's canonical root is checked for what versioned objects need from
-  outside them: extensions (name and version), roles named as owners or
-  in grants, and objects of ordinary schemas. A clone missing any refuses,
-  naming each.
+- **Shared dependencies** (part 1). **Decided by the user, 2026-10-17:**
+  a folded root records what its versioned objects need from outside
+  them, and a clone installs the extensions and checks the rest before
+  anything is written:
+  - **Recorded at each commit:** a "d:" item per dependency outside the
+    versioned schemas, by kind and qualified name: an extension with its
+    version, a role (an owner, or named in a grant or policy), a type,
+    function, operator, collation or other object of an ordinary schema.
+    Found through `pg_depend` and `pg_shdepend` for the objects the fold
+    describes, and only the changed objects' are looked up again. A new
+    canonical format (a clean break, as #149's), which the user accepted
+    at this stage for the better feature.
+  - **At clone:** for every branch's head, not only the default one's, the
+    recorded extensions are created at their recorded versions where the
+    server has their files (`CREATE EXTENSION … VERSION`); then every
+    other dependency is checked. A clone missing any refuses once,
+    before writing, naming all of them (each role, object and extension,
+    with why: not installed on this server, another version). Clone is
+    the only operation that installs an extension: its database is empty
+    and its own.
+  - **At a move** (checkout, merge, reset, cherry-pick, pull): an
+    extension is every branch's, so a move never creates or alters one. A
+    move to a commit needing an extension the database lacks, or a newer
+    version than it has, refuses with a hint to install or update it
+    first (`ALTER EXTENSION … UPDATE`, which the user runs, for every
+    branch at once). Other missing dependencies refuse as at clone.
+  - **In diffs:** `dolt_diff` and `dolt_status` show dependencies added
+    and removed, an extension's version changing among them, beside the
+    schema changes that needed them.
+  - **The backstop:** `pg_depend` doesn't see what a function's body
+    names (its source is text), so the list can't be complete; making the
+    copies still fails, rolls back and names what it lacked, as before.
+  - **Not versioned:** extensions themselves. One version of an extension
+    serves a database, and the server loads one copy of its library for
+    every database, so per-branch extensions couldn't isolate what an
+    upgrade changes. An upgrade is tested in a clone (`CREATE DATABASE`,
+    `dolt_clone`, `ALTER EXTENSION … UPDATE` there, the tests), then made
+    in the database.
 - **Options for where:** (a) into an existing, empty database,
   `CREATE DATABASE x; \c x; SELECT dolt_clone(url);`; (b) a new database
   made by the clone, `SELECT dolt_clone(url, 'x')`, which needs a
@@ -1215,11 +1248,10 @@ Not as designed, or not yet:
   V4 to say what it saves.
 - **Shared dependencies.** A clone whose objects need something the
   database lacks fails where its copies are made, naming that object,
-  and leaves nothing (one transaction). Naming every missing dependency
-  before anything is written, as 7.4 asks, needs the folded root to record
-  what its objects depend on outside the versioned schemas (types,
-  functions, extensions, roles): items it lacks, so a format change, the
-  user's to decide.
+  and leaves nothing (one transaction). The recorded dependencies 7.4
+  decides (2026-10-17: "d:" items, a new format; extensions created at
+  clone, everything checked for every branch before writing; moves refuse
+  rather than change extensions) are the next layer.
 - **A push moves the remote's head as it is reached,** not with the
   transaction: the remote-tracking branch moves with the transaction, so a
   push whose transaction aborts leaves it behind the remote until the
