@@ -11,6 +11,7 @@ diff feature..base|added,modified,removed
 diff base..base|0
 checkout main|t
 commit main|t
-merge|t
+merge|{0,0,"merge successful"}
+merge commit|t
 merged rows|1:ONE,2:two,4:four,5:FIVE
 diff main..feature|modified,removed

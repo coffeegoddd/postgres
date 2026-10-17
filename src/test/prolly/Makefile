@@ -8,8 +8,10 @@
 #	make -C src/test/prolly check PROLLY_AM=prolly_d1
 #
 # (prolly_d1 is the default; PROLLY_AM=prolly runs the groups the page-based
-# engine supports, and check-vc-commits runs on it whatever PROLLY_AM is,
-# after check-vc-target passes on it.)
+# engine supports.  check-vc and check-vc-isolation run on prolly whatever
+# PROLLY_AM is, after check-vc-target passes on it; check-vc-d1 and
+# check-vc-isolation-d1 run the tree engine's own version control tests
+# on PROLLY_AM, which can't be prolly.)
 #
 # The semantics, isolation and durability groups also run against heap
 # (PROLLY_AM=heap), which is how the tests themselves are validated: their
@@ -50,7 +52,8 @@ EXTRA_INSTALL = contrib/btree_gist
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
-check: check-target check-semantics check-isolation check-vc check-vc-isolation check-tap
+check: check-target check-semantics check-isolation check-vc check-vc-isolation \
+	check-vc-d1 check-vc-isolation-d1 check-tap
 
 check-target: PROVE_TESTS = t/003_target_guard.pl
 check-target: require-tap temp-install
@@ -77,6 +80,10 @@ check-vc: temp-install check-vc-target-prolly vc.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_schedule
 
+# The tree engine's version control, through its prolly_* API.
+check-vc-d1: require-legacy-vc check-vc-target temp-install prolly_am.conf
+	$(pg_regress_check) $(REGRESS_OPTS) --schedule=$(srcdir)/vc_d1_schedule
+
 check-isolation: PROVE_TESTS = t/002_isolation.pl
 check-isolation: require-tap temp-install
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
@@ -86,6 +93,11 @@ check-vc-isolation: temp-install check-vc-target-prolly vc.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation all
 	$(pg_isolation_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_isolation_schedule
+
+check-vc-isolation-d1: require-legacy-vc check-vc-target temp-install prolly_am.conf
+	$(MAKE) -C $(top_builddir)/src/test/isolation all
+	$(pg_isolation_regress_check) $(REGRESS_OPTS) \
+		--schedule=$(srcdir)/vc_d1_isolation_schedule
 
 # TAP tests: 1xx are durability (also run against heap), 2xx version control.
 check-tap: check-tap-durability check-tap-vc
@@ -135,5 +147,6 @@ clean distclean:
 	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
+	check-vc-d1 check-vc-isolation-d1 \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-upstream-regress check-upstream-isolation check-upstream-bmap require-tap require-legacy-vc FORCE

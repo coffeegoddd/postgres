@@ -77,8 +77,7 @@ jobs:
       - name: Requirements on versioned prolly storage
         run: |
           make -C src/test/prolly check-target check-semantics check-isolation \
-            check-tap-durability check-vc-target check-vc check-vc-isolation \
-            PROLLY_AM=prolly
+            check-tap-durability check-vc check-vc-isolation PROLLY_AM=prolly
 
       - name: Version-control targeting on D1 and negative controls
         run: |

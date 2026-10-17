@@ -31,6 +31,9 @@ Extensions live in an ordinary extensions schema.  Individual groups:
 	                      independence and canonical form of branches made
 	                      by copying (always on prolly, whatever PROLLY_AM is)
 	check-vc-isolation    sessions on different branches at once (likewise)
+	check-vc-d1           branches, diff and merge on the tree engine,
+	                      through its prolly_* API (tree engines only)
+	check-vc-isolation-d1 sessions on different branches at once on it
 	check-tap-vc          history independence across clusters (tree
 	                      engines only)
 
@@ -38,8 +41,8 @@ Semantics, isolation and TAP groups require --enable-tap-tests; a build
 without TAP support fails these targets instead of reporting success.
 For the page-based prolly AM, run check-semantics, check-isolation,
 check-tap-durability and check-vc-target with PROLLY_AM=prolly.  check-vc
-and check-vc-isolation run on it always; check-tap-vc still describes the
-legacy tree-engine API and rejects that target.
+and check-vc-isolation run on it always; check-vc-d1, check-vc-isolation-d1
+and check-tap-vc use the legacy tree-engine API and reject that target.
 
 Run check-vc-target before claiming version-control coverage for an AM:
 
@@ -113,7 +116,8 @@ Covered: requirements that are decided.
 	                versioned, including cached plans and functions
 	                (vc_schema); diff and non-conflicting merge
 	                (vc_diff_merge); sessions on different branches
-	                (vc_branch_sessions)
+	                (vc_branch_sessions); the same on the tree engine
+	                (d1_vc_*)
 	Canonical form  history independence within a database (vc_history),
 	                across client encodings and databases (vc_canonical)
 	                and across clusters (201)
