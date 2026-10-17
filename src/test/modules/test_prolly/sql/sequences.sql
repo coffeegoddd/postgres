@@ -44,5 +44,70 @@ SELECT nextval('app.untouched');
 SELECT length(dolt_commit('-Am', 'just a value')::text) AS committed;
 SELECT dolt_commit('-Am', 'nothing');
 
+-- A move's sequence values roll back with its rows.
+SELECT (dolt_commit('-Am', 'before the rollback', '--allow-empty'))[1] AS here \gset
+SELECT last_value FROM app.s;
+BEGIN;
+SELECT dolt_reset('--hard', :'base');
+SELECT last_value FROM app.s;
+ROLLBACK;
+SELECT last_value FROM app.s;
+INSERT INTO app.t (v) VALUES ('no clash');
+
+-- Merges compare the value each would give next: one set back and not yet
+-- called (next 2000) is ahead of theirs called at 1500 (next 1501).
+SELECT dolt_branch('-D', 'feature');
+SELECT length(dolt_commit('-Am', 'clash checked')::text) AS committed;
+SELECT dolt_branch('feature');
+SELECT dolt_checkout('feature');
+SELECT setval('app.s', 1500);
+SELECT length(dolt_commit('-Am', 'feature at 1500')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT setval('app.s', 2000, false);
+SELECT length(dolt_commit('-Am', 'main next 2000')::text) AS committed;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT last_value, is_called FROM app.s;
+
+-- and a descending sequence's lower value is the further one.
+CREATE SEQUENCE app.down INCREMENT -1 START -1 MINVALUE -1000 MAXVALUE -1;
+SELECT length(dolt_commit('-Am', 'down')::text) AS committed;
+SELECT dolt_branch('-D', 'feature');
+SELECT dolt_branch('feature');
+SELECT dolt_checkout('feature');
+SELECT setval('app.down', -3);
+SELECT length(dolt_commit('-Am', 'feature at -3')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT setval('app.down', -10);
+SELECT length(dolt_commit('-Am', 'main at -10')::text) AS committed;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT last_value, is_called FROM app.down;
+
+-- An uncommitted value stops a merge, as uncommitted rows do.
+SELECT dolt_checkout('feature');
+SELECT setval('app.s', 5000);
+SELECT length(dolt_commit('-Am', 'feature at 5000')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT nextval('app.s') > 0 AS taken;
+SELECT dolt_merge('feature');
+SELECT dolt_reset('--hard');
+
+-- Folding and moving need no privilege on the sequences beyond the
+-- branch's: a role that may only use one sees status and resets.
+CREATE ROLE seq_user;
+GRANT USAGE ON SCHEMA app TO seq_user;
+GRANT ALL ON app.t TO seq_user;
+GRANT USAGE ON SEQUENCE app.s TO seq_user;
+SELECT dolt_hashof('HEAD') AS granted \gset
+SET ROLE seq_user;
+INSERT INTO app.t (v) VALUES ('by seq_user');
+SELECT * FROM dolt_status();
+SELECT dolt_reset('--hard', :'granted');
+SELECT count(*) FROM app.t WHERE v = 'by seq_user';
+RESET ROLE;
+REVOKE ALL ON app.t FROM seq_user;
+REVOKE ALL ON SEQUENCE app.s FROM seq_user;
+REVOKE ALL ON SCHEMA app FROM seq_user;
+DROP ROLE seq_user;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA app CASCADE;

@@ -49,14 +49,18 @@
 #include "access/table.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_sequence.h"
 #include "commands/sequence.h"
+#include "common/int.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/varlena.h"
 
 /* A table as one version has it. */
@@ -248,11 +252,18 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 
 /* A versioned table of the session branch's, by qualified name. */
 static Oid
-table_named(const char *name)
+rel_named(const char *name, LOCKMODE lockmode, bool missing_ok)
 {
 	List	   *names = stringToQualifiedNameList(name, NULL);
 
-	return RangeVarGetRelid(makeRangeVarFromNameList(names), NoLock, true);
+	return RangeVarGetRelid(makeRangeVarFromNameList(names), lockmode,
+							missing_ok);
+}
+
+static Oid
+table_named(const char *name)
+{
+	return rel_named(name, NoLock, true);
 }
 
 static char *
@@ -559,40 +570,100 @@ sequences_of(const ProllyNodeRef *root)
 	return list;
 }
 
-static Sequence *
-find_sequence(List *list, const char *name)
-{
-	ListCell   *lc;
-
-	foreach(lc, list)
-		if (strcmp(((Sequence *) lfirst(lc))->name, name) == 0)
-			return lfirst(lc);
-	return NULL;
-}
-
 static bool
 same_sequence(const Sequence *a, const Sequence *b)
 {
 	return a->last == b->last && a->called == b->called;
 }
 
-/* How far a sequence has gone: the values it gave out, or none. */
-static bool
-further(const Sequence *a, const Sequence *b)
+/*
+ * The value a sequence gives out next (saturating at the type's end, as
+ * no further one is).
+ */
+static int64
+next_value(const Sequence *sq, int64 increment)
 {
-	if (a->called != b->called)
-		return a->called;
-	return a->last > b->last;
+	int64		next;
+
+	if (!sq->called)
+		return sq->last;
+	if (pg_add_s64_overflow(sq->last, increment, &next))
+		return increment > 0 ? PG_INT64_MAX : PG_INT64_MIN;
+	return next;
 }
 
+/*
+ * a has gone further than b: it gives out next a value b would only after
+ * (higher, or lower for a descending sequence).
+ */
+static bool
+further(const Sequence *a, const Sequence *b, int64 increment)
+{
+	int64		na = next_value(a, increment);
+	int64		nb = next_value(b, increment);
+
+	return increment > 0 ? na > nb : na < nb;
+}
+
+static int64
+sequence_increment(Oid relid)
+{
+	HeapTuple	tup = SearchSysCache1(SEQRELID, ObjectIdGetDatum(relid));
+	int64		increment;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for sequence %u", relid);
+	increment = ((Form_pg_sequence) GETSTRUCT(tup))->seqincrement;
+	ReleaseSysCache(tup);
+	return increment;
+}
+
+/*
+ * A sequence set as a commit has it: with the transaction (a rollback
+ * undoes it, as the rows), as the branch's data rather than as setval.
+ */
 static void
 set_sequence(const Sequence *sq)
 {
-	List	   *names = stringToQualifiedNameList(sq->name, NULL);
-	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(names),
-										 RowExclusiveLock, false);
+	RestoreSequenceState(rel_named(sq->name, NoLock, false), sq->last,
+						 sq->called);
+}
 
-	SetSequence(relid, sq->last, sq->called);
+/* Sequences by name, to find each once. */
+typedef struct SequenceEntry
+{
+	char		name[2 * (2 * NAMEDATALEN + 2) + 2];	/* (the key) */
+	Sequence   *sq;
+} SequenceEntry;
+
+static HTAB *
+sequences_by_name(List *list)
+{
+	HASHCTL		ctl;
+	HTAB	   *h;
+	ListCell   *lc;
+
+	ctl.keysize = sizeof(((SequenceEntry *) NULL)->name);
+	ctl.entrysize = sizeof(SequenceEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	h = hash_create("prolly sequences", Max(list_length(list), 16), &ctl,
+					HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	foreach(lc, list)
+	{
+		Sequence   *sq = lfirst(lc);
+		SequenceEntry *e = hash_search(h, sq->name, HASH_ENTER, NULL);
+
+		e->sq = sq;
+	}
+	return h;
+}
+
+static Sequence *
+lookup_sequence(HTAB *h, const char *name)
+{
+	SequenceEntry *e = hash_search(h, name, HASH_FIND, NULL);
+
+	return e ? e->sq : NULL;
 }
 
 /*
@@ -625,12 +696,12 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 
 	/* and every sequence's value */
 	{
-		List	   *now = sequences_of(working);
+		HTAB	   *now = sequences_by_name(sequences_of(working));
 
 		foreach(lc, sequences_of(target))
 		{
 			Sequence   *t = lfirst(lc);
-			Sequence   *f = find_sequence(now, t->name);
+			Sequence   *f = lookup_sequence(now, t->name);
 
 			if (f == NULL || !same_sequence(f, t))
 				set_sequence(t);
@@ -671,19 +742,20 @@ static void
 merge_sequences(const ProllyNodeRef *base, const ProllyNodeRef *ours,
 				const ProllyNodeRef *theirs)
 {
-	List	   *b = sequences_of(base);
-	List	   *o = sequences_of(ours);
+	HTAB	   *b = sequences_by_name(sequences_of(base));
+	HTAB	   *o = sequences_by_name(sequences_of(ours));
 	ListCell   *lc;
 
 	foreach(lc, sequences_of(theirs))
 	{
 		Sequence   *t = lfirst(lc);
-		Sequence   *bs = find_sequence(b, t->name);
-		Sequence   *os = find_sequence(o, t->name);
+		Sequence   *bs = lookup_sequence(b, t->name);
+		Sequence   *os = lookup_sequence(o, t->name);
 
 		if (bs && same_sequence(bs, t))
 			continue;
-		if (os == NULL || further(t, os))
+		if (os == NULL ||
+			further(t, os, sequence_increment(rel_named(t->name, NoLock, false))))
 			set_sequence(t);
 	}
 }
@@ -1084,10 +1156,27 @@ static void
 check_clean(const char *what)
 {
 	bool		changed = false;
+	ProllyNodeRef head;
+	ProllyNodeRef working;
+	HTAB	   *now;
+	ListCell   *lc;
 
 	folded_tables("HEAD", "WORKING", note_change, &changed);
 	if (changed)
 		refuse_local_changes(what);
+
+	/* sequences' values too: a merge would set them from the head's */
+	root_of("HEAD", &head);
+	root_of("WORKING", &working);
+	now = sequences_by_name(sequences_of(&working));
+	foreach(lc, sequences_of(&head))
+	{
+		Sequence   *h = lfirst(lc);
+		Sequence   *w = lookup_sequence(now, h->name);
+
+		if (w && !same_sequence(h, w))
+			refuse_local_changes(what);
+	}
 }
 
 /*
