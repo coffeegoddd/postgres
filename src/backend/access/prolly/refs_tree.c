@@ -112,16 +112,6 @@ static ProllyComponents comps;
 static ProllyTreeEnv env;
 static ProllyRootEnv root_env;
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 static void
 refs_init(void)
 {
@@ -135,7 +125,7 @@ refs_init(void)
 	env.node_store = comps.node_store;
 	env.store = PROLLY_CALL(comps.node_store, open, NULL);
 	env.log = comps.log;
-	env.compare = memcmp_keys;
+	env.compare = prolly_bytes_compare;
 	root_env.tree = comps.tree;
 	root_env.tree_env = &env;
 	ready = true;
@@ -1133,7 +1123,10 @@ tree_set_head(const ProllyHash *commit_id)
 	ProllyBranchId branch = prolly_session_branch();
 
 	lock_refs();
+	/* as a commit or a reset: nothing else commits to the branch meanwhile */
+	PROLLY_CALL(comps.commit, branch_lock, branch);
 	branch_put(branch_name(branch), branch, commit_id);
+	bump_epoch();
 }
 
 static void
@@ -1272,7 +1265,7 @@ edit_cmp(const ListCell *a, const ListCell *b)
 	const RefEdit *eb = lfirst(b);
 	ProllyKey	ka = {(const uint8 *) ea->key.data, ea->key.len};
 	ProllyKey	kb = {(const uint8 *) eb->key.data, eb->key.len};
-	int			r = memcmp_keys(&ka, &kb, NULL);
+	int			r = prolly_bytes_compare(&ka, &kb, NULL);
 
 	/* list_sort() isn't stable: keep the order made for each key. */
 	if (r == 0)
@@ -1338,7 +1331,7 @@ refs_precommit(void)
 			RefEdit    *e = lfirst(lc);
 			ProllyKey	k = {(const uint8 *) e->key.data, e->key.len};
 
-			if (n > 0 && memcmp_keys(&edits[n - 1].key, &k, NULL) == 0)
+			if (n > 0 && prolly_bytes_compare(&edits[n - 1].key, &k, NULL) == 0)
 				n--;
 			edits[n].key = k;
 			edits[n].value.data = (const uint8 *) e->value.data;

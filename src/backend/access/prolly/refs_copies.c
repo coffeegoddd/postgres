@@ -90,16 +90,6 @@ static bool copies_commit_working_set(const ProllyHash *commit_id,
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 static void
 refs_init(void)
 {
@@ -113,7 +103,7 @@ refs_init(void)
 	env.chunk_store = prolly_chunk_store();
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
-	env.compare = memcmp_keys;
+	env.compare = prolly_bytes_compare;
 	RegisterXactCallback(refs_xact_callback, NULL);
 	ready = true;
 }
@@ -763,6 +753,28 @@ fold(ProllyNodeRef *root)
 }
 
 /*
+ * Hold the refs for a commit to branch name with these parents.  Parents
+ * read before the refs were held (a merge's, say) may no longer have the
+ * head among them: committing would leave the commit another made
+ * meanwhile off the branch.  True if a snapshot that sees the head was
+ * pushed, for the commit's fold (see_head()).
+ */
+static bool
+hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
+{
+	ProllyHash	head;
+
+	lock_refs();
+	if (nparents > 0 && branch_head(name, &head) && !same_hash(&head, &parents[0]))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved while this was being committed",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+	return see_head(name);
+}
+
+/*
  * Commit the session branch as it is, with these parents; the fold is the
  * branch's next baseline.
  */
@@ -774,22 +786,8 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	ProllyNodeRef root;
 	ProllyNodeRef next;
 	bool		pushed;
-	ProllyHash	head;
 
-	lock_refs();
-
-	/*
-	 * Parents read before the refs were held (a merge's, say) may no longer
-	 * have the head among them: committing would leave the commit another
-	 * made meanwhile off the branch.
-	 */
-	if (nparents > 0 && branch_head(name, &head) && !same_hash(&head, &parents[0]))
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("could not serialize access: branch \"%s\" moved while this was being committed",
-						name),
-				 errhint("The transaction might succeed if retried.")));
-	pushed = see_head(name);
+	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next);
 	if (pushed)
 		PopActiveSnapshot();
@@ -999,6 +997,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	ProllyNodeRef root;
 	ProllyNodeRef next;
 	char	   *name;
+	bool		pushed;
 
 	if (working_set == NULL)
 	{
@@ -1006,8 +1005,10 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 		return;
 	}
 	name = branch_ops()->current();
-	lock_refs();
+	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next);
+	if (pushed)
+		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);

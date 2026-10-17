@@ -261,16 +261,6 @@ static void spill_clear(D1Spill *sp);
 static bool same_hash(const ProllyNodeRef *a, const ProllyNodeRef *b);
 static void maybe_spill(void);
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 static void
 backend_init(void)
 {
@@ -285,7 +275,7 @@ backend_init(void)
 	backend.memcmp_env.node_store = backend.c.node_store;
 	backend.memcmp_env.store = backend.store;
 	backend.memcmp_env.log = backend.c.log;
-	backend.memcmp_env.compare = memcmp_keys;
+	backend.memcmp_env.compare = prolly_bytes_compare;
 	backend.memcmp_env.counters = &backend.counters;
 	backend.root_env.tree = backend.c.tree;
 	backend.root_env.tree_env = &backend.memcmp_env;
@@ -657,7 +647,7 @@ ws_compare(D1WriteSet *ws, const uint8 *a, uint32 alen, const uint8 *b,
 
 	if (order_set(&ws->order))
 		return keying_compare(&ka, &kb, &ws->order);
-	return memcmp_keys(&ka, &kb, NULL);
+	return prolly_bytes_compare(&ka, &kb, NULL);
 }
 
 static int
@@ -816,7 +806,7 @@ entry_bytes_cmp(const void *a, const void *b)
 	ProllyKey	ka = {ea->key, ea->keylen};
 	ProllyKey	kb = {eb->key, eb->keylen};
 
-	return memcmp_keys(&ka, &kb, NULL);
+	return prolly_bytes_compare(&ka, &kb, NULL);
 }
 
 static D1Entry **
@@ -844,7 +834,7 @@ find_by_bytes(D1Entry **arr, int n, const ProllyKey *key)
 	{
 		int			mid = lo + (hi - lo) / 2;
 		ProllyKey	k = {arr[mid]->key, arr[mid]->keylen};
-		int			r = memcmp_keys(key, &k, NULL);
+		int			r = prolly_bytes_compare(key, &k, NULL);
 
 		if (r == 0)
 			return arr[mid];
@@ -2155,7 +2145,7 @@ typedef struct D1Row
 static int
 row_bytes_cmp(const void *a, const void *b)
 {
-	return memcmp_keys(&((const D1Row *) a)->key, &((const D1Row *) b)->key,
+	return prolly_bytes_compare(&((const D1Row *) a)->key, &((const D1Row *) b)->key,
 					   NULL);
 }
 

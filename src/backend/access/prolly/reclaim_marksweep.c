@@ -57,16 +57,6 @@ typedef struct Marks
 	int64		maxgarbage;
 } Marks;
 
-static int
-memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (r != 0)
-		return r;
-	return (a->len > b->len) - (a->len < b->len);
-}
-
 static bool
 marked(const Marks *m, BlockNumber blk)
 {
@@ -175,7 +165,7 @@ marksweep_collect(ProllyGcResult *result)
 	 * The layout's own trees order keys by memcmp; relation trees are
 	 * walked, which needs no order.
 	 */
-	env.compare = memcmp_keys;
+	env.compare = prolly_bytes_compare;
 	PROLLY_CALL(c.commit, live_roots, mark_root, &m);
 
 	PROLLY_CALL(c.node_store, scan, store, sweep_node, &m);

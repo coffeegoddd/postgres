@@ -1242,14 +1242,6 @@ tables_at(const ProllyHash *id)
 	return tables_in_root(&root);
 }
 
-static int
-canon_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
-{
-	int			r = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	return r != 0 ? r : (a->len > b->len) - (a->len < b->len);
-}
-
 /*
  * The working set holds something of its own: an object other than a
  * versioned schema (a branch with no commit has nothing else to lose).
@@ -1267,7 +1259,7 @@ working_has_objects(void)
 
 	root_of("WORKING", &working);
 	chunk_env(&env);
-	env.compare = canon_compare;
+	env.compare = prolly_bytes_compare;
 	c = PROLLY_CALL(tree, cursor_open, &env, &working, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
 	while (!found && PROLLY_CALL(tree, cursor_next, c, &k, &v))
@@ -1390,24 +1382,13 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	}
 }
 
-/* The same, of three commits. */
-static int
-merge_commits(const ProllyHash *base, const ProllyHash *ours,
-			  const ProllyHash *theirs, bool fail_on_conflict,
-			  const char *what, const char *name, List **conflicted)
-{
-	ProllyNodeRef roots[3];
-
-	commit_root(base, &roots[0]);
-	commit_root(ours, &roots[1]);
-	commit_root(theirs, &roots[2]);
-	return merge_roots(roots, fail_on_conflict, what, name, conflicted);
-}
-
 /*
  * What the working set changed since the head: the canonical items that
  * differ, each with the head's value (to put back), and by kind the
- * tables and sequences among them, by name.
+ * tables, sequences and materialized views (refreshed) among them, by
+ * name.  A collation's item isn't among them: it says how the collation
+ * orders now, which the working set's commits record whatever else they
+ * leave out (the rows of the tables it keys are checked as they're read).
  */
 typedef struct Local
 {
@@ -1416,19 +1397,49 @@ typedef struct Local
 	List	   *edits;			/* ProllyEdit *: the head's items, in order */
 	List	   *tables;			/* char * */
 	List	   *sequences;		/* char * */
+	List	   *matviews;		/* char * */
 	bool		definitions;	/* something other than tables and sequences */
 } Local;
+
+/* Does item key, of kind ("t:", say), name an object of that kind? */
+static bool
+item_kind(const ProllyKey *key, const char *kind)
+{
+	return key->len >= 2 && memcmp(key->data, kind, 2) == 0;
+}
+
+static char *
+item_name(const ProllyKey *key)
+{
+	return pnstrdup((const char *) key->data + 2, key->len - 2);
+}
+
+/*
+ * A materialized view's item: its data tree's hash (length, then hash),
+ * then its query; the query alone, past the hash.
+ */
+static bool
+same_matview_query(const ProllyValue *a, const ProllyValue *b)
+{
+	uint32		ha = a->len > 0 ? 1 + a->data[0] : 0;
+	uint32		hb = b->len > 0 ? 1 + b->data[0] : 0;
+
+	return ha <= a->len && hb <= b->len && a->len - ha == b->len - hb &&
+		memcmp(a->data + ha, b->data + hb, a->len - ha) == 0;
+}
 
 static void
 local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		   const ProllyValue *after, void *arg)
 {
 	Local	   *l = arg;
-	ProllyEdit *e = palloc0(sizeof(ProllyEdit));
-	uint8	   *k = palloc(Max(key->len, 1));
-	char	   *name = key->len >= 2 ?
-		pnstrdup((const char *) key->data + 2, key->len - 2) : pstrdup("");
+	ProllyEdit *e;
+	uint8	   *k;
 
+	if (item_kind(key, "c:"))
+		return;
+	e = palloc0(sizeof(ProllyEdit));
+	k = palloc(Max(key->len, 1));
 	memcpy(k, key->data, key->len);
 	e->key.data = k;
 	e->key.len = key->len;
@@ -1444,13 +1455,39 @@ local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		e->is_delete = true;
 	l->edits = lappend(l->edits, e);
 
-	if (key->len >= 2 && memcmp(key->data, "t:", 2) == 0)
-		l->tables = lappend(l->tables, name);
-	else if (key->len >= 2 && memcmp(key->data, "s:", 2) == 0)
-		l->sequences = lappend(l->sequences, name);
-	else if (!(key->len >= 2 && memcmp(key->data, "c:", 2) == 0))
-		l->definitions = true;	/* (collations aren't objects: the rows of
-								 * the tables they key are checked as read) */
+	if (item_kind(key, "t:"))
+		l->tables = lappend(l->tables, item_name(key));
+	else if (item_kind(key, "s:"))
+		l->sequences = lappend(l->sequences, item_name(key));
+	else if (item_kind(key, "m:") && before && after &&
+			 same_matview_query(before, after))
+		l->matviews = lappend(l->matviews, item_name(key));
+	else
+		l->definitions = true;
+}
+
+/* Root's item key, into out; false if it has none. */
+static bool
+root_item(const ProllyNodeRef *root, const ProllyKey *key, StringInfo out)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		found;
+
+	chunk_env(&env);
+	env.compare = prolly_bytes_compare;
+	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, key, ForwardScanDirection);
+	found = PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		prolly_bytes_compare(&k, key, NULL) == 0;
+	resetStringInfo(out);
+	if (found)
+		appendBinaryStringInfo(out, (const char *) v.data, v.len);
+	PROLLY_CALL(tree, cursor_close, c);
+	return found;
 }
 
 static void
@@ -1462,7 +1499,7 @@ local_changes(const ProllyHash *head, Local *l)
 	commit_root(head, &l->head);
 	(void) PROLLY_CALL(components().refs, working_set, NULL, &l->working);
 	chunk_env(&env);
-	env.compare = canon_compare;
+	env.compare = prolly_bytes_compare;
 	PROLLY_CALL(prolly_tree_lookup("cow"), diff, &env, &l->head, &l->working,
 				local_item, l);
 }
@@ -1513,12 +1550,13 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 				 errhint("Commit the changes, or reset the branch, first.")));
 	PROLLY_CALL(dc.canonicalizer, tables, base, add_table, &bt);
 	PROLLY_CALL(dc.canonicalizer, tables, theirs, add_table, &tt);
+	/* (base and theirs define the same objects) */
 	foreach(lc, tt.tables)
 	{
 		Table	   *t = lfirst(lc);
 		Table	   *b = find_table(bt.tables, t->name);
 
-		if ((b == NULL || !same_hash(&b->data.hash, &t->data.hash)) &&
+		if (!same_hash(&b->data.hash, &t->data.hash) &&
 			list_has_name(l->tables, t->name))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1527,32 +1565,45 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 							   t->name, what),
 					 errhint("Commit the changes, or reset the branch, first.")));
 	}
-	foreach(lc, bt.tables)
-	{
-		Table	   *b = lfirst(lc);
-
-		if (find_table(tt.tables, b->name) == NULL &&
-			list_has_name(l->tables, b->name))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("local changes would be stomped by %s", what),
-					 errdetail("Table \"%s\" has uncommitted changes, and the %s drops it.",
-							   b->name, what)));
-	}
 	bs = sequences_by_name(sequences_of(base));
 	ts = sequences_of(theirs);
 	foreach(lc, ts)
 	{
 		Sequence   *t = lfirst(lc);
-		Sequence   *b = lookup_sequence(bs, t->name);
 
-		if ((b == NULL || !same_sequence(b, t)) &&
+		if (!same_sequence(lookup_sequence(bs, t->name), t) &&
 			list_has_name(l->sequences, t->name))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("local changes would be stomped by %s", what),
 					 errdetail("Sequence \"%s\" has uncommitted changes, and the %s changes it too.",
-							   t->name, what)));
+							   t->name, what),
+					 errhint("Commit the changes, or reset the branch, first.")));
+	}
+	/* a materialized view refreshed: refused if theirs refreshed it too */
+	foreach(lc, l->matviews)
+	{
+		const char *name = lfirst(lc);
+		StringInfoData key;
+		StringInfoData bv;
+		StringInfoData tv;
+		ProllyKey	k;
+
+		initStringInfo(&key);
+		initStringInfo(&bv);
+		initStringInfo(&tv);
+		appendStringInfoString(&key, "m:");
+		appendStringInfoString(&key, name);
+		k.data = (const uint8 *) key.data;
+		k.len = key.len;
+		if (root_item(base, &k, &bv) != root_item(theirs, &k, &tv) ||
+			bv.len != tv.len || memcmp(bv.data, tv.data, bv.len) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("local changes would be stomped by %s", what),
+					 errdetail("Materialized view \"%s\" has uncommitted changes, and the %s changes it too.",
+							   name, what),
+					 errhint("Commit the changes, or reset the branch, first.")));
 	}
 }
 
@@ -1579,7 +1630,7 @@ without_local(const Local *l, ProllyNodeRef *root)
 	foreach(lc, l->edits)
 		edits[n++] = *(ProllyEdit *) lfirst(lc);
 	chunk_env(&env);
-	env.compare = canon_compare;
+	env.compare = prolly_bytes_compare;
 	PROLLY_CALL(prolly_tree_lookup("cow"), apply, &env, &now, edits, n, root);
 }
 
@@ -1696,11 +1747,20 @@ merge_held(const char *branch, const char *message, int flags,
 	}
 
 	/* Three-way. */
-	conflicts = merge_commits(&base, &ours, &theirs,
-							  (flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
-							  "merge", branch, &conflicted);
+	conflicts = merge_roots(roots, (flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
+							"merge", branch, &conflicted);
 
-	/* Conflicts: a merge in progress, to resolve before its commit. */
+	/*
+	 * Conflicts: a merge in progress, to resolve before its commit.  Not
+	 * over uncommitted changes, which its commit would take in, and its
+	 * abort (a reset) would lose.
+	 */
+	if (conflicts > 0 && has_local_changes(&local))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot merge with uncommitted changes when the merge conflicts"),
+				 errdetail("The merge has %d conflicting rows.", conflicts),
+				 errhint("Commit the changes, or reset the branch, first.")));
 	if (conflicts > 0)
 	{
 		int			i = 0;
