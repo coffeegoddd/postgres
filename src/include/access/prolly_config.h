@@ -52,14 +52,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyCanonRoutine *canonicalizer;
 } ProllyDatabaseComponents;
 
-/*
- * Components for a table using table AM amname, which must be prolly's
- * (an error otherwise).
- */
-extern void prolly_components_for_am(const char *amname,
-									 ProllyComponents *components);
-
-/* Components for rel: a prolly table, or an index on one. */
+/* Components for rel: a prolly table, or an index on one (an error otherwise). */
 extern void prolly_components_for_relation(Relation rel,
 										   ProllyComponents *components);
 

@@ -101,12 +101,13 @@ node_loaded(const TNode *node)
  * may outlive the one current at the read.
  */
 static void
-chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
-				MemoryContext cxt)
+node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+			 MemoryContext cxt)
 {
 	StringInfoData data;
 	MemoryContext old = MemoryContextSwitchTo(cxt);
 
+	node->chunk.data = NULL;
 	initStringInfo(&data);
 	MemoryContextSwitchTo(old);
 	if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
@@ -123,15 +124,6 @@ chunk_node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 	node->level = node->chunk.level;
 	node->nitems = node->chunk.nitems;
 	node->ref = *ref;
-}
-
-/* Read a node, its chunk's bytes in cxt. */
-static void
-node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
-			 MemoryContext cxt)
-{
-	node->chunk.data = NULL;
-	chunk_node_read(env, ref, node, cxt);
 }
 
 /* Read a node kept no longer than the current context. */

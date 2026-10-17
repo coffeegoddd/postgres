@@ -13,7 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
-	canon_catalogs.o \
+	canon_folded.o \
 	canon_stub.o \
 	changes_pages.o \
 	changes_stub.o \
@@ -28,7 +28,7 @@ OBJS = \
 	hash_stub.o \
 	keyenc_ordered.o \
 	keyenc_stub.o \
-	keying_pkcontent.o \
+	keying_pkprefix.o \
 	keying_stub.o \
 	merge_stub.o \
 	prolly_chunkstore.o \

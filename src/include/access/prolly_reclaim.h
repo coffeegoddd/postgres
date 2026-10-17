@@ -1,18 +1,23 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_reclaim.h
- *	  Reclamation interface: deciding what is garbage and freeing it.
+ *	  Reclamation interface: deciding what in a database's chunk store is
+ *	  garbage and freeing it.
  *
- * Implementations: root-reachability GC (D1, D2), birth epoch (D3a), lazy
- * reference counts (D3b), in-page vacuum (D4).
+ * Live chunks are those the refs reach (prolly_refs.h, walk()): every
+ * branch's head commit, baseline and working-set root, merges in progress,
+ * remotes' and remote-tracking heads; from a commit its parents and root,
+ * from a root its trees.  Everything else in the store is garbage.
  *
  * Contract:
- * - Nothing reachable from a root that a branch, a snapshot or a prepared
- *   transaction can still use is ever freed.
- * - may_modify_in_place() is true only if no root other than the caller's
- *   private one reaches node, so changing it in place is invisible to others.
- * - node_created/node_dropped/root_retired are notifications; an
- *   implementation that doesn't need one leaves it as a no-op, not NULL.
+ * - Nothing a live ref reaches is ever freed, nor anything a transaction
+ *   that may still commit has written or referenced since the collection
+ *   began: commits go on during a collection, except for a short final
+ *   window.
+ * - collect() reclaims the database's chunk store: by default what was
+ *   written since the last collection, or every chunk if full.  A crash at
+ *   any point leaves the store as it was or as the collection made it,
+ *   never with a live chunk missing.
  *
  * Provisional (v0).
  *
@@ -25,44 +30,29 @@
 
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
-#include "storage/buf.h"
-#include "utils/relcache.h"
 
-struct VacuumParams;
-
-/* What one reclamation of the node store did. */
+/* What one collection did. */
 typedef struct ProllyGcResult
 {
-	uint64		nodes_kept;
-	uint64		nodes_freed;
+	uint64		chunks_kept;
+	uint64		chunks_freed;
+	uint64		bytes_freed;
 } ProllyGcResult;
 
 typedef struct ProllyReclaimRoutine
 {
 	ProllyImplInfo info;
 
-	bool		(*may_modify_in_place) (Relation rel, const ProllyNodeRef *node);
-
-	void		(*node_created) (Relation rel, const ProllyNodeRef *node);
-	void		(*node_dropped) (Relation rel, const ProllyNodeRef *node);
-	void		(*root_retired) (ProllyBranchId branch, const ProllyNodeRef *root);
-
-	/* One reclamation pass over rel (VACUUM or background worker). */
-	void		(*run) (Relation rel, const struct VacuumParams *params,
-						BufferAccessStrategy bstrategy);
-
 	/*
-	 * Reclaim every node of the store that no live root reaches.  Waits
-	 * for, and holds off, every transaction that writes nodes, until the
-	 * current transaction ends.
+	 * Collect the current database's chunk store: what was written since
+	 * the last collection, or (full) all of it.
 	 */
-	void		(*collect) (ProllyGcResult *result);
+	void		(*collect) (bool full, ProllyGcResult *result);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \
-	"may_modify_in_place", "node_created", "node_dropped", "root_retired", \
-	"run", "collect"
-#define PROLLY_RECLAIM_FIRST_CALLBACK may_modify_in_place
+	"collect"
+#define PROLLY_RECLAIM_FIRST_CALLBACK collect
 #define PROLLY_RECLAIM_LAST_CALLBACK collect
 
 static inline const ProllyReclaimRoutine *

@@ -24,8 +24,8 @@ static const char *const type_names[] = {
 	"TYPE_14", "TYPE_15",
 };
 
-static void
-chunks_desc(StringInfo buf, XLogReaderState *record)
+void
+prolly_chunks_desc(StringInfo buf, XLogReaderState *record)
 {
 	xl_prolly_header hdr;
 
@@ -39,20 +39,8 @@ chunks_desc(StringInfo buf, XLogReaderState *record)
 					 (unsigned) (XLogRecGetDataLen(record) - SizeOfProllyHeader));
 }
 
-static const char *
-chunks_identify(uint8 info)
-{
-	return type_names[(info & PROLLY_XLOG_TYPE_MASK) >> 4];
-}
-
-void
-prolly_chunks_desc(StringInfo buf, XLogReaderState *record)
-{
-	chunks_desc(buf, record);
-}
-
 const char *
 prolly_chunks_identify(uint8 info)
 {
-	return chunks_identify(info);
+	return type_names[(info & PROLLY_XLOG_TYPE_MASK) >> 4];
 }

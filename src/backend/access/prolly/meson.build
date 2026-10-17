@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 backend_sources += files(
-  'canon_catalogs.c',
+  'canon_folded.c',
   'canon_stub.c',
   'changes_pages.c',
   'changes_stub.c',
@@ -16,7 +16,7 @@ backend_sources += files(
   'hash_stub.c',
   'keyenc_ordered.c',
   'keyenc_stub.c',
-  'keying_pkcontent.c',
+  'keying_pkprefix.c',
   'keying_stub.c',
   'merge_stub.c',
   'prolly_chunkstore.c',

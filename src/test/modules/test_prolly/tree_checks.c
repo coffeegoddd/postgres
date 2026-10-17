@@ -50,9 +50,8 @@ memcmp_keys(const ProllyKey *a, const ProllyKey *b, void *arg)
 }
 
 static void
-make_env(const ProllyTreeRoutine *tree, ProllyTreeEnv *env)
+make_env(ProllyTreeEnv *env)
 {
-	(void) tree;
 	memset(env, 0, sizeof(*env));
 	env->chunk_format = prolly_chunkformat_lookup("basic");
 	env->chunker = prolly_chunker_lookup("bytes");
@@ -283,7 +282,7 @@ tree_build_and_get(const ProllyImplInfo *impl)
 	Ref		   *ref = palloc(sizeof(Ref));
 	ProllyNodeRef root;
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(ref, 3, 1);
 	build_ref(tr, &env, ref, &root);
 
@@ -323,7 +322,7 @@ tree_cursor_scans(const ProllyImplInfo *impl)
 	ProllyValue value;
 	static const int seeks[] = {0, 1, 2, 3, 299, 300, 301, 9999, 19998, 19999, 25000};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(ref, 3, 1);			/* keys 0, 3, 6, ..., 19998 */
 	build_ref(tr, &env, ref, &root);
 
@@ -406,7 +405,7 @@ tree_apply_matches_reference(const ProllyImplInfo *impl)
 	int		   *keys = palloc(sizeof(int) * MAX_KEY);
 	int		   *versions = palloc(sizeof(int) * MAX_KEY);
 
-	make_env(tr, &env);
+	make_env(&env);
 	pg_prng_seed(&rng, 20261013);
 	fill_ref(ref, 2, 1);
 	build_ref(tr, &env, ref, &root);
@@ -488,7 +487,7 @@ tree_apply_past_the_end(const ProllyImplInfo *impl)
 	ProllyNodeRef root;
 	int			last;
 
-	make_env(tr, &env);
+	make_env(&env);
 	last = leaf_boundary_key(&env, 500);	/* several leaves, two levels */
 	memset(ref, 0xff, sizeof(Ref));
 	for (int k = 0; k <= last; k++)
@@ -540,7 +539,7 @@ tree_history_independent(const ProllyImplInfo *impl)
 	int		   *versions = palloc(sizeof(int) * MAX_KEY);
 	pg_prng_state rng;
 
-	make_env(tr, &env);
+	make_env(&env);
 
 	/* The target state: a mix of keys and versions. */
 	pg_prng_seed(&rng, 42);
@@ -674,7 +673,7 @@ tree_edits_share_nodes(const ProllyImplInfo *impl)
 	int			keys[1] = {10001};
 	int			versions[1] = {99};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(ref, 1, 1);
 	build_ref(tr, &env, ref, &before);
 	after = before;
@@ -752,7 +751,7 @@ tree_diff_reports_changes(const ProllyImplInfo *impl)
 	int		   *keys = palloc(sizeof(int) * MAX_KEY);
 	int		   *versions = palloc(sizeof(int) * MAX_KEY);
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(from, 2, 1);
 	build_ref(tr, &env, from, &rfrom);
 	memcpy(to, from, sizeof(Ref));
@@ -815,7 +814,7 @@ tree_counts_nodes(const ProllyImplInfo *impl)
 	HashSet		nodes = {0};
 	HashSet		walked = {0};
 
-	make_env(tr, &env);
+	make_env(&env);
 	/* Values not in the store yet, even when the check runs again. */
 	fill_ref(ref, 1, 1000 + (int) pg_prng_uint64_range(&pg_global_prng_state, 0, 1000000));
 	env.counters = &cnt;
@@ -862,7 +861,7 @@ tree_seeks_in_order(const ProllyImplInfo *impl)
 	ProllyNodeCounters cnt = {0};
 	ScanDirection dirs[] = {ForwardScanDirection, BackwardScanDirection};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(ref, 1, 1);
 	build_ref(tr, &env, ref, &root);
 	PROLLY_CALL(tr, walk, &env, &root, collect_node, &nodes);
@@ -919,7 +918,7 @@ tree_diff_reads_changed_paths(const ProllyImplInfo *impl)
 	ProllyNodeCounters cnt = {0};
 	int			ds[] = {1, 2, 4, 8};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(from, 1, 1);
 	build_ref(tr, &env, from, &rfrom);
 	PROLLY_CALL(tr, walk, &env, &rfrom, collect_node, &nodes);
@@ -1006,7 +1005,7 @@ tree_diff_across_heights(const ProllyImplInfo *impl)
 	HashSet		hs = {0};
 	HashSet		hl = {0};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(large, 1, 2);
 	/* A few keys, some in large with the same value, some with another. */
 	fill_ref(small, 1, ABSENT);
@@ -1135,7 +1134,7 @@ tree_equal_keys_take_new_bytes(const ProllyImplInfo *impl)
 	SpelledDiff seen = {0, false};
 	int			n = 3000;
 
-	make_env(tr, &env);
+	make_env(&env);
 	env.compare = spelled_compare;
 	build_spelled(tr, &env, n, -1, &before);
 	build_spelled(tr, &env, n, 77, &built);
@@ -1200,7 +1199,7 @@ tree_nodes_are_valid(const ProllyImplInfo *impl)
 	ProllyNodeRef root;
 	NodeCheck	pc = {&env, 0};
 
-	make_env(tr, &env);
+	make_env(&env);
 	fill_ref(ref, 1, 4);			/* every key, longer values */
 	build_ref(tr, &env, ref, &root);
 	PROLLY_CALL(tr, walk, &env, &root, check_node, &pc);
@@ -1284,7 +1283,7 @@ tree_large_values(const ProllyImplInfo *impl)
 	int			nnodes = 0;
 	BigDiff		d = {0};
 
-	make_env(tr, &env);
+	make_env(&env);
 	initStringInfo(&vbuf);
 
 	/* Built at once. */
@@ -1421,7 +1420,7 @@ tree_large_keys(const ProllyImplInfo *impl)
 	ResourceOwner owner = CurrentResourceOwner;
 	bool		refused = false;
 
-	make_env(tr, &env);
+	make_env(&env);
 	initStringInfo(&kbuf);
 
 	for (int nkeys = 1; nkeys <= 40; nkeys += 39)
