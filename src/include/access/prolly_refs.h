@@ -175,7 +175,10 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Visit every node the refs keep alive, from the root of their own
-	 * store (the head of PROLLY_REFS_BRANCH): for reclamation.
+	 * store (the head of PROLLY_REFS_BRANCH): for reclamation and
+	 * transfer.  A commit whose node the visitor declines isn't looked
+	 * into (its root and parents are taken as seen), as a tree's node
+	 * isn't.
 	 */
 	void		(*walk) (const ProllyNodeRef *refs, ProllyTreeVisitNode visit,
 						 void *arg);

@@ -296,6 +296,46 @@ test_refs_walk_reaches(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(r.found);
 }
 
+typedef struct Declines
+{
+	ProllyHash	declined;
+	int64		visited;
+} Declines;
+
+static bool
+count_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Declines   *d = arg;
+
+	d->visited++;
+	return !(node->hash.len == d->declined.len &&
+			 memcmp(node->hash.bytes, d->declined.bytes, node->hash.len) == 0);
+}
+
+/*
+ * How many nodes the refs' walk visits from the chunk store's root, the
+ * node whose hash is given (none if NULL) declined: what lies below it,
+ * through a commit's root and parents too, isn't visited.
+ */
+PG_FUNCTION_INFO_V1(test_refs_walk_count);
+Datum
+test_refs_walk_count(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef refs;
+	Declines	d;
+
+	memset(&d, 0, sizeof(d));
+	if (!PG_ARGISNULL(0))
+		text_hash(PG_GETARG_TEXT_PP(0), &d.declined);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	refs.location.blkno = InvalidBlockNumber;
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk, &refs, count_node, &d);
+	PG_RETURN_INT64(d.visited);
+}
+
 static void
 tree_row(const char *name, const ProllyNodeRef *data,
 		 const ProllyValue *description, const char *unreadable, void *arg)

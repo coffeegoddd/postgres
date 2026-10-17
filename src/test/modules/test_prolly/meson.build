@@ -74,6 +74,7 @@ tests += {
       'head_only_branches',
       'clean_checkouts',
       'keyless_keys',
+      'walks',
     ],
   },
   'tap': {
