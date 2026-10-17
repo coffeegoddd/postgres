@@ -276,7 +276,7 @@ SELECT (dolt_merge('f'))[2:4];
 SELECT 'ff over local changes' AS after, * FROM pg_temp.checkouts();
          after         | pages | candidates | full_tables | changed | folds_agree 
 -----------------------+-------+------------+-------------+---------+-------------
- ff over local changes |    86 |       4040 |           0 |       1 | t
+ ff over local changes |     0 |          0 |           0 |       1 | t
 (1 row)
 
 SELECT 'ff over local again' AS after, * FROM pg_temp.checkouts();
