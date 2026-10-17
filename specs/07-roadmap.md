@@ -2,8 +2,8 @@
 
 **Status: history.** This was the roadmap for the tree engines (D1–D4)
 until the direction changed on 2026-10-15; its status notes are D1's. D1
-was removed on 2026-10-17 (#177, #178, #183), with the interfaces only it
-used; what this file says was built is at the tag `prolly-d1`. The plan
+is removed by #177, #178 and #183, with the interfaces only it used; what
+this file says was built is at `cff08be5c3`, D1's last state. The plan
 being followed is `11-pages-and-dolt-snapshots.md`, part 4.
 
 The roadmap is these six steps and ends at step 6. Nothing is planned beyond

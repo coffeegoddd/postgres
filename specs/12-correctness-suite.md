@@ -127,7 +127,7 @@ default, a table created anywhere else is quietly a heap table
 only set the default would test heap twice and report a perfect score. So
 for `prolly` each database gets `CREATE SCHEMA versioned VERSIONED` and
 `search_path = versioned`. (The earlier design's AMs, `prolly_d1`–`prolly_d4`,
-needed only the default; they were removed on 2026-10-17.)
+needed only the default; they are removed by #183.)
 
 The harness keeps this in one place, `pbench/core/targets.py`: for
 `prolly`, the versioned schema. The S and V suites had the same problem:
@@ -273,8 +273,8 @@ or comments.
 3. **Which engines.** Recommended: `heap` and `prolly`; `prolly_d1` (the
    earlier design, tagged `prolly-d1`) only if its results still matter.
    `prolly_d2`–`prolly_d4` are stubs and would report `not_implemented`
-   throughout. (Since 2026-10-17 only `heap` and `prolly` exist; `prolly_d1`
-   runs from a build of the tag.)
+   throughout. (Since #183 only `heap` and `prolly` exist; `prolly_d1`
+   runs from a build of `cff08be5c3`, its last state.)
 4. **A suite of `prolly_bench`, not a separate tool.** Recommended: yes; it
    reuses the cluster setup, `--pg-bin`, labels, environment recording and
    the results layout. The C suite has no timed window or collectors, so its

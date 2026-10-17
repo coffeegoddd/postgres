@@ -1,7 +1,8 @@
 # 11. Pages for the working set, Dolt-style history
 
 **Status: steps 0–5 built and merged (2026-10-17), with the gaps each
-step's notes list; steps 6–8 not started.** This replaces the design in which prolly trees are a table's
+step's notes list; step 6's file remotes built, its network remotes and
+steps 7–8 not started.** This replaces the design in which prolly trees are a table's
 primary storage (engines D1–D4, `04-candidate-designs.md`). The decisions
 below marked "user" were made on the dates given; everything else is a
 recommendation to be settled before the step that needs it. Part 4 is the
@@ -361,9 +362,10 @@ As this plan was written (2026-10-15):
   merge, canonical commits, the `dolt_*` SQL interface, conflicts,
   versioned databases, and the 16 fixes from Postgres's own suites (4h).
 
-As of 2026-10-17, steps 0–5 below are built and merged; each step says
-with which PRs. D1 has been removed (#177, #178, #183): the "Today" column
-below is its history, at the tag `prolly-d1`.
+As of 2026-10-17, steps 0–5 below are built and merged, and step 6's
+file remotes; each step says with which PRs. D1 is removed by #177, #178
+and #183: the "Today" column below is its history, at `cff08be5c3`, its
+last state.
 
 ### What carries over
 
@@ -377,7 +379,7 @@ below is its history, at the tag `prolly-d1`.
 | Interface registry and stub pattern (`prolly_registry.c`) | Kept; the new interfaces register there |
 | Requirements suite (`src/test/prolly`), `test_prolly`'s version-control tests, the benchmark harness, gates 1–7 | Kept; storage-engine tests went with D1 (#178), what only they covered ported first (#177) |
 | The node store (`nodestore_global.c`), reclamation (#19) | Replaced by the journal and table-file store and its GC; removed with D1 (#183) |
-| D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Removed on 2026-10-17 (#177, #178, #183), ahead of step 8, which builds them from the tag `prolly-d1` |
+| D1 and K1 (table AM on trees, row locks, TID maps, keyings, spill, SERIALIZABLE at table granularity, the 4h fixes to them), the prolly index AM | Superseded by pages. Removed by #177, #178 and #183, ahead of step 8, which builds them from `cff08be5c3`, D1's last state |
 | `09-versioned-catalogs.md` part 4 stages 2–7, and #34 (catalog writes through the table AM) | Superseded by per-branch copies of versioned schemas; #34 stays harmless |
 
 ### Steps
@@ -386,7 +388,9 @@ Each step is a stack of PRs with its own tests (every bug with a test that
 fails without its fix), and Postgres's suites keep passing after each one.
 
 **Step 0. Settle the open stack and these specs.** Done 2026-10-15.
-- #12–#47 merged; the D1 engine's final state is tagged `prolly-d1`.
+- #12–#47 merged; the D1 engine's state then is tagged `prolly-d1`. (Its
+  last state, after #53's rename of the index AM and three later fixes,
+  is `cff08be5c3`.)
 - Types without a binary send format are stored as their text output
   (user, question 35).
 - Shared catalogs stay cluster-wide and unversioned (user).
@@ -574,12 +578,13 @@ built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
 
 **Step 8. Measure.**
 - Gates 1–7 and the S and V suites for this design against stock heap and
-  against D1, built from the tag `prolly-d1`; `10-complexity-requirements.md`
+  against D1, built from `cff08be5c3`, its last state; `10-complexity-requirements.md`
   rechecked operation by operation.
 
 **D1's removal, moved ahead (user, 2026-10-17).** D1 is retired once file
-remotes (#171–#176) merge, before step 6's network remotes, not after step
-8's measurements: those build D1 from the tag `prolly-d1` instead. In
+remotes (#171, #172, #174, #175) merge, before step 6's network remotes,
+not after step 8's measurements: those build D1 from its last state,
+`cff08be5c3`, instead. In
 order, each a PR:
 1. **Coverage first.** What only D1's tests cover is tested on versioned
    schemas (`dolt_*` functions' arguments, errors and views, conflicts and
@@ -607,9 +612,14 @@ order, each a PR:
    `00-architecture-principles.md`; their numbers are kept, with gaps.
    Removing D1 also removed its WAL resource managers (Prolly,
    ProllyStore, ProllyCommit; ProllyChunks stays), lock tags, settings,
-   two-phase-commit hooks and `pg_database.datversioned`.
+   two-phase-commit hooks and `pg_database.datversioned`, and the core
+   patches only it used: `GetOpenSubTransactionIds()`, the table AM row
+   sampler for ANALYZE, and optional parallel scans
+   (`AMFLAG_NO_PARALLEL_SCAN`); `02-postgres-integration.md` lists which
+   of its section B patches are still live.
 4. **The specs:** D1's columns and rows become pointers to history.
-   **Done:** specs 00, 04, 07, 08, 10, 12 and this part point to the tag.
+   **Done:** specs 00, 02, 04, 07, 08, 10, 12, the README and this part
+   point to D1's last state.
 
 ### Risks to retire early
 
