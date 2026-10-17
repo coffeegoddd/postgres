@@ -736,3 +736,22 @@ test_refs_set_upstream(PG_FUNCTION_ARGS)
 				text_to_cstring(PG_GETARG_TEXT_PP(2)));
 	PG_RETURN_VOID();
 }
+
+/*
+ * test_walk_commit_count(id): how many nodes the refs' walk from one
+ * commit visits (its own, its root's, its ancestors').
+ */
+PG_FUNCTION_INFO_V1(test_walk_commit_count);
+Datum
+test_walk_commit_count(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	Declines	d;
+
+	memset(&d, 0, sizeof(d));
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk_commit, &id, count_node, &d);
+	PG_RETURN_INT64(d.visited);
+}

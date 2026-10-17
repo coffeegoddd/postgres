@@ -104,6 +104,13 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'feature');
 SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
 
+-- a walk from a commit: a chunk that isn't a commit visits nothing, one
+-- the store hasn't is an error (its store isn't whole)
+SELECT test_walk_commit_count(dolt_hashof('main')) > 0 AS walks_a_commit;
+SELECT test_walk_commit_count(tree) AS not_a_commit
+  FROM test_fold_trees() WHERE name = 'rm.t';
+SELECT test_walk_commit_count(encode(sha256('no such commit'::bytea), 'hex'));
+
 -- a long history pushed and fetched: walked a commit at a time, each
 -- once, however long
 SELECT dolt_checkout('-b', 'long') IS NOT NULL AS on_long;

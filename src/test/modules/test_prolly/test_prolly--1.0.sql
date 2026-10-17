@@ -303,3 +303,8 @@ CREATE FUNCTION test_refs_set_upstream(branch text, remote text,
 	remote_branch text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- How many nodes the refs' walk from one commit visits.
+CREATE FUNCTION test_walk_commit_count(commit_id text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
