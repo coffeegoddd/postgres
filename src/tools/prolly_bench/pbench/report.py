@@ -33,7 +33,7 @@ C_METRICS = [
     "timeout", "did_not_run", "skipped", "files", "reruns",
 ]
 # For comparisons: whether a larger value is better.
-HIGHER_IS_BETTER = {"tps", "rows_per_second", "io_hit_ratio", "background_tps"}
+HIGHER_IS_BETTER = {"tps", "qps", "rows_per_second", "io_hit_ratio", "background_tps"}
 
 
 def load_results(out_dir: Path) -> list[dict[str, Any]]:
