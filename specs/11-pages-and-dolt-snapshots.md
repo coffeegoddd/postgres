@@ -893,26 +893,84 @@ are part 1's and `10-complexity-requirements.md`'s: fetch and push
 O(E + B) (chunk references examined, bytes moved), clone O(B) plus the
 first use's pages and index builds.
 
+Dolt's remotes (2.4.2, `go/store/datas/pull`, `go/store/nbs`,
+`go/libraries/doltcore/remotestorage` and `remotesrv`) were read for this
+design; what is taken from them, and what is done otherwise, is said
+where it applies and listed in 7.10.
+
 ### 7.1 What moves
 
 Chunks, by hash: commits, the canonical roots they name, and the trees
-under them. Content addressing makes the rest follow:
+under them.
 
-- **Negotiation by walk.** The receiver walks from the heads it wants:
-  each commit, its parents, its root, the root's trees, down to chunks it
-  has (`has()`), and asks only for those it lacks. A chunk it has, it has
-  all under, so the walk stops there: O(E) chunk references examined.
-  Commits are walked first, then roots, so a fetch of a branch a few
-  commits ahead reads a few commits' changed paths, not whole trees.
-- **Batched as table files.** What one fetch or push receives is written
-  as one new table file (step 3's format, LZ4 or not, #110), WAL-logged
-  as table files are, then added to the manifest; not appended to the
-  journal chunk by chunk.
-- **Checked as received.** Each chunk's hash is recomputed and compared,
-  and its format version byte checked; a root's `"!:format"` item must be
-  this build's (#149's clean break): a root of another format refuses the
-  whole fetch, naming it. A fetch that fails part way leaves its table
-  file unreferenced, for step 7's GC.
+**The closure invariant.** A store that has a chunk has every chunk it
+references. Every transfer below relies on it: a chunk the receiver has
+needn't be sent, nor anything under it. It is checked wherever chunks
+enter a store from outside, not assumed:
+
+- **Admission check.** Before a received table file is added to the
+  manifest, every reference in its chunks is resolved, in the store or
+  in the file itself; one that resolves in neither refuses the whole
+  transfer, naming it. One `has()` a reference, a small part of moving
+  the bytes. Always, an empty receiver included: Dolt skips its check
+  (`refCheckAllSources`) when the receiver's root is empty, so a clone
+  trusts its source; here it doesn't.
+- **Each chunk re-hashed.** Its hash is recomputed from its bytes and
+  compared with the address it came under, and its format version byte
+  checked. (Dolt checks a CRC and the file's structure, but labels the
+  bytes with the hash the sender gave, `CompressedChunk.ToChunk`.)
+- **The format.** A root's `"!:format"` item must be this build's
+  (#149's clean break): a root of another format refuses the transfer,
+  naming it.
+- **Checked before visible.** A received file is checked in full before
+  it is renamed into place and logged as added; a check that fails
+  leaves nothing the store reads. (Dolt's file-backed server renames an
+  uploaded file into place before the reader whose close checks its
+  length and MD5 is closed, and drops that close's error.)
+
+Garbage collection (step 7) must keep the invariant across a transfer:
+a chunk a receiver answered "have" for may not be collected before the
+transfer commits, or the admission check after it refuses the transfer
+(safe, but a failure). Dolt pins each such chunk for the GC in progress
+(`gcDependencyMode_TakeDependency`); step 7 needs the same, and step 7's
+design follows this one so that it can say how.
+
+**Finding what to send: the walk.** The receiver walks from the heads it
+wants, breadth-first by discovery: each chunk received, its references
+are queued; queued hashes are checked against the receiver's store in
+batches (`has()` of many at once), each hash once (a seen set), and only
+the absent are fetched. A chunk the receiver has ends that path. Checks,
+fetches, decoding and writing overlap, as Dolt's puller's do
+(`PullChunkTracker`: batches of 64K, three in flight). O(E) references
+examined. The seen set is bounded by `maintenance_work_mem`, spilling
+as a hash join does past it (Dolt's is unbounded).
+
+**Finding what to send: from known heads.** The walk learns a commit's
+parent only once it has the commit, so k new commits in a line cost k
+round trips to the remote however the rest is overlapped; Dolt has that
+cost. A remote here runs this code, so a fetch can do it in one: the
+receiver names the heads it already has from that remote (its
+remote-tracking heads), the sender walks the commit graph from the
+wanted heads down to those (O(new commits)), and sends the chunks of
+each new commit's root that the known roots don't have, found by the
+tree diff that skips subtrees with equal hashes (step 4's). Push is the
+same the other way. Correctness doesn't rest on the sender's guess: the
+admission check refuses a transfer that leaves anything unresolved (a
+known head the receiver has since lost, say, to a forced fetch's GC),
+and the receiver falls back to the walk. This is git's negotiation, not
+Dolt's.
+
+**Sent as stored.** A remote sends chunks as its files hold them,
+compressed or not (step 3's table files, LZ4 or not, #110), without
+decoding: a sender reads byte ranges of its table files, and ranges
+within 8 KB of each other are read as one (Dolt's `ranges.Tree`
+coalesces at that gap).
+
+**Received as table files.** What one transfer receives is written as
+new table files, then added to the manifest at once, in one transaction
+with the refs it moves (7.7); not appended to the journal chunk by
+chunk. A transfer that fails part way leaves its files unreferenced, for
+step 7's GC to remove; none are read.
 
 ### 7.2 Remote refs
 
@@ -940,13 +998,17 @@ under them. Content addressing makes the rest follow:
   sent what it lacks, then asked to move its branch's head, which it
   does as a compare-and-swap of the head it was told about (the chunk
   store's `move_root` is already one), and only as a fast-forward unless
-  `--force`. A branch the remote has copies of is moved there as a
-  fast-forward is (`fast_forward_local`, #142): its rows written into its
-  pages, refused when that branch has uncommitted changes the move would
-  touch. Recommendation: refuse a push to a branch some session on the
-  remote has checked out with uncommitted changes at all, as git refuses
-  a push to a checked-out branch, rather than move a working set under a
-  session.
+  `--force`. The ref is compared and moved inside a compare-and-swap of
+  the whole refs root, as Dolt's are (`database.update`,
+  `doFastForward`): a concurrent push to another branch retries, one to
+  the same branch fails. A branch the remote has copies of is moved there
+  as a fast-forward is (`fast_forward_local`, #142), its rows written
+  into its pages. Recommendation: refuse the push, in the same
+  transaction, when that branch's working set has uncommitted changes
+  (its changed pages differ from its head: the change finder's "anything
+  changed?"), whoever made them, as Dolt's sql-server does
+  (`ErrDirtyWorkspace` under `PUSH_CONCURRENCY_CONTROL_ASSERT_WORKING_SET`);
+  `--force` moves it anyway, resetting them.
 
 ### 7.4 Clone
 
@@ -954,6 +1016,19 @@ under them. Content addressing makes the rest follow:
 fetched, each a head-only branch at its remote's head, `origin` set, and
 the session checked out on the remote's default branch, which makes its
 copies (the one O(N) step: rows written to pages, indexes built).
+
+- **Whole files.** The receiver is empty, so there is nothing to walk
+  against: the remote lists its manifest (root and table files) and the
+  receiver copies the files whole, a few at a time, its journal as a
+  table file made while it is read; then every file is checked (7.1:
+  re-hashed, references resolved) before any is added. As Dolt's
+  `pull.Clone`, with its fallback: when the journal is a large part of
+  the store (a fifth, `canSyncRootsWithClone`), the walk instead. A
+  whole-file clone brings the remote's garbage too, until the receiver's
+  GC.
+- **Never over a root.** A clone into a database whose store isn't empty
+  is refused; it never overwrites a root (Dolt's clone and backup set
+  the root over whatever is there, after ten tries).
 
 - **Shared dependencies** (part 1): before anything is written, the
   head's canonical root is checked for what versioned objects need from
@@ -997,7 +1072,12 @@ copies (the one O(N) step: rows written to pages, indexes built).
   - **Recommendation: (A)** after file remotes. It is the
     Postgres-native choice (a remote is another Postgres database) and
     has authentication and encryption already; COPY's binary stream is
-    near what (B) would move. (C) can follow without changing (A).
+    near what (B) would move. And since the remote runs this code, (A)
+    gets the one-round-trip transfer from known heads (7.1), which a
+    passive store (Dolt's remotes, (C)) can't serve. (C) can follow
+    without changing (A); then Dolt's download machinery applies
+    (concurrency raised and halved by success and failure, a throughput
+    watchdog, URLs refreshed), which over one libpq stream doesn't.
 
 ### 7.6 Privileges
 
@@ -1016,27 +1096,47 @@ reading it is reading all of them, whatever SELECT privileges say now.
 
 ### 7.7 Durability and concurrency
 
-- Received table files and the refs they move are WAL-logged as any
-  chunk store change is (step 3): a crash leaves either the fetch done or
-  its table file unreferenced; a standby replays both.
-- Local commits during a fetch don't wait: a fetch moves only
-  remote-tracking refs. Two pushes to one remote branch: the second's
-  compare-and-swap fails, and it's refused with a hint to fetch first.
+- **One transaction.** A transfer's table files are added and its refs
+  moved (every remote-tracking head a fetch moves, a push's head)
+  together, WAL-logged as any chunk store change is (step 3): a crash
+  leaves the transfer done or not at all; a standby replays it. Dolt
+  moves each tracking ref separately, and keeps upstreams in a file
+  outside the database (`repo_state.json`); here both are in the refs.
+- **The WAL's cost.** A table file's bytes are WAL-logged before they
+  are written (`table_file_write`), so a clone of B bytes writes about
+  2B locally and sends B to each standby. That is what keeps standbys
+  right without anything else; kept.
+- **Concurrency.** Local commits during a fetch don't wait: a fetch
+  moves only remote-tracking refs. Two pushes to one remote branch: the
+  second's compare-and-swap fails, and it's refused with a hint to fetch
+  first.
+- **Resuming.** Not in step 6, as in Dolt (a failed push starts over).
+  Room is left for it: received files stay out of the manifest until the
+  end, so a later version can keep them across a failure and let the
+  resumed walk count their chunks as received, checking them as 7.1
+  does.
 
 ### 7.8 Building it
 
 In order, each a PR with its tests:
 
-1. The transfer interface's implementation over a remote interface
-   (file, then network) with a walk, `has`, chunks in batches, and a head
-   move; remotes and remote-tracking refs in the refs.
-2. File remotes: fetch, push, pull, clone, with crash tests at each
-   record and the shared-dependency check.
-3. Network remotes over libpq (if (A)): the remote functions, their
-   privileges, TLS tested.
-4. V4 (`06-benchmarking.md`): clone, fetch and push between two local
+1. The admission check (7.1) on every path that adds table files, with
+   tests of each refusal: a dangling reference, a wrong hash, another
+   format.
+2. The transfer interface's implementation over a remote interface
+   (file, then network): the walk with batched `has`, chunks sent as
+   stored, received as table files; remotes and remote-tracking refs in
+   the refs.
+3. File remotes: fetch, push, pull, clone (whole files, then checked),
+   with crash tests at each record and the shared-dependency check.
+4. Network remotes over libpq (if (A)): the remote functions, their
+   privileges, TLS tested; the transfer from known heads, with its
+   fallback to the walk tested.
+5. V4 (`06-benchmarking.md`): clone, fetch and push between two local
    instances, timed and counted (chunks examined and moved against E and
-   B).
+   B; round trips against new commits).
+
+Step 7 then pins chunks a transfer was told are present (7.1).
 
 ### 7.9 For the user to decide
 
@@ -1044,10 +1144,28 @@ In order, each a PR with its tests:
    protocol and port, or both in time. Recommended: (A).
 2. **Clone target:** (a) into an existing empty database, or (b) a new
    one the clone makes. Recommended: (a).
-3. **Push to a checked-out branch** on the remote: refuse when a session
-   there has it checked out with uncommitted changes, or move it as a
-   fast-forward over them when they don't conflict. Recommended: refuse.
+3. **Push to a branch with uncommitted changes** on the remote: refuse
+   (unless `--force`, which resets them), or move it as a fast-forward
+   over them when they don't conflict. Recommended: refuse, as Dolt's
+   sql-server does.
 4. **Who may fetch:** the owner, plus roles granted EXECUTE on the
    remote functions (revoked from PUBLIC). Recommended as stated.
 5. **Object storage remotes** now or later. Recommended: later, as a
    file remote's variant.
+
+### 7.10 From Dolt
+
+Taken: the closure invariant and its check before files are added; the
+batched, overlapped walk that stops at chunks the receiver has; chunks
+sent as stored, nearby ranges read as one; whole-file clone into an empty
+store, with its fallback to the walk; received data as new files added at
+once; a ref compared inside a compare-and-swap of the whole root; a push
+refused over a dirty working set; and (for step 7) chunks pinned against
+GC once a receiver says it has them.
+
+Done otherwise: the check also on an empty receiver; chunks re-hashed on
+receipt; files checked before they are renamed into place; one
+transaction for all of a transfer's refs, upstreams in the refs; no root
+overwritten by a clone; a bounded seen set; and the transfer from known
+heads, one round trip for a line of new commits.
+
