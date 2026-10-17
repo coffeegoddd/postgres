@@ -1529,8 +1529,12 @@ typedef struct TableDef
 typedef struct SchemaMove
 {
 	List	   *before;			/* statements before the rows are written */
+	List	   *changes;		/* before too, once the objects they may use
+								 * are made: tables made, columns added and
+								 * changed, keys added */
 	List	   *after;			/* and after */
 	List	   *foreign_keys;	/* after, last */
+	List	   *rekeyed;		/* tables whose keys change in place */
 } SchemaMove;
 
 static char *
@@ -1778,6 +1782,15 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 				sm->before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
 											name, first_field(lfirst(lc))),
 								   sm->before);
+		/* (sequences its columns own stay: to has them, or drops them) */
+		sm->before = lappend(sm->before,
+							 psprintf("DO $move$ DECLARE s regclass; BEGIN "
+									  "FOR s IN SELECT d.objid::pg_catalog.regclass FROM pg_catalog.pg_depend d "
+									  "JOIN pg_catalog.pg_class c ON c.oid = d.objid AND c.relkind = 'S' "
+									  "WHERE d.refobjid = %s::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+									  "AND d.deptype = 'a' LOOP "
+									  "EXECUTE pg_catalog.format('ALTER SEQUENCE %%s OWNED BY NONE', s); END LOOP; END $move$",
+									  quote_literal_cstr(name)));
 		sm->before = lappend(sm->before, psprintf("DROP TABLE %s", name));
 		return true;
 	}
@@ -1837,7 +1850,23 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
 							 column_sql(lfirst(lc)));
 		appendStringInfoChar(&sql, ')');
-		sm->before = lappend(sm->before, sql.data);
+		sm->changes = lappend(sm->changes, sql.data);
+
+		/* sequences its defaults draw from, that no column owns: its own */
+		sm->changes = lappend(sm->changes,
+							  psprintf("DO $move$ DECLARE r record; BEGIN "
+									   "FOR r IN SELECT d.refobjid::pg_catalog.regclass AS seq, a.attname "
+									   "FROM pg_catalog.pg_attrdef ad "
+									   "JOIN pg_catalog.pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+									   "JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass "
+									   "AND d.objid = ad.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+									   "JOIN pg_catalog.pg_class c ON c.oid = d.refobjid AND c.relkind = 'S' "
+									   "WHERE ad.adrelid = %s::pg_catalog.regclass AND NOT EXISTS "
+									   "(SELECT FROM pg_catalog.pg_depend o WHERE o.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+									   "AND o.objid = d.refobjid AND o.deptype IN ('a', 'i')) LOOP "
+									   "EXECUTE pg_catalog.format('ALTER SEQUENCE %%s OWNED BY %%s.%%I', r.seq, %s, r.attname); "
+									   "END LOOP; END $move$",
+									   quote_literal_cstr(name), quote_literal_cstr(name)));
 		from = &none;
 	}
 	else
@@ -1857,24 +1886,35 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 			if (i < 0)
 			{
-				sm->before = lappend(sm->before,
-									 psprintf("ALTER TABLE %s ADD COLUMN %s",
-											  name, column_sql(line)));
+				sm->changes = lappend(sm->changes,
+									  psprintf("ALTER TABLE %s ADD COLUMN %s",
+											   name, column_sql(line)));
 				continue;
 			}
 			old = list_nth(from->columns, i);
 			if (strcmp(column_type_sql(old), column_type_sql(line)) != 0)
-				sm->before = lappend(sm->before,
-									 psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s",
-											  name, col, column_type_sql(line), col,
-											  column_type_sql(line)));
-			if (!same_strings(column_attr(old, "default "), column_attr(line, "default ")))
-				sm->before = lappend(sm->before,
-									 column_attr(line, "default ") ?
-									 psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
-											  name, col, column_attr(line, "default ")) :
-									 psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
-											  name, col));
+			{
+				/* the old default goes first: it may not cast */
+				if (column_attr(old, "default "))
+					sm->changes = lappend(sm->changes,
+										  psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
+												   name, col));
+				sm->changes = lappend(sm->changes,
+									  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s",
+											   name, col, column_type_sql(line), col,
+											   column_type_sql(line)));
+				if (column_attr(line, "default "))
+					sm->changes = lappend(sm->changes,
+										  psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+												   name, col, column_attr(line, "default ")));
+			}
+			else if (!same_strings(column_attr(old, "default "), column_attr(line, "default ")))
+				sm->changes = lappend(sm->changes,
+									  column_attr(line, "default ") ?
+									  psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+											   name, col, column_attr(line, "default ")) :
+									  psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
+											   name, col));
 		}
 	}
 
@@ -1895,8 +1935,13 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 		if (list_has_string(to->constraints, lfirst(lc)))
 			continue;
-		sql = psprintf("ALTER TABLE %s DROP CONSTRAINT %s", name,
+		/* (IF EXISTS: a column dropped took its own) */
+		sql = psprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s", name,
 					   first_field(lfirst(lc)));
+		/* a key going: the foreign keys into it go first, and come back */
+		if (strstr(lfirst(lc), "\tPRIMARY KEY ") != NULL ||
+			strstr(lfirst(lc), "\tUNIQUE ") != NULL)
+			sm->rekeyed = lappend(sm->rekeyed, pstrdup(name));
 		/* (foreign keys first: they may need others' keys) */
 		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
 			sm->before = lcons(sql, sm->before);
@@ -1913,7 +1958,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			if (strcmp(first_field(lfirst(c)), idx) == 0)
 				owned = true;	/* goes with its constraint */
 		if (!owned && !list_has_string(to->indexes, lfirst(lc)))
-			sm->before = lappend(sm->before, psprintf("DROP INDEX %s.%s",
+			sm->before = lappend(sm->before, psprintf("DROP INDEX IF EXISTS %s.%s",
 													  schema_of(name), idx));
 	}
 
@@ -1944,8 +1989,15 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
 							   quote_literal_cstr(name), quote_literal_cstr(first_field(line)),
 							   quote_literal_cstr(sql));
-			if (not_null || key)
-				sm->before = lappend(sm->before, sql);
+			/*
+			 * (a column added to a table with rows has none in it until
+			 * they are written: its NOT NULL after them)
+			 */
+			if (not_null && from != &none &&
+				!list_has_string(from_names, strstr(line, "\tNOT NULL ") + 10))
+				sm->after = lappend(sm->after, sql);
+			else if (not_null || key)
+				sm->changes = lappend(sm->changes, sql);
 			else if (strstr(line, "\tFOREIGN KEY ") != NULL)
 				sm->foreign_keys = lappend(sm->foreign_keys, sql);
 			else
@@ -2014,8 +2066,12 @@ create_type_sql(const char *name, const char *def)
 
 		if (tab)
 			*tab = '\0';
-		appendStringInfo(&sql, "CREATE DOMAIN %s AS %s%s", name, base,
-						 tab ? " NOT NULL" : "");
+		/* (a NOT NULL constraint line names it: not said twice) */
+		if (tab && strstr(def, "\tNOT NULL\n") == NULL &&
+			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
+			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s NOT NULL", name, base);
+		else
+			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s", name, base);
 		while ((line = strtok(NULL, "\n")) != NULL)
 		{
 			char	   *t = strchr(line, '\t');
@@ -2055,8 +2111,9 @@ drop_routine_sql(const MoveItem *it)
 }
 
 /*
- * Make views, each after the views it uses: those that fail are tried
- * again once others are made, until none can be.
+ * Make views, each after the views it uses, or drop them, each after those
+ * using it: those that fail are tried again once others are done, until
+ * none can be.
  */
 static void
 make_views(List *views)
@@ -2118,6 +2175,86 @@ run_statements(List *stmts)
 	}
 }
 
+/* A routine's definition up to its body: its signature and what it returns. */
+static char *
+routine_signature(const char *def)
+{
+	const char *body = strstr(def, "\n LANGUAGE ");
+
+	return body ? pnstrdup(def, body - def) : pstrdup(def);
+}
+
+/* An identifier as written (quoted or not), as it is. */
+static char *
+unquoted(const char *ident)
+{
+	StringInfoData out;
+
+	if (ident[0] != '"')
+		return pstrdup(ident);
+	initStringInfo(&out);
+	for (const char *p = ident + 1; *p; p++)
+	{
+		if (*p == '"' && p[1] == '"')
+			p++;
+		else if (*p == '"')
+			break;
+		appendStringInfoChar(&out, *p);
+	}
+	return out.data;
+}
+
+/*
+ * The sequences identity columns made by this move make (their tables made,
+ * made again, or the columns added): named as Postgres names them.
+ */
+static List *
+identity_sequences(List *from, List *to, List *remade)
+{
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, 't', t->name);
+		TableDef	td;
+		TableDef	fd;
+		ListCell   *c;
+		const char *dot;
+
+		if (t->kind != 't')
+			continue;
+		parse_table_def(t->def, &td);
+		if (f && !list_has_string(remade, t->name))
+			parse_table_def(f->def, &fd);
+		dot = strrchr(t->name, '.');
+		foreach(c, td.columns)
+		{
+			char	   *col = first_field(lfirst(c));
+			bool		made = f == NULL || list_has_string(remade, t->name);
+			ListCell   *o;
+
+			if (column_attr(lfirst(c), "identity ") == NULL)
+				continue;
+			if (!made)
+			{
+				made = true;
+				foreach(o, fd.columns)
+					if (strcmp(first_field(lfirst(o)), col) == 0)
+						made = false;
+			}
+			if (made)
+				names = lappend(names,
+								psprintf("%s.%s", schema_of(t->name),
+										 quote_identifier(psprintf("%s_%s_seq",
+																   unquoted(dot + 1),
+																   unquoted(col)))));
+		}
+	}
+	return names;
+}
+
 /*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
@@ -2130,8 +2267,12 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	Canon		cn;
 	List	   *from;
 	List	   *to;
-	SchemaMove	sm = {NIL, NIL, NIL};
+	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL};
 	List	   *views = NIL;
+	List	   *view_drops = NIL;
+	List	   *keyed;
+	List	   *identities;
+	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
 	List	   *remade = NIL;
 	ListCell   *lc;
@@ -2149,11 +2290,15 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *f = lfirst(lc);
 		MoveItem   *t = find_item(to, f->kind, f->name);
 
-		/* Views go, and come again: they may use what changes. */
+		/*
+		 * Views go, and come again: they may use what changes.  (Not with
+		 * CASCADE: what else uses one, unchanged, would go and not come
+		 * back; the views go each after the views using it.)
+		 */
 		if (f->kind == 'v')
 		{
-			sm.before = lcons(psprintf("DROP VIEW IF EXISTS %s CASCADE", f->name),
-							  sm.before);
+			view_drops = lappend(view_drops,
+								 psprintf("DROP VIEW IF EXISTS %s", f->name));
 			continue;
 		}
 		if (t && strcmp(t->def, f->def) == 0)
@@ -2193,9 +2338,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 
 	/*
-	 * Foreign keys both sides have, into a table made again or dropped: they
-	 * go first, and the ones kept come back last.
+	 * Foreign keys both sides have, into a table made again or dropped, or
+	 * whose keys change: they go first, and the ones kept come back last.
 	 */
+	keyed = list_concat_copy(remade, sm.rekeyed);
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -2204,7 +2350,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	td;
 		ListCell   *c;
 
-		if (f->kind != 't' || remade == NIL || list_has_string(remade, f->name))
+		if (f->kind != 't' || keyed == NIL || list_has_string(remade, f->name))
 			continue;
 		parse_table_def(f->def, &fd);
 		if (t)
@@ -2217,7 +2363,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			if (strstr(line, "\tFOREIGN KEY ") == NULL ||
 				(t && !list_has_string(td.constraints, line)))
 				continue;		/* (changed ones are move_table()'s) */
-			foreach(r, remade)
+			foreach(r, keyed)
 			{
 				if (strstr(line, psprintf(" REFERENCES %s(", (char *) lfirst(r))) == NULL)
 					continue;
@@ -2232,7 +2378,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			}
 		}
 	}
-	sm.before = list_concat(sm.before, routines);
+	/* routines, types and sequences going: once the tables don't use them */
+	late = list_concat(late, routines);
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -2240,9 +2387,9 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (find_item(to, f->kind, f->name) == NULL)
 		{
 			if (f->kind == 'y')
-				sm.before = lappend(sm.before, psprintf("DROP TYPE %s", f->name));
+				late = lappend(late, psprintf("DROP TYPE %s", f->name));
 			else if (f->kind == 's')
-				sm.before = lappend(sm.before, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
+				late = lappend(late, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
 		}
 	}
 	/* Schemas going: last, what was in them gone already. */
@@ -2251,11 +2398,16 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *f = lfirst(lc);
 
 		if (f->kind == 'n' && find_item(to, 'n', f->name) == NULL)
-			sm.before = lappend(sm.before,
-								psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
+			late = lappend(late,
+						   psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
 	}
 
-	/* Coming: schemas, types, sequences, routines, tables; views after the rows. */
+	/*
+	 * Coming: schemas, types, sequences, routines, tables; views after the
+	 * rows.  An identity column made here makes its own sequence, whose
+	 * options are set after.
+	 */
+	identities = identity_sequences(from, to, remade);
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
@@ -2275,6 +2427,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			continue;			/* (above) */
 		if (t->kind == 'y')
 			sm.before = lappend(sm.before, create_type_sql(t->name, t->def));
+		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
+			sm.after = lappend(sm.after,
+							   psprintf("ALTER SEQUENCE %s %s", t->name,
+										sequence_options(t->def)));
 		else if (t->kind == 's')
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
@@ -2287,8 +2443,12 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *t = lfirst(lc);
 		MoveItem   *f = find_item(from, t->kind, t->name);
 
-		if (t->kind == 'f' && !(f && strcmp(t->def, f->def) == 0))
-			sm.before = lappend(sm.before, t->def);
+		if (t->kind != 'f' || (f && strcmp(t->def, f->def) == 0))
+			continue;
+		/* (CREATE OR REPLACE can't change what a routine returns) */
+		if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+			sm.before = lappend(sm.before, drop_routine_sql(f));
+		sm.before = lappend(sm.before, t->def);
 	}
 	foreach(lc, to)
 	{
@@ -2316,8 +2476,12 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	(void) set_config_option("check_function_bodies", "off", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	/* (what's already gone, an IF EXISTS skips: no notice of it) */
+	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
-	run_statements(sm.before);
+	make_views(view_drops);
+	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
 	CommandCounterIncrement();
 	rows(arg);
 	run_statements(sm.after);

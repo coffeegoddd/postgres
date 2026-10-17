@@ -527,22 +527,22 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	table_close(ap.rel, NoLock);
 }
 
-/* Write every table's rows that differ from the root's (arg). */
+/*
+ * Write every table's rows that differ from target's, the branch's as
+ * working has them.
+ */
 static void
-move_rows(void *arg)
+rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 {
-	const ProllyNodeRef *target = arg;
 	ProllyDatabaseComponents dc = components();
-	ProllyNodeRef working;
 	Tables		from = {NIL};
 	Tables		to = {NIL};
 	ListCell   *lc;
 
-	PROLLY_CALL(dc.canonicalizer, fold, &working);
-	PROLLY_CALL(dc.canonicalizer, tables, &working, add_table, &from);
+	PROLLY_CALL(dc.canonicalizer, tables, working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, tables, target, add_table, &to);
 	/* materialized views' rows too: a commit holds them as it was made */
-	PROLLY_CALL(dc.canonicalizer, materialized_views, &working, add_table, &from);
+	PROLLY_CALL(dc.canonicalizer, materialized_views, working, add_table, &from);
 	PROLLY_CALL(dc.canonicalizer, materialized_views, target, add_table, &to);
 	foreach(lc, to.tables)
 	{
@@ -556,6 +556,16 @@ move_rows(void *arg)
 	}
 }
 
+/* The same after definitions changed: the branch folded as it is now. */
+static void
+move_rows(void *arg)
+{
+	ProllyNodeRef working;
+
+	PROLLY_CALL(components().canonicalizer, fold, &working);
+	rows_from(&working, arg);
+}
+
 /* The definitions first, if they differ, then the rows. */
 static void
 folded_move_to(const ProllyNodeRef *target)
@@ -565,7 +575,7 @@ folded_move_to(const ProllyNodeRef *target)
 
 	PROLLY_CALL(dc.canonicalizer, fold, &working);
 	if (PROLLY_CALL(dc.canonicalizer, same_schema, &working, target))
-		move_rows((void *) target);
+		rows_from(&working, target);	/* (folded already) */
 	else
 		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
 					(void *) target);

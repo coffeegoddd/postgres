@@ -101,6 +101,81 @@ SELECT dolt_reset('--hard', (:'with_schemas'::text[])[1]);
 SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sm\_%' ORDER BY 1;
 SELECT * FROM sm_full.u;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS schemas_back;
+
+-- Changes that need others made first, or that take their own along: a
+-- column of a type, sequence or function made in the same move; a column
+-- retyped whose old default won't cast; a NOT NULL, indexed column
+-- dropped; a serial table made again; a NOT NULL domain; a key changed in
+-- place under a foreign key; a function's result type; an identity column.
+CREATE SCHEMA sm7 VERSIONED;
+CREATE TABLE sm7.a (id int PRIMARY KEY, s text DEFAULT 'x', g int NOT NULL);
+CREATE INDEX a_g ON sm7.a (g);
+INSERT INTO sm7.a VALUES (1, 'happy', 1);
+CREATE TABLE sm7.p (id serial PRIMARY KEY, name text);
+INSERT INTO sm7.p (name) VALUES ('one');
+CREATE TABLE sm7.k (id int PRIMARY KEY);
+CREATE TABLE sm7.r (id int PRIMARY KEY, k int REFERENCES sm7.k);
+INSERT INTO sm7.k VALUES (1);
+INSERT INTO sm7.r VALUES (1, 1);
+CREATE FUNCTION sm7.f(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+SELECT (dolt_commit('-Am', 'sm7 base'))[1] AS sm7_base \gset
+SELECT dolt_branch('sm7_feature');
+SELECT dolt_checkout('sm7_feature');
+CREATE TYPE sm7.mood AS ENUM ('sad', 'happy');
+CREATE SEQUENCE sm7.seq;
+CREATE FUNCTION sm7.five() RETURNS int LANGUAGE sql AS 'SELECT 5';
+ALTER TABLE sm7.a ADD COLUMN m sm7.mood;
+ALTER TABLE sm7.a ADD COLUMN n int DEFAULT nextval('sm7.seq');
+ALTER TABLE sm7.a ADD COLUMN q int DEFAULT sm7.five();
+ALTER TABLE sm7.a ALTER COLUMN s DROP DEFAULT;
+ALTER TABLE sm7.a ALTER COLUMN s TYPE sm7.mood USING s::sm7.mood;
+ALTER TABLE sm7.a ALTER COLUMN s SET DEFAULT 'happy';
+ALTER TABLE sm7.a DROP COLUMN g;
+DROP TABLE sm7.p;
+CREATE TABLE sm7.p (name text, id serial PRIMARY KEY);
+INSERT INTO sm7.p (name) VALUES ('again');
+CREATE DOMAIN sm7.pos AS int NOT NULL;
+CREATE TABLE sm7.d (v sm7.pos);
+ALTER TABLE sm7.k RENAME CONSTRAINT k_pkey TO k_key;
+DROP FUNCTION sm7.f(int);
+CREATE FUNCTION sm7.f(int) RETURNS text LANGUAGE sql AS 'SELECT $1::text';
+CREATE TABLE sm7.i (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO sm7.i (v) VALUES ('a');
+SELECT (dolt_commit('-Am', 'sm7 feature'))[1] AS sm7_feature \gset
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('sm7_feature'))[2:4];
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+SELECT * FROM sm7.a;
+SELECT * FROM sm7.p;
+SELECT nextval('sm7.p_id_seq') > 1 AS serial_kept, pg_get_serial_sequence('sm7.p', 'id');
+SELECT * FROM sm7.i ORDER BY id;
+SELECT count(*) AS identity_sequences FROM pg_class
+WHERE relnamespace = 'sm7'::regnamespace AND relname LIKE 'i_id_seq%';
+SELECT sm7.f(3);
+SELECT dolt_reset('--hard');
+SELECT dolt_reset('--hard', :'sm7_base');
+SELECT test_fold_root() = prolly_root_hash(:'sm7_base') AS same_root;
+SELECT * FROM sm7.a;
+SELECT sm7.f(3);
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm7.k'::regclass;
+SELECT dolt_branch('-D', 'sm7_feature');
+DROP SCHEMA sm7 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm7')::text) AS committed;
+
+-- A view's unchanged dependents aren't dropped with it: a move that would
+-- fails instead.
+CREATE SCHEMA sm8 VERSIONED;
+CREATE TABLE sm8.t (id int PRIMARY KEY);
+CREATE VIEW sm8.v AS SELECT id FROM sm8.t;
+CREATE MATERIALIZED VIEW sm8.mv AS SELECT id FROM sm8.v;
+SELECT (dolt_commit('-Am', 'sm8 base'))[1] AS sm8_base \gset
+CREATE TABLE sm8.u (id int);
+SELECT length(dolt_commit('-Am', 'sm8 more')::text) AS committed;
+SELECT dolt_reset('--hard', :'sm8_base');
+SELECT to_regclass('sm8.mv') IS NOT NULL AS mv_kept;
+DROP SCHEMA sm8 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm8')::text) AS committed;
+
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
