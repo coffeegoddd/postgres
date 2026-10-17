@@ -1,8 +1,8 @@
 -- A table without a primary key keys a row by its first bytes, then its
 -- content's hash: rows that begin alike (on their first columns) stay
 -- together in the tree, so a change to a run of them writes a few chunks,
--- not one each, as a keyed table's does.  Its definition says so ("keys"),
--- so a version keyed otherwise reads as a change of definition.
+-- not one each, as a keyed table's does.  A root keyed otherwise, by the
+-- hash alone, is of an older format: its tables' rows aren't read.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -10,8 +10,15 @@ RESET client_min_messages;
 
 CREATE SCHEMA kk VERSIONED;
 CREATE TABLE kk.n (a int, b text);
+CREATE TABLE kk.z (a int, b text, c1 text, c2 text, c3 text, c4 text,
+	c5 text, c6 text, d text);
 CREATE TABLE kk.k (a int PRIMARY KEY, b text);
 INSERT INTO kk.n SELECT g, 'v' || g FROM generate_series(1, 50000) g;
+INSERT INTO kk.z SELECT g, 'v' || g,
+	CASE WHEN m & 1 = 0 THEN 'c' END, CASE WHEN m & 2 = 0 THEN 'c' END,
+	CASE WHEN m & 4 = 0 THEN 'c' END, CASE WHEN m & 8 = 0 THEN 'c' END,
+	CASE WHEN m & 16 = 0 THEN 'c' END, CASE WHEN m & 32 = 0 THEN 'c' END, 'd'
+  FROM (SELECT g, (g * 37) % 64 AS m FROM generate_series(1, 50000) g) x;
 INSERT INTO kk.k SELECT g, 'v' || g FROM generate_series(1, 50000) g;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
 
@@ -31,6 +38,11 @@ SELECT length(dolt_commit('-am', 'keyed run')::text) AS committed;
 SELECT pg_temp.journal() AS j2 \gset
 SELECT :j1 - :j0 < 4 * (:j2 - :j1) AS keyless_writes_like_keyed,
 	:j1 - :j0 < 512 * 1024 AS a_few_chunks;
+-- and whatever the later columns' NULLs (64 patterns of them here)
+UPDATE kk.z SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
+SELECT length(dolt_commit('-am', 'keyless run, NULLs')::text) AS committed;
+SELECT pg_temp.journal() AS j3 \gset
+SELECT :j3 - :j2 < 4 * (:j2 - :j1) AS nulls_write_like_keyed;
 
 -- the rows read back as written, copies counted
 INSERT INTO kk.n SELECT a, b FROM kk.n WHERE a <= 3;
@@ -38,9 +50,20 @@ SELECT a, b, count(*) FROM kk.n WHERE a <= 4 OR a BETWEEN 20000 AND 20001
  GROUP BY a, b ORDER BY a;
 SELECT test_fold_root() = test_fold_root(true) AS folds_agree;
 
--- the definition says how the rows are keyed: keyless only
-SELECT key, position('content prefix and hash' IN value) > 0 AS keyed_by_prefix
-  FROM test_fold_items() WHERE key LIKE 't:kk.%' ORDER BY key;
+-- the root says its format: one with another (or none) has its tables
+-- listed, their rows not read
+SELECT value AS format FROM test_fold_items() WHERE key = '!:format';
+
+-- a primary key WITHOUT OVERLAPS doesn't key the rows (the key encoder
+-- can't order it): across a change of definition they read, as keyless
+CREATE TABLE kk.r (r int4range, s int4range, PRIMARY KEY (r, s WITHOUT OVERLAPS));
+INSERT INTO kk.r VALUES ('[1,2)', '[1,5)'), ('[2,3)', '[1,5)');
+SELECT length(dolt_commit('-Am', 'ranges')::text) AS committed;
+ALTER TABLE kk.r ADD COLUMN v int;
+UPDATE kk.r SET v = 1 WHERE r = '[1,2)';
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::kk.r) ORDER BY 2;
+SELECT length(dolt_commit('-am', 'a column')::text) AS committed;
+SELECT count(*) AS rows_diffed FROM dolt_diff('HEAD~1', 'HEAD', NULL::kk.r);
 
 DROP SCHEMA kk CASCADE;
 SELECT length(dolt_commit('-Am', 'kk gone')::text) AS committed;

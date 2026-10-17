@@ -7,6 +7,8 @@
  * The canonical root is a tree keyed (by memcmp) by kind and qualified
  * name, every string in UTF-8:
  *
+ *	"!:format"			-> (folded only) the format its data trees are in,
+ *						   FOLDED_FORMAT
  *	"e:" extension		-> its version
  *	"f:" function(args)	-> its definition
  *	"i:" index			-> a prolly index's tree (hash length, hash)
@@ -137,6 +139,13 @@ typedef struct CanonItem
 } CanonItem;
 
 typedef struct BaseTable BaseTable;
+
+/*
+ * The format a folded root's data trees are in: "2", keyless rows keyed by
+ * their first bytes and their hash.  A root in another (one without the
+ * item was keyed by the hash alone) has its tables' rows unreadable here.
+ */
+#define FOLDED_FORMAT	"2"
 
 typedef struct Canon
 {
@@ -650,22 +659,6 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	appendStringInfoString(out, "rules\n");
 	append_sorted_defs(out, RewriteRelationId, Anum_pg_rewrite_ev_class,
 					   RewriteRelRulenameIndexId, RelationGetRelid(rel));
-
-	/*
-	 * How a table without a primary key keys its rows, which its data tree
-	 * depends on: a table described otherwise (keyed by its rows' hash
-	 * alone) has its rows read and keyed again, as across any change of
-	 * definition.
-	 */
-	if (cn->folded)
-	{
-		const ProllyKeyingRoutine *kr = prolly_history_keying();
-		ProllyKeying *k = PROLLY_CALL(kr, open_rewritten, rel, CurrentMemoryContext);
-
-		if (PROLLY_CALL(kr, keyless, k))
-			appendStringInfoString(out, "keys\ncontent prefix and hash\n");
-		PROLLY_CALL(kr, close, k);
-	}
 }
 
 /* ------------------------------------------------------------------------
@@ -1385,6 +1378,8 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	collect(cn);
 	AtEOXact_GUC(false, save_nestlevel);
 	add_collations(cn);		/* (none unless folded) */
+	if (cn->folded)
+		appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
 
 	list_sort(cn->items, item_cmp);
 	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
@@ -1572,6 +1567,26 @@ folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
  * data tree and definition; tables' rows may be unreadable here (their
  * keys ordered by a collation that differs now).
  */
+/* Is a folded root in the current format (its "!:format" item)? */
+static bool
+root_in_format(Canon *cn, const ProllyNodeRef *root)
+{
+	ProllyTreeCursor *c;
+	ProllyKey	want = {(const uint8 *) "!:format", 8};
+	ProllyKey	k;
+	ProllyValue v;
+	bool		current;
+
+	c = PROLLY_CALL(cn->tree, cursor_open, &cn->env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn->tree, cursor_seek, c, &want, ForwardScanDirection);
+	current = PROLLY_CALL(cn->tree, cursor_next, c, &k, &v) &&
+		k.len == want.len && memcmp(k.data, want.data, want.len) == 0 &&
+		v.len == strlen(FOLDED_FORMAT) &&
+		memcmp(v.data, FOLDED_FORMAT, v.len) == 0;
+	PROLLY_CALL(cn->tree, cursor_close, c);
+	return current;
+}
+
 static void
 folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 			 void *arg)
@@ -1584,11 +1599,19 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 	ProllyKey	from = {(const uint8 *) prefix, 2};
 	List	   *stale = NIL;
 
+	bool		current;
+
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
 	canon_env(&cn);
 	if (kind == 't')
 		stale = stale_collations(&cn, root);
+	current = root_in_format(&cn, root);
+	if (!current && kind != 't')
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialized views' rows of a commit made by an older format can't be read"),
+				 errhint("Commit the branch to write it in the current format.")));
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
@@ -1602,9 +1625,9 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 		(void) tree_item(&k, &v, &data, &description);
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
 		visit(name, &data, &description,
-			  kind == 't' ?
-			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale) :
-			  NULL,
+			  kind != 't' ? NULL :
+			  !current ? "it was committed in an older format of prolly's history (commit the branch to write it in the current one)" :
+			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
 			  arg);
 		pfree(name);
 	}
@@ -1768,7 +1791,6 @@ typedef struct TableDef
 	List	   *indexes;		/* statements */
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
-	List	   *keys;			/* how rows are keyed (none: as always) */
 } TableDef;
 
 typedef struct SchemaMove
@@ -1861,8 +1883,6 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
-		else if (strcmp(line, "keys") == 0)
-			section = &td->keys;
 		else if (section && *section != NIL && strchr(line, '\t') == NULL &&
 				 (section == &td->columns || section == &td->constraints))
 		{
@@ -1911,8 +1931,14 @@ folded_table_columns(const ProllyValue *description, bool *keyed)
 	{
 		const char *def = strchr(lfirst(lc), '\t');
 
+		/*
+		 * (as the keying has it: a deferrable key, or one over a range
+		 * WITHOUT OVERLAPS, which the key encoder can't order, doesn't key
+		 * the rows)
+		 */
 		if (def && strncmp(def + 1, "PRIMARY KEY", 11) == 0 &&
-			strstr(def, "DEFERRABLE") == NULL)
+			strstr(def, "DEFERRABLE") == NULL &&
+			strstr(def, "WITHOUT OVERLAPS") == NULL)
 			*keyed = true;
 	}
 	return cols;
