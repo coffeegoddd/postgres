@@ -18,9 +18,10 @@
  *					   working set's rows (so TIDs given out before it
  *					   aren't reused)
  *	'M' branch id	-> its merge in progress: the merged head and the
- *					   common ancestor (hash length, hash each), then the
- *					   OIDs of tables with unresolved conflicts (4 bytes
- *					   each, big-endian)
+ *					   common ancestor (hash length, hash each), the count
+ *					   of tables with unresolved conflicts and their OIDs
+ *					   (4 bytes each, big-endian), then, if it is a
+ *					   cherry-pick, the picked commit's message
  *	'N'				-> the next branch id to give out (4 bytes)
  *
  * A commit is a tree of its own (keys by memcmp), and its id is that
@@ -809,7 +810,10 @@ tree_commit(const char *message, ProllyHash *commit_id)
 	if (head.len > 0)
 		parents[nparents++] = head;
 
-	/* Ending a merge: once its conflicts are resolved, both heads. */
+	/*
+	 * Ending a merge: once its conflicts are resolved, both heads (a
+	 * cherry-pick's, the head alone).
+	 */
 	merging = tree_merge_state(&ms);
 	if (merging)
 	{
@@ -820,7 +824,8 @@ tree_commit(const char *message, ProllyHash *commit_id)
 					 errdetail("Table \"%s\" has conflicts.",
 							   get_rel_name(ms.tables[0])),
 					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
-		parents[nparents++] = ms.theirs;
+		if (!ms.pick)
+			parents[nparents++] = ms.theirs;
 		tree_set_merge_state(NULL);
 	}
 
@@ -1108,10 +1113,22 @@ tree_merge_state(ProllyMergeState *state)
 
 		p = get_hash(p, end, &state->theirs);
 		p = get_hash(p, end, &state->base);
-		state->ntables = (end - p) / 4;
+		if (end - p < 4)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold an invalid merge state")));
+		state->ntables = get_be32(p);
+		p += 4;
+		if (end - p < (int64) state->ntables * 4)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold an invalid merge state")));
 		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
-		for (int i = 0; i < state->ntables; i++)
-			state->tables[i] = get_be32(p + i * 4);
+		for (int i = 0; i < state->ntables; i++, p += 4)
+			state->tables[i] = get_be32(p);
+		/* a cherry-pick's message */
+		state->pick = p < end;
+		state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -1134,8 +1151,14 @@ tree_set_merge_state(const ProllyMergeState *state)
 		initStringInfo(&v);
 		put_hash(&v, &state->theirs);
 		put_hash(&v, &state->base);
+		put_be32(&v, state->ntables);
 		for (int i = 0; i < state->ntables; i++)
 			put_be32(&v, state->tables[i]);
+		if (state->pick)
+		{
+			appendStringInfoChar(&v, 'p');
+			appendStringInfoString(&v, state->message ? state->message : "");
+		}
 		add_edit(key.data, key.len, &v);
 		pfree(v.data);
 	}

@@ -63,6 +63,17 @@ COMMIT;
 SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 SELECT dolt_hashof('HEAD^2');
 SELECT dolt_reset('--hard', 'HEAD~1');
+-- (--continue after ours kept: nothing to commit, unless allowed)
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+SELECT dolt_conflicts_resolve('--ours', 'app.t');
+SAVEPOINT s;
+SELECT dolt_cherry_pick('--continue');
+ROLLBACK TO s;
+SELECT length((dolt_cherry_pick('--allow-empty', '--continue'))[1]) AS picked;
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+SELECT dolt_reset('--hard', 'HEAD~1');
 -- one kept with its conflicts is aborted
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_cherry_pick('feature~1'))[2:4];
@@ -70,6 +81,15 @@ RESET dolt.allow_commit_conflicts;
 SELECT (dolt_cherry_pick('--abort'))[1:2];
 SELECT id, v FROM app.t WHERE id = 1;
 SELECT dolt_cherry_pick('--continue');
+SELECT dolt_cherry_pick('--continue', '--abort');
+-- (a pick that conflicts isn't made over uncommitted changes, which its
+-- commit would take in and its abort lose)
+UPDATE app.k SET a = 'uncommitted';
+BEGIN;
+SELECT (dolt_cherry_pick('feature~1'))[2:4];
+ROLLBACK;
+SELECT a FROM app.k;
+SELECT dolt_reset('--hard');
 UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
 SELECT dolt_cherry_pick(:'two');
 SELECT dolt_reset('--hard');

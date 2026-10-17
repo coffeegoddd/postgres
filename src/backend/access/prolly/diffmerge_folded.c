@@ -1675,6 +1675,31 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 }
 
 /*
+ * Record a merge in progress on the session's branch, of theirs from base,
+ * with conflicts in the tables of conflicted (OIDs); with pick_message, a
+ * cherry-pick's, whose commit takes that message and one parent.
+ */
+static void
+record_merge_state(const ProllyHash *theirs, const ProllyHash *base,
+				   List *conflicted, const char *pick_message)
+{
+	ProllyMergeState ms;
+	ListCell   *lc;
+	int			i = 0;
+
+	memset(&ms, 0, sizeof(ms));
+	ms.theirs = *theirs;
+	ms.base = *base;
+	ms.ntables = list_length(conflicted);
+	ms.tables = palloc(sizeof(Oid) * Max(ms.ntables, 1));
+	foreach(lc, conflicted)
+		ms.tables[i++] = lfirst_oid(lc);
+	ms.pick = pick_message != NULL;
+	ms.message = unconstify(char *, pick_message);
+	PROLLY_CALL(components().refs, set_merge_state, &ms);
+}
+
+/*
  * Merge branch into the session's: nothing to do if it is merged already,
  * a fast-forward if the session's head is its ancestor, else three-way.
  * The heads are read with the refs held, so they stay as read until the
@@ -1693,7 +1718,6 @@ merge_held(const char *branch, const char *message, int flags,
 	ProllyMergeState ms;
 	List	   *conflicted = NIL;
 	int			conflicts = 0;
-	ListCell   *lc;
 	ProllyHash	parents[2];
 	ProllyNodeRef roots[3];
 	Local		local;
@@ -1763,16 +1787,7 @@ merge_held(const char *branch, const char *message, int flags,
 				 errhint("Commit the changes, or reset the branch, first.")));
 	if (conflicts > 0)
 	{
-		int			i = 0;
-
-		memset(&ms, 0, sizeof(ms));
-		ms.theirs = theirs;
-		ms.base = base;
-		ms.ntables = list_length(conflicted);
-		ms.tables = palloc(sizeof(Oid) * ms.ntables);
-		foreach(lc, conflicted)
-			ms.tables[i++] = lfirst_oid(lc);
-		PROLLY_CALL(dc.refs, set_merge_state, &ms);
+		record_merge_state(&theirs, &base, conflicted, NULL);
 		memset(commit_id, 0, sizeof(*commit_id));
 		return conflicts;
 	}
@@ -1883,22 +1898,23 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
 		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
 		conflicts = merge_roots(roots, revert, fn, NULL, &conflicted);
+
+		/*
+		 * A pick's (a revert's failed): the pick in progress.  Not over
+		 * uncommitted changes, which its commit would take in, and its
+		 * abort (a reset) would lose.
+		 */
+		if (conflicts > 0 && has_local_changes(&local))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot %s with uncommitted changes when the %s conflicts",
+							what, what),
+					 errdetail("The %s has %d conflicting rows.", what, conflicts),
+					 errhint("Commit the changes, or reset the branch, first.")));
 		if (conflicts > 0)
 		{
-			/* a pick's (a revert's failed): the pick in progress */
-			int			j = 0;
-			ListCell   *lc;
-
-			memset(&ms, 0, sizeof(ms));
-			ms.theirs = picked[i];
-			ms.base = info[i].parents[0];
-			ms.ntables = list_length(conflicted);
-			ms.tables = palloc(sizeof(Oid) * ms.ntables);
-			foreach(lc, conflicted)
-				ms.tables[j++] = lfirst_oid(lc);
-			ms.pick = true;
-			ms.message = info[i].message;
-			PROLLY_CALL(dc.refs, set_merge_state, &ms);
+			record_merge_state(&picked[i], &info[i].parents[0], conflicted,
+							   info[i].message);
 			memset(commit_id, 0, sizeof(*commit_id));
 			return conflicts;
 		}
