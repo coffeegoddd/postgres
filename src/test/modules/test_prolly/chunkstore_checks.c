@@ -21,6 +21,7 @@
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "utils/tuplestore.h"
 #include "miscadmin.h"
 #include "utils/array.h"
@@ -231,6 +232,13 @@ test_chunk_table_files(PG_FUNCTION_ARGS)
  * the branch's baseline (as commits fold), or from nothing with 'full': the
  * two must be the same.
  */
+/* The session branch's working set, folded in full, from no baseline. */
+static void
+fold_in_full(ProllyNodeRef *root)
+{
+	PROLLY_CALL(prolly_canon_lookup("folded"), fold, NULL, root, NULL);
+}
+
 PG_FUNCTION_INFO_V1(test_fold_root);
 Datum
 test_fold_root(PG_FUNCTION_ARGS)
@@ -238,7 +246,7 @@ test_fold_root(PG_FUNCTION_ARGS)
 	ProllyNodeRef root;
 
 	if (PG_NARGS() > 0 && PG_GETARG_BOOL(0))
-		PROLLY_CALL(prolly_canon_lookup("folded"), fold, NULL, &root, NULL);
+		fold_in_full(&root);
 	else
 	{
 		ProllyDatabaseComponents dc;
@@ -288,46 +296,42 @@ test_refs_walk_reaches(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(r.found);
 }
 
-typedef struct FindTree
-{
-	const char *name;
-	ProllyNodeRef data;
-	bool		found;
-} FindTree;
-
 static void
-find_tree(const char *name, const ProllyNodeRef *data,
-		  const ProllyValue *description, const char *unreadable, void *arg)
+tree_row(const char *name, const ProllyNodeRef *data,
+		 const ProllyValue *description, const char *unreadable, void *arg)
 {
-	FindTree   *ft = arg;
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {0};
 
-	if (strcmp(name, ft->name) == 0)
-	{
-		ft->data = *data;
-		ft->found = true;
-	}
+	/* (canonical names are UTF-8) */
+	values[0] = CStringGetTextDatum(pg_any_to_server(name, strlen(name), PG_UTF8));
+	values[1] = PointerGetDatum(hash_text(&data->hash));
+	if (unreadable)
+		values[2] = CStringGetTextDatum(unreadable);
+	else
+		nulls[2] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
 /*
- * The hash of a table's data tree in the session branch's working set,
- * folded; NULL if it has no such table.  (The tree depends on the rows'
- * keys and encodings, the node format and the hash, not on the table's
- * definition.)
+ * test_fold_trees(): each table's data tree in the session branch's working
+ * set, folded once: its qualified name, the tree's hash, and why its tree
+ * can't be read as ordered now (a key's collation changed), if it can't.
+ * (The tree depends on the rows' keys and encodings, the node format and
+ * the hash, not on the table's definition.)
  */
-PG_FUNCTION_INFO_V1(test_fold_tree_hash);
+PG_FUNCTION_INFO_V1(test_fold_trees);
 Datum
-test_fold_tree_hash(PG_FUNCTION_ARGS)
+test_fold_trees(PG_FUNCTION_ARGS)
 {
-	const ProllyCanonRoutine *canon = prolly_canon_lookup("folded");
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	ProllyNodeRef root;
-	FindTree	ft = {0};
 
-	ft.name = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	PROLLY_CALL(canon, fold, NULL, &root, NULL);
-	PROLLY_CALL(canon, tables, &root, find_tree, &ft);
-	if (!ft.found)
-		PG_RETURN_NULL();
-	PG_RETURN_TEXT_P(hash_text(&ft.data.hash));
+	InitMaterializedSRF(fcinfo, 0);
+	fold_in_full(&root);
+	PROLLY_CALL(prolly_canon_lookup("folded"), tables, &root, tree_row, rsinfo);
+	return (Datum) 0;
 }
 
 /* What the session's folds have read: pages, candidates, full tables. */
