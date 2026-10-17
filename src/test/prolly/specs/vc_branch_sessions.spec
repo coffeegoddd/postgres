@@ -11,16 +11,27 @@ setup
 setup		{ DO $$ BEGIN PERFORM dolt_commit('-Am', 'vbs base'); END $$; }
 setup		{ DO $$ BEGIN PERFORM dolt_branch('vbs_b'); END $$; }
 
-teardown	{ DROP SCHEMA vbs CASCADE; }
+# leaves main as it was, and no branch (s2 back on main first)
+teardown
+{
+	DO $$
+	BEGIN
+		PERFORM dolt_checkout('main');
+		DROP SCHEMA vbs CASCADE;
+		PERFORM dolt_branch('-D', 'vbs_b');
+		PERFORM dolt_commit('-Am', 'vbs gone');
+	END $$;
+}
 
 session s1
-step s1_main	{ SELECT dolt_checkout('main') IS NOT NULL AS ok; }
+step s1_main	{ SELECT (dolt_checkout('main'))[1] = '0' AS ok; }
 step s1_insert	{ INSERT INTO vbs.vbs VALUES (2, 'main'), (5, 'main'); }
 step s1_read	{ SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs.vbs; }
 
 session s2
-step s2_b		{ SELECT dolt_checkout('vbs_b') IS NOT NULL AS ok; }
+step s2_b		{ SELECT (dolt_checkout('vbs_b'))[1] = '0' AS ok; }
 step s2_insert	{ INSERT INTO vbs.vbs VALUES (3, 'b'), (5, 'b'); }
 step s2_read	{ SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vbs.vbs; }
+step s2_main	{ SELECT (dolt_checkout('main'))[1] = '0' AS ok; }
 
-permutation s1_main s2_b s1_insert s2_insert s1_read s2_read
+permutation s1_main s2_b s1_insert s2_insert s1_read s2_read s2_main

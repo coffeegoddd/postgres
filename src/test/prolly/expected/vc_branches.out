@@ -15,9 +15,10 @@ feature rows kept|1:changed,2:feature
 commit feature|t
 checkout main again|t
 main rows kept|1:base,3:main
+commit main|t
 branch from commit|t
 checkout old|t
-old rows|1:base,3:main
-after rollback|2
+old rows|1:base
+after rollback|1
 ERROR:  branch "vb_no_such_branch" does not exist
 back to main|t

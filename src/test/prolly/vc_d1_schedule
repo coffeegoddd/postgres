@@ -1,0 +1,4 @@
+# Version control on the tree engine (D1), through its prolly_* API:
+# branches, diff and merge
+test: d1_vc_branches
+test: d1_vc_diff_merge

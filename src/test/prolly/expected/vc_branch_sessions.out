@@ -1,13 +1,13 @@
 Parsed test spec with 2 sessions
 
-starting permutation: s1_main s2_b s1_insert s2_insert s1_read s2_read
-step s1_main: SELECT dolt_checkout('main') IS NOT NULL AS ok;
+starting permutation: s1_main s2_b s1_insert s2_insert s1_read s2_read s2_main
+step s1_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
 ok
 --
 t 
 (1 row)
 
-step s2_b: SELECT dolt_checkout('vbs_b') IS NOT NULL AS ok;
+step s2_b: SELECT (dolt_checkout('vbs_b'))[1] = '0' AS ok;
 ok
 --
 t 
@@ -25,5 +25,11 @@ step s2_read: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows FROM vb
 rows          
 --------------
 1:base,3:b,5:b
+(1 row)
+
+step s2_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
 (1 row)
 

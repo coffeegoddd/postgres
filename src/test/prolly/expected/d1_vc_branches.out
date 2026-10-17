@@ -1,0 +1,23 @@
+--
+-- Version control on the tree engine (D1), through its prolly_* API: branches isolate data.  Each branch keeps its own
+-- working set; checking out another branch shows that branch's rows, and
+-- coming back shows this branch's uncommitted changes again.
+--
+\set ECHO none
+commit base|t
+create branch|t
+checkout feature|t
+feature rows|1:changed,2:feature
+checkout main|t
+main rows|1:base
+back to feature|t
+feature rows kept|1:changed,2:feature
+commit feature|t
+checkout main again|t
+main rows kept|1:base,3:main
+branch from commit|t
+checkout old|t
+old rows|1:base,3:main
+after rollback|2
+ERROR:  prolly branch "vb_no_such_branch" does not exist
+back to main|t
