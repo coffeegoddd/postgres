@@ -43,6 +43,7 @@
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_xact.h"
 #include "access/table.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
@@ -856,37 +857,34 @@ reset_to(const ProllyHash *id)
 	pfree(hex);
 }
 
+/* what: the operation refused ("merge", "cherry-pick", "revert") */
 static void
-refuse_local_changes(void)
+refuse_local_changes(const char *what)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("cannot merge with uncommitted changes"),
+			 errmsg("cannot %s with uncommitted changes", what),
 			 errhint("Commit them, or reset the branch, first.")));
 }
 
 /*
- * Write to the session's branch (at ours, with no changes since) what
- * changed from base to theirs, three-way: what (a merge, a cherry-pick)
- * fails if a row conflicts and fail_on_conflict, else conflicted gets the
- * tables with conflicts.  Returns how many keys conflict.
+ * Write to the session's branch (its rows as roots[1] has them) what
+ * changed from roots[0] to roots[2], three-way: what (a merge of branch
+ * name, a cherry-pick) fails if a row conflicts and fail_on_conflict, else
+ * conflicted gets the tables with conflicts.  Returns how many keys
+ * conflict.
  */
 static int
-merge_commits(const ProllyHash *base, const ProllyHash *ours,
-			  const ProllyHash *theirs, bool fail_on_conflict,
-			  const char *what, List **conflicted)
+merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
+			const char *what, const char *name, List **conflicted)
 {
 	ProllyDatabaseComponents dc = components();
-	ProllyNodeRef roots[3];
 	List	   *base_tables;
 	List	   *ours_tables;
 	List	   *theirs_tables;
 	ListCell   *lc;
 	int			conflicts = 0;
 
-	commit_root(base, &roots[0]);
-	commit_root(ours, &roots[1]);
-	commit_root(theirs, &roots[2]);
 	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
 		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
 		ereport(ERROR,
@@ -913,6 +911,14 @@ merge_commits(const ProllyHash *base, const ProllyHash *ours,
 			continue;
 		}
 		n = merge_table(relid, b, o, t, WALK_MERGE, NULL);
+		if (n > 0 && fail_on_conflict && name)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("%s of branch \"%s\" conflicts in table \"%s\"",
+							what, name, get_rel_name(relid)),
+					 errdetail_plural("%d row was changed differently on both sides.",
+									  "%d rows were changed differently on both sides.",
+									  n, n)));
 		if (n > 0 && fail_on_conflict)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -929,15 +935,29 @@ merge_commits(const ProllyHash *base, const ProllyHash *ours,
 	return conflicts;
 }
 
+/* The same, of three commits. */
+static int
+merge_commits(const ProllyHash *base, const ProllyHash *ours,
+			  const ProllyHash *theirs, bool fail_on_conflict,
+			  const char *what, const char *name, List **conflicted)
+{
+	ProllyNodeRef roots[3];
+
+	commit_root(base, &roots[0]);
+	commit_root(ours, &roots[1]);
+	commit_root(theirs, &roots[2]);
+	return merge_roots(roots, fail_on_conflict, what, name, conflicted);
+}
+
 /* Refuse a merge or pick over uncommitted changes, which it would lose. */
 static void
-check_clean(void)
+check_clean(const char *what)
 {
 	bool		changed = false;
 
 	folded_tables("HEAD", "WORKING", note_change, &changed);
 	if (changed)
-		refuse_local_changes();
+		refuse_local_changes(what);
 }
 
 /*
@@ -980,7 +1000,7 @@ merge_held(const char *branch, const char *message, int flags,
 					 errmsg("the current branch has no commit to merge into")));
 		/* all it has is uncommitted */
 		if (working_has_objects())
-			refuse_local_changes();
+			refuse_local_changes("merge");
 		reset_to(&theirs);
 		*commit_id = theirs;
 		return 0;
@@ -996,7 +1016,7 @@ merge_held(const char *branch, const char *message, int flags,
 		return 0;
 	}
 
-	check_clean();
+	check_clean("merge");
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
 		reset_to(&theirs);
@@ -1007,8 +1027,7 @@ merge_held(const char *branch, const char *message, int flags,
 	/* Three-way. */
 	conflicts = merge_commits(&base, &ours, &theirs,
 							  (flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
-							  psprintf("merge of branch \"%s\"", branch),
-							  &conflicted);
+							  "merge", branch, &conflicted);
 
 	/* Conflicts: a merge in progress, to resolve before its commit. */
 	if (conflicts > 0)
@@ -1048,51 +1067,93 @@ folded_merge(const char *branch, const char *message, int flags,
 }
 
 /*
- * Commit ref's changes again on the session's branch (from its parent to
- * it), or, reverting, undo them (from it to its parent): three-way, as a
- * merge, with one parent.  Conflicts are an error, for now.
+ * Commit refs' changes (each from its parent) again on the session's
+ * branch, or, reverting, undo them (each from it to its parent): every ref
+ * resolved before anything moves, each merged three-way into the branch as
+ * the ones before left it, and one commit made of them all, with one
+ * parent.  Conflicts are an error, for now; so is a commit of nothing,
+ * unless allow_empty.  A cherry-pick keeps its commit's author.
  */
 static void
-pick_held(const char *ref, bool revert, ProllyHash *commit_id)
+pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
+		  ProllyHash *commit_id)
 {
 	ProllyDatabaseComponents dc = components();
+	const char *what = revert ? "revert" : "cherry-pick";
+	const char *fn = revert ? "dolt_revert" : "dolt_cherry_pick";
+	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
+	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
 	ProllyHash	ours;
-	ProllyHash	picked;
-	ProllyCommitInfo info;
+	ProllyNodeRef roots[3];
+	ProllyNodeRef head;
 	ProllyMergeState ms;
 	List	   *conflicted = NIL;
-	char	   *message;
-	const char *what = revert ? "dolt_revert" : "dolt_cherry_pick";
+	StringInfoData message;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("a merge is in progress on the current branch"),
 				 errhint("Resolve its conflicts and commit, or abort it.")));
-	if (!PROLLY_CALL(dc.refs, resolve, ref, &picked) ||
-		!PROLLY_CALL(dc.refs, commit_get, &picked, &info))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("prolly ref \"%s\" does not exist", ref)));
-	if (info.nparents != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("%s of a commit with %d parents isn't supported", what,
-						info.nparents),
-				 errdetail("Its changes are changes from one parent.")));
+	for (int i = 0; i < nrefs; i++)
+	{
+		if (!PROLLY_CALL(dc.refs, resolve, refs[i], &picked[i]) ||
+			!PROLLY_CALL(dc.refs, commit_get, &picked[i], &info[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", refs[i])));
+		if (info[i].nparents == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s of a branch's first commit isn't supported", fn),
+					 errdetail("Commit \"%s\" has no parent to take its changes from.",
+							   refs[i])));
+		if (info[i].nparents != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s of a commit with %d parents isn't supported", fn,
+							info[i].nparents),
+					 errdetail("Its changes are changes from one parent.")));
+	}
 	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no commit to apply changes to")));
-	check_clean();
-	if (revert)
-		(void) merge_commits(&picked, &ours, &info.parents[0], true, what,
-							 &conflicted);
-	else
-		(void) merge_commits(&info.parents[0], &ours, &picked, true, what,
-							 &conflicted);
-	message = revert ? psprintf("Revert \"%s\"", info.message) : info.message;
-	PROLLY_CALL(dc.refs, commit_with, message, &ours, 1, NULL, commit_id);
+	check_clean(what);
+
+	commit_root(&ours, &head);
+	roots[1] = head;
+	initStringInfo(&message);
+	for (int i = 0; i < nrefs; i++)
+	{
+		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
+		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
+		(void) merge_roots(roots, true, fn, NULL, &conflicted);
+		/* the next merges into the rows as this one left them */
+		root_of("WORKING", &roots[1]);
+		if (!revert)
+			appendStringInfoString(&message, info[i].message);
+		else
+			appendStringInfo(&message, i == 0 ? "Revert \"%s\"" : " and \"%s\"",
+							 info[i].message);
+	}
+	if (same_hash(&roots[1].hash, &head.hash) && !allow_empty)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s changes nothing on the branch", fn),
+				 revert ? 0 : errhint("Pass --allow-empty to commit it anyway.")));
+
+	if (!revert)
+		prolly_set_commit_author(info[0].author);
+	PG_TRY();
+	{
+		PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1, NULL, commit_id);
+	}
+	PG_FINALLY();
+	{
+		prolly_set_commit_author(NULL);
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -1155,12 +1216,13 @@ folded_resolve(Oid relid, bool theirs)
 }
 
 static void
-folded_cherry_pick(const char *ref, bool revert, ProllyHash *commit_id)
+folded_cherry_pick(const char *const *refs, int nrefs, bool revert,
+				   bool allow_empty, ProllyHash *commit_id)
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 
-	pick_held(ref, revert, commit_id);
+	pick_held(refs, nrefs, revert, allow_empty, commit_id);
 	if (pushed)
 		PopActiveSnapshot();
 }

@@ -46,6 +46,8 @@ extern void prolly_session_init(const char *branch);
 
 /* Who the session's commits are by: dolt.author, else the session user. */
 extern const char *prolly_commit_author(void);
+/* Commits name author until reset (NULL), whatever dolt.author says. */
+extern void prolly_set_commit_author(const char *author);
 
 /* Whether a transaction may commit with unresolved merge conflicts. */
 extern bool prolly_allow_commit_conflicts(void);

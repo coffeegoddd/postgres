@@ -50,5 +50,60 @@ COMMIT;
 SELECT dolt_cherry_pick('HEAD');		-- a merge commit
 SELECT dolt_revert('nope');
 
+-- Several reverts are one commit, every ref named as the branch was
+-- before: HEAD~1 is r1, not the commit HEAD's revert makes.
+UPDATE app.t SET v = 'r1' WHERE id = 6;
+SELECT length(dolt_commit('-am', 'r1')::text) AS committed;
+UPDATE app.t SET v = 'r2' WHERE id = 7;
+SELECT length(dolt_commit('-am', 'r2')::text) AS committed;
+SELECT dolt_hashof('HEAD~2') AS before_r \gset
+SELECT dolt_revert('HEAD', 'HEAD~1');
+SELECT id, v FROM app.t WHERE id IN (6, 7) ORDER BY id;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+SELECT dolt_hashof('HEAD~3') = :'before_r' AS one_commit;
+
+-- Picking what the branch has already changes nothing: refused, unless
+-- --allow-empty.  A pick keeps its commit's author.
+UPDATE app.t SET v = 'e1' WHERE id = 8;
+SELECT (dolt_commit('-am', 'e1'))[1] AS e1 \gset
+SELECT dolt_cherry_pick(:'e1');
+SELECT (dolt_cherry_pick('--allow-empty', :'e1'))[2:4];
+SELECT dolt_hashof('HEAD^') = :'e1' AS on_e1;
+SELECT dolt_branch('cp_author');
+SELECT dolt_checkout('cp_author');
+UPDATE app.t SET v = 'ada' WHERE id = 9;
+SELECT length(dolt_commit('-am', 'by ada', '--author', 'Ada <ada@example.com>')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_cherry_pick('cp_author'))[2:4];
+SELECT committer, email, message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+
+-- Refusals name what was refused; a branch's first commit has no
+-- changes from a parent to undo.
+UPDATE app.t SET v = 'uncommitted' WHERE id = 3;
+SELECT dolt_revert('HEAD');
+SELECT dolt_reset('--hard');
+SELECT commit_hash AS first FROM dolt_log('main') ORDER BY commit_order LIMIT 1 \gset
+\set VERBOSITY terse
+SELECT dolt_revert(:'first');
+\set VERBOSITY default
+
+-- Nor is a pick or revert made while a merge is in progress.
+SELECT dolt_branch('cp_c');
+SELECT dolt_checkout('cp_c');
+UPDATE app.t SET v = 'c' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'c')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE app.t SET v = 'm' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'm')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('cp_c'))[2:4];
+SAVEPOINT s;
+SELECT dolt_cherry_pick('cp_author');
+ROLLBACK TO s;
+SELECT dolt_revert('HEAD');
+ROLLBACK;
+SELECT dolt_branch('-D', 'cp_c');
+SELECT dolt_branch('-D', 'cp_author');
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA app CASCADE;
