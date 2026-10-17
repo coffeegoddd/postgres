@@ -79,13 +79,6 @@ typedef struct ProllyRemoteRoutine
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
 #define PROLLY_REMOTE_LAST_CALLBACK move_head
 
-static inline const ProllyRemoteRoutine *
-prolly_remote_lookup(const char *name)
-{
-	return (const ProllyRemoteRoutine *)
-		prolly_get_impl(PROLLY_IFACE_REMOTE, name);
-}
-
 /* The implementation serving url's scheme; an error if none does. */
 extern const ProllyRemoteRoutine *prolly_remote_for_url(const char *url);
 

@@ -976,53 +976,6 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
-static bool
-cow_key_at(const ProllyTreeEnv *env, const ProllyNodeRef *root, uint64 ordinal,
-		   StringInfo key)
-{
-	TNode		node;
-	ProllyNodeRef ref = *root;
-
-	for (;;)
-	{
-		bool		down = false;
-
-		node_read(env, &ref, &node);
-		if (node.level == 0)
-		{
-			bool		found = ordinal < (uint64) node.nitems;
-
-			if (found)
-			{
-				ProllyKey	k;
-				ProllyValue v;
-
-				node_item(env, &node, (int) ordinal, &k, &v, NULL);
-				appendBinaryStringInfo(key, (const char *) k.data, k.len);
-			}
-			node_release(&node);
-			return found;
-		}
-		for (int i = 0; i < node.nitems; i++)
-		{
-			ProllyNodeRef child;
-			uint64		count;
-
-			node_child(env, &node, i, &child, &count);
-			if (ordinal < count)
-			{
-				ref = child;
-				down = true;
-				break;
-			}
-			ordinal -= count;
-		}
-		node_release(&node);
-		if (!down)
-			return false;
-	}
-}
-
 /* Whether the visitor took the node. */
 static bool
 walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
@@ -1832,7 +1785,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 		.impl_id = COW_IMPL_ID,
 		.format_version = 1,
 		.name = "cow",
-		.description = "copy-on-write prolly trees in a hash-addressed node store",
+		.description = "copy-on-write prolly trees in a chunk store",
 	},
 	.build_begin = cow_build_begin,
 	.build_add = cow_build_add,
@@ -1844,7 +1797,6 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.cursor_close = cow_cursor_close,
 	.apply = cow_apply,
 	.count = cow_count,
-	.key_at = cow_key_at,
 	.walk = cow_walk,
 	.diff = cow_diff,
 };

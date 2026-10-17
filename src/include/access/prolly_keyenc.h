@@ -13,12 +13,6 @@
  *   a and b, column by column, honouring DESC and NULLS FIRST/LAST.
  * - Encodings are part of the canonical format: identical on every
  *   platform, in every cluster and in every session, with no local OIDs.
- * - decode() returns false if the encoding can't be reversed (e.g. collation
- *   sort keys); callers then read the column from the row.
- * - Encodings are self-delimiting: an encoded key followed by other bytes
- *   can be split again, and prefix_length() says how many bytes the first
- *   ncols columns of an encoded key take (a key of fewer columns, encoded
- *   by an encoder begun for those columns, compares with that prefix).
  *
  * Provisional (v0).
  *
@@ -56,36 +50,15 @@ typedef struct ProllyKeyEncoderRoutine
 	void		(*encode) (ProllyKeyEncoder *enc, const Datum *values,
 						   const bool *isnull, StringInfo out);
 
-	bool		(*decode) (ProllyKeyEncoder *enc, const ProllyKey *key,
-						   Datum *values, bool *isnull);
-
 	int			(*compare) (ProllyKeyEncoder *enc, const ProllyKey *a,
 							const ProllyKey *b);
-
-	/*
-	 * True if keys compare() equal only when their encodings are the same
-	 * bytes (false, e.g., for numeric, where 1.0 and 1.00 are equal, or a
-	 * nondeterministic collation), so a key's bytes can name it.
-	 */
-	bool		(*equal_bytes) (ProllyKeyEncoder *enc);
-
-	uint32		(*prefix_length) (ProllyKeyEncoder *enc, const ProllyKey *key,
-								  int ncols);
 
 	void		(*end) (ProllyKeyEncoder *enc);
 } ProllyKeyEncoderRoutine;
 
 #define PROLLY_KEYENC_CALLBACK_NAMES \
-	"supports", "begin", "encode", "decode", "compare", "equal_bytes", \
-	"prefix_length", "end"
+	"supports", "begin", "encode", "compare", "end"
 #define PROLLY_KEYENC_FIRST_CALLBACK supports
 #define PROLLY_KEYENC_LAST_CALLBACK end
-
-static inline const ProllyKeyEncoderRoutine *
-prolly_keyenc_lookup(const char *name)
-{
-	return (const ProllyKeyEncoderRoutine *)
-		prolly_get_impl(PROLLY_IFACE_KEY_ENCODER, name);
-}
 
 #endif							/* PROLLY_KEYENC_H */

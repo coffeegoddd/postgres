@@ -55,11 +55,4 @@ typedef struct ProllyReclaimRoutine
 #define PROLLY_RECLAIM_FIRST_CALLBACK collect
 #define PROLLY_RECLAIM_LAST_CALLBACK collect
 
-static inline const ProllyReclaimRoutine *
-prolly_reclaim_lookup(const char *name)
-{
-	return (const ProllyReclaimRoutine *)
-		prolly_get_impl(PROLLY_IFACE_RECLAMATION, name);
-}
-
 #endif							/* PROLLY_RECLAIM_H */

@@ -8,7 +8,7 @@
  * prolly_register_impl() from its _PG_init.
  *
  * Callers normally use the typed lookup helpers in each interface header
- * (prolly_engine_lookup() and so on), or prolly_config.h, rather than these.
+ * (prolly_tree_lookup() and so on), or prolly_config.h, rather than these.
  *
  * src/include/access/prolly_registry.h
  *

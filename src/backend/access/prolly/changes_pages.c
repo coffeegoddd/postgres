@@ -294,7 +294,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	 * every row (the scan gives its missing value), so whether the table was
 	 * rewritten since doesn't change the encoding.
 	 */
-	f->k = PROLLY_CALL(f->kr, open_rewritten, rel, CurrentMemoryContext);
+	f->k = PROLLY_CALL(f->kr, open, rel, CurrentMemoryContext);
 	f->keyless = PROLLY_CALL(f->kr, keyless, f->k);
 	f->env = *env;
 	f->env.compare = keying_compare;

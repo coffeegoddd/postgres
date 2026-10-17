@@ -147,16 +147,8 @@ typedef struct ProllyTreeRoutine
 						  const ProllyEdit *edits, int nedits,
 						  ProllyNodeRef *new_root);
 
-	/* Number of items. */
+	/* Number of items, from the subtree counts internal items record. */
 	uint64		(*count) (const ProllyTreeEnv *env, const ProllyNodeRef *root);
-
-	/*
-	 * Append the key of the item at position ordinal (from 0, in key order)
-	 * to key; false if there are no more items.  O(log n), from subtree
-	 * counts.
-	 */
-	bool		(*key_at) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
-						   uint64 ordinal, StringInfo key);
 
 	/*
 	 * Visit every node reachable from root (value trees too), parents
@@ -180,7 +172,7 @@ typedef struct ProllyTreeRoutine
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
-	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", "key_at", \
+	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
 #define PROLLY_TREE_LAST_CALLBACK diff

@@ -4,9 +4,9 @@
  *	  The prolly shared-memory subsystem and checkpoint hook.
  *
  * At postmaster startup this reserves a shared area for every registered
- * chunk store implementation whose shmem_size() is non-zero, named after the implementation, and calls
- * its shmem_init() with the area once.  Every process finds the area again
- * with prolly_shmem_area().
+ * chunk store implementation whose shmem_size() is non-zero, named after
+ * the implementation, and calls its shmem_init() with the area once.
+ * Every process finds the area again with prolly_shmem_area().
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_shmem.c

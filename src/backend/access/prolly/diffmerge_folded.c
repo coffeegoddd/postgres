@@ -30,15 +30,14 @@
  * the merge in progress in the refs.  Its conflicts are found again from
  * the three commits when they're listed or resolved.  A keyless table's
  * rows have no identity: a row's copies merge as merge_table() says,
- * without conflicts (implementation "rows", the tree engine's, adds the
- * two sides' changes up, and conflicts below none).  The branch may have uncommitted changes, as in Dolt, if the merge
- * changes none of the tables and sequences they changed, and no
- * definitions change: they stay uncommitted, left out of the merge's
- * commit.  Definitions changed since the ancestor are merged first (the canonicalizer's
- * merge_schema(): an object both sides changed differently fails the
- * merge); then a table all three define alike merges its rows three-way,
- * and one defined otherwise takes the rows of the side that redefined,
- * made or kept it, if the other side didn't change them.
+ * without conflicts.  The branch may have uncommitted changes, as in Dolt,
+ * if the merge changes none of the tables and sequences they changed, and
+ * no definitions change: they stay uncommitted, left out of the merge's
+ * commit.  Definitions changed since the ancestor are merged first (the
+ * canonicalizer's merge_schema(): an object both sides changed differently
+ * fails the merge); then a table all three define alike merges its rows
+ * three-way, and one defined otherwise takes the rows of the side that
+ * redefined, made or kept it, if the other side didn't change them.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/diffmerge_folded.c
@@ -316,7 +315,7 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 	require_readable(to);
 	rel = table_open(relid, AccessShareLock);
 	rd.kr = keying_of(rel);
-	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
+	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
 	rd.relid = relid;
 	rd.sink = sink;
 	chunk_env(&env);
@@ -904,7 +903,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.rel = table_open(relid, RowExclusiveLock);
 	ap.ar = prolly_applier_lookup("replication");
 	ap.c.rd.kr = keying_of(ap.rel);
-	ap.c.rd.k = PROLLY_CALL(ap.c.rd.kr, open_rewritten, ap.rel,
+	ap.c.rd.k = PROLLY_CALL(ap.c.rd.kr, open, ap.rel,
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	chunk_env(&env);
@@ -1237,7 +1236,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		note_written(relid);
 	memset(&tc, 0, sizeof(tc));
 	tc.rd.kr = keying_of(rel);
-	tc.rd.k = PROLLY_CALL(tc.rd.kr, open_rewritten, rel, CurrentMemoryContext);
+	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	oc = tc;
 	chunk_env(&env);
@@ -1531,7 +1530,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	require_readable(x);
 
 	rd.kr = keying_of(rel);
-	rd.k = PROLLY_CALL(rd.kr, open_rewritten, rel, CurrentMemoryContext);
+	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
 	cols = version_columns(x, &keyed);
 	if (keyed == PROLLY_CALL(rd.kr, keyless, rd.k))
 		ereport(ERROR,

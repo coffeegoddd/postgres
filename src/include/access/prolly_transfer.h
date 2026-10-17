@@ -51,11 +51,4 @@ typedef struct ProllyTransferRoutine
 #define PROLLY_TRANSFER_FIRST_CALLBACK receive
 #define PROLLY_TRANSFER_LAST_CALLBACK send
 
-static inline const ProllyTransferRoutine *
-prolly_transfer_lookup(const char *name)
-{
-	return (const ProllyTransferRoutine *)
-		prolly_get_impl(PROLLY_IFACE_TRANSFER, name);
-}
-
 #endif							/* PROLLY_TRANSFER_H */

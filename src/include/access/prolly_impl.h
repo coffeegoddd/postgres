@@ -4,7 +4,7 @@
  *	  The interface -> implementation pattern used by all prolly components.
  *
  * Every prolly component is an interface: a routine struct of callbacks,
- * declared in its own header (prolly_engine.h, prolly_hash.h, ...).  Every
+ * declared in its own header (prolly_tree.h, prolly_hash.h, ...).  Every
  * routine struct starts with a ProllyImplInfo, followed only by callback
  * pointers.  Implementations fill in a const routine struct and are found by
  * name through the registry (prolly_registry.h).
@@ -72,30 +72,6 @@ typedef struct ProllyImplInfo
 } ProllyImplInfo;
 
 #define PROLLY_STUB_IMPL_ID		0
-
-/*
- * What persisted data records about the implementation that wrote it, so
- * data written by one implementation can be recognized and refused, migrated
- * or read by another.  Serialize field by field; don't write the struct's
- * bytes.
- */
-typedef struct ProllyFormatStamp
-{
-	uint8		iface;			/* ProllyInterface */
-	uint16		impl_id;
-	uint16		format_version;
-} ProllyFormatStamp;
-
-static inline ProllyFormatStamp
-prolly_format_stamp(const ProllyImplInfo *impl)
-{
-	ProllyFormatStamp stamp;
-
-	stamp.iface = (uint8) impl->iface;
-	stamp.impl_id = impl->impl_id;
-	stamp.format_version = impl->format_version;
-	return stamp;
-}
 
 /* Raises ERRCODE_FEATURE_NOT_SUPPORTED for a missing callback. */
 pg_noreturn extern void prolly_not_implemented(const ProllyImplInfo *impl,

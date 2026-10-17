@@ -25,26 +25,9 @@
  *   give columns other types than the relation has now: a table rewrite
  *   reads the old rows with the types they were written with.
  * - compare() orders keys as the data tree must be ordered.
- * - equal_bytes() is true when keys that compare() equal are always the
- *   same bytes, so a key's bytes name its row (for row locks); false
- *   when they may differ (numeric 1.0 and 1.00, a nondeterministic
- *   collation) or the keys can't be compared any more.
- * - can_compare() is false when compare() can no longer order the keys
- *   of a keying opened from a description, because something it orders
- *   by (a key column's type, operator family or collation) has since
- *   been dropped.  Callers can still match keys by their bytes, which
- *   agrees with compare() except under a nondeterministic collation.
  * - A keying is opened for one relation and is valid until the relation's
  *   relcache entry is rebuilt; callers reopen after invalidation.  It
  *   holds nothing but memory in the context it was opened in.
- * - describe() gives bytes that identify how rows are keyed and encoded
- *   (local, not canonical); open() with them reads rows written that way,
- *   whatever the relation looks like now.  That changes when a primary key
- *   is added or dropped, when Postgres rewrites the table through one
- *   without a key, and when columns are dropped without a rewrite.  A
- *   tree records the description it was written with; can_read() says
- *   whether such rows still read correctly as the relation is now, and if
- *   not the tree is rebuilt before it is next written.
  *
  * Provisional (v0).
  *
@@ -68,25 +51,12 @@ typedef struct ProllyKeyingRoutine
 	ProllyImplInfo info;
 
 	/*
-	 * Rows of rel as keyed now (description NULL), or as described by an
-	 * earlier describe().
-	 */
-	ProllyKeying *(*open) (Relation rel, const ProllyValue *description,
-						   MemoryContext mcxt);
-
-	/*
 	 * Rows of rel as keyed now, as they are once Postgres rewrites the
 	 * table (CLUSTER, VACUUM FULL): the catalog's missing values of added
-	 * columns are cleared then, so every row carries its own.  Describes
-	 * itself as open(rel, NULL) does once they are cleared.
+	 * columns are cleared then, so every row carries its own, and a folded
+	 * row is the same however the table came to have it.
 	 */
-	ProllyKeying *(*open_rewritten) (Relation rel, MemoryContext mcxt);
-
-	/* Append the description of this keying. */
-	void		(*describe) (ProllyKeying *k, StringInfo out);
-
-	/* True if rows written as description reads read correctly with k. */
-	bool		(*can_read) (ProllyKeying *k, const ProllyValue *description);
+	ProllyKeying *(*open) (Relation rel, MemoryContext mcxt);
 
 	/* True if rows are keyed by content (and values carry a count). */
 	bool		(*keyless) (ProllyKeying *k);
@@ -105,34 +75,20 @@ typedef struct ProllyKeyingRoutine
 	void		(*parse_value) (ProllyKeying *k, const ProllyValue *value,
 								ProllyValue *row, uint64 *count);
 
-	/* The content hash of an encoded row. */
-	void		(*content_hash) (ProllyKeying *k, const ProllyValue *row,
-								 ProllyHash *content);
-
 	/* Store the encoded row into slot (as a virtual tuple). */
 	void		(*decode_row) (ProllyKeying *k, const ProllyValue *row,
 							   TupleTableSlot *slot);
 
 	int			(*compare) (ProllyKeying *k, const ProllyKey *a,
 							const ProllyKey *b);
-	bool		(*can_compare) (ProllyKeying *k);
-	bool		(*equal_bytes) (ProllyKeying *k);
 
 	void		(*close) (ProllyKeying *k);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
-	"open", "open_rewritten", "describe", "can_read", "keyless", "encode_row", "make_value", \
-	"parse_value", "content_hash", "decode_row", "compare", "can_compare", \
-	"equal_bytes", "close"
+	"open", "keyless", "encode_row", "make_value", "parse_value", \
+	"decode_row", "compare", "close"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 #define PROLLY_KEYING_LAST_CALLBACK close
-
-static inline const ProllyKeyingRoutine *
-prolly_keying_lookup(const char *name)
-{
-	return (const ProllyKeyingRoutine *)
-		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, name);
-}
 
 #endif							/* PROLLY_KEYING_H */

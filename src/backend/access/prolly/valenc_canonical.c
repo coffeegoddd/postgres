@@ -182,19 +182,6 @@ canonical_begin_layout(TupleDesc desc, const ProllyValue *layout,
 	return enc;
 }
 
-static bool
-canonical_reads_layout(ProllyValueEncoder *enc, const ProllyValue *layout)
-{
-	int			n;
-	int		   *attnos = parse_layout(layout, &n);
-	bool		ok = (n <= enc->nlive);
-
-	for (int j = 0; ok && j < n; j++)
-		ok = (attnos[j] == enc->live_attno[j]);
-	pfree(attnos);
-	return ok;
-}
-
 static void
 canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 {
@@ -344,7 +331,6 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.begin = canonical_begin,
 	.layout = canonical_layout,
 	.begin_layout = canonical_begin_layout,
-	.reads_layout = canonical_reads_layout,
 	.encode = canonical_encode,
 	.decode = canonical_decode,
 	.end = canonical_end,

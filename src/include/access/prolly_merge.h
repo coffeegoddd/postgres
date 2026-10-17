@@ -4,8 +4,8 @@
  *	  Diff and merge interface: comparing and combining versions.
  *
  * Diff and three-way merge work on canonical trees, so they don't depend on
- * the engine that stores either side.  Structural sharing lets a diff skip
- * every subtree whose hash is equal on both sides.
+ * how either side's working set is stored.  Structural sharing lets a diff
+ * skip every subtree whose hash is equal on both sides.
  *
  * Contract:
  * - diff() reports every row that differs between the two refs, once, in
@@ -110,12 +110,5 @@ typedef struct ProllyMergeRoutine
 	"cherry_pick", "verify"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 #define PROLLY_MERGE_LAST_CALLBACK verify
-
-static inline const ProllyMergeRoutine *
-prolly_merge_lookup(const char *name)
-{
-	return (const ProllyMergeRoutine *)
-		prolly_get_impl(PROLLY_IFACE_DIFF_MERGE, name);
-}
 
 #endif							/* PROLLY_MERGE_H */

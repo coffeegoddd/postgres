@@ -95,8 +95,8 @@ tps = 1234.567890 (without initial connection time)
 
     def test_not_implemented_from_client_output(self):
         with self.assertRaises(NotImplementedByEngine):
-            check_client_error('pgbench: error: query failed: ERROR:  engine '
-                               'implementation "d1" does not implement tree_create')
+            check_client_error('pgbench: error: query failed: ERROR:  reclamation '
+                               'implementation "stub" does not implement collect')
         check_client_error("ERROR:  duplicate key value")  # no exception
 
 

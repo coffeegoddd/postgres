@@ -68,8 +68,6 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_CHUNKER, "deterministic", "begin add end", chunker_deterministic},
 	{PROLLY_IFACE_CHUNKER, "forced_split_respects_capacity", "begin add end",
 	chunker_forced_split},
-	{PROLLY_IFACE_CHUNKER, "reset_equals_begin", "begin add reset end",
-	chunker_reset_equals_begin},
 
 	/* chunk node format */
 	{PROLLY_IFACE_CHUNK_FORMAT, "items_round_trip",
@@ -96,12 +94,6 @@ static const ConformanceCase cases[] = {
 	"supports begin encode compare end", keyenc_order_matches_opclass},
 	{PROLLY_IFACE_KEY_ENCODER, "desc_and_nulls_ordering",
 	"supports begin encode compare end", keyenc_desc_and_nulls},
-	{PROLLY_IFACE_KEY_ENCODER, "decode_round_trip", "begin encode decode end",
-	keyenc_decode_round_trip},
-	{PROLLY_IFACE_KEY_ENCODER, "self_delimiting_prefixes",
-	"begin encode prefix_length end", keyenc_prefix_lengths},
-	{PROLLY_IFACE_KEY_ENCODER, "equal_bytes_name_keys",
-	"begin encode compare equal_bytes end", keyenc_equal_bytes},
 
 	/* value encoder */
 	{PROLLY_IFACE_VALUE_ENCODER, "round_trip", "begin encode decode end",
@@ -115,7 +107,7 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_VALUE_ENCODER, "missing_values", "begin encode decode end",
 	valenc_missing_values},
 	{PROLLY_IFACE_VALUE_ENCODER, "decodes_earlier_layouts",
-	"begin layout begin_layout reads_layout encode decode end",
+	"begin layout begin_layout encode decode end",
 	valenc_decodes_earlier_layouts},
 
 	/* reclamation */
@@ -127,15 +119,9 @@ static const ConformanceCase cases[] = {
 	"open keyless encode_row make_value parse_value decode_row close",
 	keying_round_trip},
 	{PROLLY_IFACE_TABLE_KEYING, "keys_and_content",
-	"open encode_row content_hash compare close", keying_keys_and_content},
-	{PROLLY_IFACE_TABLE_KEYING, "description_reopens",
-	"open describe keyless encode_row close", keying_description_reopens},
-	{PROLLY_IFACE_TABLE_KEYING, "reads_after_key_column_dropped",
-	"open describe encode_row compare decode_row close", keying_reads_dropped_key},
+	"open encode_row compare close", keying_keys_and_content},
 	{PROLLY_IFACE_TABLE_KEYING, "owns_its_memory",
 	"open encode_row decode_row close", keying_owns_its_memory},
-	{PROLLY_IFACE_TABLE_KEYING, "cannot_compare_after_key_type_dropped",
-	"open describe can_compare close", keying_compare_after_type_dropped},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",

@@ -26,19 +26,6 @@
  * not one each; the hash makes the key the row's alone.  Keys are compared
  * as bytes, so the order depends on no collation.
  *
- * A description is 'Q' for prefix-and-hash keying or 'P' for a primary
- * key, the
- * length and bytes of the value encoder's row layout, and for 'P' the
- * number of key columns and per column its attribute number, options,
- * opfamily, collation and type, in native byte order (descriptions are
- * local).  The type is recorded because a table's old rows must stay
- * readable after their key column is dropped, when the relation no longer
- * says what type it had.
- *
- * The key encoder starts the first time keys are encoded or compared: a
- * scan of old rows needs neither, and the key's type may be gone by then
- * (DROP TYPE ... CASCADE drops the column with it).
- *
  * IDENTIFICATION
  *	  src/backend/access/prolly/keying_pkprefix.c
  *
@@ -50,7 +37,6 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "utils/rel.h"
-#include "utils/syscache.h"
 
 /* How much of a row without a primary key begins its key. */
 #define KEY_PREFIX	32
@@ -105,6 +91,8 @@ static void
 setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 		  const ProllyKeyEncoderRoutine *keyenc)
 {
+	ProllyKeyDesc desc;
+
 	k->nkeys = nkeys;
 	k->key_attnos = MemoryContextAlloc(k->mcxt, sizeof(AttrNumber) * nkeys);
 	k->key_values = MemoryContextAlloc(k->mcxt, sizeof(Datum) * nkeys);
@@ -126,22 +114,12 @@ setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 		k->types[i] = cols[i].type;
 	}
 	k->keyenc_routine = keyenc;
-}
-
-static ProllyKeyEncoder *
-key_encoder(ProllyKeying *k)
-{
-	ProllyKeyDesc desc;
-
-	if (k->keyenc)
-		return k->keyenc;
-	desc.nkeys = k->nkeys;
+	desc.nkeys = nkeys;
 	desc.types = k->types;
 	desc.opfamilies = k->opfamilies;
 	desc.collations = k->collations;
 	desc.options = k->options;
-	k->keyenc = PROLLY_CALL(k->keyenc_routine, begin, &desc, k->mcxt);
-	return k->keyenc;
+	k->keyenc = PROLLY_CALL(keyenc, begin, &desc, k->mcxt);
 }
 
 /* The key columns of rel's primary key index pkoid. */
@@ -166,207 +144,51 @@ primary_key_columns(Relation rel, Oid pkoid, KeyColumn *cols)
 	return nkeys;
 }
 
-/* A parsed description; layout points into it. */
-typedef struct Description
-{
-	bool		keyless;
-	ProllyValue layout;
-	int			nkeys;
-	KeyColumn	cols[INDEX_MAX_KEYS];
-} Description;
-
-static void
-parse_description(const ProllyValue *d, Description *out)
-{
-	Size		off = 0;
-	uint16		len;
-	uint16		nkeys;
-
-	if (d->len < 1 + sizeof(uint16) ||
-		(d->data[0] != 'Q' && d->data[0] != 'P'))
-		goto bad;
-	out->keyless = (d->data[0] == 'Q');
-	off = 1;
-	memcpy(&len, d->data + off, sizeof(len));
-	off += sizeof(len);
-	if (d->len < off + len)
-		goto bad;
-	out->layout.data = d->data + off;
-	out->layout.len = len;
-	off += len;
-	out->nkeys = 0;
-	if (out->keyless)
-	{
-		if (off != d->len)
-			goto bad;
-		return;
-	}
-	if (d->len < off + sizeof(uint16))
-		goto bad;
-	memcpy(&nkeys, d->data + off, sizeof(nkeys));
-	off += sizeof(nkeys);
-	if (nkeys == 0 || nkeys > INDEX_MAX_KEYS ||
-		d->len != off + nkeys * sizeof(KeyColumn))
-		goto bad;
-	memcpy(out->cols, d->data + off, nkeys * sizeof(KeyColumn));
-	out->nkeys = nkeys;
-	return;
-
-bad:
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("invalid prolly table keying description")));
-}
-
 /*
- * Everything open() allocates, temporaries included, is in mcxt: a keying
- * is often kept longer than its caller's memory (a cache), so nothing it
- * keeps may be in the caller's.
- */
-/*
- * rewritten: encode with the table's columns as they are once its missing
- * values are cleared (k->desc is a copy without them).
+ * Rows of rel as keyed now, encoded with the table's columns as they are
+ * once its missing values are cleared (k->desc is a copy without them).
+ * Everything this allocates, temporaries included, is in mcxt: a keying is
+ * often kept longer than its caller's memory (a cache), so nothing it keeps
+ * may be in the caller's.
  */
 static ProllyKeying *
-open_keying(Relation rel, const ProllyValue *description, bool rewritten,
-			MemoryContext mcxt)
+pkprefix_open(Relation rel, MemoryContext mcxt)
 {
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyComponents c;
 	ProllyKeying *k = palloc0(sizeof(ProllyKeying));
-	Description d;
+	KeyColumn	cols[INDEX_MAX_KEYS];
+	int			nkeys;
+
+	/* Not a deferrable one: it may hold duplicates until commit. */
+	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 	prolly_components_for_relation(rel, &c);
 	k->mcxt = mcxt;
 	k->hash = c.hash;
 	k->valenc_routine = c.value_encoder;
 	k->desc = CreateTupleDescCopy(RelationGetDescr(rel));
+	k->valenc = PROLLY_CALL(c.value_encoder, begin, k->desc, mcxt);
 
-	if (description)
-	{
-		parse_description(description, &d);
-		k->valenc = PROLLY_CALL(c.value_encoder, begin_layout,
-								RelationGetDescr(rel), &d.layout, mcxt);
-	}
-	else
-	{
-		/* Not a deferrable one: it may hold duplicates until commit. */
-		Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
+	k->keyless = !OidIsValid(pkoid);
+	nkeys = k->keyless ? 0 : primary_key_columns(rel, pkoid, cols);
 
-		d.keyless = !OidIsValid(pkoid);
-		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
-
-		/*
-		 * A primary key the key encoder can't order (WITHOUT OVERLAPS, kept
-		 * by a GiST index) doesn't key the rows: they are keyed by content.
-		 */
-		for (int i = 0; i < d.nkeys && !d.keyless; i++)
-			if (!PROLLY_CALL(c.key_encoder, supports, d.cols[i].opfamily,
-							 d.cols[i].type, d.cols[i].collation))
-				d.keyless = true;
-		if (d.keyless)
-			d.nkeys = 0;
-		k->valenc = PROLLY_CALL(c.value_encoder, begin,
-								rewritten ? k->desc : RelationGetDescr(rel),
-								mcxt);
-	}
-	k->keyless = d.keyless;
+	/*
+	 * A primary key the key encoder can't order (WITHOUT OVERLAPS, kept by
+	 * a GiST index) doesn't key the rows: they are keyed by content.
+	 */
+	for (int i = 0; i < nkeys && !k->keyless; i++)
+		if (!PROLLY_CALL(c.key_encoder, supports, cols[i].opfamily,
+						 cols[i].type, cols[i].collation))
+			k->keyless = true;
 	if (!k->keyless)
-	{
-		bool		supported = true;
-
-		setup_key(k, rel, d.nkeys, d.cols, c.key_encoder);
-
-		/*
-		 * Begin the key encoder now, while the catalogs can be read: keys
-		 * may be compared next while a (sub)transaction aborts.  One whose
-		 * operator family or collation is gone is begun if it's ever needed.
-		 */
-		for (int i = 0; i < k->nkeys && supported; i++)
-			supported = SearchSysCacheExists1(TYPEOID,
-											  ObjectIdGetDatum(k->types[i])) &&
-				SearchSysCacheExists1(OPFAMILYOID,
-									  ObjectIdGetDatum(k->opfamilies[i])) &&
-				(!OidIsValid(k->collations[i]) ||
-				 SearchSysCacheExists1(COLLOID,
-									   ObjectIdGetDatum(k->collations[i]))) &&
-				PROLLY_CALL(c.key_encoder, supports, k->opfamilies[i],
-							k->types[i], k->collations[i]);
-		if (supported)
-			(void) key_encoder(k);
-	}
+		setup_key(k, rel, nkeys, cols, c.key_encoder);
 	initStringInfo(&k->layout);
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);
 	return k;
 }
 
-static ProllyKeying *
-pkprefix_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
-{
-	return open_keying(rel, description, false, mcxt);
-}
-
-static ProllyKeying *
-pkprefix_open_rewritten(Relation rel, MemoryContext mcxt)
-{
-	return open_keying(rel, NULL, true, mcxt);
-}
-
-static void
-pkprefix_describe(ProllyKeying *k, StringInfo out)
-{
-	uint16		nkeys = (uint16) k->nkeys;
-	StringInfoData layout;
-	uint16		len;
-
-	initStringInfo(&layout);
-	PROLLY_CALL(k->valenc_routine, layout, k->valenc, &layout);
-	len = (uint16) layout.len;
-	appendStringInfoChar(out, k->keyless ? 'Q' : 'P');
-	appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
-	appendBinaryStringInfo(out, layout.data, layout.len);
-	pfree(layout.data);
-	if (k->keyless)
-		return;
-	appendBinaryStringInfo(out, (const char *) &nkeys, sizeof(nkeys));
-	for (int i = 0; i < k->nkeys; i++)
-	{
-		KeyColumn	col;
-
-		memset(&col, 0, sizeof(col));
-		col.attno = k->key_attnos[i];
-		col.option = k->options[i];
-		col.opfamily = k->opfamilies[i];
-		col.collation = k->collations[i];
-		col.type = k->types[i];
-		appendBinaryStringInfo(out, (const char *) &col, sizeof(col));
-	}
-}
-
-/*
- * Rows read correctly if they are keyed the same way and the value
- * encoder reads their layout.
- */
-static bool
-pkprefix_can_read(ProllyKeying *k, const ProllyValue *description)
-{
-	Description d;
-
-	parse_description(description, &d);
-	if (d.keyless != k->keyless || d.nkeys != k->nkeys)
-		return false;
-	for (int i = 0; i < d.nkeys; i++)
-	{
-		if (d.cols[i].attno != k->key_attnos[i] ||
-			d.cols[i].opfamily != k->opfamilies[i] ||
-			d.cols[i].collation != k->collations[i] ||
-			d.cols[i].option != k->options[i] ||
-			d.cols[i].type != k->types[i])
-			return false;
-	}
-	return PROLLY_CALL(k->valenc_routine, reads_layout, k->valenc, &d.layout);
-}
 
 static bool
 pkprefix_keyless(ProllyKeying *k)
@@ -408,7 +230,7 @@ pkprefix_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 		k->key_values[i] = slot->tts_values[att];
 		k->key_isnull[i] = slot->tts_isnull[att];
 	}
-	PROLLY_CALL(k->keyenc_routine, encode, key_encoder(k), k->key_values,
+	PROLLY_CALL(k->keyenc_routine, encode, k->keyenc, k->key_values,
 				k->key_isnull, key);
 }
 
@@ -445,13 +267,6 @@ pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
 		*count = 1;
 	row->data = (const uint8 *) p;
 	row->len = end - p;
-}
-
-static void
-pkprefix_content_hash(ProllyKeying *k, const ProllyValue *row,
-					   ProllyHash *content)
-{
-	hash_row(k, row->data, row->len, content);
 }
 
 static void
@@ -492,43 +307,11 @@ pkprefix_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 	int			r;
 
 	if (!k->keyless)
-		return PROLLY_CALL(k->keyenc_routine, compare, key_encoder(k), a, b);
+		return PROLLY_CALL(k->keyenc_routine, compare, k->keyenc, a, b);
 	r = memcmp(a->data, b->data, Min(a->len, b->len));
 	if (r != 0)
 		return r;
 	return (a->len > b->len) - (a->len < b->len);
-}
-
-/*
- * Keys are ordered by their columns' btree comparison functions, which
- * need the types, operator families and collations they were recorded
- * with.
- */
-static bool
-pkprefix_can_compare(ProllyKeying *k)
-{
-	if (k->keyless)
-		return true;
-	for (int i = 0; i < k->nkeys; i++)
-	{
-		if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(k->types[i])) ||
-			!SearchSysCacheExists1(OPFAMILYOID, ObjectIdGetDatum(k->opfamilies[i])) ||
-			(OidIsValid(k->collations[i]) &&
-			 !SearchSysCacheExists1(COLLOID, ObjectIdGetDatum(k->collations[i]))))
-			return false;
-	}
-	return true;
-}
-
-/* Content hashes are equal only as bytes; key columns, as encoded. */
-static bool
-pkprefix_equal_bytes(ProllyKeying *k)
-{
-	if (k->keyless)
-		return true;
-	if (!pkprefix_can_compare(k))
-		return false;
-	return PROLLY_CALL(k->keyenc_routine, equal_bytes, key_encoder(k));
 }
 
 static void
@@ -554,17 +337,11 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 		"bytes and hash with a count for tables without one",
 	},
 	.open = pkprefix_open,
-	.describe = pkprefix_describe,
-	.open_rewritten = pkprefix_open_rewritten,
-	.can_read = pkprefix_can_read,
 	.keyless = pkprefix_keyless,
 	.encode_row = pkprefix_encode_row,
 	.make_value = pkprefix_make_value,
 	.parse_value = pkprefix_parse_value,
-	.content_hash = pkprefix_content_hash,
 	.decode_row = pkprefix_decode_row,
 	.compare = pkprefix_compare,
-	.can_compare = pkprefix_can_compare,
-	.equal_bytes = pkprefix_equal_bytes,
 	.close = pkprefix_close,
 };

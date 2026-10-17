@@ -30,10 +30,9 @@
  * fallback is slower; it is what keeps every btree opclass and collation
  * usable as a prolly key, ordered exactly as btree orders it.
  *
- * Every encoding is reversible, so decode() always succeeds.  The encodings
- * use fixed byte order, UTF-8 text and canonical value bytes, so they are
- * the same on every platform, in every cluster and in every session, and
- * hold no local OIDs.
+ * The encodings use fixed byte order, UTF-8 text and canonical value
+ * bytes, so they are the same on every platform, in every cluster and in
+ * every session, and hold no local OIDs.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/keyenc_ordered.c
@@ -88,7 +87,6 @@ struct ProllyKeyEncoder
 {
 	int			ncols;
 	bool		all_memcmp;
-	bool		equal_bytes;	/* equal keys are the same bytes */
 	KeyColumn  *cols;
 };
 
@@ -199,23 +197,6 @@ classify(Oid opfamily, Oid type, Oid collation, ColumnKind *kind,
 	return true;
 }
 
-/*
- * Does equality under the opfamily imply equal values, byte for byte
- * (btree's "equalimage" support function, as deduplication asks)?  Then
- * equal values encode to the same bytes, since encodings are functions of
- * the value.  memcmp-ordered columns need no asking.
- */
-static bool
-equal_image(Oid opfamily, Oid base, Oid collation)
-{
-	Oid			proc = get_opfamily_proc(opfamily, base, base, BTEQUALIMAGE_PROC);
-
-	if (!OidIsValid(proc))
-		return false;
-	return DatumGetBool(OidFunctionCall1Coll(proc, collation,
-											 ObjectIdGetDatum(base)));
-}
-
 static bool
 ordered_supports(Oid opfamily, Oid type, Oid collation)
 {
@@ -234,7 +215,6 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 	enc->ncols = desc->nkeys;
 	enc->cols = MemoryContextAllocZero(mcxt, sizeof(KeyColumn) * desc->nkeys);
 	enc->all_memcmp = true;
-	enc->equal_bytes = true;
 
 	for (int i = 0; i < desc->nkeys; i++)
 	{
@@ -258,8 +238,6 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 		{
 			enc->all_memcmp = false;
 			fmgr_info_cxt(cmpproc, &col->cmp, mcxt);
-			if (!equal_image(desc->opfamilies[i], base, col->collation))
-				enc->equal_bytes = false;
 		}
 		if (col->kind == KIND_SEND)
 			col->codec = prolly_datum_codec(desc->types[i], -1, mcxt);
@@ -469,26 +447,6 @@ segment_value(const KeyColumn *col, const Segment *seg)
 	return (Datum) 0;			/* keep compiler quiet */
 }
 
-static bool
-ordered_decode(ProllyKeyEncoder *enc, const ProllyKey *key, Datum *values,
-			   bool *isnull)
-{
-	const uint8 *p = key->data;
-	const uint8 *end = key->data + key->len;
-
-	for (int i = 0; i < enc->ncols; i++)
-	{
-		Segment		seg;
-
-		next_segment(&enc->cols[i], &p, end, &seg);
-		isnull[i] = seg.marker != MARKER_VALUE;
-		values[i] = isnull[i] ? (Datum) 0 : segment_value(&enc->cols[i], &seg);
-	}
-	if (p != end)
-		elog(ERROR, "prolly key has %d bytes after its last column", (int) (end - p));
-	return true;
-}
-
 static int
 compare_bytes(const uint8 *a, uint32 alen, const uint8 *b, uint32 blen)
 {
@@ -547,29 +505,6 @@ ordered_compare(ProllyKeyEncoder *enc, const ProllyKey *a, const ProllyKey *b)
 	return 0;
 }
 
-static uint32
-ordered_prefix_length(ProllyKeyEncoder *enc, const ProllyKey *key, int ncols)
-{
-	const uint8 *p = key->data;
-	const uint8 *end = key->data + key->len;
-
-	if (ncols < 0 || ncols > enc->ncols)
-		elog(ERROR, "prolly key prefix of %d columns out of %d", ncols, enc->ncols);
-	for (int i = 0; i < ncols; i++)
-	{
-		Segment		seg;
-
-		next_segment(&enc->cols[i], &p, end, &seg);
-	}
-	return p - key->data;
-}
-
-static bool
-ordered_equal_bytes(ProllyKeyEncoder *enc)
-{
-	return enc->equal_bytes;
-}
-
 static void
 ordered_end(ProllyKeyEncoder *enc)
 {
@@ -589,9 +524,6 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.supports = ordered_supports,
 	.begin = ordered_begin,
 	.encode = ordered_encode,
-	.decode = ordered_decode,
 	.compare = ordered_compare,
-	.equal_bytes = ordered_equal_bytes,
-	.prefix_length = ordered_prefix_length,
 	.end = ordered_end,
 };
