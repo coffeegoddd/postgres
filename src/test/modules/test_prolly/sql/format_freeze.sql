@@ -40,6 +40,9 @@ CREATE TABLE frozen.composite (id int PRIMARY KEY, p frozen.pair, a int[], ta te
 INSERT INTO frozen.composite
 SELECT g, ROW(g, 'p' || g)::frozen.pair, ARRAY[g, g + 1, NULL], ARRAY['a', NULL, 'c' || g]
 FROM generate_series(1, 300) g;
+-- A table without a primary key: its rows keyed by their first 32 encoded
+-- bytes, then their content's hash ("keys: content prefix and hash" in its
+-- definition, which a table keyed by the hash alone, as before, lacks).
 CREATE TABLE frozen.keyless (a int, b text);
 INSERT INTO frozen.keyless SELECT g % 10, 'same' FROM generate_series(1, 500) g;
 

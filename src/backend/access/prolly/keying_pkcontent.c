@@ -13,15 +13,21 @@
  *
  * A table without one (as in Dolt's keyless tables):
  *
- *	key		the row's content hash
+ *	key		"pk_or_content": the row's content hash; "pk_or_prefix": the
+ *			first KEY_PREFIX bytes of the encoded row (all of it if
+ *			shorter), then its content hash
  *	value	varint count of identical rows, then the row
  *
  * so identical rows are one item, and the tree depends only on which rows
  * the table holds, not on the order they were inserted in.  A row's
  * content hash is the content-hash implementation's digest of its encoded
- * row.
+ * row.  The prefix keeps rows that begin alike (on their first columns)
+ * together in the tree, so a change to a run of them changes a few chunks,
+ * not one each; the hash makes the key the row's alone.  Keys are compared
+ * as bytes, so the order depends on no collation.
  *
- * A description is 'C' for content keying or 'P' for a primary key, the
+ * A description is 'C' for content-hash keying, 'Q' for prefix-and-hash
+ * keying, or 'P' for a primary key, the
  * length and bytes of the value encoder's row layout, and for 'P' the
  * number of key columns and per column its attribute number, options,
  * opfamily, collation and type, in native byte order (descriptions are
@@ -46,6 +52,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* How much of a row without a primary key begins its key. */
+#define KEY_PREFIX	32
+
 struct ProllyKeying
 {
 	MemoryContext mcxt;
@@ -61,6 +70,7 @@ struct ProllyKeying
 
 	/* Primary key, if any. */
 	bool		keyless;
+	bool		prefixed;		/* keyless keys begin with the row's bytes */
 	const ProllyKeyEncoderRoutine *keyenc_routine;
 	ProllyKeyEncoder *keyenc;
 	int			nkeys;
@@ -161,6 +171,7 @@ primary_key_columns(Relation rel, Oid pkoid, KeyColumn *cols)
 typedef struct Description
 {
 	bool		keyless;
+	bool		prefixed;
 	ProllyValue layout;
 	int			nkeys;
 	KeyColumn	cols[INDEX_MAX_KEYS];
@@ -173,9 +184,11 @@ parse_description(const ProllyValue *d, Description *out)
 	uint16		len;
 	uint16		nkeys;
 
-	if (d->len < 1 + sizeof(uint16) || (d->data[0] != 'C' && d->data[0] != 'P'))
+	if (d->len < 1 + sizeof(uint16) ||
+		(d->data[0] != 'C' && d->data[0] != 'Q' && d->data[0] != 'P'))
 		goto bad;
-	out->keyless = (d->data[0] == 'C');
+	out->keyless = (d->data[0] != 'P');
+	out->prefixed = (d->data[0] == 'Q');
 	off = 1;
 	memcpy(&len, d->data + off, sizeof(len));
 	off += sizeof(len);
@@ -219,7 +232,7 @@ bad:
  */
 static ProllyKeying *
 open_keying(Relation rel, const ProllyValue *description, bool rewritten,
-			MemoryContext mcxt)
+			bool prefixed, MemoryContext mcxt)
 {
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyComponents c;
@@ -244,6 +257,7 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 		Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 		d.keyless = !OidIsValid(pkoid);
+		d.prefixed = prefixed;
 		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
 
 		/*
@@ -261,6 +275,7 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 								mcxt);
 	}
 	k->keyless = d.keyless;
+	k->prefixed = d.keyless && d.prefixed;
 	if (!k->keyless)
 	{
 		bool		supported = true;
@@ -294,13 +309,25 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 static ProllyKeying *
 pkcontent_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 {
-	return open_keying(rel, description, false, mcxt);
+	return open_keying(rel, description, false, false, mcxt);
 }
 
 static ProllyKeying *
 pkcontent_open_rewritten(Relation rel, MemoryContext mcxt)
 {
-	return open_keying(rel, NULL, true, mcxt);
+	return open_keying(rel, NULL, true, false, mcxt);
+}
+
+static ProllyKeying *
+pkprefix_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
+{
+	return open_keying(rel, description, false, true, mcxt);
+}
+
+static ProllyKeying *
+pkprefix_open_rewritten(Relation rel, MemoryContext mcxt)
+{
+	return open_keying(rel, NULL, true, true, mcxt);
 }
 
 static void
@@ -313,7 +340,7 @@ pkcontent_describe(ProllyKeying *k, StringInfo out)
 	initStringInfo(&layout);
 	PROLLY_CALL(k->valenc_routine, layout, k->valenc, &layout);
 	len = (uint16) layout.len;
-	appendStringInfoChar(out, k->keyless ? 'C' : 'P');
+	appendStringInfoChar(out, !k->keyless ? 'P' : k->prefixed ? 'Q' : 'C');
 	appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
 	appendBinaryStringInfo(out, layout.data, layout.len);
 	pfree(layout.data);
@@ -344,7 +371,8 @@ pkcontent_can_read(ProllyKeying *k, const ProllyValue *description)
 	Description d;
 
 	parse_description(description, &d);
-	if (d.keyless != k->keyless || d.nkeys != k->nkeys)
+	if (d.keyless != k->keyless || d.nkeys != k->nkeys ||
+		(d.keyless && d.prefixed != k->prefixed))
 		return false;
 	for (int i = 0; i < d.nkeys; i++)
 	{
@@ -375,6 +403,9 @@ pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 
 	if (k->keyless)
 	{
+		if (k->prefixed)
+			appendBinaryStringInfo(key, row->data + start,
+								   Min(row->len - start, KEY_PREFIX));
 		appendBinaryStringInfo(key, content->bytes, content->len);
 		return;
 	}
@@ -533,6 +564,31 @@ const ProllyKeyingRoutine prolly_keying_pk_or_content = {
 	.open = pkcontent_open,
 	.describe = pkcontent_describe,
 	.open_rewritten = pkcontent_open_rewritten,
+	.can_read = pkcontent_can_read,
+	.keyless = pkcontent_keyless,
+	.encode_row = pkcontent_encode_row,
+	.make_value = pkcontent_make_value,
+	.parse_value = pkcontent_parse_value,
+	.content_hash = pkcontent_content_hash,
+	.decode_row = pkcontent_decode_row,
+	.compare = pkcontent_compare,
+	.can_compare = pkcontent_can_compare,
+	.equal_bytes = pkcontent_equal_bytes,
+	.close = pkcontent_close,
+};
+
+const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
+	.info = {
+		.iface = PROLLY_IFACE_TABLE_KEYING,
+		.impl_id = 2,
+		.format_version = 1,
+		.name = "pk_or_prefix",
+		.description = "keyed by the primary key, or by row content's first "
+		"bytes and hash with a count for tables without one",
+	},
+	.open = pkprefix_open,
+	.describe = pkcontent_describe,
+	.open_rewritten = pkprefix_open_rewritten,
 	.can_read = pkcontent_can_read,
 	.keyless = pkcontent_keyless,
 	.encode_row = pkcontent_encode_row,

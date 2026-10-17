@@ -283,8 +283,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->rel = rel;
 	f->snap = GetActiveSnapshot();
 	f->tree = prolly_tree_lookup("cow");
-	f->kr = (const ProllyKeyingRoutine *)
-		prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_content");
+	f->kr = prolly_history_keying();
 	/*
 	 * Rows as a rewrite leaves them: a column added with a default is in
 	 * every row (the scan gives its missing value), so whether the table was

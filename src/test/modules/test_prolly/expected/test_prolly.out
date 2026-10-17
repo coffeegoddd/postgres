@@ -55,6 +55,7 @@ FROM prolly_implementations();
  root_layout     | subroots         |       1 |              3
  root_layout     | stub             |       0 |              0
  table_keying    | pk_or_content    |       1 |              2
+ table_keying    | pk_or_prefix     |       2 |              1
  table_keying    | stub             |       0 |              0
  index_keying    | columns_then_row |       1 |              1
  index_keying    | stub             |       0 |              0
@@ -69,12 +70,13 @@ FROM prolly_implementations();
  table_file      | stub             |       0 |              0
  change_finder   | pages            |       1 |              3
  change_finder   | stub             |       0 |              0
-(60 rows)
+(61 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
+NOTICE:  drop cascades to column m of table conf_kt
 NOTICE:  drop cascades to column m of table conf_kt
     interface    |  implementation  |                  test                   |                                                                                                      result                                                                                                       
 -----------------+------------------+-----------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -388,6 +390,14 @@ NOTICE:  drop cascades to column m of table conf_kt
  table_keying    | pk_or_content    | owns_its_memory                         | pass
  table_keying    | pk_or_content    | cannot_compare_after_key_type_dropped   | pass
  table_keying    | pk_or_content    | complete                                | pass
+ table_keying    | pk_or_prefix     | identity                                | pass
+ table_keying    | pk_or_prefix     | round_trip                              | pass
+ table_keying    | pk_or_prefix     | keys_and_content                        | pass
+ table_keying    | pk_or_prefix     | description_reopens                     | pass
+ table_keying    | pk_or_prefix     | reads_after_key_column_dropped          | pass
+ table_keying    | pk_or_prefix     | owns_its_memory                         | pass
+ table_keying    | pk_or_prefix     | cannot_compare_after_key_type_dropped   | pass
+ table_keying    | pk_or_prefix     | complete                                | pass
  table_keying    | stub             | identity                                | pass
  table_keying    | stub             | round_trip                              | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying    | stub             | keys_and_content                        | not implemented (missing open, encode_row, content_hash, compare, close)
@@ -430,7 +440,7 @@ NOTICE:  drop cascades to column m of table conf_kt
  change_finder   | pages            | complete                                | pass
  change_finder   | stub             | identity                                | pass
  change_finder   | stub             | complete                                | not implemented (3 of 3 callbacks missing)
-(352 rows)
+(360 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

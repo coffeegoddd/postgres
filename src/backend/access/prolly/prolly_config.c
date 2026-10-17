@@ -94,10 +94,12 @@ static const ProllyProfile history_profile =
 		[PROLLY_IFACE_CONTENT_HASH] = "sha256",
 		[PROLLY_IFACE_KEY_ENCODER] = "ordered",
 		[PROLLY_IFACE_VALUE_ENCODER] = "canonical",
-		[PROLLY_IFACE_TABLE_KEYING] = "pk_or_content",
+		[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",
 		[PROLLY_IFACE_INDEX_KEYING] = "columns_then_row",
 		[PROLLY_IFACE_TREE] = "cow",
 }};
+
+
 
 static const char *const database_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_REFS] = "tree",
@@ -215,6 +217,14 @@ prolly_note_tablespace(Oid amoid, const char *tablespacename)
 				 errdetail("Their rows are kept in the cluster's node store.")));
 	if (amname)
 		pfree(amname);
+}
+
+/* How the history of page-based prolly tables keys their rows. */
+const ProllyKeyingRoutine *
+prolly_history_keying(void)
+{
+	return (const ProllyKeyingRoutine *)
+		profile_impl(history_profile.impls, PROLLY_IFACE_TABLE_KEYING);
 }
 
 void
