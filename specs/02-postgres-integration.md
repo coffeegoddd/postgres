@@ -1,5 +1,11 @@
 # 02. Integrating with Postgres
 
+**Status: largely history.** This was written for engines that keep rows in
+prolly trees. The page design (`11-pages-and-dolt-snapshots.md`) keeps rows
+in heap's pages, so the engine-specific rows below and section C describe
+D1, removed on 2026-10-17 (tag `prolly-d1`). Section B records what the
+fork patched for D1; the page design's core changes are in spec 11.
+
 Every engine in `04-candidate-designs.md` must satisfy these interfaces. They
 are written in terms of the coordination-in-the-tree candidate (option 8 in
 `01-context.md`), but most apply to all candidates. Line numbers were checked

@@ -30,7 +30,8 @@ distributions.
 
 "Ours (required)" is the bound we must meet; "aim" is where the design can
 do better than Dolt. Two status columns: D1's, as of 2026-10-14, kept as
-the record of what that design met; and the page design's
+the record of what that design met (D1 was removed on 2026-10-17; tag
+`prolly-d1`); and the page design's
 (`11-pages-and-dolt-snapshots.md`), as of 2026-10-17, from the PRs that
 built it and the measurements in `13-keyless-tables.md`. For the
 page design (`11-pages-and-dolt-snapshots.md`), built through its step 5 on
