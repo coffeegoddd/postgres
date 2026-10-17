@@ -1,0 +1,24 @@
+@step load 1
+%LOAD%;
+@step create_index 1
+CREATE INDEX t_a ON t (a);
+@setup
+%ANALYZE%;
+@step point_update 20
+UPDATE t SET c = c + 1 WHERE a = 200000 + {i};
+@step dup_update 20
+UPDATE t SET c = c + 1 WHERE a = 1000 + {i};
+@step point_insert 20
+INSERT INTO t VALUES (2000000 + {i}, 'new', 1);
+@step point_delete 20
+DELETE FROM t WHERE a = 300000 + {i};
+@step range_update_10k 3
+UPDATE t SET c = c + 1 WHERE a BETWEEN 400000 + {i} * 10000 AND 409999 + {i} * 10000;
+@step range_delete_10k 3
+DELETE FROM t WHERE a BETWEEN 500000 + {i} * 10000 AND 509999 + {i} * 10000;
+@step insert_select_10k 3
+INSERT INTO t SELECT a + 3000000 + {i} * 1000000, b, c FROM t WHERE a BETWEEN 600000 AND 609999;
+@step scan_count 5
+SELECT count(*), sum(c) FROM t;
+@step distinct_rows 3
+SELECT count(*) FROM (SELECT DISTINCT a, b, c FROM t) d;
