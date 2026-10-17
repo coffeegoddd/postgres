@@ -563,7 +563,7 @@ fails without its fix), and Postgres's suites keep passing after each one.
   commit; the check for shared dependencies (part 1).
 - **Exit:** V4.
 
-**Step 7. Reclamation.** Proposed in part 8, not decided.
+**Step 7. Reclamation.** Designed in part 8 (decided 2026-10-17).
 - Chunk-store GC with WAL (table files, `oldgen`, journal retirement);
   page-set and physical-page reclamation; the fold epoch's retained page
   versions.
@@ -1191,10 +1191,10 @@ overwritten by a clone; a bounded seen set; and the transfer from known
 heads, one round trip for a line of new commits.
 
 
-## 8. Step 7 design: reclamation (proposed)
+## 8. Step 7 design: reclamation
 
-**Status: proposed, 2026-10-17; nothing here is decided.** 8.9 lists what
-is the user's to decide.
+**Status: decided by the user, 2026-10-17, as recommended** (8.9 lists
+the decisions); not built.
 
 Two stores reclaim space: the chunk store, whose history grows with every
 commit and never shrinks today (a commit's changed chunks, every root the
@@ -1395,23 +1395,21 @@ manifest's own record at the end of recovery, not by deleting what no
 process has open; standby conflicts as VACUUM's; one manifest with
 settled files, not a second store.
 
-### 8.9 For the user to decide
+### 8.9 Decisions
 
-1. **Online, by seal, horizon and append check** (8.2, 8.3), or a GC that
-   holds every writer off for its whole run (D1's `prolly_gc()` does).
-   Recommended: online.
-2. **The append check** on every batch of chunks (an index lookup per
-   reference), or only on a commit's root, as Dolt. Recommended: every
-   batch; it is what lets a GC be online without a hook on reads.
+Decided by the user on 2026-10-17, each as recommended:
+
+1. **Online:** by seal, horizon and append check (8.2, 8.3), not a GC
+   that holds every writer off for its run.
+2. **The append check** on every batch of chunks, not only on a commit's
+   root (8.2); step 8 measures its cost against a fold's.
 3. **Generations:** a default GC that stops at settled files, and a full
-   one, or every GC full. Recommended: both.
-4. **Automatic GC by autovacuum**, on by default (as Dolt's is), or by
-   hand only. Recommended: autovacuum, on.
-5. **Unreachable commits** collected at the next GC (Dolt), or kept for a
-   grace period (git's `gc.pruneExpire`). Recommended: collected; a
-   reflog, if wanted, is its own decision.
+   one (8.4).
+4. **Automatic GC by autovacuum,** on by default (8.5).
+5. **Unreachable commits** are collected at the next GC; a reflog, if
+   wanted, is its own decision (8.1).
 6. **The page sweep** holds off branch creation in its database while it
-   reads the maps. Recommended.
+   reads the maps (8.6).
 
 ### 8.10 Building it
 
