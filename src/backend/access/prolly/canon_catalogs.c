@@ -2571,9 +2571,13 @@ unsupported:
 /*
  * The definitions of base, ours and theirs merged: each object as the side
  * that changed it since base has it (ours if neither, or both alike).  An
- * object both changed differently is a schema conflict, and fails.  The
- * root's tables name ours' rows, or theirs' for tables only theirs has:
- * the definitions are what count.
+ * object both changed differently is a schema conflict, and fails; so is a
+ * schema one side dropped that the other put objects in.  Only the
+ * definitions count: a table's item is the side's it was taken from, its
+ * rows that side's, which the merge doesn't use (it merges the rows
+ * itself).  Collations' items aren't definitions, but what the fold
+ * recorded of them: either side's will do, the merge commit's fold
+ * recording them as they are then.
  */
 static void
 folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_root,
@@ -2585,6 +2589,9 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	ProllyKey	k[3];
 	ProllyValue v[3];
 	ProllyTreeBuilder *b;
+	List	   *dropped = NIL;	/* schemas the merge drops */
+	List	   *kept = NIL;		/* the names of the objects it keeps */
+	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
@@ -2632,6 +2639,10 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 #undef SAME
 		if (take)
 			PROLLY_CALL(cn.tree, build_add, b, least, take);
+		if (least->data[0] == 'n' && has[0] && !take)
+			dropped = lappend(dropped, from_utf8(least->data + 2, least->len - 2));
+		else if (take && least->data[0] != 'n' && least->data[0] != 'c')
+			kept = lappend(kept, from_utf8(least->data + 2, least->len - 2));
 
 		/* (the least key last: the others point into its cursor's node) */
 		for (int i = 0; i < 3; i++)
@@ -2644,6 +2655,15 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	PROLLY_CALL(cn.tree, build_finish, b, merged);
 	for (int i = 0; i < 3; i++)
 		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
+
+	/* a schema dropped on one side, given objects on the other */
+	foreach(lc, kept)
+		if (list_has_string(dropped, schema_of(lfirst(lc))))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
+							schema_of(lfirst(lc)), (char *) lfirst(lc)),
+					 errdetail("Dropping it would drop what the other side made in it.")));
 }
 
 const ProllyCanonRoutine prolly_canon_folded = {

@@ -100,6 +100,96 @@ SELECT (dolt_merge('sg_side'))[2:4];
 SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sg\_%' ORDER BY 1;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
 SELECT dolt_branch('-D', 'sg_side');
+
+-- A table theirs made again (an identity added) keeps ours' rows.
+CREATE SCHEMA mr VERSIONED;
+CREATE TABLE mr.t (id int NOT NULL PRIMARY KEY, v text);
+INSERT INTO mr.t VALUES (1, 'a'), (2, 'b');
+CREATE TABLE mr.u (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mr base')::text) AS committed;
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+ALTER TABLE mr.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;
+SELECT length(dolt_commit('-Am', 'identity')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO mr.u VALUES (1);
+SELECT length(dolt_commit('-Am', 'mr main')::text) AS committed;
+SELECT (dolt_merge('mr_side'))[2:4];
+SELECT * FROM mr.t ORDER BY id;
+
+-- A table both sides made alike merges its rows three-way.
+SELECT dolt_branch('-D', 'mr_side');
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+CREATE TABLE mr.both (k int PRIMARY KEY);
+INSERT INTO mr.both VALUES (2);
+SELECT length(dolt_commit('-Am', 'side makes both')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE mr.both (k int PRIMARY KEY);
+INSERT INTO mr.both VALUES (1);
+SELECT length(dolt_commit('-Am', 'main makes both')::text) AS committed;
+SELECT (dolt_merge('mr_side'))[2:4];
+SELECT * FROM mr.both ORDER BY k;
+
+-- The other side's rows, taken into a table one side redefined, must fit
+-- it as it is defined now: ours narrows a column, theirs adds a row too
+-- long for it.
+SELECT dolt_branch('-D', 'mr_side');
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+INSERT INTO mr.u VALUES (2);
+INSERT INTO mr.t OVERRIDING SYSTEM VALUE VALUES (3, 'abcdefghij');
+SELECT length(dolt_commit('-Am', 'a long one')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ALTER TABLE mr.t ALTER COLUMN v TYPE varchar(5);
+SELECT length(dolt_commit('-Am', 'narrowed')::text) AS committed;
+SELECT (dolt_merge('mr_side'))[2:4];
+SELECT max(length(v)) FROM mr.t;
+
+-- A sequence ours dropped, whose value theirs changed: dropped.
+SELECT dolt_branch('-D', 'mr_side');
+CREATE SEQUENCE mr.s;
+SELECT length(dolt_commit('-Am', 'mr.s')::text) AS committed;
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+SELECT nextval('mr.s');
+SELECT length(dolt_commit('-Am', 'side takes a value')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+DROP SEQUENCE mr.s;
+SELECT length(dolt_commit('-Am', 'main drops it')::text) AS committed;
+SELECT (dolt_merge('mr_side'))[2:4];
+SELECT to_regclass('mr.s') IS NULL AS dropped;
+
+-- What one side dropped that the other side's new objects use is a schema
+-- conflict: a schema with a new table in it, a function a new view calls.
+SELECT dolt_branch('-D', 'mr_side');
+CREATE SCHEMA mr_gone VERSIONED;
+CREATE FUNCTION mr.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+SELECT length(dolt_commit('-Am', 'mr_gone, twice')::text) AS committed;
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+DROP SCHEMA mr_gone;
+SELECT length(dolt_commit('-Am', 'side drops mr_gone')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE mr_gone.x (id int PRIMARY KEY);
+INSERT INTO mr_gone.x VALUES (1);
+SELECT length(dolt_commit('-Am', 'main fills mr_gone')::text) AS committed;
+SELECT dolt_merge('mr_side');
+SELECT * FROM mr_gone.x;
+SELECT dolt_branch('-D', 'mr_side');
+DROP SCHEMA mr_gone CASCADE;
+SELECT length(dolt_commit('-Am', 'without mr_gone')::text) AS committed;
+SELECT dolt_branch('mr_side');
+SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
+DROP FUNCTION mr.twice(int);
+SELECT length(dolt_commit('-Am', 'side drops twice')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE VIEW mr.tv AS SELECT mr.twice(id) AS d FROM mr.u;
+SELECT length(dolt_commit('-Am', 'main uses twice')::text) AS committed;
+SELECT dolt_merge('mr_side');
+SELECT dolt_branch('-D', 'mr_side');
+DROP SCHEMA mr CASCADE;
+SELECT length(dolt_commit('-Am', 'without mr')::text) AS committed;
 DROP SCHEMA sg_new CASCADE;
 DROP SCHEMA sg_new_empty;
 DROP SCHEMA app CASCADE;
