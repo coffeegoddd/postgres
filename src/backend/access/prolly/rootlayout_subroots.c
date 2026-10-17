@@ -370,14 +370,17 @@ subroots_walk(const ProllyRootEnv *env, const ProllyNodeRef *root,
 	ProllyTreeEnv tenv;
 
 	layout_env(env, &tenv);
-	PROLLY_CALL(env->tree, walk, &tenv, root, visit, arg);
+	/* (a root or subroot the visitor declines: it has seen what it names) */
+	if (!PROLLY_CALL(env->tree, walk, &tenv, root, visit, arg))
+		return;
 	for (int s = 0; s < PROLLY_NUM_SUBROOTS; s++)
 	{
 		ProllyNodeRef subroot;
 		WalkTrees	w = {0};
 
 		subroots_subroot(env, root, (ProllySubRoot) s, &subroot);
-		PROLLY_CALL(env->tree, walk, &tenv, &subroot, visit, arg);
+		if (!PROLLY_CALL(env->tree, walk, &tenv, &subroot, visit, arg))
+			continue;
 
 		/* Collect first, so the cursor isn't held open across long walks. */
 		scan_subroot(env, &subroot, (ProllySubRoot) s, collect_tree, &w);

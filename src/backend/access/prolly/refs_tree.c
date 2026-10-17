@@ -898,7 +898,8 @@ tree_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 	ListCell   *lc;
 
 	refs_init();
-	PROLLY_CALL(comps.tree, walk, &env, refs, visit, arg);
+	if (!PROLLY_CALL(comps.tree, walk, &env, refs, visit, arg))
+		return;
 	c = PROLLY_CALL(comps.tree, cursor_open, &env, refs, CurrentMemoryContext);
 	PROLLY_CALL(comps.tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(comps.tree, cursor_next, c, &k, &v))
@@ -923,7 +924,10 @@ tree_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 
 		CHECK_FOR_INTERRUPTS();
 		ref_of(&pair[0], &ref);
-		PROLLY_CALL(comps.tree, walk, &env, &ref, visit, arg);
+
+		/* (a commit the visitor declines: it has seen its roots) */
+		if (!PROLLY_CALL(comps.tree, walk, &env, &ref, visit, arg))
+			continue;
 		initStringInfo(&rv);
 		if (read_item(&ref, "root", &rv))
 		{

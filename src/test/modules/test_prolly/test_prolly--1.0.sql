@@ -223,6 +223,11 @@ CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The value of the refs' entry key (a tag, then a name).
+CREATE FUNCTION test_refs_value(key text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- How many nodes the refs' walk visits, one node (by hash) declined.
 CREATE FUNCTION test_refs_walk_count(declined text)
 RETURNS int8
