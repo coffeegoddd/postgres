@@ -276,7 +276,12 @@ measured yet.
 
 Prolly again, the same runs on a release build of `a2c14b4b68`: #149's
 keying (a keyless row's first 32 encoded bytes, then its hash) and #150's
-merge rule, over #141 and #142 with their reviews' fixes. Times in ms:
+merge rule, over #141 and #142 with their reviews' fixes. (#149's review
+since moved the prefix to start after the row's column count and NULLs,
+so rows cluster whatever their NULLs; this table's rows have none, so
+the keys group as measured here. The format is recorded in each folded
+root, "!:format", and a root keyed as before has its tables' rows
+unreadable.) Times in ms:
 
 | Operation | Prolly keyless (part 6) | Now | Prolly keyed (part 6) | Now |
 |---|---|---|---|---|
