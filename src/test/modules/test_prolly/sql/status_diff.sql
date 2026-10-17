@@ -95,3 +95,39 @@ DROP TABLE app."я";
 SELECT * FROM dolt_status ORDER BY table_name;
 \c contrib_regression
 DROP DATABASE sd_win1251;
+
+-- Reading what changed doesn't need what a commit does: objects the
+-- canonical form doesn't describe yet (a partitioned table, an aggregate,
+-- a policy) are left out of status and diff, and only a commit refuses
+-- them.
+CREATE SCHEMA sdu VERSIONED;
+CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
+CREATE TABLE sdu.p (id int) PARTITION BY RANGE (id);
+CREATE AGGREGATE sdu.total (int) (sfunc = int4pl, stype = int);
+CREATE POLICY sdu_own ON sdu.t USING (true);
+INSERT INTO sdu.t VALUES (1, 'one');
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
+SELECT name, dirty FROM dolt_branches WHERE name = 'main';
+SELECT dolt_commit('-am', 'refused');
+DROP SCHEMA sdu CASCADE;
+SELECT length(dolt_commit('-Am', 'sdu gone')::text) AS committed;
+
+-- A diff of one table reads that table's changes alone, however many
+-- others changed.
+CREATE SCHEMA sdo VERSIONED;
+CREATE TABLE sdo.one (id int PRIMARY KEY, v text);
+CREATE TABLE sdo.other (id int PRIMARY KEY, v text);
+INSERT INTO sdo.one VALUES (1, 'a');
+INSERT INTO sdo.other SELECT g, 'x' FROM generate_series(1, 5000) g;
+SELECT length(dolt_commit('-Am', 'sdo')::text) AS committed;
+UPDATE sdo.one SET v = 'b';
+UPDATE sdo.other SET v = 'y';
+SELECT count(*) AS reset FROM test_fold_counters(true);
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdo.one);
+SELECT pages < 10 AS only_its_pages, full_tables FROM test_fold_counters(true);
+SELECT count(*) FROM dolt_diff('WORKING', 'WORKING', NULL::sdo.one);
+SELECT pages < 10 AS only_its_pages FROM test_fold_counters(true);
+DROP SCHEMA sdo CASCADE;
+SELECT length(dolt_commit('-Am', 'sdo gone')::text) AS committed;

@@ -90,7 +90,6 @@ typedef struct Table
 	char	   *utf8;			/* the same in UTF-8, as the canonical tree
 								 * orders them */
 	ProllyNodeRef data;
-	ProllyHash	description;	/* of its definition */
 	char	   *text;			/* the definition, as described */
 	int			textlen;
 	char	   *unreadable;		/* why its rows can't be read here, or NULL */
@@ -121,13 +120,14 @@ components(void)
 static void
 chunk_env(ProllyTreeEnv *env)
 {
-	memset(env, 0, sizeof(*env));
-	env->chunk_format = prolly_chunkformat_lookup("basic");
-	env->chunker = prolly_chunker_lookup("bytes");
-	env->hash = prolly_hash_lookup("sha256");
-	env->chunk_store = prolly_chunk_store();
-	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
-							  MyDatabaseTableSpace);
+	prolly_folded_tree_env(env);
+	env->compare = NULL;
+}
+
+static bool
+is_working(const char *ref)
+{
+	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
 }
 
 /* The canonical root of a ref: a commit's, or WORKING folded now. */
@@ -138,7 +138,7 @@ root_of(const char *ref, ProllyNodeRef *root)
 	ProllyHash	id;
 	ProllyCommitInfo info;
 
-	if (strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0)
+	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
 		return;
@@ -157,8 +157,6 @@ add_table(const char *name, const ProllyNodeRef *data,
 {
 	Tables	   *ts = arg;
 	Table	   *t = palloc(sizeof(Table));
-	const ProllyHashRoutine *h = prolly_hash_lookup("sha256");
-	ProllyHashCtx *ctx = PROLLY_CALL(h, begin, CurrentMemoryContext);
 
 	/* (the canonical tree's names are UTF-8; the catalogs' the server's) */
 	t->name = pstrdup(pg_any_to_server(name, strlen(name), PG_UTF8));
@@ -170,18 +168,23 @@ add_table(const char *name, const ProllyNodeRef *data,
 	memcpy(t->text, description->data, description->len);
 	t->text[description->len] = '\0';
 	t->textlen = description->len;
-	PROLLY_CALL(h, update, ctx, description->data, description->len);
-	PROLLY_CALL(h, finish, ctx, &t->description);
 	ts->tables = lappend(ts->tables, t);
 }
 
+/*
+ * A ref's tables, to read: WORKING's read (objects a commit would refuse
+ * left out), only relid's rows if it is valid.
+ */
 static List *
-tables_of(const char *ref)
+tables_of(const char *ref, Oid relid)
 {
 	ProllyNodeRef root;
 	Tables		ts = {NIL};
 
-	root_of(ref, &root);
+	if (is_working(ref))
+		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid, &root);
+	else
+		root_of(ref, &root);
 	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
 	return ts.tables;
 }
@@ -190,6 +193,13 @@ static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+/* The same definition, as described. */
+static bool
+same_description(const Table *a, const Table *b)
+{
+	return a->textlen == b->textlen && memcmp(a->text, b->text, a->textlen) == 0;
 }
 
 static Table *
@@ -312,12 +322,6 @@ table_name(Oid relid)
  * ------------------------------------------------------------------------
  */
 
-static int
-name_cmp(const ListCell *a, const ListCell *b)
-{
-	return strcmp(lfirst(a), lfirst(b));
-}
-
 /*
  * Does any table (relid's, if it's valid) differ between versions from and
  * to, in its rows or its definition, or is in one alone?
@@ -354,28 +358,90 @@ tables_differ(List *from, List *to, Oid relid)
  * Every table the session branch has: tables only in other versions can't
  * be read as rows here (tables() names them).
  */
+/* A table of either side of a diff, with its versions. */
+typedef struct DiffTable
+{
+	const char *name;
+	Table	   *from;
+	Table	   *to;
+	Table	   *now;
+} DiffTable;
+
+static int
+diff_table_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((DiffTable *) lfirst(a))->name, ((DiffTable *) lfirst(b))->name);
+}
+
+/*
+ * The tables of from and to, each with its versions in from, to and now:
+ * the lists merged (each in the canonical tree's order), then sorted by
+ * name.
+ */
+static List *
+diff_tables(List *from, List *to, List *now)
+{
+	List	   *out = NIL;
+	ListCell   *a = list_head(from);
+	ListCell   *b = list_head(to);
+	ListCell   *n = list_head(now);
+
+	while (a || b)
+	{
+		Table	   *ta = a ? lfirst(a) : NULL;
+		Table	   *tb = b ? lfirst(b) : NULL;
+		int			c = !ta ? 1 : !tb ? -1 : strcmp(ta->utf8, tb->utf8);
+		DiffTable  *d = palloc0(sizeof(DiffTable));
+
+		d->from = c <= 0 ? ta : NULL;
+		d->to = c >= 0 ? tb : NULL;
+		d->name = (d->from ? d->from : d->to)->name;
+		while (n && strcmp(((Table *) lfirst(n))->utf8,
+						   (d->from ? d->from : d->to)->utf8) < 0)
+			n = lnext(now, n);
+		if (n && strcmp(((Table *) lfirst(n))->utf8,
+						(d->from ? d->from : d->to)->utf8) == 0)
+			d->now = lfirst(n);
+		out = lappend(out, d);
+		if (c <= 0)
+			a = lnext(from, a);
+		if (c >= 0)
+			b = lnext(to, b);
+	}
+	list_sort(out, diff_table_cmp);
+	return out;
+}
+
+/*
+ * Every table the session branch has: tables only in other versions can't
+ * be read as rows here (tables() names them).  With relid valid, that
+ * table's alone: only its rows are folded.
+ */
 static void
 folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 			ProllyDiffSink *sink)
 {
-	List	   *from = tables_of(from_ref);
-	List	   *to = tables_of(to_ref);
-	List	   *names = NIL;
-	ListCell   *lc;
+	List	   *from = tables_of(from_ref, relid);
+	List	   *to;
 	List	   *now;
+	ListCell   *lc;
+
+	/* (WORKING folded once) */
+	to = is_working(to_ref) && is_working(from_ref) ? from :
+		tables_of(to_ref, relid);
 
 	/*
 	 * Rows are read as the tables are defined now: the working set's
 	 * definitions, folded only if a version may define one otherwise.
 	 */
-	if (strcmp(to_ref, "WORKING") == 0)
+	if (is_working(to_ref))
 		now = to;
-	else if (strcmp(from_ref, "WORKING") == 0)
+	else if (is_working(from_ref))
 		now = from;
 	else if (!tables_differ(from, to, relid))
 		return;
 	else
-		now = tables_of("WORKING");
+		now = tables_of("WORKING", relid);
 
 	if (OidIsValid(relid))
 	{
@@ -385,22 +451,13 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 					  find_table(now, name), sink);
 		return;
 	}
-	foreach(lc, from)
-		names = lappend(names, ((Table *) lfirst(lc))->name);
-	foreach(lc, to)
+	foreach(lc, diff_tables(from, to, now))
 	{
-		if (!find_table(from, ((Table *) lfirst(lc))->name))
-			names = lappend(names, ((Table *) lfirst(lc))->name);
-	}
-	list_sort(names, name_cmp);
-	foreach(lc, names)
-	{
-		char	   *name = lfirst(lc);
-		Oid			tid = table_named(name);
+		DiffTable  *d = lfirst(lc);
+		Oid			tid = table_named(d->name);
 
 		if (OidIsValid(tid))
-			diff_rows_now(tid, find_table(from, name), find_table(to, name),
-						  find_table(now, name), sink);
+			diff_rows_now(tid, d->from, d->to, d->now, sink);
 	}
 }
 
@@ -408,8 +465,9 @@ static void
 folded_tables(const char *from_ref, const char *to_ref,
 			  ProllyTableChangeVisit visit, void *arg)
 {
-	List	   *from = tables_of(from_ref);
-	List	   *to = tables_of(to_ref);
+	List	   *from = tables_of(from_ref, InvalidOid);
+	List	   *to = strcmp(to_ref, from_ref) == 0 ? from :
+		tables_of(to_ref, InvalidOid);
 	ListCell   *a = list_head(from);
 	ListCell   *b = list_head(to);
 
@@ -433,7 +491,7 @@ folded_tables(const char *from_ref, const char *to_ref,
 		else
 		{
 			if (!same_hash(&ta->data.hash, &tb->data.hash) ||
-				!same_hash(&ta->description, &tb->description))
+				!same_description(ta, tb))
 				visit(ta->name, PROLLY_DIFF_MODIFIED, arg);
 			a = lnext(from, a);
 			b = lnext(to, b);
@@ -1407,7 +1465,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	if (x == NULL)
 		return NULL;
 	*out = *x;
-	if (now == NULL || same_hash(&x->description, &now->description))
+	if (now == NULL || same_description(x, now))
 		return out;
 	require_readable(x);
 
@@ -1613,7 +1671,6 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	}
 	PROLLY_CALL(tree, build_finish, b, &out->data);
 	MemoryContextDelete(rowcxt);
-	out->description = now->description;
 	out->text = now->text;
 	out->textlen = now->textlen;
 	PROLLY_CALL(ve, end, enc);
@@ -1642,8 +1699,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	if (from && to && same_hash(&from->data.hash, &to->data.hash) &&
 		same_description(from, to))
 		return;
-	if (now == NULL || ((from == NULL || same_hash(&from->description, &now->description)) &&
-						(to == NULL || same_hash(&to->description, &now->description))))
+	if (now == NULL || ((from == NULL || same_description(from, now)) &&
+						(to == NULL || same_description(to, now))))
 	{
 		diff_rows(relid, from, to, sink);
 		return;
@@ -1670,11 +1727,6 @@ typedef struct MergeRows
 								 * known (NIL: folded when needed) */
 } MergeRows;
 
-static bool
-same_description(const Table *a, const Table *b)
-{
-	return same_hash(&a->description, &b->description);
-}
 
 /* What failed, for an error: a merge of branch name, or what (a pick). */
 static char *
@@ -2839,7 +2891,7 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	char	   *name = table_name(relid);
 	ProllyHash	ours;
 
-	Table	   *now = find_table(tables_of("WORKING"), name);
+	Table	   *now = find_table(tables_of("WORKING", relid), name);
 	Table		b;
 	Table		o;
 	Table		t;

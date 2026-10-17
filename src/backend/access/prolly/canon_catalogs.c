@@ -155,9 +155,24 @@ typedef struct Canon
 	int			maxbase;
 	bool		advance;
 	List	   *next;			/* CanonItem *, the next baseline's */
+	bool		reading;		/* objects not described are left out */
+	Oid			only;			/* valid: only this table's rows folded */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
+
+void
+prolly_folded_tree_env(ProllyTreeEnv *env)
+{
+	memset(env, 0, sizeof(*env));
+	env->chunk_format = prolly_chunkformat_lookup("basic");
+	env->chunker = prolly_chunker_lookup("bytes");
+	env->hash = prolly_hash_lookup("sha256");
+	env->chunk_store = prolly_chunk_store();
+	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
+							  MyDatabaseTableSpace);
+	env->compare = prolly_bytes_compare;
+}
 
 static void
 canon_env(Canon *cn)
@@ -166,13 +181,7 @@ canon_env(Canon *cn)
 	memset(&cn->env, 0, sizeof(cn->env));
 	if (cn->folded)
 	{
-		cn->env.chunk_format = prolly_chunkformat_lookup("basic");
-		cn->env.chunker = prolly_chunker_lookup("bytes");
-		cn->env.hash = prolly_hash_lookup("sha256");
-		cn->env.chunk_store = prolly_chunk_store();
-		cn->env.chunks = PROLLY_CALL(cn->env.chunk_store, open, MyDatabaseId,
-									 MyDatabaseTableSpace);
-		cn->env.compare = prolly_bytes_compare;
+		prolly_folded_tree_env(&cn->env);
 		return;
 	}
 	prolly_components_for_engine(&prolly_engine_d1.info, &cn->c);
@@ -247,9 +256,15 @@ is_prolly_am(Oid amoid)
 	return prolly;
 }
 
-static void
-uncovered(const char *what, const char *name)
+/*
+ * An object the canonical form doesn't describe: refused, or, when only
+ * reading, left out (true).
+ */
+static bool
+uncovered(Canon *cn, const char *what, const char *name)
 {
+	if (cn->reading)
+		return true;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("prolly commits don't cover %s yet: %s", what, name),
@@ -403,6 +418,20 @@ folded_table_root(Canon *cn, CanonItem *it, Relation rel,
 		tf.data = bt->data;
 		tf.state.data = (const uint8 *) bt->state.data;
 		tf.state.len = bt->state.len;
+	}
+	/* (when reading another table: its rows as the baseline has them) */
+	if (OidIsValid(cn->only) && RelationGetRelid(rel) != cn->only)
+	{
+		if (bt)
+			*root = bt->data;
+		else
+		{
+			ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
+											   CurrentMemoryContext);
+
+			PROLLY_CALL(cn->tree, build_finish, b, root);
+		}
+		return;
 	}
 	initStringInfo(&state);
 	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, root,
@@ -751,7 +780,7 @@ describe_type(Canon *cn, Form_pg_type typ)
 		/* Array types of covered types come with them. */
 		if (OidIsValid(typ->typelem) && typ->typcategory == TYPCATEGORY_ARRAY)
 			return;
-		uncovered("this type", qualified(typ->typnamespace, NameStr(typ->typname)));
+		(void) uncovered(cn, "this type", qualified(typ->typnamespace, NameStr(typ->typname)));
 	}
 }
 
@@ -890,11 +919,11 @@ collect(Canon *cn)
 				}
 				break;
 			case RELKIND_FOREIGN_TABLE:
-				uncovered("foreign tables", qualified(form->relnamespace, name));
+				(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name));
 				break;
 			case RELKIND_PARTITIONED_TABLE:
 			case RELKIND_PARTITIONED_INDEX:
-				uncovered("partitioned tables", qualified(form->relnamespace, name));
+				(void) uncovered(cn, "partitioned tables", qualified(form->relnamespace, name));
 				break;
 		}
 	}
@@ -961,8 +990,9 @@ collect(Canon *cn)
 							TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
 																	ObjectIdGetDatum(proc->oid))));
 			if (proc->prokind != PROKIND_FUNCTION &&
-				proc->prokind != PROKIND_PROCEDURE)
-				uncovered("aggregates and window functions", name);
+				proc->prokind != PROKIND_PROCEDURE &&
+				uncovered(cn, "aggregates and window functions", name))
+				continue;
 			it = add_item(cn, "f:", name);
 			append_utf8(&it->value,
 						TextDatumGetCString(DirectFunctionCall1(pg_get_functiondef,
@@ -980,7 +1010,7 @@ collect(Canon *cn)
 			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
 
 			if (canon_namespace(cn, get_rel_namespace(pol->polrelid)))
-				uncovered("row security policies", NameStr(pol->polname));
+				(void) uncovered(cn, "row security policies", NameStr(pol->polname));
 		}
 		systable_endscan(scan);
 		table_close(pg_policy, AccessShareLock);
@@ -1359,13 +1389,15 @@ build_baseline(Canon *cn, ProllyNodeRef *next)
 }
 
 static void
-folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
-			ProllyNodeRef *next_baseline)
+fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
+		   ProllyNodeRef *next_baseline, bool reading, Oid only)
 {
 	Canon		cn;
 
 	memset(&cn, 0, sizeof(cn));
 	cn.folded = true;
+	cn.reading = reading;
+	cn.only = only;
 	canon_env(&cn);
 	cn.finder = prolly_changes_lookup("pages");
 	cn.advance = next_baseline != NULL;
@@ -1396,6 +1428,19 @@ folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	PG_END_TRY();
 	if (next_baseline)
 		build_baseline(&cn, next_baseline);
+}
+
+static void
+folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
+			ProllyNodeRef *next_baseline)
+{
+	fold_canon(baseline, root, next_baseline, false, InvalidOid);
+}
+
+static void
+folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root)
+{
+	fold_canon(baseline, root, NULL, true, only);
 }
 
 /* A baseline's tree, its tables' data trees and the finder's states. */
@@ -3347,6 +3392,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	},
 	.walk = folded_walk,
 	.fold = folded_fold,
+	.read_fold = folded_read_fold,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

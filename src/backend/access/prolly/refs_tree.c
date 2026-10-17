@@ -1065,6 +1065,16 @@ tree_working_set(const char *branch, ProllyNodeRef *root)
 }
 
 /*
+ * Reading the working set: it is kept as trees already, nothing folded, so
+ * all of it is as cheap as one table's.
+ */
+static bool
+tree_read_working_set(const char *branch, Oid only, ProllyNodeRef *root)
+{
+	return tree_working_set(branch, root);
+}
+
+/*
  * A working-set checkpoint: the working set is kept as trees already, so
  * there is nothing to fold; its root is the session's.
  */
@@ -1406,6 +1416,7 @@ const ProllyRefsRoutine prolly_refs_tree = {
 	.epoch = tree_epoch,
 	.branches = tree_branches,
 	.working_set = tree_working_set,
+	.read_working_set = tree_read_working_set,
 	.reset = tree_reset,
 	.merge_state = tree_merge_state,
 	.set_merge_state = tree_set_merge_state,
