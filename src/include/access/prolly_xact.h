@@ -40,9 +40,12 @@ extern void prolly_set_session_branch(ProllyBranchId branch);
  * Per-session setup once connected to a database: defines the dolt.*
  * settings, makes prolly the default table access method of a versioned
  * database, and checks out branch (from a "dbname/branch" connection)
- * unless NULL.
+ * unless NULL.  In a database of versioned schemas the checkout waits for
+ * prolly_session_ready(), called once the backend is processing normally:
+ * a branch with only a head has its copies made then, which takes DDL.
  */
 extern void prolly_session_init(const char *branch);
+extern void prolly_session_ready(void);
 
 /* Who the session's commits are by: dolt.author, else the session user. */
 extern const char *prolly_commit_author(void);

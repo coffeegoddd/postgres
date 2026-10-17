@@ -33,6 +33,7 @@
 
 #include "access/parallel.h"
 #include "access/printtup.h"
+#include "access/prolly_xact.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/async.h"
@@ -4482,6 +4483,10 @@ PostgresMain(const char *dbname, const char *username)
 	}
 
 	SetProcessingMode(NormalProcessing);
+
+	/* the prolly branch the connection asked for, if it waited for this */
+	if (!am_walsender)
+		prolly_session_ready();
 
 	/*
 	 * Now all GUC states are fully set up.  Report them to client if
