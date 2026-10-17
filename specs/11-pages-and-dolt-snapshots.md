@@ -563,7 +563,7 @@ fails without its fix), and Postgres's suites keep passing after each one.
   commit; the check for shared dependencies (part 1).
 - **Exit:** V4.
 
-**Step 7. Reclamation.**
+**Step 7. Reclamation.** Proposed in part 8, not decided.
 - Chunk-store GC with WAL (table files, `oldgen`, journal retirement);
   page-set and physical-page reclamation; the fold epoch's retained page
   versions.
@@ -1190,3 +1190,241 @@ transaction for all of a transfer's refs, upstreams in the refs; no root
 overwritten by a clone; a bounded seen set; and the transfer from known
 heads, one round trip for a line of new commits.
 
+
+## 8. Step 7 design: reclamation (proposed)
+
+**Status: proposed, 2026-10-17; nothing here is decided.** 8.9 lists what
+is the user's to decide.
+
+Two stores reclaim space: the chunk store, whose history grows with every
+commit and never shrinks today (a commit's changed chunks, every root the
+refs had, what a deleted branch alone reached); and the page store, which
+frees blocks already, as a fold lets go of old page versions
+(`bmap_fold_prune`) and as a dropped relation's blocks lose their last
+map, but leaks in three cases (8.6). Dolt's GC (2.4.2, `go/store/nbs`,
+`go/store/types/value_store.go`, `go/libraries/doltcore/sqle/auto_gc.go`
+and `dsess`) was read for this design; 8.8 lists what is taken from it.
+
+The bound (`10-complexity-requirements.md`): space returns after a
+branch is deleted and GC runs; a GC costs O(live chunks written since the
+last GC) by default, O(live chunks) when full; neither stops commits for
+longer than a short final window.
+
+### 8.1 What is live
+
+The roots are the refs tree at the store's root (refs `copies`): every
+branch's head commit ('B'), its baseline and working-set root ('W'), its
+merge in progress ('M'), and step 6's remotes and remote-tracking heads.
+From a commit, its parents and its root; from a root, its trees.
+Everything else in the store is garbage: earlier versions of the refs
+tree (every ROOT record but the last), commits no ref reaches (a deleted
+branch's, a forced reset's), and chunks a transaction wrote and then
+didn't use (an aborted one's).
+
+What isn't in the refs: chunks a running transaction holds only in
+memory (a tree it is folding, a hash it read, a commit named by its hash
+in a call). 8.3 keeps these without tracking them, by the transaction
+horizon, where Dolt visits each session's roots (`VisitGCRoots`) and
+waits for every session to reach a command boundary.
+
+A commit no ref reaches is collected, so a call naming it by hash fails
+after GC, as in Dolt. A reflog (Dolt's `dolt_reflog`, which its GC
+truncates) would have to be a root, or say that it is lost.
+
+### 8.2 The invariant
+
+Step 6's closure invariant (a store that has a chunk has every chunk it
+references) is what makes GC safe, so it is checked where chunks enter
+the store from inside as well: when a transaction's chunks are appended
+(each batch, and the rest at pre-commit), every reference they hold is
+looked up, in the batch or the store's index. One that resolves in
+neither is a reference to a chunk a GC collected meanwhile: the
+transaction fails with a serialization failure (40001), retryable, never
+a dangling tree. Dolt checks a commit's root's direct references
+(`errorIfDangling`) and chunks a remote sends, not every local put; the
+check here costs an index lookup per reference, which step 8 measures
+against a fold's cost.
+
+### 8.3 The collection, online
+
+A GC runs in one database at a time, by `dolt_gc()` or the trigger
+(8.5), and moves through four records:
+
+1. **Seal.** `GC_BEGIN` (WAL) closes the journal: appends go on to a new
+   journal segment (the manifest names segments, as it names table
+   files). Everything in segments from there on is kept whole; the
+   sealed segment and the table files are what the GC collects.
+2. **Mark and copy.** From the root as of the seal, the walk marks what
+   it reaches in the sealed files, breadth first, copying each live
+   chunk as it goes into new table files (WAL-logged as any table file's
+   bytes are, step 3). Writers go on: their chunks go to the new segment.
+   Nothing blocks.
+3. **Swap.** The journal's append lock is taken exclusively, which waits
+   for an append in progress (one batch, not a transaction) and holds
+   new ones off. Every chunk in the new segment is now a root too: the
+   walk marks what they reference in the sealed files (all of what
+   writers made meanwhile, committed or not, and so every hash they
+   took from the sealed files and used), copying what it reaches. Then
+   `GC_SWAP` (WAL) replaces the manifest whole: the new table files, the
+   new segment, the next GC generation. The lock is released. The window
+   costs the chunks written during the GC, not the store; the new files
+   are checked (re-hashed, references resolved) before the window, not
+   in it (Dolt checks its new files twice inside its blocking window).
+4. **Retire.** The sealed segment and the replaced table files are
+   unlinked once every transaction that was running at the swap has
+   ended (the GC waits for their virtual transaction ids, as `CREATE
+   INDEX CONCURRENTLY` does), so no backend reads a file it opened
+   before (a VFD may be closed and reopened at any time, so an unlinked
+   file isn't readable to the end of a transaction as an open one would
+   be). `GC_RETIRE` (WAL) names them.
+
+A transaction that straddles the swap and then appends a reference to a
+chunk the GC found unreachable fails the check (8.2); one that only reads
+reads on, in old files until it ends. A transfer (step 6) is a
+transaction: chunks it was told the receiver has stay until it ends, and
+its admission check runs against the store as it is then. A table file a
+transfer or conjoin adds carries the GC generation it was made under, and
+is refused (the transfer retried) if a swap changed it, as Dolt's
+`ErrGCGenerationExpired`. Conjoin doesn't run during a GC.
+
+### 8.4 Generations: the default and full
+
+A GC's new files are closed under references (they hold everything the
+live chunks in them reference, or a kept segment does). Recorded as such
+in the manifest, they are **settled**: the default GC's walk stops at a
+settled chunk without reading it, as Dolt's oldgen filter does, so a
+default GC costs what changed since the last one, not the history. A
+settled chunk that later becomes garbage (its branch deleted) is
+collected only by a **full** GC (`dolt_gc('--full')`), which walks
+everything and rewrites only the settled files whose garbage passes a
+fraction (half), keeping the rest whole: a full GC of a mostly live store
+writes little. Dolt keeps a second store for its old generation
+(`GenerationalNBS`); here one manifest marks files settled.
+
+**The mark's state is bounded.** A chunk's place is a file and an
+ordinal in that file's index, so the marks are one bit per chunk of the
+sealed files, not a set of hashes (Dolt's `visited` is a hash set of
+every live chunk, unbounded); the walk's frontier is kept within
+`maintenance_work_mem`, spilling as a sort does.
+
+**The WAL's cost.** Copied chunks are WAL-logged: a default GC writes the
+live part of what changed since the last GC, a full GC the live part of
+the files it rewrites. A standby replays both and stays a copy without
+anything else.
+
+### 8.5 Starting it
+
+- `dolt_gc()`, and `dolt_gc('--full')`: the database's owner, or members
+  of `pg_maintain`, as `VACUUM` asks.
+- **Automatic**, by autovacuum: a database's worker runs a default GC
+  when its journal segment has passed `prolly.gc_journal_threshold` (128
+  MB, Dolt's) and grown since the last GC by more than the settled files'
+  size times `prolly.gc_growth_scale_factor`; a full GC when the
+  settled files' estimated garbage passes a fraction, estimated from the
+  branches and commits dropped since the last full one. Dolt's auto GC
+  waits for a low load average; autovacuum's cost-based delay
+  (`autovacuum_vacuum_cost_delay`) does that here.
+
+### 8.6 The page store
+
+The page store already frees blocks; three cases leak them:
+
+- a crash between a drop's commit and the records that free its blocks
+  (part 5);
+- a block whose reference count saturated (255 maps), never freed;
+- a crash part way through `bmap_fold_prune`, whose blocks stay
+  allocated.
+
+A **sweep** per tablespace and database finds them: every block-mapped
+relation's map (every branch's copies, so every catalog row of every
+branch) and every changed-page list's old versions are read, and each
+physical block's references counted exactly; allocated blocks nobody
+holds are freed, and saturated counts rewritten exactly (a count past
+255 is kept elsewhere than the byte: a small table of blocks with large
+counts, so a block shared by a thousand branches can be freed too). Only
+making a branch adds references to blocks it didn't allocate, so the
+sweep holds off branch creation in that database while it reads the
+maps (O(map pages), not data pages); remaps and extensions allocate new
+blocks, which the sweep never frees (it frees only blocks allocated when
+it began). Free blocks at the page store's end shorten the file, as
+VACUUM truncates a heap. VACUUM runs the sweep on a database when its
+page store's allocated blocks exceed what its relations map by a
+fraction; `prolly_page_sweep()` runs it by hand.
+
+### 8.7 Crashes, standbys
+
+- **Records.** `GC_BEGIN`, the table files' bytes, `GC_SWAP` and
+  `GC_RETIRE` are WAL records, so redo makes the same GC on a standby and
+  after a crash. A crash before the swap leaves the new files unnamed: at
+  the end of recovery, files the manifest doesn't name, of ids the
+  manifest has given, are unlinked (deterministically, from the
+  manifest; not Dolt's prune, which deletes every file a process hasn't
+  open, and so assumes one process owns the directory). The GC isn't
+  resumed in step 7 (Dolt's resumes only its incremental oldgen files);
+  it is run again, and its default walk is short where the last one's
+  files settled.
+- **Standbys.** Replaying `GC_RETIRE` conflicts with standby queries that
+  began before the swap's replay (they may read the files): they are
+  cancelled after `max_standby_streaming_delay`, as VACUUM's cleanup
+  conflicts are (`ResolveRecoveryConflictWithVirtualXIDs`); a standby's
+  feedback (`hot_standby_feedback`) doesn't hold a GC back, since chunks
+  aren't xid-stamped.
+- **Tests.** Crash tests at each record (before the seal's segment is
+  written to, mid-copy, between the swap and the retire); a writer
+  straddling the swap refused with 40001; a standby query cancelled by
+  a retire; space returned after a branch is deleted and GC runs, and
+  after the page sweep.
+
+### 8.8 From Dolt
+
+Taken: chunks written during the GC kept as roots (Dolt adds every hash a
+session touches to a keep set, `gcAddChunk`; here the new segment holds
+them); a short final window that blocks writes alone; copying live
+chunks forward into new files, then one manifest swap carrying a GC
+generation that table-file adds check; the journal retired at GC rather
+than rewritten; generations, a default GC that stops at settled data and
+a full one; conjoin held off during GC; an automatic GC on journal
+growth.
+
+Done otherwise: no per-read hook (Dolt's keeper on every get and has):
+the transaction horizon keeps what readers hold, and the append check
+(8.2) refuses what a writer would leave dangling; no session visits or
+killed connections; the mark as one bit per chunk, not a hash set; new
+files checked before the window, not in it; orphans removed from the
+manifest's own record at the end of recovery, not by deleting what no
+process has open; standby conflicts as VACUUM's; one manifest with
+settled files, not a second store.
+
+### 8.9 For the user to decide
+
+1. **Online, by seal, horizon and append check** (8.2, 8.3), or a GC that
+   holds every writer off for its whole run (D1's `prolly_gc()` does).
+   Recommended: online.
+2. **The append check** on every batch of chunks (an index lookup per
+   reference), or only on a commit's root, as Dolt. Recommended: every
+   batch; it is what lets a GC be online without a hook on reads.
+3. **Generations:** a default GC that stops at settled files, and a full
+   one, or every GC full. Recommended: both.
+4. **Automatic GC by autovacuum**, on by default (as Dolt's is), or by
+   hand only. Recommended: autovacuum, on.
+5. **Unreachable commits** collected at the next GC (Dolt), or kept for a
+   grace period (git's `gc.pruneExpire`). Recommended: collected; a
+   reflog, if wanted, is its own decision.
+6. **The page sweep** holds off branch creation in its database while it
+   reads the maps. Recommended.
+
+### 8.10 Building it
+
+In order, each a PR with its tests:
+
+1. The append check (8.2), with its test of a dangling reference refused.
+2. Journal segments and the manifest's settled files.
+3. The GC: seal, mark and copy, swap, retire, and the interface it is
+   behind (a collector over the chunk store's primitives, so another can
+   be swapped in); `dolt_gc()`; crash and standby tests.
+4. The full GC and the rewrite threshold.
+5. The page sweep and exact counts past 255.
+6. Automatic GC and the page sweep under autovacuum.
+7. Measured (step 8's suites): space after deleting branches and GC;
+   default and full GC times against live and changed data; the window's
+   length under a write load.
