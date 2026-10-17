@@ -1232,7 +1232,8 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 		values[3] = CStringGetTextDatum(email);
 		values[4] = TimestampTzGetDatum(info.committed_at);
 		values[5] = CStringGetTextDatum(info.message);
-		values[6] = BoolGetDatum(PROLLY_CALL(refs(), working_set, name, &ws) &&
+		values[6] = BoolGetDatum(PROLLY_CALL(refs(), read_working_set, name,
+											 InvalidOid, &ws) &&
 								 PROLLY_CALL(refs(), commit_working_set, head,
 											 &committed) &&
 								 !same_hash(&ws.hash, &committed.hash));

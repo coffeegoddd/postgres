@@ -1258,6 +1258,55 @@ fold_into(void *arg)
 	fold((ProllyNodeRef *) arg);
 }
 
+/* The session branch's working set read: see read_working_set(). */
+typedef struct ReadFold
+{
+	Oid			only;
+	ProllyNodeRef *root;
+} ReadFold;
+
+static void
+read_fold_into(void *arg)
+{
+	ReadFold   *rf = arg;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	bool		have = branch_baseline(branch_ops()->current(), &baseline);
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, read_fold, have ? &baseline : NULL, rf->only,
+				rf->root);
+}
+
+/* A branch's working set as a head-only one has it: false if none. */
+static bool
+head_working_set(const char *branch, ProllyNodeRef *root)
+{
+	ProllyHash	head;
+	ProllyCommitInfo info;
+
+	if (!branch_head(branch, &head) || !copies_commit_get(&head, &info))
+		return false;
+	*root = info.root;
+	return true;
+}
+
+static bool
+copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root)
+{
+	ReadFold	rf = {only, root};
+
+	if (branch == NULL)
+	{
+		read_fold_into(&rf);
+		return true;
+	}
+	if (!OidIsValid(branch_oid(branch)))
+		return head_working_set(branch, root);
+	branch_ops()->run_on(branch, read_fold_into, &rf);
+	return true;
+}
+
 static bool
 copies_working_set(const char *branch, ProllyNodeRef *root)
 {
@@ -1266,17 +1315,9 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 		fold(root);
 		return true;
 	}
+	/* (one with only a head: its working set is the head's) */
 	if (!OidIsValid(branch_oid(branch)))
-	{
-		ProllyHash	head;
-		ProllyCommitInfo info;
-
-		/* one with only a head: its working set is the head's */
-		if (!branch_head(branch, &head) || !copies_commit_get(&head, &info))
-			return false;
-		*root = info.root;
-		return true;
-	}
+		return head_working_set(branch, root);
 	branch_ops()->run_on(branch, fold_into, root);
 	return true;
 }
@@ -1660,6 +1701,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_with = copies_commit_with,
 	.branches = copies_branches,
 	.working_set = copies_working_set,
+	.read_working_set = copies_read_working_set,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

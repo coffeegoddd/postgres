@@ -145,6 +145,14 @@ typedef struct ProllyRefsRoutine
 	bool		(*working_set) (const char *branch, ProllyNodeRef *root);
 
 	/*
+	 * working_set() for reading what changed, never to commit or move from:
+	 * objects a commit would refuse are left out, and with only valid, only
+	 * that table's rows are read (the canonicalizer's read_fold()).
+	 */
+	bool		(*read_working_set) (const char *branch, Oid only,
+									 ProllyNodeRef *root);
+
+	/*
 	 * Make the commit ref names the session branch's head commit, and its
 	 * working set the one that commit recorded, when the transaction
 	 * commits (a hard reset, or a fast-forward).  The transaction must not
@@ -209,7 +217,7 @@ typedef struct ProllyRefsRoutine
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "epoch", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
-	"set_violations"
+	"set_violations", "read_working_set"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 
 /*

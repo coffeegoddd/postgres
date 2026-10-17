@@ -95,6 +95,16 @@ typedef struct ProllyCanonRoutine
 						 void *arg);
 	void		(*fold) (const ProllyNodeRef *baseline, ProllyNodeRef *root,
 						 ProllyNodeRef *next_baseline);
+
+	/*
+	 * fold() for reading what changed, never for a commit: objects the
+	 * canonical form doesn't describe are left out of root, not refused.
+	 * With only valid, only that table's rows are folded: the others' are
+	 * the baseline's (none if it hasn't the table as defined now), so root
+	 * reads right for that table alone.
+	 */
+	void		(*read_fold) (const ProllyNodeRef *baseline, Oid only,
+							  ProllyNodeRef *root);
 	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 						   void *arg);
 	/* Its materialized views' rows, as tables' (never unreadable). */
@@ -123,8 +133,14 @@ typedef struct ProllyCanonRoutine
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"prepare", "canonical_root", "walk", "fold", "tables", \
 	"materialized_views", "same_schema", "move_schema", "sequences", \
-	"merge_schema", "walk_baseline", "table_columns"
+	"merge_schema", "walk_baseline", "table_columns", "read_fold"
 #define PROLLY_CANON_FIRST_CALLBACK prepare
+
+/*
+ * The tree environment of folded canonical trees: the chunk store's,
+ * ordered by bytes.
+ */
+extern void prolly_folded_tree_env(ProllyTreeEnv *env);
 
 static inline const ProllyCanonRoutine *
 prolly_canon_lookup(const char *name)
