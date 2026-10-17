@@ -173,10 +173,9 @@ $second->query_until(qr/started/, q{
 ok(waits_for('dolt_cherry_pick'), 'a cherry-pick waits for the committer');
 $first->query_safe('COMMIT');
 $second->query_until(qr/done/, '');
-like($second->{stderr}, qr/could not serialize access: branch "main" moved/,
-	'and fails');
-is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}), 'before the pick',
-	'the commit it waited for stays the head');
+is($second->{stderr}, '', 'and, read committed, picks');
+is(sql(q{SELECT message FROM dolt_log('main') OFFSET 1 LIMIT 1}), 'before the pick',
+	'onto the commit it waited for');
 $second->query('SELECT dolt_reset(\'--hard\')');
 $first->quit;
 $second->quit;
