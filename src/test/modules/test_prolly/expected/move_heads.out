@@ -406,7 +406,7 @@ SELECT dolt_merge('other');
 ERROR:  branch "other" has no history in common with the current one
 \c contrib_regression
 DROP DATABASE mh_fresh;
--- --no-ff where a fast-forward would do: no merge commit is made yet
+-- --no-ff where a fast-forward would do: a merge commit
 CREATE SCHEMA mhf VERSIONED;
 CREATE TABLE mhf.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'mhf')::text) AS committed;
@@ -441,12 +441,15 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 (1 row)
 
 SELECT (dolt_merge('--no-ff', 'mh_ahead'))[2:4];
-ERROR:  branches made by copying can only fast-forward so far
-DETAIL:  A merge commit where a fast-forward would do (--no-ff) isn't made yet.
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
 SELECT count(*) FROM mhf.t;
  count 
 -------
-     0
+     1
 (1 row)
 
 SELECT dolt_branch('-D', 'mh_ahead');
