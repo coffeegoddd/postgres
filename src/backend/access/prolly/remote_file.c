@@ -54,6 +54,7 @@
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
@@ -620,6 +621,7 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", path)));
+	INJECTION_POINT("prolly-remote-file-written", NULL);
 
 	/* named: the newest file first, where recent chunks are */
 	t = MemoryContextAllocZero(r->cxt, sizeof(RemoteTable));
