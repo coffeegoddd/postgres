@@ -20,7 +20,8 @@
  * Every change writes what it adds first (a table file, synced), then a
  * new manifest aside, synced and renamed over the old one: a reader sees
  * the old manifest or the new, and a file a crash left unnamed is never
- * read.  The lock serializes changes; reads take none.
+ * read (one whose writer fails before its manifest is removed).  The lock
+ * serializes changes; reads take none.
  *
  * Reading.  The first lookup reads every table file's index into one hash
  * table, so each later lookup is one probe however many files the remote
@@ -569,28 +570,20 @@ file_has(ProllyRemote *r, const ProllyHash *hash)
 	return file_find(r, hash, &t, &offset, &len);
 }
 
-static void
-file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+/*
+ * Write the chunks next() gives, the first given already, as table file
+ * path, synced; its size.
+ */
+static uint64
+write_table_file(const char *path, ProllyHash *hash, StringInfo data,
+				 ProllyChunkNext next, void *arg)
 {
 	const ProllyTableFileRoutine *fmt = table_format();
-	StringInfoData data;
-	StringInfoData buf;
-	ProllyHash	hash;
 	ProllyTableFileWriter *w;
-	Manifest	m;
-	RemoteTable *t;
-	char	   *path;
+	StringInfoData buf;
 	uint64		size = 0;
-	int			lock;
 	int			fd;
 
-	check_privilege(r, true);
-	initStringInfo(&data);
-	if (!next(arg, &hash, &data))
-		return;
-	lock = lock_remote(r);
-	m = r->m;
-	path = remote_path(r, table_name(m.last + 1));
 	fd = OpenTransientFile(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		ereport(ERROR,
@@ -600,8 +593,8 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 	initStringInfo(&buf);
 	do
 	{
-		PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
-		resetStringInfo(&data);
+		PROLLY_CALL(fmt, write_add, w, hash, data->data, data->len, &buf);
+		resetStringInfo(data);
 		if (buf.len >= 1024 * 1024)
 		{
 			write_all(fd, path, &buf);
@@ -609,7 +602,7 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 			resetStringInfo(&buf);
 		}
 		CHECK_FOR_INTERRUPTS();
-	} while (next(arg, &hash, &data));
+	} while (next(arg, hash, data));
 	PROLLY_CALL(fmt, write_finish, w, &buf);
 	write_all(fd, path, &buf);
 	size += buf.len;
@@ -621,7 +614,43 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", path)));
-	INJECTION_POINT("prolly-remote-file-written", NULL);
+	return size;
+}
+
+static void
+file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	StringInfoData data;
+	ProllyHash	hash;
+	Manifest	m;
+	RemoteTable *t;
+	char	   *path;
+	uint64		size;
+	int			lock;
+
+	check_privilege(r, true);
+	initStringInfo(&data);
+	if (!next(arg, &hash, &data))
+		return;
+	lock = lock_remote(r);
+	m = r->m;
+	path = remote_path(r, table_name(m.last + 1));
+
+	/*
+	 * A file that fails before the manifest is written (not after: the
+	 * rename may have named it) is removed, not left for the next writer.
+	 */
+	PG_TRY();
+	{
+		size = write_table_file(path, &hash, &data, next, arg);
+		INJECTION_POINT("prolly-remote-file-written", NULL);
+	}
+	PG_CATCH();
+	{
+		(void) unlink(path);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* named: the newest file first, where recent chunks are */
 	t = MemoryContextAllocZero(r->cxt, sizeof(RemoteTable));

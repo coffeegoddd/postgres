@@ -67,6 +67,9 @@ static bool dolt_allow_commit_conflicts = false;
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
 
+/* a branch to check out once the backend processes normally */
+static char *connect_branch = NULL;
+
 void
 prolly_session_init(const char *branch)
 {
@@ -99,13 +102,37 @@ prolly_session_init(const char *branch)
 	if (MyDatabaseVersioned)
 		SetConfigOption("default_table_access_method", "prolly_d1",
 						PGC_USERSET, PGC_S_DYNAMIC_DEFAULT);
-	if (branch)
+	if (branch && prolly_database_uses_copies())
+		connect_branch = MemoryContextStrdup(TopMemoryContext, branch);
+	else if (branch)
 	{
 		ProllyDatabaseComponents dc;
 
 		prolly_database_components(&dc);
 		PROLLY_CALL(dc.refs, checkout, branch);
 	}
+}
+
+/*
+ * The branch a connection asked for, checked out in a transaction of its
+ * own now that the backend processes normally.  (An error here, before the
+ * main loop, ends the connection: it isn't left on another branch.)
+ */
+void
+prolly_session_ready(void)
+{
+	ProllyDatabaseComponents dc;
+
+	if (connect_branch == NULL)
+		return;
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, checkout, connect_branch);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pfree(connect_branch);
+	connect_branch = NULL;
 }
 
 bool
