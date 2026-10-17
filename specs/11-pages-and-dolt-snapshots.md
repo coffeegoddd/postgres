@@ -570,12 +570,35 @@ built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
   versions.
 - **Exit:** space returns after branch deletion and GC; crash tests of GC.
 
-**Step 8. Measure, then retire D1.**
+**Step 8. Measure.**
 - Gates 1–7 and the S and V suites for this design against stock heap and
-  against D1; `10-complexity-requirements.md` rechecked operation by
-  operation.
-- Then remove D1, K1, the prolly index AM, the node store and anything
-  else superseded, in their own PRs, and update the specs.
+  against D1, built from the tag `prolly-d1`; `10-complexity-requirements.md`
+  rechecked operation by operation.
+
+**D1's removal, moved ahead (user, 2026-10-17).** D1 is retired once file
+remotes (#171–#176) merge, before step 6's network remotes, not after step
+8's measurements: those build D1 from the tag `prolly-d1` instead. In
+order, each a PR:
+1. **Coverage first.** What only D1's tests cover is tested on versioned
+   schemas (`dolt_*` functions' arguments, errors and views, conflicts and
+   their resolution, branches and merges across crashes and standbys:
+   `t/019`–`t/023`); and whether `src/test/prolly`'s run of the core
+   regression suite with prolly as the default table AM (`prolly_am.conf`)
+   runs on D1 is checked, and if so replaced for this design.
+2. **D1's SQL surface:** the `prolly_*` version-control functions,
+   `CREATE DATABASE … VERSIONED`, the `prolly_d1` table AM and the prolly
+   index AM, `prolly_gc()`.
+3. **D1's implementations:** the engines (`d1`; `d2`–`d4`, stubs),
+   coordination, the node store, root layout, row identity, the commit
+   pipeline, the log, reclamation's `mark_sweep`, refs `tree`, diff-merge
+   `rows`, canonicalizer `catalogs`, value encoder `heaptuple`, keying
+   `pk_or_content`, chunker `keyhash`; configuration down to one profile.
+   **Interfaces no remaining component uses are deleted with them**
+   (engine, coordination, node store, root layout, row identity, commit
+   pipeline, log, and any other left with only a stub); every interface
+   this design uses stays, reclamation's among them (step 7 implements it
+   again).
+4. **The specs:** D1's columns and rows become pointers to history.
 
 ### Risks to retire early
 
