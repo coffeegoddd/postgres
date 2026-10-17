@@ -147,8 +147,8 @@ is(sql($rows, 'copied/feature'), $feature_rows, 'and the branch');
 $node->stop;
 
 # With wal_level minimal, a relation made in a transaction skips WAL and is
-# synced at commit; a copy of it would be neither, so the transaction can't
-# change branches.
+# synced at commit; a copy of it would be neither, so making a branch from
+# it is refused.  Changing branches copies nothing, and is allowed.
 my $minimal = PostgreSQL::Test::Cluster->new('branch_minimal');
 $minimal->init;
 $minimal->append_conf('postgresql.conf', qq{
@@ -158,11 +158,52 @@ max_wal_senders = 0
 $minimal->start;
 my ($mret, $mout, $merr) = $minimal->psql('postgres', q{
 	CREATE SCHEMA app VERSIONED;
+	CREATE TABLE app.t (id int PRIMARY KEY);
+	INSERT INTO app.t VALUES (1);
+	SELECT dolt_commit('-Am', 'first');
+	SELECT dolt_branch('other');
+	SELECT dolt_checkout('other');	-- (its copies made)
+	SELECT dolt_checkout('main');
 	BEGIN;
 	CREATE TABLE app.new_here (id int);
 	SELECT dolt_checkout('-b', 'from_new');
 });
-like($merr, qr/cannot change branches in a transaction whose new relations skip WAL/,
-	'a transaction whose new relations skip WAL can\'t change branches');
+like($merr,
+	qr/cannot copy relation "new_here" to a branch in the transaction that made it/,
+	'a relation that skips WAL isn\'t copied to a new branch');
+
+# (other's copies exist already: the checkouts copy nothing)
+$minimal->safe_psql('postgres', q{
+	BEGIN;
+	CREATE TABLE app.made_here (id int);
+	INSERT INTO app.made_here VALUES (7);
+	SELECT dolt_checkout('other');
+	SELECT dolt_checkout('main');
+	COMMIT;
+});
+
+# A branch first used here, whose copies are made from its head rather than
+# shared with another branch's (a clone's): its new relations skip WAL too.
+my $remote = $minimal->basedir . '/remote';
+mkdir $remote or die "mkdir $remote: $!";
+$minimal->safe_psql('postgres', qq{
+	SELECT dolt_remote('add', 'origin', 'file://$remote');
+	SELECT dolt_push('origin', 'other');
+});
+$minimal->safe_psql('postgres', 'CREATE DATABASE cloned');
+$minimal->safe_psql('cloned', qq{SELECT dolt_clone('file://$remote')});
+is($minimal->safe_psql('cloned', q{
+	SELECT dolt_checkout('other');
+	SELECT active_branch(), count(*) FROM app.t;
+}), "{0,\"Switched to branch 'other'\"}\nother|1",
+	'a cloned branch is checked out under wal_level minimal');
+
+# Their storage was synced at commit: a crash loses none of it.
+$minimal->stop('immediate');
+$minimal->start;
+is($minimal->safe_psql('postgres', 'SELECT id FROM app.made_here'), '7',
+	'a relation made before a branch change survives a crash');
+is($minimal->safe_psql('cloned/other', 'SELECT count(*) FROM app.t'), '1',
+	'a cloned branch\'s copies survive a crash');
 $minimal->stop;
 done_testing();

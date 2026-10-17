@@ -134,6 +134,19 @@ copy_storage(Form_pg_class c)
 		elog(ERROR, "versioned relation \"%s\" is not permanent",
 			 NameStr(c->relname));
 
+	/*
+	 * A relation made in this transaction whose storage skips WAL
+	 * (wal_level minimal) is synced at commit; a copy of it would be
+	 * neither logged nor synced.
+	 */
+	if (RelFileLocatorSkippingWAL(src))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot copy relation \"%s\" to a branch in the transaction that made it",
+						NameStr(c->relname)),
+				 errdetail("Its storage skips WAL until the transaction commits."),
+				 errhint("Commit first, or set \"wal_level\" to \"replica\" or higher.")));
+
 	if (smgrcanshare(ssrc))
 	{
 		RelationCreateStorageShared(dst, ssrc, true);
