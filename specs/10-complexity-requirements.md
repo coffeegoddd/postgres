@@ -60,9 +60,9 @@ that design.
 | Cherry-pick, revert | One three-way merge plus commit work per commit | The same | As three-way merge | 4g (V3) | Built (#106, #117): as three-way merge; 10,000 rows, 67–104 ms |
 | Rebase k commits | Sum of k replays and commits | The same | As three-way merge, per commit | 4g (V3) | Not built |
 | Log, history | O(h log(w + 1)) (priority queue of width w); linear history O(h); worst O(H log H) | The same | Commit graph walked with a priority queue by commit order | 4g | Built (`dolt_log`) |
-| Fetch, push | O(E + B) plus storage and ref costs | O(E + B) | Chunks sent by content hash; descent stops at chunks the other side has; out-of-line values found through the node format's reference contract (question 48) | Not built (V4) | Not built (step 6) |
-| Full clone | O(B) plus file and ref metadata | O(B) | Canonical chunks copied; TID maps not built (implicit maps, question 41); local catalogs rebuilt from canonical schema, O(catalog rows) | Not built (V4). Exception: a non-prolly index on a cloned table is rebuilt, O(N log N), as in a restore (question 41); tables whose indexes are prolly indexes meet O(B) | Not built (step 6): a cloned branch would be head-only until first used, its copies made then |
-| Pull | Fetch + merge | Fetch + merge | As above | Not built (V4) | Not built (step 6) |
+| Fetch, push | O(E + B) plus storage and ref costs | O(E + B) | Chunks sent by content hash; descent stops at chunks the other side has; out-of-line values found through the node format's reference contract (question 48) | Not built (V4) | Built for file remotes (#172): the refs' walk from each head, declining what the other side has (#171), O(E + B); not batched yet |
+| Full clone | O(B) plus file and ref metadata | O(B) | Canonical chunks copied; TID maps not built (implicit maps, question 41); local catalogs rebuilt from canonical schema, O(catalog rows) | Not built (V4). Exception: a non-prolly index on a cloned table is rebuilt, O(N log N), as in a restore (question 41); tables whose indexes are prolly indexes meet O(B) | Built for file remotes (#174): a fetch of every branch, O(B), each branch head-only until first used, the default one's copies made then |
+| Pull | Fetch + merge | Fetch + merge | As above | Not built (V4) | Built for file remotes (#172) |
 
 ## Space
 
@@ -73,7 +73,7 @@ that design.
 | One-parent commit | O(log H + log R) new nodes; row trees shared | O(log H + log R + d log T) new nodes | d log T: the canonical directory's changed paths; row trees shared | Built: changed chunks only; the journal keeps every commit's (no GC until step 7) |
 | Sparse merge | O((I + 1)(Δ + 1) log N) new nodes, plus conflict records | The same | | Built |
 | History traversal | O(h) | O(h) | | Built |
-| Fetch, push | O(E) seen addresses | O(E) | Plus buffers; disk growth follows missing chunks | Not built |
+| Fetch, push | O(E) seen addresses | O(E) | Plus buffers; disk growth follows missing chunks | Built: a seen set in memory and a temporary file of what was received |
 | SQL transaction (pending writes) | Bounded by flushing (about 64K entries) | Bounded (question 47) | **Not met:** D1 holds a transaction's writes in memory without a limit. Fixed in 4e | Met: writes are heap-like pages, bounded as heap's are |
 | Per-branch local state | None | O(rows written on the branch) of TID-map entries | Postgres-only: TID maps are local and per working set; clone avoids building them (question 41) | Pages a branch changed (copy-on-write) and their changed-page lists; no TID maps |
 

@@ -557,7 +557,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
 
-**Step 6. Remotes.** Designed in part 7 (decided 2026-10-17).
+**Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
+built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
 - File remotes first, then network remotes over libpq: fetch, push,
   clone, pull; a cloned branch's copies made on first use from its head
   commit; the check for shared dependencies (part 1).
@@ -1190,6 +1191,43 @@ transaction for all of a transfer's refs, upstreams in the refs; no root
 overwritten by a clone; a bounded seen set; and the transfer from known
 heads, one round trip for a line of new commits.
 
+
+### 7.11 As built (file remotes)
+
+Built: the remote interface with "file" (7.5), the transfer interface's
+receive and send ("chunks"), remotes, remote-tracking branches and
+upstreams in the refs (7.2), `dolt_remote`, `dolt_fetch`, `dolt_push`,
+`dolt_pull` and `dolt_clone`, the views `dolt_remotes` and
+`dolt_remote_branches`, and file remotes' privileges (7.6). The receive
+check is 7.1's: each chunk re-hashed before anything reads it, a chunk the
+remote lacks an error, each received commit's root of this build's
+format, and only then one table file added. The typed walks stop at a
+commit or root the visitor declines (#171), so a fetch or push reads what
+changed, not the history.
+
+Not as designed, or not yet:
+
+- **The walk isn't batched or overlapped.** It asks the remote for a chunk
+  at a time, as the walks read them; over a file remote that is a read.
+  Batching (7.1) matters over the network and comes with it.
+- **Clone walks** rather than copying the remote's files whole and then
+  checking them (7.4): the same bound, O(B); the whole-file copy waits for
+  V4 to say what it saves.
+- **Shared dependencies.** A clone whose objects need something the
+  database lacks fails where its copies are made, naming that object,
+  and leaves nothing (one transaction). Naming every missing dependency
+  before anything is written, as 7.4 asks, needs the folded root to record
+  what its objects depend on outside the versioned schemas (types,
+  functions, extensions, roles): items it lacks, so a format change, the
+  user's to decide.
+- **A push moves the remote's head as it is reached,** not with the
+  transaction: the remote-tracking branch moves with the transaction, so a
+  push whose transaction aborts leaves it behind the remote until the
+  next fetch.
+- **Not built:** network remotes over libpq, the transfer from known
+  heads, `pg_prolly_fetch` and `pg_prolly_push` (they guard the remote
+  functions, which come with them), deleting a remote's branch (so
+  `dolt_fetch --prune` too), resuming, and V4.
 
 ## 8. Step 7 design: reclamation
 
