@@ -2,7 +2,9 @@
 
 **Status: measured 2026-10-17, on master plus stack #138 (#135–#139,
 with their reviews' fixes); prolly again in part 6, on `e25140de87` (#141
-and #142 before their reviews).**
+and #142 before their reviews), and in part 7 with keyless rows keyed by
+their first bytes (#149) and merged by the rule #150 makes, on
+`a2c14b4b68`.**
 This compares how stock Postgres (heap), page-based prolly and Dolt store
 tables without a primary key ("keyless" tables), what their operations
 cost, and how their merges treat them. Where prolly falls short, the
@@ -161,28 +163,33 @@ had paid that cost while loading (5.7 s against prolly's 0.18 s).
 The same six cases in both, each from a committed base, one change on a
 branch and one on `main`, then `dolt_merge` into `main`:
 
-| Case (base → ours, theirs) | Prolly | Dolt |
-|---|---|---|
-| Both add a copy of an existing row (1 → 2, 2) | Merges: 2 copies | Conflict (base 1, ours 2, theirs 2) |
-| Both add the same new row | Merges: 1 copy | Conflict |
-| Each adds a different row | Merges: both | Merges: both |
-| Both delete the same row | Merges: deleted | Conflict |
-| Both update the same row differently | Merges: both new rows, old one gone | Conflict on the shared delete; both new rows in the working set |
-| Base has 2 copies; ours deletes one, theirs adds one | Merges: 2 copies | Conflict |
+| Case (base → ours, theirs) | Prolly, as measured | Prolly, since #150 | Dolt |
+|---|---|---|---|
+| Both add a copy of an existing row (1 → 2, 2) | 2 copies | 3 copies | Conflict (base 1, ours 2, theirs 2) |
+| Both add the same new row | 1 copy | 2 copies | Conflict |
+| Each adds a different row | Both | Both | Both |
+| Both delete the same row | Deleted | Deleted | Conflict |
+| Both update the same row differently | Both new rows, old one gone | The same | Conflict on the shared delete; both new rows in the working set |
+| Base has 2 copies; ours deletes one, theirs adds one | 2 copies | 2 copies | Conflict |
 
-Prolly's rule (`merge_table`, `diffmerge_folded.c`): changes in a row's
-copies add up, unless both sides made it the same number, which converges
-as a keyed row's identical change does; a conflict only when theirs removes
-more copies than ours has. Dolt's: any key both sides changed is a
+Prolly's rule as measured (`merge_table`, `diffmerge_folded.c`): changes
+in a row's copies add up, unless both sides made it the same number,
+which converges as a keyed row's identical change does; a conflict only
+when theirs removes more copies than ours has.  Since #150: a row has the
+base's copies, those each side added, less the most either removed, and
+never conflicts. Dolt's: any key both sides changed is a
 conflict, identical changes too (`valueMerger.TryMerge` returns at once for
 keyless; `merge_rows.go:424`, "For keyless tables, this counts as a
 conflict"). Dolt's own tests skip the update case as resolving incorrectly
 (`integration-tests/bats/keyless.bats:685`).
 
-Prolly's convergence rule gives 2 copies, not 3, when both sides add a copy
-of the same row: two people each adding a row is read as both making the
-same change. That is the keyed rule carried over, and a choice to confirm,
-not an accident; summing would give 3.
+The convergence rule gave 2 copies, not 3, when both sides add a copy of
+the same row: two people each adding a row was read as both making the
+same change, the keyed rule carried over. #150 counts them as the two
+rows they are (a log's two entries), and deletes once what both deleted.
+Two different updates of the same row still keep both new rows: a
+keyless row has no identity to tell an update from a delete and an
+insert.
 
 ## 5. What to change in prolly
 
@@ -199,22 +206,23 @@ In order of what the numbers say matters:
    advance, and what #141 now settles. A move folds from the head once, as
    a branch's first use does, and a clean checkout reads nothing (0 pages,
    counted, in `clean_checkouts`): 0.45 ms keyless, 0.60 ms keyed.
-3. **Decide the keyless merge rule:** keep prolly's (counts add up,
-   identical changes converge), take Dolt's (any change on both sides
-   conflicts), or sum always (both adding a copy gives 3).
-4. **Key keyless rows by their content, not its hash.** Changes to a range
-   of rows would then touch a few chunks, as a keyed table's do, not one
-   each: the history grows 21 times as fast keyless as keyed now (part
-   6's journal sizes), and a fold of 10,000 changed rows costs 4–5 times
-   a keyed one. The proposal: a key of the row's first bytes as the
-   canonical encoding writes them (32 here), then its hash. That orders
-   by bytes, not by any type's comparison, so every column type has it
-   (json, xml or a point as well as an int), and a wide or TOASTed row's
-   key is no longer than any other's; the hash keeps it the row's alone.
-   Rows whose first bytes are random (a UUID first) gain nothing, and
-   lose nothing. The canonical format is frozen, so this needs a new
-   keying, recorded in the table's definition; decided before step 6,
-   since remotes carry the format.
+3. **Decide the keyless merge rule.** Decided (user, 2026-10-17) and done
+   in #150: copies added on either side add up, copies removed on both
+   are removed once, and a keyless row never conflicts (part 4).
+4. **Key keyless rows by their content, not its hash.** Decided (user,
+   2026-10-17) and done in #149, as proposed below; part 7 measures it.
+   Changes to a range of rows would then touch a few chunks, as a keyed
+   table's do, not one each: the history grows 21 times as fast keyless
+   as keyed now (part 6's journal sizes), and a fold of 10,000 changed
+   rows costs 4–5 times a keyed one. The proposal: a key of the row's
+   first bytes as the canonical encoding writes them (32 here), then its
+   hash. That orders by bytes, not by any type's comparison, so every
+   column type has it (json, xml or a point as well as an int), and a
+   wide or TOASTed row's key is no longer than any other's; the hash
+   keeps it the row's alone. Rows whose first bytes are random (a UUID
+   first) gain nothing, and lose nothing. The canonical format is
+   frozen, so this needs a new keying, recorded in the table's
+   definition; decided before step 6, since remotes carry the format.
 5. **Moves are O(rows changed), Dolt's O(1).** That follows from keeping
    the working set in pages: after 1 and 2, a fast-forward of 10,000 rows
    is 68 ms keyed (260 keyless), a reset 102 (270).
@@ -263,3 +271,43 @@ order alone: a move finds each keyless row it changes by its whole
 content (the row applier's index scan, or the keyless index it builds),
 where a keyed one is found by its key. Which part costs what isn't
 measured yet.
+
+## 7. Keyed by their first bytes
+
+Prolly again, the same runs on a release build of `a2c14b4b68`: #149's
+keying (a keyless row's first 32 encoded bytes, then its hash) and #150's
+merge rule, over #141 and #142 with their reviews' fixes. Times in ms:
+
+| Operation | Prolly keyless (part 6) | Now | Prolly keyed (part 6) | Now |
+|---|---|---|---|---|
+| Commit after 10,000 rows updated | 188 | 22 | 40 | 37 |
+| `dolt_diff` of two commits 10,000 rows apart | 45 | 3.4 | 2.9 | 2.8 |
+| `dolt_status` after 10,000 rows updated | 185 | 22 | 36 | 34 |
+| Hard reset of 10,000 changed rows | 270 | 65 | 102 | 96 |
+| Check out a new branch (its first use) | 3.5 | 3.8 | 4.7 | 4.8 |
+| Check out another branch, nothing changed | 0.45 | 0.45 | 0.60 | 0.64 |
+| Check out another branch, 10,000 rows changed | 345 | 45 | 63 | 63 |
+| Fast-forward merge of 10,000 changed rows | 260 | 50 | 68 | 68 |
+| Three-way merge, 10,000 rows changed on each side | 307 | 53 | 71 | 71 |
+| Three-way merge, one row changed on each side | 1.1 | 1.2 | 1.6 | 1.8 |
+| Cherry-pick of 10,000 changed rows | 394 | 67 | 102 | 104 |
+
+Space after the run, in bytes:
+
+| | Prolly keyless (part 6) | Now | Prolly keyed (part 6) | Now |
+|---|---|---|---|---|
+| Database on disk | 1,269 M | 226 M | 245 M | 245 M |
+| of which the chunk journal | 1,129 M | 86 M | 53 M | 53 M |
+
+(the journals 86,301,774 and 52,959,296 bytes)
+
+Keyed by their first bytes, keyless rows changed in a run write a few
+chunks, and every gap part 6 found closes with it: a keyless table's
+commits, diffs, statuses and moves now cost what a keyed one's do or
+less (why less isn't measured), and its history is 1.6 times a keyed
+one's,
+not 21 times. Part 6's guess that keyless moves cost more for finding
+rows by content was wrong: what they paid was the history's order too
+(each move reads and writes the trees). Writes and reads are as before,
+heap's (part 2). Dolt's keyless history still has the random order
+(part 3).
