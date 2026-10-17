@@ -65,7 +65,7 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
                            if line.startswith("MemTotal")), None),
         "cpu_governors": governors,
         "cpu_energy_preference": epp,
-        "cpu_boost": _read("/sys/devices/system/cpu/cpufreq/boost"),
+        "cpu_boost": _cpu_boost(),
         "perf_event_paranoid": _read("/proc/sys/kernel/perf_event_paranoid"),
         "system_prepare_applied": STATE_FILE.exists(),
         "loadavg_at_start": _read("/proc/loadavg"),
@@ -127,6 +127,18 @@ def slt_source_hash(repo: Path) -> str:
     for n in names:
         h.update((src / n).read_bytes())
     return h.hexdigest()
+
+
+def _cpu_boost() -> str:
+    """'1' if boost is on, '0' if off, '' if unknown.  With intel_pstate
+    there is no cpufreq/boost: its no_turbo says the opposite."""
+    boost = _read("/sys/devices/system/cpu/cpufreq/boost")
+    if boost in ("0", "1"):
+        return boost
+    no_turbo = _read("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    if no_turbo in ("0", "1"):
+        return "1" if no_turbo == "0" else "0"
+    return boost
 
 
 def warnings(env: dict[str, Any], suite: str = "S") -> list[str]:

@@ -72,7 +72,7 @@ class VWorkload(Workload):
     suite = "V"
 
     def check(self, ctx):
-        if ctx.table_am != "prolly_d1":
+        if ctx.table_am not in targets.VERSIONED_HISTORY:
             raise NotImplementedByEngine(f"{ctx.table_am}: no verified data-history adapter for V benchmarks")
         # Same data-history requirement as vcscenario: restoring a committed
         # value must actually restore SQL-visible data. Timing a ref-only
@@ -80,10 +80,13 @@ class VWorkload(Workload):
         db = "pbench_vc_probe"
         ctx.cluster.sql(f"CREATE DATABASE {db}")
         try:
-            ctx.cluster.sql("""
+            setup = targets.for_am(ctx.table_am).setup_sql(db)
+            if setup:
+                ctx.cluster.sql(setup, dbname=db)
+            ctx.cluster.sql(f"""
                 CREATE TABLE target (id int PRIMARY KEY, v text);
                 INSERT INTO target VALUES (1, 'base');
-                SELECT prolly_commit('probe base');
+                {vc_sql(ctx).commit('probe base')};
                 UPDATE target SET v = 'dirty';
                 SELECT dolt_reset('--hard', 'HEAD');
                 DO $$ BEGIN

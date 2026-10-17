@@ -10,6 +10,7 @@ engine's result set under compare/<baseline>/<workload>/, and renders it.
 
 from __future__ import annotations
 
+import datetime as dt
 import gzip
 import json
 import subprocess
@@ -83,6 +84,8 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
             inputs.append(EXCEPTIONS)
         stamp = dest / "inputs.json"
         identity = {str(p): sha256(p) for p in inputs}
+        # (exceptions expire: a result is for the day it was computed)
+        identity["evaluated_on"] = dt.date.today().isoformat()
         differences = dest / "diffs.jsonl.gz"
         valid_cache = False
         if result.exists() and stamp.exists() and differences.exists():
@@ -131,7 +134,11 @@ def evidence(d: Path, am: str) -> tuple[list[str], dict]:
                     raise ValueError("unexpected skip or execution of excluded record")
                 if status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
                     problems.append(f"{key}: {status}")
-                if status in ("ok", "not_ok") and not (r.get("sqlstate") or (r.get("o") and r.get("s"))):
+                # (a client-side error has only its message: a result, not
+                # missing evidence)
+                if status in ("ok", "not_ok") and not (
+                        r.get("sqlstate") or (r.get("o") and r.get("s"))
+                        or (status == "not_ok" and r.get("msg"))):
                     raise ValueError("missing actual execution evidence")
                 previous = key
                 total += 1

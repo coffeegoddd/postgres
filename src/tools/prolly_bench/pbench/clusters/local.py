@@ -42,7 +42,7 @@ class LocalCluster(Cluster):
         return str(self.bin_dir / program)
 
     def _run(self, args: list[str], **kw) -> subprocess.CompletedProcess:
-        return process.run(args, capture_output=True, text=True, timeout=600, **kw)
+        return process.run(args, capture_output=True, text=True, **kw)
 
     def create(self, settings: dict[str, str]) -> None:
         if self._running:
@@ -65,7 +65,7 @@ class LocalCluster(Cluster):
 
     def start(self) -> None:
         r = self._run([self.bin("pg_ctl"), "-D", str(self.data_dir), "-l",
-                       str(self.log_file), "-w", "-t", "300", "start"])
+                       str(self.log_file), "-w", "-t", "3600", "start"])
         if r.returncode != 0:
             raise RuntimeError(f"pg_ctl start failed: {r.stdout}{r.stderr}\n"
                                f"{self.log_since(0)[-3000:]}")
@@ -75,7 +75,7 @@ class LocalCluster(Cluster):
         if not self.data_dir.exists():
             return
         r = self._run([self.bin("pg_ctl"), "-D", str(self.data_dir), "-m", mode,
-                       "-w", "-t", "300", "stop"])
+                       "-w", "-t", "3600", "stop"])
         if r.returncode != 0 and "Is server running?" not in r.stderr:
             raise RuntimeError(f"pg_ctl stop failed: {r.stdout}{r.stderr}")
         self._running = False
@@ -91,10 +91,13 @@ class LocalCluster(Cluster):
         raise RuntimeError("server did not become ready")
 
     def destroy(self) -> None:
-        self.stop("immediate")
-        if self.base.exists():
-            shutil.rmtree(self.base)
-        shutil.rmtree(self.sock_dir, ignore_errors=True)
+        try:
+            self.stop("immediate")
+        finally:
+            # (a failed stop still frees the cell's disk: each cell has its own)
+            if self.base.exists():
+                shutil.rmtree(self.base, ignore_errors=True)
+            shutil.rmtree(self.sock_dir, ignore_errors=True)
 
     # -- clients ----------------------------------------------------------
 

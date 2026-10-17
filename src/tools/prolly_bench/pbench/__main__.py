@@ -81,7 +81,7 @@ def _run(args: argparse.Namespace) -> int:
                         repo=REPO, bin_dir=args.pg_bin.resolve(),
                         work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
                         command="prolly_bench " + shlex.join(sys.argv[1:]),
-                        allow_heap_v=args.allow_heap_v, keep_failed=args.keep_failed)
+                        keep_failed=args.keep_failed)
         runners.append(runner)
         out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run
@@ -239,8 +239,6 @@ def main(argv=None) -> int:
     r.add_argument("--no-fio", action="store_true", help="skip the fio device baseline")
     r.add_argument("--keep-failed", action="store_true",
                    help="keep the cluster of a cell that errors, for debugging")
-    r.add_argument("--allow-heap-v", action="store_true",
-                   help="allow the V suite on heap (harness testing only)")
     r.set_defaults(fn=_run)
 
     sub.add_parser("list", help="list workloads, collectors and sinks").set_defaults(fn=_list)

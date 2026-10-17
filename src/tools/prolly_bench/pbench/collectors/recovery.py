@@ -15,7 +15,7 @@ from pbench.core.validation import atomic_json
 @registry.collectors.register("recovery")
 class RecoveryCollector(Collector):
     name = "recovery"
-    post_order = -100  # before VACUUM or other maintenance changes the fixture
+    post_order = 100  # last: it crashes the server
 
     def post(self, ctx, outcome):
         before = table_digests(ctx)
@@ -30,7 +30,7 @@ class RecoveryCollector(Collector):
         after = table_digests(ctx)
         atomic_json(ctx.raw_dir / "recovery-correctness.json", {
             "before": before, "after": after, "equal": before == after,
-            "scope": "process crash, warm OS cache after integrity scan, before maintenance"})
+            "scope": "process crash, warm OS cache after integrity scan, after maintenance"})
         if before != after:
             raise RuntimeError("recovered table contents differ from committed pre-crash data")
         return {"process_restart_seconds": seconds, "recovery_wal_bytes": replay,
