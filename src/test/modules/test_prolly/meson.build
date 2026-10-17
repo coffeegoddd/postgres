@@ -76,6 +76,7 @@ tests += {
       'keyless_keys',
       'walks',
       'remotes',
+      'remote_clone',
     ],
   },
   'tap': {
