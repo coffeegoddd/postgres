@@ -1604,7 +1604,7 @@ copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldIndex,
 	 */
 	NewHeap->rd_toastoid = InvalidOid;
 
-	num_pages = table_relation_stats_pages(NewHeap);
+	num_pages = RelationGetNumberOfBlocks(NewHeap);
 
 	/* Log what we did */
 	ereport(elevel,

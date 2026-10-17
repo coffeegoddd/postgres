@@ -634,29 +634,6 @@ table_block_parallelscan_nextpage(Relation rel,
  * is in the main fork rather than some other), it can use this implementation
  * of the relation_size callback rather than implementing its own.
  */
-/*
- * The size in pages that ANALYZE, CLUSTER and index builds record in
- * pg_class for rel: its main fork's blocks, or, for a table AM whose rows
- * aren't in the blocks of its main fork (one that samples its own rows for
- * ANALYZE), the pages of its size estimate, so that the rows per page
- * recorded fit what the estimate counts.
- */
-BlockNumber
-table_relation_stats_pages(Relation rel)
-{
-	if (rel->rd_tableam != NULL &&
-		rel->rd_tableam->relation_acquire_sample_rows != NULL)
-	{
-		BlockNumber pages;
-		double		tuples;
-		double		allvisfrac;
-
-		table_relation_estimate_size(rel, NULL, &pages, &tuples, &allvisfrac);
-		return pages;
-	}
-	return RelationGetNumberOfBlocks(rel);
-}
-
 uint64
 table_block_relation_size(Relation rel, ForkNumber forkNumber)
 {

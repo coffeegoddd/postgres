@@ -86,8 +86,6 @@ static void compute_index_stats(Relation onerel, double totalrows,
 static void validate_va_cols_list(Relation onerel, List *va_cols);
 static VacAttrStats *examine_attribute(Relation onerel, int attnum,
 									   Node *index_expr);
-static AcquireSampleRowsFunc table_acquirefunc(Relation rel,
-											   BlockNumber *relpages);
 static int	acquire_sample_rows(Relation onerel, int elevel,
 								HeapTuple *rows, int targrows,
 								double *totalrows, double *totaldeadrows);
@@ -215,8 +213,10 @@ analyze_rel(Oid relid, RangeVar *relation,
 	if (onerel->rd_rel->relkind == RELKIND_RELATION ||
 		onerel->rd_rel->relkind == RELKIND_MATVIEW)
 	{
-		/* Regular table: its AM's row acquisition function, and its size */
-		acquirefunc = table_acquirefunc(onerel, &relpages);
+		/* Regular table, so we'll use the regular row acquisition function */
+		acquirefunc = acquire_sample_rows;
+		/* Also get regular table's size */
+		relpages = RelationGetNumberOfBlocks(onerel);
 	}
 	else if (onerel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 	{
@@ -1253,22 +1253,6 @@ block_sampling_read_stream_next(ReadStream *stream,
 }
 
 /*
- * table_acquirefunc -- the row acquisition function for a table, and its
- * size in pages
- *
- * The table AM's own sampler if it has one, else block sampling of the
- * main fork.
- */
-static AcquireSampleRowsFunc
-table_acquirefunc(Relation rel, BlockNumber *relpages)
-{
-	*relpages = table_relation_stats_pages(rel);
-	if (rel->rd_tableam->relation_acquire_sample_rows != NULL)
-		return rel->rd_tableam->relation_acquire_sample_rows;
-	return acquire_sample_rows;
-}
-
-/*
  * acquire_sample_rows -- acquire a random sample of rows from the table
  *
  * Selected rows are returned in the caller-allocated array rows[], which
@@ -1567,8 +1551,9 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 		if (childrel->rd_rel->relkind == RELKIND_RELATION ||
 			childrel->rd_rel->relkind == RELKIND_MATVIEW)
 		{
-			/* Regular table: its AM's row acquisition function */
-			acquirefunc = table_acquirefunc(childrel, &relpages);
+			/* Regular table, so use the regular row acquisition function */
+			acquirefunc = acquire_sample_rows;
+			relpages = RelationGetNumberOfBlocks(childrel);
 		}
 		else if (childrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		{

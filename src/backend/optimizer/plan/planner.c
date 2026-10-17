@@ -22,7 +22,6 @@
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/table.h"
-#include "access/tableam.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
@@ -7314,13 +7313,11 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	/*
 	 * Determine if it's safe to proceed.
 	 *
-	 * Currently, parallel workers can't access the leader's temporary tables,
-	 * nor scan tables whose access method has no parallel scans (it may keep
-	 * a transaction's changes where workers can't see them).  Furthermore,
-	 * any index predicate or index expressions must be parallel safe.
+	 * Currently, parallel workers can't access the leader's temporary tables.
+	 * Furthermore, any index predicate or index expressions must be parallel
+	 * safe.
 	 */
 	if (heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
-		heap->rd_tableam->parallelscan_estimate == NULL ||
 		!is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) ||
 		!is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index)))
 	{
