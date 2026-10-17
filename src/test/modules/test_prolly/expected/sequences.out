@@ -370,6 +370,7 @@ SELECT nextval('app.s') > 0 AS taken;
 SELECT dolt_merge('feature');
 ERROR:  local changes would be stomped by merge
 DETAIL:  Sequence "app.s" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
