@@ -66,6 +66,8 @@
 #include "catalog/branch_ops.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -578,29 +580,61 @@ materialize(const char *name)
 	ProllyCommitInfo info;
 	ProllyNodeRef baseline;
 	ProllyNodeRef working;
+	bool		was_read_only = XactReadOnly;
 
-	if (OidIsValid(branch_oid(name)) || !branch_head(name, &head))
-		return;
-	if (!copies_commit_get(&head, &info))
+	if (RecoveryInProgress())
 		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the head commit of branch \"%s\" is missing", name)));
-	branch_ops()->create(name, NULL);
-	branch_set_baseline(name,
-						branch_baseline(branch_ops()->current(), &baseline) ?
-						&baseline : NULL, NULL);
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("branch \"%s\" hasn't been used yet", name),
+				 errdetail("A branch's first use makes its copies, which a standby can't."),
+				 errhint("Use it on the primary first.")));
 
 	/*
-	 * Moved to the head, unless the copies are there already (the session's
-	 * branch has nothing else); then folded from the head, so its folds
-	 * don't read the pages the move wrote again and again.
+	 * Its copies are the branch's as much as its head is: made whatever the
+	 * session may make or write, as it is.
 	 */
-	if (!(copies_working_set(name, &working) &&
-		  same_hash(&working.hash, &info.root.hash)))
+	XactReadOnly = false;
+	PG_TRY();
 	{
-		branch_ops()->run_on(name, move_to, &info.root);
-		branch_ops()->run_on(name, fold_as_baseline, NULL);
+		/* (with the refs held: no other session makes or deletes it meanwhile) */
+		lock_refs();
+		AcceptInvalidationMessages();
+		if (OidIsValid(branch_oid(name)) || !branch_head(name, &head))
+			goto done;
+		if (!copies_commit_get(&head, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the head commit of branch \"%s\" is missing", name)));
+		branch_ops()->make(name, NULL);
+		branch_set_baseline(name,
+							branch_baseline(branch_ops()->current(), &baseline) ?
+							&baseline : NULL, NULL);
+
+		/*
+		 * Moved to the head, unless the copies are there already (the
+		 * session's branch has nothing else); then folded from the head, so
+		 * its folds don't read the pages the move wrote again and again.
+		 */
+		if (!(copies_working_set(name, &working) &&
+			  same_hash(&working.hash, &info.root.hash)))
+		{
+			branch_ops()->run_on(name, move_to, &info.root);
+			branch_ops()->run_on(name, fold_as_baseline, NULL);
+		}
+done:
+		;
 	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+}
+
+static void
+note_made(const char *name, Oid branch, void *arg)
+{
+	(void) hash_search((HTAB *) arg, name, HASH_ENTER, NULL);
 }
 
 /* Visit the branches that have only a head (not yet copies). */
@@ -626,10 +660,27 @@ visit_head_only(void (*visit) (const char *name, void *arg), void *arg)
 		names = lappend(names, pnstrdup((const char *) k.data + 1, k.len - 1));
 	}
 	PROLLY_CALL(tree, cursor_close, c);
-	foreach(lc, names)
+	if (names == NIL)
+		return;
+
+	/* (the branches with copies, read once) */
 	{
-		if (!OidIsValid(branch_oid(lfirst(lc))))
-			visit(lfirst(lc), arg);
+		HASHCTL		ctl;
+		HTAB	   *made;
+
+		ctl.keysize = NAMEDATALEN;
+		ctl.entrysize = NAMEDATALEN;
+		ctl.hcxt = CurrentMemoryContext;
+		made = hash_create("prolly branches with copies", 64, &ctl,
+						   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+		branch_ops()->branches(note_made, made);
+		foreach(lc, names)
+		{
+			if (strlen(lfirst(lc)) >= NAMEDATALEN ||
+				hash_search(made, lfirst(lc), HASH_FIND, NULL) == NULL)
+				visit(lfirst(lc), arg);
+		}
+		hash_destroy(made);
 	}
 }
 
@@ -907,12 +958,10 @@ copies_branch_create(const char *name, const char *start_point)
 	const char *from = start_point ? start_point : branch_ops()->current();
 	ProllyHash	id;
 	ProllyCommitInfo info;
+	bool		from_exists;
 
+	branch_ops()->check_create(name);
 	lock_refs();
-	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("invalid branch name \"%s\"", name)));
 	if (branch_exists(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -923,15 +972,17 @@ copies_branch_create(const char *name, const char *start_point)
 	 * branch's uncommitted changes stay its own.  It has only the head
 	 * until it is first used.
 	 */
-	if (branch_exists(from) ? !branch_head(from, &id) :
-		!copies_resolve(from, &id))
+	from_exists = branch_exists(from);
+	if (from_exists ? !branch_head(from, &id) : !copies_resolve(from, &id))
 	{
 		ProllyNodeRef baseline;
 
-		if (branch_exists(from))
+		if (from_exists)
 		{
-			/* (a branch without commits: a copy of it, as it is) */
-			materialize(from);
+			/*
+			 * (a branch without commits, so with its copies: a copy of it,
+			 * as it is)
+			 */
 			branch_ops()->create(name, from);
 			branch_set_baseline(name, branch_baseline(from, &baseline) ?
 								&baseline : NULL, NULL);
@@ -964,8 +1015,10 @@ copies_branch_delete(const char *name, bool force)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" is not fully merged", name),
 				 errhint("Delete it anyway with -D.")));
-	if (OidIsValid(branch_oid(name)) || !branch_exists(name))
+	if (OidIsValid(branch_oid(name)) || !branch_head(name, &head))
 		branch_ops()->drop(name);	/* (which refuses one that doesn't exist) */
+	else
+		branch_ops()->check_drop(name); /* (one with only a head) */
 	branch_set_head(name, NULL);
 	branch_set_baseline(name, NULL, NULL);
 
@@ -1035,10 +1088,12 @@ static void
 copies_checkout(const char *name)
 {
 	char	   *current = branch_ops()->current();
+	Oid			oid = strcmp(current, name) != 0 ? branch_oid(name) : InvalidOid;
+	ProllyHash	only_head;
 
 	/* (one with only a head gets its copies, a connection's too) */
-	if (strcmp(current, name) != 0 && !OidIsValid(branch_oid(name)) &&
-		branch_exists(name))
+	if (strcmp(current, name) != 0 && !OidIsValid(oid) &&
+		branch_head(name, &only_head))
 	{
 		bool		pushed = !ActiveSnapshotSet();
 
@@ -1047,10 +1102,11 @@ copies_checkout(const char *name)
 		materialize(name);
 		if (pushed)
 			PopActiveSnapshot();
+		oid = branch_oid(name);
 	}
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
-		OidIsValid(branch_oid(name)))
+		OidIsValid(oid))
 	{
 		ProllyNodeRef working;
 		ProllyNodeRef kept;

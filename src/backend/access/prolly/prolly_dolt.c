@@ -484,7 +484,8 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 /*
  * The hidden branches no session is on any more (current is the session's
  * branch), deleted, each in a subtransaction: one a session is on, or
- * anything else that keeps it, is left.  Only in a transaction that can
+ * that the session may not delete, is left; any other error is the
+ * checkout's.  Only in a transaction that can
  * write, or that is read-only only for the branch it started on (one
  * leaving a commit).
  */
@@ -514,11 +515,22 @@ sweep_detached(char *current)
 		}
 		PG_CATCH();
 		{
+			ErrorData  *ed;
+
 			MemoryContextSwitchTo(cxt);
+			ed = CopyErrorData();
 			FlushErrorState();
 			RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
+			/* (a cancel, or anything else, isn't the branch kept) */
+			if (ed->sqlerrcode != ERRCODE_OBJECT_IN_USE &&
+				ed->sqlerrcode != ERRCODE_INSUFFICIENT_PRIVILEGE)
+			{
+				XactReadOnly = was_read_only;
+				ReThrowError(ed);
+			}
+			FreeErrorData(ed);
 		}
 		PG_END_TRY();
 	}
