@@ -71,6 +71,7 @@ control; this project's premise is that we should not have to.
 | [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **The design being built (user direction, 2026-10-15; steps 0–5 built 2026-10-17):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); the steps, what each built, and where the build departed from the plan |
 | [12-correctness-suite.md](12-correctness-suite.md) | **Decided (2026-10-15):** the C suite, sqllogictest against heap and every engine from `prolly_bench`, judged by agreement with heap; runner, comparison classes, gate, plan |
 | [13-keyless-tables.md](13-keyless-tables.md) | **Measured (2026-10-17):** tables without a primary key in heap, page-based prolly and Dolt: how each keeps them, what writes, commits, diffs, moves and merges cost, how merges treat them, and what to change in prolly |
+| [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Proposed (2026-10-17):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180), then C, content-addressed TOAST pointers in the chunk store (#181) |
 
 ## Related local repositories
 
