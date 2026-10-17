@@ -3453,6 +3453,14 @@ prolly_node_counters(PG_FUNCTION_ARGS)
 	bool		nulls[2] = {false, false};
 
 	prolly_components_for_am(NameStr(*PG_GETARG_NAME(0)), &c);
+
+	/* (page-based prolly keeps its trees as chunks, not in a node store) */
+	if (c.engine == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("access method \"%s\" keeps no node counters",
+						NameStr(*PG_GETARG_NAME(0))),
+				 errdetail("Its tables are pages; their history is chunks, which no node store counts.")));
 	PROLLY_CALL(c.engine, node_counters, &counters);
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
