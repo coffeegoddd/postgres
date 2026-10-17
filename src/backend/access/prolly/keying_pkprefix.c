@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * keying_pkcontent.c
+ * keying_pkprefix.c
  *	  Table keying implementation "pk_or_prefix": keyed by the primary
  *	  key if the table has one, else by row content's first bytes and hash.
  *
@@ -26,9 +26,8 @@
  * not one each; the hash makes the key the row's alone.  Keys are compared
  * as bytes, so the order depends on no collation.
  *
- * A description is 'Q' for prefix-and-hash keying ('C', for the
- * content-hash keying of commits before it, is read but never made), or
- * 'P' for a primary key, the
+ * A description is 'Q' for prefix-and-hash keying or 'P' for a primary
+ * key, the
  * length and bytes of the value encoder's row layout, and for 'P' the
  * number of key columns and per column its attribute number, options,
  * opfamily, collation and type, in native byte order (descriptions are
@@ -41,7 +40,7 @@
  * (DROP TYPE ... CASCADE drops the column with it).
  *
  * IDENTIFICATION
- *	  src/backend/access/prolly/keying_pkcontent.c
+ *	  src/backend/access/prolly/keying_pkprefix.c
  *
  *-------------------------------------------------------------------------
  */
@@ -71,7 +70,6 @@ struct ProllyKeying
 
 	/* Primary key, if any. */
 	bool		keyless;
-	bool		prefixed;		/* keyless keys begin with the row's bytes */
 	const ProllyKeyEncoderRoutine *keyenc_routine;
 	ProllyKeyEncoder *keyenc;
 	int			nkeys;
@@ -172,7 +170,6 @@ primary_key_columns(Relation rel, Oid pkoid, KeyColumn *cols)
 typedef struct Description
 {
 	bool		keyless;
-	bool		prefixed;
 	ProllyValue layout;
 	int			nkeys;
 	KeyColumn	cols[INDEX_MAX_KEYS];
@@ -186,10 +183,9 @@ parse_description(const ProllyValue *d, Description *out)
 	uint16		nkeys;
 
 	if (d->len < 1 + sizeof(uint16) ||
-		(d->data[0] != 'C' && d->data[0] != 'Q' && d->data[0] != 'P'))
+		(d->data[0] != 'Q' && d->data[0] != 'P'))
 		goto bad;
-	out->keyless = (d->data[0] != 'P');
-	out->prefixed = (d->data[0] == 'Q');
+	out->keyless = (d->data[0] == 'Q');
 	off = 1;
 	memcpy(&len, d->data + off, sizeof(len));
 	off += sizeof(len);
@@ -233,7 +229,7 @@ bad:
  */
 static ProllyKeying *
 open_keying(Relation rel, const ProllyValue *description, bool rewritten,
-			bool prefixed, MemoryContext mcxt)
+			MemoryContext mcxt)
 {
 	MemoryContext old = MemoryContextSwitchTo(mcxt);
 	ProllyComponents c;
@@ -258,7 +254,6 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 		Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 		d.keyless = !OidIsValid(pkoid);
-		d.prefixed = prefixed;
 		d.nkeys = d.keyless ? 0 : primary_key_columns(rel, pkoid, d.cols);
 
 		/*
@@ -276,7 +271,6 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 								mcxt);
 	}
 	k->keyless = d.keyless;
-	k->prefixed = d.keyless && d.prefixed;
 	if (!k->keyless)
 	{
 		bool		supported = true;
@@ -310,17 +304,17 @@ open_keying(Relation rel, const ProllyValue *description, bool rewritten,
 static ProllyKeying *
 pkprefix_open(Relation rel, const ProllyValue *description, MemoryContext mcxt)
 {
-	return open_keying(rel, description, false, true, mcxt);
+	return open_keying(rel, description, false, mcxt);
 }
 
 static ProllyKeying *
 pkprefix_open_rewritten(Relation rel, MemoryContext mcxt)
 {
-	return open_keying(rel, NULL, true, true, mcxt);
+	return open_keying(rel, NULL, true, mcxt);
 }
 
 static void
-pkcontent_describe(ProllyKeying *k, StringInfo out)
+pkprefix_describe(ProllyKeying *k, StringInfo out)
 {
 	uint16		nkeys = (uint16) k->nkeys;
 	StringInfoData layout;
@@ -329,7 +323,7 @@ pkcontent_describe(ProllyKeying *k, StringInfo out)
 	initStringInfo(&layout);
 	PROLLY_CALL(k->valenc_routine, layout, k->valenc, &layout);
 	len = (uint16) layout.len;
-	appendStringInfoChar(out, !k->keyless ? 'P' : k->prefixed ? 'Q' : 'C');
+	appendStringInfoChar(out, k->keyless ? 'Q' : 'P');
 	appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
 	appendBinaryStringInfo(out, layout.data, layout.len);
 	pfree(layout.data);
@@ -355,13 +349,12 @@ pkcontent_describe(ProllyKeying *k, StringInfo out)
  * encoder reads their layout.
  */
 static bool
-pkcontent_can_read(ProllyKeying *k, const ProllyValue *description)
+pkprefix_can_read(ProllyKeying *k, const ProllyValue *description)
 {
 	Description d;
 
 	parse_description(description, &d);
-	if (d.keyless != k->keyless || d.nkeys != k->nkeys ||
-		(d.keyless && d.prefixed != k->prefixed))
+	if (d.keyless != k->keyless || d.nkeys != k->nkeys)
 		return false;
 	for (int i = 0; i < d.nkeys; i++)
 	{
@@ -376,13 +369,13 @@ pkcontent_can_read(ProllyKeying *k, const ProllyValue *description)
 }
 
 static bool
-pkcontent_keyless(ProllyKeying *k)
+pkprefix_keyless(ProllyKeying *k)
 {
 	return k->keyless;
 }
 
 static void
-pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
+pkprefix_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 					 StringInfo row, ProllyHash *content)
 {
 	int			start = row->len;
@@ -392,20 +385,17 @@ pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 
 	if (k->keyless)
 	{
-		if (k->prefixed)
-		{
-			/*
-			 * (from after the row's header, its column count and NULLs, so
-			 * rows that begin alike stay together whatever their later
-			 * columns' NULLs)
-			 */
-			const char *p = row->data + start;
-			const char *end = row->data + row->len;
-			uint64		n = prolly_get_varint(&p, end);
+		/*
+		 * (from after the row's header, its column count and NULLs, so rows
+		 * that begin alike stay together whatever their later columns'
+		 * NULLs)
+		 */
+		const char *p = row->data + start;
+		const char *end = row->data + row->len;
+		uint64		n = prolly_get_varint(&p, end);
 
-			p += Min((uint64) (end - p), (n + 7) / 8);
-			appendBinaryStringInfo(key, p, Min(end - p, KEY_PREFIX));
-		}
+		p += Min((uint64) (end - p), (n + 7) / 8);
+		appendBinaryStringInfo(key, p, Min(end - p, KEY_PREFIX));
 		appendBinaryStringInfo(key, content->bytes, content->len);
 		return;
 	}
@@ -423,7 +413,7 @@ pkcontent_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 }
 
 static void
-pkcontent_make_value(ProllyKeying *k, const ProllyValue *row, uint64 count,
+pkprefix_make_value(ProllyKeying *k, const ProllyValue *row, uint64 count,
 					 StringInfo value)
 {
 	if (k->keyless)
@@ -437,7 +427,7 @@ pkcontent_make_value(ProllyKeying *k, const ProllyValue *row, uint64 count,
 }
 
 static void
-pkcontent_parse_value(ProllyKeying *k, const ProllyValue *value,
+pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
 					  ProllyValue *row, uint64 *count)
 {
 	const char *p = (const char *) value->data;
@@ -458,14 +448,14 @@ pkcontent_parse_value(ProllyKeying *k, const ProllyValue *value,
 }
 
 static void
-pkcontent_content_hash(ProllyKeying *k, const ProllyValue *row,
+pkprefix_content_hash(ProllyKeying *k, const ProllyValue *row,
 					   ProllyHash *content)
 {
 	hash_row(k, row->data, row->len, content);
 }
 
 static void
-pkcontent_decode_row(ProllyKeying *k, const ProllyValue *row,
+pkprefix_decode_row(ProllyKeying *k, const ProllyValue *row,
 					 TupleTableSlot *slot)
 {
 	TupleDesc	sd = slot->tts_tupleDescriptor;
@@ -497,7 +487,7 @@ pkcontent_decode_row(ProllyKeying *k, const ProllyValue *row,
 }
 
 static int
-pkcontent_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
+pkprefix_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 {
 	int			r;
 
@@ -515,7 +505,7 @@ pkcontent_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
  * with.
  */
 static bool
-pkcontent_can_compare(ProllyKeying *k)
+pkprefix_can_compare(ProllyKeying *k)
 {
 	if (k->keyless)
 		return true;
@@ -532,17 +522,17 @@ pkcontent_can_compare(ProllyKeying *k)
 
 /* Content hashes are equal only as bytes; key columns, as encoded. */
 static bool
-pkcontent_equal_bytes(ProllyKeying *k)
+pkprefix_equal_bytes(ProllyKeying *k)
 {
 	if (k->keyless)
 		return true;
-	if (!pkcontent_can_compare(k))
+	if (!pkprefix_can_compare(k))
 		return false;
 	return PROLLY_CALL(k->keyenc_routine, equal_bytes, key_encoder(k));
 }
 
 static void
-pkcontent_close(ProllyKeying *k)
+pkprefix_close(ProllyKeying *k)
 {
 	PROLLY_CALL(k->valenc_routine, end, k->valenc);
 	if (k->alt_valenc)
@@ -564,17 +554,17 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 		"bytes and hash with a count for tables without one",
 	},
 	.open = pkprefix_open,
-	.describe = pkcontent_describe,
+	.describe = pkprefix_describe,
 	.open_rewritten = pkprefix_open_rewritten,
-	.can_read = pkcontent_can_read,
-	.keyless = pkcontent_keyless,
-	.encode_row = pkcontent_encode_row,
-	.make_value = pkcontent_make_value,
-	.parse_value = pkcontent_parse_value,
-	.content_hash = pkcontent_content_hash,
-	.decode_row = pkcontent_decode_row,
-	.compare = pkcontent_compare,
-	.can_compare = pkcontent_can_compare,
-	.equal_bytes = pkcontent_equal_bytes,
-	.close = pkcontent_close,
+	.can_read = pkprefix_can_read,
+	.keyless = pkprefix_keyless,
+	.encode_row = pkprefix_encode_row,
+	.make_value = pkprefix_make_value,
+	.parse_value = pkprefix_parse_value,
+	.content_hash = pkprefix_content_hash,
+	.decode_row = pkprefix_decode_row,
+	.compare = pkprefix_compare,
+	.can_compare = pkprefix_can_compare,
+	.equal_bytes = pkprefix_equal_bytes,
+	.close = pkprefix_close,
 };

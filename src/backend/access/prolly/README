@@ -16,7 +16,7 @@ as they do on heap.
 
 A commit folds the session branch's versioned schemas into canonical,
 content-addressed prolly trees, kept in the database's chunk store, and
-names the canonical root (canon_catalogs.c).  Diffs and merges compare
+names the canonical root (canon_folded.c).  Diffs and merges compare
 those trees; remotes exchange their chunks.
 
 
@@ -104,7 +104,7 @@ resource manager (prolly_xlog.h).
 Commits
 -------
 
-Table keying (keying_pkcontent.c) keys a folded table by its primary key,
+Table keying (keying_pkprefix.c) keys a folded table by its primary key,
 or, without one, by its rows' leading bytes and content hash with a count
 of identical rows.  A commit folds each table's rows into its data tree:
 in full the first time, then from its baseline, re-reading only the rows on

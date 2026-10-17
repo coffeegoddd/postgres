@@ -24,7 +24,6 @@
 
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
-#include "storage/block.h"
 
 /* The implementation's record type, in the info byte. */
 #define PROLLY_XLOG_TYPE_MASK	0xF0

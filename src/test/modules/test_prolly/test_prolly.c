@@ -119,10 +119,8 @@ static const ConformanceCase cases[] = {
 	valenc_decodes_earlier_layouts},
 
 	/* reclamation */
-	{PROLLY_IFACE_RECLAMATION, "reachable_never_freed",
-	"node_created node_dropped root_retired run", NULL},
-	{PROLLY_IFACE_RECLAMATION, "in_place_only_when_private",
-	"may_modify_in_place", NULL},
+	{PROLLY_IFACE_RECLAMATION, "live_chunks_never_freed", "collect", NULL},
+	{PROLLY_IFACE_RECLAMATION, "keeps_what_writers_reference", "collect", NULL},
 
 	/* table keying */
 	{PROLLY_IFACE_TABLE_KEYING, "round_trip",

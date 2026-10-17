@@ -19,7 +19,6 @@
 #include "access/prolly_config.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
-#include "commands/defrem.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -79,13 +78,22 @@ prolly_check_unlogged(Relation rel)
 }
 
 void
-prolly_components_for_am(const char *amname, ProllyComponents *components)
+prolly_components_for_relation(Relation rel, ProllyComponents *components)
 {
-	if (amname == NULL || strcmp(amname, "prolly") != 0)
+	Oid			amoid;
+
+	/* (an index's are its table's) */
+	if (rel->rd_rel->relkind == RELKIND_INDEX ||
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+		amoid = get_rel_relam(rel->rd_index->indrelid);
+	else
+		amoid = rel->rd_rel->relam;
+
+	if (amoid != PROLLY_TABLE_AM_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("access method \"%s\" is not a prolly table access method",
-						amname ? amname : "(none)")));
+				 errmsg("\"%s\" is not a prolly table",
+						RelationGetRelationName(rel))));
 	components->chunker = (const ProllyChunkerRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_CHUNKER);
 	components->hash = (const ProllyHashRoutine *)
@@ -98,21 +106,6 @@ prolly_components_for_am(const char *amname, ProllyComponents *components)
 		profile_impl(history_profile, PROLLY_IFACE_TREE);
 	components->keying = (const ProllyKeyingRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_TABLE_KEYING);
-}
-
-void
-prolly_components_for_relation(Relation rel, ProllyComponents *components)
-{
-	Oid			amoid;
-
-	/* (an index's are its table's) */
-	if (rel->rd_rel->relkind == RELKIND_INDEX ||
-		rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
-		amoid = get_rel_relam(rel->rd_index->indrelid);
-	else
-		amoid = rel->rd_rel->relam;
-
-	prolly_components_for_am(get_am_name(amoid), components);
 }
 
 void

@@ -99,9 +99,9 @@ NOTICE:  drop cascades to column m of table conf_keying.conf_kt
  value_encoder | stub           | decodes_earlier_layouts               | not implemented (missing begin, layout, begin_layout, reads_layout, encode, decode, end)
  value_encoder | stub           | complete                              | not implemented (7 of 7 callbacks missing)
  reclamation   | stub           | identity                              | pass
- reclamation   | stub           | reachable_never_freed                 | not implemented (missing node_created, node_dropped, root_retired, run)
- reclamation   | stub           | in_place_only_when_private            | not implemented (missing may_modify_in_place)
- reclamation   | stub           | complete                              | not implemented (6 of 6 callbacks missing)
+ reclamation   | stub           | live_chunks_never_freed               | not implemented (missing collect)
+ reclamation   | stub           | keeps_what_writers_reference          | not implemented (missing collect)
+ reclamation   | stub           | complete                              | not implemented (1 of 1 callbacks missing)
  refs          | copies         | identity                              | pass
  refs          | copies         | branch_lifecycle                      | no checks yet
  refs          | copies         | commit_then_resolve                   | no checks yet

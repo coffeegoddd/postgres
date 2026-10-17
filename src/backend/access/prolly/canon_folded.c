@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * canon_catalogs.c
+ * canon_folded.c
  *	  Canonicalizer implementation "folded": the canonical form of the
  *	  session branch's versioned schemas, derived from the catalogs, by
  *	  name, their tables' rows folded into trees.
@@ -58,7 +58,7 @@
  * indexes, triggers) after.
  *
  * IDENTIFICATION
- *	  src/backend/access/prolly/canon_catalogs.c
+ *	  src/backend/access/prolly/canon_folded.c
  *
  *-------------------------------------------------------------------------
  */
@@ -395,7 +395,7 @@ find_base_table(Canon *cn, const StringInfoData *key)
  * history they come from.
  */
 static void
-folded_table_root(Canon *cn, CanonItem *it, Relation rel,
+table_root(Canon *cn, CanonItem *it, Relation rel,
 				  const StringInfoData *description, ProllyNodeRef *root)
 {
 	ProllyHash	dh;
@@ -461,24 +461,9 @@ folded_table_root(Canon *cn, CanonItem *it, Relation rel,
 	pfree(state.data);
 }
 
-/* A table's data tree: folded from its rows. */
-static void
-table_root(Canon *cn, CanonItem *it, Relation rel,
-		   const StringInfoData *description, ProllyNodeRef *root)
-{
-	folded_table_root(cn, it, rel, description, root);
-}
-
-/* Is a relation of this access method's rows in the canonical form? */
-static bool
-versioned_am(Canon *cn, Oid amoid)
-{
-	return amoid == PROLLY_TABLE_AM_OID;
-}
-
 /* Is an object in this namespace the canonical form's? */
 static bool
-canon_namespace(Canon *cn, Oid nsp)
+canon_namespace(Oid nsp)
 {
 	if (is_system_namespace(nsp))
 		return false;
@@ -845,7 +830,7 @@ collect(Canon *cn)
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
 		char	   *name = NameStr(form->relname);
 
-		if (!canon_namespace(cn, form->relnamespace) ||
+		if (!canon_namespace(form->relnamespace) ||
 			in_extension(RelationRelationId, form->oid))
 			continue;
 		switch (form->relkind)
@@ -858,7 +843,7 @@ collect(Canon *cn)
 									 qualified(form->relnamespace, name));
 					break;
 				}
-				if (versioned_am(cn, form->relam))
+				if (form->relam == PROLLY_TABLE_AM_OID)
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
 					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
@@ -901,7 +886,7 @@ collect(Canon *cn)
 								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
 																		ObjectIdGetDatum(form->oid),
 																		BoolGetDatum(false))));
-					if (versioned_am(cn, form->relam))
+					if (form->relam == PROLLY_TABLE_AM_OID)
 					{
 						Relation	rel = table_open(form->oid, AccessShareLock);
 						ProllyNodeRef root;
@@ -935,7 +920,7 @@ collect(Canon *cn)
 		{
 			Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
 
-			if (canon_namespace(cn, ns->oid))
+			if (canon_namespace(ns->oid))
 				(void) add_item(cn, "n:", quote_identifier(NameStr(ns->nspname)));
 		}
 		systable_endscan(scan);
@@ -951,7 +936,7 @@ collect(Canon *cn)
 		{
 			Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
 
-			if (!canon_namespace(cn, typ->typnamespace) ||
+			if (!canon_namespace(typ->typnamespace) ||
 				in_extension(TypeRelationId, typ->oid))
 				continue;
 			/* Tables' row types come with their tables. */
@@ -977,7 +962,7 @@ collect(Canon *cn)
 			char	   *name;
 			CanonItem  *it;
 
-			if (!canon_namespace(cn, proc->pronamespace) ||
+			if (!canon_namespace(proc->pronamespace) ||
 				in_extension(ProcedureRelationId, proc->oid))
 				continue;
 			name = psprintf("%s(%s)",
@@ -1004,7 +989,7 @@ collect(Canon *cn)
 		{
 			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
 
-			if (canon_namespace(cn, get_rel_namespace(pol->polrelid)))
+			if (canon_namespace(get_rel_namespace(pol->polrelid)))
 				(void) uncovered(cn, "row security policies",
 								 psprintf("%s on %s",
 										  quote_identifier(NameStr(pol->polname)),
