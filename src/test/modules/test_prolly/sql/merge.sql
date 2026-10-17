@@ -176,3 +176,86 @@ SELECT * FROM mgc.t ORDER BY k;
 SELECT dolt_branch('-D', 'mgc_side');
 DROP SCHEMA mgc CASCADE;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
+
+-- Theirs swapping two rows' unique values merges: the rows going are
+-- removed before those coming are written.
+CREATE SCHEMA mgu VERSIONED;
+CREATE TABLE mgu.t (id int PRIMARY KEY, u int UNIQUE, v text);
+INSERT INTO mgu.t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c');
+SELECT length(dolt_commit('-Am', 'unique')::text) AS committed;
+SELECT dolt_branch('mgu_side');
+SELECT dolt_checkout('mgu_side') IS NOT NULL AS on_side;
+UPDATE mgu.t SET u = 10 WHERE id = 1;
+UPDATE mgu.t SET u = 1 WHERE id = 2;
+UPDATE mgu.t SET u = 2 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'swapped')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mgu.t SET v = 'main' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'main too')::text) AS committed;
+SELECT (dolt_merge('mgu_side'))[2:4];
+SELECT * FROM mgu.t ORDER BY id;
+
+-- A merge in progress keeps the commits it merges, though their branch
+-- goes; and goes with its own branch, not passing to one made later.
+SELECT dolt_branch('mgu_k');
+SELECT dolt_checkout('mgu_k') IS NOT NULL AS on_k;
+UPDATE mgu.t SET v = 'k' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'k')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('mgu_m');
+SELECT dolt_checkout('mgu_m') IS NOT NULL AS on_m;
+UPDATE mgu.t SET v = 'm' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'm')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('mgu_k'))[2:4];
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_hashof('mgu_k') AS theirs \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'mgu_k');
+SELECT test_refs_walk_reaches(:'theirs') AS kept;
+SELECT dolt_branch('-D', 'mgu_m');
+SELECT test_refs_walk_reaches(:'theirs') AS kept_once_its_merge_is_gone;
+SELECT dolt_branch('mgu_m');
+SELECT dolt_checkout('mgu_m') IS NOT NULL AS on_m;
+SELECT * FROM dolt_conflicts();
+SELECT dolt_merge('--abort');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'mgu_m');
+
+-- Unresolved conflicts aren't committed by checking out another branch
+-- first, nor by preparing the transaction.
+SELECT dolt_branch('mgu_k');
+SELECT dolt_checkout('mgu_k') IS NOT NULL AS on_k;
+UPDATE mgu.t SET v = 'k' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'k')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE mgu.t SET v = 'main again' WHERE id = 3;
+INSERT INTO mgu.t VALUES (4, 4, 'main');
+SELECT length(dolt_commit('-am', 'main again')::text) AS committed;
+SELECT dolt_checkout('mgu_k') IS NOT NULL AS on_k;
+INSERT INTO mgu.t VALUES (5, 5, 'k');
+SELECT length(dolt_commit('-am', 'k adds 5')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT (dolt_merge('mgu_k'))[2:4];
+SELECT dolt_checkout('mgu_k') IS NOT NULL AS on_k;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT (dolt_merge('mgu_k'))[2:4];
+PREPARE TRANSACTION 'mgu';
+SELECT * FROM dolt_conflicts();
+
+-- A merge that wrote rows (5, here) is aborted in its transaction: the
+-- branch is as it was.
+BEGIN;
+SELECT (dolt_merge('mgu_k'))[2:4];
+SELECT id, v FROM mgu.t ORDER BY id;
+SELECT (dolt_merge('--abort'))[2:4];
+SELECT id, v FROM mgu.t ORDER BY id;
+COMMIT;
+SELECT * FROM dolt_status();
+SELECT dolt_branch('-D', 'mgu_k');
+SELECT dolt_branch('-D', 'mgu_side');
+DROP SCHEMA mgu CASCADE;
+SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;

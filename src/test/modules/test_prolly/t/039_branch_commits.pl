@@ -119,9 +119,8 @@ is(sql(q{SELECT test_fold_root() = prolly_root_hash('main')}), 't',
 	'to the head, its rows and nothing else');
 
 # A merge that waited for a committer reads the heads after it: read
-# committed, as a newer snapshot sees them (here, branches that have both
-# changed, which only fast-forward so far); where the snapshot can't move,
-# it fails to be retried.  Either way the commit it waited for stays.
+# committed, as a newer snapshot sees them, merging onto the commit it
+# waited for; where the snapshot can't move, it fails to be retried.
 $first->query_safe(q{SELECT dolt_branch('m'); SELECT dolt_checkout('m');
 	INSERT INTO app.t VALUES (30, 'm'); SELECT dolt_commit('-am', 'on m');
 	SELECT dolt_checkout('main')});
@@ -136,14 +135,16 @@ $second->query_until(qr/started/, q{
 ok(waits_for('dolt_merge'), 'a merge waits for the committer');
 $first->query_safe('COMMIT');
 $second->query_until(qr/done/, '');
-like($second->{stderr}, qr/can only fast-forward so far/,
-	'and, read committed, merges the heads as they are now');
-is(sql(q{SELECT message FROM dolt_log('main') LIMIT 1}), 'before the merge',
-	'the commit it waited for stays the head');
+is($second->{stderr}, '', 'and, read committed, merges');
+is(sql(q{SELECT dolt_hashof('main^1') = dolt_hashof('main~1') AND
+	(SELECT message FROM dolt_log('main') OFFSET 1 LIMIT 1) = 'before the merge'}),
+	't', 'onto the commit it waited for');
 
 $second->{stderr} = '';
+$first->query_safe(q{SELECT dolt_checkout('m'); INSERT INTO app.t VALUES (33, 'm');
+	SELECT dolt_commit('-am', 'on m again'); SELECT dolt_checkout('main')});
 $second->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
-$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (32, 'first');
+$first->query_safe(q{BEGIN; INSERT INTO app.t VALUES (35, 'first');
 	SELECT dolt_commit('-m', 'before the repeatable read merge')});
 $second->query_until(qr/started/, q{
 	\echo started

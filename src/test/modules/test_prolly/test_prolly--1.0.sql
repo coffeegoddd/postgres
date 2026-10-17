@@ -182,6 +182,11 @@ CREATE FUNCTION test_fold_root()
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Whether the refs' walk, what reclamation keeps, reaches a commit.
+CREATE FUNCTION test_refs_walk_reaches(commit_id text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The folded canonical tree's items, for inspection.
 CREATE FUNCTION test_fold_items(OUT key text, OUT value text)
 RETURNS SETOF record

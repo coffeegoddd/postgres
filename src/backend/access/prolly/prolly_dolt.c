@@ -550,7 +550,11 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no merge to abort")));
-		if (prolly_xact_has_writes())
+		/*
+		 * (Branch copies reset their working set's rows, the transaction's
+		 * writes as any others; the rows engine can't undo its own.)
+		 */
+		if (!prolly_database_uses_copies() && prolly_xact_has_writes())
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot abort a merge in a transaction that has written to prolly tables"),
