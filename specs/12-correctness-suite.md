@@ -281,7 +281,9 @@ or comments.
    the results layout. The C suite has no timed window or collectors, so its
    cells skip both.
 5. **CI.** Recommended: not yet. Once the baseline is clean, `c_smoke.toml`
-   on `prolly` would fit the lean CI. (Since built: the smoke config and
-   `cgate` run on every pull request, the full corpus nightly; spec 16
-   proposes the full corpus on every pull request, a heap baseline and a
-   results comment.)
+   on `prolly` would fit the lean CI. (Since built: `c_ci.toml`, the smoke
+   files with CI's settings (256 MB of shared buffers, 4 workers, the
+   pinned corpus's path), and `cgate` run on every pull request that
+   changes more than specs, the full corpus nightly; spec 16 proposes the
+   full corpus on every pull request, a heap baseline and a results
+   comment.)

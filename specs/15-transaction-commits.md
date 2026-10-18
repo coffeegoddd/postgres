@@ -1,6 +1,7 @@
 # 15. A Dolt commit for every SQL transaction
 
-**Status: proposed 2026-10-18, on `64c9001f9a`. Nothing here is built.**
+**Status: proposed 2026-10-18; code references at `1603edcaa2`. Nothing
+here is built.**
 Dolt's `@@dolt_transaction_commit` makes every SQL `COMMIT` that changed
 data also make a Dolt commit. This describes exactly what Dolt does, and
 proposes the same mode for versioned schemas in two phases: phase 1
@@ -61,15 +62,16 @@ one write.
 ## 2. What prolly has today
 
 - `dolt_commit()` on versioned schemas (refs "copies") holds the refs
-  until the transaction ends (`lock_refs()`, `refs_copies.c:262-293`: it
+  until the transaction ends (`lock_refs()`, `refs_copies.c:283-305`: it
   moves the chunk store's root to itself, so commits are serialized
   **per database**), then folds the session branch from its baseline
   under a snapshot that sees the head (`commit_branch()`,
-  `refs_copies.c:930-955`).
+  `refs_copies.c:974-990`).
 - If another transaction moved the head since this one's snapshot,
   `see_head()` takes a newer snapshot under read committed, and fails the
   transaction with a serialization failure under repeatable read and
-  serializable (`refs_copies.c:390-431`).
+  serializable (`head_moved_unseen()` and `see_head()`,
+  `refs_copies.c:406-444`).
 - The commit's tree is written with the transaction; the commit record
   carries the new root; a rollback, or a rollback to a savepoint taken
   before the commit, undoes it.
@@ -80,7 +82,7 @@ one write.
 - There is no staging (user decision, 2026-10-17): a commit commits
   everything in the working set.
 - `dolt.author` and `dolt.allow_commit_conflicts` are the existing
-  settings (`prolly_dolt.c:62-135`).
+  settings (`prolly_dolt.c:69-107`).
 
 ## 3. The mode
 
@@ -97,10 +99,12 @@ reverse of their registration order, so the mode registers after the
 chunk store or the chunk store calls it):
 
 1. The transaction changed nothing in a versioned schema: no commit.
-   "Changed" is a flag set where a block-mapped page of a versioned
-   relation is first changed in the transaction and where a branch-aware
-   catalog row is written, so read-only and unversioned transactions pay
-   nothing.
+   "Changed" is a flag set by the `prolly` table AM's write paths
+   (`tuple_insert`, `multi_insert`, `tuple_update`, `tuple_delete`, and
+   what rewrites or truncates a table) and where a branch-aware catalog
+   row is written, never by page changes a read makes (pruning, hint
+   bits, visibility-map bits), so read-only and unversioned transactions
+   pay nothing.
 2. It changed more than one branch (it checked out another and wrote
    there): the commit fails, as Dolt's does.
 3. On a detached head: the commit fails, as Dolt's does.
@@ -119,7 +123,13 @@ transaction and its Dolt commit are always both made or both not.
 
 **`dolt_commit()` inside the transaction.** Its commit stands. The
 transaction's commit then holds only what was changed after it, and is
-not made if nothing was.
+not made if nothing was. Phase 1 gets this from rule 7: its fold finds
+the head holding what came before. Phase 2 marks its list of recorded
+changes (part 5) at the `dolt_commit()`: entries before the mark are in
+that commit and left out of the delta, and the "changed" flag is reset.
+The mark is kept per subtransaction level, so a rollback to a savepoint
+taken before the `dolt_commit()`, which undoes its commit, moves the mark
+back and the entries before it count again.
 
 **Moving heads inside the transaction** (`dolt_merge`, `dolt_reset`,
 `dolt_cherry_pick`, `dolt_revert`): they make their own commits as they
@@ -173,7 +183,13 @@ TID of every update and delete, in a per-transaction list that spills to
 a tuplestore. At commit, entries whose `xmin` (new versions) or update
 xid (old versions; `HeapTupleGetUpdateXid`, ignoring lock-only `xmax`) is
 not `TransactionIdIsCurrentTransactionId` are dropped, which drops
-aborted subtransactions' changes without bookkeeping per savepoint.
+aborted subtransactions' changes without bookkeeping per savepoint. The
+list is then deduplicated by TID and role (new version or old) before
+the delta is built: the same TID can be recorded twice and pass the
+filter both times (an old version updated in a subtransaction rolled
+back, then updated again; an aborted version's slot pruned and reused by
+a later insert of the transaction), and counting it twice would put a
+keyless table's count, or a delete, in history twice.
 
 **The delta.** For each table: old versions are deletes of their key,
 new versions are puts of key and canonical row. A key both deleted and

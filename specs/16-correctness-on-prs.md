@@ -165,7 +165,11 @@ sharded so the wall clock fits:
   largest first into the least-loaded shard (the runner already orders
   by size), deterministically from the pinned corpus; C1 and C2 go to
   shard 1. Each shard runs heap, then `prolly`, then `cgate` and
-  `cbaseline check` on its part.
+  `cbaseline check` on its part. `cgate` requires one cell per workload
+  it is given, so each shard passes `--workloads` the workloads it holds
+  files of (C1 and C2 only on shard 1; a workload with no files on a
+  shard isn't gated there), and the **C suite gate** job checks that
+  every workload was gated by some shard.
 - Four shards: the full corpus's 38 minutes on one runner become about
   10 minutes per shard, plus build and setup.
 
@@ -218,15 +222,26 @@ comment.md` builds it from the shards' result sets, using the existing
    `cgate`, `cbaseline check`; upload the result sets.
 4. **C suite gate** (the required check): always runs; passes for
    specs-only, otherwise downloads every shard, builds `comment.md` and
-   uploads it with the PR number, and fails if any shard failed or any
-   shard is missing.
+   uploads it, and fails if any shard failed or any shard is missing.
 
 `.github/workflows/correctness-comment.yml`, on `workflow_run` of the
 above: downloads `comment.md` and posts or updates the sticky comment,
 with `pull-requests: write`. Commenting from a separate workflow keeps
 write permission away from the pull request's code, and works for forks.
+Everything in the artifact was made by the pull request's code, so the
+commenter trusts none of it but the comment's text: it takes the pull
+request from the event (`workflow_run.pull_requests`, or, for a fork,
+where that is empty, the open pull request whose head is the run's
+`head_sha`, looked up through the API), posts nothing if it finds no
+single one, and only edits a comment carrying the marker in that pull
+request.
 
-`prolly.yml` drops its two C steps and the corpus checkout.
+`prolly.yml` drops its two C steps and the corpus checkout, and, since
+**build and test** becomes a required check, its `paths-ignore`: it gets
+the same always-running **classify** job, and `build and test` runs its
+steps only when something outside `specs/**` changed, reporting success
+at once otherwise, so a specs-only pull request can merge. It also gets
+the `merge_group` trigger, so a queued merge runs both required checks.
 
 **On `master`.** Every push runs the full suite. A failure (two pull
 requests that each passed, merged in some order, or a flake) opens or
@@ -236,9 +251,9 @@ closes it on the next pass.
 **Repository settings.**
 - Protect `master`: require **C suite gate** and **build and test**.
 - Require branches to be up to date before merging, or enable the merge
-  queue (the workflow's `merge_group` trigger then runs the suite on the
-  queued merge), so two passing pull requests can't merge into a failing
-  `master`.
+  queue (both workflows' `merge_group` triggers then run the required
+  checks on the queued merge), so two passing pull requests can't merge
+  into a failing `master`.
 
 ## 4. Why not the others' baselines
 
@@ -246,9 +261,13 @@ closes it on the next pass.
   per record. Its bot commits to pull request branches race, and need a
   token that can push.
 - **Running `master` beside every pull request (Doltgres).** Twice the
-  compute, for what the baseline file gives exactly: heap on `master`
-  produces the file by construction, because nothing merges that
-  disagrees with it.
+  compute, for what the baseline file gives exactly, given part 3.4's
+  setting (branches up to date before merging, or the merge queue): then
+  every merge into `master` was checked against the file as it merges,
+  and heap on `master` produces the file by construction. Without that
+  setting `master` can drift (two passing pull requests, merged in some
+  order), and the tracking issue on `master` (3.4) is what catches it; a
+  flake is caught the same way.
 - **Private infrastructure (Dolt, Doltgres's release run).** Hosted
   runners finish the full corpus in about 15 minutes sharded; Dolt's
   comment asks for 25.
