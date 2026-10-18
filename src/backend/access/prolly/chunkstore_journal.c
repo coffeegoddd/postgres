@@ -852,7 +852,13 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 			pfree(lfirst(lc));
 		}
 		else
+		{
+			/* (kept with the segment, as its pads are) */
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
 			still_pads = lappend(still_pads, lfirst(lc));
+			MemoryContextSwitchTo(old);
+		}
 	}
 	list_free(g->pads);
 	g->pads = still_pads;
