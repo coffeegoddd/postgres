@@ -117,6 +117,33 @@ SELECT dolt_commit('-am', 'refused');
 DROP SCHEMA sdu CASCADE;
 SELECT length(dolt_commit('-Am', 'sdu gone')::text) AS committed;
 
+-- A column whose values are local OIDs (oid, a large object's reference
+-- through a domain over it, the reg* types, and types made of them) is
+-- one too: status lists it and still shows its table's rows; a commit
+-- refuses it, rather than versioning the numbers.
+CREATE SCHEMA sdl VERSIONED;
+CREATE DOMAIN sdl.lo AS oid;
+CREATE TYPE sdl.pair AS (a int, b regclass);
+CREATE TABLE sdl.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'sdl')::text) AS committed;
+ALTER TABLE sdl.t ADD COLUMN doc sdl.lo;
+INSERT INTO sdl.t VALUES (1, 'one', 16400);
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdl.t);
+SELECT dolt_commit('-am', 'a large object');
+ALTER TABLE sdl.t DROP COLUMN doc;
+CREATE TABLE sdl.u (id int PRIMARY KEY, o oid, c regclass, r oid[], p sdl.pair,
+	x oid8);
+SELECT dolt_commit('-Am', 'oids');
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
+CREATE MATERIALIZED VIEW sdl.mv USING prolly AS SELECT 'sdl.t'::regclass AS c;
+DROP TABLE sdl.u;
+SELECT dolt_commit('-Am', 'a materialized view');
+DROP MATERIALIZED VIEW sdl.mv;
+SELECT length(dolt_commit('-Am', 'no oids')::text) AS committed;
+DROP SCHEMA sdl CASCADE;
+SELECT length(dolt_commit('-Am', 'sdl gone')::text) AS committed;
+
 -- A diff of one table reads that table's changes alone, however many
 -- others changed.
 CREATE SCHEMA sdo VERSIONED;

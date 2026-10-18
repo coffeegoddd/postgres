@@ -54,7 +54,9 @@
  * Ordinary schemas and extensions are every branch's, not the commit's.
  * Anything else in versioned schemas (window functions, foreign tables,
  * partitions apart from their partitioned tables, other types) makes a
- * commit fail: never a hash that might depend on history.
+ * commit fail: never a hash that might depend on history.  So does a
+ * column whose values are local OIDs (type_holds_oids()): never a hash of
+ * local identifiers.
  *
  * What the versioned objects depend on outside the versioned schemas
  * isn't in the root, which is what they are: fold_dependencies() builds a
@@ -154,6 +156,7 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 typedef struct CanonItem
 {
@@ -1426,6 +1429,90 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 	return false;
 }
 
+/*
+ * Whether a type's values hold local OIDs, which no root may: oid and oid8,
+ * the reg* types (their send functions send the OID), and the domains,
+ * arrays, composites and ranges made of them.  A large object's reference
+ * is an oid, and the object itself is every branch's: versioned as the
+ * number alone, a reset or merge wouldn't bring its contents back.
+ */
+static bool
+type_holds_oids(Oid typid)
+{
+	Oid			base = getBaseType(typid);
+	Oid			elem;
+
+	switch (base)
+	{
+		case OIDOID:
+		case OID8OID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGCLASSOID:
+		case REGCOLLATIONOID:
+		case REGTYPEOID:
+		case REGROLEOID:
+		case REGNAMESPACEOID:
+		case REGDATABASEOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+			return true;
+	}
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+		return type_holds_oids(elem);
+	switch (get_typtype(base))
+	{
+		case TYPTYPE_COMPOSITE:
+			{
+				TupleDesc	desc = lookup_rowtype_tupdesc(base, -1);
+				bool		holds = false;
+
+				for (int i = 0; i < desc->natts && !holds; i++)
+				{
+					Form_pg_attribute att = TupleDescAttr(desc, i);
+
+					holds = !att->attisdropped && type_holds_oids(att->atttypid);
+				}
+				ReleaseTupleDesc(desc);
+				return holds;
+			}
+		case TYPTYPE_RANGE:
+			return type_holds_oids(get_range_subtype(base));
+		case TYPTYPE_MULTIRANGE:
+			return type_holds_oids(get_multirange_range(base));
+	}
+	return false;
+}
+
+/*
+ * Note each column of rel whose type holds OIDs as not covered; whether
+ * there was one.  Reading, the table is still folded, with the numbers.
+ */
+static bool
+oid_columns(Canon *cn, Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	bool		any = false;
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped || !type_holds_oids(att->atttypid))
+			continue;
+		(void) uncovered(cn, "columns of types that hold OIDs",
+						 psprintf("%s.%s",
+								  qualified(RelationGetNamespace(rel),
+											RelationGetRelationName(rel)),
+								  quote_identifier(NameStr(att->attname))));
+		any = true;
+	}
+	return any;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -1451,10 +1538,16 @@ collect(Canon *cn)
 					!partition_uncovered(cn, form, name))
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
-					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
+					CanonItem  *it;
 					ProllyNodeRef root;
 					StringInfoData desc;
 
+					if (oid_columns(cn, rel) && !cn->reading)
+					{
+						table_close(rel, AccessShareLock);
+						break;
+					}
+					it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					initStringInfo(&desc);
 					describe_table(cn, rel, &desc);
 					table_root(cn, it, rel, &desc, &root);
@@ -1496,8 +1589,11 @@ collect(Canon *cn)
 						Relation	rel = table_open(form->oid, AccessShareLock);
 						ProllyNodeRef root;
 
-						table_root(cn, it, rel, &query, &root);
-						put_hash(&it->value, &root.hash);
+						if (!oid_columns(cn, rel) || cn->reading)
+						{
+							table_root(cn, it, rel, &query, &root);
+							put_hash(&it->value, &root.hash);
+						}
 						table_close(rel, AccessShareLock);
 					}
 					appendBinaryStringInfo(&it->value, query.data, query.len);
