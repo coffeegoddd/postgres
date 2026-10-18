@@ -478,7 +478,7 @@ Existing values move when their rows are rewritten; a table rewrite
 (`VACUUM FULL`, `CLUSTER`) converts them all. A table keeps its TOAST
 relation (decided 2026-10-18): it is needed while the table holds OID
 pointers, and dropping it later buys little. B3's memo stays while OID
-pointers exist, its size a setting, `prolly.value_memo_entries` (8192
+pointers exist, its size a setting, `prolly_value_memo_entries` (8192
 today, fixed).
 
 `pg_upgrade` of a cluster with hash pointers is unsupported (the
@@ -517,9 +517,102 @@ needs only tests.
    method, not a copy of heap's routine (C2); a collection's roots
    include the versioned heaps, dead tuples too, and the chunks appended
    after the oldest slot's position (C4); out-of-line values rely on the
-   table files' LZ4 (C4); `prolly.value_memo_entries`, `VACUUM FULL` and
+   table files' LZ4 (C4); `prolly_value_memo_entries`, `VACUUM FULL` and
    `CLUSTER` converting, the TOAST relation kept, `pg_upgrade`
    unsupported and `pg_dump` tested only (C6).
+
+### C8. Measured gates and round 2 decisions
+
+A throwaway prototype of the save path (kept off master) measured gates
+1 and 3, on a release build (`-O2`, no assertions, OpenSSL) with random,
+incompressible values. Three setups: a stock heap table; a versioned
+table as built (TOAST in its TOAST table, "OID"); and the prototype
+("hash"), which built a value tree in `toast_save_datum` and wrote a
+SHA-256 pointer.
+
+**Gate 3, save cost.** pgbench, one INSERT a transaction, tps (mean of
+two 10 s runs):
+
+| size | writers | heap | OID | hash | hash, append outside the lock | hash, no flush of its own |
+|---|---|---|---|---|---|---|
+| 2 KB | 1 | 1306 | 1275 | 656 | 655 | 1241 |
+| 2 KB | 8 | 5105 | 5440 | 670 | 2751 | 5544 |
+| 64 KB | 1 | 976 | 933 | 523 | 550 | 908 |
+| 64 KB | 8 | 4623 | 4340 | 958 | 2337 | 3724 |
+| 1 MB | 1 | 210 | 204 | 145 | 146 | 178 |
+| 1 MB | 8 | 550 | 556 | 286 | 458 | 567 |
+
+One statement inserting many values, one commit (CPU), µs a value with
+the values' generation subtracted: 2 KB 12.0 (heap), 11.9 (OID), 17.8
+(hash); 64 KB 161, 166, 303; 1 MB 2839, 2919, 4700.
+
+- With the journal as built, gate 3 fails: 1.8–1.9x per value with one
+  writer at 2 KB and 64 KB, 4.5x (64 KB) to 8x (2 KB) with eight.
+  `append_bytes()` holds `ProllyJournalLock` across `XLogFlush()` and the
+  write, so writers take turns at an fsync, and a transaction flushes
+  twice (its chunks, then its commit record).
+- A 64 KB hybrid doesn't help: 64 KB and 1 MB values fail too with eight
+  writers. What fails is the append, at every size.
+- Appending outside the lock removes most of the concurrent loss; not
+  flushing the chunks on their own as well (an unsafe stand-in for
+  writing them after the commit record's flush, as a root is written over
+  its PAD) gives 0.98–1.17x of the versioned table as built.
+- Where the CPU goes (64 KB, perf): the value chunker's rolling hash about
+  32%, SHA-256 22%, the journal's hash-table lookups 15%, CRC 4%.
+- Found on the way: a backend's first chunk-store miss scans the whole
+  unsealed journal to index it, about 1 s a GB (3.0 s at 3.2 GB). With C
+  the journal grows with the working set's writes, not with commits.
+
+**Gate 1, the heap roots.** Warm buffers; a table of 1 M rows with 2 KB
+values and 100 K of them updated (98 MB, 1.1 M pointers counting dead
+tuples), and one of 5 M narrow rows (365 MB, none):
+
+| scan | pages | pointers | ms |
+|---|---|---|---|
+| documents, deforming each tuple | 12,500 | 1.1 M | 221–239 |
+| documents, bytes (conservative) | 12,500 | 1.1 M + 1,118 false | 207 |
+| narrow, deforming | 46,729 | 0 | 79 |
+| narrow, bytes | 46,729 | 696 false | 38 |
+
+About 0.2 s a GB of heap plus 0.2 µs a pointer (a hash set's insert; a
+collector marks by slot instead), against 7–10 s for the collection
+itself of a 5 GB journal. Scanning each branch's heap would multiply by
+the branches; scanning the page store's physical blocks reads each once.
+Gate 1 passes. Gate 2 (compression) wasn't measured.
+
+**Decided (user, 2026-10-18, round 2):**
+
+1. No hybrid. C's first engine layer reworks the journal's append: the
+   range is reserved under the lock and logged and written outside it,
+   batches share a group flush, a transaction's last batch is written
+   after its commit record's flush, and a range left unwritten is padded.
+   Gate 3 is measured again on it.
+2. The collection's heap roots land before the save hook, so no build
+   saves values a collection could free.
+3. The roots are found by a conservative byte scan of the page store's
+   physical blocks: each block once, whichever branches map it, freed
+   blocks skipped. Bytes that spell a hash pointer keep its tree; nothing
+   named is lost (as the collector already treats chunks' bytes).
+4. The journal is bounded: past a size, autovacuum seals it and moves its
+   chunks into a table file, collecting nothing.
+
+**The layers**, one stack, each with its tests:
+
+1. This part.
+2. jsonb's on-disk canonical bytes, with a version byte (C7 question 1).
+3. The journal's append (decision 1), gate 3 measured again.
+4. The journal's bound (decision 4).
+5. The pointer (C1): `VARTAG_ONDISK_SHA256`, the fetch hook (whole and by
+   slice), and the audit of `VARATT_IS_EXTERNAL_ONDISK`'s uses.
+6. The collection's roots (C4, decision 3): hash pointers in the page
+   store, and the keep set while a collection runs.
+7. The save hook (C2): the toaster's destination by access method.
+8. The fold (C3): a hash pointer's hash is the column's reference.
+9. Apply (C3): hash pointers written for any row.
+10. Logical decoding (C4), and a collection keeping the chunks appended
+    after the oldest replication slot's position.
+11. `VACUUM FULL` and `CLUSTER` convert (C6).
+12. The acceptance tests (#181).
 
 ## 7. Large objects
 
