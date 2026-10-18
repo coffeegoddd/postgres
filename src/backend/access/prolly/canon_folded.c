@@ -866,9 +866,12 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 static char *qualified_function(Oid fn);
 
-/* Is a function part of a type (a range type's constructors)? */
+/*
+ * Is an object part of a type (a range type's constructors, its cast to its
+ * multirange type)?
+ */
 static bool
-part_of_type(Oid fn)
+part_of_type(Oid classid, Oid objid)
 {
 	Relation	depRel = table_open(DependRelationId, AccessShareLock);
 	ScanKeyData key[2];
@@ -877,9 +880,9 @@ part_of_type(Oid fn)
 	bool		found = false;
 
 	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
+				F_OIDEQ, ObjectIdGetDatum(classid));
 	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(fn));
+				F_OIDEQ, ObjectIdGetDatum(objid));
 	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
 	while (!found && (tup = systable_getnext(scan)) != NULL)
 	{
@@ -898,8 +901,9 @@ part_of_type(Oid fn)
  * none) and its multirange type, a line each, as CREATE TYPE ... AS RANGE
  * names them.  Its multirange type, constructors and cast come with it.  A
  * canonical function is written in C, and is made with a shell type the
- * range fills: not held.  Nor is a subtype difference function of a
- * versioned schema, which a move would make after the type.
+ * range fills: not held.  Nor is a range whose subtype difference
+ * function, operator class or collation is of a versioned schema, which a
+ * move would make after the type.
  */
 static void
 describe_range(Canon *cn, Form_pg_type typ)
@@ -924,6 +928,21 @@ describe_range(Canon *cn, Form_pg_type typ)
 		ReleaseSysCache(tup);
 		(void) uncovered(cn, "range types whose subtype difference function is versioned", name);
 		return;
+	}
+	{
+		ObjectAddress opc;
+		ObjectAddress coll;
+
+		ObjectAddressSet(opc, OperatorClassRelationId, rng->rngsubopc);
+		ObjectAddressSet(coll, CollationRelationId, rng->rngcollation);
+		if (canon_namespace(get_object_namespace(&opc)) ||
+			(OidIsValid(rng->rngcollation) &&
+			 canon_namespace(get_object_namespace(&coll))))
+		{
+			ReleaseSysCache(tup);
+			(void) uncovered(cn, "range types whose operator class or collation is versioned", name);
+			return;
+		}
 	}
 	it = add_item(cn, "y:", name);
 	appendStringInfoString(&it->value, "range\n");
@@ -1790,7 +1809,9 @@ collect(Canon *cn)
 
 			if (!canon_namespace(proc->pronamespace) ||
 				in_extension(ProcedureRelationId, proc->oid) ||
-				part_of_type(proc->oid))
+				((get_typtype(proc->prorettype) == TYPTYPE_RANGE ||
+				  get_typtype(proc->prorettype) == TYPTYPE_MULTIRANGE) &&
+				 part_of_type(ProcedureRelationId, proc->oid)))
 				continue;
 			name = psprintf("%s(%s)",
 							qualified(proc->pronamespace, NameStr(proc->proname)),
@@ -3895,6 +3916,46 @@ moved_type(List *moved, Oid typid)
 	return NULL;
 }
 
+/*
+ * Does anything use a range type, its multirange type or an array of
+ * either (anything but what comes with them)?
+ */
+static bool
+range_in_use(Oid typid)
+{
+	Oid			multi = get_range_multirange(typid);
+	Oid			types[4] = {typid, get_array_type(typid), multi,
+	get_array_type(multi)};
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	bool		used = false;
+
+	for (int i = 0; i < 4 && !used; i++)
+	{
+		ScanKeyData key[2];
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		if (!OidIsValid(types[i]))
+			continue;
+		ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+		ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(types[i]));
+		scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+		while (!used && (tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+			/* (its constructors take it, and are part of it) */
+			used = d->deptype != DEPENDENCY_INTERNAL &&
+				!part_of_type(d->classid, d->objid);
+		}
+		systable_endscan(scan);
+	}
+	table_close(depRel, AccessShareLock);
+	return used;
+}
+
 /* A type of the branch's, as from and to name it: added to moved. */
 static MovedType *
 move_type(List **moved, List *from, List *to, Oid typid, const char *user)
@@ -3909,6 +3970,14 @@ move_type(List **moved, List *from, List *to, Oid typid, const char *user)
 	typ = (Form_pg_type) GETSTRUCT(tup);
 	name = qualified(typ->typnamespace, NameStr(typ->typname));
 	ReleaseSysCache(tup);
+	/* (renamed aside, its constructors and multirange would collide) */
+	if (typ->typtype == TYPTYPE_RANGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+						user),
+				 errdetail("Range type %s uses it, and a range type in use can't be made again in place.",
+						   name)));
 	mt = palloc0(sizeof(MovedType));
 	mt->from = find_item(from, 'y', name);
 	mt->to = find_item(to, 'y', name);
@@ -3982,22 +4051,32 @@ type_moves(List *from, List *to)
 		MoveItem   *t = find_item(to, f->kind, f->name);
 
 		/*
-		 * (a range type can't be made otherwise in place, nor beside itself:
-		 * its constructors would collide; Postgres can't alter one either)
+		 * A range type can't be made otherwise beside itself (renamed aside,
+		 * its constructors and multirange would collide), nor altered: one
+		 * nothing uses goes and comes again; one in use is refused.
 		 */
 		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0 &&
 			(strncmp(f->def, "range\n", 6) == 0 || strncmp(t->def, "range\n", 6) == 0))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
-							f->name),
-					 errdetail("A range type can't be changed in place; a move can't change one either.")));
+		{
+			Oid			typid = typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL)));
+
+			if (range_in_use(typid))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+								f->name),
+						 errdetail("A range type in use can't be changed in place; a move can't change one either.")));
+			tm.before = lappend(tm.before, psprintf("DROP TYPE %s", f->name));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.any = true;
+			continue;
+		}
 		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0)
 			(void) move_type(&moved, from, to,
 							 typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL))),
 							 f->name);
 	}
-	tm.any = moved != NIL;
+	tm.any = tm.any || moved != NIL;
 
 	/* each one, and what uses it or arrays of it (more types, found as it goes) */
 	for (i = 0; i < list_length(moved); i++)
@@ -4166,6 +4245,11 @@ type_moves(List *from, List *to)
 						handled = true;
 					}
 				}
+				else if (d->classid == ProcedureRelationId &&
+						 part_of_type(ProcedureRelationId, d->objid))
+					/* (a range type's constructor: the range is) */
+					(void) move_type(&moved, from, to, get_func_rettype(d->objid),
+									 mt->from->name);
 				else if (d->classid == ProcedureRelationId)
 				{
 					HeapTuple	pt = SearchSysCache1(PROCOID, ObjectIdGetDatum(d->objid));

@@ -60,6 +60,46 @@ SELECT dolt_reset('--hard', 'rv_changed');
 SELECT * FROM dolt_status;
 SELECT dolt_branch('-D', 'rv_changed');
 
+-- one nothing uses, changed, goes and comes again: an uncommitted
+-- redefinition is discarded by a reset
+CREATE TYPE rv.lone AS RANGE (subtype = int4);
+SELECT length(dolt_commit('-Am', 'lone')::text) AS committed;
+DROP TYPE rv.lone;
+CREATE TYPE rv.lone AS RANGE (subtype = int8);
+SELECT dolt_reset('--hard');
+SELECT rngsubtype::regtype FROM pg_range WHERE rngtypid = 'rv.lone'::regtype;
+SELECT * FROM dolt_status;
+
+-- one over a domain the move changes: refused, and clearly
+CREATE DOMAIN rv.small AS int4 CHECK (VALUE < 100);
+CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
+SELECT length(dolt_commit('-Am', 'over a domain')::text) AS committed;
+SELECT dolt_branch('rv_domain');
+SELECT dolt_checkout('rv_domain');
+DROP TYPE rv.sspan;
+DROP DOMAIN rv.small;
+CREATE DOMAIN rv.small AS int4 CHECK (VALUE < 1000);
+CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
+SELECT length(dolt_commit('-Am', 'a wider domain')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard', 'rv_domain');
+SELECT dolt_branch('-D', 'rv_domain');
+DROP TYPE rv.sspan;
+DROP DOMAIN rv.small;
+SELECT length(dolt_commit('-Am', 'no domain')::text) AS committed;
+
+-- a multirange outside the range's versioned schema is refused where made
+CREATE TYPE rv.pspan AS RANGE (subtype = int4, multirange_type_name = public.pspans);
+
+-- not held: one with a collation of a versioned schema (a move makes
+-- types before collations)
+CREATE COLLATION rv.coll FROM "C";
+CREATE TYPE rv.cspan AS RANGE (subtype = text, collation = rv.coll);
+SELECT * FROM dolt_status WHERE status = 'not covered';
+SELECT dolt_commit('-Am', 'refused');
+DROP TYPE rv.cspan;
+DROP COLLATION rv.coll;
+
 -- not held: one with a subtype difference function of a versioned schema
 -- (a move makes types before functions)
 CREATE FUNCTION rv.diff(int4, int4) RETURNS float8 LANGUAGE sql IMMUTABLE
