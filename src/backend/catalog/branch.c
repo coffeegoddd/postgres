@@ -759,6 +759,24 @@ branch_note_write(Oid branch)
 	}
 }
 
+void
+branch_forget_written(Oid branch)
+{
+	ListCell   *lc;
+
+	foreach(lc, written_branches)
+	{
+		WrittenBranch *wb = lfirst(lc);
+
+		if (wb->branch == branch)
+		{
+			written_branches = foreach_delete_current(written_branches, lc);
+			pfree(wb);
+		}
+	}
+	last_written = InvalidOid;
+}
+
 bool
 branch_written(Oid branch)
 {

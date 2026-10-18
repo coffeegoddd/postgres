@@ -45,6 +45,7 @@
 #include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -64,10 +65,11 @@
 static char *dolt_writer = NULL;
 static bool dolt_writer_nowait = false;
 
-static const char *const mode_names[] = {
-	[PROLLY_WRITERS_SHARED] = "shared",
-	[PROLLY_WRITERS_OWNED] = "owned",
-};
+static const char *const mode_names[] = {PROLLY_WRITER_MODE_NAMES};
+
+/* the mode, as the transaction last read or set it */
+static LocalTransactionId mode_lxid = InvalidLocalTransactionId;
+static ProllyWriterMode mode_read;
 
 static bool
 check_writer(char **newval, void **extra, GucSource source)
@@ -134,12 +136,15 @@ refs(void)
 	return dc.refs;
 }
 
+/* (read once a transaction: a write's first note needn't read the refs) */
 static ProllyWriterMode
 modes_mode(void)
 {
 	StringInfoData v;
 	ProllyWriterMode mode = PROLLY_WRITERS_SHARED;
 
+	if (MyProc->vxid.lxid == mode_lxid)
+		return mode_read;
 	initStringInfo(&v);
 	if (PROLLY_CALL(refs(), config_get, MODE_SETTING, &v))
 	{
@@ -150,6 +155,8 @@ modes_mode(void)
 		}
 	}
 	pfree(v.data);
+	mode_lxid = MyProc->vxid.lxid;
+	mode_read = mode;
 	return mode;
 }
 
@@ -167,11 +174,13 @@ modes_set_mode(ProllyWriterMode mode)
 					   get_database_name(MyDatabaseId));
 	PROLLY_CALL(refs(), config_set, MODE_SETTING,
 				mode == PROLLY_WRITERS_SHARED ? NULL : mode_names[mode]);
+	mode_lxid = MyProc->vxid.lxid;
+	mode_read = mode;
 }
 
 /* branch's pg_branch row, with its owner (NULL if none) and owner's role */
 static HeapTuple
-branch_row(Relation rel, Oid branch, char **owner, Oid *role)
+branch_row(Oid branch, char **owner, Oid *role)
 {
 	HeapTuple	tup = SearchSysCacheCopy1(BRANCHOID, ObjectIdGetDatum(branch));
 	Datum		d;
@@ -181,7 +190,7 @@ branch_row(Relation rel, Oid branch, char **owner, Oid *role)
 	*role = InvalidOid;
 	if (!HeapTupleIsValid(tup))
 		return NULL;
-	d = heap_getattr(tup, Anum_pg_branch_browner, RelationGetDescr(rel), &isnull);
+	d = SysCacheGetAttr(BRANCHOID, tup, Anum_pg_branch_browner, &isnull);
 	if (!isnull)
 		*owner = TextDatumGetCString(d);
 	*role = ((Form_pg_branch) GETSTRUCT(tup))->brownerrole;
@@ -209,6 +218,15 @@ set_owner(Relation rel, HeapTuple tup, const char *owner, Oid role)
 	heap_freetuple(newtup);
 }
 
+/* (a role dropped since it claimed a branch has no name) */
+static const char *
+role_name(Oid role)
+{
+	const char *name = OidIsValid(role) ? GetUserNameFromId(role, true) : NULL;
+
+	return name ? name : "?";
+}
+
 static void
 refuse(HeapTuple tup, const char *owner)
 {
@@ -222,77 +240,102 @@ refuse(HeapTuple tup, const char *owner)
 					 owner, name)));
 }
 
+/* the ownership lock, waited for (or, with dolt.writer_nowait, not) */
+static void
+lock_ownership(Oid branch, LOCKMODE mode, const char *name)
+{
+	if (mode == ExclusiveLock && dolt_writer_nowait)
+	{
+		if (!ConditionalLockDatabaseObject(BranchRelationId, branch,
+										   OWNERSHIP_SUBID, mode))
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("branch \"%s\" is being written", name)));
+	}
+	else
+		LockDatabaseObject(BranchRelationId, branch, OWNERSHIP_SUBID, mode);
+}
+
 /*
  * Claim branch for the session's writer: as the owner's write, or as a
- * clean branch's first; or (take) whatever its owner, for the database's
- * owner or the role holding it.
+ * clean branch's first; or (take) a dirty branch whatever its owner, for
+ * the database's owner or the role holding it.
+ *
+ * The owner's writers share the ownership lock; a claimer has it alone,
+ * once their transactions end.  Either way the row is read again once the
+ * lock is had, since meanwhile the branch may have been claimed, made
+ * clean or taken over.  No lock on pg_branch is held while waiting (the
+ * owner's transaction may make a branch meanwhile).
  */
 static void
 claim(Oid branch, bool take)
 {
 	char	   *writer = prolly_current_writer();
-	Relation	rel;
 	HeapTuple	tup;
 	char	   *owner;
 	Oid			role;
+	char	   *name;
+	bool		shared;
+	Relation	rel;
 
-	rel = table_open(BranchRelationId, RowExclusiveLock);
-	tup = branch_row(rel, branch, &owner, &role);
+	tup = branch_row(branch, &owner, &role);
 	if (tup == NULL)
-	{
-		table_close(rel, RowExclusiveLock);
 		return;
-	}
-	if (!take && owner != NULL && strcmp(owner, writer) == 0)
+	name = pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	if (take)
 	{
+		/* (a clean branch has nothing to take: the next write claims it) */
+		if (owner == NULL)
+			return;
+		if (!database_owner() &&
+			!(OidIsValid(role) && has_privs_of_role(GetUserId(), role)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be the database's owner or role \"%s\" to take branch \"%s\" over",
+							role_name(role), name)));
+	}
+	else if (owner != NULL && strcmp(owner, writer) != 0)
+		refuse(tup, owner);
+
+	shared = !take && owner != NULL;
+	lock_ownership(branch, shared ? ShareLock : ExclusiveLock, name);
+	heap_freetuple(tup);
+	tup = branch_row(branch, &owner, &role);
+	if (tup == NULL)
+		return;
+	if (!take && owner == NULL && shared)
+	{
+		/* (made clean while the owner's write waited: claimed alone) */
+		lock_ownership(branch, ExclusiveLock, name);
+		heap_freetuple(tup);
+		tup = branch_row(branch, &owner, &role);
+		if (tup == NULL)
+			return;
+	}
+	if (!take && owner != NULL)
+	{
+		if (strcmp(owner, writer) != 0)
+			refuse(tup, owner);
+
 		/* (a writer is a role's: another role can't write as it) */
 		if (OidIsValid(role) && !has_privs_of_role(GetUserId(), role) &&
 			!database_owner())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("writer \"%s\" of branch \"%s\" is role \"%s\"'s",
-							writer, NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname),
-							GetUserNameFromId(role, false))));
-		LockDatabaseObject(BranchRelationId, branch, OWNERSHIP_SUBID, ShareLock);
-		table_close(rel, RowExclusiveLock);
+							writer, name, role_name(role))));
+		heap_freetuple(tup);
 		return;
 	}
-	if (owner != NULL && !take)
-		refuse(tup, owner);
-	if (take && !database_owner() &&
-		!(OidIsValid(role) && has_privs_of_role(GetUserId(), role)))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be the database's owner or role \"%s\" to take branch \"%s\" over",
-						OidIsValid(role) ? GetUserNameFromId(role, false) : "?",
-						NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname))));
-
-	/* (its writers' transactions end first; then look again) */
-	if (dolt_writer_nowait)
+	if (take && owner == NULL)
 	{
-		if (!ConditionalLockDatabaseObject(BranchRelationId, branch,
-										   OWNERSHIP_SUBID, ExclusiveLock))
-			ereport(ERROR,
-					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("branch \"%s\" is being written",
-							NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname))));
-	}
-	else
-		LockDatabaseObject(BranchRelationId, branch, OWNERSHIP_SUBID,
-						   ExclusiveLock);
-	heap_freetuple(tup);
-	tup = branch_row(rel, branch, &owner, &role);
-	if (tup == NULL)
-	{
-		table_close(rel, RowExclusiveLock);
+		heap_freetuple(tup);
 		return;
 	}
-	if (!take && owner != NULL && strcmp(owner, writer) != 0)
-		refuse(tup, owner);
-	if (owner == NULL || strcmp(owner, writer) != 0 || role != GetUserId())
-		set_owner(rel, tup, writer, GetUserId());
-	heap_freetuple(tup);
+	rel = table_open(BranchRelationId, RowExclusiveLock);
+	set_owner(rel, tup, writer, GetUserId());
 	table_close(rel, RowExclusiveLock);
+	heap_freetuple(tup);
 }
 
 static void
@@ -336,6 +379,10 @@ working_is_head(const char *name)
 	return same;
 }
 
+/*
+ * (from a version-control call, between its own writes and the next
+ * statement's: the claim it may have just made is seen)
+ */
 static void
 modes_settled(Oid branch)
 {
@@ -344,16 +391,24 @@ modes_settled(Oid branch)
 	char	   *owner;
 	Oid			role;
 
-	rel = table_open(BranchRelationId, RowExclusiveLock);
-	tup = branch_row(rel, branch, &owner, &role);
-	if (tup != NULL && owner != NULL &&
+	CommandCounterIncrement();
+	tup = branch_row(branch, &owner, &role);
+	if (tup == NULL)
+		return;
+	if (owner != NULL &&
 		ConditionalLockDatabaseObject(BranchRelationId, branch,
 									  OWNERSHIP_SUBID, ExclusiveLock) &&
 		working_is_head(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname)))
+	{
+		rel = table_open(BranchRelationId, RowExclusiveLock);
 		set_owner(rel, tup, NULL, InvalidOid);
-	if (tup != NULL)
-		heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
+		table_close(rel, RowExclusiveLock);
+		CommandCounterIncrement();
+
+		/* (the transaction's next write to it claims it again) */
+		branch_forget_written(branch);
+	}
+	heap_freetuple(tup);
 }
 
 const ProllyWritersRoutine prolly_writers_modes = {

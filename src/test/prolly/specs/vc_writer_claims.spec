@@ -34,6 +34,7 @@ step a_rollback	{ ROLLBACK; }
 step a_sleep		{ SELECT pg_sleep(0.5); }
 step a_dolt		{ SELECT length(dolt_commit('-m', 'alice')::text) AS committed; }
 step a_owner	{ SELECT owner FROM dolt_branches() WHERE name = 'main'; }
+step a_insert5	{ INSERT INTO vwc.t VALUES (5, 'alice'); }
 
 session a2
 setup			{ SET dolt.writer = 'alice'; }
@@ -47,6 +48,13 @@ step b_insert	{ INSERT INTO vwc.t VALUES (4, 'bob'); }
 step b_nowait	{ SET dolt.writer_nowait = on; }
 step b_timeout	{ SET lock_timeout = '100ms'; }
 step b_reset	{ SELECT dolt_reset('--hard') AS reset; }
+
+session d
+setup			{ SET dolt.writer = 'dave'; }
+step d_begin	{ BEGIN; }
+step d_take		{ SELECT dolt_branch('--take', 'main') AS taken; }
+step d_commit	{ COMMIT; }
+step d_reset	{ SELECT dolt_reset('--hard') AS reset; }
 
 # committed changes: refused at once
 permutation a_insert b_insert a_dolt b_insert a_owner b_reset
@@ -64,3 +72,6 @@ permutation a_begin a_insert b_timeout b_insert a_sleep a_rollback
 # one writer, two sessions: both write; a commit while the other writes
 # keeps the owner, the next one clears it
 permutation a_insert a2_begin a2_insert a_dolt a_owner a2_commit a_dolt a_owner
+
+# the owner's write waits for a takeover, then finds the branch another's
+permutation a_insert d_begin d_take a_insert5 d_commit a_owner d_reset

@@ -5,8 +5,9 @@ CREATE SCHEMA wm VERSIONED;
 CREATE TABLE wm.t (id int PRIMARY KEY, v text);
 INSERT INTO wm.t VALUES (1, 'base');
 CREATE ROLE wm_other;
-GRANT USAGE ON SCHEMA wm TO wm_other;
-GRANT ALL ON wm.t TO wm_other;
+CREATE ROLE wm_carol;
+GRANT USAGE ON SCHEMA wm TO wm_other, wm_carol;
+GRANT ALL ON wm.t TO wm_other, wm_carol;
 SELECT length(dolt_commit('-m', 'wm base')::text) AS committed;
 SELECT dolt_writer_mode();
 
@@ -67,6 +68,39 @@ SELECT name, owner FROM dolt_branches() WHERE name = 'main';
 SELECT dolt_reset('--hard');
 SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
 
+-- A commit in the middle of a transaction gives the branch up, and the
+-- transaction's next write claims it again.
+BEGIN;
+INSERT INTO wm.t VALUES (30, 'bob');
+SELECT length(dolt_commit('-m', 'bob, mid-transaction')::text) AS committed;
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.t VALUES (31, 'bob');
+COMMIT;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+SELECT dolt_reset('--hard');
+-- (taking a clean branch over takes nothing: the next write claims it)
+SELECT dolt_branch('--take', 'main');
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+
+-- An aborted merge is a reset: the owner's, and it gives the branch up.
+SELECT dolt_branch('wm_c');
+SELECT dolt_checkout('wm_c');
+UPDATE wm.t SET v = 'on c' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'wm c')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE wm.t SET v = 'on main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'wm main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('wm_c'))[3] AS conflicts;
+RESET dolt.allow_commit_conflicts;
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+SET dolt.writer = 'alice';
+SELECT dolt_merge('--abort');
+SET dolt.writer = 'bob';
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+SELECT dolt_branch('-D', 'wm_c');
+
 -- A write that changes nothing still claims (the branch counts as dirty
 -- until a commit or reset says otherwise).
 INSERT INTO wm.t VALUES (5, 'gone');
@@ -79,6 +113,7 @@ SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
 
 -- Another role can't write as a writer that is a role's, nor take a
 -- branch over without owning the database or being the role.
+SET ROLE wm_carol;
 SET dolt.writer = 'carol';
 INSERT INTO wm.t VALUES (7, 'carol');
 SET ROLE wm_other;
@@ -119,6 +154,7 @@ RESET ROLE;
 SELECT dolt_writer_mode('nobody');
 SELECT dolt_writer_mode('shared');
 RESET dolt.writer;
-REVOKE ALL ON wm.t FROM wm_other;
-REVOKE USAGE ON SCHEMA wm FROM wm_other;
+REVOKE ALL ON wm.t FROM wm_other, wm_carol;
+REVOKE USAGE ON SCHEMA wm FROM wm_other, wm_carol;
 DROP ROLE wm_other;
+DROP ROLE wm_carol;

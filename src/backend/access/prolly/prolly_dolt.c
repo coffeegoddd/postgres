@@ -750,6 +750,7 @@ abort_in_progress(const char *what)
 {
 	branch_note_write(MyBranch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, "HEAD"));
+	settled();
 }
 
 /*
@@ -1336,8 +1337,9 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 		}
 		if (OidIsValid(role))
 		{
-			values[8] = CStringGetTextDatum(GetUserNameFromId(role, true) ?
-											GetUserNameFromId(role, true) : "?");
+			const char *rolname = GetUserNameFromId(role, true);
+
+			values[8] = CStringGetTextDatum(rolname ? rolname : "?");
 			nulls[8] = false;
 		}
 		ReleaseSysCache(tup);
@@ -1376,10 +1378,7 @@ dolt_branches(PG_FUNCTION_ARGS)
 Datum
 dolt_writer_mode(PG_FUNCTION_ARGS)
 {
-	static const char *const names[] = {
-		[PROLLY_WRITERS_SHARED] = "shared",
-		[PROLLY_WRITERS_OWNED] = "owned",
-	};
+	static const char *const names[] = {PROLLY_WRITER_MODE_NAMES};
 
 	if (PG_NARGS() > 0)
 	{

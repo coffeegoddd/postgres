@@ -1,4 +1,4 @@
-Parsed test spec with 3 sessions
+Parsed test spec with 4 sessions
 
 starting permutation: a_insert b_insert a_dolt b_insert a_owner b_reset
 mode 
@@ -143,5 +143,36 @@ step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
 owner
 -----
      
+(1 row)
+
+
+starting permutation: a_insert d_begin d_take a_insert5 d_commit a_owner d_reset
+mode 
+-----
+owned
+(1 row)
+
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step d_begin: BEGIN;
+step d_take: SELECT dolt_branch('--take', 'main') AS taken;
+taken
+-----
+{0}  
+(1 row)
+
+step a_insert5: INSERT INTO vwc.t VALUES (5, 'alice'); <waiting ...>
+step d_commit: COMMIT;
+step a_insert5: <... completed>
+ERROR:  branch "main" has uncommitted changes by writer "dave"
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+dave 
+(1 row)
+
+step d_reset: SELECT dolt_reset('--hard') AS reset;
+reset
+-----
+{0}  
 (1 row)
 

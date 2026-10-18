@@ -63,6 +63,9 @@ extern void RegisterBranchWriteCallback(BranchWriteCallback callback,
 										void *arg);
 extern void branch_note_write(Oid branch);
 extern bool branch_written(Oid branch);
+
+/* the branch's next write is noted (and told) again, as a first one */
+extern void branch_forget_written(Oid branch);
 extern List *branches_written(void);
 extern int	branch_writes_hush(void);
 extern void branch_writes_unhush(int depth);

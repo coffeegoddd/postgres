@@ -20,9 +20,10 @@
  *   undone if the transaction aborts.
  * - settled() is called once the session's branch may be clean again (its
  *   working set committed or reset); it forgets the owner if the branch is
- *   clean and no other backend of the writer is writing it.
+ *   clean and no other backend of the writer is writing it, and then the
+ *   transaction's next write to it claims it again.
  * - take() makes a dirty branch the session's writer's, for the database
- *   owner or the role that holds it.
+ *   owner or the role that holds it (a clean one has nothing to take).
  * - mode() and set_mode() read and set the database's mode; setting it
  *   needs the database's ownership.
  *
@@ -42,6 +43,11 @@ typedef enum ProllyWriterMode
 	PROLLY_WRITERS_SHARED,		/* every session writes the branch */
 	PROLLY_WRITERS_OWNED,		/* one writer per dirty branch */
 } ProllyWriterMode;
+
+/* the modes' names, by ProllyWriterMode */
+#define PROLLY_WRITER_MODE_NAMES \
+	[PROLLY_WRITERS_SHARED] = "shared", \
+	[PROLLY_WRITERS_OWNED] = "owned"
 
 typedef struct ProllyWritersRoutine
 {
