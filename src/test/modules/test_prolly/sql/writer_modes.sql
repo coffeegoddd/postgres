@@ -311,14 +311,15 @@ SELECT dolt_branch('-D', 'writer/hank/main');
 SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
 
 -- Renamed, a protected branch stays protected, by its new name; only the
--- database's owner renames it, or replaces it; a writer's branch keeps its
--- name.
+-- database's owner renames it, replaces it or moves it; a writer's branch
+-- keeps its name.
 SELECT dolt_branch('wm_pr');
 SELECT dolt_branch('wm_pq');
 SELECT dolt_branch('--protect', 'wm_pr');
 SET ROLE wm_other;
 SELECT dolt_branch('-m', 'wm_pr', 'wm_pr2');
 SELECT dolt_branch('-m', '-f', 'wm_pq', 'wm_pr');
+SELECT dolt_branch('-f', 'wm_pr', 'wm_pq');
 RESET ROLE;
 SELECT dolt_branch('-m', 'wm_pr', 'wm_pr2');
 SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_p%' ORDER BY name;

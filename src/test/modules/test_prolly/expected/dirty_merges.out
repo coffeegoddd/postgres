@@ -633,3 +633,76 @@ drop cascades to sequence dm.s2
 drop cascades to materialized view dm.mv
 drop cascades to table dm.k
 DROP COLLATION public.dm_c_utf8;
+-- A fast-forward over an uncommitted foreign key whose rows it would
+-- break: refused, as a merge leaving violations over uncommitted changes
+-- is.
+CREATE SCHEMA dmf VERSIONED;
+CREATE TABLE dmf.a (id int PRIMARY KEY);
+CREATE TABLE dmf.b (id int PRIMARY KEY, aid int);
+INSERT INTO dmf.a VALUES (1), (2);
+INSERT INTO dmf.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'dmf base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dmf_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dmf_feature');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'dmf_feature'"}
+(1 row)
+
+DELETE FROM dmf.a WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a row gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE dmf.b ADD FOREIGN KEY (aid) REFERENCES dmf.a;
+SELECT (dolt_merge('dmf_feature'))[2:4];
+ERROR:  cannot merge with uncommitted changes when the merge conflicts
+DETAIL:  The fast-forward leaves 1 constraint violation.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT id FROM dmf.a ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dmf_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dmf CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table dmf.a
+drop cascades to table dmf.b
+SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

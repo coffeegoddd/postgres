@@ -3466,7 +3466,9 @@ without_local(const Local *l, ProllyNodeRef *root)
 /*
  * A fast-forward to theirs with uncommitted changes: the rows and sequence
  * values theirs changed since the head written, the changes left as they
- * are, and theirs made the head.
+ * are, and theirs made the head.  Refused if the rows written break a
+ * foreign key, as a merge over uncommitted changes that leaves violations
+ * is: the working set may have one the head hasn't.
  */
 static void
 fast_forward_local(const Local *l, const ProllyHash *theirs)
@@ -3477,6 +3479,8 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 	Tables		tt = {NIL};
 	HTAB	   *hs;
 	List	   *ts;
+	List	   *relids = NIL;
+	List	   *broken;
 	ListCell   *lc;
 
 	commit_root(theirs, &target);
@@ -3488,8 +3492,21 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 		Table	   *h = find_table(ht.tables, t->name);
 
 		if (h && !same_hash(&h->data.hash, &t->data.hash))
-			apply_rows(table_named(t->name), h, t);
+		{
+			Oid			relid = table_named(t->name);
+
+			apply_rows(relid, h, t);
+			relids = lappend_oid(relids, relid);
+		}
 	}
+	if (relids != NIL && (broken = foreign_key_violations(relids)) != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot merge with uncommitted changes when the merge conflicts"),
+				 errdetail_plural("The fast-forward leaves %d constraint violation.",
+								  "The fast-forward leaves %d constraint violations.",
+								  list_length(broken), list_length(broken)),
+				 errhint("Commit the changes, or reset the branch, first.")));
 	hs = sequences_by_name(sequences_of(&l->head));
 	ts = sequences_of(&target);
 	foreach(lc, ts)

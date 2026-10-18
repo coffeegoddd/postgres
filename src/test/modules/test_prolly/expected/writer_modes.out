@@ -973,8 +973,8 @@ SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
 (1 row)
 
 -- Renamed, a protected branch stays protected, by its new name; only the
--- database's owner renames it, or replaces it; a writer's branch keeps its
--- name.
+-- database's owner renames it, replaces it or moves it; a writer's branch
+-- keeps its name.
 SELECT dolt_branch('wm_pr');
  dolt_branch 
 -------------
@@ -1000,6 +1000,9 @@ HINT:  Only the database's owner renames or replaces a protected branch.
 SELECT dolt_branch('-m', '-f', 'wm_pq', 'wm_pr');
 ERROR:  branch "wm_pr" is protected
 HINT:  Only the database's owner renames or replaces a protected branch.
+SELECT dolt_branch('-f', 'wm_pr', 'wm_pq');
+ERROR:  branch "wm_pr" is protected
+HINT:  Only the database's owner moves a protected branch.
 RESET ROLE;
 SELECT dolt_branch('-m', 'wm_pr', 'wm_pr2');
  dolt_branch 

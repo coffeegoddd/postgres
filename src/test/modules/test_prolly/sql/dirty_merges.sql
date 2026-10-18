@@ -178,3 +178,25 @@ UPDATE pg_collation SET collicurules = NULL WHERE collname = 'dm_c_utf8';
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA dm CASCADE;
 DROP COLLATION public.dm_c_utf8;
+
+-- A fast-forward over an uncommitted foreign key whose rows it would
+-- break: refused, as a merge leaving violations over uncommitted changes
+-- is.
+CREATE SCHEMA dmf VERSIONED;
+CREATE TABLE dmf.a (id int PRIMARY KEY);
+CREATE TABLE dmf.b (id int PRIMARY KEY, aid int);
+INSERT INTO dmf.a VALUES (1), (2);
+INSERT INTO dmf.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'dmf base')::text) AS committed;
+SELECT dolt_branch('dmf_feature');
+SELECT dolt_checkout('dmf_feature');
+DELETE FROM dmf.a WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a row gone')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE dmf.b ADD FOREIGN KEY (aid) REFERENCES dmf.a;
+SELECT (dolt_merge('dmf_feature'))[2:4];
+SELECT id FROM dmf.a ORDER BY id;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dmf_feature');
+DROP SCHEMA dmf CASCADE;
+SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;

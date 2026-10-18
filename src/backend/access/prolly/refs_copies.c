@@ -871,8 +871,12 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 {
 	ProllyCommitInfo info;
 
-	/* HEAD, in any case: the session branch's head commit, as in Dolt. */
-	if (pg_strcasecmp(refname, "HEAD") == 0)
+	/*
+	 * HEAD, in any case: the session branch's head commit, as in Dolt.  (A
+	 * branch so named, made before HEAD's other cases were refused, is
+	 * still itself.)
+	 */
+	if (pg_strcasecmp(refname, "HEAD") == 0 && !branch_exists(refname))
 		refname = branch_ops()->current();
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
@@ -1166,10 +1170,14 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
  * ------------------------------------------------------------------------
  */
 
-/* A branch whose name differs from name only by case: found into *arg. */
+/*
+ * A branch whose name differs from name only by case, other than ignore:
+ * found into *arg.
+ */
 typedef struct OtherCase
 {
 	const char *name;
+	const char *ignore;
 	char	   *found;
 } OtherCase;
 
@@ -1179,6 +1187,7 @@ find_other_case(const char *name, const ProllyHash *head, void *arg)
 	OtherCase  *oc = arg;
 
 	if (oc->found == NULL && strcmp(name, oc->name) != 0 &&
+		(oc->ignore == NULL || strcmp(name, oc->ignore) != 0) &&
 		pg_strcasecmp(name, oc->name) == 0)
 		oc->found = pstrdup(name);
 }
@@ -1186,14 +1195,20 @@ find_other_case(const char *name, const ProllyHash *head, void *arg)
 static void copies_branches(ProllyBranchVisit visit, void *arg);
 
 /*
- * Refuse a new branch name that differs from a branch's only by case, as
- * Dolt does: on a case-insensitive file system (or to a user) they're one.
+ * Refuse a new branch name that differs from a branch's, other than
+ * ignore's (a branch being renamed), only by case, as Dolt does: on a
+ * case-insensitive file system (or to a user) they're one.  Names are
+ * ASCII, folded as such.  (The hidden branches of sessions checked out at
+ * commits, named for them, aren't checked: no user names them.)  Every
+ * branch is visited: a create's cost grows with the branches there are.
  */
 static void
-refuse_other_case(const char *name)
+refuse_other_case(const char *name, const char *ignore)
 {
-	OtherCase	oc = {name, NULL};
+	OtherCase	oc = {name, ignore, NULL};
 
+	if (strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		return;
 	copies_branches(find_other_case, &oc);
 	if (oc.found)
 		ereport(ERROR,
@@ -1212,7 +1227,7 @@ copies_branch_create(const char *name, const char *start_point)
 
 	branch_ops()->check_create(name);
 	lock_refs();
-	refuse_other_case(name);
+	refuse_other_case(name, NULL);
 	if (branch_exists(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -1317,9 +1332,13 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 				 errmsg("branch \"%s\" does not exist", name)));
 	if (strcmp(name, newname) == 0)
 		return;
-	if (pg_strcasecmp(name, newname) != 0)
-		refuse_other_case(newname);
-	/* forced, it takes the place of a branch of the new name, as in Dolt */
+	refuse_other_case(newname, name);
+
+	/*
+	 * Forced, it takes the place of a branch of the new name, as in Dolt;
+	 * not one whose name differs only by case, refused above either way:
+	 * the user named another branch.
+	 */
 	if (branch_exists(newname) && !force)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),

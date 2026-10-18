@@ -320,6 +320,19 @@ text_array(int n, const char *const *vals)
 	return PointerGetDatum(construct_array_builtin(d, n, TEXTOID));
 }
 
+/*
+ * Where the options end: the index of the first "--" (what follows it is
+ * a branch or ref, even one beginning with "-"), or nargs.
+ */
+static int
+options_end(char **args, int nargs)
+{
+	for (int i = 0; i < nargs; i++)
+		if (strcmp(args[i], "--") == 0)
+			return i;
+	return nargs;
+}
+
 /* The argument after option args[*i]. */
 static char *
 option_value(char **args, int nargs, int *i, const char *fn)
@@ -830,6 +843,59 @@ create_branch(const char *name, const char *from)
 }
 
 /*
+ * A forced create (or copy) of branch name, which exists: moved to from's
+ * head commit (the session branch's, if NULL), its uncommitted changes
+ * dropped, as Dolt moves it; not the session's own branch.  The start
+ * point is resolved first, so it may name the branch itself.  The move is
+ * a compare-and-swap: refused if another session moved or deleted the
+ * branch meanwhile.
+ */
+static void
+force_branch(const char *name, const char *from)
+{
+	ProllyHash	at;
+	ProllyHash	head;
+	bool		moved = false;
+	bool		was_read_only = XactReadOnly;
+
+	if (strcmp(name, branch_ops()->current()) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is checked out", name),
+				 errhint("Check out another branch first.")));
+	branch_ops()->check_create(name);
+
+	/*
+	 * (no commit to move to, or from: a branch without commits, made again
+	 * as a copy of the start point as it is)
+	 */
+	if (!PROLLY_CALL(refs(), resolve, from ? from : "HEAD", &head) ||
+		!PROLLY_CALL(refs(), resolve, name, &at))
+	{
+		PROLLY_CALL(refs(), branch_delete, name, true);
+		create_branch(name, from);
+		return;
+	}
+	/* (another branch's rows written, as a create makes its copies) */
+	if (XactReadOnlyFromBranch)
+		XactReadOnly = false;
+	PG_TRY();
+	{
+		moved = PROLLY_CALL(refs(), branch_move, name, &at, &head, true);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+	if (!moved)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("branch \"%s\" changed while it was moved", name),
+				 errhint("Try again.")));
+}
+
+/*
  * Check out a branch, though the transaction is read-only for the branch it
  * started on: a branch first used gets its copies (writes), as one made
  * there does.
@@ -994,6 +1060,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
+	int			dashes = options_end(args, nargs);
 	char	   *branch = NULL;
 	char	   *start = NULL;
 	bool		create = false;
@@ -1003,19 +1070,24 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "-b") == 0)
+		if (i == dashes)
+			continue;
+		if (i > dashes || a[0] != '-')
+		{
+			if (branch == NULL)
+				branch = a;
+			else if (create && start == NULL)
+				start = a;
+			else
+				unexpected("dolt_checkout", a);
+		}
+		else if (strcmp(a, "-b") == 0)
 		{
 			create = true;
 			branch = option_value(args, nargs, &i, "dolt_checkout");
 		}
-		else if (a[0] == '-')
-			unsupported("dolt_checkout", a);
-		else if (branch == NULL)
-			branch = a;
-		else if (create && start == NULL)
-			start = a;
 		else
-			unexpected("dolt_checkout", a);
+			unsupported("dolt_checkout", a);
 	}
 	if (branch == NULL)
 		ereport(ERROR,
@@ -1296,14 +1368,17 @@ dolt_branch(PG_FUNCTION_ARGS)
 		reserved_branch_name(name);
 		if (force && PROLLY_CALL(refs(), branch_lookup, name, &(ProllyBranchId) {0}))
 		{
-			if (strcmp(name, branch_ops()->current()) == 0)
+			/* (a protected branch is the database owner's to move so) */
+			if (PROLLY_CALL(writers(), protected, name) &&
+				!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("branch \"%s\" is checked out", name),
-						 errhint("Check out another branch first.")));
-			PROLLY_CALL(refs(), branch_delete, name, true);
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("branch \"%s\" is protected", name),
+						 errhint("Only the database's owner moves a protected branch.")));
+			force_branch(name, from);
 		}
-		create_branch(name, from);
+		else
+			create_branch(name, from);
 		/* (a copy is protected as its source is, where the owner may say so) */
 		if (copy && from && strcmp(from, "main") != 0 &&
 			PROLLY_CALL(writers(), protected, from) &&
@@ -1388,6 +1463,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
+	int			dashes = options_end(args, nargs);
 	char	   *branch = NULL;
 	char	   *message = NULL;
 	int			flags = 0;
@@ -1405,7 +1481,16 @@ dolt_merge(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--no-ff") == 0)
+		if (i == dashes)
+			continue;
+		if (i > dashes || a[0] != '-')
+		{
+			if (branch == NULL)
+				branch = a;
+			else
+				unexpected("dolt_merge", a);
+		}
+		else if (strcmp(a, "--no-ff") == 0)
 			flags |= PROLLY_MERGE_NO_FF;
 		else if (strcmp(a, "--ff-only") == 0)
 			flags |= PROLLY_MERGE_FF_ONLY;
@@ -1419,12 +1504,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 			abort_merge = true;
 		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
 			message = option_value(args, nargs, &i, "dolt_merge");
-		else if (a[0] == '-')
-			unsupported("dolt_merge", a);
-		else if (branch == NULL)
-			branch = a;
 		else
-			unexpected("dolt_merge", a);
+			unsupported("dolt_merge", a);
 	}
 	if (abort_merge)
 	{
@@ -1986,6 +2067,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
+	int			dashes = options_end(args, nargs);
 	bool		hard = false;
 	char	   *ref = NULL;
 	const char *result[1] = {"0"};
@@ -1994,14 +2076,19 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--hard") == 0)
+		if (i == dashes)
+			continue;
+		if (i > dashes || a[0] != '-')
+		{
+			if (ref == NULL)
+				ref = a;
+			else
+				unexpected("dolt_reset", a);
+		}
+		else if (strcmp(a, "--hard") == 0)
 			hard = true;
-		else if (a[0] == '-')
-			unsupported("dolt_reset", a);
-		else if (ref == NULL)
-			ref = a;
 		else
-			unexpected("dolt_reset", a);
+			unsupported("dolt_reset", a);
 	}
 	if (!hard)
 		ereport(ERROR,
@@ -2092,6 +2179,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
+	int			dashes = options_end(args, nargs);
 	const char *ref = NULL;
 	bool		allow_empty = false;
 	ProllyHash	id;
@@ -2103,18 +2191,23 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (strcmp(args[i], "--allow-empty") == 0)
+		if (i == dashes)
+			continue;
+		if (i > dashes || args[i][0] != '-')
+		{
+			if (ref == NULL)
+				ref = args[i];
+			else
+				unexpected("dolt_cherry_pick", args[i]);
+		}
+		else if (strcmp(args[i], "--allow-empty") == 0)
 			allow_empty = true;
 		else if (strcmp(args[i], "--abort") == 0)
 			abort_pick = true;
 		else if (strcmp(args[i], "--continue") == 0)
 			continue_pick = true;
-		else if (args[i][0] == '-')
-			unsupported("dolt_cherry_pick", args[i]);
-		else if (ref == NULL)
-			ref = args[i];
 		else
-			unexpected("dolt_cherry_pick", args[i]);
+			unsupported("dolt_cherry_pick", args[i]);
 	}
 	if (abort_pick && continue_pick)
 		ereport(ERROR,
@@ -2231,22 +2324,25 @@ dolt_revert(PG_FUNCTION_ARGS)
 	const char *result[4] = {"", "0", "0", "0"};
 	const char **refs_given = palloc(sizeof(char *) * Max(nargs, 1));
 	int			nrefs = 0;
+	int			dashes = options_end(args, nargs);
 	bool		abort_revert = false;
 	bool		continue_revert = false;
 	char	   *author = NULL;
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (strcmp(args[i], "--abort") == 0)
+		if (i == dashes)
+			continue;
+		if (i > dashes || args[i][0] != '-')
+			refs_given[nrefs++] = args[i];
+		else if (strcmp(args[i], "--abort") == 0)
 			abort_revert = true;
 		else if (strcmp(args[i], "--continue") == 0)
 			continue_revert = true;
 		else if (strcmp(args[i], "--author") == 0)
 			author = option_value(args, nargs, &i, "dolt_revert");
-		else if (args[i][0] == '-')
-			unsupported("dolt_revert", args[i]);
 		else
-			refs_given[nrefs++] = args[i];
+			unsupported("dolt_revert", args[i]);
 	}
 	if (abort_revert && continue_revert)
 		ereport(ERROR,

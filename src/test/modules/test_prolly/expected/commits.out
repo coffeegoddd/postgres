@@ -446,6 +446,42 @@ SELECT name FROM dolt_branches WHERE name = '-dash';
  -dash
 (1 row)
 
+-- (and named after "--" to the others taking a branch or ref)
+SELECT dolt_checkout('-dash');
+ERROR:  dolt_checkout: "-dash" is not supported
+SELECT dolt_checkout('--', '-dash');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch '-dash'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ -dash
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('--', '-dash'))[4];
+      dolt_merge       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT dolt_reset('--hard', '--', '-dash');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_cherry_pick('--', '-dash');
+ERROR:  dolt_cherry_pick changes nothing on the branch
+HINT:  Pass --allow-empty to commit it anyway.
 SELECT dolt_branch('-D', '--', '-dash');
  dolt_branch 
 -------------
@@ -488,6 +524,25 @@ SELECT name FROM dolt_branches WHERE lower(name) = 'cased';
  cased
 (1 row)
 
+-- (a branch renamed to its own name in another case: still one)
+SELECT dolt_branch('-m', 'cased', 'Cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-m', 'Cased', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE lower(name) = 'cased';
+ name  
+-------
+ cased
+(1 row)
+
 -- Forced, a branch made or copied takes the place of one of its name
 -- (not the session's own).
 SELECT dolt_hashof('cased') AS cased_at \gset
@@ -523,6 +578,85 @@ SELECT dolt_hashof('cased') = dolt_hashof('other') AS copied;
  copied 
 --------
  t
+(1 row)
+
+-- moved, not made again: to a start point naming the branch itself, its
+-- uncommitted changes dropped; main, from another branch
+SELECT dolt_hashof('cased~1') AS back \gset
+SELECT dolt_branch('-f', 'cased', 'cased~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('cased') = :'back' AS moved_back;
+ moved_back 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('-cf', 'cased', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cased');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'cased'"}
+(1 row)
+
+INSERT INTO ca.t VALUES (4);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-f', 'cased', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cased');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'cased'"}
+(1 row)
+
+SELECT id FROM ca.t ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT dolt_hashof('main') AS main_at \gset
+SELECT dolt_branch('-f', 'main', 'main~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('main') <> :'main_at' AS main_moved;
+ main_moved 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('-f', 'main', :'main_at');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
 (1 row)
 
 SELECT dolt_branch('-f', 'main');
