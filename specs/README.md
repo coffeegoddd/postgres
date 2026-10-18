@@ -74,6 +74,7 @@ control; this project's premise is that we should not have to.
 | [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Proposed (2026-10-17):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180), then C, content-addressed TOAST pointers in the chunk store (#181) |
 | [15-transaction-commits.md](15-transaction-commits.md) | **Proposed (2026-10-18):** a Dolt commit for every SQL transaction, as Dolt's `@@dolt_transaction_commit`: what Dolt does, phase 1 folding at pre-commit (#228), phase 2 committing only the transaction's own row changes (#229) |
 | [16-correctness-on-prs.md](16-correctness-on-prs.md) | **Proposed (2026-10-18):** C suite results on every pull request and a gate that blocks regressions: how Dolt, Doltgres and doltlite do it, a heap baseline checked both ways, the full corpus in shards, a sticky comment, branch protection (#234) |
+| [17-performance-on-prs.md](17-performance-on-prs.md) | **Proposed (2026-10-18):** the S suite on every pull request: how Dolt, Doltgres and doltlite benchmark and gate PRs, and two layers here: deterministic work counters on hosted runners (required) and paired, retry-confirmed timing against the PR's base, gated on the dedicated host; one sticky comment (#240) |
 
 ## Related local repositories
 
