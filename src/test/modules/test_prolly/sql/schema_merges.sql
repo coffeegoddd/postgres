@@ -207,8 +207,39 @@ SELECT length(dolt_commit('-Am', 'main table')::text) AS committed;
 SELECT dolt_merge('ma_side') IS NOT NULL AS merged;
 SELECT ma.add(1, 2);
 SELECT dolt_branch('-D', 'ma_side');
+-- dropped on one side, given such a routine on the other: a conflict
+SELECT dolt_checkout('-b', 'ma_drop') IS NOT NULL AS on_drop;
+DROP SCHEMA ma CASCADE;
+SELECT length(dolt_commit('-Am', 'ma dropped')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE FUNCTION ma.mul(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 * $2 * $3';
+SELECT length(dolt_commit('-Am', 'ma.mul')::text) AS committed;
+SELECT dolt_merge('ma_drop');
+SELECT dolt_branch('-D', 'ma_drop');
 DROP SCHEMA ma CASCADE;
 SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
+
+-- a versioned public dropped on one side: what has no schema (the root's
+-- format) isn't taken for public's
+SELECT current_database() AS db \gset
+CREATE DATABASE regress_public_merge;
+\c regress_public_merge
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE TABLE public.t (id int PRIMARY KEY);
+CREATE SCHEMA other VERSIONED;
+CREATE TABLE other.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'public')::text) AS committed;
+SELECT dolt_checkout('-b', 'no_public') IS NOT NULL AS on_side;
+DROP SCHEMA public CASCADE;
+SELECT length(dolt_commit('-Am', 'public dropped')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO other.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'a row elsewhere')::text) AS committed;
+SELECT dolt_merge('no_public') IS NOT NULL AS merged;
+SELECT count(*) AS public_schemas FROM pg_namespace WHERE nspname = 'public';
+\c :db
+DROP DATABASE regress_public_merge;
 DROP SCHEMA sg_new CASCADE;
 DROP SCHEMA sg_new_empty;
 DROP SCHEMA app CASCADE;

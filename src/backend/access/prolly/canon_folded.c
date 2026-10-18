@@ -2269,30 +2269,23 @@ list_has_string(List *list, const char *s)
 }
 
 /*
- * The schema of a qualified name, as written; a routine's (its signature,
- * "s.f(integer, text)") without its arguments.
+ * The schema of a qualified name as an item's key writes it (quoted as
+ * needed, a routine's followed by its arguments): what is before its
+ * first unquoted '.'; NULL for a name without one (the root's format).
  */
 static char *
 schema_of(const char *qualified_name)
 {
-	char	   *copy = pstrdup(qualified_name);
 	bool		quoted = false;
-	List	   *names;
 
-	for (char *c = copy; *c; c++)
+	for (const char *c = qualified_name; *c; c++)
 	{
 		if (*c == '"')
 			quoted = !quoted;
-		else if (*c == '(' && !quoted)
-		{
-			*c = '\0';
-			break;
-		}
+		else if (*c == '.' && !quoted)
+			return pnstrdup(qualified_name, c - qualified_name);
 	}
-	names = stringToQualifiedNameList(copy, NULL);
-
-	return list_length(names) > 1 ? pstrdup(quote_identifier(strVal(linitial(names)))) :
-		pstrdup("public");
+	return NULL;
 }
 
 /* A column, as CREATE TABLE and ADD COLUMN write it. */
@@ -3724,13 +3717,22 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
 
 	/* a schema dropped on one side, given objects on the other */
-	foreach(lc, kept)
-		if (list_has_string(dropped, schema_of(lfirst(lc))))
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
-							schema_of(lfirst(lc)), (char *) lfirst(lc)),
-					 errdetail("Dropping it would drop what the other side made in it.")));
+	if (dropped != NIL)
+	{
+		foreach(lc, kept)
+		{
+			char	   *schema = schema_of(lfirst(lc));
+
+			if (schema && list_has_string(dropped, schema))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
+								schema, (char *) lfirst(lc)),
+						 errdetail("Dropping it would drop what the other side made in it.")));
+			if (schema)
+				pfree(schema);
+		}
+	}
 }
 
 const ProllyCanonRoutine prolly_canon_folded = {
