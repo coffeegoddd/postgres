@@ -2223,10 +2223,11 @@ dolt_gc(PG_FUNCTION_ARGS)
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, full, &gc);
 	ereport(DEBUG1,
-			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed",
+			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 (unsigned long long) gc.chunks_kept,
 							 (unsigned long long) gc.chunks_freed,
-							 (unsigned long long) gc.bytes_freed)));
+							 (unsigned long long) gc.bytes_freed,
+							 (unsigned long long) gc.window_usec)));
 	PG_RETURN_DATUM(text_array(1, result));
 }
 

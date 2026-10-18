@@ -119,6 +119,7 @@ typedef struct ProllyGcResult
 	uint64		chunks_kept;
 	uint64		chunks_freed;
 	uint64		bytes_freed;
+	uint64		window_usec;	/* how long appends were held off */
 } ProllyGcResult;
 
 /*

@@ -1032,8 +1032,8 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
 	TupleDesc	desc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -1042,6 +1042,7 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum((int64) r.chunks_kept);
 	values[1] = Int64GetDatum((int64) r.chunks_freed);
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
+	values[3] = Int64GetDatum((int64) r.window_usec);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

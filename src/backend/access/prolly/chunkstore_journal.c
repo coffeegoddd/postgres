@@ -138,6 +138,7 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 #define JOURNAL_FILE		"prolly_journal"	/* segment 0's */
@@ -3120,6 +3121,7 @@ struct ProllyChunkGc
 	uint8	   *copied;			/* slots gc_copy() wrote */
 	List	   *written;		/* ManifestFile *, the new files */
 	bool		window;
+	TimestampTz window_began;
 	VirtualTransactionId *readers;	/* running at the swap */
 	int			nreaders;
 };
@@ -3617,6 +3619,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		INJECTION_POINT("prolly-gc-window", NULL);
 		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
 		gc->window = true;
+		gc->window_began = GetCurrentTimestamp();
 	}
 
 	scan_journal(s);
@@ -3840,6 +3843,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	ListCell   *lc;
 	uint64		freed_bytes = 0;
 	uint64		written_bytes = 0;
+	uint64		window_usec;
 
 	Assert(gc->window);
 	gc_write(gc, marks, keep);
@@ -3887,6 +3891,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	LWLockRelease(ProllyJournalLock);
 	gc->window = false;
+	window_usec = GetCurrentTimestamp() - gc->window_began;
 	unlock_manifest(s);
 	gc->readers = GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
 										&gc->nreaders);
@@ -3906,6 +3911,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 		}
 		result->bytes_freed = freed_bytes > written_bytes ?
 			freed_bytes - written_bytes : 0;
+		result->window_usec = window_usec;
 	}
 	INJECTION_POINT("prolly-gc-swapped", NULL);
 }

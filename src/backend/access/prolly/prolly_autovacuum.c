@@ -128,11 +128,12 @@ collect(void)
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, false, &r);
 	ereport(DEBUG1,
-			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed",
+			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 get_database_name(MyDatabaseId),
 							 (unsigned long long) r.chunks_kept,
 							 (unsigned long long) r.chunks_freed,
-							 (unsigned long long) r.bytes_freed)));
+							 (unsigned long long) r.bytes_freed,
+							 (unsigned long long) r.window_usec)));
 }
 
 /*

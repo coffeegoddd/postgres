@@ -122,6 +122,7 @@ tests += {
       't/049_page_sweep.pl',
       't/050_bmap_evictions.pl',
       't/051_autovacuum_reclaim.pl',
+      't/052_gc_measure.pl',
       't/053_serve_snapshots.pl',
       't/054_journal_segments.pl',
       't/055_gc.pl',

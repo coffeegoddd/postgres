@@ -243,6 +243,58 @@ class V3(VWorkload):
                        transactions=2, unit="operation")
 
 
+@registry.workloads.register("V6")
+class V6(VWorkload):
+    """Reclamation: the space branches take and give back once deleted and
+    the chunk store collected, and how long default and full collections
+    take (dolt_gc)."""
+
+    id, title = "V6", "Space and collection after deleting branches"
+
+    # the chunk store's files, in bytes
+    SPACE = ("SELECT sum((pg_stat_file(d || '/' || f)).size) FROM "
+             "(SELECT 'base/' || oid AS d FROM pg_database "
+             "WHERE datname = current_database()) db, pg_ls_dir(d) f "
+             "WHERE f LIKE 'prolly\\_journal%' OR f LIKE 'prolly\\_table\\_%'")
+
+    def own_variants(self, params):
+        return [(f"b{b}-n{n}", {"branches": int(b), "changes": int(n)})
+                for b, n in product(params.get("branches", [20]),
+                                    params.get("changes", [10000]))]
+
+    def _space(self, ctx) -> float:
+        return int(ctx.cluster.scalar(self.SPACE, dbname=ctx.dbname) or 0) / 1048576
+
+    def operations(self, ctx):
+        n, nb, rows = ctx.params["changes"], ctx.params["branches"], self.rows(ctx)
+        if n > rows:
+            raise ValueError("V6 changes exceed the dataset; refusing to clamp the workload")
+        vc = VC_SQL
+        stmts = ["SELECT dolt_gc()"]
+        for b in range(nb):
+            lo = b * n % rows
+            stmts += [vc.branch(f"v6_b{b}"), vc.checkout(f"v6_b{b}"),
+                      f"UPDATE vc_data SET payload = md5(payload) "
+                      f"WHERE id > {lo} AND id <= {lo + n}",
+                      vc.commit(f"v6 {b}"), vc.checkout("main")]
+        timed_session(ctx, stmts, "v6-branches")
+        with_branches = self._space(ctx)
+        t = timed_session(ctx, ["SELECT dolt_gc()"], "v6-gc")
+        collected = self._space(ctx)
+        timed_session(ctx, [f"SELECT dolt_branch('-D', 'v6_b{b}')" for b in range(nb)],
+                      "v6-delete")
+        t += timed_session(ctx, ["SELECT dolt_gc()", "SELECT dolt_gc('--full')",
+                                 "SELECT dolt_gc('--full')"], "v6-full")
+        return Outcome(metrics={"default_gc_ms": t[0],
+                                "default_gc_after_delete_ms": t[1],
+                                "full_gc_ms": t[2],
+                                "full_gc_all_live_ms": t[3],
+                                "space_with_branches_mb": with_branches,
+                                "space_collected_mb": collected,
+                                "space_after_full_mb": self._space(ctx)},
+                       transactions=4, unit="collection")
+
+
 @registry.workloads.register("V4")
 class V4(VWorkload):
     """Clone, then fetch and push, between this instance and a second local

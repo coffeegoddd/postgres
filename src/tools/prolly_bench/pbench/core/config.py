@@ -153,7 +153,8 @@ def validate(cfg: dict, suite: str) -> None:
     keys = {"S3": {"ranges"}, "S5": {"hot_rows"}, "S8": {"percents"},
             "S9": {"isolation", "weights"}, "S10": {"tests"}, "S13": {"modes", "weights", "isolation"},
             "V1": {"iterations", "background"}, "V2": {"iterations", "background", "changes"},
-            "V3": {"background", "changes", "locality", "conflict_percent"}, "V4": {"background", "changes"}}
+            "V3": {"background", "changes", "locality", "conflict_percent"}, "V4": {"background", "changes"},
+            "V6": {"background", "branches", "changes"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})
     keys.update({f"S{i}": set() for i in (1, 2, 4, 6, 7)})
     for wid, params in cfg["workloads"].items():
@@ -168,14 +169,14 @@ def validate(cfg: dict, suite: str) -> None:
                               "locality": {"clustered", "scattered"}}.items():
             if name in params and (not params[name] or not set(params[name]) <= choices):
                 raise ConfigError(f"invalid {wid}.{name}")
-        for name in ("clients", "ranges", "changes", "percents", "conflict_percent"):
+        for name in ("clients", "ranges", "changes", "percents", "conflict_percent", "branches"):
             if name in params:
                 if not params[name] or len(set(params[name])) != len(params[name]):
                     raise ConfigError(f"empty or duplicate {wid}.{name}")
                 for v in params[name]:
                     number(v, f"{wid}.{name}", 0 if name == "conflict_percent" else 1,
                            100 if name in ("percents", "conflict_percent") else None)
-                    if name in ("clients", "ranges", "changes") and type(v) is not int:
+                    if name in ("clients", "ranges", "changes", "branches") and type(v) is not int:
                         raise ConfigError(f"{wid}.{name} must contain integers")
         for name in ("iterations", "workers", "hot_rows", "timeout_seconds", "measure_seconds", "warmup_seconds"):
             if name in params:
