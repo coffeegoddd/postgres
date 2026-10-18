@@ -54,8 +54,10 @@ scenarios; the pin makes an upstream change to their source visible.
 It was drafted by rules on each suite and on what each case's literal uses
 (the first matching feature decides), then reviewed; a case's class changes
 by editing its entry. The verifier checks that every catalog case is
-classified once, by its literal's hash, and that a full port is of a P case
-(a partial one of a P or F case). `dolt-corpus` reports P cases by area as
+classified once and that a full port is of a P case (a partial one of a P
+or F case); with `--catalog`, as CI runs it, each entry's hash is checked
+against its case's literal too (offline, only the ported and deferred
+cases' hashes are). `dolt-corpus` reports P cases by area as
 ported, partial, deferred or not started, and F cases by feature; `--markdown`
 writes those tables, which CI adds to the job summary.
 

@@ -224,6 +224,10 @@ func TestClassification(t *testing.T) {
 		}
 		ported += a.Ported + a.Partial
 	}
+	// (partial ports of F cases are counted under their features)
+	for _, f := range c.Features {
+		ported += f.PartiallyPorted
+	}
 	if ported != r.PortedCases+r.PartialCases {
 		t.Fatalf("ports counted %d times by area, %d ported", ported, r.PortedCases+r.PartialCases)
 	}

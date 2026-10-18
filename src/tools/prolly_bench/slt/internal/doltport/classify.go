@@ -2,6 +2,7 @@ package doltport
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -40,21 +41,28 @@ type AreaCoverage struct {
 	NotStarted int    `json:"not_started"`
 }
 
-// FeatureCoverage is the cases waiting on a feature, by the area they're in.
+// FeatureCoverage is the cases waiting on a feature, by the area they're
+// in, with those partially ported and those deferred.
 type FeatureCoverage struct {
-	Feature string         `json:"feature"`
-	Cases   int            `json:"cases"`
-	Ported  int            `json:"partially_ported"`
-	Areas   map[string]int `json:"areas"`
+	Feature         string         `json:"feature"`
+	Cases           int            `json:"cases"`
+	PartiallyPorted int            `json:"partially_ported"`
+	Deferred        int            `json:"deferred"`
+	Areas           map[string]int `json:"areas"`
 }
 
 type ClassCoverage struct {
-	Portable      int               `json:"portable"`
-	FeatureGated  int               `json:"feature_gated"`
-	NotApplicable int               `json:"not_applicable"`
-	Areas         []AreaCoverage    `json:"areas"`
-	Features      []FeatureCoverage `json:"features"`
+	Portable      int `json:"portable"`
+	FeatureGated  int `json:"feature_gated"`
+	NotApplicable int `json:"not_applicable"`
+	// deferrals of N cases (the manifest records why they don't apply)
+	DeferredNotApplicable int               `json:"deferred_not_applicable"`
+	Areas                 []AreaCoverage    `json:"areas"`
+	Features              []FeatureCoverage `json:"features"`
 }
+
+// Areas and features are slugs, so the coverage tables render as tables.
+var slug = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
 func classKey(suite string, index int) string { return fmt.Sprintf("%s[%d]", suite, index) }
 
@@ -73,8 +81,9 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 		if _, dup := byKey[key]; dup {
 			return cov, fmt.Errorf("case %s classified twice", key)
 		}
-		if strings.TrimSpace(k.Reason) == "" || strings.TrimSpace(k.Area) == "" {
-			return cov, fmt.Errorf("case %s needs an area and a reason", key)
+		if strings.TrimSpace(k.Reason) == "" || !slug.MatchString(k.Area) ||
+			(k.Feature != "" && !slug.MatchString(k.Feature)) {
+			return cov, fmt.Errorf("case %s needs an area and a reason (area and feature lower-case slugs)", key)
 		}
 		switch k.Class {
 		case "P", "N":
@@ -106,7 +115,7 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 			}
 		}
 	}
-	ported, deferred := map[string]bool{}, map[string]bool{}
+	ported, deferred, partialKey := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, p := range m.Ports {
 		key := classKey(p.Suite, p.Index)
 		k, ok := byKey[key]
@@ -117,6 +126,9 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 			return cov, fmt.Errorf("port %s: a full port must be of a P case, a partial one of P or F (is %s)", p.ID, k.Class)
 		}
 		ported[key] = true
+		if partial[p.ID] {
+			partialKey[key] = true
+		}
 	}
 	for _, d := range m.Deferred {
 		key := classKey(d.Suite, d.Index)
@@ -126,16 +138,13 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 		deferred[key] = true
 	}
 	areas, features := map[string]*AreaCoverage{}, map[string]*FeatureCoverage{}
-	partialKey := map[string]bool{}
-	for _, p := range m.Ports {
-		if partial[p.ID] {
-			partialKey[classKey(p.Suite, p.Index)] = true
-		}
-	}
 	for key, k := range byKey {
 		switch k.Class {
 		case "N":
 			cov.NotApplicable++
+			if deferred[key] {
+				cov.DeferredNotApplicable++
+			}
 		case "F":
 			cov.FeatureGated++
 			f := features[k.Feature]
@@ -145,8 +154,11 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 			}
 			f.Cases++
 			f.Areas[k.Area]++
-			if ported[key] {
-				f.Ported++
+			if partialKey[key] {
+				f.PartiallyPorted++
+			}
+			if deferred[key] {
+				f.Deferred++
 			}
 		case "P":
 			cov.Portable++
@@ -199,14 +211,17 @@ func (c ClassCoverage) Markdown() string {
 		t.NotStarted += a.NotStarted
 	}
 	fmt.Fprintf(&b, "| **total** | %d | %d | %d | %d | %d |\n\n", t.Portable, t.Ported, t.Partial, t.Deferred, t.NotStarted)
-	b.WriteString("| Feature | F cases | Partially ported | Areas |\n| --- | ---: | ---: | --- |\n")
+	if c.DeferredNotApplicable > 0 {
+		fmt.Fprintf(&b, "Also deferred: %d N cases (the manifest says why they don't apply).\n\n", c.DeferredNotApplicable)
+	}
+	b.WriteString("| Feature | F cases | Partially ported | Deferred | Areas |\n| --- | ---: | ---: | ---: | --- |\n")
 	for _, f := range c.Features {
 		var areas []string
 		for a, n := range f.Areas {
 			areas = append(areas, fmt.Sprintf("%s %d", a, n))
 		}
 		sort.Strings(areas)
-		fmt.Fprintf(&b, "| %s | %d | %d | %s |\n", f.Feature, f.Cases, f.Ported, strings.Join(areas, ", "))
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %s |\n", f.Feature, f.Cases, f.PartiallyPorted, f.Deferred, strings.Join(areas, ", "))
 	}
 	return b.String()
 }

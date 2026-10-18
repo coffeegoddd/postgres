@@ -40,7 +40,15 @@ func run() error {
 		return closeErr
 	}
 	if *markdown != "" {
-		if err := os.WriteFile(*markdown, []byte(report.Classes.Markdown()), 0644); err != nil {
+		m, err := os.OpenFile(*markdown, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err != nil {
+			return err
+		}
+		_, err = m.WriteString(report.Classes.Markdown())
+		if closeErr := m.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
 			return err
 		}
 	}
