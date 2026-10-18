@@ -1151,12 +1151,17 @@ copies (the one O(N) step: rows written to pages, indexes built).
     version than it has, refuses with a hint to install or update it
     first (`ALTER EXTENSION … UPDATE`, which the user runs, for every
     branch at once). Other missing dependencies refuse as at clone. As
-    built: a branch's first use checks its head (by `dolt_checkout` or a
-    connection to it), a reset its target, a merge (a pull's too) the
-    incoming head unless it is already merged, a cherry-pick each picked
-    commit; a revert, which goes back to what the branch had, isn't
-    checked, and a checkout of a branch that has its copies already moves
-    nothing.
+    built, each checks what the move brings in, not all its target
+    records: a branch's first use (by `dolt_checkout` or a connection to
+    it) its head, checked before the refs are held; a reset what its
+    target needs that the head doesn't (a reset to the head, or an abort,
+    nothing); a merge (a pull's too) what the incoming head needs that the
+    merge base didn't; a cherry-pick what each commit needs that its
+    parent didn't, and a revert what the parent needed that the commit
+    doesn't. A checkout of a branch that has its copies moves nothing.
+    Measured by recorded entries, a new use of something the base already
+    needed isn't a new need; the copies failing still catches what the
+    check can't see.
   - **Not in diffs (as built):** `dolt_diff` and `dolt_status` compare
     roots, and the dependencies are beside the root, so neither shows
     them; a commit's are read with its other fields.
