@@ -121,6 +121,68 @@ SELECT count(*) FROM dep.c;
 \c :db
 DROP DATABASE regress_deps_b;
 
+-- What commits made elsewhere may record, checked directly (a commit
+-- recording given dependencies, checked as a clone checks its heads).
+CREATE DATABASE regress_deps_c;
+\c regress_deps_c
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SELECT test_fold_root() AS root \gset
+CREATE FUNCTION pg_temp.ext(text) RETURNS text LANGUAGE sql
+  AS $$ SELECT 'extension ' || $1 $$;
+
+-- an extension that requires another recorded one is made after it, at the
+-- recorded version (test_prolly_a sorts first, and requires test_prolly_b,
+-- whose default is 1.1)
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('test_prolly_a'), pg_temp.ext('test_prolly_b')],
+						   ARRAY['{1.0,public}', '{1.0,public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+SELECT extname, extversion FROM pg_extension
+  WHERE extname LIKE 'test_prolly_%' ORDER BY extname;
+
+-- an extension the server has no control file for, at two versions: named
+-- with the rest, not an error of its own
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('no_such_ext'), 'type dep_util.mood'],
+						   ARRAY['{1.0,public}', '{type,"{dep_util.mood}","{}"}']) AS c1 \gset
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('no_such_ext')],
+						   ARRAY['{1.1,public}']) AS c2 \gset
+SELECT test_check_dependencies(ARRAY[:'c1', :'c2'], true);
+
+-- an object whose address names a type of an extension to be made: the
+-- extension isn't missing (it would be made), the object is
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('ltree'), 'function dep_util.lf(public.ltree)'],
+						   ARRAY['{1.3,public}', '{function,"{dep_util,lf}","{public.ltree}"}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+SELECT count(*) AS ltree FROM pg_extension WHERE extname = 'ltree';	-- (none made)
+
+-- an extension recorded without a version: any; made at its default
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('ltree')], ARRAY['{"",public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+SELECT extversion FROM pg_extension WHERE extname = 'ltree';
+CREATE EXTENSION hstore VERSION '1.4';
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('hstore')], ARRAY['{"",public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], false);	-- what it has will do
+SELECT extversion FROM pg_extension WHERE extname = 'hstore';
+
+-- an extension's schema: made there, which must exist; one the database
+-- has elsewhere, or that commits record in different schemas, refused
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext')], ARRAY['{1.8,dep_ext}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+CREATE SCHEMA dep_ext;
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'citext';
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext')], ARRAY['{1.8,public}']) AS c2 \gset
+SELECT test_check_dependencies(ARRAY[:'c2'], false);
+SELECT test_check_dependencies(ARRAY[:'c', :'c2'], false);
+
+-- an error other than "not found" while looking for an object is raised
+-- as it is, not taken for a missing object
+SELECT test_commit_needing(:'root', ARRAY['nonsense x'], ARRAY['{nonsense,"{x}","{}"}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], false);
+\c :db
+DROP DATABASE regress_deps_c;
+
 DROP SCHEMA dep CASCADE;
 SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
 SELECT dolt_branch('-D', 'dep_side');

@@ -16,6 +16,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
+#include "access/prolly_deps.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_remote.h"
@@ -716,10 +717,14 @@ commit_item(const ProllyTreeRoutine *tree, ProllyTreeBuilder *b,
 	PROLLY_CALL(tree, build_add, b, &k, &v);
 }
 
-/* A commit naming root, with parent (none if its len is 0), as the refs write one. */
+/*
+ * A commit naming root, with parent (none if its len is 0), as the refs
+ * write one; recording deps if given, or recording none (as one made
+ * before commits recorded them).
+ */
 static void
-make_commit(const ProllyHash *root, const ProllyHash *parent,
-			const char *message, ProllyHash *id)
+make_commit_needing(const ProllyHash *root, const ProllyHash *parent,
+					const char *message, const ProllyHash *deps, ProllyHash *id)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
@@ -736,12 +741,133 @@ make_commit(const ProllyHash *root, const ProllyHash *parent,
 	memcpy(parents + 1, parent->bytes, parent->len);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	commit_item(tree, b, "author", "test", 4);
+	if (deps)
+	{
+		char		hashed_deps[1 + PROLLY_HASH_MAX_LEN];
+
+		hashed_deps[0] = (char) deps->len;
+		memcpy(hashed_deps + 1, deps->bytes, deps->len);
+		commit_item(tree, b, "dependencies", hashed_deps, 1 + deps->len);
+	}
 	commit_item(tree, b, "message", message, strlen(message));
 	commit_item(tree, b, "parents", parents, parent->len ? 1 + parent->len : 0);
 	commit_item(tree, b, "root", hashed, 1 + root->len);
 	commit_item(tree, b, "time", time, 8);
 	PROLLY_CALL(tree, build_finish, b, &ref);
 	*id = ref.hash;
+}
+
+static void
+make_commit(const ProllyHash *root, const ProllyHash *parent,
+			const char *message, ProllyHash *id)
+{
+	make_commit_needing(root, parent, message, NULL, id);
+}
+
+/* A dependency for test_commit_needing(), by its name and value. */
+typedef struct TestDependency
+{
+	char	   *name;
+	char	   *value;
+} TestDependency;
+
+static int
+test_dependency_cmp(const ListCell *a, const ListCell *b)
+{
+	const char *x = ((TestDependency *) lfirst(a))->name;
+	const char *y = ((TestDependency *) lfirst(b))->name;
+	int			c = memcmp(x, y, Min(strlen(x), strlen(y)));
+
+	return c != 0 ? c : (int) strlen(x) - (int) strlen(y);
+}
+
+/*
+ * test_commit_needing(root, names, values): a commit with no parents
+ * naming root and recording the dependencies given, each a name and a
+ * value as the canonicalizer's dependencies() visits them; its id.  For
+ * what a commit made elsewhere may record.
+ */
+PG_FUNCTION_INFO_V1(test_commit_needing);
+Datum
+test_commit_needing(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef deps;
+	ProllyHash	root;
+	ProllyHash	none = {0};
+	ProllyHash	id;
+	Datum	   *names;
+	Datum	   *values;
+	int			nnames;
+	int			nvalues;
+	List	   *items = NIL;
+	ListCell   *lc;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &root);
+	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(1), TEXTOID, &names, NULL, &nnames);
+	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(2), TEXTOID, &values, NULL, &nvalues);
+	if (nnames != nvalues)
+		elog(ERROR, "as many names as values, please");
+	for (int i = 0; i < nnames; i++)
+	{
+		TestDependency *d = palloc(sizeof(TestDependency));
+
+		d->name = TextDatumGetCString(names[i]);
+		d->value = TextDatumGetCString(values[i]);
+		items = lappend(items, d);
+	}
+	list_sort(items, test_dependency_cmp);
+
+	prolly_folded_tree_env(&env);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	foreach(lc, items)
+	{
+		TestDependency *d = lfirst(lc);
+		ProllyKey	k = {(const uint8 *) d->name, strlen(d->name)};
+		ProllyValue v = {(const uint8 *) d->value, strlen(d->value)};
+
+		PROLLY_CALL(tree, build_add, b, &k, &v);
+	}
+	PROLLY_CALL(tree, build_finish, b, &deps);
+	make_commit_needing(&root, &none, "needing", &deps.hash, &id);
+	PG_RETURN_TEXT_P(hash_text(&id));
+}
+
+/*
+ * test_check_dependencies(commits, install): check what the commits record
+ * they need against the database, as a clone (install) or a move does.
+ */
+PG_FUNCTION_INFO_V1(test_check_dependencies);
+Datum
+test_check_dependencies(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	Datum	   *commits;
+	int			ncommits;
+	List	   *trees = NIL;
+
+	prolly_database_components(&dc);
+	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(0), TEXTOID, &commits, NULL, &ncommits);
+	for (int i = 0; i < ncommits; i++)
+	{
+		ProllyHash	id;
+		ProllyCommitInfo info;
+
+		text_hash(DatumGetTextPP(commits[i]), &id);
+		if (!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+			elog(ERROR, "no such commit");
+		if (info.has_dependencies)
+		{
+			ProllyNodeRef *tree = palloc(sizeof(ProllyNodeRef));
+
+			*tree = info.dependencies;
+			trees = lappend(trees, tree);
+		}
+	}
+	prolly_check_dependencies(trees, PG_GETARG_BOOL(1), "check");
+	PG_RETURN_VOID();
 }
 
 /*

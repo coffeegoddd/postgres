@@ -27,6 +27,12 @@ test_install_libs += test_prolly
 test_install_data += files(
   'test_prolly.control',
   'test_prolly--1.0.sql',
+  'test_prolly_a.control',
+  'test_prolly_a--1.0.sql',
+  'test_prolly_b.control',
+  'test_prolly_b--1.0.sql',
+  'test_prolly_b--1.0--1.1.sql',
+  'test_prolly_b--1.1.sql',
 )
 
 tests += {

@@ -246,6 +246,17 @@ CREATE FUNCTION test_root_without_sequence_values(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A commit with no parents naming root and recording the dependencies
+-- given (names and values, as the canonicalizer visits them).
+CREATE FUNCTION test_commit_needing(root text, names text[], vals text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Check what the commits record they need, as a clone (install) or a move.
+CREATE FUNCTION test_check_dependencies(commits text[], install boolean)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- What a commit records its versioned objects needed from outside, each
 -- "name => value"; NULL if it doesn't record them.
 CREATE FUNCTION test_commit_dependencies(commit_id text)

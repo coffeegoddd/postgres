@@ -1,0 +1,4 @@
+comment = 'An extension that requires test_prolly_b'
+default_version = '1.0'
+requires = 'test_prolly_b'
+relocatable = true
