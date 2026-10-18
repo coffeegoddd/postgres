@@ -156,8 +156,7 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	}
 	ttc.ttc_attr = toast_attr;
 	toast_tuple_init(&ttc);
-	has_destination = ttc.ttc_destination != NULL ||
-		rel->rd_rel->reltoastrelid != InvalidOid;
+	has_destination = (ttc.ttc_flags & TOAST_CAN_EXTERNALIZE) != 0;
 
 	/* ----------
 	 * Compress and/or save external until data fits into target length

@@ -46,6 +46,9 @@ toast_tuple_init(ToastTupleContext *ttc)
 
 	ttc->ttc_flags = 0;
 	ttc->ttc_destination = toast_relation_destination(ttc->ttc_rel);
+	if (ttc->ttc_destination != NULL ||
+		OidIsValid(ttc->ttc_rel->rd_rel->reltoastrelid))
+		ttc->ttc_flags |= TOAST_CAN_EXTERNALIZE;
 
 	for (i = 0; i < numAttrs; i++)
 	{
@@ -102,6 +105,20 @@ toast_tuple_init(ToastTupleContext *ttc)
 					continue;
 				}
 			}
+
+			/* likewise a value named by content that the update kept */
+			else if (att->attlen == -1 && !ttc->ttc_oldisnull[i] &&
+					 !ttc->ttc_isnull[i] &&
+					 VARATT_IS_EXTERNAL_ONDISK_HASH(old_value) &&
+					 VARATT_IS_EXTERNAL_ONDISK_HASH(new_value) &&
+					 memcmp(old_value, new_value,
+							VARSIZE_EXTERNAL(old_value)) == 0 &&
+					 att->attstorage != TYPSTORAGE_PLAIN &&
+					 att->attstorage != TYPSTORAGE_MAIN)
+			{
+				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
+				continue;
+			}
 		}
 		else
 		{
@@ -135,11 +152,16 @@ toast_tuple_init(ToastTupleContext *ttc)
 			/*
 			 * A value named by content has no owner: whichever row it came
 			 * from, this one may hold it as it is, if its table's values go
-			 * where that pointer's do (PLAIN storage still wants it inline).
+			 * where that pointer's do and the destination would store a
+			 * value of this column as the pointer has it (reference()).
+			 * MAIN storage wants it inline if it fits, PLAIN always.
 			 */
 			else if (VARATT_IS_EXTERNAL_ONDISK_HASH(new_value) &&
+					 att->attstorage != TYPSTORAGE_MAIN &&
 					 ttc->ttc_destination != NULL &&
-					 ttc->ttc_destination == toast_pointer_destination(new_value))
+					 ttc->ttc_destination == toast_pointer_destination(new_value) &&
+					 ttc->ttc_destination->reference(ttc->ttc_rel, new_value,
+													 att->atttypid))
 			{
 				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
 				continue;
@@ -155,7 +177,9 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 */
 			if (VARATT_IS_EXTERNAL(new_value))
 			{
-				ttc->ttc_attr[i].tai_oldexternal = new_value;
+				/* (an OID pointer's value ID, kept by a rewrite) */
+				if (VARATT_IS_EXTERNAL_ONDISK(new_value))
+					ttc->ttc_attr[i].tai_oldexternal = new_value;
 				if (att->attstorage == TYPSTORAGE_PLAIN)
 					new_value = detoast_attr(new_value);
 				else

@@ -179,14 +179,24 @@ UPDATE inc.keyless SET b = 'after the multixact' WHERE ctid = (SELECT pg_temp.on
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'after multixact')::text) AS committed;
 
--- A fold that gives up (a deleted row's value out of line may be gone)
--- counts only the full read.
+-- A fold that gives up (a deleted row's value in the TOAST relation may
+-- be gone) counts only the full read.
+SET debug_toast_relation = on;
 INSERT INTO inc.keyless
   SELECT 5000, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
+RESET debug_toast_relation;
 SELECT length(dolt_commit('-am', 'out of line')::text) AS committed;
 DELETE FROM inc.keyless WHERE a = 5000;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'out of line gone')::text) AS committed;
+
+-- A deleted row's value stored by content stays: the fold doesn't give up.
+INSERT INTO inc.keyless
+  SELECT 5001, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
+SELECT length(dolt_commit('-am', 'by content')::text) AS committed;
+DELETE FROM inc.keyless WHERE a = 5001;
+SELECT * FROM pg_temp.fold();
+SELECT length(dolt_commit('-am', 'by content gone')::text) AS committed;
 
 -- A table redefined, or rewritten, is read in full once.
 ALTER TABLE inc.big ADD COLUMN w int;

@@ -34,6 +34,14 @@ typedef struct ToastDestinationRoutine
 	varlena    *(*save) (Relation rel, Datum value, Oid typid);
 
 	/*
+	 * A hash pointer a row of rel is given for a column of type typid:
+	 * whether the row may hold it as it is (save() would store such a
+	 * value as the pointer has it), the value it names then kept as
+	 * save()'s are.
+	 */
+	bool		(*reference) (Relation rel, varlena *pointer, Oid typid);
+
+	/*
 	 * Bytes [offset, offset + length) of the value a hash pointer names
 	 * (length < 0: to its end; fewer if it ends first), as an uncompressed
 	 * varlena with a 4-byte header.  offset >= 0.

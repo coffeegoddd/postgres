@@ -738,7 +738,7 @@
   ifdef => 'DEBUG_NODE_TESTS_ENABLED',
 },
 
-{ name => 'debug_toast_relation', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+{ name => 'debug_toast_relation', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Moves values out of line to the TOAST relation even where the table has another TOAST destination, for testing.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'debug_toast_relation',

@@ -80,11 +80,15 @@ typedef struct
  *
  * TOAST_NEEDS_CHANGE indicates that a new tuple needs to built; in other
  * words, the toaster did something.
+ *
+ * TOAST_CAN_EXTERNALIZE indicates that values can be moved out of line:
+ * the table has a TOAST relation or another destination.
  */
 #define TOAST_NEEDS_DELETE_OLD				0x0001
 #define TOAST_NEEDS_FREE					0x0002
 #define TOAST_HAS_NULLS						0x0004
 #define TOAST_NEEDS_CHANGE					0x0008
+#define TOAST_CAN_EXTERNALIZE				0x0010
 
 /*
  * Flags indicating the status of a TOAST operation with respect to a

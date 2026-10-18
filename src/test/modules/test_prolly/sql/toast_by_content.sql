@@ -103,4 +103,53 @@ SELECT md5(t) = md5((SELECT string_agg(md5('1/' || i), '' ORDER BY i)
 					 FROM generate_series(1, 3000) i) || 'x') AS working_value_kept
 FROM tc.docs WHERE id = 1;
 
+-- A pointer given to a MAIN column isn't kept as it is: the value is
+-- stored inline, compressed, if it fits.
+CREATE TABLE tc.ext (id int PRIMARY KEY, t text STORAGE EXTERNAL);
+INSERT INTO tc.ext VALUES (1, repeat('ab', 50000));
+INSERT INTO tc.main SELECT 3, t, 'p' FROM tc.ext;
+SELECT test_toast_pointer(t) IS NOT NULL AS ext_by_content,
+	   (SELECT test_toast_pointer(a) IS NULL FROM tc.main WHERE id = 3) AS main_inline,
+	   (SELECT pg_column_compression(a) IS NOT NULL FROM tc.main WHERE id = 3) AS main_compressed
+FROM tc.ext;
+
+-- With debug_toast_relation, a rewrite of rows that hold hash pointers
+-- moves their values to the TOAST relation (a hash pointer isn't taken
+-- for an OID pointer whose value ID to keep).  Only a superuser sets it.
+SELECT d AS before_rewrite FROM tc.digest \gset
+SET debug_toast_relation = on;
+VACUUM FULL tc.docs;
+RESET debug_toast_relation;
+SELECT d = :'before_rewrite' AS same_after_rewrite FROM tc.digest;
+CREATE ROLE regress_tc_user;
+SET ROLE regress_tc_user;
+SET debug_toast_relation = on;
+RESET ROLE;
+DROP ROLE regress_tc_user;
+
 DROP SCHEMA tc CASCADE;
+
+-- In LATIN1, a pointer to text, stored in UTF-8, given to a bytea column
+-- (by a cast without a function) is stored again as bytes, the form a
+-- bytea is stored in.
+SELECT current_database() AS db \gset
+CREATE DATABASE tc_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'
+  TEMPLATE template0;
+\c tc_latin1
+SET client_encoding = 'UTF8';
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE CAST (text AS bytea) WITHOUT FUNCTION;
+CREATE SCHEMA tc VERSIONED;
+CREATE TABLE tc.texts (id int PRIMARY KEY, t text);
+CREATE TABLE tc.bytes (id int PRIMARY KEY, b bytea);
+INSERT INTO tc.texts
+SELECT 1, string_agg('é' || md5(g::text), '') FROM generate_series(1, 400) g;
+INSERT INTO tc.bytes SELECT id, t::bytea FROM tc.texts;
+SELECT (test_toast_pointer(t)).form AS text_form,
+	   (SELECT (test_toast_pointer(b)).form FROM tc.bytes) AS bytea_form,
+	   (SELECT b FROM tc.bytes) = convert_to(t, 'LATIN1') AS same_bytes
+FROM tc.texts;
+\c :db
+DROP DATABASE tc_latin1;

@@ -459,7 +459,33 @@ chunkstore_save(Relation rel, Datum value, Oid typid)
 	return prolly_toast_store(value, typid);
 }
 
+/*
+ * A hash pointer a versioned table's row is given: held as it is if its
+ * form is the one a value of the column's type is stored in (a pointer of
+ * bytes is, whatever the type: a value whose conversion wouldn't give it
+ * back is stored so), its tree kept.
+ */
+static bool
+chunkstore_reference(Relation rel, varlena *pointer, Oid typid)
+{
+	varatt_external_hash p;
+	ProllyHash	root;
+	int			form;
+
+	ensure_env();
+	VARATT_EXTERNAL_GET_POINTER(p, pointer);
+	form = p.va_extinfo >> VARLENA_EXTSIZE_BITS;
+	if (form != toast_form(typid) &&
+		!(form == PROLLY_TOAST_FORM_BYTES && toast_form(typid) == PROLLY_TOAST_FORM_UTF8))
+		return false;
+	root.len = sizeof(p.va_hash);
+	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
+	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root);
+	return true;
+}
+
 const ToastDestinationRoutine prolly_toast_chunkstore = {
 	.save = chunkstore_save,
+	.reference = chunkstore_reference,
 	.fetch = chunkstore_fetch,
 };

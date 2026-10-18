@@ -339,6 +339,7 @@ typedef struct JournalShared
 
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
+	pg_atomic_uint64 keeps_begun;	/* keep sets begun */
 
 	/*
 	 * a process's own, by proc number: ranges, then (touches()) touches;
@@ -939,6 +940,13 @@ wait_appends(ProllyChunkStore *s, uint64 before)
 
 static bool journal_has(ProllyChunkStore *s, const ProllyHash *hash);
 
+/*
+ * The chunks this transaction told keep() of since keeps_begun was
+ * kept_here_begun (in TopTransactionContext)
+ */
+static HTAB *kept_here = NULL;
+static uint64 kept_here_begun = 0;
+
 static KeepTouch *
 touches(JournalShared *js)
 {
@@ -967,6 +975,34 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 	JournalShared *js = shared();
 	KeepTouch  *t = &touches(js)[MyProcNumber];
 	TransactionId xid = GetTopTransactionId();
+	uint64		begun = pg_atomic_read_u64(&js->keeps_begun);
+	ProllyHash	key;
+	bool		found;
+
+	/*
+	 * Told already in this transaction, and no keep set begun since: the
+	 * transaction is noted, and every set running has the chunk.
+	 */
+	hash_key(&key, hash);
+	if (kept_here != NULL && kept_here_begun != begun)
+	{
+		hash_destroy(kept_here);
+		kept_here = NULL;
+	}
+	if (kept_here == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = TopTransactionContext;
+		kept_here = hash_create("prolly chunks kept", 64, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		kept_here_begun = begun;
+	}
+	(void) hash_search(kept_here, &key, HASH_FIND, &found);
+	if (found)
+		return;
 
 	LWLockAcquire(ProllyJournalLock, LW_SHARED);
 	SpinLockAcquire(&js->mutex);
@@ -995,6 +1031,7 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 				 errmsg("could not serialize access due to a concurrent collection of the chunk store"),
 				 errdetail("A value stored by content was collected meanwhile."),
 				 errhint("The transaction might succeed if retried.")));
+	(void) hash_search(kept_here, &key, HASH_ENTER, NULL);
 }
 
 /*
@@ -1056,6 +1093,7 @@ keep_touch_end(void)
 	JournalShared *js;
 	KeepTouch  *t;
 
+	kept_here = NULL;			/* (it went with the transaction) */
 	if (journal_shared == NULL)
 		return;
 	js = journal_shared;
@@ -1094,6 +1132,7 @@ keep_begin(ProllyChunkStore *s, List **xids)
 		js->keeps[slot].dboid = s->dboid;
 		js->keeps[slot].spcoid = s->spcoid;
 		js->keeps[slot].n = 0;
+		pg_atomic_fetch_add_u64(&js->keeps_begun, 1);
 	}
 	for (int i = 0; i < js->nranges + js->nprepared; i++)
 	{
@@ -4893,6 +4932,7 @@ journal_shmem_init(void *area)
 	memset(js, 0, journal_shmem_size());
 	/* every backend reads the manifests once */
 	pg_atomic_init_u64(&js->manifests, 1);
+	pg_atomic_init_u64(&js->keeps_begun, 0);
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
 	js->nranges = append_ranges();
