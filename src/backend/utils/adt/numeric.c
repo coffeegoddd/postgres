@@ -837,6 +837,61 @@ numeric_is_nan(Numeric num)
 }
 
 /*
+ * numeric_is_canonical() -
+ *
+ *	Is num, whose varlena header is whole and says its length, a finite
+ *	value as make_result() builds one: its length what its header's format
+ *	says, digits below NBASE, no leading or trailing zero digit, zero
+ *	positive and of weight 0, no digit the display scale hides, and the
+ *	short format whenever the value fits it?  For bytes read from elsewhere,
+ *	before anything reads them as a numeric.
+ */
+bool
+numeric_is_canonical(Numeric num)
+{
+	Size		len = VARSIZE(num);
+	int			ndigits;
+	int			weight;
+	int			dscale;
+	int			frac;
+	NumericDigit *digits;
+
+	if (len < NUMERIC_HDRSZ_SHORT || NUMERIC_IS_SPECIAL(num))
+		return false;
+	if (!NUMERIC_IS_SHORT(num) && len < NUMERIC_HDRSZ)
+		return false;
+	if ((len - NUMERIC_HEADER_SIZE(num)) % sizeof(NumericDigit) != 0)
+		return false;
+	ndigits = NUMERIC_NDIGITS(num);
+	weight = NUMERIC_WEIGHT(num);
+	dscale = NUMERIC_DSCALE(num);
+	digits = NUMERIC_DIGITS(num);
+	for (int i = 0; i < ndigits; i++)
+		if (digits[i] < 0 || digits[i] >= NBASE)
+			return false;
+	if (ndigits == 0)
+		return weight == 0 && NUMERIC_SIGN(num) == NUMERIC_POS &&
+			(NUMERIC_IS_SHORT(num) || !NUMERIC_CAN_BE_SHORT(dscale, weight));
+	if (digits[0] == 0 || digits[ndigits - 1] == 0)
+		return false;
+	/* the last digit's decimal digits past the display scale are zeros */
+	frac = ndigits - 1 - weight;
+	if (frac > 0 && frac * DEC_DIGITS > dscale)
+	{
+		int			hidden = frac * DEC_DIGITS - dscale;
+		int			unit = 1;
+
+		if (hidden >= DEC_DIGITS)
+			return false;
+		while (hidden-- > 0)
+			unit *= 10;
+		if (digits[ndigits - 1] % unit != 0)
+			return false;
+	}
+	return NUMERIC_IS_SHORT(num) || !NUMERIC_CAN_BE_SHORT(dscale, weight);
+}
+
+/*
  * numeric_is_inf() -
  *
  *	Is Numeric value an infinity?

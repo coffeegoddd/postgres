@@ -97,8 +97,8 @@ WHERE name LIKE 'frozen.%' ORDER BY name;
  frozen.composite | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
  frozen.keyless   | b5ef3d66d0a49c160542af1794d03a1493a4a0256c0181782b3eac7c76ba1d0d | 
  frozen.large     | 0358a81e973ee335bd03364304062146a27611383d5b505807236bb0677739a3 | 
- frozen.non_ascii | fbfdec03cd6bf8c832b6fce610b3b0c899fb72c1f7fb1b24c614822a0c635186 | 
- frozen.scalars   | 9c3fda84043a3b5acf5e6d10f4dfa70877cbab01de9176208d315186629a4363 | 
+ frozen.non_ascii | 881042d5598a8757ea1eba578e15b41282775389f9e62d4ec048cf2a80513263 | 
+ frozen.scalars   | ee0bd1c0ae4bb95200fa516c1d9f7efc8072488e20466dbd970f822a5c9acf97 | 
  frozen.sent_keys | 8bb2334d74f996b153d6c002289e2504480ced23f8d7efd0589ff1e0a53a0c7c | 
  frozen.special   | bc3c956bf4a022e9df3bf6399c48a6645ff6b283d1ad54d4e08e5bf07ca910de | 
  frozen.special_n | ab02342d95270ade28aab540f2ba4b0fc9c170fb176617dec9346f8c5aa47020 | 

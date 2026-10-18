@@ -22,9 +22,10 @@
  *					canonical bytes.  No type OIDs.
  *	anyarray		the element type's qualified name (varint length, UTF-8),
  *					then the array (pg_statistic holds such values).
- *	jsonb			a version byte (1), then the document as jsonb stores it
+ *	jsonb			a version byte (2), then the document as jsonb stores it
  *					(after its varlena header), its strings in UTF-8: in a
- *					UTF-8 database, the bytes the value holds.
+ *					UTF-8 database, the bytes the value holds.  Version 1,
+ *					jsonb's send format, is still read.
  *	anything else	the type's binary send format, produced with the client
  *					encoding fixed to UTF-8, so text-like values are UTF-8
  *					whatever the session's client_encoding or the server
