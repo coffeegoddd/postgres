@@ -210,15 +210,16 @@ test_chunk_conjoin(PG_FUNCTION_ARGS)
 }
 
 static void
-file_row(const char *name, int nchunks, uint64 size, void *arg)
+file_row(const char *name, int nchunks, uint64 size, bool settled, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 
 	values[0] = CStringGetTextDatum(name);
 	values[1] = Int32GetDatum(nchunks);
 	values[2] = Int64GetDatum((int64) size);
+	values[3] = BoolGetDatum(settled);
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -231,6 +232,27 @@ test_chunk_table_files(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	PROLLY_CALL(cs(), table_files, store(), file_row, rsinfo);
 	return (Datum) 0;
+}
+
+/* The journal's segments, oldest first. */
+PG_FUNCTION_INFO_V1(test_chunk_segments);
+Datum
+test_chunk_segments(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	PROLLY_CALL(cs(), segments, store(), file_row, rsinfo);
+	return (Datum) 0;
+}
+
+/* Seal the journal's segment: appends go on to a new one. */
+PG_FUNCTION_INFO_V1(test_chunk_seal);
+Datum
+test_chunk_seal(PG_FUNCTION_ARGS)
+{
+	PROLLY_CALL(cs(), seal, store());
+	PG_RETURN_VOID();
 }
 
 /*

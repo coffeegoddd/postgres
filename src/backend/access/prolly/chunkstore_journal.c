@@ -3,8 +3,8 @@
  * chunkstore_journal.c
  *	  Chunk store: an append-only journal per database.
  *
- * A database's chunks are records in one file, prolly_journal, in its
- * directory in its default tablespace: a header, then records
+ * A database's chunks are records in its journal, in its directory in its
+ * default tablespace: in segments, files of a header, then records
  *
  *		uint32 len (of the whole record), uint8 kind, payload,
  *		uint32 CRC-32C of kind and payload
@@ -14,17 +14,30 @@
  *				xid, which others don't see while it is in progress
  *		ROOT	uint8 hash length, the hash: the store's root from here on
  *		PAD		room for a ROOT record, which its transaction's commit
- *				writes over it (a PAD left means the transaction aborted)
+ *				writes over it (a PAD left means the transaction aborted);
+ *				its payload starts with its transaction's xid
+ *
+ * Segments.  The manifest (below) names the journal's segments, oldest
+ * first: prolly_journal (segment 0, all of a journal before segments
+ * were), then prolly_journal_<id> (id in hex, from the ids table files are
+ * given); a store without a manifest has segment 0 alone.  Appends go to
+ * the last.  seal() makes a new one, its header written, and a manifest
+ * naming it, both under ProllyJournal, so every append after goes to it: a
+ * backend reads the segments again, if a manifest was written since, before
+ * it appends.  Every segment named is read; a backend notices a manifest
+ * that drops one (a collection's) at its next lookup, and forgets the
+ * segment's records.
  *
  * Appending.  A backend gathers its transaction's chunks and appends them
  * in batches, and the rest before it commits, under ProllyJournal: a
  * batch's bytes are WAL-logged, the log is flushed, and only then are they
- * written at the file's end.  So the file never holds a byte the WAL
+ * written at the segment's end.  So a segment never holds a byte the WAL
  * doesn't, and redo rewrites whatever a crash lost.  A checkpoint waits for
- * an append in progress (DELAY_CHKPT_START) and fsyncs the journals.  A
+ * an append in progress (DELAY_CHKPT_START) and fsyncs the segments.  A
  * batch is checked first: every chunk its chunks name is in the batch or
- * the store, or the transaction fails with a serialization failure, so the
- * store never has a chunk without the chunks it names.
+ * the store (as of a manifest no other replaced before the append), or the
+ * transaction fails with a serialization failure, so the store never has a
+ * chunk without the chunks it names.
  *
  * Reading.  Each backend indexes the records by hash in memory, scanning
  * the file from where it left off when a lookup misses or the root is
@@ -40,23 +53,28 @@
  * The root.  A move locks the store until its transaction ends, so moves
  * are serialized, and they reach the file in commit order: at pre-commit a
  * PAD is appended for the new ROOT record; the commit record carries its
- * offset and the root; once the commit record is flushed, still within the
- * commit's critical section, the ROOT record is written over the PAD (redo
- * of the commit record writes it too).  The root is the last ROOT record.
+ * segment and offset and the root; once the commit record is flushed,
+ * still within the commit's critical section, the ROOT record is written
+ * over the PAD (redo of the commit record writes it too), in a segment
+ * sealed meanwhile as in any.  The root is the last ROOT record of the
+ * segments named, in their order; if they have none, the manifest's.
  *
  * Table files.  Chunks added together (received from another store, or
  * rewritten by conjoin()) go to an immutable table file of their own,
  * prolly_table_<id> (id in hex), in the table file format.  The manifest,
- * prolly_manifest, names the table files and the last id given, the root
- * as of its writing and the GC generation; it is replaced whole (written
- * aside, then renamed over the old one).  Every byte of a table file is
- * WAL-logged before it is written, as journal appends are; the file is
- * synced before the manifest naming it is logged; a manifest's record
- * carries its contents, and an unlink's names the file.  One writer of
- * table files at a time (a lock on the manifest, until its transaction
- * ends); a file whose writer failed before its manifest stays unnamed,
- * and the next writer, given the same id, writes over it.  Backends notice
- * a new manifest by a counter in shared memory, when a lookup misses.
+ * prolly_manifest, names the table files (each settled or not: closed
+ * under what its chunks name), the segments, the files and segments
+ * retiring (no longer named, kept until whoever may read them has ended),
+ * the last id given, the root as of its writing and the GC generation; it
+ * is replaced whole (written aside, then renamed over the old one).  Every
+ * byte of a table file is WAL-logged before it is written, as journal
+ * appends are; the file is synced before the manifest naming it is logged;
+ * a manifest's record carries its contents, and an unlink's names the
+ * file.  One writer of table files (and sealer of segments) at a time (a
+ * lock on the manifest, until its transaction ends); a file or segment
+ * whose writer failed before its manifest stays unnamed, and the next
+ * writer removes it.  Backends notice a new manifest by a counter in shared
+ * memory, when a lookup misses.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/chunkstore_journal.c
@@ -92,11 +110,13 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
-#define JOURNAL_FILE		"prolly_journal"
+#define JOURNAL_FILE		"prolly_journal"	/* segment 0's */
+#define SEGMENT_PREFIX		"prolly_journal_"	/* the others', id in hex */
 #define MANIFEST_FILE		"prolly_manifest"
 #define MANIFEST_TEMP		"prolly_manifest.tmp"
 #define MANIFEST_MAGIC		"PRLYMAN1"
-#define MANIFEST_VERSION	1
+#define MANIFEST_VERSION	2
+#define MANIFEST_V1			1	/* no segments (segment 0 alone), no flags */
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
 #define JOURNAL_VERSION		1
@@ -126,6 +146,7 @@ typedef struct xl_chunks_append
 	xl_prolly_header hdr;
 	Oid			dboid;
 	Oid			spcoid;
+	uint64		segment;		/* the journal segment's id */
 	uint64		offset;
 	/* the bytes follow */
 } xl_chunks_append;
@@ -134,7 +155,11 @@ typedef struct xl_chunks_append
 
 #define XLOG_CHUNKS_FILE		0x20	/* table file bytes written at an offset */
 #define XLOG_CHUNKS_MANIFEST	0x30	/* the manifest replaced */
-#define XLOG_CHUNKS_UNLINK		0x40	/* a table file removed */
+#define XLOG_CHUNKS_UNLINK		0x40	/* a table file or segment removed */
+
+/* XLOG_CHUNKS_UNLINK's offset: what it removes */
+#define UNLINK_TABLE_FILE		0
+#define UNLINK_SEGMENT			1
 
 typedef struct xl_chunks_file
 {
@@ -150,21 +175,31 @@ typedef struct xl_chunks_file
 /* XLOG_CHUNKS_MANIFEST: the manifest's contents follow */
 #define SizeOfChunksManifest	(offsetof(xl_chunks_file, id))
 
-/* the manifest: the table files, and the ids given */
+/* a table file's flags in the manifest */
+#define MANIFEST_FILE_SETTLED	0x01	/* closed under what its chunks name */
+
+/* the manifest: the table files, the journal's segments, and the ids given */
 typedef struct ManifestFile
 {
 	uint64		id;
 	uint32		nchunks;
 	uint64		size;
+	uint8		flags;
 } ManifestFile;
 
 typedef struct Manifest
 {
-	uint64		last_id;		/* table file ids given so far */
+	uint64		last_id;		/* table file and segment ids given so far */
 	uint32		gc_generation;
-	ProllyHash	root;			/* as of the manifest's writing */
+	ProllyHash	root;			/* as of the manifest's writing: the root
+								 * while no segment it names has a ROOT */
 	int			nfiles;
 	ManifestFile *files;
+	int			nsegments;		/* at least one */
+	uint64	   *segments;		/* oldest first; appends go to the last */
+	int			nretiring;
+	uint64	   *retiring;		/* table files and segments no longer named,
+								 * kept until those who may read them end */
 } Manifest;
 
 /* a table file a backend reads */
@@ -174,6 +209,7 @@ typedef struct TableFile
 	char	   *path;
 	File		file;
 	uint64		size;
+	bool		settled;
 	ProllyTableFile *tf;
 } TableFile;
 
@@ -190,6 +226,7 @@ typedef struct CommitPayload
 {
 	Oid			dboid;
 	Oid			spcoid;
+	uint64		segment;		/* the PAD's */
 	uint64		offset;			/* of the PAD the ROOT record goes over */
 	ProllyHash	root;
 } CommitPayload;
@@ -198,6 +235,7 @@ typedef struct CommitPayload
 typedef struct IndexEntry
 {
 	ProllyHash	hash;			/* key; unused bytes zero */
+	uint64		segment;		/* the record's journal segment */
 	uint64		offset;			/* of the record, or in pending */
 	uint32		len;			/* of the record */
 	TransactionId xid;			/* its transaction, while not known to have
@@ -205,21 +243,30 @@ typedef struct IndexEntry
 	struct IndexEntry *other;	/* another copy, while this one isn't */
 } IndexEntry;
 
+/* a journal segment a backend reads, and (the last) appends to */
+typedef struct Segment
+{
+	uint64		id;
+	char	   *path;
+	File		file;
+	uint64		scanned;		/* indexed up to here */
+	List	   *pads;			/* offsets of PADs seen, which may become ROOTs */
+} Segment;
+
 struct ProllyChunkStore
 {
 	Oid			dboid;
 	Oid			spcoid;
-	char	   *path;
-	File		file;
 
-	HTAB	   *index;			/* chunks in the file, by hash */
-	uint64		scanned;		/* the file is indexed up to here */
-	List	   *pads;			/* offsets of PADs seen, which may become ROOTs */
+	List	   *segments;		/* Segment *, as the manifest last read names */
+	HTAB	   *index;			/* chunks in the segments, by hash */
 	ProllyHash	root;
-	uint64		root_offset;	/* of the last ROOT record seen */
+	uint64		root_segment;	/* where the last ROOT record seen is; 0, 0: */
+	uint64		root_offset;	/* the manifest's root, or none */
 
 	List	   *tables;			/* TableFile *, as the manifest last read named */
 	uint64		manifests_seen; /* the shared count when it was read */
+	uint64		segments_seen;	/* likewise, for the segments */
 
 	/* chunks the store hasn't, read from elsewhere (read_through()) */
 	ProllyChunkGet through;
@@ -234,6 +281,7 @@ struct ProllyChunkStore
 	List	   *saved;			/* MoveSave *, innermost last */
 	List	   *pending_saved;	/* PendingSave *, innermost last */
 	uint64		flushes;		/* times pending was appended */
+	Segment    *pad_segment;
 	uint64		pad_offset;		/* 0: no PAD yet */
 	/* the ROOT record, made before the commit's critical section */
 	char		root_rec[RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN];
@@ -318,7 +366,10 @@ hash_payload(const ProllyHash *hash, uint8 *buf, Size *len)
 	*len = 1 + hash->len;
 }
 
-/* A ROOT record (or a PAD as long as one), in buf. */
+/*
+ * A ROOT record, in buf; or a PAD as long as one, which names its
+ * transaction in its payload's first bytes (the rest zero).
+ */
 static void
 root_record(StringInfo buf, const ProllyHash *root, bool pad)
 {
@@ -327,7 +378,12 @@ root_record(StringInfo buf, const ProllyHash *root, bool pad)
 
 	hash_payload(root, payload, &len);
 	if (pad)
+	{
+		TransactionId xid = GetTopTransactionIdIfAny();
+
 		memset(payload, 0, len);
+		memcpy(payload, &xid, Min(len, sizeof(xid)));
+	}
 	record_append(buf, pad ? KIND_PAD : KIND_ROOT, payload, len, NULL, 0);
 }
 
@@ -392,8 +448,8 @@ record_hash(const char *rec, uint32 len, ProllyHash *hash, Size *after)
  * aren't known to be everyone's.
  */
 static void
-index_add(HTAB *index, const ProllyHash *key, uint64 offset, uint32 len,
-		  TransactionId xid)
+index_add(HTAB *index, const ProllyHash *key, uint64 segment, uint64 offset,
+		  uint32 len, TransactionId xid)
 {
 	bool		found;
 	IndexEntry *e = hash_search(index, key, HASH_ENTER, &found);
@@ -401,6 +457,7 @@ index_add(HTAB *index, const ProllyHash *key, uint64 offset, uint32 len,
 
 	if (!found)
 	{
+		e->segment = segment;
 		e->offset = offset;
 		e->len = len;
 		e->xid = xid;
@@ -416,6 +473,7 @@ index_add(HTAB *index, const ProllyHash *key, uint64 offset, uint32 len,
 	}
 	last->other = MemoryContextAlloc(TopMemoryContext, sizeof(IndexEntry));
 	*last->other = *e;
+	last->other->segment = segment;
 	last->other->offset = offset;
 	last->other->len = len;
 	last->other->xid = xid;
@@ -477,56 +535,94 @@ index_has(HTAB *index, const ProllyHash *key)
 }
 
 /* ----------------------------------------------------------------
- * The file
+ * The segments
  * ----------------------------------------------------------------
  */
 
-static void
-read_exact(ProllyChunkStore *s, char *buf, Size len, uint64 offset)
+static char *
+segment_path(Oid dboid, Oid spcoid, uint64 id)
 {
-	ssize_t		n = FileRead(s->file, buf, len, offset, WAIT_EVENT_DATA_FILE_READ);
+	char	   *dir = GetDatabasePath(dboid, spcoid);
+	char	   *path;
+
+	if (id == 0)
+		path = psprintf("%s/%s", dir, JOURNAL_FILE);
+	else
+		path = psprintf("%s/%s%016llx", dir, SEGMENT_PREFIX,
+						(unsigned long long) id);
+	pfree(dir);
+	return path;
+}
+
+static Segment *
+segment_of(ProllyChunkStore *s, uint64 id)
+{
+	ListCell   *lc;
+
+	foreach(lc, s->segments)
+	{
+		if (((Segment *) lfirst(lc))->id == id)
+			return lfirst(lc);
+	}
+	return NULL;
+}
+
+/* the segment appends go to */
+static Segment *
+current_segment(ProllyChunkStore *s)
+{
+	return llast(s->segments);
+}
+
+static void
+read_exact(Segment *g, char *buf, Size len, uint64 offset)
+{
+	ssize_t		n = FileRead(g->file, buf, len, offset, WAIT_EVENT_DATA_FILE_READ);
 
 	if (n != len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-						len, (unsigned long long) offset, s->path)));
+						len, (unsigned long long) offset, g->path)));
+}
+
+/* Open a segment's file; false if it has none yet. */
+static bool
+open_segment(Segment *g)
+{
+	if (g->file >= 0)
+		return true;
+	g->file = PathNameOpenFile(g->path, O_RDWR | PG_BINARY);
+	if (g->file < 0)
+	{
+		if (errno == ENOENT)
+			return false;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", g->path)));
+	}
+	return true;
 }
 
 /*
- * Append bytes at the file's end: WAL-logged and flushed first, so the file
- * never holds what the WAL doesn't.  Returns the offset they went to.  The
- * header is appended to an empty file only (header true), and nothing else
- * is.
+ * WAL-log bytes written to a segment at offset, flush the log, and only
+ * then write them (to file, or to fd if file is -1): so the segment never
+ * holds what the WAL doesn't.  A checkpoint waits meanwhile
+ * (DELAY_CHKPT_START), so one whose redo point follows the record finds
+ * the bytes written.
  */
-static uint64
-append_bytes(ProllyChunkStore *s, const char *data, Size len, bool header)
+static void
+logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
+			 const char *data, Size len, File file, int fd, const char *path)
 {
 	xl_chunks_append xlrec;
 	XLogRecPtr	lsn;
-	pgoff_t		size;
-	uint64		offset;
 	ssize_t		n;
 
-	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
-	size = FileSize(s->file);
-	if (size < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not determine the size of file \"%s\": %m",
-						s->path)));
-	offset = size;
-	if (header != (offset == 0))
-	{
-		LWLockRelease(ProllyJournalLock);
-		if (header)
-			return 0;			/* another backend wrote it */
-		elog(ERROR, "chunk journal \"%s\" has no header", s->path);
-	}
-
 	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
-	xlrec.dboid = s->dboid;
-	xlrec.spcoid = s->spcoid;
+	xlrec.dboid = dboid;
+	xlrec.spcoid = spcoid;
+	xlrec.segment = segment;
 	xlrec.offset = offset;
 
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
@@ -537,16 +633,89 @@ append_bytes(ProllyChunkStore *s, const char *data, Size len, bool header)
 	XLogRegisterData(data, len);
 	lsn = XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_APPEND);
 	XLogFlush(lsn);
-	n = FileWrite(s->file, data, len, offset, WAIT_EVENT_DATA_FILE_WRITE);
+	if (file >= 0)
+		n = FileWrite(file, data, len, offset, WAIT_EVENT_DATA_FILE_WRITE);
+	else
+	{
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_WRITE);
+		n = pg_pwrite(fd, data, len, offset);
+		pgstat_report_wait_end();
+	}
 	if (n != len)
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
-						len, (unsigned long long) offset, s->path)));
+						len, (unsigned long long) offset, path)));
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
+}
+
+/*
+ * Give segment id its header, if it has none, logged as any append.  The
+ * caller holds ProllyJournalLock.
+ */
+static void
+segment_header(Oid dboid, Oid spcoid, uint64 id)
+{
+	char	   *path = segment_path(dboid, spcoid, id);
+	int			fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	struct stat st;
+	char		header[JOURNAL_HEADER_SIZE];
+	uint32		version = JOURNAL_VERSION;
+
+	if (fd < 0 || fstat(fd, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+	if (st.st_size == 0)
+	{
+		memset(header, 0, sizeof(header));
+		memcpy(header, JOURNAL_MAGIC, 8);
+		memcpy(header + 8, &version, sizeof(version));
+		logged_write(dboid, spcoid, id, 0, header, sizeof(header), -1, fd, path);
+	}
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
+	pfree(path);
+}
+
+static void refresh_segments(ProllyChunkStore *s);
+static uint64 manifests_count(void);
+
+/*
+ * Append bytes at the end of the segment appends go to; returns the offset
+ * they went to, and the segment (*seg).  The segments are read again first
+ * if a manifest was written since (a seal takes the same lock), so nothing
+ * is appended to a segment that was sealed.  With checked, the bytes'
+ * chunks were checked against the store as of that manifest count: if a
+ * manifest was written since, nothing is appended and false returned (the
+ * caller checks them again).
+ */
+static bool
+append_bytes(ProllyChunkStore *s, const char *data, Size len, uint64 checked,
+			 Segment **seg, uint64 *at)
+{
+	Segment    *g;
+	pgoff_t		size;
+
+	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	if (checked != 0 && manifests_count() != checked)
+	{
+		LWLockRelease(ProllyJournalLock);
+		return false;
+	}
+	refresh_segments(s);
+	g = current_segment(s);
+	if (!open_segment(g) || (size = FileSize(g->file)) < JOURNAL_HEADER_SIZE)
+		elog(ERROR, "chunk journal \"%s\" has no header", g->path);
+	logged_write(s->dboid, s->spcoid, g->id, size, data, len, g->file, -1,
+				 g->path);
 	LWLockRelease(ProllyJournalLock);
-	return offset;
+	*seg = g;
+	*at = size;
+	return true;
 }
 
 /* Write bytes at offset, in redo or over a PAD; the WAL has them. */
@@ -572,40 +741,38 @@ write_at(const char *path, const char *data, Size len, uint64 offset)
 				 errmsg("could not close file \"%s\": %m", path)));
 }
 
-static char *
-journal_path(Oid dboid, Oid spcoid)
+/* Is a ROOT record at (segment, offset) later than the root's? */
+static bool
+root_later(ProllyChunkStore *s, uint64 segment, uint64 offset)
 {
-	char	   *dir = GetDatabasePath(dboid, spcoid);
-	char	   *path = psprintf("%s/%s", dir, JOURNAL_FILE);
-
-	pfree(dir);
-	return path;
+	return segment > s->root_segment ||
+		(segment == s->root_segment && offset >= s->root_offset);
 }
 
 /*
- * Index the records written since the last scan: up to the first that
- * isn't whole yet.  A PAD seen may since have become a ROOT.
+ * Index a segment's records written since its last scan: up to the first
+ * that isn't whole yet.  A PAD seen may since have become a ROOT.
  */
 static void
-scan_journal(ProllyChunkStore *s)
+scan_segment(ProllyChunkStore *s, Segment *g)
 {
 	uint64		size;
-	uint64		offset = s->scanned;
+	uint64		offset = g->scanned;
 	ListCell   *lc;
 	List	   *still_pads = NIL;
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
-	if (!ensure_journal(s, false))
+	if (!open_segment(g))
 		return;
-	size = FileSize(s->file);
+	size = FileSize(g->file);
 
-	foreach(lc, s->pads)
+	foreach(lc, g->pads)
 	{
 		uint64		pad = *(uint64 *) lfirst(lc);
 		uint8		kind;
 
-		read_exact(s, (char *) &kind, 1, pad + sizeof(uint32));
+		read_exact(g, (char *) &kind, 1, pad + sizeof(uint32));
 		if (kind == KIND_ROOT)
 		{
 			uint32		len;
@@ -613,14 +780,15 @@ scan_journal(ProllyChunkStore *s)
 			ProllyHash	h;
 			Size		after;
 
-			read_exact(s, (char *) &len, sizeof(len), pad);
+			read_exact(g, (char *) &len, sizeof(len), pad);
 			if (len <= sizeof(buf))
 			{
-				read_exact(s, buf, len, pad);
+				read_exact(g, buf, len, pad);
 				if (record_valid(buf, len) && record_hash(buf, len, &h, &after) &&
-					pad >= s->root_offset)
+					root_later(s, g->id, pad))
 				{
 					s->root = h;
+					s->root_segment = g->id;
 					s->root_offset = pad;
 				}
 			}
@@ -629,8 +797,8 @@ scan_journal(ProllyChunkStore *s)
 		else
 			still_pads = lappend(still_pads, lfirst(lc));
 	}
-	list_free(s->pads);
-	s->pads = still_pads;
+	list_free(g->pads);
+	g->pads = still_pads;
 
 	while (offset + RECORD_OVERHEAD <= size)
 	{
@@ -640,7 +808,7 @@ scan_journal(ProllyChunkStore *s)
 		Size		after;
 		TransactionId xid;
 
-		read_exact(s, (char *) &len, sizeof(len), offset);
+		read_exact(g, (char *) &len, sizeof(len), offset);
 		if (len < RECORD_OVERHEAD || offset + len > size)
 			break;
 		if (len > reclen)
@@ -650,7 +818,7 @@ scan_journal(ProllyChunkStore *s)
 			reclen = Max(len, 8192);
 			rec = MemoryContextAlloc(TopMemoryContext, reclen);
 		}
-		read_exact(s, rec, len, offset);
+		read_exact(g, rec, len, offset);
 		if (!record_valid(rec, len))
 			break;
 		kind = (uint8) rec[sizeof(uint32)];
@@ -660,12 +828,16 @@ scan_journal(ProllyChunkStore *s)
 			ProllyHash	key;
 
 			hash_key(&key, &h);
-			index_add(s->index, &key, offset, len, xid);
+			index_add(s->index, &key, g->id, offset, len, xid);
 		}
 		else if (kind == KIND_ROOT && record_hash(rec, len, &h, &after))
 		{
-			s->root = h;
-			s->root_offset = offset;
+			if (root_later(s, g->id, offset))
+			{
+				s->root = h;
+				s->root_segment = g->id;
+				s->root_offset = offset;
+			}
 		}
 		else if (kind == KIND_PAD)
 		{
@@ -673,14 +845,124 @@ scan_journal(ProllyChunkStore *s)
 			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
 			*pad = offset;
-			s->pads = lappend(s->pads, pad);
+			g->pads = lappend(g->pads, pad);
 			MemoryContextSwitchTo(old);
 		}
 		offset += len;
 	}
 	if (rec)
 		pfree(rec);
-	s->scanned = offset;
+	g->scanned = offset;
+}
+
+/* Index what was written to the segments since they were last scanned. */
+static void
+scan_journal(ProllyChunkStore *s)
+{
+	ListCell   *lc;
+
+	refresh_segments(s);
+	foreach(lc, s->segments)
+		scan_segment(s, lfirst(lc));
+}
+
+/* Forget the index's copies in a segment no longer named. */
+static void
+index_drop_segment(HTAB *index, uint64 segment)
+{
+	HASH_SEQ_STATUS status;
+	IndexEntry *e;
+
+	hash_seq_init(&status, index);
+	while ((e = hash_seq_search(&status)) != NULL)
+	{
+		IndexEntry **link = &e->other;
+
+		while (*link != NULL)
+		{
+			if ((*link)->segment == segment)
+			{
+				IndexEntry *gone = *link;
+
+				*link = gone->other;
+				pfree(gone);
+			}
+			else
+				link = &(*link)->other;
+		}
+		if (e->segment != segment)
+			continue;
+		if (e->other == NULL)
+			hash_search(index, &e->hash, HASH_REMOVE, NULL);
+		else
+		{
+			IndexEntry *next = e->other;
+
+			e->segment = next->segment;
+			e->offset = next->offset;
+			e->len = next->len;
+			e->xid = next->xid;
+			e->other = next->other;
+			pfree(next);
+		}
+	}
+}
+
+/*
+ * Take the segments a manifest names, in its order: those read before as
+ * they are, new ones to be read from their start.  The index forgets the
+ * records of those no longer named (a collection retired them), and a root
+ * read from one gives way to the manifest's.
+ */
+static void
+load_segments(ProllyChunkStore *s, const Manifest *m)
+{
+	List	   *segs = NIL;
+	List	   *dropped = NIL;
+	ListCell   *lc;
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	for (int i = 0; i < m->nsegments; i++)
+	{
+		Segment    *g = segment_of(s, m->segments[i]);
+
+		if (g == NULL)
+		{
+			g = palloc0(sizeof(Segment));
+			g->id = m->segments[i];
+			g->path = segment_path(s->dboid, s->spcoid, g->id);
+			g->file = -1;
+			g->scanned = JOURNAL_HEADER_SIZE;
+		}
+		segs = lappend(segs, g);
+	}
+	foreach(lc, s->segments)
+	{
+		if (!list_member_ptr(segs, lfirst(lc)))
+			dropped = lappend(dropped, lfirst(lc));
+	}
+	MemoryContextSwitchTo(old);
+	list_free(s->segments);
+	s->segments = segs;
+
+	if (s->root_offset == 0 || segment_of(s, s->root_segment) == NULL)
+	{
+		s->root = m->root;
+		s->root_segment = 0;
+		s->root_offset = 0;
+	}
+	foreach(lc, dropped)
+	{
+		Segment    *g = lfirst(lc);
+
+		index_drop_segment(s->index, g->id);
+		if (g->file >= 0)
+			FileClose(g->file);
+		list_free_deep(g->pads);
+		pfree(g->path);
+		pfree(g);
+	}
+	list_free(dropped);
 }
 
 /* ----------------------------------------------------------------
@@ -772,19 +1054,33 @@ flush_pending(ProllyChunkStore *s)
 {
 	HASH_SEQ_STATUS status;
 	IndexEntry *e;
+	Segment    *g;
 	uint64		base;
 
 	if (s->pending.len == 0)
 		return;
-	check_pending(s);
 	(void) ensure_journal(s, true);
-	base = append_bytes(s, s->pending.data, s->pending.len, false);
+
+	/*
+	 * Checked against the store as of a manifest, and appended only if no
+	 * manifest replaced it meanwhile (a collection's would have removed
+	 * chunks).
+	 */
+	for (;;)
+	{
+		uint64		count = manifests_count();
+
+		load_tables(s, false);
+		check_pending(s);
+		if (append_bytes(s, s->pending.data, s->pending.len, count, &g, &base))
+			break;
+	}
 
 	/* the chunks are in the file now */
 	hash_seq_init(&status, s->pending_index);
 	while ((e = hash_seq_search(&status)) != NULL)
 	{
-		index_add(s->index, &e->hash, base + e->offset, e->len, e->xid);
+		index_add(s->index, &e->hash, g->id, base + e->offset, e->len, e->xid);
 		hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
 	}
 	resetStringInfo(&s->pending);
@@ -841,7 +1137,9 @@ journal_xact_callback(XactEvent event, void *arg)
 				(void) ensure_journal(s, true);
 				initStringInfo(&pad);
 				root_record(&pad, &s->new_root, true);
-				s->pad_offset = append_bytes(s, pad.data, pad.len, false);
+				(void) append_bytes(s, pad.data, pad.len, 0, &s->pad_segment,
+									&s->pad_offset);
+				INJECTION_POINT("prolly-root-padded", NULL);
 				resetStringInfo(&pad);
 				root_record(&pad, &s->new_root, false);
 				Assert(pad.len <= sizeof(s->root_rec));
@@ -955,50 +1253,38 @@ journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 }
 
 /*
- * Open the journal, if it has one; with create, make it (with its header,
- * logged as any append) if not.  A store with none is empty.  In recovery
- * nothing is made: redo makes the journal, and the store reads as it is.
+ * Open the segment appends go to, if it exists; with create, make it (with
+ * its header, logged as any append) if not.  A store with none is empty.
+ * In recovery nothing is made: redo makes the segments, and the store reads
+ * as it is.
  */
 static bool
 ensure_journal(ProllyChunkStore *s, bool create)
 {
 	char		header[JOURNAL_HEADER_SIZE];
+	Segment    *g;
 
-	if (s->file >= 0 && FileSize(s->file) >= JOURNAL_HEADER_SIZE)
+	refresh_segments(s);
+	g = current_segment(s);
+	if (g->file >= 0 && FileSize(g->file) >= JOURNAL_HEADER_SIZE)
 		return true;
 	if (create && RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot change a chunk store during recovery")));
-	if (s->file < 0)
+	if (create)
 	{
-		s->file = PathNameOpenFile(s->path,
-								   O_RDWR | (create ? O_CREAT : 0) | PG_BINARY);
-		if (s->file < 0)
-		{
-			if (errno == ENOENT && !create)
-				return false;
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", s->path)));
-		}
+		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+		segment_header(s->dboid, s->spcoid, g->id);
+		LWLockRelease(ProllyJournalLock);
 	}
-	if (FileSize(s->file) < JOURNAL_HEADER_SIZE)
-	{
-		uint32		version = JOURNAL_VERSION;
-
-		if (!create)
-			return false;
-		memset(header, 0, sizeof(header));
-		memcpy(header, JOURNAL_MAGIC, 8);
-		memcpy(header + 8, &version, sizeof(version));
-		(void) append_bytes(s, header, sizeof(header), true);
-	}
-	read_exact(s, header, sizeof(header), 0);
+	if (!open_segment(g) || FileSize(g->file) < JOURNAL_HEADER_SIZE)
+		return false;
+	read_exact(g, header, sizeof(header), 0);
 	if (memcmp(header, JOURNAL_MAGIC, 8) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("file \"%s\" is not a chunk journal", s->path)));
+				 errmsg("file \"%s\" is not a chunk journal", g->path)));
 	return true;
 }
 
@@ -1084,7 +1370,14 @@ manifest_bytes(const Manifest *m, StringInfo out)
 		append_le(out, m->files[i].id, 8);
 		append_le(out, m->files[i].nchunks, 4);
 		append_le(out, m->files[i].size, 8);
+		append_le(out, m->files[i].flags, 1);
 	}
+	append_le(out, m->nsegments, 4);
+	for (int i = 0; i < m->nsegments; i++)
+		append_le(out, m->segments[i], 8);
+	append_le(out, m->nretiring, 4);
+	for (int i = 0; i < m->nretiring; i++)
+		append_le(out, m->retiring[i], 8);
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, out->data, out->len);
 	FIN_CRC32C(crc);
@@ -1094,8 +1387,8 @@ manifest_bytes(const Manifest *m, StringInfo out)
 static bool read_manifest_at(const char *path, Manifest *m);
 
 /*
- * Read the manifest in database directory dir into m; false (m empty) if
- * there is none.
+ * Read the manifest in database directory dir into m; false (m empty, but
+ * for segment 0) if there is none.
  */
 static bool
 read_manifest(const char *dir, Manifest *m)
@@ -1107,7 +1400,19 @@ read_manifest(const char *dir, Manifest *m)
 	return found;
 }
 
-/* Read the manifest at path into m; false (m empty) if there is none. */
+/* A manifest naming segment 0 alone, as a store without one has. */
+static void
+manifest_segment_zero(Manifest *m)
+{
+	m->nsegments = 1;
+	m->segments = palloc0(sizeof(uint64));
+}
+
+/*
+ * Read the manifest at path into m; false (m empty, but for segment 0) if
+ * there is none.  One of version 1 names segment 0 alone, and no file
+ * settled.
+ */
 static bool
 read_manifest_at(const char *path, Manifest *m)
 {
@@ -1120,13 +1425,17 @@ read_manifest_at(const char *path, Manifest *m)
 	uint32		version;
 	uint8		rootlen;
 	uint32		nfiles;
+	Size		entry;
 
 	memset(m, 0, sizeof(*m));
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
+		{
+			manifest_segment_zero(m);
 			return false;
+		}
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", path)));
@@ -1156,7 +1465,7 @@ read_manifest_at(const char *path, Manifest *m)
 	p += 8;
 	version = (uint32) read_le(p, 4);
 	p += 4;
-	if (version != MANIFEST_VERSION)
+	if (version != MANIFEST_VERSION && version != MANIFEST_V1)
 		goto corrupt;
 	m->gc_generation = (uint32) read_le(p, 4);
 	p += 4;
@@ -1170,16 +1479,55 @@ read_manifest_at(const char *path, Manifest *m)
 	p += rootlen;
 	nfiles = (uint32) read_le(p, 4);
 	p += 4;
-	if ((Size) (end - p) != (Size) nfiles * 20)
+	entry = version == MANIFEST_V1 ? 20 : 21;
+	if ((Size) (end - p) < (Size) nfiles * entry)
 		goto corrupt;
 	m->nfiles = nfiles;
-	m->files = palloc(sizeof(ManifestFile) * Max(nfiles, 1));
+	m->files = palloc0(sizeof(ManifestFile) * Max(nfiles, 1));
 	for (uint32 i = 0; i < nfiles; i++)
 	{
 		m->files[i].id = read_le(p, 8);
 		m->files[i].nchunks = (uint32) read_le(p + 8, 4);
 		m->files[i].size = read_le(p + 12, 8);
-		p += 20;
+		if (version != MANIFEST_V1)
+			m->files[i].flags = (uint8) p[20];
+		p += entry;
+	}
+	if (version == MANIFEST_V1)
+	{
+		if (p != end)
+			goto corrupt;
+		manifest_segment_zero(m);
+	}
+	else
+	{
+		uint32		nsegs;
+		uint32		nretiring;
+
+		if (end - p < 4)
+			goto corrupt;
+		nsegs = (uint32) read_le(p, 4);
+		p += 4;
+		if (nsegs < 1 || (Size) (end - p) < (Size) nsegs * 8 + 4)
+			goto corrupt;
+		m->nsegments = nsegs;
+		m->segments = palloc(sizeof(uint64) * nsegs);
+		for (uint32 i = 0; i < nsegs; i++)
+		{
+			m->segments[i] = read_le(p, 8);
+			p += 8;
+		}
+		nretiring = (uint32) read_le(p, 4);
+		p += 4;
+		if ((Size) (end - p) != (Size) nretiring * 8)
+			goto corrupt;
+		m->nretiring = nretiring;
+		m->retiring = palloc(sizeof(uint64) * Max(nretiring, 1));
+		for (uint32 i = 0; i < nretiring; i++)
+		{
+			m->retiring[i] = read_le(p, 8);
+			p += 8;
+		}
 	}
 	pfree(buf);
 	return true;
@@ -1249,6 +1597,30 @@ static void
 manifests_changed(void)
 {
 	pg_atomic_fetch_add_u64(&shared()->manifests, 1);
+}
+
+/* Manifests written or replayed, in any database: a change if it moved. */
+static uint64
+manifests_count(void)
+{
+	return pg_atomic_read_u64(&shared()->manifests);
+}
+
+/* Read the segments again, if a manifest was written since they were. */
+static void
+refresh_segments(ProllyChunkStore *s)
+{
+	uint64		count = manifests_count();
+	char	   *dir;
+	Manifest	m;
+
+	if (count == s->segments_seen)
+		return;
+	dir = GetDatabasePath(s->dboid, s->spcoid);
+	(void) read_manifest(dir, &m);
+	load_segments(s, &m);
+	s->segments_seen = count;
+	pfree(dir);
 }
 
 /*
@@ -1326,17 +1698,20 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 	END_CRIT_SECTION();
 }
 
+/* Remove a table file, or (segment) a journal segment. */
 static void
-table_file_unlink(ProllyChunkStore *s, const char *dir, uint64 id)
+table_file_unlink(ProllyChunkStore *s, const char *dir, uint64 id,
+				  bool segment)
 {
 	xl_chunks_file xlrec;
-	char	   *path = table_file_path(dir, id);
+	char	   *path = segment ? segment_path(s->dboid, s->spcoid, id) :
+		table_file_path(dir, id);
 
 	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
 	xlrec.dboid = s->dboid;
 	xlrec.spcoid = s->spcoid;
 	xlrec.id = id;
-	xlrec.offset = 0;
+	xlrec.offset = segment ? UNLINK_SEGMENT : UNLINK_TABLE_FILE;
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfChunksFile);
 	XLogFlush(XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_UNLINK));
@@ -1379,6 +1754,7 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 	t->id = f->id;
 	t->path = table_file_path(dir, t->id);
 	t->size = f->size;
+	t->settled = (f->flags & MANIFEST_FILE_SETTLED) != 0;
 	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
 	MemoryContextSwitchTo(old);
 	if (t->file < 0)
@@ -1501,6 +1877,11 @@ load_tables(ProllyChunkStore *s, bool force)
 		s->tables = kept;
 		close_tables(dropped);
 		s->manifests_seen = count;
+		if (s->segments_seen < count)
+		{
+			load_segments(s, &m);
+			s->segments_seen = count;
+		}
 		break;
 	}
 	pfree(dir);
@@ -1559,11 +1940,12 @@ tables_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 
 /*
  * Write a table file of the chunks next() gives, and a manifest naming it
- * beside the files keep (of m) names; the files m names that keep leaves
- * out are removed after.  The manifest's lock is held.
+ * (with flags) beside the files keep (of m) names and m's segments; the
+ * files m names that keep leaves out are removed after.  The manifest's
+ * lock is held.
  */
 static void
-write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
+write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 				 ProllyChunkNext next, void *arg)
 {
 	const ProllyTableFileRoutine *fmt = table_format();
@@ -1655,14 +2037,19 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 	nm.files[nm.nfiles].id = id;
 	nm.files[nm.nfiles].nchunks = nchunks;
 	nm.files[nm.nfiles].size = offset;
+	nm.files[nm.nfiles].flags = flags;
 	nm.nfiles++;
+	nm.nsegments = m->nsegments;
+	nm.segments = m->segments;
+	nm.nretiring = m->nretiring;
+	nm.retiring = m->retiring;
 	replace_manifest(s, &nm);
 	INJECTION_POINT("prolly-manifest-replaced", NULL);
 
 	for (int i = 0; i < m->nfiles; i++)
 	{
 		if (!keep[i])
-			table_file_unlink(s, dir, m->files[i].id);
+			table_file_unlink(s, dir, m->files[i].id, false);
 	}
 	load_tables(s, true);
 	pfree(nm.files);
@@ -1673,10 +2060,11 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep,
 }
 
 /*
- * Remove the table files of dir its manifest m doesn't name: those a
- * writer replaced but didn't get to remove (it failed, or the server
- * stopped, in between), or one it was writing.  With the manifest's lock
- * held, no writer is writing one now.
+ * Remove the table files and journal segments of dir its manifest m
+ * doesn't name, as kept or retiring: those a writer replaced but didn't
+ * get to remove (it failed, or the server stopped, in between), or one it
+ * was writing.  With the manifest's lock held, no writer is writing one
+ * now.
  */
 static void
 remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
@@ -1684,6 +2072,7 @@ remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
 	DIR		   *d = AllocateDir(dir);
 	struct dirent *de;
 	List	   *ids = NIL;
+	List	   *segs = NIL;
 	ListCell   *lc;
 
 	while ((de = ReadDir(d, dir)) != NULL)
@@ -1691,26 +2080,59 @@ remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
 		uint64		id;
 		char	   *end;
 		bool		named = false;
+		bool		segment;
 
-		if (strncmp(de->d_name, "prolly_table_", 13) != 0)
+		if (strcmp(de->d_name, JOURNAL_FILE) == 0)
+		{
+			id = 0;
+			segment = true;
+		}
+		else if (strncmp(de->d_name, SEGMENT_PREFIX, strlen(SEGMENT_PREFIX)) == 0)
+		{
+			id = strtou64(de->d_name + strlen(SEGMENT_PREFIX), &end, 16);
+			if (*end != '\0')
+				continue;
+			segment = true;
+		}
+		else if (strncmp(de->d_name, "prolly_table_", 13) == 0)
+		{
+			id = strtou64(de->d_name + 13, &end, 16);
+			if (*end != '\0')
+				continue;
+			segment = false;
+		}
+		else
 			continue;
-		id = strtou64(de->d_name + 13, &end, 16);
-		if (*end != '\0')
-			continue;
-		for (int i = 0; i < m->nfiles; i++)
-			named |= m->files[i].id == id;
+		if (segment)
+		{
+			for (int i = 0; i < m->nsegments; i++)
+				named |= m->segments[i] == id;
+		}
+		else
+		{
+			for (int i = 0; i < m->nfiles; i++)
+				named |= m->files[i].id == id;
+		}
+		for (int i = 0; i < m->nretiring; i++)
+			named |= m->retiring[i] == id;
 		if (!named)
 		{
 			uint64	   *p = palloc(sizeof(uint64));
 
 			*p = id;
-			ids = lappend(ids, p);
+			if (segment)
+				segs = lappend(segs, p);
+			else
+				ids = lappend(ids, p);
 		}
 	}
 	FreeDir(d);
 	foreach(lc, ids)
-		table_file_unlink(s, dir, *(uint64 *) lfirst(lc));
+		table_file_unlink(s, dir, *(uint64 *) lfirst(lc), false);
+	foreach(lc, segs)
+		table_file_unlink(s, dir, *(uint64 *) lfirst(lc), true);
 	list_free_deep(ids);
+	list_free_deep(segs);
 }
 
 /* Take the table file writers' lock, and read the manifest it protects. */
@@ -1756,7 +2178,6 @@ journal_open(Oid dboid, Oid spcoid)
 	s = palloc0(sizeof(ProllyChunkStore));
 	s->dboid = dboid;
 	s->spcoid = spcoid;
-	s->path = journal_path(dboid, spcoid);
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(IndexEntry);
 	s->index = hash_create("prolly journal index", 1024, &ctl,
@@ -1766,8 +2187,7 @@ journal_open(Oid dboid, Oid spcoid)
 	initStringInfo(&s->pending);
 	MemoryContextSwitchTo(old);
 
-	s->file = -1;
-	s->scanned = JOURNAL_HEADER_SIZE;
+	refresh_segments(s);
 	(void) ensure_journal(s, false);
 
 	RegisterXactCallback(journal_xact_callback, NULL);
@@ -1837,9 +2257,9 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		flush_pending(s);
 }
 
-/* The chunk's bytes from its record (rec, len bytes) to out. */
+/* The chunk's bytes from its record (rec, len bytes, in path) to out. */
 static void
-chunk_bytes(ProllyChunkStore *s, const char *rec, uint32 len, StringInfo out)
+chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
 {
 	ProllyHash	h;
 	Size		after;
@@ -1847,7 +2267,7 @@ chunk_bytes(ProllyChunkStore *s, const char *rec, uint32 len, StringInfo out)
 	if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupt chunk record in file \"%s\"", s->path)));
+				 errmsg("corrupt chunk record in file \"%s\"", path)));
 	appendBinaryStringInfo(out, rec + after, len - after - sizeof(uint32));
 }
 
@@ -1856,15 +2276,17 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 {
 	ProllyHash	key;
 	IndexEntry *e;
+	Segment    *g;
 	char	   *rec;
 
 	hash_key(&key, hash);
 	e = hash_search(s->pending_index, &key, HASH_FIND, NULL);
 	if (e != NULL)
 	{
-		chunk_bytes(s, s->pending.data + e->offset, e->len, out);
+		chunk_bytes("(pending)", s->pending.data + e->offset, e->len, out);
 		return true;
 	}
+	refresh_segments(s);
 	e = index_find(s->index, &key);
 	if (e == NULL)
 	{
@@ -1880,9 +2302,13 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 			return s->through != NULL && s->through(s->through_arg, hash, out);
 		}
 	}
+	g = segment_of(s, e->segment);
+	if (g == NULL || !open_segment(g))
+		elog(ERROR, "chunk journal segment %llu is missing",
+			 (unsigned long long) e->segment);
 	rec = palloc(e->len);
-	read_exact(s, rec, e->len, e->offset);
-	chunk_bytes(s, rec, e->len, out);
+	read_exact(g, rec, e->len, e->offset);
+	chunk_bytes(g->path, rec, e->len, out);
 	pfree(rec);
 	return true;
 }
@@ -1893,8 +2319,10 @@ journal_has(ProllyChunkStore *s, const ProllyHash *hash)
 	ProllyHash	key;
 
 	hash_key(&key, hash);
-	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		stored_has(s, &key))
+	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL)
+		return true;
+	refresh_segments(s);
+	if (stored_has(s, &key))
 		return true;
 	return s->through != NULL && s->through(s->through_arg, hash, NULL);
 }
@@ -1965,6 +2393,7 @@ journal_commit_payload(char **data)
 	p = palloc0(sizeof(CommitPayload));
 	p->dboid = s->dboid;
 	p->spcoid = s->spcoid;
+	p->segment = s->pad_segment->id;
 	p->offset = s->pad_offset;
 	p->root = s->new_root;
 	*data = (char *) p;
@@ -1979,12 +2408,14 @@ journal_committed(void)
 
 	if (s == NULL || !s->moving)
 		return;
-	if (FileWrite(s->file, s->root_rec, s->root_rec_len, s->pad_offset,
-				  WAIT_EVENT_DATA_FILE_WRITE) != s->root_rec_len)
+	if (FileWrite(s->pad_segment->file, s->root_rec, s->root_rec_len,
+				  s->pad_offset, WAIT_EVENT_DATA_FILE_WRITE) != s->root_rec_len)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not write the root in file \"%s\": %m", s->path)));
+				 errmsg("could not write the root in file \"%s\": %m",
+						s->pad_segment->path)));
 	s->root = s->new_root;
+	s->root_segment = s->pad_segment->id;
 	s->root_offset = s->pad_offset;
 }
 
@@ -2000,7 +2431,7 @@ journal_commit_redo(const char *data, Size len)
 	memcpy(&p, data, sizeof(p));
 	initStringInfo(&rec);
 	root_record(&rec, &p.root, false);
-	path = journal_path(p.dboid, p.spcoid);
+	path = segment_path(p.dboid, p.spcoid, p.segment);
 	write_at(path, rec.data, rec.len, p.offset);
 	pfree(path);
 	pfree(rec.data);
@@ -2064,7 +2495,9 @@ table_files_redo(XLogReaderState *record)
 	}
 	else
 	{
-		char	   *path = table_file_path(dir, xlrec.id);
+		char	   *path = xlrec.offset == UNLINK_SEGMENT ?
+			segment_path(xlrec.dboid, xlrec.spcoid, xlrec.id) :
+			table_file_path(dir, xlrec.id);
 
 		if (unlink(path) != 0 && errno != ENOENT)
 			ereport(WARNING,
@@ -2087,7 +2520,7 @@ journal_redo(XLogReaderState *record)
 	{
 		case XLOG_CHUNKS_APPEND:
 			memcpy(&xlrec, XLogRecGetData(record), SizeOfChunksAppend);
-			path = journal_path(xlrec.dboid, xlrec.spcoid);
+			path = segment_path(xlrec.dboid, xlrec.spcoid, xlrec.segment);
 			write_at(path, XLogRecGetData(record) + SizeOfChunksAppend,
 					 XLogRecGetDataLen(record) - SizeOfChunksAppend, xlrec.offset);
 			pfree(path);
@@ -2103,25 +2536,30 @@ journal_redo(XLogReaderState *record)
 }
 
 /*
- * fsync the journal in database directory dir, if it has one, and every
- * table file there: those the manifest names (written by replay, unsynced),
- * one being written, and those a new database is being given, which no
- * manifest names yet.
+ * fsync the journal's segments in database directory dir, if it has any,
+ * and every table file there: those the manifest names (written by replay,
+ * unsynced), one being written, and those a new database is being given,
+ * which no manifest names yet.
  */
 static void
 sync_journal_in(const char *dir)
 {
-	char	   *path = psprintf("%s/%s", dir, JOURNAL_FILE);
+	char	   *path;
 	DIR		   *d;
 	struct dirent *de;
 
-	sync_if_exists(path);
-	pfree(path);
 	d = AllocateDir(dir);
 	if (d == NULL)
 		return;
 	while ((de = ReadDir(d, dir)) != NULL)
 	{
+		if (strncmp(de->d_name, JOURNAL_FILE, strlen(JOURNAL_FILE)) == 0)
+		{
+			path = dir_file(dir, de->d_name);
+			sync_if_exists(path);
+			pfree(path);
+			continue;
+		}
 		if (strncmp(de->d_name, "prolly_table_", 13) != 0)
 			continue;
 		INJECTION_POINT("prolly-checkpoint-table-file", NULL);
@@ -2213,7 +2651,7 @@ journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, next, arg);
+	write_table_file(s, &m, keep, 0, next, arg);
 	pfree(keep);
 }
 
@@ -2266,7 +2704,10 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 	return false;
 }
 
-/* Rewrite the table files as one, which the manifest names alone. */
+/*
+ * Rewrite the table files as one, which the manifest names alone: settled
+ * if they all were.
+ */
 static void
 journal_conjoin(ProllyChunkStore *s)
 {
@@ -2276,10 +2717,13 @@ journal_conjoin(ProllyChunkStore *s)
 	HASHCTL		ctl;
 	char	   *dir;
 	ListCell   *lc;
+	uint8		flags = MANIFEST_FILE_SETTLED;
 
 	lock_manifest(s, &m);
 	if (m.nfiles < 2)
 		return;
+	for (int i = 0; i < m.nfiles; i++)
+		flags &= m.files[i].flags;
 
 	/* the files as the lock's manifest names them, opened for this */
 	dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -2307,7 +2751,7 @@ journal_conjoin(ProllyChunkStore *s)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, conjoin_next, &cs);
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs);
 	}
 	PG_FINALLY();
 	{
@@ -2336,8 +2780,72 @@ journal_table_files(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
 		TableFile  *t = lfirst(lc);
 		char	   *name = table_file_name(t->id);
 
-		visit(name, PROLLY_CALL(table_format(), count, t->tf), t->size, arg);
+		visit(name, PROLLY_CALL(table_format(), count, t->tf), t->size,
+			  t->settled, arg);
 		pfree(name);
+	}
+}
+
+/*
+ * Seal the segment appends go to: a new one is made (its header written)
+ * and a manifest names it after the others, under the append lock, so
+ * every append from here on goes to it.  The manifest's lock is held; m is
+ * the manifest, and becomes the new one.  Returns the new segment's id.
+ */
+static uint64
+seal_segment(ProllyChunkStore *s, Manifest *m)
+{
+	uint64		id = m->last_id + 1;
+	uint64	   *segs = palloc(sizeof(uint64) * (m->nsegments + 1));
+
+	memcpy(segs, m->segments, sizeof(uint64) * m->nsegments);
+	segs[m->nsegments] = id;
+	scan_journal(s);
+	m->root = s->root;
+	m->last_id = id;
+	m->segments = segs;
+	m->nsegments++;
+	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	segment_header(s->dboid, s->spcoid, id);
+	INJECTION_POINT("prolly-segment-made", NULL);
+	replace_manifest(s, m);
+	LWLockRelease(ProllyJournalLock);
+	return id;
+}
+
+static void
+journal_seal(ProllyChunkStore *s)
+{
+	Manifest	m;
+
+	lock_manifest(s, &m);
+	(void) seal_segment(s, &m);
+}
+
+static void
+journal_segments(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
+{
+	ListCell   *lc;
+
+	scan_journal(s);
+	foreach(lc, s->segments)
+	{
+		Segment    *g = lfirst(lc);
+		HASH_SEQ_STATUS status;
+		IndexEntry *e;
+		int			n = 0;
+		char	   *name = strrchr(g->path, '/') + 1;
+
+		hash_seq_init(&status, s->index);
+		while ((e = hash_seq_search(&status)) != NULL)
+		{
+			IndexEntry *c = e;
+
+			while (c != NULL && c->segment != g->id)
+				c = c->other;
+			n += c != NULL;
+		}
+		visit(name, n, open_segment(g) ? FileSize(g->file) : 0, false, arg);
 	}
 }
 
@@ -2411,6 +2919,7 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 		pfree(spath);
 		pfree(dpath);
 	}
+	m.nretiring = 0;		/* (the source's, never copied) */
 	replace_manifest(dst, &m);
 	pfree(buf);
 	pfree(dst);
@@ -2420,95 +2929,81 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 
 /*
  * A new database's store: the files of the database it was made from.
- * The journal is copied a piece at a time as appends to the new one are
- * (WAL-logged and flushed, then written), and the table files and manifest
- * as they are written, so redo, standbys and base backups make them too.
- * One whose files were copied (the file-copy strategy) has them already.
- * Nobody else uses the source meanwhile (CREATE DATABASE sees to that), so
- * its files hold still.
+ * The journal's segments are copied a piece at a time as appends to the new
+ * one are (WAL-logged and flushed, then written), and the table files and
+ * manifest as they are written, so redo, standbys and base backups make
+ * them too.  One whose files were copied (the file-copy strategy) has them
+ * already.  Nobody else uses the source meanwhile (CREATE DATABASE sees to
+ * that), so its files hold still.
  */
 static void
 journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 					  Oid dst_spcoid)
 {
-	char	   *src = journal_path(src_dboid, src_spcoid);
-	char	   *dst = journal_path(dst_dboid, dst_spcoid);
+	char	   *sdir = GetDatabasePath(src_dboid, src_spcoid);
 	char	   *ddir = GetDatabasePath(dst_dboid, dst_spcoid);
+	char	   *dseg = segment_path(dst_dboid, dst_spcoid, 0);
 	char	   *dman = dir_file(ddir, MANIFEST_FILE);
 	struct stat st;
-	int			fd;
-	int			dfd;
 	char	   *buf;
-	uint64		offset = 0;
-	bool		copied = stat(dst, &st) == 0 || stat(dman, &st) == 0;
+	Manifest	m;
+	bool		copied = stat(dseg, &st) == 0 || stat(dman, &st) == 0;
 
-	pfree(ddir);
+	pfree(dseg);
 	pfree(dman);
 	if (copied)
-	{
-		pfree(src);
-		pfree(dst);
 		return;
-	}
 	copy_table_files(src_dboid, src_spcoid, dst_dboid, dst_spcoid);
-	if (stat(src, &st) != 0)
-	{
-		pfree(src);
-		pfree(dst);
-		return;
-	}
-	fd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", src)));
-	dfd = OpenTransientFile(dst, O_RDWR | O_CREAT | PG_BINARY);
-	if (dfd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", dst)));
+	(void) read_manifest(sdir, &m);
 	buf = palloc(APPEND_BATCH);
-	while (offset < (uint64) st.st_size)
+	for (int i = 0; i < m.nsegments; i++)
 	{
-		Size		len = Min((uint64) APPEND_BATCH, (uint64) st.st_size - offset);
-		xl_chunks_append xlrec;
-		XLogRecPtr	lsn;
+		char	   *src = segment_path(src_dboid, src_spcoid, m.segments[i]);
+		char	   *dst = segment_path(dst_dboid, dst_spcoid, m.segments[i]);
+		uint64		offset = 0;
+		int			fd;
+		int			dfd;
 
-		if (pg_pread(fd, buf, len, offset) != len)
+		if (stat(src, &st) != 0)
+		{
+			pfree(src);
+			pfree(dst);
+			continue;
+		}
+		fd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
+		if (fd < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-							len, (unsigned long long) offset, src)));
-		xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
-		xlrec.dboid = dst_dboid;
-		xlrec.spcoid = dst_spcoid;
-		xlrec.offset = offset;
-
-		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
-		START_CRIT_SECTION();
-		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, SizeOfChunksAppend);
-		XLogRegisterData(buf, len);
-		lsn = XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_APPEND);
-		XLogFlush(lsn);
-		if (pg_pwrite(dfd, buf, len, offset) != len)
-			ereport(PANIC,
+					 errmsg("could not open file \"%s\": %m", src)));
+		dfd = OpenTransientFile(dst, O_RDWR | O_CREAT | PG_BINARY);
+		if (dfd < 0)
+			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
-							len, (unsigned long long) offset, dst)));
-		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
-		END_CRIT_SECTION();
-		offset += len;
+					 errmsg("could not open file \"%s\": %m", dst)));
+		while (offset < (uint64) st.st_size)
+		{
+			Size		len = Min((uint64) APPEND_BATCH, (uint64) st.st_size - offset);
+
+			if (pg_pread(fd, buf, len, offset) != len)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
+								len, (unsigned long long) offset, src)));
+			logged_write(dst_dboid, dst_spcoid, m.segments[i], offset, buf, len,
+						 -1, dfd, dst);
+			offset += len;
+		}
+		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close file \"%s\": %m", src)));
+		fsync_fname(dst, false);
+		pfree(src);
+		pfree(dst);
 	}
-	if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", src)));
-	fsync_fname(dst, false);
 	pfree(buf);
-	pfree(src);
-	pfree(dst);
+	pfree(sdir);
+	pfree(ddir);
 }
 
 const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
@@ -2539,4 +3034,6 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.copy_database = journal_copy_database,
 	.read_through = journal_read_through,
 	.prefetch = journal_prefetch,
+	.seal = journal_seal,
+	.segments = journal_segments,
 };

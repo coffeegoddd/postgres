@@ -86,6 +86,7 @@ tests += {
       'policies',
       'partitions',
       'append_check',
+      'journal_segments',
     ],
   },
   'tap': {
@@ -116,6 +117,7 @@ tests += {
       't/047_network_remotes.pl',
       't/048_network_batches.pl',
       't/053_serve_snapshots.pl',
+      't/054_journal_segments.pl',
     ],
   },
 }

@@ -38,8 +38,13 @@
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
  *   transaction aborts; its chunks are reachable once a root naming them
- *   is.  conjoin() rewrites the table files as one.  table_files() visits
- *   the store's table files.
+ *   is.  conjoin() rewrites the table files as one (settled if they all
+ *   were).  table_files() visits the store's table files: a settled one is
+ *   closed under what its chunks name (they are in it, in another settled
+ *   file, or in the journal's segments).
+ * - The journal (where put() appends) is in segments: seal() closes the one
+ *   appends go to, and they go on to a new one; segments() visits them,
+ *   oldest first.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -83,9 +88,13 @@ typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo ou
 /* Hears the chunks a walk is about to read (prefetch()'s). */
 typedef void (*ProllyChunkHint) (void *arg, const ProllyHash *hashes, int n);
 
-/* Visits a table file: its name, its chunk count and its size in bytes. */
+/*
+ * Visits a table file or segment: its name, its chunk count, its size in
+ * bytes, and whether it is settled (a table file closed under what its
+ * chunks name).
+ */
 typedef void (*ProllyChunkFileVisit) (const char *name, int nchunks,
-									  uint64 size, void *arg);
+									  uint64 size, bool settled, void *arg);
 
 typedef struct ProllyChunkStoreRoutine
 {
@@ -146,15 +155,20 @@ typedef struct ProllyChunkStoreRoutine
 								 ProllyChunkHint hint, void *arg);
 	bool		(*prefetch) (ProllyChunkStore *store, const ProllyHash *hashes,
 							 int n);
+
+	/* The journal's segments. */
+	void		(*seal) (ProllyChunkStore *store);
+	void		(*segments) (ProllyChunkStore *store, ProllyChunkFileVisit visit,
+							 void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
 	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
-	"read_through", "prefetch"
+	"read_through", "prefetch", "seal", "segments"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK prefetch
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK segments
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

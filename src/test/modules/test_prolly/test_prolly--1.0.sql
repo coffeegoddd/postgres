@@ -164,8 +164,19 @@ RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 CREATE FUNCTION test_chunk_table_files(OUT name text, OUT chunks int,
-	OUT bytes bigint)
+	OUT bytes bigint, OUT settled boolean)
 RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The journal's segments, oldest first (settled is always false).
+CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
+	OUT bytes bigint, OUT settled boolean)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Seal the journal's segment: appends go on to a new one.
+CREATE FUNCTION test_chunk_seal()
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The canonical root of the session branch's versioned schemas, folded
