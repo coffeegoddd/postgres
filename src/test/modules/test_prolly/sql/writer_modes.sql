@@ -198,6 +198,27 @@ SELECT id, v FROM wm.t WHERE id = 11;
 SELECT dolt_integrate('-m', 'on main');
 SELECT dolt_reset('--hard', 'HEAD');
 
+-- An integration doesn't open the branch to the transaction's other writes;
+-- moving a protected branch to another commit is the database owner's.
+BEGIN;
+SELECT dolt_reset('--hard');
+INSERT INTO wm.t VALUES (13, 'after an integration');
+ROLLBACK;
+SET ROLE wm_other;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset_to_head;
+RESET ROLE;
+-- Once an integration is done, a checkout after it isn't undone if the
+-- transaction aborts.
+SELECT dolt_checkout('-b', 'wm_ivy');
+INSERT INTO wm.t VALUES (14, 'ivy');
+BEGIN;
+SELECT (dolt_integrate('-m', 'ivy''s'))[2] AS fast_forward;
+SELECT dolt_checkout('main');
+SELECT 1 / 0;
+ROLLBACK;
+SELECT active_branch();
+
 -- Protection by branch, in any mode: main unprotected, and others
 -- protected; only the database's owner sets it, and deletes a protected
 -- branch; a copy is protected as its source.
@@ -213,6 +234,15 @@ SELECT dolt_branch('--unprotect', 'wm_frank');
 SELECT dolt_branch('-D', 'wm_frank');
 RESET ROLE;
 SELECT dolt_branch('--protect', 'no_such_branch');
+-- (a branch with changes isn't protected: they'd be any integration's)
+SELECT dolt_checkout('wm_ivy');
+INSERT INTO wm.t VALUES (15, 'ivy, uncommitted');
+SELECT dolt_checkout('main');
+SELECT dolt_branch('--protect', 'wm_ivy');
+SELECT dolt_checkout('wm_ivy');
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'wm_ivy');
 SELECT dolt_branch('-D', 'wm_frank', 'wm_frank2', 'wm_gina');
 SELECT dolt_branch('wm_frank');
 SELECT name, protected FROM dolt_branches() WHERE name = 'wm_frank';

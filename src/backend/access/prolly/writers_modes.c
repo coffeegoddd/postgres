@@ -50,6 +50,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -85,8 +86,15 @@ static const char *const mode_names[] = {PROLLY_WRITER_MODE_NAMES};
 static LocalTransactionId mode_lxid = InvalidLocalTransactionId;
 static ProllyWriterMode mode_read;
 
-/* the setting that keeps a branch's protection, by its name */
-#define PROTECTION_SETTING	"protected/"
+/*
+ * The setting that keeps branches' protections, where set: a line for each,
+ * the branch's name, a space, and "on" or "off".
+ */
+#define PROTECTION_SETTING	"protected"
+
+/* the protections, as the transaction last read or set them */
+static LocalTransactionId protections_lxid = InvalidLocalTransactionId;
+static char *protections = NULL;
 
 
 static bool
@@ -204,36 +212,131 @@ protected_by_default(const char *name)
 		modes_mode() == PROLLY_WRITERS_BRANCH_ONLY;
 }
 
+/* (read once a transaction, as the mode is) */
+static const char *
+read_protections(void)
+{
+	StringInfoData v;
+
+	if (MyProc->vxid.lxid == protections_lxid && protections != NULL)
+		return protections;
+	initStringInfo(&v);
+	if (!PROLLY_CALL(refs(), config_get, PROTECTION_SETTING, &v))
+		resetStringInfo(&v);
+	if (protections)
+		pfree(protections);
+	protections = MemoryContextStrdup(TopMemoryContext, v.data);
+	protections_lxid = MyProc->vxid.lxid;
+	pfree(v.data);
+	return protections;
+}
+
+/* the end of the line at p: its newline, or the string's end */
+static const char *
+line_end(const char *p)
+{
+	const char *eol = strchr(p, '\n');
+
+	return eol ? eol : p + strlen(p);
+}
+
+/* name's line among the protections: its "on" or "off", or NULL */
+static const char *
+protection_of(const char *all, const char *name)
+{
+	size_t		len = strlen(name);
+
+	for (const char *p = all; *p;)
+	{
+		const char *eol = line_end(p);
+
+		if ((size_t) (eol - p) > len && strncmp(p, name, len) == 0 &&
+			p[len] == ' ')
+			return p + len + 1;
+		p = *eol ? eol + 1 : eol;
+	}
+	return NULL;
+}
+
 static bool
 modes_protected(const char *name)
 {
-	StringInfoData v;
-	char	   *key = psprintf(PROTECTION_SETTING "%s", name);
-	bool		protected;
+	const char *set = protection_of(read_protections(), name);
 
-	initStringInfo(&v);
-	if (PROLLY_CALL(refs(), config_get, key, &v))
-		protected = strcmp(v.data, "on") == 0;
-	else
-		protected = protected_by_default(name);
-	pfree(v.data);
-	pfree(key);
-	return protected;
+	if (set)
+		return strncmp(set, "on", 2) == 0;
+	return protected_by_default(name);
 }
 
-/* (kept only where it isn't what the mode has: the mode's again otherwise) */
+static bool working_is_head(const char *name);
+static HeapTuple branch_row(Oid branch, char **owner, Oid *role);
+
+/*
+ * (kept only where it isn't what the mode has: the mode's again otherwise;
+ * a branch with changes, or an owner, isn't protected: its changes would
+ * be any integration's to commit or discard)
+ */
 static void
 modes_set_protected(const char *name, ProllyBranchProtection protection)
 {
+	const char *all;
+	StringInfoData v;
+	size_t		len = strlen(name);
+
 	if (!database_owner())
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
+	if (protection == PROLLY_PROTECT_ON && !modes_protected(name))
+	{
+		HeapTuple	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+		char	   *owner = NULL;
+		Oid			role;
+
+		if (HeapTupleIsValid(tup))
+		{
+			Oid			branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+			HeapTuple	row;
+
+			ReleaseSysCache(tup);
+			row = branch_row(branch, &owner, &role);
+			if (row)
+				heap_freetuple(row);
+			if (owner != NULL || !working_is_head(name))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("branch \"%s\" has uncommitted changes", name),
+						 errhint("Commit or reset them before protecting it.")));
+		}
+	}
 	if (protection != PROLLY_PROTECT_DEFAULT &&
 		(protection == PROLLY_PROTECT_ON) == protected_by_default(name))
 		protection = PROLLY_PROTECT_DEFAULT;
-	PROLLY_CALL(refs(), config_set, psprintf(PROTECTION_SETTING "%s", name),
-				protection == PROLLY_PROTECT_DEFAULT ? NULL :
-				protection == PROLLY_PROTECT_ON ? "on" : "off");
+
+	/* every other branch's line as it was, and this one's as set */
+	all = read_protections();
+	initStringInfo(&v);
+	for (const char *p = all; *p;)
+	{
+		const char *eol = line_end(p);
+
+		if (!((size_t) (eol - p) > len && strncmp(p, name, len) == 0 &&
+			  p[len] == ' '))
+		{
+			appendBinaryStringInfo(&v, p, eol - p);
+			appendStringInfoChar(&v, '\n');
+		}
+		p = *eol ? eol + 1 : eol;
+	}
+	if (protection != PROLLY_PROTECT_DEFAULT)
+		appendStringInfo(&v, "%s %s\n", name,
+						 protection == PROLLY_PROTECT_ON ? "on" : "off");
+	PROLLY_CALL(refs(), config_set, PROTECTION_SETTING,
+				v.len > 0 ? v.data : NULL);
+	if (protections)
+		pfree(protections);
+	protections = MemoryContextStrdup(TopMemoryContext, v.data);
+	protections_lxid = MyProc->vxid.lxid;
+	pfree(v.data);
 }
 
 /* branch's pg_branch row, with its owner (NULL if none) and owner's role */

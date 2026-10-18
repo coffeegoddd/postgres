@@ -571,6 +571,62 @@ SELECT dolt_reset('--hard', 'HEAD');
  {0}
 (1 row)
 
+-- An integration doesn't open the branch to the transaction's other writes;
+-- moving a protected branch to another commit is the database owner's.
+BEGIN;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO wm.t VALUES (13, 'after an integration');
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+ROLLBACK;
+SET ROLE wm_other;
+SELECT dolt_reset('--hard', 'HEAD~1');
+ERROR:  branch "main" is protected
+HINT:  Only the database's owner resets a protected branch to another commit.
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset_to_head;
+ reset_to_head 
+---------------
+ t
+(1 row)
+
+RESET ROLE;
+-- Once an integration is done, a checkout after it isn't undone if the
+-- transaction aborts.
+SELECT dolt_checkout('-b', 'wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (14, 'ivy');
+BEGIN;
+SELECT (dolt_integrate('-m', 'ivy''s'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT 1 / 0;
+ERROR:  division by zero
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
 -- Protection by branch, in any mode: main unprotected, and others
 -- protected; only the database's owner sets it, and deletes a protected
 -- branch; a copy is protected as its source.
@@ -611,7 +667,8 @@ SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_%' ORDER BY name
  wm_frank  | t
  wm_frank2 | t
  wm_gina   | f
-(3 rows)
+ wm_ivy    | f
+(4 rows)
 
 SET ROLE wm_other;
 SELECT dolt_branch('--unprotect', 'wm_frank');
@@ -622,6 +679,47 @@ HINT:  Only the database's owner deletes a protected branch.
 RESET ROLE;
 SELECT dolt_branch('--protect', 'no_such_branch');
 ERROR:  branch "no_such_branch" does not exist
+-- (a branch with changes isn't protected: they'd be any integration's)
+SELECT dolt_checkout('wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (15, 'ivy, uncommitted');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('--protect', 'wm_ivy');
+ERROR:  branch "wm_ivy" has uncommitted changes
+HINT:  Commit or reset them before protecting it.
+SELECT dolt_checkout('wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_ivy');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('-D', 'wm_frank', 'wm_frank2', 'wm_gina');
  dolt_branch 
 -------------

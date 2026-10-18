@@ -123,9 +123,11 @@ extern void note_new_branch(Oid branch);
 
 /*
  * If the current (sub)transaction aborts, the session goes back to the branch
- * it is on now.
+ * it is on now; until branch_return_done() with the token returned, once
+ * the operation that asked has succeeded.
  */
-extern void branch_return_on_abort(void);
+extern int	branch_return_on_abort(void);
+extern void branch_return_done(int token);
 
 /* is this storage another branch's relation's (for logical decoding)? */
 extern bool relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber);

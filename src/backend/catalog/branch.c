@@ -693,11 +693,12 @@ static List *returns = NIL;		/* of NewBranch, branch unused */
 
 static void register_branch_callbacks(void);
 
-void
+int
 branch_return_on_abort(void)
 {
 	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 	NewBranch  *nb = palloc(sizeof(NewBranch));
+	int			token = list_length(returns);
 
 	register_branch_callbacks();
 	nb->branch = InvalidOid;
@@ -706,6 +707,17 @@ branch_return_on_abort(void)
 	nb->left_read_only = MyBranchReadOnly;
 	returns = lappend(returns, nb);
 	MemoryContextSwitchTo(old);
+	return token;
+}
+
+void
+branch_return_done(int token)
+{
+	while (list_length(returns) > token)
+	{
+		pfree(llast(returns));
+		returns = list_delete_last(returns);
+	}
 }
 
 /* (oldest first: the earliest return of what aborts is where it began) */

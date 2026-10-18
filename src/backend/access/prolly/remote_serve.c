@@ -668,5 +668,9 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 											 &expected,
 											 has_head ? &head : NULL,
 											 PG_GETARG_BOOL(4)));
+
+	/* (a protected branch deleted takes its protection with it) */
+	if (moved && !has_head && PROLLY_CALL(dc.writers, protected, branch))
+		PROLLY_CALL(dc.writers, set_protected, branch, PROLLY_PROTECT_DEFAULT);
 	PG_RETURN_BOOL(moved);
 }

@@ -124,7 +124,9 @@ SELECT test_branches_written() AS written;
 ROLLBACK;
 
 -- What changes the session's branch as a write would is the branch's write
--- (said once, before), though its own writes are made on its behalf.
+-- (said once, before), though its own writes are made on its behalf; once
+-- it has committed or reset the branch, the changes so far aren't the
+-- transaction's any more.
 INSERT INTO bw.t VALUES (107, 'dirty');
 BEGIN;
 SELECT dolt_reset('--hard');

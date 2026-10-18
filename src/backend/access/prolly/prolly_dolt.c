@@ -327,11 +327,16 @@ must_commit(int left, const char *what)
 						 name)));
 }
 
-/* The session's branch may be clean again: committed, reset or merged. */
+/*
+ * The session's branch may be clean again: committed, reset or merged.  Its
+ * changes so far are a commit's (or gone): a later write is noted, and
+ * allowed or not, again.
+ */
 static void
 settled(void)
 {
 	PROLLY_CALL(writers(), settled, MyBranch);
+	branch_forget_written(MyBranch);
 }
 
 /* Splits "Name <email>" into its parts; without <...>, all of it is a name. */
@@ -906,10 +911,11 @@ dolt_merge(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_merge needs a branch")));
+	/* (the branch held first: its head is read as the merge finds it) */
+	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
 	known = list_length(PROLLY_CALL(refs(), violations));
-	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
 												 message, flags, &id));
 	must_commit(conflicts, "a merge");
@@ -978,6 +984,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	ProllyHash	id = {0};
 	ProllyHash	ignored;
 	ProllyHash	mine_head = {0};
+	int			returning;
 	bool		had_head;
 	bool		committed;
 	int			conflicts;
@@ -1011,7 +1018,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				 errhint("Check out a branch with dolt_checkout('-b', ...) first.")));
 
 	/* (failing, the session stays on its branch, as everything else does) */
-	branch_return_on_abort();
+	returning = branch_return_on_abort();
 
 	/* the branch's changes, committed */
 	note_integration();
@@ -1023,13 +1030,13 @@ dolt_integrate(PG_FUNCTION_ARGS)
 
 	/* merged into target, as it commits */
 	checkout_branch(target);
-	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	note_integration();
+	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
 												 message, 0, &id));
 	if (conflicts > 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" can't be integrated into \"%s\": the merge has conflicts or constraint violations",
 						mine, target),
 				 errdetail("Nothing was committed or merged."),
@@ -1044,6 +1051,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 											0, &ignored));
 	settled();
 
+	branch_return_done(returning);
 	result[0] = hash_hex(&id);
 	result[1] = had_head && same_hash(&id, &mine_head) &&
 		!same_hash(&before, &id) ? "1" : "0";
@@ -1103,6 +1111,25 @@ dolt_reset(PG_FUNCTION_ARGS)
 											 has_head &&
 											 PROLLY_CALL(refs(), commit_get, &head, &before) ?
 											 &before : NULL, "reset");
+	}
+	/*
+	 * (a protected branch moved to another commit loses what it holds: the
+	 * database owner's to do, as a push to it is)
+	 */
+	if (ref)
+	{
+		ProllyHash	head;
+		ProllyHash	target;
+
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			PROLLY_CALL(refs(), resolve, ref, &target) &&
+			!same_hash(&head, &target) &&
+			PROLLY_CALL(writers(), protected, branch_ops()->current()) &&
+			!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("branch \"%s\" is protected", branch_ops()->current()),
+					 errhint("Only the database's owner resets a protected branch to another commit.")));
 	}
 	/* (the database's owner discards whoever's changes they are) */
 	if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
