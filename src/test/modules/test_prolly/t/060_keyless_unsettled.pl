@@ -29,13 +29,19 @@ sql(q{
 # Rows in flight while a commit folds.
 my $bg = $node->background_psql('postgres');
 $bg->query_safe(q{BEGIN; INSERT INTO ku.h VALUES (-1, 'committed later')});
+# (and rows in flight on pages added to the table meanwhile)
+my $bg3 = $node->background_psql('postgres');
+$bg3->query_safe(q{BEGIN;
+	INSERT INTO ku.h SELECT 100000 + g, 'extended' FROM generate_series(1, 2000) g});
 my $bg2 = $node->background_psql('postgres');
 $bg2->query_safe(q{BEGIN; INSERT INTO ku.h VALUES (-2, 'rolled back')});
 sql(q{INSERT INTO ku.h VALUES (0, 'mine'); SELECT dolt_commit('-am', 'mine')});
 $bg->query_safe(q{COMMIT});
 $bg2->query_safe(q{ROLLBACK});
+$bg3->query_safe(q{COMMIT});
 $bg->quit;
 $bg2->quit;
+$bg3->quit;
 
 # The next commit counts them, reading the carried pages, not the table.
 # (the counters are the backend's: one session)
@@ -51,10 +57,10 @@ is(sql(q{SELECT dirty FROM dolt_branches() WHERE name = 'main'}), 'f',
 
 # What the commit holds is what the table holds.
 sql(q{SELECT dolt_reset('--hard', 'HEAD')});
-is(sql(q{SELECT string_agg(v, ',' ORDER BY n) FROM ku.h WHERE v <> 'base'}),
+is(sql(q{SELECT string_agg(v, ',' ORDER BY n) FROM ku.h WHERE v NOT IN ('base', 'extended')}),
 	'committed later,mine,after',
 	'a hard reset to it gives back the committed rows, not the rolled back one');
-is(sql(q{SELECT count(*) FROM ku.h}), '5003', 'and every row');
+is(sql(q{SELECT count(*) FROM ku.h}), '7003', 'and every row');
 
 $node->stop;
 done_testing();

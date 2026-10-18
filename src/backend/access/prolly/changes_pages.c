@@ -1088,6 +1088,12 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 		pages = repalloc_array(pages, OldPage, npages + st->nblocks_carried);
 		for (uint32 i = 0; i < st->nblocks_carried; i++)
 		{
+			/*
+			 * (one added to the table after the fold began held none of its
+			 * rows: it is read again as a page past the length then)
+			 */
+			if (st->blocks_carried[i] >= st->fold.nblocks)
+				continue;
 			if (st->blocks_carried[i] >= Min(low, nblocks))
 				return false;
 			pages[npages].blkno = st->blocks_carried[i];
