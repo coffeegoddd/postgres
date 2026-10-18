@@ -47,9 +47,10 @@
  * isn't in the root, which is what they are: fold_dependencies() builds a
  * tree of it for a commit to record beside its root (prolly_refs.h), keyed
  * by kind and identity ("extension hstore", "type public.money2"):
- * an extension valued by its version, another object by its address (type,
- * names and arguments, as pg_identify_object_as_address() gives them),
- * which pg_get_object_address() finds again in another database.  Found
+ * an extension valued by its version, another object by its address (a
+ * text[] literal of its type and of text[] literals of its names and
+ * arguments, as pg_identify_object_as_address() gives them), which
+ * pg_get_object_address() finds again in another database.  Found
  * through pg_depend: each object of an ordinary schema, as the extension
  * with its version if an extension's member, and each extension a
  * versioned object depends on explicitly (DEPENDS ON EXTENSION); not what
@@ -921,9 +922,10 @@ describe_dependency(const ObjectAddress *addr)
 		List	   *objargs = NIL;
 
 		(void) getObjectIdentityParts(addr, &names, &objargs, false);
-		append_utf8(&dep->value, psprintf("%s\t%s\t%s", type,
-										  text_array_literal(names),
-										  text_array_literal(objargs)));
+		append_utf8(&dep->value,
+					text_array_literal(list_make3(type,
+												  text_array_literal(names),
+												  text_array_literal(objargs))));
 	}
 	return dep;
 }

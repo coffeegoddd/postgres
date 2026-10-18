@@ -18,7 +18,8 @@ CREATE EXTENSION citext VERSION '1.4';
 CREATE EXTENSION hstore;
 CREATE SCHEMA dep_util;
 CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
-CREATE TYPE dep_util.U&"tab\0009in" AS ENUM ('x');	-- a tab in its name
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int	-- a tab in its name
+  LANGUAGE sql AS 'SELECT 7';
 CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
 CREATE SCHEMA dep VERSIONED;
 CREATE TABLE dep.plain (id int PRIMARY KEY, n numeric, t text);
@@ -35,8 +36,9 @@ SELECT test_commit_dependencies(dolt_hashof('HEAD'));	-- none: built-ins only
 (1 row)
 
 CREATE TABLE dep.t (id int PRIMARY KEY, m dep_util.mood,
-					c citext DEFAULT dep_util.twice(1)::text,
-					w dep_util.U&"tab\0009in");
+					c citext DEFAULT dep_util.twice(1)::text);
+CREATE FUNCTION dep.seven() RETURNS int LANGUAGE sql
+  BEGIN ATOMIC SELECT dep_util.U&"tab\0009in"(); END;
 GRANT SELECT ON dep.t TO regress_dep_reader;		-- (not a dependency)
 CREATE FUNCTION dep.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
 ALTER FUNCTION dep.f() DEPENDS ON EXTENSION hstore;
@@ -47,13 +49,13 @@ SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                                    deps                                     
------------------------------------------------------------------------------
+                                     deps                                      
+-------------------------------------------------------------------------------
  extension citext => 1.4
  extension hstore => 1.8
- function dep_util.twice(integer) => function | {dep_util,twice} | {integer}
- type dep_util."tab | in" => type | {"dep_util.\"tab | in\""} | {}
- type dep_util.mood => type | {dep_util.mood} | {}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
 (5 rows)
 
 -- a commit that didn't record them (as one made before they were): unknown
@@ -87,13 +89,13 @@ SELECT length(dolt_commit('--allow-empty', '-Am', 'at 1.6')::text) AS committed;
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                                    deps                                     
------------------------------------------------------------------------------
+                                     deps                                      
+-------------------------------------------------------------------------------
  extension citext => 1.6
  extension hstore => 1.8
- function dep_util.twice(integer) => function | {dep_util,twice} | {integer}
- type dep_util."tab | in" => type | {"dep_util.\"tab | in\""} | {}
- type dep_util.mood => type | {dep_util.mood} | {}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
 (5 rows)
 
 -- a branch whose head recorded another version: clean when checked out
@@ -122,13 +124,13 @@ SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
 (1 row)
 
 SELECT * FROM pg_temp.deps();					-- described now: citext 1.6
-                                    deps                                     
------------------------------------------------------------------------------
+                                     deps                                      
+-------------------------------------------------------------------------------
  extension citext => 1.6
  extension hstore => 1.8
- function dep_util.twice(integer) => function | {dep_util,twice} | {integer}
- type dep_util."tab | in" => type | {"dep_util.\"tab | in\""} | {}
- type dep_util.mood => type | {dep_util.mood} | {}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
 (5 rows)
 
 SELECT dolt_checkout('main');
@@ -154,18 +156,19 @@ SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                               deps                                
--------------------------------------------------------------------
+                                    deps                                     
+-----------------------------------------------------------------------------
  extension citext => 1.8
  extension hstore => 1.8
- type dep_util."tab | in" => type | {"dep_util.\"tab | in\""} | {}
- type dep_util.mood => type | {dep_util.mood} | {}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
 (4 rows)
 
 DROP SCHEMA dep CASCADE;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table dep.plain
 drop cascades to table dep.t
+drop cascades to function dep.seven()
 drop cascades to function dep.f()
 drop cascades to table dep.u
 SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
@@ -183,7 +186,7 @@ SELECT dolt_branch('-D', 'dep_side');
 DROP SCHEMA dep_util CASCADE;
 NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to type dep_util.mood
-drop cascades to type dep_util."tab	in"
+drop cascades to function dep_util."tab	in"()
 drop cascades to function dep_util.twice(integer)
 DROP EXTENSION citext;
 DROP EXTENSION hstore;

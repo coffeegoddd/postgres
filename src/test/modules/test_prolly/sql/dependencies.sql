@@ -21,7 +21,8 @@ CREATE EXTENSION citext VERSION '1.4';
 CREATE EXTENSION hstore;
 CREATE SCHEMA dep_util;
 CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
-CREATE TYPE dep_util.U&"tab\0009in" AS ENUM ('x');	-- a tab in its name
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int	-- a tab in its name
+  LANGUAGE sql AS 'SELECT 7';
 CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
 
 CREATE SCHEMA dep VERSIONED;
@@ -30,8 +31,9 @@ SELECT length(dolt_commit('-Am', 'plain')::text) AS committed;
 SELECT test_commit_dependencies(dolt_hashof('HEAD'));	-- none: built-ins only
 
 CREATE TABLE dep.t (id int PRIMARY KEY, m dep_util.mood,
-					c citext DEFAULT dep_util.twice(1)::text,
-					w dep_util.U&"tab\0009in");
+					c citext DEFAULT dep_util.twice(1)::text);
+CREATE FUNCTION dep.seven() RETURNS int LANGUAGE sql
+  BEGIN ATOMIC SELECT dep_util.U&"tab\0009in"(); END;
 GRANT SELECT ON dep.t TO regress_dep_reader;		-- (not a dependency)
 CREATE FUNCTION dep.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
 ALTER FUNCTION dep.f() DEPENDS ON EXTENSION hstore;

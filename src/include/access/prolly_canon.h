@@ -38,8 +38,9 @@
  *   versioned objects need from outside the versioned schemas, for a
  *   commit to record beside its root: keyed by kind and identity
  *   ("extension hstore"), an extension valued by its version, another
- *   object by its address (type, names and arguments as
- *   pg_identify_object_as_address() gives them, tab-separated).  Not
+ *   object by its address (a text[] literal: its type, and text[]
+ *   literals of its names and arguments, as
+ *   pg_identify_object_as_address() gives them).  Not
  *   roles.  It is no part of the root, so what changes outside never makes
  *   a branch's working set differ from its head.
  * - dependencies() visits each item of such a tree, in key order.
