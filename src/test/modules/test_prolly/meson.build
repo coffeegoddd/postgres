@@ -159,6 +159,7 @@ tests += {
       't/060_journal_move.pl',
       't/061_gc_roots.pl',
       't/062_toast_folds.pl',
+      't/063_toast_apply.pl',
     ],
   },
 }

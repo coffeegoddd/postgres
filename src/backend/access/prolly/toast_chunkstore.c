@@ -23,7 +23,10 @@
  *
  * The toaster stores the values it moves out of a versioned table's rows
  * here (save()), the table's access method choosing this destination, and
- * keeps a hash pointer a row is given as it is.
+ * keeps a hash pointer a row is given as it is (reference()).  History's
+ * value trees are named by pointers made from their references, unread
+ * (prolly_toast_pointer()), so a row written from history (a reset, a
+ * merge) holds the tree history has.
  *
  * A tree is the chunk store's, not a row's: nothing deletes it with the
  * rows that name it.  A collection of the store keeps every tree a hash
@@ -279,6 +282,44 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 	*len = VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo);
 	(void) prolly_toast_reference(pointer, ref);
 	return true;
+}
+
+varlena *
+prolly_toast_pointer(const ProllyHash *root, uint64 len, Oid typid)
+{
+	Oid			base = getBaseType(typid);
+	varatt_external_hash p;
+	varlena    *result;
+	int			form;
+	Size		rawsize;
+
+	/*
+	 * In another encoding, text and jsonb are stored converted, and their
+	 * size is only known once converted back.
+	 */
+	if (base == BYTEAOID ||
+		(text_like(base) && GetDatabaseEncoding() == PG_UTF8))
+	{
+		form = PROLLY_TOAST_FORM_BYTES;
+		rawsize = len + VARHDRSZ;
+	}
+	else if (base == JSONBOID && GetDatabaseEncoding() == PG_UTF8 && len > 1)
+	{
+		/* (the canonical bytes: a version byte, then the document) */
+		form = PROLLY_TOAST_FORM_JSONB;
+		rawsize = len - 1 + VARHDRSZ;
+	}
+	else
+		return NULL;
+	if (root->len != sizeof(p.va_hash) || len > VARLENA_EXTSIZE_MASK)
+		return NULL;
+	p.va_rawsize = rawsize;
+	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
+	memcpy(p.va_hash, root->bytes, sizeof(p.va_hash));
+	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(p));
+	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_SHA256);
+	memcpy(VARDATA_EXTERNAL(result), &p, sizeof(p));
+	return result;
 }
 
 int

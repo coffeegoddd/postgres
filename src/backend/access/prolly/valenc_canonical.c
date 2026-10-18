@@ -25,7 +25,10 @@
  * A value stored by content (a hash pointer, prolly_toast.h) whose tree
  * holds its canonical bytes is that tree: its reference is written from
  * the pointer, and the value isn't read (one short enough to be inline is,
- * and is stored inline).  A value TOAST stored out of line in a TOAST
+ * and is stored inline).  Decoding gives a long value whose tree a hash
+ * pointer can name as that pointer, unread (prolly_toast_pointer()): a row
+ * written from history holds the tree history has, and a value no one
+ * reads is never fetched.  A value TOAST stored out of line in a TOAST
  * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
@@ -64,6 +67,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "varatt.h"
 
@@ -477,15 +481,29 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 			else if (enc->codecs[i] != NULL && out_of_line)
 			{
 				ProllyValue ref = {(const uint8 *) p, (uint32) len};
+				ProllyHash	root;
+				uint64		vlen;
+				varlena    *pointer;
 
 				if (enc->values == NULL)
 					no_values();
-				resetStringInfo(&enc->scratch);
-				PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
-							&ref, 0, PG_UINT64_MAX, &enc->scratch);
-				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
-														  enc->scratch.data,
-														  enc->scratch.len);
+
+				/* a tree a hash pointer can name: named, not read */
+				PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
+				pointer = prolly_toast_pointer(&root, vlen,
+											   TupleDescAttr(desc, i)->atttypid);
+				if (pointer != NULL)
+					slot->tts_values[i] = PointerGetDatum(pointer);
+				else
+				{
+					INJECTION_POINT("prolly-value-read", NULL);
+					resetStringInfo(&enc->scratch);
+					PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
+								&ref, 0, PG_UINT64_MAX, &enc->scratch);
+					slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
+															  enc->scratch.data,
+															  enc->scratch.len);
+				}
 				slot->tts_isnull[i] = false;
 			}
 			else if (enc->codecs[i] != NULL)
