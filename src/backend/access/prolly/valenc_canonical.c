@@ -303,46 +303,82 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	MemoryContextReset(enc->tmpcxt);
 }
 
+/* Called with each out-of-line value of a row: its column and reference. */
+typedef void (*RowRefVisit) (int column, const char *ref, uint64 len,
+							 void *arg);
+
 /*
- * The references to value trees an encoded row holds, by encoded column
- * (NULL where a column has none): pointers into row, in the current memory
- * context.  n gets how many columns the row stores.
+ * Visit the references to value trees an encoded row holds, checking the
+ * row is whole: a header its bytes hold, values within it, nothing after
+ * them.  (A row of an earlier layout may have more columns than enc's.)
+ * Returns how many columns the row stores.
  */
-static ProllyValue *
-row_refs_by_column(ProllyValueEncoder *enc, const ProllyValue *row, int *n)
+static int
+walk_row_refs(const ProllyValue *row, RowRefVisit visit, void *arg)
 {
 	const char *p = (const char *) row->data;
 	const char *end = p + row->len;
 	const char *nulls;
-	ProllyValue *refs;
+	uint64		n = prolly_get_varint(&p, end);
 
-	*n = (int) prolly_get_varint(&p, end);
-	if (*n > enc->nlive || end - p < (*n + 7) / 8)
+	if ((uint64) (end - p) < (n + 7) / 8)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid canonical prolly row header")));
-	refs = palloc0(sizeof(ProllyValue) * Max(*n, 1));
 	nulls = p;
-	p += (*n + 7) / 8;
-	for (int j = 0; j < *n; j++)
+	p += (n + 7) / 8;
+	for (uint64 j = 0; j < n; j++)
 	{
 		uint64		len;
+		bool		out_of_line;
 
 		if (((uint8) nulls[j / 8] >> (j % 8)) & 1)
 			continue;
 		len = prolly_get_varint(&p, end);
-		if (len > VALUE_INLINE_MAX)
-		{
+		out_of_line = len > VALUE_INLINE_MAX;
+		if (out_of_line)
 			len -= VALUE_INLINE_MAX + 1;
-			refs[j].data = (const uint8 *) p;
-			refs[j].len = (uint32) len;
-		}
 		if (len > (uint64) (end - p))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid canonical prolly row: value runs past the end")));
+		if (out_of_line)
+			visit((int) j, p, len, arg);
 		p += len;
 	}
+	if (p != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row: %d trailing bytes",
+						(int) (end - p))));
+	return (int) n;
+}
+
+static void
+note_column_ref(int column, const char *ref, uint64 len, void *arg)
+{
+	ProllyValue *refs = arg;
+
+	refs[column].data = (const uint8 *) ref;
+	refs[column].len = (uint32) len;
+}
+
+/*
+ * The references to value trees an encoded row of enc's layout holds, by
+ * encoded column (empty where a column has none): pointers into row, in
+ * the current memory context.  n gets how many columns the row stores.
+ */
+static ProllyValue *
+row_refs_by_column(ProllyValueEncoder *enc, const ProllyValue *row, int *n)
+{
+	ProllyValue *refs = palloc0(sizeof(ProllyValue) * Max(enc->nlive, 1));
+	const char *p = (const char *) row->data;
+
+	if (prolly_get_varint(&p, p + row->len) > (uint64) enc->nlive)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row header")));
+	*n = walk_row_refs(row, note_column_ref, refs);
 	return refs;
 }
 
@@ -487,44 +523,15 @@ canonical_set_values(ProllyValueEncoder *enc, const ProllyValueStore *values)
 }
 
 static void
+append_ref(int column, const char *ref, uint64 len, void *arg)
+{
+	appendBinaryStringInfo((StringInfo) arg, ref, (int) len);
+}
+
+static void
 canonical_refs(ProllyValueEncoder *enc, const ProllyValue *row, StringInfo refs)
 {
-	const char *p = (const char *) row->data;
-	const char *end = p + row->len;
-	const char *nulls;
-	uint64		n = prolly_get_varint(&p, end);
-
-	/* (a row of an earlier layout may have more columns than enc's) */
-	if ((uint64) (end - p) < (n + 7) / 8)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid canonical prolly row header")));
-	nulls = p;
-	p += (n + 7) / 8;
-	for (uint64 j = 0; j < n; j++)
-	{
-		uint64		len;
-		bool		out_of_line;
-
-		if (((uint8) nulls[j / 8] >> (j % 8)) & 1)
-			continue;
-		len = prolly_get_varint(&p, end);
-		out_of_line = len > VALUE_INLINE_MAX;
-		if (out_of_line)
-			len -= VALUE_INLINE_MAX + 1;
-		if (len > (uint64) (end - p))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid canonical prolly row: value runs past the end")));
-		if (out_of_line)
-			appendBinaryStringInfo(refs, p, (int) len);
-		p += len;
-	}
-	if (p != end)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid canonical prolly row: %d trailing bytes",
-						(int) (end - p))));
+	(void) walk_row_refs(row, append_ref, refs);
 }
 
 static void

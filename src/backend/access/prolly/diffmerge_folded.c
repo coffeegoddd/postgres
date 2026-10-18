@@ -663,6 +663,20 @@ decode(Changes *c, const StringInfoData *value, TupleTableSlot *slot)
 	return count;
 }
 
+/* How many copies a tree value stands for, its row not decoded. */
+static uint64
+count_of(Changes *c, const StringInfoData *value)
+{
+	ProllyValue v = {(const uint8 *) value->data, value->len};
+	ProllyValue row;
+	uint64		count;
+
+	if (value->len == 0)
+		return 0;
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &row, &count);
+	return count;
+}
+
 /*
  * While a merge (or pick) runs: the constraint violations it records, and
  * the tables it wrote to, whose foreign keys are checked after; and the
@@ -749,6 +763,29 @@ violation(Oid relid, const char *type, char *row, char *info)
 	return pv;
 }
 
+/* Whether rel has a unique or exclusion index other than its primary key's. */
+static bool
+other_unique_index(Relation rel)
+{
+	ListCell   *lc;
+
+	foreach(lc, RelationGetIndexList(rel))
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+		Form_pg_index index;
+		bool		other;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for index %u", lfirst_oid(lc));
+		index = (Form_pg_index) GETSTRUCT(tup);
+		other = !index->indisprimary && (index->indisunique || index->indisexclusion);
+		ReleaseSysCache(tup);
+		if (other)
+			return true;
+	}
+	return false;
+}
+
 /*
  * May a row a merge writes to rel break one of its constraints there: a
  * check, a not-null column outside the primary key, or a unique or
@@ -760,7 +797,6 @@ may_break_constraints(Relation rel)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
-	ListCell   *lc;
 
 	if (RelationGetRelid(rel) == breakable_relid)
 		return breakable;
@@ -777,20 +813,8 @@ may_break_constraints(Relation rel)
 			!bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, pk))
 			return true;
 	}
-	foreach(lc, RelationGetIndexList(rel))
-	{
-		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
-		Form_pg_index index;
-		bool		unique;
-
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for index %u", lfirst_oid(lc));
-		index = (Form_pg_index) GETSTRUCT(tup);
-		unique = !index->indisprimary && (index->indisunique || index->indisexclusion);
-		ReleaseSysCache(tup);
-		if (unique)
-			return true;
-	}
+	if (other_unique_index(rel))
+		return true;
 	breakable = false;
 	return false;
 }
@@ -878,6 +902,7 @@ typedef struct Applying
 	TupleTableSlot *slot;
 	TupleTableSlot *old;		/* a row updated, as it was */
 	bool	   *kept;			/* its columns kept as stored */
+	Bitmapset  *pk;				/* the primary key's columns */
 	bool		keyless;
 	bool		in_place;		/* changed keyed rows updated in place */
 	bool		inserting;
@@ -892,40 +917,25 @@ typedef struct Applying
 static bool
 updates_in_place(Relation rel)
 {
-	ListCell   *lc;
-
-	foreach(lc, RelationGetIndexList(rel))
-	{
-		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
-		Form_pg_index index;
-		bool		other;
-
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for index %u", lfirst_oid(lc));
-		index = (Form_pg_index) GETSTRUCT(tup);
-		other = !index->indisprimary && (index->indisunique || index->indisexclusion);
-		ReleaseSysCache(tup);
-		if (other)
-			return false;
-	}
-	return true;
+	return !other_unique_index(rel);
 }
 
 /*
- * A keyed row's update in place: old as it was, with the columns out of
- * line that row has too left unread, but its primary key whole (the row is
- * found by it); and row, those columns marked in kept.
+ * A keyed row's update in place: old as it was, with its columns out of
+ * line left unread, but its primary key (pk, its columns as
+ * RelationGetIndexAttrBitmap() gives them) whole: the row is found by it;
+ * and row, with the columns out of line that old has too marked in kept.
  */
 static void
-decode_update(Changes *c, Relation rel, const ProllyValue *before,
-			  const ProllyValue *after, TupleTableSlot *old,
-			  TupleTableSlot *row, bool *kept)
+decode_update(Changes *c, Relation rel, const Bitmapset *pk,
+			  const ProllyValue *before, const ProllyValue *after,
+			  TupleTableSlot *old, TupleTableSlot *row, bool *kept)
 {
-	Bitmapset  *pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	TupleDesc	desc = RelationGetDescr(rel);
 
+	/* (decoded as kept against itself: every column out of line unread) */
 	ExecClearTuple(old);
-	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, before, after, old, kept);
+	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, before, before, old, kept);
 	for (int i = 0; i < desc->natts; i++)
 	{
 		if (kept[i] &&
@@ -967,8 +977,8 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	{
 		if (!ap->inserting)
 			return;
-		decode_update(&ap->c, ap->rel, &brow, &arow, ap->old, ap->slot,
-					  ap->kept);
+		decode_update(&ap->c, ap->rel, ap->pk, &brow, &arow, ap->old,
+					  ap->slot, ap->kept);
 		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept))
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -1043,6 +1053,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.slot = table_slot_create(ap.rel, NULL);
 	ap.old = table_slot_create(ap.rel, NULL);
 	ap.kept = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
+	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	for (int pass = 0; pass < 2; pass++)
 	{
@@ -1052,6 +1063,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
 	ExecDropSingleTupleTableSlot(ap.old);
+	pfree(ap.kept);
+	bms_free(ap.pk);
 	PROLLY_CALL(ap.c.rd.kr, close, ap.c.rd.k);
 	table_close(ap.rel, NoLock);
 }
@@ -1364,6 +1377,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	bool		keyless;
 	bool		in_place;
 	bool	   *kept;
+	Bitmapset  *pk;
 	List	   *writes = NIL;
 
 	require_readable(base);
@@ -1377,6 +1391,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	in_place = !keyless && updates_in_place(rel);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	oc = tc;
 	chunk_env(&env);
 	env.compare = changes_compare;
@@ -1420,14 +1435,14 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			}
 		}
 
-		/* the row as the branch has it, and as theirs has it */
+		/* the row as the branch has it, and as theirs has it: how many */
 		now = o ? &o->after : &t->before;
-		have = (int64) decode(&tc, now, s1);
-		want = (int64) decode(&tc, &t->after, s2);
+		have = (int64) count_of(&tc, now);
+		want = (int64) count_of(&tc, &t->after);
 		row = &t->after;
 		if (keyless)
 		{
-			int64		had = (int64) decode(&tc, &t->before, s2);
+			int64		had = (int64) count_of(&tc, &t->before);
 			int64		by_ours = have - had;
 			int64		by_theirs = want - had;
 
@@ -1534,7 +1549,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			v.data = (const uint8 *) w->row->data;
 			v.len = w->row->len;
 			PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &v, &after, &count);
-			decode_update(&tc, rel, &before, &after, s1, s2, kept);
+			decode_update(&tc, rel, pk, &before, &after, s1, s2, kept);
 			if (!merge_write(ar, a, rel, s1, s2, kept))
 				goto missing;
 			continue;
@@ -1557,6 +1572,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		PROLLY_CALL(ar, end, a);
 	ExecDropSingleTupleTableSlot(s1);
 	ExecDropSingleTupleTableSlot(s2);
+	pfree(kept);
+	bms_free(pk);
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
 	table_close(rel, NoLock);
 	return conflicts;

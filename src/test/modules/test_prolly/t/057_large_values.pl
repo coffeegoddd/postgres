@@ -62,6 +62,42 @@ is( $standby->safe_psql('postgres',
 	'modified:192000:192003',
 	'a standby reads the values from history');
 
+# A reset that keeps a row's long value as stored, its row changed by
+# another transaction after the reset's fold read it, keeps nothing of
+# that transaction's: it fails, to be retried.
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  if $ENV{enable_injection_points} ne 'yes';
+	sql(q{
+		CREATE EXTENSION injection_points;
+		CREATE TABLE lv.kept (id int PRIMARY KEY, n int, body text);
+		ALTER TABLE lv.kept ALTER COLUMN body SET STORAGE EXTERNAL;
+		INSERT INTO lv.kept SELECT 1, 0, string_agg(md5(i::text), '') FROM generate_series(1, 2000) i;
+	});
+	my $k1 = sql(q{SELECT (dolt_commit('-Am', 'kept'))[1]});
+	sql(q{UPDATE lv.kept SET n = 1});
+	sql(q{SELECT dolt_commit('-am', 'counted')});
+	my $s = $node->background_psql('postgres', on_error_stop => 0);
+	$s->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-update-keeping', 'wait')});
+	$s->query_until(qr/resetting/, qq{
+		\\echo resetting
+		SELECT dolt_reset('--hard', '$k1');
+		\\echo reset
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-update-keeping'}) or die 'the reset did not wait';
+	sql(q{UPDATE lv.kept SET body = 'concurrent'});
+	sql(q{SELECT injection_points_wakeup('prolly-update-keeping')});
+	$s->query_until(qr/reset/, '');
+	like($s->{stderr}, qr/changed while the branch was moved/,
+		'a row changed after the fold read it fails the reset');
+	$s->quit;
+	is(sql(q{SELECT n || ':' || body FROM lv.kept}), '1:concurrent',
+		'and the row is as the other transaction left it');
+}
+
 $standby->stop;
 $node->stop;
 done_testing();

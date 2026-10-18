@@ -26,7 +26,6 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
-#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
@@ -51,8 +50,8 @@
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/injection_point.h"
 #include "utils/syscache.h"
-#include "varatt.h"
 
 #define WRITE_PRIVS		(ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE)
 
@@ -599,9 +598,25 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 }
 
 /*
- * The columns keep marks, from the row found: its stored values.  A
- * materialized view's row is deleted before the new one goes in, taking
- * its values out of line with it, so those are read into the new row.
+ * Whether the row found is as the fold before the change read it: not
+ * written since by a transaction the active snapshot doesn't see.  (The
+ * row found by its key is its newest version.)
+ */
+static bool
+found_as_read(ProllyApplier *a)
+{
+	bool		isnull;
+	TransactionId xmin = DatumGetTransactionId(slot_getsysattr(a->found,
+															   MinTransactionIdAttributeNumber,
+															   &isnull));
+
+	return TransactionIdIsCurrentTransactionId(xmin) ||
+		!XidInMVCCSnapshot(xmin, GetActiveSnapshot());
+}
+
+/*
+ * The columns keep marks, from the row found: its stored values.  (Never a
+ * materialized view's: it has no primary key to find its rows by.)
  */
 static void
 keep_found(ProllyApplier *a, TupleTableSlot *row, const bool *keep)
@@ -610,6 +625,7 @@ keep_found(ProllyApplier *a, TupleTableSlot *row, const bool *keep)
 	Datum	   *values = palloc_array(Datum, desc->natts);
 	bool	   *isnull = palloc_array(bool, desc->natts);
 
+	Assert(!a->matview);
 	slot_getallattrs(a->found);
 	slot_getallattrs(row);
 	for (int i = 0; i < desc->natts; i++)
@@ -618,10 +634,6 @@ keep_found(ProllyApplier *a, TupleTableSlot *row, const bool *keep)
 
 		values[i] = from->tts_values[i];
 		isnull[i] = from->tts_isnull[i];
-		if (keep[i] && !isnull[i] && a->matview &&
-			TupleDescAttr(desc, i)->attlen == -1 &&
-			VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
-			values[i] = PointerGetDatum(detoast_external_attr((varlena *) DatumGetPointer(values[i])));
 	}
 	/* (formed anew: the found row's values are its buffer's) */
 	ExecForceStoreHeapTuple(heap_form_tuple(desc, values, isnull), row, true);
@@ -633,14 +645,25 @@ static bool
 replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 				   const bool *keep)
 {
-	if (!find_row(a, old))
+	bool		keeping = false;
+
+	for (int i = 0; keep && i < RelationGetDescr(a->rel)->natts; i++)
+		keeping |= keep[i];
+	if (keeping)
+		INJECTION_POINT("prolly-update-keeping", NULL);
+
+	/*
+	 * A row another transaction changed since the fold read it isn't old,
+	 * whatever its key: its values aren't the ones to keep.
+	 */
+	if (!find_row(a, old) || (keeping && !found_as_read(a)))
 	{
 		ExecClearTuple(a->found);
 		return false;
 	}
 	PG_TRY();
 	{
-		if (keep)
+		if (keeping)
 			keep_found(a, row, keep);
 		if (a->matview)
 		{
