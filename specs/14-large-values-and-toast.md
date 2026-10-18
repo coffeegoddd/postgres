@@ -19,7 +19,7 @@ and are only touched in part 7.
 | Out-of-line form | Rows of `pg_toast_N (chunk_id, chunk_seq, chunk_data)`, 1996-byte chunks, value named by an OID | A blob tree, fixed 4000-byte leaves, named by its hash | A value tree, buzhash chunks of 512–4096 bytes keyed by byte offset, named by its hash (`tree_cow.c:560-608`); since B, addressed by byte counts and one per long column (part 5) |
 | Sharing | None: one owner per value; an unchanged value keeps its pointer on UPDATE | Identical values are one tree | Identical rows are one tree; since B, identical long values are one tree wherever they are, and an apply in place keeps a row's own TOAST pointer for a value that didn't change |
 | Slice reads | Uncompressed values fetch only the chunks they need; pglz fetches a prefix | None | None |
-| Deletion | With its row; VACUUM of the TOAST table reclaims | `dolt gc` | No chunk-store reclamation yet |
+| Deletion | With its row; VACUUM of the TOAST table reclaims | `dolt gc` | No chunk-store reclamation at first; since #210–#225, a collection of the chunk store, which keeps every value tree a leaf names |
 
 The versioned working set is heap pages with stock TOAST: a versioned
 table's TOAST table and its index are block-mapped and branch-aware
@@ -126,8 +126,11 @@ nobody has history worth keeping.)
   put, and a leaf item that holds references leads with them, flagged
   `PROLLY_ITEM_VALUE_REFS`. Fetch, push, clone and reclamation follow
   them from the nodes alone, as do a walk's prefetch hints and the node
-  diffs (`diff_nodes()`) network transfers send; reads return the value
-  without them.
+  diffs (`diff_nodes()`) network transfers send, and the tree's
+  `references()`, by which the chunk store checks a chunk's references
+  are stored before it stores it (a collection keeps whatever a chunk
+  names); reads return the value without them. `large_values` collects
+  the whole store and reads the long values back from history.
 - **Not as designed:** the format change is a clean break, #149's, not
   the cross-format comparison above (the user's choice for this work):
   the value encoder's format goes to 2 and the folded roots' `!:format`
@@ -161,7 +164,7 @@ Measured: a one-byte insertion or deletion in the middle of a 3 MB value
 writes at most 8 nodes (conformance, which holds it to 8); three bytes
 inserted into a 192 KB value of a versioned table committed 8 new nodes
 when measured (`large_values`, SQL, which holds it under 20).
-D1's `016_d1_large_values.pl` cases are `052_large_values.pl` on
+D1's `016_d1_large_values.pl` cases are `057_large_values.pl` on
 versioned tables (#221): through a crash, and on a standby through
 `dolt_diff`.
 
@@ -271,7 +274,7 @@ first is deleted. Sharing across rows needs C.
 - A row found by its key that a transaction the move's snapshot doesn't
   see wrote since the fold (a concurrent update) isn't the row the move
   expects: the move fails, to be retried, rather than keep that
-  transaction's value (`052_large_values.pl`, by an injection point).
+  transaction's value (`057_large_values.pl`, by an injection point).
 - A merge's in-place update that breaks a constraint while violations
   are recorded is rolled back in its subtransaction, leaving the row as
   it was.
