@@ -2,11 +2,12 @@
 
 **Status: steps 0–7 built and merged (2026-10-18), with the gaps each
 step's notes list, and with them everything part 4's "Up to step 8"
-lists; step 8 (measurement) not started.** This replaces the design in which prolly trees are a table's
-primary storage (engines D1–D4, `04-candidate-designs.md`). The decisions
-below marked "user" were made on the dates given; everything else is a
-recommendation to be settled before the step that needs it. Part 4 is the
-plan, with what each step built and where the build departed from it.
+lists; step 8 (measurement) not started.** This replaces the design in
+which prolly trees are a table's primary storage (engines D1–D4,
+`04-candidate-designs.md`). The decisions below marked "user" were made on
+the dates given; everything else is a recommendation to be settled before
+the step that needs it. Part 4 is the plan, with what each step built and
+where the build departed from it.
 
 ## 1. The design
 
@@ -517,26 +518,44 @@ fails without its fix), and Postgres's suites keep passing after each one.
   folds that table alone. (Of those, only foreign tables remain: the
   objects stack, below.)
 - **As built (objects):** commits hold aggregates, row security policies
-  and partitioned tables (the objects stack), and range types (below).
-  Still refused: foreign tables, window functions (only C writes one),
-  base types, partitions apart from their partitioned tables (below),
-  range types with a canonical function or with a subtype difference
-  function of a versioned schema; and, since the objects stack, objects
-  that were neither held nor refused before: operators, operator classes
-  and families, conversions, text search configurations, dictionaries,
-  parsers and templates, extended statistics, and casts of versioned
-  types that aren't part of a type (`CREATE CAST`). Each is listed as
-  not covered rather than left out of a commit's hash. Collations made in
-  a versioned schema are held (`c:` items).
+  and partitioned tables (the objects stack, #205–#208); since, range
+  types (#230), and extended statistics, casts and collations of
+  versioned schemas (#231). Still refused: foreign tables, window
+  functions (only C writes one), base types, partitions apart from their
+  partitioned tables (below), range types with a canonical function or
+  whose subtype difference function, operator class or collation is of a
+  versioned schema; and (#231) every other kind a branch-aware catalog
+  holds in a versioned schema, which were neither held nor refused
+  before: operators, operator classes and families, conversions, text
+  search configurations, dictionaries, parsers and templates. That list
+  is the branch-aware catalogs with a schema column whose kind a commit
+  doesn't hold, so a kind added later is refused, not left out. Each is
+  listed as not covered, named as Postgres describes it.
+  - **Only a commit refuses** (#231). A move, a checkout and a checkpoint
+    fold the working set leaving such objects out: a move to a commit (a
+    reset, a branch's first use, a push's) discards them and what depends
+    on them as uncommitted work; a checkout leaves them on their branch,
+    whose catalogs hold them; a push is refused over them, as over any
+    uncommitted change. (Before, any move refused while one existed, and
+    a reset couldn't discard it.)
+  - Extended statistics are part of their table's definition (a section,
+    if it has any: each one's name, its CREATE STATISTICS and its target);
+    a cast of a versioned type that isn't part of a type is an "x:" item
+    (its method and function, its context); a collation of a versioned
+    schema is an "l:" item (provider, locale, rules, determinism). Moves
+    make and drop them; a collation, like a range type, can't be altered,
+    so a changed one nothing uses goes and comes again and one in use is
+    refused.
   - A range type is a type item, "range", with its subtype, the
     subtype's operator class, its collation, its subtype difference
     function and its multirange type, as CREATE TYPE ... AS RANGE names
     them; its multirange type, constructors and cast come with it (and
     aren't items). `pg_range` and `pg_cast` are branch-aware catalogs
     (part 6.3): a range's row belongs where its type does, a cast where a
-    versioned type it casts does. A move makes one and drops one; a move
-    to a commit defining one otherwise is refused, as Postgres can't
-    change one in place. Operator classes' entries (`pg_amop`,
+    versioned type it casts does. A move makes one and drops one; one
+    defined otherwise goes and comes again if nothing uses it, and is
+    refused if something does (or if a type it uses changes), as Postgres
+    can't change one in place. Operator classes' entries (`pg_amop`,
     `pg_amproc`) count as versioned where their family is, so a class can
     be made in a versioned schema (and is refused by a commit).
   - An aggregate is a routine item whose definition is the CREATE OR
@@ -666,9 +685,8 @@ transfer from known heads and V4 built and merged (#198–#203, 7.12).
 **Step 7. Reclamation.** Designed in part 8 (decided 2026-10-17). Built
 and merged (#210, #211, #212, #213, #214, #216, #223, #225; 2026-10-18);
 8.11 says what was built and where it departs from part 8. The eviction
-self-deadlock under a map page's lock found while it was reviewed is
-fixed at its cause in #227 (a change locks its map page after every
-buffer it reads, checked in assert-enabled builds).
+self-deadlock under a map page's lock, which its crash tests (and CI's
+run of `t/041`) hit, is fixed at its cause in #227 (8.11).
 - Chunk-store GC with WAL (table files, `oldgen`, journal retirement);
   page-set and physical-page reclamation; the fold epoch's retained page
   versions.
@@ -680,9 +698,10 @@ buffer it reads, checked in assert-enabled builds).
 **Up to step 8 (user, 2026-10-17).** Decided as recommended, each group
 a stack of PRs, in this order. **All built and merged (2026-10-18):** the
 dependency check (#188, #189, #192, #193), escaping (#194–#196), network
-remotes (#198–#203), reclamation (#210–#225), the objects (#205–#208;
-range types and the refusal of undescribed objects after), large values'
-refusal and B (#217–#221, #224).
+remotes (#198–#203), reclamation (#210–#214, #216, #223, #225), the
+objects (#205–#208), large values' refusal and B (#217–#221, #224); range
+types and what commits hold or refuse since (#230, #231) are in the same
+stack as this note.
 1. **The dependency check at moves** (part 7.4): checkout, merge, reset,
    cherry-pick and pull refuse a commit needing what the database lacks,
    naming all of it; a move never creates or alters an extension. (The
@@ -1915,9 +1934,12 @@ measurements (#223).
   store shortened (a SHRINK record). Branch creation waits for it while it
   counts; while a page store is swept its allocator reuses no freed block
   (other stores' do). Its
-  crash tests found a bug, fixed with its own test (#214's first commit):
-  a write evicted while its backend held the map page holding the evicted
-  page's entry locked it again.
+  crash tests found a bug: a write evicted while its backend held the map
+  page holding the evicted page's entry locked it again. #214 worked
+  around it (the write copied a page its backend held locked); #227 fixed
+  it at its cause and removed the workaround: a change locks its map page
+  only after every buffer it reads, which assert-enabled builds check at
+  every read (`t/050`, `t/056`).
 - **Automatic** (8.5). After its tables, an autovacuum worker collects
   the chunk store when what a default collection collects (the journal
   segment, and the table files not settled) has passed
