@@ -508,20 +508,31 @@ fails without its fix), and Postgres's suites keep passing after each one.
   #137 reads leave such objects out (partitions with their partitioned
   tables), `dolt_status` lists them as "not covered" and unstaged, a branch
   with them is dirty, only a commit refuses them, and a diff of one table
-  folds that table alone.
+  folds that table alone. (Of those, only foreign tables remain: the
+  objects stack, below.)
 - **As built (objects):** commits hold aggregates, row security policies
   and partitioned tables (the objects stack); foreign tables and window
   functions (only C writes one) are what they still refuse.
   - An aggregate is a routine item whose definition is the CREATE OR
     REPLACE AGGREGATE that makes it, every option written (Postgres has
-    no deparser for aggregates; pg_dump writes them so). A move makes
-    aggregates after the functions they use and drops them before.
-  - A table's definition ends with its policies: row security on, and
-    forced, then each policy as CREATE POLICY makes it, its roles by name.
-    Roles aren't recorded dependencies (they aren't versioned): a policy
-    naming a role the database lacks fails where it is made. The fold
-    and the row writer work below the planner, where policies don't
-    apply.
+    no deparser for aggregates; pg_dump writes them so). A move replaces
+    one changed in place (what uses it, a materialized view, stays),
+    unless a function is dropped: then every aggregate goes before the
+    functions and comes after them and after new tables, whose row types
+    they may use. A removed one goes before anything else.
+  - A table's definition ends with its policies, if it has any or row
+    security on: row security on, and forced, then each policy as CREATE
+    POLICY makes it, its roles by name (a table with neither has no
+    section, its description as older builds wrote it). Roles aren't
+    recorded dependencies (they aren't versioned): a policy naming a role
+    the database lacks fails where it is made, and a role renamed changes
+    the text of every policy naming it, as it changes what pg_dump
+    writes. A move drops every policy first and makes every one last, as
+    views go and come, as a policy may use anything the move changes.
+    The fold and the row writer work below the planner, where policies
+    don't apply. `dolt_diff`, `dolt_conflicts` and
+    `dolt_constraint_violations` refuse a table whose row security
+    applies to the reader (part 4, item 5).
   - A partitioned table is a table item with an empty data tree and its
     key; a partition, a table item with its parent and bound, its rows
     folded as any table's. A move makes partitioned tables before their

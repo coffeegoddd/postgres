@@ -808,8 +808,9 @@ rows of tables whose rows aren't canonical: rows from before a column was
 dropped (the keying check rebuilds them) or added with a default (written
 again with it), once per schema change (a META record notes the keying
 the rows were last made canonical under). Objects not covered yet
-(aggregates, policies, partitioned and foreign tables, other types) make a
-commit fail, never a hash that might depend on history; heap tables are
+(then aggregates, policies, partitioned and foreign tables, other types;
+since the objects stack only foreign tables, window functions and other
+types) make a commit fail, never a hash that might depend on history; heap tables are
 not versioned and are left out. The engine gained `tree_root`; reclamation
 walks canonical roots through the canonicalizer. Tests: `021_d1_canonical.pl`
 (two databases reach the same content by different histories and get the
