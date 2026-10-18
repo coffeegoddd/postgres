@@ -14,6 +14,13 @@
  * UTF-8).  Fetching converts back.  A slice of a value stored as its bytes
  * reads only the tree's nodes that hold it; one converted is read whole.
  *
+ * A value is stored converted only if fetching gives its bytes back: the
+ * conversion is checked to undo itself (it doesn't for characters of
+ * another encoding that map to one Unicode character), and the converted
+ * value is small enough to convert back.  Otherwise, and for every other
+ * type, the tree holds the value's bytes, which are not its canonical
+ * bytes: a fold reads such a value rather than take its tree.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/toast_chunkstore.c
  *
@@ -36,17 +43,19 @@
 /* the trees' environment, the current database's */
 static ProllyTreeEnv env;
 static const ProllyTreeRoutine *tree;
-static Oid	env_database = InvalidOid;
+static bool env_ready = false;
 static ProllyDatumCodec *jsonb_codec;
 
 static void
 ensure_env(void)
 {
-	if (env_database == MyDatabaseId)
+	if (env_ready)
 		return;
+	if (!OidIsValid(MyDatabaseId))
+		elog(ERROR, "values by content need a database");
 	tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&env);
-	env_database = MyDatabaseId;
+	env_ready = true;
 }
 
 static ProllyDatumCodec *
@@ -57,13 +66,85 @@ jsonb(void)
 	return jsonb_codec;
 }
 
-/* Is typid text, varchar or bpchar (a domain over one included)? */
-static bool
-text_like(Oid typid)
+/*
+ * The form a value of type typid is stored in, if it can be: its bytes,
+ * unless converting them to the canonical bytes changes more than their
+ * form (text-like in another encoding than UTF-8, jsonb).
+ */
+static int
+toast_form(Oid typid)
 {
 	Oid			base = getBaseType(typid);
 
-	return base == TEXTOID || base == VARCHAROID || base == BPCHAROID;
+	if (base == JSONBOID)
+		return PROLLY_TOAST_FORM_JSONB;
+	/* (SQL_ASCII's bytes are no encoding's: kept as they are) */
+	if ((base == TEXTOID || base == VARCHAROID || base == BPCHAROID) &&
+		GetDatabaseEncoding() != PG_UTF8 &&
+		GetDatabaseEncoding() != PG_SQL_ASCII)
+		return PROLLY_TOAST_FORM_UTF8;
+	return PROLLY_TOAST_FORM_BYTES;
+}
+
+/* The longest string an encoding conversion takes */
+#define CONVERTIBLE_MAX		(MaxAllocSize / MAX_CONVERSION_GROWTH - 1)
+
+/* The longest value fetched whole: its bytes and header in a StringInfo */
+#define FETCHABLE_MAX		(MaxAllocSize - 1 - VARHDRSZ)
+
+/*
+ * data, len bytes of the server's encoding, in UTF-8 into out, if
+ * converting them back gives them back; false if not, or if either is too
+ * long to convert.
+ */
+static bool
+to_utf8(const char *data, Size len, StringInfo out)
+{
+	char	   *u;
+	char	   *back;
+	Size		ulen;
+	bool		same;
+
+	if (len > CONVERTIBLE_MAX)
+		return false;
+	u = pg_server_to_any(data, len, PG_UTF8);
+	ulen = (u == data) ? len : strlen(u);
+	if (ulen > CONVERTIBLE_MAX)
+		return false;
+	back = (u == data) ? u : pg_any_to_server(u, ulen, PG_UTF8);
+	same = (back == u) ? (ulen == len) :
+		(strlen(back) == len && memcmp(back, data, len) == 0);
+	if (same)
+		appendBinaryStringInfo(out, u, ulen);
+	if (back != u && back != data)
+		pfree(back);
+	if (u != data)
+		pfree(u);
+	return same;
+}
+
+/*
+ * A jsonb document's canonical bytes into out, if decoding them gives its
+ * bytes back (they hold its strings in UTF-8, which in another encoding
+ * may not convert back, or sort its keys otherwise).
+ */
+static bool
+to_canonical_jsonb(varlena *plain, StringInfo out)
+{
+	varlena    *back;
+	bool		same;
+
+	prolly_datum_encode(jsonb(), PointerGetDatum(plain), out);
+	if (GetDatabaseEncoding() == PG_UTF8)
+		return true;
+	back = (varlena *) DatumGetPointer(prolly_datum_decode(jsonb(), out->data,
+														   out->len));
+	same = VARSIZE(back) == VARSIZE_ANY(plain) &&
+		memcmp(VARDATA(back), VARDATA_ANY(plain), VARSIZE_ANY_EXHDR(plain)) == 0;
+	pfree(back);
+	if (!same)
+		resetStringInfo(out);
+	return same;
 }
 
 varlena *
@@ -73,7 +154,6 @@ prolly_toast_store(Datum value, Oid typid)
 	varlena    *plain = v;
 	const char *data;
 	Size		len;
-	char	   *converted = NULL;
 	StringInfoData canonical;
 	StringInfoData ref;
 	ProllyValue r;
@@ -89,26 +169,23 @@ prolly_toast_store(Datum value, Oid typid)
 	data = VARDATA_ANY(plain);
 	len = VARSIZE_ANY_EXHDR(plain);
 	initStringInfo(&canonical);
-	if (getBaseType(typid) == JSONBOID)
+	switch (toast_form(typid))
 	{
-		form = PROLLY_TOAST_FORM_JSONB;
-		prolly_datum_encode(jsonb(), PointerGetDatum(plain), &canonical);
+		case PROLLY_TOAST_FORM_JSONB:
+			if (to_canonical_jsonb(plain, &canonical))
+				form = PROLLY_TOAST_FORM_JSONB;
+			break;
+		case PROLLY_TOAST_FORM_UTF8:
+			if (to_utf8(data, len, &canonical))
+				form = PROLLY_TOAST_FORM_UTF8;
+			break;
+	}
+	if (form != PROLLY_TOAST_FORM_BYTES)
+	{
 		data = canonical.data;
 		len = canonical.len;
 	}
-	else if (text_like(typid) && GetDatabaseEncoding() != PG_UTF8)
-	{
-		form = PROLLY_TOAST_FORM_UTF8;
-		converted = pg_server_to_any(data, len, PG_UTF8);
-		if (converted != data)
-		{
-			data = converted;
-			len = strlen(converted);
-		}
-		else
-			converted = NULL;
-	}
-	if (len > VARLENA_EXTSIZE_MASK)
+	if (len > FETCHABLE_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("value of %zu bytes is too large to store by content", len)));
@@ -130,8 +207,6 @@ prolly_toast_store(Datum value, Oid typid)
 
 	pfree(ref.data);
 	pfree(canonical.data);
-	if (converted)
-		pfree(converted);
 	if (plain != v)
 		pfree(plain);
 	return result;
@@ -219,6 +294,8 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
 				n = (s == out.data + VARHDRSZ) ? out.len - VARHDRSZ : strlen(s);
 				whole = new_varlena(n);
 				memcpy(VARDATA(whole), s, n);
+				if (s != out.data + VARHDRSZ)
+					pfree(s);
 				break;
 			}
 		case PROLLY_TOAST_FORM_JSONB:

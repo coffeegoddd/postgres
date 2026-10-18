@@ -54,6 +54,7 @@ FROM v;
 
 -- In a LATIN1 database, text is stored in UTF-8 and read back in LATIN1,
 -- whole or sliced; jsonb in its canonical form.
+SELECT current_database() AS db \gset
 CREATE DATABASE hp_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'
   TEMPLATE template0;
 \c hp_latin1
@@ -74,5 +75,40 @@ SELECT (test_toast_pointer(test_toast_hash_pointer(t))).form AS text_form,
 	   (test_toast_pointer(test_toast_hash_pointer(j))).form AS jsonb_form,
 	   test_toast_hash_pointer(j) = j AS jsonb_same
 FROM v ORDER BY t;
-\c contrib_regression
+\c :db
 DROP DATABASE hp_latin1;
+
+-- In EUC_JP, 0xADF0 and 0xA2E2 are one Unicode character, which converts
+-- back to 0xA2E2: text holding 0xADF0 is stored as its bytes, and read
+-- back as they were; text without one is stored in UTF-8.
+CREATE DATABASE hp_euc_jp ENCODING 'EUC_JP' LC_COLLATE 'C' LC_CTYPE 'C'
+  TEMPLATE template0;
+\c hp_euc_jp
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE TEMP TABLE v AS
+SELECT repeat(convert_from('\xadf0'::bytea, 'EUC_JP') || 'x', 2000) AS t,
+	   repeat(convert_from('\xa2e2'::bytea, 'EUC_JP') || 'x', 2000) AS u;
+SELECT (test_toast_pointer(test_toast_hash_pointer(t))).form AS no_round_trip_form,
+	   convert_to(test_toast_hash_pointer(t), 'EUC_JP') = convert_to(t, 'EUC_JP') AS same_bytes,
+	   (test_toast_pointer(test_toast_hash_pointer(u))).form AS round_trip_form,
+	   convert_to(test_toast_hash_pointer(u), 'EUC_JP') = convert_to(u, 'EUC_JP') AS u_same_bytes
+FROM v;
+\c :db
+DROP DATABASE hp_euc_jp;
+
+-- In SQL_ASCII, text's bytes are kept as they are, whatever they hold.
+CREATE DATABASE hp_sql_ascii ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'
+  TEMPLATE template0;
+\c hp_sql_ascii
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE TEMP TABLE v AS
+SELECT repeat(convert_from('\xe9ff'::bytea, 'SQL_ASCII') || 'x', 2000) AS t;
+SELECT (test_toast_pointer(test_toast_hash_pointer(t))).form AS sql_ascii_form,
+	   test_toast_hash_pointer(t) = t AS same
+FROM v;
+\c :db
+DROP DATABASE hp_sql_ascii;

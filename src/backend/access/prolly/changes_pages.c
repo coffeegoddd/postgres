@@ -429,7 +429,6 @@ add_candidate(Candidate **arr, int *n, int *max, const StringInfoData *key,
 	memcpy(c->keyrow, keyrow->data, keyrow->len);
 }
 
-/* Is the value of column i (0-based) stored out of line? */
 /*
  * A table without a key carries the blocks of tuples the snapshot doesn't
  * see as settled, to read again next time: unless the tuple is the fold's
@@ -467,12 +466,16 @@ carry_tuple(Finder *f, HeapTuple tup)
 	MemoryContextSwitchTo(old);
 }
 
+/*
+ * Is the value of column i (0-based) in its TOAST relation?  Its row's
+ * old version may outlive it there.  (A hash pointer's value doesn't go
+ * with its row.)
+ */
 static bool
 out_of_line(TupleDesc desc, int i, Datum value, bool isnull)
 {
 	return !isnull && TupleDescAttr(desc, i)->attlen == -1 &&
-		(VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)) ||
-		 VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(value)));
+		VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value));
 }
 
 /* Visits a tuple of a page version; false stops the walk. */

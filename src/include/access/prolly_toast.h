@@ -11,7 +11,11 @@
  * so that the pointer's hash is the column's reference in history: a
  * text-like value's bytes in UTF-8 when the database's encoding is
  * another; a jsonb document's canonical bytes.  The form is the pointer's,
- * in va_extinfo's high bits; fetching undoes it.
+ * in va_extinfo's high bits; fetching undoes it, giving the value's bytes
+ * back (a value whose conversion wouldn't is stored as its bytes).  Other
+ * types' trees hold their bytes, which aren't their canonical bytes (a
+ * pointer doesn't say its type, so fetching couldn't decode them): their
+ * pointers' hashes aren't the columns' references.
  *
  * src/include/access/prolly_toast.h
  *
