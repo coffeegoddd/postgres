@@ -102,14 +102,14 @@ class Runner:
     def __init__(self, *, suite: str, cfg: dict[str, Any], table_am: str, label: str,
                  repo: Path, bin_dir: Path, work_dir: Path, out_root: Path,
                  command: str, keep_failed: bool = False, build: str = "",
-                 build_commit: Optional[str] = None):
+                 builds: tuple[str, ...] = ()):
         registry.load_all()
         self.suite, self.cfg, self.table_am, self.label = suite, cfg, table_am, label
         self.repo, self.bin_dir, self.work_dir = repo, bin_dir, work_dir
         self.command, self.keep_failed = command, keep_failed
         # The build this runner's server is ("" unless builds are compared),
-        # and the commit its build provenance must name, if given.
-        self.build, self.build_commit = build, build_commit
+        # and every build compared, the base first.
+        self.build, self.builds = build, tuple(builds)
         if suite == "V" and table_am not in targets.VERSIONED_HISTORY:
             raise SystemExit("The V suite measures version control, which only "
                              f"{', '.join(sorted(targets.VERSIONED_HISTORY))} has.")
@@ -170,12 +170,6 @@ class Runner:
         if self.cfg["run"]["fio_baseline"]:
             environment["fio"] = env_mod.fio_baseline(
                 self.work_dir, int(self.cfg["run"]["fio_seconds"]), raw_root)
-        if self.build_commit is not None:
-            provenance = environment["postgres"].get("build_provenance") or {}
-            if provenance.get("commit") != self.build_commit:
-                raise RuntimeError(f"the {self.build} build at {self.bin_dir} is of "
-                                   f"{provenance.get('commit') or 'no recorded commit'}, "
-                                   f"not {self.build_commit}")
         warnings = env_mod.warnings(environment, self.suite)
         if (self.cfg["run"]["quality"] == "benchmark" or self.suite == "C") and warnings:
             raise RuntimeError("benchmark conditions failed: " + "; ".join(warnings))
@@ -187,7 +181,8 @@ class Runner:
                        started=dt.datetime.now().isoformat(timespec="seconds"),
                        command=self.command, config=self.cfg, environment=environment,
                        warnings=warnings, out_dir=self.out_dir,
-                       planned_cells=[key for key, _ in cells], build=self.build)
+                       planned_cells=[key for key, _ in cells], build=self.build,
+                       builds=list(self.builds))
         for s in self.sinks:
             s.open(info)
 
@@ -236,10 +231,8 @@ class Runner:
             for program, digest in self.info.environment["postgres"]["binary_hashes"].items():
                 if sha256(self.bin_dir / program) != digest:
                     raise RuntimeError(f"{program} changed after the run was planned")
-            provenance = self.bin_dir.parent / "pbench-build.json"
-            recorded = self.info.environment["postgres"].get("build_provenance")
-            if recorded is not None and (not provenance.exists() or
-                                         json.loads(provenance.read_text()) != recorded):
+            if env_mod.build_provenance(self.bin_dir) != \
+                    self.info.environment["postgres"].get("build_provenance"):
                 raise RuntimeError("the build's provenance changed after the run was planned")
             cluster.create(config_mod.server_settings(self.cfg))
             cluster.start()

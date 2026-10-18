@@ -141,14 +141,14 @@ class CounterShapeTest(unittest.TestCase):
 
 
 def build_set(root: Path, build: str, am: str, tps: list[float], *, identity="test",
-              workload="S1", seeds=None) -> Path:
+              workload="S1", seeds=None, builds=("base", "candidate")) -> Path:
     """A sealed S result set of one build and engine: a cell per repetition."""
     label = f"{build}-{'B0' if am == 'heap' else am}"
     d = root / label
     d.mkdir()
     (d / "run.json").write_text(json.dumps(
         {"suite": "S", "label": label, "table_am": am, "build": build,
-         "started": "2026-10-18T00:00:00"}))
+         "builds": list(builds), "started": "2026-10-18T00:00:00"}))
     with open(d / "results.jsonl", "w") as f:
         for rep, value in enumerate(tps, 1):
             f.write(json.dumps({
@@ -215,8 +215,35 @@ class BuildPairingTest(unittest.TestCase):
             self.assertAlmostEqual(rows[1].over_heap["base"], 0.8)
             self.assertAlmostEqual(rows[1].over_heap["candidate"], 0.8)
             md = bcompare.to_markdown(rows)
-            self.assertIn("| S1 | - | 8 | prolly | 1.00 [", md)
+            self.assertIn("| S1 | - | pr | 8 | prolly | 1.00 [", md)
+            self.assertIn("| same |", md)
             self.assertIn("0.80 → 0.80", md)
+
+    def test_the_base_is_the_build_named_first(self):
+        # (not "base" by name, nor the first in directory order)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            build_set(root, "old", "heap", [1000.0] * 5, builds=("old", "new"))
+            build_set(root, "new", "heap", [800.0] * 5, builds=("old", "new"))
+            sets = [table.load_set(p) for p in sorted(root.iterdir())]
+            self.assertEqual(sets[0].build, "new")
+            rows = bcompare.compare(sets)
+            self.assertAlmostEqual(rows[0].ratios["throughput"].estimate, 0.8)
+            self.assertEqual(bcompare.verdict(rows[0]), "regressed")
+
+    def test_straddling_either_threshold_is_inconclusive(self):
+        r = bcompare.Ratio(1.02, 0.97, 1.12, 5)
+        self.assertEqual(bcompare.regression(r, True, 0.05), "inconclusive")
+        self.assertEqual(bcompare.regression(bcompare.Ratio(1.0, 0.97, 1.03, 5), True, 0.05), "same")
+
+    def test_build_commits(self):
+        from pbench.__main__ import build_commits
+        builds = [("base", Path("/a")), ("candidate", Path("/b"))]
+        self.assertEqual(build_commits("base=ABC1234,candidate=0123456789", builds),
+                         {"base": "abc1234", "candidate": "0123456789"})
+        for bad in ("base=abc1234,candidate", "base=abc", "base=xyz1234", "other=abc1234"):
+            with self.assertRaises(SystemExit, msg=bad):
+                build_commits(bad, builds)
 
     def test_slowed_candidate_detected(self):
         with tempfile.TemporaryDirectory() as d:

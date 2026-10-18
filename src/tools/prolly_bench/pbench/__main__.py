@@ -50,15 +50,33 @@ def pg_bins(text: str) -> list[tuple[str, Path]]:
 
 
 def build_commits(text: str | None, builds: list[tuple[str, Path]]) -> dict[str, str]:
-    """--build-commit base=SHA,candidate=SHA: the commit each build's
-    provenance must name."""
+    """--build-commit base=SHA,candidate=SHA: the commit (or a prefix of 7
+    or more of its hex digits) each build's provenance must name."""
     if not text:
         return {}
-    out = dict(part.split("=", 1) for part in text.split(","))
+    out = {}
+    for part in text.split(","):
+        name, sep, sha = part.partition("=")
+        if not sep or len(sha) < 7 or any(c not in "0123456789abcdef" for c in sha.lower()):
+            raise SystemExit(f"--build-commit: expected NAME=SHA (7 or more hex digits), got {part!r}")
+        out[name] = sha.lower()
     unknown = set(out) - {name for name, _ in builds}
     if unknown:
         raise SystemExit(f"--build-commit names no build given to --pg-bin: {sorted(unknown)}")
     return out
+
+
+def check_build_commits(builds: list[tuple[str, Path]], commits: dict[str, str]) -> None:
+    """Refuse, before anything runs, a build whose provenance names another
+    commit than --build-commit gives it."""
+    from pbench.core.env import build_provenance
+    for name, bin_dir in builds:
+        if name not in commits:
+            continue
+        commit = (build_provenance(bin_dir.resolve()) or {}).get("commit") or ""
+        if not commit.startswith(commits[name]):
+            raise SystemExit(f"the {name} build at {bin_dir} is of "
+                             f"{commit or 'no recorded commit'}, not {commits[name]}")
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -107,6 +125,10 @@ def _run(args: argparse.Namespace) -> int:
         raise SystemExit("--label names one result set; give one --am and one --pg-bin with it")
     if len(builds) > 1 and args.suite != "S":
         raise SystemExit("builds are compared in the S suite only")
+    if cfg["run"]["comparison_only"] and len(builds) < 2:
+        raise SystemExit("a comparison_only configuration compares builds: give "
+                         "--pg-bin base=DIR,candidate=DIR")
+    check_build_commits(builds, commits)
     ok = True
     out_dirs = []
     runners = []
@@ -125,7 +147,7 @@ def _run(args: argparse.Namespace) -> int:
                             work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
                             command="prolly_bench " + shlex.join(sys.argv[1:]),
                             keep_failed=args.keep_failed, build=build,
-                            build_commit=commits.get(build))
+                            builds=tuple(name for name, _ in builds if name))
             runners.append(runner)
             out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run

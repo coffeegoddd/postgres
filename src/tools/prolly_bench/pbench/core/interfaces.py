@@ -320,6 +320,7 @@ class RunInfo:
     out_dir: Path
     planned_cells: list[CellKey] = field(default_factory=list)
     build: str = ""                  # the build compared, if builds are
+    builds: list[str] = field(default_factory=list)   # all of them, the base first
 
 
 class Sink(abc.ABC):
