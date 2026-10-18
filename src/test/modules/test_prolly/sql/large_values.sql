@@ -137,6 +137,21 @@ SELECT md5(body) AS body4 FROM lv.memo WHERE id = 4 \gset
 DELETE FROM lv.memo WHERE id = 4;
 SELECT dolt_reset('--hard', :'m3');
 SELECT md5(body) = :'body4' AS body4_from_history FROM lv.memo WHERE id = 4;
+-- a fold in a savepoint released into one rolled back: forgotten too
+INSERT INTO lv.memo
+SELECT 6, 0, string_agg(md5('6/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT length(dolt_commit('-am', 'in a savepoint')::text) AS committed;
+RELEASE b;
+ROLLBACK TO a;
+COMMIT;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+SELECT length(dolt_commit('-am', 'savepoints')::text) AS committed;
+SELECT hits = 4 AS others_hit, misses = 1 AS rolled_back_missed
+FROM test_memo_counters(true);
+DELETE FROM lv.memo WHERE id = 6;
 -- a value whose first chunk is frozen isn't remembered (its xmin's age is
 -- unknown): every fold reads it
 INSERT INTO lv.memo

@@ -723,7 +723,7 @@ valenc_long_values(const ProllyImplInfo *impl)
 	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	TupleTableSlot *dst = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	ProllyTreeEnv env;
-	ProllyValueStore values;
+	ProllyValueStore values = {0};
 	StringInfoData buf;
 	StringInfoData refs;
 	static const int lens[] = {2048, 2049, 100000};

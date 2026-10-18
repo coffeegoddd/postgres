@@ -277,7 +277,10 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 		{
 			if (enc->values == NULL)
 				no_values();
-			initStringInfo(&ref);
+			if (toasted)
+				resetStringInfo(&ref);	/* (the lookup's) */
+			else
+				initStringInfo(&ref);
 			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
 						(const uint8 *) val.data, val.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);

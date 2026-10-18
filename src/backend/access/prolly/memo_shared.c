@@ -25,8 +25,12 @@
  *
  * A transaction's entries are kept in its backend until it commits (they
  * name chunks no one else can read until then), and forgotten if it, or
- * the subtransaction that made them, aborts.  A hit is also checked
- * against the chunk store, in case anything else removed the tree.
+ * the subtransaction that made them, aborts, or if it is prepared (they
+ * wait for no COMMIT PREPARED).  A parallel worker's are forgotten when it
+ * ends: its leader may yet abort.  At most MEMO_ENTRIES are kept, one per
+ * key.  A hit is also checked against the chunk store, in case anything
+ * else removed the tree; an entry of the transaction's that fails it is
+ * dropped.
  *
  * The table has MEMO_ENTRIES slots under a spinlock; a key is looked for
  * in MEMO_PROBE slots from its hash, and a new entry takes the first free
@@ -54,6 +58,7 @@
 #include "miscadmin.h"
 #include "storage/spin.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "varatt.h"
@@ -89,14 +94,15 @@ typedef struct MemoShared
 /* An entry of this backend's transaction, not yet everyone's. */
 typedef struct Pending
 {
-	MemoKey		key;
-	SubTransactionId subxid;
+	MemoKey		key;			/* the hash key */
+	SubTransactionId subxid;	/* the subtransaction that made it */
 	uint8		reflen;
 	uint8		ref[MEMO_REF_MAX];
 } Pending;
 
 static MemoShared *memo = NULL;
-static List *pending = NIL;		/* of Pending *, in TopMemoryContext */
+static HTAB *pending = NULL;	/* by key; NULL if none */
+static SubTransactionId pending_newest; /* no subxid of theirs is later */
 static bool callbacks_registered = false;
 static ProllyMemoCounters counts;
 
@@ -221,7 +227,7 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 	bool		frozen;
 	uint8		buf[MEMO_REF_MAX];
 	int			len = -1;
-	ListCell   *lc;
+	bool		own = false;
 
 	if (!VARATT_IS_EXTERNAL_ONDISK(pointer) ||
 		!key_of(pointer, typid, &key, &frozen, false))
@@ -231,15 +237,15 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 	}
 
 	/* This transaction's own, then everyone's. */
-	foreach(lc, pending)
+	if (pending != NULL)
 	{
-		Pending    *p = lfirst(lc);
+		Pending    *p = hash_search(pending, &key, HASH_FIND, NULL);
 
-		if (same_key(&p->key, &key))
+		if (p != NULL)
 		{
 			len = p->reflen;
 			memcpy(buf, p->ref, len);
-			break;
+			own = true;
 		}
 	}
 	if (len < 0)
@@ -276,6 +282,8 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 			counts.hits++;
 			return true;
 		}
+		if (own)
+			(void) hash_search(pending, &key, HASH_REMOVE, NULL);
 	}
 	counts.misses++;
 	return false;
@@ -286,11 +294,12 @@ publish(void)
 {
 	MemoShared *m = shared();
 	uint64		now = U64FromFullTransactionId(ReadNextFullTransactionId());
-	ListCell   *lc;
+	HASH_SEQ_STATUS seq;
+	Pending    *p;
 
-	foreach(lc, pending)
+	hash_seq_init(&seq, pending);
+	while ((p = hash_seq_search(&seq)) != NULL)
 	{
-		Pending    *p = lfirst(lc);
 		int			slot = first_slot(&p->key);
 		MemoEntry  *take = NULL;
 
@@ -318,8 +327,9 @@ publish(void)
 static void
 forget_all(void)
 {
-	list_free_deep(pending);
-	pending = NIL;
+	if (pending != NULL)
+		hash_destroy(pending);
+	pending = NULL;
 	last_pointer_len = 0;
 }
 
@@ -329,15 +339,18 @@ memo_xact_callback(XactEvent event, void *arg)
 	switch (event)
 	{
 		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-			if (pending != NIL)
+			if (pending != NULL)
 				publish();
 			forget_all();
 			break;
 		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
-			/* (a prepared transaction's chunks wait for COMMIT PREPARED) */
+			/*
+			 * (a worker's leader may still abort; a prepared transaction's
+			 * chunks wait for COMMIT PREPARED)
+			 */
 			forget_all();
 			break;
 		default:
@@ -345,28 +358,29 @@ memo_xact_callback(XactEvent event, void *arg)
 	}
 }
 
+/*
+ * A subtransaction's entries are its parent's when it commits, and they
+ * keep its ID: every subtransaction begun since an open one began is that
+ * one's descendant, so when a subtransaction aborts, the entries to forget
+ * are those of its ID or a later one.
+ */
 static void
 memo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					  SubTransactionId parentSubid, void *arg)
 {
-	ListCell   *lc;
+	HASH_SEQ_STATUS seq;
+	Pending    *p;
 
-	foreach(lc, pending)
-	{
-		Pending    *p = lfirst(lc);
-
-		if (p->subxid != mySubid)
-			continue;
-		if (event == SUBXACT_EVENT_COMMIT_SUB)
-			p->subxid = parentSubid;
-		else if (event == SUBXACT_EVENT_ABORT_SUB)
-		{
-			pending = foreach_delete_current(pending, lc);
-			pfree(p);
-		}
-	}
-	if (event == SUBXACT_EVENT_ABORT_SUB)
-		last_pointer_len = 0;
+	if (event != SUBXACT_EVENT_ABORT_SUB)
+		return;
+	last_pointer_len = 0;
+	if (pending == NULL || pending_newest < mySubid)
+		return;
+	hash_seq_init(&seq, pending);
+	while ((p = hash_seq_search(&seq)) != NULL)
+		if (p->subxid >= mySubid)
+			(void) hash_search(pending, &p->key, HASH_REMOVE, NULL);
+	pending_newest = mySubid - 1;	/* (at most) */
 }
 
 static void
@@ -385,17 +399,27 @@ shared_remember(const void *pointer, Oid typid, const ProllyValue *ref)
 		RegisterSubXactCallback(memo_subxact_callback, NULL);
 		callbacks_registered = true;
 	}
-	p = MemoryContextAlloc(TopMemoryContext, sizeof(Pending));
-	p->key = key;
+	if (pending == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(MemoKey);
+		ctl.entrysize = sizeof(Pending);
+		ctl.hcxt = TopMemoryContext;
+		pending = hash_create("prolly value memo", 256, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		pending_newest = InvalidSubTransactionId;
+	}
+	/* (no more than the shared table holds: the rest would be dropped) */
+	p = hash_search(pending, &key,
+					hash_get_num_entries(pending) < MEMO_ENTRIES ?
+					HASH_ENTER : HASH_FIND, NULL);
+	if (p == NULL)
+		return;
 	p->subxid = GetCurrentSubTransactionId();
+	pending_newest = Max(pending_newest, p->subxid);
 	p->reflen = (uint8) ref->len;
 	memcpy(p->ref, ref->data, ref->len);
-	{
-		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-
-		pending = lappend(pending, p);
-		MemoryContextSwitchTo(old);
-	}
 }
 
 static void

@@ -108,8 +108,6 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 		profile_impl(history_profile, PROLLY_IFACE_TREE);
 	components->keying = (const ProllyKeyingRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_TABLE_KEYING);
-	components->value_memo = (const ProllyValueMemoRoutine *)
-		profile_impl(history_profile, PROLLY_IFACE_VALUE_MEMO);
 }
 
 void

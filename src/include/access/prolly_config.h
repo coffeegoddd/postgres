@@ -42,7 +42,6 @@ typedef struct ProllyComponents
 	const ProllyValueEncoderRoutine *value_encoder;
 	const ProllyTreeRoutine *tree;
 	const ProllyKeyingRoutine *keying;
-	const ProllyValueMemoRoutine *value_memo;
 } ProllyComponents;
 
 /* Database-wide components: version control. */
