@@ -8,7 +8,7 @@
       "index": 0,
       "name": "dolt_checkout changes working set",
       "source_sha256": "cd3d2b88247cde756dc93b2bc5a92085ea1bbcd17b5e422f6bbec67497ded7b8",
-      "scenario_sha256": "711c7277005b4706bab684ea9ade71d5db5a8ddb61c3e5c5a4f1bd8ba8fb7d7a",
+      "scenario_sha256": "1fad078591529eab9d890a483b6c6ebebe0756448701603745bf042129a9c603",
       "setup": [
         {
           "index": 0,
@@ -22,7 +22,7 @@
           "steps": [
             "setup-1"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         },
         {
           "index": 2,
@@ -50,7 +50,7 @@
           "steps": [
             "setup-5"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         },
         {
           "index": 6,
@@ -71,7 +71,7 @@
           "steps": [
             "setup-8"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         },
         {
           "index": 9,
@@ -92,7 +92,7 @@
           "steps": [
             "setup-11"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         },
         {
           "index": 12,
@@ -183,7 +183,7 @@
       ],
       "adaptations": [
         "MySQL CALL becomes typed native VC operations.",
-        "D1 commits all data without a staging area; no staging-specific assertion is present.",
+        "prolly commits all data without a staging area; no staging-specific assertion is present.",
         "SQL result values are exact strings; unordered result multiplicity is preserved."
       ]
     },
@@ -194,7 +194,7 @@
       "index": 1,
       "name": "dolt_checkout with new branch",
       "source_sha256": "68a848299ac653355e96960d114c6fd0464082ea1438cacb31e82e2bde8af977",
-      "scenario_sha256": "781ca5ae92127f014ea5fa1c865bbdcba361af15c9461812b541c9e783a3e1e5",
+      "scenario_sha256": "841a794bf731bf095046b6153ec922c33baab2f26fc1345db690148c9bf62a3e",
       "setup": [
         {
           "index": 0,
@@ -215,7 +215,7 @@
           "steps": [
             "setup-2"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         },
         {
           "index": 3,
@@ -237,7 +237,7 @@
           "steps": [
             "setup-5"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags map to D1 commit-all semantics. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
         }
       ],
       "assertions": [
@@ -286,7 +286,7 @@
       ],
       "adaptations": [
         "MySQL CALL becomes typed native VC operations.",
-        "D1 commits all data without a staging area; no staging-specific assertion is present.",
+        "prolly commits all data without a staging area; no staging-specific assertion is present.",
         "SQL result values are exact strings; unordered result multiplicity is preserved."
       ]
     },
@@ -297,7 +297,7 @@
       "index": 29,
       "name": "test hashof",
       "source_sha256": "6c8297864baea78a2675fee67667bc576be4039848d21b34a77c40992542e59a",
-      "scenario_sha256": "79a95f8c1ccbb6c43cdaadf7e673789a3a22ec8e951711b5de4438cc3c085d8a",
+      "scenario_sha256": "ad8799d651bc53f8f25a258cc84d0f4542fb6c075ea23bcea682ee6f560ba365",
       "setup": [
         {
           "index": 0,
@@ -318,7 +318,7 @@
           "steps": [
             "first"
           ],
-          "note": "D1 commit snapshots all tables without staging; source dolt_add prepares the same first commit."
+          "note": "A commit takes the whole working set (no staging area); the source dolt_add prepares the same first commit."
         },
         {
           "index": 3,
@@ -402,8 +402,127 @@
       ],
       "adaptations": [
         "hashof alias maps to dolt_hashof. Native commit IDs are opaque and captured directly.",
-        "Staging is absent in D1; all-table commit preserves this case's snapshots.",
+        "Staging is absent in prolly; all-table commit preserves this case's snapshots.",
         "PostgreSQL text booleans and error SQLSTATE replace MySQL booleans and error strings."
+      ]
+    },
+    {
+      "id": "dolt-reset-conflicted-merge",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltResetTestScripts",
+      "index": 1,
+      "name": "CALL DOLT_RESET('--hard') should reset the merge state after conflicting merge",
+      "source_sha256": "71e328bdfbf6f557fb4ddbd8a3e6bbaa8a15c9be01e7a22233796769b6cda98d",
+      "scenario_sha256": "9bb306c8883ff818f42785bbe1cd37c444f957920c6cac71d18df9520abc5fcf",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "allow"
+          ],
+          "note": "The Dolt session variable as prolly's setting."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "added"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "branch",
+            "checkout-branch"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "theirs"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "theirs-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "ours"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "ours-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "merge"
+          ],
+          "note": "Conflicting merge kept in progress; checks it reports one conflicting table."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "reset"
+          ],
+          "note": "Hard reset to HEAD."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "abort"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout.",
+        "dolt_allow_commit_conflicts is the dolt.allow_commit_conflicts setting.",
+        "No staging area: dolt_add stages nothing and commits take the whole working set.",
+        "The conflicting merge runs outside a transaction block and keeps its conflicts because dolt.allow_commit_conflicts is on; its result row is checked.",
+        "Dolt's 'fatal: There is no merge to abort' is checked as SQLSTATE 55000."
       ]
     }
   ],
@@ -414,7 +533,7 @@
       "index": 2,
       "name": "dolt_reset('--hard') commits the active SQL transaction",
       "source_sha256": "8b66b23de2450b01b85304fea5e8a7be99557bc2f161f52a7842a6691e3487b2",
-      "reason": "Dolt reset commits an active SQL transaction; the native adapter requires idle transactions. This semantic difference needs its own contract, not an inserted COMMIT that would erase the assertion."
+      "reason": "Intended divergence (dolt divergences: transactions): prolly's version-control operations are transactional and roll back with their transaction, so a hard reset doesn't commit the active SQL transaction as Dolt's does. The adapter runs typed operations only on idle sessions; a port would have to insert a COMMIT that erases the assertion."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
@@ -422,15 +541,7 @@
       "index": 5,
       "name": "dolt_reset(rev) moves HEAD, resets the index, and leaves the working tree alone",
       "source_sha256": "132b2fc5896a967ff25ff007594dffa9374f7649ae257724072f98acfad2bc90",
-      "reason": "Mixed reset and staged/working tree separation have no D1 counterpart. Only hard reset is currently supported."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltResetTestScripts",
-      "index": 0,
-      "name": "CALL DOLT_RESET('--hard') should reset the merge state after uncommitted merge",
-      "source_sha256": "3beb1bcd37dc2863e171d39c216e979fa489ab2ac4c85538cde3f59118fd3e72",
-      "reason": "Merge-state reset requires merge and abort operations beyond the current vc.core adapter contract."
+      "reason": "Not applicable (dolt divergences: no staging area): a mixed reset moves HEAD and resets the index while keeping the working tree; prolly has no index and only does hard resets."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
@@ -438,7 +549,15 @@
       "index": 11,
       "name": "hard reset inserted rows continues auto increment",
       "source_sha256": "cef0aa3b8c3c3014d5cf7b79d6c505619bb97e6305ceaa18794af7dcb3036bc8",
-      "reason": "Intended divergence: a versioned schema's sequences are per branch and recorded in each commit, so a hard reset restores the commit's value and the next generated key is 3, not Dolt's 5 (decided 2026-10-17). Dolt keeps its auto-increment counter outside the working set."
+      "reason": "Intended divergence: a versioned schema's sequences are per branch and recorded in each commit, so a hard reset restores the commit's value and the next generated key is 3, not Dolt's 5 (dolt divergences: sequences are per branch). Dolt keeps its auto-increment counter outside the working set."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltResetTestScripts",
+      "index": 0,
+      "name": "CALL DOLT_RESET('--hard') should reset the merge state after uncommitted merge",
+      "source_sha256": "3beb1bcd37dc2863e171d39c216e979fa489ab2ac4c85538cde3f59118fd3e72",
+      "reason": "Needs cell-wise merge: the setup's merge edits different columns of one row, which Dolt merges and prolly reports as a conflict. Ported once prolly merges cell-wise."
     }
   ]
 }

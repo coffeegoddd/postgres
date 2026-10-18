@@ -41,28 +41,23 @@ zero-based mapping to scenario step IDs and a review note. An empty mapping
 requires a note and makes the case partial, never fully ported. All scenario
 steps must appear in the mapping.
 
-The first tranche preserves all 23 assertion entries from three cases:
+Ports adapt MySQL `CALL` and staging flags to prolly's commit-all
+operations (there is no staging area: `dolt_add` stages nothing), call
+`dolt_*` functions with `SELECT`, capture returned commit IDs instead of
+MySQL variables, use PostgreSQL DDL, and check PostgreSQL SQLSTATEs instead
+of Dolt's error text. Each adaptation that follows from an intended
+divergence names it, from the list of intended divergences from Dolt.
+Upstream `SkipResultsCheck` becomes operation success plus a check of the
+resulting state (on checkout, the active branch); it is not propagated as a
+bypass.
 
-| Source behavior | Scenario |
-| --- | --- |
-| Three independent committed working sets | dolt-checkout-working-set |
-| Create, leave and revisit a branch | dolt-checkout-new-branch |
-| Distinct commits, HEAD/parent/main references and invalid refs | dolt-hashof |
-
-These ports explicitly adapt MySQL CALL/staging flags to native commit-all
-operations, capture returned commit IDs instead of MySQL variables, use
-PostgreSQL identity columns, and check PostgreSQL SQLSTATEs. Upstream
-`SkipResultsCheck` on checkout becomes operation success plus active-branch
-verification; it is not propagated as a bypass.
-
-The manifest also records four deferred cases with concrete reasons. One is
-an intended divergence: a hard reset restores a versioned schema's
-sequences to the commit's values (they are per branch and in each commit),
-where Dolt continues its auto-increment counter.
-An active-transaction reset, mixed reset/staging, and merge-state reset cannot
-be represented by the current adapter without changing the behavior under
-test. Another 1,226 catalog cases remain unreviewed. No subset pass is a claim
-of full Dolt compatibility.
+The manifest also records deferred cases, each with a concrete reason: an
+intended divergence (for example, a hard reset restores a versioned
+schema's sequences to the commit's values, since they are per branch and in
+each commit, where Dolt continues its auto-increment counter), a case that
+doesn't apply (a mixed reset needs the staging area), or a prolly behavior
+still to be fixed. The remaining catalog cases are unreviewed. No subset
+pass is a claim of full Dolt compatibility.
 
 Validate the mappings (omit `--catalog` for an offline excerpt check):
 
@@ -103,18 +98,17 @@ translation or execute arbitrary upstream Go.
 ## CI
 
 Each PR fetches the pinned Dolt source, regenerates the catalog and verifies
-the committed lock and mappings before running the imported scenarios on D1.
-The D1 execution and coverage commands must both exit successfully.
+the committed lock and mappings before running the imported scenarios on
+prolly. The prolly execution and coverage commands must both exit
+successfully.
 
-A separate contract check records the same cases as unsupported on heap,
-prolly, D2, D3a, D3b and D4. Both commands must exit with the expected
-incomplete-coverage status, and the generated ledger must contain exactly
-those six engines, every selected case unsupported, and zero passes, failures,
-not-run cases or credited assertions. This checks truthful capability
-reporting; it does not test VC correctness on those engines. Enabling VC on
-another engine requires moving it into the success gate and updating this
-explicit ledger expectation.
+A separate contract check records the same cases as unsupported on heap.
+Both commands must exit with the expected incomplete-coverage status, and
+the generated ledger must contain exactly that engine, every selected case
+unsupported, and zero passes, failures, not-run cases or credited
+assertions. This checks truthful capability reporting; it does not test VC
+correctness on heap.
 
 The existing `test-logs` artifact includes the generated source catalog,
-mapping review, saved scenarios and runner/server logs, plus separate D1 and
-unsupported-engine coverage reports under `engine-results/dolt-*`.
+mapping review, saved scenarios and runner/server logs, plus separate prolly
+and unsupported-engine coverage reports under `engine-results/dolt-*`.

@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,8 +22,8 @@ func EngineProfile(am string) (Profile, error) {
 	p := Profile{Engine: am}
 	switch am {
 	case "prolly":
-		p.Supported = []string{"sql", "vc.core"}
-		p.Limitations = "Versioned public schema: data commit/branch/hard-reset; no schema-merge or concurrency claim."
+		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff"}
+		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist."
 	case "heap":
 		p.Supported = []string{"sql"}
 		p.Limitations = "Ordinary heap has no version-control capability."
@@ -70,12 +71,14 @@ func (p *Postgres) Verify(ctx context.Context, requires []string) (err error) {
 	if e = probe.Open(ctx, s.Sessions); e != nil {
 		return e
 	}
+	// (once, for any version-control capability)
 	for _, r := range requires {
-		if r == "vc.core" {
+		if strings.HasPrefix(r, "vc.") {
 			_, detail := execute(ctx, s, probe)
 			if detail != "" {
 				return fmt.Errorf("VC canary: %s", detail)
 			}
+			break
 		}
 	}
 	return nil
@@ -215,6 +218,9 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 	switch s.Op {
 	case "commit":
 		sql = "SELECT (dolt_commit('-m', $1))[1]"
+		if len(args) > 1 {
+			sql = "SELECT (dolt_commit(" + placeholders(len(args))[len("$1::text, "):] + ", '-m', $1))[1]"
+		}
 	case "branch":
 		sql = "SELECT dolt_branch($1)"
 		if len(args) == 2 {
@@ -224,12 +230,28 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		sql = "SELECT dolt_checkout($1)"
 	case "reset":
 		sql = "SELECT dolt_reset('--hard', $1)"
+	case "merge", "cherrypick":
+		// the commit made (merge: or fast-forwarded to); empty when none was
+		sql = "SELECT (dolt_" + map[string]string{"merge": "merge", "cherrypick": "cherry_pick"}[s.Op] + "(" + placeholders(len(args)) + "))[1]"
+	case "revert":
+		sql = "SELECT (dolt_revert(" + placeholders(len(args)) + "))[1]"
 	default:
 		return Outcome{}, fmt.Errorf("unsupported operation %s", s.Op)
 	}
 	o, err := p.query(ctx, c, sql, args)
 	if err != nil || o.SQLState != "" {
 		return o, err
+	}
+	// A revert returns its status; what it committed is the new head, read
+	// only when it committed (status 0).
+	if s.Op == "revert" && len(o.Rows) == 1 && len(o.Rows[0]) == 1 && o.Rows[0][0] != nil && *o.Rows[0][0] == "0" {
+		head, e := p.must(ctx, c, "SELECT dolt_hashof('HEAD')")
+		if e != nil {
+			return o, e
+		}
+		o.Rows = head.Rows
+	} else if s.Op == "revert" {
+		o.Rows = [][]*string{{nil}}
 	}
 	if s.Op == "checkout" {
 		check, e := p.must(ctx, c, "SELECT active_branch()")
@@ -241,6 +263,15 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		}
 	}
 	return o, nil
+}
+
+// "$1::text, ..., $n::text": Dolt's arguments, for a variadic text call.
+func placeholders(n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("$%d::text", i+1)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (p *Postgres) CheckTarget(ctx context.Context, session string) error {

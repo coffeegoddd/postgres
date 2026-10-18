@@ -60,14 +60,15 @@ type Scenario struct {
 }
 
 type Step struct {
-	ID      string    `json:"id"`
-	Session string    `json:"session"`
-	Op      string    `json:"op"`
-	SQL     string    `json:"sql,omitempty"`
-	Params  []Value   `json:"params,omitempty"`
-	Args    []Value   `json:"args,omitempty"`
-	Save    string    `json:"save,omitempty"`
-	Expect  *Expected `json:"expect,omitempty"`
+	ID       string    `json:"id"`
+	Session  string    `json:"session"`
+	Op       string    `json:"op"`
+	Requires []string  `json:"requires,omitempty"`
+	SQL      string    `json:"sql,omitempty"`
+	Params   []Value   `json:"params,omitempty"`
+	Args     []Value   `json:"args,omitempty"`
+	Save     string    `json:"save,omitempty"`
+	Expect   *Expected `json:"expect,omitempty"`
 }
 
 type Expected struct {
@@ -111,7 +112,7 @@ func (s Scenario) Validate() error {
 	}
 	requires := map[string]bool{}
 	for _, r := range s.Requires {
-		if (r != "sql" && r != "vc.core") || requires[r] {
+		if _, ok := Capabilities[r]; !ok || requires[r] {
 			return fmt.Errorf("unknown or duplicate capability %q", r)
 		}
 		requires[r] = true
@@ -119,6 +120,9 @@ func (s Scenario) Validate() error {
 	if !requires["sql"] {
 		return fmt.Errorf("sql capability is required")
 	}
+	// The scenario requires exactly what its steps need: a capability it
+	// doesn't use would wrongly report it unsupported on an engine.
+	used := map[string]bool{"sql": true}
 	sessions := map[string]bool{}
 	for _, n := range s.Sessions {
 		if !identifier.MatchString(n) || sessions[n] {
@@ -133,17 +137,36 @@ func (s Scenario) Validate() error {
 		}
 		ids[st.ID] = true
 		isSQL := st.Op == "exec" || st.Op == "query"
+		if _, typed := opCapability[st.Op]; !isSQL && !typed {
+			return fmt.Errorf("%s: unknown operation %q", st.ID, st.Op)
+		}
+		need, err := stepRequires(st)
+		if err != nil {
+			return err
+		}
+		for _, c := range need {
+			if !requires[c] {
+				return fmt.Errorf("%s: needs capability %s, which the scenario doesn't require", st.ID, c)
+			}
+			used[c] = true
+		}
 		if isSQL {
 			if st.SQL == "" || len(st.Args) != 0 || st.Save != "" {
 				return fmt.Errorf("%s: SQL steps require sql, optional params, no args/save", st.ID)
 			}
 		} else {
-			if !requires["vc.core"] || st.SQL != "" || len(st.Params) != 0 {
-				return fmt.Errorf("%s: VC steps require vc.core and args only", st.ID)
+			if st.SQL != "" || len(st.Params) != 0 {
+				return fmt.Errorf("%s: VC steps take args only", st.ID)
 			}
 			n := len(st.Args)
 			switch st.Op {
-			case "commit", "checkout", "reset":
+			case "commit":
+				// the message, then any of Dolt's other flags
+				// (--allow-empty, --author name)
+				if n < 1 {
+					return fmt.Errorf("%s: commit takes a message and optional flags", st.ID)
+				}
+			case "checkout", "reset":
 				if n != 1 {
 					return fmt.Errorf("%s: %s takes one argument", st.ID, st.Op)
 				}
@@ -151,8 +174,12 @@ func (s Scenario) Validate() error {
 				if n < 1 || n > 2 {
 					return fmt.Errorf("%s: branch takes name and optional start ref", st.ID)
 				}
-			default:
-				return fmt.Errorf("%s: unknown operation %q", st.ID, st.Op)
+			case "merge", "cherrypick", "revert":
+				// Dolt's arguments, flags included (--no-ff, --abort,
+				// --continue, ...), passed through as they are.
+				if n < 1 {
+					return fmt.Errorf("%s: %s needs arguments", st.ID, st.Op)
+				}
 			}
 			for _, a := range st.Args {
 				if a.Text == nil && a.Ref == "" {
@@ -161,12 +188,14 @@ func (s Scenario) Validate() error {
 			}
 		}
 		errExpected := st.Expect != nil && st.Expect.SQLState != ""
-		if st.Op == "commit" && !errExpected {
-			if !identifier.MatchString(st.Save) || bindings[st.Save] {
-				return fmt.Errorf("%s: commit needs a unique save binding", st.ID)
-			}
-		} else if st.Save != "" {
-			return fmt.Errorf("%s: save is only valid on successful commits", st.ID)
+		// A commit's id is always captured; a merge's, pick's or revert's
+		// when the scenario names it (they can end without a commit).
+		saves := st.Op == "commit" || st.Op == "merge" || st.Op == "cherrypick" || st.Op == "revert"
+		if st.Op == "commit" && !errExpected && st.Save == "" {
+			return fmt.Errorf("%s: commit needs a unique save binding", st.ID)
+		}
+		if st.Save != "" && (!saves || errExpected || !identifier.MatchString(st.Save) || bindings[st.Save]) {
+			return fmt.Errorf("%s: save is only valid, and unique, on successful commits, merges, picks and reverts", st.ID)
 		}
 		values := append(append([]Value{}, st.Params...), st.Args...)
 		if e := st.Expect; e != nil {
@@ -205,6 +234,11 @@ func (s Scenario) Validate() error {
 		}
 		if st.Save != "" {
 			bindings[st.Save] = true
+		}
+	}
+	for r := range requires {
+		if !used[r] {
+			return fmt.Errorf("requires %s, which no step needs", r)
 		}
 	}
 	return nil

@@ -39,12 +39,20 @@ func manifestAt(t *testing.T, root string) Manifest {
 	}
 	return m
 }
+
+// The reviewed corpus: a port added or deferred updates these.
+const (
+	reviewedPorts      = 4
+	reviewedAssertions = 24
+	reviewedDeferred   = 4
+)
+
 func TestReviewedCorpus(t *testing.T) {
 	r, err := Verify(fixture, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != 3 || r.MappedAssertions != 23 || r.DeferredCases != 4 || r.UnreviewedCases != 1226 || len(r.Engines) != 0 {
+	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != reviewedPorts || r.MappedAssertions != reviewedAssertions || r.DeferredCases != reviewedDeferred || r.UnreviewedCases != 1233-reviewedPorts-reviewedDeferred || len(r.Engines) != 0 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -121,7 +129,7 @@ func TestExplicitOmissionIsPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.PortedCases != 2 || r.PartialCases != 1 || r.MappedAssertions != 22 || r.OmittedAssertions != 1 {
+	if r.PortedCases != reviewedPorts-1 || r.PartialCases != 1 || r.MappedAssertions != reviewedAssertions-1 || r.OmittedAssertions != 1 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -155,15 +163,22 @@ func passing(t *testing.T) execution {
 	return e
 }
 func TestExecutionAccounting(t *testing.T) {
+	// what the first port earns when it passes
+	first := 0
+	for _, a := range manifestAt(t, fixture).Ports[0].Assertions {
+		if len(a.Steps) > 0 {
+			first++
+		}
+	}
 	tests := []struct {
 		name                        string
 		mutate                      func(*execution)
 		wantErr                     bool
 		passed, credit, unsupported int
 	}{
-		{"all pass", func(*execution) {}, false, 3, 23, 0},
-		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, 2, 12, 1},
-		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, 2, 12, 0},
+		{"all pass", func(*execution) {}, false, reviewedPorts, reviewedAssertions, 0},
+		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, reviewedPorts - 1, reviewedAssertions - first, 1},
+		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, reviewedPorts - 1, reviewedAssertions - first, 0},
 		{"missing case", func(e *execution) { e.Results = e.Results[1:] }, true, 0, 0, 0},
 		{"duplicate case", func(e *execution) { e.Results = append(e.Results, e.Results[0]) }, true, 0, 0, 0},
 		{"truncated pass", func(e *execution) { e.Results[0].Steps = nil }, true, 0, 0, 0},

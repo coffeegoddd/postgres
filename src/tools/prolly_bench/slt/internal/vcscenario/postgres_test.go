@@ -10,7 +10,7 @@ import (
 
 func TestBundledScenariosAndCapabilityExclusions(t *testing.T) {
 	paths, err := filepath.Glob("cases/*.json")
-	if err != nil || len(paths) != 2 {
+	if err != nil || len(paths) != 3 {
 		t.Fatalf("cases: %v %v", paths, err)
 	}
 	for _, path := range paths {
