@@ -52,7 +52,8 @@
  *   transaction ends (another collection meanwhile is refused, as is one
  *   in a transaction that used the store), seals the journal, and numbers
  *   the chunks collected (slots 0 .. *nslots - 1): the sealed segments',
- *   and the table files' (with full all of them, else those not settled),
+ *   and the table files' (as scope says: those not settled, all of them,
+ *   or none),
  *   each file's slots together, as gc_files() visits them; *root is the
  *   root as of the seal.  gc_find() gives a chunk's slot (-1: not collected), gc_read() a
  *   slot's bytes.  gc_new() visits what is new since the seal, or since its
@@ -60,7 +61,8 @@
  *   for the transactions that appended to the sealed segments and were in
  *   progress at the seal, and with window true it holds every append off
  *   until gc_swap().  gc_copy() writes the marked slots (but those of files
- *   kept whole) to new, settled table files, before the window; gc_swap()
+ *   kept whole) to new table files (settled, unless the scope is the
+ *   journal), before the window; gc_swap()
  *   writes those marked since, and replaces the manifest: the new files and
  *   those kept, the segment appends go to, the next GC generation.  What
  *   was collected and not kept is no longer found; gc_retire() removes it
@@ -135,6 +137,19 @@ typedef void (*ProllyChunkGcVisit) (const ProllyHash *hash, const char *data,
  */
 typedef void (*ProllyChunkGcFileVisit) (int file, uint64 first, uint64 nslots,
 										bool settled, uint64 size, void *arg);
+
+/*
+ * What a collection collects: by default the journal's sealed segments and
+ * the table files not settled; full, every file; the journal, its sealed
+ * segments only.  What a collection of the journal writes isn't settled
+ * (it may be told to keep what nothing names: a move).
+ */
+typedef enum ProllyGcScope
+{
+	PROLLY_GC_DEFAULT,
+	PROLLY_GC_FULL,
+	PROLLY_GC_JOURNAL,
+} ProllyGcScope;
 
 /*
  * Visits a table file or segment: its name, its chunk count, its size in
@@ -217,7 +232,7 @@ typedef struct ProllyChunkStoreRoutine
 							 ProllyChunkFileVisit visit, void *arg);
 
 	/* Garbage collection: marks are a bit a slot, slot 0 the low bit of 0. */
-	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, bool full,
+	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, ProllyGcScope scope,
 								ProllyHash *root, uint64 *nslots);
 	void		(*gc_files) (ProllyChunkGc *gc, ProllyChunkGcFileVisit visit,
 							 void *arg);

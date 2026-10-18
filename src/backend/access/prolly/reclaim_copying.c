@@ -204,7 +204,9 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
-	mk.gc = PROLLY_CALL(cs, gc_begin, store, full, &root, &mk.nslots);
+	mk.gc = PROLLY_CALL(cs, gc_begin, store,
+						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT,
+						&root, &mk.nslots);
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
 	mk.cap = 1024;
@@ -258,10 +260,10 @@ mark_none(const ProllyHash *hash, const char *data, Size len, void *arg)
 }
 
 /*
- * A default collection with every chunk marked: the journal's sealed
- * segments and the table files not settled rewritten as one settled file,
- * nothing dropped.  (It is closed under what its chunks name: those
- * outside it are in the settled files, which are.)
+ * A collection of the journal with every chunk marked: its sealed segments
+ * rewritten as one table file, not settled (it keeps garbage, which the
+ * next default collection collects), nothing dropped; the table files are
+ * left as they are.  Copying is paced as marking is.
  */
 static void
 copying_move(ProllyGcResult *result)
@@ -276,7 +278,7 @@ copying_move(ProllyGcResult *result)
 	int			nfiles = 0;
 	bool	   *keep;
 
-	gc = PROLLY_CALL(cs, gc_begin, store, false, &root, &nslots);
+	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, &root, &nslots);
 	marks = MemoryContextAllocHuge(CurrentMemoryContext, nslots / 8 + 1);
 	memset(marks, 0xFF, nslots / 8 + 1);
 	PROLLY_CALL(cs, gc_files, gc, count_file, &nfiles);

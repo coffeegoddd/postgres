@@ -22,10 +22,11 @@
  *   kept whole), or every chunk if full; result says what was kept and
  *   freed.  A crash at any point leaves the store as it was or as the
  *   collection made it, never with a live chunk missing.
- * - move() is a default collection that keeps every chunk: what was
- *   written since the last collection is rewritten into the store's
- *   settled files, garbage and all, so the journal a backend indexes by
- *   reading it stays short.  It frees nothing.
+ * - move() rewrites the journal's sealed segments into a table file, every
+ *   chunk, garbage and all (not settled: the next default collection still
+ *   collects it), so the journal a backend indexes by reading it stays
+ *   short.  It frees nothing, and leaves the table files as they are.
+ *   Optional.
  *
  * Provisional (v0).
  *

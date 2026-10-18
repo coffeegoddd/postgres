@@ -134,6 +134,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "commands/vacuum.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -3609,6 +3610,7 @@ struct ProllyChunkGc
 	MemoryContext cxt;
 	int			level;			/* the transaction nesting level it began at */
 	bool		full;
+	bool		settle;			/* the files written are settled */
 	Manifest	m;				/* as the seal left it */
 	uint64		segment;		/* where appends go from the seal */
 	int			nfiles;
@@ -3881,9 +3883,10 @@ gc_add_segment(ProllyChunkGc *gc, GcFile *f)
 }
 
 static ProllyChunkGc *
-journal_gc_begin(ProllyChunkStore *s, bool full, ProllyHash *root,
+journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 				 uint64 *nslots)
 {
+	bool		full = (scope == PROLLY_GC_FULL);
 	MemoryContext cxt;
 	MemoryContext old;
 	ProllyChunkGc *gc;
@@ -3929,6 +3932,7 @@ journal_gc_begin(ProllyChunkStore *s, bool full, ProllyHash *root,
 	gc->s = s;
 	gc->cxt = cxt;
 	gc->full = full;
+	gc->settle = (scope != PROLLY_GC_JOURNAL);
 	gc->level = GetCurrentTransactionNestLevel();
 
 	/*
@@ -3983,7 +3987,7 @@ journal_gc_begin(ProllyChunkStore *s, bool full, ProllyHash *root,
 		GcFile	   *f;
 		bool		settled = (gc->m.files[i].flags & MANIFEST_FILE_SETTLED) != 0;
 
-		if (settled && !full)
+		if ((settled && !full) || scope == PROLLY_GC_JOURNAL)
 			continue;
 		f = &gc->files[n++];
 		f->id = gc->m.files[i].id;
@@ -4183,6 +4187,7 @@ typedef struct GcCopy
 	const bool *keep;
 	uint64		next;
 	const ProllyHashRoutine *hash;
+	bool		paced;			/* by the cost-based vacuum delay */
 } GcCopy;
 
 static bool
@@ -4205,6 +4210,14 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 		gc->copied[slot / 8] |= 1 << (slot % 8);
 		journal_gc_read(gc, slot, data);
 
+		/* (read and written: a page missed and one dirtied) */
+		if (gcc->paced)
+		{
+			if (VacuumCostActive)
+				VacuumCostBalance += VacuumCostPageMiss + VacuumCostPageDirty;
+			vacuum_delay_point(false);
+		}
+
 		/* checked as it is copied: its bytes are its hash's */
 		ctx = PROLLY_CALL(gcc->hash, begin, CurrentMemoryContext);
 		PROLLY_CALL(gcc->hash, update, ctx, (const uint8 *) data->data, data->len);
@@ -4219,11 +4232,15 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 	return false;
 }
 
-/* Write the marked slots not yet written (but kept files') to a new file. */
+/*
+ * Write the marked slots not yet written (but kept files') to a new file;
+ * paced by the cost-based vacuum delay where one is active (not in the
+ * window, where interrupts are held).
+ */
 static void
-gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
+gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 {
-	GcCopy		gcc = {gc, marks, keep, 0, prolly_hash_lookup("sha256")};
+	GcCopy		gcc = {gc, marks, keep, 0, prolly_hash_lookup("sha256"), paced};
 	uint32		nchunks;
 	uint64		size;
 
@@ -4237,7 +4254,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 		f->id = gc->next_id++;
 		f->nchunks = nchunks;
 		f->size = size;
-		f->flags = MANIFEST_FILE_SETTLED;
+		f->flags = gc->settle ? MANIFEST_FILE_SETTLED : 0;
 		gc->written = lappend(gc->written, f);
 		MemoryContextSwitchTo(old);
 	}
@@ -4294,7 +4311,7 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 	HASH_SEQ_STATUS status;
 	GcSlot	   *e;
 
-	gc_write(gc, marks, keep);
+	gc_write(gc, marks, keep, true);
 	INJECTION_POINT("prolly-gc-copied", NULL);
 
 	hashes = MemoryContextAllocHuge(gc->cxt, (gc->nslots + 1) * (Size) gc->hash_len);
@@ -4359,7 +4376,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	uint64		window_usec;
 
 	Assert(gc->window);
-	gc_write(gc, marks, keep);
+	gc_write(gc, marks, keep, false);
 
 	memset(&nm, 0, sizeof(nm));
 	nm.gc_generation = gc->m.gc_generation + 1;
