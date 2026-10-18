@@ -13,6 +13,7 @@
   prolly_bench table [DIR ...]                  engines side by side, per metric
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
   prolly_bench scounters RUN RUN2               S counter runs of one build: unstable counters
+  prolly_bench scalibrate --counters ... --timing ...   S gate: the noise of A/A runs
 """
 
 from __future__ import annotations
@@ -472,6 +473,17 @@ def main(argv=None) -> int:
     sc.add_argument("--instructions-tolerance", type=float, default=0.01,
                     help="relative difference instruction counts may have (default 0.01)")
     sc.set_defaults(fn=scounters.run)
+
+    from pbench import scalibrate
+    cal = sub.add_parser("scalibrate", help="S suite gate: noise of A/A counter and timing runs")
+    cal.add_argument("--counters", type=Path, nargs="*", default=[],
+                     help="counter runs of one build (configs/s_counters.toml)")
+    cal.add_argument("--timing", type=Path, nargs="*", default=[],
+                     help="timing runs of one build against itself (configs/s_pr.toml)")
+    cal.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
+    cal.add_argument("--out", type=Path, help="Markdown report")
+    cal.add_argument("--json", type=Path)
+    cal.set_defaults(fn=scalibrate.run)
 
     from pbench import complexity
     growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")

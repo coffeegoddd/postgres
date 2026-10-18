@@ -473,3 +473,44 @@ Decided by the user 2026-10-18, as recommended:
    both suites; `perf_accept.toml` under CODEOWNERS (a review request,
    not enforced); the nightly the
    360-cell shape, not `standard.toml`.
+
+## 8. Calibration (part 3.5): the tooling, and what is measured so far
+
+**Status: the hosted A/A data is pending.** The tooling is built (#244);
+the thresholds below are the proposed starting points, provisional until
+the hosted runs are recorded here.
+
+- `.github/workflows/performance-calibration.yml` runs the A/A
+  calibration on GitHub-hosted runners: one release build, then ten
+  runners, each with four counter runs of that build
+  (`s_counters.toml`) and one timing run of it against itself
+  (`s_pr.toml`, `--pg-bin base=X,candidate=X`); it probes each runner
+  for hardware instruction counters and records the answer. It runs by
+  hand and on a pull request that changes it.
+- `prolly_bench scalibrate` measures each counter's stability, the
+  instruction noise, each timing cell's interval width and how often an
+  A/A cell regresses at 5% and 10%, and the counter gate's false
+  failures: the gate applied to four distinct runs as base, base again,
+  candidate and candidate again (all choices, or a seeded sample of
+  2,000). It suggests settings: an instruction tolerance twice the
+  largest spread, and, if the gate fails A/A runs 1% of the time or more,
+  floors twice the largest difference it failed on.
+- `src/tools/prolly_bench/configs/s_gate.toml` holds the settings the
+  gate uses: today relative 5%, floors of 8 events and 8 KB, instruction
+  tolerance 1%, timing threshold 5% (reported only on hosted runners),
+  3 attempts.
+
+**Measured on a development machine** (not a hosted runner; 2026-10-18,
+release builds, two counter runs of heap and prolly, S13 left out):
+every counter of S1, S2, S3, S4, S8 and S10's three tests took the same
+value in both runs (305 of 315 counters); S7's WAL, full-page-image,
+extend and relation-size counters varied by under 4%, because GiST
+breaks ties between equally good pages at random (`gistchoose()`), which
+no setting seeds, so the gate reports them as unstable in the base.
+Two causes of variation were removed: S7's update drew its new point from
+the server's unseeded `random()` (it now uses pgbench's seed), and
+`ANALYZE` sampled rows at random (the counter shape's statistics target
+now makes it read every row). User-space instructions, counted with
+`perf stat`, varied by at most 0.17% (S4), most cells by under 0.01%.
+A timing A/A run on the same, busy machine (5 s windows) gave ratios of
+0.93 to 1.02 with every interval containing 1.

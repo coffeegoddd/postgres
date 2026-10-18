@@ -1,0 +1,175 @@
+# Calibration of the S suite's gate: the same build against itself (A/A) on
+# GitHub-hosted runners, ten times over, to measure the noise the gate must
+# live with: each counter's stability, the instruction counts' noise (where
+# the runners have hardware counters), and the width of the timing
+# intervals.  prolly_bench scalibrate summarizes all of it and suggests the
+# gate's floors and tolerances (configs/s_gate.toml).
+#
+# Runs by hand, and on a pull request that changes this file (so the pull
+# request that brings it measures the noise it is for).
+
+name: performance calibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'A/A runs (one per runner)'
+        default: '10'
+  pull_request:
+    paths:
+      - '.github/workflows/performance-calibration.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-calibration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      runs: ${{ steps.runs.outputs.runs }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: How many runs
+        id: runs
+        env:
+          RUNS: ${{ github.event.inputs.runs || '10' }}
+        run: echo "runs=[$(seq -s , 1 "$RUNS")]" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync
+
+      - name: Build attested release binaries
+        run: |
+          bash src/tools/prolly_bench/build_postgres.sh --jobs 4 \
+            --build-dir "$PWD/build-bench/server" -- --with-openssl
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Fetch pinned BenchBase source
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/benchbase
+          ref: a3a748326f4d1e615fd12db4a6ae59a60190a6ee
+          path: benchbase-source
+
+      - name: Build BenchBase
+        run: bash src/tools/prolly_bench/build_benchbase.sh "$PWD/benchbase-source"
+
+      - name: Pack the server and BenchBase
+        run: |
+          tar -czf s-build.tgz build-bench/server/inst \
+            build-bench/benchbase/benchbase-postgres build-bench/benchbase/BUILD_COMMIT
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: s-calibration-build
+          path: s-build.tgz
+          retention-days: 3
+
+  a-a:
+    name: A/A ${{ matrix.run }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.build.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: s-calibration-build
+
+      - name: Unpack, install clients, and allow counting instructions
+        run: |
+          tar -xzf s-build.tgz
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sysbench \
+            "linux-tools-$(uname -r)" linux-tools-common || \
+            sudo apt-get install -y --no-install-recommends sysbench
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Probe for hardware instruction counters
+        working-directory: src/tools/prolly_bench
+        run: |
+          python3 -c 'from pbench.collectors.instructions import probe; print(probe())' \
+            | tee "$RUNNER_TEMP/probe.txt"
+
+      - name: Counter runs, four of one build
+        run: |
+          bin="$PWD/build-bench/server/inst/bin"
+          for i in 1 2 3 4; do
+            src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
+              --config src/tools/prolly_bench/configs/s_counters.toml --pg-bin "$bin" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/aa/counters-${{ matrix.run }}-$i"
+          done
+          cp "$RUNNER_TEMP/probe.txt" aa/
+
+      - name: Timing, the build against itself
+        run: |
+          bin="$PWD/build-bench/server/inst/bin"
+          src/tools/prolly_bench/prolly_bench run S --am heap,prolly \
+            --config src/tools/prolly_bench/configs/s_pr.toml \
+            --pg-bin "base=$bin,candidate=$bin" \
+            --work-dir "$RUNNER_TEMP/work" --out "$PWD/aa/timing-${{ matrix.run }}"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-calibration-${{ matrix.run }}
+          path: aa
+          retention-days: 30
+
+  summary:
+    name: calibration summary
+    needs: a-a
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: s-calibration-[0-9]*
+          path: runs
+          merge-multiple: true
+
+      - name: Measure the noise
+        run: |
+          mkdir -p calibration
+          cat runs/probe.txt > calibration/probe.txt || true
+          src/tools/prolly_bench/prolly_bench scalibrate \
+            --counters runs/counters-* --timing runs/timing-* \
+            --thresholds src/tools/prolly_bench/configs/s_gate.toml \
+            --out calibration/calibration.md --json calibration/calibration.json
+          { echo '```'; cat calibration/probe.txt; echo '```'; cat calibration/calibration.md; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-calibration-summary
+          path: calibration
+          retention-days: 90

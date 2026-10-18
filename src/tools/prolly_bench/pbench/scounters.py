@@ -82,6 +82,42 @@ def counters(results: list[dict], engine: str) -> dict[CellId, CellCounters]:
     return out
 
 
+# The counter rule's defaults: a counter regresses when it is more than
+# relative above the base's and, in total, more than its kind's floor above
+# it.  configs/s_gate.toml (set by calibration) overrides them.
+DEFAULTS = {"relative": 0.05, "floor_events": 8.0, "floor_bytes": 8192.0,
+            "floor_instructions": 0.0, "instructions_tolerance": 0.01,
+            "timing_threshold": 0.05, "attempts": 3}
+
+
+def thresholds(path: Optional[Path] = None) -> dict:
+    out = dict(DEFAULTS)
+    if path:
+        import tomllib
+        with open(path, "rb") as f:
+            raw = tomllib.load(f).get("gate", {})
+        unknown = set(raw) - set(DEFAULTS)
+        if unknown:
+            raise ValueError(f"{path}: unknown gate settings {sorted(unknown)}")
+        out.update(raw)
+    return out
+
+
+def change(metric: str, base: float, cand: float, t: dict) -> str:
+    """"regression", "improvement" or "" (the same, by the rule)."""
+    delta = cand - base
+    relative = t["relative"]
+    if kind(metric) == "instructions":
+        relative = max(relative, t["instructions_tolerance"])
+    floor = {"events": t["floor_events"], "bytes": t["floor_bytes"],
+             "instructions": t["floor_instructions"]}[kind(metric)]
+    if delta > floor and (base == 0 or delta / base > relative):
+        return "regression"
+    if -delta > floor and (base == 0 or -delta / base > relative):
+        return "improvement"
+    return ""
+
+
 def differs(a: float, b: float, metric: str, tolerance: float) -> bool:
     if kind(metric) == "instructions":
         return abs(a - b) > tolerance * max(abs(a), abs(b), 1.0)

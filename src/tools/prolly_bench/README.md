@@ -280,6 +280,15 @@ read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
 Its numbers only compare builds (`comparison_only`), so it may run with
 `synchronous_commit = off`; they are never reported as the procedure's.
 
+## Calibrating the gate
+
+`prolly_bench scalibrate --counters RUN ... --timing RUN ...` measures the
+noise of A/A runs (one build against itself): each counter's stability, the
+instruction counts' spread, the timing intervals' widths, and how often the
+gate would fail a pull request that changed nothing; it suggests the gate's
+settings (`configs/s_gate.toml`).  `.github/workflows/performance-calibration.yml`
+runs it on GitHub's hosted runners.
+
 ## Targets
 
 `prolly` tables exist only in versioned schemas, and with `prolly` as the
