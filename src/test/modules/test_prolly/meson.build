@@ -87,6 +87,7 @@ tests += {
   'tap': {
     'env': {
        'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+       'with_ssl': ssl_library,
     },
     'tests': [
       't/028_bmap_storage.pl',
@@ -108,6 +109,7 @@ tests += {
       't/044_merge_violations.pl',
       't/045_remotes.pl',
       't/046_branch_crash.pl',
+      't/047_network_remotes.pl',
       't/053_serve_snapshots.pl',
     ],
   },

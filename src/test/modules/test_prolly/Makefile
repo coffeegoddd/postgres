@@ -25,6 +25,7 @@ EXTRA_INSTALL = contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_r
 	src/test/modules/injection_points
 
 export enable_injection_points
+export with_ssl
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

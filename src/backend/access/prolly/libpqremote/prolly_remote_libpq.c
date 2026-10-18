@@ -45,6 +45,7 @@ struct ProllyRemote
 {
 	PGconn	   *conn;
 	char	   *where;			/* host and database, for messages */
+	bool		in_transaction; /* a BEGIN sent, not ended */
 };
 
 static uint32 we_connect;
@@ -140,6 +141,8 @@ remote_error(ProllyRemote *r, PGresult *res, const char *what)
 			 errcontext("%s on remote %s", what, r->where)));
 }
 
+static void run_command(ProllyRemote *r, const char *sql, const char *what);
+
 /* Run a statement there; its result, which the caller clears. */
 static PGresult *
 run(ProllyRemote *r, const char *sql, int nparams, const Oid *types,
@@ -149,6 +152,12 @@ run(ProllyRemote *r, const char *sql, int nparams, const Oid *types,
 	PGresult   *res;
 	ExecStatusType status;
 
+	/* (the transaction a push's commit ended, begun again when needed) */
+	if (!r->in_transaction)
+	{
+		r->in_transaction = true;
+		run_command(r, "BEGIN", "beginning");
+	}
 	res = libpqsrv_exec_params(r->conn, sql, nparams, types, values, lengths,
 							   formats, result_format, we_result);
 	status = PQresultStatus(res);
@@ -201,6 +210,7 @@ libpq_open(const char *url, bool create)
 	}
 	PG_TRY();
 	{
+		r->in_transaction = true;
 		run_command(r, "BEGIN", "beginning");
 	}
 	PG_CATCH();
@@ -255,13 +265,11 @@ result_hash(ProllyRemote *r, PGresult *res, int row, int col, ProllyHash *h)
 {
 	int			len = PQgetlength(res, row, col);
 
+	/* (res the caller's to clear, on an error too) */
 	if (len <= 0 || len > PROLLY_HASH_MAX_LEN)
-	{
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("remote %s sent a hash of %d bytes", r->where, len)));
-	}
 	memset(h, 0, sizeof(*h));
 	h->len = len;
 	memcpy(h->bytes, PQgetvalue(res, row, col), len);
@@ -456,7 +464,8 @@ libpq_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
 	moved = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 	PQclear(res);
 	run_command(r, moved ? "COMMIT" : "ROLLBACK", "ending the push");
-	run_command(r, "BEGIN", "beginning");
+	/* (the next statement begins again: a push committed is pushed) */
+	r->in_transaction = false;
 	return moved;
 }
 

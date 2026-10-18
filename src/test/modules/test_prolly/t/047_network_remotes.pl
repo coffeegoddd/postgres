@@ -99,7 +99,7 @@ is(o('fresh', 'SELECT count(*) FROM n.t'), '202', 'with its rows');
 # a role that isn't a superuser: a password, used, and pg_prolly_fetch
 o('postgres', q{CREATE ROLE alice LOGIN PASSWORD 'secret'});
 # (alice authenticates with her password; everyone else as before)
-prepend_hba("local all alice scram-sha-256\n");
+prepend_hba("local all alice scram-sha-256\nhost all alice 127.0.0.1/32 scram-sha-256\nhost all alice ::1/128 scram-sha-256\n");
 $origin->reload;
 l('c', q{CREATE ROLE bob; GRANT pg_prolly_fetch TO bob});
 my $alice = 'postgresql:///postgres?host=' . $origin->host . '&port=' . $origin->port .
@@ -118,7 +118,12 @@ o('postgres', 'GRANT pg_prolly_fetch TO alice');
 ($ret, $out, $err) = $local->psql('c', q{SET ROLE bob; SELECT dolt_fetch('as_alice_pw')});
 is($ret, 0, 'fetched with both') or diag($err);
 
-# a remote that takes TLS connections only
+# a remote that takes TLS connections only (a build with OpenSSL)
+if ($ENV{with_ssl} ne 'openssl')
+{
+	done_testing();
+	exit;
+}
 my $ssl = $origin->data_dir;
 copy("$FindBin::Bin/../../../ssl/ssl/server-cn-only.crt", "$ssl/server.crt") or die;
 copy("$FindBin::Bin/../../../ssl/ssl/server-cn-only.key", "$ssl/server.key") or die;
