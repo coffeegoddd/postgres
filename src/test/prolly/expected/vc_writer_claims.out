@@ -1,0 +1,147 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_insert b_insert a_dolt b_insert a_owner b_reset
+mode 
+-----
+owned
+(1 row)
+
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob');
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob');
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+bob  
+(1 row)
+
+step b_reset: SELECT dolt_reset('--hard') AS reset;
+reset
+-----
+{0}  
+(1 row)
+
+
+starting permutation: a_begin a_insert b_insert a_commit a_owner a_dolt
+mode 
+-----
+owned
+(1 row)
+
+step a_begin: BEGIN;
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob'); <waiting ...>
+step a_commit: COMMIT;
+step b_insert: <... completed>
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+alice
+(1 row)
+
+step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+
+
+starting permutation: a_begin a_insert b_insert a_rollback a_owner b_reset
+mode 
+-----
+owned
+(1 row)
+
+step a_begin: BEGIN;
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob'); <waiting ...>
+step a_rollback: ROLLBACK;
+step b_insert: <... completed>
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+bob  
+(1 row)
+
+step b_reset: SELECT dolt_reset('--hard') AS reset;
+reset
+-----
+{0}  
+(1 row)
+
+
+starting permutation: a_begin a_insert b_nowait b_insert a_rollback
+mode 
+-----
+owned
+(1 row)
+
+step a_begin: BEGIN;
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step b_nowait: SET dolt.writer_nowait = on;
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob');
+ERROR:  branch "main" is being written
+step a_rollback: ROLLBACK;
+
+starting permutation: a_begin a_insert b_timeout b_insert a_sleep a_rollback
+mode 
+-----
+owned
+(1 row)
+
+step a_begin: BEGIN;
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step b_timeout: SET lock_timeout = '100ms';
+step b_insert: INSERT INTO vwc.t VALUES (4, 'bob'); <waiting ...>
+step a_sleep: SELECT pg_sleep(0.5);
+pg_sleep
+--------
+        
+(1 row)
+
+step b_insert: <... completed>
+ERROR:  canceling statement due to lock timeout
+step a_rollback: ROLLBACK;
+
+starting permutation: a_insert a2_begin a2_insert a_dolt a_owner a2_commit a_dolt a_owner
+mode 
+-----
+owned
+(1 row)
+
+step a_insert: INSERT INTO vwc.t VALUES (2, 'alice');
+step a2_begin: BEGIN;
+step a2_insert: INSERT INTO vwc.t VALUES (3, 'alice too');
+step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+alice
+(1 row)
+
+step a2_commit: COMMIT;
+step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+
+step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
+owner
+-----
+     
+(1 row)
+

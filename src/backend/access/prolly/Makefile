@@ -60,6 +60,8 @@ OBJS = \
 	tree_cow.o \
 	tree_stub.o \
 	valenc_canonical.o \
-	valenc_stub.o
+	valenc_stub.o \
+	writers_modes.o \
+	writers_stub.o
 
 include $(top_srcdir)/src/backend/common.mk

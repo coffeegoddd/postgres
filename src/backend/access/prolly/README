@@ -45,6 +45,7 @@ design choice can be changed later by writing a new implementation:
 	change_finder     prolly_changes.h        pages, stub
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
+	writers           prolly_writers.h        modes, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -112,6 +113,21 @@ holds, so walks reach those trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
+
+
+Writers
+-------
+
+Every write to a branch is noted before it is made (branch_note_write(),
+catalog/branch.h): rows of prolly tables, versioned sequences, and
+versioned objects' catalog rows, unless made on the session's behalf by
+a version-control call.  The writers ("modes", writers_modes.c) decide
+whether the write may go ahead.  In the shared mode every session writes
+every branch, as in Dolt.  In the owned mode a dirty branch is one
+writer's (dolt.writer, by default the session): its pg_branch row records
+the owner, claimed by the first write and forgotten once a commit or
+reset leaves the branch clean, and anyone else's write is refused.  The
+mode is a database setting kept in the refs.
 
 
 Commits

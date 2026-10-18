@@ -427,6 +427,8 @@ copies_make(const char *name, const char *start_point)
 	namestrcpy(&brname, name);
 	values[Anum_pg_branch_oid - 1] = ObjectIdGetDatum(branch);
 	values[Anum_pg_branch_brname - 1] = NameGetDatum(&brname);
+	values[Anum_pg_branch_brownerrole - 1] = ObjectIdGetDatum(InvalidOid);
+	nulls[Anum_pg_branch_browner - 1] = true;	/* (a new branch is clean) */
 	tup = heap_form_tuple(RelationGetDescr(brel), values, nulls);
 	CatalogTupleInsert(brel, tup);
 	heap_freetuple(tup);

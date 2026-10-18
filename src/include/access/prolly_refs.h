@@ -275,6 +275,15 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*branch_move) (const char *name, const ProllyHash *expected,
 								const ProllyHash *head, bool force);
+
+	/*
+	 * The database's setting called name, as config_set() last set it (false
+	 * if it never was), and setting it (value NULL: unset), with the
+	 * transaction.  Settings are the database's own: clones and pushes
+	 * don't carry them.
+	 */
+	bool		(*config_get) (const char *name, StringInfo value);
+	void		(*config_set) (const char *name, const char *value);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
@@ -284,9 +293,9 @@ typedef struct ProllyRefsRoutine
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
-	"branch_move"
+	"branch_move", "config_get", "config_set"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branch_move
+#define PROLLY_REFS_LAST_CALLBACK config_set
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

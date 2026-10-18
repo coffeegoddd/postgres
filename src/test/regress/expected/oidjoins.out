@@ -237,6 +237,7 @@ NOTICE:  checking pg_default_acl {defaclrole} => pg_authid {oid}
 NOTICE:  checking pg_default_acl {defaclnamespace} => pg_namespace {oid}
 NOTICE:  checking pg_init_privs {classoid} => pg_class {oid}
 NOTICE:  checking pg_seclabel {classoid} => pg_class {oid}
+NOTICE:  checking pg_branch {brownerrole} => pg_authid {oid}
 NOTICE:  checking pg_shseclabel {classoid} => pg_class {oid}
 NOTICE:  checking pg_collation {collnamespace} => pg_namespace {oid}
 NOTICE:  checking pg_collation {collowner} => pg_authid {oid}

@@ -1,0 +1,289 @@
+-- Writer modes: in the shared mode (the default) every session writes a
+-- branch; in the owned mode a dirty branch is one writer's (dolt.writer),
+-- claimed by its first write and given up when it is clean again.
+CREATE SCHEMA wm VERSIONED;
+CREATE TABLE wm.t (id int PRIMARY KEY, v text);
+INSERT INTO wm.t VALUES (1, 'base');
+CREATE ROLE wm_other;
+GRANT USAGE ON SCHEMA wm TO wm_other;
+GRANT ALL ON wm.t TO wm_other;
+SELECT length(dolt_commit('-m', 'wm base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+-- Shared: writers mix, and nobody owns the branch.
+SET dolt.writer = 'alice';
+INSERT INTO wm.t VALUES (2, 'alice');
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+SELECT name, dirty, owner, owner_role FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner | owner_role 
+------+-------+-------+------------
+ main | t     |       | 
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- Owned: the first write claims the branch, as a catalog row of the
+-- transaction (gone if it aborts).
+SELECT dolt_writer_mode('owned');
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SET dolt.writer = 'alice';
+BEGIN;
+INSERT INTO wm.t VALUES (2, 'alice');
+ROLLBACK;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+INSERT INTO wm.t VALUES (2, 'alice');
+SELECT name, dirty, owner, owner_role = current_user AS owner_role
+FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner | owner_role 
+------+-------+-------+------------
+ main | t     | alice | t
+(1 row)
+
+-- The owner writes on; anyone else is refused at once, rows and
+-- definitions and sequences alike.
+UPDATE wm.t SET v = 'alice again' WHERE id = 2;
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+CREATE TABLE wm.u (id int);
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+CREATE SEQUENCE wm.s;
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT dolt_commit('-m', 'bob commits alice''s work');
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT * FROM wm.t ORDER BY id;
+ id |      v      
+----+-------------
+  1 | base
+  2 | alice again
+(2 rows)
+
+-- Reads and unversioned writes are anyone's.
+CREATE TABLE wm_plain (id int);
+INSERT INTO wm_plain VALUES (1);
+DROP TABLE wm_plain;
+-- A transaction is one writer's: it can't change writer once it has
+-- written.
+SET dolt.writer = 'alice';
+BEGIN;
+INSERT INTO wm.t VALUES (4, 'alice');
+SET LOCAL dolt.writer = 'bob';
+ERROR:  invalid value for parameter "dolt.writer": "bob"
+DETAIL:  The transaction has written as writer "alice".
+ROLLBACK;
+SET dolt.writer = 'not a writer!';
+ERROR:  invalid value for parameter "dolt.writer": "not a writer!"
+DETAIL:  A writer is made of letters, digits, and ".", "_", "-", "@" or "+".
+SET dolt.writer = 'a_writer_name_far_longer_than_thirty_two_bytes';
+ERROR:  invalid value for parameter "dolt.writer": "a_writer_name_far_longer_than_thirty_two_bytes"
+DETAIL:  A writer is at most 32 bytes.
+-- The owner's commit makes the branch clean, and anyone's to claim.
+SELECT length(dolt_commit('-m', 'alice''s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | bob
+(1 row)
+
+-- A reset by the owner discards the changes and the claim.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- A write that changes nothing still claims (the branch counts as dirty
+-- until a commit or reset says otherwise).
+INSERT INTO wm.t VALUES (5, 'gone');
+DELETE FROM wm.t WHERE id = 5;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | bob
+(1 row)
+
+SET dolt.writer = 'alice';
+INSERT INTO wm.t VALUES (6, 'alice');
+ERROR:  branch "main" has uncommitted changes by writer "bob"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "bob" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT dolt_reset('--hard');	-- (the database's owner discards bob's)
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- Another role can't write as a writer that is a role's, nor take a
+-- branch over without owning the database or being the role.
+SET dolt.writer = 'carol';
+INSERT INTO wm.t VALUES (7, 'carol');
+SET ROLE wm_other;
+INSERT INTO wm.t VALUES (8, 'carol, spoofed');
+ERROR:  writer "carol" of branch "main" is role "dustin"'s
+SELECT dolt_branch('--take', 'main');
+ERROR:  must be the database's owner or role "dustin" to take branch "main" over
+SET dolt.writer = 'dave';
+INSERT INTO wm.t VALUES (8, 'dave');
+ERROR:  branch "main" has uncommitted changes by writer "carol"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "carol" to commit, or take the changes over with dolt_branch('--take', 'main').
+RESET ROLE;
+-- The database's owner takes it over: carol's changes become dave's.
+SET dolt.writer = 'dave';
+SELECT dolt_branch('--take', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | dave
+(1 row)
+
+INSERT INTO wm.t VALUES (8, 'dave');
+SELECT length(dolt_commit('-m', 'carol''s and dave''s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- Branches are owned each on their own.
+SELECT dolt_checkout('-b', 'wm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_f'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (9, 'dave on f');
+SET dolt.writer = 'erin';
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (9, 'erin on main');
+SELECT name, owner FROM dolt_branches() WHERE name IN ('main', 'wm_f') ORDER BY name;
+ name | owner 
+------+-------
+ main | erin
+ wm_f | dave
+(2 rows)
+
+SELECT dolt_checkout('wm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_f'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (10, 'erin on f');
+ERROR:  branch "wm_f" has uncommitted changes by writer "dave"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "dave" to commit, or take the changes over with dolt_branch('--take', 'wm_f').
+SET dolt.writer = 'dave';
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET dolt.writer = 'erin';
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Only the database's owner sets the mode; and back to shared.
+SET ROLE wm_other;
+SELECT dolt_writer_mode('shared');
+ERROR:  must be owner of database contrib_regression
+RESET ROLE;
+SELECT dolt_writer_mode('nobody');
+ERROR:  unknown writer mode "nobody"
+HINT:  The writer modes are "shared" and "owned".
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+RESET dolt.writer;
+REVOKE ALL ON wm.t FROM wm_other;
+REVOKE USAGE ON SCHEMA wm FROM wm_other;
+DROP ROLE wm_other;

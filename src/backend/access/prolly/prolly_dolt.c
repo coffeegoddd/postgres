@@ -42,6 +42,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
+#include "catalog/pg_branch.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
@@ -63,6 +64,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
@@ -72,6 +74,8 @@ static bool dolt_allow_commit_conflicts = false;
 
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
+
+static void writers_note_write(Oid branch, void *arg);
 
 /* a branch to check out once the backend processes normally */
 static char *connect_branch = NULL;
@@ -92,6 +96,8 @@ prolly_session_init(const char *branch)
 								   0,
 								   NULL, NULL, NULL);
 		prolly_autovacuum_init();
+		prolly_writers_init();
+		RegisterBranchWriteCallback(writers_note_write, NULL);
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
 								 "Lets a transaction commit with unresolved merge conflicts.",
 								 "They stay to be resolved later; until then the branch can't commit.",
@@ -264,6 +270,29 @@ diff_merge(void)
 	return dc.diff_merge;
 }
 
+static const ProllyWritersRoutine *
+writers(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.writers;
+}
+
+/* A write to a branch is first its writers' to allow. */
+static void
+writers_note_write(Oid branch, void *arg)
+{
+	PROLLY_CALL(writers(), note_write, branch);
+}
+
+/* The session's branch may be clean again: committed, reset or merged. */
+static void
+settled(void)
+{
+	PROLLY_CALL(writers(), settled, MyBranch);
+}
+
 /* Splits "Name <email>" into its parts; without <...>, all of it is a name. */
 static void
 split_author(const char *author, char **name, char **email)
@@ -373,6 +402,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("nothing to commit"),
 				 errhint("Pass --allow-empty to commit anyway.")));
+	settled();
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -621,6 +651,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	bool		delete = false;
 	bool		copy = false;
 	bool		force = false;
+	bool		take = false;
 	List	   *names = NIL;
 	const char *result[1] = {"0"};
 
@@ -636,6 +667,8 @@ dolt_branch(PG_FUNCTION_ARGS)
 			force = true;
 		else if (strcmp(a, "-c") == 0 || strcmp(a, "--copy") == 0)
 			copy = true;
+		else if (strcmp(a, "--take") == 0)
+			take = true;
 		else if (a[0] == '-')
 			unsupported("dolt_branch", a);
 		else
@@ -645,6 +678,38 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+	if (take)
+	{
+		ListCell   *lc;
+
+		if (delete || copy)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_branch --take takes no other option")));
+		foreach(lc, names)
+		{
+			HeapTuple	tup = SearchSysCache1(BRANCHNAME,
+											  CStringGetDatum((char *) lfirst(lc)));
+			Oid			branch;
+
+			/* (a branch never used has no changes to take) */
+			if (!HeapTupleIsValid(tup))
+			{
+				ProllyHash	head;
+
+				if (!PROLLY_CALL(refs(), resolve, (char *) lfirst(lc), &head))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("branch \"%s\" does not exist",
+									(char *) lfirst(lc))));
+				continue;
+			}
+			branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+			ReleaseSysCache(tup);
+			PROLLY_CALL(writers(), take, branch);
+		}
+		PG_RETURN_DATUM(text_array(1, result));
+	}
 	if (delete)
 	{
 		ListCell   *lc;
@@ -789,6 +854,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[3] = conflicts > 0 ? "conflicts found" : "constraint violations found";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
+	settled();
 	result[0] = hash_hex(&id);
 	result[1] = had_head && same_hash(&id, &theirs) &&
 		!same_hash(&before, &theirs) ? "1" : "0";
@@ -852,8 +918,13 @@ dolt_reset(PG_FUNCTION_ARGS)
 											 PROLLY_CALL(refs(), commit_get, &head, &before) ?
 											 &before : NULL, "reset");
 	}
+	/* (the database's owner discards whoever's changes they are) */
+	if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
+		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		PROLLY_CALL(writers(), take, MyBranch);
 	branch_note_write(MyBranch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+	settled();
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -927,6 +998,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("dolt_cherry_pick changes nothing on the branch"),
 					 errhint("Pass --allow-empty to commit it anyway.")));
+		settled();
 		result[0] = hash_hex(&id);
 		PG_RETURN_DATUM(text_array(4, result));
 	}
@@ -967,6 +1039,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		result[3] = psprintf("%d", nviolations);
 		PG_RETURN_DATUM(text_array(4, result));
 	}
+	settled();
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(4, result));
 }
@@ -1020,6 +1093,8 @@ dolt_revert(PG_FUNCTION_ARGS)
 					 errhint("Revert in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
 		result[0] = "1";
 	}
+	else
+		settled();
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -1203,8 +1278,9 @@ static void
 branch_row(const char *name, const ProllyHash *head, void *arg)
 {
 	BranchRows *br = arg;
-	Datum		values[7];
-	bool		nulls[7] = {0};
+	Datum		values[9];
+	bool		nulls[9] = {0};
+	HeapTuple	tup;
 	ProllyCommitInfo info;
 	ProllyNodeRef ws;
 	ProllyNodeRef committed;
@@ -1242,6 +1318,30 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 			nulls[i] = true;
 		values[6] = BoolGetDatum(true);
 	}
+
+	/* (its owner: the writer whose changes it holds, in an owning mode) */
+	nulls[7] = nulls[8] = true;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+	if (HeapTupleIsValid(tup))
+	{
+		bool		isnull;
+		Datum		owner = SysCacheGetAttr(BRANCHNAME, tup,
+											Anum_pg_branch_browner, &isnull);
+		Oid			role = ((Form_pg_branch) GETSTRUCT(tup))->brownerrole;
+
+		if (!isnull)
+		{
+			values[7] = datumCopy(owner, false, -1);
+			nulls[7] = false;
+		}
+		if (OidIsValid(role))
+		{
+			values[8] = CStringGetTextDatum(GetUserNameFromId(role, true) ?
+											GetUserNameFromId(role, true) : "?");
+			nulls[8] = false;
+		}
+		ReleaseSysCache(tup);
+	}
 	tuplestore_putvalues(br->rsinfo->setResult, br->rsinfo->setDesc, values,
 						 nulls);
 }
@@ -1264,6 +1364,47 @@ dolt_branches(PG_FUNCTION_ARGS)
 	br.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	PROLLY_CALL(refs(), branches, branch_row, &br);
 	return (Datum) 0;
+}
+
+/*
+ * dolt_writer_mode() returns text: the database's writer mode
+ * (dolt_writer_mode_noargs).
+ * dolt_writer_mode(mode text) returns text: sets it (the database's owner
+ * only): "shared" (every session writes every branch), or "owned" (a dirty
+ * branch is one writer's).
+ */
+Datum
+dolt_writer_mode(PG_FUNCTION_ARGS)
+{
+	static const char *const names[] = {
+		[PROLLY_WRITERS_SHARED] = "shared",
+		[PROLLY_WRITERS_OWNED] = "owned",
+	};
+
+	if (PG_NARGS() > 0)
+	{
+		char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		int			m;
+
+		for (m = 0; m < lengthof(names); m++)
+		{
+			if (strcmp(mode, names[m]) == 0)
+				break;
+		}
+		if (m == lengthof(names))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unknown writer mode \"%s\"", mode),
+					 errhint("The writer modes are \"shared\" and \"owned\".")));
+		PROLLY_CALL(writers(), set_mode, (ProllyWriterMode) m);
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(names[PROLLY_CALL(writers(), mode)]));
+}
+
+Datum
+dolt_writer_mode_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_writer_mode(fcinfo);
 }
 
 /* dolt_status's rows ("name\tstatus") by name, which may hold a tab. */

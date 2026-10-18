@@ -17,7 +17,7 @@ $node->safe_psql('postgres', q{
 	CREATE SCHEMA app VERSIONED;
 	CREATE TABLE app.t (id int);
 	SET allow_system_table_mods = on;
-	INSERT INTO pg_branch VALUES (99999, 'other');
+	INSERT INTO pg_branch (oid, brname, brownerrole) VALUES (99999, 'other', 0);
 });
 
 is($node->safe_psql('postgres', q{SELECT test_branch_current()}),

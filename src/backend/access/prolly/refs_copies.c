@@ -93,6 +93,7 @@
 #define TAG_TRACKING	'R'
 #define TAG_UPSTREAM	'U'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
+#define TAG_CONFIG		'C'	/* a database setting */
 
 static bool ready = false;
 
@@ -1928,6 +1929,39 @@ copies_upstream(const char *branch, char **remote, char **remote_branch)
 	return found;
 }
 
+static bool
+copies_config_get(const char *name, StringInfo value)
+{
+	StringInfoData key;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	appendStringInfoChar(&key, TAG_CONFIG);
+	appendStringInfoString(&key, name);
+	found = refs_get(key.data, key.len, value);
+	pfree(key.data);
+	return found;
+}
+
+static void
+copies_config_set(const char *name, const char *value)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_CONFIG);
+	appendStringInfoString(&key, name);
+	if (value)
+		appendStringInfoString(&v, value);
+	refs_put(key.data, key.len, value ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
 typedef struct WalkState
 {
 	ProllyTreeVisitNode visit;
@@ -2268,4 +2302,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.upstream_set = copies_upstream_set,
 	.upstream = copies_upstream,
 	.branch_move = copies_branch_move,
+	.config_get = copies_config_get,
+	.config_set = copies_config_set,
 };

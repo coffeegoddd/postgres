@@ -43,6 +43,7 @@ static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_DIFF_MERGE] = "folded",
 	[PROLLY_IFACE_CANONICALIZER] = "folded",
 	[PROLLY_IFACE_RECLAMATION] = "copying",
+	[PROLLY_IFACE_WRITERS] = "modes",
 };
 
 static const ProllyImplInfo *
@@ -123,6 +124,8 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(copies_profile, PROLLY_IFACE_CANONICALIZER);
 	components->reclamation = (const ProllyReclaimRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_RECLAMATION);
+	components->writers = (const ProllyWritersRoutine *)
+		profile_impl(copies_profile, PROLLY_IFACE_WRITERS);
 }
 
 /* A data tree value's references: its row's. */
