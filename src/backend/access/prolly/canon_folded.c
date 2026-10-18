@@ -895,6 +895,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 static char *qualified_function(Oid fn);
 static void refuse_undescribed(Canon *cn);
 static void describe_casts(Canon *cn);
+static void describe_collations(Canon *cn);
 
 /*
  * Is an object part of a type (a range type's constructors, its cast to its
@@ -1992,6 +1993,57 @@ refuse_undescribed(Canon *cn)
 	}
 
 	describe_casts(cn);
+	describe_collations(cn);
+}
+
+/*
+ * Collations of versioned schemas: "l:" items, each its provider, its
+ * locale (a libc one's LC_COLLATE and LC_CTYPE), its ICU rules (empty if
+ * none) and whether it is deterministic, a line each: what CREATE
+ * COLLATION takes.  (A "c:" item records the version of each collation
+ * that orders keys, these among them.)
+ */
+static void
+describe_collations(Canon *cn)
+{
+	Relation	rel = table_open(CollationRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(tup);
+		CanonItem  *it;
+		bool		isnull;
+		Datum		d;
+
+		if (coll->oid < FirstNormalObjectId || !canon_namespace(coll->collnamespace) ||
+			in_extension(CollationRelationId, coll->oid))
+			continue;
+		it = add_item(cn, "l:", qualified(coll->collnamespace, NameStr(coll->collname)));
+		appendStringInfo(&it->value, "%c\n", coll->collprovider);
+		if (coll->collprovider == COLLPROVIDER_LIBC)
+		{
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_collcollate);
+			append_field(&it->value, TextDatumGetCString(d));
+			appendStringInfoChar(&it->value, '\t');
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_collctype);
+			append_field(&it->value, TextDatumGetCString(d));
+		}
+		else
+		{
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_colllocale);
+			append_field(&it->value, TextDatumGetCString(d));
+		}
+		appendStringInfoChar(&it->value, '\n');
+		d = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collicurules, &isnull);
+		if (!isnull)
+			append_field(&it->value, TextDatumGetCString(d));
+		appendStringInfoChar(&it->value, '\n');
+		appendStringInfo(&it->value, "%s\n", coll->collisdeterministic ? "t" : "f");
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
 }
 
 /*
@@ -3812,6 +3864,65 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	return remake;
 }
 
+/* A collation, as described (provider, locale, rules, deterministic). */
+static char *
+create_collation_sql(const char *name, const char *def)
+{
+	char	   *f[4];
+	char	   *p = pstrdup(def);
+	StringInfoData sql;
+
+	for (int i = 0; i < 4; i++)
+	{
+		char	   *nl = strchr(p, '\n');
+
+		if (nl == NULL)
+			elog(ERROR, "unexpected collation definition for %s", name);
+		*nl = '\0';
+		f[i] = p;
+		p = nl + 1;
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE COLLATION %s (provider = %s, ", name,
+					 f[0][0] == COLLPROVIDER_LIBC ? "libc" :
+					 f[0][0] == COLLPROVIDER_ICU ? "icu" : "builtin");
+	if (f[0][0] == COLLPROVIDER_LIBC)
+	{
+		char	   *tab = strchr(f[1], '\t');
+
+		*tab = '\0';
+		appendStringInfo(&sql, "lc_collate = %s, lc_ctype = %s",
+						 quote_literal_cstr(unescape_field(f[1])),
+						 quote_literal_cstr(unescape_field(tab + 1)));
+	}
+	else
+		appendStringInfo(&sql, "locale = %s", quote_literal_cstr(unescape_field(f[1])));
+	if (*f[2])
+		appendStringInfo(&sql, ", rules = %s", quote_literal_cstr(unescape_field(f[2])));
+	appendStringInfo(&sql, ", deterministic = %s)", strcmp(f[3], "t") == 0 ? "true" : "false");
+	return sql.data;
+}
+
+/* Does anything use a collation? */
+static bool
+collation_in_use(Oid coll)
+{
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		used;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(CollationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(coll));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	used = systable_getnext(scan) != NULL;
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return used;
+}
+
 /* A cast, as described (its method, then its context). */
 static char *
 create_cast_sql(const char *name, const char *def)
@@ -4644,6 +4755,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
+	List	   *collation_drops = NIL;
+	List	   *collation_makes = NIL;
 	List	   *schema_drops = NIL;
 	TypeMoves	tm;
 	bool		matviews_change;
@@ -4697,6 +4810,25 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					sm.before = lcons(drop_routine_sql(f), sm.before);
 				else if (t == NULL)
 					routines = lappend(routines, drop_routine_sql(f));
+				break;
+			case 'l':
+				if (t == NULL)
+					collation_drops = lappend(collation_drops,
+											  psprintf("DROP COLLATION IF EXISTS %s", f->name));
+				else
+				{
+					/* (one can't be altered: one nothing uses goes, and comes again) */
+					Oid			coll = get_collation_oid(stringToQualifiedNameList(f->name, NULL),
+														 false);
+
+					if (collation_in_use(coll))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines collation %s otherwise",
+										f->name),
+								 errdetail("A collation in use can't be changed in place; a move can't change one either.")));
+					tm.before = lappend(tm.before, psprintf("DROP COLLATION %s", f->name));
+				}
 				break;
 			case 'x':
 				/* (before the routines and types it uses go) */
@@ -4820,7 +4952,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			continue;
 		if (t->kind == 'n')
 			continue;			/* (above) */
-		if (t->kind == 'y' && f == NULL)
+		if (t->kind == 'l')
+			collation_makes = lappend(collation_makes,
+									  create_collation_sql(t->name, t->def));
+		else if (t->kind == 'y' && f == NULL)
 			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
@@ -5033,12 +5168,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 */
 	run_statements(tm.before);
 	run_statements(schemas);
+	run_statements(collation_makes);	/* (types and columns may use them) */
 	make_views(tm.creates);
 	run_statements(tm.converts);
 	make_views(tm.drops);
 	run_statements(tm.after);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
 	make_views(type_drops);
+	run_statements(collation_drops);
 	run_statements(schema_drops);
 	CommandCounterIncrement();
 	/* the rows in the caller's memory: what they keep outlives SPI's */
