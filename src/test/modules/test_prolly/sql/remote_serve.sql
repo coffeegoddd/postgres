@@ -53,6 +53,10 @@ SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fm
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fmt', true);
 SELECT id, v FROM rs.t ORDER BY id;		-- as the commit has them
 SELECT * FROM dolt_status;
+-- a commit needing what the database lacks: refused, as any move is
+SELECT test_commit_needing(test_fold_root(), ARRAY['extension ltree'],
+						   ARRAY['{1.3,public}']) AS lt \gset
+SELECT dolt_serve_move_head('main', pg_temp.h('main'), decode(:'lt', 'hex'), :'fmt', false);
 -- another format: refused
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
 

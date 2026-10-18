@@ -2162,6 +2162,15 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("branch \"%s\" has uncommitted changes", name),
 						 errhint("Commit or reset them there, or push with --force, which drops them.")));
+			/* (what the commit needs that the branch's head doesn't) */
+			if (head)
+			{
+				ProllyCommitInfo was;
+
+				prolly_check_commit_dependencies(&info,
+												 at.len > 0 && copies_commit_get(&at, &was) ?
+												 &was : NULL, "push");
+			}
 			if (head == NULL)
 				;
 			else if (strcmp(name, branch_ops()->current()) == 0)

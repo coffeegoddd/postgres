@@ -162,6 +162,14 @@ SELECT * FROM dolt_status;
 ------------+--------+--------
 (0 rows)
 
+-- a commit needing what the database lacks: refused, as any move is
+SELECT test_commit_needing(test_fold_root(), ARRAY['extension ltree'],
+						   ARRAY['{1.3,public}']) AS lt \gset
+SELECT dolt_serve_move_head('main', pg_temp.h('main'), decode(:'lt', 'hex'), :'fmt', false);
+ERROR:  the push needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension ltree: version 1.3, not installed
+HINT:  Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.
 -- another format: refused
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
 ERROR:  this database holds commits of canonical format 2, not 0
