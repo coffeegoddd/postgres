@@ -18,13 +18,14 @@
  * A fold's snapshot doesn't see transactions running when it was taken, or
  * committed since; their rows stay as they were in the tree, and the keys
  * of the tuples they wrote or deleted are carried into the next baseline,
- * to be candidates again.  (A table without a primary key notes only that
- * it has some.)
+ * to be candidates again.  (A table without a primary key carries the
+ * blocks that hold them.)
  *
  * A table without a primary key keys a row by its content and counts its
- * copies: of each row on a listed page, the copies the fold saw on the
- * page's old version are taken from the baseline's count, and those the
- * snapshot sees on its version now added.
+ * copies: of each row on a listed page, or a carried one, the copies the
+ * fold saw on the page's old version (by the fold's snapshot) are taken
+ * from the baseline's count, and those the snapshot sees on its version
+ * now added.  A carried page not listed is as the fold saw it.
  *
  * A table is folded in full instead, every row read, when the baseline
  * isn't of its changes list's lineage (it was never folded, or rewritten
@@ -43,7 +44,7 @@
  * it saw running (a count, then each), flags, the fold's own transaction
  * (if it had written), and the tree of carried keys
  * (each key with the key columns' encoded row, to look it up by; an empty
- * hash for none).
+ * hash for none), then the blocks carried (a count, then each).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/changes_pages.c
@@ -78,7 +79,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		6
+#define STATE_VERSION		7
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -99,6 +100,8 @@ typedef struct State
 	uint8		flags;
 	TransactionId own;			/* the fold's transaction, if it wrote */
 	ProllyNodeRef carried;
+	uint32		nblocks_carried;	/* without a key: blocks to read again */
+	BlockNumber *blocks_carried;	/* sorted */
 } State;
 
 static ProllyChangeCounters counters;
@@ -142,6 +145,10 @@ typedef struct Finder
 	bool		unsettled;		/* some rows weren't, and their keys aren't
 								 * carried */
 	bool		give_up;
+	const State *base;			/* the baseline's fold, folding from it */
+	BlockNumber *cblocks;		/* without a key: the blocks carried */
+	int			ncblocks;
+	int			maxcblocks;
 	ProllyChangeCounters work;	/* what this fold read, counted once it's done */
 } Finder;
 
@@ -192,6 +199,9 @@ put_state(StringInfo out, const State *st)
 	put_u32(out, st->own);
 	appendStringInfoChar(out, (char) st->carried.hash.len);
 	appendBinaryStringInfo(out, st->carried.hash.bytes, st->carried.hash.len);
+	put_u32(out, st->nblocks_carried);
+	for (uint32 i = 0; i < st->nblocks_carried; i++)
+		put_u32(out, st->blocks_carried[i]);
 }
 
 static bool
@@ -225,10 +235,18 @@ parse_state(const ProllyValue *state, State *st)
 	st->own = get_u32(p);
 	p += 4;
 	hlen = *p++;
-	if (hlen > PROLLY_HASH_MAX_LEN || end - p != hlen)
+	if (hlen > PROLLY_HASH_MAX_LEN || end - p < hlen + 4)
 		return false;
 	st->carried.hash.len = hlen;
 	memcpy(st->carried.hash.bytes, p, hlen);
+	p += hlen;
+	st->nblocks_carried = get_u32(p);
+	p += 4;
+	if ((uint64) (end - p) != (uint64) st->nblocks_carried * 4)
+		return false;
+	st->blocks_carried = palloc_array(BlockNumber, Max(st->nblocks_carried, 1));
+	for (uint32 i = 0; i < st->nblocks_carried; i++, p += 4)
+		st->blocks_carried[i] = get_u32(p);
 	return true;
 }
 
@@ -405,6 +423,24 @@ add_candidate(Candidate **arr, int *n, int *max, const StringInfoData *key,
 }
 
 /* Is the value of column i (0-based) stored out of line? */
+/*
+ * A table without a key carries the blocks of tuples the snapshot doesn't
+ * see as settled, to read again next time.
+ */
+static void
+carry_block(Finder *f, BlockNumber blkno)
+{
+	if (f->ncblocks > 0 && f->cblocks[f->ncblocks - 1] == blkno)
+		return;
+	if (f->ncblocks == f->maxcblocks)
+	{
+		f->maxcblocks = Max(64, f->maxcblocks * 2);
+		f->cblocks = f->cblocks ? repalloc_array(f->cblocks, BlockNumber, f->maxcblocks) :
+			palloc_array(BlockNumber, f->maxcblocks);
+	}
+	f->cblocks[f->ncblocks++] = blkno;
+}
+
 static bool
 out_of_line(TupleDesc desc, int i, Datum value, bool isnull)
 {
@@ -489,7 +525,8 @@ page_tuple(Finder *f, HeapTuple tup, void *arg)
 		return true;
 	if (f->keyless)
 	{
-		f->unsettled |= unsettled;
+		if (unsettled)
+			carry_block(f, ItemPointerGetBlockNumber(&tup->t_self));
 		return true;
 	}
 	if (!tuple_key(f, tup, &pv->key, &pv->keyrow))
@@ -719,12 +756,32 @@ xid_committed(TransactionId xid, bool *known)
 }
 
 /*
- * Was this tuple of an old page version, settled for the fold, visible to
- * it?  *known set false if that can't be told.  The caller holds
+ * Did the baseline's fold see xid's writes?  Those of its own transaction,
+ * and of any its snapshot saw finished that committed (hinted: known to
+ * have).  *known set false if that can't be told.
+ */
+static bool
+base_saw(Finder *f, TransactionId xid, bool hinted, bool *known)
+{
+	const State *st = f->base;
+
+	if (!TransactionIdIsNormal(xid))
+		return xid == FrozenTransactionId || xid == BootstrapTransactionId;
+	if (TransactionIdIsNormal(st->own) && TransactionIdEquals(xid, st->own))
+		return true;
+	if (!TransactionIdPrecedes(xid, st->xmax) ||
+		bsearch(&xid, st->xip, st->nxip, sizeof(TransactionId), xid_cmp) != NULL)
+		return false;
+	return hinted || xid_committed(xid, known);
+}
+
+/*
+ * Was this tuple of an old page version visible to the baseline's fold?
+ * *known set false if that can't be told.  The caller holds
  * XactTruncationLock and MultiXactTruncationLock.
  */
 static bool
-fold_saw(HeapTupleHeader t, bool *known)
+fold_saw(Finder *f, HeapTupleHeader t, bool *known)
 {
 	uint16		mask = t->t_infomask;
 	TransactionId updater;
@@ -733,8 +790,8 @@ fold_saw(HeapTupleHeader t, bool *known)
 	{
 		if (mask & HEAP_XMIN_INVALID)
 			return false;
-		if (!(mask & HEAP_XMIN_COMMITTED) &&
-			!xid_committed(HeapTupleHeaderGetRawXmin(t), known))
+		if (!base_saw(f, HeapTupleHeaderGetRawXmin(t),
+					  (mask & HEAP_XMIN_COMMITTED) != 0, known))
 			return false;
 	}
 	if ((mask & HEAP_XMAX_INVALID) || HEAP_XMAX_IS_LOCKED_ONLY(mask))
@@ -754,14 +811,10 @@ fold_saw(HeapTupleHeader t, bool *known)
 		updater = HeapTupleHeaderGetUpdateXid(t);
 		if (!TransactionIdIsValid(updater))
 			return true;		/* (lockers alone) */
+		return !base_saw(f, updater, false, known);
 	}
-	else
-	{
-		if (mask & HEAP_XMAX_COMMITTED)
-			return false;
-		updater = HeapTupleHeaderGetRawXmax(t);
-	}
-	return !xid_committed(updater, known);
+	return !base_saw(f, HeapTupleHeaderGetRawXmax(t),
+					 (mask & HEAP_XMAX_COMMITTED) != 0, known);
 }
 
 /*
@@ -824,7 +877,7 @@ old_tuple(Finder *f, HeapTuple tup, void *arg)
 {
 	OldVisit   *ov = arg;
 
-	if (fold_saw(tup->t_data, &ov->known))
+	if (fold_saw(f, tup->t_data, &ov->known))
 		ov->ct->t[ov->ct->n++] = *tup;
 	return ov->known;
 }
@@ -845,7 +898,8 @@ now_tuple(Finder *f, HeapTuple tup, void *arg)
 {
 	NowVisit   *nv = arg;
 
-	f->unsettled |= tuple_unsettled(f, tup->t_data);
+	if (tuple_unsettled(f, tup->t_data))
+		carry_block(f, ItemPointerGetBlockNumber(&tup->t_self));
 	if (HeapTupleSatisfiesVisibility(tup, f->snap, nv->buf))
 		nv->ct->t[nv->ct->n++] = *heap_copytuple(tup);
 	return true;
@@ -865,13 +919,14 @@ same_data(const HeapTupleData *a, const HeapTupleData *b)
 
 /*
  * The copies on page blkno: those the fold saw on its old version (if
- * old_block is valid), counted -1, and those the snapshot sees on its
- * version now (if 'now'), counted +1.  A tuple on both, the same row,
- * cancels unread.  False to fold in full instead.
+ * old_block is valid; or, unchanged, if 'unchanged', the version now),
+ * counted -1, and those the snapshot sees on its version now (if 'now'),
+ * counted +1.  A tuple on both, the same row, cancels unread.  False to
+ * fold in full instead.
  */
 static bool
 block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
-			 BlockNumber old_block, bool now)
+			 BlockNumber old_block, bool unchanged, bool now)
 {
 	Counted    *was = &bs->was;
 	Counted    *is = &bs->is;
@@ -880,11 +935,22 @@ block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
 
 	was->n = is->n = 0;
 	MemoryContextReset(bs->cxt);
-	if (BlockNumberIsValid(old_block))
+	if (BlockNumberIsValid(old_block) || unchanged)
 	{
 		OldVisit	ov = {was, true};
 
-		bmap_read_old(RelationGetSmgr(f->rel), blkno, old_block, bs->oldpage.data);
+		if (unchanged)
+		{
+			Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
+												 RBM_NORMAL, NULL);
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			memcpy(bs->oldpage.data, BufferGetPage(buf), BLCKSZ);
+			UnlockReleaseBuffer(buf);
+		}
+		else
+			bmap_read_old(RelationGetSmgr(f->rel), blkno, old_block,
+						  bs->oldpage.data);
 
 		/* (the statuses of its transactions, while they are kept) */
 		LWLockAcquire(XactTruncationLock, LW_SHARED);
@@ -978,8 +1044,9 @@ old_page_cmp(const void *a, const void *b)
  * False if it must be read in full instead.
  */
 static bool
-fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
-			 BlockNumber low, BlockNumber nblocks, ProllyNodeRef *data)
+fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
+			 const Listed *l, BlockNumber low, BlockNumber nblocks,
+			 ProllyNodeRef *data)
 {
 	Copies		cs = {0};
 	BlockScratch *bs = palloc_aligned(sizeof(BlockScratch), PG_IO_ALIGN_SIZE, 0);
@@ -1009,6 +1076,26 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 			pages[npages].listed = i;
 			npages++;
 		}
+
+	/*
+	 * And the pages whose tuples the fold carried, unsettled for it: one
+	 * not listed is as the fold saw it, and whether it saw each tuple is
+	 * told by its snapshot.  (One past the table's shortest length since:
+	 * in full.)
+	 */
+	if (st->nblocks_carried > 0)
+	{
+		pages = repalloc_array(pages, OldPage, npages + st->nblocks_carried);
+		for (uint32 i = 0; i < st->nblocks_carried; i++)
+		{
+			if (st->blocks_carried[i] >= Min(low, nblocks))
+				return false;
+			pages[npages].blkno = st->blocks_carried[i];
+			pages[npages].old_block = InvalidBlockNumber;
+			pages[npages].listed = l->n;	/* (after any listed) */
+			npages++;
+		}
+	}
 	if (npages > 1)
 	{
 		int			u = 1;
@@ -1028,6 +1115,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 	for (int i = 0; ok && i < npages; i++)
 	{
 		ok = block_copies(f, &cs, bs, pages[i].blkno, pages[i].old_block,
+						  !BlockNumberIsValid(pages[i].old_block),
 						  pages[i].blkno < nblocks);
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1037,7 +1125,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const Listed *l,
 			p++;
 		if (p < npages && pages[p].blkno == blk)
 			continue;
-		ok = block_copies(f, &cs, bs, blk, InvalidBlockNumber, true);
+		ok = block_copies(f, &cs, bs, blk, InvalidBlockNumber, false, true);
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (!ok)
@@ -1160,12 +1248,13 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	/* a table without a key: unchanged, or its rows' copies counted again */
 	if (f->keyless)
 	{
-		if (l.n == 0 && low >= nblocks)
+		f->base = st;
+		if (l.n == 0 && low >= nblocks && st->nblocks_carried == 0)
 		{
 			*data = baseline->data;
 			return true;
 		}
-		return fold_keyless(f, baseline, &l, low, nblocks, data);
+		return fold_keyless(f, baseline, st, &l, low, nblocks, data);
 	}
 
 	/* the pages listed, as they were and as they are */
@@ -1695,6 +1784,7 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 			/* (what the fold from the baseline read is thrown away) */
 			memset(&f.work, 0, sizeof(f.work));
 			f.ncarried = 0;
+			f.ncblocks = 0;
 			f.unsettled = false;
 			fold_all(&f, data, next != NULL);
 		}
@@ -1715,6 +1805,18 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 			ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
 			ns.own = GetTopTransactionIdIfAny();
 			carried_tree(&f, &ns.carried);
+			if (f.ncblocks > 1)
+			{
+				int			u = 1;
+
+				qsort(f.cblocks, f.ncblocks, sizeof(BlockNumber), block_cmp);
+				for (int i = 1; i < f.ncblocks; i++)
+					if (f.cblocks[i] != f.cblocks[u - 1])
+						f.cblocks[u++] = f.cblocks[i];
+				f.ncblocks = u;
+			}
+			ns.nblocks_carried = f.ncblocks;
+			ns.blocks_carried = f.cblocks;
 			MemoryContextSwitchTo(old);
 			put_state(next, &ns);
 			MemoryContextSwitchTo(cxt);
