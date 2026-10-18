@@ -37,12 +37,11 @@
  * - fold_dependencies() builds the tree of what the session branch's
  *   versioned objects need from outside the versioned schemas, for a
  *   commit to record beside its root: keyed by kind and identity
- *   ("extension hstore"), an extension valued by its version, another
- *   object by its address (a text[] literal: its type, and text[]
- *   literals of its names and arguments, as
- *   pg_identify_object_as_address() gives them).  Not
- *   roles.  It is no part of the root, so what changes outside never makes
- *   a branch's working set differ from its head.
+ *   ("extension hstore"), an extension valued by its version and schema,
+ *   another object by its address (its type, names and arguments, as
+ *   pg_identify_object_as_address() gives them), each a text[] literal.
+ *   Not roles.  It is no part of the root, so what changes outside never
+ *   makes a branch's working set differ from its head.
  * - dependencies() visits each item of such a tree, in key order.
  * - sequences() visits each sequence a folded root holds, in name order,
  *   with its value: its last value, and whether it was given out.
@@ -67,14 +66,14 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 
-/*
- * Visits one sequence of a canonical root, with its value (one recorded
- * without one, unreadable where it was folded, isn't visited).
- */
 /* Visits one dependency a commit records: its name and its value. */
 typedef void (*ProllyCanonDependencyVisit) (const char *name,
 											const char *value, void *arg);
 
+/*
+ * Visits one sequence of a canonical root, with its value (one recorded
+ * without one, unreadable where it was folded, isn't visited).
+ */
 typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 										  bool called, void *arg);
 

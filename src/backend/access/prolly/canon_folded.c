@@ -47,7 +47,9 @@
  * isn't in the root, which is what they are: fold_dependencies() builds a
  * tree of it for a commit to record beside its root (prolly_refs.h), keyed
  * by kind and identity ("extension hstore", "type public.money2"):
- * an extension valued by its version, another object by its address (a
+ * an extension valued by its version and the schema it is in (a text[]
+ * literal: the objects that use its members name them there), another
+ * object by its address (a
  * text[] literal of its type and of text[] literals of its names and
  * arguments, as pg_identify_object_as_address() gives them), which
  * pg_get_object_address() finds again in another database.  Found
@@ -113,6 +115,7 @@
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "commands/extension.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
@@ -857,6 +860,8 @@ extension_version(Oid extoid)
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	if (version == NULL)
+		elog(ERROR, "cache lookup failed for extension %u", extoid);
 	return version;
 }
 
@@ -897,8 +902,8 @@ dependency_cmp(const ListCell *a, const ListCell *b)
 
 /*
  * Describe a dependency outside the versioned schemas: its key, kind and
- * identity; its value, an extension's version or another object's
- * address.
+ * identity; its value, an extension's version and schema or another
+ * object's address.
  */
 static Dependency *
 describe_dependency(const ObjectAddress *addr)
@@ -911,10 +916,11 @@ describe_dependency(const ObjectAddress *addr)
 	append_utf8(&dep->key, psprintf("%s %s", type, getObjectIdentity(addr, false)));
 	if (addr->classId == ExtensionRelationId)
 	{
-		char	   *version = extension_version(addr->objectId);
+		Oid			nsp = get_extension_schema(addr->objectId);
 
-		if (version)
-			append_utf8(&dep->value, version);
+		append_utf8(&dep->value,
+					text_array_literal(list_make2(extension_version(addr->objectId),
+												  get_namespace_name(nsp))));
 	}
 	else
 	{
