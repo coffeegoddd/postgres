@@ -100,6 +100,36 @@ SELECT pg_temp.commits() - :before AS commits,
        1 | made u
 (1 row)
 
+-- (a commit's message isn't empty)
+SET dolt.transaction_commit_message = '';
+ERROR:  invalid value for parameter "dolt.transaction_commit_message": ""
+DETAIL:  A commit needs a message.
+-- Owned by its writer, a branch a transaction leaves clean (nothing to
+-- commit) is given up too.
+SELECT dolt_writer_mode('owned');
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SET dolt.writer = 'tc_writer';
+BEGIN;
+INSERT INTO tc.t VALUES (40, 'gone');
+DELETE FROM tc.t WHERE id = 40;
+COMMIT;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+RESET dolt.writer;
 -- A dolt_commit() in the transaction commits what came before it; the
 -- transaction's commit holds only what came after, if anything did.
 SELECT pg_temp.commits() AS before \gset

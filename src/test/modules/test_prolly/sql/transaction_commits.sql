@@ -63,6 +63,21 @@ COMMIT;
 SELECT pg_temp.commits() - :before AS commits,
 	(SELECT message FROM dolt_log('main') LIMIT 1) AS message;
 
+-- (a commit's message isn't empty)
+SET dolt.transaction_commit_message = '';
+
+-- Owned by its writer, a branch a transaction leaves clean (nothing to
+-- commit) is given up too.
+SELECT dolt_writer_mode('owned');
+SET dolt.writer = 'tc_writer';
+BEGIN;
+INSERT INTO tc.t VALUES (40, 'gone');
+DELETE FROM tc.t WHERE id = 40;
+COMMIT;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+SELECT dolt_writer_mode('shared');
+RESET dolt.writer;
+
 -- A dolt_commit() in the transaction commits what came before it; the
 -- transaction's commit holds only what came after, if anything did.
 SELECT pg_temp.commits() AS before \gset

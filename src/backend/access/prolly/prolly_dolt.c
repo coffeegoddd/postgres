@@ -90,6 +90,18 @@ static bool txn_commit_on = false;
 
 static void transaction_commit_at_end(bool prepare);
 
+/* (a commit's message isn't empty, as dolt_commit's isn't) */
+static bool
+check_commit_message(char **newval, void **extra, GucSource source)
+{
+	if (**newval == '\0')
+	{
+		GUC_check_errdetail("A commit needs a message.");
+		return false;
+	}
+	return true;
+}
+
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
 
@@ -130,7 +142,7 @@ prolly_session_init(const char *branch)
 								   "Transaction commit",
 								   PGC_USERSET,
 								   0,
-								   NULL, NULL, NULL);
+								   check_commit_message, NULL, NULL);
 		prolly_refs_end_hook = transaction_commit_at_end;
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
@@ -322,8 +334,11 @@ static bool integrating = false;
 /*
  * A write to a branch is first its writers' to allow.  The transaction's
  * first takes dolt.transaction_commit as it is now, and opens the refs if
- * the transaction is to commit through them as it ends (their end comes
- * before the chunk store's only if they are opened first).
+ * the transaction is to commit through them as it ends: their transaction
+ * callback must be registered before COMMIT begins (one registered while
+ * the callbacks run isn't called), and, callbacks running newest first,
+ * the refs', registered after the chunk store's (which they open first),
+ * runs before the chunk store's flush.
  */
 static void
 writers_note_write(Oid branch, void *arg)
@@ -404,7 +419,6 @@ transaction_commit_at_end(bool prepare)
 	List	   *branches;
 	ProllyMergeState ms;
 	ProllyHash	id;
-	bool		committed;
 	bool		pushed;
 
 	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on)
@@ -436,11 +450,11 @@ transaction_commit_at_end(bool prepare)
 	pushed = !ActiveSnapshotSet();
 	if (pushed)
 		PushActiveSnapshot(GetTransactionSnapshot());
-	BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit,
-												 dolt_transaction_commit_message,
-												 false, &id));
-	if (committed)
-		settled();
+	BRANCH_WRITES_HUSHED((void) PROLLY_CALL(refs(), commit,
+											dolt_transaction_commit_message,
+											false, &id));
+	/* (committed or not, the branch may be clean: its owner given up) */
+	settled();
 	if (pushed)
 		PopActiveSnapshot();
 }
