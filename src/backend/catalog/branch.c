@@ -684,6 +684,54 @@ undo_new_branches(SubTransactionId subid)
 }
 
 /* release the locks of branches the session has left */
+/*
+ * Branches to return to if a (sub)transaction aborts, each with the
+ * subtransaction that asked: an operation that checks out others on its way
+ * leaves the session where it was if it fails.
+ */
+static List *returns = NIL;		/* of NewBranch, branch unused */
+
+static void register_branch_callbacks(void);
+
+void
+branch_return_on_abort(void)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	NewBranch  *nb = palloc(sizeof(NewBranch));
+
+	register_branch_callbacks();
+	nb->branch = InvalidOid;
+	nb->subid = GetCurrentSubTransactionId();
+	nb->left = MyBranch;
+	nb->left_read_only = MyBranchReadOnly;
+	returns = lappend(returns, nb);
+	MemoryContextSwitchTo(old);
+}
+
+/* (oldest first: the earliest return of what aborts is where it began) */
+static void
+undo_returns(SubTransactionId subid)
+{
+	ListCell   *lc;
+	bool		returned = false;
+
+	foreach(lc, returns)
+	{
+		NewBranch  *nb = lfirst(lc);
+
+		if (subid != InvalidSubTransactionId && nb->subid != subid)
+			continue;
+		if (!returned && MyBranch != nb->left)
+		{
+			set_session_branch(nb->left);
+			MyBranchReadOnly = nb->left_read_only;
+		}
+		returned = true;
+		returns = foreach_delete_current(returns, lc);
+		pfree(nb);
+	}
+}
+
 static void
 release_left_branches(void)
 {
@@ -710,7 +758,6 @@ release_left_branches(void)
 }
 
 static void forget_written(SubTransactionId subid);
-static void register_branch_callbacks(void);
 
 void
 RegisterBranchWriteCallback(BranchWriteCallback callback, void *arg)
@@ -854,6 +901,7 @@ branch_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			undo_new_branches(InvalidSubTransactionId);
+			undo_returns(InvalidSubTransactionId);
 			release_left_branches();
 			forget_written(InvalidSubTransactionId);
 			break;
@@ -862,6 +910,8 @@ branch_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PREPARE:
 			list_free_deep(new_branches);
 			new_branches = NIL;
+			list_free_deep(returns);
+			returns = NIL;
 			release_left_branches();
 			forget_written(InvalidSubTransactionId);
 			break;
@@ -880,6 +930,7 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
 			undo_new_branches(mySubid);
+			undo_returns(mySubid);
 			forget_written(mySubid);
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:
@@ -896,6 +947,13 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 				if (wb->subid == mySubid)
 					wb->subid = parentSubid;
+			}
+			foreach(lc, returns)
+			{
+				NewBranch  *nb = lfirst(lc);
+
+				if (nb->subid == mySubid)
+					nb->subid = parentSubid;
 			}
 			foreach(lc, hushes)
 			{

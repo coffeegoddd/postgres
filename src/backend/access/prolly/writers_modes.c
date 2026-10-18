@@ -59,6 +59,20 @@
 /* the setting in the refs that keeps the mode */
 #define MODE_SETTING	"writer_branches"
 
+/* branch's name, or NULL if it has no row */
+static char *
+get_branch_name(Oid branch)
+{
+	HeapTuple	tup = SearchSysCache1(BRANCHOID, ObjectIdGetDatum(branch));
+	char	   *name;
+
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	name = pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	ReleaseSysCache(tup);
+	return name;
+}
+
 /* the ownership lock: on the branch's pg_branch row, subobject 1 */
 #define OWNERSHIP_SUBID 1
 
@@ -70,6 +84,10 @@ static const char *const mode_names[] = {PROLLY_WRITER_MODE_NAMES};
 /* the mode, as the transaction last read or set it */
 static LocalTransactionId mode_lxid = InvalidLocalTransactionId;
 static ProllyWriterMode mode_read;
+
+/* the setting that keeps a branch's protection, by its name */
+#define PROTECTION_SETTING	"protected/"
+
 
 static bool
 check_writer(char **newval, void **extra, GucSource source)
@@ -176,6 +194,46 @@ modes_set_mode(ProllyWriterMode mode)
 				mode == PROLLY_WRITERS_SHARED ? NULL : mode_names[mode]);
 	mode_lxid = MyProc->vxid.lxid;
 	mode_read = mode;
+}
+
+/* as the mode has it: main, in the branch-only mode */
+static bool
+protected_by_default(const char *name)
+{
+	return strcmp(name, "main") == 0 &&
+		modes_mode() == PROLLY_WRITERS_BRANCH_ONLY;
+}
+
+static bool
+modes_protected(const char *name)
+{
+	StringInfoData v;
+	char	   *key = psprintf(PROTECTION_SETTING "%s", name);
+	bool		protected;
+
+	initStringInfo(&v);
+	if (PROLLY_CALL(refs(), config_get, key, &v))
+		protected = strcmp(v.data, "on") == 0;
+	else
+		protected = protected_by_default(name);
+	pfree(v.data);
+	pfree(key);
+	return protected;
+}
+
+/* (kept only where it isn't what the mode has: the mode's again otherwise) */
+static void
+modes_set_protected(const char *name, ProllyBranchProtection protection)
+{
+	if (!database_owner())
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
+					   get_database_name(MyDatabaseId));
+	if (protection != PROLLY_PROTECT_DEFAULT &&
+		(protection == PROLLY_PROTECT_ON) == protected_by_default(name))
+		protection = PROLLY_PROTECT_DEFAULT;
+	PROLLY_CALL(refs(), config_set, psprintf(PROTECTION_SETTING "%s", name),
+				protection == PROLLY_PROTECT_DEFAULT ? NULL :
+				protection == PROLLY_PROTECT_ON ? "on" : "off");
 }
 
 /* branch's pg_branch row, with its owner (NULL if none) and owner's role */
@@ -339,8 +397,27 @@ claim(Oid branch, bool take)
 }
 
 static void
-modes_note_write(Oid branch)
+modes_note_write(Oid branch, bool integration)
 {
+	char	   *name = get_branch_name(branch);
+
+	/*
+	 * A protected branch has no writers: an integration holds it alone, and
+	 * commits before its transaction ends.
+	 */
+	if (name != NULL && modes_protected(name))
+	{
+		if (!integration)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" is protected", name),
+					 errdetail("A protected branch changes only by a merge, cherry-pick, revert or reset that commits."),
+					 errhint("Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('%s', ...).",
+							 name)));
+		LockDatabaseObject(BranchRelationId, branch, OWNERSHIP_SUBID,
+						   ExclusiveLock);
+		return;
+	}
 	if (modes_mode() == PROLLY_WRITERS_SHARED)
 		return;
 	claim(branch, false);
@@ -417,11 +494,13 @@ const ProllyWritersRoutine prolly_writers_modes = {
 		.impl_id = 1,
 		.format_version = 1,
 		.name = "modes",
-		.description = "writer modes: shared, or one owner per dirty branch",
+		.description = "writer modes: shared, one owner per dirty branch, protected branches",
 	},
 	.note_write = modes_note_write,
 	.settled = modes_settled,
 	.take = modes_take,
 	.mode = modes_mode,
 	.set_mode = modes_set_mode,
+	.protected = modes_protected,
+	.set_protected = modes_set_protected,
 };

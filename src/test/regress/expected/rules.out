@@ -1294,8 +1294,9 @@ dolt_branches| SELECT name,
     latest_commit_message,
     dirty,
     owner,
-    owner_role
-   FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty, owner, owner_role);
+    owner_role,
+    protected
+   FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty, owner, owner_role, protected);
 dolt_conflicts| SELECT table_name,
     num_conflicts
    FROM dolt_conflicts() dolt_conflicts(table_name, num_conflicts);

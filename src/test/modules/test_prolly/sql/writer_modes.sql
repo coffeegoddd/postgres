@@ -147,6 +147,83 @@ SET dolt.writer = 'erin';
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'wm_f');
 
+-- Branch-only: main is protected, written only by integrations, which
+-- commit as they change it.
+SELECT dolt_writer_mode('branch-only');
+SET dolt.writer = 'frank';
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.t VALUES (11, 'frank on main');
+CREATE TABLE wm.v (id int);
+SELECT dolt_commit('-m', 'nothing on main');
+SELECT dolt_checkout('-b', 'wm_frank');
+SELECT name, protected FROM dolt_branches() WHERE name IN ('main', 'wm_frank') ORDER BY name;
+INSERT INTO wm.t VALUES (11, 'frank');
+SELECT (dolt_integrate('-m', 'frank''s first'))[2] AS fast_forward;
+SELECT dolt_hashof('main') = dolt_hashof('wm_frank') AS same_head,
+	(SELECT message FROM dolt_log('main') LIMIT 1) AS message;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name IN ('main', 'wm_frank') ORDER BY name;
+SELECT id, v FROM wm.t WHERE id = 11;
+
+-- Another writer's branch, from before; its change conflicts with
+-- frank's once frank's is in main.
+SELECT dolt_branch('wm_gina', 'main~1');
+SET dolt.writer = 'gina';
+SELECT dolt_checkout('wm_gina');
+INSERT INTO wm.t VALUES (11, 'gina');
+SELECT dolt_integrate('main', '-m', 'gina''s');
+-- (all of it undone: gina's commit too, and gina is on her branch)
+SELECT active_branch();
+SELECT name, dirty, owner FROM dolt_branches() WHERE name IN ('main', 'wm_gina') ORDER BY name;
+SELECT (SELECT count(*) FROM dolt_log('wm_gina')) = (SELECT count(*) FROM dolt_log('main')) - 1 AS not_committed;
+-- (a merge into main that would stop with conflicts is refused, too)
+SELECT length(dolt_commit('-m', 'gina''s')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT dolt_merge('wm_gina');
+ROLLBACK;
+-- resolved on her branch, it integrates
+SELECT dolt_checkout('wm_gina');
+BEGIN;
+SELECT (dolt_merge('main'))[3] AS conflicts;
+SELECT dolt_conflicts_resolve('--ours', 'wm.t');
+SELECT length(dolt_commit('-m', 'gina merges main')::text) AS committed;
+COMMIT;
+SELECT (dolt_integrate('-m', 'gina''s, resolved'))[2] AS fast_forward;
+SELECT id, v FROM wm.t WHERE id = 11;
+SELECT dolt_checkout('main');
+SELECT id, v FROM wm.t WHERE id = 11;
+
+-- A reset of main is an integration too; dolt_integrate isn't run on
+-- the branch it integrates into.
+SELECT dolt_integrate('-m', 'on main');
+SELECT dolt_reset('--hard', 'HEAD');
+
+-- Protection by branch, in any mode: main unprotected, and others
+-- protected; only the database's owner sets it, and deletes a protected
+-- branch; a copy is protected as its source.
+SELECT dolt_branch('--unprotect', 'main');
+INSERT INTO wm.t VALUES (12, 'gina on main');
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('--protect', 'main');
+SELECT dolt_branch('--protect', 'wm_frank');
+SELECT dolt_branch('-c', 'wm_frank', 'wm_frank2');
+SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_%' ORDER BY name;
+SET ROLE wm_other;
+SELECT dolt_branch('--unprotect', 'wm_frank');
+SELECT dolt_branch('-D', 'wm_frank');
+RESET ROLE;
+SELECT dolt_branch('--protect', 'no_such_branch');
+SELECT dolt_branch('-D', 'wm_frank', 'wm_frank2', 'wm_gina');
+SELECT dolt_branch('wm_frank');
+SELECT name, protected FROM dolt_branches() WHERE name = 'wm_frank';
+SELECT dolt_branch('-D', 'wm_frank');
+-- (as the mode has it, a branch's protection is the mode's again)
+SELECT dolt_branch('--unprotect', 'main');
+SELECT dolt_branch('--protect', 'main');
+SELECT dolt_writer_mode('owned');
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+SELECT dolt_writer_mode('branch-only');
+
 -- Only the database's owner sets the mode; and back to shared.
 SET ROLE wm_other;
 SELECT dolt_writer_mode('shared');

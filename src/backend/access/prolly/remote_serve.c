@@ -628,6 +628,13 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 	if (VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_PP(1)) > 0)
 		bytea_hash(PG_GETARG_BYTEA_PP(1), &expected);
 	prolly_database_components(&dc);
+	/* (a push moving a protected branch integrates: the owner's to make) */
+	if (PROLLY_CALL(dc.writers, protected, branch) &&
+		!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("branch \"%s\" is protected", branch),
+				 errhint("Only the database's owner pushes to a protected branch.")));
 	initStringInfo(&mine);
 	PROLLY_CALL(dc.canonicalizer, format, &mine);
 	if (strcmp(text_to_cstring(PG_GETARG_TEXT_PP(3)), mine.data) != 0)

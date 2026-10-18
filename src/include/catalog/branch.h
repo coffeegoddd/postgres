@@ -121,6 +121,12 @@ extern bool lock_branch_for_delete(Oid branch);
 /* note a branch the current subtransaction made */
 extern void note_new_branch(Oid branch);
 
+/*
+ * If the current (sub)transaction aborts, the session goes back to the branch
+ * it is on now.
+ */
+extern void branch_return_on_abort(void);
+
 /* is this storage another branch's relation's (for logical decoding)? */
 extern bool relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber);
 
