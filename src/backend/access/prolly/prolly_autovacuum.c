@@ -9,7 +9,11 @@
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
  * collection, by the database's reclamation.  Only sizes are read, not the
- * journal.  It sweeps a page store when bmap_sweep_due()
+ * journal.  If no collection was due, it moves the journal (the
+ * reclamation's move(): a collection that frees nothing) once the segment
+ * appends go to has passed prolly.journal_move_threshold, which bounds
+ * what a backend reads to index the journal when collections are rare (a
+ * large store) or off.  It sweeps a page store when bmap_sweep_due()
  * says so.  Each runs in a transaction of its own, an error reported and
  * passed over, as autovacuum's tables' are; a collection reads under
  * autovacuum's cost-based delay.
@@ -38,6 +42,7 @@
 
 int			prolly_gc_journal_threshold = 128;
 double		prolly_gc_growth_scale_factor = 0.2;
+int			prolly_journal_move_threshold = 256;
 
 void
 prolly_autovacuum_init(void)
@@ -62,6 +67,14 @@ prolly_autovacuum_init(void)
 							 PGC_SIGHUP,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.journal_move_threshold",
+							"How far the chunk journal grows before autovacuum moves its chunks into a table file.",
+							"Moving frees nothing; -1 turns it off.",
+							&prolly_journal_move_threshold,
+							256, -1, MAX_KILOBYTES / 1024,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
 	defined = true;
 }
 
@@ -115,14 +128,18 @@ collection_due(void)
 		collected > s.settled * prolly_gc_growth_scale_factor;
 }
 
+static bool collected;
+
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
 
+	collected = false;
 	if (!collection_due())
 		return;
+	collected = true;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	prolly_database_components(&dc);
@@ -133,6 +150,40 @@ collect(void)
 							 (unsigned long long) r.chunks_kept,
 							 (unsigned long long) r.chunks_freed,
 							 (unsigned long long) r.bytes_freed,
+							 (unsigned long long) r.window_usec)));
+}
+
+static bool
+move_due(void)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store;
+	Sizes		s = {0, 0, 0, 0};
+
+	if (prolly_journal_move_threshold < 0 || collected)
+		return false;
+	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
+	PROLLY_CALL(cs, segments, store, false, last_segment, &s);
+	return s.chunks != 0 &&
+		s.segment > (uint64) prolly_journal_move_threshold * 1024 * 1024;
+}
+
+static void
+move(void)
+{
+	ProllyDatabaseComponents dc;
+	ProllyGcResult r;
+
+	if (!move_due())
+		return;
+	VacuumUpdateCosts();
+	VacuumCostBalance = 0;
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, move, &r);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic move of the chunk journal of database \"%s\": %llu chunks moved, appends held off %llu us",
+							 get_database_name(MyDatabaseId),
+							 (unsigned long long) r.chunks_kept,
 							 (unsigned long long) r.window_usec)));
 }
 
@@ -192,7 +243,7 @@ sweep(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {collect, sweep};
+	void		(*steps[]) (void) = {collect, move, sweep};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{

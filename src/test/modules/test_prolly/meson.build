@@ -153,6 +153,7 @@ tests += {
       't/061_journal_pads.pl',
       't/062_long_history.pl',
       't/059_journal_appends.pl',
+      't/060_journal_move.pl',
     ],
   },
 }

@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_autovacuum.h
- *	  Prolly's stores reclaimed by autovacuum: the chunk store collected
- *	  and the page stores swept, when due.
+ *	  Prolly's stores reclaimed by autovacuum: the chunk store collected,
+ *	  its journal moved, and the page stores swept, when due.
  *
  * src/include/access/prolly_autovacuum.h
  *
@@ -17,6 +17,8 @@
 extern PGDLLIMPORT int prolly_gc_journal_threshold;
 /* prolly.gc_growth_scale_factor */
 extern PGDLLIMPORT double prolly_gc_growth_scale_factor;
+/* prolly.journal_move_threshold (MB; -1: the journal is never moved) */
+extern PGDLLIMPORT int prolly_journal_move_threshold;
 
 /* Define the settings (once per process). */
 extern void prolly_autovacuum_init(void);

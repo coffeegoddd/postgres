@@ -251,6 +251,42 @@ copying_collect(bool full, ProllyGcResult *result)
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 }
 
+/* (nothing to mark: every chunk is) */
+static void
+mark_none(const ProllyHash *hash, const char *data, Size len, void *arg)
+{
+}
+
+/*
+ * A default collection with every chunk marked: the journal's sealed
+ * segments and the table files not settled rewritten as one settled file,
+ * nothing dropped.  (It is closed under what its chunks name: those
+ * outside it are in the settled files, which are.)
+ */
+static void
+copying_move(ProllyGcResult *result)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	ProllyChunkGc *gc;
+	ProllyHash	root;
+	uint64		nslots;
+	uint8	   *marks;
+	int			nfiles = 0;
+	bool	   *keep;
+
+	gc = PROLLY_CALL(cs, gc_begin, store, false, &root, &nslots);
+	marks = MemoryContextAllocHuge(CurrentMemoryContext, nslots / 8 + 1);
+	memset(marks, 0xFF, nslots / 8 + 1);
+	PROLLY_CALL(cs, gc_files, gc, count_file, &nfiles);
+	keep = palloc0(sizeof(bool) * Max(nfiles, 1));
+	PROLLY_CALL(cs, gc_copy, gc, marks, keep);
+	PROLLY_CALL(cs, gc_new, gc, true, mark_none, NULL);
+	PROLLY_CALL(cs, gc_swap, gc, marks, keep, result);
+	PROLLY_CALL(cs, gc_retire, gc);
+}
+
 const ProllyReclaimRoutine prolly_reclaim_copying = {
 	.info = {
 		.iface = PROLLY_IFACE_RECLAMATION,
@@ -261,4 +297,5 @@ const ProllyReclaimRoutine prolly_reclaim_copying = {
 		"to new files, online",
 	},
 	.collect = copying_collect,
+	.move = copying_move,
 };
