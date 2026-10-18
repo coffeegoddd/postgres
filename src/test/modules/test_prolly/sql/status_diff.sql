@@ -131,17 +131,32 @@ INSERT INTO sdl.t VALUES (1, 'one', 16400);
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdl.t);
 SELECT dolt_commit('-am', 'a large object');
+-- a reset folds the working set as a commit does, so it is refused too
+-- until the column is dropped
+SELECT dolt_reset('--hard');
 ALTER TABLE sdl.t DROP COLUMN doc;
 CREATE TABLE sdl.u (id int PRIMARY KEY, o oid, c regclass, r oid[], p sdl.pair,
 	x oid8);
 SELECT dolt_commit('-Am', 'oids');
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
-CREATE MATERIALIZED VIEW sdl.mv USING prolly AS SELECT 'sdl.t'::regclass AS c;
 DROP TABLE sdl.u;
+-- domains over arrays, ranges and multiranges (of an ordinary schema's
+-- range type), arrays of composites, and pg_node_tree, whose text names
+-- objects by OID
+CREATE SCHEMA sdl_shared;
+CREATE TYPE sdl_shared.oidrange AS RANGE (subtype = oid);
+CREATE DOMAIN sdl.los AS oid[];
+CREATE TABLE sdl.w (id int PRIMARY KEY, a sdl.los, g sdl_shared.oidrange,
+	m sdl_shared.oidmultirange, ps sdl.pair[], n pg_node_tree, ok int[]);
+SELECT dolt_commit('-Am', 'more oids');
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.w%' ORDER BY table_name;
+DROP TABLE sdl.w;
+CREATE MATERIALIZED VIEW sdl.mv USING prolly AS SELECT 'sdl.t'::regclass AS c;
 SELECT dolt_commit('-Am', 'a materialized view');
 DROP MATERIALIZED VIEW sdl.mv;
 SELECT length(dolt_commit('-Am', 'no oids')::text) AS committed;
 DROP SCHEMA sdl CASCADE;
+DROP SCHEMA sdl_shared CASCADE;
 SELECT length(dolt_commit('-Am', 'sdl gone')::text) AS committed;
 
 -- A diff of one table reads that table's changes alone, however many

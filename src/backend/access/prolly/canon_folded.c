@@ -1431,8 +1431,9 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 
 /*
  * Whether a type's values hold local OIDs, which no root may: oid and oid8,
- * the reg* types (their send functions send the OID), and the domains,
- * arrays, composites and ranges made of them.  A large object's reference
+ * the reg* types (their send functions send the OID), pg_node_tree (whose
+ * text names objects by OID), and the domains, arrays, composites and
+ * ranges made of them.  A large object's reference
  * is an oid, and the object itself is every branch's: versioned as the
  * number alone, a reset or merge wouldn't bring its contents back.
  */
@@ -1458,6 +1459,7 @@ type_holds_oids(Oid typid)
 		case REGDATABASEOID:
 		case REGCONFIGOID:
 		case REGDICTIONARYOID:
+		case PG_NODE_TREEOID:
 			return true;
 	}
 	elem = get_element_type(base);
@@ -1576,24 +1578,31 @@ collect(Canon *cn)
 				break;
 			case RELKIND_MATVIEW:
 				{
-					CanonItem  *it = add_item(cn, "m:", qualified(form->relnamespace, name));
+					CanonItem  *it;
+					Relation	rel = NULL;
 					StringInfoData query;
 
+					if (form->relam == PROLLY_TABLE_AM_OID)
+					{
+						rel = table_open(form->oid, AccessShareLock);
+						if (oid_columns(cn, rel) && !cn->reading)
+						{
+							table_close(rel, AccessShareLock);
+							break;
+						}
+					}
+					it = add_item(cn, "m:", qualified(form->relnamespace, name));
 					initStringInfo(&query);
 					append_utf8(&query,
 								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
 																		ObjectIdGetDatum(form->oid),
 																		BoolGetDatum(false))));
-					if (form->relam == PROLLY_TABLE_AM_OID)
+					if (rel != NULL)
 					{
-						Relation	rel = table_open(form->oid, AccessShareLock);
 						ProllyNodeRef root;
 
-						if (!oid_columns(cn, rel) || cn->reading)
-						{
-							table_root(cn, it, rel, &query, &root);
-							put_hash(&it->value, &root.hash);
-						}
+						table_root(cn, it, rel, &query, &root);
+						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
 					appendBinaryStringInfo(&it->value, query.data, query.len);
