@@ -202,7 +202,7 @@ def _creport(args) -> int:
     report = creport.build(args.dirs, args.shards, args.base_baseline, corpus=args.corpus,
                            head=args.head, base=args.base, base_ref=args.base_ref,
                            run_url=args.run_url, wall_clock=args.wall_clock,
-                           failed_jobs=args.failed_job)
+                           failed_jobs=args.failed_job, engines=args.engines)
     args.out.write_text(report.text)
     if args.json:
         args.json.write_text(json.dumps(report.summary, indent=1) + "\n")
@@ -377,6 +377,8 @@ def main(argv=None) -> int:
     cr.add_argument("--json", type=Path, help="also a summary, JSON")
     cr.add_argument("--corpus", type=Path, help="the corpus's test/ directory "
                     "(default: as the result sets recorded it)")
+    cr.add_argument("--engines", type=_csv(str),
+                    help="the engines besides heap every shard must have (default: those found)")
     cr.add_argument("--head", default="", help="the pull request's head commit")
     cr.add_argument("--base", default="", help="the base commit")
     cr.add_argument("--base-ref", default="master")

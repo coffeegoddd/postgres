@@ -201,7 +201,8 @@ exactly which records moved.
 ```sh
 src/tools/prolly_bench/prolly_bench creport SHARD_RESULTS... --shards N \
     --base-baseline BASE_BASELINE --out comment.md [--json summary.json] \
-    [--head SHA --base SHA --run-url URL --wall-clock '14 min' --failed-job NAME]
+    [--engines prolly] [--head SHA --base SHA --run-url URL --wall-clock '14 min'] \
+    [--failed-job NAME]
 ```
 
 `creport` reads every shard's result sets (heap and each engine) and
@@ -215,11 +216,17 @@ entries to remove), stale exceptions, time per cell, and the per-shard
 tables. It is cut at 65,000 characters with a notice.
 
 It is also the gate over the shards as a whole, and exits 1 when any shard
-1..N is missing or incomplete, when the shards' files together aren't the
-whole corpus exactly once, when an engine differs from heap, or when heap
-differs from the baseline. `--base-baseline` is the baseline file at the
-pull request's base (`git show BASE:src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz`),
-so a stacked pull request is compared with the one below it.
+1..N is missing or incomplete or lacks an engine of `--engines`, when the
+shards' files together aren't the whole corpus exactly once, when an
+engine differs from heap, or when heap differs from the baseline. Each
+row's gate column fails with the problems that name its engine. It reads
+each shard's comparisons where `cgate` left them, and recomputes one
+whose inputs changed. `--base-baseline` is the baseline file at the pull
+request's base (`git show BASE:src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz`),
+so a stacked pull request is compared with the one below it; when the
+base has none, or one for another corpus pin, "vs base" shows n/a and a
+note, and the report doesn't fail for it. Timeouts and records that didn't
+run don't count as failing records against the base.
 
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on

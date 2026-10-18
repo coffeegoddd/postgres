@@ -19,7 +19,6 @@ the verdict come from the same data.
 
 from __future__ import annotations
 
-import gzip
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -44,15 +43,22 @@ HEADINGS = ["agree", "pg semantics", "regression", "hidden", "order only", "cras
 class Engine:
     am: str
     label: str = ""
-    records: int = 0
-    ran: int = 0
+    ran: int = 0                        # records that ran (not skipped)
     ok: int = 0
-    failing: int = 0                    # ran, didn't pass
+    incomplete: int = 0                 # timed out or didn't run
     counts: Counter = field(default_factory=Counter)
     gate_failures: int = 0
     stale: list[dict[str, Any]] = field(default_factory=list)
-    diffs: list[dict[str, Any]] = field(default_factory=list)
+    # Gating differences: a count per class, and the first PER_CLASS of each.
+    differences: Counter = field(default_factory=Counter)
+    examples: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
     seconds: dict[tuple[str, str], float] = field(default_factory=dict)   # (shard, workload)
+    failed: bool = False                # a problem names this engine
+
+    @property
+    def failing(self) -> int:
+        """Records that ran to a result and didn't pass (the baseline's sense)."""
+        return self.ran - self.ok - self.incomplete
 
 
 @dataclass
@@ -69,33 +75,9 @@ def _shard_of(rs: ResultSet) -> tuple[str, dict]:
     return spec or "1/1", cfg
 
 
-def _pct(ok: int, ran: int) -> Optional[float]:
-    return 100 * ok / ran if ran else None
-
-
 def _short(text: str, n: int = QUERY_CHARS) -> str:
     text = " ".join(text.split())
     return text if len(text) <= n else text[:n - 1] + "…"
-
-
-def _cmp_dir(base: ResultSet, eng: ResultSet) -> Path:
-    return eng.path / "compare" / base.path.name
-
-
-def _comparisons(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
-    """The shard job's comparison of eng with base, as cgate left it in the
-    result set; computed again only if it isn't there."""
-    d = _cmp_dir(base, eng)
-    found = {p.parent.name: json.loads(p.read_text()) for p in sorted(d.glob("*/compare.json"))}
-    return found or ccompare.compare(base, eng)
-
-
-def _diffs(base: ResultSet, eng: ResultSet) -> list[dict[str, Any]]:
-    out = []
-    for p in sorted(_cmp_dir(base, eng).glob("*/diffs.jsonl.gz")):
-        with gzip.open(p, "rt") as f:
-            out += [json.loads(line) for line in f]
-    return out
 
 
 def _covered(rs: ResultSet) -> dict[str, list[str]]:
@@ -108,42 +90,63 @@ def _covered(rs: ResultSet) -> dict[str, list[str]]:
 
 def build(dirs: list[Path], shards: int, base_baseline: Path, *,
           baseline: Path = cbaseline.BASELINE, pin_file: Path = cbaseline.PIN,
-          corpus: Optional[Path] = None, head: str = "", base: str = "",
-          base_ref: str = "master", run_url: str = "", wall_clock: str = "",
-          failed_jobs: list[str] = (), max_chars: int = MAX_CHARS) -> Report:
+          engines: Optional[list[str]] = None, corpus: Optional[Path] = None,
+          head: str = "", base: str = "", base_ref: str = "master", run_url: str = "",
+          wall_clock: str = "", failed_jobs: list[str] = (),
+          max_chars: int = MAX_CHARS) -> Report:
+    """The comment over every shard's result sets in dirs.  engines are the
+    engines besides heap every shard must have (default: those found)."""
     problems: list[str] = [f"job failed: {j}" for j in failed_jobs]
+    notes: list[str] = []          # shown, but not failing the report
+    failed: set[str] = set()       # engines a problem names ("*": all)
+
+    def fail(message: str, *ams: str) -> None:
+        problems.append(message)
+        failed.update(ams or ("*",))
+
     sets = []
     for d in dirs:
         try:
             sets.append(load_set(d))
         except (OSError, ValueError, KeyError) as e:
-            problems.append(f"{d.name}: unreadable result set: {e}")
-    commit = cbaseline.pin(pin_file)
+            fail(f"{d.name}: unreadable result set: {e}")
+    try:
+        commit = cbaseline.pin(pin_file)
+    except OSError as e:
+        fail(f"no corpus pin: {e}")
+        commit = "?"
 
     # Shard -> engine -> result set.
     by_shard: dict[str, dict[str, ResultSet]] = defaultdict(dict)
     cfgs: dict[str, dict] = {}
     for rs in sets:
-        spec, cfg = _shard_of(rs)
+        try:
+            spec, cfg = _shard_of(rs)
+        except (OSError, ValueError) as e:
+            fail(f"{rs.path.name}: no configuration: {e}", rs.table_am)
+            continue
         if rs.table_am in by_shard[spec]:
-            problems.append(f"shard {spec}: two {rs.table_am} result sets")
+            fail(f"shard {spec}: two {rs.table_am} result sets", rs.table_am)
         by_shard[spec][rs.table_am] = rs
         cfgs[spec] = cfg
-        problems += [f"shard {spec} {rs.label}: {p}" for p in rs.problems]
+        for p in rs.problems:
+            fail(f"shard {spec} {rs.label}: {p}", rs.table_am)
     wanted = [f"{i}/{shards}" for i in range(1, shards + 1)]
     for spec in sorted(set(by_shard) - set(wanted)):
-        problems.append(f"shard {spec}: not one of the {shards} shards expected")
-    ams = sorted({am for e in by_shard.values() for am in e}, key=lambda am: am != "heap")
-    engines = [am for am in ams if am != "heap"]
+        fail(f"shard {spec}: not one of the {shards} shards expected")
+    found = {am for e in by_shard.values() for am in e if am != "heap"}
+    engines = sorted(engines if engines else found)
+    for am in sorted(found - set(engines)):
+        fail(f"{am}: an engine that wasn't expected", am)
     if not engines:
-        problems.append("no engine besides heap")
+        fail("no engine besides heap")
     for spec in wanted:
         got = by_shard.get(spec, {})
         if not got:
-            problems.append(f"shard {spec}: missing")
+            fail(f"shard {spec}: missing")
         for am in ["heap"] + engines:
             if got and am not in got:
-                problems.append(f"shard {spec}: no {am} result set")
+                fail(f"shard {spec}: no {am} result set", am)
 
     # Coverage: every shard's files, together the corpus once.
     heap_sets = [by_shard[s]["heap"] for s in wanted if "heap" in by_shard.get(s, {})]
@@ -152,99 +155,118 @@ def build(dirs: list[Path], shards: int, base_baseline: Path, *,
         cfg = next(iter(cfgs.values()))
         if any(p.get("sample", "all") != "all" for p in cfg.get("workloads", {}).values()):
             sample = "smoke"
-        corpus = corpus or ccompare.corpus_path(heap_sets[0] if heap_sets else sets[0])
         try:
+            corpus = corpus or ccompare.corpus_path(heap_sets[0] if heap_sets else sets[0])
             full = cshard.workload_files(corpus, cfg)
             for am in ["heap"] + engines:
                 parts = [_covered(by_shard[s][am]) for s in wanted if am in by_shard.get(s, {})]
-                problems += [f"{am}: {p}" for p in cshard.overlap_and_gaps(parts, full)]
-        except (OSError, ValueError) as e:
-            problems.append(f"cannot list the corpus at {corpus}: {e}")
+                for p in cshard.overlap_and_gaps(parts, full):
+                    fail(f"{am}: {p}", am)
+        except (OSError, ValueError, KeyError) as e:
+            fail(f"cannot list the corpus at {corpus}: {e}")
 
     # Heap against the baseline at the head, and the base's for the change.
-    check = cbaseline.check(heap_sets, cbaseline.read(baseline), commit) if heap_sets else None
-    if check and not check.ok:
-        problems.append(check.summary())
+    check = None
+    if heap_sets:
+        try:
+            check = cbaseline.check(heap_sets, cbaseline.read(baseline), commit)
+            if not check.ok:
+                fail(check.summary(), "heap")
+        except (OSError, ValueError, EOFError) as e:
+            fail(f"heap baseline {baseline}: {e}", "heap")
+    base_failing: Optional[int] = None
     try:
-        base_entries = cbaseline.read(base_baseline).entries
+        base_file = cbaseline.read(base_baseline)
+        if base_file.commit != commit:
+            notes.append(f"the base's baseline is for sqllogictest {base_file.commit[:7]}, "
+                         f"not {commit[:7]}: no change against the base")
+        elif check:
+            base_failing = sum(1 for (f, _) in base_file.entries if f in check.files)
     except (OSError, ValueError, EOFError) as e:
-        problems.append(f"base baseline {base_baseline}: {e}")
-        base_entries = {}
-    covered = check.files if check else set()
-    base_failing = sum(1 for (f, _) in base_entries if f in covered)
+        notes.append(f"no heap baseline at the base ({e}): no change against the base")
 
     rows: dict[str, Engine] = {am: Engine(am) for am in ["heap"] + engines}
     for spec in wanted:
         got = by_shard.get(spec, {})
-        for am, rs in got.items():
+        for am, rs in sorted(got.items()):
             e = rows.setdefault(am, Engine(am))
             e.label = rs.label
             for r in rs.results:
                 w = r["key"]["workload"]
                 if r["status"] != "ok":
-                    problems.append(f"shard {spec} {rs.label}/{w}: {r['status']}")
+                    fail(f"shard {spec} {rs.label}/{w}: {r['status']}", am)
                     continue
-                m = r["metrics"]
-                ran = m["records"] - m["skipped"]
-                e.records += m["records"]
+                try:
+                    m = r["metrics"]
+                    ran = m["records"] - m["skipped"]
+                    e.ok += m["ok"]
+                    e.incomplete += m.get("timeout", 0) + m.get("did_not_run", 0)
+                except (KeyError, TypeError) as err:
+                    fail(f"shard {spec} {rs.label}/{w}: no metric {err}", am)
+                    continue
                 e.ran += ran
-                e.ok += m["ok"]
-                e.failing += ran - m["ok"]
                 e.seconds[(spec, w)] = m.get("window_seconds") or 0
                 if am == "heap":
                     for st in ("crashed", "timeout"):
                         e.counts[st] += m.get(st, 0)
                     e.counts["other"] += m.get("not_implemented", 0) + m.get("did_not_run", 0)
                     e.counts["postgres_semantics"] += m.get("not_ok", 0)
-        heap = got.get("heap")
-        for am in engines:
-            if heap is None or am not in got:
+            if am == "heap":
                 continue
-            e, rs = rows[am], got[am]
+            heap = got.get("heap")
+            if heap is None:
+                continue
+            gated = sorted(set(ccompare.run_workloads(rs)))
+            if sorted(ccompare.slt_dirs(rs)) != gated:
+                fail(f"shard {spec} {am}: incomplete cells", am)
             try:
-                cmps = _comparisons(heap, rs)
+                cmps = ccompare.compare(heap, rs)
+                if sorted(cmps) != gated:
+                    fail(f"shard {spec} {am}: compared {sorted(cmps)}, ran {gated}", am)
+                for w, cm in cmps.items():
+                    for cls, n in cm["counts"].items():
+                        e.counts[cls if cls in COLUMNS else "other"] += n
+                    e.gate_failures += cm["gate_failures"]
+                    e.stale += cm["stale_exceptions"]
+                for d in ccompare.compared_diffs(heap, rs):
+                    if d["class"] in ("agree", "postgres_semantics", "exception"):
+                        continue
+                    e.differences[d["class"]] += 1
+                    if len(e.examples[d["class"]]) < PER_CLASS:
+                        e.examples[d["class"]].append({**d, "shard": spec})
             except (RuntimeError, OSError, ValueError, KeyError) as err:
-                problems.append(f"shard {spec} {am}: no comparison with heap: {err}")
-                continue
-            gated = set(ccompare.run_workloads(rs))
-            if set(cmps) != gated:
-                problems.append(f"shard {spec} {am}: compared {sorted(cmps)}, ran {sorted(gated)}")
-            for w, cm in cmps.items():
-                for cls, n in cm["counts"].items():
-                    e.counts[cls if cls in COLUMNS else "other"] += n
-                e.gate_failures += cm["gate_failures"]
-                e.stale += cm["stale_exceptions"]
-            e.diffs += [{**d, "shard": spec} for d in _diffs(heap, rs)
-                        if d["class"] not in ("agree", "postgres_semantics", "exception")]
-        for am in engines:
-            if am in got and heap is not None:
-                gated = sorted(set(ccompare.run_workloads(got[am])))
-                if gated and sorted(ccompare.slt_dirs(got[am])) != gated:
-                    problems.append(f"shard {spec} {am}: incomplete cells")
+                fail(f"shard {spec} {am}: no comparison with heap: {err}", am)
     for am in engines:
         e = rows[am]
-        if e.gate_failures or e.diffs:
-            problems.append(f"{am}: {max(e.gate_failures, len(e.diffs)):,} records differ from heap")
+        n = max(e.gate_failures, sum(e.differences.values()))
+        if n:
+            fail(f"{am}: {n:,} records differ from heap", am)
         if e.stale:
-            problems.append(f"{am}: {len(e.stale)} stale exceptions")
+            fail(f"{am}: {len(e.stale)} stale exceptions", am)
+    for am, e in rows.items():
+        e.failed = "*" in failed or am in failed
 
     passed = not problems
-    text = _render(rows, engines, check, base_failing, problems, passed, commit=commit,
+    text = _render(rows, engines, check, base_failing, problems, notes, passed, commit=commit,
                    sample=sample, shards=shards, head=head, base=base, base_ref=base_ref,
                    run_url=run_url, wall_clock=wall_clock, corpus=corpus,
                    by_shard=by_shard, wanted=wanted)
     text = truncate(text, max_chars, run_url)
-    summary = {"pass": passed, "problems": problems, "shards": shards, "coverage": sample,
-               "corpus": commit, "engines": {
-                   am: {"records": e.ran, "ok": e.ok, "failing": e.failing,
-                        "vs_base": e.failing - base_failing, "counts": dict(e.counts),
-                        "differences": len(e.diffs), "stale_exceptions": len(e.stale)}
+    summary = {"pass": passed, "problems": problems, "notes": notes, "shards": shards,
+               "coverage": sample, "corpus": commit, "engines": {
+                   am: {"ran": e.ran, "ok": e.ok, "failing": e.failing,
+                        "incomplete": e.incomplete,
+                        "vs_base": None if base_failing is None else e.failing - base_failing,
+                        "counts": dict(e.counts), "differences": dict(e.differences),
+                        "stale_exceptions": len(e.stale), "gate": not e.failed}
                    for am, e in rows.items()},
                "baseline": check.to_json() if check else None}
     return Report(text, passed, problems, summary)
 
 
-def _vs_base(e: Engine, base_failing: int) -> str:
+def _vs_base(e: Engine, base_failing: Optional[int]) -> str:
+    if base_failing is None:
+        return "n/a"
     delta = e.failing - base_failing
     if not delta:
         return "±0"
@@ -252,7 +274,8 @@ def _vs_base(e: Engine, base_failing: int) -> str:
     return f"{pp:+.3f} pp ({delta:+,} failing)"
 
 
-def _render(rows, engines, check, base_failing, problems, passed, *, commit, sample, shards,
+def _render(rows, engines, check, base_failing, problems, notes, passed, *, commit, sample,
+            shards,
             head, base, base_ref, run_url, wall_clock, corpus, by_shard, wanted) -> str:
     heap = rows["heap"]
     out = [MARKER,
@@ -266,8 +289,7 @@ def _render(rows, engines, check, base_failing, problems, passed, *, commit, sam
     out.append("| | Pass (corpus) | vs base | " + " | ".join(HEADINGS) + " | gate |")
     out.append("|---|---|---|" + "---|" * len(HEADINGS) + "---|")
     for am, e in rows.items():
-        pct = _pct(e.ok, e.ran)
-        cells = [f"{pct:.3f}%" if pct is not None else "-", _vs_base(e, base_failing)]
+        cells = [ccompare._pct(e.ok, e.ran), _vs_base(e, base_failing)]
         if am == "heap":
             cells += ["—", f"{e.counts['postgres_semantics']:,}", "—", "—", "—",
                       f"{e.counts['crashed']:,}", f"{e.counts['timeout']:,}",
@@ -276,11 +298,10 @@ def _render(rows, engines, check, base_failing, problems, passed, *, commit, sam
                     f"baseline: {len(check.new) + len(check.changed):,} new, "
                     f"{len(check.fixed):,} fixed"
                     + (f", {len(check.incomplete):,} incomplete" if check.incomplete else "")
-                    + ("" if check.ok else " (FAIL)"))
+                    + (" (FAIL)" if e.failed else ""))
         else:
             cells += [f"{e.counts[c]:,}" for c in COLUMNS] + [f"{e.counts['other']:,}"]
-            ok = not (e.gate_failures or e.diffs or e.stale) and e.ran
-            gate = "pass" if ok else "FAIL"
+            gate = "pass" if not e.failed and e.ran else "FAIL"
         out.append(f"| {e.label or am} | " + " | ".join(cells) + f" | {gate} |")
     out.append("")
     if problems:
@@ -289,16 +310,21 @@ def _render(rows, engines, check, base_failing, problems, passed, *, commit, sam
         if len(problems) > 40:
             out.append(f"- ... {len(problems) - 40} more")
         out.append("")
+    if notes:
+        out += [f"_Note: {n}._" for n in notes] + [""]
 
     # New failures, per class: the engines' differences, and heap's.
     groups: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    sizes: Counter = Counter()
     for am in engines:
-        for d in rows[am].diffs:
-            groups[d["class"]].append((am, d))
+        for cls, examples in sorted(rows[am].examples.items()):
+            groups[cls] += [(am, d) for d in examples]
+        sizes.update(rows[am].differences)
     if check:
-        for d in check.new + check.changed:
-            groups["heap regression"].append(("heap", d))
-    n = sum(len(v) for v in groups.values())
+        heap = check.new + check.changed
+        groups["heap regression"] += [("heap", d) for d in heap[:PER_CLASS]]
+        sizes["heap regression"] += len(heap)
+    n = sum(sizes.values())
     out.append(f"<details><summary>New failures ({n:,})</summary>\n")
     if not n:
         out.append("None.\n")
@@ -306,7 +332,7 @@ def _render(rows, engines, check, base_failing, problems, passed, *, commit, sam
         sorted(c for c in groups if c not in ccompare.CLASSES)
     for cls in order:
         items = groups[cls]
-        out.append(f"#### {cls}: {len(items):,}\n")
+        out.append(f"#### {cls}: {sizes[cls]:,}\n")
         for am, d in items[:PER_CLASS]:
             out.append(f"- `{d['file']}:{d['line']}` ({am}"
                        + (f", shard {d['shard']}" if d.get("shard") else "") + ")")
@@ -320,8 +346,8 @@ def _render(rows, engines, check, base_failing, problems, passed, *, commit, sam
             else:
                 out.append(f"  - heap: {ccompare._side(d.get('baseline'))}")
                 out.append(f"  - {am}: {ccompare._side(d.get('engine'))}")
-        if len(items) > PER_CLASS:
-            out.append(f"- ... {len(items) - PER_CLASS:,} more")
+        if sizes[cls] > len(items[:PER_CLASS]):
+            out.append(f"- ... {sizes[cls] - len(items[:PER_CLASS]):,} more")
         out.append("")
     out.append("</details>\n")
 

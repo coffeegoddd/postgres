@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pbench import cbaseline, creport
+from pbench import cbaseline, ccompare, creport
 from evidence_helpers import c_result
 
 FILES = {"C1": [f"select{i}.test" for i in range(1, 6)], "C2": ["evidence/e.test"],
@@ -50,6 +50,7 @@ class ReportTest(unittest.TestCase):
     def sets(self):
         self.n = getattr(self, "n", 0) + 1
         dirs = []
+        heaps = {}
         for (spec, am), recs in self.records.items():
             if (spec, am) in self.skip:
                 continue
@@ -57,15 +58,19 @@ class ReportTest(unittest.TestCase):
             ws = SHARDS[spec]
             config = {"run": {"shard": spec, "workloads": ws},
                       "workloads": {w: {"shard_files": FILES[w]} for w in ws},
-                      "tools": {"sqllogictest": str(self.corpus.parent)}}
-            c_result(path, am, recs, config)
-            if am == "prolly":
+                      "tools": {"sqllogictest": str(self.corpus.parent),
+                                "slt_runner": str(self.root / "no-runner")}}
+            rs = c_result(path, am, recs, config)
+            heaps[spec] = heaps.get(spec, rs)
+            if am == "prolly" and (spec, "heap") not in self.skip:
                 for w in ws:
                     d = path / "compare" / "2026-10-18-C-heap" / w
                     d.mkdir(parents=True)
                     (d / "compare.json").write_text(json.dumps(self.compare[spec][w]))
                     with gzip.open(d / "diffs.jsonl.gz", "wt") as f:
                         f.writelines(json.dumps(x) + "\n" for x in self.diffs[spec][w])
+                    # (as cgate leaves it in the shard's job)
+                    ccompare.seal_comparison(heaps[spec], rs, w)
             dirs.append(path)
         return dirs
 
@@ -185,6 +190,59 @@ class ReportTest(unittest.TestCase):
                           pin_file=self.pin, corpus=self.corpus)
         self.assertFalse(r.passed)
         self.assertTrue(any("shard 2/2 prolly" in p for p in r.problems), r.problems)
+
+    def test_engine_row_fails_with_its_own_problems(self):
+        self.skip = {("2/2", "prolly")}
+        r = self.report()
+        self.assertTrue(self.row(r.text, "prolly").endswith("| FAIL |"))
+        self.assertTrue(self.row(r.text, "B0").endswith("| baseline: 0 new, 0 fixed |"))
+
+    def test_expected_engine_missing_everywhere(self):
+        r = self.report(engines=["prolly", "other"])
+        self.assertFalse(r.passed)
+        self.assertIn("shard 1/2: no other result set", r.problems)
+
+    def test_no_or_other_base_baseline_is_a_note(self):
+        self.base_baseline.unlink()
+        r = self.report()
+        self.assertTrue(r.passed, r.problems)
+        self.assertIn("| 95.833% | n/a |", self.row(r.text, "B0"))
+        self.assertIn("_Note: no heap baseline at the base", r.text)
+        cbaseline.write(self.base_baseline, "older", {})
+        r = self.report()
+        self.assertTrue(r.passed, r.problems)
+        self.assertIn("| n/a |", self.row(r.text, "prolly"))
+        self.assertIn("not pin: no change against the base", r.text)
+
+    def test_incomplete_records_are_not_failing_against_the_base(self):
+        for am in ("heap", "prolly"):
+            self.records["1/2", am]["C1"][0].update(status="timeout")
+        self.compare["1/2"]["C1"]["counts"] = {"agree": 14, "timeout": 1}
+        self.compare["1/2"]["C1"]["gate_failures"] = 1
+        r = self.report()
+        self.assertFalse(r.passed)
+        self.assertIn("| ±0 |", self.row(r.text, "B0"))
+        self.assertIn("1 incomplete", self.row(r.text, "B0"))
+
+    def test_unreadable_inputs_still_write_a_report(self):
+        dirs = self.sets()
+        self.baseline.write_text("not gzip")
+        (dirs[0] / "config.json").unlink()
+        r = creport.build(dirs, 2, self.base_baseline, baseline=self.baseline,
+                          pin_file=self.root / "no-pin", corpus=self.corpus)
+        self.assertFalse(r.passed)
+        self.assertTrue(r.text.startswith(creport.MARKER))
+        self.assertTrue(any(p.startswith("no corpus pin") for p in r.problems), r.problems)
+
+    def test_stale_comparison_is_not_trusted(self):
+        dirs = self.sets()
+        # (edited after cgate stamped it: not to be trusted, and no runner here)
+        (dirs[1] / "compare" / "2026-10-18-C-heap" / "C1" / "compare.json").write_text(
+            json.dumps({"counts": {"agree": 99}, "gate_failures": 0, "stale_exceptions": []}))
+        r = creport.build(dirs, 2, self.base_baseline, baseline=self.baseline,
+                          pin_file=self.pin, corpus=self.corpus)
+        self.assertFalse(r.passed)
+        self.assertTrue(any("no comparison with heap" in p for p in r.problems), r.problems)
 
     def test_failed_job_fails_the_report(self):
         r = self.report(failed_jobs=["shard 3"])
