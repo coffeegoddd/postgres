@@ -2,7 +2,7 @@
 
 **Status: steps 0–5 built and merged (2026-10-17), with the gaps each
 step's notes list; step 6's file remotes built, its network remotes not
-started; step 7 built in stack #215, not yet merged (8.11); step 8 not
+started; step 7 built in #210–#225, not yet merged (8.11); step 8 not
 started.** This replaces the design in which prolly trees are a table's
 primary storage (engines D1–D4, `04-candidate-designs.md`). The decisions
 below marked "user" were made on the dates given; everything else is a
@@ -645,7 +645,7 @@ transfer from known heads and V4 built in the network-remotes stack (7.12).
 - **Exit:** V4.
 
 **Step 7. Reclamation.** Designed in part 8 (decided 2026-10-17). Built
-in stack #215 (#210, #211, #212, #213, #214, #216, #223), not yet merged;
+in a stack of PRs (#210, #211, #212, #213, #214, #216, #223, #225), not yet merged;
 8.11 says what was built and where it departs from part 8.
 - Chunk-store GC with WAL (table files, `oldgen`, journal retirement);
   page-set and physical-page reclamation; the fold epoch's retained page
@@ -1495,9 +1495,12 @@ Not as designed, or not yet:
   7.1 does. A store whose closure broke (a GC that removed a chunk a
   transfer was told it had) would be admitted unchecked: step 7 must keep
   the closure (8.2, 8.3), and the receive doesn't verify it. As built
-  (8.11): the append check refuses a chunk naming one the store lacks; a
-  full collection keeps what the files it keeps whole name; a transfer
-  that began before a collection's swap is refused.
+  (8.11), the receive still doesn't: what it adds goes to a table file
+  unchecked. What keeps the closure is the rest: the append check on
+  what transactions put (the references the tree format declares; other
+  hashes only against what a swap dropped), a full collection keeping
+  what the files it keeps whole name, and a transfer that began before a
+  collection's swap refused.
 - **The seen sets aren't bounded.** What a receive has seen (each chunk
   received, its hash in memory, its bytes in a temporary file) and what a
   send has seen are hash tables in memory, growing with the chunks moved;
@@ -1601,7 +1604,7 @@ Built: decision (A) of 7.5, behind the remote interface (#198–#203).
 ## 8. Step 7 design: reclamation
 
 **Status: decided by the user, 2026-10-17, as recommended** (8.9 lists
-the decisions); built in stack #215, not yet merged, as 8.11 says.
+the decisions); built in #210–#225, not yet merged, as 8.11 says.
 
 Two stores reclaim space: the chunk store, whose history grows with every
 commit and never shrinks today (a commit's changed chunks, every root the
@@ -1836,15 +1839,18 @@ In order, each a PR with its tests:
 
 ### 8.11 As built
 
-Built in stack #215, in 8.10's order: the append check (#210), journal
+Built in a stack of PRs, in 8.10's order: the append check (#210), journal
 segments and the manifest's settled files (#211), the collection and
 `dolt_gc()` (#212), the full collection (#213), the page sweep (#214),
 automatic collection and sweeps under autovacuum (#216), and the
 measurements (#223).
 
 - **The append check** (8.2). Each batch a transaction appends, and the
-  rest at pre-commit, is checked against the store as of a manifest, and
-  appended only if no manifest replaced it meanwhile. What a chunk names
+  rest at pre-commit, is checked against the store as of a GC generation,
+  and appended only if no swap came meanwhile (only a swap removes
+  chunks); so is the root a transaction moves to, before its PAD (it may
+  be an older root the transaction didn't write). A subtransaction that
+  aborts takes the chunks it put with it. What a chunk names
   is the tree's to say: a new tree callback, `references()`, visits a
   node's children and out-of-line value trees from its bytes alone.
 - **Segments** (8.3's seal). The manifest (version 2; version 1 is read)
@@ -1856,47 +1862,62 @@ measurements (#223).
   ("copying") over new chunk-store primitives (`gc_begin`, `gc_files`,
   `gc_find`, `gc_read`, `gc_new`, `gc_copy`, `gc_swap`, `gc_retire`).
   Seal, mark and copy, swap and retire as designed, with SEAL, SWAP and
-  RETIRE manifest records; copied chunks are re-hashed before the window;
+  RETIRE manifest records; copied chunks are re-hashed as they are
+  copied, before the window, and those marked in the window in it (so the
+  window's time includes their reading, hashing and writing);
   the retire waits for the swap's virtual transactions, and a standby
   cancels the queries that were running when it replayed the swap
   (`ResolveRecoveryConflictWithFileReaders()`, a thin export from
   `standby.c`). A transfer that began before a swap is refused (8.3's
-  generation check). `dolt_gc()` and `dolt_gc('--full')`: the database's
-  owner or `pg_maintain`.
+  generation check). One collection at a time, a second refused rather
+  than left to wait (the first waits for every transaction running at its
+  swap, the second among them); none in a transaction that used the
+  store; one begun in a subtransaction that aborts is abandoned with it.
+  `dolt_gc()` and `dolt_gc('--full')`: the database's owner or
+  `pg_maintain`.
 - **Generations** (8.4). A default collection doesn't collect settled
   files, so its marking ends there; a full one collects every file and
   keeps whole each settled file at most half garbage, marking whatever a
   kept file's chunks name, live or not, so the store stays closed under
-  what its chunks name (7.11's trust holds).
+  what its chunks name (7.11's trust holds); chosen again until none is
+  newly kept, as what kept files name counts as live where it is. Nothing
+  a kept file holds is on the swap's dropped list.
 - **The page sweep** (8.6). `bmap_sweep()` per tablespace and database,
   `prolly_page_sweep()` for the current database: exact counts of what
   every map and changes list holds, read under each map header's lock;
   blocks nothing holds freed, stuck counts rewritten once they fit, the
   store shortened (a SHRINK record). Branch creation waits for it while it
-  counts; while any sweep runs the allocator reuses no freed block. Its
+  counts; while a page store is swept its allocator reuses no freed block
+  (other stores' do). Its
   crash tests found a bug, fixed with its own test (#214's first commit):
   a write evicted while its backend held the map page holding the evicted
   page's entry locked it again.
 - **Automatic** (8.5). After its tables, an autovacuum worker collects
-  the chunk store when the journal segment holds chunks, has passed
+  the chunk store when what a default collection collects (the journal
+  segment, and the table files not settled) has passed
   `prolly.gc_journal_threshold` (128MB; -1 is off) and exceeds the
-  settled files' size times `prolly.gc_growth_scale_factor` (0.2), its
-  reads paced by the cost-based delay; and sweeps a page store when one
-  is due (below). Both are SIGHUP settings.
+  settled files' size times `prolly.gc_growth_scale_factor` (0.2), read
+  from sizes alone, its reads paced by the cost-based delay; and sweeps a
+  page store when one is due (below). Both are SIGHUP settings. A worker
+  started only to prevent wraparound, with autovacuum off, does neither.
 - **Tests.** Regression: `append_check`, `journal_segments`, `gc`,
-  `gc_full`, `page_sweep`. TAP: `047_journal_segments` (a ROOT in a
-  sealed segment, a failed seal, standby, crash), `048_gc` (writers
-  straddling the swap refused or committing, a transfer refused, standby
-  files and a cancelled standby query, a crash at each step),
-  `049_page_sweep` (crashed prune and drop leaks freed, a share waiting,
-  standby), `050_bmap_evictions`, `051_autovacuum_reclaim`,
-  `052_gc_measure`.
+  `gc_full`, `page_sweep`. TAP: `054_journal_segments` (a ROOT in a
+  sealed segment, a failed seal, standby, crash), `055_gc` (writers
+  straddling the swap refused or committing, a root moved to a dropped
+  chunk refused, a second collection refused, one failed in a
+  subtransaction, a transfer refused, a kept file's garbage named across
+  a full collection's swap, standby files and a cancelled standby query,
+  a crash at each step), `049_page_sweep` (crashed prune and drop leaks
+  freed, a share waiting, another store reusing blocks meanwhile,
+  standby), `050_bmap_evictions` (with 16 buffers),
+  `051_autovacuum_reclaim`, `052_gc_measure`.
 
 **Measured** (`052_gc_measure.pl` at `PROLLY_GC_MEASURE_SCALE=50`,
 `PROLLY_GC_MEASURE_BRANCHES=50`: a million rows, 50 branches each
 changing 50,000 of them; an assertion-enabled debug build on the
 development machine, so indicative, not step 8's numbers; prolly_bench's
-new V6 workload measures the same on an optimized build):
+new V6 workload measures the space and the collections' times on an
+optimized build, not the window under committing sessions):
 
 | Measure | Result |
 |---|---|
@@ -1905,11 +1926,14 @@ new V6 workload measures the same on an optimized build):
 | After a full collection | 50.9 MB |
 | Default collection: the base; the branches' changes; nothing new | 255 ms; 248 ms; 12 ms |
 | Full collection after the deletes; again, all live | 377 ms; 276 ms |
-| The window, under four sessions committing | median 0.14 ms, max 0.16 ms (the collection: median 18 ms) |
+| The window, under four sessions committing | median 0.14 ms, max 0.16 ms (the collection: median 18 ms); the upper of the two middle samples of ten (the test now reports their mean) |
 
 A default collection costs what changed (the branches' changes cost
-about what the base did, nothing new costs almost nothing), and the
-window costs what was appended during the collection, not the store.
+about what the base did, nothing new costs almost nothing). The window
+reads, hashes and writes what was appended during the collection, not
+the store; it also passes over every collected slot's mark (bits, nothing
+read) to find those, and over the manifest's files, which grows with the
+store but was too small to see here.
 
 Not as designed, or not yet:
 
@@ -1932,8 +1956,9 @@ Not as designed, or not yet:
   names is). A long transaction that appended a batch before the seal
   holds the collection there.
 - **The manifest's lock is let go at the swap**, and a lock of the
-  collection's own held from its start to its retire: a transfer waiting
-  for the manifest would otherwise deadlock with the retire's wait.
+  collection's own held to the end of its transaction (past the retire):
+  a transfer waiting for the manifest would otherwise deadlock with the
+  retire's wait.
 - **The window holds `ProllyJournal`**, which is the server's, not the
   database's: every database's appends wait for it.
 - **Files a crash leaves** (a collection's unnamed new files, segments
@@ -1953,10 +1978,10 @@ Not as designed, or not yet:
   the relations map by a fraction": with sharing, what the maps hold is
   known only by reading them, which is the sweep. A store is swept once
   after the server starts (a crash before may have leaked a drop's or a
-  prune's blocks) and whenever its stuck counts aren't those the last
-  sweep left. A relation dropped since the last checkpoint still counts
-  (its map's file stays until then): its blocks may wait for the next
-  sweep.
+  prune's blocks) and whenever a stuck count has lost a holder since its
+  last sweep began (up to 1024 stores remembered). A relation dropped
+  while a sweep reads it counts for that sweep: its blocks may wait for
+  the next.
 - **No automatic full collection.** The design's estimate of settled
   garbage, from the branches and commits dropped since the last full
   collection, needs those counted where the store keeps them;
