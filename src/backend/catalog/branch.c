@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -90,6 +91,30 @@ Oid			MyBranch = BRANCH_MAIN_OID;
 bool		MyBranchReadOnly = false;
 Oid			CatalogBranchIndexTable = InvalidOid;
 bool		CatalogKeepRowBranch = false;
+
+/*
+ * The branches the transaction has written, each with the subtransaction
+ * that first wrote it: a write the transaction's own statements made, not
+ * one made on the session's behalf (hushed).  A subtransaction's abort
+ * forgets what it first wrote, so a later write is noted again.
+ */
+typedef struct WrittenBranch
+{
+	Oid			branch;
+	SubTransactionId subid;
+} WrittenBranch;
+
+static List *written_branches = NIL;	/* of WrittenBranch */
+static Oid	last_written = InvalidOid;	/* (the last noted, still noted) */
+static List *hushes = NIL;		/* subtransaction of each hush in effect */
+
+typedef struct BranchWriteCallbackItem
+{
+	BranchWriteCallback callback;
+	void	   *arg;
+} BranchWriteCallbackItem;
+
+static List *write_callbacks = NIL;
 bool		CatalogAllBranches = false;
 
 static const CatalogBranchInfo branch_catalogs[] = {
@@ -418,6 +443,7 @@ catalog_row_with_branch(Relation rel, HeapTuple tup)
 		return tup;
 
 	branch = row_branch(rel, tup);
+	branch_note_write(branch);
 
 	/*
 	 * A row formed with the column null (callers that start from all-null
@@ -454,6 +480,24 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 	branch = row_branch(rel, tup);
 	heap_freetuple(tup);
 	slot->tts_values[info->attnum - 1] = ObjectIdGetDatum(branch);
+	branch_note_write(branch);
+}
+
+void
+catalog_note_delete(Relation rel, const ItemPointerData *tid)
+{
+	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
+	HeapTupleData tup;
+	Buffer		buf;
+
+	if (info == NULL || hushes != NIL || !database_has_versioned_schemas())
+		return;
+	tup.t_self = *tid;
+	if (heap_fetch(rel, SnapshotAny, &tup, &buf, false))
+	{
+		branch_note_write(catalog_row_branch(info, &tup));
+		ReleaseBuffer(buf);
+	}
 }
 
 /*
@@ -659,6 +703,122 @@ release_left_branches(void)
 	MemoryContextSwitchTo(old);
 }
 
+static void forget_written(SubTransactionId subid);
+static void register_branch_callbacks(void);
+
+void
+RegisterBranchWriteCallback(BranchWriteCallback callback, void *arg)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	BranchWriteCallbackItem *item = palloc(sizeof(BranchWriteCallbackItem));
+
+	item->callback = callback;
+	item->arg = arg;
+	write_callbacks = lappend(write_callbacks, item);
+	MemoryContextSwitchTo(old);
+}
+
+void
+branch_note_write(Oid branch)
+{
+	MemoryContext old;
+	WrittenBranch *wb;
+	ListCell   *lc;
+
+	if (hushes != NIL || !OidIsValid(branch) || branch == last_written)
+		return;
+	foreach(lc, written_branches)
+	{
+		if (((WrittenBranch *) lfirst(lc))->branch == branch)
+		{
+			last_written = branch;
+			return;
+		}
+	}
+	register_branch_callbacks();
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	wb = palloc(sizeof(WrittenBranch));
+	wb->branch = branch;
+	wb->subid = GetCurrentSubTransactionId();
+	written_branches = lappend(written_branches, wb);
+	MemoryContextSwitchTo(old);
+	last_written = branch;
+
+	/* (a callback's error is the write's) */
+	foreach(lc, write_callbacks)
+	{
+		BranchWriteCallbackItem *item = lfirst(lc);
+
+		item->callback(branch, item->arg);
+	}
+}
+
+bool
+branch_written(Oid branch)
+{
+	ListCell   *lc;
+
+	foreach(lc, written_branches)
+	{
+		if (((WrittenBranch *) lfirst(lc))->branch == branch)
+			return true;
+	}
+	return false;
+}
+
+List *
+branches_written(void)
+{
+	List	   *branches = NIL;
+	ListCell   *lc;
+
+	foreach(lc, written_branches)
+		branches = lappend_oid(branches, ((WrittenBranch *) lfirst(lc))->branch);
+	return branches;
+}
+
+void
+branch_writes_hush(void)
+{
+	MemoryContext old;
+
+	register_branch_callbacks();
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	hushes = lappend_int(hushes, (int) GetCurrentSubTransactionId());
+	MemoryContextSwitchTo(old);
+}
+
+void
+branch_writes_unhush(void)
+{
+	Assert(hushes != NIL);
+	hushes = list_delete_last(hushes);
+}
+
+static void
+forget_written(SubTransactionId subid)
+{
+	ListCell   *lc;
+
+	foreach(lc, written_branches)
+	{
+		WrittenBranch *wb = lfirst(lc);
+
+		if (subid == InvalidSubTransactionId || wb->subid == subid)
+		{
+			written_branches = foreach_delete_current(written_branches, lc);
+			pfree(wb);
+		}
+	}
+	foreach(lc, hushes)
+	{
+		if (subid == InvalidSubTransactionId ||
+			(SubTransactionId) lfirst_int(lc) == subid)
+			hushes = foreach_delete_current(hushes, lc);
+	}
+	last_written = InvalidOid;
+}
+
 static void
 branch_xact_callback(XactEvent event, void *arg)
 {
@@ -668,6 +828,7 @@ branch_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 			undo_new_branches(InvalidSubTransactionId);
 			release_left_branches();
+			forget_written(InvalidSubTransactionId);
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -675,6 +836,7 @@ branch_xact_callback(XactEvent event, void *arg)
 			list_free_deep(new_branches);
 			new_branches = NIL;
 			release_left_branches();
+			forget_written(InvalidSubTransactionId);
 			break;
 		default:
 			break;
@@ -691,6 +853,7 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
 			undo_new_branches(mySubid);
+			forget_written(mySubid);
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:
 			foreach(lc, new_branches)
@@ -699,6 +862,18 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 				if (nb->subid == mySubid)
 					nb->subid = parentSubid;
+			}
+			foreach(lc, written_branches)
+			{
+				WrittenBranch *wb = lfirst(lc);
+
+				if (wb->subid == mySubid)
+					wb->subid = parentSubid;
+			}
+			foreach(lc, hushes)
+			{
+				if ((SubTransactionId) lfirst_int(lc) == mySubid)
+					lfirst_int(lc) = (int) parentSubid;
 			}
 			break;
 		default:

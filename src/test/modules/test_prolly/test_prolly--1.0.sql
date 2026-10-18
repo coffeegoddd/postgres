@@ -46,6 +46,11 @@ CREATE FUNCTION test_branch_switch(name text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The names of the branches the transaction has written.
+CREATE FUNCTION test_branches_written()
+RETURNS text[]
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- The refs' commit of the session branch, as the engine calls it: the
 -- commit's id, or NULL when it was refused as empty.
 CREATE FUNCTION test_refs_commit(message text, allow_empty bool)

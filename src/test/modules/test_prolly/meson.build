@@ -52,6 +52,7 @@ tests += {
       'branches',
       'fold',
       'commits',
+      'branch_writes',
       'status_diff',
       'collations',
       'applier',

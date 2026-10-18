@@ -17,6 +17,7 @@
 #include "access/htup.h"
 #include "access/transam.h"
 #include "executor/tuptable.h"
+#include "nodes/pg_list.h"
 #include "utils/relcache.h"
 
 /* a branch-aware catalog's branch column */
@@ -46,6 +47,28 @@ extern PGDLLIMPORT bool CatalogKeepRowBranch;
  * cache, since an OID can name a row on each branch.
  */
 extern PGDLLIMPORT bool CatalogAllBranches;
+
+/*
+ * Writes to a branch's versioned objects: rows of a versioned table or
+ * sequence, or a versioned object's catalog rows.  The first write of each
+ * branch in a transaction is noted (and again after a subtransaction that
+ * first wrote it aborts), and callbacks are told; a write made on the
+ * session's behalf while hushed (a branch's copies made, a branch moved to
+ * a commit) isn't the transaction's.  The callbacks' errors are the
+ * write's.
+ */
+typedef void (*BranchWriteCallback) (Oid branch, void *arg);
+
+extern void RegisterBranchWriteCallback(BranchWriteCallback callback,
+										void *arg);
+extern void branch_note_write(Oid branch);
+extern bool branch_written(Oid branch);
+extern List *branches_written(void);
+extern void branch_writes_hush(void);
+extern void branch_writes_unhush(void);
+
+/* a catalog row of a versioned object is to be deleted: its branch is written */
+extern void catalog_note_delete(Relation rel, const ItemPointerData *tid);
 
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);

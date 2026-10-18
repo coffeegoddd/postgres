@@ -391,5 +391,6 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 void
 CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
 {
+	catalog_note_delete(heapRel, tid);
 	simple_heap_delete(heapRel, tid);
 }

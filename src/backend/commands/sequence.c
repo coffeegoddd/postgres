@@ -658,6 +658,16 @@ DeleteSequenceTuple(Oid relid)
 }
 
 /*
+ * A versioned sequence is its branch's: a change of its value is a write to
+ * the branch.
+ */
+static void
+note_sequence_write(Relation seqrel)
+{
+	branch_note_write(seqrel->rd_rel->relbranch);
+}
+
+/*
  * Note: nextval with a text argument is no longer exported as a pg_proc
  * entry, but we keep it around to ease porting of C code that may have
  * called the function directly.
@@ -730,6 +740,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
 		PreventCommandIfReadOnly("nextval()");
+	note_sequence_write(seqrel);
 
 	/*
 	 * Forbid this during parallel operation because, to make it work, the
@@ -1047,6 +1058,7 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
 		PreventCommandIfReadOnly("setval()");
+	note_sequence_write(seqrel);
 
 	/*
 	 * Forbid this during parallel operation because, to make it work, the

@@ -73,6 +73,7 @@
 #include "access/prolly_xact.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -635,6 +636,7 @@ materialize(const char *name)
 	 * session may make or write, as it is.
 	 */
 	XactReadOnly = false;
+	branch_writes_hush();
 	PG_TRY();
 	{
 		/* (with the refs held: no other session makes or deletes it meanwhile) */
@@ -660,6 +662,7 @@ done:
 	}
 	PG_FINALLY();
 	{
+		branch_writes_unhush();
 		XactReadOnly = was_read_only;
 	}
 	PG_END_TRY();
