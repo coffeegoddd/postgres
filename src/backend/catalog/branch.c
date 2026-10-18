@@ -28,6 +28,8 @@
 #include "catalog/branch.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_cast.h"
+#include "catalog/pg_range.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
@@ -126,6 +128,8 @@ static const CatalogBranchInfo branch_catalogs[] = {
 	{TSTemplateRelationId, offsetof(FormData_pg_ts_template, tmplbranch), Anum_pg_ts_template_tmplbranch},
 	{SecLabelRelationId, offsetof(FormData_pg_seclabel, objbranch), Anum_pg_seclabel_objbranch},
 	{DefaultAclRelationId, offsetof(FormData_pg_default_acl, defaclbranch), Anum_pg_default_acl_defaclbranch},
+	{RangeRelationId, offsetof(FormData_pg_range, rngbranch), Anum_pg_range_rngbranch},
+	{CastRelationId, offsetof(FormData_pg_cast, castbranch), Anum_pg_cast_castbranch},
 };
 
 /* every branch-aware catalog's OID is below this; a table indexes them */
@@ -364,6 +368,19 @@ row_branch(Relation rel, HeapTuple tup)
 		case AggregateRelationId:
 			return catalog_object_branch(ProcedureRelationId,
 										 ((Form_pg_aggregate) form)->aggfnoid);
+		case RangeRelationId:
+			return catalog_object_branch(TypeRelationId,
+										 ((Form_pg_range) form)->rngtypid);
+		case CastRelationId:
+			{
+				/* a cast belongs where a versioned type it casts does */
+				Form_pg_cast c = (Form_pg_cast) form;
+				Oid			branch = catalog_object_branch(TypeRelationId,
+														   c->castsource);
+
+				return OidIsValid(branch) ? branch :
+					catalog_object_branch(TypeRelationId, c->casttarget);
+			}
 		case AccessMethodOperatorRelationId:
 			return catalog_object_branch(OperatorFamilyRelationId,
 										 ((Form_pg_amop) form)->amopfamily);

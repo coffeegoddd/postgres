@@ -85,6 +85,7 @@ tests += {
       'aggregates',
       'policies',
       'partitions',
+      'range_types',
       'append_check',
       'journal_segments',
       'gc',

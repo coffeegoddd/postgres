@@ -59,6 +59,8 @@ CATALOG(pg_range,3541,RangeRelationId)
 
 	/* subtype difference as a float8, or 0 */
 	regproc		rngsubdiff BKI_LOOKUP_OPT(pg_proc);
+
+	Oid			rngbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_range;
 
 END_CATALOG_STRUCT
@@ -70,8 +72,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_range *Form_pg_range;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_range_rngtypid_index, 3542, RangeTypidIndexId, pg_range, btree(rngtypid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_range_rngmultitypid_index, 2228, RangeMultirangeTypidIndexId, pg_range, btree(rngmultitypid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_range_rngtypid_index, 3542, RangeTypidIndexId, pg_range, btree(rngtypid oid_ops, rngbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_range_rngmultitypid_index, 2228, RangeMultirangeTypidIndexId, pg_range, btree(rngmultitypid oid_ops, rngbranch oid_ops));
 
 MAKE_SYSCACHE(RANGETYPE, pg_range_rngtypid_index, 4);
 MAKE_SYSCACHE(RANGEMULTIRANGE, pg_range_rngmultitypid_index, 4);

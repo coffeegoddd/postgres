@@ -124,8 +124,10 @@
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_range.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
@@ -862,6 +864,95 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
  * ------------------------------------------------------------------------
  */
 
+static char *qualified_function(Oid fn);
+
+/* Is a function part of a type (a range type's constructors)? */
+static bool
+part_of_type(Oid fn)
+{
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(fn));
+	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
+	while (!found && (tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+		found = d->deptype == DEPENDENCY_INTERNAL && d->refclassid == TypeRelationId;
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return found;
+}
+
+/*
+ * A range type: "range", then its subtype, the subtype's operator class,
+ * its collation (empty if none), its subtype difference function (empty if
+ * none) and its multirange type, a line each, as CREATE TYPE ... AS RANGE
+ * names them.  Its multirange type, constructors and cast come with it.  A
+ * canonical function is written in C, and is made with a shell type the
+ * range fills: not held.  Nor is a subtype difference function of a
+ * versioned schema, which a move would make after the type.
+ */
+static void
+describe_range(Canon *cn, Form_pg_type typ)
+{
+	HeapTuple	tup = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(typ->oid));
+	Form_pg_range rng;
+	char	   *name = qualified(typ->typnamespace, NameStr(typ->typname));
+	CanonItem  *it;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for range type %u", typ->oid);
+	rng = (Form_pg_range) GETSTRUCT(tup);
+	if (OidIsValid(rng->rngcanonical))
+	{
+		ReleaseSysCache(tup);
+		(void) uncovered(cn, "range types with a canonical function", name);
+		return;
+	}
+	if (OidIsValid(rng->rngsubdiff) &&
+		canon_namespace(get_func_namespace(rng->rngsubdiff)))
+	{
+		ReleaseSysCache(tup);
+		(void) uncovered(cn, "range types whose subtype difference function is versioned", name);
+		return;
+	}
+	it = add_item(cn, "y:", name);
+	appendStringInfoString(&it->value, "range\n");
+	append_field(&it->value, format_type_extended(rng->rngsubtype, -1,
+												  FORMAT_TYPE_FORCE_QUALIFY));
+	appendStringInfoChar(&it->value, '\n');
+	{
+		HeapTuple	ctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(rng->rngsubopc));
+		Form_pg_opclass opc;
+
+		if (!HeapTupleIsValid(ctup))
+			elog(ERROR, "cache lookup failed for operator class %u", rng->rngsubopc);
+		opc = (Form_pg_opclass) GETSTRUCT(ctup);
+		append_field(&it->value, qualified(opc->opcnamespace, NameStr(opc->opcname)));
+		ReleaseSysCache(ctup);
+	}
+	appendStringInfoChar(&it->value, '\n');
+	if (OidIsValid(rng->rngcollation))
+		append_field(&it->value, generate_collation_name(rng->rngcollation));
+	appendStringInfoChar(&it->value, '\n');
+	if (OidIsValid(rng->rngsubdiff))
+		append_field(&it->value, qualified_function(rng->rngsubdiff));
+	appendStringInfoChar(&it->value, '\n');
+	append_field(&it->value, format_type_extended(rng->rngmultitypid, -1,
+												  FORMAT_TYPE_FORCE_QUALIFY));
+	appendStringInfoChar(&it->value, '\n');
+	ReleaseSysCache(tup);
+}
+
 static void
 describe_type(Canon *cn, Form_pg_type typ)
 {
@@ -987,8 +1078,11 @@ describe_type(Canon *cn, Form_pg_type typ)
 		}
 		relation_close(crel, AccessShareLock);
 	}
-	else if (typ->typtype == TYPTYPE_RANGE || typ->typtype == TYPTYPE_MULTIRANGE ||
-			 typ->typtype == TYPTYPE_BASE)
+	else if (typ->typtype == TYPTYPE_RANGE)
+		describe_range(cn, typ);
+	else if (typ->typtype == TYPTYPE_MULTIRANGE)
+		return;					/* (with its range type) */
+	else if (typ->typtype == TYPTYPE_BASE)
 	{
 		/* Array types of covered types come with them. */
 		if (OidIsValid(typ->typelem) && typ->typcategory == TYPCATEGORY_ARRAY)
@@ -1695,7 +1789,8 @@ collect(Canon *cn)
 			CanonItem  *it;
 
 			if (!canon_namespace(proc->pronamespace) ||
-				in_extension(ProcedureRelationId, proc->oid))
+				in_extension(ProcedureRelationId, proc->oid) ||
+				part_of_type(proc->oid))
 				continue;
 			name = psprintf("%s(%s)",
 							qualified(proc->pronamespace, NameStr(proc->proname)),
@@ -3417,7 +3512,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	return remake;
 }
 
-/* A type, as described ("enum", "domain" or "composite", then lines). */
+/* A type, as described ("enum", "domain", "composite" or "range", then lines). */
 static char *
 create_type_sql(const char *name, const char *def)
 {
@@ -3437,6 +3532,30 @@ create_type_sql(const char *name, const char *def)
 			first = false;
 		}
 		appendStringInfoChar(&sql, ')');
+	}
+	else if (strcmp(kind, "range") == 0)
+	{
+		/* (strtok would skip an empty line: split by hand) */
+		char	   *f[5];
+		char	   *p = copy + strlen(kind) + 1;
+
+		for (int i = 0; i < 5; i++)
+		{
+			char	   *nl = strchr(p, '\n');
+
+			if (nl == NULL)
+				elog(ERROR, "unexpected range type definition for %s", name);
+			*nl = '\0';
+			f[i] = unescape_field(p);
+			p = nl + 1;
+		}
+		appendStringInfo(&sql, "CREATE TYPE %s AS RANGE (SUBTYPE = %s, SUBTYPE_OPCLASS = %s",
+						 name, f[0], f[1]);
+		if (*f[2])
+			appendStringInfo(&sql, ", COLLATION = %s", f[2]);
+		if (*f[3])
+			appendStringInfo(&sql, ", SUBTYPE_DIFF = %s", f[3]);
+		appendStringInfo(&sql, ", MULTIRANGE_TYPE_NAME = %s)", f[4]);
 	}
 	else if (strcmp(kind, "composite") == 0)
 	{
@@ -3862,6 +3981,17 @@ type_moves(List *from, List *to)
 		MoveItem   *f = lfirst(lc);
 		MoveItem   *t = find_item(to, f->kind, f->name);
 
+		/*
+		 * (a range type can't be made otherwise in place, nor beside itself:
+		 * its constructors would collide; Postgres can't alter one either)
+		 */
+		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0 &&
+			(strncmp(f->def, "range\n", 6) == 0 || strncmp(t->def, "range\n", 6) == 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+							f->name),
+					 errdetail("A range type can't be changed in place; a move can't change one either.")));
 		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0)
 			(void) move_type(&moved, from, to,
 							 typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL))),
