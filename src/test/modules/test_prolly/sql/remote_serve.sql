@@ -27,6 +27,13 @@ SELECT dolt_serve_has(ARRAY[pg_temp.h('main'), '\x00ff'::bytea]);
 SELECT hash = pg_temp.h('main') AS same_hash, length(chunk) > 0 AS has_bytes
   FROM dolt_serve_get(ARRAY[pg_temp.h('main'), '\x00ff'::bytea]);
 
+-- what changed since known commits: a head's own chunks and what its root
+-- changed, far fewer than all it reaches; nothing for a known head
+SELECT (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main~1')]))
+	 < (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], '{}')) AS fewer,
+	   (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main~1')])) > 0 AS some,
+	   (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main')])) AS none;
+
 -- a push's move: a compare-and-swap of the branch's head
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('main'), pg_temp.h('main'), :'fmt', false);	-- not there
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'), pg_temp.h('main'), :'fmt', false);

@@ -365,6 +365,130 @@ dolt_serve_get(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* What dolt_serve_since() sends: each chunk once. */
+typedef struct Since
+{
+	ReturnSetInfo *rsinfo;
+	ProllyChunkStore *store;
+	HTAB	   *sent;
+	StringInfoData data;
+} Since;
+
+static bool
+send_since(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Since	   *sn = arg;
+	ProllyHash	key;
+	bool		found;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	memset(&key, 0, sizeof(key));
+	key.len = node->hash.len;
+	memcpy(key.bytes, node->hash.bytes, key.len);
+	(void) hash_search(sn->sent, &key, HASH_ENTER, &found);
+	if (found)
+		return false;
+	resetStringInfo(&sn->data);
+	if (!PROLLY_CALL(prolly_chunk_store(), get, sn->store, &node->hash, &sn->data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk %s is missing from the chunk store",
+						prolly_hash_hex(&node->hash))));
+	values[0] = PointerGetDatum(hash_bytea(&node->hash));
+	values[1] = PointerGetDatum(bytes_bytea(sn->data.data, sn->data.len));
+	tuplestore_putvalues(sn->rsinfo->setResult, sn->rsinfo->setDesc, values, nulls);
+	CHECK_FOR_INTERRUPTS();
+	return true;
+}
+
+/*
+ * dolt_serve_since(wanted bytea[], known bytea[], OUT hash bytea, OUT chunk
+ * bytea) returns setof record: what a receiver that has the known commits
+ * (and all they reach) lacks of the wanted ones, as best it can be told in
+ * one go: the commits from the wanted down to the known (by parents), and
+ * of each, its own chunks and what its root changed from its first
+ * parent's (each tree diffed, equal subtrees skipped).  O(new commits and
+ * what they changed), not the history.  The receiver checks all it is
+ * sent, and reads what it still lacks as it would without this.
+ */
+Datum
+dolt_serve_since(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	Since		sn;
+	HASHCTL		ctl;
+	HTAB	   *known;
+	HTAB	   *seen;
+	int			nwanted;
+	int			nknown;
+	ProllyHash *wanted;
+	ProllyHash *known_hashes;
+	List	   *queue = NIL;
+
+	check_serving(false);
+	wanted = array_hashes(PG_GETARG_ARRAYTYPE_P(0), &nwanted);
+	known_hashes = array_hashes(PG_GETARG_ARRAYTYPE_P(1), &nknown);
+	prolly_database_components(&dc);
+	prolly_folded_tree_env(&env);
+	InitMaterializedSRF(fcinfo, 0);
+	sn.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	sn.store = store();
+	initStringInfo(&sn.data);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	sn.sent = hash_create("prolly chunks sent since", 1024, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	known = hash_create("prolly known commits", 64, &ctl,
+						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	seen = hash_create("prolly commits since", 64, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < nknown; i++)
+		(void) hash_search(known, &known_hashes[i], HASH_ENTER, NULL);
+	for (int i = 0; i < nwanted; i++)
+		queue = lappend(queue, &wanted[i]);
+
+	while (queue != NIL)
+	{
+		ProllyHash *id = linitial(queue);
+		ProllyCommitInfo info;
+		ProllyCommitInfo parent;
+		ProllyNodeRef commit;
+		bool		found;
+
+		queue = list_delete_first(queue);
+		if (hash_search(known, id, HASH_FIND, NULL) != NULL)
+			continue;
+		(void) hash_search(seen, id, HASH_ENTER, &found);
+		if (found || !PROLLY_CALL(dc.refs, commit_get, id, &info))
+			continue;			/* (one it hasn't: the receiver's walk asks) */
+
+		memset(&commit, 0, sizeof(commit));
+		commit.hash = *id;
+		(void) PROLLY_CALL(tree, walk, &env, &commit, send_since, &sn);
+		if (info.has_dependencies)
+			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, send_since, &sn);
+		PROLLY_CALL(dc.canonicalizer, walk_changes,
+					info.nparents > 0 &&
+					PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &parent) ?
+					&parent.root : NULL,
+					&info.root, send_since, &sn);
+		for (int p = 0; p < info.nparents; p++)
+		{
+			ProllyHash *ph = palloc(sizeof(ProllyHash));
+
+			memset(ph, 0, sizeof(*ph));
+			ph->len = info.parents[p].len;
+			memcpy(ph->bytes, info.parents[p].bytes, ph->len);
+			queue = lappend(queue, ph);
+		}
+	}
+	return (Datum) 0;
+}
+
 /*
  * dolt_serve_receive(hashes bytea[], chunks bytea[]) returns void: chunks
  * a push sends, kept for dolt_serve_move_head() in the same transaction.

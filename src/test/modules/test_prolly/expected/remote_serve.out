@@ -58,6 +58,17 @@ SELECT hash = pg_temp.h('main') AS same_hash, length(chunk) > 0 AS has_bytes
  t         | t
 (1 row)
 
+-- what changed since known commits: a head's own chunks and what its root
+-- changed, far fewer than all it reaches; nothing for a known head
+SELECT (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main~1')]))
+	 < (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], '{}')) AS fewer,
+	   (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main~1')])) > 0 AS some,
+	   (SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main')])) AS none;
+ fewer | some | none 
+-------+------+------
+ t     | t    |    0
+(1 row)
+
 -- a push's move: a compare-and-swap of the branch's head
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('main'), pg_temp.h('main'), :'fmt', false);	-- not there
  dolt_serve_move_head 

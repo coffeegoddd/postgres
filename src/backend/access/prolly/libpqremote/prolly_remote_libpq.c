@@ -420,6 +420,68 @@ libpq_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
 	PQclear(res);
 }
 
+/*
+ * What a store with the known commits lacks of the wanted ones, as the
+ * remote tells: streamed a row at a time, not held whole.
+ */
+static void
+libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
+				const ProllyHash *known, int nknown,
+				ProllyRemoteChunkVisit visit, void *arg)
+{
+	StringInfoData w;
+	StringInfoData k;
+	const char *values[2];
+	int			lengths[2];
+	int			formats[2] = {1, 1};
+	Oid			types[2] = {BYTEAARRAYOID, BYTEAARRAYOID};
+	PGresult   *res;
+
+	initStringInfo(&w);
+	initStringInfo(&k);
+	hashes_param(&w, wanted, nwanted);
+	hashes_param(&k, known, nknown);
+	values[0] = w.data;
+	lengths[0] = w.len;
+	values[1] = k.data;
+	lengths[1] = k.len;
+	if (!PQsendQueryParams(r->conn,
+						   "SELECT hash, chunk FROM pg_catalog.dolt_serve_since($1, $2)",
+						   2, types, values, lengths, formats, 1) ||
+		!PQsetSingleRowMode(r->conn))
+		remote_error(r, NULL, "reading what changed");
+	pfree(w.data);
+	pfree(k.data);
+	for (;;)
+	{
+		ExecStatusType status;
+
+		res = libpqsrv_get_result(r->conn, we_result);
+		if (res == NULL)
+			break;
+		status = PQresultStatus(res);
+		if (status == PGRES_SINGLE_TUPLE)
+		{
+			ProllyHash	h;
+
+			PG_TRY();
+			{
+				result_hash(r, res, 0, 0, &h);
+				visit(&h, PQgetvalue(res, 0, 1), PQgetlength(res, 0, 1), arg);
+			}
+			PG_CATCH();
+			{
+				PQclear(res);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		}
+		else if (status != PGRES_TUPLES_OK)
+			remote_error(r, res, "reading what changed");
+		PQclear(res);
+	}
+}
+
 /* Send a batch of a push's chunks. */
 static void
 send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, int n)
@@ -546,4 +608,5 @@ static const ProllyRemoteRoutine libpq_routine = {
 	.move_head = libpq_move_head,
 	.get_many = libpq_get_many,
 	.has_many = libpq_has_many,
+	.get_since = libpq_get_since,
 };

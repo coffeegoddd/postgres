@@ -27,6 +27,10 @@
  * - get_many() visits each chunk of those it has, and has_many() answers
  *   for each, in one exchange with a remote across a network (optional:
  *   get() and has() each otherwise).
+ * - get_since() visits, in one exchange, what a store that has the known
+ *   commits lacks of the wanted ones, as the remote can tell (optional, for
+ *   a remote that runs this code): a guess the caller checks, and
+ *   completes, as it would without it.
  * - move_head() moves branch from expected (an empty hash: the branch
  *   doesn't exist) to head (NULL: delete it), durably, as a compare-and-
  *   swap: false, changing nothing, if the branch isn't at expected.  The
@@ -85,13 +89,16 @@ typedef struct ProllyRemoteRoutine
 							 int n, ProllyRemoteChunkVisit visit, void *arg);
 	void		(*has_many) (ProllyRemote *remote, const ProllyHash *hashes,
 							 int n, bool *has);
+	void		(*get_since) (ProllyRemote *remote, const ProllyHash *wanted,
+							  int nwanted, const ProllyHash *known, int nknown,
+							  ProllyRemoteChunkVisit visit, void *arg);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
 	"check_url", "open", "close", "format", "heads", "get", "has", \
-	"add_chunks", "move_head", "get_many", "has_many"
+	"add_chunks", "move_head", "get_many", "has_many", "get_since"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
-#define PROLLY_REMOTE_LAST_CALLBACK has_many
+#define PROLLY_REMOTE_LAST_CALLBACK get_since
 
 /*
  * The implementation of remotes over a libpq connection, which the loadable

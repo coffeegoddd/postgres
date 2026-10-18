@@ -743,6 +743,17 @@ file_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
 		has[i] = file_has(r, &hashes[i]);
 }
 
+/*
+ * A directory runs no code to tell what changed: nothing, and the walk
+ * reads what the receiver lacks.
+ */
+static void
+file_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
+			   const ProllyHash *known, int nknown,
+			   ProllyRemoteChunkVisit visit, void *arg)
+{
+}
+
 const ProllyRemoteRoutine prolly_remote_file = {
 	.info = {
 		.iface = PROLLY_IFACE_REMOTE,
@@ -762,6 +773,7 @@ const ProllyRemoteRoutine prolly_remote_file = {
 	.move_head = file_move_head,
 	.get_many = file_get_many,
 	.has_many = file_has_many,
+	.get_since = file_get_since,
 };
 
 const ProllyRemoteRoutine *

@@ -2,7 +2,9 @@
 
 # A transfer over a network remote asks for chunks in batches: a clone
 # reads the chunks below each node of a tree in one exchange, and a push
-# asks which of them the remote has in one; not a round trip a chunk.
+# asks which of them the remote has in one; not a round trip a chunk.  And
+# a fetch of commits made since the heads the database has takes one
+# exchange, however many there are.
 
 use strict;
 use warnings FATAL => 'all';
@@ -59,5 +61,27 @@ my $has = calls('dolt_serve_has', $offset);
 cmp_ok($has, '<', 60, "the push asked in few requests ($has)");
 is($origin->safe_psql('postgres', q{SELECT count(*) FROM b.t WHERE v LIKE '%y'}), '400',
 	'and the remote has its rows');
+
+# commits in a line since what the clone has: sent in one exchange, from
+# the heads it has, not a round trip a commit
+$origin->safe_psql('postgres', q{
+	DO $$
+	BEGIN
+		FOR i IN 1..30 LOOP
+			UPDATE b.t SET v = v || 'z' WHERE id = i * 100;
+			PERFORM dolt_commit('-am', 'line ' || i);
+		END LOOP;
+	END $$;
+});
+$offset = -s $origin->logfile;
+$local->safe_psql('c', q{SELECT dolt_pull('origin')});
+my $since = calls('dolt_serve_since', $offset);
+$gets = calls('dolt_serve_get', $offset);
+is($since, 1, 'the new commits asked for once');
+cmp_ok($gets, '<=', 2, "and hardly anything after ($gets)");
+is($local->safe_psql('c', q{SELECT count(*) FROM b.t WHERE v LIKE '%z'}), '30',
+	'pulled all 30 commits\' rows');
+is($local->safe_psql('c', q{SELECT dolt_hashof('main')}),
+	$origin->safe_psql('postgres', q{SELECT dolt_hashof('main')}), 'at the remote\'s head');
 
 done_testing();

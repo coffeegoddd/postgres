@@ -273,6 +273,42 @@ received_next(void *arg, ProllyHash *hash, StringInfo data)
 	return true;
 }
 
+/* The heads this database has, which a remote can send what changed since. */
+typedef struct Known
+{
+	const ProllyChunkStoreRoutine *cs;
+	ProllyChunkStore *store;
+	ProllyHash *hashes;
+	int			n;
+	int			size;
+} Known;
+
+static void
+add_known(Known *k, const ProllyHash *commit)
+{
+	if (commit->len == 0 || !PROLLY_CALL(k->cs, has, k->store, commit))
+		return;
+	if (k->n == k->size)
+	{
+		k->size *= 2;
+		k->hashes = repalloc(k->hashes, sizeof(ProllyHash) * k->size);
+	}
+	hash_key(&k->hashes[k->n++], commit);
+}
+
+static void
+known_branch(const char *name, const ProllyHash *head, void *arg)
+{
+	add_known(arg, head);
+}
+
+static void
+known_tracking(const char *remote, const char *branch, const ProllyHash *commit,
+			   void *arg)
+{
+	add_known(arg, commit);
+}
+
 /* Every commit received from those given: those the store hasn't. */
 static void
 check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
@@ -363,6 +399,28 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	walk = palloc0(sizeof(bool) * Max(ncommits, 1));
 	for (int i = 0; i < ncommits; i++)
 		walk[i] = !PROLLY_CALL(rv.cs, has, rv.store, &commits[i]);
+
+	/*
+	 * A remote that runs this code is told the heads this database has, and
+	 * sends what changed since them in one exchange: kept as received, and
+	 * checked by the walk below, which asks for what it didn't send.
+	 */
+	if (PROLLY_HAS(rr, get_since))
+	{
+		Known		k = {rv.cs, rv.store, palloc(sizeof(ProllyHash) * 16), 0, 16};
+		ProllyHash *wanted = palloc(sizeof(ProllyHash) * Max(ncommits, 1));
+		int			nwanted = 0;
+
+		PROLLY_CALL(dc.refs, branches, known_branch, &k);
+		if (PROLLY_HAS(dc.refs, trackings))
+			PROLLY_CALL(dc.refs, trackings, NULL, known_tracking, &k);
+		for (int i = 0; i < ncommits; i++)
+			if (walk[i])
+				wanted[nwanted++] = commits[i];
+		if (nwanted > 0)
+			PROLLY_CALL(rr, get_since, remote, wanted, nwanted, k.hashes, k.n,
+						receive_many_visit, &rv);
+	}
 
 	PROLLY_CALL(rv.cs, read_through, rv.store, receive_chunk, receive_hint, &rv);
 	PG_TRY();

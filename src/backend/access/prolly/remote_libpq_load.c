@@ -124,6 +124,15 @@ libpq_has_many(ProllyRemote *remote, const ProllyHash *hashes, int n, bool *has)
 		has[i] = PROLLY_CALL(libpq(), has, remote, &hashes[i]);
 }
 
+static void
+libpq_get_since(ProllyRemote *remote, const ProllyHash *wanted, int nwanted,
+				const ProllyHash *known, int nknown,
+				ProllyRemoteChunkVisit visit, void *arg)
+{
+	PROLLY_CALL(libpq(), get_since, remote, wanted, nwanted, known, nknown,
+				visit, arg);
+}
+
 #define LIBPQ_CALLBACKS \
 	.check_url = libpq_check_url, \
 	.open = libpq_open, \
@@ -135,7 +144,8 @@ libpq_has_many(ProllyRemote *remote, const ProllyHash *hashes, int n, bool *has)
 	.add_chunks = libpq_add_chunks, \
 	.move_head = libpq_move_head, \
 	.get_many = libpq_get_many, \
-	.has_many = libpq_has_many
+	.has_many = libpq_has_many, \
+	.get_since = libpq_get_since
 
 const ProllyRemoteRoutine prolly_remote_postgresql = {
 	.info = {
