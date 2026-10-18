@@ -98,6 +98,21 @@ typedef struct ProllyNodeCounters
  * A hash as text (lowercase hex), and read back from len characters of hex
  * (false if they aren't a hash's): prolly_hashtext.c.
  */
+/*
+ * hash as a hash table's key: its bytes past its length zeroed, so equal
+ * hashes are equal keys.
+ */
+static inline ProllyHash
+prolly_hash_key(const ProllyHash *hash)
+{
+	ProllyHash	k;
+
+	memset(&k, 0, sizeof(k));
+	k.len = hash->len;
+	memcpy(k.bytes, hash->bytes, hash->len);
+	return k;
+}
+
 extern char *prolly_hash_hex(const ProllyHash *hash);
 extern bool prolly_hash_from_hex(const char *hex, size_t len, ProllyHash *hash);
 

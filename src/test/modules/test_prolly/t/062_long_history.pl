@@ -22,16 +22,16 @@ sql(q{
 	SELECT dolt_commit('-Am', 'base');
 	DO $$
 	BEGIN
-		FOR i IN 1 .. 3000 LOOP
+		FOR i IN 1 .. 8000 LOOP
 			PERFORM dolt_commit('--allow-empty', '-m', 'empty ' || i);
 		END LOOP;
 	END $$;
 });
 is(sql(q{SET max_stack_depth = '100kB';
 	SELECT count(*), max(commit_order) FROM dolt_log('main')}),
-	'3001|3001', 'every commit listed, the deepest last in order');
+	'8001|8001', 'every commit listed, the deepest last in order');
 is(sql(q{SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1}),
-	'empty 3000', 'the head first');
+	'empty 8000', 'the head first');
 
 $node->stop;
 done_testing();
