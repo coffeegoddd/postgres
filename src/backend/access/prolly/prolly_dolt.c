@@ -66,6 +66,7 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -2485,23 +2486,29 @@ active_branch(PG_FUNCTION_ARGS)
 
 typedef struct LogEntry
 {
+	ProllyHash	key;			/* hash key: info.id, zero-padded */
 	ProllyCommitInfo info;
 	int64		order;			/* 1 + the most of its parents' */
 } LogEntry;
 
-static LogEntry *
-log_find(List *entries, const ProllyHash *id)
+/* (a key with nothing past the hash's length, for the table) */
+static ProllyHash
+log_key(const ProllyHash *id)
 {
-	ListCell   *lc;
+	ProllyHash	k;
 
-	foreach(lc, entries)
-	{
-		LogEntry   *e = lfirst(lc);
+	memset(&k, 0, sizeof(k));
+	k.len = id->len;
+	memcpy(k.bytes, id->bytes, id->len);
+	return k;
+}
 
-		if (same_hash(&e->info.id, id))
-			return e;
-	}
-	return NULL;
+static LogEntry *
+log_find(HTAB *entries, const ProllyHash *id)
+{
+	ProllyHash	k = log_key(id);
+
+	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
 static int
@@ -2517,25 +2524,47 @@ log_cmp(const ListCell *a, const ListCell *b)
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
-/* The order of e: its parents' first (they are all in entries). */
-static int64
-log_order(List *entries, LogEntry *e)
+/*
+ * The order of e, its parents' first (they are all in entries): without
+ * recursion, as history may be as deep as it is long.
+ */
+static void
+log_order(HTAB *entries, LogEntry *e)
 {
-	if (e->order == 0)
+	List	   *stack = list_make1(e);
+
+	while (stack != NIL)
 	{
+		LogEntry   *top = llast(stack);
 		int64		most = 0;
+		bool		ready = true;
 
-		check_stack_depth();
-		for (int i = 0; i < e->info.nparents; i++)
+		if (top->order != 0)
 		{
-			LogEntry   *p = log_find(entries, &e->info.parents[i]);
-
-			if (p)
-				most = Max(most, log_order(entries, p));
+			stack = list_delete_last(stack);
+			continue;
 		}
-		e->order = most + 1;
+		for (int i = 0; i < top->info.nparents; i++)
+		{
+			LogEntry   *p = log_find(entries, &top->info.parents[i]);
+
+			if (p == NULL)
+				continue;
+			if (p->order == 0)
+			{
+				stack = lappend(stack, p);
+				ready = false;
+			}
+			else
+				most = Max(most, p->order);
+		}
+		if (ready)
+		{
+			top->order = most + 1;
+			stack = list_delete_last(stack);
+		}
+		CHECK_FOR_INTERRUPTS();
 	}
-	return e->order;
 }
 
 /*
@@ -2551,11 +2580,18 @@ dolt_log(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ProllyHash	start;
+	HTAB	   *seen;
+	HASHCTL		ctl = {0};
 	List	   *entries = NIL;
 	List	   *todo = NIL;
 	ListCell   *lc;
 
 	InitMaterializedSRF(fcinfo, 0);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(LogEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("dolt_log commits", 256, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
 	{
 		if (pg_strcasecmp(ref, "HEAD") == 0)
@@ -2570,11 +2606,16 @@ dolt_log(PG_FUNCTION_ARGS)
 		ProllyHash *id = linitial(todo);
 		LogEntry   *e;
 
+		ProllyHash	key = log_key(id);
+		bool		found;
+
 		todo = list_delete_first(todo);
 		CHECK_FOR_INTERRUPTS();
-		if (log_find(entries, id))
+		e = hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
 			continue;
-		e = palloc0(sizeof(LogEntry));
+		memset(&e->info, 0, sizeof(e->info));
+		e->order = 0;
 		if (!PROLLY_CALL(refs(), commit_get, id, &e->info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -2584,7 +2625,7 @@ dolt_log(PG_FUNCTION_ARGS)
 			todo = lappend(todo, copy_hash(&e->info.parents[i]));
 	}
 	foreach(lc, entries)
-		(void) log_order(entries, lfirst(lc));
+		log_order(seen, lfirst(lc));
 	list_sort(entries, log_cmp);
 	foreach(lc, entries)
 	{
