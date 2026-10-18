@@ -158,9 +158,11 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root's data trees are in: "2", keyless rows keyed by
- * their first bytes and their hash.  A root in another (one without the
- * item was keyed by the hash alone) has its tables' rows unreadable here.
+ * The format a folded root is in: "3", its definitions' fields escaped
+ * (append_field()); "2" was keyless rows keyed by their first bytes and
+ * their hash, and a root without the item keyed them by the hash alone.
+ * A root in another has its tables' rows unreadable here, and is neither
+ * moved to nor merged: its definitions' text isn't this format's.
  */
 #define FOLDED_FORMAT	"3"
 
@@ -1758,6 +1760,20 @@ root_in_format(Canon *cn, const ProllyNodeRef *root)
 	return current;
 }
 
+/*
+ * Refuse a root of another format: its definitions' text isn't this
+ * format's, so it is neither moved to nor merged (how: "moved to").
+ */
+static void
+check_format(Canon *cn, const ProllyNodeRef *root, const char *how)
+{
+	if (!root_in_format(cn, root))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a commit made in an older format of prolly's history can't be %s", how),
+				 errhint("Commit the branch to write it in the current one.")));
+}
+
 static bool
 folded_in_format(const ProllyNodeRef *root)
 {
@@ -2272,17 +2288,21 @@ folded_table_columns(const ProllyValue *description, bool *keyed)
 static char *
 first_field(const char *line)
 {
-	return unescape_field(pnstrdup(line, strcspn(line, "\t")));
+	char	   *field = pnstrdup(line, strcspn(line, "\t"));
+	char	   *name = unescape_field(field);
+
+	pfree(field);
+	return name;
 }
 
-/* A constraint line's definition, after its name. */
+/* A line's fields after its first, as one (a constraint's definition, an attribute's type). */
 static char *
 constraint_def(const char *line)
 {
 	const char *tab = strchr(line, '\t');
 
 	if (tab == NULL)
-		elog(ERROR, "unexpected constraint line \"%s\"", line);
+		elog(ERROR, "unexpected definition line \"%s\"", line);
 	return unescape_field(tab + 1);
 }
 
@@ -2732,13 +2752,8 @@ create_type_sql(const char *name, const char *def)
 		appendStringInfo(&sql, "CREATE TYPE %s AS (", name);
 		while ((line = strtok(NULL, "\n")) != NULL)
 		{
-			char	   *tab = strchr(line, '\t');
-
-			if (tab == NULL)
-				elog(ERROR, "unexpected attribute line \"%s\"", line);
-			*tab = '\0';
 			appendStringInfo(&sql, "%s%s %s", first ? "" : ", ",
-							 unescape_field(line), unescape_field(tab + 1));
+							 first_field(line), constraint_def(line));
 			first = false;
 		}
 		appendStringInfoChar(&sql, ')');
@@ -3412,6 +3427,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
+	check_format(&cn, to_root, "moved to");
 	from = move_items(&cn, from_root);
 	to = move_items(&cn, to_root);
 	tm = type_moves(from, to);
@@ -3727,6 +3743,10 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
+	/* (a merge base too: its definitions are what both sides changed from) */
+	check_format(&cn, base_root, "merged");
+	check_format(&cn, ours_root, "merged");
+	check_format(&cn, theirs_root, "merged");
 	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, base_root, CurrentMemoryContext);
 	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, ours_root, CurrentMemoryContext);
 	cur[2] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, theirs_root, CurrentMemoryContext);

@@ -27,6 +27,10 @@ CREATE VIEW esc.U&"v\0009iew" AS SELECT id, note || E'\t' AS tabbed FROM esc.U&"
 CREATE FUNCTION esc.U&"f\0009n"(U&"a\000Arg" esc.U&"tab\0009type") RETURNS text
   LANGUAGE sql AS $$ SELECT E'\t' || $1::text $$;
 CREATE SEQUENCE esc.U&"s\0009eq";
+CREATE DOMAIN esc.tabbed AS text CONSTRAINT U&"no\0009tab" CHECK (VALUE <> E'\t');
+CREATE COLLATION esc.ruled (provider = icu, locale = 'und', rules = E'&a < b\n&c < d');
+CREATE TABLE esc.keyed (k text COLLATE esc.ruled PRIMARY KEY, d esc.tabbed);
+INSERT INTO esc.keyed VALUES ('a', 'x'), ('b', 'y');
 -- (a rule's definition is written over several lines)
 CREATE RULE U&"r\0009ule" AS ON INSERT TO esc.base WHERE new.id < 0 DO INSTEAD NOTHING;
 INSERT INTO esc.U&"t\000Abl" (id, p) VALUES (1, ROW(2, E'z\tz'));
@@ -53,6 +57,14 @@ CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
 	SELECT 'seq ' || relname FROM pg_class WHERE relkind = 'S' AND relnamespace = 'esc'::regnamespace
 	UNION ALL
 	SELECT 'rule ' || definition FROM pg_rules WHERE schemaname = 'esc'
+	UNION ALL
+	SELECT 'domain ' || conname || ' ' || pg_get_constraintdef(oid) FROM pg_constraint
+	  WHERE contypid = 'esc.tabbed'::regtype
+	UNION ALL
+	SELECT 'collation ' || collname || ' ' || colllocale || ' ' || collicurules
+	  FROM pg_collation WHERE collnamespace = 'esc'::regnamespace
+	UNION ALL
+	SELECT 'keyed ' || string_agg((k COLLATE "C") || '=' || d, ',' ORDER BY k) FROM esc.keyed
 	ORDER BY 1
 $$;
 SELECT * FROM pg_temp.show();
@@ -80,6 +92,11 @@ CREATE TABLE esc.U&"tab\0009le" (id int PRIMARY KEY);
 SELECT * FROM dolt_status;
 
 SELECT dolt_checkout('main');
+
+-- a commit of an older format (made before names were escaped) is
+-- neither moved to nor merged
+SELECT test_commit_of(test_root_without_format(test_fold_root()), 'older') AS older \gset
+SELECT dolt_reset('--hard', :'older');
 
 -- the type changed under a constraint that uses it: the constraint made
 -- again, as it was

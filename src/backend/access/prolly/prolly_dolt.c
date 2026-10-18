@@ -1265,10 +1265,17 @@ dolt_branches(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* dolt_status's rows ("name\tstatus") by name, which may hold a tab. */
 static int
-name_cmp(const ListCell *a, const ListCell *b)
+status_cmp(const ListCell *a, const ListCell *b)
 {
-	return strcmp(lfirst(a), lfirst(b));
+	const char *x = lfirst(a);
+	const char *y = lfirst(b);
+	size_t		xl = strrchr(x, '\t') - x;
+	size_t		yl = strrchr(y, '\t') - y;
+	int			c = memcmp(x, y, Min(xl, yl));
+
+	return c != 0 ? c : xl < yl ? -1 : xl > yl ? 1 : strcmp(x + xl, y + yl);
 }
 
 typedef struct StatusSink
@@ -1382,7 +1389,7 @@ dolt_status(PG_FUNCTION_ARGS)
 									 "conflict" : "modified"));
 		}
 	}
-	list_sort(names, name_cmp);
+	list_sort(names, status_cmp);
 	foreach(lc, names)
 	{
 		Datum		values[3];
