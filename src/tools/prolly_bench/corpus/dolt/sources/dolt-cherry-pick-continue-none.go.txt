@@ -1,0 +1,18 @@
+{
+		Name: "cherry-pick --continue not in a cherry-pick state",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-am', 'add row from branch1');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_cherry_pick('--continue');",
+				ExpectedErrStr: "error: There is no cherry-pick merge to continue",
+			},
+		},
+	}

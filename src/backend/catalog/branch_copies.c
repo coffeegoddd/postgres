@@ -353,15 +353,17 @@ delete_here(void *arg)
 /*
  * Is name a branch's name by git's rules (git check-ref-format, as Dolt
  * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
- * refspec, and so on: a branch so named couldn't be named again.
+ * refspec, and so on: a branch so named couldn't be named again.  As in
+ * Dolt, a name may begin with "-" (given after "--"), and "HEAD" in any
+ * case is the session branch's head, not a branch.
  */
 static bool
 branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
 
-	if (strcmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
-		name[0] == '-' || name[0] == '/' || name[len - 1] == '/' ||
+	if (pg_strcasecmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
+		name[0] == '/' || name[len - 1] == '/' ||
 		name[len - 1] == '.' || strstr(name, "..") != NULL ||
 		strstr(name, "@{") != NULL || strstr(name, "//") != NULL)
 		return false;
@@ -396,7 +398,7 @@ copies_check_create(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" or \"@\"; not beginning with \"-\" or \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	/* (one made on the session's behalf is the database's mechanism, not the role's) */
 	if (BranchCreateOnBehalf)

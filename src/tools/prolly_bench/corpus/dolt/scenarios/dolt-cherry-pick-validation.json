@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "id": "dolt-cherry-pick-validation",
+  "description": "Reviewed Dolt port: error cases: basic validation",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
+    "case": "DoltCherryPickTests: error cases: basic validation"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.cherrypick"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, v varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit-create",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table t"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "change",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit-change",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "adding row 1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT dolt_cherry_pick('HEAD~100')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT dolt_cherry_pick('abcdaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT dolt_cherry_pick('--abort')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}

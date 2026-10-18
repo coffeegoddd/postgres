@@ -1,0 +1,213 @@
+{
+  "version": 1,
+  "id": "dolt-revert-series-stops",
+  "description": "Reviewed Dolt port: dolt_revert() multi-commit: stops at first conflict",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() multi-commit: stops at first conflict"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.conflicts",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(2,2),(3,3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "seed table"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "a",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (4, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "a-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "insert row 4"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "b",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 42 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "b-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "change row 2"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "c",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 99 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "c-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "change row 2 again"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT r[1], r[2], r[3], r[4] FROM dolt_revert('HEAD~2', 'HEAD~1') r",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "1",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM test ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ],
+          [
+            "2"
+          ],
+          [
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT table_name FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.test"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

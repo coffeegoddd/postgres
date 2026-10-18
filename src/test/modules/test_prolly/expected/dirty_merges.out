@@ -1,7 +1,7 @@
 -- Merges into a working set with uncommitted changes, as in Dolt: allowed
 -- when the merge changes none of the tables and sequences they changed,
--- and no definitions change; they stay uncommitted, left out of the
--- merge's commit.
+-- and no definitions change on both sides; they stay uncommitted, left
+-- out of the merge's commit.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -226,7 +226,9 @@ SELECT table_name FROM dolt_status;
  dm.b
 (1 row)
 
--- Uncommitted changes of definitions aren't merged into.
+-- Uncommitted changes of tables' definitions are merged into when the
+-- merge changes neither those tables nor any definition: a table altered
+-- or made stays as it is, uncommitted.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -234,6 +236,74 @@ SELECT dolt_reset('--hard');
 (1 row)
 
 ALTER TABLE dm.b ADD COLUMN w int;
+CREATE TABLE dm.made (id int PRIMARY KEY);
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
+ b_left_out 
+------------
+          0
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status   
+------------+-----------
+ dm.b       | modified
+ dm.made    | new table
+(2 rows)
+
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'b' ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ v
+ w
+(3 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- not when the merge changes that table's rows, nor when it changes
+-- definitions too
+ALTER TABLE dm.a ADD COLUMN w int;
+SELECT (dolt_merge('feature'))[2:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "dm.a" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE dm.a ADD COLUMN x int;
+SELECT length(dolt_commit('-am', 'feature alters a')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TABLE dm.made (id int PRIMARY KEY);
 SELECT (dolt_merge('feature'))[2:4];
 ERROR:  cannot merge with uncommitted changes where definitions change
 HINT:  Commit the changes, or reset the branch, first.
@@ -241,6 +311,24 @@ SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
  {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
 (1 row)
 
 -- A merge that conflicts isn't made over uncommitted changes: its commit

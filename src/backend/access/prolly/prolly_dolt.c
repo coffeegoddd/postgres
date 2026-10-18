@@ -1079,7 +1079,9 @@ dolt_checkout(PG_FUNCTION_ARGS)
  * dolt_branch(VARIADIC args text[]) returns text[]: {status}
  *
  * branch [start point]; -c/--copy from to; -d/--delete branch...;
- * -D (or -d with -f/--force) branch....
+ * -D (or -d with -f/--force) branch....  Forced, a branch made (or
+ * copied) takes the place of one of its name, as in Dolt, unless it is
+ * the session's own.
  */
 Datum
 dolt_branch(PG_FUNCTION_ARGS)
@@ -1292,6 +1294,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		from = copy ? linitial(names) :
 			list_length(names) > 1 ? (char *) lsecond(names) : NULL;
 		reserved_branch_name(name);
+		if (force && PROLLY_CALL(refs(), branch_lookup, name, &(ProllyBranchId) {0}))
+		{
+			if (strcmp(name, branch_ops()->current()) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("branch \"%s\" is checked out", name),
+						 errhint("Check out another branch first.")));
+			PROLLY_CALL(refs(), branch_delete, name, true);
+		}
 		create_branch(name, from);
 		/* (a copy is protected as its source is, where the owner may say so) */
 		if (copy && from && strcmp(from, "main") != 0 &&
@@ -2451,7 +2462,7 @@ dolt_log(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
 	{
-		if (strcmp(ref, "HEAD") == 0)
+		if (pg_strcasecmp(ref, "HEAD") == 0)
 			return (Datum) 0;	/* nothing committed yet */
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),

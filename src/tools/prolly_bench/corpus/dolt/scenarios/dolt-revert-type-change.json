@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "id": "dolt-revert-type-change",
+  "description": "Reviewed Dolt port: dolt_revert() automatically resolves some conflicts",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() automatically resolves some conflicts"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE tableA (id int PRIMARY KEY, col1 varchar(255))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "commit-table",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table"
+      ],
+      "save": "table"
+    },
+    {
+      "id": "row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO tableA VALUES (1, 'test')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "add2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "commit-row",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new row"
+      ],
+      "save": "row"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "new_row"
+      ]
+    },
+    {
+      "id": "change",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE tableA ALTER COLUMN col1 TYPE text",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "add3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "commit-change",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "change col"
+      ],
+      "save": "changed"
+    },
+    {
+      "id": "revert",
+      "session": "a",
+      "op": "revert",
+      "args": [
+        "new_row"
+      ],
+      "save": "reverted"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM tableA",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

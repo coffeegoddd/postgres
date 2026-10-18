@@ -1,0 +1,36 @@
+{
+		Name: "dolt_revert() multi-commit: stops at first conflict",
+		SetUpScript: []string{
+			"set @@autocommit=0;",
+			"create table test (pk int primary key, c0 int);",
+			"insert into test values (1,1),(2,2),(3,3);",
+			"call dolt_commit('-Am', 'seed table');",
+			// commit A - clean revert target
+			"insert into test values (4, 4);",
+			"call dolt_commit('-am', 'insert row 4');",
+			// commit B - will conflict when reverted
+			"update test set c0 = 42 where pk = 2;",
+			"call dolt_commit('-am', 'change row 2');",
+			// commit C - modifies same row as B's revert, causing conflict
+			"update test set c0 = 99 where pk = 2;",
+			"call dolt_commit('-am', 'change row 2 again');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// Reverting HEAD~2 (insert row 4) first, then HEAD~1 (change row 2).
+				// HEAD~2 reverts cleanly (commit created). HEAD~1 conflicts.
+				Query:    "call dolt_revert('HEAD~2', 'HEAD~1');",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				// The first revert (insert row 4) committed cleanly.
+				Query:    "select pk from test order by pk;",
+				Expected: []sql.Row{{1}, {2}, {3}},
+			},
+			{
+				// The second revert (change row 2) left conflicts.
+				Query:    "select `table` from dolt_conflicts;",
+				Expected: []sql.Row{{"test"}},
+			},
+		},
+	}

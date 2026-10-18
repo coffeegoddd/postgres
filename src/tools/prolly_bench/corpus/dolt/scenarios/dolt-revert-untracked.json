@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "id": "dolt-revert-untracked",
+  "description": "Reviewed Dolt port: dolt_revert() proceeds with untracked tables disjoint from revert target",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() proceeds with untracked tables disjoint from revert target"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(2,2),(3,3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed table"
+      ],
+      "save": "seeded"
+    },
+    {
+      "id": "change",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 42 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "change-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "answer of the universe: 42"
+      ],
+      "save": "changed"
+    },
+    {
+      "id": "create-untracked",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE dont_track (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "untracked-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO dont_track VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_revert($1) r",
+      "params": [
+        "HEAD"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk, c0 FROM test WHERE pk = 2",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM dont_track",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

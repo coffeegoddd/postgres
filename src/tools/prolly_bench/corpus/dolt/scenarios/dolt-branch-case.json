@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "id": "dolt-branch-case",
+  "description": "Reviewed Dolt port: a branch name differing from an existing one only by case is rejected",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltBranchScripts: a branch name differing from an existing one only by case is rejected"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (a int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "br",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "br"
+      ]
+    },
+    {
+      "id": "feature",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-f', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('-b', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'br', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'feature', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-cf', 'feature', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-mf', 'feature', 'BR')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('br')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_branches WHERE name = 'br' OR name = 'BR'",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

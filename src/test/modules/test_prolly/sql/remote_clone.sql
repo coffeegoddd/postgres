@@ -86,11 +86,11 @@ SELECT name FROM dolt_remotes;
 \c :db
 DROP DATABASE regress_clone_c;
 
--- a remote's branch whose name isn't one here (beginning "-") is refused,
+-- a remote's branch whose name isn't one here (with "..") is refused,
 -- by the rule every branch made is checked by
 SELECT dolt_remote('add', 'oddname', :'url_odd');
 SELECT dolt_push('oddname', 'main') AS pushed;
-SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), :'fmt');
+SELECT test_remote_set_head(:'url_odd', 'odd..name', dolt_hashof('main'), :'fmt');
 CREATE DATABASE regress_clone_g;
 \c regress_clone_g
 SELECT dolt_clone(:'url_odd');

@@ -1,0 +1,44 @@
+{
+		Name: "Copy branches from other branches using dolt_branch procedure",
+		SetUpScript: []string{
+			"CALL DOLT_BRANCH('myNewBranch1')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL DOLT_BRANCH('-c')",
+				ExpectedErrStr: "error: invalid usage",
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', 'myNewBranch1')",
+				ExpectedErrStr: "error: invalid usage",
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', 'myNewBranch2')",
+				ExpectedErrStr: "error: invalid usage",
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', '', '')",
+				ExpectedErrStr: "error: cannot branch empty string",
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('-c', 'myNewBranch1', 'myNewBranch2')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_BRANCHES WHERE NAME='myNewBranch2';",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', 'myNewBranch1', 'myNewBranch2')",
+				ExpectedErrStr: "fatal: A branch named 'myNewBranch2' already exists.",
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('-cf', 'myNewBranch1', 'myNewBranch2')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', 'myNewBranch1', 'HEAD')",
+				ExpectedErrStr: "fatal: 'HEAD' is not a valid branch name.",
+			},
+		},
+	}

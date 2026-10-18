@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "id": "dolt-revert-dirty-disjoint",
+  "description": "Reviewed Dolt port: dolt_revert() proceeds when dirty table is disjoint from revert target",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() proceeds when dirty table is disjoint from revert target"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create-t",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-meta",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE meta (pk int PRIMARY KEY, note varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed schema"
+      ],
+      "save": "seeded"
+    },
+    {
+      "id": "rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 1), (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "rows-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add rows to t"
+      ],
+      "save": "rows"
+    },
+    {
+      "id": "side",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO meta VALUES (1, 'side')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_revert($1) r",
+      "params": [
+        "HEAD"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk, c0 FROM t ORDER BY pk",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk, note FROM meta",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "side"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

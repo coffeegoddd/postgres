@@ -1,0 +1,22 @@
+{
+		Name: "schema change: ALTER TABLE DROP COLUMN",
+		SetUpScript: []string{
+			"create table test(pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table test on main');",
+			"call dolt_checkout('-b', 'branch1');",
+			"ALTER TABLE test DROP COLUMN v;",
+			"call dolt_commit('-am', 'drop column v from test on branch1');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW CREATE TABLE test;",
+				Expected: []sql.Row{{"test", "CREATE TABLE `test` (\n  `pk` int NOT NULL,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	}

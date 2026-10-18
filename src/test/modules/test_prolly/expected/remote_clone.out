@@ -248,7 +248,7 @@ SELECT name FROM dolt_remotes;
 
 \c :db
 DROP DATABASE regress_clone_c;
--- a remote's branch whose name isn't one here (beginning "-") is refused,
+-- a remote's branch whose name isn't one here (with "..") is refused,
 -- by the rule every branch made is checked by
 SELECT dolt_remote('add', 'oddname', :'url_odd');
  dolt_remote 
@@ -262,7 +262,7 @@ SELECT dolt_push('oddname', 'main') AS pushed;
  {0,"main -> oddname/main"}
 (1 row)
 
-SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), :'fmt');
+SELECT test_remote_set_head(:'url_odd', 'odd..name', dolt_hashof('main'), :'fmt');
  test_remote_set_head 
 ----------------------
  t
@@ -271,8 +271,8 @@ SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), :'fmt');
 CREATE DATABASE regress_clone_g;
 \c regress_clone_g
 SELECT dolt_clone(:'url_odd');
-ERROR:  invalid branch name "-flag"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+ERROR:  invalid branch name "odd..name"
+DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 \c :db
 DROP DATABASE regress_clone_g;
 SELECT dolt_remote('remove', 'oddname');

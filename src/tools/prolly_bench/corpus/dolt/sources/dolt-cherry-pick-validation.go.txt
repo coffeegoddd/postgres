@@ -1,0 +1,26 @@
+{
+		Name: "error cases: basic validation",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL Dolt_Cherry_Pick('HEAD~100');",
+				ExpectedErrStr: "invalid ancestor spec",
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick('abcdaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
+				ExpectedErrStr: "target commit not found",
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick('--abort');",
+				ExpectedErrStr: "error: There is no cherry-pick merge to abort",
+			},
+		},
+	}

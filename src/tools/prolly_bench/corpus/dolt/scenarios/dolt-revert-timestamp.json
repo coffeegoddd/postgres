@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "dolt-revert-timestamp",
+  "description": "Reviewed Dolt port: dolt_revert() commit has current timestamp",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() commit has current timestamp"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(2,2),(3,3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed table"
+      ],
+      "save": "seeded"
+    },
+    {
+      "id": "change",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 42 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "change-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "answer of the universe: 42"
+      ],
+      "save": "changed"
+    },
+    {
+      "id": "revert",
+      "session": "a",
+      "op": "revert",
+      "args": [
+        "HEAD"
+      ],
+      "save": "reverted"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT extract(year FROM date) > 2000 FROM dolt_log ORDER BY commit_order DESC LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

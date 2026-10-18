@@ -1,0 +1,27 @@
+{
+		Name: "error cases: error with staged or unstaged changes ",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+			"INSERT INTO t VALUES (100, 'onehundy');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL Dolt_Cherry_Pick(@commit1);",
+				ExpectedErrStr: "cannot cherry-pick with uncommitted changes",
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick(@commit1);",
+				ExpectedErrStr: "cannot cherry-pick with uncommitted changes",
+			},
+		},
+	}

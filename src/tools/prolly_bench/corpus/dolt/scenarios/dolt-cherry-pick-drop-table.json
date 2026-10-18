@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "id": "dolt-cherry-pick-drop-table",
+  "description": "Reviewed Dolt port: schema change: DROP TABLE",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
+    "case": "DoltCherryPickTests: schema change: DROP TABLE"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.cherrypick"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE dropme (pk bigint PRIMARY KEY, v varchar(10))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO dropme VALUES (11, 'aa'), (22, 'ab')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit-create",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table dropme"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "drop",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE dropme",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "commit-drop",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "drop table dropme"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+      "expect": {
+        "rows": [
+          [
+            "dropme"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_cherry_pick($1) r",
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

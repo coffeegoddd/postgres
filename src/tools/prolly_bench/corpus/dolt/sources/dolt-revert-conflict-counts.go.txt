@@ -1,0 +1,30 @@
+{
+		Name: "dolt_revert() detects conflicts and returns conflict counts",
+		SetUpScript: []string{
+			"set @@autocommit=0;",
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(2,2),(3,3);",
+			"call dolt_commit('-Am', 'seed table');",
+			"update test set c0 = 42 where pk = 2;",
+			"call dolt_commit('-am', 'first change');",
+			"update test set c0 = 23 where pk = 2;",
+			"call dolt_commit('-am', 'second change');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// Reverting HEAD~1 creates a conflict: both ours (HEAD) and theirs
+				// (HEAD~2, parent of the reverted commit) modified pk=2.
+				Query:    "call dolt_revert('HEAD~1');",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    "select `table` from dolt_conflicts;",
+				Expected: []sql.Row{{"test"}},
+			},
+			{
+				// Working set is left in conflicted state; no new commit was created.
+				Query:    "select message from dolt_log limit 1;",
+				Expected: []sql.Row{{"second change"}},
+			},
+		},
+	}
