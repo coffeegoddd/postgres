@@ -509,6 +509,33 @@ fails without its fix), and Postgres's suites keep passing after each one.
   tables), `dolt_status` lists them as "not covered" and unstaged, a branch
   with them is dirty, only a commit refuses them, and a diff of one table
   folds that table alone.
+- **As built (objects):** commits hold aggregates, row security policies
+  and partitioned tables (the objects stack); foreign tables and window
+  functions (only C writes one) are what they still refuse.
+  - An aggregate is a routine item whose definition is the CREATE OR
+    REPLACE AGGREGATE that makes it, every option written (Postgres has
+    no deparser for aggregates; pg_dump writes them so). A move makes
+    aggregates after the functions they use and drops them before.
+  - A table's definition ends with its policies: row security on, and
+    forced, then each policy as CREATE POLICY makes it, its roles by name.
+    Roles aren't recorded dependencies (they aren't versioned): a policy
+    naming a role the database lacks fails where it is made. The fold
+    and the row writer work below the planner, where policies don't
+    apply.
+  - A partitioned table is a table item with an empty data tree and its
+    key; a partition, a table item with its parent and bound, its rows
+    folded as any table's. A move makes partitioned tables before their
+    partitions (by PARTITION OF), lets Postgres make what a partition
+    has of its parent (constraints and indexes made only if missing;
+    triggers cloned from the parent aren't the partition's own), drops
+    partitions first, and detaches and attaches a partition whose bound
+    or parent changed. Refused: a changed partition key, a table becoming
+    or ceasing to be a partition, a partitioned table whose columns would
+    be made again. Not exact: a partition attached with its columns in
+    another order than its parent's comes back in the parent's, so the
+    next commit's hash differs.
+  - Names are read as identifiers where a move drops by name (a quoted
+    trigger, rule, index or policy name with a space came back cut).
 - **As built:** a table's schema, a type's definition and a collation's
   description are text split into lines and fields, and the names and
   expressions in them were written as they were: a quoted name or string
@@ -1323,8 +1350,9 @@ privileges.
 - **A file remote** is the server's files: only superusers, or roles
   granted `pg_read_server_files` and `pg_write_server_files`, may use one,
   as `COPY … FROM 'file'` asks.
-- Row security is no gap: a commit refuses row security policies on
-  versioned tables, so none relies on them.
+- Row security doesn't narrow a fetch: commits hold policies (since the
+  objects stack), but history holds every row whatever they say, so
+  fetching takes the roles above, as `pg_read_all_data` bypasses them.
 
 ### 7.7 Durability and concurrency
 
