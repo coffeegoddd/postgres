@@ -124,7 +124,14 @@
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_conversion.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_opfamily.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_ts_config.h"
+#include "catalog/pg_ts_dict.h"
+#include "catalog/pg_ts_parser.h"
+#include "catalog/pg_ts_template.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_range.h"
@@ -134,6 +141,7 @@
 #include "catalog/partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
@@ -865,6 +873,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
  */
 
 static char *qualified_function(Oid fn);
+static void refuse_undescribed(Canon *cn);
 
 /*
  * Is an object part of a type (a range type's constructors, its cast to its
@@ -1832,6 +1841,87 @@ collect(Canon *cn)
 		systable_endscan(scan);
 		table_close(pg_proc, AccessShareLock);
 	}
+	refuse_undescribed(cn);
+}
+
+/*
+ * Objects of versioned schemas the canonical form doesn't describe: each
+ * refused, not left out of a commit's hash (a clone or checkout wouldn't
+ * have them).  A cast has no schema: one is refused if it casts a
+ * versioned type and isn't part of a type.
+ */
+static void
+refuse_undescribed(Canon *cn)
+{
+	static const struct
+	{
+		Oid			classid;
+		const char *what;
+	}			kinds[] = {
+		{OperatorRelationId, "operators"},
+		{OperatorClassRelationId, "operator classes"},
+		{OperatorFamilyRelationId, "operator families"},
+		{ConversionRelationId, "conversions"},
+		{TSConfigRelationId, "text search configurations"},
+		{TSDictionaryRelationId, "text search dictionaries"},
+		{TSParserRelationId, "text search parsers"},
+		{TSTemplateRelationId, "text search templates"},
+		{StatisticExtRelationId, "extended statistics"},
+	};
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	for (int k = 0; k < lengthof(kinds); k++)
+	{
+		AttrNumber	nspatt = get_object_attnum_namespace(kinds[k].classid);
+		AttrNumber	nameatt = get_object_attnum_name(kinds[k].classid);
+		AttrNumber	oidatt = get_object_attnum_oid(kinds[k].classid);
+
+		rel = table_open(kinds[k].classid, AccessShareLock);
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			bool		isnull;
+			Oid			nsp = DatumGetObjectId(heap_getattr(tup, nspatt,
+															RelationGetDescr(rel), &isnull));
+			Oid			oid = DatumGetObjectId(heap_getattr(tup, oidatt,
+															RelationGetDescr(rel), &isnull));
+			Name		name = DatumGetName(heap_getattr(tup, nameatt,
+														 RelationGetDescr(rel), &isnull));
+
+			if (!canon_namespace(nsp) || in_extension(kinds[k].classid, oid))
+				continue;
+			(void) uncovered(cn, kinds[k].what, qualified(nsp, NameStr(*name)));
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
+
+	rel = table_open(CastRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_cast c = (Form_pg_cast) GETSTRUCT(tup);
+
+		ObjectAddress src;
+		ObjectAddress tgt;
+
+		ObjectAddressSet(src, TypeRelationId, c->castsource);
+		ObjectAddressSet(tgt, TypeRelationId, c->casttarget);
+		if (!canon_namespace(get_object_namespace(&src)) &&
+			!canon_namespace(get_object_namespace(&tgt)))
+			continue;
+		if (part_of_type(CastRelationId, c->oid) ||
+			in_extension(CastRelationId, c->oid))
+			continue;
+		(void) uncovered(cn, "casts",
+						 psprintf("(%s AS %s)",
+								  format_type_extended(c->castsource, -1, FORMAT_TYPE_FORCE_QUALIFY),
+								  format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)));
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
 }
 
 /*

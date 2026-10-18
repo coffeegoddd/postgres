@@ -1,0 +1,81 @@
+-- Objects of versioned schemas the canonical form doesn't describe are
+-- refused by a commit and listed as not covered, never left out of a
+-- commit's hash: a clone or checkout wouldn't have them.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA ud VERSIONED;
+CREATE TABLE ud.t (id int PRIMARY KEY, a int, b int);
+SELECT length(dolt_commit('-Am', 'table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
+CREATE OPERATOR FAMILY ud.fam USING btree;
+CREATE OPERATOR CLASS ud.cls FOR TYPE int4 USING hash AS
+  OPERATOR 1 =, FUNCTION 1 hashint4(int4);
+CREATE CONVERSION ud.conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;
+CREATE TEXT SEARCH CONFIGURATION ud.cfg (COPY = pg_catalog.simple);
+CREATE TEXT SEARCH DICTIONARY ud.dict (TEMPLATE = pg_catalog.simple);
+CREATE TEXT SEARCH PARSER ud.prs (START = prsd_start, GETTOKEN = prsd_nexttoken,
+  END = prsd_end, LEXTYPES = prsd_lextype);
+CREATE TEXT SEARCH TEMPLATE ud.tmpl (INIT = dsimple_init, LEXIZE = dsimple_lexize);
+CREATE STATISTICS ud.st ON a, b FROM ud.t;
+CREATE TYPE ud.e AS ENUM ('a', 'b');
+CREATE CAST (ud.e AS int4) WITH INOUT;
+SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name;
+    table_name     | staged |   status    
+-------------------+--------+-------------
+ ud."==="          | f      | not covered
+ ud.cfg            | f      | not covered
+ ud.cls            | f      | not covered
+ ud.conv           | f      | not covered
+ ud.dict           | f      | not covered
+ (ud.e AS integer) | f      | not covered
+ ud.fam            | f      | not covered
+ ud.prs            | f      | not covered
+ ud.st             | f      | not covered
+ ud.tmpl           | f      | not covered
+(10 rows)
+
+SELECT dolt_commit('-Am', 'refused');
+ERROR:  prolly commits don't cover casts yet: (ud.e AS integer)
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+-- each one gone, the commit goes through
+DROP CAST (ud.e AS int4);
+SELECT dolt_commit('-Am', 'refused');
+ERROR:  prolly commits don't cover operators yet: ud."==="
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP OPERATOR ud.=== (int, int);
+DROP OPERATOR CLASS ud.cls USING hash;
+DROP OPERATOR FAMILY ud.cls USING hash;
+DROP OPERATOR FAMILY ud.fam USING btree;
+DROP CONVERSION ud.conv;
+DROP TEXT SEARCH CONFIGURATION ud.cfg;
+DROP TEXT SEARCH DICTIONARY ud.dict;
+DROP TEXT SEARCH PARSER ud.prs;
+DROP TEXT SEARCH TEMPLATE ud.tmpl;
+DROP STATISTICS ud.st;
+SELECT * FROM dolt_status WHERE status = 'not covered';
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT length(dolt_commit('-Am', 'an enum')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP SCHEMA ud CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table ud.t
+drop cascades to type ud.e
+SELECT length(dolt_commit('-Am', 'ud gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

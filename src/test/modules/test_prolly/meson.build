@@ -86,6 +86,7 @@ tests += {
       'policies',
       'partitions',
       'range_types',
+      'undescribed_objects',
       'append_check',
       'journal_segments',
       'gc',

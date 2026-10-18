@@ -39,6 +39,9 @@
 #include "access/table.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
@@ -214,6 +217,23 @@ object_is_versioned(const ObjectAddress *object)
 			if (!HeapTupleIsValid(tup))
 				return false;
 			versioned = namespace_is_versioned(((Form_pg_default_acl) GETSTRUCT(tup))->defaclnamespace);
+			heap_freetuple(tup);
+			return versioned;
+		case AccessMethodOperatorRelationId:
+		case AccessMethodProcedureRelationId:
+			/* an operator family's entries: versioned if the family is */
+			tup = fetch_row(object->classId, object->objectId);
+			if (!HeapTupleIsValid(tup))
+				return false;
+			{
+				ObjectAddress family;
+
+				ObjectAddressSet(family, OperatorFamilyRelationId,
+								 object->classId == AccessMethodOperatorRelationId ?
+								 ((Form_pg_amop) GETSTRUCT(tup))->amopfamily :
+								 ((Form_pg_amproc) GETSTRUCT(tup))->amprocfamily);
+				versioned = object_is_versioned(&family);
+			}
 			heap_freetuple(tup);
 			return versioned;
 		case CastRelationId:
