@@ -57,6 +57,7 @@ typedef struct Needs
 {
 	List	   *extensions;
 	List	   *objects;
+	List	   *except;			/* "name\nvalue": already needed, not checked */
 } Needs;
 
 /* An extension to create. */
@@ -115,10 +116,27 @@ find_extension(Needs *needs, const char *name)
 }
 
 static void
+note_except(const char *name, const char *value, void *arg)
+{
+	Needs	   *needs = arg;
+
+	needs->except = lappend(needs->except, psprintf("%s\n%s", name, value));
+}
+
+static void
 note_need(const char *name, const char *value, void *arg)
 {
 	Needs	   *needs = arg;
 	ListCell   *lc;
+
+	foreach(lc, needs->except)
+	{
+		const char *e = lfirst(lc);
+		size_t		len = strlen(name);
+
+		if (strncmp(e, name, len) == 0 && e[len] == '\n' && strcmp(e + len + 1, value) == 0)
+			return;
+	}
 
 	if (strncmp(name, EXTENSION_PREFIX, strlen(EXTENSION_PREFIX)) == 0)
 	{
@@ -160,11 +178,7 @@ note_need(const char *name, const char *value, void *arg)
 	}
 }
 
-/*
- * Run a query with text parameters; the rows, in SPI_tuptable.  Not
- * read-only: each query takes a new snapshot, so it sees the extensions
- * this transaction made (a clone's, before its moves check them).
- */
+/* Run a query with text parameters; the rows, in SPI_tuptable. */
 static void
 query(const char *sql, int nparams, const char **params)
 {
@@ -176,7 +190,7 @@ query(const char *sql, int nparams, const char **params)
 		types[i] = TEXTOID;
 		values[i] = CStringGetTextDatum(params[i]);
 	}
-	if (SPI_execute_with_args(sql, nparams, types, values, NULL, false, 0) != SPI_OK_SELECT)
+	if (SPI_execute_with_args(sql, nparams, types, values, NULL, true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_with_args failed: %s", sql);
 }
 
@@ -495,7 +509,7 @@ object_exists(const char *address)
 		Oid			types[3] = {TEXTOID, TEXTOID, TEXTOID};
 
 		if (SPI_execute_with_args("SELECT pg_catalog.pg_get_object_address($1, $2::text[], $3::text[])",
-								  3, types, parts, NULL, false, 1) != SPI_OK_SELECT)
+								  3, types, parts, NULL, true, 1) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_execute_with_args failed");
 		found = true;
 		ReleaseCurrentSubTransaction();
@@ -532,23 +546,22 @@ collect_trees(List *trees, Needs *needs)
 		PROLLY_CALL(dc.canonicalizer, dependencies, lfirst(lc), note_need, needs);
 }
 
-void
-prolly_check_dependencies(List *trees, bool install, const char *what)
+/* Check the needs, as prolly_check_dependencies() says. */
+static void
+check_needs(Needs *needs, bool install, const char *what)
 {
-	Needs		needs = {NIL, NIL};
 	StringInfoData missing;
 	List	   *installs = NIL;
 	ListCell   *lc;
 	bool		any_extension = false;
 
-	collect_trees(trees, &needs);
-	if (needs.extensions == NIL && needs.objects == NIL)
+	if (needs->extensions == NIL && needs->objects == NIL)
 		return;
 
 	initStringInfo(&missing);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	foreach(lc, needs.extensions)
+	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
 		char	   *version = check_extension(e, &missing, &any_extension);
@@ -571,7 +584,7 @@ prolly_check_dependencies(List *trees, bool install, const char *what)
 			installs = lappend(installs, add);
 		}
 	}
-	foreach(lc, needs.objects)
+	foreach(lc, needs->objects)
 	{
 		NeededObject *o = lfirst(lc);
 
@@ -594,9 +607,28 @@ prolly_check_dependencies(List *trees, bool install, const char *what)
 }
 
 void
-prolly_check_commit_dependencies(const ProllyCommitInfo *commit, const char *what)
+prolly_check_dependencies(List *trees, bool install, const char *what)
 {
-	if (commit->has_dependencies)
-		prolly_check_dependencies(list_make1((ProllyNodeRef *) &commit->dependencies),
-								  false, what);
+	Needs		needs = {NIL, NIL, NIL};
+
+	collect_trees(trees, &needs);
+	check_needs(&needs, install, what);
+}
+
+void
+prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
+								 const ProllyCommitInfo *since, const char *what)
+{
+	ProllyDatabaseComponents dc;
+	Needs		needs = {NIL, NIL, NIL};
+
+	if (!commit->has_dependencies)
+		return;
+	prolly_database_components(&dc);
+	if (since && since->has_dependencies)
+		PROLLY_CALL(dc.canonicalizer, dependencies, &since->dependencies,
+					note_except, &needs);
+	PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+				note_need, &needs);
+	check_needs(&needs, false, what);
 }

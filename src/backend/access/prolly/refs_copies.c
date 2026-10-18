@@ -604,6 +604,7 @@ static void
 materialize(const char *name)
 {
 	ProllyHash	head;
+	ProllyHash	checked;
 	ProllyCommitInfo info;
 	ProllyNodeRef baseline;
 	bool		was_read_only = XactReadOnly;
@@ -614,6 +615,17 @@ materialize(const char *name)
 				 errmsg("branch \"%s\" hasn't been used yet", name),
 				 errdetail("A branch's first use makes its copies, which a standby can't."),
 				 errhint("Use it on the primary first.")));
+
+	/*
+	 * What its head needs from outside, checked before the refs are held
+	 * (the check reads catalogs and extensions' control files; other
+	 * sessions' commits needn't wait for it), and again under them only if
+	 * the head moved meanwhile.
+	 */
+	if (branch_head(name, &checked) && copies_commit_get(&checked, &info))
+		prolly_check_commit_dependencies(&info, NULL, "branch's first use");
+	else
+		memset(&checked, 0, sizeof(checked));
 
 	/*
 	 * Its copies are the branch's as much as its head is: made whatever the
@@ -631,7 +643,8 @@ materialize(const char *name)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the head commit of branch \"%s\" is missing", name)));
-		prolly_check_commit_dependencies(&info, "checkout");
+		if (!same_hash(&head, &checked))
+			prolly_check_commit_dependencies(&info, NULL, "branch's first use");
 		branch_ops()->make(name, NULL);
 		branch_set_baseline(name,
 							branch_baseline(branch_ops()->current(), &baseline) ?
@@ -1369,7 +1382,6 @@ copies_reset(const char *ref)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
-	prolly_check_commit_dependencies(&info, "reset");
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
 	move_settled(&info.root);

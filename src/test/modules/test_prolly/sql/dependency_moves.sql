@@ -11,35 +11,50 @@ CREATE SCHEMA mv_util;
 CREATE FUNCTION mv_util.one() RETURNS int LANGUAGE sql AS 'SELECT 1';
 CREATE SCHEMA mv VERSIONED;
 CREATE TABLE mv.t (id int PRIMARY KEY, n int);
-SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT (dolt_commit('-Am', 'base'))[1] AS base \gset
 ALTER TABLE mv.t ALTER COLUMN n SET DEFAULT mv_util.one();
 SELECT (dolt_commit('-Am', 'default'))[1] AS needs_one \gset
+-- a side that only adds a row; another that adds a use of the function
 SELECT dolt_checkout('-b', 'side');
 INSERT INTO mv.t (id) VALUES (1);
 SELECT (dolt_commit('-Am', 'side row'))[1] AS side \gset
 SELECT dolt_checkout('main');
-SELECT dolt_branch('-D', 'side');		-- (its copies would need the function)
+SELECT dolt_checkout('-b', 'uses', :'base');
+CREATE TABLE mv.u (id int PRIMARY KEY, k int DEFAULT mv_util.one() + 1);
+SELECT (dolt_commit('-Am', 'another use'))[1] AS uses \gset
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'side');		-- (their copies would need the function)
+SELECT dolt_branch('-D', 'uses');
 SELECT dolt_branch('old', 'HEAD');		-- only a head, until first used
 ALTER TABLE mv.t ALTER COLUMN n DROP DEFAULT;
-SELECT length(dolt_commit('-Am', 'no default')::text) AS committed;
+SELECT (dolt_commit('-Am', 'no default'))[1] AS no_default \gset
 DROP FUNCTION mv_util.one();
 
--- each move to a commit needing the function: refused, nothing moved
+-- each move bringing in a use of the function: refused, nothing moved
 SELECT dolt_checkout('old');
 SELECT dolt_reset('--hard', :'needs_one');
-SELECT dolt_cherry_pick(:'needs_one');
-SELECT dolt_merge(:'side');
+SELECT dolt_cherry_pick(:'needs_one');		-- (it made the default)
+SELECT dolt_merge(:'uses');					-- (its side made a use)
+SELECT dolt_revert(:'no_default');			-- (it would bring the default back)
 SELECT * FROM dolt_status;
-SELECT column_default FROM information_schema.columns
-  WHERE table_schema = 'mv' AND column_name = 'n';
+SELECT table_name, column_name, column_default FROM information_schema.columns
+  WHERE table_schema = 'mv' ORDER BY 1, 2;
+
+-- a move whose changes need nothing missing goes ahead: the side only
+-- added a row, and the merge keeps main's dropped default
+SELECT dolt_merge(:'side') IS NOT NULL AS merged;
+SELECT id, n FROM mv.t;
+SELECT dolt_reset('--hard', 'HEAD');		-- (a reset to the head moves nothing in)
+
 -- with the function made again, each goes ahead
 CREATE FUNCTION mv_util.one() RETURNS int LANGUAGE sql AS 'SELECT 1';
 SELECT dolt_checkout('old');
 SELECT column_default FROM information_schema.columns
   WHERE table_schema = 'mv' AND column_name = 'n';
 SELECT dolt_checkout('main');
-SELECT dolt_merge(:'side') IS NOT NULL AS merged;
-SELECT id, n FROM mv.t;
+SELECT dolt_merge(:'uses') IS NOT NULL AS merged;
+SELECT table_name, column_name, column_default FROM information_schema.columns
+  WHERE table_schema = 'mv' ORDER BY 1, 2;
 
 -- a commit (made elsewhere) needing an extension the database lacks: the
 -- move says to install it; nothing is installed

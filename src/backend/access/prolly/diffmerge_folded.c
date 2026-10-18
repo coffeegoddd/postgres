@@ -2016,6 +2016,24 @@ merge_rows(void *arg)
 	}
 }
 
+/*
+ * What a commit needs from outside the versioned schemas that since (NULL:
+ * nothing) didn't, checked before a move (what) brings it in.
+ */
+static void
+check_needs(const ProllyHash *commit, const ProllyHash *since, const char *what)
+{
+	ProllyCommitInfo info;
+	ProllyCommitInfo before;
+
+	if (!PROLLY_CALL(components().refs, commit_get, commit, &info) ||
+		(since && !PROLLY_CALL(components().refs, commit_get, since, &before)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit is missing")));
+	prolly_check_commit_dependencies(&info, since ? &before : NULL, what);
+}
+
 /* A commit's canonical root. */
 static void
 commit_root(const ProllyHash *id, ProllyNodeRef *root)
@@ -2756,6 +2774,7 @@ merge_held(const char *branch, const char *message, int flags,
 		/* all it has is uncommitted */
 		if (working_has_objects())
 			refuse_local_changes("merge");
+		check_needs(&theirs, NULL, "merge");
 		reset_to(&theirs);
 		*commit_id = theirs;
 		return 0;
@@ -2770,15 +2789,8 @@ merge_held(const char *branch, const char *message, int flags,
 		*commit_id = ours;
 		return 0;
 	}
-	{
-		ProllyCommitInfo info;
-
-		if (!PROLLY_CALL(dc.refs, commit_get, &theirs, &info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit is missing")));
-		prolly_check_commit_dependencies(&info, "merge");
-	}
+	/* (what their changes since the base bring in) */
+	check_needs(&theirs, &base, "merge");
 	commit_root(&base, &roots[0]);
 	commit_root(&ours, &roots[1]);
 	commit_root(&theirs, &roots[2]);
@@ -2899,9 +2911,14 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 					 errmsg("%s of a commit with %d parents isn't supported", fn,
 							info[i].nparents),
 					 errdetail("Its changes are changes from one parent.")));
-		/* (a revert goes back to what the branch had) */
-		if (!revert)
-			prolly_check_commit_dependencies(&info[i], what);
+		/*
+		 * What its changes bring in: a pick's, what it needs that its parent
+		 * didn't; a revert's, what the parent needed that it doesn't.
+		 */
+		if (revert)
+			check_needs(&info[i].parents[0], &picked[i], what);
+		else
+			check_needs(&picked[i], &info[i].parents[0], what);
 	}
 	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
 		ereport(ERROR,
