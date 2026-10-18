@@ -23,20 +23,21 @@ CREATE TEXT SEARCH PARSER ud.prs (START = prsd_start, GETTOKEN = prsd_nexttoken,
   END = prsd_end, LEXTYPES = prsd_lextype);
 CREATE TEXT SEARCH TEMPLATE ud.tmpl (INIT = dsimple_init, LEXIZE = dsimple_lexize);
 SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name COLLATE "C";
- table_name | staged |   status    
-------------+--------+-------------
- ud."==="   | f      | not covered
- ud.cfg     | f      | not covered
- ud.cls     | f      | not covered
- ud.conv    | f      | not covered
- ud.dict    | f      | not covered
- ud.fam     | f      | not covered
- ud.prs     | f      | not covered
- ud.tmpl    | f      | not covered
-(8 rows)
+                   table_name                   | staged |   status    
+------------------------------------------------+--------+-------------
+ conversion ud.conv                             | f      | not covered
+ operator class ud.cls for access method hash   | f      | not covered
+ operator family ud.cls for access method hash  | f      | not covered
+ operator family ud.fam for access method btree | f      | not covered
+ operator ud.===(integer,integer)               | f      | not covered
+ text search configuration ud.cfg               | f      | not covered
+ text search dictionary ud.dict                 | f      | not covered
+ text search parser ud.prs                      | f      | not covered
+ text search template ud.tmpl                   | f      | not covered
+(9 rows)
 
 SELECT dolt_commit('-Am', 'refused');
-ERROR:  prolly commits don't cover operators yet: ud."==="
+ERROR:  prolly commits don't cover conversion objects yet: conversion ud.conv
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 -- each one gone, the commit goes through
 DROP OPERATOR ud.=== (int, int);
@@ -114,9 +115,9 @@ SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regname
 (1 row)
 
 SELECT * FROM dolt_status WHERE status = 'not covered';
- table_name | staged |   status    
-------------+--------+-------------
- ud."==="   | f      | not covered
+            table_name            | staged |   status    
+----------------------------------+--------+-------------
+ operator ud.===(integer,integer) | f      | not covered
 (1 row)
 
 SELECT dolt_reset('--hard');

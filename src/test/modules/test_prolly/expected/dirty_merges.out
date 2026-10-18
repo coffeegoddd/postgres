@@ -431,10 +431,11 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
--- A collation that orders otherwise now isn't an uncommitted change the
--- merge must leave out: its commit records the collation as it is.
-CREATE COLLATION dm.c_utf8 (provider = builtin, locale = 'C.UTF-8');
-CREATE TABLE dm.k (k text COLLATE dm.c_utf8 PRIMARY KEY);
+-- A collation (of an ordinary schema) that orders otherwise now isn't an
+-- uncommitted change the merge must leave out: its commit records the
+-- collation as it is.
+CREATE COLLATION public.dm_c_utf8 (provider = builtin, locale = 'C.UTF-8');
+CREATE TABLE dm.k (k text COLLATE public.dm_c_utf8 PRIMARY KEY);
 INSERT INTO dm.k VALUES ('a'), ('b');
 SELECT length(dolt_commit('-Am', 'a collated table')::text) AS committed;
  committed 
@@ -461,7 +462,7 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
-UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
+UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'dm_c_utf8';
 SELECT (dolt_merge('feature', '-m', 'merged with a collation changed'))[3:4];
        dolt_merge       
 ------------------------
@@ -473,7 +474,7 @@ SELECT table_name, status FROM dolt_status ORDER BY 1;
 ------------+--------
 (0 rows)
 
-UPDATE pg_collation SET collicurules = NULL WHERE collname = 'c_utf8';
+UPDATE pg_collation SET collicurules = NULL WHERE collname = 'dm_c_utf8';
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -481,11 +482,11 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 DROP SCHEMA dm CASCADE;
-NOTICE:  drop cascades to 7 other objects
+NOTICE:  drop cascades to 6 other objects
 DETAIL:  drop cascades to table dm.a
 drop cascades to table dm.b
 drop cascades to sequence dm.s1
 drop cascades to sequence dm.s2
 drop cascades to materialized view dm.mv
-drop cascades to collation dm.c_utf8
 drop cascades to table dm.k
+DROP COLLATION public.dm_c_utf8;

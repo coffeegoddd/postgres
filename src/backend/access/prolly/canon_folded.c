@@ -111,6 +111,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_depend.h"
@@ -143,6 +144,9 @@
 #include "catalog/partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -896,6 +900,7 @@ static char *qualified_function(Oid fn);
 static void refuse_undescribed(Canon *cn);
 static void describe_casts(Canon *cn);
 static void describe_collations(Canon *cn);
+static bool held_kind(Oid classid);
 
 /*
  * Is an object part of a type (a range type's constructors, its cast to its
@@ -1357,6 +1362,16 @@ depender_is_canonical(const ObjectAddress *object)
 {
 	Oid			nsp;
 
+	/*
+	 * (what a commit doesn't hold needs nothing for it: an operator class's
+	 * entries, say)
+	 */
+	if (object->classId == AccessMethodOperatorRelationId ||
+		object->classId == AccessMethodProcedureRelationId ||
+		(is_objectclass_supported(object->classId) &&
+		 get_object_attnum_namespace(object->classId) != InvalidAttrNumber &&
+		 !held_kind(object->classId)))
+		return false;
 	if (!object_is_versioned(object) ||
 		in_extension(object->classId, object->objectId))
 		return false;
@@ -1936,57 +1951,88 @@ collect(Canon *cn)
 }
 
 /*
- * Objects of versioned schemas the canonical form doesn't describe: each
- * refused, not left out of a commit's hash (a clone or checkout wouldn't
- * have them).  (Casts, which have no schema, are described.)
+ * Is a catalog's kind of object one a commit holds (or one never held:
+ * privileges)?  Every other kind a branch-aware catalog holds in a
+ * versioned schema is refused, not left out of a commit's hash (a clone or
+ * checkout wouldn't have it): a kind added later included.
+ */
+static bool
+held_kind(Oid classid)
+{
+	switch (classid)
+	{
+		case NamespaceRelationId:
+		case RelationRelationId:
+		case TypeRelationId:
+		case ProcedureRelationId:
+		case ConstraintRelationId:	/* (a table's or a domain's) */
+		case CollationRelationId:
+		case StatisticExtRelationId:	/* (a table's) */
+		case DefaultAclRelationId:	/* (privileges aren't held) */
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Objects of versioned schemas the canonical form doesn't describe, each
+ * named as Postgres describes it (which tells an operator's argument
+ * types, an operator class's access method): refused.  Branch-aware
+ * catalogs with a schema column are the ones that can hold them.  (Casts,
+ * which have no schema, are described.)
  */
 static void
 refuse_undescribed(Canon *cn)
 {
-	static const struct
-	{
-		Oid			classid;
-		const char *what;
-	}			kinds[] = {
-		{OperatorRelationId, "operators"},
-		{OperatorClassRelationId, "operator classes"},
-		{OperatorFamilyRelationId, "operator families"},
-		{ConversionRelationId, "conversions"},
-		{TSConfigRelationId, "text search configurations"},
-		{TSDictionaryRelationId, "text search dictionaries"},
-		{TSParserRelationId, "text search parsers"},
-		{TSTemplateRelationId, "text search templates"},
-	};
-	Relation	rel;
-	SysScanDesc scan;
-	HeapTuple	tup;
+	int			ncatalogs;
+	const CatalogBranchInfo *catalogs = catalog_branch_catalogs(&ncatalogs);
+	List	   *versioned = NIL;	/* schemas seen, and whether */
+	List	   *plain = NIL;
 
-	for (int k = 0; k < lengthof(kinds); k++)
+	for (int k = 0; k < ncatalogs; k++)
 	{
-		AttrNumber	nspatt = get_object_attnum_namespace(kinds[k].classid);
-		AttrNumber	nameatt = get_object_attnum_name(kinds[k].classid);
-		AttrNumber	oidatt = get_object_attnum_oid(kinds[k].classid);
+		Oid			classid = catalogs[k].relid;
+		AttrNumber	nspatt;
+		AttrNumber	oidatt;
+		Relation	rel;
+		SysScanDesc scan;
+		HeapTuple	tup;
 
-		rel = table_open(kinds[k].classid, AccessShareLock);
+		if (held_kind(classid) || !is_objectclass_supported(classid) ||
+			(nspatt = get_object_attnum_namespace(classid)) == InvalidAttrNumber)
+			continue;
+		oidatt = get_object_attnum_oid(classid);
+		rel = table_open(classid, AccessShareLock);
 		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			bool		isnull;
-			Oid			nsp = DatumGetObjectId(heap_getattr(tup, nspatt,
-															RelationGetDescr(rel), &isnull));
 			Oid			oid = DatumGetObjectId(heap_getattr(tup, oidatt,
 															RelationGetDescr(rel), &isnull));
-			Name		name = DatumGetName(heap_getattr(tup, nameatt,
-														 RelationGetDescr(rel), &isnull));
+			Oid			nsp;
+			ObjectAddress self;
 
-			if (!canon_namespace(nsp) || in_extension(kinds[k].classid, oid))
+			/* (what initdb made is in no versioned schema) */
+			if (oid < FirstNormalObjectId)
 				continue;
+			nsp = DatumGetObjectId(heap_getattr(tup, nspatt, RelationGetDescr(rel), &isnull));
+			if (isnull || list_member_oid(plain, nsp))
+				continue;
+			if (!list_member_oid(versioned, nsp))
 			{
-				ObjectAddress self;
-
-				ObjectAddressSet(self, kinds[k].classid, oid);
-				(void) uncovered(cn, kinds[k].what, qualified(nsp, NameStr(*name)), &self);
+				if (!canon_namespace(nsp))
+				{
+					plain = lappend_oid(plain, nsp);
+					continue;
+				}
+				versioned = lappend_oid(versioned, nsp);
 			}
+			if (in_extension(classid, oid))
+				continue;
+			ObjectAddressSet(self, classid, oid);
+			(void) uncovered(cn, psprintf("%s objects", get_object_class_descr(classid)),
+							 getObjectDescription(&self, false), &self);
 		}
 		systable_endscan(scan);
 		table_close(rel, AccessShareLock);
