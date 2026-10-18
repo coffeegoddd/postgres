@@ -48,11 +48,12 @@
  *
  * Covered, in versioned schemas: prolly tables, their columns,
  * constraints, indexes, triggers and rules; views and materialized views;
- * functions and procedures; enum, domain and composite types; sequences.
+ * functions, procedures and aggregates; enum, domain and composite types;
+ * sequences.
  * Ordinary schemas and extensions are every branch's, not the commit's.
- * Anything else in versioned schemas (aggregates, policies, partitioned or
- * foreign tables, other types) makes a commit fail: never a hash that
- * might depend on history.
+ * Anything else in versioned schemas (window functions, policies,
+ * partitioned or foreign tables, other types) makes a commit fail: never a
+ * hash that might depend on history.
  *
  * What the versioned objects depend on outside the versioned schemas
  * isn't in the root, which is what they are: fold_dependencies() builds a
@@ -1131,8 +1132,15 @@ folded_dependencies(const ProllyNodeRef *tree, ProllyCanonDependencyVisit visit,
 static char *
 qualified_function(Oid fn)
 {
-	return quote_qualified_identifier(get_namespace_name(get_func_namespace(fn)),
-									  get_func_name(fn));
+	return qualified(get_func_namespace(fn), get_func_name(fn));
+}
+
+/* An aggregate's FINALFUNC_MODIFY or MFINALFUNC_MODIFY, as written. */
+static const char *
+aggmodify_name(char modify)
+{
+	return modify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
+		modify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE";
 }
 
 /*
@@ -1154,8 +1162,7 @@ aggregate_def(Form_pg_proc proc)
 	agg = (Form_pg_aggregate) GETSTRUCT(tup);
 	initStringInfo(&def);
 	appendStringInfo(&def, "CREATE OR REPLACE AGGREGATE %s(%s) (\n SFUNC = %s,\n STYPE = %s",
-					 quote_qualified_identifier(get_namespace_name(proc->pronamespace),
-												NameStr(proc->proname)),
+					 qualified(proc->pronamespace, NameStr(proc->proname)),
 					 TextDatumGetCString(DirectFunctionCall1(pg_get_function_arguments,
 															 ObjectIdGetDatum(proc->oid))),
 					 qualified_function(agg->aggtransfn),
@@ -1168,9 +1175,7 @@ aggregate_def(Form_pg_proc proc)
 		if (agg->aggfinalextra)
 			appendStringInfoString(&def, ",\n FINALFUNC_EXTRA");
 	}
-	appendStringInfo(&def, ",\n FINALFUNC_MODIFY = %s",
-					 agg->aggfinalmodify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
-					 agg->aggfinalmodify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE");
+	appendStringInfo(&def, ",\n FINALFUNC_MODIFY = %s", aggmodify_name(agg->aggfinalmodify));
 	if (OidIsValid(agg->aggcombinefn))
 		appendStringInfo(&def, ",\n COMBINEFUNC = %s", qualified_function(agg->aggcombinefn));
 	if (OidIsValid(agg->aggserialfn))
@@ -1196,8 +1201,7 @@ aggregate_def(Form_pg_proc proc)
 				appendStringInfoString(&def, ",\n MFINALFUNC_EXTRA");
 		}
 		appendStringInfo(&def, ",\n MFINALFUNC_MODIFY = %s",
-						 agg->aggmfinalmodify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
-						 agg->aggmfinalmodify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE");
+						 aggmodify_name(agg->aggmfinalmodify));
 		d = SysCacheGetAttr(AGGFNOID, tup, Anum_pg_aggregate_aggminitval, &isnull);
 		if (!isnull)
 			appendStringInfo(&def, ",\n MINITCOND = %s",
@@ -3259,6 +3263,9 @@ converted_value(const char *expr, const char *old_def, const char *new_def,
 }
 
 /* What a move does about the types the commit defines otherwise, in turn. */
+static bool is_aggregate(const MoveItem *it);
+static char *drop_routine_sql(const MoveItem *it);
+
 typedef struct TypeMoves
 {
 	List	   *before;			/* what uses them dropped; then each renamed
@@ -3268,6 +3275,8 @@ typedef struct TypeMoves
 	List	   *converts;		/* the columns using them moved to the new */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
+	List	   *aggregate_drops;	/* (before the functions they use; made
+									 * again with the others, after them) */
 	bool		any;
 } TypeMoves;
 
@@ -3569,7 +3578,12 @@ type_moves(List *from, List *to)
 					ReleaseSysCache(pt);
 					fp = find_item(from, 'f', name);
 					tp = find_item(to, 'f', name);
-					if (fp)
+					if (fp && is_aggregate(fp))
+					{
+						tm.aggregate_drops = lappend(tm.aggregate_drops, drop_routine_sql(fp));
+						handled = true;
+					}
+					else if (fp)
 					{
 						tm.before = lcons(drop_routine_sql(fp), tm.before);
 						if (tp && strcmp(tp->def, fp->def) == 0)
@@ -3602,6 +3616,7 @@ type_moves(List *from, List *to)
 		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def));
 		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
 	}
+	tm.before = list_concat(list_copy(tm.aggregate_drops), tm.before);
 	return tm;
 }
 
@@ -3627,6 +3642,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
+	List	   *aggregates_made = NIL;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
@@ -3675,11 +3691,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		switch (f->kind)
 		{
 			case 'f':
-				/* (an aggregate before the functions it uses) */
-				if (t == NULL)
-					routines = is_aggregate(f) ?
-						lcons(drop_routine_sql(f), routines) :
-						lappend(routines, drop_routine_sql(f));
+				/*
+				 * (an aggregate going, first: before the functions and the
+				 * tables' row types it uses; what stays doesn't use it)
+				 */
+				if (t == NULL && is_aggregate(f))
+					sm.before = lcons(drop_routine_sql(f), sm.before);
+				else if (t == NULL)
+					routines = lappend(routines, drop_routine_sql(f));
 				break;
 			case 'y':
 			case 'm':
@@ -3814,29 +3833,54 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			goto unsupported;
 	}
 	{
-		List	   *aggregates = NIL;
+		/* (a type move's drop of an aggregate counts too) */
+		bool		functions_dropped = routines != NIL || tm.aggregate_drops != NIL;
 
+		/* (a function a routine's signature change drops) */
 		foreach(lc, to)
 		{
 			MoveItem   *t = lfirst(lc);
 			MoveItem   *f = find_item(from, t->kind, t->name);
 
-			if (t->kind != 'f' || (f && strcmp(t->def, f->def) == 0))
+			if (t->kind == 'f' && f && !is_aggregate(t) && strcmp(t->def, f->def) != 0 &&
+				strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+				functions_dropped = true;
+		}
+
+		/*
+		 * Aggregates: where a function goes, any may use it, so all go
+		 * before the functions and all are made after them (and after the
+		 * tables, whose row types they may use); otherwise one changed is
+		 * replaced in place, what uses it kept.
+		 */
+		foreach(lc, from)
+		{
+			MoveItem   *f = lfirst(lc);
+
+			if (f->kind == 'f' && is_aggregate(f) && functions_dropped &&
+				find_item(to, 'f', f->name) != NULL)
+				sm.before = lcons(drop_routine_sql(f), sm.before);
+		}
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+			MoveItem   *f = find_item(from, t->kind, t->name);
+
+			if (t->kind != 'f')
 				continue;
-			/* (an aggregate after the functions it uses) */
 			if (is_aggregate(t))
 			{
-				if (f)
-					sm.before = lappend(sm.before, drop_routine_sql(f));
-				aggregates = lappend(aggregates, t->def);
+				if (functions_dropped || !f || strcmp(t->def, f->def) != 0)
+					aggregates_made = lappend(aggregates_made, t->def);
 				continue;
 			}
+			if (f && strcmp(t->def, f->def) == 0)
+				continue;
 			/* (CREATE OR REPLACE can't change what a routine returns) */
 			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
 				sm.before = lappend(sm.before, drop_routine_sql(f));
 			sm.before = lappend(sm.before, t->def);
 		}
-		sm.before = list_concat(sm.before, aggregates);
 	}
 	foreach(lc, to)
 	{
@@ -3848,6 +3892,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(t->def, &td);
 		move_table(&sm, t->name, NULL, &td);
 	}
+	/* (aggregates after the tables, whose row types they may use) */
+	sm.changes = list_concat(sm.changes, aggregates_made);
 	/*
 	 * Materialized views go and come again, with the rows the commit holds,
 	 * if any changes, or a view or a type they may use does: all of them,

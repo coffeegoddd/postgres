@@ -87,6 +87,54 @@ SELECT dolt_reset('--hard', 'main');
 SELECT count(*) AS norm FROM pg_proc WHERE proname IN ('norm', 'step', 'done')
   AND pronamespace = 'ag'::regnamespace;
 
+-- what moves around aggregates: each case a commit, a branch at the one
+-- before reset to it
+SELECT dolt_checkout('main');
+CREATE MATERIALIZED VIEW ag.mv AS SELECT ag.total(n) AS total FROM ag.t;
+CREATE FUNCTION ag.add8(int8, int) RETURNS int8 LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+CREATE FUNCTION ag.fin(int8) RETURNS numeric LANGUAGE sql IMMUTABLE AS 'SELECT $1::numeric';
+CREATE AGGREGATE ag.fsum(int) (SFUNC = ag.add8, STYPE = int8, FINALFUNC = ag.fin, INITCOND = '0');
+CREATE TYPE ag.st AS (a int);
+CREATE FUNCTION ag.st_step(ag.st, int) RETURNS ag.st LANGUAGE sql IMMUTABLE
+  AS 'SELECT ROW(coalesce(($1).a, 0) + $2)::ag.st';
+CREATE AGGREGATE ag.stagg(int) (SFUNC = ag.st_step, STYPE = ag.st);
+SELECT length(dolt_commit('-Am', 'before')::text) AS committed;
+SELECT dolt_branch('ag_cases');
+-- (an aggregate a materialized view uses, changed: replaced in place)
+CREATE OR REPLACE AGGREGATE ag.total(int) (
+	SFUNC = int4pl, STYPE = int4, INITCOND = '1000',
+	MSFUNC = int4pl, MINVFUNC = int4mi, MSTYPE = int4, MINITCOND = '0');
+-- (a final function returning another type: the aggregate goes first)
+DROP AGGREGATE ag.fsum(int);
+DROP FUNCTION ag.fin(int8);
+CREATE FUNCTION ag.fin(int8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1::float8';
+CREATE AGGREGATE ag.fsum(int) (SFUNC = ag.add8, STYPE = int8, FINALFUNC = ag.fin, INITCOND = '0');
+-- (an aggregate over a new table's row type)
+CREATE TABLE ag.pt (id int PRIMARY KEY, w int);
+CREATE AGGREGATE ag.collect(ag.pt) (SFUNC = array_append, STYPE = ag.pt[], INITCOND = '{}');
+-- (its state type changed under it and its state function)
+DROP AGGREGATE ag.stagg(int);
+DROP FUNCTION ag.st_step(ag.st, int);
+ALTER TYPE ag.st ADD ATTRIBUTE b int;
+CREATE FUNCTION ag.st_step(ag.st, int) RETURNS ag.st LANGUAGE sql IMMUTABLE
+  AS 'SELECT ROW(coalesce(($1).a, 0) + $2, 1)::ag.st';
+CREATE AGGREGATE ag.stagg(int) (SFUNC = ag.st_step, STYPE = ag.st);
+REFRESH MATERIALIZED VIEW ag.mv;
+SELECT length(dolt_commit('-Am', 'after')::text) AS committed;
+SELECT dolt_checkout('ag_cases');
+SELECT dolt_reset('--hard', 'main');
+SELECT * FROM dolt_status;
+SELECT total FROM ag.mv;
+SELECT pg_typeof(ag.fsum(n)) AS fsum FROM ag.t;
+SELECT pg_get_function_arguments('ag.collect(ag.pt)'::regprocedure) AS collect_args;
+SELECT ag.stagg(n) FROM ag.t;
+SELECT dolt_reset('--hard', 'HEAD~1');		-- and back
+SELECT * FROM dolt_status;
+SELECT pg_typeof(ag.fsum(n)) AS fsum FROM ag.t;
+SELECT ag.stagg(n) FROM ag.t;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'ag_cases');
+
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'ag_reset');
 SELECT dolt_branch('-D', 'ag_merge');

@@ -212,6 +212,136 @@ SELECT count(*) AS norm FROM pg_proc WHERE proname IN ('norm', 'step', 'done')
     0
 (1 row)
 
+-- what moves around aggregates: each case a commit, a branch at the one
+-- before reset to it
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE MATERIALIZED VIEW ag.mv AS SELECT ag.total(n) AS total FROM ag.t;
+CREATE FUNCTION ag.add8(int8, int) RETURNS int8 LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+CREATE FUNCTION ag.fin(int8) RETURNS numeric LANGUAGE sql IMMUTABLE AS 'SELECT $1::numeric';
+CREATE AGGREGATE ag.fsum(int) (SFUNC = ag.add8, STYPE = int8, FINALFUNC = ag.fin, INITCOND = '0');
+CREATE TYPE ag.st AS (a int);
+CREATE FUNCTION ag.st_step(ag.st, int) RETURNS ag.st LANGUAGE sql IMMUTABLE
+  AS 'SELECT ROW(coalesce(($1).a, 0) + $2)::ag.st';
+CREATE AGGREGATE ag.stagg(int) (SFUNC = ag.st_step, STYPE = ag.st);
+SELECT length(dolt_commit('-Am', 'before')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('ag_cases');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (an aggregate a materialized view uses, changed: replaced in place)
+CREATE OR REPLACE AGGREGATE ag.total(int) (
+	SFUNC = int4pl, STYPE = int4, INITCOND = '1000',
+	MSFUNC = int4pl, MINVFUNC = int4mi, MSTYPE = int4, MINITCOND = '0');
+-- (a final function returning another type: the aggregate goes first)
+DROP AGGREGATE ag.fsum(int);
+DROP FUNCTION ag.fin(int8);
+CREATE FUNCTION ag.fin(int8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1::float8';
+CREATE AGGREGATE ag.fsum(int) (SFUNC = ag.add8, STYPE = int8, FINALFUNC = ag.fin, INITCOND = '0');
+-- (an aggregate over a new table's row type)
+CREATE TABLE ag.pt (id int PRIMARY KEY, w int);
+CREATE AGGREGATE ag.collect(ag.pt) (SFUNC = array_append, STYPE = ag.pt[], INITCOND = '{}');
+-- (its state type changed under it and its state function)
+DROP AGGREGATE ag.stagg(int);
+DROP FUNCTION ag.st_step(ag.st, int);
+ALTER TYPE ag.st ADD ATTRIBUTE b int;
+CREATE FUNCTION ag.st_step(ag.st, int) RETURNS ag.st LANGUAGE sql IMMUTABLE
+  AS 'SELECT ROW(coalesce(($1).a, 0) + $2, 1)::ag.st';
+CREATE AGGREGATE ag.stagg(int) (SFUNC = ag.st_step, STYPE = ag.st);
+REFRESH MATERIALIZED VIEW ag.mv;
+SELECT length(dolt_commit('-Am', 'after')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('ag_cases');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'ag_cases'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT total FROM ag.mv;
+ total 
+-------
+  1087
+(1 row)
+
+SELECT pg_typeof(ag.fsum(n)) AS fsum FROM ag.t;
+       fsum       
+------------------
+ double precision
+(1 row)
+
+SELECT pg_get_function_arguments('ag.collect(ag.pt)'::regprocedure) AS collect_args;
+ collect_args 
+--------------
+ ag.pt
+(1 row)
+
+SELECT ag.stagg(n) FROM ag.t;
+ stagg  
+--------
+ (87,1)
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');		-- and back
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT pg_typeof(ag.fsum(n)) AS fsum FROM ag.t;
+  fsum   
+---------
+ numeric
+(1 row)
+
+SELECT ag.stagg(n) FROM ag.t;
+ stagg 
+-------
+ (87)
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'ag_cases');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
@@ -231,13 +361,22 @@ SELECT dolt_branch('-D', 'ag_merge');
 (1 row)
 
 DROP SCHEMA ag CASCADE;
-NOTICE:  drop cascades to 6 other objects
+NOTICE:  drop cascades to 15 other objects
 DETAIL:  drop cascades to table ag.t
+drop cascades to function ag.total(integer)
 drop cascades to function ag.least_of(integer)
 drop cascades to function ag.pct(double precision,integer)
 drop cascades to function ag.rnk("any")
-drop cascades to function ag.total(integer)
 drop cascades to table ag.other
+drop cascades to materialized view ag.mv
+drop cascades to function ag.add8(bigint,integer)
+drop cascades to type ag.st
+drop cascades to function ag.fin(bigint)
+drop cascades to function ag.fsum(integer)
+drop cascades to table ag.pt
+drop cascades to function ag.collect(ag.pt)
+drop cascades to function ag.st_step(ag.st,integer)
+drop cascades to function ag.stagg(integer)
 SELECT length(dolt_commit('-Am', 'ag gone')::text) AS committed;
  committed 
 -----------
