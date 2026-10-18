@@ -2,13 +2,15 @@
 -- counts the same, exactly: a commit of rows writes so many nodes, and
 -- every node it writes is a chunk appended.
 
--- A database of its own, so nothing else counts in it.
+-- A database of its own, so nothing else counts in it, and a table
+-- autovacuum leaves alone (its chunk-store collection needs far more
+-- journal than this writes).
 SELECT current_database() AS home \gset
 CREATE DATABASE stat_prolly;
 \c stat_prolly
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
-CREATE TABLE sp.t (id int PRIMARY KEY, v text);
+CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
 SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
 -- (what this session counted so far is flushed before the reset)
 SELECT pg_stat_force_next_flush();
@@ -40,7 +42,7 @@ CREATE DATABASE stat_prolly_again;
 \c stat_prolly_again
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
-CREATE TABLE sp.t (id int PRIMARY KEY, v text);
+CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
 SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
 INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-m', '1000 rows')::text) > 0 AS committed;

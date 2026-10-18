@@ -1,5 +1,4 @@
-"""Unit tests for the S suite's pull-request gate: its counters, run
-shapes, pairing by build, gate and report.  No database needed.
+"""Unit tests for the S suite's harness pieces that need no database.
 
 Run: cd src/tools/prolly_bench && python3 -m unittest discover -s tests
 """

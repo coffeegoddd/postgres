@@ -589,8 +589,10 @@ typedef struct PgStat_WalStats
  * PgStat_ProllyStats	The prolly storage engine's work, per database
  *
  * Counters, not timings: what the engine did, so two runs of the same work
- * count the same.  pg_stat_prolly shows each as a (name, value) row, named
- * by pgstat_prolly_counter_name().
+ * count the same.  Work counts when it is done, whether or not its
+ * transaction commits (chunks a rollback discards were still appended).
+ * pg_stat_prolly shows each as a (name, value) row, named by
+ * pgstat_prolly_counter_name().
  * -------
  */
 typedef enum PgStat_ProllyCounter
@@ -607,7 +609,7 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_CANDIDATES,	/* rows the change finder looked up */
 	PGSTAT_PROLLY_FOLD_FULL,	/* tables folded from every row */
 	PGSTAT_PROLLY_COMMITS,		/* commits written */
-	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads moved */
+	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */
 	PGSTAT_PROLLY_MEMO_MISSES,	/* and those that didn't */
 } PgStat_ProllyCounter;

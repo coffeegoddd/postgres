@@ -227,6 +227,9 @@ PostPrepare_PgStat(void)
 	}
 	pgStatXactStack = NULL;
 
+	/* (the prolly engine's work counts whether its transaction commits) */
+	AtEOXact_PgStat_Prolly();
+
 	/* Make sure any stats snapshot is thrown away */
 	pgstat_clear_snapshot();
 }

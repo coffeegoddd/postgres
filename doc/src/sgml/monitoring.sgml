@@ -5636,9 +5636,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
    The <structname>pg_stat_prolly</structname> view will contain one row for
    each counter of the work the prolly storage engine did in the current
    database: what it read, wrote and hashed, not how long that took, so the
-   same work counts the same.  Each backend counts in its own memory and
-   flushes its counts when its transaction ends, as for the other cumulative
-   statistics.
+   same work counts the same.  Work counts when it is done, whether or not
+   its transaction commits: chunks a rollback discards were still appended,
+   and a head set to the commit it already named was still set.  Each
+   backend counts in its own memory and flushes its counts when its
+   transaction ends, as for the other cumulative statistics.
   </para>
 
   <table id="pg-stat-prolly-view" xreflabel="pg_stat_prolly">

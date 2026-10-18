@@ -6121,7 +6121,7 @@
   prosrc => 'pg_stat_get_slru' },
 { oid => '9721',
   descr => 'statistics: the prolly storage engine\'s work in the current database',
-  proname => 'pg_stat_get_prolly', prorows => '16', proisstrict => 'f',
+  proname => 'pg_stat_get_prolly', prorows => '15', proisstrict => 'f',
   proretset => 't', provolatile => 's', proparallel => 'r',
   prorettype => 'record', proargtypes => '', proallargtypes => '{text,int8}',
   proargmodes => '{o,o}', proargnames => '{name,value}',

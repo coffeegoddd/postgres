@@ -1,13 +1,15 @@
 -- pg_stat_prolly: the engine's work, counted per database.  The same work
 -- counts the same, exactly: a commit of rows writes so many nodes, and
 -- every node it writes is a chunk appended.
--- A database of its own, so nothing else counts in it.
+-- A database of its own, so nothing else counts in it, and a table
+-- autovacuum leaves alone (its chunk-store collection needs far more
+-- journal than this writes).
 SELECT current_database() AS home \gset
 CREATE DATABASE stat_prolly;
 \c stat_prolly
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
-CREATE TABLE sp.t (id int PRIMARY KEY, v text);
+CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
 SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
  committed 
 -----------
@@ -112,7 +114,7 @@ CREATE DATABASE stat_prolly_again;
 \c stat_prolly_again
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
-CREATE TABLE sp.t (id int PRIMARY KEY, v text);
+CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
 SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
  committed 
 -----------
