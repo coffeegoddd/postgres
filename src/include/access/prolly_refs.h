@@ -260,6 +260,18 @@ typedef struct ProllyRefsRoutine
 								 const char *remote_branch);
 	bool		(*upstream) (const char *branch, char **remote,
 							 char **remote_branch);
+
+	/*
+	 * Move branch name from expected (an empty hash: no head, or no
+	 * branch) to commit head (NULL: delete the branch), as a push to this
+	 * database moves it: a compare-and-swap, the refs held, false and
+	 * nothing changed if the branch isn't at expected.  A branch that
+	 * doesn't exist is made, with only its head; one with copies is moved
+	 * there, its rows written, refused if it has uncommitted changes
+	 * unless force (which drops them).  With the transaction.
+	 */
+	bool		(*branch_move) (const char *name, const ProllyHash *expected,
+								const ProllyHash *head, bool force);
 } ProllyRefsRoutine;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
@@ -268,9 +280,10 @@ typedef struct ProllyRefsRoutine
 	"commit_with", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
-	"remotes", "tracking_set", "trackings", "upstream_set", "upstream"
+	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
+	"branch_move"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK upstream
+#define PROLLY_REFS_LAST_CALLBACK branch_move
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

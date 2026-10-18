@@ -2261,7 +2261,7 @@ dolt_push(PG_FUNCTION_ARGS)
 			}
 			(void) PROLLY_CALL(dc.transfer, send, rr, r, &local, 1);
 			if (!PROLLY_CALL(rr, move_head, r, remote_branch, &theirs, &local,
-							 build_format()))
+							 build_format(), force))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("the push to %s/%s was rejected: the remote's branch moved meanwhile",

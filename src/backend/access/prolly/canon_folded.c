@@ -1735,11 +1735,112 @@ folded_walk(const ProllyNodeRef *root, ProllyTreeVisitNode visit, void *arg)
 		PROLLY_CALL(cn.tree, walk, &cn.env, lfirst(lc), visit, arg);
 }
 
+/* A data tree a root names, by its item's key. */
+typedef struct NamedTree
+{
+	char	   *key;
+	ProllyNodeRef ref;
+} NamedTree;
+
+/* The data trees a root's items name. */
+static List *
+named_trees(Canon *cn, const ProllyNodeRef *root)
+{
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *trees = NIL;
+
+	c = PROLLY_CALL(cn->tree, cursor_open, &cn->env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn->tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn->tree, cursor_next, c, &k, &v))
+	{
+		NamedTree  *t = palloc0(sizeof(NamedTree));
+		ProllyValue def;
+
+		if (!tree_item(&k, &v, &t->ref, &def))
+		{
+			pfree(t);
+			continue;
+		}
+		t->key = pnstrdup((const char *) k.data, k.len);
+		trees = lappend(trees, t);
+	}
+	PROLLY_CALL(cn->tree, cursor_close, c);
+	return trees;
+}
+
 /*
- * The items of a folded root of one kind ("t:" or "m:"), each with its
- * data tree and definition; tables' rows may be unreadable here (their
- * keys ordered by a collation that differs now).
+ * Visit the nodes of root to (its trees and the data trees it names) that
+ * root from (NULL: none) may lack: each tree diffed against from's of the
+ * same name, so what changed between them is visited, not all of to.
  */
+/* A data tree an item changed between two roots names: before and after. */
+typedef struct ChangedTree
+{
+	bool		was;
+	ProllyNodeRef before;
+	ProllyNodeRef after;
+} ChangedTree;
+
+static void
+note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
+				  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	List	  **changed = arg;
+	ChangedTree *c;
+	ProllyValue def;
+
+	if (after == NULL)
+		return;
+	c = palloc0(sizeof(ChangedTree));
+	if (!tree_item(key, after, &c->after, &def))
+	{
+		pfree(c);
+		return;
+	}
+	c->was = before != NULL && tree_item(key, before, &c->before, &def);
+	*changed = lappend(*changed, c);
+}
+
+/*
+ * Visit the nodes of root to (its trees and the data trees it names) that
+ * root from (NULL: none) may lack: the roots diffed, and each data tree an
+ * item added or changed names diffed against the one it named before, so
+ * what changed is visited, not all of to.
+ */
+static void
+folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
+					ProllyTreeVisitNode visit, void *arg)
+{
+	Canon		cn;
+	List	   *changed = NIL;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	PROLLY_CALL(cn.tree, diff_nodes, &cn.env, from, to, visit, arg);
+	if (from && from->hash.len > 0)
+		PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_changed_tree, &changed);
+	else
+	{
+		foreach(lc, named_trees(&cn, to))
+		{
+			ChangedTree *c = palloc0(sizeof(ChangedTree));
+
+			c->after = ((NamedTree *) lfirst(lc))->ref;
+			changed = lappend(changed, c);
+		}
+	}
+	foreach(lc, changed)
+	{
+		ChangedTree *c = lfirst(lc);
+
+		PROLLY_CALL(cn.tree, diff_nodes, &cn.env, c->was ? &c->before : NULL,
+					&c->after, visit, arg);
+	}
+}
+
 /* Is a folded root in the current format (its "!:format" item)? */
 static bool
 root_in_format(Canon *cn, const ProllyNodeRef *root)
@@ -3836,6 +3937,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 		"versioned schemas, their tables' rows folded into trees",
 	},
 	.walk = folded_walk,
+	.walk_changes = folded_walk_changes,
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
 	.tables = folded_tables,

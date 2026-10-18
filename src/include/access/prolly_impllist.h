@@ -34,6 +34,8 @@ PG_PROLLY_IMPL(ProllyMergeRoutine, prolly_merge_folded)
 PG_PROLLY_IMPL(ProllyCanonRoutine, prolly_canon_folded)
 PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_chunks)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_file)
+PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgresql)
+PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgres)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)

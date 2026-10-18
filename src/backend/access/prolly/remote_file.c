@@ -667,7 +667,7 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 
 static bool
 file_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
-			   const ProllyHash *head, const char *format)
+			   const ProllyHash *head, const char *format, bool force)
 {
 	Manifest	m;
 	RemoteHead *at = NULL;
@@ -719,6 +719,41 @@ file_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
 	return true;
 }
 
+/* (a file remote's reads are the server's own: one at a time costs nothing) */
+static void
+file_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
+			  ProllyRemoteChunkVisit visit, void *arg)
+{
+	StringInfoData data;
+
+	initStringInfo(&data);
+	for (int i = 0; i < n; i++)
+	{
+		resetStringInfo(&data);
+		if (file_get(r, &hashes[i], &data))
+			visit(&hashes[i], data.data, data.len, arg);
+	}
+	pfree(data.data);
+}
+
+static void
+file_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	for (int i = 0; i < n; i++)
+		has[i] = file_has(r, &hashes[i]);
+}
+
+/*
+ * A directory runs no code to tell what changed: nothing, and the walk
+ * reads what the receiver lacks.
+ */
+static void
+file_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
+			   const ProllyHash *known, int nknown,
+			   ProllyRemoteChunkVisit visit, void *arg)
+{
+}
+
 const ProllyRemoteRoutine prolly_remote_file = {
 	.info = {
 		.iface = PROLLY_IFACE_REMOTE,
@@ -736,6 +771,9 @@ const ProllyRemoteRoutine prolly_remote_file = {
 	.has = file_has,
 	.add_chunks = file_add_chunks,
 	.move_head = file_move_head,
+	.get_many = file_get_many,
+	.has_many = file_has_many,
+	.get_since = file_get_since,
 };
 
 const ProllyRemoteRoutine *

@@ -2049,6 +2049,153 @@ copies_hold(void)
 	return see_head(branch_ops()->current());
 }
 
+static void
+count_table(const char *name, const ProllyNodeRef *data,
+			const ProllyValue *description, const char *unreadable, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+static void
+count_object(const char *name, ProllyDiffKind kind, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+/*
+ * Has a branch with copies changes its head lacks?  One without commits
+ * has whatever its working set holds (a versioned schema, though empty).
+ */
+static bool
+branch_dirty(const char *name, const ProllyHash *head)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef ws;
+	ProllyNodeRef committed;
+	List	   *left_out = NIL;
+
+	if (!copies_read_working_set(name, InvalidOid, &ws, &left_out))
+		return false;
+	if (left_out != NIL)
+		return true;
+	if (head->len > 0)
+		return !(copies_commit_working_set(head, &committed) &&
+				 same_hash(&ws.hash, &committed.hash));
+	{
+		ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &env,
+										   CurrentMemoryContext);
+		ProllyNodeRef empty;
+		int			n = 0;
+
+		PROLLY_CALL(tree, build_finish, b, &empty);
+		prolly_database_components(&dc);
+		PROLLY_CALL(dc.canonicalizer, tables, &ws, count_table, &n);
+		PROLLY_CALL(dc.canonicalizer, objects, &empty, &ws, count_object, &n);
+		return n > 0;
+	}
+}
+
+/* End a branch's merge in progress (and its violations), if it has one. */
+static void
+end_merge(const char *name)
+{
+	StringInfoData key;
+	ProllyMergeState ms;
+
+	initStringInfo(&key);
+	if (merge_state_of(name, &ms))
+	{
+		merge_key(&key, name);
+		refs_put(key.data, key.len, NULL);
+	}
+	if (violations_of(name) != NIL)
+	{
+		resetStringInfo(&key);
+		violations_key(&key, name);
+		refs_put(key.data, key.len, NULL);
+	}
+	pfree(key.data);
+}
+
+static bool
+copies_branch_move(const char *name, const ProllyHash *expected,
+				   const ProllyHash *head, bool force)
+{
+	ProllyHash	at;
+	ProllyCommitInfo info;
+	bool		pushed = false;
+
+	lock_refs();
+	AcceptInvalidationMessages();
+	(void) branch_head(name, &at);
+	if (!same_hash(&at, expected))
+		return false;
+	if (head && !copies_commit_get(head, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("commit %s is missing", prolly_hash_hex(head))));
+	if (!branch_exists(name))
+	{
+		/* (one already gone: deleted, as asked) */
+		if (head == NULL)
+			return true;
+		/* made at the commit, with only its head */
+		branch_ops()->check_create(name);
+		branch_set_head(name, head);
+		branch_set_baseline(name, NULL, NULL);
+		return true;
+	}
+
+	/*
+	 * A branch with copies: its working set read as of its head (a snapshot
+	 * that sees the transaction that moved it there), refused if it has
+	 * uncommitted changes unless forced, then moved, its rows written, or
+	 * deleted.
+	 */
+	if (OidIsValid(branch_oid(name)))
+	{
+		pushed = see_head(name);
+		PG_TRY();
+		{
+			if (!force && branch_dirty(name, &at))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("branch \"%s\" has uncommitted changes", name),
+						 errhint("Commit or reset them there, or push with --force, which drops them.")));
+			/* (what the commit needs that the branch's head doesn't) */
+			if (head)
+			{
+				ProllyCommitInfo was;
+
+				prolly_check_commit_dependencies(&info,
+												 at.len > 0 && copies_commit_get(&at, &was) ?
+												 &was : NULL, "push");
+			}
+			if (head == NULL)
+				;
+			else if (strcmp(name, branch_ops()->current()) == 0)
+				move_settled(&info.root);
+			else
+				branch_ops()->run_on(name, move_settled, &info.root);
+		}
+		PG_FINALLY();
+		{
+			if (pushed)
+				PopActiveSnapshot();
+		}
+		PG_END_TRY();
+	}
+	if (head == NULL)
+	{
+		/* (whether merged into this session's branch doesn't matter here) */
+		copies_branch_delete(name, true);
+		return true;
+	}
+	branch_set_head(name, head);
+	end_merge(name);	/* (a move ends a merge in progress there, as a reset does) */
+	return true;
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -2087,4 +2234,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.trackings = copies_trackings,
 	.upstream_set = copies_upstream_set,
 	.upstream = copies_upstream,
+	.branch_move = copies_branch_move,
 };

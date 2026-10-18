@@ -53,6 +53,10 @@ iterations = 3
 changes = [100]
 locality = ["clustered"]
 
+[workloads.V4]
+changes = [100]
+background = ["none"]
+
 [tools]
 benchbase = "build-bench/benchbase/benchbase-postgres"
 benchbase_source = "~/cursor_src/benchbase"

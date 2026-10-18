@@ -158,6 +158,16 @@ typedef struct ProllyCanonRoutine
 
 	/* The format this build folds, as a root's "!:format" item says it. */
 	void		(*format) (StringInfo out);
+
+	/*
+	 * Visit the nodes root to keeps alive that root from (NULL: none) may
+	 * lack, its trees each diffed against from's of the same name: what
+	 * changed, not all of to (a transfer sending what a receiver that has
+	 * from lacks).
+	 */
+	void		(*walk_changes) (const ProllyNodeRef *from,
+								 const ProllyNodeRef *to,
+								 ProllyTreeVisitNode visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -165,9 +175,9 @@ typedef struct ProllyCanonRoutine
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
-	"in_format", "format"
+	"in_format", "format", "walk_changes"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK format
+#define PROLLY_CANON_LAST_CALLBACK walk_changes
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

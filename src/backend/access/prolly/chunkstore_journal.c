@@ -220,6 +220,7 @@ struct ProllyChunkStore
 
 	/* chunks the store hasn't, read from elsewhere (read_through()) */
 	ProllyChunkGet through;
+	ProllyChunkHint through_hint;
 	void	   *through_arg;
 
 	/* this transaction's */
@@ -749,12 +750,14 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->pad_offset = 0;
 			s->saved = NIL;
 			s->through = NULL;
+			s->through_hint = NULL;
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			discard_pending(s);
 			s->saved = NIL;
 			s->through = NULL;
+			s->through_hint = NULL;
 			break;
 	}
 }
@@ -2017,10 +2020,22 @@ journal_checkpoint(void)
 }
 
 static void
-journal_read_through(ProllyChunkStore *s, ProllyChunkGet source, void *arg)
+journal_read_through(ProllyChunkStore *s, ProllyChunkGet source,
+					 ProllyChunkHint hint, void *arg)
 {
 	s->through = source;
+	s->through_hint = hint;
 	s->through_arg = arg;
+}
+
+static bool
+journal_prefetch(ProllyChunkStore *s, const ProllyHash *hashes, int n)
+{
+	if (s->through_hint == NULL)
+		return false;
+	if (n > 0)
+		s->through_hint(s->through_arg, hashes, n);
+	return true;
 }
 
 static void
@@ -2358,4 +2373,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.shmem_init = journal_shmem_init,
 	.copy_database = journal_copy_database,
 	.read_through = journal_read_through,
+	.prefetch = journal_prefetch,
 };

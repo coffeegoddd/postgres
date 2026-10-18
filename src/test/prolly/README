@@ -114,9 +114,10 @@ Covered: requirements that are decided.
 	                and across clusters (201)
 
 Not covered until decided: temporary and unlogged tables, tablespaces,
-logical decoding (deferred), clone/push/fetch (V4, out of scope for the
-first engine), the staging API, how merge conflicts are reported, merges
-that change schema, and branch scope of cluster-wide catalogs.
+logical decoding (deferred), the staging API, how merge conflicts are
+reported, merges that change schema, and branch scope of cluster-wide
+catalogs.  Clone, fetch and push are covered by test_prolly (its remote
+tests, file and network) and timed by prolly_bench's V4.
 
 The version-control tests assume the default branch is named "main" and
 that an unknown branch is reported as

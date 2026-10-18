@@ -38,7 +38,12 @@
  * - read_through() makes this backend's get() and has() ask source for a
  *   chunk the store hasn't, until it is cleared (source NULL) or the
  *   transaction ends: so walks that know what chunks hold can read another
- *   store's (a transfer's) as if it were this one's.
+ *   store's (a transfer's) as if it were this one's.  Its hint, if given
+ *   (with or without a source), hears what prefetch() is told.
+ * - prefetch() is told the chunks a walk is about to read (a node's
+ *   children), so that a read-through source can fetch them at once
+ *   (optional): whether a hint heard them, and with none (n 0), whether
+ *   one would, so a walk collects them only when it would.
  *
  * Provisional (v0).
  *
@@ -64,6 +69,9 @@ typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
  * false if it has none by that hash.
  */
 typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo out);
+
+/* Hears the chunks a walk is about to read (prefetch()'s). */
+typedef void (*ProllyChunkHint) (void *arg, const ProllyHash *hashes, int n);
 
 /* Visits a table file: its name, its chunk count and its size in bytes. */
 typedef void (*ProllyChunkFileVisit) (const char *name, int nchunks,
@@ -125,16 +133,18 @@ typedef struct ProllyChunkStoreRoutine
 
 	/* Chunks the store hasn't, read from source (NULL: no longer). */
 	void		(*read_through) (ProllyChunkStore *store, ProllyChunkGet source,
-								 void *arg);
+								 ProllyChunkHint hint, void *arg);
+	bool		(*prefetch) (ProllyChunkStore *store, const ProllyHash *hashes,
+							 int n);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
 	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
-	"read_through"
+	"read_through", "prefetch"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK read_through
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK prefetch
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

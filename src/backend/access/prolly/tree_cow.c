@@ -976,6 +976,51 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
+/*
+ * Tell the store which chunks the walk reads next: an internal node's
+ * children, or a leaf's value trees (a source a store reads through can
+ * fetch them at once).
+ */
+static void
+prefetch_below(const ProllyTreeEnv *env, TNode *node)
+{
+	ProllyHash *hashes;
+	int			n = 0;
+
+	/* (only when a hint would hear them) */
+	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
+		node->nitems == 0 ||
+		!PROLLY_CALL(env->chunk_store, prefetch, env->chunks, NULL, 0))
+		return;
+	hashes = palloc(sizeof(ProllyHash) * node->nitems);
+	for (int i = 0; i < node->nitems; i++)
+	{
+		ProllyNodeRef ref;
+
+		if (node->level > 0)
+		{
+			uint64		count;
+
+			node_child(env, node, i, &ref, &count);
+		}
+		else
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+			uint64		len;
+
+			node_item(env, node, i, &k, &v, &flags);
+			if (!(flags & PROLLY_ITEM_VALUE_REF))
+				continue;
+			decode_value_ref(&v, &ref, &len);
+		}
+		hashes[n++] = ref.hash;
+	}
+	(void) PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
+	pfree(hashes);
+}
+
 /* Whether the visitor took the node. */
 static bool
 walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
@@ -987,6 +1032,8 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 	CHECK_FOR_INTERRUPTS();
 	node_read(env, ref, &node);
 	took = visit(&node.ref, node.level, arg);
+	if (took)
+		prefetch_below(env, &node);
 	if (!took)
 		;						/* the visitor has seen what is below */
 	else if (node.level == 0)
@@ -1779,6 +1826,133 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	pfree(bufb.data);
 }
 
+/* A leaf item's value tree, if it is stored out of line: walked. */
+static void
+walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
+		   ProllyTreeVisitNode visit, void *arg)
+{
+	ProllyTreeEnv venv;
+	ProllyNodeRef vroot;
+	uint64		len;
+
+	if (!(flags & PROLLY_ITEM_VALUE_REF))
+		return;
+	value_env(env, &venv);
+	decode_value_ref(value, &vroot, &len);
+	(void) walk_node(&venv, &vroot, visit, arg);
+}
+
+/*
+ * Visit the nodes of to that from may not have, as the diff finds them:
+ * subtrees with equal hashes skipped without being read, a subtree only to
+ * has walked whole, value trees of values added or changed walked.  So
+ * with d changed keys it visits O((d + 1) log n) nodes.  (A node from has
+ * elsewhere may be visited; none to has that from lacks is missed.)  The
+ * visitor declining a node skips what is below it only where the node is
+ * walked whole.
+ */
+static void
+cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
+			   const ProllyNodeRef *to, ProllyTreeVisitNode visit, void *arg)
+{
+	DiffSide	a;
+	DiffSide	b;
+
+	if (from == NULL || from->hash.len == 0)
+	{
+		(void) walk_node(env, to, visit, arg);
+		return;
+	}
+	if (same_hash(&from->hash, &to->hash))
+		return;
+	side_open(&a, env, from);
+	side_open(&b, env, to);
+	/* (the empty tree too: a table emptied has it for its root) */
+	(void) visit(to, b.depth >= 0 ? side_height(&b) : 0, arg);
+
+	while (b.depth >= 0)
+	{
+		ProllyNodeRef cb;
+		ProllyKey	ka,
+					kb;
+		ProllyValue va,
+					vb;
+		uint8		fa,
+					fb;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* What is left of to: all of it. */
+		if (a.depth < 0)
+		{
+			if (side_height(&b) > 0)
+			{
+				side_child(&b, &cb);
+				(void) walk_node(env, &cb, visit, arg);
+			}
+			else
+			{
+				side_leaf_item(&b, &kb, &vb, &fb);
+				walk_value(env, &vb, fb, visit, arg);
+			}
+			side_advance(&b);
+			continue;
+		}
+		if (side_height(&a) > side_height(&b))
+		{
+			side_descend(&a);
+			continue;
+		}
+		if (side_height(&b) > side_height(&a))
+		{
+			side_child(&b, &cb);
+			(void) visit(&cb, side_height(&b) - 1, arg);
+			side_descend(&b);
+			continue;
+		}
+		if (side_height(&a) > 0)
+		{
+			ProllyNodeRef ca;
+
+			side_child(&a, &ca);
+			side_child(&b, &cb);
+			if (same_hash(&ca.hash, &cb.hash))
+			{
+				side_advance(&a);
+				side_advance(&b);
+			}
+			else
+			{
+				(void) visit(&cb, side_height(&b) - 1, arg);
+				side_descend(&a);
+				side_descend(&b);
+			}
+			continue;
+		}
+
+		/* Both on leaf items: a value to added or changed is new. */
+		side_leaf_item(&a, &ka, &va, &fa);
+		side_leaf_item(&b, &kb, &vb, &fb);
+		{
+			int			r = cmp_keys(env, &ka, &kb);
+
+			if (r < 0)
+				side_advance(&a);
+			else
+			{
+				if (r > 0 || fa != fb || va.len != vb.len ||
+					memcmp(va.data, vb.data, va.len) != 0)
+					walk_value(env, &vb, fb, visit, arg);
+				if (r == 0)
+					side_advance(&a);
+				side_advance(&b);
+			}
+		}
+	}
+	side_close(&a);
+	side_close(&b);
+}
+
 const ProllyTreeRoutine prolly_tree_cow = {
 	.info = {
 		.iface = PROLLY_IFACE_TREE,
@@ -1799,4 +1973,5 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.count = cow_count,
 	.walk = cow_walk,
 	.diff = cow_diff,
+	.diff_nodes = cow_diff_nodes,
 };

@@ -32,6 +32,8 @@ backend_sources += files(
   'prolly_vcs.c',
   'reclaim_stub.c',
   'remote_file.c',
+  'remote_libpq_load.c',
+  'remote_serve.c',
   'refs_copies.c',
   'refs_history.c',
   'refs_stub.c',

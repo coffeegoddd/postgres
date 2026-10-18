@@ -24,11 +24,19 @@
  *   all at once: none is found before every one is durable.  A remote
  *   that has a chunk has every chunk it references, so the caller sends
  *   what the remote lacks of a closed set.
+ * - get_many() visits each chunk of those it has, and has_many() answers
+ *   for each, in one exchange with a remote across a network (optional:
+ *   get() and has() each otherwise).
+ * - get_since() visits, in one exchange, what a store that has the known
+ *   commits lacks of the wanted ones, as the remote can tell (optional, for
+ *   a remote that runs this code): a guess the caller checks, and
+ *   completes, as it would without it.
  * - move_head() moves branch from expected (an empty hash: the branch
  *   doesn't exist) to head (NULL: delete it), durably, as a compare-and-
  *   swap: false, changing nothing, if the branch isn't at expected.  The
  *   remote must have head's chunks.  A format is recorded with the first
- *   head.
+ *   head.  A remote that is a database refuses to move a branch with
+ *   uncommitted changes there, unless force.
  *
  * Provisional (v0).
  *
@@ -45,6 +53,10 @@
 #include "lib/stringinfo.h"
 
 typedef struct ProllyRemote ProllyRemote;
+
+/* Visits a chunk a remote gave: its hash and its bytes, as stored. */
+typedef void (*ProllyRemoteChunkVisit) (const ProllyHash *hash,
+										const char *data, int len, void *arg);
 
 /* Visits a remote's branch and the commit it is at. */
 typedef void (*ProllyRemoteHeadVisit) (const char *branch,
@@ -70,14 +82,30 @@ typedef struct ProllyRemoteRoutine
 							   void *arg);
 	bool		(*move_head) (ProllyRemote *remote, const char *branch,
 							  const ProllyHash *expected,
-							  const ProllyHash *head, const char *format);
+							  const ProllyHash *head, const char *format,
+							  bool force);
+
+	void		(*get_many) (ProllyRemote *remote, const ProllyHash *hashes,
+							 int n, ProllyRemoteChunkVisit visit, void *arg);
+	void		(*has_many) (ProllyRemote *remote, const ProllyHash *hashes,
+							 int n, bool *has);
+	void		(*get_since) (ProllyRemote *remote, const ProllyHash *wanted,
+							  int nwanted, const ProllyHash *known, int nknown,
+							  ProllyRemoteChunkVisit visit, void *arg);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
 	"check_url", "open", "close", "format", "heads", "get", "has", \
-	"add_chunks", "move_head"
+	"add_chunks", "move_head", "get_many", "has_many", "get_since"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
-#define PROLLY_REMOTE_LAST_CALLBACK move_head
+#define PROLLY_REMOTE_LAST_CALLBACK get_since
+
+/*
+ * The implementation of remotes over a libpq connection, which the loadable
+ * module prolly_remote_libpq sets when it is loaded (core doesn't link
+ * libpq); the "postgresql" and "postgres" schemes forward to it.
+ */
+extern PGDLLIMPORT const ProllyRemoteRoutine *prolly_remote_libpq_routine;
 
 /* The implementation serving url's scheme; an error if none does. */
 extern const ProllyRemoteRoutine *prolly_remote_for_url(const char *url);

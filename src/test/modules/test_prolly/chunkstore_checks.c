@@ -590,7 +590,7 @@ test_remote_set_head(PG_FUNCTION_ARGS)
 
 	text_hash(PG_GETARG_TEXT_PP(2), &head);
 	moved = PROLLY_CALL(rr, move_head, r, branch, &none, &head,
-						text_to_cstring(PG_GETARG_TEXT_PP(3)));
+						text_to_cstring(PG_GETARG_TEXT_PP(3)), false);
 	PROLLY_CALL(rr, close, r);
 	PG_RETURN_BOOL(moved);
 }

@@ -218,6 +218,7 @@ pg_test_mod_args = pg_mod_args + {
 
 subdir('jit/llvm')
 subdir('replication/libpqwalreceiver')
+subdir('access/prolly/libpqremote')
 subdir('replication/pgoutput')
 subdir('replication/pgrepack')
 subdir('snowball')

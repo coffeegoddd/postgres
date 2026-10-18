@@ -168,14 +168,24 @@ typedef struct ProllyTreeRoutine
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyTreeVisitChange visit,
 						 void *arg);
+
+	/*
+	 * Visit the nodes of to (value trees too) that from may lack, as diff
+	 * finds them: O((d + 1) log n) nodes for d changed keys, every one to
+	 * has that from lacks among them (and perhaps some it has elsewhere).
+	 * from NULL or empty: every node of to, as walk.
+	 */
+	void		(*diff_nodes) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
+							   const ProllyNodeRef *to,
+							   ProllyTreeVisitNode visit, void *arg);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
-	"walk", "diff"
+	"walk", "diff", "diff_nodes"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff
+#define PROLLY_TREE_LAST_CALLBACK diff_nodes
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)
