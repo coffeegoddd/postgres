@@ -688,7 +688,9 @@ static uint64 manifests_count(void);
  * Append bytes at the end of the segment appends go to; returns the offset
  * they went to, and the segment (*seg).  The segments are read again first
  * if a manifest was written since (a seal takes the same lock), so nothing
- * is appended to a segment that was sealed.  With checked, the bytes'
+ * is appended to a segment that was sealed: before the lock, and under it
+ * only if another manifest came meanwhile, so the lock is seldom held
+ * while a manifest is read.  With checked, the bytes'
  * chunks were checked against the store as of that manifest count: if a
  * manifest was written since, nothing is appended and false returned (the
  * caller checks them again).
@@ -700,6 +702,7 @@ append_bytes(ProllyChunkStore *s, const char *data, Size len, uint64 checked,
 	Segment    *g;
 	pgoff_t		size;
 
+	refresh_segments(s);
 	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
 	if (checked != 0 && manifests_count() != checked)
 	{
@@ -2187,7 +2190,6 @@ journal_open(Oid dboid, Oid spcoid)
 	initStringInfo(&s->pending);
 	MemoryContextSwitchTo(old);
 
-	refresh_segments(s);
 	(void) ensure_journal(s, false);
 
 	RegisterXactCallback(journal_xact_callback, NULL);
@@ -2835,6 +2837,7 @@ journal_segments(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
 		IndexEntry *e;
 		int			n = 0;
 		char	   *name = strrchr(g->path, '/') + 1;
+		pgoff_t		size;
 
 		hash_seq_init(&status, s->index);
 		while ((e = hash_seq_search(&status)) != NULL)
@@ -2845,7 +2848,13 @@ journal_segments(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
 				c = c->other;
 			n += c != NULL;
 		}
-		visit(name, n, open_segment(g) ? FileSize(g->file) : 0, false, arg);
+		size = open_segment(g) ? FileSize(g->file) : 0;
+		if (size < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not determine the size of file \"%s\": %m",
+							g->path)));
+		visit(name, n, (uint64) size, false, arg);
 	}
 }
 
