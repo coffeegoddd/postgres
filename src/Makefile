@@ -22,6 +22,7 @@ SUBDIRS = \
 	include \
 	interfaces \
 	backend/replication/libpqwalreceiver \
+	backend/access/prolly/libpqremote \
 	backend/replication/pgoutput \
 	backend/replication/pgrepack \
 	fe_utils \

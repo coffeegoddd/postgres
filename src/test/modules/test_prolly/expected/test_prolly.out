@@ -41,7 +41,9 @@ FROM prolly_implementations();
  change_finder | pages        |       1 |              4
  change_finder | stub         |       0 |              0
  remote        | file         |       1 |              1
-(32 rows)
+ remote        | postgresql   |       2 |              1
+ remote        | postgres     |       3 |              1
+(34 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -190,7 +192,13 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  remote        | file           | identity                       | pass
  remote        | file           | heads_and_chunks               | no checks yet
  remote        | file           | complete                       | pass
-(141 rows)
+ remote        | postgresql     | identity                       | pass
+ remote        | postgresql     | heads_and_chunks               | no checks yet
+ remote        | postgresql     | complete                       | pass
+ remote        | postgres       | identity                       | pass
+ remote        | postgres       | heads_and_chunks               | no checks yet
+ remote        | postgres       | complete                       | pass
+(147 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

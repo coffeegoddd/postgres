@@ -667,7 +667,7 @@ file_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 
 static bool
 file_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
-			   const ProllyHash *head, const char *format)
+			   const ProllyHash *head, const char *format, bool force)
 {
 	Manifest	m;
 	RemoteHead *at = NULL;

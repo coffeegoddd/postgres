@@ -28,7 +28,8 @@
  *   doesn't exist) to head (NULL: delete it), durably, as a compare-and-
  *   swap: false, changing nothing, if the branch isn't at expected.  The
  *   remote must have head's chunks.  A format is recorded with the first
- *   head.
+ *   head.  A remote that is a database refuses to move a branch with
+ *   uncommitted changes there, unless force.
  *
  * Provisional (v0).
  *
@@ -70,7 +71,8 @@ typedef struct ProllyRemoteRoutine
 							   void *arg);
 	bool		(*move_head) (ProllyRemote *remote, const char *branch,
 							  const ProllyHash *expected,
-							  const ProllyHash *head, const char *format);
+							  const ProllyHash *head, const char *format,
+							  bool force);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
@@ -78,6 +80,13 @@ typedef struct ProllyRemoteRoutine
 	"add_chunks", "move_head"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
 #define PROLLY_REMOTE_LAST_CALLBACK move_head
+
+/*
+ * The implementation of remotes over a libpq connection, which the loadable
+ * module prolly_remote_libpq sets when it is loaded (core doesn't link
+ * libpq); the "postgresql" and "postgres" schemes forward to it.
+ */
+extern PGDLLIMPORT const ProllyRemoteRoutine *prolly_remote_libpq_routine;
 
 /* The implementation serving url's scheme; an error if none does. */
 extern const ProllyRemoteRoutine *prolly_remote_for_url(const char *url);
