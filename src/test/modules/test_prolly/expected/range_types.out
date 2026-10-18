@@ -1,0 +1,321 @@
+-- Range types in versioned schemas: made per branch (their pg_range row,
+-- multirange type, constructors and cast with them), held by commits,
+-- made and dropped by moves.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA rv VERSIONED;
+CREATE TABLE rv.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('rv_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE TYPE rv.span AS RANGE (subtype = int4);
+CREATE TYPE rv.tspan AS RANGE (subtype = text, collation = "C",
+  multirange_type_name = rv.tspans);
+CREATE TYPE rv.fspan AS RANGE (subtype = float8,
+  subtype_diff = pg_catalog.float8mi);
+CREATE TABLE rv.t (id int PRIMARY KEY, s rv.span, ms rv.span_multirange,
+  ts rv.tspan, fs rv.fspan);
+INSERT INTO rv.t VALUES (1, '[1,5)', '{[1,2),[3,4)}', '[a,c)', '[1.5,2.5]');
+SELECT s, s::rv.span_multirange AS cast, rv.span(2, 7) AS made, ts, fs FROM rv.t;
+   s   |  cast   | made  |  ts   |    fs     
+-------+---------+-------+-------+-----------
+ [1,5) | {[1,5)} | [2,7) | [a,c) | [1.5,2.5]
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY table_name;
+ table_name | staged |  status   
+------------+--------+-----------
+ rv.fspan   | t      | new table
+ rv.span    | t      | new table
+ rv.t       | t      | new table
+ rv.tspan   | t      | new table
+(4 rows)
+
+SELECT length(dolt_commit('-Am', 'ranges')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- per branch: another branch has none of it
+SELECT dolt_checkout('rv_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'rv_other'"}
+(1 row)
+
+SELECT count(*) AS ranges FROM pg_range WHERE rngtypid::regtype::text LIKE 'rv.%';
+ ranges 
+--------
+      0
+(1 row)
+
+SELECT count(*) AS casts FROM pg_cast WHERE castsource::regtype::text LIKE 'rv.%';
+ casts 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS types FROM pg_type WHERE typnamespace = 'rv'::regnamespace
+  AND typname LIKE '%span%';
+ types 
+-------
+     0
+(1 row)
+
+-- a reset makes them from the commit, and back drops them
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT s, ms, s::rv.span_multirange AS cast, rv.span(2, 7) AS made, ts, fs,
+  pg_typeof(fs - fs) FROM rv.t;
+   s   |      ms       |  cast   | made  |  ts   |    fs     | pg_typeof 
+-------+---------------+---------+-------+-------+-----------+-----------
+ [1,5) | {[1,2),[3,4)} | {[1,5)} | [2,7) | [a,c) | [1.5,2.5] | rv.fspan
+(1 row)
+
+SELECT rngtypid::regtype, rngsubtype::regtype, rngmultitypid::regtype,
+  rngcollation::regcollation, rngsubdiff
+  FROM pg_range WHERE rngtypid::regtype::text LIKE 'rv.%' ORDER BY 1::text;
+ rngtypid |    rngsubtype    |    rngmultitypid    | rngcollation | rngsubdiff 
+----------+------------------+---------------------+--------------+------------
+ rv.fspan | double precision | rv.fspan_multirange | -            | float8mi
+ rv.span  | integer          | rv.span_multirange  | -            | -
+ rv.tspan | text             | rv.tspans           | "C"          | -
+(3 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT count(*) AS types FROM pg_type WHERE typnamespace = 'rv'::regnamespace
+  AND typname LIKE '%span%';
+ types 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS functions FROM pg_proc WHERE pronamespace = 'rv'::regnamespace;
+ functions 
+-----------
+         0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'rv_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- one changed can't be moved to: Postgres can't change one in place
+SELECT dolt_branch('rv_changed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('rv_changed');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'rv_changed'"}
+(1 row)
+
+DROP TABLE rv.t;
+DROP TYPE rv.span;
+CREATE TYPE rv.span AS RANGE (subtype = int8);
+SELECT length(dolt_commit('-Am', 'span of int8')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('rv_changed') IS NOT NULL AS merged;
+ERROR:  the branch can't be moved to a commit that defines type rv.span otherwise
+DETAIL:  A range type in use can't be changed in place; a move can't change one either.
+SELECT dolt_reset('--hard', 'rv_changed');
+ERROR:  the branch can't be moved to a commit that defines type rv.span otherwise
+DETAIL:  A range type in use can't be changed in place; a move can't change one either.
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'rv_changed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- one nothing uses, changed, goes and comes again: an uncommitted
+-- redefinition is discarded by a reset
+CREATE TYPE rv.lone AS RANGE (subtype = int4);
+SELECT length(dolt_commit('-Am', 'lone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP TYPE rv.lone;
+CREATE TYPE rv.lone AS RANGE (subtype = int8);
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT rngsubtype::regtype FROM pg_range WHERE rngtypid = 'rv.lone'::regtype;
+ rngsubtype 
+------------
+ integer
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- one over a domain the move changes: refused, and clearly
+CREATE DOMAIN rv.small AS int4 CHECK (VALUE < 100);
+CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
+SELECT length(dolt_commit('-Am', 'over a domain')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('rv_domain');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('rv_domain');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'rv_domain'"}
+(1 row)
+
+DROP TYPE rv.sspan;
+DROP DOMAIN rv.small;
+CREATE DOMAIN rv.small AS int4 CHECK (VALUE < 1000);
+CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
+SELECT length(dolt_commit('-Am', 'a wider domain')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'rv_domain');
+ERROR:  the branch can't be moved to a commit that defines type rv.small otherwise
+DETAIL:  Range type rv.sspan uses it, and a range type in use can't be made again in place.
+SELECT dolt_branch('-D', 'rv_domain');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TYPE rv.sspan;
+DROP DOMAIN rv.small;
+SELECT length(dolt_commit('-Am', 'no domain')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- a multirange outside the range's versioned schema is refused where made
+CREATE TYPE rv.pspan AS RANGE (subtype = int4, multirange_type_name = public.pspans);
+ERROR:  type pspans can't depend on type rv.pspan, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+-- not held: one with a collation of a versioned schema (a move makes
+-- types before collations)
+CREATE COLLATION rv.coll FROM "C";
+CREATE TYPE rv.cspan AS RANGE (subtype = text, collation = rv.coll);
+SELECT * FROM dolt_status WHERE status = 'not covered';
+ table_name | staged |   status    
+------------+--------+-------------
+ rv.cspan   | f      | not covered
+(1 row)
+
+SELECT dolt_commit('-Am', 'refused');
+ERROR:  prolly commits don't cover range types whose operator class or collation is versioned yet: rv.cspan
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP TYPE rv.cspan;
+DROP COLLATION rv.coll;
+-- not held: one with a subtype difference function of a versioned schema
+-- (a move makes types before functions)
+CREATE FUNCTION rv.diff(int4, int4) RETURNS float8 LANGUAGE sql IMMUTABLE
+  AS 'SELECT ($1 - $2)::float8';
+CREATE TYPE rv.dspan AS RANGE (subtype = int4, subtype_diff = rv.diff);
+SELECT * FROM dolt_status WHERE status = 'not covered';
+ table_name | staged |   status    
+------------+--------+-------------
+ rv.dspan   | f      | not covered
+(1 row)
+
+SELECT dolt_commit('-Am', 'refused');
+ERROR:  prolly commits don't cover range types whose subtype difference function is versioned yet: rv.dspan
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP TYPE rv.dspan;
+DROP FUNCTION rv.diff(int4, int4);
+DROP SCHEMA rv CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table rv.base
+drop cascades to type rv.span
+drop cascades to type rv.tspan
+drop cascades to type rv.fspan
+drop cascades to table rv.t
+drop cascades to type rv.lone
+SELECT length(dolt_commit('-Am', 'rv gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

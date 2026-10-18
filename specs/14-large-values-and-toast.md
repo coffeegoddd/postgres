@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided; questions 3 (C's gates) and 4 (the hybrid) stay open until those gates are measured. The refusal and B built 2026-10-17 (#217–#221, one stack), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C isn't built.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided; questions 3 (C's gates) and 4 (the hybrid) stay open until those gates are measured. The refusal and B built 2026-10-17 and merged 2026-10-18 (#217–#221, #224, one stack), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C isn't built.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with

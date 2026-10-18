@@ -52,9 +52,10 @@ UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'c_utf8';
 SELECT * FROM dolt_status() ORDER BY table_name;
  table_name | staged |  status  
 ------------+--------+----------
+ app.c_utf8 | t      | modified
  app.n      | t      | modified
  app.t      | t      | modified
-(2 rows)
+(3 rows)
 
 SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
 ERROR:  the rows of table app.t in this version can't be read here
@@ -106,3 +107,167 @@ DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table app.c
 drop cascades to table app.n
+-- Collations of versioned schemas are held as objects: a move makes them
+-- (before the types and tables using them), drops them, and makes one
+-- nothing uses again when it changes; one in use is refused.
+CREATE SCHEMA mv VERSIONED;
+CREATE TABLE mv.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mv')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mv_none');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE COLLATION mv.c1 FROM "C";
+CREATE COLLATION mv.c2 (provider = builtin, locale = 'C.UTF-8');
+CREATE COLLATION mv.lone (provider = libc, locale = 'C');
+CREATE TABLE mv.t (k text COLLATE mv.c2 PRIMARY KEY, v text COLLATE mv.c1);
+INSERT INTO mv.t VALUES ('b', 'x'), ('a', 'y');
+SELECT key, replace(value, E'\n', ' | ') AS value
+FROM test_fold_items() WHERE key LIKE 'l:mv.%' ORDER BY key;
+    key    |         value         
+-----------+-----------------------
+ l:mv.c1   | c | C\x09C |  | t | 
+ l:mv.c2   | b | C.UTF-8 |  | t | 
+ l:mv.lone | c | C\x09C |  | t | 
+(3 rows)
+
+SELECT length(dolt_commit('-Am', 'collations')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mv_none');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'mv_none'"}
+(1 row)
+
+SELECT count(*) AS collations FROM pg_collation WHERE collnamespace = 'mv'::regnamespace;
+ collations 
+------------
+          0
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT collname, collprovider, collcollate, colllocale FROM pg_collation
+  WHERE collnamespace = 'mv'::regnamespace ORDER BY 1;
+ collname | collprovider | collcollate | colllocale 
+----------+--------------+-------------+------------
+ c1       | c            | C           | 
+ c2       | b            |             | C.UTF-8
+ lone     | c            | C           | 
+(3 rows)
+
+SELECT k, v FROM mv.t ORDER BY k;
+ k | v 
+---+---
+ a | y
+ b | x
+(2 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS collations FROM pg_collation WHERE collnamespace = 'mv'::regnamespace;
+ collations 
+------------
+          0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP COLLATION mv.lone;
+CREATE COLLATION mv.lone (provider = builtin, locale = 'C');
+SELECT length(dolt_commit('-am', 'lone changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mv_none');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'mv_none'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT collname, collprovider FROM pg_collation WHERE collname = 'lone';
+ collname | collprovider 
+----------+--------------
+ lone     | b
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP TABLE mv.t;
+DROP COLLATION mv.c1;
+CREATE COLLATION mv.c1 (provider = builtin, locale = 'C');
+CREATE TABLE mv.t (k text COLLATE mv.c2 PRIMARY KEY, v text COLLATE mv.c1);
+SELECT length(dolt_commit('-Am', 'c1 changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ERROR:  the branch can't be moved to a commit that defines collation mv.c1 otherwise
+DETAIL:  A collation in use can't be changed in place; a move can't change one either.
+SELECT dolt_reset('--hard', 'HEAD');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mv_none');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mv CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table mv.base
+drop cascades to collation mv.c2
+drop cascades to collation mv.lone
+drop cascades to collation mv.c1
+drop cascades to table mv.t

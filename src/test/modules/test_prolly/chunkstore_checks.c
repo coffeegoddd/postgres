@@ -266,7 +266,7 @@ test_chunk_seal(PG_FUNCTION_ARGS)
 static void
 fold_in_full(ProllyNodeRef *root)
 {
-	PROLLY_CALL(prolly_canon_lookup("folded"), fold, NULL, root, NULL);
+	PROLLY_CALL(prolly_canon_lookup("folded"), fold, NULL, root, NULL, true);
 }
 
 PG_FUNCTION_INFO_V1(test_fold_root);
@@ -448,7 +448,7 @@ test_fold_items(PG_FUNCTION_ARGS)
 	ProllyValue v;
 
 	InitMaterializedSRF(fcinfo, 0);
-	PROLLY_CALL(canon, fold, NULL, &root, NULL);
+	PROLLY_CALL(canon, fold, NULL, &root, NULL, true);
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");

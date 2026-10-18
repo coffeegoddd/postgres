@@ -331,12 +331,21 @@ SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdl.t);
 SELECT dolt_commit('-am', 'a large object');
 ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.t.doc
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
--- a reset folds the working set as a commit does, so it is refused too
--- until the column is dropped
+-- only a commit refuses it: a reset discards the column, as any
+-- uncommitted change
 SELECT dolt_reset('--hard');
-ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.t.doc
-DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
-ALTER TABLE sdl.t DROP COLUMN doc;
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS doc_columns FROM pg_attribute
+  WHERE attrelid = 'sdl.t'::regclass AND attname = 'doc';
+ doc_columns 
+-------------
+           0
+(1 row)
+
 CREATE TABLE sdl.u (id int PRIMARY KEY, o oid, c regclass, r oid[], p sdl.pair,
 	x oid8);
 SELECT dolt_commit('-Am', 'oids');
@@ -345,14 +354,13 @@ DETAIL:  A commit's root hash must depend only on what it holds, and the canonic
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
  table_name | staged |   status    
 ------------+--------+-------------
- sdl.t      | t      | modified
  sdl.u      | t      | new table
  sdl.u.c    | f      | not covered
  sdl.u.o    | f      | not covered
  sdl.u.p    | f      | not covered
  sdl.u.r    | f      | not covered
  sdl.u.x    | f      | not covered
-(7 rows)
+(6 rows)
 
 DROP TABLE sdl.u;
 -- domains over arrays, ranges and multiranges (of an ordinary schema's

@@ -49,6 +49,8 @@ CATALOG(pg_cast,2605,CastRelationId)
 
 	/* cast method */
 	char		castmethod;
+
+	Oid			castbranch BKI_DEFAULT(0);	/* branch of a versioned object's row; 0 if shared */
 } FormData_pg_cast;
 
 END_CATALOG_STRUCT
@@ -60,8 +62,8 @@ END_CATALOG_STRUCT
  */
 typedef FormData_pg_cast *Form_pg_cast;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_cast_oid_index, 2660, CastOidIndexId, pg_cast, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_cast_source_target_index, 2661, CastSourceTargetIndexId, pg_cast, btree(castsource oid_ops, casttarget oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_cast_oid_index, 2660, CastOidIndexId, pg_cast, btree(oid oid_ops, castbranch oid_ops));
+DECLARE_UNIQUE_INDEX(pg_cast_source_target_index, 2661, CastSourceTargetIndexId, pg_cast, btree(castsource oid_ops, casttarget oid_ops, castbranch oid_ops));
 
 MAKE_SYSCACHE(CASTSOURCETARGET, pg_cast_source_target_index, 256);
 

@@ -23,13 +23,15 @@
  *						   out ("t" or "f")
  *	"t:" table			-> its data tree (hash length, hash), then its schema
  *	"v:" view			-> its query
- *	"y:" type			-> an enum's labels, a domain's or a composite
- *						   type's definition
+ *	"x:" source AS target -> a cast: its method (and function), its
+ *						   context
+ *	"y:" type			-> an enum's labels, a domain's, a composite or
+ *						   a range type's definition
  *
  * A table's schema lists its live columns in order (name, type, nullness,
  * collation if not the type's, default, identity, generation), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
- * prints them.  Names are qualified whatever the session's search path (it
+ * prints them (then its policies and extended statistics, if any).  Names are qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
  * order, dropped columns) reaches the hash.
@@ -109,6 +111,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_depend.h"
@@ -124,14 +127,27 @@
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_conversion.h"
+#include "catalog/pg_opclass.h"
+#include "catalog/pg_opfamily.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_ts_config.h"
+#include "catalog/pg_ts_dict.h"
+#include "catalog/pg_ts_parser.h"
+#include "catalog/pg_ts_template.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_range.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_default_acl.h"
+#include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
@@ -194,11 +210,14 @@ typedef struct Canon
 	List	   *next;			/* CanonItem *, the next baseline's */
 	bool		reading;		/* objects not described are left out */
 	List	   *left_out;		/* (reading) their names */
+	List	   *left_addrs;		/* (reading) ObjectAddress *: the same */
 	List	   *refused;		/* (committing) Refused *: the same */
 	Oid			only;			/* valid: only this table's rows folded */
+	bool		no_rows;		/* no table's rows folded (objects only) */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
+static void append_statistics(StringInfo out, Relation rel);
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -325,14 +344,25 @@ typedef struct Refused
 
 /*
  * An object the canonical form doesn't describe: left out (true).  When
- * reading, its name is noted; when committing, it is refused once every
- * object has been read (check_refused()).
+ * reading, its name is noted, and its address if it is left out whole (a
+ * move may discard it); when committing, it is refused once every object
+ * has been read (check_refused()).
  */
 static bool
-uncovered(Canon *cn, const char *what, const char *name)
+uncovered(Canon *cn, const char *what, const char *name,
+		  const ObjectAddress *addr)
 {
 	if (cn->reading)
+	{
 		cn->left_out = lappend(cn->left_out, pstrdup(name));
+		if (addr)
+		{
+			ObjectAddress *a = palloc(sizeof(ObjectAddress));
+
+			*a = *addr;
+			cn->left_addrs = lappend(cn->left_addrs, a);
+		}
+	}
 	else
 	{
 		Refused    *r = palloc(sizeof(Refused));
@@ -531,7 +561,8 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		tf.state.len = bt->state.len;
 	}
 	/* (when reading another table: its rows as the baseline has them) */
-	if (OidIsValid(cn->only) && RelationGetRelid(rel) != cn->only)
+	if (cn->no_rows ||
+		(OidIsValid(cn->only) && RelationGetRelid(rel) != cn->only))
 	{
 		if (bt)
 			*root = bt->data;
@@ -827,6 +858,9 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfo(out, "policies\n%s", policies.data);
 	}
 
+	/* Extended statistics on it, by name (a section only if it has any). */
+	append_statistics(out, rel);
+
 	/* A partitioned table's key; a partition's parent and bound. */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
@@ -861,6 +895,167 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
  * Types, sequences, extensions
  * ------------------------------------------------------------------------
  */
+
+static char *qualified_function(Oid fn);
+static void refuse_undescribed(Canon *cn);
+static void describe_casts(Canon *cn);
+static void describe_collations(Canon *cn);
+static bool held_kind(Oid classid);
+
+/*
+ * Is an object part of a type (a range type's constructors, its cast to its
+ * multirange type)?
+ */
+static bool
+part_of_type(Oid classid, Oid objid)
+{
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(classid));
+	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(objid));
+	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
+	while (!found && (tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+		found = d->deptype == DEPENDENCY_INTERNAL && d->refclassid == TypeRelationId;
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return found;
+}
+
+/*
+ * rel's extended statistics objects, sorted, one per line: its qualified
+ * name, the CREATE STATISTICS that makes it (as Postgres's deparser prints
+ * it), and its statistics target if one was set.  None: no section.
+ */
+static void
+append_statistics(StringInfo out, Relation rel)
+{
+	Relation	srel = table_open(StatisticExtRelationId, AccessShareLock);
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	ScanKeyInit(&skey, Anum_pg_statistic_ext_stxrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(srel, StatisticExtRelidIndexId, true, NULL, 1, &skey);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_statistic_ext stx = (Form_pg_statistic_ext) GETSTRUCT(tup);
+		StringInfoData line;
+		bool		isnull;
+		Datum		target = heap_getattr(tup, Anum_pg_statistic_ext_stxstattarget,
+										  RelationGetDescr(srel), &isnull);
+
+		initStringInfo(&line);
+		append_field(&line, qualified(stx->stxnamespace, NameStr(stx->stxname)));
+		appendStringInfoChar(&line, '\t');
+		append_field(&line, pg_get_statisticsobjdef_string(stx->oid));
+		if (!isnull)
+			appendStringInfo(&line, "\t%d", DatumGetInt16(target));
+		lines = lappend(lines, line.data);
+	}
+	systable_endscan(scan);
+	table_close(srel, AccessShareLock);
+	if (lines == NIL)
+		return;
+	list_sort(lines, cstring_cmp);
+	appendStringInfoString(out, "statistics\n");
+	foreach(lc, lines)
+	{
+		appendStringInfoString(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
+}
+
+/*
+ * A range type: "range", then its subtype, the subtype's operator class,
+ * its collation (empty if none), its subtype difference function (empty if
+ * none) and its multirange type, a line each, as CREATE TYPE ... AS RANGE
+ * names them.  Its multirange type, constructors and cast come with it.  A
+ * canonical function is written in C, and is made with a shell type the
+ * range fills: not held.  Nor is a range whose subtype difference
+ * function, operator class or collation is of a versioned schema, which a
+ * move would make after the type.
+ */
+static void
+describe_range(Canon *cn, Form_pg_type typ)
+{
+	HeapTuple	tup = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(typ->oid));
+	Form_pg_range rng;
+	char	   *name = qualified(typ->typnamespace, NameStr(typ->typname));
+	CanonItem  *it;
+	ObjectAddress self;
+
+	ObjectAddressSet(self, TypeRelationId, typ->oid);
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for range type %u", typ->oid);
+	rng = (Form_pg_range) GETSTRUCT(tup);
+	if (OidIsValid(rng->rngcanonical))
+	{
+		ReleaseSysCache(tup);
+		(void) uncovered(cn, "range types with a canonical function", name, &self);
+		return;
+	}
+	if (OidIsValid(rng->rngsubdiff) &&
+		canon_namespace(get_func_namespace(rng->rngsubdiff)))
+	{
+		ReleaseSysCache(tup);
+		(void) uncovered(cn, "range types whose subtype difference function is versioned", name, &self);
+		return;
+	}
+	{
+		ObjectAddress opc;
+		ObjectAddress coll;
+
+		ObjectAddressSet(opc, OperatorClassRelationId, rng->rngsubopc);
+		ObjectAddressSet(coll, CollationRelationId, rng->rngcollation);
+		if (canon_namespace(get_object_namespace(&opc)) ||
+			(OidIsValid(rng->rngcollation) &&
+			 canon_namespace(get_object_namespace(&coll))))
+		{
+			ReleaseSysCache(tup);
+			(void) uncovered(cn, "range types whose operator class or collation is versioned", name, &self);
+			return;
+		}
+	}
+	it = add_item(cn, "y:", name);
+	appendStringInfoString(&it->value, "range\n");
+	append_field(&it->value, format_type_extended(rng->rngsubtype, -1,
+												  FORMAT_TYPE_FORCE_QUALIFY));
+	appendStringInfoChar(&it->value, '\n');
+	{
+		HeapTuple	ctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(rng->rngsubopc));
+		Form_pg_opclass opc;
+
+		if (!HeapTupleIsValid(ctup))
+			elog(ERROR, "cache lookup failed for operator class %u", rng->rngsubopc);
+		opc = (Form_pg_opclass) GETSTRUCT(ctup);
+		append_field(&it->value, qualified(opc->opcnamespace, NameStr(opc->opcname)));
+		ReleaseSysCache(ctup);
+	}
+	appendStringInfoChar(&it->value, '\n');
+	if (OidIsValid(rng->rngcollation))
+		append_field(&it->value, generate_collation_name(rng->rngcollation));
+	appendStringInfoChar(&it->value, '\n');
+	if (OidIsValid(rng->rngsubdiff))
+		append_field(&it->value, qualified_function(rng->rngsubdiff));
+	appendStringInfoChar(&it->value, '\n');
+	append_field(&it->value, format_type_extended(rng->rngmultitypid, -1,
+												  FORMAT_TYPE_FORCE_QUALIFY));
+	appendStringInfoChar(&it->value, '\n');
+	ReleaseSysCache(tup);
+}
 
 static void
 describe_type(Canon *cn, Form_pg_type typ)
@@ -987,13 +1182,20 @@ describe_type(Canon *cn, Form_pg_type typ)
 		}
 		relation_close(crel, AccessShareLock);
 	}
-	else if (typ->typtype == TYPTYPE_RANGE || typ->typtype == TYPTYPE_MULTIRANGE ||
-			 typ->typtype == TYPTYPE_BASE)
+	else if (typ->typtype == TYPTYPE_RANGE)
+		describe_range(cn, typ);
+	else if (typ->typtype == TYPTYPE_MULTIRANGE)
+		return;					/* (with its range type) */
+	else if (typ->typtype == TYPTYPE_BASE)
 	{
+		ObjectAddress self;
+
 		/* Array types of covered types come with them. */
 		if (OidIsValid(typ->typelem) && typ->typcategory == TYPCATEGORY_ARRAY)
 			return;
-		(void) uncovered(cn, "this type", qualified(typ->typnamespace, NameStr(typ->typname)));
+		ObjectAddressSet(self, TypeRelationId, typ->oid);
+		(void) uncovered(cn, "this type", qualified(typ->typnamespace, NameStr(typ->typname)),
+						 &self);
 	}
 }
 
@@ -1160,6 +1362,16 @@ depender_is_canonical(const ObjectAddress *object)
 {
 	Oid			nsp;
 
+	/*
+	 * (what a commit doesn't hold needs nothing for it: an operator class's
+	 * entries, say)
+	 */
+	if (object->classId == AccessMethodOperatorRelationId ||
+		object->classId == AccessMethodProcedureRelationId ||
+		(is_objectclass_supported(object->classId) &&
+		 get_object_attnum_namespace(object->classId) != InvalidAttrNumber &&
+		 !held_kind(object->classId)))
+		return false;
 	if (!object_is_versioned(object) ||
 		in_extension(object->classId, object->objectId))
 		return false;
@@ -1401,6 +1613,9 @@ column_names(Oid relid)
 static bool
 partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 {
+	ObjectAddress self;
+
+	ObjectAddressSet(self, RelationRelationId, form->oid);
 	if (form->relispartition)
 	{
 		Oid			parent = get_partition_parent(form->oid, false);
@@ -1411,14 +1626,14 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 
 		if (!canon_namespace(get_rel_namespace(parent)))
 			return uncovered(cn, "partitions of tables outside versioned schemas",
-							 qualified(form->relnamespace, name));
+							 qualified(form->relnamespace, name), &self);
 		if (list_length(own) != list_length(its))
 			return uncovered(cn, "partitions with columns their partitioned table lacks",
-							 qualified(form->relnamespace, name));
+							 qualified(form->relnamespace, name), &self);
 		forboth(a, own, b, its)
 			if (strcmp(lfirst(a), lfirst(b)) != 0)
 				return uncovered(cn, "partitions with their columns in another order than their partitioned table's",
-								 qualified(form->relnamespace, name));
+								 qualified(form->relnamespace, name), &self);
 	}
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
 	{
@@ -1426,8 +1641,9 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 
 		foreach(lc, find_inheritance_children(form->oid, AccessShareLock))
 			if (!canon_namespace(get_rel_namespace(lfirst_oid(lc))))
+				/* (not discarded: its partitions outside are every branch's) */
 				return uncovered(cn, "partitioned tables with partitions outside versioned schemas",
-								 qualified(form->relnamespace, name));
+								 qualified(form->relnamespace, name), NULL);
 	}
 	return false;
 }
@@ -1512,7 +1728,8 @@ oid_columns(Canon *cn, Relation rel)
 						 psprintf("%s.%s",
 								  qualified(RelationGetNamespace(rel),
 											RelationGetRelationName(rel)),
-								  quote_identifier(NameStr(att->attname))));
+								  quote_identifier(NameStr(att->attname))),
+						 NULL);	/* (when reading, its table is read whole) */
 		any = true;
 	}
 	return any;
@@ -1613,7 +1830,13 @@ collect(Canon *cn)
 				}
 				break;
 			case RELKIND_FOREIGN_TABLE:
-				(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name));
+				{
+					ObjectAddress self;
+
+					ObjectAddressSet(self, RelationRelationId, form->oid);
+					(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name),
+									 &self);
+				}
 				break;
 			case RELKIND_PARTITIONED_TABLE:
 				{
@@ -1695,16 +1918,24 @@ collect(Canon *cn)
 			CanonItem  *it;
 
 			if (!canon_namespace(proc->pronamespace) ||
-				in_extension(ProcedureRelationId, proc->oid))
+				in_extension(ProcedureRelationId, proc->oid) ||
+				((get_typtype(proc->prorettype) == TYPTYPE_RANGE ||
+				  get_typtype(proc->prorettype) == TYPTYPE_MULTIRANGE) &&
+				 part_of_type(ProcedureRelationId, proc->oid)))
 				continue;
 			name = psprintf("%s(%s)",
 							qualified(proc->pronamespace, NameStr(proc->proname)),
 							TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
 																	ObjectIdGetDatum(proc->oid))));
 			/* (a window function is written in C: none to hold) */
-			if (proc->prokind == PROKIND_WINDOW &&
-				uncovered(cn, "window functions", name))
+			if (proc->prokind == PROKIND_WINDOW)
+			{
+				ObjectAddress self;
+
+				ObjectAddressSet(self, ProcedureRelationId, proc->oid);
+				(void) uncovered(cn, "window functions", name, &self);
 				continue;
+			}
 			it = add_item(cn, "f:", name);
 			if (proc->prokind == PROKIND_AGGREGATE)
 				append_utf8(&it->value, aggregate_def(proc));
@@ -1716,6 +1947,203 @@ collect(Canon *cn)
 		systable_endscan(scan);
 		table_close(pg_proc, AccessShareLock);
 	}
+	refuse_undescribed(cn);
+}
+
+/*
+ * Is a catalog's kind of object one a commit holds (or one never held:
+ * privileges)?  Every other kind a branch-aware catalog holds in a
+ * versioned schema is refused, not left out of a commit's hash (a clone or
+ * checkout wouldn't have it): a kind added later included.
+ */
+static bool
+held_kind(Oid classid)
+{
+	switch (classid)
+	{
+		case NamespaceRelationId:
+		case RelationRelationId:
+		case TypeRelationId:
+		case ProcedureRelationId:
+		case ConstraintRelationId:	/* (a table's or a domain's) */
+		case CollationRelationId:
+		case StatisticExtRelationId:	/* (a table's) */
+		case DefaultAclRelationId:	/* (privileges aren't held) */
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Objects of versioned schemas the canonical form doesn't describe, each
+ * named as Postgres describes it (which tells an operator's argument
+ * types, an operator class's access method): refused.  Branch-aware
+ * catalogs with a schema column are the ones that can hold them.  (Casts,
+ * which have no schema, are described.)
+ */
+static void
+refuse_undescribed(Canon *cn)
+{
+	int			ncatalogs;
+	const CatalogBranchInfo *catalogs = catalog_branch_catalogs(&ncatalogs);
+	List	   *versioned = NIL;	/* schemas seen, and whether */
+	List	   *plain = NIL;
+
+	for (int k = 0; k < ncatalogs; k++)
+	{
+		Oid			classid = catalogs[k].relid;
+		AttrNumber	nspatt;
+		AttrNumber	oidatt;
+		Relation	rel;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		if (held_kind(classid) || !is_objectclass_supported(classid) ||
+			(nspatt = get_object_attnum_namespace(classid)) == InvalidAttrNumber)
+			continue;
+		oidatt = get_object_attnum_oid(classid);
+		rel = table_open(classid, AccessShareLock);
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			bool		isnull;
+			Oid			oid = DatumGetObjectId(heap_getattr(tup, oidatt,
+															RelationGetDescr(rel), &isnull));
+			Oid			nsp;
+			ObjectAddress self;
+
+			/* (what initdb made is in no versioned schema) */
+			if (oid < FirstNormalObjectId)
+				continue;
+			nsp = DatumGetObjectId(heap_getattr(tup, nspatt, RelationGetDescr(rel), &isnull));
+			if (isnull || list_member_oid(plain, nsp))
+				continue;
+			if (!list_member_oid(versioned, nsp))
+			{
+				if (!canon_namespace(nsp))
+				{
+					plain = lappend_oid(plain, nsp);
+					continue;
+				}
+				versioned = lappend_oid(versioned, nsp);
+			}
+			if (in_extension(classid, oid))
+				continue;
+			ObjectAddressSet(self, classid, oid);
+			(void) uncovered(cn, psprintf("%s objects", get_object_class_descr(classid)),
+							 getObjectDescription(&self, false), &self);
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
+
+	describe_casts(cn);
+	describe_collations(cn);
+}
+
+/*
+ * Collations of versioned schemas: "l:" items, each its provider, its
+ * locale (a libc one's LC_COLLATE and LC_CTYPE), its ICU rules (empty if
+ * none) and whether it is deterministic, a line each: what CREATE
+ * COLLATION takes.  (A "c:" item records the version of each collation
+ * that orders keys, these among them.)
+ */
+static void
+describe_collations(Canon *cn)
+{
+	Relation	rel = table_open(CollationRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(tup);
+		CanonItem  *it;
+		bool		isnull;
+		Datum		d;
+
+		if (coll->oid < FirstNormalObjectId || !canon_namespace(coll->collnamespace) ||
+			in_extension(CollationRelationId, coll->oid))
+			continue;
+		it = add_item(cn, "l:", qualified(coll->collnamespace, NameStr(coll->collname)));
+		appendStringInfo(&it->value, "%c\n", coll->collprovider);
+		if (coll->collprovider == COLLPROVIDER_LIBC)
+		{
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_collcollate);
+			append_field(&it->value, TextDatumGetCString(d));
+			appendStringInfoChar(&it->value, '\t');
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_collctype);
+			append_field(&it->value, TextDatumGetCString(d));
+		}
+		else
+		{
+			d = SysCacheGetAttrNotNull(COLLOID, tup, Anum_pg_collation_colllocale);
+			append_field(&it->value, TextDatumGetCString(d));
+		}
+		appendStringInfoChar(&it->value, '\n');
+		d = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collicurules, &isnull);
+		if (!isnull)
+			append_field(&it->value, TextDatumGetCString(d));
+		appendStringInfoChar(&it->value, '\n');
+		appendStringInfo(&it->value, "%s\n", coll->collisdeterministic ? "t" : "f");
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+}
+
+/*
+ * Casts of a type of a versioned schema, but those part of one (a range
+ * type's to its multirange type): "x:" items named "source AS target",
+ * each its method ("function" and the function's qualified signature,
+ * "inout" or "binary") and its context ("explicit", "assignment" or
+ * "implicit"), a line each.  (What initdb made casts no such type.)
+ */
+static void
+describe_casts(Canon *cn)
+{
+	Relation	rel = table_open(CastRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_cast c = (Form_pg_cast) GETSTRUCT(tup);
+		ObjectAddress src;
+		ObjectAddress tgt;
+		CanonItem  *it;
+
+		if (c->oid < FirstNormalObjectId)
+			continue;
+		ObjectAddressSet(src, TypeRelationId, c->castsource);
+		ObjectAddressSet(tgt, TypeRelationId, c->casttarget);
+		if (!canon_namespace(get_object_namespace(&src)) &&
+			!canon_namespace(get_object_namespace(&tgt)))
+			continue;
+		if (part_of_type(CastRelationId, c->oid) ||
+			in_extension(CastRelationId, c->oid))
+			continue;
+		it = add_item(cn, "x:",
+					  psprintf("%s AS %s",
+							   format_type_extended(c->castsource, -1, FORMAT_TYPE_FORCE_QUALIFY),
+							   format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)));
+		if (c->castmethod == COERCION_METHOD_FUNCTION)
+		{
+			append_field(&it->value, "function");
+			appendStringInfoChar(&it->value, '\t');
+			append_field(&it->value, format_procedure_qualified(c->castfunc));
+		}
+		else
+			append_field(&it->value, c->castmethod == COERCION_METHOD_INOUT ?
+						 "inout" : "binary");
+		appendStringInfoChar(&it->value, '\n');
+		append_field(&it->value, c->castcontext == COERCION_CODE_IMPLICIT ? "implicit" :
+					 c->castcontext == COERCION_CODE_ASSIGNMENT ? "assignment" :
+					 "explicit");
+		appendStringInfoChar(&it->value, '\n');
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
 }
 
 /*
@@ -2040,9 +2468,47 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 
 static void
 folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
-			ProllyNodeRef *next_baseline)
+			ProllyNodeRef *next_baseline, bool commit)
 {
-	(void) fold_canon(baseline, root, next_baseline, false, InvalidOid);
+	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid);
+}
+
+/*
+ * Drop the objects of the session branch's versioned schemas that the
+ * canonical form doesn't describe, and what depends on them: work no
+ * commit holds, which a move to a commit discards.  (Objects only: no
+ * table's rows are folded.)
+ */
+static void
+folded_discard_undescribed(void)
+{
+	Canon		cn;
+	ObjectAddresses *addrs;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	cn.no_rows = true;
+	canon_env(&cn);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		collect(&cn);
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	if (cn.left_addrs == NIL)
+		return;
+	addrs = new_object_addresses();
+	foreach(lc, cn.left_addrs)
+		add_exact_object_address(lfirst(lc), addrs);
+	performMultipleDeletions(addrs, DROP_CASCADE, 0);
+	free_object_addresses(addrs);
+	CommandCounterIncrement();
 }
 
 static void
@@ -2650,6 +3116,8 @@ typedef struct TableDef
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
 	List	   *policies;		/* statements */
+	List	   *statistics;		/* lines: name, a tab, the statement[, a tab,
+								 * the target] */
 	bool		row_security;	/* (and forced) */
 	bool		forced_row_security;
 	char	   *partition_by;	/* a partitioned table's key, or NULL */
@@ -2748,6 +3216,8 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->rules;
 		else if (strcmp(line, "policies") == 0)
 			section = &td->policies;
+		else if (strcmp(line, "statistics") == 0)
+			section = &td->statistics;
 		else if (section == &td->policies && strcmp(line, ROW_SECURITY) == 0)
 			td->row_security = true;
 		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
@@ -2766,7 +3236,8 @@ parse_table_def(const char *def, TableDef *td)
 				*next++ = '\0';
 			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
 		}
-		else if (section == &td->columns || section == &td->constraints)
+		else if (section == &td->columns || section == &td->constraints ||
+				 section == &td->statistics)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
 			*section = lappend(*section, unescape_field(line));
@@ -3405,6 +3876,28 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	/* Statistics: one changed goes and comes again. */
+	foreach(lc, from->statistics)
+		if (!list_has_string(to->statistics, lfirst(lc)))
+			sm->before = lappend(sm->before,
+								 psprintf("DROP STATISTICS IF EXISTS %s",
+										  first_field(lfirst(lc))));
+	foreach(lc, to->statistics)
+		if (!list_has_string(from->statistics, lfirst(lc)))
+		{
+			char	   *copy = pstrdup(lfirst(lc));
+			char	   *tab = strchr(copy, '\t');
+			char	   *target = tab ? strchr(tab + 1, '\t') : NULL;
+
+			if (target)
+				*target++ = '\0';
+			sm->after = lappend(sm->after, unescape_field(tab + 1));
+			if (target)
+				sm->after = lappend(sm->after,
+									psprintf("ALTER STATISTICS %s SET STATISTICS %s",
+											 first_field(lfirst(lc)), target));
+		}
+
 	/* (policies: every move's, in move_schema) */
 	if (from->row_security != to->row_security)
 		sm->after = lappend(sm->after,
@@ -3417,7 +3910,91 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	return remake;
 }
 
-/* A type, as described ("enum", "domain" or "composite", then lines). */
+/* A collation, as described (provider, locale, rules, deterministic). */
+static char *
+create_collation_sql(const char *name, const char *def)
+{
+	char	   *f[4];
+	char	   *p = pstrdup(def);
+	StringInfoData sql;
+
+	for (int i = 0; i < 4; i++)
+	{
+		char	   *nl = strchr(p, '\n');
+
+		if (nl == NULL)
+			elog(ERROR, "unexpected collation definition for %s", name);
+		*nl = '\0';
+		f[i] = p;
+		p = nl + 1;
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE COLLATION %s (provider = %s, ", name,
+					 f[0][0] == COLLPROVIDER_LIBC ? "libc" :
+					 f[0][0] == COLLPROVIDER_ICU ? "icu" : "builtin");
+	if (f[0][0] == COLLPROVIDER_LIBC)
+	{
+		char	   *tab = strchr(f[1], '\t');
+
+		*tab = '\0';
+		appendStringInfo(&sql, "lc_collate = %s, lc_ctype = %s",
+						 quote_literal_cstr(unescape_field(f[1])),
+						 quote_literal_cstr(unescape_field(tab + 1)));
+	}
+	else
+		appendStringInfo(&sql, "locale = %s", quote_literal_cstr(unescape_field(f[1])));
+	if (*f[2])
+		appendStringInfo(&sql, ", rules = %s", quote_literal_cstr(unescape_field(f[2])));
+	appendStringInfo(&sql, ", deterministic = %s)", strcmp(f[3], "t") == 0 ? "true" : "false");
+	return sql.data;
+}
+
+/* Does anything use a collation? */
+static bool
+collation_in_use(Oid coll)
+{
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		used;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(CollationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(coll));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	used = systable_getnext(scan) != NULL;
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return used;
+}
+
+/* A cast, as described (its method, then its context). */
+static char *
+create_cast_sql(const char *name, const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *method = strtok(copy, "\n");
+	char	   *context = unescape_field(strtok(NULL, "\n"));
+	char	   *tab = strchr(method, '\t');
+	StringInfoData sql;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE CAST (%s) ", name);
+	if (tab)
+		appendStringInfo(&sql, "WITH FUNCTION %s", unescape_field(tab + 1));
+	else if (strcmp(method, "inout") == 0)
+		appendStringInfoString(&sql, "WITH INOUT");
+	else
+		appendStringInfoString(&sql, "WITHOUT FUNCTION");
+	if (strcmp(context, "assignment") == 0)
+		appendStringInfoString(&sql, " AS ASSIGNMENT");
+	else if (strcmp(context, "implicit") == 0)
+		appendStringInfoString(&sql, " AS IMPLICIT");
+	return sql.data;
+}
+
+/* A type, as described ("enum", "domain", "composite" or "range", then lines). */
 static char *
 create_type_sql(const char *name, const char *def)
 {
@@ -3437,6 +4014,30 @@ create_type_sql(const char *name, const char *def)
 			first = false;
 		}
 		appendStringInfoChar(&sql, ')');
+	}
+	else if (strcmp(kind, "range") == 0)
+	{
+		/* (strtok would skip an empty line: split by hand) */
+		char	   *f[5];
+		char	   *p = copy + strlen(kind) + 1;
+
+		for (int i = 0; i < 5; i++)
+		{
+			char	   *nl = strchr(p, '\n');
+
+			if (nl == NULL)
+				elog(ERROR, "unexpected range type definition for %s", name);
+			*nl = '\0';
+			f[i] = unescape_field(p);
+			p = nl + 1;
+		}
+		appendStringInfo(&sql, "CREATE TYPE %s AS RANGE (SUBTYPE = %s, SUBTYPE_OPCLASS = %s",
+						 name, f[0], f[1]);
+		if (*f[2])
+			appendStringInfo(&sql, ", COLLATION = %s", f[2]);
+		if (*f[3])
+			appendStringInfo(&sql, ", SUBTYPE_DIFF = %s", f[3]);
+		appendStringInfo(&sql, ", MULTIRANGE_TYPE_NAME = %s)", f[4]);
 	}
 	else if (strcmp(kind, "composite") == 0)
 	{
@@ -3776,6 +4377,46 @@ moved_type(List *moved, Oid typid)
 	return NULL;
 }
 
+/*
+ * Does anything use a range type, its multirange type or an array of
+ * either (anything but what comes with them)?
+ */
+static bool
+range_in_use(Oid typid)
+{
+	Oid			multi = get_range_multirange(typid);
+	Oid			types[4] = {typid, get_array_type(typid), multi,
+	get_array_type(multi)};
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	bool		used = false;
+
+	for (int i = 0; i < 4 && !used; i++)
+	{
+		ScanKeyData key[2];
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		if (!OidIsValid(types[i]))
+			continue;
+		ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+		ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(types[i]));
+		scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+		while (!used && (tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+			/* (its constructors take it, and are part of it) */
+			used = d->deptype != DEPENDENCY_INTERNAL &&
+				!part_of_type(d->classid, d->objid);
+		}
+		systable_endscan(scan);
+	}
+	table_close(depRel, AccessShareLock);
+	return used;
+}
+
 /* A type of the branch's, as from and to name it: added to moved. */
 static MovedType *
 move_type(List **moved, List *from, List *to, Oid typid, const char *user)
@@ -3790,6 +4431,14 @@ move_type(List **moved, List *from, List *to, Oid typid, const char *user)
 	typ = (Form_pg_type) GETSTRUCT(tup);
 	name = qualified(typ->typnamespace, NameStr(typ->typname));
 	ReleaseSysCache(tup);
+	/* (renamed aside, its constructors and multirange would collide) */
+	if (typ->typtype == TYPTYPE_RANGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+						user),
+				 errdetail("Range type %s uses it, and a range type in use can't be made again in place.",
+						   name)));
 	mt = palloc0(sizeof(MovedType));
 	mt->from = find_item(from, 'y', name);
 	mt->to = find_item(to, 'y', name);
@@ -3862,12 +4511,33 @@ type_moves(List *from, List *to)
 		MoveItem   *f = lfirst(lc);
 		MoveItem   *t = find_item(to, f->kind, f->name);
 
+		/*
+		 * A range type can't be made otherwise beside itself (renamed aside,
+		 * its constructors and multirange would collide), nor altered: one
+		 * nothing uses goes and comes again; one in use is refused.
+		 */
+		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0 &&
+			(strncmp(f->def, "range\n", 6) == 0 || strncmp(t->def, "range\n", 6) == 0))
+		{
+			Oid			typid = typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL)));
+
+			if (range_in_use(typid))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+								f->name),
+						 errdetail("A range type in use can't be changed in place; a move can't change one either.")));
+			tm.before = lappend(tm.before, psprintf("DROP TYPE %s", f->name));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.any = true;
+			continue;
+		}
 		if (f->kind == 'y' && t != NULL && strcmp(t->def, f->def) != 0)
 			(void) move_type(&moved, from, to,
 							 typenameTypeId(NULL, makeTypeNameFromNameList(stringToQualifiedNameList(f->name, NULL))),
 							 f->name);
 	}
-	tm.any = moved != NIL;
+	tm.any = tm.any || moved != NIL;
 
 	/* each one, and what uses it or arrays of it (more types, found as it goes) */
 	for (i = 0; i < list_length(moved); i++)
@@ -4036,6 +4706,11 @@ type_moves(List *from, List *to)
 						handled = true;
 					}
 				}
+				else if (d->classid == ProcedureRelationId &&
+						 part_of_type(ProcedureRelationId, d->objid))
+					/* (a range type's constructor: the range is) */
+					(void) move_type(&moved, from, to, get_func_rettype(d->objid),
+									 mt->from->name);
 				else if (d->classid == ProcedureRelationId)
 				{
 					HeapTuple	pt = SearchSysCache1(PROCOID, ObjectIdGetDatum(d->objid));
@@ -4126,6 +4801,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
+	List	   *collation_drops = NIL;
+	List	   *collation_makes = NIL;
 	List	   *schema_drops = NIL;
 	TypeMoves	tm;
 	bool		matviews_change;
@@ -4179,6 +4856,30 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					sm.before = lcons(drop_routine_sql(f), sm.before);
 				else if (t == NULL)
 					routines = lappend(routines, drop_routine_sql(f));
+				break;
+			case 'l':
+				if (t == NULL)
+					collation_drops = lappend(collation_drops,
+											  psprintf("DROP COLLATION IF EXISTS %s", f->name));
+				else
+				{
+					/* (one can't be altered: one nothing uses goes, and comes again) */
+					Oid			coll = get_collation_oid(stringToQualifiedNameList(f->name, NULL),
+														 false);
+
+					if (collation_in_use(coll))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines collation %s otherwise",
+										f->name),
+								 errdetail("A collation in use can't be changed in place; a move can't change one either.")));
+					tm.before = lappend(tm.before, psprintf("DROP COLLATION %s", f->name));
+				}
+				break;
+			case 'x':
+				/* (before the routines and types it uses go) */
+				sm.before = lcons(psprintf("DROP CAST IF EXISTS (%s)", f->name),
+								  sm.before);
 				break;
 			case 'y':
 			case 'm':
@@ -4297,7 +4998,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			continue;
 		if (t->kind == 'n')
 			continue;			/* (above) */
-		if (t->kind == 'y' && f == NULL)
+		if (t->kind == 'l')
+			collation_makes = lappend(collation_makes,
+									  create_collation_sql(t->name, t->def));
+		else if (t->kind == 'y' && f == NULL)
 			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
@@ -4309,7 +5013,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
 										 t->name, sequence_options_sql(t->def)));
-		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
+		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v' && t->kind != 'x')
 			goto unsupported;
 	}
 	{
@@ -4361,6 +5065,15 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				sm.before = lappend(sm.before, drop_routine_sql(f));
 			sm.before = lappend(sm.before, t->def);
 		}
+	}
+	/* Casts coming, once the types and routines they name are made. */
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		if (t->kind == 'x' && !(f && strcmp(t->def, f->def) == 0))
+			sm.before = lappend(sm.before, create_cast_sql(t->name, t->def));
 	}
 	/* Tables made: a partition after its partitioned table. */
 	{
@@ -4501,12 +5214,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 */
 	run_statements(tm.before);
 	run_statements(schemas);
+	run_statements(collation_makes);	/* (types and columns may use them) */
 	make_views(tm.creates);
 	run_statements(tm.converts);
 	make_views(tm.drops);
 	run_statements(tm.after);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
 	make_views(type_drops);
+	run_statements(collation_drops);
 	run_statements(schema_drops);
 	CommandCounterIncrement();
 	/* the rows in the caller's memory: what they keep outlives SPI's */
@@ -4662,6 +5377,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk_changes = folded_walk_changes,
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
+	.discard_undescribed = folded_discard_undescribed,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

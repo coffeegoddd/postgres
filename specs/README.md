@@ -28,13 +28,14 @@ control; this project's premise is that we should not have to.
 - **Only what is marked decided is decided.** Decisions are recorded in
   `08-open-questions.md` (the status table at its top) with their date;
   everything else is a design under discussion.
-- **Where the work is (2026-10-17):** steps 0–5 of spec 11 are built and
+- **Where the work is (2026-10-18):** steps 0–7 of spec 11 are built and
   merged: block-mapped storage and the `prolly` table AM, branches as
   copy-on-write copies of versioned schemas, the WAL-logged chunk store,
-  Dolt commits folded from pages, and moving heads (reset, merge,
-  cherry-pick, revert, detached checkout). Step 6's file remotes are
-  built (#171, #172, #174, #175); next are its network remotes, then reclamation (7)
-  and measurement (8). Each step's PRs are listed in spec 11, part 4.
+  Dolt commits folded from pages, moving heads (reset, merge,
+  cherry-pick, revert, detached checkout), remotes (file and network) and
+  reclamation; and with them the rest of the work up to step 8 (the
+  dependency check, escaping, the objects commits hold, large values).
+  Next is measurement (8). Each step's PRs are listed in spec 11, part 4.
   `07-roadmap.md`, `04-candidate-designs.md` and the rows of
   `08-open-questions.md` marked (D1) are D1's history.
 - **Code never refers to these specs** (user rule, 2026-10-13): no paths,
@@ -68,7 +69,7 @@ control; this project's premise is that we should not have to.
 | `src/test/prolly/README` | The requirements suite: what an engine must pass, and how to run it |
 | [09-versioned-catalogs.md](09-versioned-catalogs.md) | Versioned schema and canonical form: the decided design (Postgres-native working set, canonical commits, identity by name), proposals, and what Postgres assumes about heap catalogs |
 | [10-complexity-requirements.md](10-complexity-requirements.md) | **Requirement:** every version-control operation at worst matches Dolt's time and space bounds, ideally beats them; per-operation bounds, how the design meets them, and status |
-| [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **The design being built (user direction, 2026-10-15; steps 0–5 built 2026-10-17):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); the steps, what each built, and where the build departed from the plan |
+| [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **The design being built (user direction, 2026-10-15; steps 0–7 built 2026-10-18):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); the steps, what each built, and where the build departed from the plan |
 | [12-correctness-suite.md](12-correctness-suite.md) | **Decided (2026-10-15):** the C suite, sqllogictest against heap and every engine from `prolly_bench`, judged by agreement with heap; runner, comparison classes, gate, plan |
 | [13-keyless-tables.md](13-keyless-tables.md) | **Measured (2026-10-17):** tables without a primary key in heap, page-based prolly and Dolt: how each keeps them, what writes, commits, diffs, moves and merges cost, how merges treat them, and what to change in prolly |
 | [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Proposed (2026-10-17):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180), then C, content-addressed TOAST pointers in the chunk store (#181) |
