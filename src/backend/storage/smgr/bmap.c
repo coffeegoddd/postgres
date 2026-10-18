@@ -236,20 +236,29 @@ static const PGIOAlignedBlock zero_block;
 /* sweeps running whose page stores are listed, at most */
 #define BMAP_SWEEPS_LISTED	64
 
-/*
- * Shared by every backend: the sweeps running, during which the allocator
- * of a page store being swept reuses no freed block (one freed and taken
- * again meanwhile could be held by a map the sweep read before).
- */
 /* page stores swept since the server started, remembered at most */
-#define BMAP_SWEPT_MAX		64
+#define BMAP_SWEPT_MAX		1024
 
+/*
+ * A page store swept since the server started: the times a stuck count of
+ * it lost a holder (which it keeps, stuck), and how many times that had
+ * happened as its last sweep began.
+ */
 typedef struct BmapSwept
 {
 	Oid			spcOid;
 	Oid			dbOid;
-	uint64		stuck;			/* counts the sweep left stuck */
+	bool		swept;			/* a sweep of it ended */
+	uint64		released;
+	uint64		swept_at;
 } BmapSwept;
+
+/*
+ * Shared by every backend: the sweeps running, during which the allocator
+ * of a page store being swept reuses no freed block (one freed and taken
+ * again meanwhile could be held by a map the sweep read before); and the
+ * page stores swept since the server started.
+ */
 
 typedef struct BmapShared
 {
@@ -340,35 +349,59 @@ sweep_note(RelFileLocator rel, bool begin)
 		pg_atomic_fetch_sub_u32(&bmap_shared->sweeps, 1);
 }
 
-/*
- * Was the page store of rel swept since the server started, and with how
- * many counts left stuck (*stuck)?  With note, it is, with stuck left.
- */
-static bool
-swept_since_start(RelFileLocator rel, bool note, uint64 *stuck)
+/* rel's page store's entry among those swept, or NULL; the mutex held */
+static BmapSwept *
+swept_find(RelFileLocator rel)
 {
-	BmapSwept  *found = NULL;
-	bool		swept;
-
-	SpinLockAcquire(&bmap_shared->mutex);
-	for (int i = 0; i < bmap_shared->nswept && found == NULL; i++)
+	for (int i = 0; i < bmap_shared->nswept; i++)
 		if (bmap_shared->swept[i].spcOid == rel.spcOid &&
 			bmap_shared->swept[i].dbOid == rel.dbOid)
-			found = &bmap_shared->swept[i];
-	if (found == NULL && note && bmap_shared->nswept < BMAP_SWEPT_MAX)
+			return &bmap_shared->swept[i];
+	return NULL;
+}
+
+/*
+ * A sweep of rel's page store begins (*at: the releases so far, to note
+ * when it ends), or ends.  Past the most remembered, a store is not.
+ */
+static void
+swept_note(RelFileLocator rel, bool begin, uint64 *at)
+{
+	BmapSwept  *found;
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	found = swept_find(rel);
+	if (found == NULL && begin && bmap_shared->nswept < BMAP_SWEPT_MAX)
 	{
 		found = &bmap_shared->swept[bmap_shared->nswept++];
+		memset(found, 0, sizeof(*found));
 		found->spcOid = rel.spcOid;
 		found->dbOid = rel.dbOid;
 	}
-	if (found != NULL && note)
-		found->stuck = *stuck;
-	/* (past the most remembered, every store counts as swept) */
-	swept = found != NULL || bmap_shared->nswept == BMAP_SWEPT_MAX;
-	if (found != NULL && !note)
-		*stuck = found->stuck;
+	if (found != NULL && begin)
+		*at = found->released;
+	else if (found != NULL)
+	{
+		found->swept = true;
+		found->swept_at = *at;
+	}
 	SpinLockRelease(&bmap_shared->mutex);
-	return swept;
+}
+
+/*
+ * A stuck count of rel's page store lost a holder, which it keeps: a sweep
+ * may now free the block, or fit its count.
+ */
+static void
+stuck_released(RelFileLocator rel)
+{
+	BmapSwept  *found;
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	found = swept_find(rel);
+	if (found != NULL)
+		found->released++;
+	SpinLockRelease(&bmap_shared->mutex);
 }
 
 const ShmemCallbacks BmapShmemCallbacks = {
@@ -1788,7 +1821,10 @@ unref_blocks(RelFileLocator rel, const BlockNumber *blocks, uint32 n,
 			uint8		c = refs_get(&rp, blocks[k]);
 
 			if (c == BMAP_REFS_STUCK)
+			{
+				stuck_released(rel);
 				continue;
+			}
 			if (c > 0)
 			{
 				refs_set(&rp, blocks[k], c - 1);
@@ -1926,6 +1962,8 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 			{
 				if (c != BMAP_REFS_STUCK)
 					refs_set(&rp, phys[k], c - 1);
+				else
+					stuck_released(rel);
 				ent[ndelta->nentries].block = InvalidBlockNumber;
 				ent[ndelta->nentries].epoch = 0;
 			}
@@ -3183,6 +3221,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 					  &new_block, zeroed && reused ? 1 : 0, false);
 
 		/* a listed block keeps the reference, which the list holds */
+		if (count == BMAP_REFS_STUCK && !listed)
+			stuck_released(rel);
 		if (count != BMAP_REFS_STUCK && !listed)
 		{
 			xl_bmap_ref_delta *ref;
@@ -3713,6 +3753,7 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 {
 	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
 	char	   *path = GetDatabasePath(dbOid, spcOid);
+	uint64		released = 0;
 
 	memset(result, 0, sizeof(*result));
 	if (RecoveryInProgress())
@@ -3721,6 +3762,7 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 				 errmsg("cannot sweep a page store during recovery")));
 	if (!alloc_exists(rel))
 		return;
+	swept_note(rel, true, &released);
 	sweep_note(rel, true);
 	PG_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
 	{
@@ -3729,47 +3771,36 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	PG_END_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
 	sweep_done(0, PointerGetDatum(&rel));
 	result->truncated = sweep_shrink(rel);
-	(void) swept_since_start(rel, true, &result->stuck);
+	swept_note(rel, false, &released);
 	pfree(path);
 }
 
 /*
  * Is a sweep of a database's page store in a tablespace due?  Once after
  * the server starts (a crash before may have leaked blocks: a drop's or a
- * prune's), and whenever the stuck counts aren't those the last sweep left
- * (counted from the count pages, a page for every BMAP_REFS_PER_PAGE
- * blocks): one left stuck still has more holders than a count holds.
+ * prune's), and whenever a stuck count has lost a holder since the last
+ * sweep began (it keeps it, stuck: the sweep may free the block or fit the
+ * count).  A count left stuck by a sweep, its holders all still there, is
+ * no reason for another.  Past the most stores remembered, a store not
+ * among them isn't due.
  */
 bool
 bmap_sweep_due(Oid spcOid, Oid dbOid)
 {
 	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
-	BlockNumber nrefpages;
-	uint64		left = 0;
-	uint64		stuck = 0;
+	BmapSwept  *found;
+	bool		due;
 
 	if (!alloc_exists(rel))
 		return false;
-	if (!swept_since_start(rel, false, &left))
-		return true;
-	nrefpages = refs_nblocks(rel);
-	for (BlockNumber blk = 0; blk < nrefpages; blk++)
-	{
-		Buffer		buf = refs_read(rel, blk);
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (!PageIsNew(BufferGetPage(buf)))
-		{
-			uint8	   *counts = PageGetBmapRefs(BufferGetPage(buf));
-
-			check_refs_page(BufferGetPage(buf), rel, blk);
-			for (uint32 i = 0; i < BMAP_REFS_PER_PAGE; i++)
-				stuck += counts[i] == BMAP_REFS_STUCK;
-		}
-		UnlockReleaseBuffer(buf);
-		CHECK_FOR_INTERRUPTS();
-	}
-	return stuck != left;
+	SpinLockAcquire(&bmap_shared->mutex);
+	found = swept_find(rel);
+	if (found == NULL)
+		due = bmap_shared->nswept < BMAP_SWEPT_MAX;
+	else
+		due = !found->swept || found->released != found->swept_at;
+	SpinLockRelease(&bmap_shared->mutex);
+	return due;
 }
 
 static void

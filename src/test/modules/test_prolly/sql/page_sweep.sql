@@ -63,6 +63,21 @@ SELECT count(*), sum(a) FROM cow.v;
 CHECKPOINT;
 SELECT * FROM prolly_page_sweep();
 
+-- A sweep is due when a stuck count loses a holder (it keeps it, stuck),
+-- not for counts left stuck by the last sweep, their holders all there.
+CREATE TABLE cow.z (a int8);
+INSERT INTO cow.z SELECT g FROM generate_series(1, 1000) g;
+SELECT pg_relation_filenode('cow.z') AS z \gset
+CREATE TEMP TABLE zcopies AS
+SELECT test_bmap_share(:z) AS copy FROM generate_series(1, 300);
+CHECKPOINT;
+SELECT freed >= 0 AS swept FROM prolly_page_sweep();
+SELECT test_bmap_sweep_due() AS due_after_sweep;
+SELECT count(test_bmap_unlink(copy)) FROM (SELECT copy FROM zcopies LIMIT 10) c;
+SELECT test_bmap_sweep_due() AS due_after_holders_left;
+SELECT recounted = 0 AS still_stuck FROM prolly_page_sweep();
+SELECT test_bmap_sweep_due() AS due_after_second_sweep;
+
 -- Privileges, as dolt_gc().
 CREATE ROLE sweep_user;
 SET ROLE sweep_user;

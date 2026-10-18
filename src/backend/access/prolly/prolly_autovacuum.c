@@ -4,10 +4,12 @@
  *	  Prolly's stores reclaimed by autovacuum.
  *
  * After its tables, a database's autovacuum worker collects the chunk
- * store when its journal segment (what was written since the last
- * collection) has passed prolly.gc_journal_threshold and the settled files'
- * size times prolly.gc_growth_scale_factor: a default collection, by the
- * database's reclamation.  It sweeps a page store when bmap_sweep_due()
+ * store when what a default collection would collect (the journal segment
+ * appends go to, written since the last collection, and the table files
+ * not settled, received since) has passed prolly.gc_journal_threshold and
+ * the settled files' size times prolly.gc_growth_scale_factor: a default
+ * collection, by the database's reclamation.  Only sizes are read, not the
+ * journal.  It sweeps a page store when bmap_sweep_due()
  * says so.  Each runs in a transaction of its own, an error reported and
  * passed over, as autovacuum's tables' are; a collection reads under
  * autovacuum's cost-based delay.
@@ -67,7 +69,8 @@ prolly_autovacuum_init(void)
 typedef struct Sizes
 {
 	uint64		segment;		/* the segment appends go to */
-	int			chunks;			/* its chunks */
+	int			chunks;			/* whether it has any (0: none) */
+	uint64		unsettled;		/* the table files not settled */
 	uint64		settled;		/* the settled table files */
 } Sizes;
 
@@ -89,6 +92,8 @@ settled_file(const char *name, int nchunks, uint64 size, bool settled,
 
 	if (settled)
 		s->settled += size;
+	else
+		s->unsettled += size;
 }
 
 static bool
@@ -96,16 +101,18 @@ collection_due(void)
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store;
-	Sizes		s = {0, 0, 0};
+	Sizes		s = {0, 0, 0, 0};
+	uint64		collected;
 
 	if (prolly_gc_journal_threshold < 0)
 		return false;
 	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
-	PROLLY_CALL(cs, segments, store, last_segment, &s);
+	PROLLY_CALL(cs, segments, store, false, last_segment, &s);
 	PROLLY_CALL(cs, table_files, store, settled_file, &s);
-	return s.chunks > 0 &&
-		s.segment > (uint64) prolly_gc_journal_threshold * 1024 * 1024 &&
-		s.segment > s.settled * prolly_gc_growth_scale_factor;
+	collected = (s.chunks != 0 ? s.segment : 0) + s.unsettled;
+	return collected > 0 &&
+		collected > (uint64) prolly_gc_journal_threshold * 1024 * 1024 &&
+		collected > s.settled * prolly_gc_growth_scale_factor;
 }
 
 static void

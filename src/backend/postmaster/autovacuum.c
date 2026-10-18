@@ -2752,8 +2752,12 @@ deleted:
 	/* Finally close out the last transaction. */
 	CommitTransactionCommand();
 
-	/* Prolly's stores: the chunk store collected, page stores swept, if due */
-	prolly_autovacuum();
+	/*
+	 * Prolly's stores: the chunk store collected, page stores swept, if due;
+	 * not by a worker started only to prevent wraparound.
+	 */
+	if (AutoVacuumingActive())
+		prolly_autovacuum();
 }
 
 /*

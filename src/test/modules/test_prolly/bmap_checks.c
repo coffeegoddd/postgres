@@ -193,6 +193,15 @@ test_bmap_free_blocks(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(nfree);
 }
 
+/* test_bmap_sweep_due(): is a sweep of the page store due? */
+PG_FUNCTION_INFO_V1(test_bmap_sweep_due);
+
+Datum
+test_bmap_sweep_due(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(bmap_sweep_due(MyDatabaseTableSpace, MyDatabaseId));
+}
+
 /*
  * test_bmap_unlink(relnumber): drop storage, freeing what no copy holds.
  * The records are flushed before returning: this transaction has no

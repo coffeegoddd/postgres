@@ -45,6 +45,14 @@ sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 100000), 'UTF8')))
 ok($node->poll_query_until('av', qq{SELECT NOT test_chunk_has('$dead')}),
 	'past the threshold, autovacuum collects the garbage');
 
+# Table files not settled (a transfer's) count as the segment does: past
+# the threshold, their garbage is collected too.
+sql(q{SELECT test_chunk_table_file(array_agg(convert_to(repeat(g::text, 100000) || ' received', 'UTF8')))
+	FROM generate_series(1, 20) g});
+my $received = sql(q{SELECT encode(sha256(convert_to(repeat('7', 100000) || ' received', 'UTF8')), 'hex')});
+ok($node->poll_query_until('av', qq{SELECT NOT test_chunk_has('$received')}),
+	'past the threshold in table files not settled, autovacuum collects them');
+
 # With the threshold -1, it doesn't.
 $node->append_conf('postgresql.conf', 'prolly.gc_journal_threshold = -1');
 $node->reload;

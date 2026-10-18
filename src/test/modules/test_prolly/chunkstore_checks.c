@@ -242,7 +242,7 @@ test_chunk_segments(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
-	PROLLY_CALL(cs(), segments, store(), file_row, rsinfo);
+	PROLLY_CALL(cs(), segments, store(), true, file_row, rsinfo);
 	return (Datum) 0;
 }
 

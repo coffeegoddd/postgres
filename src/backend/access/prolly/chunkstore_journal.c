@@ -3004,37 +3004,71 @@ journal_seal(ProllyChunkStore *s)
 }
 
 static void
-journal_segments(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
+journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
+				 void *arg)
 {
 	ListCell   *lc;
+	int			nsegs;
+	int		   *counts;
+	int		   *last;
+	int			i;
 
-	scan_journal(s);
-	foreach(lc, s->segments)
+	/* each chunk once per segment it has a copy in, in one pass */
+	if (count)
+		scan_journal(s);
+	else
+		refresh_segments(s);
+	nsegs = list_length(s->segments);
+	counts = palloc0(sizeof(int) * Max(nsegs, 1));
+	last = palloc(sizeof(int) * Max(nsegs, 1));
+	memset(last, -1, sizeof(int) * Max(nsegs, 1));
+	if (count)
 	{
-		Segment    *g = lfirst(lc);
 		HASH_SEQ_STATUS status;
 		IndexEntry *e;
-		int			n = 0;
-		char	   *name = strrchr(g->path, '/') + 1;
-		pgoff_t		size;
+		int			ordinal = 0;
 
 		hash_seq_init(&status, s->index);
 		while ((e = hash_seq_search(&status)) != NULL)
 		{
-			IndexEntry *c = e;
-
-			while (c != NULL && c->segment != g->id)
-				c = c->other;
-			n += c != NULL;
+			for (IndexEntry *c = e; c != NULL; c = c->other)
+			{
+				i = 0;
+				foreach(lc, s->segments)
+				{
+					if (((Segment *) lfirst(lc))->id == c->segment)
+						break;
+					i++;
+				}
+				if (i < nsegs && last[i] != ordinal)
+				{
+					counts[i]++;
+					last[i] = ordinal;
+				}
+			}
+			ordinal++;
 		}
+	}
+	i = 0;
+	foreach(lc, s->segments)
+	{
+		Segment    *g = lfirst(lc);
+		char	   *name = strrchr(g->path, '/') + 1;
+		pgoff_t		size;
+		int			n = counts[i++];
+
 		size = open_segment(g) ? FileSize(g->file) : 0;
 		if (size < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not determine the size of file \"%s\": %m",
 							g->path)));
+		if (!count)
+			n = size > JOURNAL_HEADER_SIZE ? -1 : 0;
 		visit(name, n, (uint64) size, false, arg);
 	}
+	pfree(counts);
+	pfree(last);
 }
 
 /* ----------------------------------------------------------------

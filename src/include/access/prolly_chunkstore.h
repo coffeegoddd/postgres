@@ -44,7 +44,8 @@
  *   file, or in the journal's segments).
  * - The journal (where put() appends) is in segments: seal() closes the one
  *   appends go to, and they go on to a new one; segments() visits them,
- *   oldest first.
+ *   oldest first (with count, each with its chunks counted; without, only
+ *   whether it has any, nchunks 0 or -1, so nothing is read but sizes).
  * - Garbage collection is the store's side of a collector's work
  *   (prolly_reclaim.h), in this order, in one transaction:
  *   gc_begin() holds off conjoins and new table files until the
@@ -204,8 +205,8 @@ typedef struct ProllyChunkStoreRoutine
 
 	/* The journal's segments. */
 	void		(*seal) (ProllyChunkStore *store);
-	void		(*segments) (ProllyChunkStore *store, ProllyChunkFileVisit visit,
-							 void *arg);
+	void		(*segments) (ProllyChunkStore *store, bool count,
+							 ProllyChunkFileVisit visit, void *arg);
 
 	/* Garbage collection: marks are a bit a slot, slot 0 the low bit of 0. */
 	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, bool full,
