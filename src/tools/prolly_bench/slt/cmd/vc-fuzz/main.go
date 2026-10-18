@@ -33,8 +33,8 @@ func readHistories(paths []string) ([]vcfuzz.History, error) {
 		if err := json.Unmarshal(b, &h); err != nil {
 			return nil, fmt.Errorf("%s: %w", p, err)
 		}
-		if h.Version != 1 || h.Sessions < 1 {
-			return nil, fmt.Errorf("%s: unsupported history", p)
+		if err := h.Validate(); err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
 		}
 		hs = append(hs, h)
 	}

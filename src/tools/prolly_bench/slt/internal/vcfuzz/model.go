@@ -256,26 +256,34 @@ func (m *Model) ancestors(c int) map[int]bool {
 }
 
 // MergeBase is the common ancestor of two commits no other common ancestor
-// descends from, or false if there are several (a criss-cross, where
-// engines choose differently).
+// descends from, or false if there are several (a criss-cross, where the
+// model doesn't say which an engine takes).
 func (m *Model) MergeBase(x, y int) (int, bool) {
 	ax, ay := m.ancestors(x), m.ancestors(y)
-	var common []int
+	common := map[int]bool{}
 	for c := range ax {
 		if ay[c] {
-			common = append(common, c)
+			common[c] = true
 		}
 	}
-	var maximal []int
-	for _, c := range common {
-		dominated := false
-		for _, d := range common {
-			if d != c && m.ancestors(d)[c] {
-				dominated = true
-				break
-			}
+	// (what's beneath a common one: its parents' ancestors, walked once)
+	beneath := map[int]bool{}
+	var stack []int
+	for c := range common {
+		stack = append(stack, m.Commits[c].Parents...)
+	}
+	for len(stack) > 0 {
+		c := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if beneath[c] {
+			continue
 		}
-		if !dominated {
+		beneath[c] = true
+		stack = append(stack, m.Commits[c].Parents...)
+	}
+	var maximal []int
+	for c := range common {
+		if !beneath[c] {
 			maximal = append(maximal, c)
 		}
 	}
@@ -348,7 +356,9 @@ func (m *Model) Legal(op Op) bool {
 	}
 	switch op.Kind {
 	case OpCommit, OpBranch, OpCheckout:
-		// (another session's open transaction on the branch keeps it)
+		// (a commit, or a branch made, while another session's open
+		// transaction writes on the branch doesn't wait: the commit takes
+		// the working set as committed, without that transaction's rows)
 		if op.Kind == OpCheckout {
 			// A branch's first use makes its tables, copying the
 			// session's branch's under a lock that waits for the
@@ -363,16 +373,20 @@ func (m *Model) Legal(op Op) bool {
 		}
 		return true
 	}
-	// the rest move the branch: none while any transaction is open, and
-	// none with uncommitted changes on the branch
-	if m.anyTxn() || m.Dirty(ms.Branch) {
+	// the rest move the branch: none while any transaction is open; a
+	// hard reset drops uncommitted changes, the others need none
+	if m.anyTxn() {
+		return false
+	}
+	if op.Kind == OpReset {
+		_, ok := m.Resolve(op.Session, op.Ref)
+		return ok
+	}
+	if m.Dirty(ms.Branch) {
 		return false
 	}
 	head := m.Branches[ms.Branch]
 	switch op.Kind {
-	case OpReset:
-		_, ok := m.Resolve(op.Session, op.Ref)
-		return ok
 	case OpMerge:
 		theirs, ok := m.Resolve(op.Session, op.Ref)
 		if !ok {

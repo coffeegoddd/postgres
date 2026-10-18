@@ -192,6 +192,27 @@ func (p *Postgres) Apply(op Op) (Outcome, error) {
 	return Outcome{Class: ClassOK}, nil
 }
 
+// mergeOutcome reads dolt_merge's result (commit id, fast-forward,
+// conflicts, message): its class, or one naming a result of another shape.
+func mergeOutcome(rows [][]string) Outcome {
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		return Outcome{Class: fmt.Sprintf("unexpected merge result: %v", rows)}
+	}
+	result := strings.Trim(rows[0][0], "{}")
+	fields := strings.SplitN(result, ",", 4)
+	switch {
+	case len(fields) != 4:
+		return Outcome{Class: "unexpected merge result: " + rows[0][0]}
+	case strings.Contains(fields[3], "up-to-date") || strings.Contains(fields[3], "is ahead of"):
+		return Outcome{Class: ClassUpToDate}
+	case fields[1] == "1":
+		return Outcome{Class: ClassFastForward}
+	case fields[2] != "0":
+		return Outcome{Class: ClassConflict}
+	}
+	return Outcome{Class: ClassOK}
+}
+
 // merge merges outside a transaction block, or in one, resolving or
 // aborting the conflicts it finds.
 func (p *Postgres) merge(c *pgconn.PgConn, op Op, message string) (Outcome, error) {
@@ -219,15 +240,19 @@ func (p *Postgres) merge(c *pgconn.PgConn, op Op, message string) (Outcome, erro
 		}
 		return classify(pgerr), nil
 	}
-	result := strings.Trim(rows[0][0], "{}")
-	o := Outcome{Class: ClassOK}
-	switch {
-	case strings.Contains(result, "up-to-date") || strings.Contains(result, "is ahead of"):
-		o.Class = ClassUpToDate
-	case strings.HasPrefix(strings.SplitN(result, ",", 2)[1], "1,"):
-		o.Class = ClassFastForward
-	case strings.Contains(result, "conflicts found"):
-		o.Class = ClassConflict
+	o := mergeOutcome(rows)
+	switch o.Class {
+	case ClassOK, ClassUpToDate, ClassFastForward, ClassConflict:
+	default:
+		// (a result no model predicts: reported, the block ended)
+		if block {
+			if _, err := p.must(c, "ROLLBACK"); err != nil {
+				return Outcome{}, err
+			}
+		}
+		return o, nil
+	}
+	if o.Class == ClassConflict {
 		n, err := p.must(c, "SELECT coalesce(sum(num_conflicts), 0) FROM dolt_conflicts")
 		if err != nil {
 			return Outcome{}, err

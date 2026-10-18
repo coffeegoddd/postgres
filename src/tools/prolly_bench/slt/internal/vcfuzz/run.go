@@ -20,9 +20,17 @@ func (f *Failure) Error() string {
 }
 
 // Signature identifies a failure apart from where in a history it falls,
-// so a reduced history can be checked to fail the same way.
+// so a reduced history can be checked to fail the same way: its kind and
+// op, and, for an outcome, the outcome classes.  Rows, commit ids and
+// hashes, which any removal of an op changes, aren't in it.
 func (f *Failure) Signature() string {
-	return f.Kind + ":" + f.Op.Kind + ":" + fmt.Sprint(f.Expected) + ":" + fmt.Sprint(f.Got)
+	sig := f.Kind + ":" + f.Op.Kind
+	if want, ok := f.Expected.(Outcome); ok {
+		if got, ok := f.Got.(Outcome); ok {
+			sig += ":" + want.Class + ":" + got.Class
+		}
+	}
+	return sig
 }
 
 // Report is what a run did: the ops it ran and skipped, the outcomes by

@@ -332,7 +332,8 @@ jobs:
           if [ "$NIGHTLY" = true ]; then
             seeds=200
             steps=150
-            seed="$GITHUB_RUN_NUMBER"
+            # (each night's seeds apart from the last night's)
+            seed=$((GITHUB_RUN_NUMBER * 200))
           fi
           src/tools/prolly_bench/prolly_bench vcfuzz \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \

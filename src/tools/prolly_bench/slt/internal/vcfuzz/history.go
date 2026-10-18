@@ -191,6 +191,57 @@ func dull(m *Model, op Op, r *rand.Rand) bool {
 	return false
 }
 
+// Validate checks a history read back (a replayed or edited one) holds only
+// what the model and engines take: every table's setup (an empty one
+// filled in), rows of known tables with keys 1..keys and columns 0 or 1,
+// and known ops.
+func (h *History) Validate() error {
+	if h.Version != 1 || h.Sessions < 1 {
+		return fmt.Errorf("unsupported history: version %d, %d sessions", h.Version, h.Sessions)
+	}
+	if h.Setup == nil {
+		h.Setup = State{}
+	}
+	known := map[string]bool{}
+	for _, t := range Tables {
+		known[t] = true
+		if h.Setup[t] == nil {
+			h.Setup[t] = map[int]Row{}
+		}
+	}
+	for t, rows := range h.Setup {
+		if !known[t] {
+			return fmt.Errorf("setup of unknown table %q", t)
+		}
+		for id := range rows {
+			if id < 1 || id > keys {
+				return fmt.Errorf("setup row %d of %s out of range", id, t)
+			}
+		}
+	}
+	for i, op := range h.Ops {
+		switch op.Kind {
+		case OpInsert, OpUpdate, OpDelete:
+			if !known[op.Table] || op.ID < 1 || op.ID > keys || op.Col < 0 || op.Col > 1 {
+				return fmt.Errorf("op %d (%s) writes outside the tables", i+1, op)
+			}
+		case OpBegin, OpCommitTxn, OpRollback, OpCommit, OpBranch, OpCheckout, OpReset, OpPick, OpRevert:
+		case OpMerge:
+			switch op.Mode {
+			case ModeAuto, ModeOurs, ModeTheirs, ModeAbort:
+			default:
+				return fmt.Errorf("op %d: unknown merge mode %q", i+1, op.Mode)
+			}
+		default:
+			return fmt.Errorf("op %d: unknown op %q", i+1, op.Kind)
+		}
+		if op.Session < 0 || op.Session >= h.Sessions {
+			return fmt.Errorf("op %d: no session %d", i+1, op.Session)
+		}
+	}
+	return nil
+}
+
 // Reduce removes ops while the history still fails the same way, halving
 // the width removed when no removal of that width does.  It is bounded by
 // budget runs; the result is smaller, not necessarily minimal.  Ops a
@@ -198,14 +249,16 @@ func dull(m *Model, op Op, r *rand.Rand) bool {
 func Reduce(h History, budget int, fails func(History) bool) History {
 	for width := (len(h.Ops) + 1) / 2; width > 0 && budget > 0; {
 		changed := false
-		for start := 0; start < len(h.Ops) && budget > 0; start += width {
+		// (after a removal the next chunk is at start: tried there)
+		for start := 0; start < len(h.Ops) && budget > 0; {
 			end := min(start+width, len(h.Ops))
 			trial := h
 			trial.Ops = append(append([]Op{}, h.Ops[:start]...), h.Ops[end:]...)
 			budget--
 			if fails(trial) {
 				h, changed = trial, true
-				break
+			} else {
+				start += width
 			}
 		}
 		if !changed {
