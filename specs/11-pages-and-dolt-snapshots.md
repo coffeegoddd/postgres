@@ -330,7 +330,8 @@ committed row versions.
 User, 2026-10-15: the Postgres facilities that page storage relies on may
 need to become interfaces, each with a standard implementation that
 behaves as Postgres does today and our own implementations beside it.
-What this design needs from each:
+(Deferred, user 2026-10-17: only smgr is one; the hooks below are this
+design's and built regardless.) What this design needs from each:
 
 | Facility | Interface today | Needed for this design |
 |---|---|---|
@@ -575,6 +576,54 @@ built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
   page-set and physical-page reclamation; the fold epoch's retained page
   versions.
 - **Exit:** space returns after branch deletion and GC; crash tests of GC.
+
+**Up to step 8 (user, 2026-10-17).** Decided as recommended, each group
+a stack of PRs, in this order:
+1. **The dependency check at moves** (part 7.4): checkout, merge, reset,
+   cherry-pick and pull refuse a commit needing what the database lacks,
+   naming all of it; a move never creates or alters an extension. (The
+   dependencies are in the commit, in a tree of their own whose values
+   are `text[]` literals, not items of the root: the escaping below
+   doesn't touch them.)
+2. **Names escaped in the canonical encoding.** The canonical text joins
+   fields with tabs and lines with newlines, and a name may hold either
+   (a type `"tab<TAB>in"` breaks a column's definition today). Every name
+   and other free text in an item is escaped; a clean break of format, as
+   #149's: a root records its format, and an older root's items aren't
+   read. Refusing such names was the alternative: they are legal
+   Postgres. Every format change before step 8 is such a clean break
+   (B's too, item 6): no history yet is worth keeping readable across one,
+   and keeping it would mean reading every older format; once history is
+   kept (step 8's measurements done, users), a change keeps older roots
+   readable, as spec 14's B1 first proposed.
+3. **Network remotes** (7.8, items 4 and 5).
+4. **Reclamation** (step 7, 8.10).
+5. **Objects a commit refuses today:** aggregates, policies (row-level
+   security, with the table's `relrowsecurity`) and partitioned tables
+   (their partitions, bounds and keys) get canonical forms, moves and
+   merges. Foreign tables stay refused: their rows aren't the database's,
+   and a definition without its server would be a commit no other
+   database could check out. A partitioned table with a foreign table
+   among its partitions is refused with it (no partition is left out).
+   Commits holding policies changes 7.6's "row security is no gap":
+   history holds every row whatever the policies say, so fetching keeps
+   its roles (as `pg_read_all_data` bypasses row security), and the
+   readers of history in SQL (`dolt_diff`) refuse a table with row
+   security that applies to the reader, rather than show it rows the
+   policies hide.
+6. **Large values** (`14-large-values-and-toast.md`): the refusal of
+   `oid` columns, then B (B2, B1, B3, B4). C waits for step 8's
+   measurements and its own gates; for C, jsonb's canonical bytes are its
+   on-disk format with a version byte, and the pointer tags its hash
+   algorithm. B adds references reclamation must follow (B1's column
+   value trees): B keeps 8.1's liveness whole, every reference a chunk
+   holds findable from it, and B3's memo is no root (a hit is checked
+   against the store, so a value reclamation took is read again).
+
+The interfaces under the pages stay deferred (only smgr is one): making
+the facilities part 3 lists swappable is deferred, not the hooks this
+design needs in them (the buffer manager's remap, part 3 and 5, is built).
+The correctness suite joins CI only once its baseline is clean.
 
 **Step 8. Measure.**
 - Gates 1–7 and the S and V suites for this design against stock heap and
