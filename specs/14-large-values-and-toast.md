@@ -658,22 +658,29 @@ to decode.
   segment's end and WAL-logs its bytes under `ProllyJournalLock`, and
   writes them outside it: a batch once the log is flushed (a flush
   concurrent appends and commits share), a transaction's last chunks and
-  its PAD once its commit record is flushed (the store's new
-  `commit_writes()` makes such a commit flush at once). The ranges
-  reserved and not written are listed in shared memory: a reader skips
-  one and reads it once written, a checkpoint and a collection wait for
-  them, an abort writes its own. A crash can leave a range the WAL never
+  its PAD once its commit record is flushed (reserved by the store's new
+  `commit_writes()` at the end of the commit's pre-commit steps, which
+  also makes such a commit flush at once). The ranges reserved and not
+  written are listed in shared memory: a reader skips one (met at its
+  start or inside it) and reads it once written, a checkpoint and a
+  collection wait for those in flight as they begin, an abort writes its
+  own. A crash can leave a range the WAL never
   had at a segment's end; the next append after a restart cuts it off
   (truncated, not padded: it is the end). Gate 3 measured again on it
   (the prototype's save path on this append, tps, mean of two 10 s runs):
   2 KB 1276 heap / 1247 OID / 1234 hash with one writer, 4957 / 5045 /
   5355 with eight; 64 KB 1055 / 955 / 925 and 4792 / 4312 / 3734; 1 MB
-  212 / 206 / 160 and 611 / 607 / 471. Gate 3 passes: at most 1.33x
-  heap TOAST per value.
-- **The journal's bound.** The reclamation's new `move()` is a default
-  collection that marks every chunk; autovacuum runs it when no
-  collection was due and the segment appends go to has passed
-  `prolly.journal_move_threshold` (256 MB).
+  212 / 206 / 160 and 611 / 607 / 471: at most 1.33x heap TOAST per
+  value. No pass line was set for gate 3 (C8); the user is asked to
+  confirm this one passes.
+- **The journal's bound.** The reclamation's new `move()` collects the
+  journal's sealed segments only (a collection's scope, `gc_begin()`'s:
+  default, full or the journal), marking every chunk, into a table file
+  that isn't settled, so the next default collection still collects its
+  garbage; table files are left as they are. Autovacuum runs it when the
+  journal's segments together (sealed ones too) have passed
+  `prolly.journal_move_threshold` (256 MB; 0 refused, -1 off), paced by
+  its cost-based delay.
 - **The pointer.** `VARTAG_ONDISK_SHA256` (5); `va_extinfo`'s high bits
   are the form the tree holds the value in: its bytes, a text-like
   value's in UTF-8 (another encoding), or a jsonb document's canonical
@@ -684,12 +691,24 @@ to decode.
 - **The roots.** The page store's allocated blocks, each read once (until
   two reads agree), their items dead or alive, not their free space;
   `keep()` notes a transaction that names a tree (a collection begun
-  later waits for it) and adds the tree to a running collection's keep
-  set (`gc_kept()`, before the window and in it; too many to remember
-  keeps every chunk).
-- **Not as designed:** `debug_toast_relation`, a developer option, sends
-  values to the TOAST relation all the same, so tests can make OID
-  pointers. A short value moved out (its row was long) is read by a fold
+  later waits for it, prepared too) and adds the tree to a running
+  collection's keep set (`gc_kept()`, before the window and in it; too
+  many to remember, or no set free, keeps every chunk). It does so under
+  the journal's lock, which the window holds from its last `gc_kept()` to
+  the swap, and fails (a serialization failure) if a swap dropped the
+  tree first. A sweep of the page store waits for the scan. A pointer a
+  row is given as it is is told to `keep()` too (the destination's
+  `reference()`).
+- **Not as designed:** `debug_toast_relation`, a developer option
+  (superuser-only), sends values to the TOAST relation all the same, so
+  tests can make OID pointers. A value is stored converted (text in
+  UTF-8, jsonb's canonical bytes) only if converting back gives its bytes
+  back and both are short enough to convert; otherwise, in SQL_ASCII, and
+  for every other type, its tree holds its bytes, which a fold reads (a
+  pointer doesn't say its type, so a fetch can't decode another type's
+  canonical bytes). An apply or merge writes pointers from history for
+  bytea and text in UTF-8, keyed tables only; jsonb is decoded (and so
+  checked) as it is written back. A short value moved out (its row was long) is read by a fold
   and stored inline, as designed; so is text in another encoding by an
   apply (its size is only known converted back). A logical slot's
   protection is by segment: a collection keeps as they are the sealed
@@ -701,12 +720,15 @@ to decode.
   value appended to a segment sealed before the slot's position. Closing
   them, by a collection scanning the WAL after the oldest slot's
   `restart_lsn` for hash pointers, is #300 (decided 2026-10-18: a
-  follow-up).
+  follow-up). A kept segment's roots are its chunks, not an aborted
+  transaction's nor its ROOT records. Logical slots on a standby aren't
+  seen by the primary's collections either (a third gap, open).
 - **The memo's size** is the server setting `prolly_value_memo_entries`
-  (core naming, decided 2026-10-18), not `prolly.value_memo_entries`.
+  (core naming, decided 2026-10-18), not `prolly.value_memo_entries`; 0
+  turns it off.
 - **Measured (acceptance):** a 32-byte slice from the middle of a 100 MB
   bytea reads 4 nodes, whether TOAST compressed it before moving it out
-  or not. Stock heap TOAST is unchanged (release builds of master and of
+  or not (the test allows at most 4). Stock heap TOAST is unchanged (release builds of master and of
   C, heap inserts of random values, tps, mean of three 10 s runs): 2 KB
   1255 / 1261 with one writer, 5150 / 5198 with eight; 64 KB 1041 / 1034
   and 5004 / 5025.

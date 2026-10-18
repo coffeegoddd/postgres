@@ -3,10 +3,11 @@
 # Values stored by content, end to end: a slice of a 100 MB value reads
 # the nodes that hold it and the path to them, whether or not TOAST
 # compressed it before moving it out; a query whose snapshot still sees a
-# row another session deleted reads its value after a collection (the
-# dead row's pointer kept it); a standby reads the values, through a
-# collection on the primary; they survive a crash; pg_dump and restore
-# carry them.
+# row another session deleted reads its value after a collection swapped
+# the store's files, and the collection waits for it before removing
+# them; a standby reads the values, through a collection on the primary;
+# they survive a crash; pg_dump and restore carry them.  (The 100 MB
+# values are dropped after the slices: the rest uses smaller ones.)
 
 use strict;
 use warnings FATAL => 'all';
@@ -26,13 +27,22 @@ sql('CREATE SCHEMA a VERSIONED');
 sql('CREATE TABLE a.big (id int PRIMARY KEY, b bytea)');
 
 # 100 MB: incompressible (md5s), and compressible (TOAST compresses it,
-# then moves it out uncompressed).  (bytea: a slice of a text in a
-# multibyte encoding is read from its start.)
-sql(q{INSERT INTO a.big SELECT 1, convert_to(string_agg(md5(i::text), ''), 'UTF8')
+# as it does in a stock table, then moves it out uncompressed).  (bytea: a
+# slice of a text in a multibyte encoding is read from its start.)
+sql(q{SET default_toast_compression = pglz;
+	ALTER TABLE a.big ALTER COLUMN b SET STORAGE EXTENDED;
+	INSERT INTO a.big SELECT 1, convert_to(string_agg(md5(i::text), ''), 'UTF8')
 	FROM generate_series(1, 3276800) i});
-sql(q{INSERT INTO a.big SELECT 2, convert_to(repeat('compressible ', 8066000), 'UTF8')});
+sql(q{SET default_toast_compression = pglz;
+	INSERT INTO a.big SELECT 2, convert_to(repeat('compressible ', 8066000), 'UTF8')});
 is(sql(q{SELECT string_agg((test_toast_pointer(b)).stored::text, ',' ORDER BY id) FROM a.big}),
 	'104857600,104858000', 'two 100 MB values stored by content, uncompressed');
+is(sql(q{CREATE TABLE public.stock (b bytea);
+	SET default_toast_compression = pglz;
+	INSERT INTO public.stock SELECT b FROM a.big WHERE id = 2;
+	SELECT pg_column_compression(b) FROM public.stock}), 'pglz',
+	'which a stock table compresses');
+sql('DROP TABLE public.stock');
 
 for my $id (1, 2)
 {
@@ -43,35 +53,54 @@ for my $id (1, 2)
 		SELECT nodes_read FROM test_toast_counters(true);});
 	my ($ignore, $same, $read) = split /\n/, $out;
 	is($same, 't', "value $id: a slice from the middle");
-	ok($read <= 8, "value $id: read $read nodes, the slice's and the path to it");
+	ok($read > 0 && $read <= 4,
+		"value $id: read $read nodes, the slice's and the path to it");
 }
+
+# The rest with smaller values, of many nodes still.
+sql('TRUNCATE a.big');
+sql(q{INSERT INTO a.big SELECT g, convert_to(string_agg(md5(g || '/' || i), ''), 'UTF8')
+	FROM generate_series(1, 2) g, generate_series(1, 100000) i GROUP BY g});
 
 my $digest = q{SELECT md5(string_agg(md5(b), ',' ORDER BY id)) FROM a.big};
 my $value1 = sql(q{SELECT md5(b) FROM a.big WHERE id = 1});
 
 # A query whose snapshot still sees a deleted row (so VACUUM can't prune
-# it) reads its value after a collection swapped the store's files (the
-# collection then waits for it before removing what it dropped).
-my $reader = $node->background_psql('postgres');
-$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-is($reader->query_safe('SELECT count(*) FROM a.big'), '2', 'a query sees both rows');
-sql('DELETE FROM a.big WHERE id = 1');
-sql('VACUUM a.big');
-my $gc = $node->background_psql('postgres');
-$gc->query_until(qr/collecting/, q{
-	\echo collecting
-	SELECT test_chunk_gc(false) IS NOT NULL;
-	\echo collected
-});
-$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-	WHERE wait_event = 'virtualxid' AND query LIKE '%test_chunk_gc%'})
-  or die 'the collection did not swap';
-is($reader->query_safe('SELECT md5(b) FROM a.big WHERE id = 1'), $value1,
-	'and reads the deleted row\'s value after a collection');
-$reader->query_safe('COMMIT');
-$reader->quit;
-$gc->query_until(qr/collected/, '');
-$gc->quit;
+# it) reads its value after a collection swapped the store's files; the
+# collection waits for it before removing them.
+SKIP:
+{
+	skip 'injection points not supported by this build', 3
+	  if $ENV{enable_injection_points} ne 'yes';
+	sql('CREATE EXTENSION injection_points');
+	my $reader = $node->background_psql('postgres');
+	$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	is($reader->query_safe('SELECT count(*) FROM a.big'), '2', 'a query sees both rows');
+	sql('DELETE FROM a.big WHERE id = 1');
+	sql('VACUUM a.big');
+	my $gc = $node->background_psql('postgres');
+	$gc->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-gc-swapped', 'wait')});
+	$gc->query_until(qr/collecting/, q{
+		\echo collecting
+		SELECT test_chunk_gc(false) IS NOT NULL;
+		\echo collected
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-gc-swapped'})
+	  or die 'the collection did not swap';
+	is($reader->query_safe('SELECT md5(b) FROM a.big WHERE id = 1'), $value1,
+		'and reads the deleted row\'s value after a collection swapped');
+	sql(q{SELECT injection_points_wakeup('prolly-gc-swapped')});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'virtualxid' AND query LIKE '%test_chunk_gc%'})
+	  or die 'the collection did not wait for the reader';
+	pass('the collection waits for the query before removing the files');
+	$reader->query_safe('COMMIT');
+	$reader->quit;
+	$gc->query_until(qr/collected/, '');
+	$gc->quit;
+}
 
 # A standby reads them, through a collection on the primary.
 $node->backup('base');
