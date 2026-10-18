@@ -5,6 +5,7 @@
   prolly_bench run C --am heap,prolly           C suite (SQL correctness), heap first
   prolly_bench run C --shard 2/4 ...            one shard of the C suite's corpus
   prolly_bench cshard --shards 4                which files each shard runs
+  prolly_bench cbaseline check DIR...           C suite: heap against the checked-in baseline
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
@@ -194,6 +195,27 @@ def _cgate(args) -> int:
     return int(bool(problems))
 
 
+def _cbaseline(args) -> int:
+    import json
+    from pbench import cbaseline, ccompare, table
+    sets = [table.load_set(d) for d in args.dirs]
+    commit = cbaseline.pin(args.pin)
+    if args.action == "update":
+        problems = cbaseline.update(sets, args.baseline, commit, ccompare.corpus_path(sets[0]))
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        if not problems:
+            print(f"written: {args.baseline}")
+        return int(bool(problems))
+    check = cbaseline.check(sets, cbaseline.read(args.baseline), commit)
+    if args.json:
+        args.json.write_text(json.dumps(check.to_json(), indent=1) + "\n")
+    for message in check.messages():
+        print(message, file=sys.stderr)
+    print(check.summary())
+    return int(not check.ok)
+
+
 def _gate(args) -> int:
     from pbench.core.validation import validate_run, compatible
     problems = []
@@ -318,6 +340,16 @@ def main(argv=None) -> int:
     sh.add_argument("--config", type=Path, default=HERE / "configs" / "c_full_ci.toml")
     sh.add_argument("--json", action="store_true")
     sh.set_defaults(fn=_cshard)
+
+    from pbench import cbaseline
+    hb = sub.add_parser("cbaseline", help="C suite: heap's results against the checked-in baseline")
+    hb.add_argument("action", choices=["check", "update"])
+    hb.add_argument("dirs", nargs="+", type=Path, help="heap result sets: a run or its shards")
+    hb.add_argument("--baseline", type=Path, default=cbaseline.BASELINE)
+    hb.add_argument("--pin", type=Path, default=cbaseline.PIN,
+                    help="the file holding the corpus commit")
+    hb.add_argument("--json", type=Path, help="check: also write the findings here")
+    hb.set_defaults(fn=_cbaseline)
 
     evidence = sub.add_parser("gate", help="validate complete, intact execution evidence and optional baseline compatibility")
     evidence.add_argument("dirs", nargs="+", type=Path)

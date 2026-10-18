@@ -49,6 +49,11 @@ class ShardTest(unittest.TestCase):
         shards = cshard.plan(self.corpus, self.cfg, 3)
         self.assertEqual(cshard.overlap_and_gaps([s.files for s in shards], full), [])
 
+    def test_missing_corpus_part_fails_the_plan(self):
+        (self.corpus / "select3.test").unlink()
+        with self.assertRaisesRegex(ValueError, "not in the corpus: .*select3.test"):
+            cshard.plan(self.corpus, self.cfg, 2)
+
     def test_first_shard_holds_c1_and_c2(self):
         shards = cshard.plan(self.corpus, self.cfg, 4)
         self.assertEqual(len(shards[0].files["C1"]), 5)

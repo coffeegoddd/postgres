@@ -303,11 +303,16 @@ jobs:
           done
           exit "$failed"
 
+      # (the pin is also what the heap baseline was generated at)
+      - name: Read the SQLLogicTest corpus pin
+        id: corpus
+        run: echo "commit=$(cat src/tools/prolly_bench/configs/sqllogictest.commit)" >> "$GITHUB_OUTPUT"
+
       - name: Fetch pinned SQLLogicTest corpus
         uses: actions/checkout@v5
         with:
           repository: dolthub/sqllogictest
-          ref: 04b0d198bf9dff62ddfbf0e5d04f5ae63a649ba3
+          ref: ${{ steps.corpus.outputs.commit }}
           path: slt-corpus
 
       - name: SQLLogicTest smoke and strict heap comparison
@@ -318,6 +323,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/c-suite" --out "$PWD/engine-results/c-suite"
           src/tools/prolly_bench/prolly_bench cgate \
             engine-results/c-suite/*-C-B0 engine-results/c-suite/*-C-prolly
+          src/tools/prolly_bench/prolly_bench cbaseline check engine-results/c-suite/*-C-B0
 
       - name: Full pinned SQLLogicTest corpus (nightly)
         if: github.event_name == 'schedule'

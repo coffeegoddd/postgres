@@ -60,6 +60,9 @@ class CWorkload(Workload):
         directory), sorted.  With sample = "per_directory", the first file
         of each directory."""
         roots = [corpus / p for p in cls.paths]
+        missing = [str(r) for r in roots if not r.exists()]
+        if missing:
+            raise ValueError(f"not in the corpus: {', '.join(missing)}")
         files = sorted(f for r in roots for f in (r.rglob("*.test") if r.is_dir() else [r]))
         if sample == "all":
             return files

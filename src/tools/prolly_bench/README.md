@@ -166,6 +166,36 @@ with an empty shard is refused. prolly_bench takes one run at a time per
 host, so shards run in parallel on separate hosts, or one after another
 with separate `--out` directories.
 
+### The heap baseline
+
+`cgate` compares an engine with heap from the same build, so a change to
+shared code (the planner, the executor, the fork's catalog changes) that
+breaks both alike passes it. `configs/c_heap_baseline.tsv.gz` holds heap's
+whole outcome on the pinned corpus: one line per record heap doesn't pass,
+sorted (`file line status sqlstate sorted-answer-digest`, `-` for an empty
+field), after a `# sqllogictest COMMIT` line.
+
+```sh
+src/tools/prolly_bench/prolly_bench cbaseline check HEAP_DIR...    # a run, or its shards
+src/tools/prolly_bench/prolly_bench cbaseline update HEAP_DIR...   # rewrite from a full run
+```
+
+`check` covers the files the run covered, so a shard checks its part. It
+fails, in both directions, on a heap failure the file doesn't list or lists
+differently (a regression in shared code), and on a listed record that now
+passes (update the file, so it stays exact). Records that timed out or
+didn't run are never written to the file; a run with any fails as
+**incomplete**, not as a regression. `update` refuses anything but a
+complete run of the whole corpus.
+
+The corpus pin is `configs/sqllogictest.commit`: CI checks out that commit,
+and `cbaseline` refuses a run of another one. **Bumping the pin
+regenerates the baseline in the same change:** run heap on the full corpus
+twice at the new commit, `cbaseline update` from the first, and `cbaseline
+check` the second against it (the two must agree). A change that alters
+heap's answers updates the file in the same commit, so the diff shows
+exactly which records moved.
+
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.
