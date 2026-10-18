@@ -3352,9 +3352,10 @@ list_has_name(List *list, const char *name)
  * A merge (or pick, or fast-forward) of what changed from base to theirs
  * into a working set with uncommitted changes, as in Dolt: refused if it
  * would change what they changed (a table's rows, a sequence's value), and,
- * for now, if definitions change on both sides, or the uncommitted ones
- * are of something other than tables and sequences.  (Tables made or
- * changed only by the working set the merge leaves alone.)
+ * for now, if the merge changes definitions (its move from ours' would put
+ * the uncommitted rows back as ours has them), or the uncommitted changes
+ * are of something other than tables and sequences.  Tables the working
+ * set made or redefined, a merge changing no definitions leaves alone.
  */
 static void
 check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
@@ -3370,9 +3371,8 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 	if (!has_local_changes(l))
 		return;
 	if (l->definitions ||
-		(!PROLLY_CALL(dc.canonicalizer, same_schema, &l->head, &l->working) &&
-		 (!PROLLY_CALL(dc.canonicalizer, same_schema, base, ours) ||
-		  !PROLLY_CALL(dc.canonicalizer, same_schema, base, theirs))))
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, ours) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, theirs))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot %s with uncommitted changes where definitions change", what),

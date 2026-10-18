@@ -92,6 +92,19 @@ SELECT dolt_reset('--hard');
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT dolt_checkout('main');
+-- nor when it changes definitions over uncommitted rows of another table
+-- (here, makes one: their table isn't the base's), which stay
+SELECT dolt_checkout('feature');
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'feature makes a table')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE dm.b SET v = 'dirty' WHERE id = 5;
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_checkout('main');
 
 -- A merge that conflicts isn't made over uncommitted changes: its commit
 -- would take them in, and its abort (a reset) would lose them.

@@ -331,6 +331,61 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- nor when it changes definitions over uncommitted rows of another table
+-- (here, makes one: their table isn't the base's), which stay
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'feature makes a table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE dm.b SET v = 'dirty' WHERE id = 5;
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+ERROR:  cannot merge with uncommitted changes where definitions change
+HINT:  Commit the changes, or reset the branch, first.
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dm.b       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
 -- A merge that conflicts isn't made over uncommitted changes: its commit
 -- would take them in, and its abort (a reset) would lose them.
 SELECT dolt_checkout('feature');
