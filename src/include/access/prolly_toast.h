@@ -85,4 +85,7 @@ extern varlena *prolly_toast_pointer(const ProllyHash *root, uint64 len,
  */
 extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
 
+/* The value tree nodes this backend read and wrote for values by content. */
+extern void prolly_toast_counters(ProllyNodeCounters *out, bool reset);
+
 #endif							/* PROLLY_TOAST_H */

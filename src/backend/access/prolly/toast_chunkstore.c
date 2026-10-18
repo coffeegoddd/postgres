@@ -65,6 +65,7 @@
 static ProllyTreeEnv env;
 static const ProllyTreeRoutine *tree;
 static bool env_ready = false;
+static ProllyNodeCounters counters; /* this backend's reads and writes */
 static ProllyDatumCodec *jsonb_codec;
 
 static void
@@ -76,6 +77,7 @@ ensure_env(void)
 		elog(ERROR, "values by content need a database");
 	tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&env);
+	env.counters = &counters;
 	env_ready = true;
 }
 
@@ -345,6 +347,14 @@ prolly_toast_readable(const varlena *pointer)
 	root.len = sizeof(p.va_hash);
 	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
 	return PROLLY_CALL(env.chunk_store, has, env.chunks, &root);
+}
+
+void
+prolly_toast_counters(ProllyNodeCounters *out, bool reset)
+{
+	*out = counters;
+	if (reset)
+		memset(&counters, 0, sizeof(counters));
 }
 
 /* a varlena of n bytes, its header made, its data to fill */

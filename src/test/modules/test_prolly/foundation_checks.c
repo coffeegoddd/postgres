@@ -1016,6 +1016,7 @@ PG_FUNCTION_INFO_V1(test_toast_hash_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer_bytes);
 PG_FUNCTION_INFO_V1(test_toast_pointer_value);
+PG_FUNCTION_INFO_V1(test_toast_counters);
 
 Datum
 prolly_canonical_value(PG_FUNCTION_ARGS)
@@ -1064,6 +1065,23 @@ test_toast_hash_pointer(PG_FUNCTION_ARGS)
 	if (get_typlen(type) != -1)
 		elog(ERROR, "only a varlena value can be stored by content");
 	PG_RETURN_POINTER(prolly_toast_store(PG_GETARG_DATUM(0), type));
+}
+
+Datum
+test_toast_counters(PG_FUNCTION_ARGS)
+{
+	ProllyNodeCounters c;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_toast_counters(&c, PG_GETARG_BOOL(0));
+	values[0] = Int64GetDatum(c.nodes_read);
+	values[1] = Int64GetDatum(c.nodes_written);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 Datum

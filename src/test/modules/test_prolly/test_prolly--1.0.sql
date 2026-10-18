@@ -51,6 +51,12 @@ CREATE FUNCTION test_toast_pointer(anyelement,
 	OUT form int, OUT rawsize int, OUT stored int, OUT root text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The value tree nodes this backend read and wrote for values stored by
+-- content.
+CREATE FUNCTION test_toast_counters(reset bool DEFAULT false,
+	OUT nodes_read int8, OUT nodes_written int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A hash pointer's own bytes, as a value to store where a collection looks
 -- for pointers; and the value a pointer's bytes name, read whole.
 CREATE FUNCTION test_toast_pointer_bytes(anyelement)

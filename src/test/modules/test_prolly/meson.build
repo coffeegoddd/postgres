@@ -162,6 +162,7 @@ tests += {
       't/063_toast_apply.pl',
       't/064_toast_decoding.pl',
       't/065_toast_rewrites.pl',
+      't/066_toast_acceptance.pl',
     ],
   },
 }

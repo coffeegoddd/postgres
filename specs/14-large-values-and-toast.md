@@ -653,6 +653,64 @@ to decode.
 11. `VACUUM FULL` and `CLUSTER` convert (C6).
 12. The acceptance tests (#181).
 
+**As built (the layers above).**
+- **The journal's append.** An append reserves its range at the
+  segment's end and WAL-logs its bytes under `ProllyJournalLock`, and
+  writes them outside it: a batch once the log is flushed (a flush
+  concurrent appends and commits share), a transaction's last chunks and
+  its PAD once its commit record is flushed (the store's new
+  `commit_writes()` makes such a commit flush at once). The ranges
+  reserved and not written are listed in shared memory: a reader skips
+  one and reads it once written, a checkpoint and a collection wait for
+  them, an abort writes its own. A crash can leave a range the WAL never
+  had at a segment's end; the next append after a restart cuts it off
+  (truncated, not padded: it is the end). Gate 3 measured again on it
+  (the prototype's save path on this append, tps, mean of two 10 s runs):
+  2 KB 1276 heap / 1247 OID / 1234 hash with one writer, 4957 / 5045 /
+  5355 with eight; 64 KB 1055 / 955 / 925 and 4792 / 4312 / 3734; 1 MB
+  212 / 206 / 160 and 611 / 607 / 471. Gate 3 passes: at most 1.33x
+  heap TOAST per value.
+- **The journal's bound.** The reclamation's new `move()` is a default
+  collection that marks every chunk; autovacuum runs it when no
+  collection was due and the segment appends go to has passed
+  `prolly.journal_move_threshold` (256 MB).
+- **The pointer.** `VARTAG_ONDISK_SHA256` (5); `va_extinfo`'s high bits
+  are the form the tree holds the value in: its bytes, a text-like
+  value's in UTF-8 (another encoding), or a jsonb document's canonical
+  bytes. A destination (`toast_destination.h`) is found by the pointer's
+  tag (fetch) and by the table's access method (save); the chunk store's
+  is `toast_chunkstore.c`. The tree interface gets `value_reference()`
+  and `value_root()`.
+- **The roots.** The page store's allocated blocks, each read once (until
+  two reads agree), their items dead or alive, not their free space;
+  `keep()` notes a transaction that names a tree (a collection begun
+  later waits for it) and adds the tree to a running collection's keep
+  set (`gc_kept()`, before the window and in it; too many to remember
+  keeps every chunk).
+- **Not as designed:** `debug_toast_relation`, a developer option, sends
+  values to the TOAST relation all the same, so tests can make OID
+  pointers. A short value moved out (its row was long) is read by a fold
+  and stored inline, as designed; so is text in another encoding by an
+  apply (its size is only known converted back). A logical slot's
+  protection is by segment: a collection keeps as they are the sealed
+  segments sealed after the oldest slot's `restart_lsn` (the manifest
+  records each segment's seal position, version 3). Two cases aren't
+  protected, both only when the row naming the value is deleted and
+  pruned before the slot decodes it: a value a transaction after the
+  slot's position reused (deduplicated, so nothing was appended), and a
+  value appended to a segment sealed before the slot's position. Closing
+  them, by a collection scanning the WAL after the oldest slot's
+  `restart_lsn` for hash pointers, is #300 (decided 2026-10-18: a
+  follow-up).
+- **The memo's size** is the server setting `prolly_value_memo_entries`
+  (core naming, decided 2026-10-18), not `prolly.value_memo_entries`.
+- **Measured (acceptance):** a 32-byte slice from the middle of a 100 MB
+  bytea reads 4 nodes, whether TOAST compressed it before moving it out
+  or not. Stock heap TOAST is unchanged (release builds of master and of
+  C, heap inserts of random values, tps, mean of three 10 s runs): 2 KB
+  1255 / 1261 with one writer, 5150 / 5198 with eight; 64 KB 1041 / 1034
+  and 5004 / 5025.
+
 ## 7. Large objects
 
 `pg_largeobject` and `pg_largeobject_metadata` are shared by all branches
