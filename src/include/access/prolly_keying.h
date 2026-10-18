@@ -93,13 +93,23 @@ typedef struct ProllyKeyingRoutine
 	void		(*set_values) (ProllyKeying *k, const ProllyValueStore *values);
 	void		(*row_refs) (ProllyKeying *k, const ProllyValue *row,
 							 StringInfo refs);
+
+	/*
+	 * decode_row(), except the columns whose values out of line row before
+	 * holds too (the value encoder's decode_kept()): left NULL and unread,
+	 * and marked in kept.
+	 */
+	void		(*decode_row_kept) (ProllyKeying *k, const ProllyValue *row,
+									const ProllyValue *before,
+									TupleTableSlot *slot, bool *kept);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
-	"decode_row", "compare", "close", "set_values", "row_refs"
+	"decode_row", "compare", "close", "set_values", "row_refs", \
+	"decode_row_kept"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK row_refs
+#define PROLLY_KEYING_LAST_CALLBACK decode_row_kept
 
 /*
  * Set up a data tree's environment and k's value store for each other:

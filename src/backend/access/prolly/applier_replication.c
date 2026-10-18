@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
@@ -51,6 +52,7 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "varatt.h"
 
 #define WRITE_PRIVS		(ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE)
 
@@ -596,8 +598,40 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 	advance(a);
 }
 
+/*
+ * The columns keep marks, from the row found: its stored values.  A
+ * materialized view's row is deleted before the new one goes in, taking
+ * its values out of line with it, so those are read into the new row.
+ */
+static void
+keep_found(ProllyApplier *a, TupleTableSlot *row, const bool *keep)
+{
+	TupleDesc	desc = RelationGetDescr(a->rel);
+	Datum	   *values = palloc_array(Datum, desc->natts);
+	bool	   *isnull = palloc_array(bool, desc->natts);
+
+	slot_getallattrs(a->found);
+	slot_getallattrs(row);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		TupleTableSlot *from = keep[i] ? a->found : row;
+
+		values[i] = from->tts_values[i];
+		isnull[i] = from->tts_isnull[i];
+		if (keep[i] && !isnull[i] && a->matview &&
+			TupleDescAttr(desc, i)->attlen == -1 &&
+			VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
+			values[i] = PointerGetDatum(detoast_external_attr((varlena *) DatumGetPointer(values[i])));
+	}
+	/* (formed anew: the found row's values are its buffer's) */
+	ExecForceStoreHeapTuple(heap_form_tuple(desc, values, isnull), row, true);
+	pfree(values);
+	pfree(isnull);
+}
+
 static bool
-replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
+replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
+				   const bool *keep)
 {
 	if (!find_row(a, old))
 	{
@@ -606,6 +640,8 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
 	}
 	PG_TRY();
 	{
+		if (keep)
+			keep_found(a, row, keep);
 		if (a->matview)
 		{
 			matview_delete(a);

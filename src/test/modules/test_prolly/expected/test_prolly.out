@@ -95,7 +95,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
  value_encoder | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
  value_encoder | stub           | long_values                    | not implemented (missing begin, encode, decode, end, set_values, refs)
- value_encoder | stub           | complete                       | not implemented (8 of 8 callbacks missing)
+ value_encoder | stub           | complete                       | not implemented (9 of 9 callbacks missing)
  reclamation   | copying        | identity                       | pass
  reclamation   | copying        | live_chunks_never_freed        | no checks yet
  reclamation   | copying        | keeps_what_writers_reference   | no checks yet
@@ -173,7 +173,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying  | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close)
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
- table_keying  | stub           | complete                       | not implemented (10 of 10 callbacks missing)
+ table_keying  | stub           | complete                       | not implemented (11 of 11 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass

@@ -303,15 +303,65 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	MemoryContextReset(enc->tmpcxt);
 }
 
+/*
+ * The references to value trees an encoded row holds, by encoded column
+ * (NULL where a column has none): pointers into row, in the current memory
+ * context.  n gets how many columns the row stores.
+ */
+static ProllyValue *
+row_refs_by_column(ProllyValueEncoder *enc, const ProllyValue *row, int *n)
+{
+	const char *p = (const char *) row->data;
+	const char *end = p + row->len;
+	const char *nulls;
+	ProllyValue *refs;
+
+	*n = (int) prolly_get_varint(&p, end);
+	if (*n > enc->nlive || end - p < (*n + 7) / 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row header")));
+	refs = palloc0(sizeof(ProllyValue) * Max(*n, 1));
+	nulls = p;
+	p += (*n + 7) / 8;
+	for (int j = 0; j < *n; j++)
+	{
+		uint64		len;
+
+		if (((uint8) nulls[j / 8] >> (j % 8)) & 1)
+			continue;
+		len = prolly_get_varint(&p, end);
+		if (len > VALUE_INLINE_MAX)
+		{
+			len -= VALUE_INLINE_MAX + 1;
+			refs[j].data = (const uint8 *) p;
+			refs[j].len = (uint32) len;
+		}
+		if (len > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid canonical prolly row: value runs past the end")));
+		p += len;
+	}
+	return refs;
+}
+
+/*
+ * Decode value into slot; with before, each column whose value is out of
+ * line with the same reference in before is left NULL, unread, and marked
+ * in kept.
+ */
 static void
-canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
-				 TupleTableSlot *slot)
+decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
+			const ProllyValue *before, TupleTableSlot *slot, bool *kept)
 {
 	TupleDesc	desc = enc->desc;
 	const char *p = (const char *) value->data;
 	const char *end = p + value->len;
 	MemoryContext old;
 	int			n;
+	ProllyValue *brefs = NULL;
+	int			nb = 0;
 
 	ExecClearTuple(slot);
 	for (int i = 0; i < desc->natts; i++)
@@ -321,6 +371,11 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 	}
 
 	old = MemoryContextSwitchTo(enc->tmpcxt);
+	if (before)
+	{
+		memset(kept, 0, sizeof(bool) * desc->natts);
+		brefs = row_refs_by_column(enc, before, &nb);
+	}
 	n = (int) prolly_get_varint(&p, end);
 	if (n > enc->nlive || end - p < (n + 7) / 8)
 		ereport(ERROR,
@@ -355,7 +410,10 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 						 errmsg("invalid canonical prolly row: value runs past the end")));
 
 			/* No codec: the column was dropped after the row was encoded. */
-			if (enc->codecs[i] != NULL && out_of_line)
+			if (enc->codecs[i] != NULL && out_of_line && j < nb &&
+				brefs[j].len == len && memcmp(brefs[j].data, p, len) == 0)
+				kept[i] = true;
+			else if (enc->codecs[i] != NULL && out_of_line)
 			{
 				ProllyValue ref = {(const uint8 *) p, (uint32) len};
 
@@ -405,6 +463,21 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 		initStringInfo(&enc->scratch);
 		MemoryContextSwitchTo(cxt);
 	}
+}
+
+static void
+canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
+				 TupleTableSlot *slot)
+{
+	decode_into(enc, value, NULL, slot, NULL);
+}
+
+static void
+canonical_decode_kept(ProllyValueEncoder *enc, const ProllyValue *value,
+					  const ProllyValue *before, TupleTableSlot *slot,
+					  bool *kept)
+{
+	decode_into(enc, value, before, slot, kept);
 }
 
 static void
@@ -484,4 +557,5 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.end = canonical_end,
 	.set_values = canonical_set_values,
 	.refs = canonical_refs,
+	.decode_kept = canonical_decode_kept,
 };

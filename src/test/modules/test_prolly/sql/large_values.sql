@@ -165,6 +165,61 @@ SELECT length(dolt_commit('-am', 'frozen again')::text) AS committed;
 SELECT hits = 8 AS others_hit, misses = 2 AS frozen_read_twice
 FROM test_memo_counters(true);
 
+-- A reset or merge that changes a keyed row updates it in place, and a
+-- long value whose reference is the same on both sides keeps the row's
+-- TOAST pointer: it isn't read, compressed or stored again.  A table with
+-- another unique index is written as before (removed and inserted, which
+-- a swap of unique values needs), its values stored anew.
+CREATE TABLE lv.keep (id int PRIMARY KEY, n int, body text);
+ALTER TABLE lv.keep ALTER COLUMN body SET STORAGE EXTERNAL;
+CREATE TABLE lv.unique2 (id int PRIMARY KEY, n int UNIQUE, body text);
+ALTER TABLE lv.unique2 ALTER COLUMN body SET STORAGE EXTERNAL;
+INSERT INTO lv.keep
+SELECT g, 0, string_agg(md5(g || '|' || i), '' ORDER BY i)
+FROM generate_series(1, 2) g, generate_series(1, 2000) i GROUP BY g;
+INSERT INTO lv.unique2 SELECT id, id, body FROM lv.keep;
+CREATE VIEW lv.toasted AS
+SELECT 'keep' AS t, id, n, pg_column_toast_chunk_id(body) AS chunk, md5(body) AS body
+FROM lv.keep
+UNION ALL
+SELECT 'unique2', id, n, pg_column_toast_chunk_id(body), md5(body) FROM lv.unique2;
+SELECT (dolt_commit('-Am', 'kept'))[1] AS p1 \gset
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+UPDATE lv.keep SET n = n + 1;
+UPDATE lv.unique2 SET n = n + 10;
+SELECT (dolt_commit('-am', 'kept, counted'))[1] AS p2 \gset
+SELECT dolt_reset('--hard', :'p1');
+SELECT t, id, a.n, a.chunk = b.chunk AS same_pointer, a.body = b.body AS same_body
+FROM lv.toasted a JOIN before_reset b USING (t, id) ORDER BY t, id;
+
+-- a body that did change is stored anew
+SELECT dolt_reset('--hard', :'p2');
+UPDATE lv.keep SET body = body || 'x' WHERE id = 2;
+SELECT (dolt_commit('-am', 'one body changed'))[1] AS p3 \gset
+DROP TABLE before_reset;
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+SELECT dolt_reset('--hard', :'p2');
+SELECT t, id, a.chunk = b.chunk AS same_pointer, length(k.body)
+FROM lv.toasted a JOIN before_reset b USING (t, id) JOIN lv.keep k USING (id)
+WHERE t = 'keep' ORDER BY id;
+
+-- a merge of a change to the counters keeps the pointers too
+SELECT dolt_reset('--hard', :'p3');
+SELECT dolt_branch('counting');
+SELECT dolt_checkout('counting') IS NOT NULL AS on_counting;
+UPDATE lv.keep SET n = n + 10;
+SELECT length(dolt_commit('-am', 'counted on a branch')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE lv.memo SET n = n + 1 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a change on main')::text) AS committed;
+DROP TABLE before_reset;
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+SELECT (dolt_merge('counting'))[2:4];
+SELECT t, id, a.n, a.chunk = b.chunk AS same_pointer, a.body = b.body AS same_body
+FROM lv.toasted a JOIN before_reset b USING (t, id) WHERE t = 'keep' ORDER BY id;
+SELECT dolt_branch('-D', 'counting');
+DROP TABLE before_reset;
+
 -- Pushed and cloned: a walk from a commit reaches every value tree its
 -- rows reference, so the clone reads them all.
 \getenv abs_builddir PG_ABS_BUILDDIR

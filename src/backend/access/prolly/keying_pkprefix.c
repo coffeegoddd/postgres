@@ -271,9 +271,9 @@ pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
 	row->len = end - p;
 }
 
-static void
-pkprefix_decode_row(ProllyKeying *k, const ProllyValue *row,
-					 TupleTableSlot *slot)
+/* The encoder that decodes into slot's descriptor. */
+static ProllyValueEncoder *
+decoder_for(ProllyKeying *k, TupleTableSlot *slot)
 {
 	TupleDesc	sd = slot->tts_tupleDescriptor;
 	ProllyValueEncoder *enc = k->valenc;
@@ -303,7 +303,23 @@ pkprefix_decode_row(ProllyKeying *k, const ProllyValue *row,
 		}
 		enc = k->alt_valenc;
 	}
-	PROLLY_CALL(k->valenc_routine, decode, enc, row, slot);
+	return enc;
+}
+
+static void
+pkprefix_decode_row(ProllyKeying *k, const ProllyValue *row,
+					 TupleTableSlot *slot)
+{
+	PROLLY_CALL(k->valenc_routine, decode, decoder_for(k, slot), row, slot);
+}
+
+static void
+pkprefix_decode_row_kept(ProllyKeying *k, const ProllyValue *row,
+						 const ProllyValue *before, TupleTableSlot *slot,
+						 bool *kept)
+{
+	PROLLY_CALL(k->valenc_routine, decode_kept, decoder_for(k, slot), row,
+				before, slot, kept);
 }
 
 static int
@@ -366,4 +382,5 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.close = pkprefix_close,
 	.set_values = pkprefix_set_values,
 	.row_refs = pkprefix_row_refs,
+	.decode_row_kept = pkprefix_decode_row_kept,
 };

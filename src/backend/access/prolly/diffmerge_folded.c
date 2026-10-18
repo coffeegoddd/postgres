@@ -17,7 +17,11 @@
  * then every row arriving inserted, so the rows are always a subset of
  * the root's or of the branch's, and a unique constraint both satisfy
  * isn't violated on the way, as it could be by changing rows one at a
- * time (two rows swapping a value).  Definitions that differ are changed
+ * time (two rows swapping a value).  Where no unique or exclusion index
+ * but the primary key's could be, a keyed row that changed is updated in
+ * place instead, its values out of line that didn't change (the same
+ * reference on both sides) kept as they are stored: TOAST keeps their
+ * pointers, and they are neither read nor stored again.  Definitions that differ are changed
  * first, by the canonicalizer.  Sequences are set to the root's values.
  * A merge gives each sequence the other side changed the larger of the
  * two values.
@@ -799,7 +803,7 @@ may_break_constraints(Relation rel)
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
-			TupleTableSlot *old, TupleTableSlot *row)
+			TupleTableSlot *old, TupleTableSlot *row, const bool *keep)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
@@ -808,7 +812,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	if (!recording || !may_break_constraints(rel))
 	{
 		if (old)
-			return PROLLY_CALL(ar, update, a, old, row);
+			return PROLLY_CALL(ar, update, a, old, row, keep);
 		PROLLY_CALL(ar, insert, a, row);
 		return true;
 	}
@@ -817,7 +821,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	PG_TRY();
 	{
 		if (old)
-			ok = PROLLY_CALL(ar, update, a, old, row);
+			ok = PROLLY_CALL(ar, update, a, old, row, keep);
 		else
 			PROLLY_CALL(ar, insert, a, row);
 		ReleaseCurrentSubTransaction();
@@ -872,9 +876,69 @@ typedef struct Applying
 	ProllyApplier *a;
 	Relation	rel;
 	TupleTableSlot *slot;
+	TupleTableSlot *old;		/* a row updated, as it was */
+	bool	   *kept;			/* its columns kept as stored */
 	bool		keyless;
+	bool		in_place;		/* changed keyed rows updated in place */
 	bool		inserting;
 } Applying;
+
+/*
+ * May a keyed row of rel that changed be updated in place, rather than
+ * removed and inserted again?  Only where no unique or exclusion index but
+ * the primary key's could be broken on the way, as by two rows swapping a
+ * value.
+ */
+static bool
+updates_in_place(Relation rel)
+{
+	ListCell   *lc;
+
+	foreach(lc, RelationGetIndexList(rel))
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+		Form_pg_index index;
+		bool		other;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for index %u", lfirst_oid(lc));
+		index = (Form_pg_index) GETSTRUCT(tup);
+		other = !index->indisprimary && (index->indisunique || index->indisexclusion);
+		ReleaseSysCache(tup);
+		if (other)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * A keyed row's update in place: old as it was, with the columns out of
+ * line that row has too left unread, but its primary key whole (the row is
+ * found by it); and row, those columns marked in kept.
+ */
+static void
+decode_update(Changes *c, Relation rel, const ProllyValue *before,
+			  const ProllyValue *after, TupleTableSlot *old,
+			  TupleTableSlot *row, bool *kept)
+{
+	Bitmapset  *pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	ExecClearTuple(old);
+	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, before, after, old, kept);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		if (kept[i] &&
+			bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber, pk))
+		{
+			ExecClearTuple(old);
+			PROLLY_CALL(c->rd.kr, decode_row, c->rd.k, before, old);
+			break;
+		}
+	}
+	ExecClearTuple(row);
+	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, after, before, row, kept);
+}
 
 /* How many copies a tree value stands for (0: none), and its row. */
 static uint64
@@ -897,6 +961,22 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	ProllyValue arow;
 	uint64		nb = copies_of(&ap->c, before, &brow);
 	uint64		na = copies_of(&ap->c, after, &arow);
+
+	/* a keyed row that changed, updated in place, while inserting */
+	if (ap->in_place && nb == 1 && na == 1)
+	{
+		if (!ap->inserting)
+			return;
+		decode_update(&ap->c, ap->rel, &brow, &arow, ap->old, ap->slot,
+					  ap->kept);
+		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("a row of \"%s\" changed while the branch was moved",
+							RelationGetRelationName(ap->rel)),
+					 errhint("Try again.")));
+		return;
+	}
 
 	/* a keyless row's copies change in number, a keyed row whole */
 	if (ap->keyless && na >= nb)
@@ -926,7 +1006,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
 		for (uint64 i = 0; i < na; i++)
-			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot);
+			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL);
 	}
 }
 
@@ -954,12 +1034,15 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.c.rd.k = PROLLY_CALL(ap.c.rd.kr, open, ap.rel,
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
+	ap.in_place = !ap.keyless && updates_in_place(ap.rel);
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
 	prolly_keying_use_env(&krefs, ap.c.rd.kr, ap.c.rd.k, tree, &env);
 
 	ap.slot = table_slot_create(ap.rel, NULL);
+	ap.old = table_slot_create(ap.rel, NULL);
+	ap.kept = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	for (int pass = 0; pass < 2; pass++)
 	{
@@ -968,6 +1051,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	}
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
+	ExecDropSingleTupleTableSlot(ap.old);
 	PROLLY_CALL(ap.c.rd.kr, close, ap.c.rd.k);
 	table_close(ap.rel, NoLock);
 }
@@ -1246,6 +1330,7 @@ typedef struct KeyWrite
 	int64		nold;
 	const StringInfoData *row;	/* the row inserted, nrow times */
 	int64		nrow;
+	bool		in_place;		/* or old updated to row */
 } KeyWrite;
 
 /*
@@ -1277,6 +1362,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	ListCell   *lt;
 	int			conflicts = 0;
 	bool		keyless;
+	bool		in_place;
+	bool	   *kept;
 	List	   *writes = NIL;
 
 	require_readable(base);
@@ -1288,6 +1375,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.kr = keying_of(rel);
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
+	in_place = !keyless && updates_in_place(rel);
+	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	oc = tc;
 	chunk_env(&env);
 	env.compare = changes_compare;
@@ -1394,6 +1483,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			w->nold = 1;
 			w->row = row;
 			w->nrow = 1;
+			w->in_place = in_place;
 		}
 		else if (want < have)
 		{
@@ -1416,7 +1506,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	{
 		KeyWrite   *w = lfirst(lt);
 
-		if (w->nold == 0)
+		if (w->nold == 0 || w->in_place)
 			continue;
 		(void) decode(&tc, w->old, s1);
 		for (int64 i = 0; i < w->nold; i++)
@@ -1430,9 +1520,28 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 
 		if (w->nrow == 0)
 			continue;
+		if (w->in_place)
+		{
+			ProllyValue before;
+			ProllyValue after;
+			ProllyValue v;
+			uint64		count;
+
+			/* (a violation recorded instead leaves the row as it was) */
+			v.data = (const uint8 *) w->old->data;
+			v.len = w->old->len;
+			PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &v, &before, &count);
+			v.data = (const uint8 *) w->row->data;
+			v.len = w->row->len;
+			PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &v, &after, &count);
+			decode_update(&tc, rel, &before, &after, s1, s2, kept);
+			if (!merge_write(ar, a, rel, s1, s2, kept))
+				goto missing;
+			continue;
+		}
 		(void) decode(&tc, w->row, s2);
 		for (int64 i = 0; i < w->nrow; i++)
-			(void) merge_write(ar, a, rel, NULL, s2);
+			(void) merge_write(ar, a, rel, NULL, s2, NULL);
 
 		/*
 		 * A keyed row theirs changed, whose new version is recorded as a
@@ -1441,7 +1550,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		if (!keyless && w->nold == 1 && list_length(recorded) > nrecorded)
 		{
 			(void) decode(&tc, w->old, s1);
-			(void) merge_write(ar, a, rel, NULL, s1);
+			(void) merge_write(ar, a, rel, NULL, s1, NULL);
 		}
 	}
 	if (a)

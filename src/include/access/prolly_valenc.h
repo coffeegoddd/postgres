@@ -74,13 +74,23 @@ typedef struct ProllyValueEncoderRoutine
 	/* Append the references to value trees an encoded row holds. */
 	void		(*refs) (ProllyValueEncoder *enc, const ProllyValue *row,
 						 StringInfo refs);
+
+	/*
+	 * decode(), except each column whose value is out of line with the same
+	 * reference in row before (of the same layout): left NULL and unread,
+	 * and marked in kept (by attribute index, false elsewhere), for the
+	 * caller to take from wherever before's value is.
+	 */
+	void		(*decode_kept) (ProllyValueEncoder *enc, const ProllyValue *row,
+								const ProllyValue *before,
+								TupleTableSlot *slot, bool *kept);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
-	"set_values", "refs"
+	"set_values", "refs", "decode_kept"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK refs
+#define PROLLY_VALENC_LAST_CALLBACK decode_kept
 
 static inline const ProllyValueEncoderRoutine *
 prolly_valenc_lookup(const char *name)
