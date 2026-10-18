@@ -68,6 +68,7 @@ tests += {
       'schema_moves',
       'sequences',
       'schema_merges',
+      'merge_truth',
       'table_files',
       'incremental_folds',
       'checkpoints',

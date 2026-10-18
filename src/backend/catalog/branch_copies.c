@@ -354,13 +354,20 @@ delete_here(void *arg)
  * Is name a branch's name by git's rules (git check-ref-format, as Dolt
  * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
  * refspec, and so on: a branch so named couldn't be named again.  As in
- * Dolt, a name may begin with "-" (given after "--"), and "HEAD" in any
- * case is the session branch's head, not a branch.
+ * Dolt, a name is ASCII, and may begin with "-" (given after "--") but
+ * isn't "-" alone (git's previous branch); and neither "HEAD", in any
+ * case, the session branch's head, nor a commit's id (64 hex digits) is a
+ * branch's name.
  */
 static bool
 branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
+
+	if (len == 64 && strspn(name, "0123456789abcdef") == len)
+		return false;
+	if (strcmp(name, "-") == 0)
+		return false;
 
 	if (pg_strcasecmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
 		name[0] == '/' || name[len - 1] == '/' ||
@@ -383,7 +390,7 @@ branch_name_ok(const char *name)
 	{
 		unsigned char c = (unsigned char) *p;
 
-		if (c <= ' ' || c == 0x7f || strchr("~^:?*[\\", c) != NULL)
+		if (c <= ' ' || c >= 0x7f || strchr("~^:?*[\\", c) != NULL)
 			return false;
 	}
 	return true;
@@ -398,7 +405,7 @@ copies_check_create(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case), \"@\" or a commit id; not \"-\" alone or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	/* (one made on the session's behalf is the database's mechanism, not the role's) */
 	if (BranchCreateOnBehalf)

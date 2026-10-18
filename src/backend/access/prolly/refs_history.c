@@ -17,6 +17,7 @@
 
 #include "access/prolly_refs.h"
 #include "miscadmin.h"
+#include "nodes/pg_list.h"
 #include "utils/hsearch.h"
 
 /* A commit id as a hash table's key: its bytes past its length zeroed. */
@@ -102,16 +103,57 @@ add_ancestor(const ProllyHash *id, void *arg)
 	return false;
 }
 
-static bool
-is_ancestor(const ProllyHash *id, void *arg)
+/*
+ * Breadth first from b, the common ancestors of it and a met first on each
+ * path (ofa: a's ancestors): every maximal one is among them, since a
+ * walk past one reaches only its own ancestors.
+ */
+static List *
+first_common(const ProllyHash *b, HTAB *ofa, ProllyCommitLookup lookup,
+			 void *lookup_arg)
 {
-	return hash_search((HTAB *) arg, id, HASH_FIND, NULL) != NULL;
+	HTAB	   *seen = id_set("prolly merge base walk");
+	List	   *queue = NIL;
+	List	   *found = NIL;
+	ProllyHash *start = palloc(sizeof(ProllyHash));
+
+	id_key(b, start);
+	(void) hash_search(seen, start, HASH_ENTER, NULL);
+	queue = lappend(queue, start);
+	while (queue != NIL)
+	{
+		ProllyHash *id = linitial(queue);
+		ProllyCommitInfo info;
+
+		queue = list_delete_first(queue);
+		CHECK_FOR_INTERRUPTS();
+		if (hash_search(ofa, id, HASH_FIND, NULL) != NULL)
+		{
+			found = lappend(found, id);
+			continue;
+		}
+		if (!lookup(id, &info, lookup_arg))
+			continue;
+		for (int i = 0; i < info.nparents; i++)
+		{
+			ProllyHash *key = palloc(sizeof(ProllyHash));
+			bool		known;
+
+			id_key(&info.parents[i], key);
+			(void) hash_search(seen, key, HASH_ENTER, &known);
+			if (!known)
+				queue = lappend(queue, key);
+		}
+	}
+	hash_destroy(seen);
+	return found;
 }
 
 /*
- * The newest common ancestor of a and b: every ancestor of a (a among
- * them), then breadth first from b to the first of those.  False if they
- * have none.
+ * The best common ancestor of a and b: of those no other common ancestor
+ * descends from (two, in a criss-cross merge's history), the one with the
+ * least id, so the same whichever way round they're asked for.  False if
+ * they have none.
  */
 bool
 prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
@@ -119,11 +161,41 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 						  ProllyHash *base)
 {
 	HTAB	   *ofa = id_set("prolly merge base");
+	HTAB	   *beneath = id_set("prolly merge base, beneath another");
 	ProllyHash	unused;
-	bool		found;
+	List	   *common;
+	ListCell   *lc;
+	bool		found = false;
 
 	(void) walk(a, lookup, lookup_arg, add_ancestor, ofa, &unused);
-	found = walk(b, lookup, lookup_arg, is_ancestor, ofa, base);
+	common = first_common(b, ofa, lookup, lookup_arg);
+
+	/* each one's ancestors (itself aside) aren't the best */
+	if (list_length(common) > 1)
+	{
+		foreach(lc, common)
+		{
+			ProllyCommitInfo info;
+
+			if (!lookup(lfirst(lc), &info, lookup_arg))
+				continue;
+			for (int i = 0; i < info.nparents; i++)
+				(void) walk(&info.parents[i], lookup, lookup_arg, add_ancestor,
+							beneath, &unused);
+		}
+	}
+	foreach(lc, common)
+	{
+		ProllyHash *id = lfirst(lc);
+
+		if (hash_search(beneath, id, HASH_FIND, NULL) != NULL)
+			continue;
+		if (!found || id->len < base->len ||
+			(id->len == base->len && memcmp(id->bytes, base->bytes, id->len) < 0))
+			*base = *id;
+		found = true;
+	}
+	hash_destroy(beneath);
 	hash_destroy(ofa);
 	return found;
 }

@@ -366,43 +366,43 @@ SELECT message, committer = current_user AS session_user,
 -- or options would read otherwise is refused.
 SELECT dolt_branch('bad~name');
 ERROR:  invalid branch name "bad~name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad^name');
 ERROR:  invalid branch name "bad^name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad:name');
 ERROR:  invalid branch name "bad:name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('two words');
 ERROR:  invalid branch name "two words"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a..b');
 ERROR:  invalid branch name "a..b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('HEAD');
 ERROR:  invalid branch name "HEAD"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('@');
 ERROR:  invalid branch name "@"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends.lock');
 ERROR:  invalid branch name "ends.lock"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('part.lock/b');
 ERROR:  invalid branch name "part.lock/b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('.hidden');
 ERROR:  invalid branch name ".hidden"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feat/.x');
 ERROR:  invalid branch name "feat/.x"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a//b');
 ERROR:  invalid branch name "a//b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends/');
 ERROR:  invalid branch name "ends/"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feature/ok-name_1.2');
  dolt_branch 
 -------------
@@ -426,7 +426,7 @@ SELECT dolt_branch('-d', 'feature/ok-name_1.2');
 -- only by case names that branch, made, copied or renamed to.
 SELECT dolt_branch('head');
 ERROR:  invalid branch name "head"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_hashof('head') = dolt_hashof('HEAD') AS head_any_case,
 	dolt_hashof('Head~0') = dolt_hashof('HEAD') AS with_steps;
  head_any_case | with_steps 

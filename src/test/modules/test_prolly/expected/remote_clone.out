@@ -272,7 +272,7 @@ CREATE DATABASE regress_clone_g;
 \c regress_clone_g
 SELECT dolt_clone(:'url_odd');
 ERROR:  invalid branch name "odd..name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 \c :db
 DROP DATABASE regress_clone_g;
 SELECT dolt_remote('remove', 'oddname');

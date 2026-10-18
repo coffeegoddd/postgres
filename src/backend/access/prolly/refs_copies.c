@@ -878,6 +878,9 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	 */
 	if (pg_strcasecmp(refname, "HEAD") == 0 && !branch_exists(refname))
 		refname = branch_ops()->current();
+	/* a branch by its full ref name, as in Dolt and git */
+	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0')
+		refname += 11;
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
 	if (tracking_head(refname, commit_id))
@@ -941,7 +944,7 @@ copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 	return copies_commit_get(id, info);
 }
 
-/* The newest common ancestor of a and b, each commit visited once. */
+/* The best common ancestor of a and b (prolly_history_merge_base()). */
 static bool
 copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 {

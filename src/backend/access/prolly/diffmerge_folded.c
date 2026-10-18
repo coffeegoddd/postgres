@@ -26,7 +26,7 @@
  * A merge gives each sequence the other side changed the larger of the
  * two values.
  *
- * Merge is three-way, from the newest common ancestor of the session's
+ * Merge is three-way, from the best common ancestor of the session's
  * head and the other one, as in implementation "rows": for each table,
  * the other side's changes since the ancestor are written to the branch
  * (with the row applier) unless the branch changed the same key to
