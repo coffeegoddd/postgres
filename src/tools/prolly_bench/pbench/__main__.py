@@ -549,6 +549,19 @@ def main(argv=None) -> int:
     diff.add_argument("--self-test", action="store_true", help="also prove the comparator rejects a known mismatch")
     diff.set_defaults(fn=differential.run)
 
+    vcfuzz = sub.add_parser("vcfuzz", help="seeded version-control histories checked against a model")
+    vcfuzz.add_argument("--pg-bin", type=Path, required=True)
+    vcfuzz.add_argument("--out", type=Path, required=True, help="new artifact directory")
+    vcfuzz.add_argument("--runner", type=Path, default=REPO / "build-bench/differential/vc-fuzz")
+    vcfuzz.add_argument("--seed", type=int, default=1)
+    vcfuzz.add_argument("--seeds", type=int, default=10)
+    vcfuzz.add_argument("--steps", type=int, default=80)
+    vcfuzz.add_argument("--sessions", type=int, default=0, help="sessions per history; 0 varies them by seed")
+    vcfuzz.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
+    vcfuzz.add_argument("--replay", help="saved history.json or reduced.json files (a glob)")
+    vcfuzz.add_argument("--self-test", action="store_true", help="also prove the checks reject known wrong engines")
+    vcfuzz.set_defaults(fn=differential.run_vc)
+
     from pbench import vc
     scenario = sub.add_parser("vc", help="version-control scenarios with explicit engine capabilities")
     scenario.add_argument("--am", default="prolly", help="comma-separated engine names")

@@ -322,6 +322,23 @@ jobs:
           done
           exit "$failed"
 
+      - name: Seeded version-control histories
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' }}
+        run: |
+          seeds=8
+          steps=80
+          seed=1
+          if [ "$NIGHTLY" = true ]; then
+            seeds=200
+            steps=150
+            seed="$GITHUB_RUN_NUMBER"
+          fi
+          src/tools/prolly_bench/prolly_bench vcfuzz \
+            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
+            --seed "$seed" --seeds "$seeds" --steps "$steps" --self-test \
+            --reduce 48 --out "$PWD/engine-results/vcfuzz"
+
       # (the C suite, SQL correctness, runs in correctness.yml)
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench
