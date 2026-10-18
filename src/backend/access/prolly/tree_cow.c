@@ -37,14 +37,32 @@
  * and single-child roots are then removed.
  *
  * Large values.  A leaf value longer than VALUE_INLINE_MAX bytes is stored
- * out of line, in a value tree: the value's bytes cut into chunks where a
- * rolling hash (buzhash) of the last bytes says so, keyed by their offsets
- * (8 bytes, big-endian), built as any tree is.  The leaf item then holds
+ * out of line, in a value tree, and the leaf item then holds its reference
  *
  *	uint8 hash length, hash of the value tree's root, varint value length
  *
  * with the chunk format's PROLLY_ITEM_VALUE_REF flag.  Every read (get,
- * cursors, diff) returns the bytes; walks visit the value trees too.  The
+ * cursors, diff) returns the bytes; walks visit the value trees too.
+ *
+ * A value may hold references to value trees of its own (a row's long
+ * columns, written with value_write()).  The environment's value_refs()
+ * finds them as each item is put, and the item leads with them, flagged
+ * PROLLY_ITEM_VALUE_REFS:
+ *
+ *	varint length of the references, each reference, then the value (or
+ *	its value tree's reference)
+ *
+ * so a walk finds them from the node alone.  Reads return the value
+ * without them.
+ *
+ * A value tree is addressed by byte counts, as Dolt's blob trees are: the
+ * value's bytes are cut into chunks where a rolling hash (buzhash) of the
+ * last bytes says so, each chunk the one item of a leaf, with no key; an
+ * internal node's items have no key either, and record each child's
+ * reference and byte count.  The levels above the leaves are cut by the
+ * chunker, given each child's hash as its item's key.  So inserting bytes
+ * changes the chunks around them and the path above, not every chunk after
+ * them, and a slice is read by descending through the byte counts.  The
  * limits and the rolling hash are part of the canonical format.
  *
  * Diff.  Each tree is walked by a cursor that stands on an item of some
@@ -248,7 +266,7 @@ typedef struct Item
 	ProllyKey	key;
 	ProllyValue value;
 	uint64		count;			/* internal items: child's item count */
-	bool		ref;			/* leaf items: the value is a value tree's */
+	uint8		flags;			/* leaf items: the chunk format's */
 } Item;
 
 static void
@@ -266,7 +284,7 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 	{
 		keys[i] = items[i].key;
 		values[i] = items[i].value;
-		flags[i] = items[i].ref ? PROLLY_ITEM_VALUE_REF : 0;
+		flags[i] = items[i].flags;
 		*count += level == 0 ? 1 : items[i].count;
 	}
 	initStringInfo(&chunk);
@@ -356,6 +374,8 @@ value_env(const ProllyTreeEnv *env, ProllyTreeEnv *venv)
 	*venv = *env;
 	venv->compare = memcmp_compare;
 	venv->compare_arg = NULL;
+	venv->value_refs = NULL;
+	venv->value_refs_arg = NULL;
 }
 
 static void
@@ -366,126 +386,422 @@ encode_value_ref(StringInfo out, const ProllyHash *hash, uint64 len)
 	prolly_put_varint(out, len);
 }
 
+/* Read the reference at *p, and move past it. */
 static void
-decode_value_ref(const ProllyValue *value, ProllyNodeRef *root, uint64 *len)
+next_value_ref(const char **p, const char *end, ProllyNodeRef *root,
+			   uint64 *len)
 {
-	const char *p = (const char *) value->data;
-	const char *end = p + value->len;
-
-	if (value->len < 1 || (uint8) p[0] > PROLLY_HASH_MAX_LEN ||
-		value->len < 1 + (uint32) (uint8) p[0])
+	if (end - *p < 1 || (uint8) (*p)[0] > PROLLY_HASH_MAX_LEN ||
+		end - *p < 1 + (uint8) (*p)[0])
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid prolly value reference")));
 	memset(root, 0, sizeof(*root));
-	root->hash.len = (uint8) p[0];
-	memcpy(root->hash.bytes, p + 1, root->hash.len);
-	p += 1 + root->hash.len;
-	*len = prolly_get_varint(&p, end);
+	root->hash.len = (uint8) (*p)[0];
+	memcpy(root->hash.bytes, *p + 1, root->hash.len);
+	*p += 1 + root->hash.len;
+	*len = prolly_get_varint(p, end);
 }
 
-static ProllyTreeBuilder *builder_create(const ProllyTreeEnv *env, uint16 base,
-										 MemoryContext mcxt);
-static ProllyTreeCursor *cow_cursor_open(const ProllyTreeEnv *env,
-										 const ProllyNodeRef *root,
-										 MemoryContext mcxt);
-static bool cow_cursor_next(ProllyTreeCursor *c, ProllyKey *key,
-							ProllyValue *value);
-static void cow_cursor_close(ProllyTreeCursor *c);
-static void builder_add_at(ProllyTreeBuilder *b, uint16 level, const Item *item);
-static void builder_finish(ProllyTreeBuilder *b, ProllyNodeRef *root);
-
-/* Store value's bytes as a value tree; append its reference to out. */
 static void
-write_value_tree(const ProllyTreeEnv *env, const ProllyValue *value,
+decode_value_ref(const ProllyValue *value, ProllyNodeRef *root, uint64 *len)
+{
+	const char *p = (const char *) value->data;
+
+	next_value_ref(&p, p + value->len, root, len);
+}
+
+/*
+ * Building a value tree.  Leaves are written as the rolling hash cuts
+ * them; each level above keeps the children of the node it is filling and
+ * its chunker, which is given each child's hash as its item's key.
+ */
+typedef struct ValueLevel
+{
+	ProllyChunker *chunker;
+	ProllyHash *hashes;			/* the node being filled: its children */
+	uint64	   *counts;			/* and their byte counts */
+	int			n;
+	int			max;
+	int			emitted;		/* nodes written */
+	ProllyNodeRef last;			/* the last of them */
+} ValueLevel;
+
+typedef struct ValueBuilder
+{
+	const ProllyTreeEnv *env;
+	StringInfoData child;		/* a child's item, for its chunker */
+	ValueLevel	levels[MAX_LEVELS];
+} ValueBuilder;
+
+static void value_add(ValueBuilder *vb, uint16 level, const ProllyHash *hash,
+					  uint64 count);
+
+/* Write the node level is filling, and add it to the level above. */
+static void
+value_flush(ValueBuilder *vb, uint16 level)
+{
+	ValueLevel *vl = &vb->levels[level];
+	Item	   *items;
+	StringInfoData *children;
+	ProllyNodeRef ref;
+	uint64		count;
+	uint64		bytes = 0;
+
+	if (vl->n == 0)
+		return;
+	items = palloc0(sizeof(Item) * vl->n);
+	children = palloc(sizeof(StringInfoData) * vl->n);
+	for (int i = 0; i < vl->n; i++)
+	{
+		initStringInfo(&children[i]);
+		encode_child(&children[i], &vl->hashes[i], vl->counts[i]);
+		items[i].value.data = (const uint8 *) children[i].data;
+		items[i].value.len = children[i].len;
+		items[i].count = vl->counts[i];
+		bytes += vl->counts[i];
+	}
+	write_node(vb->env, level, items, vl->n, &ref, &count);
+	for (int i = 0; i < vl->n; i++)
+		pfree(children[i].data);
+	pfree(children);
+	pfree(items);
+	vl->n = 0;
+	vl->emitted++;
+	vl->last = ref;
+	value_add(vb, level + 1, &ref.hash, bytes);
+}
+
+/* A child of the node level (above the leaves) is filling. */
+static void
+value_add(ValueBuilder *vb, uint16 level, const ProllyHash *hash, uint64 count)
+{
+	ValueLevel *vl;
+	ProllyKey	key = {hash->bytes, hash->len};
+	ProllyKey	nokey = {NULL, 0};
+	ProllyValue value;
+	ProllyChunkDecision d;
+
+	if (level >= MAX_LEVELS)
+		elog(ERROR, "prolly value tree is more than %d levels high", MAX_LEVELS);
+	vl = &vb->levels[level];
+	if (vl->chunker == NULL)
+	{
+		vl->chunker = PROLLY_CALL(vb->env->chunker, begin, level,
+								  level_capacity(vb->env, level),
+								  CurrentMemoryContext);
+		vl->max = 64;
+		vl->hashes = palloc(sizeof(ProllyHash) * vl->max);
+		vl->counts = palloc(sizeof(uint64) * vl->max);
+	}
+	resetStringInfo(&vb->child);
+	encode_child(&vb->child, hash, count);
+	value.data = (const uint8 *) vb->child.data;
+	value.len = vb->child.len;
+	d = PROLLY_CALL(vb->env->chunker, add, vl->chunker, &key, &value,
+					PROLLY_CALL(vb->env->chunk_format, item_space, level,
+								&nokey, &value));
+	if (d == PROLLY_CHUNK_SPLIT_BEFORE)
+		value_flush(vb, level);
+	if (vl->n == vl->max)
+	{
+		vl->max *= 2;
+		vl->hashes = repalloc(vl->hashes, sizeof(ProllyHash) * vl->max);
+		vl->counts = repalloc(vl->counts, sizeof(uint64) * vl->max);
+	}
+	vl->hashes[vl->n] = *hash;
+	vl->counts[vl->n] = count;
+	vl->n++;
+	if (d == PROLLY_CHUNK_SPLIT_AFTER)
+		value_flush(vb, level);
+}
+
+/* A leaf: one chunk of the value's bytes. */
+static void
+value_leaf(ValueBuilder *vb, const uint8 *data, uint32 len)
+{
+	Item		item = {0};
+	ProllyNodeRef ref;
+	uint64		count;
+
+	item.value.data = data;
+	item.value.len = len;
+	item.count = 1;
+	write_node(vb->env, 0, &item, len > 0 ? 1 : 0, &ref, &count);
+	vb->levels[0].emitted++;
+	vb->levels[0].last = ref;
+	if (len > 0)
+		value_add(vb, 1, &ref.hash, len);
+}
+
+/* Store len bytes as a value tree; append its reference to out. */
+static void
+write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 				 StringInfo out)
 {
 	ProllyTreeEnv venv;
-	ProllyTreeBuilder *b;
+	ValueBuilder *vb = palloc0(sizeof(ValueBuilder));
 	ProllyNodeRef root;
-	uint32		start = 0;
+	Size		start = 0;
 	uint32		h = 0;
 
 	if (!buz_ready)
 		buz_init();
 	value_env(env, &venv);
-	b = builder_create(&venv, 0, CurrentMemoryContext);
-	for (uint32 i = 0; i < value->len; i++)
+	vb->env = &venv;
+	initStringInfo(&vb->child);
+	for (Size i = 0; i < len; i++)
 	{
-		uint32		n = i - start + 1;	/* bytes in the chunk so far */
-		bool		cut;
+		Size		n = i - start + 1;	/* bytes in the chunk so far */
 
-		h = rotl32(h, 1) ^ buz_table[value->data[i]];
+		h = rotl32(h, 1) ^ buz_table[data[i]];
 		if (n > BUZ_WINDOW)
-			h ^= rotl32(buz_table[value->data[i - BUZ_WINDOW]], BUZ_WINDOW);
-		cut = (n >= CHUNK_MIN && (h & CHUNK_MASK) == CHUNK_MASK) ||
-			n >= CHUNK_MAX || i + 1 == value->len;
-		if (cut)
+			h ^= rotl32(buz_table[data[i - BUZ_WINDOW]], BUZ_WINDOW);
+		if ((n >= CHUNK_MIN && (h & CHUNK_MASK) == CHUNK_MASK) ||
+			n >= CHUNK_MAX || i + 1 == len)
 		{
-			uint8		keybuf[8];
-			Item		item;
-
-			for (int k = 0; k < 8; k++)
-				keybuf[k] = (uint8) (((uint64) start) >> (8 * (7 - k)));
-			item.key.data = keybuf;
-			item.key.len = 8;
-			item.value.data = value->data + start;
-			item.value.len = n;
-			item.count = 1;
-			item.ref = false;
-			builder_add_at(b, 0, &item);
+			value_leaf(vb, data + start, (uint32) n);
 			start = i + 1;
 			h = 0;
 		}
 	}
-	builder_finish(b, &root);
-	encode_value_ref(out, &root.hash, value->len);
+	if (len == 0)
+		value_leaf(vb, NULL, 0);
+
+	/* The first level, counting up, that has exactly one node is the root. */
+	for (uint16 level = 0;; level++)
+	{
+		if (level >= MAX_LEVELS)
+			elog(ERROR, "prolly value tree build found no root");
+		if (level > 0)
+			value_flush(vb, level);
+		if (vb->levels[level].emitted == 1)
+		{
+			root = vb->levels[level].last;
+			break;
+		}
+	}
+	for (int i = 0; i < MAX_LEVELS; i++)
+	{
+		ValueLevel *vl = &vb->levels[i];
+
+		if (vl->chunker == NULL)
+			continue;
+		PROLLY_CALL(env->chunker, end, vl->chunker);
+		pfree(vl->hashes);
+		pfree(vl->counts);
+	}
+	pfree(vb->child.data);
+	pfree(vb);
+	encode_value_ref(out, &root.hash, len);
+}
+
+/*
+ * Append bytes [offset, offset + len) of the subtree at ref, len > 0, which
+ * its parent (or the reference, for the root) says holds size bytes.
+ */
+static void
+read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+				 uint64 size, uint64 offset, uint64 len, StringInfo out)
+{
+	TNode		node;
+
+	CHECK_FOR_INTERRUPTS();
+	node_read(env, ref, &node);
+	if (node.level == 0)
+	{
+		ProllyKey	k;
+		ProllyValue v = {NULL, 0};
+
+		if (node.nitems > 0)
+			node_item(env, &node, 0, &k, &v, NULL);
+		if (node.nitems > 1 || v.len != size)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly value tree leaf holds %u bytes, its parent says %llu",
+							v.len, (unsigned long long) size)));
+		appendBinaryStringInfo(out, (const char *) v.data + offset, (int) len);
+	}
+	else
+	{
+		uint64		held = 0;
+
+		for (int i = 0; i < node.nitems; i++)
+		{
+			ProllyNodeRef child;
+			uint64		count;
+			uint64		take;
+
+			node_child(env, &node, i, &child, &count);
+			held += count;
+			if (len == 0 || offset >= count)
+			{
+				offset -= Min(offset, count);
+				continue;
+			}
+			take = Min(len, count - offset);
+			read_value_range(env, &child, count, offset, take, out);
+			len -= take;
+			offset = 0;
+		}
+		if (held != size)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly value tree node holds %llu bytes, its parent or reference says %llu",
+							(unsigned long long) held, (unsigned long long) size)));
+	}
+	node_release(&node);
+}
+
+/*
+ * Append bytes [offset, offset + len) of the value a reference refers to,
+ * as many as there are.
+ */
+static void
+read_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
+		   uint64 len, StringInfo out)
+{
+	ProllyTreeEnv venv;
+	ProllyNodeRef root;
+	uint64		total;
+
+	value_env(env, &venv);
+	decode_value_ref(ref, &root, &total);
+	if (offset >= total || len == 0)
+		return;
+	len = Min(len, total - offset);
+	if (len > (uint64) (MaxAllocSize - 1) - (uint64) out->len)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("prolly value of %llu bytes is too large to read",
+						(unsigned long long) len)));
+	enlargeStringInfo(out, (int) len);
+	read_value_range(&venv, &root, total, offset, len, out);
 }
 
 /* Append the bytes of the value a reference refers to. */
 static void
 resolve_value(const ProllyTreeEnv *env, const ProllyValue *ref, StringInfo out)
 {
-	ProllyTreeEnv venv;
+	read_value(env, ref, 0, PG_UINT64_MAX, out);
+}
+
+/* (a tree's nodes go into the store before its root does) */
+static bool
+cow_value_present(const ProllyTreeEnv *env, const ProllyValue *ref)
+{
 	ProllyNodeRef root;
 	uint64		len;
-	ProllyTreeCursor *c;
-	ProllyKey	k;
-	ProllyValue v;
-	int			before = out->len;
 
-	value_env(env, &venv);
 	decode_value_ref(ref, &root, &len);
-	c = cow_cursor_open(&venv, &root, CurrentMemoryContext);
-	while (cow_cursor_next(c, &k, &v))
-		appendBinaryStringInfo(out, (const char *) v.data, v.len);
-	cow_cursor_close(c);
-	if ((uint64) (out->len - before) != len)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("prolly value tree holds %d bytes, its reference says %llu",
-						out->len - before, (unsigned long long) len)));
+	return PROLLY_CALL(env->chunk_store, has, env->chunks, &root.hash);
 }
 
 /*
- * A leaf item for key and value, the value stored out of line if it is
- * long (its reference then built in refbuf, which the item points into).
+ * A leaf item for key and value: the value stored out of line if it is
+ * long, and led by the references it holds if the environment finds any.
+ * What the item stores is built in buf, which it points into.
  */
 static void
 leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
-		  const ProllyValue *value, Item *item, StringInfo refbuf)
+		  const ProllyValue *value, Item *item, StringInfo buf)
 {
 	item->key = *key;
 	item->count = 1;
-	item->ref = value->len > VALUE_INLINE_MAX;
-	if (item->ref)
+	item->flags = 0;
+	if (env->value_refs)
 	{
-		write_value_tree(env, value, refbuf);
-		item->value.data = (const uint8 *) refbuf->data;
-		item->value.len = refbuf->len;
+		int			start = buf->len;
+		int			n;
+
+		/* the references, then their length put before them */
+		env->value_refs(value, env->value_refs_arg, buf);
+		n = buf->len - start;
+		if (n > 0)
+		{
+			StringInfoData len;
+			char		lenbuf[16];
+
+			len.data = lenbuf;
+			len.len = 0;
+			len.maxlen = sizeof(lenbuf);
+			prolly_put_varint(&len, n);
+			enlargeStringInfo(buf, len.len);
+			memmove(buf->data + start + len.len, buf->data + start, n);
+			memcpy(buf->data + start, len.data, len.len);
+			buf->len += len.len;
+			buf->data[buf->len] = '\0';
+			item->flags |= PROLLY_ITEM_VALUE_REFS;
+		}
+	}
+	if (value->len > VALUE_INLINE_MAX)
+	{
+		item->flags |= PROLLY_ITEM_VALUE_REF;
+		write_value_tree(env, value->data, value->len, buf);
 	}
 	else
-		item->value = *value;
+		appendBinaryStringInfo(buf, (const char *) value->data, value->len);
+	item->value.data = (const uint8 *) buf->data;
+	item->value.len = buf->len;
+}
+
+/*
+ * A leaf item's value as stored, without the references it leads with:
+ * the value, or its value tree's reference.  Sets *refs to those (empty if
+ * none).
+ */
+static void
+item_payload(ProllyValue *value, uint8 flags, ProllyValue *refs)
+{
+	refs->data = value->data;
+	refs->len = 0;
+	if (flags & PROLLY_ITEM_VALUE_REFS)
+	{
+		const char *p = (const char *) value->data;
+		const char *end = p + value->len;
+		uint64		n = prolly_get_varint(&p, end);
+
+		if (n > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid prolly value references")));
+		refs->data = (const uint8 *) p;
+		refs->len = (uint32) n;
+		value->len -= (p + n) - (const char *) value->data;
+		value->data = (const uint8 *) (p + n);
+	}
+}
+
+/*
+ * A leaf value as read, without the references it leads with: if it is out
+ * of line, its bytes are appended to out (true); otherwise value is left
+ * pointing at them.
+ */
+static bool
+leaf_value_into(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
+				StringInfo out)
+{
+	ProllyValue refs;
+
+	item_payload(value, flags, &refs);
+	if (!(flags & PROLLY_ITEM_VALUE_REF))
+		return false;
+	resolve_value(env, value, out);
+	return true;
+}
+
+/* A leaf value as read: its bytes, from its value tree if out of line. */
+static void
+leaf_value(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
+		   StringInfo buf)
+{
+	if (flags & PROLLY_ITEM_VALUE_REF)
+		resetStringInfo(buf);
+	if (leaf_value_into(env, value, flags, buf))
+	{
+		value->data = (const uint8 *) buf->data;
+		value->len = buf->len;
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -641,7 +957,7 @@ builder_emit(void *arg, uint16 level, const ProllyKey *maxkey,
 	parent.value.data = (const uint8 *) child.data;
 	parent.value.len = child.len;
 	parent.count = count;
-	parent.ref = false;
+	parent.flags = 0;
 	builder_add_at(b, level + 1, &parent);
 	pfree(child.data);
 }
@@ -727,12 +1043,12 @@ static void
 cow_build_add(ProllyTreeBuilder *b, const ProllyKey *key, const ProllyValue *value)
 {
 	Item		item;
-	StringInfoData refbuf;
+	StringInfoData stored;
 
-	initStringInfo(&refbuf);
-	leaf_item(b->env, key, value, &item, &refbuf);
+	initStringInfo(&stored);
+	leaf_item(b->env, key, value, &item, &stored);
 	builder_add_at(b, 0, &item);
-	pfree(refbuf.data);
+	pfree(stored.data);
 }
 
 static void
@@ -902,7 +1218,7 @@ iter_item(Iter *it, Item *item)
 	uint8		flags;
 
 	node_item(it->env, &fr->node, fr->idx, &item->key, &item->value, &flags);
-	item->ref = (flags & PROLLY_ITEM_VALUE_REF) != 0;
+	item->flags = flags;
 	if (fr->node.level == 0)
 		item->count = 1;
 	else
@@ -941,9 +1257,7 @@ cow_get(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		node_item(env, &fr->node, i, &k, &v, &flags);
 		if (cmp_keys(env, &k, key) == 0)
 		{
-			if (flags & PROLLY_ITEM_VALUE_REF)
-				resolve_value(env, &v, value);
-			else
+			if (!leaf_value_into(env, &v, flags, value))
 				appendBinaryStringInfo(value, v.data, v.len);
 			found = true;
 		}
@@ -976,6 +1290,18 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
+/* Append h to *hashes, which holds *n of room for *max. */
+static void
+add_hash(ProllyHash **hashes, int *n, int *max, const ProllyHash *h)
+{
+	if (*n == *max)
+	{
+		*max *= 2;
+		*hashes = repalloc(*hashes, sizeof(ProllyHash) * *max);
+	}
+	(*hashes)[(*n)++] = *h;
+}
+
 /*
  * Tell the store which chunks the walk reads next: an internal node's
  * children, or a leaf's value trees (a source a store reads through can
@@ -986,39 +1312,80 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 {
 	ProllyHash *hashes;
 	int			n = 0;
+	int			max;
 
 	/* (only when a hint would hear them) */
 	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
 		node->nitems == 0 ||
 		!PROLLY_CALL(env->chunk_store, prefetch, env->chunks, NULL, 0))
 		return;
-	hashes = palloc(sizeof(ProllyHash) * node->nitems);
+	max = node->nitems;
+	hashes = palloc(sizeof(ProllyHash) * max);
 	for (int i = 0; i < node->nitems; i++)
 	{
 		ProllyNodeRef ref;
+		ProllyKey	k;
+		ProllyValue v;
+		ProllyValue refs;
+		uint8		flags;
+		uint64		len;
 
 		if (node->level > 0)
 		{
-			uint64		count;
-
-			node_child(env, node, i, &ref, &count);
+			node_child(env, node, i, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
+			continue;
 		}
-		else
+		node_item(env, node, i, &k, &v, &flags);
+		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+			continue;
+		item_payload(&v, flags, &refs);
+		if (flags & PROLLY_ITEM_VALUE_REF)
 		{
-			ProllyKey	k;
-			ProllyValue v;
-			uint8		flags;
-			uint64		len;
-
-			node_item(env, node, i, &k, &v, &flags);
-			if (!(flags & PROLLY_ITEM_VALUE_REF))
-				continue;
 			decode_value_ref(&v, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
 		}
-		hashes[n++] = ref.hash;
+		for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
+		{
+			next_value_ref(&p, end, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
+		}
 	}
 	(void) PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
 	pfree(hashes);
+}
+
+static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+					  ProllyTreeVisitNode visit, void *arg);
+
+/*
+ * A leaf item's value trees walked: its own, if it is stored out of line,
+ * and those of the references it holds.
+ */
+static void
+walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
+		   ProllyTreeVisitNode visit, void *arg)
+{
+	ProllyValue v = *value;
+	ProllyValue refs;
+	ProllyTreeEnv venv;
+	ProllyNodeRef vroot;
+	uint64		len;
+
+	if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+		return;
+	item_payload(&v, flags, &refs);
+	value_env(env, &venv);
+	if (flags & PROLLY_ITEM_VALUE_REF)
+	{
+		decode_value_ref(&v, &vroot, &len);
+		(void) walk_node(&venv, &vroot, visit, arg);
+	}
+	for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
+	{
+		next_value_ref(&p, end, &vroot, &len);
+		(void) walk_node(&venv, &vroot, visit, arg);
+	}
 }
 
 /* Whether the visitor took the node. */
@@ -1038,7 +1405,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 		;						/* the visitor has seen what is below */
 	else if (node.level == 0)
 	{
-		/* Value trees of values stored out of line. */
+		/* Value trees of values stored out of line, and of references. */
 		for (int i = 0; i < node.nitems; i++)
 		{
 			ProllyKey	k;
@@ -1046,16 +1413,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 			uint8		flags;
 
 			node_item(env, &node, i, &k, &v, &flags);
-			if (flags & PROLLY_ITEM_VALUE_REF)
-			{
-				ProllyTreeEnv venv;
-				ProllyNodeRef vroot;
-				uint64		len;
-
-				value_env(env, &venv);
-				decode_value_ref(&v, &vroot, &len);
-				(void) walk_node(&venv, &vroot, visit, arg);
-			}
+			walk_value(env, &v, flags, visit, arg);
 		}
 	}
 	else
@@ -1184,13 +1542,7 @@ cow_cursor_next(ProllyTreeCursor *c, ProllyKey *key, ProllyValue *value)
 		return false;
 	fr = iter_frame(it);
 	node_item(it->env, &fr->node, fr->idx, key, value, &flags);
-	if (flags & PROLLY_ITEM_VALUE_REF)
-	{
-		resetStringInfo(&c->value);
-		resolve_value(it->env, value, &c->value);
-		value->data = (const uint8 *) c->value.data;
-		value->len = c->value.len;
-	}
+	leaf_value(it->env, value, flags, &c->value);
 	c->advance = true;
 	return true;
 }
@@ -1304,7 +1656,7 @@ parent_put(EditList *out, const WindowNode *n)
 	e.item.value.data = (const uint8 *) child.data;
 	e.item.value.len = child.len;
 	e.item.count = n->count;
-	e.item.ref = false;
+	e.item.flags = 0;
 	e.is_delete = false;
 	editlist_add(out, &e);
 }
@@ -1532,11 +1884,11 @@ cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		}
 		else
 		{
-			StringInfoData refbuf;
+			StringInfoData stored;
 
 			/* In the apply's memory, which lasts until it ends. */
-			initStringInfo(&refbuf);
-			leaf_item(env, &edits[i].key, &edits[i].value, &e.item, &refbuf);
+			initStringInfo(&stored);
+			leaf_item(env, &edits[i].key, &edits[i].value, &e.item, &stored);
 		}
 		e.is_delete = edits[i].is_delete;
 		editlist_add(&cur, &e);
@@ -1690,13 +2042,7 @@ static const ProllyValue *
 reported(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
 		 StringInfo buf)
 {
-	if (flags & PROLLY_ITEM_VALUE_REF)
-	{
-		resetStringInfo(buf);
-		resolve_value(env, value, buf);
-		value->data = (const uint8 *) buf->data;
-		value->len = buf->len;
-	}
+	leaf_value(env, value, flags, buf);
 	return value;
 }
 
@@ -1826,22 +2172,6 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	pfree(bufb.data);
 }
 
-/* A leaf item's value tree, if it is stored out of line: walked. */
-static void
-walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
-		   ProllyTreeVisitNode visit, void *arg)
-{
-	ProllyTreeEnv venv;
-	ProllyNodeRef vroot;
-	uint64		len;
-
-	if (!(flags & PROLLY_ITEM_VALUE_REF))
-		return;
-	value_env(env, &venv);
-	decode_value_ref(value, &vroot, &len);
-	(void) walk_node(&venv, &vroot, visit, arg);
-}
-
 /*
  * Visit the nodes of to that from may not have, as the diff finds them:
  * subtrees with equal hashes skipped without being read, a subtree only to
@@ -1954,8 +2284,10 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 }
 
 /*
- * An internal node's children, a leaf's value trees: read from the chunk
- * alone, so the chunk store can check what it names before it is anyone's.
+ * An internal node's children, a leaf's value trees (its values' own, and
+ * those of the references they hold): read from the chunk alone, so the
+ * chunk store can check what it names before it is anyone's, and keep
+ * what it names when it collects.
  */
 static void
 cow_references(const ProllyChunkFormatRoutine *format, const void *data,
@@ -1971,21 +2303,30 @@ cow_references(const ProllyChunkFormatRoutine *format, const void *data,
 		ProllyValue v;
 		uint8		flags;
 		ProllyHash	ref;
+		ProllyNodeRef root;
+		ProllyValue refs;
 		uint64		n;
 
 		PROLLY_CALL(format, item_get, &node, i, &k, &v, &flags);
 		if (node.level > 0)
-			decode_child(&v, &ref, &n);
-		else if (flags & PROLLY_ITEM_VALUE_REF)
 		{
-			ProllyNodeRef root;
-
-			decode_value_ref(&v, &root, &n);
-			ref = root.hash;
-		}
-		else
+			decode_child(&v, &ref, &n);
+			visit(&ref, arg);
 			continue;
-		visit(&ref, arg);
+		}
+		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+			continue;
+		item_payload(&v, flags, &refs);
+		if (flags & PROLLY_ITEM_VALUE_REF)
+		{
+			decode_value_ref(&v, &root, &n);
+			visit(&root.hash, arg);
+		}
+		for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
+		{
+			next_value_ref(&p, end, &root, &n);
+			visit(&root.hash, arg);
+		}
 	}
 }
 
@@ -1993,7 +2334,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.info = {
 		.iface = PROLLY_IFACE_TREE,
 		.impl_id = COW_IMPL_ID,
-		.format_version = 1,
+		.format_version = 3,
 		.name = "cow",
 		.description = "copy-on-write prolly trees in a chunk store",
 	},
@@ -2011,4 +2352,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.diff = cow_diff,
 	.diff_nodes = cow_diff_nodes,
 	.references = cow_references,
+	.value_write = write_value_tree,
+	.value_read = read_value,
+	.value_present = cow_value_present,
 };

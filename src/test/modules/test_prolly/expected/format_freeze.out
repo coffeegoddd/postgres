@@ -78,6 +78,17 @@ INSERT INTO frozen.non_ascii
 SELECT convert_from(decode(h, 'hex'), 'UTF8'), convert_from(decode(h || '21', 'hex'), 'UTF8'),
 	jsonb_build_object(convert_from(decode(h, 'hex'), 'UTF8'), g)
 FROM unnest(ARRAY['c3a9', 'c39f', 'c3bc', 'c384', 'c3a96c6cc3a8', '6e61c3af7665']) WITH ORDINALITY u(h, g);
+-- Large values, out of line in value trees addressed by byte counts:
+-- rows of one long value, and of several medium ones over a node's
+-- inline limit together, from bytes that don't repeat.
+CREATE TABLE frozen.large (k int PRIMARY KEY, t text, b bytea);
+INSERT INTO frozen.large
+SELECT g, string_agg(md5(g::text || ':' || i), '' ORDER BY i), NULL
+FROM generate_series(1, 3) g, generate_series(1, 25 * g * g) i GROUP BY g;
+INSERT INTO frozen.large
+SELECT 10 + g, string_agg(md5(g::text || '-' || i), '' ORDER BY i),
+	decode(string_agg(md5(g::text || '+' || i), '' ORDER BY i), 'hex')
+FROM generate_series(1, 3) g, generate_series(1, 50) i GROUP BY g;
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
        name       |                               tree                               | unreadable 
@@ -85,15 +96,16 @@ WHERE name LIKE 'frozen.%' ORDER BY name;
  frozen.bool_keys | d04d885b23f1fc97cb3a0b562d78b9e06e3dc27d40f6912859590c77017d37c8 | 
  frozen.composite | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
  frozen.keyless   | b5ef3d66d0a49c160542af1794d03a1493a4a0256c0181782b3eac7c76ba1d0d | 
+ frozen.large     | 0358a81e973ee335bd03364304062146a27611383d5b505807236bb0677739a3 | 
  frozen.non_ascii | efa7d18e1a1a60c9fdce43ac8557fe6cd9226777440ee27d9c6a635259e1decd | 
  frozen.scalars   | d528770538ba46b234fd863614f1ff5936ca642802030d74bc138b6c8f59e4ab | 
  frozen.sent_keys | 8bb2334d74f996b153d6c002289e2504480ced23f8d7efd0589ff1e0a53a0c7c | 
  frozen.special   | bc3c956bf4a022e9df3bf6399c48a6645ff6b283d1ad54d4e08e5bf07ca910de | 
  frozen.special_n | ab02342d95270ade28aab540f2ba4b0fc9c170fb176617dec9346f8c5aa47020 | 
-(8 rows)
+(9 rows)
 
 DROP SCHEMA frozen CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 10 other objects
 DETAIL:  drop cascades to type frozen.pair
 drop cascades to table frozen.scalars
 drop cascades to table frozen.composite
@@ -103,3 +115,4 @@ drop cascades to table frozen.bool_keys
 drop cascades to table frozen.special
 drop cascades to table frozen.special_n
 drop cascades to table frozen.non_ascii
+drop cascades to table frozen.large

@@ -20,6 +20,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_memo.h"
 #include "access/prolly_remote.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_tree.h"
@@ -31,6 +32,7 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "varatt.h"
 
@@ -1043,6 +1045,80 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	values[1] = Int64GetDatum((int64) r.chunks_freed);
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
 	values[3] = Int64GetDatum((int64) r.window_usec);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+typedef struct NewNodes
+{
+	HTAB	   *seen;
+	bool		adding;			/* walking the first commit */
+	int64		visited;
+} NewNodes;
+
+static bool
+note_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	NewNodes   *n = arg;
+	ProllyHash	h;
+	bool		found;
+
+	memset(&h, 0, sizeof(h));
+	h.len = node->hash.len;
+	memcpy(h.bytes, node->hash.bytes, h.len);
+	hash_search(n->seen, &h, n->adding ? HASH_ENTER : HASH_FIND, &found);
+	if (found)
+		return false;
+	if (!n->adding)
+		n->visited++;
+	return true;
+}
+
+/*
+ * test_walk_new_count(from, to): how many nodes the refs' walk from commit
+ * to visits that it doesn't from commit from: what to added to the store.
+ */
+PG_FUNCTION_INFO_V1(test_walk_new_count);
+Datum
+test_walk_new_count(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	from;
+	ProllyHash	to;
+	HASHCTL		ctl;
+	NewNodes	n = {0};
+
+	text_hash(PG_GETARG_TEXT_PP(0), &from);
+	text_hash(PG_GETARG_TEXT_PP(1), &to);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	n.seen = hash_create("test_walk_new_count", 1024, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	prolly_database_components(&dc);
+	n.adding = true;
+	PROLLY_CALL(dc.refs, walk_commit, &from, note_node, &n);
+	n.adding = false;
+	PROLLY_CALL(dc.refs, walk_commit, &to, note_node, &n);
+	hash_destroy(n.seen);
+	PG_RETURN_INT64(n.visited);
+}
+
+/* test_memo_counters(reset): the value memo's hits and misses. */
+PG_FUNCTION_INFO_V1(test_memo_counters);
+Datum
+test_memo_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	ProllyMemoCounters c;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(prolly_memo_lookup("shared"), counters, &c, PG_GETARG_BOOL(0));
+	values[0] = Int64GetDatum((int64) c.hits);
+	values[1] = Int64GetDatum((int64) c.misses);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

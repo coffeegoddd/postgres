@@ -1,0 +1,586 @@
+-- Large values in versioned tables: TOAST holds them in the working set;
+-- a commit stores them out of line, in value trees addressed by byte
+-- counts.  They read back whole from history, and a few bytes inserted
+-- in the middle of one add a few nodes to the store, not one per chunk
+-- after them.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA lv VERSIONED;
+CREATE TABLE lv.big (id int PRIMARY KEY, t text, b bytea);
+INSERT INTO lv.big
+SELECT g, string_agg(md5(g || ':' || i), '' ORDER BY i),
+	decode(repeat(to_hex(g * 17), 30000), 'hex')
+FROM generate_series(1, 5) g, generate_series(1, 2000 * g) i GROUP BY g;
+CREATE TABLE lv.keyless (t text);
+INSERT INTO lv.keyless SELECT repeat('k', 100000) FROM generate_series(1, 3);
+CREATE VIEW lv.digest AS
+SELECT string_agg(id || ':' || length(t) || ':' || md5(t) || ':' || md5(b), ','
+				  ORDER BY id) AS d
+FROM lv.big;
+SELECT d AS before FROM lv.digest \gset
+SELECT left(:'before', 9) AS first_row;
+ first_row 
+-----------
+ 1:64000:7
+(1 row)
+
+SELECT (dolt_commit('-Am', 'large values'))[1] AS c1 \gset
+-- Three bytes inserted into the middle of a 192 KB value.
+UPDATE lv.big SET t = overlay(t PLACING 'XYZ' FROM 96000 FOR 0) WHERE id = 3;
+SELECT length(t) FROM lv.big WHERE id = 3;
+ length 
+--------
+ 192003
+(1 row)
+
+SELECT d AS after FROM lv.digest \gset
+SELECT (dolt_commit('-am', 'an insertion'))[1] AS c2 \gset
+SELECT test_walk_new_count(:'c1', :'c2') < 20 AS few_nodes_added;
+ few_nodes_added 
+-----------------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, length((from_row).t), length((to_row).t)
+FROM dolt_diff(:'c1', :'c2', NULL::lv.big);
+ diff_type | id | length | length 
+-----------+----+--------+--------
+ modified  |  3 | 192000 | 192003
+(1 row)
+
+-- Back to the first commit and forward again, from history alone.
+SELECT dolt_reset('--hard', :'c1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT d = :'before' AS restored FROM lv.digest;
+ restored 
+----------
+ t
+(1 row)
+
+DELETE FROM lv.keyless;
+SELECT dolt_reset('--hard', :'c2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT d = :'after' AS forward FROM lv.digest;
+ forward 
+---------
+ t
+(1 row)
+
+SELECT count(*), sum(length(t)) FROM lv.keyless;
+ count |  sum   
+-------+--------
+     3 | 300000
+(1 row)
+
+-- A row's long values are each out of line in a value tree of their own,
+-- named by their bytes alone: a small column's update leaves its row's
+-- long value's tree as it was, and a value copied into another row (or
+-- another table) adds nothing to the store but the row.
+CREATE TABLE lv.doc (id int PRIMARY KEY, n int, body text);
+INSERT INTO lv.doc
+SELECT 1, 0, string_agg(md5('doc' || i), '' ORDER BY i)
+FROM generate_series(1, 30000) i;
+SELECT (dolt_commit('-Am', 'a 960 KB document'))[1] AS d1 \gset
+UPDATE lv.doc SET n = n + 1;
+SELECT (dolt_commit('-am', 'its counter'))[1] AS d2 \gset
+-- (the commit, its root and the table's leaf: no node of the value's tree)
+SELECT test_walk_new_count(:'d1', :'d2') <= 3 AS small_update_few_nodes;
+ small_update_few_nodes 
+------------------------
+ t
+(1 row)
+
+INSERT INTO lv.doc SELECT 2, 0, body FROM lv.doc WHERE id = 1;
+CREATE TABLE lv.copy (body text);
+INSERT INTO lv.copy SELECT body FROM lv.doc WHERE id = 1;
+SELECT (dolt_commit('-Am', 'copies'))[1] AS d3 \gset
+-- (the commit, its root and a leaf of each table)
+SELECT test_walk_new_count(:'d2', :'d3') <= 4 AS copies_few_nodes;
+ copies_few_nodes 
+------------------
+ t
+(1 row)
+
+SELECT diff_type, (to_row).id, (to_row).n, length((to_row).body)
+FROM dolt_diff(:'d1', :'d3', NULL::lv.doc) ORDER BY 2;
+ diff_type | id | n | length 
+-----------+----+---+--------
+ modified  |  1 | 1 | 960000
+ added     |  2 | 0 | 960000
+(2 rows)
+
+-- A long primary key: the key encodes the whole value; the row holds a
+-- reference.  Rows keyed by it are found again across folds, and come
+-- back from history.
+CREATE TABLE lv.longkey (k text PRIMARY KEY, v int);
+INSERT INTO lv.longkey
+SELECT repeat(chr(97 + g), 3000) || g, g FROM generate_series(1, 5) g;
+SELECT (dolt_commit('-Am', 'long keys'))[1] AS k1 \gset
+UPDATE lv.longkey SET v = v * 10 WHERE v % 2 = 0;
+DELETE FROM lv.longkey WHERE v = 5;
+SELECT (dolt_commit('-am', 'long keys changed'))[1] AS k2 \gset
+SELECT diff_type, length(coalesce((from_row).k, (to_row).k)), (from_row).v, (to_row).v
+FROM dolt_diff(:'k1', :'k2', NULL::lv.longkey) ORDER BY 3;
+ diff_type | length | v | v  
+-----------+--------+---+----
+ modified  |   3001 | 2 | 20
+ modified  |   3001 | 4 | 40
+ removed   |   3001 | 5 |   
+(3 rows)
+
+SELECT dolt_reset('--hard', :'k1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT length(k), v FROM lv.longkey ORDER BY v;
+ length | v 
+--------+---
+   3001 | 1
+   3001 | 2
+   3001 | 3
+   3001 | 4
+   3001 | 5
+(5 rows)
+
+SELECT dolt_reset('--hard', :'k2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT length(k), v FROM lv.longkey ORDER BY v;
+ length | v  
+--------+----
+   3001 |  1
+   3001 |  3
+   3001 | 20
+   3001 | 40
+(4 rows)
+
+-- A full collection of the chunk store keeps every value tree the
+-- commits' rows reference (each leaf names them, as walks find them), so
+-- history still reads back whole.
+SELECT md5(string_agg(id || ':' || n || ':' || md5(body), ',' ORDER BY id)) AS docs_gc
+FROM lv.doc \gset
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+ kept 
+------
+ t
+(1 row)
+
+DELETE FROM lv.doc;
+UPDATE lv.longkey SET v = 0;
+SELECT dolt_reset('--hard', :'d3');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT md5(string_agg(id || ':' || n || ':' || md5(body), ',' ORDER BY id)) = :'docs_gc'
+	AS docs_after_gc
+FROM lv.doc;
+ docs_after_gc 
+---------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'k1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT length(k), v FROM lv.longkey ORDER BY v;
+ length | v 
+--------+---
+   3001 | 1
+   3001 | 2
+   3001 | 3
+   3001 | 4
+   3001 | 5
+(5 rows)
+
+SELECT dolt_reset('--hard', :'k2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A fold that meets a TOAST pointer it folded before writes the reference
+-- it made then, without reading the value (the memo): an UPDATE of a small
+-- column keeps the long one's pointer, and the next commit hits.  What a
+-- transaction remembers is forgotten if it rolls back.
+CREATE TABLE lv.memo (id int PRIMARY KEY, n int, body text);
+ALTER TABLE lv.memo ALTER COLUMN body SET STORAGE EXTERNAL;
+INSERT INTO lv.memo
+SELECT g, 0, string_agg(md5(g || '/' || i), '' ORDER BY i)
+FROM generate_series(1, 3) g, generate_series(1, 3000) i GROUP BY g;
+SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(body) IS NOT NULL) AS out_of_line
+FROM lv.memo;
+ out_of_line 
+-------------
+           3
+(1 row)
+
+SELECT count(*) AS reset FROM test_memo_counters(true);
+ reset 
+-------
+     1
+(1 row)
+
+SELECT (dolt_commit('-Am', 'memo'))[1] AS m1 \gset
+SELECT hits, misses >= 3 AS each_body_read FROM test_memo_counters(true);
+ hits | each_body_read 
+------+----------------
+    0 | t
+(1 row)
+
+UPDATE lv.memo SET n = n + 1;
+SELECT (dolt_commit('-am', 'memo counters'))[1] AS m2 \gset
+SELECT hits, misses FROM test_memo_counters(true);
+ hits | misses 
+------+--------
+    3 |      0
+(1 row)
+
+SELECT test_walk_new_count(:'m1', :'m2') <= 3 AS no_value_nodes;
+ no_value_nodes 
+----------------
+ t
+(1 row)
+
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) AS memo_rows
+FROM lv.memo \gset
+-- (the commit's rows are the table's: read back from it)
+UPDATE lv.memo SET body = 'gone';
+SELECT dolt_reset('--hard', :'m2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) = :'memo_rows'
+	AS from_history
+FROM lv.memo;
+ from_history 
+--------------
+ t
+(1 row)
+
+-- a commit rolled back: what its fold remembered is forgotten (the
+-- reset above folded the rows it wrote, and remembered their values)
+INSERT INTO lv.memo
+SELECT 4, 0, string_agg(md5('4/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+BEGIN;
+SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ROLLBACK;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+ reset 
+-------
+     1
+(1 row)
+
+SELECT (dolt_commit('-am', 'memo again'))[1] AS m3 \gset
+SELECT hits = 3 AS others_hit, misses = 1 AS rolled_back_missed
+FROM test_memo_counters(true);
+ others_hit | rolled_back_missed 
+------------+--------------------
+ t          | t
+(1 row)
+
+SELECT md5(body) AS body4 FROM lv.memo WHERE id = 4 \gset
+DELETE FROM lv.memo WHERE id = 4;
+SELECT dolt_reset('--hard', :'m3');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT md5(body) = :'body4' AS body4_from_history FROM lv.memo WHERE id = 4;
+ body4_from_history 
+--------------------
+ t
+(1 row)
+
+-- a fold in a savepoint released into one rolled back: forgotten too
+INSERT INTO lv.memo
+SELECT 6, 0, string_agg(md5('6/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT length(dolt_commit('-am', 'in a savepoint')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+RELEASE b;
+ROLLBACK TO a;
+COMMIT;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+ reset 
+-------
+     1
+(1 row)
+
+SELECT length(dolt_commit('-am', 'savepoints')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT hits = 4 AS others_hit, misses = 1 AS rolled_back_missed
+FROM test_memo_counters(true);
+ others_hit | rolled_back_missed 
+------------+--------------------
+ t          | t
+(1 row)
+
+DELETE FROM lv.memo WHERE id = 6;
+-- a value whose first chunk is frozen isn't remembered (its xmin's age is
+-- unknown): every fold reads it
+INSERT INTO lv.memo
+SELECT 5, 0, string_agg(md5('5/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+VACUUM (FREEZE) lv.memo;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+ reset 
+-------
+     1
+(1 row)
+
+SELECT length(dolt_commit('-am', 'frozen')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE lv.memo SET n = n + 1 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'frozen again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- (the freeze made every row a candidate: the others hit in both folds)
+SELECT hits = 8 AS others_hit, misses = 2 AS frozen_read_twice
+FROM test_memo_counters(true);
+ others_hit | frozen_read_twice 
+------------+-------------------
+ t          | t
+(1 row)
+
+-- A reset or merge that changes a keyed row updates it in place, and a
+-- long value whose reference is the same on both sides keeps the row's
+-- TOAST pointer: it isn't read, compressed or stored again.  A table with
+-- another unique index is written as before (removed and inserted, which
+-- a swap of unique values needs), its values stored anew.
+CREATE TABLE lv.keep (id int PRIMARY KEY, n int, body text);
+ALTER TABLE lv.keep ALTER COLUMN body SET STORAGE EXTERNAL;
+CREATE TABLE lv.unique2 (id int PRIMARY KEY, n int UNIQUE, body text);
+ALTER TABLE lv.unique2 ALTER COLUMN body SET STORAGE EXTERNAL;
+INSERT INTO lv.keep
+SELECT g, 0, string_agg(md5(g || '|' || i), '' ORDER BY i)
+FROM generate_series(1, 2) g, generate_series(1, 2000) i GROUP BY g;
+INSERT INTO lv.unique2 SELECT id, id, body FROM lv.keep;
+CREATE VIEW lv.toasted AS
+SELECT 'keep' AS t, id, n, pg_column_toast_chunk_id(body) AS chunk, md5(body) AS body
+FROM lv.keep
+UNION ALL
+SELECT 'unique2', id, n, pg_column_toast_chunk_id(body), md5(body) FROM lv.unique2;
+SELECT (dolt_commit('-Am', 'kept'))[1] AS p1 \gset
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+UPDATE lv.keep SET n = n + 1;
+UPDATE lv.unique2 SET n = n + 10;
+SELECT (dolt_commit('-am', 'kept, counted'))[1] AS p2 \gset
+SELECT dolt_reset('--hard', :'p1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT t, id, a.n, a.chunk = b.chunk AS same_pointer, a.body = b.body AS same_body
+FROM lv.toasted a JOIN before_reset b USING (t, id) ORDER BY t, id;
+    t    | id | n | same_pointer | same_body 
+---------+----+---+--------------+-----------
+ keep    |  1 | 0 | t            | t
+ keep    |  2 | 0 | t            | t
+ unique2 |  1 | 1 | f            | t
+ unique2 |  2 | 2 | f            | t
+(4 rows)
+
+-- a body that did change is stored anew
+SELECT dolt_reset('--hard', :'p2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE lv.keep SET body = body || 'x' WHERE id = 2;
+SELECT (dolt_commit('-am', 'one body changed'))[1] AS p3 \gset
+DROP TABLE before_reset;
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+SELECT dolt_reset('--hard', :'p2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT t, id, a.chunk = b.chunk AS same_pointer, length(k.body)
+FROM lv.toasted a JOIN before_reset b USING (t, id) JOIN lv.keep k USING (id)
+WHERE t = 'keep' ORDER BY id;
+  t   | id | same_pointer | length 
+------+----+--------------+--------
+ keep |  1 | t            |  64000
+ keep |  2 | f            |  64000
+(2 rows)
+
+-- a merge of a change to the counters keeps the pointers too
+SELECT dolt_reset('--hard', :'p3');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('counting');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('counting') IS NOT NULL AS on_counting;
+ on_counting 
+-------------
+ t
+(1 row)
+
+UPDATE lv.keep SET n = n + 10;
+SELECT length(dolt_commit('-am', 'counted on a branch')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE lv.memo SET n = n + 1 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a change on main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP TABLE before_reset;
+CREATE TEMP TABLE before_reset AS SELECT * FROM lv.toasted;
+SELECT (dolt_merge('counting'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT t, id, a.n, a.chunk = b.chunk AS same_pointer, a.body = b.body AS same_body
+FROM lv.toasted a JOIN before_reset b USING (t, id) WHERE t = 'keep' ORDER BY id;
+  t   | id | n  | same_pointer | same_body 
+------+----+----+--------------+-----------
+ keep |  1 | 11 | t            | t
+ keep |  2 | 11 | t            | t
+(2 rows)
+
+SELECT dolt_branch('-D', 'counting');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TABLE before_reset;
+-- Pushed and cloned: a walk from a commit reaches every value tree its
+-- rows reference, so the clone reads them all.
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/large-' || txid_current() AS url \gset
+SELECT current_database() AS db \gset
+SELECT d AS digest FROM lv.digest \gset
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) AS docs FROM lv.doc \gset
+SELECT dolt_remote('add', 'large', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('large', 'main') AS pushed;
+          pushed          
+--------------------------
+ {0,"main -> large/main"}
+(1 row)
+
+CREATE DATABASE regress_large_clone;
+\c regress_large_clone
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT d = :'digest' AS same_values FROM lv.digest;
+ same_values 
+-------------
+ t
+(1 row)
+
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) = :'docs' AS same_docs
+FROM lv.doc;
+ same_docs 
+-----------
+ t
+(1 row)
+
+SELECT count(*), sum(length(t)) FROM lv.keyless;
+ count |  sum   
+-------+--------
+     3 | 300000
+(1 row)
+
+\c :db
+DROP DATABASE regress_large_clone;
+SELECT dolt_remote('remove', 'large');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA lv CASCADE;
+NOTICE:  drop cascades to 10 other objects
+DETAIL:  drop cascades to table lv.big
+drop cascades to table lv.keyless
+drop cascades to table lv.doc
+drop cascades to table lv.copy
+drop cascades to table lv.longkey
+drop cascades to view lv.digest
+drop cascades to table lv.memo
+drop cascades to table lv.keep
+drop cascades to table lv.unique2
+drop cascades to view lv.toasted
+SELECT length(dolt_commit('-Am', 'lv gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

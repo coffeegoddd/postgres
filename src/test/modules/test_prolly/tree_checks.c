@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_datum.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "common/pg_prng.h"
@@ -1200,6 +1201,7 @@ tree_nodes_are_valid(const ProllyImplInfo *impl)
  * the out-of-line values' nodes.
  */
 #define BIG_KEYS	40
+#define CHUNK_MIN_BYTES	512	/* the value trees' smallest chunk */
 
 static void
 big_value(int k, int version, StringInfo buf)
@@ -1248,6 +1250,154 @@ big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->values_ok &= after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+}
+
+/* Whether reading [offset, offset + len) of ref fails as corrupted. */
+static bool
+value_read_corrupt(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+				   const ProllyValue *ref, uint64 offset, uint64 len)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	StringInfoData got;
+	bool		corrupt = false;
+
+	initStringInfo(&got);
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		PROLLY_CALL(tr, value_read, env, ref, offset, len, &got);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		corrupt = edata->sqlerrcode == ERRCODE_DATA_CORRUPTED;
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	pfree(got.data);
+	return corrupt;
+}
+
+/*
+ * A value tree on its own: a value of a few megabytes comes back whole and
+ * by slices (any offset and length, past the end too), reading only the
+ * nodes a slice needs; and inserting or deleting a byte in its middle
+ * writes O(depth) nodes, not one per chunk after it.
+ */
+static void
+value_trees(const ProllyTreeRoutine *tr, ProllyTreeEnv *env)
+{
+	ProllyNodeCounters counters = {0};
+	StringInfoData val;
+	StringInfoData ref;
+	StringInfoData got;
+	ProllyValue r;
+	uint64		x = 42;
+	static const uint64 offsets[] = {0, 1, 4095, 4096, 100000, 1999999, 2999999};
+	static const uint64 lens[] = {0, 1, 7, 5000, 70000};
+
+	initStringInfo(&val);
+	while (val.len < 3000000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&val, (char) (x >> 56));
+	}
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, env, (const uint8 *) val.data, val.len, &ref);
+	r.data = (const uint8 *) ref.data;
+	r.len = ref.len;
+
+	initStringInfo(&got);
+	PROLLY_CALL(tr, value_read, env, &r, 0, PG_UINT64_MAX, &got);
+	if (got.len != val.len || memcmp(got.data, val.data, val.len) != 0)
+		elog(ERROR, "a value tree of %d bytes read back otherwise", val.len);
+
+	for (int i = 0; i < lengthof(offsets); i++)
+	{
+		for (int j = 0; j < lengthof(lens); j++)
+		{
+			uint64		want = offsets[i] >= (uint64) val.len ? 0 :
+				Min(lens[j], (uint64) val.len - offsets[i]);
+
+			resetStringInfo(&got);
+			counters.nodes_read = 0;
+			env->counters = &counters;
+			PROLLY_CALL(tr, value_read, env, &r, offsets[i], lens[j], &got);
+			env->counters = NULL;
+			if ((uint64) got.len != want ||
+				memcmp(got.data, val.data + offsets[i], got.len) != 0)
+				elog(ERROR, "a slice of %llu bytes at %llu read %d bytes, or others",
+					 (unsigned long long) lens[j], (unsigned long long) offsets[i],
+					 got.len);
+			if (counters.nodes_read > 4 + lens[j] / CHUNK_MIN_BYTES)
+				elog(ERROR, "a slice of %llu bytes at %llu read %llu nodes",
+					 (unsigned long long) lens[j], (unsigned long long) offsets[i],
+					 (unsigned long long) counters.nodes_read);
+		}
+	}
+	resetStringInfo(&got);
+	PROLLY_CALL(tr, value_read, env, &r, val.len, 10, &got);
+	PROLLY_CALL(tr, value_read, env, &r, PG_UINT64_MAX - 1, 10, &got);
+	if (got.len != 0)
+		elog(ERROR, "a slice past a value's end read %d bytes", got.len);
+
+	/* A reference saying fewer or more bytes than its tree holds. */
+	for (int d = -1; d <= 1; d += 2)
+	{
+		StringInfoData bad;
+		ProllyValue b;
+
+		initStringInfo(&bad);
+		appendBinaryStringInfo(&bad, ref.data, 1 + (uint8) ref.data[0]);
+		prolly_put_varint(&bad, val.len + d);
+		b.data = (const uint8 *) bad.data;
+		b.len = bad.len;
+		if (!value_read_corrupt(tr, env, &b, 0, PG_UINT64_MAX) ||
+			!value_read_corrupt(tr, env, &b, 100, 10))
+			elog(ERROR, "a value tree of %d bytes read through a reference saying %d",
+				 val.len, val.len + d);
+		pfree(bad.data);
+	}
+
+	/* A byte inserted in the middle, then deleted. */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		StringInfoData edited;
+		StringInfoData eref;
+		int			mid = val.len / 2;
+
+		initStringInfo(&edited);
+		appendBinaryStringInfo(&edited, val.data, mid);
+		if (pass == 0)
+			appendStringInfoChar(&edited, 'x');
+		appendBinaryStringInfo(&edited, val.data + mid + (pass == 0 ? 0 : 1),
+							   val.len - mid - (pass == 0 ? 0 : 1));
+		initStringInfo(&eref);
+		counters.nodes_written = 0;
+		env->counters = &counters;
+		PROLLY_CALL(tr, value_write, env, (const uint8 *) edited.data,
+					edited.len, &eref);
+		env->counters = NULL;
+		if (counters.nodes_written > 8)
+			elog(ERROR, "%s one byte in a %d-byte value wrote %llu nodes",
+				 pass == 0 ? "inserting" : "deleting", val.len,
+				 (unsigned long long) counters.nodes_written);
+		pfree(edited.data);
+		pfree(eref.data);
+	}
+	pfree(val.data);
+	pfree(ref.data);
+	pfree(got.data);
 }
 
 void
@@ -1367,7 +1517,34 @@ tree_large_values(const ProllyImplInfo *impl)
 	if (d.nchanges != 1 || d.key != 13 || !d.values_ok)
 		elog(ERROR, "diff of one changed large value reported %d changes (key %d, values %s)",
 			 d.nchanges, d.key, d.values_ok ? "right" : "wrong");
+
+	/* One byte inserted in the middle: still few nodes, as by byte counts. */
+	{
+		ProllyEdit	edit;
+		KeyBuf		kb;
+		StringInfoData ins;
+
+		big_value(17, 0, &vbuf);
+		initStringInfo(&ins);
+		appendBinaryStringInfo(&ins, vbuf.data, vbuf.len / 2);
+		appendStringInfoChar(&ins, '#');
+		appendBinaryStringInfo(&ins, vbuf.data + vbuf.len / 2,
+							   vbuf.len - vbuf.len / 2);
+		edit.key = key_of(17, &kb);
+		edit.value.data = (const uint8 *) ins.data;
+		edit.value.len = ins.len;
+		edit.is_delete = false;
+		counters.nodes_written = 0;
+		env.counters = &counters;
+		PROLLY_CALL(tr, apply, &env, &built, &edit, 1, &changed);
+		env.counters = NULL;
+		if (counters.nodes_written > 12)
+			elog(ERROR, "inserting one byte in a %u-byte value wrote %llu nodes",
+				 vbuf.len, (unsigned long long) counters.nodes_written);
+		pfree(ins.data);
+	}
 	pfree(vbuf.data);
+	value_trees(tr, &env);
 }
 
 /* The key of large_keys' item i: n bytes, all 'a' but its first few. */
@@ -1482,4 +1659,308 @@ tree_large_keys(const ProllyImplInfo *impl)
 	if (!refused)
 		elog(ERROR, "a tree of keys of 40000 bytes was built");
 	pfree(kbuf.data);
+}
+
+/*
+ * Values that hold references to value trees of their own (value_write()'s),
+ * which the environment's value_refs() finds: they read back as they were
+ * put, from get, cursors and diff, long ones too; a tree built at once and
+ * one built by edits are the same; and a walk reaches every value tree a
+ * value references, from the nodes alone, with no value_refs() set.
+ *
+ * A held value here is a byte, the number of references, then each
+ * reference, then filler.
+ */
+#define HELD_KEYS	30
+
+static void
+held_refs(const ProllyValue *value, void *arg, StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+	int			n = (uint8) *p++;
+
+	(*(int *) arg)++;
+	for (int i = 0; i < n; i++)
+	{
+		const char *start = p;
+
+		p += 1 + (uint8) *p;
+		(void) prolly_get_varint(&p, end);
+		appendBinaryStringInfo(refs, start, p - start);
+	}
+}
+
+/* Blob b's bytes: random, 5 to 40 KB. */
+static void
+held_blob(int b, StringInfo buf)
+{
+	uint64		x = 977 * (uint64) b + 3;
+	int			len = 5000 + b * 7919 % 35000;
+
+	resetStringInfo(buf);
+	while (buf->len < len)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(buf, (char) (x >> 56));
+	}
+}
+
+/* Key k's value at version v, its references taken from refs. */
+static void
+held_value(int k, int v, StringInfo *refs, StringInfo buf)
+{
+	int			n = (k + v) % 3;
+
+	resetStringInfo(buf);
+	appendStringInfoChar(buf, (char) n);
+	for (int i = 0; i < n; i++)
+	{
+		StringInfo	r = refs[(k * 2 + i + v) % 8];
+
+		appendBinaryStringInfo(buf, r->data, r->len);
+	}
+	/* every fifth value long, stored out of line itself */
+	for (int i = 0; i < (k % 5 == 0 ? 3000 : 20); i++)
+		appendStringInfoChar(buf, (char) ('a' + (k + i) % 26));
+}
+
+typedef struct HeldDiff
+{
+	StringInfo *refs;
+	int			nchanges;
+	bool		ok;
+} HeldDiff;
+
+static void
+held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
+				const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	HeldDiff   *d = arg;
+	StringInfoData want;
+
+	d->nchanges++;
+	initStringInfo(&want);
+	held_value(key_int(key), 0, d->refs, &want);
+	d->ok &= before && before->len == want.len &&
+		memcmp(before->data, want.data, want.len) == 0;
+	held_value(key_int(key), 1, d->refs, &want);
+	d->ok &= after && after->len == want.len &&
+		memcmp(after->data, want.data, want.len) == 0;
+	pfree(want.data);
+}
+
+/* A prefetch hint: the chunks heard, into a HashSet. */
+static void
+held_hint(void *arg, const ProllyHash *hashes, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		ProllyNodeRef ref = {0};
+
+		ref.hash = hashes[i];
+		(void) collect_node(&ref, 0, arg);
+	}
+}
+
+/* A chunk's reference, into a HashSet. */
+static void
+held_reference(const ProllyHash *ref, void *arg)
+{
+	ProllyNodeRef node = {0};
+
+	node.hash = *ref;
+	(void) collect_node(&node, 0, arg);
+}
+
+/* Whether set holds the root of the value tree ref names. */
+static bool
+holds_ref(const HashSet *set, const StringInfo ref)
+{
+	ProllyHash	h;
+
+	memset(&h, 0, sizeof(h));
+	h.len = (uint8) ref->data[0];
+	memcpy(h.bytes, ref->data + 1, h.len);
+	return in_set(set, &h);
+}
+
+void
+tree_held_references(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	StringInfo	refs[8];
+	StringInfoData vbuf;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef built;
+	ProllyNodeRef edited;
+	ProllyNodeRef changed;
+	ProllyTreeCursor *c;
+	ProllyKey	key;
+	ProllyValue value;
+	HashSet		visited = {0};
+	HashSet		heard = {0};
+	HashSet		named = {0};
+	HashSet		diffed = {0};
+	HeldDiff	d = {refs, 0, true};
+	int			calls = 0;
+	int			n = 0;
+
+	make_env(&env);
+	initStringInfo(&vbuf);
+	for (int i = 0; i < 8; i++)
+	{
+		refs[i] = makeStringInfo();
+		held_blob(i, &vbuf);
+		PROLLY_CALL(tr, value_write, &env, (const uint8 *) vbuf.data, vbuf.len,
+					refs[i]);
+	}
+	env.value_refs = held_refs;
+	env.value_refs_arg = &calls;
+
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	for (int k = 0; k < HELD_KEYS; k++)
+	{
+		KeyBuf		kb;
+
+		key = key_of(k, &kb);
+		held_value(k, 0, refs, &vbuf);
+		value.data = (const uint8 *) vbuf.data;
+		value.len = vbuf.len;
+		PROLLY_CALL(tr, build_add, b, &key, &value);
+	}
+	PROLLY_CALL(tr, build_finish, b, &built);
+	if (calls != HELD_KEYS)
+		elog(ERROR, "value_refs() was called %d times for %d values", calls,
+			 HELD_KEYS);
+
+	/* By edits, in two batches. */
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tr, build_finish, b, &edited);
+	for (int half = 0; half < 2; half++)
+	{
+		ProllyEdit	edits[HELD_KEYS];
+		KeyBuf		kbs[HELD_KEYS];
+		StringInfoData bufs[HELD_KEYS];
+		int			m = 0;
+
+		for (int k = half; k < HELD_KEYS; k += 2)
+		{
+			initStringInfo(&bufs[m]);
+			held_value(k, 0, refs, &bufs[m]);
+			edits[m].key = key_of(k, &kbs[m]);
+			edits[m].value.data = (const uint8 *) bufs[m].data;
+			edits[m].value.len = bufs[m].len;
+			edits[m].is_delete = false;
+			m++;
+		}
+		PROLLY_CALL(tr, apply, &env, &edited, edits, m, &edited);
+	}
+	if (!same_hash(&built, &edited))
+		elog(ERROR, "a tree of values holding references built at once and by edits differ");
+
+	/* Read back as put. */
+	for (int k = 0; k < HELD_KEYS; k++)
+	{
+		KeyBuf		kb;
+		StringInfoData got;
+
+		key = key_of(k, &kb);
+		initStringInfo(&got);
+		held_value(k, 0, refs, &vbuf);
+		if (!PROLLY_CALL(tr, get, &env, &built, &key, &got) ||
+			got.len != vbuf.len || memcmp(got.data, vbuf.data, got.len) != 0)
+			elog(ERROR, "get of key %d returned another value", k);
+		pfree(got.data);
+	}
+	c = PROLLY_CALL(tr, cursor_open, &env, &built, CurrentMemoryContext);
+	PROLLY_CALL(tr, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tr, cursor_next, c, &key, &value))
+	{
+		held_value(key_int(&key), 0, refs, &vbuf);
+		if (value.len != vbuf.len || memcmp(value.data, vbuf.data, value.len) != 0)
+			elog(ERROR, "a cursor returned another value for key %d", key_int(&key));
+		n++;
+	}
+	PROLLY_CALL(tr, cursor_close, c);
+	if (n != HELD_KEYS)
+		elog(ERROR, "a cursor returned %d of %d keys", n, HELD_KEYS);
+
+	/*
+	 * A walk, with nothing to say how values are laid out, reaches them all;
+	 * and so do the prefetch hints it gives a store that hears them.
+	 */
+	env.value_refs = NULL;
+	if (PROLLY_HAS(env.chunk_store, read_through))
+		PROLLY_CALL(env.chunk_store, read_through, env.chunks, NULL, held_hint,
+					&heard);
+	PROLLY_CALL(tr, walk, &env, &built, collect_node, &visited);
+	if (PROLLY_HAS(env.chunk_store, read_through))
+		PROLLY_CALL(env.chunk_store, read_through, env.chunks, NULL, NULL, NULL);
+	/*
+	 * And so does what the tree says its nodes' chunks name, read from the
+	 * chunks alone (as the chunk store checks what it stores, and collects).
+	 */
+	if (PROLLY_HAS(tr, references))
+	{
+		StringInfoData chunk;
+
+		initStringInfo(&chunk);
+		for (int j = 0; j < visited.n; j++)
+		{
+			resetStringInfo(&chunk);
+			if (!PROLLY_CALL(env.chunk_store, get, env.chunks, &visited.hashes[j],
+							 &chunk))
+				elog(ERROR, "a node a walk visited isn't in the store");
+			PROLLY_CALL(tr, references, env.chunk_format, chunk.data, chunk.len,
+						held_reference, &named);
+		}
+		pfree(chunk.data);
+	}
+	for (int i = 0; i < 8; i++)
+	{
+		if (PROLLY_HAS(tr, references) && !holds_ref(&named, refs[i]))
+			elog(ERROR, "no node's chunk names value tree %d, which values reference",
+				 i);
+		if (!holds_ref(&visited, refs[i]))
+			elog(ERROR, "a walk didn't reach value tree %d, which values reference",
+				 i);
+		if (PROLLY_HAS(env.chunk_store, read_through) && !holds_ref(&heard, refs[i]))
+			elog(ERROR, "a walk's prefetch hints didn't name value tree %d", i);
+	}
+
+	/* Every other value changed: diff reports them as put. */
+	env.value_refs = held_refs;
+	{
+		ProllyEdit	edits[HELD_KEYS];
+		KeyBuf		kbs[HELD_KEYS];
+		StringInfoData bufs[HELD_KEYS];
+		int			m = 0;
+
+		for (int k = 0; k < HELD_KEYS; k += 2)
+		{
+			initStringInfo(&bufs[m]);
+			held_value(k, 1, refs, &bufs[m]);
+			edits[m].key = key_of(k, &kbs[m]);
+			edits[m].value.data = (const uint8 *) bufs[m].data;
+			edits[m].value.len = bufs[m].len;
+			edits[m].is_delete = false;
+			m++;
+		}
+		PROLLY_CALL(tr, apply, &env, &built, edits, m, &changed);
+	}
+	PROLLY_CALL(tr, diff, &env, &built, &changed, held_diff_visit, &d);
+	if (d.nchanges != HELD_KEYS / 2 || !d.ok)
+		elog(ERROR, "diff of values holding references reported %d changes (values %s)",
+			 d.nchanges, d.ok ? "right" : "wrong");
+
+	/* diff_nodes() reaches the value trees the changed values reference. */
+	PROLLY_CALL(tr, diff_nodes, &env, &built, &changed, collect_node, &diffed);
+	for (int k = 0; k < HELD_KEYS; k += 2)
+		for (int i = 0; i < (k + 1) % 3; i++)
+			if (!holds_ref(&diffed, refs[(k * 2 + i + 1) % 8]))
+				elog(ERROR, "diff_nodes() didn't reach value tree %d, which a changed value references",
+					 (k * 2 + i + 1) % 8);
+	pfree(vbuf.data);
 }

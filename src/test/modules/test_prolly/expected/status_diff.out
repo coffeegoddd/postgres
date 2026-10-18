@@ -299,6 +299,110 @@ SELECT length(dolt_commit('-Am', 'sdu gone')::text) AS committed;
         66
 (1 row)
 
+-- A column whose values are local OIDs (oid, a large object's reference
+-- through a domain over it, the reg* types, and types made of them) is
+-- one too: status lists it and still shows its table's rows; a commit
+-- refuses it, rather than versioning the numbers.
+CREATE SCHEMA sdl VERSIONED;
+CREATE DOMAIN sdl.lo AS oid;
+CREATE TYPE sdl.pair AS (a int, b regclass);
+CREATE TABLE sdl.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'sdl')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE sdl.t ADD COLUMN doc sdl.lo;
+INSERT INTO sdl.t VALUES (1, 'one', 16400);
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
+ table_name | staged |   status    
+------------+--------+-------------
+ sdl.t      | t      | modified
+ sdl.t.doc  | f      | not covered
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdl.t);
+ diff_type |    to_row     
+-----------+---------------
+ added     | (1,one,16400)
+(1 row)
+
+SELECT dolt_commit('-am', 'a large object');
+ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.t.doc
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+-- a reset folds the working set as a commit does, so it is refused too
+-- until the column is dropped
+SELECT dolt_reset('--hard');
+ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.t.doc
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+ALTER TABLE sdl.t DROP COLUMN doc;
+CREATE TABLE sdl.u (id int PRIMARY KEY, o oid, c regclass, r oid[], p sdl.pair,
+	x oid8);
+SELECT dolt_commit('-Am', 'oids');
+ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.u.c
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
+ table_name | staged |   status    
+------------+--------+-------------
+ sdl.t      | t      | modified
+ sdl.u      | t      | new table
+ sdl.u.c    | f      | not covered
+ sdl.u.o    | f      | not covered
+ sdl.u.p    | f      | not covered
+ sdl.u.r    | f      | not covered
+ sdl.u.x    | f      | not covered
+(7 rows)
+
+DROP TABLE sdl.u;
+-- domains over arrays, ranges and multiranges (of an ordinary schema's
+-- range type), arrays of composites, and pg_node_tree, whose text names
+-- objects by OID
+CREATE SCHEMA sdl_shared;
+CREATE TYPE sdl_shared.oidrange AS RANGE (subtype = oid);
+CREATE DOMAIN sdl.los AS oid[];
+CREATE TABLE sdl.w (id int PRIMARY KEY, a sdl.los, g sdl_shared.oidrange,
+	m sdl_shared.oidmultirange, ps sdl.pair[], n pg_node_tree, ok int[]);
+SELECT dolt_commit('-Am', 'more oids');
+ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.w.a
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.w%' ORDER BY table_name;
+ table_name | staged |   status    
+------------+--------+-------------
+ sdl.w      | t      | new table
+ sdl.w.a    | f      | not covered
+ sdl.w.g    | f      | not covered
+ sdl.w.m    | f      | not covered
+ sdl.w.n    | f      | not covered
+ sdl.w.ps   | f      | not covered
+(6 rows)
+
+DROP TABLE sdl.w;
+CREATE MATERIALIZED VIEW sdl.mv USING prolly AS SELECT 'sdl.t'::regclass AS c;
+SELECT dolt_commit('-Am', 'a materialized view');
+ERROR:  prolly commits don't cover columns of types that hold OIDs yet: sdl.mv.c
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP MATERIALIZED VIEW sdl.mv;
+SELECT length(dolt_commit('-Am', 'no oids')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP SCHEMA sdl CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to type sdl.lo
+drop cascades to type sdl.pair
+drop cascades to table sdl.t
+drop cascades to type sdl.los
+DROP SCHEMA sdl_shared CASCADE;
+NOTICE:  drop cascades to type sdl_shared.oidrange
+SELECT length(dolt_commit('-Am', 'sdl gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 -- A diff of one table reads that table's changes alone, however many
 -- others changed.
 CREATE SCHEMA sdo VERSIONED;

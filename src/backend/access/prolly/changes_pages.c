@@ -78,7 +78,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		4
+#define STATE_VERSION		6
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -121,6 +121,7 @@ typedef struct Finder
 	ProllyTreeEnv memenv;		/* the same, ordered by bytes */
 	const ProllyKeyingRoutine *kr;
 	ProllyKeying *k;
+	ProllyKeyingRefs krefs;		/* k's values out of line, in env's store */
 	bool		keyless;
 	TupleDesc	desc;
 	Relation	pk;				/* NULL if keyless */
@@ -204,8 +205,8 @@ parse_state(const ProllyValue *state, State *st)
 
 	memset(st, 0, sizeof(*st));
 	/*
-	 * (a baseline of another version, keyless rows keyed as they were then,
-	 * is folded again in full)
+	 * (a baseline of another version, its data trees in a format before
+	 * this one's, is folded again in full: its unchanged rows aren't kept)
 	 */
 	if (state->len < 1 + 8 + 4 + 4 + 4 + 4 || version != STATE_VERSION)
 		return false;
@@ -302,6 +303,9 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->memenv = *env;
 	f->memenv.compare = prolly_bytes_compare;
 	f->memenv.compare_arg = NULL;
+	prolly_keying_use_env(&f->krefs, f->kr, f->k, f->tree, &f->env);
+	/* (the carried keys' rows hold references too, if a key is long) */
+	prolly_keying_use_env_rows(&f->krefs, &f->memenv);
 	f->desc = RelationGetDescr(rel);
 	f->values = palloc_array(Datum, f->desc->natts);
 	f->isnull = palloc_array(bool, f->desc->natts);

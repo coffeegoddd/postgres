@@ -27,7 +27,7 @@ the record of what was decided for it. D1 is removed by #177, #178 and
 | Row locks, update chains (38, 39) | **(D1)** Decided by the user 2026-10-14: per-table writer lock, exclusive for writes and FOR [NO KEY] UPDATE, shared for FOR [KEY] SHARE; forwarding entries in the TID map. Built in 4d.2. The writer lock was a stopgap: K1's row-level locks replaced it in 4e.3 |
 | Prolly indexes (17, 42, 43) | **(D1)** Decided by the user 2026-10-14: refused on heap tables; entries point at row keys; the table AM removes old entries at once. Built in 4d.3 |
 | ANALYZE sampling (44) | **(D1)** Decided by the user 2026-10-14: a table AM hook for the row sampler, and positional lookups from subtree counts; keyless tables and tables the transaction wrote are read whole. Built in 4d.4 |
-| Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | For the page design: the format frozen (#114) and changed twice since, each a clean break of the root's `"!:format"` item (`FOLDED_FORMAT`): keyless keying (#149, "2") and names escaped in the canonical text (#195, "3"); transaction memory is Postgres's; reclamation is step 7. Was: Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
+| Canonical format freeze, transaction memory, large values, reclamation roots (45–49) | For the page design: the format frozen (#114) and changed four times since, each a clean break of the root's `"!:format"` item (`FOLDED_FORMAT`): keyless keying (#149, "2"), names escaped in the canonical text (#195, "3"), value trees addressed by byte counts (#218, "4") and a row's long values each a value tree of its own (#219, "5"); transaction memory is Postgres's; reclamation is step 7. Was: Recommended 2026-10-14 after the Dolt and DoltLite comparisons, scheduled in 4e–4g (roadmap); open until built |
 | TID source, reuse, clone (37 changed, 40, 41) | **(D1)** Decided by the user 2026-10-14: per-table counter TIDs, built in 4d.2; reuse after VACUUM required in 4f; implicit maps planned for clone |
 | Temporary and unlogged tables (28) | Decided by the user 2026-10-14: heap, never versioned, even when prolly is the default; an explicit `USING prolly` on them is refused. Built in 4e.5 |
 | Step 4's remaining decisions (23, 25, 27, 29, 34, 35, 46–56) | Decided by the user 2026-10-14, as recommended: see each question |
@@ -335,6 +335,13 @@ the record of what was decided for it. D1 is removed by #177, #178 and
       known OID-free encoding (`oid` itself, unknown extension types), with
       a clear error, rather than hashing a local identifier.
       **Decided (user, 2026-10-14):** as recommended.
+      **Built (#217, 2026-10-17), the refusal:** a commit refuses a column
+      whose type holds OIDs: `oid`, `oid8` and the `reg*` types (refused
+      until their portable codecs are built), `pg_node_tree`, and the
+      domains (contrib's `lo`), arrays, composites and ranges made of
+      them; status and diff
+      list each such column as not covered (`14-large-values-and-toast.md`
+      part 7).
     - Types with no binary send format (`aclitem`, user and extension
       types declared with text I/O only). **Decided (user, 2026-10-15):**
       stored as their text output, with the settings that affect output
@@ -538,6 +545,13 @@ the record of what was decided for it. D1 is removed by #177, #178 and
     method's version; compressing pages is a later storage choice.
     **Built (4f.1):** in the tree layer, for every tree; chunks keyed by
     offset for now.
+    **Changed (#218–#221, 2026-10-17):** value trees are addressed by byte
+    counts; a column whose canonical bytes are longer than 2 KB is stored
+    as a reference to a value tree of its own, the whole row out of line
+    only when still long; leaves record the references their values hold,
+    so walks find them; a memo from TOAST pointers to references spares a
+    fold reading unchanged values; apply keeps a row's own TOAST pointer
+    for a value that didn't change (`14-large-values-and-toast.md` part 5).
 49. **What reclamation must keep.** Reachability from branch heads alone
     isn't enough.
     **Recommended (2026-10-14), for 4f:** the live roots are every

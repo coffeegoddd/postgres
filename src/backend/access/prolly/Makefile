@@ -30,6 +30,8 @@ OBJS = \
 	keyenc_stub.o \
 	keying_pkprefix.o \
 	keying_stub.o \
+	memo_shared.o \
+	memo_stub.o \
 	merge_stub.o \
 	prolly_chunkstore.o \
 	prolly_config.o \

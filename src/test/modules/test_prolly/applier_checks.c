@@ -68,7 +68,7 @@ test_apply(PG_FUNCTION_ARGS)
 	if (strcmp(op, "insert") == 0 && new)
 		PROLLY_CALL(ar, insert, a, new);
 	else if (strcmp(op, "update") == 0 && old && new)
-		done = PROLLY_CALL(ar, update, a, old, new);
+		done = PROLLY_CALL(ar, update, a, old, new, NULL);
 	else if (strcmp(op, "remove") == 0 && old)
 		done = PROLLY_CALL(ar, remove, a, old);
 	else

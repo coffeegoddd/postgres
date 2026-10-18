@@ -109,6 +109,8 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_VALUE_ENCODER, "decodes_earlier_layouts",
 	"begin layout begin_layout encode decode end",
 	valenc_decodes_earlier_layouts},
+	{PROLLY_IFACE_VALUE_ENCODER, "long_values",
+	"begin encode decode end set_values refs", valenc_long_values},
 
 	/* reclamation */
 	{PROLLY_IFACE_RECLAMATION, "live_chunks_never_freed", "collect", NULL},
@@ -177,8 +179,11 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_TREE, "nodes_are_valid",
 	"build_begin build_add build_finish walk", tree_nodes_are_valid},
 	{PROLLY_IFACE_TREE, "large_values",
-	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff",
+	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff value_write value_read",
 	tree_large_values},
+	{PROLLY_IFACE_TREE, "held_references",
+	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff diff_nodes value_write value_read",
+	tree_held_references},
 };
 
 /* ------------------------------------------------------------------------

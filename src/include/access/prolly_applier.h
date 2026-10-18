@@ -18,7 +18,10 @@
  * - insert() adds a row.  update() replaces a row equal to old with new,
  *   and remove() deletes one; both find old by the table's primary key
  *   (deferrable or not), or, if it has none, a row whose every column has
- *   old's bytes, and return false if there's no such row.
+ *   old's bytes, and return false if there's no such row.  update() gives
+ *   each column keep marks (keep may be NULL: none) the value the row
+ *   found has, as it is stored: a value TOAST stored out of line keeps its
+ *   pointer, so it is neither read nor stored again.
  * - Rows are written with index maintenance and the checks of NOT NULL,
  *   CHECK and unique and exclusion constraints (deferrable ones when they
  *   are due), but fire no user triggers and check no foreign keys, as
@@ -50,7 +53,7 @@ typedef struct ProllyApplierRoutine
 	ProllyApplier *(*begin) (Relation rel);
 	void		(*insert) (ProllyApplier *a, TupleTableSlot *row);
 	bool		(*update) (ProllyApplier *a, TupleTableSlot *old,
-						   TupleTableSlot *row);
+						   TupleTableSlot *row, const bool *keep);
 	bool		(*remove) (ProllyApplier *a, TupleTableSlot *old);
 	void		(*end) (ProllyApplier *a);
 } ProllyApplierRoutine;

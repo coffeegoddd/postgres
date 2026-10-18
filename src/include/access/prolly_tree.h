@@ -30,7 +30,7 @@
  *   it, or until it is closed.  Nodes are immutable, so reading them takes
  *   no locks.
  * - Errors are raised with ereport(); an item too large for a node is an
- *   error (large values go out of line, in a later step).
+ *   error.  A long leaf value goes out of line, into a value tree.
  * - If env->counters is set, every node an operation reads from the chunk
  *   store adds one to nodes_read, and every node it writes (not one the
  *   store already had) one to nodes_written, so callers can check an
@@ -86,7 +86,32 @@ typedef struct ProllyTreeEnv
 	const ProllyChunkFormatRoutine *chunk_format;
 	const ProllyChunkStoreRoutine *chunk_store;
 	ProllyChunkStore *chunks;	/* opened by the caller */
+
+	/*
+	 * Optional, for a tree whose leaf values hold references to value trees
+	 * of their own (value_write()'s): appends the references a value holds
+	 * to refs, one after another.  A leaf records them, so walks reach those
+	 * value trees from the nodes alone, without knowing how values are laid
+	 * out.  Every tree written with values that hold references must have
+	 * it set.
+	 */
+	void		(*value_refs) (const ProllyValue *value, void *arg,
+							   StringInfo refs);
+	void	   *value_refs_arg;
 } ProllyTreeEnv;
+
+/*
+ * Where values out of line are stored and read: a tree implementation's
+ * value trees, in an environment's chunk store; and, optionally, a memo of
+ * the values TOAST stored out of line that were stored there before
+ * (prolly_memo.h).
+ */
+typedef struct ProllyValueStore
+{
+	const struct ProllyTreeRoutine *tree;
+	const ProllyTreeEnv *env;
+	const struct ProllyValueMemoRoutine *memo;	/* NULL if none */
+} ProllyValueStore;
 
 /* One change for apply(): a put, or a delete if is_delete. */
 typedef struct ProllyEdit
@@ -187,14 +212,33 @@ typedef struct ProllyTreeRoutine
 	void		(*references) (const ProllyChunkFormatRoutine *format,
 							   const void *data, Size len,
 							   ProllyChunkRefVisit visit, void *arg);
+
+	/*
+	 * Values out of line, as the tree stores a long leaf value: a value
+	 * tree in the same chunk store.  value_write() stores len bytes and
+	 * appends their reference to ref: a function of the bytes alone, which
+	 * names the value tree's root and records the length.  value_read()
+	 * appends bytes [offset, offset + len) of the value a reference names
+	 * (fewer if it ends first), reading only the nodes that hold them, so a
+	 * slice costs O(depth + its length).  walk() visits a value tree from
+	 * its root as any tree.
+	 */
+	void		(*value_write) (const ProllyTreeEnv *env, const uint8 *data,
+								Size len, StringInfo ref);
+	void		(*value_read) (const ProllyTreeEnv *env, const ProllyValue *ref,
+							   uint64 offset, uint64 len, StringInfo out);
+
+	/* Whether the value tree a reference names is in the chunk store. */
+	bool		(*value_present) (const ProllyTreeEnv *env,
+								  const ProllyValue *ref);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
-	"walk", "diff", "diff_nodes", "references"
+	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", "value_present"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK references
+#define PROLLY_TREE_LAST_CALLBACK value_present
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

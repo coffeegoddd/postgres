@@ -17,7 +17,7 @@ FROM prolly_implementations();
  content_hash  | test_broken  |    9002 |              0
  key_encoder   | ordered      |       1 |              1
  key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              1
+ value_encoder | canonical    |       2 |              2
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
@@ -27,7 +27,7 @@ FROM prolly_implementations();
  transfer      | stub         |       0 |              0
  diff_merge    | folded       |       3 |              1
  diff_merge    | stub         |       0 |              0
- tree          | cow          |       1 |              1
+ tree          | cow          |       1 |              3
  tree          | stub         |       0 |              0
  table_keying  | pk_or_prefix |       2 |              1
  table_keying  | stub         |       0 |              0
@@ -39,19 +39,21 @@ FROM prolly_implementations();
  row_applier   | stub         |       0 |              0
  table_file    | basic        |       1 |              1
  table_file    | stub         |       0 |              0
- change_finder | pages        |       1 |              4
+ change_finder | pages        |       1 |              6
  change_finder | stub         |       0 |              0
  remote        | file         |       1 |              1
  remote        | postgresql   |       2 |              1
  remote        | postgres     |       3 |              1
-(35 rows)
+ value_memo    | shared       |       1 |              1
+ value_memo    | stub         |       0 |              0
+(37 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
-   interface   | implementation |              test              |                                                                   result                                                                    
----------------+----------------+--------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------
+   interface   | implementation |              test              |                                                                                      result                                                                                      
+---------------+----------------+--------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  chunker       | bytes          | identity                       | pass
  chunker       | bytes          | deterministic                  | pass
  chunker       | bytes          | forced_split_respects_capacity | pass
@@ -83,6 +85,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | canonical      | independent_of_session         | pass
  value_encoder | canonical      | missing_values                 | pass
  value_encoder | canonical      | decodes_earlier_layouts        | pass
+ value_encoder | canonical      | long_values                    | pass
  value_encoder | canonical      | complete                       | pass
  value_encoder | stub           | identity                       | pass
  value_encoder | stub           | round_trip                     | not implemented (missing begin, encode, decode, end)
@@ -91,7 +94,8 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | stub           | independent_of_session         | not implemented (missing begin, encode, end)
  value_encoder | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
  value_encoder | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
- value_encoder | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ value_encoder | stub           | long_values                    | not implemented (missing begin, encode, decode, end, set_values, refs)
+ value_encoder | stub           | complete                       | not implemented (9 of 9 callbacks missing)
  reclamation   | copying        | identity                       | pass
  reclamation   | copying        | live_chunks_never_freed        | no checks yet
  reclamation   | copying        | keeps_what_writers_reference   | no checks yet
@@ -140,6 +144,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | cow            | seeks_in_order                 | pass
  tree          | cow            | nodes_are_valid                | pass
  tree          | cow            | large_values                   | pass
+ tree          | cow            | held_references                | pass
  tree          | cow            | complete                       | pass
  tree          | stub           | identity                       | pass
  tree          | stub           | build_and_get                  | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
@@ -156,8 +161,9 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree          | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
- tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff)
- tree          | stub           | complete                       | not implemented (14 of 14 callbacks missing)
+ tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read)
+ tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
+ tree          | stub           | complete                       | not implemented (17 of 17 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass
@@ -167,7 +173,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying  | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close)
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
- table_keying  | stub           | complete                       | not implemented (8 of 8 callbacks missing)
+ table_keying  | stub           | complete                       | not implemented (11 of 11 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
@@ -203,7 +209,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  remote        | postgres       | identity                       | pass
  remote        | postgres       | heads_and_chunks               | no checks yet
  remote        | postgres       | complete                       | pass
-(151 rows)
+ value_memo    | shared         | identity                       | pass
+ value_memo    | shared         | complete                       | pass
+ value_memo    | stub           | identity                       | pass
+ value_memo    | stub           | complete                       | not implemented (5 of 5 callbacks missing)
+(159 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -226,8 +236,9 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | seeks_in_order            | pass
  tree      | cow            | nodes_are_valid           | pass
  tree      | cow            | large_values              | pass
+ tree      | cow            | held_references           | pass
  tree      | cow            | complete                  | pass
-(17 rows)
+(18 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

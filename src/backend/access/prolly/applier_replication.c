@@ -50,6 +50,7 @@
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/injection_point.h"
 #include "utils/syscache.h"
 
 #define WRITE_PRIVS		(ACL_SELECT | ACL_INSERT | ACL_UPDATE | ACL_DELETE)
@@ -596,16 +597,74 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 	advance(a);
 }
 
+/*
+ * Whether the row found is as the fold before the change read it: not
+ * written since by a transaction the active snapshot doesn't see.  (The
+ * row found by its key is its newest version.)
+ */
 static bool
-replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row)
+found_as_read(ProllyApplier *a)
 {
-	if (!find_row(a, old))
+	bool		isnull;
+	TransactionId xmin = DatumGetTransactionId(slot_getsysattr(a->found,
+															   MinTransactionIdAttributeNumber,
+															   &isnull));
+
+	return TransactionIdIsCurrentTransactionId(xmin) ||
+		!XidInMVCCSnapshot(xmin, GetActiveSnapshot());
+}
+
+/*
+ * The columns keep marks, from the row found: its stored values.  (Never a
+ * materialized view's: it has no primary key to find its rows by.)
+ */
+static void
+keep_found(ProllyApplier *a, TupleTableSlot *row, const bool *keep)
+{
+	TupleDesc	desc = RelationGetDescr(a->rel);
+	Datum	   *values = palloc_array(Datum, desc->natts);
+	bool	   *isnull = palloc_array(bool, desc->natts);
+
+	Assert(!a->matview);
+	slot_getallattrs(a->found);
+	slot_getallattrs(row);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		TupleTableSlot *from = keep[i] ? a->found : row;
+
+		values[i] = from->tts_values[i];
+		isnull[i] = from->tts_isnull[i];
+	}
+	/* (formed anew: the found row's values are its buffer's) */
+	ExecForceStoreHeapTuple(heap_form_tuple(desc, values, isnull), row, true);
+	pfree(values);
+	pfree(isnull);
+}
+
+static bool
+replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
+				   const bool *keep)
+{
+	bool		keeping = false;
+
+	for (int i = 0; keep && i < RelationGetDescr(a->rel)->natts; i++)
+		keeping |= keep[i];
+	if (keeping)
+		INJECTION_POINT("prolly-update-keeping", NULL);
+
+	/*
+	 * A row another transaction changed since the fold read it isn't old,
+	 * whatever its key: its values aren't the ones to keep.
+	 */
+	if (!find_row(a, old) || (keeping && !found_as_read(a)))
 	{
 		ExecClearTuple(a->found);
 		return false;
 	}
 	PG_TRY();
 	{
+		if (keeping)
+			keep_found(a, row, keep);
 		if (a->matview)
 		{
 			matview_delete(a);

@@ -13,8 +13,13 @@
  *   hold no local OIDs.  The one allowed exception: rows of a table with a
  *   column added with a default (atthasmissing) until the table is
  *   rewritten.
- * - Storing large values out of line is the tree's job (value trees,
- *   prolly_tree.h).
+ * - A long value is stored out of line, as a reference to a value tree
+ *   (value_write(), prolly_tree.h) in the encoder's value store, given by
+ *   set_values(); which values are is fixed by the format, never by the
+ *   row they are in, so a value encodes alike in every row.  Encoding or
+ *   decoding a row that has one without a value store is an error.  refs()
+ *   lists the references a row holds, for a tree's value_refs().  A whole
+ *   row that is still long is stored out of line by the tree.
  * - Postgres doesn't rewrite a table for every DDL change (DROP COLUMN,
  *   ADD COLUMN), so rows encoded under an earlier layout of the table
  *   remain.  layout() describes the layout rows are encoded with now (as
@@ -32,6 +37,7 @@
 #define PROLLY_VALENC_H
 
 #include "access/prolly_registry.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/tupdesc.h"
 #include "executor/tuptable.h"
@@ -60,12 +66,31 @@ typedef struct ProllyValueEncoderRoutine
 						   TupleTableSlot *slot);
 
 	void		(*end) (ProllyValueEncoder *enc);
+
+	/* Store and read values out of line in values (kept, not copied). */
+	void		(*set_values) (ProllyValueEncoder *enc,
+							   const ProllyValueStore *values);
+
+	/* Append the references to value trees an encoded row holds. */
+	void		(*refs) (ProllyValueEncoder *enc, const ProllyValue *row,
+						 StringInfo refs);
+
+	/*
+	 * decode(), except each column whose value is out of line with the same
+	 * reference in row before (of the same layout): left NULL and unread,
+	 * and marked in kept (by attribute index, false elsewhere), for the
+	 * caller to take from wherever before's value is.
+	 */
+	void		(*decode_kept) (ProllyValueEncoder *enc, const ProllyValue *row,
+								const ProllyValue *before,
+								TupleTableSlot *slot, bool *kept);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
-	"begin", "layout", "begin_layout", "encode", "decode", "end"
+	"begin", "layout", "begin_layout", "encode", "decode", "end", \
+	"set_values", "refs", "decode_kept"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK end
+#define PROLLY_VALENC_LAST_CALLBACK decode_kept
 
 static inline const ProllyValueEncoderRoutine *
 prolly_valenc_lookup(const char *name)

@@ -39,6 +39,7 @@
 #define PROLLY_KEYING_H
 
 #include "access/prolly_registry.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "executor/tuptable.h"
 #include "lib/stringinfo.h"
@@ -83,12 +84,59 @@ typedef struct ProllyKeyingRoutine
 							const ProllyKey *b);
 
 	void		(*close) (ProllyKeying *k);
+
+	/*
+	 * Where rows' values out of line are stored and read (the value
+	 * encoder's set_values()), kept, not copied; and the references an
+	 * encoded row holds.
+	 */
+	void		(*set_values) (ProllyKeying *k, const ProllyValueStore *values);
+	void		(*row_refs) (ProllyKeying *k, const ProllyValue *row,
+							 StringInfo refs);
+
+	/*
+	 * decode_row(), except the columns whose values out of line row before
+	 * holds too (the value encoder's decode_kept()): left NULL and unread,
+	 * and marked in kept.
+	 */
+	void		(*decode_row_kept) (ProllyKeying *k, const ProllyValue *row,
+									const ProllyValue *before,
+									TupleTableSlot *slot, bool *kept);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
-	"decode_row", "compare", "close"
+	"decode_row", "compare", "close", "set_values", "row_refs", \
+	"decode_row_kept"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK close
+#define PROLLY_KEYING_LAST_CALLBACK decode_row_kept
+
+/*
+ * Set up a data tree's environment and k's value store for each other:
+ * k stores values out of line in env's chunk store with tree, and env
+ * finds the references a tree value of k's holds (its value_refs()).
+ * env and refs must outlive their use.
+ */
+typedef struct ProllyKeyingRefs
+{
+	const struct ProllyKeyingRoutine *routine;
+	ProllyKeying *keying;
+	ProllyValueStore values;
+} ProllyKeyingRefs;
+
+extern void prolly_keying_use_env(ProllyKeyingRefs *refs,
+								  const struct ProllyKeyingRoutine *routine,
+								  ProllyKeying *k,
+								  const struct ProllyTreeRoutine *tree,
+								  ProllyTreeEnv *env);
+
+/*
+ * Set up env, of another tree in the same chunk store whose values are
+ * rows encoded as refs' keying encodes them (not its tree values), to find
+ * the references they hold.  refs must have been set up by
+ * prolly_keying_use_env().
+ */
+extern void prolly_keying_use_env_rows(ProllyKeyingRefs *refs,
+									   ProllyTreeEnv *env);
 
 #endif							/* PROLLY_KEYING_H */

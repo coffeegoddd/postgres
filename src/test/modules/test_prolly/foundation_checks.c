@@ -20,6 +20,7 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/tupdesc_details.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_datum.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_am.h"
@@ -702,6 +703,122 @@ valenc_round_trip(const ProllyImplInfo *impl)
 		}
 	}
 	ExecDropSingleTupleTableSlot(src);
+	PROLLY_CALL(ve, end, enc);
+}
+
+/*
+ * Long values out of line: a value whose canonical bytes are longer than
+ * 2048 is stored as a reference in the encoder's value store, and the row
+ * holds only the reference; refs() lists those references; the row decodes
+ * whole.  A value of exactly 2048 bytes stays in the row.  Encoding a long
+ * value without a value store is an error, never a row in another format.
+ */
+void
+valenc_long_values(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {{COL_I4}, {COL_TEXT}, {COL_I4_ARRAY}};
+	TupleDesc	desc = make_desc(cols, lengthof(cols));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *dst = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	ProllyTreeEnv env;
+	ProllyValueStore values = {0};
+	StringInfoData buf;
+	StringInfoData refs;
+	static const int lens[] = {2048, 2049, 100000};
+
+	prolly_folded_tree_env(&env);
+	values.tree = prolly_tree_lookup("cow");
+	values.env = &env;
+	initStringInfo(&buf);
+	initStringInfo(&refs);
+	for (int l = 0; l < lengthof(lens); l++)
+	{
+		char	   *text = palloc(lens[l] + 1);
+		ProllyValue row;
+		bool		failed = false;
+		MemoryContext cxt = CurrentMemoryContext;
+
+		for (int i = 0; i < lens[l]; i++)
+			text[i] = 'a' + (i * 7 + i / 26) % 26;
+		text[lens[l]] = '\0';
+		store_row(src, cols, 1, 0, text);
+
+		/* without a value store: an error, for a long value only */
+		PG_TRY();
+		{
+			encode_row(ve, enc, src, &buf);
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cxt);
+			FlushErrorState();
+			failed = true;
+		}
+		PG_END_TRY();
+		if (failed != (lens[l] > 2048))
+			elog(ERROR, "a %d-byte value without a value store %s", lens[l],
+				 failed ? "failed" : "encoded");
+
+		PROLLY_CALL(ve, set_values, enc, &values);
+		encode_row(ve, enc, src, &buf);
+		row.data = (const uint8 *) buf.data;
+		row.len = buf.len;
+		if ((lens[l] > 2048) != (buf.len < 200))
+			elog(ERROR, "a row with a %d-byte value encoded in %d bytes",
+				 lens[l], buf.len);
+		resetStringInfo(&refs);
+		PROLLY_CALL(ve, refs, enc, &row, &refs);
+		if ((lens[l] > 2048) != (refs.len > 0))
+			elog(ERROR, "a row with a %d-byte value lists %d bytes of references",
+				 lens[l], refs.len);
+		if (refs.len > 0)
+		{
+			StringInfoData got;
+			ProllyValue ref = {(const uint8 *) refs.data, refs.len};
+
+			initStringInfo(&got);
+			PROLLY_CALL(values.tree, value_read, &env, &ref, 0, PG_UINT64_MAX, &got);
+			if (got.len != lens[l] || memcmp(got.data, text, got.len) != 0)
+				elog(ERROR, "a %d-byte value's reference names %d other bytes",
+					 lens[l], got.len);
+			pfree(got.data);
+		}
+
+		/* a row with a byte after its values: refs() refuses it, as decode() */
+		{
+			StringInfoData bad;
+			ProllyValue badrow;
+
+			initStringInfo(&bad);
+			appendBinaryStringInfo(&bad, buf.data, buf.len);
+			appendStringInfoChar(&bad, '\x01');
+			badrow.data = (const uint8 *) bad.data;
+			badrow.len = bad.len;
+			failed = false;
+			PG_TRY();
+			{
+				PROLLY_CALL(ve, refs, enc, &badrow, &refs);
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(cxt);
+				FlushErrorState();
+				failed = true;
+			}
+			PG_END_TRY();
+			if (!failed)
+				elog(ERROR, "a row with a trailing byte listed its references");
+			pfree(bad.data);
+		}
+		PROLLY_CALL(ve, decode, enc, &row, dst);
+		check_same_row(src, dst, l);
+		PROLLY_CALL(ve, set_values, enc, NULL);
+		pfree(text);
+	}
+	ExecDropSingleTupleTableSlot(src);
+	ExecDropSingleTupleTableSlot(dst);
 	PROLLY_CALL(ve, end, enc);
 }
 
