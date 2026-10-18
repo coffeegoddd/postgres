@@ -1080,19 +1080,26 @@ copies (the one O(N) step: rows written to pages, indexes built).
   a folded root records what its versioned objects need from outside
   them, and a clone installs the extensions and checks the rest before
   anything is written:
-  - **Recorded at each commit:** a "d:" item per dependency outside the
+  - **Recorded at each commit:** an entry per dependency outside the
     versioned schemas, by kind and qualified name: an extension with its
     version, a type, function, operator, collation or other object of an
-    ordinary schema. Which objects each versioned object depends on is
-    found through `pg_depend`, and only the changed objects' are looked
-    up again; but every commit describes each dependency in the set
-    afresh (an extension's version, an object's name, by OID), so
-    an `ALTER EXTENSION … UPDATE` or a rename outside the versioned schemas
-    shows in the next commit, and in its diff, though no versioned object
-    changed. A dependency that no longer exists is reported by the commit,
-    as an object it can't describe is. A new canonical format (a clean
-    break, as #149's), which the user accepted at this stage for the
-    better feature.
+    ordinary schema (with its address, which another database resolves by
+    name). Which objects each versioned object depends on is found through
+    `pg_depend`; every commit describes each dependency afresh (an
+    extension's version, an object's name, by OID), so an
+    `ALTER EXTENSION … UPDATE` or a rename outside the versioned schemas
+    shows in the next commit, though no versioned object changed.
+  - **In the commit, not the root (user, 2026-10-17).** The entries are a
+    small tree of their own, which the commit names in a "dependencies"
+    field beside its root, as it names its parents (not text in its
+    message). The root stays what the versioned objects are, so what
+    changes outside never makes a branch's working set differ from its
+    head: no dirty branch after an extension's update or a checkout, no
+    rows in `dolt_status`, no uncommitted change blocking a merge.
+    Transfer and reclamation reach the tree through the commit, as they
+    reach its root; the commit id covers it. A commit made before the
+    field existed has its dependencies unrecorded (known, not "none"). No
+    new canonical format: roots are unchanged.
   - **Not roles (user, 2026-10-17).** Owners and grants aren't part of
     the canonical form: a commit doesn't record them, and a move or clone
     doesn't restore them (objects are made by whoever runs it). A role
