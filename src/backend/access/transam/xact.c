@@ -1369,9 +1369,12 @@ RecordTransactionCommit(void)
 	Size		chunk_root_len;
 	bool		chunk_writes;
 
-	/* a chunk store root this transaction moved goes with its commit record */
-	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
+	/*
+	 * The chunks this transaction has left to write, reserved now; and a
+	 * chunk store root it moved, which goes with its commit record.
+	 */
 	chunk_writes = prolly_chunkstore_commit_writes();
+	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
 	Assert((chunk_root_len == 0 && !chunk_writes) || markXidCommitted);
 
 	/*

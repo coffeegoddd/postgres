@@ -51,7 +51,7 @@
  * the file from where it left off when a lookup misses or the root is
  * asked for.  A record not completely written yet ends the scan, until the
  * next one.  A chunk appended before its transaction commits (a batch, or
- * the rest at pre-commit) is an XCHUNK, and isn't found by others while the
+ * the rest at commit) is an XCHUNK, and isn't found by others while the
  * transaction is in progress: a chunk is others' once its transaction has
  * committed (or aborted: its bytes are whole, and anyone may use them).
  * Another transaction putting the same chunk meanwhile appends its own
@@ -59,9 +59,10 @@
  * everyone's.
  *
  * The root.  A move locks the store until its transaction ends, so moves
- * are serialized, and they reach the file in commit order: at pre-commit a
- * PAD is appended for the new ROOT record; the commit record carries its
- * segment and offset and the root; once the commit record is flushed,
+ * are serialized, and they reach the file in commit order: as the commit
+ * begins a PAD is appended for the new ROOT record; the commit record
+ * carries its segment and offset and the root; once the commit record is
+ * flushed,
  * still within the commit's critical section, the ROOT record is written
  * over the PAD (redo of the commit record writes it too), in a segment
  * sealed meanwhile as in any.  The root is the last ROOT record of the
@@ -268,7 +269,9 @@ typedef struct TableFile
 
 /*
  * A range of a segment reserved for an append whose bytes aren't written
- * yet: its backend's, by proc number (len 0: none).
+ * yet: its backend's, by proc number (len 0: none).  gen counts the
+ * reservations made in the slot, so a waiter can tell one it saw from a
+ * later one.
  */
 typedef struct AppendRange
 {
@@ -277,6 +280,7 @@ typedef struct AppendRange
 	uint64		segment;
 	uint64		offset;
 	uint64		len;
+	uint64		gen;
 } AppendRange;
 
 /* a segment whose end was checked since the server started */
@@ -299,6 +303,7 @@ typedef struct JournalShared
 	ConditionVariable written;	/* an append's bytes were written */
 	CheckedEnd	checked[CHECKED_ENDS];	/* under ProllyJournalLock */
 	int			next_checked;
+	int			inflight;		/* ranges of len > 0 */
 	int			nranges;
 	AppendRange ranges[FLEXIBLE_ARRAY_MEMBER];
 } JournalShared;
@@ -396,8 +401,8 @@ struct ProllyChunkStore
 	uint64		pad_offset;		/* 0: no PAD yet */
 
 	/*
-	 * Reserved at pre-commit: the rest of pending (and the PAD, if moving),
-	 * written once the commit record is flushed, or at abort.
+	 * Reserved as the commit begins: the rest of pending (and the PAD, if
+	 * moving), written once the commit record is flushed, or at abort.
 	 */
 	bool		at_commit;
 	Append		commit_append;
@@ -815,8 +820,10 @@ static uint64 index_range(ProllyChunkStore *s, Segment *g, uint64 offset,
 						  uint64 end, char **rec, Size *reclen);
 
 /*
- * The range reserved and not yet written that starts at offset of a
- * segment, if any: its length (0: none).
+ * The range reserved and not yet written that holds offset of a segment,
+ * if any: how much of it is at offset or after (0: none).  A reader meets
+ * one at its start (nothing of it written) or inside it (a write seen in
+ * part, its first records whole).
  */
 static uint64
 append_in_flight(ProllyChunkStore *s, uint64 segment, uint64 offset)
@@ -825,19 +832,28 @@ append_in_flight(ProllyChunkStore *s, uint64 segment, uint64 offset)
 	uint64		len = 0;
 
 	SpinLockAcquire(&js->mutex);
-	for (int i = 0; i < js->nranges; i++)
+	for (int i = 0; i < js->nranges && js->inflight > 0; i++)
 	{
 		AppendRange *r = &js->ranges[i];
 
-		if (r->len > 0 && r->offset == offset && r->segment == segment &&
-			r->dboid == s->dboid && r->spcoid == s->spcoid)
+		if (r->len > 0 && r->segment == segment &&
+			r->dboid == s->dboid && r->spcoid == s->spcoid &&
+			r->offset <= offset && offset < r->offset + r->len)
 		{
-			len = r->len;
+			len = r->offset + r->len - offset;
 			break;
 		}
 	}
 	SpinLockRelease(&js->mutex);
 	return len;
+}
+
+/* Is r, in flight, of this database's store (s NULL: any store's)? */
+static inline bool
+range_of(AppendRange *r, ProllyChunkStore *s)
+{
+	return r->len > 0 &&
+		(s == NULL || (r->dboid == s->dboid && r->spcoid == s->spcoid));
 }
 
 /*
@@ -851,12 +867,9 @@ appends_in_flight(ProllyChunkStore *s, uint64 before)
 	bool		any = false;
 
 	SpinLockAcquire(&js->mutex);
-	for (int i = 0; i < js->nranges && !any; i++)
-		any = js->ranges[i].len > 0 &&
-			(s == NULL ||
-			 (js->ranges[i].segment < before &&
-			  js->ranges[i].dboid == s->dboid &&
-			  js->ranges[i].spcoid == s->spcoid));
+	for (int i = 0; i < js->nranges && js->inflight > 0 && !any; i++)
+		any = range_of(&js->ranges[i], s) &&
+			(s == NULL || js->ranges[i].segment < before);
 	SpinLockRelease(&js->mutex);
 	return any;
 }
@@ -865,9 +878,8 @@ appends_in_flight(ProllyChunkStore *s, uint64 before)
  * Wait for every append reserved in this database's store, in a segment
  * before the one given, to be written (s NULL: every store's).  None is
  * reserved there meanwhile: the caller holds ProllyJournalLock, or those
- * segments are sealed (or, for every store, the appends reserved meanwhile
- * aren't the caller's concern).  An append in flight needs nothing to
- * finish but its own flush.
+ * segments are sealed.  An append in flight needs nothing to finish but
+ * its own flush.
  */
 static void
 wait_appends(ProllyChunkStore *s, uint64 before)
@@ -880,41 +892,121 @@ wait_appends(ProllyChunkStore *s, uint64 before)
 }
 
 /*
+ * Wait for the appends in flight now in this database's store (s NULL:
+ * every store's) to be written, not for those reserved meanwhile, so a
+ * stream of appends can't keep the caller waiting.
+ */
+static void
+wait_reserved(ProllyChunkStore *s)
+{
+	JournalShared *js = shared();
+	int		   *slots = palloc(sizeof(int) * js->nranges);
+	uint64	   *gens = palloc(sizeof(uint64) * js->nranges);
+	int			n = 0;
+
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < js->nranges && n < js->inflight; i++)
+	{
+		if (range_of(&js->ranges[i], s))
+		{
+			slots[n] = i;
+			gens[n++] = js->ranges[i].gen;
+		}
+	}
+	SpinLockRelease(&js->mutex);
+	while (n > 0)
+	{
+		int			left = 0;
+
+		SpinLockAcquire(&js->mutex);
+		for (int j = 0; j < n; j++)
+		{
+			AppendRange *r = &js->ranges[slots[j]];
+
+			if (r->len > 0 && r->gen == gens[j])
+			{
+				slots[left] = slots[j];
+				gens[left++] = gens[j];
+			}
+		}
+		SpinLockRelease(&js->mutex);
+		n = left;
+		if (n > 0)
+			ConditionVariableSleep(&js->written, WAIT_EVENT_PROLLY_JOURNAL_APPEND);
+	}
+	ConditionVariableCancelSleep();
+	pfree(slots);
+	pfree(gens);
+}
+
+/* Was a segment's end checked since the server started? */
+static bool
+end_checked(ProllyChunkStore *s, Segment *g)
+{
+	JournalShared *js = shared();
+
+	for (int i = 0; i < CHECKED_ENDS; i++)
+	{
+		CheckedEnd *c = &js->checked[i];
+
+		if (c->segment == g->id && c->dboid == s->dboid &&
+			c->spcoid == s->spcoid)
+			return true;
+	}
+	return false;
+}
+
+/* The end of the last range in flight in a segment (0: none). */
+static uint64
+in_flight_end(ProllyChunkStore *s, uint64 segment)
+{
+	JournalShared *js = shared();
+	uint64		end = 0;
+
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < js->nranges && js->inflight > 0; i++)
+	{
+		AppendRange *r = &js->ranges[i];
+
+		if (range_of(r, s) && r->segment == segment)
+			end = Max(end, r->offset + r->len);
+	}
+	SpinLockRelease(&js->mutex);
+	return end;
+}
+
+/*
  * The segment's end, where the next append goes, under ProllyJournalLock.
  * A crash can leave a range reserved at the end whose bytes the WAL never
  * had (reserved after the last flush): zeros a reader stops at, which would
  * hide whatever came after them.  So the first append to a segment after
- * the server starts cuts off what follows its last whole record; no range
- * is in flight then, every one of them being reserved after this check.
+ * the server starts (or after its entry in the short list of segments
+ * checked is reused) cuts off what follows its last whole record.  Never a
+ * range in flight: the scan skips each, and the cut stops at their end.
  */
 static uint64
 segment_end(ProllyChunkStore *s, Segment *g)
 {
 	JournalShared *js = shared();
 	pgoff_t		size;
-	int			i;
+	uint64		end;
 
 	if (!open_segment(g) || (size = FileSize(g->file)) < JOURNAL_HEADER_SIZE)
 		elog(ERROR, "chunk journal \"%s\" has no header", g->path);
-	for (i = 0; i < CHECKED_ENDS; i++)
-	{
-		CheckedEnd *c = &js->checked[i];
-
-		if (c->segment == g->id && c->dboid == s->dboid &&
-			c->spcoid == s->spcoid)
-			return size;
-	}
+	if (end_checked(s, g))
+		return size;
 	scan_segment(s, g);
-	if (g->scanned < (uint64) size)
+	end = Max(g->scanned, in_flight_end(s, g->id));
+	if (end < (uint64) size)
 	{
 		ereport(LOG,
 				(errmsg("cutting %llu bytes no record holds off the end of chunk journal \"%s\"",
-						(unsigned long long) (size - g->scanned), g->path)));
-		if (FileTruncate(g->file, g->scanned, WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
+						(unsigned long long) (size - end), g->path)));
+		if (FileTruncate(g->file, end, WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not truncate file \"%s\": %m", g->path)));
-		size = g->scanned;
+		size = end;
 	}
 	js->checked[js->next_checked].dboid = s->dboid;
 	js->checked[js->next_checked].spcoid = s->spcoid;
@@ -952,6 +1044,10 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	uint64		size;
 
 	refresh_segments(s);
+	/* a segment's first check reads it whole: most of it before the lock */
+	g = current_segment(s);
+	if (!end_checked(s, g))
+		scan_segment(s, g);
 	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
 	refresh_segments(s);
 	if (checked != NULL && s->gc_generation != *checked)
@@ -974,6 +1070,8 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	r->segment = g->id;
 	r->offset = size;
 	r->len = len;
+	r->gen++;
+	js->inflight++;
 	SpinLockRelease(&js->mutex);
 
 	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
@@ -1016,28 +1114,10 @@ append_write(Append *a, const char *data)
 						a->len, (unsigned long long) a->offset, a->g->path)));
 	SpinLockAcquire(&js->mutex);
 	r->len = 0;
+	js->inflight--;
 	SpinLockRelease(&js->mutex);
 	ConditionVariableBroadcast(&js->written);
 	END_CRIT_SECTION();
-}
-
-/*
- * Append bytes at the end of the segment appends go to, now: returns the
- * segment and offset they went to.  As append_reserve(), whose checked it
- * takes.
- */
-static bool
-append_bytes(ProllyChunkStore *s, const char *data, Size len,
-			 const uint32 *checked, Segment **seg, uint64 *at)
-{
-	Append		a;
-
-	if (!append_reserve(s, data, len, checked, &a))
-		return false;
-	*seg = a.g;
-	*at = a.offset;
-	append_write(&a, data);
-	return true;
 }
 
 /* Write bytes at offset, in redo or over a PAD; the WAL has them. */
@@ -1550,11 +1630,32 @@ flush_pending(ProllyChunkStore *s)
 }
 
 /*
- * At pre-commit: reserve the rest of the pending chunks, and a PAD for the
- * root a move goes to, as one append, whose bytes are written once the
- * commit record is flushed (committed()), so a commit flushes the log once
- * and appends hold the journal's lock only to reserve.  The chunks stay
- * pending (readable) until then.
+ * The root a move goes to has its PAD at offset of segment g: keep the
+ * ROOT record that goes over it once the commit record is flushed.
+ */
+static void
+root_padded(ProllyChunkStore *s, Segment *g, uint64 offset)
+{
+	StringInfoData rec;
+
+	s->pad_segment = g;
+	s->pad_offset = offset;
+	INJECTION_POINT("prolly-root-padded", NULL);
+	initStringInfo(&rec);
+	root_record(&rec, &s->new_root, false);
+	Assert(rec.len <= sizeof(s->root_rec));
+	memcpy(s->root_rec, rec.data, rec.len);
+	s->root_rec_len = rec.len;
+	pfree(rec.data);
+}
+
+/*
+ * As the commit begins, after everything else that runs before it (which
+ * may still put chunks): reserve the rest of the pending chunks, and a PAD
+ * for the root a move goes to, as one append, whose bytes are written once
+ * the commit record is flushed (committed()), so a commit flushes the log
+ * once and appends hold the journal's lock only to reserve.  The chunks
+ * stay pending (readable) until then.
  */
 static void
 reserve_at_commit(ProllyChunkStore *s)
@@ -1567,19 +1668,7 @@ reserve_at_commit(ProllyChunkStore *s)
 	s->at_commit = true;
 	INJECTION_POINT("prolly-append-reserved", NULL);
 	if (s->moving)
-	{
-		StringInfoData rec;
-
-		s->pad_segment = s->commit_append.g;
-		s->pad_offset = s->commit_append.offset + pad_at;
-		INJECTION_POINT("prolly-root-padded", NULL);
-		initStringInfo(&rec);
-		root_record(&rec, &s->new_root, false);
-		Assert(rec.len <= sizeof(s->root_rec));
-		memcpy(s->root_rec, rec.data, rec.len);
-		s->root_rec_len = rec.len;
-		pfree(rec.data);
-	}
+		root_padded(s, s->commit_append.g, s->commit_append.offset + pad_at);
 }
 
 /* Forget the pending chunks from offset len on. */
@@ -1623,35 +1712,20 @@ journal_xact_callback(XactEvent event, void *arg)
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
-			reserve_at_commit(s);
+			/* reserved later, by commit_writes(): chunks may still come */
 			break;
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
-			flush_pending(s);
-			if (s->moving)
+			/* a parallel worker's commit has no record: written now */
+			if (s->pending.len > 0 || s->moving)
 			{
-				StringInfoData pad;
+				Append		a;
+				int			pad_at = -1;
 
-				(void) ensure_journal(s, true);
-				initStringInfo(&pad);
-				root_record(&pad, &s->new_root, true);
-				for (;;)
-				{
-					uint32		generation;
-
-					refresh_segments(s);
-					generation = s->gc_generation;
-					check_root(s);
-					if (append_bytes(s, pad.data, pad.len, &generation,
-									 &s->pad_segment, &s->pad_offset))
-						break;
-				}
-				INJECTION_POINT("prolly-root-padded", NULL);
-				resetStringInfo(&pad);
-				root_record(&pad, &s->new_root, false);
-				Assert(pad.len <= sizeof(s->root_rec));
-				memcpy(s->root_rec, pad.data, pad.len);
-				s->root_rec_len = pad.len;
-				pfree(pad.data);
+				reserve_pending(s, &a, s->moving ? &pad_at : NULL);
+				append_write(&a, s->pending.data);
+				pending_appended(s, a.g, a.offset);
+				if (s->moving)
+					root_padded(s, a.g, a.offset + pad_at);
 			}
 			break;
 		case XACT_EVENT_PRE_PREPARE:
@@ -2964,7 +3038,12 @@ journal_commit_payload(char **data)
 static bool
 journal_commit_writes(void)
 {
-	return session_store != NULL && session_store->at_commit;
+	ProllyChunkStore *s = session_store;
+
+	if (s == NULL)
+		return false;
+	reserve_at_commit(s);
+	return s->at_commit;
 }
 
 /* In the commit's critical section: no allocation. */
@@ -3196,7 +3275,7 @@ journal_checkpoint(void)
 	struct dirent *de;
 
 	/* the appends reserved before the redo point, written */
-	wait_appends(NULL, PG_UINT64_MAX);
+	wait_reserved(NULL);
 	sync_journals_under("base");
 
 	tsdir = AllocateDir(PG_TBLSPC_DIR);
@@ -4043,8 +4122,14 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 	if (window && !gc->window)
 	{
 		INJECTION_POINT("prolly-gc-window", NULL);
+
+		/*
+		 * Every append reserved before the window, written: those in
+		 * flight now waited for before the lock, so the wait under it (for
+		 * what was reserved in between) is only for their writes.
+		 */
+		wait_reserved(s);
 		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
-		/* every append reserved before the window, written */
 		wait_appends(s, PG_UINT64_MAX);
 		gc->window = true;
 		INSTR_TIME_SET_CURRENT(gc->window_began);

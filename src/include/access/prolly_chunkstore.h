@@ -165,13 +165,16 @@ typedef struct ProllyChunkStoreRoutine
 							  const ProllyHash *root);
 
 	/*
-	 * Commit.  commit_payload() returns what the commit record carries for
-	 * the transaction's root move (0 bytes: none); commit_writes() whether
-	 * the transaction has bytes to write once its commit record is flushed
-	 * (so it is flushed at once, whatever synchronous_commit says);
-	 * committed() is called once the commit record is flushed, inside the
-	 * commit's critical section, if either; commit_redo() replays the
-	 * payload.
+	 * Commit.  commit_writes() is called first, as the commit record is
+	 * about to be written (after everything else that runs before it, and
+	 * outside its critical section: it may raise an error, which aborts
+	 * the transaction): it readies what the transaction has left to write
+	 * and returns whether it has bytes to write once its commit record is
+	 * flushed (so it is flushed at once, whatever synchronous_commit
+	 * says).  commit_payload() returns what the commit record carries for
+	 * the transaction's root move (0 bytes: none); committed() is called
+	 * once the commit record is flushed, inside the commit's critical
+	 * section, if either; commit_redo() replays the payload.
 	 */
 	Size		(*commit_payload) (char **data);
 	bool		(*commit_writes) (void);

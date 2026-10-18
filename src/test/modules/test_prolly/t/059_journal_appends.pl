@@ -73,6 +73,83 @@ is($reader->query_safe(qq{SELECT convert_from(test_chunk_get('} . hash('first') 
 	'first', 'and are once written, by the reader that skipped them');
 $reader->quit;
 
+# A reader that meets a range in flight inside it, its first records
+# whole (a write seen in part), skips the rest of it too.  The part is
+# made by hand: a record of the segment's copied to the range's start, in
+# place of the range's own first record (that reader is done with once
+# the range is written).
+my $dir = sql(q{SELECT 'base/' || oid FROM pg_database WHERE datname = 'postgres'});
+my $segment = sql(qq{SELECT '$dir/' || max(f) FROM pg_ls_dir('$dir') f
+	WHERE f LIKE 'prolly\\_journal%'});
+my $path = $node->data_dir . "/$segment";
+my $small_at = -s $path;
+sql(q{SELECT test_chunk_put('s')});
+my $small = (-s $path) - $small_at;
+my $range_at = -s $path;
+$a = stop_at_reserved(q{SELECT test_chunk_put(repeat('long', 100)::bytea)});
+cmp_ok((-s $path) - $range_at, '>', $small, 'the range is longer than the record');
+open(my $seg, '+<', $path) or die "open: $!";
+binmode $seg;
+my $record;
+sysseek($seg, $small_at, 0) or die "seek: $!";
+sysread($seg, $record, $small) == $small or die "read: $!";
+sysseek($seg, $range_at, 0) or die "seek: $!";
+syswrite($seg, $record) == $small or die "write: $!";
+close $seg;
+sql(q{SELECT test_chunk_put('after the part')});
+$reader = $node->background_psql('postgres');
+is($reader->query_safe(qq{SELECT convert_from(test_chunk_get('} . hash('after the part') . q{'), 'UTF8')}),
+	'after the part', 'a chunk after a range written in part is read');
+$reader->quit;
+go_on($a);
+
+# A checkpoint waits for the appends in flight as it begins, not for those
+# reserved after: a second appender stopped later doesn't hold it.
+$a = stop_at_reserved(q{SELECT test_chunk_put('before the checkpoint')});
+my $ckpt = $node->background_psql('postgres');
+$ckpt->query_until(qr/checkpointing/, q{
+	\echo checkpointing
+	CHECKPOINT;
+	\echo checkpointed
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE backend_type = 'checkpointer' AND wait_event = 'ProllyJournalAppend'})
+  or die 'the checkpoint did not wait';
+my $root_now = sql('SELECT test_chunk_root()');
+my $later = $node->background_psql('postgres');
+$later->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-root-padded', 'wait')});
+$later->query_until(qr/started/, q{
+	\echo started
+	BEGIN;
+	SELECT test_chunk_put('after the checkpoint began');
+	SELECT test_chunk_move_root(} . ($root_now eq '' ? 'NULL' : "'$root_now'") . q{,
+		encode(sha256('after the checkpoint began'), 'hex'));
+	COMMIT;
+	\echo done
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-root-padded'})
+  or die 'the second appender did not stop';
+go_on($a);
+$ckpt->query_until(qr/checkpointed/, '');
+pass('the checkpoint finished with the later append in flight');
+$ckpt->quit;
+sql(q{SELECT injection_points_wakeup('prolly-root-padded')});
+$later->query_until(qr/done/, '');
+$later->quit;
+
+# A chunk put by a callback that runs after the chunk store's at
+# pre-commit (registered before the store was opened) is written.
+my $fresh_put = $node->background_psql('postgres');
+$fresh_put->query_safe(q{BEGIN;
+	SELECT test_chunk_put_at_commit('put at commit');
+	SELECT test_chunk_put('put before');
+	COMMIT;});
+$fresh_put->quit;
+is(sql(qq{SELECT convert_from(test_chunk_get('} . hash('put at commit') . q{'), 'UTF8')}),
+	'put at commit', 'a chunk put after the store\'s pre-commit is written');
+
 # A collection waits for an append in flight before reading its segment.
 my $root = sql('SELECT test_chunk_root()');
 my $h = hash('rooted');
@@ -111,8 +188,7 @@ is(sql(qq{SELECT convert_from(test_chunk_get('} . hash('after abort') . q{'), 'U
 
 # Zeros at a segment's end, as a crash leaves a reservation the WAL never
 # had: cut off before the next append, which is read.
-my $dir = sql(q{SELECT 'base/' || oid FROM pg_database WHERE datname = 'postgres'});
-my $segment = sql(qq{SELECT '$dir/' || max(f) FROM pg_ls_dir('$dir') f
+$segment = sql(qq{SELECT '$dir/' || max(f) FROM pg_ls_dir('$dir') f
 	WHERE f LIKE 'prolly\\_journal%'});
 $node->stop;
 open(my $fh, '>>', $node->data_dir . "/$segment") or die "open: $!";

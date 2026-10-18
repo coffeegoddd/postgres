@@ -155,6 +155,11 @@ CREATE FUNCTION test_chunk_put(data bytea)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Put a chunk as the transaction commits, from a callback of its own.
+CREATE FUNCTION test_chunk_put_at_commit(data bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
