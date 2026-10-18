@@ -2439,10 +2439,10 @@
 
 { name => 'prolly_value_memo_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Sets how many values in versioned tables\' TOAST relations a fold remembers the history references of.',
-  long_desc => 'Values stored by content need no memo: a fold takes their references from their pointers.',
+  long_desc => 'Values stored by content need no memo: a fold takes their references from their pointers. 0 turns the memo off, and reserves no shared memory for it.',
   variable => 'prolly_value_memo_entries',
   boot_val => '8192',
-  min => '64',
+  min => '0',
   max => '16777216',
 },
 

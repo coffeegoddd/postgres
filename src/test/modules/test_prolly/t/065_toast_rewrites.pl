@@ -52,10 +52,23 @@ is(sql($forms), '3 oid, 3 hash', 'OID and hash pointers in one table');
 is(sql('SHOW prolly_value_memo_entries'), '100', 'the memo\'s size is a setting');
 sql(q{SELECT length(dolt_commit('-Am', 'both')::text)});
 sql('UPDATE w.docs SET n = n + 1');
-sql(q{SELECT count(*) FROM test_memo_counters(true)});
 is($node->safe_psql('postgres', q{SELECT length(dolt_commit('-am', 'counted')::text) > 0;
 	SELECT hits FROM test_memo_counters(true)}), "t\n6",
 	'and a commit finds the OID pointers\' values in it');
+
+# No more than the setting are remembered: of 200 values, at most 100.
+sql(q{CREATE TABLE w.many (id int PRIMARY KEY, n int, t text);
+	SET debug_toast_relation = on;
+	INSERT INTO w.many SELECT g, 0, (SELECT string_agg(md5(g || ':' || i), '')
+		FROM generate_series(1, 100) i) FROM generate_series(1, 200) g});
+sql(q{SELECT length(dolt_commit('-Am', 'many')::text)});
+sql('UPDATE w.many SET n = n + 1');
+my $hits = $node->safe_psql('postgres', q{SELECT length(dolt_commit('-am', 'many counted')::text) > 0;
+	SELECT hits FROM test_memo_counters(true)});
+$hits =~ s/^t\n//;
+ok($hits > 0 && $hits <= 100, "the memo holds no more than its size ($hits hits)");
+sql('DROP TABLE w.many');
+sql(q{SELECT length(dolt_commit('-am', 'many dropped')::text)});
 my $before = sql($digest);
 sql('UPDATE w.docs SET n = n + 1');
 is(sql($forms), '3 oid, 3 hash', 'an UPDATE of another column keeps both');
@@ -104,7 +117,8 @@ SKIP:
 	sql('CREATE EXTENSION injection_points');
 	sql('DELETE FROM w.docs WHERE id <= 3');
 	old_rows(1, 3);
-	my $r = $node->background_psql('postgres');
+	is(sql($forms), '3 oid, 3 hash', 'OID pointers before REPACK (CONCURRENTLY)');
+	my $r = $node->background_psql('postgres', on_error_stop => 0);
 	$r->query_safe(q{SELECT injection_points_set_local();
 		SELECT injection_points_attach('repack-concurrently-before-lock', 'wait')});
 	$r->query_until(qr/repacking/, q{
@@ -120,9 +134,21 @@ SKIP:
 	$before = sql($digest);
 	sql(q{SELECT injection_points_wakeup('repack-concurrently-before-lock')});
 	$r->query_until(qr/repacked/, '');
+	unlike($r->{stderr}, qr/ERROR/, 'REPACK (CONCURRENTLY) succeeds');
 	$r->quit;
 	converted('REPACK (CONCURRENTLY)');
 }
+
+# With the setting 0, there is no memo: nothing is remembered, a commit
+# reads the values.
+$node->append_conf('postgresql.conf', 'prolly_value_memo_entries = 0');
+$node->restart;
+old_rows(7, 7);
+sql(q{SELECT length(dolt_commit('-Am', 'no memo')::text)});
+sql('UPDATE w.docs SET n = n + 1');
+is($node->safe_psql('postgres', q{SELECT length(dolt_commit('-am', 'no memo counted')::text) > 0;
+	SELECT hits FROM test_memo_counters(true)}), "t\n0",
+	'with the setting 0, no memo');
 
 $node->stop;
 done_testing();
