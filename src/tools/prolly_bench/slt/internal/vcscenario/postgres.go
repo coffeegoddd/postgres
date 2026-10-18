@@ -24,7 +24,7 @@ func EngineProfile(am string) (Profile, error) {
 	case "prolly":
 		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"}
 		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist. " +
-			"Merges are row by row (a row both sides changed is a conflict) and a table's definition merges as one object. " +
+			"Rows merge column by column, and a table's definition merges as one object (both sides changing it is a schema conflict). " +
 			"No claim about concurrent sessions beyond sequential interleavings."
 	case "heap":
 		p.Supported = []string{"sql"}
