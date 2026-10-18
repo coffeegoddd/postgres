@@ -338,7 +338,7 @@ start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
 `--abort`, `--continue`, ...). Their capability is implied. Arguments are in
 `args`; SQL bind parameters are in `params`. Successful commits require a
 unique `save` name; a merge, pick or revert may name one, and must then
-commit (a revert's is the new head): a merge with nothing to merge, or one
+commit (a revert's is the last of its series): a merge with nothing to merge, or one
 that stops with conflicts, saves nothing and fails the step, its call's
 whole result in the trace. A later `{"ref":"base"}` resolves to
 that engine's captured identifier, including in query parameters and
@@ -389,7 +389,7 @@ Before running a case, the adapter creates and drops a separate probe
 database. It verifies the actual AM (and prolly's table/index/TOAST block-map
 forks); for any version-control capability, it runs the built-in history scenario, including
 branch isolation and restoration, and for any beyond `vc.core` a second
-one (`cases/vc-probe.json`) that merges, diffs, picks, reverts, and reads a
+one (`cases/vc-probe.json`) that finds a merge base, merges, diffs, picks, reverts, and reads a
 conflict and a constraint violation, each checked by its effect: a claimed
 capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring

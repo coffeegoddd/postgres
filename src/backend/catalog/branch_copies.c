@@ -499,6 +499,48 @@ copies_drop(const char *name)
 	table_close(brel, NoLock);
 }
 
+/*
+ * Renaming changes only the pg_branch row: copies, and sessions, know a
+ * branch by its id.  Not main, which every database has.
+ */
+static void
+copies_rename(const char *name, const char *newname, bool force)
+{
+	Relation	brel;
+	Oid			branch;
+	HeapTuple	tup;
+	NameData	brname;
+
+	copies_check_drop(name);
+	copies_check_create(newname);
+	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
+	branch = branch_oid(name, false);
+	if (branch == BRANCH_MAIN_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"main\" can't be renamed")));
+	if (OidIsValid(branch_oid(newname, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", newname)));
+	/* (the session's own lock on its branch doesn't conflict) */
+	if (!force && !lock_branch_for_delete(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is checked out in another session", name),
+				 errhint("Rename it anyway with -f.")));
+
+	tup = SearchSysCacheCopy1(BRANCHOID, ObjectIdGetDatum(branch));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for branch %u", branch);
+	namestrcpy(&brname, newname);
+	((Form_pg_branch) GETSTRUCT(tup))->brname = brname;
+	CatalogTupleUpdate(brel, &tup->t_self, tup);
+	heap_freetuple(tup);
+	CommandCounterIncrement();
+	table_close(brel, NoLock);
+}
+
 static void
 copies_checkout(const char *name)
 {
@@ -542,6 +584,7 @@ static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
 	.drop = copies_drop,
+	.rename = copies_rename,
 	.check_create = copies_check_create,
 	.check_drop = copies_check_drop,
 	.make = copies_make,

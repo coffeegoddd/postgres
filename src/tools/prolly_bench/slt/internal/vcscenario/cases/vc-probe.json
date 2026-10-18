@@ -1,8 +1,8 @@
 {
   "version": 1,
   "id": "vc-probe",
-  "description": "Native canary for the version-control capabilities beyond vc.core: a merge, a diff, a cherry-pick, a revert, a conflict and a constraint violation, each checked by its effect",
-  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff"],
+  "description": "Native canary for the version-control capabilities beyond vc.core: a merge base, a merge, a diff, a cherry-pick, a revert, a conflict and a constraint violation, each checked by its effect",
+  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"],
   "sessions": ["a", "b"],
   "steps": [
     {"id":"create","session":"a","op":"exec","sql":"CREATE TABLE probe_t (id int PRIMARY KEY, v text)","expect":{"tag":"CREATE TABLE"}},
@@ -17,6 +17,7 @@
     {"id":"side-commit","session":"b","op":"commit","args":["side"],"save":"sidec"},
     {"id":"main-edit","session":"a","op":"exec","sql":"INSERT INTO probe_t VALUES (3, 'main')","expect":{"tag":"INSERT 0 1"}},
     {"id":"main-commit","session":"a","op":"commit","args":["main"],"save":"mainc"},
+    {"id":"merge-base","session":"a","op":"query","requires":["vc.mergebase"],"sql":"SELECT dolt_merge_base($1, $2) = $3","params":[{"ref":"mainc"},{"ref":"sidec"},{"ref":"base"}],"expect":{"rows":[["t"]],"order":"ordered"}},
     {"id":"merge","session":"a","op":"merge","args":["probe_side"],"save":"merged"},
     {"id":"merged","session":"a","op":"query","requires":["vc.core"],"sql":"SELECT dolt_hashof('HEAD') = $1, array_agg(id ORDER BY id) FROM probe_t","params":[{"ref":"merged"}],"expect":{"rows":[["t","{1,2,3}"]],"order":"ordered"}},
     {"id":"diff","session":"a","op":"query","requires":["vc.diff"],"sql":"SELECT diff_type, (to_row).id FROM dolt_diff($1, $2, NULL::probe_t)","params":[{"ref":"mainc"},{"ref":"merged"}],"expect":{"rows":[["added","2"]],"order":"ordered"}},

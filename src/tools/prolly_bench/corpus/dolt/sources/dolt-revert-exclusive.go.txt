@@ -1,0 +1,30 @@
+{
+		Name: "dolt_revert() --continue and --abort are mutually exclusive",
+		SetUpScript: []string{
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(2,2);",
+			"call dolt_commit('-Am', 'seed table');",
+			"update test set c0 = 42 where pk = 2;",
+			"call dolt_commit('-am', 'first change');",
+			"update test set c0 = 23 where pk = 2;",
+			"call dolt_commit('-am', 'second change');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "set @@dolt_allow_commit_conflicts = 1;",
+				Expected: []sql.Row{{types.OkResult{}}},
+			},
+			{
+				Query:    "call dolt_revert('HEAD~1');",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:          "call dolt_revert('--continue', '--abort');",
+				ExpectedErrStr: "error: --continue and --abort are mutually exclusive",
+			},
+			{
+				Query:          "call dolt_revert('--abort', '--continue');",
+				ExpectedErrStr: "error: --continue and --abort are mutually exclusive",
+			},
+		},
+	}

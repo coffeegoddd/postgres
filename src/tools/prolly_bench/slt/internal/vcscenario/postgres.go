@@ -22,7 +22,7 @@ func EngineProfile(am string) (Profile, error) {
 	p := Profile{Engine: am}
 	switch am {
 	case "prolly":
-		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff"}
+		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"}
 		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist. " +
 			"Merges are row by row (a row both sides changed is a conflict) and a table's definition merges as one object. " +
 			"No claim about concurrent sessions beyond sequential interleavings."
@@ -262,8 +262,8 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 	case "cherrypick":
 		sql = "SELECT NULLIF(r[1], ''), r::text FROM dolt_cherry_pick(" + placeholders(len(args)) + ") r"
 	case "revert":
-		// its status (0: committed)
-		sql = "SELECT NULLIF(r[1], '1'), r::text FROM dolt_revert(" + placeholders(len(args)) + ") r"
+		// the last commit of its series; none if one stopped it
+		sql = "SELECT NULLIF(r[1], ''), r::text FROM dolt_revert(" + placeholders(len(args)) + ") r"
 	default:
 		return Outcome{}, fmt.Errorf("unsupported operation %s", s.Op)
 	}
@@ -279,14 +279,6 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		}
 		o.Tag = ops[s.Op].function + " returned " + *o.Rows[0][1]
 		o.Rows, o.Columns = [][]*string{{o.Rows[0][0]}}, o.Columns[:1]
-		// a revert's status 0: what it committed is the new head
-		if s.Op == "revert" && o.Rows[0][0] != nil {
-			head, e := p.must(ctx, c, "SELECT dolt_hashof('HEAD')")
-			if e != nil {
-				return o, e
-			}
-			o.Rows = head.Rows
-		}
 	}
 	if s.Op == "checkout" {
 		check, e := p.must(ctx, c, "SELECT active_branch()")

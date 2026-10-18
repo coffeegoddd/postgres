@@ -20,6 +20,7 @@ var Capabilities = map[string]string{
 	"vc.cherrypick": "dolt_cherry_pick, with --abort and --continue",
 	"vc.revert":     "dolt_revert",
 	"vc.diff":       "dolt_diff",
+	"vc.mergebase":  "dolt_merge_base",
 }
 
 // What each dolt_* name (function, view or setting) a step's SQL mentions
@@ -46,6 +47,7 @@ var callCapability = map[string]string{
 	"dolt_cherry_pick":            "vc.cherrypick",
 	"dolt_revert":                 "vc.revert",
 	"dolt_diff":                   "vc.diff",
+	"dolt_merge_base":             "vc.mergebase",
 }
 
 // A typed operation: the capability it needs, the dolt_* function it calls,

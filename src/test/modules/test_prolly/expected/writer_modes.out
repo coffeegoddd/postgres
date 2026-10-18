@@ -972,6 +972,64 @@ SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
                0
 (1 row)
 
+-- Renamed, a protected branch stays protected, by its new name; only the
+-- database's owner renames it, or replaces it; a writer's branch keeps its
+-- name.
+SELECT dolt_branch('wm_pr');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('wm_pq');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('--protect', 'wm_pr');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET ROLE wm_other;
+SELECT dolt_branch('-m', 'wm_pr', 'wm_pr2');
+ERROR:  branch "wm_pr" is protected
+HINT:  Only the database's owner renames or replaces a protected branch.
+SELECT dolt_branch('-m', '-f', 'wm_pq', 'wm_pr');
+ERROR:  branch "wm_pr" is protected
+HINT:  Only the database's owner renames or replaces a protected branch.
+RESET ROLE;
+SELECT dolt_branch('-m', 'wm_pr', 'wm_pr2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_p%' ORDER BY name;
+  name  | protected 
+--------+-----------
+ wm_pq  | f
+ wm_pr2 | t
+(2 rows)
+
+SELECT dolt_branch('-m', 'wm_pr2', 'writer/x/main');
+ERROR:  branch names beginning "writer/" are reserved
+SELECT dolt_branch('-m', 'writer/hank/other', 'wm_pr3');
+ERROR:  a writer's branch can't be renamed
+SELECT dolt_branch('--unprotect', 'wm_pr2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_pr2', 'wm_pq');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Only the database's owner sets the mode; and back to shared.
 SET ROLE wm_other;
 SELECT dolt_writer_mode('shared');

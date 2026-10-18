@@ -524,6 +524,1477 @@
         "The conflicting merge runs outside a transaction block and keeps its conflicts because dolt.allow_commit_conflicts is on; its result row is checked. (D5)",
         "Dolt's 'fatal: There is no merge to abort' is checked as SQLSTATE 55000. (D4)"
       ]
+    },
+    {
+      "id": "dolt-revert-abort-none",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+      "suite": "RevertScripts",
+      "index": 10,
+      "name": "dolt_revert() --abort not in a revert state",
+      "source_sha256": "1e81a128583581c7dd3e4649803619644a4ac77cdbfea92c7251657475de576d",
+      "scenario_sha256": "ead49389ab4af60881be411e3992a00127c7d0df893b6b3a20d931d340b0149a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "Dolt's 'error: There is no revert in progress' is checked as SQLSTATE 55000. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-revert-abort-series",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+      "suite": "RevertScripts",
+      "index": 5,
+      "name": "dolt_revert() --abort restores pre-revert state",
+      "source_sha256": "bb323b4a975d945cb448ab784fd4632514762a19f5ceedda5fdd06a813000055",
+      "scenario_sha256": "83fa532b9b58106f628b53e3c6963fbca76086ac97bb984d4bbecc0ebcb035de",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "autocommit"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "seed-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "insert3-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "first"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "first-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "second"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "second-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_revert returns {hash, data conflicts, schema conflicts, violations}, as Dolt; the hash is checked against HEAD. Preserved: the first revert commits, the second stops at a conflict. (D3, D6)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.test), where Dolt has table."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved: the first revert's commit is the head."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved {\"\",0,0,0} result."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved: the abort leaves none of the series' commits."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; @@autocommit=0 becomes BEGIN, so the script runs in one transaction block and commits are query steps. (D3, D5, D10)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "dolt_conflicts lists schema-qualified table_name (public.test) where Dolt has table.",
+        "dolt_log is newest first, ordered explicitly by commit_order."
+      ]
+    },
+    {
+      "id": "dolt-revert-continue-none",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+      "suite": "RevertScripts",
+      "index": 9,
+      "name": "dolt_revert() --continue not in a revert state",
+      "source_sha256": "1adcd4553ffcd4e61a5e8e3fbe18842ddeee85b0b583c62d377effa7c8ccb25f",
+      "scenario_sha256": "1a1a7d1dd06d8142ad6a8eb358f860b97ad51661c7717f859444c6820b9e67da",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "Dolt's 'error: There is no revert in progress' is checked as SQLSTATE 55000. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-revert-exclusive",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+      "suite": "RevertScripts",
+      "index": 11,
+      "name": "dolt_revert() --continue and --abort are mutually exclusive",
+      "source_sha256": "9d4a40e6bae0eb0852c8e813958bb4e51d871ef8e65bfd38981dec8e5f24cdff",
+      "scenario_sha256": "5e1448988ba0867cc99a1bbb3e7e42bcabff39c180666379c655daec267ef0c7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "first"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "first-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "second"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "second-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "The Dolt session variable as prolly's dolt.allow_commit_conflicts setting. (D5)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_revert returns {hash, data conflicts, schema conflicts, violations}, as Dolt; the hash is checked against HEAD. (D3, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "@@dolt_allow_commit_conflicts is the dolt.allow_commit_conflicts setting, so the conflicted revert outside a transaction block is kept. (D5, D10)",
+        "Dolt's 'error: --continue and --abort are mutually exclusive' is checked as SQLSTATE 22023. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 76,
+      "name": "--ff-only flag success when fast-forward is possible",
+      "source_sha256": "8864b0cb8131c6c31c1a5b57292bae21fb073068189fb8e90c21ec4556db6912",
+      "scenario_sha256": "e5f9b62009935ba2952536ba4a65363038a25ecbfba427effd4889e899d66216",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "feature-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "feature-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). The fast-forward's commit is the feature head. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only-no-commit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 81,
+      "name": "--ff-only with no-commit flag should work",
+      "source_sha256": "7cb05f81ee75d375860a0b8e06aa5da7f63ab2d3b51f0c79de7b8f19380d4c77",
+      "scenario_sha256": "959126e8fc429358a9c341d203acede950ad9f6e4399cd8eba1c86f7a62558ef",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "feature-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "feature-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). A fast-forward with its commit id: --no-commit makes no merge commit, and a fast-forward needs none. (D3, D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only-no-ff",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 79,
+      "name": "--ff-only conflicts with --no-ff",
+      "source_sha256": "a59c39310392a2d9ae8c7a269de5e62487ec473cec5e50973121293d826f5d3c",
+      "scenario_sha256": "dcf48609ae29f98158429a5059caf9e0144eebac5738a1405972abc724ebde10",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "initial"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. The table is the commit's only change. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'error: Flags ... cannot be used together' is SQLSTATE 22023. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only-refused",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 77,
+      "name": "--ff-only flag failure when fast-forward is not possible",
+      "source_sha256": "c0a72571deb60f2ee5d4c2da334d5fbcf696a4952affa988991558a1405766ce",
+      "scenario_sha256": "899455e9f3dd0e562b5e1a89126f1def3c87f1ced0641535d54b4455a1718831",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "feature-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "feature-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "main-commit2"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'fatal: Not possible to fast-forward, aborting' is SQLSTATE 55000. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows and their order. No changes."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only-squash",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 80,
+      "name": "--ff-only conflicts with --squash",
+      "source_sha256": "050e5ae98202ea87a3622c3ae00e709e325374c0ee5e88e48de6a4dd6814bddb",
+      "scenario_sha256": "ed336fc641e9edc5ea12ac77abf08250e4d2886bfd5fc25e12b00555d81722ec",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "initial"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. The table is the commit's only change. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'error: Flags ... cannot be used together' is SQLSTATE 22023. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-ff-only-up-to-date",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 78,
+      "name": "--ff-only flag with already up-to-date branch",
+      "source_sha256": "b0bcdbf9ddf64a11bdf8874583dcf5328f27a56a96da8e14049d808a929bd089",
+      "scenario_sha256": "f6972b045a46484c83ea27fd0509a84f96ab009689defae0ab40f6eaf6f1e40a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). Preserved: no commit id, Dolt's message. (D3, D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholder (any commit id) is checked as the feature branch's head. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-merge-squash-ff-checkout",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 15,
+      "name": "CALL DOLT_MERGE ff & squash with a checkout in between",
+      "source_sha256": "efae750cb2ea64598de1680a9e69747d50766f60d5405cdb2940a522318cd100",
+      "scenario_sha256": "3d65ac107d5540444b01a82b77b3205ec4d4f04534ef80542a650467dc0e053b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "autocommit"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "step1"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "insert3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "ff-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). doltCommit (any commit id) checked as the feature branch's head: a squashed fast-forward moves the rows, not the head. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1-branch",
+            "assert-1"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch. Preserved checkout result."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved checkout result."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows and their order. The squashed rows stay with main across the checkouts."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
+        "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)"
+      ]
+    },
+    {
+      "id": "dolt-merge-squash-ff",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 14,
+      "name": "CALL DOLT_MERGE ff & squash correctly works with autocommit off",
+      "source_sha256": "cfb15d0f769b8b26f6e7c299bcf1310d424f9532a4740e1b4a559d2a70ba8578",
+      "scenario_sha256": "12fe132ec81eb31bf17b0b5983a1f6a721eda7468c664e161cc4b254f49936c7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "autocommit"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "step1"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "insert3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "ff-commit"
+          ],
+          "note": "Commit inside the transaction block, checked to return a commit id. (D5, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). doltCommit (any commit id) checked as the feature branch's head: a squashed fast-forward moves the rows, not the head. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
+        "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)"
+      ]
+    },
+    {
+      "id": "dolt-merge-commit-flags",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 19,
+      "name": "CALL DOLT_MERGE with no conflicts works",
+      "source_sha256": "33178fbaf868539fbd8c9a0e2383614808b2b41ff4a41d098892154cec84e871",
+      "scenario_sha256": "d27f694511362457c1475c767e10deb4e7c3afbea9259c15d49e4f7d471a406a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "step1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "insert3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "normal-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "more"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "more-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). doltCommit (any id) captured as the merge commit; fast_forward 0 and no conflicts checked by its success. (D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
+        "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead.",
+        "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+      ]
+    },
+    {
+      "id": "dolt-merge-no-commit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 21,
+      "name": "CALL DOLT_MERGE with no conflicts works with no-commit flag",
+      "source_sha256": "4b4bb055323dfa178287418154ed149eb5a1f27f320960333f336428feb19427",
+      "scenario_sha256": "86531e99ff10baf7a52475078f5acce02dd2bc1e6de10ccbf464249fff304e4a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "seed"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "step1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch",
+            "checkout-feature"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "insert3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "normal-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "more"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "more-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4-branch",
+            "assert-4"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
+        "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead.",
+        "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+      ]
+    },
+    {
+      "id": "dolt-branch-rename",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltBranchScripts",
+      "index": 2,
+      "name": "Rename branches with dolt_branch procedure",
+      "source_sha256": "e5415f712442310c0d30b8acfea149bddd4ea14ab1594b69b488adba07a01da3",
+      "scenario_sha256": "3e16e68575b89cc624692e73acd3707b35b129e3ea47888056141c9b627ef11c",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "init-table",
+            "init",
+            "assert-0"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. Preceded by a first commit for the branches to start at. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. Forced, the rename replaces the branch of the new name. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "Dolt's 'fatal: A branch named ... already exists' is SQLSTATE 42710, and 'not a valid user branch name' is SQLSTATE 42602. (D4)",
+        "The branches start at main's head: a commit is made first, since a prolly branch is made from a commit (Dolt's database has its initial commits)."
+      ]
+    },
+    {
+      "id": "dolt-branch-rename-same",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltBranchScripts",
+      "index": 10,
+      "name": "renaming a branch to its own name preserves the branch and its data",
+      "source_sha256": "0e98b8f9fa33a12b8dde885793bd915e0f26534ae8dcfd54a7c6b30d1a8001ac",
+      "scenario_sha256": "02ac8c5dd41cba6e40333ea42d849596a2ff50016144219112cab479a9c373d3",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "init"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "No staging area: -Am commits the whole working set. (D1)",
+        "Dolt's 'branch not found' is SQLSTATE 42704. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-branch-rename-sessions",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "suite": "DoltBranchMultiSessionScriptTests",
+      "index": 1,
+      "name": "Test multi-session behavior for renaming branches",
+      "source_sha256": "0f5977d278fb3d58a5532b1b9dbf97eed58e6e68e96697d38f79f68534a1babf",
+      "scenario_sha256": "cd1d9d0ab53206512b23b586e87db41e62ab6d33343c6bd7b48ddffbdd185e1e",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init-table",
+            "init",
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case. Preceded by a first commit for the branches to start at."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "branch2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream checks the result row; the adapter checks the active branch."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Session a holds branch1. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4",
+            "moved-session"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. Also checks that session a, on branch1 when it was renamed, is on movedBranch1. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; '/* client a */' and '/* client b */' are the scenario's sessions a and b. (D3)",
+        "The branches start at main's head: a commit is made first, since a prolly branch is made from a commit (Dolt's database has its initial commits).",
+        "Dolt's 'unsafe to delete or rename branches in use in other sessions' is SQLSTATE 55006 (object in use); a session on the branch keeps it, under its new name, after a forced rename. (D4, D8)"
+      ]
     }
   ],
   "deferred": [

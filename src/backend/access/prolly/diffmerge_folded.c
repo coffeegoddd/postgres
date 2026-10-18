@@ -2500,6 +2500,133 @@ foreign_key_violations(List *relids)
 }
 
 /*
+ * Run each query (sql, info, relid) as its table's owner, its rows seen
+ * whatever their row security says, appending a violation of type for each
+ * row it returns (as JSON) to *found.
+ */
+static void
+violating_rows(List *queries, const char *type, List **found)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ListCell   *lc;
+
+	if (queries == NIL)
+		return;
+	CommandCounterIncrement();
+	SPI_connect();
+	foreach(lc, queries)
+	{
+		List	   *qi = lfirst(lc);
+		Oid			relid = (Oid) (uintptr_t) lthird(qi);
+		Oid			save_userid;
+		int			save_sec;
+		int			ret;
+
+		GetUserIdAndSecContext(&save_userid, &save_sec);
+		SetUserIdAndSecContext(rel_owner(relid),
+							   save_sec | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_NOFORCE_RLS);
+		ret = SPI_execute(linitial(qi), true, 0);
+		SetUserIdAndSecContext(save_userid, save_sec);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not check a constraint: %s", (char *) linitial(qi));
+		for (uint64 r = 0; r < SPI_processed; r++)
+		{
+			char	   *row = SPI_getvalue(SPI_tuptable->vals[r],
+										   SPI_tuptable->tupdesc, 1);
+			MemoryContext spi = MemoryContextSwitchTo(cxt);
+
+			*found = lappend(*found, violation(relid, type, pstrdup(row),
+											   pstrdup(lsecond(qi))));
+			MemoryContextSwitchTo(spi);
+		}
+	}
+	SPI_finish();
+}
+
+/*
+ * The rows of the tables of relids (NIL: every versioned one) that break
+ * a check or not-null constraint not validated yet: a table holds none
+ * that break one validated, Postgres checks every row written against it.
+ */
+static List *
+unvalidated_violations(List *relids)
+{
+	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
+										  NULL, 0, NULL);
+	HeapTuple	tup;
+	List	   *checks = NIL;
+	List	   *notnulls = NIL;
+	List	   *found = NIL;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+		char	   *table;
+		StringInfoData q;
+		StringInfoData info;
+
+		if ((con->contype != CONSTRAINT_CHECK && con->contype != CONSTRAINT_NOTNULL) ||
+			con->convalidated || !OidIsValid(con->conrelid) ||
+			OidIsValid(con->conparentid) ||
+			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
+			(relids != NIL && !list_member_oid(relids, con->conrelid)))
+			continue;
+		table = table_name(con->conrelid);
+		initStringInfo(&q);
+		initStringInfo(&info);
+		if (con->contype == CONSTRAINT_CHECK)
+		{
+			bool		isnull;
+			Datum		bin = heap_getattr(tup, Anum_pg_constraint_conbin,
+										   RelationGetDescr(pg_constraint), &isnull);
+			char	   *expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+																	   ObjectIdGetDatum(con->conrelid)));
+
+			appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE NOT (%s)",
+							 only_unless_partitioned(con->conrelid), table, expr);
+			appendStringInfo(&info, "{\"Name\": %s, \"Expression\": %s}",
+							 quote_json(NameStr(con->conname)), quote_json(expr));
+			checks = lappend(checks, list_make3(q.data, info.data,
+												(void *) (uintptr_t) con->conrelid));
+		}
+		else
+		{
+			AttrNumber	col = extractNotNullColumn(tup);
+			char	   *name = get_attname(con->conrelid, col, false);
+
+			appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE c.%s IS NULL",
+							 only_unless_partitioned(con->conrelid), table,
+							 quote_identifier(name));
+			appendStringInfo(&info, "{\"Name\": %s, \"Columns\": [%s]}",
+							 quote_json(NameStr(con->conname)), quote_json(name));
+			notnulls = lappend(notnulls, list_make3(q.data, info.data,
+													(void *) (uintptr_t) con->conrelid));
+		}
+	}
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+	violating_rows(checks, "check constraint", &found);
+	violating_rows(notnulls, "not null", &found);
+	return found;
+}
+
+/*
+ * dolt_verify_constraints' check of the session branch's tables of relids
+ * (NIL: every one): the rows breaking a foreign key, as a merge finds them,
+ * and those breaking a check or not-null constraint not validated yet.
+ * (The rows merges couldn't write aren't in the tables: their violations
+ * aren't found again, what to do with them is the user's.)
+ */
+static List *
+verify_constraints(List *relids)
+{
+	return list_concat(foreign_key_violations(relids),
+					   unvalidated_violations(relids));
+}
+
+/*
  * Keep the violations a merge (or pick) found with those the session's
  * branch has already (a violation found again, once).  Returns how many
  * are new.
@@ -2933,13 +3060,26 @@ merge_held(const char *branch, const char *message, int flags,
 	check_local(&local, &roots[0], &roots[1], &roots[2], "merge");
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
-		if (has_local_changes(&local))
+		if (flags & PROLLY_MERGE_SQUASH)
+		{
+			/* their rows, the head left where it is */
+			if (has_local_changes(&local))
+				refuse_local_changes("squash a merge");
+			folded_move_to(&roots[2], NULL);
+		}
+		else if (has_local_changes(&local))
 			fast_forward_local(&local, &theirs);
 		else
 			reset_to(&theirs);
 		*commit_id = theirs;
 		return 0;
 	}
+	if (flags & PROLLY_MERGE_FF_ONLY)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("not possible to fast-forward, aborting"),
+				 errdetail("The current branch has commits that branch \"%s\" doesn't.",
+						   branch)));
 
 	/* Three-way. */
 	conflicts = merge_recording(roots,
@@ -2958,17 +3098,51 @@ merge_held(const char *branch, const char *message, int flags,
 				 errdetail("The merge has %d conflicting rows and %d constraint violations.",
 						   conflicts, nviolations),
 				 errhint("Commit the changes, or reset the branch, first.")));
-	if (conflicts + nviolations > 0)
-	{
-		record_merge_state(&theirs, &base, conflicted, NULL);
-		memset(commit_id, 0, sizeof(*commit_id));
-		return conflicts + nviolations;
-	}
-	parents[0] = ours;
-	parents[1] = theirs;
 	if (message == NULL)
 		message = psprintf("Merge branch '%s' into %s", branch,
 						   branch_ops()->current());
+
+	/*
+	 * A squash's conflicts are resolved as a pick's are: its commit has the
+	 * one parent.
+	 */
+	if (conflicts + nviolations > 0)
+	{
+		record_merge_state(&theirs, &base, conflicted,
+						   (flags & PROLLY_MERGE_SQUASH) ? message : NULL);
+		memset(commit_id, 0, sizeof(*commit_id));
+		return conflicts + nviolations;
+	}
+
+	/*
+	 * No commit: the merge in progress (none, for a squash), as its
+	 * conflicts would leave it.  Not over uncommitted changes, which its
+	 * commit would take in.
+	 */
+	if (flags & PROLLY_MERGE_NO_COMMIT)
+	{
+		if (has_local_changes(&local))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot merge without committing over uncommitted changes"),
+					 errhint("Commit the changes, or reset the branch, first.")));
+		if (!(flags & PROLLY_MERGE_SQUASH))
+			record_merge_state(&theirs, &base, NIL, NULL);
+		memset(commit_id, 0, sizeof(*commit_id));
+		return 0;
+	}
+	parents[0] = ours;
+	parents[1] = theirs;
+	if (flags & PROLLY_MERGE_SQUASH)
+	{
+		ProllyNodeRef merged;
+
+		if (has_local_changes(&local))
+			without_local(&local, &merged);
+		PROLLY_CALL(dc.refs, commit_with, message, parents, 1,
+					has_local_changes(&local) ? &merged : NULL, commit_id);
+		return 0;
+	}
 	/* the merge's commit leaves the uncommitted changes uncommitted */
 	if (has_local_changes(&local))
 	{
@@ -2996,37 +3170,18 @@ folded_merge(const char *branch, const char *message, int flags,
 }
 
 /*
- * Commit refs' changes (each from its parent) again on the session's
- * branch, or, reverting, undo them (each from it to its parent): every ref
- * resolved before anything moves, each merged three-way into the branch as
- * the ones before left it, and one commit made of them all, with one
- * parent.  A pick's conflicts leave it in progress, to resolve before
- * its commit; a revert's are an error.  So is a commit of nothing, unless
- * allow_empty.  A cherry-pick keeps its commit's author.
+ * Resolve refs to commits with one parent each, whose changes a pick or
+ * revert takes (what: "cherry-pick" or "revert", fn its function), checking
+ * what their changes bring in: a pick's, what it needs that its parent
+ * didn't; a revert's, what the parent needed that it doesn't.
  */
-static int
-pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
-		  ProllyHash *commit_id)
+static void
+resolve_picks(const char *const *refs, int nrefs, bool revert, const char *fn,
+			  ProllyHash *picked, ProllyCommitInfo *info)
 {
 	ProllyDatabaseComponents dc = components();
 	const char *what = revert ? "revert" : "cherry-pick";
-	const char *fn = revert ? "dolt_revert" : "dolt_cherry_pick";
-	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
-	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
-	ProllyHash	ours;
-	ProllyNodeRef roots[3];
-	ProllyNodeRef head;
-	ProllyMergeState ms;
-	List	   *conflicted = NIL;
-	StringInfoData message;
-	ProllyNodeRef before;
-	Local		local;
 
-	if (PROLLY_CALL(dc.refs, merge_state, &ms))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("a merge is in progress on the current branch"),
-				 errhint("Resolve its conflicts and commit, or abort it.")));
 	for (int i = 0; i < nrefs; i++)
 	{
 		if (!PROLLY_CALL(dc.refs, resolve, refs[i], &picked[i]) ||
@@ -3046,15 +3201,66 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 					 errmsg("%s of a commit with %d parents isn't supported", fn,
 							info[i].nparents),
 					 errdetail("Its changes are changes from one parent.")));
-		/*
-		 * What its changes bring in: a pick's, what it needs that its parent
-		 * didn't; a revert's, what the parent needed that it doesn't.
-		 */
 		if (revert)
 			check_needs(&info[i].parents[0], &picked[i], what);
 		else
 			check_needs(&picked[i], &info[i].parents[0], what);
 	}
+}
+
+/*
+ * Commit the working set with one parent, the session's head: leaving the
+ * uncommitted changes l had uncommitted.
+ */
+static void
+commit_one_parent(const char *message, const ProllyHash *head, const Local *l,
+				  ProllyHash *commit_id)
+{
+	ProllyDatabaseComponents dc = components();
+
+	if (has_local_changes(l))
+	{
+		ProllyNodeRef root;
+
+		without_local(l, &root);
+		PROLLY_CALL(dc.refs, commit_with, message, head, 1, &root, commit_id);
+	}
+	else
+		PROLLY_CALL(dc.refs, commit_with, message, head, 1, NULL, commit_id);
+}
+
+/*
+ * Commit refs' changes (each from its parent) again on the session's
+ * branch: every ref resolved before anything moves, each merged three-way
+ * into the branch as the ones before left it, and one commit made of them
+ * all, with one parent.  Conflicts leave the pick in progress, to resolve
+ * before its commit.  So is a commit of nothing, unless allow_empty.  A
+ * cherry-pick keeps its commit's author.
+ */
+static int
+pick_held(const char *const *refs, int nrefs, bool allow_empty,
+		  ProllyHash *commit_id)
+{
+	ProllyDatabaseComponents dc = components();
+	const char *what = "cherry-pick";
+	const char *fn = "dolt_cherry_pick";
+	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
+	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
+	ProllyHash	ours;
+	ProllyNodeRef roots[3];
+	ProllyNodeRef head;
+	ProllyMergeState ms;
+	List	   *conflicted = NIL;
+	StringInfoData message;
+	ProllyNodeRef before;
+	Local		local;
+
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a merge is in progress on the current branch"),
+				 errhint("Resolve its conflicts and commit, or abort it.")));
+	resolve_picks(refs, nrefs, false, fn, picked, info);
 	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3064,8 +3270,8 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 	local_changes(&ours, &local);
 	for (int i = 0; i < nrefs; i++)
 	{
-		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
-		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
+		commit_root(&info[i].parents[0], &roots[0]);
+		commit_root(&picked[i], &roots[2]);
 		check_local(&local, &roots[0], &head, &roots[2], what);
 	}
 	root_of("WORKING", &before);
@@ -3077,16 +3283,14 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 		int			conflicts;
 		int			nviolations = 0;
 
-		commit_root(revert ? &picked[i] : &info[i].parents[0], &roots[0]);
-		commit_root(revert ? &info[i].parents[0] : &picked[i], &roots[2]);
-		/* (a revert's conflicts are an error) */
-		conflicts = merge_recording(roots, revert, fn, NULL, &conflicted,
+		commit_root(&info[i].parents[0], &roots[0]);
+		commit_root(&picked[i], &roots[2]);
+		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
 									&nviolations);
 
 		/*
-		 * A pick's (a revert's failed): the pick in progress.  Not over
-		 * uncommitted changes, which its commit would take in, and its
-		 * abort (a reset) would lose.
+		 * The pick in progress.  Not over uncommitted changes, which its
+		 * commit would take in, and its abort (a reset) would lose.
 		 */
 		if (conflicts + nviolations > 0 && has_local_changes(&local))
 			ereport(ERROR,
@@ -3098,51 +3302,135 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 					 errhint("Commit the changes, or reset the branch, first.")));
 		if (conflicts + nviolations > 0)
 		{
-			if (revert)
-				record_merge_state(&info[i].parents[0], &picked[i], conflicted,
-								   psprintf("Revert \"%s\"", info[i].message));
-			else
-				record_merge_state(&picked[i], &info[i].parents[0], conflicted,
-								   info[i].message);
+			record_merge_state(&picked[i], &info[i].parents[0], conflicted,
+							   info[i].message);
 			memset(commit_id, 0, sizeof(*commit_id));
 			return conflicts + nviolations;
 		}
 		/* the next merges into the rows as this one left them */
 		root_of("WORKING", &roots[1]);
-		if (!revert)
-			appendStringInfoString(&message, info[i].message);
-		else
-			appendStringInfo(&message, i == 0 ? "Revert \"%s\"" : " and \"%s\"",
-							 info[i].message);
+		appendStringInfoString(&message, info[i].message);
 	}
 	if (same_hash(&roots[1].hash, &before.hash) && !allow_empty)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%s changes nothing on the branch", fn),
-				 revert ? 0 : errhint("Pass --allow-empty to commit it anyway.")));
+				 errhint("Pass --allow-empty to commit it anyway.")));
 
-	if (!revert)
-		prolly_set_commit_author(info[0].author);
+	prolly_set_commit_author(info[0].author);
 	PG_TRY();
 	{
-		/* the commit leaves the uncommitted changes uncommitted */
-		if (has_local_changes(&local))
-		{
-			ProllyNodeRef picked_root;
-
-			without_local(&local, &picked_root);
-			PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1,
-						&picked_root, commit_id);
-		}
-		else
-			PROLLY_CALL(dc.refs, commit_with, message.data, &ours, 1, NULL,
-						commit_id);
+		commit_one_parent(message.data, &ours, &local, commit_id);
 	}
 	PG_FINALLY();
 	{
 		prolly_set_commit_author(NULL);
 	}
 	PG_END_TRY();
+	return 0;
+}
+
+/*
+ * Undo refs' changes (each from it to its parent), one commit each, as in
+ * Dolt: every ref resolved before anything moves, each merged three-way
+ * into the branch as the ones before left it.  A revert that conflicts (or
+ * leaves rows breaking constraints) stops the series there, in progress
+ * as a pick is: its commit, once they are resolved, is the next of the
+ * series (dolt_revert --continue goes on with the rest), and an abort
+ * goes back to series_head, the head before the series (NULL: the head
+ * now).  commit_id gets the last commit made.
+ */
+static int
+revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
+			ProllyHash *commit_id)
+{
+	ProllyDatabaseComponents dc = components();
+	const char *what = "revert";
+	const char *fn = "dolt_revert";
+	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
+	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
+	ProllyHash	ours;
+	ProllyHash	series;
+	ProllyNodeRef roots[3];
+	ProllyNodeRef head;
+	ProllyMergeState ms;
+	Local		local;
+
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a merge is in progress on the current branch"),
+				 errhint("Resolve its conflicts and commit, or abort it.")));
+	resolve_picks(refs, nrefs, true, fn, picked, info);
+	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no commit to apply changes to")));
+	series = series_head ? *series_head : ours;
+	commit_root(&ours, &head);
+	local_changes(&ours, &local);
+	for (int i = 0; i < nrefs; i++)
+	{
+		commit_root(&picked[i], &roots[0]);
+		commit_root(&info[i].parents[0], &roots[2]);
+		check_local(&local, &roots[0], &head, &roots[2], what);
+	}
+
+	roots[1] = head;
+	memset(commit_id, 0, sizeof(*commit_id));
+	for (int i = 0; i < nrefs; i++)
+	{
+		List	   *conflicted = NIL;
+		int			conflicts;
+		int			nviolations = 0;
+		char	   *message = psprintf("Revert \"%s\"", info[i].message);
+		ProllyNodeRef before;
+
+		root_of("WORKING", &before);
+		commit_root(&picked[i], &roots[0]);
+		commit_root(&info[i].parents[0], &roots[2]);
+		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
+									&nviolations);
+		if (conflicts + nviolations > 0 && has_local_changes(&local))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot %s with uncommitted changes when the %s conflicts",
+							what, what),
+					 errdetail("The %s has %d conflicting rows and %d constraint violations.",
+							   what, conflicts, nviolations),
+					 errhint("Commit the changes, or reset the branch, first.")));
+		if (conflicts + nviolations > 0)
+		{
+			ProllyMergeState rs;
+			ListCell   *lc;
+			int			n = 0;
+
+			memset(&rs, 0, sizeof(rs));
+			rs.theirs = info[i].parents[0];
+			rs.base = picked[i];
+			rs.ntables = list_length(conflicted);
+			rs.tables = palloc(sizeof(Oid) * Max(rs.ntables, 1));
+			foreach(lc, conflicted)
+				rs.tables[n++] = lfirst_oid(lc);
+			rs.pick = true;
+			rs.message = message;
+			rs.revert = true;
+			rs.series_head = series;
+			rs.npending = nrefs - i - 1;
+			rs.pending = picked + i + 1;
+			PROLLY_CALL(dc.refs, set_merge_state, &rs);
+			memset(commit_id, 0, sizeof(*commit_id));
+			return conflicts + nviolations;
+		}
+		root_of("WORKING", &roots[1]);
+		if (same_hash(&roots[1].hash, &before.hash))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("%s changes nothing on the branch", fn),
+					 errdetail("Reverting \"%s\" changes nothing.", refs[i])));
+		commit_one_parent(message, &ours, &local, commit_id);
+		ours = *commit_id;
+	}
 	return 0;
 }
 
@@ -3238,12 +3526,24 @@ folded_resolve(Oid relid, bool theirs)
 }
 
 static int
-folded_cherry_pick(const char *const *refs, int nrefs, bool revert,
-				   bool allow_empty, ProllyHash *commit_id)
+folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
+				   ProllyHash *commit_id)
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = pick_held(refs, nrefs, revert, allow_empty, commit_id);
+	int			result = pick_held(refs, nrefs, allow_empty, commit_id);
+
+	if (pushed)
+		PopActiveSnapshot();
+	return result;
+}
+
+static int
+folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
+			  ProllyHash *commit_id)
+{
+	bool		pushed = PROLLY_CALL(components().refs, hold);
+	int			result = revert_held(refs, nrefs, series_head, commit_id);
 
 	if (pushed)
 		PopActiveSnapshot();
@@ -3265,5 +3565,6 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.tables = folded_tables,
 	.move_to = folded_move_to,
 	.cherry_pick = folded_cherry_pick,
-	.verify = foreign_key_violations,
+	.revert = folded_revert,
+	.verify = verify_constraints,
 };

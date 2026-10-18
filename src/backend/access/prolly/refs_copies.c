@@ -17,8 +17,11 @@
  *	'M' name	-> the branch's merge in progress: the merged head and the
  *				   common ancestor (hash length, hash each), the count of
  *				   tables with unresolved conflicts and their OIDs (4 bytes
- *				   each, big-endian), then, if it is a cherry-pick, the
- *				   picked commit's message
+ *				   each, big-endian), then, if it is a cherry-pick, 'p'
+ *				   and the picked commit's message, or, a revert's, 'r',
+ *				   the head before its series (hash length, hash), the
+ *				   count of commits still to revert and their ids (hash
+ *				   length, hash each), and its commit's message
  *	'V' name	-> the branch's constraint violations: for each, its
  *				   table's OID (4 bytes, big-endian), then its type, row and
  *				   what it violates, each a length (4 bytes, big-endian) and
@@ -200,7 +203,7 @@ check_merge_conflicts(const char *what)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
-					 errdetail("Table \"%s\" has a row that violates a %s constraint on branch \"%s\".",
+					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
 							   get_rel_name(((ProllyViolation *) linitial(v))->relid),
 							   ((ProllyViolation *) linitial(v))->type,
 							   (char *) lfirst(lc)),
@@ -1258,6 +1261,74 @@ copies_branch_delete(const char *name, bool force)
 	}
 }
 
+/*
+ * Rename a branch: its catalog row (one with copies), then each of its
+ * entries, moved to the new name.  A rename to its own name changes
+ * nothing.
+ */
+static void
+copies_branch_rename(const char *name, const char *newname, bool force)
+{
+	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
+	TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	ListCell   *lc;
+
+	lock_refs();
+	if (!branch_exists(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" does not exist", name)));
+	if (strcmp(name, newname) == 0)
+		return;
+	/* forced, it takes the place of a branch of the new name, as in Dolt */
+	if (branch_exists(newname) && !force)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", newname),
+				 errhint("Replace it with -f.")));
+	if (branch_exists(newname))
+		copies_branch_delete(newname, true);
+	if (OidIsValid(branch_oid(name)))
+		branch_ops()->rename(name, newname, force);
+	else
+	{
+		/* (one with only a head: no session is on it) */
+		branch_ops()->check_drop(name);
+		branch_ops()->check_create(newname);
+	}
+	for (int i = 0; i < lengthof(tags); i++)
+	{
+		StringInfoData key;
+		StringInfoData v;
+
+		initStringInfo(&key);
+		initStringInfo(&v);
+		appendStringInfoChar(&key, tags[i]);
+		appendStringInfoString(&key, name);
+		if (refs_get(key.data, key.len, &v))
+		{
+			refs_put(key.data, key.len, NULL);
+			resetStringInfo(&key);
+			appendStringInfoChar(&key, tags[i]);
+			appendStringInfoString(&key, newname);
+			refs_put(key.data, key.len, &v);
+		}
+		pfree(key.data);
+		pfree(v.data);
+	}
+	/* (a merge state the transaction set is checked under the new name) */
+	foreach(lc, merge_changed)
+	{
+		if (strcmp(lfirst(lc), name) == 0)
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+			lfirst(lc) = pstrdup(newname);
+			MemoryContextSwitchTo(old);
+		}
+	}
+}
+
 static bool
 copies_branch_lookup(const char *name, ProllyBranchId *branch)
 {
@@ -1684,9 +1755,25 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
 		for (int i = 0; i < state->ntables; i++, p += 4)
 			state->tables[i] = get_be32(p);
-		/* a cherry-pick's message */
+		/* a cherry-pick's message; a revert's series, then its message */
 		state->pick = p < end;
-		state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
+		if (state->pick && *p == 'r')
+		{
+			state->revert = true;
+			p = get_hash(p + 1, end, &state->series_head);
+			if (end - p < 4)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly refs hold an invalid merge state")));
+			state->npending = get_be32(p);
+			p += 4;
+			state->pending = palloc(sizeof(ProllyHash) * Max(state->npending, 1));
+			for (int i = 0; i < state->npending; i++)
+				p = get_hash(p, end, &state->pending[i]);
+			state->message = pnstrdup(p, end - p);
+		}
+		else
+			state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -1726,7 +1813,16 @@ copies_set_merge_state(const ProllyMergeState *state)
 		put_be32(&v, state->ntables);
 		for (int i = 0; i < state->ntables; i++)
 			put_be32(&v, state->tables[i]);
-		if (state->pick)
+		if (state->revert)
+		{
+			appendStringInfoChar(&v, 'r');
+			put_hash(&v, &state->series_head);
+			put_be32(&v, state->npending);
+			for (int i = 0; i < state->npending; i++)
+				put_hash(&v, &state->pending[i]);
+			appendStringInfoString(&v, state->message ? state->message : "");
+		}
+		else if (state->pick)
 		{
 			appendStringInfoChar(&v, 'p');
 			appendStringInfoString(&v, state->message ? state->message : "");
@@ -2507,4 +2603,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.config_set = copies_config_set,
 	.open = refs_init,
 	.commit_rows = copies_commit_rows,
+	.branch_rename = copies_branch_rename,
 };

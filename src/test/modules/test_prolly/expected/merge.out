@@ -107,9 +107,9 @@ SELECT * FROM dolt_status();
 (0 rows)
 
 SELECT (dolt_merge('feature'))[2:4];		-- merged already
-          dolt_merge           
--------------------------------
- {0,0,"Everything up-to-date"}
+                            dolt_merge                            
+------------------------------------------------------------------
+ {0,0,"cannot fast forward from a to b. a is ahead of b already"}
 (1 row)
 
 -- Conflicts: both change row 5, differently; feature also changes row 6.

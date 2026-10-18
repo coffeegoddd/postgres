@@ -82,10 +82,10 @@ SELECT * FROM dolt_status();
 (0 rows)
 
 -- Reverting it undoes them.
-SELECT dolt_revert('HEAD');
+SELECT (dolt_revert('HEAD'))[2:4];
  dolt_revert 
 -------------
- {0}
+ {0,0,0}
 (1 row)
 
 SELECT id, v FROM app.t WHERE id IN (1, 2, 5, 11) ORDER BY id;
@@ -339,7 +339,7 @@ ERROR:  dolt_cherry_pick of a commit with 2 parents isn't supported
 DETAIL:  Its changes are changes from one parent.
 SELECT dolt_revert('nope');
 ERROR:  prolly ref "nope" does not exist
--- Several reverts are one commit, every ref named as the branch was
+-- Several reverts are a commit each, every ref named as the branch was
 -- before: HEAD~1 is r1, not the commit HEAD's revert makes.
 UPDATE app.t SET v = 'r1' WHERE id = 6;
 SELECT length(dolt_commit('-am', 'r1')::text) AS committed;
@@ -356,10 +356,10 @@ SELECT length(dolt_commit('-am', 'r2')::text) AS committed;
 (1 row)
 
 SELECT dolt_hashof('HEAD~2') AS before_r \gset
-SELECT dolt_revert('HEAD', 'HEAD~1');
+SELECT (dolt_revert('HEAD', 'HEAD~1'))[2:4];
  dolt_revert 
 -------------
- {0}
+ {0,0,0}
 (1 row)
 
 SELECT id, v FROM app.t WHERE id IN (6, 7) ORDER BY id;
@@ -369,15 +369,16 @@ SELECT id, v FROM app.t WHERE id IN (6, 7) ORDER BY id;
   7 | v7
 (2 rows)
 
-SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
-       message        
-----------------------
- Revert "r2" and "r1"
-(1 row)
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 2;
+   message   
+-------------
+ Revert "r1"
+ Revert "r2"
+(2 rows)
 
-SELECT dolt_hashof('HEAD~3') = :'before_r' AS one_commit;
- one_commit 
-------------
+SELECT dolt_hashof('HEAD~4') = :'before_r' AS one_commit_each;
+ one_commit_each 
+-----------------
  t
 (1 row)
 

@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "id": "dolt-merge-commit-flags",
+  "description": "Reviewed Dolt port: CALL DOLT_MERGE with no conflicts works",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: CALL DOLT_MERGE with no conflicts works"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0),(1),(2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "step1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Step 1"
+      ],
+      "save": "step1"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature-branch"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature-branch"
+      ]
+    },
+    {
+      "id": "insert3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET pk=1000 WHERE pk=0",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "normal-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "this is a normal commit"
+      ],
+      "save": "normal"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "more",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (5),(6),(7)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "more-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add some more values"
+      ],
+      "save": "more"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT dolt_merge('feature-branch', '--no-commit', '--commit')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "feature-branch",
+        "-m",
+        "this is a merge"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_status",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "this is a merge"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

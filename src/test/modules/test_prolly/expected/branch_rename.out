@@ -1,0 +1,311 @@
+-- dolt_branch -m: renaming a branch, with its head, working set, merge in
+-- progress and upstream, as in Dolt.
+CREATE SCHEMA br VERSIONED;
+CREATE TABLE br.t (a int PRIMARY KEY, v int);
+INSERT INTO br.t VALUES (1, 0);
+SELECT length(dolt_commit('-Am', 'init')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A branch with only its head, never used, renamed.
+SELECT dolt_branch('br_head');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('br_head') AS head \gset
+SELECT dolt_branch('-m', 'br_head', 'br_moved');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE name LIKE 'br\_%' ORDER BY 1;
+   name   
+----------
+ br_moved
+(1 row)
+
+SELECT dolt_hashof('br_moved') = :'head' AS same_head;
+ same_head 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('br_head');
+ERROR:  prolly ref "br_head" does not exist
+-- A branch with copies and uncommitted changes keeps them.
+SELECT dolt_checkout('br_moved');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'br_moved'"}
+(1 row)
+
+INSERT INTO br.t VALUES (2, 0);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-m', 'br_moved', 'br_used');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('br_used');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'br_used'"}
+(1 row)
+
+SELECT a, v FROM br.t ORDER BY a;
+ a | v 
+---+---
+ 1 | 0
+ 2 | 0
+(2 rows)
+
+-- The session's own branch: it stays on it, under the new name.
+SELECT dolt_branch('--move', 'br_used', 'br_mine');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ br_mine
+(1 row)
+
+SELECT a, v FROM br.t ORDER BY a;
+ a | v 
+---+---
+ 1 | 0
+ 2 | 0
+(2 rows)
+
+SELECT length(dolt_commit('-am', 'two')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT a, v FROM br.t ORDER BY a;
+ a | v 
+---+---
+ 1 | 0
+(1 row)
+
+-- A rename to its own name changes nothing; with -f too.
+SELECT dolt_branch('-m', 'br_mine', 'br_mine');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-mf', 'br_mine', 'br_mine');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT count(*) FROM dolt_branches WHERE name = 'br_mine';
+ count 
+-------
+     1
+(1 row)
+
+-- Refused: a branch that doesn't exist, a name taken or invalid, main,
+-- and the wrong number of names.
+SELECT dolt_branch('-m', 'br_nosuch', 'br_nosuch');
+ERROR:  branch "br_nosuch" does not exist
+SELECT dolt_branch('-m', 'br_nosuch', 'br_other');
+ERROR:  branch "br_nosuch" does not exist
+SELECT dolt_branch('-m', 'br_mine', 'main');
+ERROR:  branch "main" already exists
+HINT:  Replace it with -f.
+SELECT dolt_branch('-m', 'br_mine', 'HEAD');
+ERROR:  invalid branch name "HEAD"
+DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_branch('-m', 'br_mine', 'detached/x');
+ERROR:  branch names beginning "detached/" are reserved
+SELECT dolt_branch('-m', 'main', 'trunk');
+ERROR:  branch "main" can't be renamed
+SELECT dolt_branch('-m', 'br_mine');
+ERROR:  dolt_branch -m needs the branch to rename and its new name
+SELECT dolt_branch('-m', '-d', 'br_mine', 'x');
+ERROR:  dolt_branch takes one of -d, -c and -m
+-- A merge in progress moves with the branch.
+SELECT dolt_branch('br_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('br_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'br_side'"}
+(1 row)
+
+UPDATE br.t SET v = 10 WHERE a = 1;
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('br_mine');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'br_mine'"}
+(1 row)
+
+UPDATE br.t SET v = 20 WHERE a = 1;
+SELECT length(dolt_commit('-am', 'mine')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SET LOCAL dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('br_side'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT dolt_branch('-m', 'br_mine', 'br_merging');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT table_name, num_conflicts FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ br.t       |             1
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+SELECT active_branch();
+ active_branch 
+---------------
+ br_merging
+(1 row)
+
+SELECT a, v FROM br.t ORDER BY a;
+ a | v  
+---+----
+ 1 | 20
+ 2 |  0
+(2 rows)
+
+-- The renamed branch is found again as rolled back with its transaction.
+BEGIN;
+SELECT dolt_branch('-m', 'br_side', 'br_gone');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ROLLBACK;
+SELECT name FROM dolt_branches WHERE name LIKE 'br\_%' ORDER BY 1;
+    name    
+------------
+ br_merging
+ br_side
+(2 rows)
+
+-- Forced, it replaces a branch of the new name; not one checked out.
+SELECT dolt_branch('br_old');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('br_target');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-m', 'br_old', 'br_target');
+ERROR:  branch "br_target" already exists
+HINT:  Replace it with -f.
+SELECT dolt_branch('-mf', 'br_old', 'br_target');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE name LIKE 'br\_%' ORDER BY 1;
+    name    
+------------
+ br_merging
+ br_side
+ br_target
+(3 rows)
+
+SELECT dolt_branch('-M', 'br_target', 'br_merging');	-- (checked out)
+ERROR:  branch "br_merging" is checked out
+HINT:  Check out another branch first.
+SELECT dolt_branch('-D', 'br_target');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- "--" ends the options: names after it may begin with "-".
+SELECT dolt_branch('-m', '--', 'br_side', 'br_dash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE name LIKE 'br\_%' ORDER BY 1;
+    name    
+------------
+ br_dash
+ br_merging
+(2 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'br_merging');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'br_dash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA br CASCADE;
+NOTICE:  drop cascades to table br.t

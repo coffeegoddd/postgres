@@ -40,6 +40,13 @@ typedef struct BranchOpsRoutine
 	void		(*drop) (const char *name);
 
 	/*
+	 * Call branch name newname, as deleting it and making one of the new
+	 * name would check: refused if another session is on it, unless force
+	 * (sessions on it stay on it, under its new name).
+	 */
+	void		(*rename) (const char *name, const char *newname, bool force);
+
+	/*
 	 * What create and drop check of the session, alone (a branch's name,
 	 * the privileges they need, a transaction that can write): refused if
 	 * the session may not make, or delete, a branch called name.

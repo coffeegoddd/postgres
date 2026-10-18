@@ -158,7 +158,7 @@ SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child')
 ROLLBACK;
 SELECT dolt_verify_constraints();	-- can't be committed
 ERROR:  cannot commit a transaction with constraint violations
-DETAIL:  Table "child" has a row that violates a foreign key constraint on branch "main".
+DETAIL:  Table "child" has a row with a foreign key violation on branch "main".
 HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
 SET dolt.allow_commit_conflicts = on;
 SELECT dolt_verify_constraints();	-- kept
@@ -420,7 +420,7 @@ BEGIN;
 SELECT dolt_revert(:'parent10');
  dolt_revert 
 -------------
- {1}
+ {"",0,0,1}
 (1 row)
 
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');

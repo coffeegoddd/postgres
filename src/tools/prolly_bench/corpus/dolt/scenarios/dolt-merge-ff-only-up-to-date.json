@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "dolt-merge-ff-only-up-to-date",
+  "description": "Reviewed Dolt port: --ff-only flag with already up-to-date branch",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: --ff-only flag with already up-to-date branch"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'main1'), (2, 'main2')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main commit"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('--ff-only', 'feature') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "0",
+            "Everything up-to-date"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

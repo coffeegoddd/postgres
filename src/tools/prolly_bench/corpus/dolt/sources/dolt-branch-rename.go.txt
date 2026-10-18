@@ -1,0 +1,30 @@
+{
+		Name: "Rename branches with dolt_branch procedure",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_BRANCH('myNewBranch1')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('myNewBranch2')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				// Renaming to an existing name fails without the force flag
+				Query:          "CALL DOLT_BRANCH('-m', 'myNewBranch1', 'myNewBranch2')",
+				ExpectedErrStr: "fatal: A branch named 'myNewBranch2' already exists.",
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('-mf', 'myNewBranch1', 'myNewBranch2')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('-m', 'myNewBranch2', 'myNewBranch3')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-m', 'myNewBranch3', 'HEAD')",
+				ExpectedErrStr: "not a valid user branch name",
+			},
+		},
+	}

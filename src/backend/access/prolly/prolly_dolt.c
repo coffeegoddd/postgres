@@ -344,6 +344,16 @@ unexpected(const char *fn, const char *arg)
 			 errmsg("%s: unexpected argument \"%s\"", fn, arg)));
 }
 
+/* Flags a and b (named an and bn) given together are an error. */
+static void
+exclusive_flags(int flags, int a, const char *an, int b, const char *bn)
+{
+	if ((flags & a) && (flags & b))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("flags \"%s\" and \"%s\" cannot be used together", an, bn)));
+}
+
 static const ProllyRefsRoutine *
 refs(void)
 {
@@ -1058,9 +1068,12 @@ dolt_branch(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	bool		delete = false;
 	bool		copy = false;
+	bool		move = false;
 	bool		force = false;
 	bool		take = false;
 	ProllyBranchProtection protection = PROLLY_PROTECT_DEFAULT;
+	bool		options = true;
+	bool		was_protected;
 	List	   *names = NIL;
 	const char *result[1] = {"0"};
 
@@ -1068,13 +1081,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "-d") == 0 || strcmp(a, "--delete") == 0)
+		if (!options || a[0] != '-')
+			names = lappend(names, a);
+		else if (strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (strcmp(a, "--delete") == 0)
 			delete = true;
-		else if (strcmp(a, "-D") == 0)
-			delete = force = true;
-		else if (strcmp(a, "-f") == 0 || strcmp(a, "--force") == 0)
+		else if (strcmp(a, "--force") == 0)
 			force = true;
-		else if (strcmp(a, "-c") == 0 || strcmp(a, "--copy") == 0)
+		else if (strcmp(a, "--copy") == 0)
 			copy = true;
 		else if (strcmp(a, "--take") == 0)
 			take = true;
@@ -1082,10 +1097,31 @@ dolt_branch(PG_FUNCTION_ARGS)
 			protection = PROLLY_PROTECT_ON;
 		else if (strcmp(a, "--unprotect") == 0)
 			protection = PROLLY_PROTECT_OFF;
-		else if (a[0] == '-')
+		else if (strcmp(a, "--move") == 0)
+			move = true;
+		else if (a[1] == '-' || a[1] == '\0')
 			unsupported("dolt_branch", a);
 		else
-			names = lappend(names, a);
+		{
+			/* short flags, one or several together ("-mf") */
+			for (const char *f = a + 1; *f; f++)
+			{
+				if (*f == 'd')
+					delete = true;
+				else if (*f == 'D')
+					delete = force = true;
+				else if (*f == 'f')
+					force = true;
+				else if (*f == 'c')
+					copy = true;
+				else if (*f == 'm')
+					move = true;
+				else if (*f == 'M')
+					move = force = true;
+				else
+					unsupported("dolt_branch", a);
+			}
+		}
 	}
 	if (names == NIL)
 		ereport(ERROR,
@@ -1095,7 +1131,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	{
 		ListCell   *lc;
 
-		if (delete || copy || take)
+		if (delete || copy || move || take)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_branch --protect and --unprotect take no other option")));
@@ -1115,7 +1151,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	{
 		ListCell   *lc;
 
-		if (delete || copy)
+		if (delete || copy || move)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_branch --take takes no other option")));
@@ -1140,6 +1176,53 @@ dolt_branch(PG_FUNCTION_ARGS)
 			branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 			ReleaseSysCache(tup);
 			PROLLY_CALL(writers(), take, branch);
+		}
+		PG_RETURN_DATUM(text_array(1, result));
+	}
+	if ((int) delete + (int) copy + (int) move > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_branch takes one of -d, -c and -m")));
+	if (move)
+	{
+		if (list_length(names) != 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_branch -m needs the branch to rename and its new name")));
+		reserved_branch_name(lsecond(names));
+
+		/*
+		 * (a writer's branch is named by its writer; a protected one is the
+		 * database owner's to rename, and stays protected by its new name)
+		 */
+		if (writer_branch_name(linitial(names)) || writer_branch_name(lsecond(names)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a writer's branch can't be renamed")));
+		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
+		for (int i = 0; i < 2; i++)
+		{
+			char	   *n = list_nth(names, i);
+			ProllyHash	head;
+
+			/* (the second, if it is: the branch a forced rename replaces) */
+			if ((i == 0 ? was_protected :
+				 PROLLY_CALL(refs(), resolve, n, &head) &&
+				 PROLLY_CALL(writers(), protected, n)) &&
+				!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("branch \"%s\" is protected", n),
+						 errhint("Only the database's owner renames or replaces a protected branch.")));
+		}
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_rename, linitial(names),
+										 lsecond(names), force));
+		if (was_protected)
+		{
+			PROLLY_CALL(writers(), set_protected, linitial(names),
+						PROLLY_PROTECT_DEFAULT);
+			PROLLY_CALL(writers(), set_protected, lsecond(names),
+						PROLLY_PROTECT_ON);
 		}
 		PG_RETURN_DATUM(text_array(1, result));
 	}
@@ -1217,12 +1300,14 @@ abort_in_progress(const char *what)
  * dolt_merge(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward, conflicts, message}
  *
- * branch; --no-ff; -m/--message message; --abort.  Rows changed
- * differently on both sides leave the merge in progress, with conflicts
- * (dolt_conflicts) to resolve before dolt_commit makes the merge commit.
- * As in Dolt, a transaction can't commit with conflicts unless
+ * branch; --no-ff; --ff-only; --squash; --no-commit; -m/--message
+ * message; --abort.  Rows changed differently on both sides leave the
+ * merge in progress, with conflicts (dolt_conflicts) to resolve before
+ * dolt_commit makes the merge commit; --no-commit leaves it so without
+ * them.  As in Dolt, a transaction can't commit with conflicts unless
  * dolt.allow_commit_conflicts is on: outside a transaction block, the
- * merge fails and changes nothing.
+ * merge fails and changes nothing.  The commit id is empty when no commit
+ * was made or moved to (nothing to merge, a merge left in progress).
  */
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
@@ -1237,6 +1322,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	ProllyHash	id = {0};
 	bool		had_head;
 	bool		abort_merge = false;
+	bool		commit = false;
 	int			conflicts;
 	int			known;
 	const char *result[4];
@@ -1247,6 +1333,14 @@ dolt_merge(PG_FUNCTION_ARGS)
 
 		if (strcmp(a, "--no-ff") == 0)
 			flags |= PROLLY_MERGE_NO_FF;
+		else if (strcmp(a, "--ff-only") == 0)
+			flags |= PROLLY_MERGE_FF_ONLY;
+		else if (strcmp(a, "--squash") == 0)
+			flags |= PROLLY_MERGE_SQUASH;
+		else if (strcmp(a, "--no-commit") == 0)
+			flags |= PROLLY_MERGE_NO_COMMIT;
+		else if (strcmp(a, "--commit") == 0)
+			commit = true;		/* (as without it) */
 		else if (strcmp(a, "--abort") == 0)
 			abort_merge = true;
 		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
@@ -1279,6 +1373,14 @@ dolt_merge(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_merge needs a branch")));
+	if (commit && (flags & PROLLY_MERGE_NO_COMMIT))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("flags \"--commit\" and \"--no-commit\" cannot be used together")));
+	exclusive_flags(flags, PROLLY_MERGE_SQUASH, "--squash", PROLLY_MERGE_NO_FF, "--no-ff");
+	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_NO_FF, "--no-ff");
+	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_SQUASH, "--squash");
+
 	/* (the branch held first: its head is read as the merge finds it) */
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
@@ -1317,13 +1419,23 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[3] = conflicts > 0 ? "conflicts found" : "constraint violations found";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
-	settled();
-	result[0] = hash_hex(&id);
-	result[1] = had_head && same_hash(&id, &theirs) &&
-		!same_hash(&before, &theirs) ? "1" : "0";
+	/* (Dolt's messages, for nothing to merge) */
+	if (had_head && same_hash(&id, &before))
+	{
+		result[0] = "";
+		result[1] = "0";
+		result[2] = "0";
+		result[3] = same_hash(&before, &theirs) ? "Everything up-to-date" :
+			"cannot fast forward from a to b. a is ahead of b already";
+		PG_RETURN_DATUM(text_array(4, result));
+	}
+	/* (a merge not committed, --no-commit's or --squash's, leaves it dirty) */
+	if (id.len > 0)
+		settled();
+	result[0] = id.len > 0 ? hash_hex(&id) : "";
+	result[1] = had_head && same_hash(&id, &theirs) ? "1" : "0";
 	result[2] = "0";
-	result[3] = had_head && same_hash(&id, &before) ?
-		"Everything up-to-date" : "merge successful";
+	result[3] = "merge successful";
 	PG_RETURN_DATUM(text_array(4, result));
 }
 
@@ -1890,6 +2002,50 @@ dolt_reset(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The tables with conflicts and the tables with constraint violations a
+ * pick or revert in progress left, as Dolt counts them (tables, not rows).
+ */
+static void
+tables_left(int *conflicted, int *violated)
+{
+	ProllyMergeState ms;
+	List	   *relids = NIL;
+	ListCell   *lc;
+
+	*conflicted = PROLLY_CALL(refs(), merge_state, &ms) ? ms.ntables : 0;
+	foreach(lc, PROLLY_CALL(refs(), violations))
+		relids = list_append_unique_oid(relids, ((ProllyViolation *) lfirst(lc))->relid);
+	*violated = list_length(relids);
+}
+
+/*
+ * A pick's or revert's conflicts (or violations), found outside a
+ * transaction block: as a merge's, an error unless they may be kept.
+ */
+static void
+stopped_outside_block(const char *what, const char *What, int conflicts,
+					  int nviolations)
+{
+	if (IsTransactionBlock() || prolly_allow_commit_conflicts())
+		return;
+	if (conflicts > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflict detected, transaction rolled back", what),
+				 errdetail_plural("%d row was changed differently on both sides.",
+								  "%d rows were changed differently on both sides.",
+								  conflicts, conflicts),
+				 errhint("%s in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("%s constraint violations detected, transaction rolled back", what),
+			 errdetail_plural("%d row violates a constraint.",
+							  "%d rows violate constraints.",
+							  nviolations, nviolations),
+			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+}
+
+/*
  * dolt_cherry_pick(VARIADIC args text[]) returns text[]:
  *	  {commit id, data conflicts, schema conflicts, constraint violations}
  *
@@ -1897,7 +2053,8 @@ dolt_reset(PG_FUNCTION_ARGS)
  * branch, with its author.  Rows changed differently on both sides leave
  * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
  * (or [--allow-empty] --continue, with the picked commit's message) makes
- * its commit, with one parent; --abort ends it.
+ * its commit, with one parent; --abort ends it.  The counts are of tables,
+ * as Dolt's.
  */
 Datum
 dolt_cherry_pick(PG_FUNCTION_ARGS)
@@ -1939,7 +2096,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 
 		if (ref != NULL)
 			unexpected("dolt_cherry_pick", ref);
-		if (!PROLLY_CALL(refs(), merge_state, &ms) || !ms.pick)
+		if (!PROLLY_CALL(refs(), merge_state, &ms) || !ms.pick || ms.revert)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no cherry-pick to %s",
@@ -1970,35 +2127,19 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	known = list_length(PROLLY_CALL(refs(), violations));
 	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
-												 &ref, 1, false, allow_empty,
-												 &id));
+												 &ref, 1, allow_empty, &id));
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
 		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			ctables;
+		int			vtables;
 
-		conflicts -= nviolations;
-		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
-		{
-			if (conflicts > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("cherry-pick conflict detected, transaction rolled back"),
-						 errdetail_plural("%d row was changed differently on both sides.",
-										  "%d rows were changed differently on both sides.",
-										  conflicts, conflicts),
-						 errhint("Cherry-pick in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("cherry-pick constraint violations detected, transaction rolled back"),
-					 errdetail_plural("%d row violates a constraint.",
-									  "%d rows violate constraints.",
-									  nviolations, nviolations),
-					 errhint("Cherry-pick in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
-		}
+		stopped_outside_block("cherry-pick", "Cherry-pick", conflicts - nviolations, nviolations);
+		tables_left(&ctables, &vtables);
 		result[0] = "";
-		result[1] = psprintf("%d", conflicts);
-		result[3] = psprintf("%d", nviolations);
+		result[1] = psprintf("%d", ctables);
+		result[3] = psprintf("%d", vtables);
 		PG_RETURN_DATUM(text_array(4, result));
 	}
 	settled();
@@ -2007,58 +2148,136 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 }
 
 /*
- * dolt_revert(VARIADIC args text[]) returns text[]: {status}
+ * Revert commits (as hashes) from a revert series' merge state, the head
+ * before the series kept, and fill result: the last commit made, or, if
+ * one stopped, the tables it left with conflicts and violations.
+ */
+static void
+revert_series(const char *const *ids, int n, const ProllyHash *series_head,
+			  const char **result)
+{
+	int			known = list_length(PROLLY_CALL(refs(), violations));
+	ProllyHash	id;
+	int			stopped;
+
+	note_integration();
+	BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
+											   series_head, &id));
+	must_commit(stopped, "a revert");
+	if (stopped > 0)
+	{
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			ctables;
+		int			vtables;
+
+		stopped_outside_block("revert", "Revert", stopped - nviolations, nviolations);
+		tables_left(&ctables, &vtables);
+		result[0] = "";
+		result[1] = psprintf("%d", ctables);
+		result[3] = psprintf("%d", vtables);
+		return;
+	}
+	result[0] = id.len > 0 ? hash_hex(&id) : "";
+}
+
+/*
+ * dolt_revert(VARIADIC args text[]) returns text[]:
+ *	  {commit id, data conflicts, schema conflicts, constraint violations}
  *
- * commit...: their changes undone, in one commit; each named as the branch
- * was before any is.  A row the undoing can't write (or leaves breaking a
- * foreign key) is a constraint violation, as for a cherry-pick: status 1,
- * the revert in progress until they're fixed and it's committed.
+ * [--author author] commit...: each one's changes undone, in a commit of
+ * its own, in the order given (every one resolved first); the id is the
+ * last commit's.  One that conflicts stops the series there, in progress
+ * as a cherry-pick's: resolved, --continue commits it and goes on with the
+ * rest; --abort puts the branch back where it was before the series.  The
+ * counts are of tables, as Dolt's.
  */
 Datum
 dolt_revert(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	const char *result[1] = {"0"};
-	ProllyHash	id;
-	int			known;
-	int			nviolations;
+	const char *result[4] = {"", "0", "0", "0"};
+	const char **refs_given = palloc(sizeof(char *) * Max(nargs, 1));
+	int			nrefs = 0;
+	bool		abort_revert = false;
+	bool		continue_revert = false;
+	char	   *author = NULL;
 
 	for (int i = 0; i < nargs; i++)
-		if (args[i][0] == '-')
+	{
+		if (strcmp(args[i], "--abort") == 0)
+			abort_revert = true;
+		else if (strcmp(args[i], "--continue") == 0)
+			continue_revert = true;
+		else if (strcmp(args[i], "--author") == 0)
+			author = option_value(args, nargs, &i, "dolt_revert");
+		else if (args[i][0] == '-')
 			unsupported("dolt_revert", args[i]);
-	if (nargs == 0)
+		else
+			refs_given[nrefs++] = args[i];
+	}
+	if (abort_revert && continue_revert)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("dolt_revert needs a commit")));
-	known = list_length(PROLLY_CALL(refs(), violations));
-	note_integration();
-	BRANCH_WRITES_HUSHED(nviolations = PROLLY_CALL(diff_merge(), cherry_pick,
-												   (const char *const *) args,
-												   nargs, true, false, &id));
-	must_commit(nviolations, "a revert");
-
-	/*
-	 * Rows it couldn't write, or left breaking a foreign key: the revert in
-	 * progress, as a cherry-pick's, until they're fixed and committed (its
-	 * conflicts are an error).
-	 */
-	if (nviolations > 0)
+				 errmsg("dolt_revert can't --abort and --continue at once")));
+	PG_TRY();
 	{
-		nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
-		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("revert constraint violations detected, transaction rolled back"),
-					 errdetail_plural("%d row violates a constraint.",
-									  "%d rows violate constraints.",
-									  nviolations, nviolations),
-					 errhint("Revert in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
-		result[0] = "1";
+		author_override = author;
+		if (abort_revert || continue_revert)
+		{
+			ProllyMergeState ms;
+
+			if (nrefs > 0)
+				unexpected("dolt_revert", refs_given[0]);
+			if (!PROLLY_CALL(refs(), merge_state, &ms) || !ms.revert)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("there is no revert in progress")));
+			note_integration();
+			if (abort_revert)
+			{
+				BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset,
+												 hash_hex(&ms.series_head)));
+				settled();
+			}
+			else if (ms.ntables > 0 || PROLLY_CALL(refs(), violations) != NIL)
+			{
+				/* (Dolt reports what is still to resolve, without error) */
+				tables_left(&ms.ntables, &nrefs);
+				result[1] = psprintf("%d", ms.ntables);
+				result[3] = psprintf("%d", nrefs);
+			}
+			else
+			{
+				ProllyHash	id;
+				const char **pending = palloc(sizeof(char *) * Max(ms.npending, 1));
+
+				BRANCH_WRITES_HUSHED((void) PROLLY_CALL(refs(), commit, ms.message,
+														true, &id));
+				result[0] = hash_hex(&id);
+				for (int i = 0; i < ms.npending; i++)
+					pending[i] = hash_hex(&ms.pending[i]);
+				if (ms.npending > 0)
+					revert_series(pending, ms.npending, &ms.series_head, result);
+			}
+		}
+		else
+		{
+			if (nrefs == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("dolt_revert needs a commit")));
+			revert_series(refs_given, nrefs, NULL, result);
+		}
 	}
-	else
+	PG_FINALLY();
+	{
+		author_override = NULL;
+	}
+	PG_END_TRY();
+	if (result[0][0] != '\0')
 		settled();
-	PG_RETURN_DATUM(text_array(1, result));
+	PG_RETURN_DATUM(text_array(4, result));
 }
 
 /*
@@ -2095,6 +2314,33 @@ dolt_hashof(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	PG_RETURN_TEXT_P(cstring_to_text(hash_hex(&id)));
+}
+
+/*
+ * dolt_merge_base(ref1 text, ref2 text) returns text: the newest common
+ * ancestor of the commits they name, as a merge of them finds it
+ */
+Datum
+dolt_merge_base(PG_FUNCTION_ARGS)
+{
+	const char *names[2];
+	ProllyHash	ids[2];
+	ProllyHash	base;
+
+	for (int i = 0; i < 2; i++)
+	{
+		names[i] = text_to_cstring(PG_GETARG_TEXT_PP(i));
+		if (!PROLLY_CALL(refs(), resolve, names[i], &ids[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", names[i])));
+	}
+	if (!PROLLY_CALL(refs(), merge_base, &ids[0], &ids[1], &base))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("\"%s\" and \"%s\" have no history in common",
+						names[0], names[1])));
+	PG_RETURN_TEXT_P(cstring_to_text(hash_hex(&base)));
 }
 
 /* active_branch() returns text: the session's branch */
@@ -2828,11 +3074,14 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
 /*
  * dolt_verify_constraints(VARIADIC tables text[]) returns text[]: {status}
  *
- * Check the tables (none: every versioned one) against their foreign keys
- * again, as Dolt's dolt_verify_constraints: their recorded violations are
- * replaced by what is found now (rows a merge didn't write for breaking a
- * unique, check or not-null constraint are dropped: what to do with them
- * is the user's).  Status 1 if any are left, else 0.
+ * [--all] [--output-only] tables: check the tables (none: every versioned
+ * one) again, as Dolt's dolt_verify_constraints: against their foreign
+ * keys, and their check and not-null constraints not validated yet (a
+ * table holds no row breaking one validated).  Their recorded violations
+ * are replaced by what is found now, unless --output-only: rows a merge
+ * didn't write for breaking a unique, check or not-null constraint are
+ * dropped, what to do with them is the user's.  Every row is checked, so
+ * --all changes nothing.  Status 1 if any are found, else 0.
  */
 Datum
 dolt_verify_constraints(PG_FUNCTION_ARGS)
@@ -2844,9 +3093,22 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	List	   *found;
 	ListCell   *lc;
 	const char *result[1];
+	bool		output_only = false;
 
 	for (int i = 0; i < nargs; i++)
 	{
+		if (strcmp(args[i], "--all") == 0 || strcmp(args[i], "-a") == 0)
+			continue;
+		if (strcmp(args[i], "--output-only") == 0 || strcmp(args[i], "-o") == 0)
+		{
+			output_only = true;
+			continue;
+		}
+		if (strcmp(args[i], "-ao") == 0 || strcmp(args[i], "-oa") == 0)
+		{
+			output_only = true;
+			continue;
+		}
 		if (args[i][0] == '-')
 			unsupported("dolt_verify_constraints", args[i]);
 		relids = lappend_oid(relids,
@@ -2863,15 +3125,20 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	BRANCH_WRITES_HUSHED(found = PROLLY_CALL(diff_merge(), verify, relids));
 	if (relids != NIL)
 	{
+		List	   *own = NIL;
+
 		/* (a table's own foreign keys, not those of tables referencing it) */
 		foreach(lc, found)
 			if (list_member_oid(relids, ((ProllyViolation *) lfirst(lc))->relid))
-				kept = lappend(kept, lfirst(lc));
+				own = lappend(own, lfirst(lc));
+		found = own;
+		kept = list_concat(kept, own);
 	}
 	else
 		kept = found;
-	PROLLY_CALL(refs(), set_violations, kept);
-	result[0] = kept != NIL ? "1" : "0";
+	if (!output_only)
+		PROLLY_CALL(refs(), set_violations, kept);
+	result[0] = found != NIL ? "1" : "0";
 	PG_RETURN_DATUM(text_array(1, result));
 }
 

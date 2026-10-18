@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "id": "dolt-revert-continue-none",
+  "description": "Reviewed Dolt port: dolt_revert() --continue not in a revert state",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() --continue not in a revert state"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed table"
+      ],
+      "save": "seed"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT dolt_revert('--continue')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}
