@@ -1,0 +1,320 @@
+# The C suite (SQL correctness: the pinned sqllogictest corpus) on every pull
+# request, every push to master and nightly: the full corpus in shards, heap
+# and prolly on each, then one gate over all of them.  "C suite gate" always
+# reports, so it can be a required check: it passes without building for a
+# pull request that changes only specs/.
+#
+# The gate leaves the pull-request comment as an artifact; the workflow_run
+# commenter (correctness-comment.yml) posts it, so code from a pull request
+# never runs with a token that can write.
+
+name: correctness
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run; master and nightly runs
+# each get their own group (by commit), so none cancels another.
+concurrency:
+  group: correctness-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The shard count; classify turns it into the shard matrix.
+  SHARDS: 4
+  CONFIG: src/tools/prolly_bench/configs/c_full_ci.toml
+  PIN_FILE: src/tools/prolly_bench/configs/sqllogictest.commit
+
+jobs:
+  classify:
+    name: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      shards: ${{ steps.classify.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Anything outside specs/?
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            # (HEAD is the merge into the base: its first parent is the base)
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            printf '%s\n' "$changed"
+            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+          echo "shards=[$(seq -s , 1 "$SHARDS")]" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          ./configure --enable-cassert --enable-debug --enable-injection-points --with-openssl \
+            --prefix="$GITHUB_WORKSPACE/inst"
+          make -s -j4
+          make -s install
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/tools/prolly_bench/slt/go.mod
+          cache-dependency-path: src/tools/prolly_bench/slt/go.sum
+
+      - name: Build the runner
+        run: bash src/tools/prolly_bench/build_slt.sh
+
+      - name: Pack the install tree and the runner
+        run: tar -czf c-build.tgz inst build-bench/slt
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: c-build
+          path: c-build.tgz
+          retention-days: 3
+
+  shard:
+    name: shard ${{ matrix.shard }}
+    needs: [classify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.classify.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: c-build
+
+      - name: Unpack the build
+        run: tar -xzf c-build.tgz
+
+      - name: Read the corpus pin
+        id: corpus
+        run: echo "commit=$(cat "$PIN_FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Cached corpus
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: slt-corpus
+          key: sqllogictest-${{ steps.corpus.outputs.commit }}
+
+      - name: Fetch the pinned corpus
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/sqllogictest
+          ref: ${{ steps.corpus.outputs.commit }}
+          path: slt-corpus
+
+      - name: Heap and prolly on the shard, then cgate and the heap baseline
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          out="$PWD/engine-results/c-shard-$SHARD"
+          status=0
+          src/tools/prolly_bench/prolly_bench run C --am heap,prolly --shard "$SHARD/$SHARDS" \
+            --config "$CONFIG" --pg-bin "$PWD/inst/bin" \
+            --work-dir "$RUNNER_TEMP/c-suite" --out "$out" || status=1
+          src/tools/prolly_bench/prolly_bench cgate "$out"/*-C-B0 "$out"/*-C-prolly || status=1
+          src/tools/prolly_bench/prolly_bench cbaseline check "$out"/*-C-B0 || status=1
+          exit "$status"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: c-shard-${{ matrix.shard }}
+          path: engine-results/c-shard-${{ matrix.shard }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+  gate:
+    name: C suite gate
+    needs: [classify, build, shard]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Specs only
+        if: needs.classify.result == 'success' && needs.classify.outputs.code != 'true'
+        run: echo "This pull request changes only specs/; the C suite doesn't run."
+
+      - name: Classification failed
+        if: needs.classify.result != 'success'
+        run: |
+          echo "classify: ${{ needs.classify.result }}" >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        if: needs.classify.outputs.code == 'true'
+        with:
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true' && needs.build.result == 'success'
+        with:
+          name: c-build
+
+      - name: Unpack the build
+        if: needs.classify.outputs.code == 'true' && needs.build.result == 'success'
+        run: tar -xzf c-build.tgz
+
+      - name: Read the corpus pin
+        if: needs.classify.outputs.code == 'true'
+        id: corpus
+        run: echo "commit=$(cat "$PIN_FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Cached corpus
+        if: needs.classify.outputs.code == 'true'
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: slt-corpus
+          key: sqllogictest-${{ steps.corpus.outputs.commit }}
+
+      - name: Fetch the pinned corpus
+        if: needs.classify.outputs.code == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/sqllogictest
+          ref: ${{ steps.corpus.outputs.commit }}
+          path: slt-corpus
+
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true'
+        with:
+          pattern: c-shard-*
+          path: shards
+
+      - name: Report on every shard
+        if: needs.classify.outputs.code == 'true'
+        id: report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ needs.build.result }}
+          SHARD_JOBS: ${{ needs.shard.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          baseline=src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz
+          # The base: for a pull request, the first parent of the merge it ran.
+          base=$(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)
+          git show "$base:$baseline" > "$RUNNER_TEMP/base-baseline.tsv.gz" 2>/dev/null \
+            || cp "$baseline" "$RUNNER_TEMP/base-baseline.tsv.gz"
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at)
+          minutes=$(( ($(date +%s) - $(date -d "$started" +%s)) / 60 ))
+          failed=()
+          [ "$BUILD" = success ] || failed+=(--failed-job "build: $BUILD")
+          [ "$SHARD_JOBS" = success ] || failed+=(--failed-job "shards: $SHARD_JOBS")
+          mkdir -p comment
+          status=0
+          src/tools/prolly_bench/prolly_bench creport shards/c-shard-*/*-C-* \
+            --shards "$SHARDS" --base-baseline "$RUNNER_TEMP/base-baseline.tsv.gz" \
+            --corpus "$PWD/slt-corpus/test" --head "$HEAD_SHA" --base "$base" \
+            --base-ref "$BASE_REF" --run-url "$RUN_URL" --wall-clock "$minutes min" \
+            "${failed[@]}" --out comment/comment.md --json comment/summary.json || status=$?
+          cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true'
+        with:
+          name: c-suite-comment
+          path: comment
+          if-no-files-found: ignore
+
+      - name: Verdict
+        if: needs.classify.outputs.code == 'true'
+        env:
+          STATUS: ${{ steps.report.outputs.status }}
+        run: test "$STATUS" = 0
+
+  # A failure on master or in the nightly run opens (or updates) one tracking
+  # issue; the next passing run closes it.
+  master:
+    name: track master
+    needs: gate
+    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MARKER: '<!-- c-suite-master -->'
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: c-suite-comment
+          path: comment
+
+      - name: Open, update or close the tracking issue
+        env:
+          GATE: ${{ needs.gate.result }}
+        run: |
+          issue=$(gh issue list --label ci-failure --state open --limit 100 --json number,body \
+            --jq "map(select(.body | startswith(env.MARKER)))[0].number // empty")
+          if [ "$GATE" = success ]; then
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" --comment "The C suite passes on master again at $GITHUB_SHA: $RUN_URL"
+            fi
+            exit 0
+          fi
+          {
+            echo "$MARKER"
+            echo "The C suite failed on master at $GITHUB_SHA ($GITHUB_EVENT_NAME): $RUN_URL"
+            echo
+            if [ -f comment/comment.md ]; then
+              head -c 60000 comment/comment.md
+            else
+              echo "No report: the gate didn't get as far as writing one (gate: $GATE)."
+            fi
+          } > body.md
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" --body-file body.md
+            gh issue comment "$issue" --body "Failed again at $GITHUB_SHA: $RUN_URL"
+          else
+            gh label create ci-failure --color B60205 \
+              --description "A CI failure on master" 2>/dev/null || true
+            gh issue create --title "C suite fails on master" --label ci-failure --body-file body.md
+          fi

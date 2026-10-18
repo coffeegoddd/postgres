@@ -319,11 +319,22 @@ the cluster in `post`.
 
 ## Tests
 
-CI runs the C smoke corpus on heap and `prolly`, then calls:
+CI (`.github/workflows/correctness.yml`, on every pull request, every push
+to `master` and nightly) runs the full C corpus in shards: one build, then
+per shard heap and `prolly`, and
 
 ```sh
 src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR
+src/tools/prolly_bench/prolly_bench cbaseline check BASELINE_DIR
 ```
+
+then the **C suite gate** job runs `creport` over every shard and fails on
+any finding or on a missing shard. A pull request changing only `specs/`
+passes the gate without building. The gate leaves the comment as an
+artifact, and `correctness-comment.yml` (a `workflow_run` workflow, with
+the only write permission) posts it or updates it in place. A failure on
+`master` or in the nightly run opens or updates one issue labelled
+`ci-failure`, and the next pass closes it.
 
 All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,
