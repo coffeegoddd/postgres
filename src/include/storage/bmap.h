@@ -133,6 +133,17 @@ typedef struct BmapSweep
 extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
 extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
 
+/*
+ * Visit every block of a database's page store in a tablespace that is
+ * allocated as the scan begins, each once whatever maps hold it, as read
+ * from the store (pages in shared buffers aren't seen until written).  A
+ * block written meanwhile is visited until two reads of it agree, so no
+ * version of it is seen only torn.  Returns the blocks read.
+ */
+typedef void (*BmapBlockVisit) (const char *page, void *arg);
+extern uint64 bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit,
+							  void *arg);
+
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);
 

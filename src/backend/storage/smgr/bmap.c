@@ -3976,6 +3976,69 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	pfree(path);
 }
 
+uint64
+bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	SMgrRelation store;
+	Buffer		metabuf;
+	BmapMeta   *meta;
+	BlockNumber hw;
+	uint64	   *allocated;
+	PGIOAlignedBlock a;
+	PGIOAlignedBlock b;
+	uint64		nread = 0;
+
+	if (!alloc_exists(rel))
+		return 0;
+
+	/* the blocks allocated as it begins */
+	metabuf = alloc_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	hw = meta->hw;
+	allocated = MemoryContextAllocHuge(CurrentMemoryContext,
+									   (hw / 64 + 1) * sizeof(uint64));
+	for (uint32 pageno = 0; pageno * BMAP_BITS_PER_PAGE < hw; pageno++)
+	{
+		Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
+		BlockNumber first = pageno * BMAP_BITS_PER_PAGE;
+		uint32		nbits = Min(BMAP_BITS_PER_PAGE, hw - first);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel, MAIN_FORKNUM,
+				   meta->bitmap[pageno]);
+		memcpy(allocated + first / 64, PageGetBmapBits(BufferGetPage(buf)),
+			   (nbits + 63) / 64 * sizeof(uint64));
+		UnlockReleaseBuffer(buf);
+	}
+	UnlockReleaseBuffer(metabuf);
+
+	store = store_smgr(rel);
+	for (BlockNumber blk = 0; blk < hw; blk++)
+	{
+		if ((allocated[blk / 64] & (UINT64CONST(1) << (blk % 64))) == 0)
+			continue;
+		CHECK_FOR_INTERRUPTS();
+
+		/* read until two reads agree, visiting each version read */
+		smgrread(store, MAIN_FORKNUM, blk, a.data);
+		visit(a.data, arg);
+		nread++;
+		for (;;)
+		{
+			smgrread(store, MAIN_FORKNUM, blk, b.data);
+			if (memcmp(a.data, b.data, BLCKSZ) == 0)
+				break;
+			visit(b.data, arg);
+			memcpy(a.data, b.data, BLCKSZ);
+		}
+	}
+	pfree(allocated);
+	return nread;
+}
+
 /*
  * Is a sweep of a database's page store in a tablespace due?  Once after
  * the server starts (a crash before may have leaked blocks: a drop's or a

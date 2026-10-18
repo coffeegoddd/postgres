@@ -70,6 +70,14 @@
  *   running at a swap that then appends a chunk naming one no longer found
  *   fails (a serialization failure), as does one adding a table file
  *   (add_table_file()) whose transaction began before the swap.
+ * - keep() is told of a chunk a transaction names from outside the store
+ *   (a hash pointer it writes into a table) without appending it: a
+ *   collection keeps it if it runs then, or begins before the transaction
+ *   ends.  So gc_begin() makes the first gc_new() call wait for the
+ *   transactions that told keep() of a chunk before the collection began,
+ *   too, and gc_kept() visits the chunks told of since it began (false:
+ *   too many to remember, and the collector must keep every chunk
+ *   collected).
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -245,6 +253,11 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*gc_swap) (ProllyChunkGc *gc, const uint8 *marks,
 							const bool *keep, ProllyGcResult *result);
 	void		(*gc_retire) (ProllyChunkGc *gc);
+
+	/* Chunks named from outside the store, kept by a collection. */
+	void		(*keep) (ProllyChunkStore *store, const ProllyHash *hash);
+	bool		(*gc_kept) (ProllyChunkGc *gc, ProllyChunkRefVisit visit,
+							void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -253,9 +266,10 @@ typedef struct ProllyChunkStoreRoutine
 	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
-	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire"
+	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
+	"keep", "gc_kept"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retire
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_kept
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

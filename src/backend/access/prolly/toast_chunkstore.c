@@ -21,6 +21,11 @@
  * type, the tree holds the value's bytes, which are not its canonical
  * bytes: a fold reads such a value rather than take its tree.
  *
+ * A tree is the chunk store's, not a row's: nothing deletes it with the
+ * rows that name it.  A collection of the store keeps every tree a hash
+ * pointer on a page names (prolly_toast_roots()), and each tree stored is
+ * told to the store's keep(), for a collection running meanwhile.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/toast_chunkstore.c
  *
@@ -29,13 +34,21 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
 #include "access/prolly_tree.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/bmap.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "varatt.h"
@@ -197,6 +210,7 @@ prolly_toast_store(Datum value, Oid typid)
 	PROLLY_CALL(tree, value_root, &r, &root, &treelen);
 	if (root.len != sizeof(p.va_hash) || treelen != len)
 		elog(ERROR, "a value tree's root isn't a SHA-256 hash pointer's");
+	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root);
 
 	p.va_rawsize = VARSIZE_ANY_EXHDR(plain) + VARHDRSZ;
 	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
@@ -331,6 +345,107 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
 	result = slice(whole, offset, length);
 	pfree(whole);
 	return result;
+}
+
+/* the bytes a hash pointer starts with */
+typedef struct RootScan
+{
+	uint8		head[VARHDRSZ_EXTERNAL];
+	ProllyChunkRefVisit visit;
+	void	   *arg;
+} RootScan;
+
+/* Visit what bytes [start, stop) of a page spell hash pointers. */
+static void
+scan_bytes(RootScan *rs, const char *start, const char *stop)
+{
+	const char *p = start;
+	const char *end = stop -
+		(VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)) + 1;
+
+	while (p < end && (p = memchr(p, rs->head[0], end - p)) != NULL)
+	{
+		if ((uint8) p[1] == rs->head[1])
+		{
+			varatt_external_hash ptr;
+			ProllyHash	h;
+
+			memcpy(&ptr, p + VARHDRSZ_EXTERNAL, sizeof(ptr));
+			h.len = sizeof(ptr.va_hash);
+			memcpy(h.bytes, ptr.va_hash, sizeof(ptr.va_hash));
+			rs->visit(&h, rs->arg);
+		}
+		p++;
+	}
+}
+
+/*
+ * A page's items, dead or alive, as long as they have storage: not its
+ * free space, where a pruned tuple's bytes may linger.  A page whose header
+ * doesn't hold together is read whole.
+ */
+static void
+scan_page(const char *page, void *arg)
+{
+	RootScan   *rs = arg;
+	PageHeader	ph = (PageHeader) page;
+	int			nitems;
+
+	if (ph->pd_lower < SizeOfPageHeaderData || ph->pd_lower > ph->pd_upper ||
+		ph->pd_upper > ph->pd_special || ph->pd_special > BLCKSZ)
+	{
+		scan_bytes(rs, page + SizeOfPageHeaderData, page + BLCKSZ);
+		return;
+	}
+	nitems = (ph->pd_lower - SizeOfPageHeaderData) / sizeof(ItemIdData);
+	for (int i = 0; i < nitems; i++)
+	{
+		ItemId		iid = &ph->pd_linp[i];
+		unsigned	off = ItemIdGetOffset(iid);
+		unsigned	len = ItemIdGetLength(iid);
+
+		if (!ItemIdHasStorage(iid))
+			continue;
+		if (off < ph->pd_upper || off + len > ph->pd_special)
+		{
+			scan_bytes(rs, page + SizeOfPageHeaderData, page + BLCKSZ);
+			return;
+		}
+		scan_bytes(rs, page + off, page + off + len);
+	}
+}
+
+void
+prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
+{
+	RootScan	rs;
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *spcs = NIL;
+	ListCell   *lc;
+
+	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_SHA256);
+	rs.visit = visit;
+	rs.arg = arg;
+
+	/* every page's latest version on disk */
+	FlushDatabaseBuffers(MyDatabaseId);
+
+	rel = table_open(TableSpaceRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Oid			spc = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
+
+		if (spc != GLOBALTABLESPACE_OID)
+			spcs = lappend_oid(spcs, spc);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+	foreach(lc, spcs)
+		(void) bmap_scan_store(lfirst_oid(lc), MyDatabaseId, scan_page, &rs);
+	list_free(spcs);
 }
 
 const ToastDestinationRoutine prolly_toast_chunkstore = {

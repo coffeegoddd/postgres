@@ -294,6 +294,32 @@ typedef struct CheckedEnd
 
 #define CHECKED_ENDS		32
 
+/*
+ * The chunks named from outside the store (keep()) since a collection
+ * began, a collection at a time per database, up to KEEP_COLLECTIONS at
+ * once; past KEEP_MAX of them, overflow says the collection keeps all.
+ */
+#define KEEP_COLLECTIONS	8
+#define KEEP_MAX			4096
+
+typedef struct KeepSet
+{
+	bool		active;
+	bool		overflow;
+	Oid			dboid;
+	Oid			spcoid;
+	int			n;
+	ProllyHash	hashes[KEEP_MAX];
+} KeepSet;
+
+/* a transaction that told keep() of a chunk: its backend's (xid invalid: none) */
+typedef struct KeepTouch
+{
+	Oid			dboid;
+	Oid			spcoid;
+	TransactionId xid;
+} KeepTouch;
+
 /* shared by every backend */
 typedef struct JournalShared
 {
@@ -305,9 +331,17 @@ typedef struct JournalShared
 	CheckedEnd	checked[CHECKED_ENDS];	/* under ProllyJournalLock */
 	int			next_checked;
 	int			inflight;		/* ranges of len > 0 */
+
+	/* under mutex */
+	KeepSet		keeps[KEEP_COLLECTIONS];
+
+	/* a process's own, by proc number: ranges, then (touches()) touches */
 	int			nranges;
 	AppendRange ranges[FLEXIBLE_ARRAY_MEMBER];
 } JournalShared;
+
+#define TOUCHES_OFFSET(nranges) \
+	MAXALIGN(offsetof(JournalShared, ranges) + (nranges) * sizeof(AppendRange))
 
 static JournalShared *journal_shared = NULL;
 
@@ -890,6 +924,116 @@ wait_appends(ProllyChunkStore *s, uint64 before)
 	while (appends_in_flight(s, before))
 		ConditionVariableSleep(&js->written, WAIT_EVENT_PROLLY_JOURNAL_APPEND);
 	ConditionVariableCancelSleep();
+}
+
+static KeepTouch *
+touches(JournalShared *js)
+{
+	return (KeepTouch *) ((char *) js + TOUCHES_OFFSET(js->nranges));
+}
+
+/*
+ * A chunk this transaction names from outside the store: its transaction
+ * noted, for a collection that begins before it ends to wait for, and the
+ * chunk added to the keep set of a collection running now.  Both under
+ * the mutex a collection begins under, so one either waits for the
+ * transaction or keeps the chunk.
+ */
+static void
+journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
+{
+	JournalShared *js = shared();
+	KeepTouch  *t = &touches(js)[MyProcNumber];
+	TransactionId xid = GetTopTransactionId();
+
+	SpinLockAcquire(&js->mutex);
+	if (!TransactionIdIsValid(t->xid))
+	{
+		t->dboid = s->dboid;
+		t->spcoid = s->spcoid;
+		t->xid = xid;
+	}
+	for (int i = 0; i < KEEP_COLLECTIONS; i++)
+	{
+		KeepSet    *k = &js->keeps[i];
+
+		if (!k->active || k->dboid != s->dboid || k->spcoid != s->spcoid)
+			continue;
+		if (k->n < KEEP_MAX)
+			k->hashes[k->n++] = *hash;
+		else
+			k->overflow = true;
+	}
+	SpinLockRelease(&js->mutex);
+}
+
+/* The transaction has ended: a collection need wait for it no more. */
+static void
+keep_touch_end(void)
+{
+	JournalShared *js;
+	KeepTouch  *t;
+
+	if (journal_shared == NULL)
+		return;
+	js = journal_shared;
+	t = &touches(js)[MyProcNumber];
+	if (!TransactionIdIsValid(t->xid))
+		return;
+	SpinLockAcquire(&js->mutex);
+	t->xid = InvalidTransactionId;
+	SpinLockRelease(&js->mutex);
+}
+
+/*
+ * A collection begins keeping what keep() is told of, and will wait for
+ * the transactions told of one before.
+ */
+static int
+keep_begin(ProllyChunkStore *s, List **xids)
+{
+	JournalShared *js = shared();
+	KeepTouch  *ts = touches(js);
+	int			slot = -1;
+
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < KEEP_COLLECTIONS && slot < 0; i++)
+		if (!js->keeps[i].active)
+			slot = i;
+	if (slot >= 0)
+	{
+		js->keeps[slot].active = true;
+		js->keeps[slot].overflow = false;
+		js->keeps[slot].dboid = s->dboid;
+		js->keeps[slot].spcoid = s->spcoid;
+		js->keeps[slot].n = 0;
+		for (int i = 0; i < js->nranges; i++)
+		{
+			if (TransactionIdIsValid(ts[i].xid) && ts[i].dboid == s->dboid &&
+				ts[i].spcoid == s->spcoid && !list_member_xid(*xids, ts[i].xid))
+				*xids = lappend_xid(*xids, ts[i].xid);
+		}
+	}
+	SpinLockRelease(&js->mutex);
+	if (slot < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("too many chunk store collections are running")));
+	return slot;
+}
+
+/* A collection keeps no more: its keep set (*keep) let go. */
+static void
+keep_end(int *keep)
+{
+	JournalShared *js = shared();
+
+	if (*keep < 0)
+		return;
+	SpinLockAcquire(&js->mutex);
+	js->keeps[*keep].active = false;
+	SpinLockRelease(&js->mutex);
+	*keep = -1;
 }
 
 /*
@@ -1739,6 +1883,7 @@ journal_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PREPARE:
+			keep_touch_end();
 			/* the rest of the chunks and a root moved, written by committed() */
 			Assert(!s->at_commit);
 			if (s->commit_append.g != NULL)
@@ -1757,6 +1902,7 @@ journal_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 			if (s->gc != NULL)
 				gc_abort(s->gc);
+			keep_touch_end();
 			/* the WAL has them: written as any append (a PAD stays one) */
 			if (s->at_commit)
 			{
@@ -3622,6 +3768,8 @@ struct ProllyChunkGc
 								 * segments, in progress at the seal */
 	bool		waited;
 	Segment    *appended;		/* the segment appended to from the seal */
+	int			keep;			/* its KeepSet, -1 once let go */
+	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
 	List	   *written;		/* ManifestFile *, the new files */
@@ -3934,6 +4082,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->full = full;
 	gc->settle = (scope != PROLLY_GC_JOURNAL);
 	gc->level = GetCurrentTransactionNestLevel();
+	gc->keep = -1;
 
 	/*
 	 * What an earlier collection left retiring (it failed after its swap),
@@ -3959,6 +4108,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->segment = seal_segment(s, &gc->m);
 	/* the sealed segments whole before they are read */
 	wait_appends(s, gc->segment);
+	gc->keep = keep_begin(s, &gc->xids);
 	INJECTION_POINT("prolly-gc-sealed", NULL);
 	gc->next_id = gc->m.last_id + 1;
 
@@ -4449,7 +4599,37 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 			freed_bytes - written_bytes : 0;
 		result->window_usec = window_usec;
 	}
+	keep_end(&gc->keep);
 	INJECTION_POINT("prolly-gc-swapped", NULL);
+}
+
+/*
+ * Visit the chunks keep() was told of since the collection began (since
+ * the last call); false if there were too many to remember.
+ */
+static bool
+journal_gc_kept(ProllyChunkGc *gc, ProllyChunkRefVisit visit, void *arg)
+{
+	JournalShared *js = shared();
+	KeepSet    *k;
+	ProllyHash *hashes;
+	int			n;
+	bool		overflow;
+
+	if (gc->keep < 0)
+		elog(ERROR, "the collection keeps nothing any more");
+	k = &js->keeps[gc->keep];
+	hashes = palloc(sizeof(ProllyHash) * KEEP_MAX);
+	SpinLockAcquire(&js->mutex);
+	overflow = k->overflow;
+	n = k->n - gc->kept_seen;
+	memcpy(hashes, k->hashes + gc->kept_seen, sizeof(ProllyHash) * n);
+	SpinLockRelease(&js->mutex);
+	for (int i = 0; i < n; i++)
+		visit(&hashes[i], arg);
+	gc->kept_seen += n;
+	pfree(hashes);
+	return !overflow;
 }
 
 /* Close what a collection opened; its memory goes with its context. */
@@ -4469,6 +4649,7 @@ gc_abort(ProllyChunkGc *gc)
 	}
 	if (gc->appended != NULL && gc->appended->file >= 0)
 		FileClose(gc->appended->file);
+	keep_end(&gc->keep);
 	gc->s->gc = NULL;
 }
 
@@ -4595,8 +4776,8 @@ append_ranges(void)
 static Size
 journal_shmem_size(void)
 {
-	return add_size(offsetof(JournalShared, ranges),
-					mul_size(append_ranges(), sizeof(AppendRange)));
+	return add_size(TOUCHES_OFFSET(append_ranges()),
+					mul_size(append_ranges(), sizeof(KeepTouch)));
 }
 
 static void
@@ -4793,4 +4974,6 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.gc_copy = journal_gc_copy,
 	.gc_swap = journal_gc_swap,
 	.gc_retire = journal_gc_retire,
+	.keep = journal_keep,
+	.gc_kept = journal_gc_kept,
 };

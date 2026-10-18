@@ -51,6 +51,16 @@ CREATE FUNCTION test_toast_pointer(anyelement,
 	OUT form int, OUT rawsize int, OUT stored int, OUT root text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A hash pointer's own bytes, as a value to store where a collection looks
+-- for pointers; and the value a pointer's bytes name, read whole.
+CREATE FUNCTION test_toast_pointer_bytes(anyelement)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_toast_pointer_value(bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Check that catalog rows formed with a null branch column don't leak the
 -- rows written in their place.  Inserts into pg_description; roll back.
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)

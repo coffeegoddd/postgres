@@ -155,6 +155,7 @@ tests += {
       't/062_long_history.pl',
       't/059_journal_appends.pl',
       't/060_journal_move.pl',
+      't/061_gc_roots.pl',
     ],
   },
 }

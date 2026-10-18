@@ -1014,6 +1014,8 @@ PG_FUNCTION_INFO_V1(prolly_canonical_round_trip);
 PG_FUNCTION_INFO_V1(prolly_canonical_decode);
 PG_FUNCTION_INFO_V1(test_toast_hash_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer);
+PG_FUNCTION_INFO_V1(test_toast_pointer_bytes);
+PG_FUNCTION_INFO_V1(test_toast_pointer_value);
 
 Datum
 prolly_canonical_value(PG_FUNCTION_ARGS)
@@ -1062,6 +1064,33 @@ test_toast_hash_pointer(PG_FUNCTION_ARGS)
 	if (get_typlen(type) != -1)
 		elog(ERROR, "only a varlena value can be stored by content");
 	PG_RETURN_POINTER(prolly_toast_store(PG_GETARG_DATUM(0), type));
+}
+
+Datum
+test_toast_pointer_bytes(PG_FUNCTION_ARGS)
+{
+	varlena    *v = (varlena *) DatumGetPointer(PG_GETARG_DATUM(0));
+
+	if (get_typlen(get_fn_expr_argtype(fcinfo->flinfo, 0)) != -1 ||
+		!VARATT_IS_EXTERNAL_ONDISK_HASH(v))
+		elog(ERROR, "not a hash pointer");
+	PG_RETURN_BYTEA_P(cstring_to_text_with_len((const char *) v,
+											   VARSIZE_EXTERNAL(v)));
+}
+
+Datum
+test_toast_pointer_value(PG_FUNCTION_ARGS)
+{
+	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+	varlena    *p = (varlena *) VARDATA_ANY(b);
+	varlena    *copy;
+
+	if (VARSIZE_ANY_EXHDR(b) != (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)) ||
+		!VARATT_IS_EXTERNAL_ONDISK_HASH(p))
+		elog(ERROR, "not a hash pointer's bytes");
+	copy = palloc((VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)));
+	memcpy(copy, p, (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)));
+	PG_RETURN_BYTEA_P(detoast_attr(copy));
 }
 
 Datum

@@ -24,6 +24,7 @@
 #ifndef PROLLY_TOAST_H
 #define PROLLY_TOAST_H
 
+#include "access/prolly_chunkstore.h"
 #include "access/toast_destination.h"
 #include "lib/stringinfo.h"
 
@@ -52,5 +53,14 @@ extern int	prolly_toast_reference(const varlena *pointer, StringInfo ref);
  * progress).
  */
 extern bool prolly_toast_readable(const varlena *pointer);
+
+/*
+ * Visit the root of every value tree a hash pointer on a page of the
+ * current database's page stores names: every page, its items dead or
+ * alive (shared buffers written first).  Conservative: bytes anywhere in an
+ * item that spell a hash pointer are taken for one, so nothing a pointer
+ * names is missed.  A collection's roots outside the refs.
+ */
+extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
 
 #endif							/* PROLLY_TOAST_H */
