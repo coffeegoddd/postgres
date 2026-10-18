@@ -279,14 +279,26 @@ SELECT dolt_checkout('main');
 SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
 SELECT id, v FROM wm.t WHERE id = 20;
 SELECT to_regclass('wm.hank') IS NOT NULL AS hank_table;
--- one with changes stays, and the next write goes there again
+-- one with changes of its own stays; a write isn't moved there (its
+-- definitions may not be main's); it is written there once checked out
 INSERT INTO wm.t VALUES (21, 'hank');
 SELECT dolt_checkout('main');
 SELECT id FROM wm.t WHERE id = 21;
 UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
 SELECT active_branch();
+SELECT dolt_checkout('writer/hank/main');
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
 SELECT id, v FROM wm.t WHERE id IN (20, 21) ORDER BY id;
 SELECT dolt_reset('--hard');
+-- what writes no branch's objects doesn't move: a role, a temporary table
+SELECT dolt_checkout('main');
+CREATE ROLE wm_nobody;
+DROP ROLE wm_nobody;
+CREATE TEMP TABLE wm_temp (id int);
+SELECT active_branch();
+-- a writer names its branches: a branch name's rules are its
+SET dolt.writer = 'x.lock';
+SET dolt.writer = 'a..b';
 -- reads, and integrations, stay on main; a write a query makes is refused
 SELECT dolt_checkout('main');
 SELECT count(*) > 0 AS read FROM wm.t;

@@ -867,7 +867,8 @@ SELECT to_regclass('wm.hank') IS NOT NULL AS hank_table;
  t
 (1 row)
 
--- one with changes stays, and the next write goes there again
+-- one with changes of its own stays; a write isn't moved there (its
+-- definitions may not be main's); it is written there once checked out
 INSERT INTO wm.t VALUES (21, 'hank');
 NOTICE:  writing on branch "writer/hank/main"
 DETAIL:  Branch "main" is protected.
@@ -884,15 +885,22 @@ SELECT id FROM wm.t WHERE id = 21;
 (0 rows)
 
 UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
-NOTICE:  writing on branch "writer/hank/main"
-DETAIL:  Branch "main" is protected.
-HINT:  Integrate the writes with dolt_integrate('-m', ...).
+ERROR:  writer branch "writer/hank/main" has changes of its own
+DETAIL:  A statement moves to a writer branch only while it is the base's as it is.
+HINT:  Write there with dolt_checkout('writer/hank/main'), or integrate it with dolt_integrate() first.
 SELECT active_branch();
-  active_branch   
-------------------
- writer/hank/main
+ active_branch 
+---------------
+ main
 (1 row)
 
+SELECT dolt_checkout('writer/hank/main');
+                dolt_checkout                
+---------------------------------------------
+ {0,"Switched to branch 'writer/hank/main'"}
+(1 row)
+
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
 SELECT id, v FROM wm.t WHERE id IN (20, 21) ORDER BY id;
  id |      v      
 ----+-------------
@@ -906,6 +914,29 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- what writes no branch's objects doesn't move: a role, a temporary table
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE ROLE wm_nobody;
+DROP ROLE wm_nobody;
+CREATE TEMP TABLE wm_temp (id int);
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+-- a writer names its branches: a branch name's rules are its
+SET dolt.writer = 'x.lock';
+ERROR:  invalid value for parameter "dolt.writer": "x.lock"
+DETAIL:  A writer doesn't begin with "." or "-", hold "..", or end with ".lock".
+SET dolt.writer = 'a..b';
+ERROR:  invalid value for parameter "dolt.writer": "a..b"
+DETAIL:  A writer doesn't begin with "." or "-", hold "..", or end with ".lock".
 -- reads, and integrations, stay on main; a write a query makes is refused
 SELECT dolt_checkout('main');
           dolt_checkout          

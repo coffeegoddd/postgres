@@ -52,6 +52,7 @@
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "parser/analyze.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "tcop/utility.h"
@@ -540,9 +541,29 @@ checkout_branch(const char *name)
 	PG_END_TRY();
 }
 
+/* Does branch name have an owner (its changes a writer's, in an owning mode)? */
+static bool
+branch_owned(const char *name)
+{
+	HeapTuple	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+	bool		owned = false;
+
+	if (HeapTupleIsValid(tup))
+	{
+		bool		isnull;
+
+		(void) SysCacheGetAttr(BRANCHNAME, tup, Anum_pg_branch_browner, &isnull);
+		owned = !isnull;
+		ReleaseSysCache(tup);
+	}
+	return owned;
+}
+
 /*
- * A writer branch done with: clean (no owner) and merged into its base (its
- * head an ancestor of the base's, or the base's itself).
+ * A writer branch done with: clean and merged into its base (its head an
+ * ancestor of the base's, or the base's itself).  Clean is no owner, in an
+ * owning mode; in the shared mode, where no branch has one, its working set
+ * its head's.  (The cheap tests first: a sweep asks of every branch.)
  */
 static bool
 done_writer_branch(const char *name, const ProllyHash *head)
@@ -552,26 +573,26 @@ done_writer_branch(const char *name, const ProllyHash *head)
 	Oid			role;
 	ProllyHash	base_head;
 	ProllyHash	merge_base;
-	HeapTuple	tup;
-	bool		owned = false;
 
-	if (!writer_branch_name(name) ||
+	if (!writer_branch_name(name) || head->len == 0 || branch_owned(name) ||
 		!PROLLY_CALL(writers(), writer_branch, name, &writer, &base, &role) ||
-		head->len == 0 ||
-		!PROLLY_CALL(refs(), resolve, base, &base_head) ||
-		!PROLLY_CALL(refs(), merge_base, head, &base_head, &merge_base) ||
-		!same_hash(&merge_base, head))
+		!PROLLY_CALL(refs(), resolve, base, &base_head))
 		return false;
-	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
-	if (HeapTupleIsValid(tup))
+	if (PROLLY_CALL(writers(), mode) == PROLLY_WRITERS_SHARED)
 	{
-		bool		isnull;
+		ProllyNodeRef ws;
+		ProllyNodeRef committed;
+		List	   *left_out = NIL;
 
-		(void) SysCacheGetAttr(BRANCHNAME, tup, Anum_pg_branch_browner, &isnull);
-		owned = !isnull;
-		ReleaseSysCache(tup);
+		if (!(PROLLY_CALL(refs(), read_working_set, name, InvalidOid, &ws, &left_out) &&
+			  left_out == NIL &&
+			  PROLLY_CALL(refs(), commit_working_set, head, &committed) &&
+			  same_hash(&ws.hash, &committed.hash)))
+			return false;
 	}
-	return !owned;
+	return same_hash(&base_head, head) ||
+		(PROLLY_CALL(refs(), merge_base, head, &base_head, &merge_base) &&
+		 same_hash(&merge_base, head));
 }
 
 typedef struct DetachedBranches
@@ -689,8 +710,12 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_checkout needs a branch")));
-	/* (the hidden branches are checked out by their commits) */
-	reserved_branch_name(branch);
+	/*
+	 * (the hidden branches are checked out by their commits; a writer branch
+	 * is checked out as any other, but made only on a writer's behalf)
+	 */
+	if (create || !writer_branch_name(branch))
+		reserved_branch_name(branch);
 
 	/*
 	 * A commit's hash that names no branch: a detached session on it,
@@ -1039,8 +1064,13 @@ static int	statement_depth = 0;
 static LocalTransactionId stays_lxid = InvalidLocalTransactionId;
 static Oid	stays_branch = InvalidOid;
 
-/* a transaction that moved, which can't be prepared */
+/* a transaction that moved, which can't be prepared, and the subtransaction */
 static LocalTransactionId moved_lxid = InvalidLocalTransactionId;
+static SubTransactionId moved_subid = InvalidSubTransactionId;
+
+static post_parse_analyze_hook_type prev_post_parse_analyze = NULL;
+
+static bool utility_may_write_branch(Node *stmt);
 
 /*
  * Move the session to its writer branch, if the statement about to run
@@ -1048,10 +1078,12 @@ static LocalTransactionId moved_lxid = InvalidLocalTransactionId;
  * A branch made now forks from the protected branch's head as the
  * transaction's snapshot saw it (one that can't see a newer head fails, to
  * be retried; read committed takes a newer snapshot).  The move is undone
- * if the transaction aborts.
+ * if the (sub)transaction aborts.  A writer branch is moved to only while
+ * its definitions are surely the base's (made now, or clean at its head),
+ * so that what was analyzed, or planned, on the base runs on it (*same).
  */
 static bool
-move_to_writer_branch(void)
+move_to_writer_branch(bool *same)
 {
 	char	   *base;
 	char	   *writer;
@@ -1060,7 +1092,9 @@ move_to_writer_branch(void)
 	char	   *b;
 	Oid			role;
 	ProllyHash	head;
+	ProllyHash	at;
 
+	*same = false;
 	if (!IsTransactionState() || RecoveryInProgress() ||
 		(MyProc->vxid.lxid == stays_lxid && MyBranch == stays_branch) ||
 		!database_has_versioned_schemas() ||
@@ -1075,6 +1109,7 @@ move_to_writer_branch(void)
 		stays_branch = MyBranch;
 		return false;
 	}
+	*same = true;
 	writer = prolly_current_writer();
 	name = psprintf("%s%s/%s", PROLLY_WRITER_PREFIX, writer, base);
 	if (strlen(name) >= NAMEDATALEN)
@@ -1083,21 +1118,41 @@ move_to_writer_branch(void)
 				 errmsg("writer branch \"%s\" would be too long a name", name),
 				 errhint("Set a shorter dolt.writer.")));
 
-	branch_return_on_abort();
 	if (PROLLY_CALL(writers(), writer_branch, name, &w, &b, &role))
 	{
+		const char *rolname = GetUserNameFromId(role, true);
+
 		/* (a writer's branch is its role's: another can't write as it) */
-		if (!has_privs_of_role(GetUserId(), role) &&
-			!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
+			(rolname == NULL || !has_privs_of_role(GetUserId(), role)))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("writer branch \"%s\" is role \"%s\"'s", name,
-							GetUserNameFromId(role, false))));
+					 rolname ?
+					 errmsg("writer branch \"%s\" is role \"%s\"'s", name, rolname) :
+					 errmsg("writer branch \"%s\" is a dropped role's", name),
+					 rolname ? 0 :
+					 errhint("The database's owner can delete it with dolt_branch('-D', '%s').",
+							 name)));
+		/*
+		 * (one with changes of its own may define things otherwise than the
+		 * base the statement was analyzed on: written on checked out)
+		 */
+		if (!(PROLLY_CALL(refs(), resolve, name, &at) &&
+			  PROLLY_CALL(refs(), resolve, base, &head) && same_hash(&at, &head) &&
+			  !branch_owned(name)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("writer branch \"%s\" has changes of its own", name),
+					 errdetail("A statement moves to a writer branch only while it is the base's as it is."),
+					 errhint("Write there with dolt_checkout('%s'), or integrate it with dolt_integrate() first.",
+							 name)));
+		branch_return_on_abort();
 	}
 	else if (PROLLY_CALL(refs(), resolve, base, &head))
 	{
 		bool		pushed = PROLLY_CALL(refs(), hold);
 
+		branch_return_on_abort();
 		BranchCreateOnBehalf = true;
 		PG_TRY();
 		{
@@ -1112,14 +1167,59 @@ move_to_writer_branch(void)
 		if (pushed)
 			PopActiveSnapshot();
 	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" is protected and has no commit to fork a writer branch from",
+						base),
+				 errhint("Commit it, or unprotect it, first.")));
 	checkout_branch(name);
 	CommandCounterIncrement();
 	moved_lxid = MyProc->vxid.lxid;
+	moved_subid = GetCurrentSubTransactionId();
 	ereport(NOTICE,
 			(errmsg("writing on branch \"%s\"", name),
 			 errdetail("Branch \"%s\" is protected.", base),
 			 errhint("Integrate the writes with dolt_integrate('-m', ...).")));
 	return true;
+}
+
+/* Lock a statement's relations again, on the branch the session is on now. */
+static void
+relock(List *rtable)
+{
+	ListCell   *lc;
+
+	foreach(lc, rtable)
+	{
+		RangeTblEntry *rte = lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION && rte->rellockmode != NoLock)
+			LockRelationOid(rte->relid, rte->rellockmode);
+	}
+}
+
+/* Does an analyzed query write?  (A query's writes are inside functions.) */
+static bool
+query_writes(Query *query)
+{
+	return (query->commandType != CMD_SELECT &&
+			query->commandType != CMD_UTILITY) || query->hasModifyingCTE;
+}
+
+/*
+ * A top-level statement that writes moves as it is analyzed, before it is
+ * planned: its plan is then the writer branch's.
+ */
+static void
+writer_post_parse_analyze(ParseState *pstate, Query *query, const JumbleState *jstate)
+{
+	bool		same;
+
+	if (prev_post_parse_analyze)
+		prev_post_parse_analyze(pstate, query, jstate);
+	if (statement_depth == 0 && query_writes(query) && move_to_writer_branch(&same))
+		relock(query->rtable);
 }
 
 /* Does a planned statement write?  (A query's writes are inside functions.) */
@@ -1129,25 +1229,27 @@ plan_writes(PlannedStmt *stmt)
 	return stmt->commandType != CMD_SELECT || stmt->hasModifyingCTE;
 }
 
+/*
+ * A statement planned before it could move (a cached plan, as the extended
+ * protocol's) moves as it starts: run on the writer branch only if that
+ * has the base's definitions, its relations locked there as the plan locked
+ * them, and the copies just made seen.
+ */
 static void
 writer_executor_start(QueryDesc *queryDesc, int eflags)
 {
+	bool		same;
+
 	if (statement_depth == 0 && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
-		plan_writes(queryDesc->plannedstmt) && move_to_writer_branch())
+		plan_writes(queryDesc->plannedstmt) && move_to_writer_branch(&same))
 	{
-		ListCell   *lc;
-
-		/*
-		 * The plan's relations are the writer branch's now: locked there as
-		 * the plan locked them, and its copies, just made, seen.
-		 */
-		foreach(lc, queryDesc->plannedstmt->rtable)
-		{
-			RangeTblEntry *rte = lfirst(lc);
-
-			if (rte->rtekind == RTE_RELATION && rte->rellockmode != NoLock)
-				LockRelationOid(rte->relid, rte->rellockmode);
-		}
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a statement planned before the session moved to writer branch \"%s\" can't run there: its definitions may differ",
+							branch_ops()->current()),
+					 errhint("Check the writer branch out with dolt_checkout() and prepare the statement again.")));
+		relock(queryDesc->plannedstmt->rtable);
 		/*
 		 * (the statement's snapshot is its portal's own copy, registered by
 		 * it: it sees the copies at the command they were made in)
@@ -1203,10 +1305,12 @@ writer_process_utility(PlannedStmt *pstmt, const char *queryString,
 					   DestReceiver *dest, QueryCompletion *qc)
 {
 	LogStmtLevel level = GetCommandLogLevel(pstmt->utilityStmt);
+	bool		same;
 
 	if (statement_depth == 0 && context == PROCESS_UTILITY_TOPLEVEL &&
-		(level == LOGSTMT_DDL || level == LOGSTMT_MOD))
-		(void) move_to_writer_branch();
+		(level == LOGSTMT_DDL || level == LOGSTMT_MOD) &&
+		utility_may_write_branch(pstmt->utilityStmt))
+		(void) move_to_writer_branch(&same);
 	statement_depth++;
 	PG_TRY();
 	{
@@ -1224,6 +1328,49 @@ writer_process_utility(PlannedStmt *pstmt, const char *queryString,
 	PG_END_TRY();
 }
 
+/*
+ * Could a utility statement write a branch's objects?  Not one of the whole
+ * cluster's (roles, databases, tablespaces, settings), nor a temporary
+ * table, nor CREATE INDEX CONCURRENTLY (which commits as it goes): those
+ * don't move the session.  (One that does write a protected branch after
+ * all is refused there.)
+ */
+static bool
+utility_may_write_branch(Node *stmt)
+{
+	switch (nodeTag(stmt))
+	{
+		case T_CreateRoleStmt:
+		case T_AlterRoleStmt:
+		case T_AlterRoleSetStmt:
+		case T_DropRoleStmt:
+		case T_GrantRoleStmt:
+		case T_ReassignOwnedStmt:
+		case T_CreatedbStmt:
+		case T_AlterDatabaseStmt:
+		case T_AlterDatabaseSetStmt:
+		case T_AlterDatabaseRefreshCollStmt:
+		case T_DropdbStmt:
+		case T_CreateTableSpaceStmt:
+		case T_DropTableSpaceStmt:
+		case T_AlterTableSpaceOptionsStmt:
+		case T_AlterSystemStmt:
+		case T_CreateSubscriptionStmt:
+		case T_AlterSubscriptionStmt:
+		case T_DropSubscriptionStmt:
+		case T_VariableSetStmt:
+			return false;
+		case T_CreateStmt:
+			return ((CreateStmt *) stmt)->relation->relpersistence != RELPERSISTENCE_TEMP;
+		case T_CreateTableAsStmt:
+			return ((CreateTableAsStmt *) stmt)->into->rel->relpersistence != RELPERSISTENCE_TEMP;
+		case T_IndexStmt:
+			return !((IndexStmt *) stmt)->concurrent;
+		default:
+			return true;
+	}
+}
+
 /* (a move is the session's: one in a prepared transaction couldn't be undone) */
 static void
 writer_xact_callback(XactEvent event, void *arg)
@@ -1234,9 +1381,25 @@ writer_xact_callback(XactEvent event, void *arg)
 				 errmsg("cannot prepare a transaction that moved the session to its writer branch")));
 }
 
+/* (a move undone with its subtransaction is no move) */
+static void
+writer_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						SubTransactionId parentSubid, void *arg)
+{
+	if (moved_lxid != MyProc->vxid.lxid || moved_subid != mySubid)
+		return;
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		moved_lxid = InvalidLocalTransactionId;
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		moved_subid = parentSubid;
+}
+
 static void
 writer_branch_hooks(void)
 {
+	prev_post_parse_analyze = post_parse_analyze_hook;
+	post_parse_analyze_hook = writer_post_parse_analyze;
+	RegisterSubXactCallback(writer_subxact_callback, NULL);
 	prev_executor_start = ExecutorStart_hook;
 	ExecutorStart_hook = writer_executor_start;
 	prev_executor_run = ExecutorRun_hook;

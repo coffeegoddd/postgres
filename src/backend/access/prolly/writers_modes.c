@@ -116,6 +116,15 @@ check_writer(char **newval, void **extra, GucSource source)
 		GUC_check_errdetail("A writer is at most %d bytes.", WRITER_MAX);
 		return false;
 	}
+	/* (it names its writer branches: a branch name's rules are its) */
+	if ((*newval)[0] == '.' || (*newval)[0] == '-' ||
+		strstr(*newval, "..") != NULL ||
+		(strlen(*newval) >= 5 &&
+		 strcmp(*newval + strlen(*newval) - 5, ".lock") == 0))
+	{
+		GUC_check_errdetail("A writer doesn't begin with \".\" or \"-\", hold \"..\", or end with \".lock\".");
+		return false;
+	}
 	/* (what a transaction has written is one writer's) */
 	if (IsTransactionState() && branches_written() != NIL)
 	{
@@ -232,12 +241,18 @@ modes_writer_branch(const char *name, char **writer, char **base, Oid *role)
 	found = PROLLY_CALL(refs(), config_get, key, &v);
 	if (found)
 	{
-		char	   *w = strchr(v.data, ' ') + 1;
-		char	   *b = strchr(w, ' ') + 1;
+		char	   *w = strchr(v.data, ' ');
+		char	   *b = w ? strchr(w + 1, ' ') : NULL;
 
-		*role = (Oid) strtoul(v.data, NULL, 10);
-		*writer = pnstrdup(w, b - 1 - w);
-		*base = pstrdup(b);
+		/* (one not of this form is no writer branch's) */
+		if (b == NULL)
+			found = false;
+		else
+		{
+			*role = (Oid) strtoul(v.data, NULL, 10);
+			*writer = pnstrdup(w + 1, b - w - 1);
+			*base = pstrdup(b + 1);
+		}
 	}
 	pfree(v.data);
 	pfree(key);
