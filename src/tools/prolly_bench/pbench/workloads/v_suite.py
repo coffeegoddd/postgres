@@ -246,10 +246,53 @@ class V3(VWorkload):
 @registry.workloads.register("V4")
 class V4(VWorkload):
     """Clone, then fetch and push, between this instance and a second local
-    instance."""
+    instance, over a network remote (postgresql://): the second clones the
+    data, fetches a commit made since, and pushes one back (to a branch of
+    its own, so a background workload's writes on main don't refuse it)."""
 
     id, title = "V4", "Clone, fetch and push between two instances"
 
-    def operations(self, ctx):
-        # (file remotes are built; between two instances, network remotes)
-        raise NotImplementedByEngine("prolly has no network remotes yet")
+    def own_variants(self, params):
+        return [(f"n{n}", {"changes": int(n)})
+                for n in params.get("changes", [1000])]
+
+    def measure(self, ctx, window):
+        remote = ctx.make_cluster("v4-remote")
+        try:
+            remote.sql(f"CREATE DATABASE {ctx.dbname}")
+            # (the clone makes the versioned schema; its search path is the
+            # origin's, as the target's setup sets it)
+            schema = targets.for_am(ctx.table_am).schema
+            if schema:
+                remote.sql(f"ALTER DATABASE {ctx.dbname} SET search_path = {schema}, public")
+            with self.background(ctx) as bg:
+                with window:
+                    outcome = self.operations(ctx, remote)
+            if bg is not None:
+                outcome.metrics["background_tps"] = bg.tps()
+            return outcome
+        finally:
+            remote.destroy()
+
+    def operations(self, ctx, remote=None):
+        n = ctx.params["changes"]
+        if n > self.rows(ctx):
+            raise ValueError("V4 changes exceed the dataset; refusing to clamp the workload")
+        url = ctx.cluster.libpq_url(ctx.dbname)
+        clone = timed_session(ctx, [f"SELECT dolt_clone('{url}')"], "v4-clone",
+                              cluster=remote)
+        # a commit at the origin, on a branch of its own, for the fetch
+        timed_session(ctx, [VC_SQL.branch("v4_origin"), VC_SQL.checkout("v4_origin"),
+                            f"UPDATE vc_data SET payload = md5(payload) WHERE id <= {n}",
+                            VC_SQL.commit("v4 origin change")], "v4-origin")
+        fetch = timed_session(ctx, ["SELECT dolt_fetch('origin')"], "v4-fetch",
+                              cluster=remote)
+        # a commit at the clone, pushed back as a new branch
+        push = timed_session(ctx, [
+            "SELECT dolt_checkout('-b', 'v4_pushed')",
+            f"UPDATE vc_data SET payload = md5(payload || 'p') WHERE id <= {n}",
+            VC_SQL.commit("v4 clone change"),
+            "SELECT dolt_push('origin', 'v4_pushed')"], "v4-push", cluster=remote)
+        return Outcome(metrics={"clone_ms": clone[0], "fetch_ms": fetch[0],
+                                "push_ms": push[3]},
+                       transactions=3, unit="operation")
