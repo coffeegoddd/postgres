@@ -9,12 +9,30 @@
     "case": "DoltTempTableScripts: temporary table tag collision"
   },
   "requires": [
-    "sql"
+    "sql",
+    "vc.core"
   ],
   "sessions": [
     "a"
   ],
   "steps": [
+    {
+      "id": "on-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
     {
       "id": "note",
       "session": "a",

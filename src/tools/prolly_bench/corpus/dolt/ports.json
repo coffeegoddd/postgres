@@ -13531,323 +13531,6 @@
       ]
     },
     {
-      "id": "dolt-temp-table-collisions",
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltTempTableScripts",
-      "index": 0,
-      "name": "temporary and non-temporary table name collisions",
-      "source_sha256": "b927235a6dcd1758f96c750288f512d0ee253382e146395d48ac2e5c269a3a8f",
-      "scenario_sha256": "31eba163ad3af72ab651d7b2c976a26d3805f4e83a5789b8ef6a860944799bf3",
-      "setup": [
-        {
-          "index": 0,
-          "steps": [
-            "t1"
-          ],
-          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
-        },
-        {
-          "index": 1,
-          "steps": [
-            "t1-row"
-          ],
-          "note": "Preserved SQL and ordering."
-        },
-        {
-          "index": 2,
-          "steps": [
-            "tmp-t1"
-          ],
-          "note": "Preserved SQL and ordering."
-        },
-        {
-          "index": 3,
-          "steps": [
-            "tmp-t1-row"
-          ],
-          "note": "Preserved SQL and ordering."
-        },
-        {
-          "index": 4,
-          "steps": [
-            "tmp-t2"
-          ],
-          "note": "Preserved SQL and ordering."
-        },
-        {
-          "index": 5,
-          "steps": [
-            "t2"
-          ],
-          "note": "Made in the versioned schema by name: with pg_temp first in the search path, CREATE TABLE t2 would still make a table there, but naming it says so. (D2)"
-        },
-        {
-          "index": 6,
-          "steps": [
-            "tmp-t3"
-          ],
-          "note": "Preserved SQL and ordering."
-        }
-      ],
-      "assertions": [
-        {
-          "index": 0,
-          "steps": [
-            "assert-0"
-          ],
-          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
-        },
-        {
-          "index": 1,
-          "steps": [
-            "assert-1"
-          ],
-          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's ErrTableAlreadyExists: SQLSTATE 42P07. (D4)"
-        },
-        {
-          "index": 2,
-          "steps": [
-            "assert-2"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
-        },
-        {
-          "index": 3,
-          "steps": [
-            "assert-3"
-          ],
-          "note": "DROP TABLE drops the temporary table, the first in the search path; checked by its tag."
-        },
-        {
-          "index": 4,
-          "steps": [
-            "assert-4"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. After the drop, t1 is the versioned table again. (D10)"
-        }
-      ],
-      "adaptations": [
-        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
-      ]
-    },
-    {
-      "id": "dolt-temp-table-identity",
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltTempTableScripts",
-      "index": 1,
-      "name": "temporary table supports auto increment",
-      "source_sha256": "5bf4d617497035589c19ea0025e90f35f11eeafcd9548e073bcce48873332c86",
-      "scenario_sha256": "8189b0f63bc9d7690af3fd6f52a2ba71eaeb38704748312d62b23775351dc478",
-      "setup": [
-        {
-          "index": 0,
-          "steps": [
-            "create"
-          ],
-          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
-        }
-      ],
-      "assertions": [
-        {
-          "index": 0,
-          "steps": [
-            "assert-0"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
-        },
-        {
-          "index": 1,
-          "steps": [
-            "assert-1"
-          ],
-          "note": "MySQL's VALUES (), (), () as VALUES (DEFAULT) x3; checked by its tag (an OK result's count). (D10)"
-        },
-        {
-          "index": 2,
-          "steps": [],
-          "note": "Omitted: the AUTO_INCREMENT counter SHOW CREATE TABLE prints is MySQL's. (D10)"
-        },
-        {
-          "index": 3,
-          "steps": [
-            "assert-3"
-          ],
-          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
-        },
-        {
-          "index": 4,
-          "steps": [
-            "assert-4"
-          ],
-          "note": "Checked by its tag."
-        },
-        {
-          "index": 5,
-          "steps": [],
-          "note": "Omitted: MySQL's counter jumps past a value given explicitly (to 1001); a Postgres identity's sequence doesn't (D6). (D10)"
-        },
-        {
-          "index": 6,
-          "steps": [],
-          "note": "Omitted: follows the counter MySQL moved. (D10)"
-        },
-        {
-          "index": 7,
-          "steps": [],
-          "note": "Omitted: follows the counter MySQL moved (1001-1003 where Postgres gives 4-6). (D10)"
-        }
-      ],
-      "adaptations": [
-        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
-      ]
-    },
-    {
-      "id": "dolt-temp-table-columns",
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltTempTableScripts",
-      "index": 2,
-      "name": "temporary table tag collision",
-      "source_sha256": "deb20d99df17a1258e394d03eafb9c2db3e92239fd55d127f0f6f931a23f71ea",
-      "scenario_sha256": "bd40970c96cef75023f57fa424578edb2b5ac805e42a84463d8e3e8868df5aba",
-      "setup": [
-        {
-          "index": 0,
-          "steps": [
-            "note"
-          ],
-          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
-        }
-      ],
-      "assertions": [
-        {
-          "index": 0,
-          "steps": [
-            "assert-0"
-          ],
-          "note": "Dolt's column tags could collide; checked as succeeding by its tag."
-        }
-      ],
-      "adaptations": [
-        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
-      ]
-    },
-    {
-      "id": "dolt-temp-table-drop",
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltTempTableScripts",
-      "index": 3,
-      "name": "drop temporary table behavior",
-      "source_sha256": "eda851408c412125efa79df4c09fa45dbb470f7b6c55a328babf5da87e4b8a3e",
-      "scenario_sha256": "d68f1cb2061567a2ad1c85632a64336f314ea42f3cf17d15bbf474d448807f9c",
-      "setup": [
-        {
-          "index": 0,
-          "steps": [
-            "t"
-          ],
-          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
-        },
-        {
-          "index": 1,
-          "steps": [
-            "tmp"
-          ],
-          "note": "Preserved SQL and ordering."
-        }
-      ],
-      "assertions": [
-        {
-          "index": 0,
-          "steps": [
-            "assert-0"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
-        },
-        {
-          "index": 1,
-          "steps": [
-            "assert-1"
-          ],
-          "note": "MySQL's DROP TEMPORARY TABLE as DROP TABLE of the name in pg_temp. (D10)"
-        },
-        {
-          "index": 2,
-          "steps": [
-            "assert-2"
-          ],
-          "note": "Preserved SQL and ordering."
-        },
-        {
-          "index": 3,
-          "steps": [
-            "assert-3"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
-        },
-        {
-          "index": 4,
-          "steps": [
-            "assert-4"
-          ],
-          "note": "MySQL's DROP TEMPORARY TABLE as DROP TABLE of the name in pg_temp. (D10)"
-        },
-        {
-          "index": 5,
-          "steps": [
-            "assert-5"
-          ],
-          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. After the drop, t is the versioned table. (D10)"
-        },
-        {
-          "index": 6,
-          "steps": [
-            "assert-6"
-          ],
-          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's ErrUnknownTable: no temporary table of that name, SQLSTATE 42P01. (D4)"
-        }
-      ],
-      "adaptations": [
-        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
-      ]
-    },
-    {
-      "id": "dolt-temp-table-procedure",
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltTempTableScripts",
-      "index": 4,
-      "name": "temporary tables in stored procedures",
-      "source_sha256": "b13cfc9a28cc315760722360ce8f675de46bc092eb8132261a3a623ec0ce4834",
-      "scenario_sha256": "91a57bea9e62221de3ce541a8fedecc85652621dd4bfc81ac47c0620a9766feb",
-      "setup": [
-        {
-          "index": 0,
-          "steps": [
-            "proc"
-          ],
-          "note": "MySQL's procedure as a PL/pgSQL one; a Postgres procedure returns no result set, so its final SELECT is left out. (D10)"
-        }
-      ],
-      "assertions": [
-        {
-          "index": 0,
-          "steps": [
-            "assert-0"
-          ],
-          "note": "The call, checked by its tag: its rows are the next assertion's (a Postgres procedure returns none)."
-        },
-        {
-          "index": 1,
-          "steps": [
-            "assert-1"
-          ],
-          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
-        }
-      ],
-      "adaptations": [
-        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
-      ]
-    },
-    {
       "id": "dolt-cherry-pick-add-column",
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
       "suite": "DoltCherryPickTests",
@@ -14829,6 +14512,328 @@
       "adaptations": [
         "CALL becomes SELECT. (D3)",
         "No staging area: -Am/-am commit the whole working set. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-temp-table-collisions",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltTempTableScripts",
+      "index": 0,
+      "name": "temporary and non-temporary table name collisions",
+      "source_sha256": "b927235a6dcd1758f96c750288f512d0ee253382e146395d48ac2e5c269a3a8f",
+      "scenario_sha256": "e6357890eb61fc22c4f0093f6bb5a7444e49b7eb6240e8ea8df5d0f9ab361a94",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "on-branch",
+            "t1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. Dolt's suite runs on the main branch of a Dolt database: the port first checks the session is on branch main of a versioned database, where the temporary tables are made. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "t1-row"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "tmp-t1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "tmp-t1-row"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "tmp-t2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "t2"
+          ],
+          "note": "Made in the versioned schema by name: with pg_temp first in the search path, CREATE TABLE t2 would still make a table there, but naming it says so. (D2)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "tmp-t3"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's ErrTableAlreadyExists: SQLSTATE 42P07. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "DROP TABLE drops the temporary table, the first in the search path; checked by its tag."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. After the drop, t1 is the versioned table again. (D10)"
+        }
+      ],
+      "adaptations": [
+        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
+      ]
+    },
+    {
+      "id": "dolt-temp-table-identity",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltTempTableScripts",
+      "index": 1,
+      "name": "temporary table supports auto increment",
+      "source_sha256": "5bf4d617497035589c19ea0025e90f35f11eeafcd9548e073bcce48873332c86",
+      "scenario_sha256": "7bee2a1f288cbb613d168a43d8b54bbab6b49356899e59658d97dde6a5a59288",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "on-branch",
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. Dolt's suite runs on the main branch of a Dolt database: the port first checks the session is on branch main of a versioned database, where the temporary tables are made. (D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's VALUES (), (), () as VALUES (DEFAULT) x3; checked by its tag (an OK result's count). (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Omitted: the AUTO_INCREMENT counter SHOW CREATE TABLE prints is MySQL's. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Checked by its tag."
+        },
+        {
+          "index": 5,
+          "steps": [],
+          "note": "Omitted: MySQL's counter jumps past a value given explicitly (to 1001); a Postgres identity's sequence doesn't (D6). (D10)"
+        },
+        {
+          "index": 6,
+          "steps": [],
+          "note": "Omitted: follows the counter MySQL moved. (D10)"
+        },
+        {
+          "index": 7,
+          "steps": [],
+          "note": "Omitted: follows the counter MySQL moved (1001-1003 where Postgres gives 4-6). (D10)"
+        }
+      ],
+      "adaptations": [
+        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
+      ]
+    },
+    {
+      "id": "dolt-temp-table-columns",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltTempTableScripts",
+      "index": 2,
+      "name": "temporary table tag collision",
+      "source_sha256": "deb20d99df17a1258e394d03eafb9c2db3e92239fd55d127f0f6f931a23f71ea",
+      "scenario_sha256": "a1cf4808ae361c2e3f61f993f90a1942f23e86ff3f1989bcfe4fa95e92576f87",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "on-branch",
+            "note"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. Dolt's suite runs on the main branch of a Dolt database: the port first checks the session is on branch main of a versioned database, where the temporary tables are made. (D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt's column tags could collide; checked as succeeding by its tag."
+        }
+      ],
+      "adaptations": [
+        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
+      ]
+    },
+    {
+      "id": "dolt-temp-table-drop",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltTempTableScripts",
+      "index": 3,
+      "name": "drop temporary table behavior",
+      "source_sha256": "eda851408c412125efa79df4c09fa45dbb470f7b6c55a328babf5da87e4b8a3e",
+      "scenario_sha256": "28dee9264e6b45cf541d3c9ea6f769832b773b5a3be25ceca80438f9769e6332",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "on-branch",
+            "t"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. Dolt's suite runs on the main branch of a Dolt database: the port first checks the session is on branch main of a versioned database, where the temporary tables are made. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "tmp"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's DROP TEMPORARY TABLE as DROP TABLE of the name in pg_temp. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "MySQL's DROP TEMPORARY TABLE as DROP TABLE of the name in pg_temp. (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "SHOW CREATE TABLE is MySQL's: whether the name reads as the temporary table is checked by its persistence (pg_class.relpersistence, t for temporary), and its columns from information_schema. After the drop, t is the versioned table. (D10)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's ErrUnknownTable: no temporary table of that name, SQLSTATE 42P01. (D4)"
+        }
+      ],
+      "adaptations": [
+        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
+      ]
+    },
+    {
+      "id": "dolt-temp-table-procedure",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltTempTableScripts",
+      "index": 4,
+      "name": "temporary tables in stored procedures",
+      "source_sha256": "b13cfc9a28cc315760722360ce8f675de46bc092eb8132261a3a623ec0ce4834",
+      "scenario_sha256": "7b618453a90c8691ce47930dd69b878ee3d4ecb6e0b2788f9a79749b20d34c5b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "on-branch",
+            "proc"
+          ],
+          "note": "MySQL's procedure as a PL/pgSQL one; a Postgres procedure returns no result set, so its final SELECT is left out. Dolt's suite runs on the main branch of a Dolt database: the port first checks the session is on branch main of a versioned database, where the temporary tables are made. (D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "The call, checked by its tag: its rows are the next assertion's (a Postgres procedure returns none)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
       ]
     }
   ],
