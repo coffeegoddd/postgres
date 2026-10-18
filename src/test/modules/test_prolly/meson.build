@@ -145,6 +145,7 @@ tests += {
       't/059_bmap_free_many.pl',
       't/067_bmap_drop_flush.pl',
       't/060_keyless_unsettled.pl',
+      't/061_journal_pads.pl',
     ],
   },
 }
