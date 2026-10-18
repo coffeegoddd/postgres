@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided; questions 3 (C's gates) and 4 (the hybrid) stay open until those gates are measured. The refusal and B built 2026-10-17 and merged 2026-10-18 (#217–#221, #224, one stack), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C isn't built.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided. The refusal and B built 2026-10-17 and merged 2026-10-18 (#217–#221, #224, one stack); B is complete (#180 closed 2026-10-18), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C's questions 3 and 4 and how to build it decided by the user 2026-10-18, as recommended (C7). C isn't built (#181). Code references refreshed on `8faba578f9`.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with
@@ -29,7 +29,7 @@ on the session's branch (part 11, lines 78-90). Folding a row into history
 decodes every column: `CODEC_TEXT` through `DatumGetTextPP`, other types
 through their send functions (`prolly_datum.c:176-191, 594-618`); jsonb's
 send form is its text. No TOAST pointer or value OID reaches history, and
-TOAST relations are never folded themselves (`canon_catalogs.c:904-906`).
+TOAST relations are never folded themselves (`canon_folded.c:1786-1788`).
 
 ## 2. What has to hold
 
@@ -66,7 +66,7 @@ Folding `pg_toast_N` as an ordinary versioned table keyed by
    decompresses and rehashes the row's large columns, though TOAST kept
    their pointers unchanged.
 4. **Every apply re-toasts.** Merge, reset and branch-at-commit write rows
-   through the applier (`applier_replication.c:575-642`) as decoded datums,
+   through the applier (`applier_replication.c:574-688`) as decoded datums,
    so the heap compresses and stores every large value again, under a new
    OID, even where the target row already holds the same value.
 5. **jsonb is stored as text.** Large documents round-trip through
@@ -289,9 +289,13 @@ first is deleted. Sharing across rows needs C.
 - Fixes cost 1 and 2 fully, 3 for unchanged values, 4 for rows whose large
   value didn't change.
 - Leaves: a new large value is hashed once at commit; large values are
-  stored twice (compressed in TOAST, uncompressed in chunks); historical
-  reads have no slice reads; merge still re-toasts a value that moves
-  between rows.
+  stored twice (compressed in TOAST, in chunks compressed only once a
+  table file holds them); historical reads have no slice reads; merge
+  still re-toasts a value that moves between rows.
+- Not tested yet: that rows whose values TOAST stored differently
+  (another `SET COMPRESSION`, another `toast_tuple_target`) give
+  identical commit hashes. Invariant 1 says they must; a test of it is
+  owed.
 - **As measured (#217–#221):** cost 1 (`large_values`: an int's update
   next to a 960 KB document commits 3 nodes; copies share the document's
   tree) and cost 2 (an insertion committed 8 nodes when measured; the
@@ -342,16 +346,19 @@ bytes, so the hash is B1's reference) and writes its chunks to the chunk
 store. Stock heap tables never take the new path; their only cost is a
 tag check in `detoast.c`.
 
-Where the callback lives is open. Returning a copy of
-`GetHeapamTableAmRoutine()` with it set breaks the code that recognizes
+Where the callback lives was open (decided 2026-10-18, C7). Returning a
+copy of `GetHeapamTableAmRoutine()` with it set breaks the code that recognizes
 heap by its routine's address: `heap_getnext` (`heapam.c:1451`, "only heap
-AM is supported") and `REPACK (CONCURRENTLY)` (`repack.c:995`), both of
+AM is supported") and `REPACK (CONCURRENTLY)` (`repack.c:994`), both of
 which prolly tables (and their TOAST tables) pass today. Either those two
 checks learn to accept the prolly routine (they check the routine, not the
 OID, precisely so that AMs reusing heap's handler work), or the
 destination is chosen outside `TableAmRoutine`, by a toaster hook that
 looks at the relation's access method, as block-mapped storage is chosen.
-Recommended: the hook, which keeps prolly's routine heap's own.
+Recommended, and decided: the hook. (Spec 15's transaction commits wrap
+prolly's routine anyway, for its write paths, and so make those two
+checks accept it; the hook keeps the TOAST destination out of the
+routine all the same.)
 
 Fetching: `detoast.c` dispatches the new tag to a registered fetch hook,
 whole or by slice. Slices descend B2's byte counts and read only the
@@ -406,14 +413,16 @@ for a relation with a chunk-store destination:
 ### C4. What it costs
 
 - **Reclamation moves from VACUUM to the chunk store.** `toast_delete_datum`
-  does nothing for hash pointers. The chunk store has no reclamation today
-  (`chunkstore_journal.c` conjoins table files; `prolly_gc()` is the D1 node
-  store's, `reclaim_marksweep.c`). C needs one, marking from every commit
-  root, every branch's working-set heap (scanning versioned heaps for hash
-  pointers), and every chunk newer than the collection's start. Working-set
-  churn (a 1 MB document updated a thousand times between dolt commits) is
-  garbage until then. Dolt has the same property. Two things the roots
-  alone miss:
+  does nothing for hash pointers. The chunk store has reclamation since
+  spec 11's step 7 (part 8 there; `reclaim_copying.c`, `dolt_gc()`, and
+  autovacuum starting it): a copying collector from the refs' roots,
+  with chunks newer than the collection's start kept and every appended
+  batch's references checked. What C adds to it is roots outside the
+  refs: every branch's working-set heap, scanned for hash pointers, and
+  the chunks replication slots may still decode (below). Working-set
+  churn (a 1 MB document updated a thousand times between dolt commits)
+  is garbage until a collection. Dolt has the same property. Two things
+  the refs' roots alone miss:
   - **Chunks a writer starts using again.** Content dedup means a writer
     can reference an old chunk set without appending anything: a value
     whose tree already exists, or an apply copying a reference. If marking
@@ -431,23 +440,29 @@ for a relation with a chunk-store destination:
     and that pruning's WAL, replayed before the collection's, already
     conflicted with (or was held back for) every standby snapshot that
     could read those tuples. Reclaiming history's own chunks (unreachable
-    commits) needs a horizon of its own, part 8 of spec 11.
+    commits) has its own horizon, part 8 of spec 11.
+  - **Logical decoding.** A collection keeps every chunk appended after
+    the oldest replication slot's position, so a value a slot may still
+    decode is there to fetch.
 - **Compression moves below the hash.** Values out of line lose TOAST's
-  compression unless the chunk store compresses chunks (question 48 left
-  "compressing pages" as a later storage choice). Compressing chunks keeps
-  hashes over uncompressed bytes.
+  compression; the chunk store's table files compress chunks with LZ4
+  (spec 11, step 3), and C relies on that, keeping hashes over
+  uncompressed bytes. The journal, where a transaction's chunks land
+  first, holds them uncompressed until its chunks move to a table file.
 - **Write throughput.** Chunk-store appends serialize on one
-  `ProllyJournalLock` and flush WAL per batch (`chunkstore_journal.c:470-525`).
-  A TOAST-heavy insert load goes through it.
+  `ProllyJournalLock` and flush WAL per batch (`logged_write()` and
+  `append_bytes()`, `chunkstore_journal.c:669-778`). A TOAST-heavy insert
+  load goes through it.
 - **Logical decoding.** The reorder buffer reassembles TOAST values from
   the TOAST table's WAL. Hash pointers have no TOAST table rows; decoding
   fetches from the chunk store, which is safe because chunks are immutable,
-  as long as reclamation keeps chunks a replication slot may still decode.
+  as long as reclamation keeps chunks a replication slot may still decode
+  (above).
 
 ### C5. What it keeps from the chunk store as it is
 
 - **Durability and standbys.** Every appended byte is WAL-logged and
-  flushed before it's written (`chunkstore_journal.c:18-25, 488-525`), so a
+  flushed before it's written (`chunkstore_journal.c:31-36, 669-778`), so a
   crash and a physical standby see a value's chunks before any heap commit
   that names it.
 - **Rollback.** A transaction's chunks are XCHUNK records, invisible to
@@ -460,8 +475,15 @@ for a relation with a chunk-store destination:
 
 OID pointers and hash pointers coexist in one table, as oid and oid8 do.
 Existing values move when their rows are rewritten; a table rewrite
-(`VACUUM FULL`, `CLUSTER`) converts them all. A table's TOAST relation is
-kept while it holds OID pointers.
+(`VACUUM FULL`, `CLUSTER`) converts them all. A table keeps its TOAST
+relation (decided 2026-10-18): it is needed while the table holds OID
+pointers, and dropping it later buys little. B3's memo stays while OID
+pointers exist, its size a setting, `prolly.value_memo_entries` (8192
+today, fixed).
+
+`pg_upgrade` of a cluster with hash pointers is unsupported (the
+chunk store isn't carried over); `pg_dump` writes values detoasted, so it
+needs only tests.
 
 ### C7. Open questions
 
@@ -477,10 +499,27 @@ kept while it holds OID pointers.
    for every tuple walker. **Decided (user, 2026-10-17): a tag per
    algorithm.**
 3. **Gates before building.** Per-value save cost against heap TOAST at 2
-   KB, 64 KB and 1 MB, single and concurrent writers; and a reclamation
-   design for the chunk store.
-4. **A hybrid.** Hash pointers only above a size (64 KB?), OID TOAST below.
-   Only if gate 3 shows small values are too costly in the chunk store.
+   KB, 64 KB and 1 MB, single and concurrent writers; and reclamation's
+   new roots (C4). **Decided (user, 2026-10-18):** a throwaway prototype
+   of the save path first, used to measure the gates (save cost at 2 KB,
+   64 KB and 1 MB with one writer and with concurrent writers; a
+   collection with the working set's roots), then C built for real.
+4. **A hybrid.** Hash pointers only above a size, OID TOAST below.
+   **Decided (user, 2026-10-18):** no hybrid unless gate 3 fails; then a
+   fixed 64 KB, in code (a format rule, not a setting, as `T` is).
+5. **The format.** **Decided (user, 2026-10-18):** a clean break of
+   history's format is acceptable until spec 11's step 8 (measurement)
+   is done, as every format change before it has been; after it, older
+   formats stay readable.
+6. **With them**, decided as recommended: `T` stays 2048; jsonb's on-disk
+   canonical bytes (question 1) come first, as a PR of their own; the
+   destination is chosen by a toaster hook keyed on the relation's access
+   method, not a copy of heap's routine (C2); a collection's roots
+   include the versioned heaps, dead tuples too, and the chunks appended
+   after the oldest slot's position (C4); out-of-line values rely on the
+   table files' LZ4 (C4); `prolly.value_memo_entries`, `VACUUM FULL` and
+   `CLUSTER` converting, the TOAST relation kept, `pg_upgrade`
+   unsupported and `pg_dump` tested only (C6).
 
 ## 7. Large objects
 
@@ -517,4 +556,5 @@ send function, so its tables can't be folded at all.
    aren't silently versioned as numbers. Built (#217).
 2. B2, then B1 (B1's references use B2's trees), then B3 and B4. Built
    (#218, #219, #220, #221).
-3. C's gates (part 6, question 3), then C.
+3. jsonb's on-disk canonical bytes (C7, question 1), a PR of its own;
+   then C's prototype and gates (C7, question 3), then C (#181).

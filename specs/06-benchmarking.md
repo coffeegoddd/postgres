@@ -106,8 +106,9 @@ each other.
 | Space amplification | On-disk size / logical data size; allocation waste for D3/D4 by block size |
 | Cache hit rate, buffer evictions | `pg_stat_io` |
 | CPU per transaction, hashing share | `perf` profiles |
-| Commit-pipeline queue depth and wait time | Engine-specific counters exposed in a stats view |
-| Lock/coordination memory | Engine-specific counters |
+| Engine work: nodes read and written, chunks appended and their bytes, bytes hashed, fold rows, value-tree chunks, commits, head moves, memo hits and misses, the change finder's counts | `pg_stat_prolly`, a per-database view of `(name, value)` rows from the cumulative statistics system (`17-performance-on-prs.md`, decided 2026-10-18; not built) |
+| Commit-pipeline queue depth and wait time | Engine counters in `pg_stat_prolly` |
+| Lock/coordination memory | Engine counters in `pg_stat_prolly` |
 | Recovery time | Time from crash to accepting connections after a fixed WAL volume |
 | GC / vacuum cost | Time and I/O of the engine's reclamation pass |
 | Bytes by structure | Canonical bytes (data and index trees), allocated pages (node occupancy), TID-map bytes, and WAL, reported separately; tree operations measured apart from SQL execution |

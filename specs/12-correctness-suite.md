@@ -286,4 +286,9 @@ or comments.
    pinned corpus's path), and `cgate` run on every pull request that
    changes more than specs, the full corpus nightly; spec 16 proposes the
    full corpus on every pull request, a heap baseline and a results
-   comment.)
+   comment. Decided there, 2026-10-18: `master` protected with the **C
+   suite gate** as the only required check at first, **build and test**
+   added once `test_prolly`'s flakes are fixed; no merge queue (the
+   repository is a personal account's) and no rule that branches be up
+   to date, so a failure on `master` opens a tracking issue labelled
+   `ci-failure`.)

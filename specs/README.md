@@ -36,6 +36,11 @@ control; this project's premise is that we should not have to.
   reclamation; and with them the rest of the work up to step 8 (the
   dependency check, escaping, the objects commits hold, large values).
   Next is measurement (8). Each step's PRs are listed in spec 11, part 4.
+  Decided 2026-10-18 and not built (round 1 of the issue queue, listed
+  in `08-open-questions.md`): writer modes (spec 11, 6.2), Dolt test
+  parity (spec 11, part 4; divergences in spec 18), transaction commits
+  (15), large values' C (14), and the C and S suites on pull requests
+  (16, 17).
   `07-roadmap.md`, `04-candidate-designs.md` and the rows of
   `08-open-questions.md` marked (D1) are D1's history.
 - **Code never refers to these specs** (user rule, 2026-10-13): no paths,
@@ -72,10 +77,11 @@ control; this project's premise is that we should not have to.
 | [11-pages-and-dolt-snapshots.md](11-pages-and-dolt-snapshots.md) | **The design being built (user direction, 2026-10-15; steps 0–7 built 2026-10-18):** the working set in Postgres pages, branches as copy-on-write page sets, history in a chunk store shaped like Dolt's (our own formats); the steps, what each built, and where the build departed from the plan |
 | [12-correctness-suite.md](12-correctness-suite.md) | **Decided (2026-10-15):** the C suite, sqllogictest against heap and every engine from `prolly_bench`, judged by agreement with heap; runner, comparison classes, gate, plan |
 | [13-keyless-tables.md](13-keyless-tables.md) | **Measured (2026-10-17):** tables without a primary key in heap, page-based prolly and Dolt: how each keeps them, what writes, commits, diffs, moves and merges cost, how merges treat them, and what to change in prolly |
-| [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Proposed (2026-10-17):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180), then C, content-addressed TOAST pointers in the chunk store (#181) |
-| [15-transaction-commits.md](15-transaction-commits.md) | **Proposed (2026-10-18):** a Dolt commit for every SQL transaction, as Dolt's `@@dolt_transaction_commit`: what Dolt does, phase 1 folding at pre-commit (#228), phase 2 committing only the transaction's own row changes (#229) |
-| [16-correctness-on-prs.md](16-correctness-on-prs.md) | **Proposed (2026-10-18):** C suite results on every pull request and a gate that blocks regressions: how Dolt, Doltgres and doltlite do it, a heap baseline checked both ways, the full corpus in shards, a sticky comment, branch protection (#234) |
-| [17-performance-on-prs.md](17-performance-on-prs.md) | **Proposed (2026-10-18):** the S suite on every pull request: how Dolt, Doltgres and doltlite benchmark and gate PRs, and two layers here: deterministic work counters on hosted runners (required) and paired, retry-confirmed timing against the PR's base, gated on the dedicated host; one sticky comment (#240) |
+| [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Decided (2026-10-17; C's questions 2026-10-18):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180, built), then C, content-addressed TOAST pointers in the chunk store (#181, prototype first) |
+| [15-transaction-commits.md](15-transaction-commits.md) | **Decided (2026-10-18), not built:** a Dolt commit for every SQL transaction, as Dolt's `@@dolt_transaction_commit`: what Dolt does, phase 1 folding at pre-commit (#228), phase 2 committing only the transaction's own row changes (#229) |
+| [16-correctness-on-prs.md](16-correctness-on-prs.md) | **Decided (2026-10-18), not built:** C suite results on every pull request and a gate that blocks regressions: how Dolt, Doltgres and doltlite do it, a heap baseline checked both ways, the full corpus in shards, a sticky comment, branch protection with the C suite gate required, a tracking issue for `master` (#234) |
+| [17-performance-on-prs.md](17-performance-on-prs.md) | **Decided (2026-10-18), not built:** the S suite on every pull request: how Dolt, Doltgres and doltlite benchmark and gate PRs, and two layers here: deterministic work counters on hosted runners (the gate, required after calibration) and paired, retry-confirmed timing against the PR's base, reported (gated only once a dedicated host exists); one sticky comment (#240) |
+| [18-dolt-divergences.md](18-dolt-divergences.md) | **Decided (2026-10-18):** the intended differences from Dolt, each with a stable ID (D1, D2, …) that Dolt test ports cite: no staging area, versioned schemas only, return shapes, SQLSTATEs, transactions, merges, hashes, concurrency, what isn't ported (#156) |
 
 ## Related local repositories
 
