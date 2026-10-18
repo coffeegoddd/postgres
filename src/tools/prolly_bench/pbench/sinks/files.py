@@ -39,6 +39,7 @@ class FilesSink(Sink):
             "planned_cells": [dataclasses.asdict(k) for k in run.planned_cells],
             "comparison_identity": comparison_identity(run.config, run.environment),
             "suite": run.suite, "label": run.label, "table_am": run.table_am,
+            "build": run.build,
             "started": run.started, "command": run.command,
             "warnings": run.warnings}
         atomic_json(run.out_dir / "run.json", self.manifest)

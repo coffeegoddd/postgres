@@ -1,0 +1,53 @@
+# The S suite's timing on a pull request: its build (the candidate) against
+# its base's, run with --pg-bin base=DIR,candidate=DIR --am heap,prolly,
+# every cell of the two builds and two engines in random order, with the
+# same seed per repetition.
+#
+# Fewer workloads at five repetitions, the fewest that give a paired
+# interval: S1, S2 and S10's read-write test, 8 clients, 5 s warm-up and
+# 20 s measured: 3 x 2 x 2 x 5 = 60 cells.  S5 and S9 run nightly.
+#
+# The numbers compare two builds and are never reported as the
+# procedure's (comparison_only): synchronous_commit is off, fsync on, so a
+# shared machine's flush time doesn't bury the change; WAL written is
+# counted exactly by the counter runs.
+
+[run]
+quality = "smoke"
+comparison_only = true
+repetitions = 5
+clients = [8]
+warmup_seconds = 5
+measure_seconds = 20
+sizes = ["pr"]
+workloads = ["S1", "S2", "S10"]
+fio_baseline = false
+seed = 1
+latency_sampling_rate = 1.0
+collectors = ["wal", "pg_stat_io", "cpu", "space", "engine_counters"]
+required_collectors = ["wal", "pg_stat_io"]
+
+[postgres]
+shared_buffers = "1GB"
+max_wal_size = "8GB"
+checkpoint_timeout = "15min"
+synchronous_commit = "off"
+fsync = "on"
+full_page_writes = "on"
+max_connections = 32
+
+[sizes.pr]
+pgbench_scale = 10
+s4_rows = 100000
+s7_rows = 100000
+tpcc_warehouses = 1
+tpch_scale = 0.01
+v_rows = 10000
+sysbench_tables = 4
+sysbench_table_size = 50000
+
+[workloads.S10]
+tests = ["oltp_read_write"]
+
+[tools]
+benchbase = "build-bench/benchbase/benchbase-postgres"

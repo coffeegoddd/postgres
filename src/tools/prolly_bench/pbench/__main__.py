@@ -33,6 +33,34 @@ def _csv(conv):
     return lambda s: [conv(x) for x in s.split(",") if x]
 
 
+def pg_bins(text: str) -> list[tuple[str, Path]]:
+    """--pg-bin: one directory ([("", DIR)]), or builds to compare, the base
+    first: base=DIR,candidate=DIR."""
+    if "=" not in text:
+        return [("", Path(text))]
+    builds = []
+    for part in text.split(","):
+        name, sep, path = part.partition("=")
+        if not sep or not name or not path or not name.replace("_", "").isalnum():
+            raise SystemExit(f"--pg-bin: expected NAME=DIR, got {part!r}")
+        builds.append((name, Path(path)))
+    if len(builds) < 2 or len({n for n, _ in builds}) != len(builds):
+        raise SystemExit("--pg-bin: give two or more builds, each named once")
+    return builds
+
+
+def build_commits(text: str | None, builds: list[tuple[str, Path]]) -> dict[str, str]:
+    """--build-commit base=SHA,candidate=SHA: the commit each build's
+    provenance must name."""
+    if not text:
+        return {}
+    out = dict(part.split("=", 1) for part in text.split(","))
+    unknown = set(out) - {name for name, _ in builds}
+    if unknown:
+        raise SystemExit(f"--build-commit names no build given to --pg-bin: {sorted(unknown)}")
+    return out
+
+
 def _run(args: argparse.Namespace) -> int:
     from pbench.core.runner import Runner, run_many
 
@@ -70,40 +98,54 @@ def _run(args: argparse.Namespace) -> int:
         from pbench import cshard
         print(cshard.to_text([cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])]))
 
-    # Each engine retains its result set; matched cells run as randomized pairs.
+    # Each engine (and build) retains its result set; matched cells run as
+    # randomized groups.
     ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
-    if args.label and len(ams) > 1:
-        raise SystemExit("--label names one result set; give one --am with it")
+    builds = pg_bins(args.pg_bin)
+    commits = build_commits(args.build_commit, builds)
+    if args.label and len(ams) * len(builds) > 1:
+        raise SystemExit("--label names one result set; give one --am and one --pg-bin with it")
+    if len(builds) > 1 and args.suite != "S":
+        raise SystemExit("builds are compared in the S suite only")
     ok = True
     out_dirs = []
     runners = []
-    for am in ams:
-        label = args.label
-        if not label:
-            label = "B0" if am == "heap" else am
-            if cfg["postgres"].get("full_page_writes") == "off" and \
-                    args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
-                label += "-fpw-off"
-        runner = Runner(suite=args.suite, cfg=cfg, table_am=am, label=label,
-                        repo=REPO, bin_dir=args.pg_bin.resolve(),
-                        work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
-                        command="prolly_bench " + shlex.join(sys.argv[1:]),
-                        keep_failed=args.keep_failed)
-        runners.append(runner)
-        out_dirs.append(runner.out_dir)
+    for build, bin_dir in builds:
+        for am in ams:
+            label = args.label
+            if not label:
+                label = "B0" if am == "heap" else am
+                if cfg["postgres"].get("full_page_writes") == "off" and \
+                        args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
+                    label += "-fpw-off"
+                if build:
+                    label = f"{build}-{label}"
+            runner = Runner(suite=args.suite, cfg=cfg, table_am=am, label=label,
+                            repo=REPO, bin_dir=bin_dir.resolve(),
+                            work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
+                            command="prolly_bench " + shlex.join(sys.argv[1:]),
+                            keep_failed=args.keep_failed, build=build,
+                            build_commit=commits.get(build))
+            runners.append(runner)
+            out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run
     all_results = run_many(runners)
     ok = all(bool(results) and not validate_run(runner.out_dir)
              for runner, results in zip(runners, all_results))
-    if args.suite == "S" and "heap" in ams:
+    if args.suite == "S":
         from pbench.core.validation import compatible
-        baseline = runners[ams.index("heap")].out_dir
-        for runner in runners:
-            if runner.table_am != "heap":
-                problems = compatible(baseline, runner.out_dir)
-                for problem in problems:
-                    print(problem, file=sys.stderr)
-                ok = ok and not problems
+        by = {(r.build, r.table_am): r.out_dir for r in runners}
+        pairs = [(by[(b, "heap")], by[(b, am)], "engine")
+                 for b, _ in builds for am in ams if am != "heap" and (b, "heap") in by]
+        if len(builds) > 1:
+            first = builds[0][0]
+            pairs += [(by[(first, am)], by[(b, am)], "build")
+                      for b, _ in builds[1:] for am in ams]
+        for base, other, vary in pairs:
+            problems = compatible(base, other, vary)
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            ok = ok and not problems
     if args.suite == "C" and len(out_dirs) > 1:
         from pbench import ccompare, table
         print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
@@ -273,6 +315,9 @@ def _table(args) -> int:
         return int(base is None or len(sets) < 2 or any(ccompare.gate(base, s, workloads)
                    for s in sets if s is not base))
     md = table.to_markdown(sets, suite)
+    if any(s.build for s in sets):
+        from pbench import bcompare
+        md += "\n" + bcompare.to_markdown(bcompare.compare(sets))
     out.with_suffix(".md").write_text(md)
     out.with_suffix(".html").write_text(table.to_html(sets, suite))
     print(md)
@@ -305,7 +350,11 @@ def main(argv=None) -> int:
     r.add_argument("--measure", type=int, help="measured seconds")
     r.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                    help="Postgres setting override (repeatable)")
-    r.add_argument("--pg-bin", type=Path, default=REPO / "build-rel" / "inst" / "bin")
+    r.add_argument("--pg-bin", default=str(REPO / "build-rel" / "inst" / "bin"),
+                   help="the server's bin directory, or builds to compare, base first: "
+                        "base=DIR,candidate=DIR (S suite)")
+    r.add_argument("--build-commit", metavar="NAME=SHA,...",
+                   help="the commit each build's provenance must name")
     r.add_argument("--work-dir", type=Path, default=REPO / "build-bench" / "work",
                    help="where clusters live: on the device under test")
     r.add_argument("--out", type=Path, default=REPO / "specs" / "results")

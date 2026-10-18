@@ -5,10 +5,16 @@ Run: cd src/tools/prolly_bench && python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from evidence_helpers import seal
+from pbench import bcompare, table
+from pbench.core.interfaces import CellKey
+from pbench.core.runner import interleave
+from pbench.core.validation import compatible
 from pbench.collectors.cachegrind import instructions as cachegrind_instructions
 from pbench.collectors.engine_counters import engine_metrics
 from pbench.collectors.instructions import parse_perf_stat
@@ -132,6 +138,131 @@ class CounterShapeTest(unittest.TestCase):
         self.assertFalse(is_counter("tps"))
         self.assertEqual(kind("wal_bytes"), "bytes")
         self.assertEqual(kind("wal_records"), "events")
+
+
+def build_set(root: Path, build: str, am: str, tps: list[float], *, identity="test",
+              workload="S1", seeds=None) -> Path:
+    """A sealed S result set of one build and engine: a cell per repetition."""
+    label = f"{build}-{'B0' if am == 'heap' else am}"
+    d = root / label
+    d.mkdir()
+    (d / "run.json").write_text(json.dumps(
+        {"suite": "S", "label": label, "table_am": am, "build": build,
+         "started": "2026-10-18T00:00:00"}))
+    with open(d / "results.jsonl", "w") as f:
+        for rep, value in enumerate(tps, 1):
+            f.write(json.dumps({
+                "key": {"suite": "S", "workload": workload, "size": "pr", "variant": "",
+                        "clients": 8, "rep": rep, "build": build},
+                "status": "ok", "metrics": {"tps": value, "latency_p50_ms": 8000.0 / value},
+                "measurement": {"seed": (seeds or {}).get(rep, 1 + rep), "seconds": 20,
+                                "quality": "smoke"}}) + "\n")
+    seal(d)
+    run = json.loads((d / "run.json").read_text())
+    run["comparison_identity"] = identity
+    (d / "run.json").write_text(json.dumps(run))
+    return d
+
+
+class BuildPairingTest(unittest.TestCase):
+    def test_pg_bin_builds(self):
+        from pbench.__main__ import pg_bins
+        self.assertEqual(pg_bins("/x/bin"), [("", Path("/x/bin"))])
+        self.assertEqual(pg_bins("base=/a,candidate=/b"),
+                         [("base", Path("/a")), ("candidate", Path("/b"))])
+        for bad in ("base=/a", "base=/a,base=/b", "=/a,candidate=/b", "base=/a,candidate"):
+            with self.assertRaises(SystemExit, msg=bad):
+                pg_bins(bad)
+
+    def test_key_paths(self):
+        k = CellKey("S", "S1", "pr", "", 8, 3, build="candidate")
+        self.assertEqual(k.pair_path(), Path("S1/pr/c8/r3"))
+        self.assertEqual(k.path(), Path("candidate/S1/pr/c8/r3"))
+        self.assertEqual(CellKey("S", "S1", "pr", "", 8, 3).path(), Path("S1/pr/c8/r3"))
+
+    def test_builds_and_engines_run_in_groups(self):
+        plans = []
+        for build in ("base", "candidate"):
+            for am in ("heap", "prolly"):
+                plans.append([(CellKey("S", w, "pr", "", 8, rep, build=build), {"am": am})
+                              for w in ("S1", "S2") for rep in (1, 2, 3)])
+        order = interleave(plans, 7)
+        self.assertEqual(len(order), 24)
+        groups = [order[i:i + 4] for i in range(0, 24, 4)]
+        for g in groups:
+            self.assertEqual(len({str(k.pair_path()) for _, k, _ in g}), 1)
+            self.assertEqual({i for i, _, _ in g}, {0, 1, 2, 3})
+        # (in random order: not always the base first)
+        self.assertGreater(len({tuple(i for i, _, _ in g) for g in groups}), 1)
+
+    def test_a_a_ratios_are_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            noise = [1000.0, 1010.0, 990.0, 1005.0, 995.0]
+            build_set(root, "base", "heap", noise)
+            build_set(root, "candidate", "heap", [noise[i] for i in (1, 0, 3, 2, 4)])
+            build_set(root, "base", "prolly", [v * 0.8 for v in noise])
+            build_set(root, "candidate", "prolly", [v * 0.8 for v in noise])
+            rows = bcompare.compare([table.load_set(p) for p in sorted(root.iterdir())])
+            self.assertEqual([r.engine for r in rows], ["heap", "prolly"])
+            for row in rows:
+                r = row.ratios["throughput"]
+                self.assertEqual(row.problems, [])
+                self.assertLessEqual(r.low, 1.0)
+                self.assertGreaterEqual(r.high, 1.0)
+                self.assertAlmostEqual(r.estimate, 1.0, delta=0.02)
+                self.assertNotEqual(bcompare.regression(r, True, 0.05), "regressed")
+            self.assertAlmostEqual(rows[1].over_heap["base"], 0.8)
+            self.assertAlmostEqual(rows[1].over_heap["candidate"], 0.8)
+            md = bcompare.to_markdown(rows)
+            self.assertIn("| S1 | - | 8 | prolly | 1.00 [", md)
+            self.assertIn("0.80 → 0.80", md)
+
+    def test_slowed_candidate_detected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            noise = [1000.0, 1010.0, 990.0, 1005.0, 995.0]
+            build_set(root, "base", "heap", noise)
+            build_set(root, "candidate", "heap", [v * 0.85 for v in noise])
+            rows = bcompare.compare([table.load_set(p) for p in sorted(root.iterdir())])
+            self.assertEqual(bcompare.regression(rows[0].ratios["throughput"], True, 0.05),
+                             "regressed")
+            self.assertEqual(bcompare.regression(rows[0].ratios["latency_p50_ms"], False, 0.05),
+                             "regressed")
+
+    def test_unpaired_seeds_are_not_compared(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            build_set(root, "base", "heap", [1000.0] * 5)
+            build_set(root, "candidate", "heap", [1000.0] * 5, seeds={3: 99})
+            rows = bcompare.compare([table.load_set(p) for p in sorted(root.iterdir())])
+            self.assertIn("repetition 3 ran with different seeds", rows[0].problems)
+            self.assertIsNone(rows[0].ratios["throughput"].low)   # 4 pairs: no interval
+
+    def test_compatible_varies_only_the_build(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            base = build_set(root, "base", "heap", [1000.0] * 5)
+            cand = build_set(root, "candidate", "heap", [1000.0] * 5)
+            cand_prolly = build_set(root, "candidate", "prolly", [1000.0] * 5)
+            (root / "elsewhere").mkdir()
+            other_machine = build_set(root / "elsewhere", "candidate", "heap", [1000.0] * 5,
+                                      identity="elsewhere")
+            self.assertEqual(compatible(base, cand, "build"), [])
+            self.assertTrue(compatible(base, cand_prolly, "build"))      # engine differs too
+            self.assertTrue(compatible(base, base, "build"))             # one build
+            self.assertTrue(compatible(base, other_machine, "build"))    # conditions differ
+            self.assertTrue(compatible(base, cand, "engine"))            # builds differ
+
+    def test_comparison_only_may_relax_commit(self):
+        cfg = config.load(HERE / "configs" / "s_pr.toml", {})
+        self.assertEqual(cfg["postgres"]["synchronous_commit"], "off")
+        self.assertEqual(cfg["postgres"]["fsync"], "on")
+        self.assertEqual(cfg["run"]["repetitions"], 5)
+        with self.assertRaises(config.ConfigError):
+            config.load(HERE / "configs" / "s_pr.toml", {"run": {"comparison_only": False}})
+        with self.assertRaises(config.ConfigError):
+            config.load(HERE / "configs" / "s_pr.toml", {"postgres": {"fsync": "off"}})
 
 
 if __name__ == "__main__":

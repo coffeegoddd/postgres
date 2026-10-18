@@ -71,6 +71,7 @@ class ResultSet:
     started: str
     results: list[dict]
     problems: list[str] = field(default_factory=list)
+    build: str = ""              # the build, if the run compared builds
 
     @property
     def is_baseline(self) -> bool:
@@ -85,7 +86,7 @@ def load_set(path: Path) -> ResultSet:
     except (OSError, ValueError, KeyError):
         results = []  # Keep incomplete evidence visible in discovery and reports.
     return ResultSet(path, run["suite"], run["label"], run["table_am"],
-                     run["started"], results, problems)
+                     run["started"], results, problems, run.get("build", ""))
 
 
 def discover(root: Path, suite: str) -> list[ResultSet]:

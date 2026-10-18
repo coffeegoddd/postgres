@@ -139,7 +139,10 @@ def comparison_identity(cfg: dict, env: dict) -> str:
     })
 
 
-def compatible(base: Path, other: Path) -> list[str]:
+def compatible(base: Path, other: Path, vary: str = "engine") -> list[str]:
+    """Why other's results can't be compared with base's, varying only
+    vary: "engine" (the table AM, one build) or "build" (the server build,
+    one engine); empty if they can."""
     problems = validate_run(base) + validate_run(other)
     if problems:
         return problems
@@ -147,13 +150,24 @@ def compatible(base: Path, other: Path) -> list[str]:
     e = json.loads((other / "run.json").read_text())
     if not b.get("comparison_identity") or b["comparison_identity"] != e.get("comparison_identity"):
         problems.append("different workload, build mode, client, harness or machine conditions")
+    if vary == "build":
+        if b.get("table_am") != e.get("table_am"):
+            problems.append(f"different engines ({b.get('table_am')}, {e.get('table_am')}) "
+                            "in a comparison of builds")
+        if not b.get("build") or not e.get("build") or b["build"] == e["build"]:
+            problems.append("a comparison of builds needs two labelled builds")
+    elif b.get("build", "") != e.get("build", ""):
+        problems.append(f"different builds ({b.get('build')}, {e.get('build')}) "
+                        "in a comparison of engines")
     if not problems:
-        base_results = {cell_id(r["key"]): r for r in
+        def unbuilt(key):
+            return cell_id({k: v for k, v in key.items() if k != "build"})
+        base_results = {unbuilt(r["key"]): r for r in
                         (json.loads(line) for line in (base / "results.jsonl").read_text().splitlines())}
         for line in (other / "results.jsonl").read_text().splitlines():
             r = json.loads(line)
             if r["key"].get("workload") == "S13":
-                reference = base_results.get(cell_id(r["key"]))
+                reference = base_results.get(unbuilt(r["key"]))
                 if reference is None or tpch_answers(other / r["raw_dir"]) != tpch_answers(base / reference["raw_dir"]):
                     problems.append(f"TPC-H query parameters, types, row counts or actual answers differ: {r['key']}")
     return problems

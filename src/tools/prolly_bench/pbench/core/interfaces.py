@@ -133,13 +133,21 @@ class CellKey:
     variant: str          # "" when the workload has one variant
     clients: int
     rep: int
+    # The server build the cell ran ("base", "candidate"), when a run
+    # compares builds; "" otherwise.
+    build: str = ""
 
-    def path(self) -> Path:
+    def pair_path(self) -> Path:
+        """The cell, whatever build and engine: cells with the same one are
+        run as a group, in random order, and compared with each other."""
         parts = [self.workload, self.size]
         if self.variant:
             parts.append(self.variant)
         parts += [f"c{self.clients}", f"r{self.rep}"]
         return Path(*parts)
+
+    def path(self) -> Path:
+        return Path(self.build, self.pair_path()) if self.build else self.pair_path()
 
 
 @dataclass
@@ -311,6 +319,7 @@ class RunInfo:
     warnings: list[str]
     out_dir: Path
     planned_cells: list[CellKey] = field(default_factory=list)
+    build: str = ""                  # the build compared, if builds are
 
 
 class Sink(abc.ABC):

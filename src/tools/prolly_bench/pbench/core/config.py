@@ -39,6 +39,11 @@ RUN_DEFAULTS: dict[str, Any] = {
     # that did the work has flushed its statistics), pg_stat_io's for client
     # backends only: for runs whose counters are compared exactly.
     "settled_counters": False,
+    # A run whose numbers only compare two builds of the server (a pull
+    # request and its base) and are never reported as the procedure's: it
+    # may turn synchronous_commit off (fsync stays on), so a machine's
+    # flush time doesn't bury the change compared.
+    "comparison_only": False,
 }
 
 # Settings every S and V run requires: results are only comparable when
@@ -103,6 +108,8 @@ def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, A
         if suite in DURABILITY_EXEMPT_SUITES:
             break
         actual = cfg["postgres"].get(k, v)
+        if k == "synchronous_commit" and cfg["run"]["comparison_only"] and actual == "off":
+            continue
         if actual != v:
             raise ConfigError(f"{k} = {actual}: the procedure requires {k} = {v} "
                               "(results with it off are not reported)")
@@ -151,8 +158,9 @@ def validate(cfg: dict, suite: str) -> None:
         raise ConfigError("benchmark quality requires at least 5 repetitions and warmup")
     if run["quality"] == "benchmark" and "environment" not in run["collectors"]:
         raise ConfigError("benchmark quality requires runtime environment monitoring")
-    if type(run["settled_counters"]) is not bool:
-        raise ConfigError("settled_counters must be true or false")
+    for name in ("settled_counters", "comparison_only"):
+        if type(run[name]) is not bool:
+            raise ConfigError(f"{name} must be true or false")
     if run["settled_counters"] and suite == "S" and (not run["workloads"] or "S6" in run["workloads"]):
         raise ConfigError("settled_counters waits until no other client is connected, and S6 "
                           "holds a session open for its whole window: leave S6 out")

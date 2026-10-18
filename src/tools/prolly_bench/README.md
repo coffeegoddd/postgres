@@ -254,6 +254,32 @@ Without hardware counters, `configs/s_cachegrind.toml` counts instructions
 with the server under Cachegrind (the `cachegrind` cluster and collector),
 on a reduced workload.
 
+## Comparing builds
+
+`--pg-bin base=DIR,candidate=DIR` runs two builds of the server, a pull
+request's base and the pull request, as the variable compared: a result set
+per build and engine (`base-B0`, `base-prolly`, `candidate-B0`, ...), the
+cells with the same workload, size, clients and repetition run as a group
+in random order, with the same seed.  Before every cell, each build's
+binaries and provenance are checked against what the run recorded;
+`--build-commit base=SHA,candidate=SHA` also checks the commit each build's
+provenance names.  `table` then gives each candidate cell's ratio to the
+same engine's base cell, with the paired bootstrap interval (5 repetitions
+or more), and prolly's ratio to heap in each build.  A comparison of builds
+is refused unless everything but the build matches (engine, configuration,
+harness, clients, machine).
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_pr.toml \
+    --pg-bin base=build-base/inst/bin,candidate=build-rel/inst/bin --out pr
+src/tools/prolly_bench/prolly_bench table pr/*-S-*
+```
+
+`configs/s_pr.toml` is a pull request's timing shape: S1, S2 and S10's
+read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
+Its numbers only compare builds (`comparison_only`), so it may run with
+`synchronous_commit = off`; they are never reported as the procedure's.
+
 ## Targets
 
 `prolly` tables exist only in versioned schemas, and with `prolly` as the
