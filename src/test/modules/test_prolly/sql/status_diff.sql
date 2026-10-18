@@ -98,8 +98,7 @@ DROP DATABASE sd_win1251;
 
 -- Reading what changed doesn't need what a commit does: objects the
 -- canonical form doesn't describe yet (a partitioned table, a foreign
--- table, a policy) are left out of status and diff, and only a commit
--- refuses them.
+-- table) are left out of status and diff, and only a commit refuses them.
 CREATE FOREIGN DATA WRAPPER sd_fdw;
 CREATE SERVER sd_srv FOREIGN DATA WRAPPER sd_fdw;
 CREATE SCHEMA sdu VERSIONED;
@@ -113,9 +112,8 @@ CREATE TABLE sdu.p1 PARTITION OF sdu.p FOR VALUES FROM (1) TO (10);
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
-CREATE POLICY sdu_own ON sdu.t USING (true);
 INSERT INTO sdu.t VALUES (1, 'one');
-SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%' OR table_name LIKE 'sdu_own%';
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 SELECT dolt_commit('-am', 'refused');
@@ -155,13 +153,10 @@ SELECT diff_type, length((from_row).big), left((from_row).big, 1),
 	length((to_row).big), left((to_row).big, 1)
   FROM dolt_diff('HEAD', 'WORKING', NULL::sdt.t);
 
--- a foreign table, or a row security policy, makes a commit fail, each alone
+-- a foreign table makes a commit fail
 CREATE FOREIGN TABLE sdt.ft (id int) SERVER sd_srv;
 SELECT dolt_commit('-Am', 'foreign table');
 DROP FOREIGN TABLE sdt.ft;
-ALTER TABLE sdt.t ENABLE ROW LEVEL SECURITY;
-CREATE POLICY sdt_pol ON sdt.t USING (true);
-SELECT dolt_commit('-Am', 'policy');
 DROP SCHEMA sdt CASCADE;
 SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;
 

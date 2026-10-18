@@ -240,8 +240,7 @@ SELECT * FROM dolt_status ORDER BY table_name;
 DROP DATABASE sd_win1251;
 -- Reading what changed doesn't need what a commit does: objects the
 -- canonical form doesn't describe yet (a partitioned table, a foreign
--- table, a policy) are left out of status and diff, and only a commit
--- refuses them.
+-- table) are left out of status and diff, and only a commit refuses them.
 CREATE FOREIGN DATA WRAPPER sd_fdw;
 CREATE SERVER sd_srv FOREIGN DATA WRAPPER sd_fdw;
 CREATE SCHEMA sdu VERSIONED;
@@ -271,17 +270,15 @@ SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 (2 rows)
 
 CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
-CREATE POLICY sdu_own ON sdu.t USING (true);
 INSERT INTO sdu.t VALUES (1, 'one');
-SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%' OR table_name LIKE 'sdu_own%';
-    table_name    | staged |   status    
-------------------+--------+-------------
- sdu.ft           | f      | not covered
- sdu.p            | f      | not covered
- sdu.p1           | f      | not covered
- sdu.t            | t      | modified
- sdu_own on sdu.t | f      | not covered
-(5 rows)
+SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
+ table_name | staged |   status    
+------------+--------+-------------
+ sdu.ft     | f      | not covered
+ sdu.p      | f      | not covered
+ sdu.p1     | f      | not covered
+ sdu.t      | t      | modified
+(4 rows)
 
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
  diff_type | to_row  
@@ -399,17 +396,12 @@ SELECT diff_type, length((from_row).big), left((from_row).big, 1),
  modified  |   6000 | a    |   7000 | b
 (1 row)
 
--- a foreign table, or a row security policy, makes a commit fail, each alone
+-- a foreign table makes a commit fail
 CREATE FOREIGN TABLE sdt.ft (id int) SERVER sd_srv;
 SELECT dolt_commit('-Am', 'foreign table');
 ERROR:  prolly commits don't cover foreign tables yet: sdt.ft
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP FOREIGN TABLE sdt.ft;
-ALTER TABLE sdt.t ENABLE ROW LEVEL SECURITY;
-CREATE POLICY sdt_pol ON sdt.t USING (true);
-SELECT dolt_commit('-Am', 'policy');
-ERROR:  prolly commits don't cover row security policies yet: sdt_pol on sdt.t
-DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP SCHEMA sdt CASCADE;
 NOTICE:  drop cascades to table sdt.t
 SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;

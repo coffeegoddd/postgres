@@ -608,6 +608,83 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 	}
 }
 
+/* A table's policies section's lines for its row security being on. */
+#define ROW_SECURITY		"row level security"
+#define FORCED_ROW_SECURITY "forced row level security"
+
+/*
+ * rel's row security policies, sorted, one per line, each as CREATE POLICY
+ * makes it (Postgres has no deparser for policies; pg_dump writes them
+ * so): permissive or restrictive, its command, its roles by name (sorted),
+ * its expressions.
+ */
+static void
+append_policies(StringInfo out, Relation rel)
+{
+	Relation	prel = table_open(PolicyRelationId, AccessShareLock);
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *defs = NIL;
+	ListCell   *lc;
+	char	   *table = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												   RelationGetRelationName(rel));
+
+	ScanKeyInit(&skey, Anum_pg_policy_polrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(prel, PolicyPolrelidPolnameIndexId, true, NULL, 1,
+							  &skey);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
+		StringInfoData def;
+		Datum		d;
+		bool		isnull;
+		Datum	   *roles;
+		int			nroles;
+		List	   *names = NIL;
+
+		initStringInfo(&def);
+		appendStringInfo(&def, "CREATE POLICY %s ON %s AS %s FOR %s TO ",
+						 quote_identifier(NameStr(pol->polname)), table,
+						 pol->polpermissive ? "PERMISSIVE" : "RESTRICTIVE",
+						 pol->polcmd == ACL_SELECT_CHR ? "SELECT" :
+						 pol->polcmd == ACL_INSERT_CHR ? "INSERT" :
+						 pol->polcmd == ACL_UPDATE_CHR ? "UPDATE" :
+						 pol->polcmd == ACL_DELETE_CHR ? "DELETE" : "ALL");
+		d = heap_getattr(tup, Anum_pg_policy_polroles, RelationGetDescr(prel), &isnull);
+		deconstruct_array_builtin(DatumGetArrayTypeP(d), OIDOID, &roles, NULL, &nroles);
+		for (int i = 0; i < nroles; i++)
+			names = lappend(names, DatumGetObjectId(roles[i]) == ACL_ID_PUBLIC ?
+							pstrdup("PUBLIC") :
+							pstrdup(quote_identifier(GetUserNameFromId(DatumGetObjectId(roles[i]),
+																	   false))));
+		list_sort(names, cstring_cmp);
+		foreach(lc, names)
+			appendStringInfo(&def, "%s%s", foreach_current_index(lc) > 0 ? ", " : "",
+							 (char *) lfirst(lc));
+		d = heap_getattr(tup, Anum_pg_policy_polqual, RelationGetDescr(prel), &isnull);
+		if (!isnull)
+			appendStringInfo(&def, " USING (%s)",
+							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
+																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+		d = heap_getattr(tup, Anum_pg_policy_polwithcheck, RelationGetDescr(prel), &isnull);
+		if (!isnull)
+			appendStringInfo(&def, " WITH CHECK (%s)",
+							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
+																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+		defs = lappend(defs, def.data);
+	}
+	systable_endscan(scan);
+	table_close(prel, AccessShareLock);
+	list_sort(defs, cstring_cmp);
+	foreach(lc, defs)
+	{
+		append_field(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
+}
+
 static void
 describe_table(Canon *cn, Relation rel, StringInfo out)
 {
@@ -709,6 +786,14 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	appendStringInfoString(out, "rules\n");
 	append_sorted_defs(out, RewriteRelationId, Anum_pg_rewrite_ev_class,
 					   RewriteRelRulenameIndexId, RelationGetRelid(rel));
+
+	/* Row security: whether it is on (and forced), then policies by name. */
+	appendStringInfoString(out, "policies\n");
+	if (rel->rd_rel->relrowsecurity)
+		appendStringInfoString(out, ROW_SECURITY "\n");
+	if (rel->rd_rel->relforcerowsecurity)
+		appendStringInfoString(out, FORCED_ROW_SECURITY "\n");
+	append_policies(out, rel);
 }
 
 /* ------------------------------------------------------------------------
@@ -1397,24 +1482,6 @@ collect(Canon *cn)
 		}
 		systable_endscan(scan);
 		table_close(pg_proc, AccessShareLock);
-	}
-	{
-		Relation	pg_policy = table_open(PolicyRelationId, AccessShareLock);
-
-		scan = systable_beginscan(pg_policy, InvalidOid, false, NULL, 0, NULL);
-		while ((tup = systable_getnext(scan)) != NULL)
-		{
-			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
-
-			if (canon_namespace(get_rel_namespace(pol->polrelid)))
-				(void) uncovered(cn, "row security policies",
-								 psprintf("%s on %s",
-										  quote_identifier(NameStr(pol->polname)),
-										  qualified(get_rel_namespace(pol->polrelid),
-													get_rel_name(pol->polrelid))));
-		}
-		systable_endscan(scan);
-		table_close(pg_policy, AccessShareLock);
 	}
 }
 
@@ -2349,6 +2416,7 @@ typedef struct TableDef
 	List	   *indexes;		/* statements */
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
+	List	   *policies;		/* ROW_SECURITY lines, then statements */
 } TableDef;
 
 typedef struct SchemaMove
@@ -2441,6 +2509,8 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
+		else if (strcmp(line, "policies") == 0)
+			section = &td->policies;
 		else if (section == &td->columns || section == &td->constraints)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
@@ -2514,6 +2584,26 @@ constraint_def(const char *line)
 	return unescape_field(tab + 1);
 }
 
+/* The identifier p begins with, as written: quoted (spaces and all) or not. */
+static char *
+leading_identifier(const char *p)
+{
+	const char *end = p;
+
+	if (*end != '"')
+		return pnstrdup(p, strcspn(p, " "));
+	for (end++; *end; end++)
+	{
+		if (*end == '"')
+		{
+			if (end[1] != '"')
+				break;
+			end++;				/* (a doubled quote) */
+		}
+	}
+	return pnstrdup(p, end + (*end ? 1 : 0) - p);
+}
+
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
 static char *
 index_name(const char *stmt)
@@ -2522,11 +2612,13 @@ index_name(const char *stmt)
 
 	if (p == NULL)
 		elog(ERROR, "unexpected index definition \"%s\"", stmt);
-	p += strlen(" INDEX ");
-	return pnstrdup(p, strcspn(p, " "));
+	return leading_identifier(p + strlen(" INDEX "));
 }
 
-/* A trigger's or rule's name: CREATE [CONSTRAINT] TRIGGER name ..., CREATE RULE name ... */
+/*
+ * A trigger's, rule's or policy's name: CREATE [CONSTRAINT] TRIGGER name
+ * ..., CREATE RULE name ..., CREATE POLICY name ...
+ */
 static char *
 object_name(const char *stmt, const char *word)
 {
@@ -2534,8 +2626,7 @@ object_name(const char *stmt, const char *word)
 
 	if (p == NULL)
 		elog(ERROR, "unexpected definition \"%s\"", stmt);
-	p += strlen(word);
-	return pnstrdup(p, strcspn(p, " "));
+	return leading_identifier(p + strlen(word));
 }
 
 /* Where s is in list, or -1. */
@@ -2837,6 +2928,12 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sm->before = lappend(sm->before,
 								 psprintf("DROP RULE %s ON %s",
 										  object_name(lfirst(lc), "CREATE RULE "), name));
+	foreach(lc, from->policies)
+		if (strncmp(lfirst(lc), "CREATE POLICY ", 14) == 0 &&
+			!list_has_string(to->policies, lfirst(lc)))
+			sm->before = lappend(sm->before,
+								 psprintf("DROP POLICY IF EXISTS %s ON %s",
+										  object_name(lfirst(lc), "CREATE POLICY "), name));
 	foreach(lc, from->constraints)
 	{
 		char	   *sql;
@@ -2931,6 +3028,26 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	foreach(lc, to->policies)
+		if (strncmp(lfirst(lc), "CREATE POLICY ", 14) == 0 &&
+			!list_has_string(from->policies, lfirst(lc)))
+			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	{
+		static const char *const flags[2] = {ROW_SECURITY, FORCED_ROW_SECURITY};
+		static const char *const on[2] = {"ENABLE", "FORCE"};
+		static const char *const off[2] = {"DISABLE", "NO FORCE"};
+
+		for (int i = 0; i < 2; i++)
+		{
+			bool		was = list_has_string(from->policies, flags[i]);
+			bool		is = list_has_string(to->policies, flags[i]);
+
+			if (was != is)
+				sm->after = lappend(sm->after,
+									psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
+											 is ? on[i] : off[i]));
+		}
+	}
 	return remake;
 }
 

@@ -83,6 +83,7 @@ tests += {
       'dependency_moves',
       'canonical_escapes',
       'aggregates',
+      'policies',
     ],
   },
   'tap': {
