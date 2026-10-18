@@ -474,11 +474,54 @@ Decided by the user 2026-10-18, as recommended:
    not enforced); the nightly the
    360-cell shape, not `standard.toml`.
 
-## 8. Calibration (part 3.5): the tooling, and what is measured so far
+## 8. Calibration (part 3.5): measured on hosted runners
 
-**Status: the hosted A/A data is pending.** The tooling is built (#244);
-the thresholds below are the proposed starting points, provisional until
-the hosted runs are recorded here.
+**Status: measured 2026-10-18 on GitHub's hosted runners (ubuntu-24.04),
+#244.** The counter gate's settings below hold: no false failure in the
+A/A data.  Timing stays reported, not gated (decision 1): ten runs can't
+show a false-failure rate under 1%, and the intervals are wide.
+
+**Hardware counters: none.** `perf stat -e instructions:u,instructions:k`
+reports both `<not supported>` on every hosted runner probed (twenty,
+over two calibration runs), so
+instructions are out of the hosted gate, and the nightly counts them with
+Cachegrind on a reduced workload, reported (part 3.1's fallback).
+
+**Counters** (run 39155625916: 40 counter runs of one build, four on
+each of ten runners, heap and prolly, `s_counters.toml` with S13):
+
+- 305 of 350 exact counters took the same value in every run.
+- The rest jitter by a page or a few records: S7's (GiST's random
+  tie-breaking), S10's read-write and update-index tests' extends,
+  relation size and WAL (up to 25% of a handful of extends, about 1% of
+  WAL), S13's hits (under 0.05%).  Under the original rule (any
+  difference between a build's own two runs is instability, and
+  instability only in the candidate fails), 1,809 of 2,000 simulated
+  gates failed.  So a build's runs now disagree (unstable) only by what
+  the rule would call a change, more than 5% and over the floor; smaller
+  differences are jitter, gated as usual and listed.
+- With that, 0 of 2,000 simulated gates (four distinct runs as base, base
+  again, candidate, candidate again) failed; the same held for an earlier
+  set of 40 runs (run 39153335247).  The floors stay 8 events and 8 KB.
+- A pull request's own run (#274, the candidate's engine code identical
+  to its base's) passed the counter gate with 36 jittering counters listed.
+
+**Timing** (the same run: ten A/A runs of `s_pr.toml`, 8 clients, 5
+repetitions, 5 s warm-up, 20 s measured):
+
+| | median 95% CI width | widest |
+|---|---|---|
+| throughput, heap | 2.6–7.2% | 31% |
+| throughput, prolly | 3.0–6.2% | 17% |
+| p50 latency | 3.5–9.3% | 28% |
+| p99 latency | 4.5–12.6% | 46% |
+
+No cell of any of the ten runs regressed at 5% or at 10%.  A 5%
+threshold is narrower than many intervals: such cells are inconclusive,
+not failures, and a 10% gate (open question 2) would need more runs
+than ten to show it fails under 1% of pull requests.
+
+**Tooling:**
 
 - `.github/workflows/performance-calibration.yml` runs the A/A
   calibration on GitHub-hosted runners: one release build, then ten
