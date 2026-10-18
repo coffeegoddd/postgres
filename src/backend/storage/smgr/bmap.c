@@ -4355,6 +4355,18 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	drop_blocks(reln);
 }
 
+/*
+ * Writing a page out looks it up on its map page, cached or read from disk
+ * (read_node()).  A map page whose buffer is dropped without being written
+ * may be stale or all zeroes on disk, so its buffers go after the pages
+ * they map.
+ */
+bool
+bmapwritesread(ForkNumber forknum)
+{
+	return forknum == BMAP_FORKNUM;
+}
+
 void
 bmapextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
@@ -4542,6 +4554,7 @@ bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		mdwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
 		return;
 	}
+	INJECTION_POINT("bmap-write", NULL);
 	ssrel = store_smgr(reln->smgr_rlocator.locator);
 	while (nblocks > 0)
 	{

@@ -5180,28 +5180,49 @@ void
 DropDatabaseBuffers(Oid dbid)
 {
 	int			i;
+	bool		last[MAX_FORKNUM + 1];
 
 	/*
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.
 	 */
 
-	for (i = 0; i < NBuffers; i++)
+	/*
+	 * Writing out a page may read buffers of another fork of its relation
+	 * (smgrwritesread()), and a page being written out meanwhile, by the
+	 * checkpointer say, must find them.  So those forks' buffers are
+	 * dropped in a second pass, once the first has dropped every page that
+	 * could need them, waiting for any being written out.
+	 */
+	for (ForkNumber forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		last[forknum] = smgrwritesread(forknum);
+
+	for (int pass = 0; pass < 2; pass++)
 	{
-		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		for (i = 0; i < NBuffers; i++)
+		{
+			BufferDesc *bufHdr = GetBufferDescriptor(i);
+			ForkNumber	forknum;
 
-		/*
-		 * As in DropRelationBuffers, an unlocked precheck should be safe and
-		 * saves some cycles.
-		 */
-		if (bufHdr->tag.dbOid != dbid)
-			continue;
+			/*
+			 * As in DropRelationBuffers, an unlocked precheck should be safe
+			 * and saves some cycles.  (A tag changing meanwhile may give no
+			 * valid fork; such a buffer is no longer this database's.)
+			 */
+			if (bufHdr->tag.dbOid != dbid)
+				continue;
+			forknum = BufTagGetForkNum(&bufHdr->tag);
+			if (forknum < 0 || forknum > MAX_FORKNUM ||
+				last[forknum] != (pass == 1))
+				continue;
 
-		LockBufHdr(bufHdr);
-		if (bufHdr->tag.dbOid == dbid)
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
-		else
-			UnlockBufHdr(bufHdr);
+			LockBufHdr(bufHdr);
+			if (bufHdr->tag.dbOid == dbid &&
+				last[BufTagGetForkNum(&bufHdr->tag)] == (pass == 1))
+				InvalidateBuffer(bufHdr);	/* releases spinlock */
+			else
+				UnlockBufHdr(bufHdr);
+		}
 	}
 }
 

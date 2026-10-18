@@ -140,6 +140,12 @@ typedef struct f_smgr
 									  BlockNumber blocknum, bool *copies);
 	/* before a relation's buffers are dropped to unlink it; may be NULL */
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
+
+	/*
+	 * May writing out a page of one of a relation's forks read the
+	 * relation's buffers of 'forknum'?  May be NULL (never).
+	 */
+	bool		(*smgr_writesread) (ForkNumber forknum);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
@@ -219,6 +225,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
 		.smgr_predrop = bmappredrop,
+		.smgr_writesread = bmapwritesread,
 		.smgr_unlink = bmapunlink,
 		.smgr_extend = bmapextend,
 		.smgr_zeroextend = bmapzeroextend,
@@ -728,6 +735,23 @@ smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	return smgrsw[reln->smgr_which].smgr_pageisshared != NULL &&
 		smgrsw[reln->smgr_which].smgr_pageisshared(reln, forknum, blocknum,
 												   copies);
+}
+
+/*
+ * smgrwritesread() -- May writing out a page of one fork read the buffers of
+ *					   'forknum', of the same relation?
+ *
+ * Asked of every implementation, since a buffer doesn't say which one holds
+ * its page.  Whoever drops such buffers while pages they serve may still be
+ * written out drops them last.
+ */
+bool
+smgrwritesread(ForkNumber forknum)
+{
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_writesread && smgrsw[i].smgr_writesread(forknum))
+			return true;
+	return false;
 }
 
 /* does this relation's storage implementation share pages (smgrshare())? */

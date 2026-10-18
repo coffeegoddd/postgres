@@ -45,6 +45,7 @@ extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
+extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
 extern void bmapextend(SMgrRelation reln, ForkNumber forknum,

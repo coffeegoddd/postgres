@@ -110,6 +110,7 @@ extern void smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum,
 						   bool isRedo);
 extern void smgrshare(SMgrRelation src, SMgrRelation dst);
 extern bool smgrcanshare(SMgrRelation reln);
+extern bool smgrwritesread(ForkNumber forknum);
 extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
