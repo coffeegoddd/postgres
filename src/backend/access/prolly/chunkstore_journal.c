@@ -3701,19 +3701,28 @@ hash_bytes_cmp(const void *a, const void *b, void *arg)
 
 /*
  * Add an unmarked chunk's hash to the dropped list (hashes, n of them so
- * far), unless another copy of it is live; returns the new count.
+ * far), unless another copy of it is live or in a file kept whole; returns
+ * the new count.
  */
 static uint64
-dropped_add(ProllyChunkGc *gc, const uint8 *marks, const ProllyHash *h,
-			char *hashes, uint64 n)
+dropped_add(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
+			const ProllyHash *h, char *hashes, uint64 n)
 {
 	int64		live;
+	ProllyHash	key;
 
 	if (h->len != gc->hash_len)
 		return n;
 	live = journal_gc_find(gc, h);
 	if (live >= 0 && marked(marks, live))
 		return n;
+	hash_key(&key, h);
+	for (int i = 0; i < gc->nfiles; i++)
+	{
+		if (keep[i] && !gc->files[i].segment &&
+			PROLLY_CALL(table_format(), locate, gc->files[i].t->tf, &key) >= 0)
+			return n;
+	}
 	memcpy(hashes + n * gc->hash_len, h->bytes, gc->hash_len);
 	return n + 1;
 }
@@ -3745,7 +3754,7 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 	while ((e = hash_seq_search(&status)) != NULL)
 	{
 		if (!marked(marks, e->slot) && !keep[slot_file(gc, e->slot) - gc->files])
-			n = dropped_add(gc, marks, &e->hash, hashes, n);
+			n = dropped_add(gc, marks, keep, &e->hash, hashes, n);
 	}
 
 	/* a table file's by its index */
@@ -3765,7 +3774,7 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 				continue;
 			PROLLY_CALL(table_format(), entry, f->t->tf, (int) (slot - f->first),
 						&h, &o, &l);
-			n = dropped_add(gc, marks, &h, hashes, n);
+			n = dropped_add(gc, marks, keep, &h, hashes, n);
 		}
 	}
 	qsort_arg(hashes, n, gc->hash_len, hash_bytes_cmp, &gc->hash_len);

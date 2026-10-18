@@ -256,6 +256,50 @@ for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	is(sql($reads), '20', "a crash at $point: and the live chunks read after it");
 }
 
+# A full collection keeps a mostly live settled file whole, garbage and
+# all: a chunk of its garbage isn't on the swap's dropped list, though
+# another copy of it (in a file rewritten) is garbage too, so a writer
+# naming it across the swap commits.
+# (A chunk named by one put during a collection, after its seal, is
+# copied with the live ones; once that one is collected, nothing names it.)
+my $x = sql(q{SELECT test_chunk_put('kept x')});
+my $kl = sql(q{SELECT array_agg(test_chunk_put(convert_to('kept live ' || g, 'UTF8')))
+	FROM generate_series(1, 10) g});
+my $root_k = sql(qq{SELECT test_chunk_put_node(1, '$kl'::text[])});
+sql("SELECT test_chunk_move_root('$root', '$root_k')");
+$g = $node->background_psql('gcdb');
+$g->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-gc-sealed', 'wait')});
+$g->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo done
+});
+$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-gc-sealed'}) or die 'the collection did not stop';
+sql(qq{SELECT test_chunk_put_node(1, ARRAY['$x'])});
+sql(q{SELECT injection_points_wakeup('prolly-gc-sealed')});
+$g->query_until(qr/done/, '');
+$g->quit;
+sql('SELECT test_chunk_gc(false)');
+sql(q{SELECT test_chunk_table_file(ARRAY['kept x'::bytea])});
+my $k = $node->background_psql('gcdb', on_error_stop => 0);
+$k->query_safe(qq{BEGIN; SELECT test_chunk_has('$root_k')});
+$g = $node->background_psql('gcdb');
+$g->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_gc(true) IS NOT NULL;
+	\echo done
+});
+$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
+$k->query(qq{SELECT test_chunk_put_node(1, ARRAY['$x']); COMMIT});
+is($k->{stderr}, '', 'a writer naming garbage a kept file holds commits across the swap');
+$g->query_until(qr/done/, '');
+$g->quit;
+$k->quit;
+is(has($x), 't', 'and the chunk is still there');
+
 $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('gcdb', $files), sql($files),
 	'the standby\'s files are the primary\'s after it all');

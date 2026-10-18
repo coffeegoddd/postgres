@@ -85,7 +85,7 @@ SELECT test_chunk_has(:'big_head') AS big_head;
 
 -- A full one frees it: the file is mostly garbage, so rewritten.
 SELECT name AS big_file FROM test_chunk_table_files()
-ORDER BY chunks DESC LIMIT 1 \gset
+ORDER BY chunks DESC, name LIMIT 1 \gset
 SELECT kept > 0 AS kept, freed > 10 AS freed, bytes_freed > 100000 AS bytes_freed
 FROM test_chunk_gc(true);
  kept | freed | bytes_freed 
@@ -141,7 +141,7 @@ SELECT dolt_gc();
 (1 row)
 
 SELECT name AS live_file FROM test_chunk_table_files()
-ORDER BY chunks DESC LIMIT 1 \gset
+ORDER BY chunks DESC, name LIMIT 1 \gset
 UPDATE app.t SET v = 'changed' WHERE id = 7;
 SELECT length(dolt_commit('-m', 'a change')::text) AS committed;
  committed 
@@ -155,6 +155,17 @@ SELECT dolt_gc();
  {0}
 (1 row)
 
+-- (Which files it keeps, by name: the mostly live ones kept whole, none
+-- rewritten, the one wholly garbage gone.)
+SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
+             name              | chunks | settled 
+-------------------------------+--------+---------
+ prolly_table_0000000000000004 |      1 | t
+ prolly_table_0000000000000006 |      5 | t
+ prolly_table_0000000000000008 |    164 | t
+ prolly_table_000000000000000a |      7 | t
+(4 rows)
+
 SELECT freed > 0 AS freed FROM test_chunk_gc(true);
  freed 
 -------
@@ -167,6 +178,14 @@ WHERE name = :'live_file';
 ----------------------
                     1
 (1 row)
+
+SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
+             name              | chunks | settled 
+-------------------------------+--------+---------
+ prolly_table_0000000000000006 |      5 | t
+ prolly_table_0000000000000008 |    164 | t
+ prolly_table_000000000000000a |      7 | t
+(3 rows)
 
 SELECT count(*) AS rows FROM app.t;
  rows 
@@ -274,6 +293,74 @@ SELECT test_chunk_has(:'g') AS g_kept_with_its_file, test_chunk_has(:'h') AS h_i
  t                    | t          | f    | f
 (1 row)
 
+-- Which files are kept is chosen again once a kept file's garbage has
+-- marked what it names: file B, all garbage from the root, is half live
+-- through what kept file A's garbage names, so it is kept whole too.
+\c postgres
+CREATE DATABASE gc_again_db;
+\c gc_again_db
+CREATE EXTENSION test_prolly;
+SELECT array_agg(test_chunk_put(convert_to('b ' || g, 'UTF8'))) AS bs
+FROM generate_series(1, 10) g \gset
+SELECT test_chunk_put_node(1, :'bs'::text[]) AS root_b \gset
+SELECT test_chunk_move_root(NULL, :'root_b');
+ test_chunk_move_root 
+----------------------
+ t
+(1 row)
+
+SELECT kept FROM test_chunk_gc(false);
+ kept 
+------
+   11
+(1 row)
+
+SELECT name AS file_b FROM test_chunk_table_files() \gset
+SELECT array_agg(test_chunk_put(convert_to('a ' || g, 'UTF8'))) AS as_
+FROM generate_series(1, 10) g \gset
+SELECT test_chunk_put_node(1, (:'bs'::text[])[1:6]) AS names_b \gset
+SELECT test_chunk_put_node(1, :'as_'::text[] || ARRAY[:'names_b']) AS root_a \gset
+SELECT test_chunk_move_root(:'root_b', :'root_a');
+ test_chunk_move_root 
+----------------------
+ t
+(1 row)
+
+SELECT kept FROM test_chunk_gc(false);
+ kept 
+------
+   12
+(1 row)
+
+SELECT test_chunk_put_node(1, :'as_'::text[]) AS root_c \gset
+SELECT test_chunk_move_root(:'root_a', :'root_c');
+ test_chunk_move_root 
+----------------------
+ t
+(1 row)
+
+SELECT kept, freed FROM test_chunk_gc(true);
+ kept | freed 
+------+-------
+    1 |     0
+(1 row)
+
+SELECT count(*) FILTER (WHERE name = :'file_b') AS file_b_kept_whole,
+	count(*) AS files
+FROM test_chunk_table_files();
+ file_b_kept_whole | files 
+-------------------+-------
+                 1 |     3
+(1 row)
+
+SELECT test_chunk_has((:'bs'::text[])[1]) AS named_from_kept,
+	test_chunk_has(:'root_c') AS root;
+ named_from_kept | root 
+-----------------+------
+ t               | t
+(1 row)
+
 \c postgres
 DROP DATABASE gc_full_db;
 DROP DATABASE gc_closure_db;
+DROP DATABASE gc_again_db;

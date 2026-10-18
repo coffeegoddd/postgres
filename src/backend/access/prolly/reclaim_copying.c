@@ -27,7 +27,8 @@
  * full one collects every file, marks through all of them, then keeps
  * whole each settled file whose garbage is at most REWRITE_GARBAGE of its
  * chunks, rewriting only the rest: a full collection of a mostly live
- * store writes little.  A file kept whole keeps its garbage too, and with
+ * store writes little.  (Chosen again until none is newly kept: what a kept
+ * file's garbage names counts as live in the files it is in.)  A file kept whole keeps its garbage too, and with
  * it the store's closure: whatever its chunks name, live or not, is marked
  * (and copied from the files rewritten).
  *
@@ -144,9 +145,10 @@ typedef struct Keep
 {
 	Mark	   *mk;
 	bool	   *keep;
+	bool		changed;		/* a file was newly kept */
 } Keep;
 
-/* A settled file with little garbage is kept whole. */
+/* A settled file with little garbage, as marked so far, is kept whole. */
 static void
 choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 			void *arg)
@@ -154,31 +156,32 @@ choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 	Keep	   *k = arg;
 	uint64		live = 0;
 
-	if (!settled || nslots == 0)
+	if (k->keep[file] || !settled || nslots == 0)
 		return;
 	for (uint64 slot = first; slot < first + nslots; slot++)
 		live += (k->mk->marks[slot / 8] >> (slot % 8)) & 1;
-	k->keep[file] = (double) (nslots - live) <= REWRITE_GARBAGE * nslots;
+	if ((double) (nslots - live) <= REWRITE_GARBAGE * nslots)
+	{
+		k->keep[file] = true;
+		k->changed = true;
+	}
 }
 
-/* What a file kept whole names, live or not, is kept with it. */
+/*
+ * What a file kept whole names, live or not, is kept with it: its chunks
+ * marked (those marked before were read already), then read.
+ */
 static void
 mark_from_kept(int file, uint64 first, uint64 nslots, bool settled,
 			   uint64 size, void *arg)
 {
 	Keep	   *k = arg;
-	Mark	   *mk = k->mk;
 
 	if (!k->keep[file])
 		return;
 	for (uint64 slot = first; slot < first + nslots; slot++)
-	{
-		resetStringInfo(&mk->buf);
-		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
-		mark_named(mk, mk->buf.data, mk->buf.len);
-		CHECK_FOR_INTERRUPTS();
-	}
-	drain(mk);
+		mark_slot(k->mk, slot);
+	drain(k->mk);
 }
 
 static void
@@ -216,10 +219,19 @@ copying_collect(bool full, ProllyGcResult *result)
 	/* the settled files kept whole, and what they name */
 	if (full)
 	{
-		Keep		k = {&mk, keep};
+		Keep		k = {&mk, keep, true};
 
-		PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
-		PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+		/*
+		 * Until no file is newly kept: marking from a kept file's garbage
+		 * may bring another file to little enough garbage to keep.
+		 */
+		while (k.changed)
+		{
+			k.changed = false;
+			PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
+			if (k.changed)
+				PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+		}
 	}
 
 	/* copied, before the window */
