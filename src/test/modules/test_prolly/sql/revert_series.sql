@@ -85,4 +85,18 @@ SELECT (dolt_revert('HEAD~3'))[2:4];
 SELECT dolt_revert('--continue', 'HEAD');
 ROLLBACK;
 
+-- Neither a revert nor a pick starts on a branch with constraint
+-- violations (Dolt's working set holds them, and must be clean): those
+-- they leave are their own.
+BEGIN;
+ALTER TABLE rv.t ADD CONSTRAINT t_short CHECK (length(c1) < 1) NOT VALID;
+SELECT dolt_verify_constraints();
+SELECT dolt_revert('HEAD');
+ROLLBACK;
+BEGIN;
+ALTER TABLE rv.t ADD CONSTRAINT t_short CHECK (length(c1) < 1) NOT VALID;
+SELECT dolt_verify_constraints();
+SELECT dolt_cherry_pick('HEAD~1');
+ROLLBACK;
+
 DROP SCHEMA rv CASCADE;

@@ -71,6 +71,22 @@ SELECT dolt_verify_constraints('-ao');
  {1}
 (1 row)
 
+SELECT dolt_verify_constraints('-oa');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_verify_constraints('-aoa');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_verify_constraints('-ax');
+ERROR:  dolt_verify_constraints: "-ax" is not supported
+SELECT dolt_verify_constraints('-');
+ERROR:  dolt_verify_constraints: "-" is not supported
 SELECT dolt_verify_constraints('--nope');
 ERROR:  dolt_verify_constraints: "--nope" is not supported
 -- Fixed, nothing is found; and validated, a constraint is Postgres's.
@@ -112,7 +128,34 @@ SELECT dolt_verify_constraints('-o', 'vc.u');
  {1}
 (1 row)
 
+-- A partitioned table's check, unvalidated: each row breaking it found
+-- once, through the partitioned table (not again through its partition's).
+CREATE TABLE vc.parted (k int, v int) PARTITION BY RANGE (k);
+CREATE TABLE vc.parted_1 PARTITION OF vc.parted FOR VALUES FROM (0) TO (10);
+INSERT INTO vc.parted VALUES (1, -1), (2, 2);
+ALTER TABLE vc.parted ADD CONSTRAINT parted_pos CHECK (v > 0) NOT VALID;
+BEGIN;
+SELECT dolt_verify_constraints('vc.parted', 'vc.parted_1');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ vc.parted  |              1
+(1 row)
+
+SELECT violating_row FROM dolt_constraint_violations('vc.parted');
+   violating_row   
+-------------------
+ {"k": 1, "v": -1}
+(1 row)
+
+ROLLBACK;
 DROP SCHEMA vc CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table vc.t
 drop cascades to table vc.u
+drop cascades to table vc.parted

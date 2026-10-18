@@ -76,6 +76,19 @@ SELECT dolt_branch('br_target');
 SELECT dolt_branch('-m', 'br_old', 'br_target');
 SELECT dolt_branch('-mf', 'br_old', 'br_target');
 SELECT name FROM dolt_branches WHERE name LIKE 'br\_%' ORDER BY 1;
+
+-- What the branch replaced had, the renamed one doesn't get: its upstream.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT dolt_branch('br_up');
+SELECT test_refs_set_upstream('br_up', 'origin', 'br_up');
+SELECT dolt_branch('br_plain');
+SELECT dolt_branch('-mf', 'br_plain', 'br_up');
+SELECT dolt_checkout('br_up');
+SELECT dolt_push();
+SELECT dolt_checkout('br_merging');
+SELECT dolt_branch('-D', 'br_up');
 SELECT dolt_branch('-M', 'br_target', 'br_merging');	-- (checked out)
 SELECT dolt_branch('-D', 'br_target');
 

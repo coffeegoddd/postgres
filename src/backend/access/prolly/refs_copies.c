@@ -1305,6 +1305,11 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		initStringInfo(&v);
 		appendStringInfoChar(&key, tags[i]);
 		appendStringInfoString(&key, name);
+
+		/*
+		 * (what the source hasn't, the new name hasn't either: a branch it
+		 * replaced may have left its upstream there)
+		 */
 		if (refs_get(key.data, key.len, &v))
 		{
 			refs_put(key.data, key.len, NULL);
@@ -1312,6 +1317,13 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 			appendStringInfoChar(&key, tags[i]);
 			appendStringInfoString(&key, newname);
 			refs_put(key.data, key.len, &v);
+		}
+		else
+		{
+			resetStringInfo(&key);
+			appendStringInfoChar(&key, tags[i]);
+			appendStringInfoString(&key, newname);
+			refs_put(key.data, key.len, NULL);
 		}
 		pfree(key.data);
 		pfree(v.data);

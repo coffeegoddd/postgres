@@ -112,6 +112,7 @@ static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
 static List *foreign_key_violations(List *relids);
+static void violating_rows(List *queries, const char *type, List **found);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
 						  const Table *now, ProllyDiffSink *sink);
 
@@ -2380,8 +2381,6 @@ foreign_key_violations(List *relids)
 	HeapTuple	tup;
 	List	   *found = NIL;
 	List	   *queries = NIL;
-	ListCell   *lc;
-	MemoryContext cxt = CurrentMemoryContext;
 
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
@@ -2458,51 +2457,16 @@ foreign_key_violations(List *relids)
 	systable_endscan(scan);
 	table_close(pg_constraint, AccessShareLock);
 
-	if (queries == NIL)
-		return NIL;
-	/*
-	 * With a snapshot that sees the merge's writes; as each referencing
-	 * table's owner, its rows and those it references seen whatever their
-	 * row security says, as the foreign key's own checks see them.
-	 */
-	CommandCounterIncrement();
-	SPI_connect();
-	foreach(lc, queries)
-	{
-		List	   *qi = lfirst(lc);
-		Oid			relid = (Oid) (uintptr_t) lthird(qi);
-		Oid			save_userid;
-		int			save_sec;
-		int			ret;
-
-		INJECTION_POINT("prolly-merge-foreign-keys", NULL);
-		GetUserIdAndSecContext(&save_userid, &save_sec);
-		SetUserIdAndSecContext(rel_owner(relid),
-							   save_sec | SECURITY_LOCAL_USERID_CHANGE |
-							   SECURITY_NOFORCE_RLS);
-		ret = SPI_execute(linitial(qi), false, 0);
-		SetUserIdAndSecContext(save_userid, save_sec);
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "could not check a foreign key: %s", (char *) linitial(qi));
-		for (uint64 r = 0; r < SPI_processed; r++)
-		{
-			char	   *row = SPI_getvalue(SPI_tuptable->vals[r],
-										   SPI_tuptable->tupdesc, 1);
-			MemoryContext spi = MemoryContextSwitchTo(cxt);
-
-			found = lappend(found, violation(relid, "foreign key", pstrdup(row),
-											 pstrdup(lsecond(qi))));
-			MemoryContextSwitchTo(spi);
-		}
-	}
-	SPI_finish();
+	violating_rows(queries, "foreign key", &found);
 	return found;
 }
 
 /*
- * Run each query (sql, info, relid) as its table's owner, its rows seen
- * whatever their row security says, appending a violation of type for each
- * row it returns (as JSON) to *found.
+ * Run each query (sql, info, relid), appending a violation of type for each
+ * row it returns (as JSON) to *found: with a snapshot that sees what was
+ * written before (a merge's writes), as the table's owner, its rows and
+ * those it references seen whatever their row security says, as a foreign
+ * key's own checks see them.
  */
 static void
 violating_rows(List *queries, const char *type, List **found)
@@ -2522,11 +2486,12 @@ violating_rows(List *queries, const char *type, List **found)
 		int			save_sec;
 		int			ret;
 
+		INJECTION_POINT("prolly-merge-foreign-keys", NULL);
 		GetUserIdAndSecContext(&save_userid, &save_sec);
 		SetUserIdAndSecContext(rel_owner(relid),
 							   save_sec | SECURITY_LOCAL_USERID_CHANGE |
 							   SECURITY_NOFORCE_RLS);
-		ret = SPI_execute(linitial(qi), true, 0);
+		ret = SPI_execute(linitial(qi), false, 0);
 		SetUserIdAndSecContext(save_userid, save_sec);
 		if (ret != SPI_OK_SELECT)
 			elog(ERROR, "could not check a constraint: %s", (char *) linitial(qi));
@@ -2567,9 +2532,14 @@ unvalidated_violations(List *relids)
 		StringInfoData q;
 		StringInfoData info;
 
+		/*
+		 * (a partition's inherited one is checked as its partitioned
+		 * table's, whose query reads every partition)
+		 */
 		if ((con->contype != CONSTRAINT_CHECK && con->contype != CONSTRAINT_NOTNULL) ||
 			con->convalidated || !OidIsValid(con->conrelid) ||
 			OidIsValid(con->conparentid) ||
+			(!con->conislocal && get_rel_relispartition(con->conrelid)) ||
 			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
 			(relids != NIL && !list_member_oid(relids, con->conrelid)))
 			continue;
@@ -2969,27 +2939,37 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 }
 
 /*
- * Record a merge in progress on the session's branch, of theirs from base,
- * with conflicts in the tables of conflicted (OIDs); with pick_message, a
+ * A merge in progress on the session's branch, of theirs from base, with
+ * conflicts in the tables of conflicted (OIDs); with pick_message, a
  * cherry-pick's, whose commit takes that message and one parent.
  */
+static void
+fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
+				 const ProllyHash *base, List *conflicted,
+				 const char *pick_message)
+{
+	ListCell   *lc;
+	int			i = 0;
+
+	memset(ms, 0, sizeof(*ms));
+	ms->theirs = *theirs;
+	ms->base = *base;
+	ms->ntables = list_length(conflicted);
+	ms->tables = palloc(sizeof(Oid) * Max(ms->ntables, 1));
+	foreach(lc, conflicted)
+		ms->tables[i++] = lfirst_oid(lc);
+	ms->pick = pick_message != NULL;
+	ms->message = unconstify(char *, pick_message);
+}
+
+/* Record such a merge in progress (fill_merge_state()). */
 static void
 record_merge_state(const ProllyHash *theirs, const ProllyHash *base,
 				   List *conflicted, const char *pick_message)
 {
 	ProllyMergeState ms;
-	ListCell   *lc;
-	int			i = 0;
 
-	memset(&ms, 0, sizeof(ms));
-	ms.theirs = *theirs;
-	ms.base = *base;
-	ms.ntables = list_length(conflicted);
-	ms.tables = palloc(sizeof(Oid) * Max(ms.ntables, 1));
-	foreach(lc, conflicted)
-		ms.tables[i++] = lfirst_oid(lc);
-	ms.pick = pick_message != NULL;
-	ms.message = unconstify(char *, pick_message);
+	fill_merge_state(&ms, theirs, base, conflicted, pick_message);
 	PROLLY_CALL(components().refs, set_merge_state, &ms);
 }
 
@@ -3402,18 +3382,9 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 		if (conflicts + nviolations > 0)
 		{
 			ProllyMergeState rs;
-			ListCell   *lc;
-			int			n = 0;
 
-			memset(&rs, 0, sizeof(rs));
-			rs.theirs = info[i].parents[0];
-			rs.base = picked[i];
-			rs.ntables = list_length(conflicted);
-			rs.tables = palloc(sizeof(Oid) * Max(rs.ntables, 1));
-			foreach(lc, conflicted)
-				rs.tables[n++] = lfirst_oid(lc);
-			rs.pick = true;
-			rs.message = message;
+			fill_merge_state(&rs, &info[i].parents[0], &picked[i], conflicted,
+							 message);
 			rs.revert = true;
 			rs.series_head = series;
 			rs.npending = nrefs - i - 1;

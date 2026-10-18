@@ -26,6 +26,10 @@ SELECT * FROM dolt_constraint_violations();
 SELECT dolt_verify_constraints('-o', 'vc.t');
 SELECT dolt_verify_constraints('--all', '--output-only');
 SELECT dolt_verify_constraints('-ao');
+SELECT dolt_verify_constraints('-oa');
+SELECT dolt_verify_constraints('-aoa');
+SELECT dolt_verify_constraints('-ax');
+SELECT dolt_verify_constraints('-');
 SELECT dolt_verify_constraints('--nope');
 
 -- Fixed, nothing is found; and validated, a constraint is Postgres's.
@@ -43,5 +47,17 @@ INSERT INTO vc.u VALUES (-1);
 ALTER TABLE vc.u ADD CONSTRAINT u_pos CHECK (a > 0) NOT VALID;
 SELECT dolt_verify_constraints('-o', 'vc.t');
 SELECT dolt_verify_constraints('-o', 'vc.u');
+
+-- A partitioned table's check, unvalidated: each row breaking it found
+-- once, through the partitioned table (not again through its partition's).
+CREATE TABLE vc.parted (k int, v int) PARTITION BY RANGE (k);
+CREATE TABLE vc.parted_1 PARTITION OF vc.parted FOR VALUES FROM (0) TO (10);
+INSERT INTO vc.parted VALUES (1, -1), (2, 2);
+ALTER TABLE vc.parted ADD CONSTRAINT parted_pos CHECK (v > 0) NOT VALID;
+BEGIN;
+SELECT dolt_verify_constraints('vc.parted', 'vc.parted_1');
+SELECT * FROM dolt_constraint_violations();
+SELECT violating_row FROM dolt_constraint_violations('vc.parted');
+ROLLBACK;
 
 DROP SCHEMA vc CASCADE;

@@ -263,5 +263,32 @@ SELECT (dolt_revert('HEAD~3'))[2:4];
 SELECT dolt_revert('--continue', 'HEAD');
 ERROR:  dolt_revert: unexpected argument "HEAD"
 ROLLBACK;
+-- Neither a revert nor a pick starts on a branch with constraint
+-- violations (Dolt's working set holds them, and must be clean): those
+-- they leave are their own.
+BEGIN;
+ALTER TABLE rv.t ADD CONSTRAINT t_short CHECK (length(c1) < 1) NOT VALID;
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_revert('HEAD');
+ERROR:  cannot revert with constraint violations on the branch
+HINT:  Resolve them, or reset the branch, first.
+ROLLBACK;
+BEGIN;
+ALTER TABLE rv.t ADD CONSTRAINT t_short CHECK (length(c1) < 1) NOT VALID;
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_cherry_pick('HEAD~1');
+ERROR:  cannot cherry-pick with constraint violations on the branch
+HINT:  Resolve them, or reset the branch, first.
+ROLLBACK;
 DROP SCHEMA rv CASCADE;
 NOTICE:  drop cascades to table rv.t

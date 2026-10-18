@@ -1297,6 +1297,49 @@ abort_in_progress(const char *what)
 }
 
 /*
+ * A merge's, pick's or revert's conflicts (or violations), found outside a
+ * transaction block: an error unless they may be kept.  between: what the
+ * rows were changed on ("branches", "sides").
+ */
+static void
+stopped_outside_block(const char *what, const char *What, const char *between,
+					  int conflicts, int nviolations)
+{
+	if (IsTransactionBlock() || prolly_allow_commit_conflicts())
+		return;
+	if (conflicts > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflict detected, transaction rolled back", what),
+				 errdetail_plural("%d row was changed differently on both %s.",
+								  "%d rows were changed differently on both %s.",
+								  conflicts, conflicts, between),
+				 errhint("%s in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("%s constraint violations detected, transaction rolled back", what),
+			 errdetail_plural("%d row violates a constraint.",
+							  "%d rows violate constraints.",
+							  nviolations, nviolations),
+			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+}
+
+/*
+ * A pick or revert starts only on a branch without constraint violations,
+ * as Dolt's only on a clean working set (which holds them): the ones it
+ * leaves are its own.
+ */
+static void
+refuse_violations(const char *what)
+{
+	if (PROLLY_CALL(refs(), violations) != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot %s with constraint violations on the branch", what),
+				 errhint("Resolve them, or reset the branch, first.")));
+}
+
+/*
  * dolt_merge(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward, conflicts, message}
  *
@@ -1395,24 +1438,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
 
 		conflicts -= nviolations;
-		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts())
-		{
-			if (conflicts > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("merge conflict detected, transaction rolled back"),
-						 errdetail_plural("%d row was changed differently on both branches.",
-										  "%d rows were changed differently on both branches.",
-										  conflicts, conflicts),
-						 errhint("Merge in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.")));
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("merge constraint violations detected, transaction rolled back"),
-					 errdetail_plural("%d row violates a constraint.",
-									  "%d rows violate constraints.",
-									  nviolations, nviolations),
-					 errhint("Merge in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.")));
-		}
+		stopped_outside_block("merge", "Merge", "branches", conflicts, nviolations);
 		result[0] = "";
 		result[1] = "0";
 		result[2] = "1";
@@ -2003,7 +2029,8 @@ dolt_reset(PG_FUNCTION_ARGS)
 
 /*
  * The tables with conflicts and the tables with constraint violations a
- * pick or revert in progress left, as Dolt counts them (tables, not rows).
+ * pick or revert in progress left, as Dolt counts them (tables, not rows):
+ * the branch had no violations before it (refuse_violations()).
  */
 static void
 tables_left(int *conflicted, int *violated)
@@ -2016,33 +2043,6 @@ tables_left(int *conflicted, int *violated)
 	foreach(lc, PROLLY_CALL(refs(), violations))
 		relids = list_append_unique_oid(relids, ((ProllyViolation *) lfirst(lc))->relid);
 	*violated = list_length(relids);
-}
-
-/*
- * A pick's or revert's conflicts (or violations), found outside a
- * transaction block: as a merge's, an error unless they may be kept.
- */
-static void
-stopped_outside_block(const char *what, const char *What, int conflicts,
-					  int nviolations)
-{
-	if (IsTransactionBlock() || prolly_allow_commit_conflicts())
-		return;
-	if (conflicts > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("%s conflict detected, transaction rolled back", what),
-				 errdetail_plural("%d row was changed differently on both sides.",
-								  "%d rows were changed differently on both sides.",
-								  conflicts, conflicts),
-				 errhint("%s in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
-	ereport(ERROR,
-			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-			 errmsg("%s constraint violations detected, transaction rolled back", what),
-			 errdetail_plural("%d row violates a constraint.",
-							  "%d rows violate constraints.",
-							  nviolations, nviolations),
-			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
 }
 
 /*
@@ -2069,7 +2069,6 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	bool		continue_pick = false;
 	bool		committed;
 	int			conflicts;
-	int			known;
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -2124,18 +2123,19 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
-	known = list_length(PROLLY_CALL(refs(), violations));
+	refuse_violations("cherry-pick");
 	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
 												 &ref, 1, allow_empty, &id));
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
 		int			ctables;
 		int			vtables;
 
-		stopped_outside_block("cherry-pick", "Cherry-pick", conflicts - nviolations, nviolations);
+		stopped_outside_block("cherry-pick", "Cherry-pick", "sides",
+							  conflicts - nviolations, nviolations);
 		tables_left(&ctables, &vtables);
 		result[0] = "";
 		result[1] = psprintf("%d", ctables);
@@ -2156,21 +2156,22 @@ static void
 revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 			  const char **result)
 {
-	int			known = list_length(PROLLY_CALL(refs(), violations));
 	ProllyHash	id;
 	int			stopped;
 
+	refuse_violations("revert");
 	note_integration();
 	BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
 											   series_head, &id));
 	must_commit(stopped, "a revert");
 	if (stopped > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
 		int			ctables;
 		int			vtables;
 
-		stopped_outside_block("revert", "Revert", stopped - nviolations, nviolations);
+		stopped_outside_block("revert", "Revert", "sides",
+							  stopped - nviolations, nviolations);
 		tables_left(&ctables, &vtables);
 		result[0] = "";
 		result[1] = psprintf("%d", ctables);
@@ -3097,16 +3098,18 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (strcmp(args[i], "--all") == 0 || strcmp(args[i], "-a") == 0)
+		if (strcmp(args[i], "--all") == 0)
 			continue;
-		if (strcmp(args[i], "--output-only") == 0 || strcmp(args[i], "-o") == 0)
+		if (strcmp(args[i], "--output-only") == 0)
 		{
 			output_only = true;
 			continue;
 		}
-		if (strcmp(args[i], "-ao") == 0 || strcmp(args[i], "-oa") == 0)
+		/* short flags, together or apart: -a, -o, -ao */
+		if (args[i][0] == '-' && args[i][1] != '-' && args[i][1] != '\0' &&
+			strspn(args[i] + 1, "ao") == strlen(args[i] + 1))
 		{
-			output_only = true;
+			output_only |= strchr(args[i], 'o') != NULL;
 			continue;
 		}
 		if (args[i][0] == '-')
