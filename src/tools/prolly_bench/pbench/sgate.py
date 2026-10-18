@@ -30,8 +30,9 @@ A cell regresses when its whole 95% interval lies beyond the threshold in
 the worse direction, and is inconclusive when the interval straddles it.
 Cells that regress are run again (RETRY runs, of those cells only), up to 3
 attempts in all; a cell that regresses in every attempt is confirmed, the
-rest are transient.  With --report-only (hosted runners), timing never
-fails the gate.
+rest are transient.  With --report-only (hosted runners), a regression
+never fails the gate; a run whose evidence fails (cells missing or invalid,
+no comparison of two builds) always does.
 
 Each writes its findings as JSON (--json) for sreport, and exits 1 when
 the gate fails.
@@ -136,10 +137,9 @@ def run_sets(path: Path) -> dict[str, Path]:
     return out
 
 
-def _invariants(label: str, sets: dict[str, Path]) -> list[Finding]:
+def _invariants(label: str, sets: dict[str, table.ResultSet]) -> list[Finding]:
     out = []
-    for engine, p in sets.items():
-        rs = table.load_set(p)
+    for engine, rs in sets.items():
         for problem in rs.problems:
             out.append(Finding("-", engine, "evidence", "invariant", detail=f"{label}: {problem}"))
         for r in rs.results:
@@ -154,8 +154,10 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
                   accept: list[Acceptance], t: dict) -> list[Finding]:
     runs = {name: run_sets(p) for name, p in
             (("base", base), ("base2", base2), ("candidate", cand), ("candidate2", cand2))}
+    loaded = {name: {e: table.load_set(p) for e, p in sets.items()}
+              for name, sets in runs.items()}
     findings = []
-    for name, sets in runs.items():
+    for name, sets in loaded.items():
         findings += _invariants(name, sets)
     engines = sorted(set().union(*runs.values()), key=lambda e: e != "heap")
     for engine in engines:
@@ -168,8 +170,7 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
         problems = [p for p in problems if "different builds" not in p]
         for p in problems:
             findings.append(Finding("-", engine, "comparison", "invariant", detail=p))
-        c = {n: scounters.counters(table.load_set(s[engine]).results, engine)
-             for n, s in runs.items()}
+        c = {n: scounters.counters(s[engine].results, engine) for n, s in loaded.items()}
         in_base = scounters.instability(c["base"], c["base2"], t)
         in_cand = scounters.instability(c["candidate"], c["candidate2"], t)
         for cid in sorted(set(c["base"]) | set(c["candidate"]), key=str):
@@ -179,9 +180,12 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
                 findings.append(Finding(w, engine, "cell", "invariant",
                                         detail="missing from the " + ("base" if b is None else "candidate")))
                 continue
-            if b.units != k.units:
+            # (the same work in all four runs: each build's two, and the builds)
+            amounts = {n: c[n][cid].units if cid in c[n] else None for n in c}
+            if len(set(amounts.values())) > 1:
                 findings.append(Finding(w, engine, "units of work", "invariant", b.units, k.units,
-                                        detail="the two did different amounts of work"))
+                                        detail="the runs did different amounts of work: " +
+                                        ", ".join(f"{n} {u}" for n, u in amounts.items())))
                 continue
             for m in sorted(set(b.counters) | set(k.counters)):
                 x, y = b.counters.get(m), k.counters.get(m)
@@ -228,17 +232,29 @@ class Cell:
     reason: str = ""
 
 
-def _rows(run: Path) -> list[bcompare.Row]:
-    return bcompare.compare([table.load_set(p) for p in sorted(run.iterdir())
-                             if (p / "run.json").exists()])
+def _rows(run: Path) -> tuple[list[bcompare.Row], list[str]]:
+    """The comparison's rows, and the run's evidence problems."""
+    sets = [table.load_set(p) for p in sorted(run.iterdir()) if (p / "run.json").exists()]
+    problems = [f"{s.path.name}: {p}" for s in sets for p in s.problems]
+    rows = bcompare.compare(sets)
+    if not rows:
+        problems.append("no comparison of two builds in the run")
+    return rows, problems
 
 
 def gate_timing(run: Path, retries: list[Path], t: dict,
                 accept: list[Acceptance]) -> list[Cell]:
-    retry_rows = [{(r.key, r.engine): r for r in _rows(p)} for p in retries]
-    cells = []
-    for row in _rows(run):
+    retry_rows = [{(r.key, r.engine): r for r in _rows(p)[0]} for p in retries]
+    rows, problems = _rows(run)
+    # (evidence that fails is an invariant: it fails the gate, timing
+    # reported or not)
+    cells = [Cell("-", 0, "-", "evidence", "invalid", problems=[p]) for p in problems]
+    for row in rows:
         w = f"{row.workload}/{row.variant}" if row.variant else row.workload
+        if row.problems or all(r.estimate is None for r in row.ratios.values()):
+            cells.append(Cell(w, row.clients, row.engine, "-", "invalid",
+                              problems=row.problems or ["no repetition of the cell compared"]))
+            continue
         for m, _, higher in bcompare.METRICS:
             ratio = row.ratios.get(m)
             if ratio is None or ratio.estimate is None:
@@ -273,8 +289,27 @@ def regressed_workloads(cells: list[Cell]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _acceptances(args) -> list[Acceptance]:
-    head = load_accept(args.accept)
-    return added(head, load_accept(args.accept_base)) if args.accept_base else head
+    """The entries the pull request adds: --accept's that --accept-base
+    hasn't.  Both files must exist (the base's empty if it has none)."""
+    if not args.accept:
+        return []
+    if not args.accept_base:
+        raise SystemExit("--accept needs --accept-base: only entries the pull request adds count")
+    for path in (args.accept, args.accept_base):
+        if not path.exists():
+            raise SystemExit(f"{path}: no such file")
+    return added(load_accept(args.accept), load_accept(args.accept_base))
+
+
+def _finite(value):
+    """value with every non-finite float made None, for strict JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
 
 
 def run(args) -> int:
@@ -295,7 +330,8 @@ def run(args) -> int:
         if not args.runs:
             raise SystemExit("sgate timing RUN [RETRY ...]")
         cells = gate_timing(args.runs[0], args.runs[1:], t, accept)
-        failed = [] if args.report_only else [c for c in cells if c.result == "confirmed"]
+        failed = [c for c in cells if c.result == "invalid" or
+                  (c.result == "confirmed" and not args.report_only)]
         out = {"layer": "timing", "thresholds": t, "report_only": args.report_only,
                "passed": not failed, "cells": [asdict(c) for c in cells],
                "rerun": regressed_workloads(cells)}
@@ -303,8 +339,9 @@ def run(args) -> int:
             if c.result in ("confirmed", "transient"):
                 print(f"{c.result.upper()} {c.workload} c{c.clients} {c.engine} {c.metric}: "
                       f"{c.ratio:.3f} [{c.low:.3f}, {c.high:.3f}]", file=sys.stderr)
-    text = json.dumps(out, indent=2, default=lambda v: None if isinstance(v, float)
-                      and not math.isfinite(v) else str(v))
+            elif c.result == "invalid":
+                print(f"INVALID {c.workload} {c.engine}: {'; '.join(c.problems)}", file=sys.stderr)
+    text = json.dumps(_finite(out), indent=2, allow_nan=False, default=str)
     if args.json:
         args.json.write_text(text + "\n")
     print(f"S suite {args.layer}: {'passed' if out['passed'] else 'FAILED'}")

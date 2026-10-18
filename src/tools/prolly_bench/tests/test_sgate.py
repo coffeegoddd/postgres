@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from evidence_helpers import seal
 from pbench import scounters, sgate, sreport
 from test_s_suite import build_set
 from test_scalibrate import counter_run
@@ -110,6 +111,29 @@ class CountersGateTest(unittest.TestCase):
             f = self.gate(BASE, {**BASE, "wal_bytes": 120000.0}, accept=got)
             self.assertEqual(self.results(f), {("wal_bytes", "regression")})
 
+    def test_work_differing_within_a_build_is_an_invariant(self):
+        runs = [counter_run(self.root, n, BASE) for n in ("b", "b2", "c")]
+        c2 = counter_run(self.root, "c2", BASE)
+        res = c2 / "x-S-prolly" / "results.jsonl"
+        r = json.loads(res.read_text())
+        r["denominator"] = 1990
+        res.write_text(json.dumps(r) + "\n")
+        seal(c2 / "x-S-prolly")
+        f = sgate.gate_counters(*runs, c2, [], self.t)
+        self.assertEqual({(x.counter, x.result) for x in f}, {("units of work", "invariant")})
+
+    def test_accept_needs_the_base_file(self):
+        args = type("A", (), dict(accept=Path("x.toml"), accept_base=None))
+        with self.assertRaises(SystemExit):
+            sgate._acceptances(args)
+        args.accept_base = Path("/nonexistent/base.toml")
+        with self.assertRaises(SystemExit):
+            sgate._acceptances(args)
+
+    def test_json_is_strict(self):
+        self.assertEqual(sgate._finite({"a": [float("inf"), 1.0], "b": float("nan")}),
+                         {"a": [None, 1.0], "b": None})
+
     def test_an_entry_needs_a_reason(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "a.toml"
@@ -165,6 +189,18 @@ class TimingGateTest(unittest.TestCase):
         build_set(d, "candidate", "heap", [800.0, 1200.0, 900.0, 1100.0, 940.0])
         self.assertEqual(self.tps(sgate.gate_timing(d, [], self.t, [])).result, "inconclusive")
 
+    def test_failed_cells_and_missing_builds_are_invalid(self):
+        d = self.root / "r1"
+        d.mkdir()
+        build_set(d, "base", "heap", self.NOISE)
+        cells = sgate.gate_timing(d, [], self.t, [])          # no candidate at all
+        self.assertEqual([c.result for c in cells], ["invalid"])
+        d2 = self.root / "r2"
+        d2.mkdir()
+        build_set(d2, "base", "heap", self.NOISE)
+        build_set(d2, "candidate", "heap", self.NOISE, seeds={2: 99})
+        self.assertIn("invalid", {c.result for c in sgate.gate_timing(d2, [], self.t, [])})
+
     def test_same(self):
         self.assertEqual(self.tps(sgate.gate_timing(self.run_dir("r1", 1.0), [], self.t, [])).result,
                          "same")
@@ -196,7 +232,7 @@ class ReportTest(unittest.TestCase):
         text, passed = self.render(self.counters([self.finding("improvement")], True), timing)
         self.assertTrue(passed)
         self.assertTrue(text.startswith(sreport.MARKER + "\n## S suite: PASS (counters; timing reported)"))
-        self.assertIn("| S2 | 8 | prolly | 0.80 [0.78, 0.82] | - | 0.71 → 0.70 | confirmed |", text)
+        self.assertIn("| S2 | 8 | prolly | 0.80 [0.78, 0.82] | - | - | 0.71 → 0.70 | confirmed |", text)
         self.assertIn("<summary>Improvements (1)</summary>", text)
 
     def test_regression_fails(self):
@@ -229,6 +265,40 @@ class ReportTest(unittest.TestCase):
         text, _ = self.render(self.counters(many, False))
         self.assertLessEqual(len(text), sreport.LIMIT)
         self.assertTrue(text.startswith(sreport.MARKER))
+
+    def test_cut_leaves_no_section_open(self):
+        jitter = [self.finding("jitter", counter=f"engine.c{i}") for i in range(2000)]
+        text, passed = self.render(self.counters(jitter, True))
+        self.assertTrue(passed)
+        self.assertLessEqual(len(text), sreport.LIMIT)
+        self.assertEqual(text.count("<details>"), text.count("</details>"))
+        self.assertEqual(text.count("```") % 2, 0)
+        self.assertIn("cut at 65,000 characters", text)
+
+    def test_cells_are_escaped(self):
+        text, _ = self.render(self.counters(
+            [self.finding("accepted", reason="fold root | see\n#210")], True))
+        self.assertIn('accepted: "fold root \\| see #210"', text)
+
+    def test_missing_results_files_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "comment.md"
+            args = type("A", (), dict(counters=[Path(d) / "nope.json"], timing=Path(d) / "t.json",
+                                      failed_job=[], head="c", base="b", runner="x",
+                                      run_url=None, reproduce=None, out=out))
+            self.assertEqual(sreport.run(args), 1)
+            text = out.read_text()
+            self.assertIn("counter results missing", text)
+            self.assertIn("timing results missing", text)
+
+    def test_invalid_timing_fails_even_reported(self):
+        timing = {"report_only": True, "thresholds": scounters.thresholds(), "cells": [
+            {"workload": "S1", "clients": 8, "engine": "heap", "metric": "-",
+             "result": "invalid", "ratio": None, "low": None, "high": None, "over_heap": {},
+             "attempts": [], "problems": ["repetition 3 invalid"], "reason": ""}]}
+        text, passed = self.render(self.counters([], True), timing)
+        self.assertFalse(passed)
+        self.assertIn("**invalid**: repetition 3 invalid", text)
 
 
 if __name__ == "__main__":
