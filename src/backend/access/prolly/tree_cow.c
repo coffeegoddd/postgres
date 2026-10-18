@@ -1867,8 +1867,8 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		return;
 	side_open(&a, env, from);
 	side_open(&b, env, to);
-	if (b.depth >= 0)
-		(void) visit(to, side_height(&b), arg);
+	/* (the empty tree too: a table emptied has it for its root) */
+	(void) visit(to, b.depth >= 0 ? side_height(&b) : 0, arg);
 
 	while (b.depth >= 0)
 	{

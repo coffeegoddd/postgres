@@ -264,13 +264,30 @@ received_next(void *arg, ProllyHash *hash, StringInfo data)
 	Receiving  *rv = arg;
 	Received   *r;
 
-	if (rv->next == NULL)
-		return false;
-	r = lfirst(rv->next);
-	rv->next = lnext(rv->order, rv->next);
+	/*
+	 * (only what the walk reached, so had its references resolved: a chunk
+	 * a remote sent that no wanted commit reaches isn't taken)
+	 */
+	do
+	{
+		if (rv->next == NULL)
+			return false;
+		r = lfirst(rv->next);
+		rv->next = lnext(rv->order, rv->next);
+	} while (!r->visited);
 	*hash = r->hash;
 	spool_read(rv, r, data);
 	return true;
+}
+
+/* What a remote sent since known heads: kept, but not what the store has. */
+static void
+receive_since_visit(const ProllyHash *hash, const char *data, int len, void *arg)
+{
+	Receiving  *rv = arg;
+
+	if (!PROLLY_CALL(rv->cs, has, rv->store, hash))
+		(void) keep_chunk(rv, hash, data, len);
 }
 
 /* The heads this database has, which a remote can send what changed since. */
@@ -419,7 +436,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 				wanted[nwanted++] = commits[i];
 		if (nwanted > 0)
 			PROLLY_CALL(rr, get_since, remote, wanted, nwanted, k.hashes, k.n,
-						receive_many_visit, &rv);
+						receive_since_visit, &rv);
 	}
 
 	PROLLY_CALL(rv.cs, read_through, rv.store, receive_chunk, receive_hint, &rv);
@@ -438,7 +455,9 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	}
 	PG_END_TRY();
 
-	count = list_length(rv.order);
+	count = 0;
+	foreach_ptr(Received, r, rv.order)
+		count += r->visited ? 1 : 0;
 	rv.next = list_head(rv.order);
 	PROLLY_CALL(rv.cs, add_table_file, rv.store, received_next, &rv);
 	BufFileClose(rv.spool);

@@ -36,7 +36,7 @@ sub calls
 {
 	my ($fn, $offset) = @_;
 	my $log = slurp_file($origin->logfile, $offset);
-	my @calls = ($log =~ /(?:statement|execute [^:]*): SELECT .*pg_catalog\.$fn\(/g);
+	my @calls = ($log =~ /(?:statement|execute [^:]*): SELECT .*[ (]pg_catalog\.$fn\(/g);
 	return scalar @calls;
 }
 
@@ -83,5 +83,45 @@ is($local->safe_psql('c', q{SELECT count(*) FROM b.t WHERE v LIKE '%z'}), '30',
 	'pulled all 30 commits\' rows');
 is($local->safe_psql('c', q{SELECT dolt_hashof('main')}),
 	$origin->safe_psql('postgres', q{SELECT dolt_hashof('main')}), 'at the remote\'s head');
+
+# a table emptied: its empty tree is sent with the rest
+$origin->safe_psql('postgres', q{
+	CREATE TABLE b.e (id int PRIMARY KEY);
+	INSERT INTO b.e SELECT generate_series(1, 500);
+	SELECT dolt_commit('-Am', 'e');
+});
+$local->safe_psql('c', q{SELECT dolt_pull('origin')});
+$origin->safe_psql('postgres', q{
+	DELETE FROM b.e;
+	SELECT dolt_commit('-am', 'e emptied');
+});
+$offset = -s $origin->logfile;
+$local->safe_psql('c', q{SELECT dolt_pull('origin')});
+is(calls('dolt_serve_get', $offset), 0, 'an emptied table: nothing asked after');
+is($local->safe_psql('c', 'SELECT count(*) FROM b.e'), '0', 'and it is empty');
+
+# a branch forked behind the head the clone has: what it made since its
+# fork point is sent, not the history before it
+$origin->safe_psql('postgres', q{
+	SELECT dolt_branch('feature', 'HEAD~20');
+	SELECT dolt_checkout('feature');
+	UPDATE b.t SET v = 'f' WHERE id = 1;
+	SELECT dolt_commit('-am', 'feature');
+	SELECT dolt_checkout('main');
+});
+my $before = $local->safe_psql('c', 'SELECT sum(chunks) FROM test_chunk_table_files()');
+$local->safe_psql('c', q{SELECT dolt_fetch('origin', 'feature')});
+my $got = $local->safe_psql('c', 'SELECT sum(chunks) FROM test_chunk_table_files()') - $before;
+cmp_ok($got, '<', 30, "a fork behind the head: only what is new ($got chunks)");
+
+# a remote without dolt_serve_since() (an older build): the walk serves
+$origin->safe_psql('postgres', q{
+	ALTER FUNCTION pg_catalog.dolt_serve_since(bytea[], bytea[]) RENAME TO dolt_serve_since_hidden;
+	UPDATE b.t SET v = 'old' WHERE id = 2;
+	SELECT dolt_commit('-am', 'for an older remote');
+});
+$local->safe_psql('c', q{SELECT dolt_pull('origin')});
+is($local->safe_psql('c', q{SELECT v FROM b.t WHERE id = 2}), 'old',
+	'pulled from a remote without it');
 
 done_testing();

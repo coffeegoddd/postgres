@@ -1775,29 +1775,69 @@ named_trees(Canon *cn, const ProllyNodeRef *root)
  * root from (NULL: none) may lack: each tree diffed against from's of the
  * same name, so what changed between them is visited, not all of to.
  */
+/* A data tree an item changed between two roots names: before and after. */
+typedef struct ChangedTree
+{
+	bool		was;
+	ProllyNodeRef before;
+	ProllyNodeRef after;
+} ChangedTree;
+
+static void
+note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
+				  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	List	  **changed = arg;
+	ChangedTree *c;
+	ProllyValue def;
+
+	if (after == NULL)
+		return;
+	c = palloc0(sizeof(ChangedTree));
+	if (!tree_item(key, after, &c->after, &def))
+	{
+		pfree(c);
+		return;
+	}
+	c->was = before != NULL && tree_item(key, before, &c->before, &def);
+	*changed = lappend(*changed, c);
+}
+
+/*
+ * Visit the nodes of root to (its trees and the data trees it names) that
+ * root from (NULL: none) may lack: the roots diffed, and each data tree an
+ * item added or changed names diffed against the one it named before, so
+ * what changed is visited, not all of to.
+ */
 static void
 folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 					ProllyTreeVisitNode visit, void *arg)
 {
 	Canon		cn;
-	List	   *before = NIL;
+	List	   *changed = NIL;
 	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
 	PROLLY_CALL(cn.tree, diff_nodes, &cn.env, from, to, visit, arg);
 	if (from && from->hash.len > 0)
-		before = named_trees(&cn, from);
-	foreach(lc, named_trees(&cn, to))
+		PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_changed_tree, &changed);
+	else
 	{
-		NamedTree  *t = lfirst(lc);
-		const ProllyNodeRef *was = NULL;
-		ListCell   *b;
+		foreach(lc, named_trees(&cn, to))
+		{
+			ChangedTree *c = palloc0(sizeof(ChangedTree));
 
-		foreach(b, before)
-			if (strcmp(((NamedTree *) lfirst(b))->key, t->key) == 0)
-				was = &((NamedTree *) lfirst(b))->ref;
-		PROLLY_CALL(cn.tree, diff_nodes, &cn.env, was, &t->ref, visit, arg);
+			c->after = ((NamedTree *) lfirst(lc))->ref;
+			changed = lappend(changed, c);
+		}
+	}
+	foreach(lc, changed)
+	{
+		ChangedTree *c = lfirst(lc);
+
+		PROLLY_CALL(cn.tree, diff_nodes, &cn.env, c->was ? &c->before : NULL,
+					&c->after, visit, arg);
 	}
 }
 

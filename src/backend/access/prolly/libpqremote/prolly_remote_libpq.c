@@ -46,6 +46,7 @@ struct ProllyRemote
 	PGconn	   *conn;
 	char	   *where;			/* host and database, for messages */
 	bool		in_transaction; /* a BEGIN sent, not ended */
+	int			has_since;		/* dolt_serve_since() there: -1 not asked */
 };
 
 static uint32 we_connect;
@@ -184,6 +185,7 @@ libpq_open(const char *url, bool create)
 	if (we_result == 0)
 		we_result = WaitEventExtensionNew("ProllyRemoteResult");
 	r = palloc0(sizeof(ProllyRemote));
+	r->has_since = -1;
 	MemoryContextSwitchTo(old);
 
 	r->conn = libpqsrv_connect(url, we_connect);
@@ -437,10 +439,24 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	Oid			types[2] = {BYTEAARRAYOID, BYTEAARRAYOID};
 	PGresult   *res;
 
+	/*
+	 * (a remote of a build before it has no dolt_serve_since(): it tells
+	 * nothing, and the walk reads what is lacked)
+	 */
+	if (r->has_since < 0)
+	{
+		res = run(r, "SELECT pg_catalog.to_regprocedure('pg_catalog.dolt_serve_since(bytea[], bytea[])') IS NOT NULL",
+				  0, NULL, NULL, NULL, NULL, 0, "asking what it serves");
+		r->has_since = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
+		PQclear(res);
+	}
+	if (!r->has_since)
+		return;
+
 	initStringInfo(&w);
 	initStringInfo(&k);
-	hashes_param(&w, wanted, nwanted);
-	hashes_param(&k, known, nknown);
+	hashes_array(&w, wanted, nwanted);
+	hashes_array(&k, known, nknown);
 	values[0] = w.data;
 	lengths[0] = w.len;
 	values[1] = k.data;
@@ -471,13 +487,23 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 			}
 			PG_CATCH();
 			{
+				/* (rows still coming: the connection isn't usable, so it goes) */
 				PQclear(res);
+				libpqsrv_disconnect(r->conn);
+				r->conn = NULL;
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
 		}
 		else if (status != PGRES_TUPLES_OK)
+		{
+			PGresult   *rest;
+
+			/* (the query's end read first: the connection is free again) */
+			while ((rest = libpqsrv_get_result(r->conn, we_result)) != NULL)
+				PQclear(rest);
 			remote_error(r, res, "reading what changed");
+		}
 		PQclear(res);
 	}
 }

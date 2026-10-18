@@ -398,6 +398,9 @@ send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 	values[0] = PointerGetDatum(hash_bytea(&node->hash));
 	values[1] = PointerGetDatum(bytes_bytea(sn->data.data, sn->data.len));
 	tuplestore_putvalues(sn->rsinfo->setResult, sn->rsinfo->setDesc, values, nulls);
+	/* (the tuplestore has its copy, spilled as it grows: not these) */
+	pfree(DatumGetPointer(values[0]));
+	pfree(DatumGetPointer(values[1]));
 	CHECK_FOR_INTERRUPTS();
 	return true;
 }
@@ -427,6 +430,7 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	ProllyHash *wanted;
 	ProllyHash *known_hashes;
 	List	   *queue = NIL;
+	MemoryContext per_commit;
 
 	check_serving(false);
 	wanted = array_hashes(PG_GETARG_ARRAYTYPE_P(0), &nwanted);
@@ -446,10 +450,33 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	seen = hash_create("prolly commits since", 64, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	/*
+	 * What the receiver has: the known heads, and each one's merge base
+	 * with each wanted commit (what it has below its heads that the wanted
+	 * share, a fork point behind its branch's head).
+	 */
 	for (int i = 0; i < nknown; i++)
+	{
 		(void) hash_search(known, &known_hashes[i], HASH_ENTER, NULL);
+		for (int w = 0; w < nwanted; w++)
+		{
+			ProllyHash	base;
+
+			if (PROLLY_CALL(dc.refs, commit_get, &known_hashes[i], &(ProllyCommitInfo) {0}) &&
+				PROLLY_CALL(dc.refs, merge_base, &wanted[w], &known_hashes[i], &base))
+			{
+				ProllyHash	key = {0};
+
+				key.len = base.len;
+				memcpy(key.bytes, base.bytes, base.len);
+				(void) hash_search(known, &key, HASH_ENTER, NULL);
+			}
+		}
+	}
 	for (int i = 0; i < nwanted; i++)
 		queue = lappend(queue, &wanted[i]);
+	per_commit = AllocSetContextCreate(CurrentMemoryContext, "prolly since commit",
+									   ALLOCSET_DEFAULT_SIZES);
 
 	while (queue != NIL)
 	{
@@ -458,6 +485,7 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 		ProllyCommitInfo parent;
 		ProllyNodeRef commit;
 		bool		found;
+		MemoryContext old;
 
 		queue = list_delete_first(queue);
 		if (hash_search(known, id, HASH_FIND, NULL) != NULL)
@@ -465,6 +493,17 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 		(void) hash_search(seen, id, HASH_ENTER, &found);
 		if (found || !PROLLY_CALL(dc.refs, commit_get, id, &info))
 			continue;			/* (one it hasn't: the receiver's walk asks) */
+		for (int p = 0; p < info.nparents; p++)
+		{
+			ProllyHash *ph = palloc0(sizeof(ProllyHash));
+
+			ph->len = info.parents[p].len;
+			memcpy(ph->bytes, info.parents[p].bytes, ph->len);
+			queue = lappend(queue, ph);
+		}
+
+		/* (what one commit's walks allocate, gone after it) */
+		old = MemoryContextSwitchTo(per_commit);
 
 		memset(&commit, 0, sizeof(commit));
 		commit.hash = *id;
@@ -476,15 +515,8 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 					PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &parent) ?
 					&parent.root : NULL,
 					&info.root, send_since, &sn);
-		for (int p = 0; p < info.nparents; p++)
-		{
-			ProllyHash *ph = palloc(sizeof(ProllyHash));
-
-			memset(ph, 0, sizeof(*ph));
-			ph->len = info.parents[p].len;
-			memcpy(ph->bytes, info.parents[p].bytes, ph->len);
-			queue = lappend(queue, ph);
-		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(per_commit);
 	}
 	return (Datum) 0;
 }
