@@ -54,5 +54,19 @@ sql(q{SELECT pg_drop_replication_slot('s')});
 sql('SELECT test_chunk_gc(false) IS NOT NULL');
 is(sql("SELECT test_chunk_has('$root')"), 'f', 'without the slot, it is collected');
 
+# A segment kept for a slot that is missing is an error, not a segment
+# nothing is marked from.
+sql(q{SELECT pg_create_logical_replication_slot('s2', 'test_decoding')});
+sql(q{SELECT test_chunk_put('kept for s2')});
+sql('SELECT test_chunk_seal()');
+my $dir = sql(q{SELECT 'base/' || oid FROM pg_database WHERE datname = 'postgres'});
+my $kept = sql(q{SELECT name FROM test_chunk_segments() WHERE chunks > 0
+	ORDER BY name DESC LIMIT 1});
+unlink($node->data_dir . "/$dir/$kept") or die "unlink $kept: $!";
+my ($ret, $out, $err) = $node->psql('postgres', 'SELECT test_chunk_gc(false) IS NOT NULL');
+like($err, qr/journal segment \d+ of the manifest is missing/,
+	'a missing segment kept for a slot is an error');
+sql(q{SELECT pg_drop_replication_slot('s2')});
+
 $node->stop;
 done_testing();

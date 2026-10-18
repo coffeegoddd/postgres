@@ -4427,13 +4427,6 @@ journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out)
 }
 
 /*
- * The root, and the chunks appended since the seal (or the last call).
- * The first call waits for the transactions that appended to the sealed
- * segments and were in progress at the seal: then their PADs are ROOTs or
- * left, and their chunks committed or not, for good.  With window, appends
- * are held off from here until the swap.
- */
-/*
  * The oldest position a logical replication slot of database dboid may
  * decode from (invalid: it has none).
  */
@@ -4465,8 +4458,35 @@ logical_horizon(Oid dboid)
 }
 
 /*
+ * The whole, valid record of segment g at offset, within its first size
+ * bytes: its length, its bytes read into *rec (palloc'd, grown as needed,
+ * *reclen bytes); 0 if there is none.
+ */
+static uint32
+gc_record(Segment *g, uint64 offset, uint64 size, char **rec, Size *reclen)
+{
+	uint32		len;
+
+	if (offset + RECORD_OVERHEAD > size)
+		return 0;
+	read_exact(g, (char *) &len, sizeof(len), offset);
+	if (len < RECORD_OVERHEAD || offset + len > size)
+		return 0;
+	if (len > *reclen)
+	{
+		*reclen = Max(len, 8192);
+		*rec = *rec ? repalloc(*rec, *reclen) : palloc(*reclen);
+	}
+	read_exact(g, *rec, len, offset);
+	return record_valid(*rec, len) ? len : 0;
+}
+
+/*
  * Visit every chunk of the sealed segments a collection keeps as they are
- * (a logical replication slot may still decode what names them): roots.
+ * (a logical replication slot may still decode a row naming it): roots.
+ * Not an aborted transaction's, which no row names, nor the ROOT records
+ * (decoding reads rows' values, not history).  A transaction in progress
+ * has its chunks visited all the same, so it isn't waited for.
  */
 static void
 journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
@@ -4480,40 +4500,30 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 		uint64		offset = JOURNAL_HEADER_SIZE;
 		char	   *rec = NULL;
 		Size		reclen = 0;
+		uint32		len;
 
 		memset(&g, 0, sizeof(g));
 		g.id = gc->retained[i];
 		g.path = segment_path(s->dboid, s->spcoid, g.id);
 		g.file = -1;
 		if (!open_segment(&g))
-			continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("journal segment %llu of the manifest is missing",
+							(unsigned long long) g.id)));
 		size = FileSize(g.file);
-		while (offset + RECORD_OVERHEAD <= size)
+		while ((len = gc_record(&g, offset, size, &rec, &reclen)) > 0)
 		{
-			uint32		len;
-			uint8		kind;
+			uint8		kind = (uint8) rec[sizeof(uint32)];
 			ProllyHash	h;
 			Size		after;
 			TransactionId xid;
 
 			CHECK_FOR_INTERRUPTS();
-			read_exact(&g, (char *) &len, sizeof(len), offset);
-			if (len < RECORD_OVERHEAD || offset + len > size)
-				break;
-			if (len > reclen)
-			{
-				reclen = Max(len, 8192);
-				rec = rec ? repalloc(rec, reclen) : palloc(reclen);
-			}
-			read_exact(&g, rec, len, offset);
-			if (!record_valid(rec, len))
-				break;
-			kind = (uint8) rec[sizeof(uint32)];
 			if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
-				record_hash_xid(rec, len, &h, &after, &xid))
+				record_hash_xid(rec, len, &h, &after, &xid) &&
+				!(TransactionIdIsValid(xid) && TransactionIdDidAbort(xid)))
 				visit(&h, rec + after, len - after - sizeof(uint32), arg);
-			else if (kind == KIND_ROOT && record_hash(rec, len, &h, &after))
-				visit(&h, NULL, 0, arg);
 			offset += len;
 		}
 		FileClose(g.file);
@@ -4523,6 +4533,13 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 	}
 }
 
+/*
+ * The root, and the chunks appended since the seal (or the last call).
+ * The first call waits for the transactions that appended to the sealed
+ * segments and were in progress at the seal: then their PADs are ROOTs or
+ * left, and their chunks committed or not, for good.  With window, appends
+ * are held off from here until the swap.
+ */
 static void
 journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			   void *arg)
@@ -4533,6 +4550,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 	uint64		offset;
 	char	   *rec = NULL;
 	Size		reclen = 0;
+	uint32		len;
 	ListCell   *lc;
 
 	if (!gc->waited)
@@ -4565,26 +4583,13 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		return;
 	size = FileSize(g->file);
 	offset = g->scanned;
-	while (offset + RECORD_OVERHEAD <= size)
+	while ((len = gc_record(g, offset, size, &rec, &reclen)) > 0)
 	{
-		uint32		len;
-		uint8		kind;
+		uint8		kind = (uint8) rec[sizeof(uint32)];
 		ProllyHash	h;
 		Size		after;
 		TransactionId xid;
 
-		read_exact(g, (char *) &len, sizeof(len), offset);
-		if (len < RECORD_OVERHEAD || offset + len > size)
-			break;
-		if (len > reclen)
-		{
-			reclen = Max(len, 8192);
-			rec = rec ? repalloc(rec, reclen) : palloc(reclen);
-		}
-		read_exact(g, rec, len, offset);
-		if (!record_valid(rec, len))
-			break;
-		kind = (uint8) rec[sizeof(uint32)];
 		if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
 			record_hash_xid(rec, len, &h, &after, &xid))
 			visit(&h, rec + after, len - after - sizeof(uint32), arg);
