@@ -3294,7 +3294,7 @@ type_moves(List *from, List *to)
 						if (same_table_line(ft, tt, 'k', cname))
 							tm.after = lappend(tm.after,
 											   psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", tname, cname,
-														strchr(table_def_line(tt, 'k', cname), '\t') + 1));
+														constraint_def(table_def_line(tt, 'k', cname))));
 						handled = true;
 					}
 					ReleaseSysCache(ct);

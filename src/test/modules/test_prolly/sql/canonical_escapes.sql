@@ -19,7 +19,8 @@ CREATE TABLE esc.U&"t\000Abl" (
 	U&"col\0009umn" esc.U&"tab\0009type" DEFAULT E'a\tlabel',
 	note text DEFAULT E'line one\nline two\\',
 	p esc.pair,
-	CONSTRAINT U&"chk\000Aname" CHECK (note <> E'\t')
+	CONSTRAINT U&"chk\000Aname" CHECK (note <> E'\t'),
+	CONSTRAINT enum_chk CHECK (U&"col\0009umn" <> E'new\nline')
 );
 CREATE INDEX U&"idx\0009name" ON esc.U&"t\000Abl" (note) WHERE note <> E'x\ty';
 CREATE VIEW esc.U&"v\0009iew" AS SELECT id, note || E'\t' AS tabbed FROM esc.U&"t\000Abl";
@@ -79,6 +80,19 @@ CREATE TABLE esc.U&"tab\0009le" (id int PRIMARY KEY);
 SELECT * FROM dolt_status;
 
 SELECT dolt_checkout('main');
+
+-- the type changed under a constraint that uses it: the constraint made
+-- again, as it was
+SELECT dolt_branch('esc_type');
+ALTER TYPE esc.U&"tab\0009type" ADD VALUE 'more';
+SELECT length(dolt_commit('-Am', 'more')::text) AS committed;
+SELECT dolt_checkout('esc_type');
+SELECT dolt_reset('--hard', 'main');
+SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c
+  JOIN pg_class r ON r.oid = c.conrelid
+  WHERE r.relname = E't\nbl' AND conname = 'enum_chk';
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'esc_type');
 SELECT dolt_branch('-D', 'esc_reset');
 SELECT dolt_branch('-D', 'esc_merge');
 DROP SCHEMA esc CASCADE;

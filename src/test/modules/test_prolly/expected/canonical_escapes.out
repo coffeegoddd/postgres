@@ -31,7 +31,8 @@ CREATE TABLE esc.U&"t\000Abl" (
 	U&"col\0009umn" esc.U&"tab\0009type" DEFAULT E'a\tlabel',
 	note text DEFAULT E'line one\nline two\\',
 	p esc.pair,
-	CONSTRAINT U&"chk\000Aname" CHECK (note <> E'\t')
+	CONSTRAINT U&"chk\000Aname" CHECK (note <> E'\t'),
+	CONSTRAINT enum_chk CHECK (U&"col\0009umn" <> E'new\nline')
 );
 CREATE INDEX U&"idx\0009name" ON esc.U&"t\000Abl" (note) WHERE note <> E'x\ty';
 CREATE VIEW esc.U&"v\0009iew" AS SELECT id, note || E'\t' AS tabbed FROM esc.U&"t\000Abl";
@@ -77,6 +78,8 @@ SELECT * FROM pg_temp.show();
  line
  check chk                                                       +
  name CHECK ((note <> '  '::text))
+ check enum_chk CHECK (("col     umn" <> 'new                    +
+ line'::esc."tab type"))
  enum {"a        label","new                                     +
  line","back\\slash"}
  fn      new                                                     +
@@ -95,7 +98,7 @@ SELECT * FROM pg_temp.show();
  seq s   eq
  view (1,"line one                                               +
  line two\\      ")
-(11 rows)
+(12 rows)
 
 -- a reset to the commit makes every object from its canonical form
 SELECT dolt_checkout('esc_reset');
@@ -122,6 +125,8 @@ SELECT * FROM pg_temp.show();
  line
  check chk                                                       +
  name CHECK ((note <> '  '::text))
+ check enum_chk CHECK (("col     umn" <> 'new                    +
+ line'::esc."tab type"))
  enum {"a        label","new                                     +
  line","back\\slash"}
  fn      new                                                     +
@@ -140,7 +145,7 @@ SELECT * FROM pg_temp.show();
  seq s   eq
  view (1,"line one                                               +
  line two\\      ")
-(11 rows)
+(12 rows)
 
 INSERT INTO esc.U&"t\000Abl" (id) VALUES (2);
 SELECT note FROM esc.U&"t\000Abl" WHERE id = 2;
@@ -182,6 +187,8 @@ SELECT * FROM pg_temp.show();
  line
  check chk                                                         +
  name CHECK ((note <> '  '::text))
+ check enum_chk CHECK (("col     umn" <> 'new                      +
+ line'::esc."tab type"))
  enum {"a        label","new                                       +
  line","back\\slash"}
  fn      new                                                       +
@@ -201,7 +208,7 @@ SELECT * FROM pg_temp.show();
  seq s   eq
  view (1,"line one                                                 +
  line two\\      ")
-(12 rows)
+(13 rows)
 
 INSERT INTO esc.base VALUES (-1);		-- (the rule)
 SELECT count(*) FROM esc.base;
@@ -222,6 +229,54 @@ SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
  {0,"Switched to branch 'main'"}
+(1 row)
+
+-- the type changed under a constraint that uses it: the constraint made
+-- again, as it was
+SELECT dolt_branch('esc_type');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE esc.U&"tab\0009type" ADD VALUE 'more';
+SELECT length(dolt_commit('-Am', 'more')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('esc_type');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'esc_type'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c
+  JOIN pg_class r ON r.oid = c.conrelid
+  WHERE r.relname = E't\nbl' AND conname = 'enum_chk';
+     pg_get_constraintdef     
+------------------------------
+ CHECK (("col    umn" <> 'new+
+ line'::esc."tab type"))
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'esc_type');
+ dolt_branch 
+-------------
+ {0}
 (1 row)
 
 SELECT dolt_branch('-D', 'esc_reset');
