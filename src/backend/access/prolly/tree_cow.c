@@ -1279,6 +1279,18 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
+/* Append h to *hashes, which holds *n of room for *max. */
+static void
+add_hash(ProllyHash **hashes, int *n, int *max, const ProllyHash *h)
+{
+	if (*n == *max)
+	{
+		*max *= 2;
+		*hashes = repalloc(*hashes, sizeof(ProllyHash) * *max);
+	}
+	(*hashes)[(*n)++] = *h;
+}
+
 /*
  * Tell the store which chunks the walk reads next: an internal node's
  * children, or a leaf's value trees (a source a store reads through can
@@ -1289,39 +1301,80 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 {
 	ProllyHash *hashes;
 	int			n = 0;
+	int			max;
 
 	/* (only when a hint would hear them) */
 	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
 		node->nitems == 0 ||
 		!PROLLY_CALL(env->chunk_store, prefetch, env->chunks, NULL, 0))
 		return;
-	hashes = palloc(sizeof(ProllyHash) * node->nitems);
+	max = node->nitems;
+	hashes = palloc(sizeof(ProllyHash) * max);
 	for (int i = 0; i < node->nitems; i++)
 	{
 		ProllyNodeRef ref;
+		ProllyKey	k;
+		ProllyValue v;
+		ProllyValue refs;
+		uint8		flags;
+		uint64		len;
 
 		if (node->level > 0)
 		{
-			uint64		count;
-
-			node_child(env, node, i, &ref, &count);
+			node_child(env, node, i, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
+			continue;
 		}
-		else
+		node_item(env, node, i, &k, &v, &flags);
+		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+			continue;
+		item_payload(&v, flags, &refs);
+		if (flags & PROLLY_ITEM_VALUE_REF)
 		{
-			ProllyKey	k;
-			ProllyValue v;
-			uint8		flags;
-			uint64		len;
-
-			node_item(env, node, i, &k, &v, &flags);
-			if (!(flags & PROLLY_ITEM_VALUE_REF))
-				continue;
 			decode_value_ref(&v, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
 		}
-		hashes[n++] = ref.hash;
+		for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
+		{
+			next_value_ref(&p, end, &ref, &len);
+			add_hash(&hashes, &n, &max, &ref.hash);
+		}
 	}
 	(void) PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
 	pfree(hashes);
+}
+
+static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+					  ProllyTreeVisitNode visit, void *arg);
+
+/*
+ * A leaf item's value trees walked: its own, if it is stored out of line,
+ * and those of the references it holds.
+ */
+static void
+walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
+		   ProllyTreeVisitNode visit, void *arg)
+{
+	ProllyValue v = *value;
+	ProllyValue refs;
+	ProllyTreeEnv venv;
+	ProllyNodeRef vroot;
+	uint64		len;
+
+	if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+		return;
+	item_payload(&v, flags, &refs);
+	value_env(env, &venv);
+	if (flags & PROLLY_ITEM_VALUE_REF)
+	{
+		decode_value_ref(&v, &vroot, &len);
+		(void) walk_node(&venv, &vroot, visit, arg);
+	}
+	for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
+	{
+		next_value_ref(&p, end, &vroot, &len);
+		(void) walk_node(&venv, &vroot, visit, arg);
+	}
 }
 
 /* Whether the visitor took the node. */
@@ -1341,35 +1394,15 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 		;						/* the visitor has seen what is below */
 	else if (node.level == 0)
 	{
-		/* Value trees of values stored out of line. */
+		/* Value trees of values stored out of line, and of references. */
 		for (int i = 0; i < node.nitems; i++)
 		{
 			ProllyKey	k;
 			ProllyValue v;
 			uint8		flags;
 
-			ProllyValue refs;
-			ProllyTreeEnv venv;
-			ProllyNodeRef vroot;
-			uint64		len;
-
 			node_item(env, &node, i, &k, &v, &flags);
-			if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
-				continue;
-			item_payload(&v, flags, &refs);
-			value_env(env, &venv);
-			if (flags & PROLLY_ITEM_VALUE_REF)
-			{
-				decode_value_ref(&v, &vroot, &len);
-				(void) walk_node(&venv, &vroot, visit, arg);
-			}
-			/* and those of the references the value holds */
-			for (const char *p = (const char *) refs.data,
-				 *end = p + refs.len; p < end;)
-			{
-				next_value_ref(&p, end, &vroot, &len);
-				(void) walk_node(&venv, &vroot, visit, arg);
-			}
+			walk_value(env, &v, flags, visit, arg);
 		}
 	}
 	else
@@ -2126,22 +2159,6 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	side_close(&b);
 	pfree(bufa.data);
 	pfree(bufb.data);
-}
-
-/* A leaf item's value tree, if it is stored out of line: walked. */
-static void
-walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
-		   ProllyTreeVisitNode visit, void *arg)
-{
-	ProllyTreeEnv venv;
-	ProllyNodeRef vroot;
-	uint64		len;
-
-	if (!(flags & PROLLY_ITEM_VALUE_REF))
-		return;
-	value_env(env, &venv);
-	decode_value_ref(value, &vroot, &len);
-	(void) walk_node(&venv, &vroot, visit, arg);
 }
 
 /*

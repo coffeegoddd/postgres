@@ -182,7 +182,7 @@ static const ConformanceCase cases[] = {
 	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff value_write value_read",
 	tree_large_values},
 	{PROLLY_IFACE_TREE, "held_references",
-	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff value_write value_read",
+	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff diff_nodes value_write value_read",
 	tree_held_references},
 };
 

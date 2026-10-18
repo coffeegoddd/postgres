@@ -1750,6 +1750,31 @@ held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	pfree(want.data);
 }
 
+/* A prefetch hint: the chunks heard, into a HashSet. */
+static void
+held_hint(void *arg, const ProllyHash *hashes, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		ProllyNodeRef ref = {0};
+
+		ref.hash = hashes[i];
+		(void) collect_node(&ref, 0, arg);
+	}
+}
+
+/* Whether set holds the root of the value tree ref names. */
+static bool
+holds_ref(const HashSet *set, const StringInfo ref)
+{
+	ProllyHash	h;
+
+	memset(&h, 0, sizeof(h));
+	h.len = (uint8) ref->data[0];
+	memcpy(h.bytes, ref->data + 1, h.len);
+	return in_set(set, &h);
+}
+
 void
 tree_held_references(const ProllyImplInfo *impl)
 {
@@ -1765,6 +1790,8 @@ tree_held_references(const ProllyImplInfo *impl)
 	ProllyKey	key;
 	ProllyValue value;
 	HashSet		visited = {0};
+	HashSet		heard = {0};
+	HashSet		diffed = {0};
 	HeldDiff	d = {refs, 0, true};
 	int			calls = 0;
 	int			n = 0;
@@ -1849,19 +1876,24 @@ tree_held_references(const ProllyImplInfo *impl)
 	if (n != HELD_KEYS)
 		elog(ERROR, "a cursor returned %d of %d keys", n, HELD_KEYS);
 
-	/* A walk, with nothing to say how values are laid out, reaches them all. */
+	/*
+	 * A walk, with nothing to say how values are laid out, reaches them all;
+	 * and so do the prefetch hints it gives a store that hears them.
+	 */
 	env.value_refs = NULL;
+	if (PROLLY_HAS(env.chunk_store, read_through))
+		PROLLY_CALL(env.chunk_store, read_through, env.chunks, NULL, held_hint,
+					&heard);
 	PROLLY_CALL(tr, walk, &env, &built, collect_node, &visited);
+	if (PROLLY_HAS(env.chunk_store, read_through))
+		PROLLY_CALL(env.chunk_store, read_through, env.chunks, NULL, NULL, NULL);
 	for (int i = 0; i < 8; i++)
 	{
-		ProllyHash	h;
-
-		memset(&h, 0, sizeof(h));
-		h.len = (uint8) refs[i]->data[0];
-		memcpy(h.bytes, refs[i]->data + 1, h.len);
-		if (!in_set(&visited, &h))
+		if (!holds_ref(&visited, refs[i]))
 			elog(ERROR, "a walk didn't reach value tree %d, which values reference",
 				 i);
+		if (PROLLY_HAS(env.chunk_store, read_through) && !holds_ref(&heard, refs[i]))
+			elog(ERROR, "a walk's prefetch hints didn't name value tree %d", i);
 	}
 
 	/* Every other value changed: diff reports them as put. */
@@ -1888,5 +1920,13 @@ tree_held_references(const ProllyImplInfo *impl)
 	if (d.nchanges != HELD_KEYS / 2 || !d.ok)
 		elog(ERROR, "diff of values holding references reported %d changes (values %s)",
 			 d.nchanges, d.ok ? "right" : "wrong");
+
+	/* diff_nodes() reaches the value trees the changed values reference. */
+	PROLLY_CALL(tr, diff_nodes, &env, &built, &changed, collect_node, &diffed);
+	for (int k = 0; k < HELD_KEYS; k += 2)
+		for (int i = 0; i < (k + 1) % 3; i++)
+			if (!holds_ref(&diffed, refs[(k * 2 + i + 1) % 8]))
+				elog(ERROR, "diff_nodes() didn't reach value tree %d, which a changed value references",
+					 (k * 2 + i + 1) % 8);
 	pfree(vbuf.data);
 }
