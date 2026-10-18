@@ -27,11 +27,11 @@ CREATE TABLE dep.t (id int PRIMARY KEY, m dep_util.mood,
 					c citext DEFAULT dep_util.twice(1)::text);
 GRANT SELECT ON dep.t TO regress_dep_reader;
 SELECT * FROM pg_temp.deps();
-                key                 | value 
-------------------------------------+-------
+                key                 |                   value                   
+------------------------------------+-------------------------------------------
  d:extension citext                 | 1.6
- d:function dep_util.twice(integer) | 
- d:type dep_util.mood               | 
+ d:function dep_util.twice(integer) | function\x09{dep_util,twice}\x09{integer}
+ d:type dep_util.mood               | type\x09{dep_util.mood}\x09{}
 (3 rows)
 
 SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
@@ -44,11 +44,11 @@ SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
 ALTER EXTENSION citext UPDATE TO '1.8';
 ALTER FUNCTION dep_util.twice(int) RENAME TO double_it;
 SELECT * FROM pg_temp.deps();
-                  key                   | value 
-----------------------------------------+-------
+                  key                   |                     value                     
+----------------------------------------+-----------------------------------------------
  d:extension citext                     | 1.8
- d:function dep_util.double_it(integer) | 
- d:type dep_util.mood                   | 
+ d:function dep_util.double_it(integer) | function\x09{dep_util,double_it}\x09{integer}
+ d:type dep_util.mood                   | type\x09{dep_util.mood}\x09{}
 (3 rows)
 
 SELECT * FROM dolt_status ORDER BY table_name;	-- shown as changes
@@ -104,11 +104,11 @@ SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                  key                   | value 
-----------------------------------------+-------
+                  key                   |                     value                     
+----------------------------------------+-----------------------------------------------
  d:extension citext                     | 1.8
- d:function dep_util.double_it(integer) | 
- d:type dep_util.mood                   | 
+ d:function dep_util.double_it(integer) | function\x09{dep_util,double_it}\x09{integer}
+ d:type dep_util.mood                   | type\x09{dep_util.mood}\x09{}
 (3 rows)
 
 SELECT dolt_checkout('dep_side');
@@ -118,11 +118,11 @@ SELECT dolt_checkout('dep_side');
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                  key                   | value 
-----------------------------------------+-------
+                  key                   |                     value                     
+----------------------------------------+-----------------------------------------------
  d:extension citext                     | 1.8
- d:function dep_util.double_it(integer) | 
- d:type dep_util.mood                   | 
+ d:function dep_util.double_it(integer) | function\x09{dep_util,double_it}\x09{integer}
+ d:type dep_util.mood                   | type\x09{dep_util.mood}\x09{}
 (3 rows)
 
 SELECT dolt_checkout('main');

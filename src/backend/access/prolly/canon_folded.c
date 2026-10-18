@@ -12,9 +12,11 @@
  *	"c:" collation		-> its provider, locale, ICU rules, whether it is
  *						   deterministic and its library's version, a line
  *						   each ("default": the database's)
- *	"d:" dependency		-> nothing; an extension's version: what the
- *						   versioned objects need from outside them, by kind
- *						   and identity ("extension hstore",
+ *	"d:" dependency		-> an extension's version; another object's
+ *						   address (type, names and arguments, as
+ *						   pg_identify_object_as_address() gives them): what
+ *						   the versioned objects need from outside them, by
+ *						   kind and identity ("extension hstore",
  *						   "type public.money2")
  *	"f:" function(args)	-> its definition
  *	"m:" materialized view -> its data tree (hash length, hash), then its
@@ -858,27 +860,58 @@ extension_version(Oid extoid)
 	return version;
 }
 
+/* A list of strings as a text[] literal. */
+static char *
+text_array_literal(List *strings)
+{
+	Datum	   *elems = palloc(sizeof(Datum) * Max(list_length(strings), 1));
+	int			n = 0;
+	ListCell   *lc;
+
+	foreach(lc, strings)
+		elems[n++] = CStringGetTextDatum(lfirst(lc));
+	/* (through fmgr: array_out keeps state in its flinfo) */
+	return OidOutputFunctionCall(F_ARRAY_OUT,
+								 PointerGetDatum(construct_array_builtin(elems, n, TEXTOID)));
+}
+
 /*
  * A dependency outside the versioned schemas: an extension's member is the
- * extension, with its version.  Kept as "kind identity", a tab, and the
- * value, to be sorted and made items once each.
+ * extension, valued by its version; another object is valued by its
+ * address as pg_identify_object_as_address() gives it (type, names and
+ * arguments, tab-separated), which pg_get_object_address() finds again in
+ * another database.  Kept as "kind identity", a tab, and the value, to be
+ * sorted and made items once each.
  */
 static void
 note_dependency(List **deps, const ObjectAddress *object)
 {
 	ObjectAddress addr = *object;
 	Oid			ext = getExtensionOfObject(addr.classId, addr.objectId);
-	char	   *version = NULL;
+	char	   *type;
+	char	   *value;
 
 	if (OidIsValid(ext))
 		ObjectAddressSet(addr, ExtensionRelationId, ext);
 	addr.objectSubId = 0;
+	type = getObjectTypeDescription(&addr, false);
 	if (addr.classId == ExtensionRelationId)
-		version = extension_version(addr.objectId);
-	*deps = lappend(*deps, psprintf("%s %s\t%s",
-									getObjectTypeDescription(&addr, false),
-									getObjectIdentity(&addr, false),
-									version ? version : ""));
+	{
+		value = extension_version(addr.objectId);
+		if (value == NULL)
+			value = "";
+	}
+	else
+	{
+		List	   *names = NIL;
+		List	   *objargs = NIL;
+
+		(void) getObjectIdentityParts(&addr, &names, &objargs, false);
+		value = psprintf("%s\t%s\t%s", type, text_array_literal(names),
+						 text_array_literal(objargs));
+	}
+	*deps = lappend(*deps, psprintf("%s %s\t%s", type,
+									getObjectIdentity(&addr, false), value));
 }
 
 /*
