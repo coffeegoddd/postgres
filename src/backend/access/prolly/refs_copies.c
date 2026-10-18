@@ -208,9 +208,13 @@ refs_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_PRE_COMMIT:
 			check_merge_conflicts("commit");
+			if (prolly_refs_end_hook)
+				prolly_refs_end_hook(false);
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			check_merge_conflicts("prepare");
+			if (prolly_refs_end_hook)
+				prolly_refs_end_hook(true);
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
@@ -2304,4 +2308,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branch_move = copies_branch_move,
 	.config_get = copies_config_get,
 	.config_set = copies_config_set,
+	.open = refs_init,
 };

@@ -153,6 +153,11 @@ subtrees that differ; moving a branch to another commit writes the
 differences back through the row applier (applier_replication.c), as
 logical replication's apply worker writes rows.
 
+With dolt.transaction_commit on, a transaction that changed a branch makes
+its commit as it commits: the refs, opened by its first write, call
+prolly_refs_end_hook at their pre-commit, before the chunk store's own, and
+the commit is made there (none if nothing changed since the head).
+
 
 Remotes
 -------

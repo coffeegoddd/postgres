@@ -23,6 +23,8 @@
 #include "utils/rel.h"
 
 /* The prolly table access method's components, by ProllyInterface. */
+ProllyRefsEndHook prolly_refs_end_hook = NULL;
+
 static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_CHUNKER] = "bytes",
 	[PROLLY_IFACE_CONTENT_HASH] = "sha256",

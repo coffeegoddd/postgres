@@ -54,6 +54,7 @@ tests += {
       'commits',
       'branch_writes',
       'writer_modes',
+      'transaction_commits',
       'status_diff',
       'collations',
       'applier',

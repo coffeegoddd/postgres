@@ -284,7 +284,22 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*config_get) (const char *name, StringInfo value);
 	void		(*config_set) (const char *name, const char *value);
+
+	/*
+	 * Open the refs now, if not yet: a transaction that will need them at
+	 * its end (prolly_refs_end_hook) opens them before it.
+	 */
+	void		(*open) (void);
 } ProllyRefsRoutine;
+
+/*
+ * Called by the refs as the transaction they were opened in is about to
+ * commit (prepare: or be prepared), before the chunk store's own end of
+ * transaction, once the refs' own checks have passed: what it records then
+ * is the transaction's.
+ */
+typedef void (*ProllyRefsEndHook) (bool prepare);
+extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
@@ -293,9 +308,9 @@ typedef struct ProllyRefsRoutine
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
-	"branch_move", "config_get", "config_set"
+	"branch_move", "config_get", "config_set", "open"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK config_set
+#define PROLLY_REFS_LAST_CALLBACK open
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -78,6 +78,18 @@
 static char *dolt_author = NULL;
 static bool dolt_allow_commit_conflicts = false;
 
+/*
+ * dolt.transaction_commit: every SQL transaction that changes a branch makes
+ * a Dolt commit of it too, as it commits, with dolt.transaction_commit_message
+ * (as it is then).  Whether to is read at the transaction's first write.
+ */
+static bool dolt_transaction_commit = false;
+static char *dolt_transaction_commit_message = NULL;
+static LocalTransactionId txn_commit_lxid = InvalidLocalTransactionId;
+static bool txn_commit_on = false;
+
+static void transaction_commit_at_end(bool prepare);
+
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
 
@@ -103,6 +115,23 @@ prolly_session_init(const char *branch)
 								   0,
 								   NULL, NULL, NULL);
 		prolly_autovacuum_init();
+		DefineCustomBoolVariable("dolt.transaction_commit",
+								 "Makes a Dolt commit of every transaction that changes a branch, as it commits.",
+								 "Read at the transaction's first write; the message, at its commit.",
+								 &dolt_transaction_commit,
+								 false,
+								 PGC_USERSET,
+								 0,
+								 NULL, NULL, NULL);
+		DefineCustomStringVariable("dolt.transaction_commit_message",
+								   "The message of the Dolt commits dolt.transaction_commit makes.",
+								   NULL,
+								   &dolt_transaction_commit_message,
+								   "Transaction commit",
+								   PGC_USERSET,
+								   0,
+								   NULL, NULL, NULL);
+		prolly_refs_end_hook = transaction_commit_at_end;
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
 		writer_branch_hooks();
@@ -290,11 +319,23 @@ writers(void)
 /* while set, the session's branch is written by an operation that commits */
 static bool integrating = false;
 
-/* A write to a branch is first its writers' to allow. */
+/*
+ * A write to a branch is first its writers' to allow.  The transaction's
+ * first takes dolt.transaction_commit as it is now, and opens the refs if
+ * the transaction is to commit through them as it ends (their end comes
+ * before the chunk store's only if they are opened first).
+ */
 static void
 writers_note_write(Oid branch, void *arg)
 {
 	PROLLY_CALL(writers(), note_write, branch, integrating);
+	if (MyProc->vxid.lxid != txn_commit_lxid)
+	{
+		txn_commit_lxid = MyProc->vxid.lxid;
+		txn_commit_on = dolt_transaction_commit;
+		if (txn_commit_on)
+			PROLLY_CALL(refs(), open);
+	}
 }
 
 /*
@@ -338,13 +379,70 @@ must_commit(int left, const char *what)
 /*
  * The session's branch may be clean again: committed, reset or merged.  Its
  * changes so far are a commit's (or gone): a later write is noted, and
- * allowed or not, again.
+ * allowed or not, again, and only it is the transaction's to commit at its
+ * end.
  */
 static void
 settled(void)
 {
 	PROLLY_CALL(writers(), settled, MyBranch);
 	branch_forget_written(MyBranch);
+}
+
+/*
+ * As a transaction that changed a branch commits in dolt.transaction_commit's
+ * mode: a Dolt commit of the branch, unless nothing changed (an insert
+ * deleted again, a commit already made of it all).  Changes to two branches,
+ * or to one the session has left, can't be committed so, and a transaction
+ * that would commit can't be prepared.  With conflicts kept (allowed by
+ * dolt.allow_commit_conflicts) the transaction commits without one, as the
+ * conflicts are to be resolved before the branch can commit.
+ */
+static void
+transaction_commit_at_end(bool prepare)
+{
+	List	   *branches;
+	ProllyMergeState ms;
+	ProllyHash	id;
+	bool		committed;
+	bool		pushed;
+
+	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on)
+		return;
+	branches = branches_written();
+	if (branches == NIL)
+		return;
+	if (prepare)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot prepare a transaction that dolt.transaction_commit would commit")));
+	if (list_length(branches) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("dolt.transaction_commit can't commit a transaction that changed more than one branch"),
+				 errhint("Change each branch in a transaction of its own.")));
+	if (linitial_oid(branches) != MyBranch)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("dolt.transaction_commit can't commit changes to a branch the session has left"),
+				 errhint("Check the changed branch out again before committing.")));
+	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.ntables > 0)
+	{
+		ereport(WARNING,
+				(errmsg("transaction committed without a Dolt commit: it has unresolved merge conflicts"),
+				 errhint("Resolve them with dolt_conflicts_resolve(), then commit.")));
+		return;
+	}
+	pushed = !ActiveSnapshotSet();
+	if (pushed)
+		PushActiveSnapshot(GetTransactionSnapshot());
+	BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit,
+												 dolt_transaction_commit_message,
+												 false, &id));
+	if (committed)
+		settled();
+	if (pushed)
+		PopActiveSnapshot();
 }
 
 /* Splits "Name <email>" into its parts; without <...>, all of it is a name. */
