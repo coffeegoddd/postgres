@@ -23,7 +23,10 @@ name: performance
 
 on:
   pull_request:
+  # (a branch's pushes build and cache its head: a pull request onto it
+  # finds its base cached; a pull request's own run builds its merge)
   push:
+    tags-ignore: ['**']
 
 permissions:
   contents: read
@@ -90,33 +93,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync
 
-      # Builds are cached by commit and runner image (the toolchain).
+      # Builds are cached by commit and runner image (the toolchain), each
+      # at one path outside the checkout, so a push's build of a commit is
+      # the one a pull request onto it finds as its base, and no build
+      # lies in the tree the next one hashes as source.  The head is built
+      # first, from the checkout; the base with the head's build script,
+      # from the base's source beside it (which may predate the script).
       - name: Runner image
         id: image
         run: echo "image=$ImageOS-$ImageVersion" | tee -a "$GITHUB_OUTPUT"
 
-      - name: Cached base build
-        if: env.BASE != ''
-        id: base-cache
-        uses: actions/cache@v4
-        with:
-          path: s-builds/base
-          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
-
-      - name: Build the base
-        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
-        run: |
-          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
-          bash "$RUNNER_TEMP/base-src/$BENCH/build_postgres.sh" --jobs 4 \
-            --build-dir "$RUNNER_TEMP/base-build" -- --with-openssl
-          mkdir -p s-builds
-          mv "$RUNNER_TEMP/base-build/inst" s-builds/base
-
       - name: Cached head build
         id: head-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: s-builds/candidate
+          path: ${{ runner.temp }}/s-cache
           key: s-server-${{ env.CANDIDATE }}-${{ steps.image.outputs.image }}
 
       - name: Build the head
@@ -124,19 +115,52 @@ jobs:
         run: |
           bash "$BENCH/build_postgres.sh" --jobs 4 \
             --build-dir "$RUNNER_TEMP/head-build" -- --with-openssl
-          mkdir -p s-builds
-          mv "$RUNNER_TEMP/head-build/inst" s-builds/candidate
+          mv "$RUNNER_TEMP/head-build/inst" "$RUNNER_TEMP/s-cache"
+
+      - uses: actions/cache/save@v4
+        if: steps.head-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.CANDIDATE }}-${{ steps.image.outputs.image }}
+
+      - name: Set the head aside
+        run: |
+          mkdir -p "$RUNNER_TEMP/s-builds"
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/candidate"
+
+      - name: Cached base build
+        if: env.BASE != ''
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
+
+      - name: Build the base
+        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
+          bash "$BENCH/build_postgres.sh" --source "$RUNNER_TEMP/base-src" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/base-build" -- --with-openssl
+          mv "$RUNNER_TEMP/base-build/inst" "$RUNNER_TEMP/s-cache"
+
+      - uses: actions/cache/save@v4
+        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
 
       - name: Both builds are of their commits
         if: github.event_name == 'pull_request'
         run: |
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/base"
           for b in base candidate; do
             want=$([ "$b" = base ] && echo "$BASE" || echo "$CANDIDATE")
             got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' \
-              "s-builds/$b/pbench-build.json")
+              "$RUNNER_TEMP/s-builds/$b/pbench-build.json")
             test "$got" = "$want" || { echo "$b build is of $got, not $want" >&2; exit 1; }
           done
-          { echo "base=$BASE"; echo "candidate=$CANDIDATE"; } > s-builds/SHAS
+          { echo "base=$BASE"; echo "candidate=$CANDIDATE"; } > "$RUNNER_TEMP/s-builds/SHAS"
 
       - name: Cached BenchBase
         if: github.event_name == 'pull_request'
@@ -166,7 +190,9 @@ jobs:
 
       - name: Pack both builds and BenchBase
         if: github.event_name == 'pull_request'
-        run: tar -czf s-builds.tgz s-builds build-bench/benchbase/benchbase-postgres
+        run: |
+          tar -czf s-builds.tgz -C "$RUNNER_TEMP" s-builds \
+            -C "$GITHUB_WORKSPACE" build-bench/benchbase/benchbase-postgres
 
       - uses: actions/upload-artifact@v5
         if: github.event_name == 'pull_request'
@@ -273,8 +299,11 @@ jobs:
             --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt1" || true
           runs=(timing/attempt1)
           for attempt in 2 3; do
+            # (this attempt's findings, never a former's)
+            rm -f timing/sgate.json
             "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
               --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
+            [ -f timing/sgate.json ] || break
             rerun=$(python3 -c 'import json; print(",".join(json.load(open("timing/sgate.json"))["rerun"]))')
             [ -n "$rerun" ] || break
             "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_pr.toml" \
@@ -282,6 +311,7 @@ jobs:
               --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt$attempt" || true
             runs+=("timing/attempt$attempt")
           done
+          rm -f timing/sgate.json
           "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
             --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
           test -f timing/sgate.json
@@ -314,8 +344,10 @@ jobs:
       - uses: actions/checkout@v5
         if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
 
+      # (a job that left nothing is reported by Report, as a failed job)
       - uses: actions/download-artifact@v5
         if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
         with:
           pattern: s-counters-*
           path: counters
