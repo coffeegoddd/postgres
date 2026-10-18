@@ -148,8 +148,10 @@ def _fit(main: list[str], sections: list[list[str]], tail: list[str]) -> str:
 
 def render(counters: Optional[dict], timing: Optional[dict], *, head: str, base: str,
            runner: str, run_url: str = "", failed_jobs: list[str] = (),
-           reproduce: str = "") -> tuple[str, bool]:
-    """(comment, passed)."""
+           reproduce: str = "", nightly: bool = False) -> tuple[str, bool]:
+    """(comment, passed).  nightly: a night against the night before,
+    timing only; it passes when its timing has results, valid, and no
+    regression is confirmed."""
     findings = counters["findings"] if counters else []
     failed = [f for f in findings if f["result"] in ("regression", "unstable_candidate", "invariant")]
     accepted = [f for f in findings if f["result"] == "accepted"]
@@ -158,31 +160,41 @@ def render(counters: Optional[dict], timing: Optional[dict], *, head: str, base:
     improved = [f for f in findings if f["result"] == "improvement"]
     cells = timing["cells"] if timing else []
     report_only = bool(timing and timing.get("report_only"))
+    confirmed = [c for c in cells if c["result"] == "confirmed"]
     timing_failed = [c for c in cells if c["result"] == "invalid"
                      or (c["result"] == "confirmed" and not report_only)]
-    passed = (counters is not None and counters["passed"] and not failed_jobs
-              and not timing_failed)
-
-    verdict = "PASS" if passed else "FAIL"
-    what = "counters" if not timing else ("counters; timing reported" if report_only
-                                          else "counters and timing")
-    main = [MARKER, f"## S suite: {verdict} ({what})",
-            f"Base `{base[:10]}` · candidate `{head[:10]}` · on {runner}", ""]
+    if nightly:
+        compared = [c for c in cells if c["result"] != "invalid"]
+        passed = bool(compared) and not confirmed and not timing_failed and not failed_jobs
+        verdict = f"{len(confirmed)} confirmed regression(s)" if confirmed else \
+            "no confirmed regression" if passed else "no valid results"
+        main = [MARKER, f"## S suite nightly: {verdict}",
+                f"The night before `{base[:10]}` · tonight `{head[:10]}` · on {runner} "
+                "(timing with a shared machine's noise)", ""]
+    else:
+        passed = (counters is not None and counters["passed"] and not failed_jobs
+                  and not timing_failed)
+        verdict = "PASS" if passed else "FAIL"
+        what = "counters" if not timing else ("counters; timing reported" if report_only
+                                              else "counters and timing")
+        main = [MARKER, f"## S suite: {verdict} ({what})",
+                f"Base `{base[:10]}` · candidate `{head[:10]}` · on {runner}", ""]
     for job in failed_jobs:
         main.append(f"- **{_cell(job)}**: the gate fails")
-    if counters is None:
+    if counters is None and not nightly:
         main.append("- **No counter results**: the counter runs left none.")
-    if failed_jobs or counters is None:
+    if failed_jobs or (counters is None and not nightly):
         main.append("")
 
-    t = (counters or {}).get("thresholds", {})
-    main.append(f"### Counters (a regression is > {t.get('relative', 0.05):.0%} and, "
-                "in total over the fixed work, over its floor)")
-    if failed or accepted:
-        main += _counter_rows(failed + accepted)
-    elif counters is not None:
-        main.append("No counter regressed.")
-    main.append("")
+    if not nightly:
+        t = (counters or {}).get("thresholds", {})
+        main.append(f"### Counters (a regression is > {t.get('relative', 0.05):.0%} and, "
+                    "in total over the fixed work, over its floor)")
+        if failed or accepted:
+            main += _counter_rows(failed + accepted)
+        elif counters is not None:
+            main.append("No counter regressed.")
+        main.append("")
 
     if timing:
         thr = timing.get("thresholds", {}).get("timing_threshold", 0.05)
@@ -249,7 +261,8 @@ def run(args) -> int:
         failed_jobs.append(f"timing results missing: {args.timing}")
     text, passed = render(merge_counters(parts), timing, head=args.head,
                           base=args.base, runner=args.runner, run_url=args.run_url or "",
-                          failed_jobs=failed_jobs, reproduce=args.reproduce or "")
+                          failed_jobs=failed_jobs, reproduce=args.reproduce or "",
+                          nightly=getattr(args, "nightly", False))
     args.out.write_text(text)
     print(text)
     return 0 if passed else 1

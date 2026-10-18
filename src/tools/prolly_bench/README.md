@@ -304,6 +304,12 @@ cells whose work differs, always fail.  An entry the pull request adds to
 accept nothing); the file has a code owner.  `sreport` writes the sticky
 comment, marked `<!-- s-suite -->`.
 
+The nightly (`performance.yml`'s nightly job) runs `configs/s_nightly.toml`,
+about 340 cells and 4 hours, with tonight's master against the previous
+night's, retries the cells that regress, and keeps a summary of each night
+(`prolly_bench shistory`: medians, ratios with their intervals, commits,
+comparison identities) on the orphan `perf-history` branch.
+
 ## Calibrating the gate
 
 `prolly_bench scalibrate --counters RUN ... --timing RUN ...` measures the

@@ -512,7 +512,18 @@ def main(argv=None) -> int:
     sr.add_argument("--failed-job", action="append", default=[], metavar="NAME: RESULT")
     sr.add_argument("--reproduce", help="a command that reproduces the run")
     sr.add_argument("--out", type=Path, required=True)
+    sr.add_argument("--nightly", action="store_true",
+                    help="a night against the night before: timing only")
     sr.set_defaults(fn=sreport.run)
+
+    from pbench import shistory
+    sh = sub.add_parser("shistory", help="S suite nightly: a night's summary for perf-history")
+    sh.add_argument("run", type=Path, help="the nightly's timing run")
+    sh.add_argument("--timing", type=Path, help="sgate timing --json output")
+    sh.add_argument("--instructions", type=Path, help="a cachegrind run (s_cachegrind.toml)")
+    sh.add_argument("--date", required=True)
+    sh.add_argument("--out", type=Path, required=True)
+    sh.set_defaults(fn=shistory.run)
 
     from pbench import complexity
     growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")
