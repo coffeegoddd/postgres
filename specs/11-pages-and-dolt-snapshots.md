@@ -214,8 +214,9 @@ carries over; only what assumed chunks live in 8 KB pages changes:
   `prolly_datum.h`), as built: types' binary send formats, portable
   arrays and composites, no local OIDs. Types without a binary send
   format are refused or stored as text (question 35; pending since step
-  4h). Columns whose values are local OIDs (`oid`, `reg*`, a large
-  object's `lo`) are refused (#217). A column's value longer than 2 KB is
+  4h). Columns whose values are local OIDs (`oid`, `oid8`, `reg*`,
+  `pg_node_tree`, a large object's `lo`, and the domains, arrays,
+  composites and ranges made of them) are refused (#217). A column's value longer than 2 KB is
   a reference to a value tree of its own (#219,
   `14-large-values-and-toast.md`).
 - **Chunker:** the byte-based rule already planned for step 5 (a key-only

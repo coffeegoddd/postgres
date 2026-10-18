@@ -13,11 +13,11 @@ and are only touched in part 7.
 
 | | Stock Postgres (TOAST) | Dolt (adaptive encoding) | Prolly history today |
 |---|---|---|---|
-| What decides | Per row, per column: the toaster runs when a row is over 2032 bytes and works down to `toast_tuple_target` | Per row, per column: a row over `target_row_size` (2048) moves columns out | Per row, the whole row: an encoded row over `VALUE_INLINE_MAX` (2048) goes out of line |
+| What decides | Per row, per column: the toaster runs when a row is over 2032 bytes and works down to `toast_tuple_target` | Per row, per column: a row over `target_row_size` (2048) moves columns out | Per row, the whole row: an encoded row over `VALUE_INLINE_MAX` (2048) goes out of line; since B, per column: a column whose canonical bytes are over 2048 goes out of line on its own, the whole row only if it is still long |
 | Which column first | The largest eligible (`toast_tuple_find_biggest_attribute`), in four passes by storage strategy | The one saving the most bytes | — |
 | Compression | pglz or lz4, per column (`attcompression`), before moving out | None | None: canonical bytes are uncompressed (question 48) |
 | Out-of-line form | Rows of `pg_toast_N (chunk_id, chunk_seq, chunk_data)`, 1996-byte chunks, value named by an OID | A blob tree, fixed 4000-byte leaves, named by its hash | A value tree, buzhash chunks of 512–4096 bytes keyed by byte offset, named by its hash (`tree_cow.c:560-608`); since B, addressed by byte counts and one per long column (part 5) |
-| Sharing | None: one owner per value; an unchanged value keeps its pointer on UPDATE | Identical values are one tree | Identical rows are one tree |
+| Sharing | None: one owner per value; an unchanged value keeps its pointer on UPDATE | Identical values are one tree | Identical rows are one tree; since B, identical long values are one tree wherever they are, and an apply in place keeps a row's own TOAST pointer for a value that didn't change |
 | Slice reads | Uncompressed values fetch only the chunks they need; pglz fetches a prefix | None | None |
 | Deletion | With its row; VACUUM of the TOAST table reclaims | `dolt gc` | No chunk-store reclamation yet |
 
@@ -125,7 +125,9 @@ nobody has history worth keeping.)
   `value_refs()`, which the keying's `row_refs()` answers as each item is
   put, and a leaf item that holds references leads with them, flagged
   `PROLLY_ITEM_VALUE_REFS`. Fetch, push, clone and reclamation follow
-  them from the nodes alone; reads return the value without them.
+  them from the nodes alone, as do a walk's prefetch hints and the node
+  diffs (`diff_nodes()`) network transfers send; reads return the value
+  without them.
 - **Not as designed:** the format change is a clean break, #149's, not
   the cross-format comparison above (the user's choice for this work):
   the value encoder's format goes to 2 and the folded roots' `!:format`
@@ -156,8 +158,9 @@ slice by descending through the byte counts, O(depth + its length)
 nodes (the tree conformance check `large_values` checks slices at every
 kind of offset and length). The tree's format version goes to 2.
 Measured: a one-byte insertion or deletion in the middle of a 3 MB value
-writes at most 8 nodes (conformance); three bytes inserted into a 192 KB
-value of a versioned table commit 8 new nodes (`large_values`, SQL).
+writes at most 8 nodes (conformance, which holds it to 8); three bytes
+inserted into a 192 KB value of a versioned table committed 8 new nodes
+when measured (`large_values`, SQL, which holds it under 20).
 D1's `016_d1_large_values.pl` cases are `052_large_values.pl` on
 versioned tables (#221): through a crash, and on a standby through
 `dolt_diff`.
@@ -207,10 +210,14 @@ reading it and remembers the reference it made on a miss. Implementation
 "shared" (`memo_shared.c`): 8192 entries in shared memory under a
 spinlock, eight probed per key, the oldest replaced; the key also holds
 the database and the column's type (whose encoding made the reference).
-Entries are kept in the backend until `XACT_EVENT_COMMIT` and forgotten
-on an abort, or on the abort of the subtransaction that made them; a hit
-asks the chunk store for the tree's root (the tree's new
-`value_present()`).
+Entries are kept in the backend, one per key and at most as many as the
+shared table holds, until `XACT_EVENT_COMMIT`, and forgotten on an abort,
+on the abort of the subtransaction that made them (or of one it was
+released into), at `PREPARE` (they aren't published at `COMMIT
+PREPARED`: the next fold misses those values once), and when a parallel
+worker ends (its leader may still abort); a hit asks the chunk store for
+the tree's root (the tree's new `value_present()`), and an entry of the
+transaction's whose tree is gone is dropped.
 - **Not as designed:** a value whose first chunk is frozen when it would
   be remembered isn't. The 2^31 rule alone leaves a case: a first chunk
   whose xmin is already more than 2^31 transactions old when its entry is
@@ -245,8 +252,9 @@ first is deleted. Sharing across rows needs C.
 
 **As built (#221).**
 - **Not as designed:** the applier didn't update rows. A reset,
-  fast-forward or merge removed every changed row and inserted its new
-  version, all removals first, so a unique constraint both sides satisfy
+  fast-forward, merge, cherry-pick or revert (everything that writes
+  rows through `apply_rows()` or `merge_table()`) removed every changed
+  row and inserted its new version, all removals first, so a unique constraint both sides satisfy
   isn't broken on the way (two rows swapping a value). Now, where a table
   has no unique or exclusion index but its primary key's (nothing to
   swap), a keyed row that changed is updated in place; otherwise it is
@@ -257,9 +265,13 @@ first is deleted. Sharing across rows needs C.
   column out of line with the same reference in both unread and marks
   it, and the applier's `update()` takes a keep mask and gives those
   columns the found row's stored values. The old version, which only
-  finds the row, is decoded the same way, whole if a kept column is in
-  the primary key. A materialized view's update deletes and inserts, so
-  its kept values are read into the new row.
+  finds the row, is decoded with every column out of line unread, whole
+  if one of those is in the primary key. A materialized view has no
+  primary key, so it is never updated in place.
+- A row found by its key that a transaction the move's snapshot doesn't
+  see wrote since the fold (a concurrent update) isn't the row the move
+  expects: the move fails, to be retried, rather than keep that
+  transaction's value (`052_large_values.pl`, by an injection point).
 - A merge's in-place update that breaks a constraint while violations
   are recorded is rolled back in its subtransaction, leaving the row as
   it was.
@@ -279,7 +291,9 @@ first is deleted. Sharing across rows needs C.
   between rows.
 - **As measured (#217–#221):** cost 1 (`large_values`: an int's update
   next to a 960 KB document commits 3 nodes; copies share the document's
-  tree) and cost 2 (an insertion commits 8 nodes) are fixed; cost 3 for
+  tree) and cost 2 (an insertion committed 8 nodes when measured; the
+  SQL test holds it under 20, the tree's conformance check a one-byte
+  edit of a 3 MB value to 8) are fixed; cost 3 for
   values TOAST stored out of line whose first chunk isn't frozen; cost 4
   for keyed rows of tables without another unique or exclusion index.
   Cost 5 (jsonb as text) and 6 are untouched, as designed.
@@ -468,19 +482,25 @@ kept while it holds OID pointers.
 ## 7. Large objects
 
 `pg_largeobject` and `pg_largeobject_metadata` are shared by all branches
-and never folded (`branch.c:94-130`); an `oid` or `lo` column is folded as
-the number only, so reset and merge don't restore an object's contents, and
-`dolt_status` doesn't report it as not covered. Question 35 decided that
-a commit refuses a column of a type with no OID-free encoding (`oid`
-itself); that isn't built, and should come before B. Versioning them
-later can reuse C: an object's pages as one value tree, and an `lo`
-reference carrying its hash.
+and never folded (`branch.c:94-130`). Before #217 an `oid` or `lo` column
+was folded as the number only, so reset and merge didn't restore an
+object's contents, and `dolt_status` didn't report it as not covered.
+Question 35 decided that a commit refuses a column of a type with no
+OID-free encoding (`oid` itself); that is built (below). Versioning large
+objects later can reuse C: an object's pages as one value tree, and an
+`lo` reference carrying its hash.
 
 **As built (#217).** A commit refuses a table or materialized view with a
-column whose type holds OIDs: `oid`, `oid8`, the `reg*` types, and the
-domains (contrib's `lo`), arrays, composites and ranges made of them.
-Status and diff list each such column (`schema.table.column`) as not
-covered and still fold its table, so its other changes show.
+column whose type holds OIDs: `oid`, `oid8`, the `reg*` types,
+`pg_node_tree` (whose text names objects by OID), and the domains
+(contrib's `lo`), arrays, composites, ranges and multiranges made of
+them. Status and diff list each such column (`schema.table.column`) as
+not covered and still fold its table, so its other changes show. A
+reset, checkout or checkpoint folds the working set as a commit does, so
+it is refused too until such a column is dropped, as for every object a
+commit refuses. Types that aren't OIDs but are local (`xid`, `tid`,
+`pg_lsn`) are versioned as the numbers they are; `aclitem` has no binary
+send function, so its tables can't be folded at all.
 - **Not as designed:** the `reg*` types are refused too. Question 35
   decided portable codecs for them (by qualified name); those aren't
   built, and their send functions send the OID, so until they are a
