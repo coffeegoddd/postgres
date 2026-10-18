@@ -142,6 +142,26 @@ exception. `cdiff` lists differences with the queries. Exceptions in
 `configs/c_exceptions.toml` must name the engine, exact actual-answer signatures,
 corpus file hash, owner, issue and expiry. Changed or stale exceptions fail.
 
+### Shards
+
+`run C --shard I/N` runs shard I of N, so the full corpus can run as N
+parallel jobs:
+
+```sh
+src/tools/prolly_bench/prolly_bench cshard --shards 4 --config CONFIG     # the plan
+src/tools/prolly_bench/prolly_bench run C --am heap,prolly --shard 2/4 --config CONFIG
+src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR       # the shard's workloads
+```
+
+Files are assigned largest first, each to the shard with the fewest bytes
+so far, so the plan depends only on the corpus's file names and sizes and
+every job computes the same one. C1 and C2 run whole on shard 1, so a
+shard runs only the workloads it has files of. A shard's `config.json`
+records `run.shard`, its workloads, and each workload's `shard_files`;
+`cgate` without `--workloads` gates the workloads the shard ran. The
+shards together cover the corpus once: a gate over all of them checks
+that their files' union is the whole corpus (`cshard.overlap_and_gaps`).
+
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.
@@ -242,7 +262,8 @@ src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR
 All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,
 incorrect AMs, stale exceptions, or differing answers. It requires C1-C4
-by default (`--workloads C1,C2` selects a smaller explicit set). Order-only
+by default, or a shard's workloads for a shard (`--workloads C1,C2`
+selects a smaller explicit set). Order-only
 findings also fail until reviewed. The comparator preserves the corpus sort
 mode and exact typed answers, independently of rounded corpus formatting.
 Documented exceptions and matching PostgreSQL/corpus differences remain

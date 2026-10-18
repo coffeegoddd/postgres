@@ -3,6 +3,8 @@
   prolly_bench run S --am heap                  S suite against stock heap (B0)
   prolly_bench run V --am prolly                V suite against an engine
   prolly_bench run C --am heap,prolly           C suite (SQL correctness), heap first
+  prolly_bench run C --shard 2/4 ...            one shard of the C suite's corpus
+  prolly_bench cshard --shards 4                which files each shard runs
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
@@ -50,6 +52,8 @@ def _run(args: argparse.Namespace) -> int:
         over["run"]["measure_seconds"] = args.measure
     if args.no_fio:
         over["run"]["fio_baseline"] = False
+    if args.shard:
+        over["run"]["shard"] = args.shard
     for s in args.set:
         k, _, v = s.partition("=")
         over["postgres"][k] = v
@@ -58,10 +62,13 @@ def _run(args: argparse.Namespace) -> int:
     if not args.am:
         raise SystemExit("at least one --am is required")
 
-    # Paths in [tools] are relative to the repository root.
-    for k, v in list(cfg["tools"].items()):
-        p = Path(v).expanduser()
-        cfg["tools"][k] = str(p if p.is_absolute() else REPO / p)
+    _resolve_tools(cfg)
+    if cfg["run"]["shard"]:
+        from pbench import cshard
+        shard = cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])
+        if not shard.workloads:
+            raise SystemExit(f"shard {shard.spec} has no files")
+        print(cshard.to_text([shard]))
 
     # Each engine retains its result set; matched cells run as randomized pairs.
     ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
@@ -106,6 +113,32 @@ def _run(args: argparse.Namespace) -> int:
             cfg["run"]["workloads"] or ["C1", "C2", "C3", "C4"])
             for s in sets if s is not base)
     return 0 if ok else 1
+
+
+def _resolve_tools(cfg: dict) -> None:
+    # Paths in [tools] are relative to the repository root.
+    for k, v in list(cfg["tools"].items()):
+        p = Path(v).expanduser()
+        cfg["tools"][k] = str(p if p.is_absolute() else REPO / p)
+
+
+def _corpus(cfg: dict) -> Path:
+    """The C suite's corpus: the test/ directory of the sqllogictest checkout."""
+    return Path(cfg["tools"]["sqllogictest"]).expanduser() / "test"
+
+
+def _cshard(args) -> int:
+    import json
+    from pbench import cshard
+    cfg = config_mod.load(args.config, {}, "C")
+    _resolve_tools(cfg)
+    shards = cshard.plan(_corpus(cfg), cfg, args.shards, cfg["run"]["workloads"])
+    if args.json:
+        print(json.dumps([{"shard": s.spec, "workloads": s.workloads, "bytes": s.bytes,
+                           "files": s.files} for s in shards], indent=1))
+    else:
+        print(cshard.to_text(shards))
+    return 0
 
 
 def _list(_args) -> int:
@@ -153,7 +186,9 @@ def _cdiff(args) -> int:
 
 def _cgate(args) -> int:
     from pbench import ccompare, table
-    problems = ccompare.gate(table.load_set(args.baseline), table.load_set(args.dir), args.workloads)
+    eng = table.load_set(args.dir)
+    problems = ccompare.gate(table.load_set(args.baseline), eng,
+                             args.workloads or ccompare.run_workloads(eng))
     for problem in problems:
         print(problem, file=sys.stderr)
     if not problems:
@@ -237,6 +272,8 @@ def main(argv=None) -> int:
                    help="where clusters live: on the device under test")
     r.add_argument("--out", type=Path, default=REPO / "specs" / "results")
     r.add_argument("--no-fio", action="store_true", help="skip the fio device baseline")
+    r.add_argument("--shard", metavar="I/N",
+                   help="C suite: run shard I of N of the corpus (see cshard)")
     r.add_argument("--keep-failed", action="store_true",
                    help="keep the cluster of a cell that errors, for debugging")
     r.set_defaults(fn=_run)
@@ -274,8 +311,15 @@ def main(argv=None) -> int:
     gate = sub.add_parser("cgate", help="fail on incomplete or differing C-suite results")
     gate.add_argument("baseline", type=Path)
     gate.add_argument("dir", type=Path)
-    gate.add_argument("--workloads", type=_csv(str), default=["C1", "C2", "C3", "C4"])
+    gate.add_argument("--workloads", type=_csv(str),
+                      help="default: the workloads the run had (a shard's, or C1-C4)")
     gate.set_defaults(fn=_cgate)
+
+    sh = sub.add_parser("cshard", help="C suite: the files each of N shards runs")
+    sh.add_argument("--shards", type=int, required=True)
+    sh.add_argument("--config", type=Path, default=HERE / "configs" / "c_full_ci.toml")
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(fn=_cshard)
 
     evidence = sub.add_parser("gate", help="validate complete, intact execution evidence and optional baseline compatibility")
     evidence.add_argument("dirs", nargs="+", type=Path)

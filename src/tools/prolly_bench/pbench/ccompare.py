@@ -56,6 +56,13 @@ def corpus_path(rs: ResultSet) -> Path:
     return Path(cfg["tools"]["sqllogictest"]).expanduser() / "test"
 
 
+def run_workloads(rs: ResultSet) -> list[str]:
+    """The workloads a run was asked for (a shard's are those it has files
+    of, cshard.py); all four when it named none."""
+    cfg = json.loads((rs.path / "config.json").read_text())
+    return list(cfg.get("run", {}).get("workloads") or ["C1", "C2", "C3", "C4"])
+
+
 def exceptions_for(am: str, path: Path = EXCEPTIONS) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -109,8 +116,10 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
     return out
 
 
-def evidence(d: Path, am: str) -> tuple[list[str], dict]:
-    """Reconcile raw records against the plan and summary; never trust counts alone."""
+def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
+    """Reconcile raw records against the plan and summary; never trust counts alone.
+    With statuses, a record that didn't run to a result (crashed, timed out,
+    ...) is a problem too."""
     problems = []
     try:
         summary = json.loads((d / "summary.json").read_text())
@@ -132,7 +141,7 @@ def evidence(d: Path, am: str) -> tuple[list[str], dict]:
                     raise ValueError("duplicate, unordered, unplanned or legacy record")
                 if expected["skip"] != (status == "skipped"):
                     raise ValueError("unexpected skip or execution of excluded record")
-                if status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
+                if statuses and status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
                     problems.append(f"{key}: {status}")
                 # (a client-side error has only its message: a result, not
                 # missing evidence)
