@@ -131,6 +131,7 @@
 #include "access/prolly_tablefile.h"
 #include "access/prolly_xlog.h"
 #include "access/transam.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -297,7 +298,8 @@ typedef struct CheckedEnd
 /*
  * The chunks named from outside the store (keep()) since a collection
  * began, a collection at a time per database, up to KEEP_COLLECTIONS at
- * once; past KEEP_MAX of them, overflow says the collection keeps all.
+ * once; past KEEP_MAX of them, overflow says the collection keeps all, as
+ * does one that finds no set free.
  */
 #define KEEP_COLLECTIONS	8
 #define KEEP_MAX			4096
@@ -312,7 +314,10 @@ typedef struct KeepSet
 	ProllyHash	hashes[KEEP_MAX];
 } KeepSet;
 
-/* a transaction that told keep() of a chunk: its backend's (xid invalid: none) */
+/*
+ * a transaction that told keep() of a chunk: its backend's, or once
+ * prepared a prepared transactions' slot's (xid invalid: none)
+ */
 typedef struct KeepTouch
 {
 	Oid			dboid;
@@ -335,13 +340,19 @@ typedef struct JournalShared
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
 
-	/* a process's own, by proc number: ranges, then (touches()) touches */
+	/*
+	 * a process's own, by proc number: ranges, then (touches()) touches;
+	 * then (prepared()) the prepared transactions' touches
+	 */
+	int			nprepared;
 	int			nranges;
 	AppendRange ranges[FLEXIBLE_ARRAY_MEMBER];
 } JournalShared;
 
 #define TOUCHES_OFFSET(nranges) \
 	MAXALIGN(offsetof(JournalShared, ranges) + (nranges) * sizeof(AppendRange))
+#define PREPARED_OFFSET(nranges) \
+	MAXALIGN(TOUCHES_OFFSET(nranges) + (nranges) * sizeof(KeepTouch))
 
 static JournalShared *journal_shared = NULL;
 
@@ -926,10 +937,18 @@ wait_appends(ProllyChunkStore *s, uint64 before)
 	ConditionVariableCancelSleep();
 }
 
+static bool journal_has(ProllyChunkStore *s, const ProllyHash *hash);
+
 static KeepTouch *
 touches(JournalShared *js)
 {
 	return (KeepTouch *) ((char *) js + TOUCHES_OFFSET(js->nranges));
+}
+
+static KeepTouch *
+prepared(JournalShared *js)
+{
+	return (KeepTouch *) ((char *) js + PREPARED_OFFSET(js->nranges));
 }
 
 /*
@@ -937,7 +956,10 @@ touches(JournalShared *js)
  * noted, for a collection that begins before it ends to wait for, and the
  * chunk added to the keep set of a collection running now.  Both under
  * the mutex a collection begins under, so one either waits for the
- * transaction or keeps the chunk.
+ * transaction or keeps the chunk; and under the journal's lock, which a
+ * collection holds from before it last reads its keep set until its
+ * swap, so a chunk isn't added once it has been read for the last time.
+ * A swap before then may have dropped the chunk: the transaction fails.
  */
 static void
 journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
@@ -946,6 +968,7 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 	KeepTouch  *t = &touches(js)[MyProcNumber];
 	TransactionId xid = GetTopTransactionId();
 
+	LWLockAcquire(ProllyJournalLock, LW_SHARED);
 	SpinLockAcquire(&js->mutex);
 	if (!TransactionIdIsValid(t->xid))
 	{
@@ -965,6 +988,65 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 			k->overflow = true;
 	}
 	SpinLockRelease(&js->mutex);
+	LWLockRelease(ProllyJournalLock);
+	if (!journal_has(s, hash))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to a concurrent collection of the chunk store"),
+				 errdetail("A value stored by content was collected meanwhile."),
+				 errhint("The transaction might succeed if retried.")));
+}
+
+/*
+ * The transaction is about to be prepared: its touch moves to a prepared
+ * transactions' slot, there until a collection finds it ended (a prepared
+ * transaction outlives its backend's).
+ */
+static void
+keep_touch_prepare(void)
+{
+	JournalShared *js;
+	KeepTouch  *t;
+	KeepTouch  *ps;
+	TransactionId *xids;
+	bool		moved = false;
+
+	if (journal_shared == NULL)
+		return;
+	js = journal_shared;
+	t = &touches(js)[MyProcNumber];
+	if (!TransactionIdIsValid(t->xid))
+		return;
+	ps = prepared(js);
+	xids = palloc(sizeof(TransactionId) * Max(js->nprepared, 1));
+	for (int pass = 0; pass < 2 && !moved; pass++)
+	{
+		SpinLockAcquire(&js->mutex);
+		for (int i = 0; i < js->nprepared && !moved; i++)
+		{
+			if (!TransactionIdIsValid(ps[i].xid))
+			{
+				ps[i] = *t;
+				t->xid = InvalidTransactionId;
+				moved = true;
+			}
+			xids[i] = ps[i].xid;
+		}
+		SpinLockRelease(&js->mutex);
+		/* (those of transactions ended since free their slots) */
+		for (int i = 0; i < js->nprepared && !moved; i++)
+		{
+			if (TransactionIdIsInProgress(xids[i]))
+				continue;
+			SpinLockAcquire(&js->mutex);
+			if (ps[i].xid == xids[i])
+				ps[i].xid = InvalidTransactionId;
+			SpinLockRelease(&js->mutex);
+		}
+	}
+	pfree(xids);
+	if (!moved)
+		elog(ERROR, "no slot for a prepared transaction's values stored by content");
 }
 
 /* The transaction has ended: a collection need wait for it no more. */
@@ -987,13 +1069,18 @@ keep_touch_end(void)
 
 /*
  * A collection begins keeping what keep() is told of, and will wait for
- * the transactions told of one before.
+ * the transactions told of one before (prepared ones too): its keep set,
+ * or -1 if none is free (it then keeps every chunk).
  */
 static int
 keep_begin(ProllyChunkStore *s, List **xids)
 {
 	JournalShared *js = shared();
 	KeepTouch  *ts = touches(js);
+	KeepTouch  *ps = prepared(js);
+	TransactionId *found = palloc(sizeof(TransactionId) *
+								  (js->nranges + js->nprepared));
+	int			nfound = 0;
 	int			slot = -1;
 
 	SpinLockAcquire(&js->mutex);
@@ -1007,18 +1094,20 @@ keep_begin(ProllyChunkStore *s, List **xids)
 		js->keeps[slot].dboid = s->dboid;
 		js->keeps[slot].spcoid = s->spcoid;
 		js->keeps[slot].n = 0;
-		for (int i = 0; i < js->nranges; i++)
-		{
-			if (TransactionIdIsValid(ts[i].xid) && ts[i].dboid == s->dboid &&
-				ts[i].spcoid == s->spcoid && !list_member_xid(*xids, ts[i].xid))
-				*xids = lappend_xid(*xids, ts[i].xid);
-		}
+	}
+	for (int i = 0; i < js->nranges + js->nprepared; i++)
+	{
+		KeepTouch  *t = i < js->nranges ? &ts[i] : &ps[i - js->nranges];
+
+		if (TransactionIdIsValid(t->xid) && t->dboid == s->dboid &&
+			t->spcoid == s->spcoid)
+			found[nfound++] = t->xid;
 	}
 	SpinLockRelease(&js->mutex);
-	if (slot < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("too many chunk store collections are running")));
+	for (int i = 0; i < nfound; i++)
+		if (!list_member_xid(*xids, found[i]))
+			*xids = lappend_xid(*xids, found[i]);
+	pfree(found);
 	return slot;
 }
 
@@ -1879,6 +1968,7 @@ journal_xact_callback(XactEvent event, void *arg)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot prepare a transaction that moved the chunk store's root")));
 			flush_pending(s);
+			keep_touch_prepare();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -3769,6 +3859,7 @@ struct ProllyChunkGc
 	bool		waited;
 	Segment    *appended;		/* the segment appended to from the seal */
 	int			keep;			/* its KeepSet, -1 once let go */
+	bool		keep_all;		/* it had none */
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
@@ -4108,7 +4199,6 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->segment = seal_segment(s, &gc->m);
 	/* the sealed segments whole before they are read */
 	wait_appends(s, gc->segment);
-	gc->keep = keep_begin(s, &gc->xids);
 	INJECTION_POINT("prolly-gc-sealed", NULL);
 	gc->next_id = gc->m.last_id + 1;
 
@@ -4171,6 +4261,14 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->appended->path = segment_path(s->dboid, s->spcoid, gc->segment);
 	gc->appended->file = -1;
 	gc->appended->scanned = JOURNAL_HEADER_SIZE;
+
+	/*
+	 * Keeping from here on (one that began before the seal is as good: a
+	 * transaction that named a chunk since is waited for), its set let go
+	 * by gc_abort() if the collection fails.
+	 */
+	gc->keep = keep_begin(s, &gc->xids);
+	gc->keep_all = (gc->keep < 0);
 	s->gc = gc;
 
 	*root = gc->m.root;
@@ -4616,15 +4714,22 @@ journal_gc_kept(ProllyChunkGc *gc, ProllyChunkRefVisit visit, void *arg)
 	int			n;
 	bool		overflow;
 
+	if (gc->keep_all)
+		return false;
 	if (gc->keep < 0)
 		elog(ERROR, "the collection keeps nothing any more");
 	k = &js->keeps[gc->keep];
-	hashes = palloc(sizeof(ProllyHash) * KEEP_MAX);
+
+	/*
+	 * Only the count under the mutex: the hashes before it are written
+	 * before it is raised, and none is changed until the set is let go.
+	 */
 	SpinLockAcquire(&js->mutex);
 	overflow = k->overflow;
 	n = k->n - gc->kept_seen;
-	memcpy(hashes, k->hashes + gc->kept_seen, sizeof(ProllyHash) * n);
 	SpinLockRelease(&js->mutex);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	memcpy(hashes, k->hashes + gc->kept_seen, sizeof(ProllyHash) * n);
 	for (int i = 0; i < n; i++)
 		visit(&hashes[i], arg);
 	gc->kept_seen += n;
@@ -4776,8 +4881,8 @@ append_ranges(void)
 static Size
 journal_shmem_size(void)
 {
-	return add_size(TOUCHES_OFFSET(append_ranges()),
-					mul_size(append_ranges(), sizeof(KeepTouch)));
+	return add_size(PREPARED_OFFSET(append_ranges()),
+					mul_size(max_prepared_xacts, sizeof(KeepTouch)));
 }
 
 static void
@@ -4791,6 +4896,7 @@ journal_shmem_init(void *area)
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
 	js->nranges = append_ranges();
+	js->nprepared = max_prepared_xacts;
 }
 
 /*

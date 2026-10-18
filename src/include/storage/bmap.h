@@ -138,7 +138,9 @@ extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
  * allocated as the scan begins, each once whatever maps hold it, as read
  * from the store (pages in shared buffers aren't seen until written).  A
  * block written meanwhile is visited until two reads of it agree, so no
- * version of it is seen only torn.  Returns the blocks read.
+ * version of it is seen only torn.  A sweep (which may free blocks and
+ * shorten the store) waits for it, as it does for a sweep.  Returns the
+ * blocks read.
  */
 typedef void (*BmapBlockVisit) (const char *page, void *arg);
 extern uint64 bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit,

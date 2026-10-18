@@ -290,6 +290,7 @@ copying_collect(bool full, ProllyGcResult *result)
 	PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
 	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
 		mark_all(&mk);
+	INJECTION_POINT("prolly-gc-kept", NULL);
 	drain(&mk);
 	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	PROLLY_CALL(cs, gc_retire, mk.gc);

@@ -4,7 +4,11 @@
 # a database's pages name, dead tuples' too, whatever branch maps the
 # page; those named by a transaction that began naming them before the
 # collection did (waited for); and those named while it runs (its keep
-# set).  A tree nothing names is freed.
+# set).  A tree nothing names is freed.  A transaction that names a tree
+# in a collection's window waits for its swap, and fails if the tree went;
+# a prepared one that named one is waited for; a sweep waits for the scan
+# of the page store; a collection that fails as it begins lets its keep
+# set go.
 
 use strict;
 use warnings FATAL => 'all';
@@ -19,7 +23,10 @@ if ($ENV{enable_injection_points} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('roots');
 $node->init;
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', qq{
+autovacuum = off
+max_prepared_transactions = 5
+});
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
@@ -121,6 +128,101 @@ $g->query_until(qr/collected/, '');
 $g->quit;
 is(has($kept), 't', 'a tree named while a collection runs is kept');
 is(reads(5, 'kept'), 't', 'every node of it');
+
+# A tree named in a collection's window, after it last read its keep set:
+# naming it waits for the swap, then fails, the swap having freed it.
+my $late = root('late');
+my $win = $node->background_psql('postgres');
+$win->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-gc-kept', 'wait')});
+$win->query_until(qr/collecting/, q{
+	\echo collecting
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo collected
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-gc-kept'})
+  or die 'the collection did not stop';
+my $namer = $node->background_psql('postgres', on_error_stop => 0);
+$namer->query_until(qr/naming/, "\\echo naming\nSELECT (test_toast_pointer("
+	  . pointer('late') . ")).root AS late_root;\n\\echo named\n");
+sleep(1);
+sql(q{SELECT injection_points_wakeup('prolly-gc-kept')});
+$win->query_until(qr/collected/, '');
+$win->quit;
+my $named_out = $namer->query_until(qr/named/, '');
+my $late_root = ($named_out =~ /([0-9a-f]{64})/) ? $1 : '';
+ok($namer->{stderr} =~ /concurrent collection of the chunk store/
+	  || ($late_root ne '' && has($late_root) eq 't'),
+	'a tree named in the window fails or is kept, never lost');
+$namer->quit;
+
+# A prepared transaction that named a tree is waited for.  (The tree is
+# there already, so naming it appends nothing; and a collection first, so
+# none is left retiring, whose readers a collection would wait for.)
+gc();
+my $prep = $node->background_psql('postgres');
+$prep->query_safe('SELECT (test_toast_pointer(' . pointer('prepared') . ')).root');
+$prep->query_safe('BEGIN');
+$prep->query_safe('SELECT (test_toast_pointer(' . pointer('prepared') . ')).root');
+$prep->query_safe(q{PREPARE TRANSACTION 'named'});
+$prep->quit;
+my $pc = $node->background_psql('postgres');
+$pc->query_until(qr/collecting/, q{
+	\echo collecting
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo collected
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event_type = 'Lock' AND wait_event = 'transactionid'
+	AND query LIKE '%test_chunk_gc%'})
+  or die 'the collection did not wait for the prepared transaction';
+pass('a collection waits for a prepared transaction that named a tree');
+sql(q{COMMIT PREPARED 'named'});
+$pc->query_until(qr/collected/, '');
+$pc->quit;
+
+# A sweep waits for a collection's scan of the page store.
+my $sc = $node->background_psql('postgres');
+$sc->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-scan-store', 'wait')});
+$sc->query_until(qr/collecting/, q{
+	\echo collecting
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo collected
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'bmap-scan-store'})
+  or die 'the collection did not stop';
+my $sw = $node->background_psql('postgres');
+$sw->query_until(qr/sweeping/, q{
+	\echo sweeping
+	SELECT count(*) FROM prolly_page_sweep();
+	\echo swept
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event_type = 'Lock' AND query LIKE '%prolly_page_sweep%'})
+  or die 'the sweep did not wait';
+pass('a sweep waits for a collection\'s scan of the page store');
+sql(q{SELECT injection_points_wakeup('bmap-scan-store')});
+$sc->query_until(qr/collected/, '');
+$sc->quit;
+$sw->query_until(qr/swept/, '');
+$sw->quit;
+
+# Collections that fail as they begin, more than there are keep sets: the
+# next one still runs, and frees a tree nothing names.
+sql(q{SELECT injection_points_attach('prolly-gc-sealed', 'error')});
+for my $i (1 .. 9)
+{
+	my ($ret, $out, $err) = $node->psql('postgres',
+		'SELECT test_chunk_gc(false) IS NOT NULL');
+	die "collection $i: $err" unless $err =~ /error triggered for injection point/;
+}
+sql(q{SELECT injection_points_detach('prolly-gc-sealed')});
+my $after = root('after failures');
+gc();
+is(has($after), 'f', 'after failed collections, one still frees');
 
 $node->stop;
 done_testing();

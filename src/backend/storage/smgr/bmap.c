@@ -3988,9 +3988,14 @@ bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
 	PGIOAlignedBlock a;
 	PGIOAlignedBlock b;
 	uint64		nread = 0;
+	LOCKTAG		sweeptag;
 
 	if (!alloc_exists(rel))
 		return 0;
+
+	/* not while a sweep frees blocks or shortens the store */
+	SET_LOCKTAG_OBJECT(sweeptag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
 
 	/* the blocks allocated as it begins */
 	metabuf = alloc_read(rel, 0);
@@ -4014,6 +4019,7 @@ bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
 		UnlockReleaseBuffer(buf);
 	}
 	UnlockReleaseBuffer(metabuf);
+	INJECTION_POINT("bmap-scan-store", NULL);
 
 	store = store_smgr(rel);
 	for (BlockNumber blk = 0; blk < hw; blk++)
@@ -4036,6 +4042,7 @@ bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
 		}
 	}
 	pfree(allocated);
+	LockRelease(&sweeptag, ShareLock, false);
 	return nread;
 }
 
