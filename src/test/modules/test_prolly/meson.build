@@ -78,6 +78,7 @@ tests += {
       'walks',
       'remotes',
       'remote_clone',
+      'remote_serve',
       'dependencies',
       'dependency_moves',
       'canonical_escapes',

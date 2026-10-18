@@ -1,0 +1,203 @@
+-- This database as another's remote: the functions a network remote calls.
+-- Fetching takes owning the database or pg_prolly_fetch's privileges,
+-- pushing pg_prolly_push's; a push's chunks are checked as a fetch's are
+-- before anything is added, and its branch moved as a compare-and-swap.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT value AS fmt FROM test_fold_items() WHERE key = '!:format' \gset
+CREATE FUNCTION pg_temp.h(ref text) RETURNS bytea LANGUAGE sql
+  AS $$ SELECT decode(dolt_hashof(ref), 'hex') $$;
+CREATE SCHEMA rs VERSIONED;
+CREATE TABLE rs.t (id int PRIMARY KEY, v text);
+INSERT INTO rs.t VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('rs_b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO rs.t VALUES (2, 'two');
+SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- what a fetch asks
+SELECT dolt_serve_format() = :'fmt' AS same_format;
+ same_format 
+-------------
+ t
+(1 row)
+
+SELECT branch, commit_id = pg_temp.h(branch) AS at_head FROM dolt_serve_heads()
+  WHERE branch IN ('main', 'rs_b') ORDER BY branch;
+ branch | at_head 
+--------+---------
+ main   | t
+ rs_b   | t
+(2 rows)
+
+SELECT dolt_serve_has(ARRAY[pg_temp.h('main'), '\x00ff'::bytea]);
+ dolt_serve_has 
+----------------
+ {t,f}
+(1 row)
+
+SELECT hash = pg_temp.h('main') AS same_hash, length(chunk) > 0 AS has_bytes
+  FROM dolt_serve_get(ARRAY[pg_temp.h('main'), '\x00ff'::bytea]);
+ same_hash | has_bytes 
+-----------+-----------
+ t         | t
+(1 row)
+
+-- a push's move: a compare-and-swap of the branch's head
+SELECT dolt_serve_move_head('rs_b', pg_temp.h('main'), pg_temp.h('main'), :'fmt', false);	-- not there
+ dolt_serve_move_head 
+----------------------
+ f
+(1 row)
+
+SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'), pg_temp.h('main'), :'fmt', false);
+ dolt_serve_move_head 
+----------------------
+ t
+(1 row)
+
+SELECT dolt_hashof('rs_b') = dolt_hashof('main') AS moved;
+ moved 
+-------
+ t
+(1 row)
+
+-- a branch it doesn't have: made, with only its head
+SELECT dolt_serve_move_head('rs_new', '', pg_temp.h('HEAD~1'), :'fmt', false);
+ dolt_serve_move_head 
+----------------------
+ t
+(1 row)
+
+SELECT dolt_hashof('rs_new') = dolt_hashof('HEAD~1') AS made;
+ made 
+------
+ t
+(1 row)
+
+-- deleted
+SELECT dolt_serve_move_head('rs_new', pg_temp.h('rs_new'), NULL, :'fmt', false);
+ dolt_serve_move_head 
+----------------------
+ t
+(1 row)
+
+SELECT count(*) AS left FROM dolt_branches WHERE name = 'rs_new';
+ left 
+------
+    0
+(1 row)
+
+-- the session's branch with uncommitted changes: refused unless forced
+INSERT INTO rs.t VALUES (3, 'three');
+SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fmt', false);
+ERROR:  branch "main" has uncommitted changes
+HINT:  Commit or reset them there, or push with --force, which drops them.
+SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fmt', true);
+ dolt_serve_move_head 
+----------------------
+ t
+(1 row)
+
+SELECT id, v FROM rs.t ORDER BY id;		-- as the commit has them
+ id |  v  
+----+-----
+  1 | one
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- another format: refused
+SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
+ERROR:  this database holds commits of canonical format 2, not 0
+-- a chunk sent under a hash it doesn't have: refused when received, and
+-- nothing moved
+SELECT dolt_hashof('rs_b') AS rs_b \gset
+BEGIN;
+SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920212223242526272829303132'::bytea],
+						  ARRAY['\xdeadbeef'::bytea]);
+ dolt_serve_receive 
+--------------------
+ 
+(1 row)
+
+SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'),
+							'\x0102030405060708091011121314151617181920212223242526272829303132',
+							:'fmt', false);
+ERROR:  the remote's chunk 0102030405060708091011121314151617181920212223242526272829303132 doesn't match its hash
+DETAIL:  Its bytes hash to 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953.
+ROLLBACK;
+SELECT dolt_hashof('rs_b') = :'rs_b' AS unmoved;
+ unmoved 
+---------
+ t
+(1 row)
+
+-- privileges: none without the roles; fetching with pg_prolly_fetch; and
+-- pushing only with pg_prolly_push
+CREATE ROLE regress_rs_none;
+CREATE ROLE regress_rs_fetch IN ROLE pg_prolly_fetch;
+CREATE ROLE regress_rs_push IN ROLE pg_prolly_push;
+SET ROLE regress_rs_none;
+SELECT dolt_serve_format();
+ERROR:  permission denied for function dolt_serve_format
+RESET ROLE;
+SET ROLE regress_rs_fetch;
+SELECT dolt_serve_format() = :'fmt' AS fetches;
+ fetches 
+---------
+ t
+(1 row)
+
+SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'), pg_temp.h('rs_b'), :'fmt', false);
+ERROR:  permission denied for function dolt_serve_move_head
+RESET ROLE;
+SET ROLE regress_rs_push;
+SELECT count(*) > 0 AS sees_heads FROM dolt_serve_heads();
+ sees_heads 
+------------
+ t
+(1 row)
+
+SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'), pg_temp.h('rs_b'), :'fmt', false) AS pushes;
+ pushes 
+--------
+ t
+(1 row)
+
+RESET ROLE;
+DROP ROLE regress_rs_none;
+DROP ROLE regress_rs_fetch;
+DROP ROLE regress_rs_push;
+SELECT dolt_branch('-D', 'rs_b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA rs CASCADE;
+NOTICE:  drop cascades to table rs.t
+SELECT length(dolt_commit('-Am', 'rs gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

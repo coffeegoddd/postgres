@@ -2049,6 +2049,110 @@ copies_hold(void)
 	return see_head(branch_ops()->current());
 }
 
+static void
+count_table(const char *name, const ProllyNodeRef *data,
+			const ProllyValue *description, const char *unreadable, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+static void
+count_object(const char *name, ProllyDiffKind kind, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+/*
+ * Has a branch with copies changes its head lacks?  One without commits
+ * has whatever its working set holds (a versioned schema, though empty).
+ */
+static bool
+branch_dirty(const char *name, const ProllyHash *head)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef ws;
+	ProllyNodeRef committed;
+	List	   *left_out = NIL;
+
+	if (!copies_read_working_set(name, InvalidOid, &ws, &left_out))
+		return false;
+	if (left_out != NIL)
+		return true;
+	if (head->len > 0)
+		return !(copies_commit_working_set(head, &committed) &&
+				 same_hash(&ws.hash, &committed.hash));
+	{
+		ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &env,
+										   CurrentMemoryContext);
+		ProllyNodeRef empty;
+		int			n = 0;
+
+		PROLLY_CALL(tree, build_finish, b, &empty);
+		prolly_database_components(&dc);
+		PROLLY_CALL(dc.canonicalizer, tables, &ws, count_table, &n);
+		PROLLY_CALL(dc.canonicalizer, objects, &empty, &ws, count_object, &n);
+		return n > 0;
+	}
+}
+
+static bool
+copies_branch_move(const char *name, const ProllyHash *expected,
+				   const ProllyHash *head, bool force)
+{
+	ProllyHash	at;
+	ProllyCommitInfo info;
+	StringInfoData key;
+
+	lock_refs();
+	AcceptInvalidationMessages();
+	(void) branch_head(name, &at);
+	if (!same_hash(&at, expected))
+		return false;
+	if (head == NULL)
+	{
+		copies_branch_delete(name, force);
+		return true;
+	}
+	if (!copies_commit_get(head, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("commit %s is missing", prolly_hash_hex(head))));
+	if (!branch_exists(name))
+	{
+		copies_branch_create(name, prolly_hash_hex(head));
+		return true;
+	}
+	/* (one with only a head is moved as its head; its copies come later) */
+	if (OidIsValid(branch_oid(name)))
+	{
+		if (!force && branch_dirty(name, &at))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" has uncommitted changes", name),
+					 errhint("Commit or reset them there, or push with --force, which drops them.")));
+		if (strcmp(name, branch_ops()->current()) == 0)
+		{
+			bool		pushed = see_head(name);
+
+			move_settled(&info.root);
+			if (pushed)
+				PopActiveSnapshot();
+		}
+		else
+			branch_ops()->run_on(name, move_settled, &info.root);
+	}
+	branch_set_head(name, head);
+
+	/* (a move ends a merge in progress there, as a reset does) */
+	initStringInfo(&key);
+	merge_key(&key, name);
+	refs_put(key.data, key.len, NULL);
+	resetStringInfo(&key);
+	violations_key(&key, name);
+	refs_put(key.data, key.len, NULL);
+	return true;
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -2087,4 +2191,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.trackings = copies_trackings,
 	.upstream_set = copies_upstream_set,
 	.upstream = copies_upstream,
+	.branch_move = copies_branch_move,
 };

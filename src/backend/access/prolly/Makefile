@@ -44,6 +44,7 @@ OBJS = \
 	prolly_vcs.o \
 	reclaim_stub.o \
 	remote_file.o \
+	remote_serve.o \
 	refs_copies.o \
 	refs_history.o \
 	refs_stub.o \
