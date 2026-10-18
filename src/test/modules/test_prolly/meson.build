@@ -87,6 +87,7 @@ tests += {
       'partitions',
       'range_types',
       'undescribed_objects',
+      'statistics_casts',
       'append_check',
       'journal_segments',
       'gc',

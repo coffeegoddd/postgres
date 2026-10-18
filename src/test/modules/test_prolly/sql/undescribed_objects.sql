@@ -20,16 +20,11 @@ CREATE TEXT SEARCH DICTIONARY ud.dict (TEMPLATE = pg_catalog.simple);
 CREATE TEXT SEARCH PARSER ud.prs (START = prsd_start, GETTOKEN = prsd_nexttoken,
   END = prsd_end, LEXTYPES = prsd_lextype);
 CREATE TEXT SEARCH TEMPLATE ud.tmpl (INIT = dsimple_init, LEXIZE = dsimple_lexize);
-CREATE STATISTICS ud.st ON a, b FROM ud.t;
-CREATE TYPE ud.e AS ENUM ('a', 'b');
-CREATE CAST (ud.e AS int4) WITH INOUT;
 
-SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name;
+SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name COLLATE "C";
 SELECT dolt_commit('-Am', 'refused');
 
 -- each one gone, the commit goes through
-DROP CAST (ud.e AS int4);
-SELECT dolt_commit('-Am', 'refused');
 DROP OPERATOR ud.=== (int, int);
 DROP OPERATOR CLASS ud.cls USING hash;
 DROP OPERATOR FAMILY ud.cls USING hash;
@@ -39,9 +34,8 @@ DROP TEXT SEARCH CONFIGURATION ud.cfg;
 DROP TEXT SEARCH DICTIONARY ud.dict;
 DROP TEXT SEARCH PARSER ud.prs;
 DROP TEXT SEARCH TEMPLATE ud.tmpl;
-DROP STATISTICS ud.st;
 SELECT * FROM dolt_status WHERE status = 'not covered';
-SELECT length(dolt_commit('-Am', 'an enum')::text) AS committed;
+SELECT length(dolt_commit('-Am', 'none')::text) AS committed;
 
 -- only a commit refuses them: a move discards them as uncommitted work
 -- (a reset), or leaves them on their branch (a checkout); a branch's first

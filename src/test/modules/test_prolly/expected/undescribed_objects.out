@@ -22,32 +22,23 @@ CREATE TEXT SEARCH DICTIONARY ud.dict (TEMPLATE = pg_catalog.simple);
 CREATE TEXT SEARCH PARSER ud.prs (START = prsd_start, GETTOKEN = prsd_nexttoken,
   END = prsd_end, LEXTYPES = prsd_lextype);
 CREATE TEXT SEARCH TEMPLATE ud.tmpl (INIT = dsimple_init, LEXIZE = dsimple_lexize);
-CREATE STATISTICS ud.st ON a, b FROM ud.t;
-CREATE TYPE ud.e AS ENUM ('a', 'b');
-CREATE CAST (ud.e AS int4) WITH INOUT;
-SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name;
-    table_name     | staged |   status    
--------------------+--------+-------------
- ud."==="          | f      | not covered
- ud.cfg            | f      | not covered
- ud.cls            | f      | not covered
- ud.conv           | f      | not covered
- ud.dict           | f      | not covered
- (ud.e AS integer) | f      | not covered
- ud.fam            | f      | not covered
- ud.prs            | f      | not covered
- ud.st             | f      | not covered
- ud.tmpl           | f      | not covered
-(10 rows)
+SELECT * FROM dolt_status WHERE status = 'not covered' ORDER BY table_name COLLATE "C";
+ table_name | staged |   status    
+------------+--------+-------------
+ ud."==="   | f      | not covered
+ ud.cfg     | f      | not covered
+ ud.cls     | f      | not covered
+ ud.conv    | f      | not covered
+ ud.dict    | f      | not covered
+ ud.fam     | f      | not covered
+ ud.prs     | f      | not covered
+ ud.tmpl    | f      | not covered
+(8 rows)
 
-SELECT dolt_commit('-Am', 'refused');
-ERROR:  prolly commits don't cover casts yet: (ud.e AS integer)
-DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
--- each one gone, the commit goes through
-DROP CAST (ud.e AS int4);
 SELECT dolt_commit('-Am', 'refused');
 ERROR:  prolly commits don't cover operators yet: ud."==="
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+-- each one gone, the commit goes through
 DROP OPERATOR ud.=== (int, int);
 DROP OPERATOR CLASS ud.cls USING hash;
 DROP OPERATOR FAMILY ud.cls USING hash;
@@ -57,18 +48,14 @@ DROP TEXT SEARCH CONFIGURATION ud.cfg;
 DROP TEXT SEARCH DICTIONARY ud.dict;
 DROP TEXT SEARCH PARSER ud.prs;
 DROP TEXT SEARCH TEMPLATE ud.tmpl;
-DROP STATISTICS ud.st;
 SELECT * FROM dolt_status WHERE status = 'not covered';
  table_name | staged | status 
 ------------+--------+--------
 (0 rows)
 
-SELECT length(dolt_commit('-Am', 'an enum')::text) AS committed;
- committed 
------------
-        66
-(1 row)
-
+SELECT length(dolt_commit('-Am', 'none')::text) AS committed;
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
 -- only a commit refuses them: a move discards them as uncommitted work
 -- (a reset), or leaves them on their branch (a checkout); a branch's first
 -- use doesn't take them from the branch it was copied from
@@ -147,9 +134,7 @@ SELECT dolt_branch('-D', 'ud_other');
 DROP SERVER ud_srv;
 DROP FOREIGN DATA WRAPPER ud_fdw;
 DROP SCHEMA ud CASCADE;
-NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table ud.t
-drop cascades to type ud.e
+NOTICE:  drop cascades to table ud.t
 SELECT length(dolt_commit('-Am', 'ud gone')::text) AS committed;
  committed 
 -----------

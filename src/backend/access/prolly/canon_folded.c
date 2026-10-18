@@ -23,13 +23,15 @@
  *						   out ("t" or "f")
  *	"t:" table			-> its data tree (hash length, hash), then its schema
  *	"v:" view			-> its query
- *	"y:" type			-> an enum's labels, a domain's or a composite
- *						   type's definition
+ *	"x:" source AS target -> a cast: its method (and function), its
+ *						   context
+ *	"y:" type			-> an enum's labels, a domain's, a composite or
+ *						   a range type's definition
  *
  * A table's schema lists its live columns in order (name, type, nullness,
  * collation if not the type's, default, identity, generation), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
- * prints them.  Names are qualified whatever the session's search path (it
+ * prints them (then its policies and extended statistics, if any).  Names are qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
  * order, dropped columns) reaches the hash.
@@ -211,6 +213,7 @@ typedef struct Canon
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
+static void append_statistics(StringInfo out, Relation rel);
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -851,6 +854,9 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfo(out, "policies\n%s", policies.data);
 	}
 
+	/* Extended statistics on it, by name (a section only if it has any). */
+	append_statistics(out, rel);
+
 	/* A partitioned table's key; a partition's parent and bound. */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
@@ -888,6 +894,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 static char *qualified_function(Oid fn);
 static void refuse_undescribed(Canon *cn);
+static void describe_casts(Canon *cn);
 
 /*
  * Is an object part of a type (a range type's constructors, its cast to its
@@ -916,6 +923,53 @@ part_of_type(Oid classid, Oid objid)
 	systable_endscan(scan);
 	table_close(depRel, AccessShareLock);
 	return found;
+}
+
+/*
+ * rel's extended statistics objects, sorted, one per line: its qualified
+ * name, the CREATE STATISTICS that makes it (as Postgres's deparser prints
+ * it), and its statistics target if one was set.  None: no section.
+ */
+static void
+append_statistics(StringInfo out, Relation rel)
+{
+	Relation	srel = table_open(StatisticExtRelationId, AccessShareLock);
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	ScanKeyInit(&skey, Anum_pg_statistic_ext_stxrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(srel, StatisticExtRelidIndexId, true, NULL, 1, &skey);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_statistic_ext stx = (Form_pg_statistic_ext) GETSTRUCT(tup);
+		StringInfoData line;
+		bool		isnull;
+		Datum		target = heap_getattr(tup, Anum_pg_statistic_ext_stxstattarget,
+										  RelationGetDescr(srel), &isnull);
+
+		initStringInfo(&line);
+		append_field(&line, qualified(stx->stxnamespace, NameStr(stx->stxname)));
+		appendStringInfoChar(&line, '\t');
+		append_field(&line, pg_get_statisticsobjdef_string(stx->oid));
+		if (!isnull)
+			appendStringInfo(&line, "\t%d", DatumGetInt16(target));
+		lines = lappend(lines, line.data);
+	}
+	systable_endscan(scan);
+	table_close(srel, AccessShareLock);
+	if (lines == NIL)
+		return;
+	list_sort(lines, cstring_cmp);
+	appendStringInfoString(out, "statistics\n");
+	foreach(lc, lines)
+	{
+		appendStringInfoString(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
 }
 
 /*
@@ -1883,8 +1937,7 @@ collect(Canon *cn)
 /*
  * Objects of versioned schemas the canonical form doesn't describe: each
  * refused, not left out of a commit's hash (a clone or checkout wouldn't
- * have them).  A cast has no schema: one is refused if it casts a
- * versioned type and isn't part of a type.
+ * have them).  (Casts, which have no schema, are described.)
  */
 static void
 refuse_undescribed(Canon *cn)
@@ -1902,7 +1955,6 @@ refuse_undescribed(Canon *cn)
 		{TSDictionaryRelationId, "text search dictionaries"},
 		{TSParserRelationId, "text search parsers"},
 		{TSTemplateRelationId, "text search templates"},
-		{StatisticExtRelationId, "extended statistics"},
 	};
 	Relation	rel;
 	SysScanDesc scan;
@@ -1939,15 +1991,32 @@ refuse_undescribed(Canon *cn)
 		table_close(rel, AccessShareLock);
 	}
 
-	rel = table_open(CastRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	describe_casts(cn);
+}
+
+/*
+ * Casts of a type of a versioned schema, but those part of one (a range
+ * type's to its multirange type): "x:" items named "source AS target",
+ * each its method ("function" and the function's qualified signature,
+ * "inout" or "binary") and its context ("explicit", "assignment" or
+ * "implicit"), a line each.  (What initdb made casts no such type.)
+ */
+static void
+describe_casts(Canon *cn)
+{
+	Relation	rel = table_open(CastRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_cast c = (Form_pg_cast) GETSTRUCT(tup);
-
 		ObjectAddress src;
 		ObjectAddress tgt;
+		CanonItem  *it;
 
+		if (c->oid < FirstNormalObjectId)
+			continue;
 		ObjectAddressSet(src, TypeRelationId, c->castsource);
 		ObjectAddressSet(tgt, TypeRelationId, c->casttarget);
 		if (!canon_namespace(get_object_namespace(&src)) &&
@@ -1956,12 +2025,24 @@ refuse_undescribed(Canon *cn)
 		if (part_of_type(CastRelationId, c->oid) ||
 			in_extension(CastRelationId, c->oid))
 			continue;
-		ObjectAddressSet(src, CastRelationId, c->oid);
-		(void) uncovered(cn, "casts",
-						 psprintf("(%s AS %s)",
-								  format_type_extended(c->castsource, -1, FORMAT_TYPE_FORCE_QUALIFY),
-								  format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)),
-						 &src);
+		it = add_item(cn, "x:",
+					  psprintf("%s AS %s",
+							   format_type_extended(c->castsource, -1, FORMAT_TYPE_FORCE_QUALIFY),
+							   format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)));
+		if (c->castmethod == COERCION_METHOD_FUNCTION)
+		{
+			append_field(&it->value, "function");
+			appendStringInfoChar(&it->value, '\t');
+			append_field(&it->value, format_procedure_qualified(c->castfunc));
+		}
+		else
+			append_field(&it->value, c->castmethod == COERCION_METHOD_INOUT ?
+						 "inout" : "binary");
+		appendStringInfoChar(&it->value, '\n');
+		append_field(&it->value, c->castcontext == COERCION_CODE_IMPLICIT ? "implicit" :
+					 c->castcontext == COERCION_CODE_ASSIGNMENT ? "assignment" :
+					 "explicit");
+		appendStringInfoChar(&it->value, '\n');
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
@@ -2937,6 +3018,8 @@ typedef struct TableDef
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
 	List	   *policies;		/* statements */
+	List	   *statistics;		/* lines: name, a tab, the statement[, a tab,
+								 * the target] */
 	bool		row_security;	/* (and forced) */
 	bool		forced_row_security;
 	char	   *partition_by;	/* a partitioned table's key, or NULL */
@@ -3035,6 +3118,8 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->rules;
 		else if (strcmp(line, "policies") == 0)
 			section = &td->policies;
+		else if (strcmp(line, "statistics") == 0)
+			section = &td->statistics;
 		else if (section == &td->policies && strcmp(line, ROW_SECURITY) == 0)
 			td->row_security = true;
 		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
@@ -3053,7 +3138,8 @@ parse_table_def(const char *def, TableDef *td)
 				*next++ = '\0';
 			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
 		}
-		else if (section == &td->columns || section == &td->constraints)
+		else if (section == &td->columns || section == &td->constraints ||
+				 section == &td->statistics)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
 			*section = lappend(*section, unescape_field(line));
@@ -3692,6 +3778,28 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	/* Statistics: one changed goes and comes again. */
+	foreach(lc, from->statistics)
+		if (!list_has_string(to->statistics, lfirst(lc)))
+			sm->before = lappend(sm->before,
+								 psprintf("DROP STATISTICS IF EXISTS %s",
+										  first_field(lfirst(lc))));
+	foreach(lc, to->statistics)
+		if (!list_has_string(from->statistics, lfirst(lc)))
+		{
+			char	   *copy = pstrdup(lfirst(lc));
+			char	   *tab = strchr(copy, '\t');
+			char	   *target = tab ? strchr(tab + 1, '\t') : NULL;
+
+			if (target)
+				*target++ = '\0';
+			sm->after = lappend(sm->after, unescape_field(tab + 1));
+			if (target)
+				sm->after = lappend(sm->after,
+									psprintf("ALTER STATISTICS %s SET STATISTICS %s",
+											 first_field(lfirst(lc)), target));
+		}
+
 	/* (policies: every move's, in move_schema) */
 	if (from->row_security != to->row_security)
 		sm->after = lappend(sm->after,
@@ -3702,6 +3810,31 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 							psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
 									 to->forced_row_security ? "FORCE" : "NO FORCE"));
 	return remake;
+}
+
+/* A cast, as described (its method, then its context). */
+static char *
+create_cast_sql(const char *name, const char *def)
+{
+	char	   *copy = pstrdup(def);
+	char	   *method = strtok(copy, "\n");
+	char	   *context = unescape_field(strtok(NULL, "\n"));
+	char	   *tab = strchr(method, '\t');
+	StringInfoData sql;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE CAST (%s) ", name);
+	if (tab)
+		appendStringInfo(&sql, "WITH FUNCTION %s", unescape_field(tab + 1));
+	else if (strcmp(method, "inout") == 0)
+		appendStringInfoString(&sql, "WITH INOUT");
+	else
+		appendStringInfoString(&sql, "WITHOUT FUNCTION");
+	if (strcmp(context, "assignment") == 0)
+		appendStringInfoString(&sql, " AS ASSIGNMENT");
+	else if (strcmp(context, "implicit") == 0)
+		appendStringInfoString(&sql, " AS IMPLICIT");
+	return sql.data;
 }
 
 /* A type, as described ("enum", "domain", "composite" or "range", then lines). */
@@ -4565,6 +4698,11 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				else if (t == NULL)
 					routines = lappend(routines, drop_routine_sql(f));
 				break;
+			case 'x':
+				/* (before the routines and types it uses go) */
+				sm.before = lcons(psprintf("DROP CAST IF EXISTS (%s)", f->name),
+								  sm.before);
+				break;
 			case 'y':
 			case 'm':
 			case 'n':
@@ -4694,7 +4832,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
 										 t->name, sequence_options_sql(t->def)));
-		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
+		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v' && t->kind != 'x')
 			goto unsupported;
 	}
 	{
@@ -4746,6 +4884,15 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				sm.before = lappend(sm.before, drop_routine_sql(f));
 			sm.before = lappend(sm.before, t->def);
 		}
+	}
+	/* Casts coming, once the types and routines they name are made. */
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+
+		if (t->kind == 'x' && !(f && strcmp(t->def, f->def) == 0))
+			sm.before = lappend(sm.before, create_cast_sql(t->name, t->def));
 	}
 	/* Tables made: a partition after its partitioned table. */
 	{

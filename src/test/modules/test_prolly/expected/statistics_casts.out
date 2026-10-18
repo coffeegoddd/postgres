@@ -1,0 +1,199 @@
+-- Extended statistics and casts of versioned types, held by commits: a
+-- table's statistics in its definition, a cast as an item of its own; a
+-- move makes, changes and drops them.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA sc VERSIONED;
+CREATE TABLE sc.t (id int PRIMARY KEY, a int, b int, c text);
+SELECT length(dolt_commit('-Am', 'table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sc_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE STATISTICS sc.st (dependencies, ndistinct) ON a, b FROM sc.t;
+CREATE STATISTICS sc."st 2" ON (a + b), c FROM sc.t;
+ALTER STATISTICS sc."st 2" SET STATISTICS 50;
+CREATE TYPE sc.e AS ENUM ('x', 'y');
+CREATE FUNCTION sc.e_int(sc.e) RETURNS int LANGUAGE sql IMMUTABLE
+  AS 'SELECT CASE $1 WHEN ''x'' THEN 1 ELSE 2 END';
+CREATE CAST (sc.e AS int) WITH FUNCTION sc.e_int(sc.e) AS ASSIGNMENT;
+CREATE CAST (sc.e AS text) WITH INOUT AS IMPLICIT;
+SELECT * FROM dolt_status ORDER BY table_name COLLATE "C";
+       table_name        | staged |  status   
+-------------------------+--------+-----------
+ sc.e                    | t      | new table
+ sc.e AS integer         | t      | new table
+ sc.e AS pg_catalog.text | t      | new table
+ sc.e_int(sc.e)          | t      | new table
+ sc.t                    | t      | modified
+(5 rows)
+
+SELECT length(dolt_commit('-Am', 'held')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
+	SELECT x FROM (
+	SELECT 'stat ' || pg_get_statisticsobjdef(oid) || ' target ' ||
+		   coalesce(stxstattarget::text, '-')
+	  FROM pg_statistic_ext WHERE stxnamespace = 'sc'::regnamespace
+	UNION ALL
+	SELECT 'cast ' || castsource::regtype || ' as ' || casttarget::regtype ||
+		   ' ' || castmethod::text || castcontext::text || ' ' || castfunc::regproc
+	  FROM pg_cast WHERE castsource = 'sc.e'::regtype) s(x)
+	ORDER BY x COLLATE "C"
+$$;
+SELECT * FROM pg_temp.show();
+                                       show                                        
+-----------------------------------------------------------------------------------
+ cast sc.e as integer fa sc.e_int
+ cast sc.e as text ii -
+ stat CREATE STATISTICS sc."st 2" ON c, (a + b) FROM sc.t target 50
+ stat CREATE STATISTICS sc.st (ndistinct, dependencies) ON a, b FROM sc.t target -
+(4 rows)
+
+-- a reset from a branch without them makes them; back drops them
+SELECT dolt_checkout('sc_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'sc_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM pg_temp.show();
+                                       show                                        
+-----------------------------------------------------------------------------------
+ cast sc.e as integer fa sc.e_int
+ cast sc.e as text ii -
+ stat CREATE STATISTICS sc."st 2" ON c, (a + b) FROM sc.t target 50
+ stat CREATE STATISTICS sc.st (ndistinct, dependencies) ON a, b FROM sc.t target -
+(4 rows)
+
+SELECT 'x'::sc.e::int AS cast_works;
+ cast_works 
+------------
+          1
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT count(*) AS statistics FROM pg_statistic_ext WHERE stxnamespace = 'sc'::regnamespace;
+ statistics 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS casts FROM pg_cast WHERE castsource::regtype::text LIKE 'sc.%';
+ casts 
+-------
+     0
+(1 row)
+
+-- changed: a statistics target, a cast's context; merged
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER STATISTICS sc."st 2" SET STATISTICS 75;
+DROP CAST (sc.e AS text);
+CREATE CAST (sc.e AS text) WITH INOUT AS ASSIGNMENT;
+DROP STATISTICS sc.st;
+SELECT * FROM dolt_status ORDER BY table_name COLLATE "C";
+       table_name        | staged |  status  
+-------------------------+--------+----------
+ sc.e AS pg_catalog.text | t      | modified
+ sc.t                    | t      | modified
+(2 rows)
+
+SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('sc_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'sc_other'"}
+(1 row)
+
+SELECT dolt_merge('main') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM pg_temp.show();
+                                show                                
+--------------------------------------------------------------------
+ cast sc.e as integer fa sc.e_int
+ cast sc.e as text ia -
+ stat CREATE STATISTICS sc."st 2" ON c, (a + b) FROM sc.t target 75
+(3 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'sc_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sc CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table sc.t
+drop cascades to type sc.e
+drop cascades to cast from sc.e to text
+drop cascades to function sc.e_int(sc.e)
+drop cascades to cast from sc.e to integer
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
