@@ -508,7 +508,57 @@ fails without its fix), and Postgres's suites keep passing after each one.
   #137 reads leave such objects out (partitions with their partitioned
   tables), `dolt_status` lists them as "not covered" and unstaged, a branch
   with them is dirty, only a commit refuses them, and a diff of one table
-  folds that table alone.
+  folds that table alone. (Of those, only foreign tables remain: the
+  objects stack, below.)
+- **As built (objects):** commits hold aggregates, row security policies
+  and partitioned tables (the objects stack). Still refused: foreign
+  tables, window functions (only C writes one), range, multirange and
+  base types, partitions apart from their partitioned tables (below).
+  Not held and not refused, as before: operators, operator classes and
+  families, collations made in a versioned schema, text search objects,
+  conversions and extended statistics; a commit leaves them out, and a
+  clone or checkout doesn't have them (open: refuse them, as other
+  uncovered objects are, or describe them).
+  - An aggregate is a routine item whose definition is the CREATE OR
+    REPLACE AGGREGATE that makes it, every option written (Postgres has
+    no deparser for aggregates; pg_dump writes them so). A move replaces
+    one changed in place (what uses it, a materialized view, stays),
+    unless a function is dropped: then every aggregate goes before the
+    functions and comes after them and after new tables, whose row types
+    they may use. A removed one goes before anything else.
+  - A table's definition has a policies section after its rules (before
+    a partitioned table's or partition's sections), if it has any policy
+    or row security on: row security on, and forced, then each policy as CREATE
+    POLICY makes it, its roles by name (a table with neither has no
+    section, its description as older builds wrote it). Roles aren't
+    recorded dependencies (they aren't versioned): a policy naming a role
+    the database lacks fails where it is made, and a role renamed changes
+    the text of every policy naming it, as it changes what pg_dump
+    writes. A move drops every policy first and makes every one last, as
+    views go and come, as a policy may use anything the move changes.
+    The fold and the row writer work below the planner, where policies
+    don't apply. `dolt_diff`, `dolt_conflicts` and
+    `dolt_constraint_violations` refuse a table whose row security
+    applies to the reader (part 4, item 5).
+  - A partitioned table is a table item with an empty data tree and its
+    key; a partition, a table item with its parent and bound, its rows
+    folded as any table's. A partition's description holds only what is
+    its own: not the constraints it has of its parent (keys, foreign
+    keys, checks, not-nulls), the indexes attached to its parent's, or
+    the triggers cloned from its parent's, which Postgres makes with it
+    and names as it names them (so an attached index's own name isn't
+    held). A move makes partitioned tables before their partitions (by
+    PARTITION OF, then the partition's own defaults), drops partitions
+    first, and detaches (first) and attaches (after the rows) a partition
+    whose bound or parent changed. Refused at a commit: a partition with
+    its columns in another order than its parent's (PARTITION OF would
+    make them in the parent's), a partition and its parent split between
+    versioned and ordinary schemas. Refused at a move: a changed
+    partition key, a table becoming or ceasing to be a partition (made
+    again or not), a partitioned table whose columns would be made
+    again.
+  - Names are read as identifiers where a move drops by name (a quoted
+    trigger, rule, index or policy name with a space came back cut).
 - **As built:** a table's schema, a type's definition and a collation's
   description are text split into lines and fields, and the names and
   expressions in them were written as they were: a quoted name or string
@@ -629,7 +679,8 @@ a stack of PRs, in this order:
    among its partitions is refused with it (no partition is left out).
    Commits holding policies changes 7.6's "row security is no gap":
    history holds every row whatever the policies say, so fetching keeps
-   its roles (as `pg_read_all_data` bypasses row security), and the
+   its roles (bypassing row security as BYPASSRLS does, further than
+   `pg_read_all_data`, which policies still filter), and the
    readers of history in SQL (`dolt_diff`) refuse a table with row
    security that applies to the reader, rather than show it rows the
    policies hide.
@@ -1323,8 +1374,11 @@ privileges.
 - **A file remote** is the server's files: only superusers, or roles
   granted `pg_read_server_files` and `pg_write_server_files`, may use one,
   as `COPY … FROM 'file'` asks.
-- Row security is no gap: a commit refuses row security policies on
-  versioned tables, so none relies on them.
+- Row security doesn't narrow a fetch: commits hold policies (since the
+  objects stack), but history holds every row whatever they say, so
+  fetching takes the roles above and bypasses them, as a BYPASSRLS role
+  does (further than `pg_read_all_data`, whose reads policies still
+  filter).
 
 ### 7.7 Durability and concurrency
 

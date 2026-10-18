@@ -47,12 +47,14 @@
  * chunk store), and the canonical tree is kept there too.
  *
  * Covered, in versioned schemas: prolly tables, their columns,
- * constraints, indexes, triggers and rules; views and materialized views;
- * functions and procedures; enum, domain and composite types; sequences.
+ * constraints, indexes, triggers, rules and row security policies;
+ * partitioned tables and their partitions; views and materialized views;
+ * functions, procedures and aggregates; enum, domain and composite types;
+ * sequences.
  * Ordinary schemas and extensions are every branch's, not the commit's.
- * Anything else in versioned schemas (aggregates, policies, partitioned or
- * foreign tables, other types) makes a commit fail: never a hash that
- * might depend on history.
+ * Anything else in versioned schemas (window functions, foreign tables,
+ * partitions apart from their partitioned tables, other types) makes a
+ * commit fail: never a hash that might depend on history.
  *
  * What the versioned objects depend on outside the versioned schemas
  * isn't in the root, which is what they are: fold_dependencies() builds a
@@ -125,6 +127,10 @@
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/partition.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "catalog/versioned.h"
@@ -466,6 +472,16 @@ find_base_table(Canon *cn, const StringInfoData *key)
 	return bsearch(&probe, cn->base, cn->nbase, sizeof(BaseTable), base_table_cmp);
 }
 
+/* The empty data tree. */
+static void
+empty_root(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
+									   CurrentMemoryContext);
+
+	PROLLY_CALL(cn->tree, build_finish, b, root);
+}
+
 /*
  * A table's data tree, folded from its rows as the transaction sees them by
  * the change finder: from its baseline if it has one for this definition
@@ -514,12 +530,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		if (bt)
 			*root = bt->data;
 		else
-		{
-			ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
-											   CurrentMemoryContext);
-
-			PROLLY_CALL(cn->tree, build_finish, b, root);
-		}
+			empty_root(cn, root);
 		return;
 	}
 	initStringInfo(&state);
@@ -581,7 +592,8 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 		{
 			Form_pg_trigger trg = (Form_pg_trigger) GETSTRUCT(tup);
 
-			if (trg->tgisinternal)
+			/* (a partition's clone of its parent's: the parent's) */
+			if (trg->tgisinternal || OidIsValid(trg->tgparentid))
 				continue;
 			def = DirectFunctionCall1(pg_get_triggerdef, ObjectIdGetDatum(trg->oid));
 		}
@@ -597,6 +609,83 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 	}
 	systable_endscan(scan);
 	table_close(crel, AccessShareLock);
+	list_sort(defs, cstring_cmp);
+	foreach(lc, defs)
+	{
+		append_field(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
+}
+
+/* A table's policies section's lines for its row security being on. */
+#define ROW_SECURITY		"row level security"
+#define FORCED_ROW_SECURITY "forced row level security"
+
+/*
+ * rel's row security policies, sorted, one per line, each as CREATE POLICY
+ * makes it (Postgres has no deparser for policies; pg_dump writes them
+ * so): permissive or restrictive, its command, its roles by name (sorted),
+ * its expressions.
+ */
+static void
+append_policies(StringInfo out, Relation rel)
+{
+	Relation	prel = table_open(PolicyRelationId, AccessShareLock);
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *defs = NIL;
+	ListCell   *lc;
+	char	   *table = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												   RelationGetRelationName(rel));
+
+	ScanKeyInit(&skey, Anum_pg_policy_polrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(prel, PolicyPolrelidPolnameIndexId, true, NULL, 1,
+							  &skey);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
+		StringInfoData def;
+		Datum		d;
+		bool		isnull;
+		Datum	   *roles;
+		int			nroles;
+		List	   *names = NIL;
+
+		initStringInfo(&def);
+		appendStringInfo(&def, "CREATE POLICY %s ON %s AS %s FOR %s TO ",
+						 quote_identifier(NameStr(pol->polname)), table,
+						 pol->polpermissive ? "PERMISSIVE" : "RESTRICTIVE",
+						 pol->polcmd == ACL_SELECT_CHR ? "SELECT" :
+						 pol->polcmd == ACL_INSERT_CHR ? "INSERT" :
+						 pol->polcmd == ACL_UPDATE_CHR ? "UPDATE" :
+						 pol->polcmd == ACL_DELETE_CHR ? "DELETE" : "ALL");
+		d = heap_getattr(tup, Anum_pg_policy_polroles, RelationGetDescr(prel), &isnull);
+		deconstruct_array_builtin(DatumGetArrayTypeP(d), OIDOID, &roles, NULL, &nroles);
+		for (int i = 0; i < nroles; i++)
+			names = lappend(names, DatumGetObjectId(roles[i]) == ACL_ID_PUBLIC ?
+							pstrdup("PUBLIC") :
+							pstrdup(quote_identifier(GetUserNameFromId(DatumGetObjectId(roles[i]),
+																	   false))));
+		list_sort(names, cstring_cmp);
+		foreach(lc, names)
+			appendStringInfo(&def, "%s%s", foreach_current_index(lc) > 0 ? ", " : "",
+							 (char *) lfirst(lc));
+		d = heap_getattr(tup, Anum_pg_policy_polqual, RelationGetDescr(prel), &isnull);
+		if (!isnull)
+			appendStringInfo(&def, " USING (%s)",
+							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
+																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+		d = heap_getattr(tup, Anum_pg_policy_polwithcheck, RelationGetDescr(prel), &isnull);
+		if (!isnull)
+			appendStringInfo(&def, " WITH CHECK (%s)",
+							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
+																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+		defs = lappend(defs, def.data);
+	}
+	systable_endscan(scan);
+	table_close(prel, AccessShareLock);
 	list_sort(defs, cstring_cmp);
 	foreach(lc, defs)
 	{
@@ -672,8 +761,12 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
-		StringInfo	line = makeStringInfo();
+		StringInfo	line;
 
+		/* (a partition's from its partitioned table: the table's) */
+		if (rel->rd_rel->relispartition && !con->conislocal)
+			continue;
+		line = makeStringInfo();
 		append_field(line, quote_identifier(NameStr(con->conname)));
 		appendStringInfoChar(line, '\t');
 		append_field(line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
@@ -695,6 +788,9 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	{
 		Oid			idx = lfirst_oid(lc);
 
+		/* (a partition's made for its partitioned table's: the table's) */
+		if (get_rel_relispartition(idx))
+			continue;
 		append_field(out, pg_get_indexdef_string(idx));
 		appendStringInfoChar(out, '\n');
 	}
@@ -706,6 +802,53 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	appendStringInfoString(out, "rules\n");
 	append_sorted_defs(out, RewriteRelationId, Anum_pg_rewrite_ev_class,
 					   RewriteRelRulenameIndexId, RelationGetRelid(rel));
+
+	/*
+	 * Row security: whether it is on (and forced), then policies by name.
+	 * (A table with none has no section, as before policies were held: its
+	 * description is the same.)
+	 */
+	{
+		StringInfoData policies;
+
+		initStringInfo(&policies);
+		if (rel->rd_rel->relrowsecurity)
+			appendStringInfoString(&policies, ROW_SECURITY "\n");
+		if (rel->rd_rel->relforcerowsecurity)
+			appendStringInfoString(&policies, FORCED_ROW_SECURITY "\n");
+		append_policies(&policies, rel);
+		if (policies.len > 0)
+			appendStringInfo(out, "policies\n%s", policies.data);
+	}
+
+	/* A partitioned table's key; a partition's parent and bound. */
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		appendStringInfoString(out, "partition by\n");
+		append_field(out, TextDatumGetCString(DirectFunctionCall1(pg_get_partkeydef,
+																  ObjectIdGetDatum(RelationGetRelid(rel)))));
+		appendStringInfoChar(out, '\n');
+	}
+	if (rel->rd_rel->relispartition)
+	{
+		Oid			parent = get_partition_parent(RelationGetRelid(rel), false);
+		HeapTuple	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+		bool		isnull;
+		Datum		bound;
+
+		if (!HeapTupleIsValid(ctup))
+			elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
+		bound = SysCacheGetAttr(RELOID, ctup, Anum_pg_class_relpartbound, &isnull);
+		if (isnull)
+			elog(ERROR, "partition %u has no bound", RelationGetRelid(rel));
+		appendStringInfoString(out, "partition of\n");
+		append_field(out, qualified(get_rel_namespace(parent), get_rel_name(parent)));
+		appendStringInfoChar(out, '\t');
+		append_field(out, TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bound,
+																  ObjectIdGetDatum(RelationGetRelid(rel)))));
+		appendStringInfoChar(out, '\n');
+		ReleaseSysCache(ctup);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -1125,6 +1268,164 @@ folded_dependencies(const ProllyNodeRef *tree, ProllyCanonDependencyVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+/* A function, by its qualified name (an aggregate's support function). */
+static char *
+qualified_function(Oid fn)
+{
+	return qualified(get_func_namespace(fn), get_func_name(fn));
+}
+
+/* An aggregate's FINALFUNC_MODIFY or MFINALFUNC_MODIFY, as written. */
+static const char *
+aggmodify_name(char modify)
+{
+	return modify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
+		modify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE";
+}
+
+/*
+ * An aggregate's definition, as CREATE OR REPLACE AGGREGATE writes it: every
+ * option, defaults too, so a change in any of them changes the commit.
+ * (Postgres has no deparser for aggregates; pg_dump writes them so.)
+ */
+static char *
+aggregate_def(Form_pg_proc proc)
+{
+	HeapTuple	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(proc->oid));
+	Form_pg_aggregate agg;
+	StringInfoData def;
+	Datum		d;
+	bool		isnull;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for aggregate %u", proc->oid);
+	agg = (Form_pg_aggregate) GETSTRUCT(tup);
+	initStringInfo(&def);
+	appendStringInfo(&def, "CREATE OR REPLACE AGGREGATE %s(%s) (\n SFUNC = %s,\n STYPE = %s",
+					 qualified(proc->pronamespace, NameStr(proc->proname)),
+					 TextDatumGetCString(DirectFunctionCall1(pg_get_function_arguments,
+															 ObjectIdGetDatum(proc->oid))),
+					 qualified_function(agg->aggtransfn),
+					 format_type_be_qualified(agg->aggtranstype));
+	if (agg->aggtransspace != 0)
+		appendStringInfo(&def, ",\n SSPACE = %d", agg->aggtransspace);
+	if (OidIsValid(agg->aggfinalfn))
+	{
+		appendStringInfo(&def, ",\n FINALFUNC = %s", qualified_function(agg->aggfinalfn));
+		if (agg->aggfinalextra)
+			appendStringInfoString(&def, ",\n FINALFUNC_EXTRA");
+	}
+	appendStringInfo(&def, ",\n FINALFUNC_MODIFY = %s", aggmodify_name(agg->aggfinalmodify));
+	if (OidIsValid(agg->aggcombinefn))
+		appendStringInfo(&def, ",\n COMBINEFUNC = %s", qualified_function(agg->aggcombinefn));
+	if (OidIsValid(agg->aggserialfn))
+		appendStringInfo(&def, ",\n SERIALFUNC = %s", qualified_function(agg->aggserialfn));
+	if (OidIsValid(agg->aggdeserialfn))
+		appendStringInfo(&def, ",\n DESERIALFUNC = %s", qualified_function(agg->aggdeserialfn));
+	d = SysCacheGetAttr(AGGFNOID, tup, Anum_pg_aggregate_agginitval, &isnull);
+	if (!isnull)
+		appendStringInfo(&def, ",\n INITCOND = %s",
+						 quote_literal_cstr(TextDatumGetCString(d)));
+	if (OidIsValid(agg->aggmtransfn))
+	{
+		appendStringInfo(&def, ",\n MSFUNC = %s,\n MINVFUNC = %s,\n MSTYPE = %s",
+						 qualified_function(agg->aggmtransfn),
+						 qualified_function(agg->aggminvtransfn),
+						 format_type_be_qualified(agg->aggmtranstype));
+		if (agg->aggmtransspace != 0)
+			appendStringInfo(&def, ",\n MSSPACE = %d", agg->aggmtransspace);
+		if (OidIsValid(agg->aggmfinalfn))
+		{
+			appendStringInfo(&def, ",\n MFINALFUNC = %s", qualified_function(agg->aggmfinalfn));
+			if (agg->aggmfinalextra)
+				appendStringInfoString(&def, ",\n MFINALFUNC_EXTRA");
+		}
+		appendStringInfo(&def, ",\n MFINALFUNC_MODIFY = %s",
+						 aggmodify_name(agg->aggmfinalmodify));
+		d = SysCacheGetAttr(AGGFNOID, tup, Anum_pg_aggregate_aggminitval, &isnull);
+		if (!isnull)
+			appendStringInfo(&def, ",\n MINITCOND = %s",
+							 quote_literal_cstr(TextDatumGetCString(d)));
+	}
+	if (OidIsValid(agg->aggsortop))
+	{
+		HeapTuple	op = SearchSysCache1(OPEROID, ObjectIdGetDatum(agg->aggsortop));
+		Form_pg_operator opform;
+
+		if (!HeapTupleIsValid(op))
+			elog(ERROR, "cache lookup failed for operator %u", agg->aggsortop);
+		opform = (Form_pg_operator) GETSTRUCT(op);
+		appendStringInfo(&def, ",\n SORTOP = OPERATOR(%s.%s)",
+						 quote_identifier(get_namespace_name(opform->oprnamespace)),
+						 NameStr(opform->oprname));
+		ReleaseSysCache(op);
+	}
+	if (agg->aggkind == AGGKIND_HYPOTHETICAL)
+		appendStringInfoString(&def, ",\n HYPOTHETICAL");
+	appendStringInfo(&def, ",\n PARALLEL = %s\n)",
+					 proc->proparallel == PROPARALLEL_SAFE ? "SAFE" :
+					 proc->proparallel == PROPARALLEL_RESTRICTED ? "RESTRICTED" : "UNSAFE");
+	ReleaseSysCache(tup);
+	return def.data;
+}
+
+
+/* rel's columns' names, in order. */
+static List *
+column_names(Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	List	   *names = NIL;
+
+	for (int i = 0; i < desc->natts; i++)
+		if (!TupleDescAttr(desc, i)->attisdropped)
+			names = lappend(names, pstrdup(NameStr(TupleDescAttr(desc, i)->attname)));
+	table_close(rel, AccessShareLock);
+	return names;
+}
+
+/*
+ * Is a partition, or a partitioned table, one a commit can't hold whole
+ * (and so refused)?  Partitioned tables and their partitions are held
+ * together, all in versioned schemas; and a partition is made again as
+ * its partitioned table's (PARTITION OF), so with its columns in that
+ * table's order.
+ */
+static bool
+partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
+{
+	if (form->relispartition)
+	{
+		Oid			parent = get_partition_parent(form->oid, false);
+		List	   *own = column_names(form->oid);
+		List	   *its = column_names(parent);
+		ListCell   *a;
+		ListCell   *b;
+
+		if (!canon_namespace(get_rel_namespace(parent)))
+			return uncovered(cn, "partitions of tables outside versioned schemas",
+							 qualified(form->relnamespace, name));
+		if (list_length(own) != list_length(its))
+			return uncovered(cn, "partitions with columns their partitioned table lacks",
+							 qualified(form->relnamespace, name));
+		forboth(a, own, b, its)
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				return uncovered(cn, "partitions with their columns in another order than their partitioned table's",
+								 qualified(form->relnamespace, name));
+	}
+	if (form->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		ListCell   *lc;
+
+		foreach(lc, find_inheritance_children(form->oid, AccessShareLock))
+			if (!canon_namespace(get_rel_namespace(lfirst_oid(lc))))
+				return uncovered(cn, "partitioned tables with partitions outside versioned schemas",
+								 qualified(form->relnamespace, name));
+	}
+	return false;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -1146,14 +1447,8 @@ collect(Canon *cn)
 		switch (form->relkind)
 		{
 			case RELKIND_RELATION:
-				/* (a partition goes with its partitioned table) */
-				if (form->relispartition)
-				{
-					(void) uncovered(cn, "partitions of partitioned tables",
-									 qualified(form->relnamespace, name));
-					break;
-				}
-				if (form->relam == PROLLY_TABLE_AM_OID)
+				if (form->relam == PROLLY_TABLE_AM_OID &&
+					!partition_uncovered(cn, form, name))
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
 					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
@@ -1213,9 +1508,28 @@ collect(Canon *cn)
 				(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name));
 				break;
 			case RELKIND_PARTITIONED_TABLE:
-			case RELKIND_PARTITIONED_INDEX:
-				(void) uncovered(cn, "partitioned tables", qualified(form->relnamespace, name));
+				{
+					/* (its rows are its partitions': an empty data tree) */
+					Relation	rel;
+					CanonItem  *it;
+					ProllyNodeRef root;
+					StringInfoData desc;
+
+					if (partition_uncovered(cn, form, name))
+						break;
+					rel = table_open(form->oid, AccessShareLock);
+					it = add_item(cn, "t:", qualified(form->relnamespace, name));
+					empty_root(cn, &root);
+					initStringInfo(&desc);
+					describe_table(cn, rel, &desc);
+					put_hash(&it->value, &root.hash);
+					appendBinaryStringInfo(&it->value, desc.data, desc.len);
+					pfree(desc.data);
+					table_close(rel, AccessShareLock);
+				}
 				break;
+			case RELKIND_PARTITIONED_INDEX:
+				break;			/* with its table */
 		}
 	}
 	systable_endscan(scan);
@@ -1279,35 +1593,20 @@ collect(Canon *cn)
 							qualified(proc->pronamespace, NameStr(proc->proname)),
 							TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
 																	ObjectIdGetDatum(proc->oid))));
-			if (proc->prokind != PROKIND_FUNCTION &&
-				proc->prokind != PROKIND_PROCEDURE &&
-				uncovered(cn, "aggregates and window functions", name))
+			/* (a window function is written in C: none to hold) */
+			if (proc->prokind == PROKIND_WINDOW &&
+				uncovered(cn, "window functions", name))
 				continue;
 			it = add_item(cn, "f:", name);
-			append_utf8(&it->value,
-						TextDatumGetCString(DirectFunctionCall1(pg_get_functiondef,
-																ObjectIdGetDatum(proc->oid))));
+			if (proc->prokind == PROKIND_AGGREGATE)
+				append_utf8(&it->value, aggregate_def(proc));
+			else
+				append_utf8(&it->value,
+							TextDatumGetCString(DirectFunctionCall1(pg_get_functiondef,
+																	ObjectIdGetDatum(proc->oid))));
 		}
 		systable_endscan(scan);
 		table_close(pg_proc, AccessShareLock);
-	}
-	{
-		Relation	pg_policy = table_open(PolicyRelationId, AccessShareLock);
-
-		scan = systable_beginscan(pg_policy, InvalidOid, false, NULL, 0, NULL);
-		while ((tup = systable_getnext(scan)) != NULL)
-		{
-			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(tup);
-
-			if (canon_namespace(get_rel_namespace(pol->polrelid)))
-				(void) uncovered(cn, "row security policies",
-								 psprintf("%s on %s",
-										  quote_identifier(NameStr(pol->polname)),
-										  qualified(get_rel_namespace(pol->polrelid),
-													get_rel_name(pol->polrelid))));
-		}
-		systable_endscan(scan);
-		table_close(pg_policy, AccessShareLock);
 	}
 }
 
@@ -2242,6 +2541,11 @@ typedef struct TableDef
 	List	   *indexes;		/* statements */
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
+	List	   *policies;		/* statements */
+	bool		row_security;	/* (and forced) */
+	bool		forced_row_security;
+	char	   *partition_by;	/* a partitioned table's key, or NULL */
+	char	   *partition_of;	/* a partition's parent and bound (escaped), or NULL */
 } TableDef;
 
 typedef struct SchemaMove
@@ -2334,6 +2638,26 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
+		else if (strcmp(line, "policies") == 0)
+			section = &td->policies;
+		else if (section == &td->policies && strcmp(line, ROW_SECURITY) == 0)
+			td->row_security = true;
+		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
+			td->forced_row_security = true;
+		else if (strcmp(line, "partition by") == 0 ||
+				 strcmp(line, "partition of") == 0)
+		{
+			char	  **field = line[10] == 'b' ? &td->partition_by : &td->partition_of;
+
+			section = NULL;
+			if (next == NULL || *next == '\0')
+				elog(ERROR, "unexpected table definition: \"%s\" ends it", line);
+			line = next;
+			next = strchr(line, '\n');
+			if (next)
+				*next++ = '\0';
+			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
+		}
 		else if (section == &td->columns || section == &td->constraints)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
@@ -2407,6 +2731,41 @@ constraint_def(const char *line)
 	return unescape_field(tab + 1);
 }
 
+/*
+ * Where the identifier p begins with ends, as written: quoted (spaces,
+ * doubled quotes and all) or up to a space.  value, if given, gets it
+ * unquoted.
+ */
+static const char *
+scan_identifier(const char *p, StringInfo value)
+{
+	if (*p != '"')
+	{
+		size_t		n = strcspn(p, " ");
+
+		if (value)
+			appendBinaryStringInfo(value, p, n);
+		return p + n;
+	}
+	for (p++; *p; p++)
+	{
+		if (*p == '"' && p[1] != '"')
+			return p + 1;
+		if (*p == '"')
+			p++;				/* (a doubled quote) */
+		if (value)
+			appendStringInfoChar(value, *p);
+	}
+	return p;
+}
+
+/* The identifier p begins with, as written: quoted (spaces and all) or not. */
+static char *
+leading_identifier(const char *p)
+{
+	return pnstrdup(p, scan_identifier(p, NULL) - p);
+}
+
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
 static char *
 index_name(const char *stmt)
@@ -2415,11 +2774,13 @@ index_name(const char *stmt)
 
 	if (p == NULL)
 		elog(ERROR, "unexpected index definition \"%s\"", stmt);
-	p += strlen(" INDEX ");
-	return pnstrdup(p, strcspn(p, " "));
+	return leading_identifier(p + strlen(" INDEX "));
 }
 
-/* A trigger's or rule's name: CREATE [CONSTRAINT] TRIGGER name ..., CREATE RULE name ... */
+/*
+ * A trigger's, rule's or policy's name: CREATE [CONSTRAINT] TRIGGER name
+ * ..., CREATE RULE name ..., CREATE POLICY name ...
+ */
 static char *
 object_name(const char *stmt, const char *word)
 {
@@ -2427,8 +2788,7 @@ object_name(const char *stmt, const char *word)
 
 	if (p == NULL)
 		elog(ERROR, "unexpected definition \"%s\"", stmt);
-	p += strlen(word);
-	return pnstrdup(p, strcspn(p, " "));
+	return leading_identifier(p + strlen(word));
 }
 
 /* Where s is in list, or -1. */
@@ -2557,6 +2917,56 @@ same_strings(const char *a, const char *b)
 	return (a == NULL && b == NULL) || (a && b && strcmp(a, b) == 0);
 }
 
+/* A column line's field that begins with prefix (unescaped), or NULL. */
+static char *
+column_field(const char *line, const char *prefix)
+{
+	char	   *copy = pstrdup(line);
+	char	   *f;
+
+	(void) strtok(copy, "\t");
+	while ((f = strtok(NULL, "\t")) != NULL)
+		if (strncmp(f, prefix, strlen(prefix)) == 0)
+			return unescape_field(f + strlen(prefix));
+	return NULL;
+}
+
+/*
+ * A partition's own defaults: its columns are its partitioned table's,
+ * with the table's defaults when made (from: NULL), but a default may be
+ * its own.  (Generated and identity columns are the table's.)
+ */
+static void
+partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
+				   const TableDef *to)
+{
+	ListCell   *lc;
+
+	foreach(lc, to->columns)
+	{
+		const char *line = lfirst(lc);
+		char	   *col = first_field(line);
+		char	   *def = column_field(line, "default ");
+		const char *was = NULL;
+		ListCell   *fc;
+
+		if (column_field(line, "generated ") || column_field(line, "identity "))
+			continue;
+		if (from != NULL)
+		{
+			foreach(fc, from->columns)
+				if (strcmp(first_field(lfirst(fc)), col) == 0)
+					was = column_field(lfirst(fc), "default ");
+			if (same_strings(was, def))
+				continue;
+		}
+		sm->after = lappend(sm->after,
+							def ? psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+										   name, col, def) :
+							psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", name, col));
+	}
+}
+
 /*
  * The statements turning table name's definition from (NULL: none) into to
  * (NULL: dropped): what must go before the rows are written, and what the
@@ -2577,6 +2987,16 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	memset(&none, 0, sizeof(none));
 	if (to == NULL)
 	{
+		/*
+		 * A partition goes before its partitioned table, which takes its
+		 * partitions with it (and so, IF EXISTS); a partition's sequences
+		 * are its parent's.
+		 */
+		if (from->partition_of)
+		{
+			sm->before = lcons(psprintf("DROP TABLE IF EXISTS %s", name), sm->before);
+			return true;
+		}
 		/* (its foreign keys first, as other tables' may point at it) */
 		foreach(lc, from->constraints)
 			if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
@@ -2639,6 +3059,25 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 				remake = true;
 		}
 	}
+	if (from != NULL && (from->partition_of == NULL) != (to->partition_of == NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s is %s partition at the commit", name,
+						to->partition_of ? "a" : "no longer a"),
+				 errdetail("A move doesn't make a table a partition, or a partition a table.")));
+	if (from != NULL && !same_strings(from->partition_by, to->partition_by))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s is partitioned differently at the commit", name),
+				 errdetail("Postgres can't change how a table is partitioned; a move can't either.")));
+	/* (a partition's columns are its partitioned table's) */
+	if (from != NULL && from->partition_of && to->partition_of)
+		remake = false;
+	if (remake && to->partition_by)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("partitioned table %s has its columns in another order at the commit", name),
+				 errdetail("Making it again would take its partitions with it.")));
 	if (from == NULL || remake)
 	{
 		StringInfoData sql;
@@ -2646,11 +3085,22 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
 		initStringInfo(&sql);
-		appendStringInfo(&sql, "CREATE TABLE %s (", name);
-		foreach(lc, to->columns)
-			appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
-							 column_sql(lfirst(lc)));
-		appendStringInfoChar(&sql, ')');
+		if (to->partition_of)
+		{
+			appendStringInfo(&sql, "CREATE TABLE %s PARTITION OF %s %s", name,
+							 first_field(to->partition_of), constraint_def(to->partition_of));
+			partition_defaults(sm, name, NULL, to);
+		}
+		else
+		{
+			appendStringInfo(&sql, "CREATE TABLE %s (", name);
+			foreach(lc, to->columns)
+				appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
+								 column_sql(lfirst(lc)));
+			appendStringInfoChar(&sql, ')');
+		}
+		if (to->partition_by)
+			appendStringInfo(&sql, " PARTITION BY %s", to->partition_by);
 		sm->changes = lappend(sm->changes, sql.data);
 
 		/* sequences its defaults draw from, that no column owns: its own */
@@ -2669,6 +3119,26 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 									   "END LOOP; END $move$",
 									   quote_literal_cstr(name), quote_literal_cstr(name)));
 		from = &none;
+	}
+	else if (from->partition_of && to->partition_of)
+	{
+		/*
+		 * A partition's columns come with its partitioned table's; moved to
+		 * another parent or bound, it is detached before the rows are
+		 * written and attached after (which checks them against the bound).
+		 */
+		if (strcmp(from->partition_of, to->partition_of) != 0)
+		{
+			/* (first: before its old partitioned table may go, with it) */
+			sm->before = lcons(psprintf("ALTER TABLE %s DETACH PARTITION %s",
+										first_field(from->partition_of), name),
+							   sm->before);
+			sm->after = lappend(sm->after,
+								psprintf("ALTER TABLE %s ATTACH PARTITION %s %s",
+										 first_field(to->partition_of), name,
+										 constraint_def(to->partition_of)));
+		}
+		partition_defaults(sm, name, from, to);
 	}
 	else
 	{
@@ -2783,8 +3253,11 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sql = psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", name,
 						   first_field(line), constraint_def(line));
 
-			/* (an identity column, or a key, may have made it already) */
-			if (not_null)
+			/*
+			 * (an identity column, or a key, may have made it already; a
+			 * partition's partitioned table, its own)
+			 */
+			if (not_null || to->partition_of)
 				sql = psprintf("DO $move$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint "
 							   "WHERE conrelid = %s::pg_catalog.regclass AND "
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
@@ -2824,6 +3297,15 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+	/* (policies: every move's, in move_schema) */
+	if (from->row_security != to->row_security)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
+									 to->row_security ? "ENABLE" : "DISABLE"));
+	if (from->forced_row_security != to->forced_row_security)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
+									 to->forced_row_security ? "FORCE" : "NO FORCE"));
 	return remake;
 }
 
@@ -2899,13 +3381,21 @@ sequence_options_sql(const char *def)
 					strcmp(cycle, "cycle") == 0 ? "CYCLE" : "NO CYCLE");
 }
 
-/* DROP FUNCTION or DROP PROCEDURE, as the definition says. */
+/* Is a routine's definition an aggregate's? */
+static bool
+is_aggregate(const MoveItem *it)
+{
+	return strncmp(it->def, "CREATE OR REPLACE AGGREGATE", 27) == 0;
+}
+
+/* DROP FUNCTION, PROCEDURE or AGGREGATE, as the definition says. */
 static char *
 drop_routine_sql(const MoveItem *it)
 {
 	return psprintf("DROP %s IF EXISTS %s",
 					strstr(it->def, "CREATE OR REPLACE PROCEDURE") == it->def ?
-					"PROCEDURE" : "FUNCTION", it->name);
+					"PROCEDURE" : is_aggregate(it) ? "AGGREGATE" : "FUNCTION",
+					it->name);
 }
 
 /*
@@ -2991,14 +3481,7 @@ unquoted(const char *ident)
 	if (ident[0] != '"')
 		return pstrdup(ident);
 	initStringInfo(&out);
-	for (const char *p = ident + 1; *p; p++)
-	{
-		if (*p == '"' && p[1] == '"')
-			p++;
-		else if (*p == '"')
-			break;
-		appendStringInfoChar(&out, *p);
-	}
+	(void) scan_identifier(ident, &out);
 	return out.data;
 }
 
@@ -3148,6 +3631,9 @@ converted_value(const char *expr, const char *old_def, const char *new_def,
 }
 
 /* What a move does about the types the commit defines otherwise, in turn. */
+static bool is_aggregate(const MoveItem *it);
+static char *drop_routine_sql(const MoveItem *it);
+
 typedef struct TypeMoves
 {
 	List	   *before;			/* what uses them dropped; then each renamed
@@ -3157,6 +3643,8 @@ typedef struct TypeMoves
 	List	   *converts;		/* the columns using them moved to the new */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
+	List	   *aggregate_drops;	/* (before the functions they use; made
+									 * again with the others, after them) */
 	bool		any;
 } TypeMoves;
 
@@ -3458,7 +3946,12 @@ type_moves(List *from, List *to)
 					ReleaseSysCache(pt);
 					fp = find_item(from, 'f', name);
 					tp = find_item(to, 'f', name);
-					if (fp)
+					if (fp && is_aggregate(fp))
+					{
+						tm.aggregate_drops = lappend(tm.aggregate_drops, drop_routine_sql(fp));
+						handled = true;
+					}
+					else if (fp)
 					{
 						tm.before = lcons(drop_routine_sql(fp), tm.before);
 						if (tp && strcmp(tp->def, fp->def) == 0)
@@ -3468,6 +3961,8 @@ type_moves(List *from, List *to)
 				}
 				else if (d->classid == RewriteRelationId)
 					handled = true; /* (a view's: it goes, and comes again) */
+				else if (d->classid == PolicyRelationId)
+					handled = true; /* (a policy's: every move's go, and come) */
 				if (!handled)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3491,6 +3986,7 @@ type_moves(List *from, List *to)
 		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def));
 		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
 	}
+	tm.before = list_concat(list_copy(tm.aggregate_drops), tm.before);
 	return tm;
 }
 
@@ -3516,6 +4012,9 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
+	List	   *aggregates_made = NIL;
+	List	   *policy_drops = NIL;
+	List	   *policy_makes = NIL;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
@@ -3564,7 +4063,13 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		switch (f->kind)
 		{
 			case 'f':
-				if (t == NULL)
+				/*
+				 * (an aggregate going, first: before the functions and the
+				 * tables' row types it uses; what stays doesn't use it)
+				 */
+				if (t == NULL && is_aggregate(f))
+					sm.before = lcons(drop_routine_sql(f), sm.before);
+				else if (t == NULL)
 					routines = lappend(routines, drop_routine_sql(f));
 				break;
 			case 'y':
@@ -3699,28 +4204,105 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
 			goto unsupported;
 	}
-	foreach(lc, to)
 	{
-		MoveItem   *t = lfirst(lc);
-		MoveItem   *f = find_item(from, t->kind, t->name);
+		/* (a type move's drop of an aggregate counts too) */
+		bool		functions_dropped = routines != NIL || tm.aggregate_drops != NIL;
 
-		if (t->kind != 'f' || (f && strcmp(t->def, f->def) == 0))
-			continue;
-		/* (CREATE OR REPLACE can't change what a routine returns) */
-		if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
-			sm.before = lappend(sm.before, drop_routine_sql(f));
-		sm.before = lappend(sm.before, t->def);
+		/* (a function a routine's signature change drops) */
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+			MoveItem   *f = find_item(from, t->kind, t->name);
+
+			if (t->kind == 'f' && f && !is_aggregate(t) && strcmp(t->def, f->def) != 0 &&
+				strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+				functions_dropped = true;
+		}
+
+		/*
+		 * Aggregates: where a function goes, any may use it, so all go
+		 * before the functions and all are made after them (and after the
+		 * tables, whose row types they may use); otherwise one changed is
+		 * replaced in place, what uses it kept.
+		 */
+		foreach(lc, from)
+		{
+			MoveItem   *f = lfirst(lc);
+
+			if (f->kind == 'f' && is_aggregate(f) && functions_dropped &&
+				find_item(to, 'f', f->name) != NULL)
+				sm.before = lcons(drop_routine_sql(f), sm.before);
+		}
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+			MoveItem   *f = find_item(from, t->kind, t->name);
+
+			if (t->kind != 'f')
+				continue;
+			if (is_aggregate(t))
+			{
+				if (functions_dropped || !f || strcmp(t->def, f->def) != 0)
+					aggregates_made = lappend(aggregates_made, t->def);
+				continue;
+			}
+			if (f && strcmp(t->def, f->def) == 0)
+				continue;
+			/* (CREATE OR REPLACE can't change what a routine returns) */
+			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+				sm.before = lappend(sm.before, drop_routine_sql(f));
+			sm.before = lappend(sm.before, t->def);
+		}
 	}
-	foreach(lc, to)
+	/* Tables made: a partition after its partitioned table. */
 	{
-		MoveItem   *t = lfirst(lc);
-		TableDef	td;
+		List	   *pending = NIL;
+		List	   *made = NIL;
 
-		if (t->kind != 't' || find_item(from, 't', t->name) != NULL)
-			continue;
-		parse_table_def(t->def, &td);
-		move_table(&sm, t->name, NULL, &td);
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+
+			if (t->kind == 't' && find_item(from, 't', t->name) == NULL)
+			{
+				TableDef   *td = palloc(sizeof(TableDef));
+
+				parse_table_def(t->def, td);
+				pending = lappend(pending, list_make2(t, td));
+			}
+		}
+		while (pending != NIL)
+		{
+			List	   *later = NIL;
+
+			foreach(lc, pending)
+			{
+				MoveItem   *t = linitial(lfirst(lc));
+				TableDef   *td = lsecond(lfirst(lc));
+				char	   *parent = td->partition_of ? first_field(td->partition_of) : NULL;
+
+				if (parent && !list_has_string(made, parent) &&
+					find_item(from, 't', parent) == NULL &&
+					find_item(to, 't', parent) != NULL)
+				{
+					later = lappend(later, lfirst(lc));
+					continue;
+				}
+				move_table(&sm, t->name, NULL, td);
+				made = lappend(made, t->name);
+			}
+			if (list_length(later) == list_length(pending))
+			{
+				TableDef   *td = lsecond(linitial(later));
+
+				elog(ERROR, "partitioned table %s can't be made before its partitions",
+					 first_field(td->partition_of));
+			}
+			pending = later;
+		}
 	}
+	/* (aggregates after the tables, whose row types they may use) */
+	sm.changes = list_concat(sm.changes, aggregates_made);
 	/*
 	 * Materialized views go and come again, with the rows the commit holds,
 	 * if any changes, or a view or a type they may use does: all of them,
@@ -3763,6 +4345,36 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	/* Run them as deparsed: names qualified, routines' bodies unchecked. */
 	save_nestlevel = NewGUCNestLevel();
+	/*
+	 * Policies: every one goes first and comes last, as views do, as they
+	 * may use any table, view, column, type or function the move changes.
+	 */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		TableDef	td;
+		ListCell   *pc;
+
+		if (f->kind != 't')
+			continue;
+		parse_table_def(f->def, &td);
+		foreach(pc, td.policies)
+			policy_drops = lappend(policy_drops,
+								   psprintf("DROP POLICY IF EXISTS %s ON %s",
+											object_name(lfirst(pc), "CREATE POLICY "),
+											f->name));
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		TableDef	td;
+
+		if (t->kind != 't')
+			continue;
+		parse_table_def(t->def, &td);
+		policy_makes = list_concat(policy_makes, td.policies);
+	}
+
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	(void) set_config_option("check_function_bodies", "off", PGC_USERSET,
@@ -3771,6 +4383,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
+	run_statements(policy_drops);
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
 
 	/*
@@ -3798,6 +4411,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(sm.after);
 	run_statements(sm.foreign_keys);
 	make_views(views);
+	run_statements(policy_makes);
 	if (matviews_made)
 	{
 		MemoryContext spi;

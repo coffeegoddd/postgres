@@ -58,6 +58,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
@@ -1451,8 +1452,25 @@ rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 }
 
 /*
+ * History holds every row whatever a table's policies say: a reader of it
+ * whom row security applies to is refused, rather than shown rows the
+ * policies hide.
+ */
+static void
+check_history_rls(Oid relid, const char *fn)
+{
+	if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": row security applies to you",
+						fn, get_rel_name(relid)),
+				 errdetail("Other commits' rows aren't filtered by its policies."),
+				 errhint("The table's owner, or a role that bypasses row security, can read them.")));
+}
+
+/*
  * The prolly table whose row type is type, opened, if the user has mode
- * on it.
+ * on it (and row security doesn't apply to them).
  */
 static Relation
 open_row_type_table(Oid relid, const char *fn, AclMode mode)
@@ -1467,6 +1485,7 @@ open_row_type_table(Oid relid, const char *fn, AclMode mode)
 	aclresult = pg_class_aclcheck(relid, GetUserId(), mode);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, fn);
 	rel = table_open(relid, AccessShareLock);
 	if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID)
 		ereport(ERROR,
@@ -1664,6 +1683,7 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, "dolt_constraint_violations");
 	foreach(lc, PROLLY_CALL(refs(), violations))
 	{
 		ProllyViolation *pv = lfirst(lc);
