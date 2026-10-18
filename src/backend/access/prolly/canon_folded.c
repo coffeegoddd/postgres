@@ -47,13 +47,14 @@
  * chunk store), and the canonical tree is kept there too.
  *
  * Covered, in versioned schemas: prolly tables, their columns,
- * constraints, indexes, triggers and rules; views and materialized views;
+ * constraints, indexes, triggers, rules and row security policies;
+ * partitioned tables and their partitions; views and materialized views;
  * functions, procedures and aggregates; enum, domain and composite types;
  * sequences.
  * Ordinary schemas and extensions are every branch's, not the commit's.
- * Anything else in versioned schemas (window functions, policies,
- * partitioned or foreign tables, other types) makes a commit fail: never a
- * hash that might depend on history.
+ * Anything else in versioned schemas (window functions, foreign tables,
+ * partitions apart from their partitioned tables, other types) makes a
+ * commit fail: never a hash that might depend on history.
  *
  * What the versioned objects depend on outside the versioned schemas
  * isn't in the root, which is what they are: fold_dependencies() builds a
@@ -127,6 +128,7 @@
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/partition.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -470,6 +472,16 @@ find_base_table(Canon *cn, const StringInfoData *key)
 	return bsearch(&probe, cn->base, cn->nbase, sizeof(BaseTable), base_table_cmp);
 }
 
+/* The empty data tree. */
+static void
+empty_root(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
+									   CurrentMemoryContext);
+
+	PROLLY_CALL(cn->tree, build_finish, b, root);
+}
+
 /*
  * A table's data tree, folded from its rows as the transaction sees them by
  * the change finder: from its baseline if it has one for this definition
@@ -518,12 +530,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		if (bt)
 			*root = bt->data;
 		else
-		{
-			ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
-											   CurrentMemoryContext);
-
-			PROLLY_CALL(cn->tree, build_finish, b, root);
-		}
+			empty_root(cn, root);
 		return;
 	}
 	initStringInfo(&state);
@@ -754,8 +761,12 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
-		StringInfo	line = makeStringInfo();
+		StringInfo	line;
 
+		/* (a partition's from its partitioned table: the table's) */
+		if (rel->rd_rel->relispartition && !con->conislocal)
+			continue;
+		line = makeStringInfo();
 		append_field(line, quote_identifier(NameStr(con->conname)));
 		appendStringInfoChar(line, '\t');
 		append_field(line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
@@ -777,6 +788,9 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	{
 		Oid			idx = lfirst_oid(lc);
 
+		/* (a partition's made for its partitioned table's: the table's) */
+		if (get_rel_relispartition(idx))
+			continue;
 		append_field(out, pg_get_indexdef_string(idx));
 		appendStringInfoChar(out, '\n');
 	}
@@ -1355,6 +1369,63 @@ aggregate_def(Form_pg_proc proc)
 	return def.data;
 }
 
+
+/* rel's columns' names, in order. */
+static List *
+column_names(Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	List	   *names = NIL;
+
+	for (int i = 0; i < desc->natts; i++)
+		if (!TupleDescAttr(desc, i)->attisdropped)
+			names = lappend(names, pstrdup(NameStr(TupleDescAttr(desc, i)->attname)));
+	table_close(rel, AccessShareLock);
+	return names;
+}
+
+/*
+ * Is a partition, or a partitioned table, one a commit can't hold whole
+ * (and so refused)?  Partitioned tables and their partitions are held
+ * together, all in versioned schemas; and a partition is made again as
+ * its partitioned table's (PARTITION OF), so with its columns in that
+ * table's order.
+ */
+static bool
+partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
+{
+	if (form->relispartition)
+	{
+		Oid			parent = get_partition_parent(form->oid, false);
+		List	   *own = column_names(form->oid);
+		List	   *its = column_names(parent);
+		ListCell   *a;
+		ListCell   *b;
+
+		if (!canon_namespace(get_rel_namespace(parent)))
+			return uncovered(cn, "partitions of tables outside versioned schemas",
+							 qualified(form->relnamespace, name));
+		if (list_length(own) != list_length(its))
+			return uncovered(cn, "partitions with columns their partitioned table lacks",
+							 qualified(form->relnamespace, name));
+		forboth(a, own, b, its)
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				return uncovered(cn, "partitions with their columns in another order than their partitioned table's",
+								 qualified(form->relnamespace, name));
+	}
+	if (form->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		ListCell   *lc;
+
+		foreach(lc, find_inheritance_children(form->oid, AccessShareLock))
+			if (!canon_namespace(get_rel_namespace(lfirst_oid(lc))))
+				return uncovered(cn, "partitioned tables with partitions outside versioned schemas",
+								 qualified(form->relnamespace, name));
+	}
+	return false;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -1376,7 +1447,8 @@ collect(Canon *cn)
 		switch (form->relkind)
 		{
 			case RELKIND_RELATION:
-				if (form->relam == PROLLY_TABLE_AM_OID)
+				if (form->relam == PROLLY_TABLE_AM_OID &&
+					!partition_uncovered(cn, form, name))
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
 					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
@@ -1438,14 +1510,16 @@ collect(Canon *cn)
 			case RELKIND_PARTITIONED_TABLE:
 				{
 					/* (its rows are its partitions': an empty data tree) */
-					Relation	rel = table_open(form->oid, AccessShareLock);
-					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
-					ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
-													   CurrentMemoryContext);
+					Relation	rel;
+					CanonItem  *it;
 					ProllyNodeRef root;
 					StringInfoData desc;
 
-					PROLLY_CALL(cn->tree, build_finish, b, &root);
+					if (partition_uncovered(cn, form, name))
+						break;
+					rel = table_open(form->oid, AccessShareLock);
+					it = add_item(cn, "t:", qualified(form->relnamespace, name));
+					empty_root(cn, &root);
 					initStringInfo(&desc);
 					describe_table(cn, rel, &desc);
 					put_hash(&it->value, &root.hash);
@@ -2692,21 +2766,6 @@ leading_identifier(const char *p)
 	return pnstrdup(p, scan_identifier(p, NULL) - p);
 }
 
-/*
- * An index statement made IF NOT EXISTS: a partition's index its
- * partitioned table's made for it, when the partition was.
- */
-static char *
-if_not_exists_index(const char *stmt)
-{
-	const char *p = strstr(stmt, " INDEX ");
-
-	if (p == NULL)
-		elog(ERROR, "unexpected index definition \"%s\"", stmt);
-	p += strlen(" INDEX ");
-	return psprintf("%.*sIF NOT EXISTS %s", (int) (p - stmt), stmt, p);
-}
-
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
 static char *
 index_name(const char *stmt)
@@ -2858,6 +2917,56 @@ same_strings(const char *a, const char *b)
 	return (a == NULL && b == NULL) || (a && b && strcmp(a, b) == 0);
 }
 
+/* A column line's field that begins with prefix (unescaped), or NULL. */
+static char *
+column_field(const char *line, const char *prefix)
+{
+	char	   *copy = pstrdup(line);
+	char	   *f;
+
+	(void) strtok(copy, "\t");
+	while ((f = strtok(NULL, "\t")) != NULL)
+		if (strncmp(f, prefix, strlen(prefix)) == 0)
+			return unescape_field(f + strlen(prefix));
+	return NULL;
+}
+
+/*
+ * A partition's own defaults: its columns are its partitioned table's,
+ * with the table's defaults when made (from: NULL), but a default may be
+ * its own.  (Generated and identity columns are the table's.)
+ */
+static void
+partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
+				   const TableDef *to)
+{
+	ListCell   *lc;
+
+	foreach(lc, to->columns)
+	{
+		const char *line = lfirst(lc);
+		char	   *col = first_field(line);
+		char	   *def = column_field(line, "default ");
+		const char *was = NULL;
+		ListCell   *fc;
+
+		if (column_field(line, "generated ") || column_field(line, "identity "))
+			continue;
+		if (from != NULL)
+		{
+			foreach(fc, from->columns)
+				if (strcmp(first_field(lfirst(fc)), col) == 0)
+					was = column_field(lfirst(fc), "default ");
+			if (same_strings(was, def))
+				continue;
+		}
+		sm->after = lappend(sm->after,
+							def ? psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+										   name, col, def) :
+							psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", name, col));
+	}
+}
+
 /*
  * The statements turning table name's definition from (NULL: none) into to
  * (NULL: dropped): what must go before the rows are written, and what the
@@ -2950,6 +3059,12 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 				remake = true;
 		}
 	}
+	if (from != NULL && (from->partition_of == NULL) != (to->partition_of == NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s is %s partition at the commit", name,
+						to->partition_of ? "a" : "no longer a"),
+				 errdetail("A move doesn't make a table a partition, or a partition a table.")));
 	if (from != NULL && !same_strings(from->partition_by, to->partition_by))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2971,8 +3086,11 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			(void) move_table(sm, name, from, NULL);
 		initStringInfo(&sql);
 		if (to->partition_of)
+		{
 			appendStringInfo(&sql, "CREATE TABLE %s PARTITION OF %s %s", name,
 							 first_field(to->partition_of), constraint_def(to->partition_of));
+			partition_defaults(sm, name, NULL, to);
+		}
 		else
 		{
 			appendStringInfo(&sql, "CREATE TABLE %s (", name);
@@ -3011,21 +3129,17 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		 */
 		if (strcmp(from->partition_of, to->partition_of) != 0)
 		{
-			sm->before = lappend(sm->before,
-								 psprintf("ALTER TABLE %s DETACH PARTITION %s",
-										  first_field(from->partition_of), name));
+			/* (first: before its old partitioned table may go, with it) */
+			sm->before = lcons(psprintf("ALTER TABLE %s DETACH PARTITION %s",
+										first_field(from->partition_of), name),
+							   sm->before);
 			sm->after = lappend(sm->after,
 								psprintf("ALTER TABLE %s ATTACH PARTITION %s %s",
 										 first_field(to->partition_of), name,
 										 constraint_def(to->partition_of)));
 		}
+		partition_defaults(sm, name, from, to);
 	}
-	else if (from->partition_of || to->partition_of)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("table %s is %s partition at the commit", name,
-						to->partition_of ? "a" : "no longer a"),
-				 errdetail("A move doesn't make a table a partition, or a partition a table.")));
 	else
 	{
 		/* Columns dropped, added, changed. */
@@ -3175,9 +3289,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			if (strcmp(first_field(lfirst(c)), idx) == 0)
 				owned = true;
 		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
-			sm->after = lappend(sm->after,
-								to->partition_of ? if_not_exists_index(lfirst(lc)) :
-								pstrdup(lfirst(lc)));
+			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
 	}
 	foreach(lc, to->triggers)
 		if (!list_has_string(from->triggers, lfirst(lc)))
@@ -4152,7 +4264,12 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			MoveItem   *t = lfirst(lc);
 
 			if (t->kind == 't' && find_item(from, 't', t->name) == NULL)
-				pending = lappend(pending, t);
+			{
+				TableDef   *td = palloc(sizeof(TableDef));
+
+				parse_table_def(t->def, td);
+				pending = lappend(pending, list_make2(t, td));
+			}
 		}
 		while (pending != NIL)
 		{
@@ -4160,24 +4277,27 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 			foreach(lc, pending)
 			{
-				MoveItem   *t = lfirst(lc);
-				TableDef	td;
-				char	   *parent;
+				MoveItem   *t = linitial(lfirst(lc));
+				TableDef   *td = lsecond(lfirst(lc));
+				char	   *parent = td->partition_of ? first_field(td->partition_of) : NULL;
 
-				parse_table_def(t->def, &td);
-				parent = td.partition_of ? first_field(td.partition_of) : NULL;
 				if (parent && !list_has_string(made, parent) &&
 					find_item(from, 't', parent) == NULL &&
 					find_item(to, 't', parent) != NULL)
 				{
-					later = lappend(later, t);
+					later = lappend(later, lfirst(lc));
 					continue;
 				}
-				move_table(&sm, t->name, NULL, &td);
+				move_table(&sm, t->name, NULL, td);
 				made = lappend(made, t->name);
 			}
 			if (list_length(later) == list_length(pending))
-				elog(ERROR, "partitions of %s can't be made", ((MoveItem *) linitial(later))->name);
+			{
+				TableDef   *td = lsecond(linitial(later));
+
+				elog(ERROR, "partitioned table %s can't be made before its partitions",
+					 first_field(td->partition_of));
+			}
 			pending = later;
 		}
 	}

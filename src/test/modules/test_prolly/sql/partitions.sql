@@ -87,6 +87,100 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT * FROM dolt_status;
 SELECT * FROM pg_temp.show();
 
+-- what a partition has of its partitioned table is the table's: a move
+-- leaves it to the table (each case a commit, a branch at the one before
+-- reset to it and back)
+SELECT dolt_checkout('main');
+CREATE TABLE pt.r (id int PRIMARY KEY, w int);
+CREATE TABLE pt.q (id int, k text, v text, ref int REFERENCES pt.r,
+  CONSTRAINT q_v CHECK (v <> ''), PRIMARY KEY (id, k)) PARTITION BY LIST (k);
+CREATE TABLE pt.a1 PARTITION OF pt.q FOR VALUES IN ('a');	-- (before pt.q)
+CREATE TABLE pt.qz PARTITION OF pt.q FOR VALUES IN ('z');
+CREATE INDEX q_v_idx ON pt.q (v);
+ALTER TABLE pt.qz ALTER COLUMN v SET DEFAULT 'own';
+CREATE TABLE pt.old (id int, k text) PARTITION BY LIST (k);
+CREATE TABLE pt.mover PARTITION OF pt.old FOR VALUES IN ('m');
+CREATE TABLE pt.new (id int, k text) PARTITION BY LIST (k);
+INSERT INTO pt.r VALUES (1, 1);
+INSERT INTO pt.q VALUES (1, 'a', 'x', 1), (2, 'z', 'y', 1);
+INSERT INTO pt.mover VALUES (1, 'm');
+SELECT length(dolt_commit('-Am', 'partitions before')::text) AS committed;
+SELECT dolt_branch('pc_cases');
+-- (the referenced table made again, its columns reordered)
+ALTER TABLE pt.q DROP CONSTRAINT q_ref_fkey;
+CREATE TABLE pt.r2 (w int, id int PRIMARY KEY);
+INSERT INTO pt.r2 SELECT w, id FROM pt.r;
+DROP TABLE pt.r;
+ALTER TABLE pt.r2 RENAME TO r;
+ALTER INDEX pt.r2_pkey RENAME TO r_pkey;
+ALTER TABLE pt.q ADD CONSTRAINT q_ref_fkey FOREIGN KEY (ref) REFERENCES pt.r;
+-- (the table's check and index dropped)
+ALTER TABLE pt.q DROP CONSTRAINT q_v;
+DROP INDEX pt.q_v_idx;
+-- (a partition's own default changed)
+ALTER TABLE pt.qz ALTER COLUMN v SET DEFAULT 'own2';
+-- (a partition moved to another table, its old one dropped)
+ALTER TABLE pt.old DETACH PARTITION pt.mover;
+DROP TABLE pt.old;
+ALTER TABLE pt.new ATTACH PARTITION pt.mover FOR VALUES IN ('m');
+SELECT length(dolt_commit('-Am', 'partitions after')::text) AS committed;
+CREATE FUNCTION pg_temp.shape() RETURNS SETOF text LANGUAGE sql AS $$
+	SELECT 'con ' || conrelid::regclass || ' ' || conname FROM pg_constraint
+	  WHERE connamespace = 'pt'::regnamespace AND conrelid::regclass::text ~ '^pt\.(q|a1|qz|r)$'
+	    AND contype <> 'n'
+	UNION ALL
+	SELECT 'index ' || indexname || ' on ' || tablename FROM pg_indexes
+	  WHERE schemaname = 'pt' AND tablename IN ('q', 'a1', 'qz')
+	UNION ALL
+	SELECT 'default ' || adrelid::regclass || ' ' || pg_get_expr(adbin, adrelid) FROM pg_attrdef
+	  WHERE adrelid IN ('pt.q'::regclass, 'pt.qz'::regclass)
+	UNION ALL
+	SELECT 'part ' || inhrelid::regclass || ' of ' || inhparent::regclass FROM pg_inherits
+	  WHERE inhrelid = 'pt.mover'::regclass
+	ORDER BY 1
+$$;
+SELECT * FROM pg_temp.shape();
+SELECT dolt_checkout('pc_cases');
+SELECT dolt_reset('--hard', 'main');
+SELECT * FROM dolt_status;
+SELECT * FROM pg_temp.shape();
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT * FROM dolt_status;
+SELECT * FROM pg_temp.shape();
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'pc_cases');
+
+-- refused: a partition with its columns in another order than its
+-- table's, and one whose table is outside versioned schemas (a partition
+-- outside of a versioned table is refused where it is made)
+CREATE TABLE pt.ord (k text, id int);
+ALTER TABLE pt.new ATTACH PARTITION pt.ord FOR VALUES IN ('o');
+SELECT dolt_commit('-Am', 'refused');
+DROP TABLE pt.ord;
+CREATE TABLE public.pt_out PARTITION OF pt.new FOR VALUES IN ('x');
+CREATE TABLE public.pt_parent (id int, k text) PARTITION BY LIST (k);
+CREATE TABLE pt.pin PARTITION OF public.pt_parent FOR VALUES IN ('i');
+SELECT dolt_commit('-Am', 'refused');
+DROP TABLE public.pt_parent;
+SELECT * FROM dolt_status;
+
+-- refused at a move: a table becoming a partition, even one whose columns
+-- are reordered (which would otherwise make it again)
+CREATE TABLE pt.t2 (k text, id int);
+SELECT length(dolt_commit('-Am', 'a table')::text) AS committed;
+SELECT dolt_branch('pc_table');
+DROP TABLE pt.t2;
+CREATE TABLE pt.t2 PARTITION OF pt.new FOR VALUES IN ('t');
+SELECT length(dolt_commit('-Am', 'a partition')::text) AS committed;
+SELECT dolt_reset('--hard', 'pc_table');
+DROP TABLE pt.t2;
+CREATE TABLE pt.t2 (k text, id int);
+SELECT length(dolt_commit('-Am', 'a table again')::text) AS committed;
+SELECT dolt_reset('--hard', 'HEAD~1');
+DROP TABLE pt.t2;
+SELECT length(dolt_commit('-Am', 'no t2')::text) AS committed;
+SELECT dolt_branch('-D', 'pc_table');
+
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'pt_reset');
 SELECT dolt_branch('-D', 'pt_merge');
