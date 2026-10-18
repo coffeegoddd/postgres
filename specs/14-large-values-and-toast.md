@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided. The refusal and B built 2026-10-17 and merged 2026-10-18 (#217–#221, #224, one stack); B is complete (#180 closed 2026-10-18), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C's questions 3 and 4 and how to build it decided by the user 2026-10-18, as recommended (C7). C isn't built (#181). Code references refreshed on `8faba578f9`.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided. The refusal and B built 2026-10-17 and merged 2026-10-18 (#217–#221, #224, one stack); B is complete (#180 closed 2026-10-18), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C's questions 3 and 4 and how to build it decided by the user 2026-10-18, as recommended (C7). Gates 1 and 3 measured on a throwaway prototype and round 2 decided by the user the same day (C8): no hybrid, the journal's append reworked first, C built as C8's layers. C isn't built (#181). Code references refreshed on `8faba578f9`.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with
@@ -464,7 +464,9 @@ for a relation with a chunk-store destination:
 - **Durability and standbys.** Every appended byte is WAL-logged and
   flushed before it's written (`chunkstore_journal.c:31-36, 669-778`), so a
   crash and a physical standby see a value's chunks before any heap commit
-  that names it.
+  that names it; and a transaction's chunks are written before it becomes
+  visible, so another backend never sees a row whose chunks it can't
+  read.
 - **Rollback.** A transaction's chunks are XCHUNK records, invisible to
   others until it commits; an aborted transaction's chunks are unreachable
   garbage.
@@ -507,6 +509,9 @@ needs only tests.
 4. **A hybrid.** Hash pointers only above a size, OID TOAST below.
    **Decided (user, 2026-10-18):** no hybrid unless gate 3 fails; then a
    fixed 64 KB, in code (a format rule, not a setting, as `T` is).
+   **Superseded (round 2, C8):** gate 3 failed at every size, so a 64 KB
+   hybrid wouldn't have passed it either; no hybrid, and the journal's
+   append is reworked instead.
 5. **The format.** **Decided (user, 2026-10-18):** a clean break of
    history's format is acceptable until spec 11's step 8 (measurement)
    is done, as every format change before it has been; after it, older
@@ -530,8 +535,10 @@ table as built (TOAST in its TOAST table, "OID"); and the prototype
 ("hash"), which built a value tree in `toast_save_datum` and wrote a
 SHA-256 pointer.
 
-**Gate 3, save cost.** pgbench, one INSERT a transaction, tps (mean of
-two 10 s runs):
+**Gate 3, save cost.** Against heap TOAST, as question 3 set it; no pass
+line was set with it, and the comparisons below give the ratio of heap's
+tps to hash's (how many times as much a value costs). pgbench, one INSERT
+a transaction, tps (mean of two 10 s runs):
 
 | size | writers | heap | OID | hash | hash, append outside the lock | hash, no flush of its own |
 |---|---|---|---|---|---|---|
@@ -546,8 +553,9 @@ One statement inserting many values, one commit (CPU), µs a value with
 the values' generation subtracted: 2 KB 12.0 (heap), 11.9 (OID), 17.8
 (hash); 64 KB 161, 166, 303; 1 MB 2839, 2919, 4700.
 
-- With the journal as built, gate 3 fails: 1.8–1.9x per value with one
-  writer at 2 KB and 64 KB, 4.5x (64 KB) to 8x (2 KB) with eight.
+- With the journal as built, gate 3 fails: 1.9–2.0x heap's cost per value
+  with one writer at 2 KB and 64 KB, 4.8x (64 KB) to 7.6x (2 KB) with
+  eight.
   `append_bytes()` holds `ProllyJournalLock` across `XLogFlush()` and the
   write, so writers take turns at an fsync, and a transaction flushes
   twice (its chunks, then its commit record).
@@ -556,14 +564,17 @@ the values' generation subtracted: 2 KB 12.0 (heap), 11.9 (OID), 17.8
 - Appending outside the lock removes most of the concurrent loss; not
   flushing the chunks on their own as well (an unsafe stand-in for
   writing them after the commit record's flush, as a root is written over
-  its PAD) gives 0.98–1.17x of the versioned table as built.
+  its PAD) costs 0.92–1.24x as much as heap (0.98–1.17x the versioned
+  table as built): 81–109% of heap's tps.
 - Where the CPU goes (64 KB, perf): the value chunker's rolling hash about
   32%, SHA-256 22%, the journal's hash-table lookups 15%, CRC 4%.
 - Found on the way: a backend's first chunk-store miss scans the whole
   unsealed journal to index it, about 1 s a GB (3.0 s at 3.2 GB). With C
   the journal grows with the working set's writes, not with commits.
 
-**Gate 1, the heap roots.** Warm buffers; a table of 1 M rows with 2 KB
+**Gate 1, the heap roots.** Warm buffers, one branch's heap read through
+shared buffers (not the page store's blocks from disk, the method decision
+3 chose); a table of 1 M rows with 2 KB
 values and 100 K of them updated (98 MB, 1.1 M pointers counting dead
 tuples), and one of 5 M narrow rows (365 MB, none):
 
@@ -578,7 +589,10 @@ About 0.2 s a GB of heap plus 0.2 µs a pointer (a hash set's insert; a
 collector marks by slot instead), against 7–10 s for the collection
 itself of a 5 GB journal. Scanning each branch's heap would multiply by
 the branches; scanning the page store's physical blocks reads each once.
-Gate 1 passes. Gate 2 (compression) wasn't measured.
+Gate 1 passes for warm scans; a cold scan of the page store's blocks
+reads them from disk at the device's sequential rate on top of this, and
+is measured on the layer that builds it. Gate 2 (compression) wasn't
+measured.
 
 **Decided (user, 2026-10-18, round 2):**
 
@@ -586,17 +600,28 @@ Gate 1 passes. Gate 2 (compression) wasn't measured.
    range is reserved under the lock and logged and written outside it,
    batches share a group flush, a transaction's last batch is written
    after its commit record's flush, and a range left unwritten is padded.
-   Gate 3 is measured again on it.
+   The last batch is written before the transaction is visible (after
+   the commit record's flush, before CLOG and the ProcArray), so C5 still
+   holds: a commit's chunks are present before anyone sees a row naming
+   them. Gate 3 is measured again on it.
 2. The collection's heap roots land before the save hook, so no build
    saves values a collection could free.
 3. The roots are found by a conservative byte scan of the page store's
    physical blocks: each block once, whichever branches map it, freed
    blocks skipped. Bytes that spell a hash pointer keep its tree; nothing
-   named is lost (as the collector already treats chunks' bytes).
+   named is lost (as the collector already treats chunks' bytes). Dirty
+   buffers are flushed to the page store before the scan, and a pointer
+   written after that is covered by the keep set: a transaction that
+   names a tree is waited for by a collection that begins later, and one
+   that names it while a collection runs adds it to the collection's keep
+   set.
 4. The journal is bounded: past a size, autovacuum seals it and moves its
    chunks into a table file, collecting nothing.
 
-**The layers**, one stack, each with its tests:
+**The layers**, one stack, each with its tests. Layers 7 to 10 merge
+together: from the save hook on, values are saved by content, and only
+layer 10 lets logical decoding read them and keeps what a slot still has
+to decode.
 
 1. This part.
 2. jsonb's on-disk canonical bytes, with a version byte (C7 question 1).
@@ -649,5 +674,6 @@ send function, so its tables can't be folded at all.
    aren't silently versioned as numbers. Built (#217).
 2. B2, then B1 (B1's references use B2's trees), then B3 and B4. Built
    (#218, #219, #220, #221).
-3. jsonb's on-disk canonical bytes (C7, question 1), a PR of its own;
-   then C's prototype and gates (C7, question 3), then C (#181).
+3. C's prototype and gates (C7, question 3; measured, C8), then C as
+   C8's layers, jsonb's on-disk canonical bytes (C7, question 1) the
+   first (#181).
