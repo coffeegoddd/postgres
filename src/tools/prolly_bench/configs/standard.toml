@@ -85,6 +85,7 @@ conflict_percent = [0]
 [workloads.V6]
 branches = [20]
 changes = [10000]
+background = ["none"]
 
 [tools]
 # An unpacked BenchBase Postgres build (build_benchbase.sh).

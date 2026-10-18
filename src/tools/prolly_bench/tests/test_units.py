@@ -167,6 +167,16 @@ class ConfigTest(unittest.TestCase):
                 config.load(Path(f.name), {})
 
 
+class V6RangeTest(unittest.TestCase):
+    def test_each_branch_changes_n_rows(self):
+        from pbench.workloads.v_suite import V6
+        rows, n = 100000, 30000
+        for b in range(20):
+            lo, past = V6.changed(b, n, rows)
+            ids = [i for i in range(1, rows + 1) if lo < i <= lo + n or i <= past]
+            self.assertEqual(len(ids), n, f"branch {b}")
+
+
 class RegistryTest(unittest.TestCase):
     def test_everything_registered(self):
         registry.load_all()

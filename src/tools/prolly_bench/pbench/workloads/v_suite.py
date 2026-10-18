@@ -265,6 +265,13 @@ class V6(VWorkload):
     def _space(self, ctx) -> float:
         return int(ctx.cluster.scalar(self.SPACE, dbname=ctx.dbname) or 0) / 1048576
 
+    @staticmethod
+    def changed(b: int, n: int, rows: int) -> tuple[int, int]:
+        """Branch b's n changed ids, from lo, wrapping past the last:
+        (lo, past), ids in lo < id <= lo + n, or id <= past."""
+        lo = b * n % rows
+        return lo, lo + n - rows
+
     def operations(self, ctx):
         n, nb, rows = ctx.params["changes"], ctx.params["branches"], self.rows(ctx)
         if n > rows:
@@ -272,10 +279,10 @@ class V6(VWorkload):
         vc = VC_SQL
         stmts = ["SELECT dolt_gc()"]
         for b in range(nb):
-            lo = b * n % rows
+            lo, past = self.changed(b, n, rows)
             stmts += [vc.branch(f"v6_b{b}"), vc.checkout(f"v6_b{b}"),
                       f"UPDATE vc_data SET payload = md5(payload) "
-                      f"WHERE id > {lo} AND id <= {lo + n}",
+                      f"WHERE (id > {lo} AND id <= {lo + n}) OR id <= {past}",
                       vc.commit(f"v6 {b}"), vc.checkout("main")]
         timed_session(ctx, stmts, "v6-branches")
         with_branches = self._space(ctx)
@@ -283,14 +290,17 @@ class V6(VWorkload):
         collected = self._space(ctx)
         timed_session(ctx, [f"SELECT dolt_branch('-D', 'v6_b{b}')" for b in range(nb)],
                       "v6-delete")
-        t += timed_session(ctx, ["SELECT dolt_gc()", "SELECT dolt_gc('--full')",
-                                 "SELECT dolt_gc('--full')"], "v6-full")
+        t += timed_session(ctx, ["SELECT dolt_gc()"], "v6-gc-deleted")
+        after_default = self._space(ctx)
+        t += timed_session(ctx, ["SELECT dolt_gc('--full')", "SELECT dolt_gc('--full')"],
+                           "v6-full")
         return Outcome(metrics={"default_gc_ms": t[0],
                                 "default_gc_after_delete_ms": t[1],
                                 "full_gc_ms": t[2],
                                 "full_gc_all_live_ms": t[3],
                                 "space_with_branches_mb": with_branches,
                                 "space_collected_mb": collected,
+                                "space_after_delete_gc_mb": after_default,
                                 "space_after_full_mb": self._space(ctx)},
                        transactions=4, unit="collection")
 
