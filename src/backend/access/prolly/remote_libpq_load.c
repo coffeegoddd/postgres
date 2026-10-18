@@ -90,17 +90,38 @@ libpq_move_head(ProllyRemote *remote, const char *branch,
 					   format, force);
 }
 
+/* (a module without batches: one at a time) */
 static void
 libpq_get_many(ProllyRemote *remote, const ProllyHash *hashes, int n,
 			   ProllyRemoteChunkVisit visit, void *arg)
 {
-	PROLLY_CALL(libpq(), get_many, remote, hashes, n, visit, arg);
+	StringInfoData data;
+
+	if (PROLLY_HAS(libpq(), get_many))
+	{
+		PROLLY_CALL(libpq(), get_many, remote, hashes, n, visit, arg);
+		return;
+	}
+	initStringInfo(&data);
+	for (int i = 0; i < n; i++)
+	{
+		resetStringInfo(&data);
+		if (PROLLY_CALL(libpq(), get, remote, &hashes[i], &data))
+			visit(&hashes[i], data.data, data.len, arg);
+	}
+	pfree(data.data);
 }
 
 static void
 libpq_has_many(ProllyRemote *remote, const ProllyHash *hashes, int n, bool *has)
 {
-	PROLLY_CALL(libpq(), has_many, remote, hashes, n, has);
+	if (PROLLY_HAS(libpq(), has_many))
+	{
+		PROLLY_CALL(libpq(), has_many, remote, hashes, n, has);
+		return;
+	}
+	for (int i = 0; i < n; i++)
+		has[i] = PROLLY_CALL(libpq(), has, remote, &hashes[i]);
 }
 
 #define LIBPQ_CALLBACKS \

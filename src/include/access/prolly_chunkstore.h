@@ -42,7 +42,8 @@
  *   (with or without a source), hears what prefetch() is told.
  * - prefetch() is told the chunks a walk is about to read (a node's
  *   children), so that a read-through source can fetch them at once
- *   (optional; without a hint, nothing).
+ *   (optional): whether a hint heard them, and with none (n 0), whether
+ *   one would, so a walk collects them only when it would.
  *
  * Provisional (v0).
  *
@@ -133,7 +134,7 @@ typedef struct ProllyChunkStoreRoutine
 	/* Chunks the store hasn't, read from source (NULL: no longer). */
 	void		(*read_through) (ProllyChunkStore *store, ProllyChunkGet source,
 								 ProllyChunkHint hint, void *arg);
-	void		(*prefetch) (ProllyChunkStore *store, const ProllyHash *hashes,
+	bool		(*prefetch) (ProllyChunkStore *store, const ProllyHash *hashes,
 							 int n);
 } ProllyChunkStoreRoutine;
 

@@ -163,10 +163,23 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 	return true;
 }
 
+/* A batch asked of the remote: what it may give. */
+typedef struct Asked
+{
+	Receiving  *rv;
+	HTAB	   *hashes;
+} Asked;
+
+/* (a chunk not asked for isn't taken: nothing says what it references is) */
 static void
 receive_many_visit(const ProllyHash *hash, const char *data, int len, void *arg)
 {
-	(void) keep_chunk(arg, hash, data, len);
+	Asked	   *asked = arg;
+	ProllyHash	key;
+
+	hash_key(&key, hash);
+	if (hash_search(asked->hashes, &key, HASH_FIND, NULL) != NULL)
+		(void) keep_chunk(asked->rv, hash, data, len);
 }
 
 /*
@@ -204,7 +217,25 @@ receive_hint(void *arg, const ProllyHash *hashes, int n)
 	}
 	PG_END_TRY();
 	if (nask > 0)
-		PROLLY_CALL(rv->rr, get_many, rv->remote, ask, nask, receive_many_visit, rv);
+	{
+		HASHCTL		ctl;
+		Asked		asked = {rv, NULL};
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = CurrentMemoryContext;
+		asked.hashes = hash_create("prolly chunks asked", nask, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		for (int i = 0; i < nask; i++)
+		{
+			ProllyHash	key;
+
+			hash_key(&key, &ask[i]);
+			(void) hash_search(asked.hashes, &key, HASH_ENTER, NULL);
+		}
+		PROLLY_CALL(rv->rr, get_many, rv->remote, ask, nask, receive_many_visit, &asked);
+		hash_destroy(asked.hashes);
+	}
 	pfree(ask);
 }
 

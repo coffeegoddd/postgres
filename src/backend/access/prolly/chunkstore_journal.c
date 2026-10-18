@@ -750,12 +750,14 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->pad_offset = 0;
 			s->saved = NIL;
 			s->through = NULL;
+			s->through_hint = NULL;
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			discard_pending(s);
 			s->saved = NIL;
 			s->through = NULL;
+			s->through_hint = NULL;
 			break;
 	}
 }
@@ -2026,11 +2028,14 @@ journal_read_through(ProllyChunkStore *s, ProllyChunkGet source,
 	s->through_arg = arg;
 }
 
-static void
+static bool
 journal_prefetch(ProllyChunkStore *s, const ProllyHash *hashes, int n)
 {
-	if (s->through_hint && n > 0)
+	if (s->through_hint == NULL)
+		return false;
+	if (n > 0)
 		s->through_hint(s->through_arg, hashes, n);
+	return true;
 }
 
 static void

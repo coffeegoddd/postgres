@@ -987,8 +987,10 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 	ProllyHash *hashes;
 	int			n = 0;
 
+	/* (only when a hint would hear them) */
 	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
-		node->nitems == 0)
+		node->nitems == 0 ||
+		!PROLLY_CALL(env->chunk_store, prefetch, env->chunks, NULL, 0))
 		return;
 	hashes = palloc(sizeof(ProllyHash) * node->nitems);
 	for (int i = 0; i < node->nitems; i++)
@@ -1015,7 +1017,7 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 		}
 		hashes[n++] = ref.hash;
 	}
-	PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
+	(void) PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
 	pfree(hashes);
 }
 

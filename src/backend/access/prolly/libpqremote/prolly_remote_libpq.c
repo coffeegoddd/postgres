@@ -235,29 +235,60 @@ libpq_close(ProllyRemote *r)
  * ------------------------------------------------------------------------
  */
 
-/* hashes[n] as a bytea[] in binary. */
+/* An array's header, in binary: one dimension of n bytea, no nulls. */
 static void
-bytea_array(StringInfo out, const ProllyHash *const *hashes,
-			const StringInfoData *const *chunks, int n)
+array_header(StringInfo out, int n)
 {
-	pq_sendint32(out, 1);		/* dimensions */
-	pq_sendint32(out, 0);		/* no nulls */
+	pq_sendint32(out, 1);
+	pq_sendint32(out, 0);
 	pq_sendint32(out, BYTEAOID);
 	pq_sendint32(out, n);
 	pq_sendint32(out, 1);		/* lower bound */
+}
+
+/* hashes[n] as a bytea[] in binary. */
+static void
+hashes_array(StringInfo out, const ProllyHash *hashes, int n)
+{
+	array_header(out, n);
 	for (int i = 0; i < n; i++)
 	{
-		if (hashes)
-		{
-			pq_sendint32(out, hashes[i]->len);
-			pq_sendbytes(out, hashes[i]->bytes, hashes[i]->len);
-		}
-		else
-		{
-			pq_sendint32(out, chunks[i]->len);
-			pq_sendbytes(out, chunks[i]->data, chunks[i]->len);
-		}
+		pq_sendint32(out, hashes[i].len);
+		pq_sendbytes(out, hashes[i].bytes, hashes[i].len);
 	}
+}
+
+/* chunks[n] as a bytea[] in binary. */
+static void
+chunks_array(StringInfo out, StringInfoData *const *chunks, int n)
+{
+	array_header(out, n);
+	for (int i = 0; i < n; i++)
+	{
+		pq_sendint32(out, chunks[i]->len);
+		pq_sendbytes(out, chunks[i]->data, chunks[i]->len);
+	}
+}
+
+/* Run a statement whose one parameter is hashes, as a bytea[]. */
+static PGresult *
+run_hashes(ProllyRemote *r, const char *sql, const ProllyHash *hashes, int n,
+		   int result_format, const char *what)
+{
+	StringInfoData param;
+	const char *values[1];
+	int			lengths[1];
+	int			formats[1] = {1};
+	Oid			types[1] = {BYTEAARRAYOID};
+	PGresult   *res;
+
+	initStringInfo(&param);
+	hashes_array(&param, hashes, n);
+	values[0] = param.data;
+	lengths[0] = param.len;
+	res = run(r, sql, 1, types, values, lengths, formats, result_format, what);
+	pfree(param.data);
+	return res;
 }
 
 static void
@@ -319,20 +350,11 @@ libpq_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
 static bool
 libpq_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 {
-	StringInfoData param;
-	const char *values[1];
-	int			lengths[1];
-	int			formats[1] = {1};
-	Oid			types[1] = {BYTEAARRAYOID};
 	PGresult   *res;
 	bool		found;
 
-	initStringInfo(&param);
-	bytea_array(&param, &hash, NULL, 1);
-	values[0] = param.data;
-	lengths[0] = param.len;
-	res = run(r, "SELECT chunk FROM pg_catalog.dolt_serve_get($1)", 1, types,
-			  values, lengths, formats, 1, "reading a chunk");
+	res = run_hashes(r, "SELECT chunk FROM pg_catalog.dolt_serve_get($1)", hash, 1,
+					 1, "reading a chunk");
 	found = PQntuples(res) > 0;
 	if (found)
 		appendBinaryStringInfo(out, PQgetvalue(res, 0, 0), PQgetlength(res, 0, 0));
@@ -343,55 +365,24 @@ libpq_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 static bool
 libpq_has(ProllyRemote *r, const ProllyHash *hash)
 {
-	StringInfoData param;
-	const char *values[1];
-	int			lengths[1];
-	int			formats[1] = {1};
-	Oid			types[1] = {BYTEAARRAYOID};
 	PGresult   *res;
 	bool		has;
 
-	initStringInfo(&param);
-	bytea_array(&param, &hash, NULL, 1);
-	values[0] = param.data;
-	lengths[0] = param.len;
-	res = run(r, "SELECT (pg_catalog.dolt_serve_has($1))[1]", 1, types, values,
-			  lengths, formats, 0, "asking for a chunk");
+	res = run_hashes(r, "SELECT (pg_catalog.dolt_serve_has($1))[1]", hash, 1, 0,
+					 "asking for a chunk");
 	has = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 	PQclear(res);
 	return has;
-}
-
-/* hashes as a bytea[] parameter, in binary */
-static void
-hashes_param(StringInfo out, const ProllyHash *hashes, int n)
-{
-	const ProllyHash **ptrs = palloc(sizeof(ProllyHash *) * Max(n, 1));
-
-	for (int i = 0; i < n; i++)
-		ptrs[i] = &hashes[i];
-	bytea_array(out, ptrs, NULL, n);
-	pfree(ptrs);
 }
 
 static void
 libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 			   ProllyRemoteChunkVisit visit, void *arg)
 {
-	StringInfoData param;
-	const char *values[1];
-	int			lengths[1];
-	int			formats[1] = {1};
-	Oid			types[1] = {BYTEAARRAYOID};
 	PGresult   *res;
 
-	initStringInfo(&param);
-	hashes_param(&param, hashes, n);
-	values[0] = param.data;
-	lengths[0] = param.len;
-	res = run(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)", 1,
-			  types, values, lengths, formats, 1, "reading chunks");
-	pfree(param.data);
+	res = run_hashes(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)",
+					 hashes, n, 1, "reading chunks");
 	PG_TRY();
 	{
 		for (int i = 0; i < PQntuples(res); i++)
@@ -412,21 +403,10 @@ libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 static void
 libpq_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
 {
-	StringInfoData param;
-	const char *values[1];
-	int			lengths[1];
-	int			formats[1] = {1};
-	Oid			types[1] = {BYTEAARRAYOID};
 	PGresult   *res;
 
-	initStringInfo(&param);
-	hashes_param(&param, hashes, n);
-	values[0] = param.data;
-	lengths[0] = param.len;
-	res = run(r, "SELECT h FROM unnest(pg_catalog.dolt_serve_has($1)) WITH ORDINALITY AS a(h, i) "
-			  "ORDER BY i", 1, types, values, lengths, formats, 0,
-			  "asking for chunks");
-	pfree(param.data);
+	res = run_hashes(r, "SELECT h FROM unnest(pg_catalog.dolt_serve_has($1)) WITH ORDINALITY AS a(h, i) "
+					 "ORDER BY i", hashes, n, 0, "asking for chunks");
 	if (PQntuples(res) != n)
 	{
 		PQclear(res);
@@ -442,7 +422,7 @@ libpq_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
 
 /* Send a batch of a push's chunks. */
 static void
-send_batch(ProllyRemote *r, ProllyHash **hashes, StringInfoData **chunks, int n)
+send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, int n)
 {
 	StringInfoData h;
 	StringInfoData c;
@@ -453,8 +433,8 @@ send_batch(ProllyRemote *r, ProllyHash **hashes, StringInfoData **chunks, int n)
 
 	initStringInfo(&h);
 	initStringInfo(&c);
-	bytea_array(&h, (const ProllyHash *const *) hashes, NULL, n);
-	bytea_array(&c, NULL, (const StringInfoData *const *) chunks, n);
+	hashes_array(&h, hashes, n);
+	chunks_array(&c, chunks, n);
 	values[0] = h.data;
 	lengths[0] = h.len;
 	values[1] = c.data;
@@ -472,7 +452,7 @@ libpq_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 											  "prolly push batch",
 											  ALLOCSET_DEFAULT_SIZES);
 	MemoryContext old = MemoryContextSwitchTo(cxt);
-	ProllyHash **hashes = palloc(sizeof(ProllyHash *) * BATCH_CHUNKS);
+	ProllyHash *hashes = palloc(sizeof(ProllyHash) * BATCH_CHUNKS);
 	StringInfoData **chunks = palloc(sizeof(StringInfoData *) * BATCH_CHUNKS);
 	int			n = 0;
 	Size		bytes = 0;
@@ -492,7 +472,7 @@ libpq_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 		more = next(arg, h, c);
 		if (more)
 		{
-			hashes[n] = h;
+			hashes[n] = *h;
 			chunks[n] = c;
 			n++;
 			bytes += c->len;
@@ -504,7 +484,7 @@ libpq_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
 			bytes = 0;
 			MemoryContextReset(cxt);
 			old = MemoryContextSwitchTo(cxt);
-			hashes = palloc(sizeof(ProllyHash *) * BATCH_CHUNKS);
+			hashes = palloc(sizeof(ProllyHash) * BATCH_CHUNKS);
 			chunks = palloc(sizeof(StringInfoData *) * BATCH_CHUNKS);
 			MemoryContextSwitchTo(old);
 		}
