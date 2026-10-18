@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "dolt-merge-float-default",
+  "description": "Reviewed Dolt port: merge with float column default",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: merge with float column default"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (f real)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "main-default",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ALTER COLUMN f SET DEFAULT '1.00'",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "change default on main"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-default",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ALTER COLUMN f SET DEFAULT '1.000000000'",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "change default on other"
+      ],
+      "save": "other"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "main"
+      ],
+      "save": "merged"
+    }
+  ]
+}

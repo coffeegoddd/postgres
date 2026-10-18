@@ -1,0 +1,38 @@
+{
+		Name: "cell-wise merges can result in a unique key violation",
+		SetUpScript: []string{
+			"SET dolt_force_transaction_commit = on;",
+			"CREATE TABLE t (pk int PRIMARY KEY, col1 int, col2 int, UNIQUE col1_col2_u (col1, col2));",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO T VALUES (1, 1, 1), (2, NULL, NULL);",
+			"CALL DOLT_COMMIT('-am', 'setup');",
+
+			"CALL DOLT_CHECKOUT('-b', 'right');",
+			"UPDATE t SET col2 = 1 where pk = 2;",
+			"CALL DOLT_COMMIT('-am', 'right edit');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"UPDATE t SET col1 = 1 where pk = 2;",
+			"CALL DOLT_COMMIT('-am', 'left edit');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{{1, 1, 1}, {2, 1, 1}},
+			},
+			{
+				Query:    "SELECT violation_type, pk, col1, col2 from dolt_constraint_violations_t;",
+				Expected: []sql.Row{{"unique index", 1, 1, 1}, {"unique index", 2, 1, 1}},
+			},
+			{
+				Query: "select * from dolt_status;",
+				Expected: []sql.Row{
+					{"t", byte(0), "constraint violation"},
+				},
+			},
+		},
+	}

@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "id": "dolt-keyless-merge-unique",
+  "description": "Reviewed Dolt port: Keyless merge with unique indexes documents violations",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "KeylessMergeCVsAndConflictsScripts: Keyless merge with unique indexes documents violations"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (col1 int, col2 int UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "setup",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "checkout-right",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "right-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right"
+      ],
+      "save": "right"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "left-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left"
+      ],
+      "save": "left"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('right') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'col1', violating_row->>'col2' FROM dolt_constraint_violations('t') ORDER BY 2",
+      "expect": {
+        "rows": [
+          [
+            "unique index",
+            "2",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t ORDER BY col1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

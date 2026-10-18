@@ -226,13 +226,16 @@ prolly_session_ready(void)
 	connect_branch = NULL;
 }
 
+/* dolt_commit's -f, while its commit runs: violations don't stop it */
+static bool commit_forced = false;
+
 bool
 prolly_allow_commit_conflicts(void)
 {
 	const char *v = GetConfigOption("dolt.allow_commit_conflicts", true, false);
 	bool		result = false;
 
-	return v != NULL && parse_bool(v, &result) && result;
+	return commit_forced || (v != NULL && parse_bool(v, &result) && result);
 }
 
 const char *
@@ -678,7 +681,9 @@ qualified_name(Oid relid)
  *
  * -m/--message message (required), --author "Name <email>", -a/-A/--all
  * (every change is always committed), --allow-empty (else a commit whose
- * root equals its parent's is refused).
+ * root equals its parent's is refused), -f/--force (constraint violations
+ * don't stop the commit, as in Dolt; the transaction still can't commit
+ * with them unless dolt.allow_commit_conflicts is on).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -688,6 +693,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	   *message = NULL;
 	char	   *author = NULL;
 	bool		allow_empty = false;
+	bool		force = false;
 	ProllyHash	id = {0};
 	bool		committed = false;
 	const char *result[1];
@@ -704,6 +710,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 			continue;
 		else if (strcmp(a, "--allow-empty") == 0)
 			allow_empty = true;
+		else if (strcmp(a, "--force") == 0)
+			force = true;
 		else if (a[0] == '-' && a[1] != '-' && a[1] != '\0')
 		{
 			/* Short options together, as -Am message. */
@@ -711,6 +719,11 @@ dolt_commit(PG_FUNCTION_ARGS)
 			{
 				if (*c == 'a' || *c == 'A')
 					continue;
+				if (*c == 'f')
+				{
+					force = true;
+					continue;
+				}
 				if (*c == 'm' && c[1] == '\0')
 					message = option_value(args, nargs, &i, "dolt_commit");
 				else
@@ -729,6 +742,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 				 errhint("Pass -m and a message.")));
 
 	author_override = author;
+	commit_forced = force;
 	PG_TRY();
 	{
 		note_integration();
@@ -738,6 +752,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_FINALLY();
 	{
 		author_override = NULL;
+		commit_forced = false;
 	}
 	PG_END_TRY();
 
@@ -1442,7 +1457,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[0] = "";
 		result[1] = "0";
 		result[2] = "1";
-		result[3] = conflicts > 0 ? "conflicts found" : "constraint violations found";
+		result[3] = "conflicts found";	/* (violations too, as in Dolt) */
 		PG_RETURN_DATUM(text_array(4, result));
 	}
 	/* (Dolt's messages, for nothing to merge) */
@@ -2682,12 +2697,35 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 }
 
 /*
+ * names ("name<tab>status") with table relid's status status, in place of
+ * any it had
+ */
+static List *
+with_status(List *names, Oid relid, const char *status)
+{
+	char	   *name = qualified_name(relid);
+	size_t		len = strlen(name);
+	ListCell   *lc;
+
+	foreach(lc, names)
+	{
+		char	   *n = lfirst(lc);
+
+		/* (the status is after the last tab: a name may hold one) */
+		if (strrchr(n, '\t') == n + len && strncmp(n, name, len) == 0)
+			names = foreach_delete_current(names, lc);
+	}
+	return lappend(names, psprintf("%s\t%s", name, status));
+}
+
+/*
  * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
  *	  returns setof record
  *
  * The tables changed since the session branch's head commit: rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
- * in progress, with conflicts ("conflict", not staged); the other objects
+ * in progress, with conflicts ("conflict", not staged), or with constraint
+ * violations ("constraint violation", not staged); the other objects
  * changed (schemas, routines with their argument types, views, types,
  * sequences), with the tables' statuses, as Doltgres lists them; and
  * objects a commit doesn't cover yet ("not covered", not staged).
@@ -2716,23 +2754,14 @@ dolt_status(PG_FUNCTION_ARGS)
 	{
 		PROLLY_CALL(diff_merge(), tables, "HEAD", "WORKING", status_table,
 					&names);
+		/* (a table with conflicts and violations shows its conflicts) */
+		foreach(lc, PROLLY_CALL(refs(), violations))
+			names = with_status(names, ((ProllyViolation *) lfirst(lc))->relid,
+								"constraint violation");
 		if (PROLLY_CALL(refs(), merge_state, &ms))
 		{
 			for (int i = 0; i < ms.ntables; i++)
-			{
-				char	   *name = qualified_name(ms.tables[i]);
-				size_t		len = strlen(name);
-
-				foreach(lc, names)
-				{
-					char	   *n = lfirst(lc);
-
-					/* (the status is after the last tab: a name may hold one) */
-					if (strrchr(n, '\t') == n + len && strncmp(n, name, len) == 0)
-						names = foreach_delete_current(names, lc);
-				}
-				names = lappend(names, psprintf("%s\tconflict", name));
-			}
+				names = with_status(names, ms.tables[i], "conflict");
 		}
 	}
 	else
@@ -2769,6 +2798,7 @@ dolt_status(PG_FUNCTION_ARGS)
 		values[0] = CStringGetTextDatum(lfirst(lc));
 		/* (a conflict, or an object a commit refuses, isn't committed) */
 		values[1] = BoolGetDatum(strcmp(tab + 1, "conflict") != 0 &&
+								 strcmp(tab + 1, "constraint violation") != 0 &&
 								 strcmp(tab + 1, "not covered") != 0);
 		values[2] = CStringGetTextDatum(tab + 1);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);

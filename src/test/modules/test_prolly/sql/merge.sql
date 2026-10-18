@@ -206,7 +206,7 @@ SELECT dolt_checkout('mgd_side') IS NOT NULL AS on_side;
 UPDATE mgd.t SET c = NULL;
 SELECT length(dolt_commit('-am', 'c is NULL')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-UPDATE mgd.t SET a = 'uno';
+UPDATE mgd.t SET a = 'uno', c = 7;
 SELECT length(dolt_commit('-am', 'a is uno')::text) AS committed;
 BEGIN;
 SELECT (dolt_merge('mgd_side'))[2:4];

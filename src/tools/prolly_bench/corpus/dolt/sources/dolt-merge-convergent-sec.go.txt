@@ -1,0 +1,30 @@
+{
+		Name: "Pk convergent updates to sec diff congruent",
+		SetUpScript: []string{
+			"create table xyz (x int primary key, y int, z int, key y_idx(y), key z_idx(z))",
+			"insert into xyz values (0,0,0), (1,1,1)",
+			"call dolt_commit('-Am', 'make table')",
+
+			"call dolt_checkout('-b', 'feature')",
+			"update xyz set z = 2 where z = 1",
+			"call dolt_commit('-am', 'update z=2')",
+
+			"call dolt_checkout('main')",
+			"update xyz set y = 2 where z = 1",
+			"call dolt_commit('-am', 'update y=2')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('feature');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select y from xyz where y >= 0",
+				Expected: []sql.Row{{0}, {2}},
+			},
+			{
+				Query:    "select z from xyz where y >= 0",
+				Expected: []sql.Row{{0}, {2}},
+			},
+		},
+	}

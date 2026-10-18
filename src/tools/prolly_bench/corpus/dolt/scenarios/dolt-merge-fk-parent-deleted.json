@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "id": "dolt-merge-fk-parent-deleted",
+  "description": "Reviewed Dolt port: foreign key violation, parent row deleted",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: foreign key violation, parent row deleted"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "ddl-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "ddl-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (fk int, FOREIGN KEY (fk) REFERENCES parent (pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "seed-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "main-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM child WHERE fk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "main-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM parent WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "delete parent and child rows"
+      ],
+      "save": "mainc"
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert child row"
+      ],
+      "save": "otherc"
+    },
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT (dolt_merge('main'))[2:4]",
+      "expect": {
+        "rows": [
+          [
+            "{0,1,\"conflicts found\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'fk' FROM dolt_constraint_violations('child')",
+      "expect": {
+        "rows": [
+          [
+            "foreign key",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

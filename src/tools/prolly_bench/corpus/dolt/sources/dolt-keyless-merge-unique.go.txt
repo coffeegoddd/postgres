@@ -1,0 +1,31 @@
+{
+		Name: "Keyless merge with unique indexes documents violations",
+		SetUpScript: []string{
+			"SET dolt_force_transaction_commit = on;",
+			"CREATE table t (col1 int, col2 int UNIQUE);",
+			"CALL DOLT_ADD('.')",
+			"CALL DOLT_COMMIT('-am', 'setup');",
+
+			"CALL DOLT_CHECKOUT('-b', 'right');",
+			"INSERT INTO t VALUES (2, 1);",
+			"CALL DOLT_COMMIT('-am', 'right');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"INSERT INTO t values (1, 1);",
+			"CALL DOLT_COMMIT('-am', 'left');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "SELECT violation_type, col1, col2 from dolt_constraint_violations_t ORDER BY col1 ASC;",
+				Expected: []sql.Row{{"unique index", 1, 1}, {"unique index", 2, 1}},
+			},
+			{
+				Query:    "SELECT * from t ORDER BY col1 ASC;",
+				Expected: []sql.Row{{1, 1}, {2, 1}},
+			},
+		},
+	}

@@ -1,0 +1,121 @@
+{
+		Name: "violations with an older commit hash are overwritten if the value is the same",
+		SetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
+
+			"CALL DOLT_CHECKOUT('-b', 'viol1');",
+			"CREATE TABLE parent (pk int PRIMARY KEY);",
+			"CREATE TABLE child (pk int PRIMARY KEY, fk int, FOREIGN KEY (fk) REFERENCES parent (pk));",
+			"CALL DOLT_ADD('.')",
+			"CALL DOLT_COMMIT('-am', 'setup table');",
+			"CALL DOLT_BRANCH('viol2');",
+			"CALL DOLT_BRANCH('other3');",
+			"INSERT INTO parent VALUES (1);",
+			"CALL DOLT_COMMIT('-am', 'viol1 setup');",
+
+			"CALL DOLT_CHECKOUT('-b', 'other');",
+			"INSERT INTO child VALUES (1, 1);",
+			"CALL DOLT_COMMIT('-am', 'insert child of 1');",
+
+			"CALL DOLT_CHECKOUT('viol1');",
+			"DELETE FROM parent where pk = 1;",
+			"CALL DOLT_COMMIT('-am', 'delete 1');",
+			"CALL DOLT_MERGE('other');",
+			"CALL DOLT_COMMIT('-afm', 'commit violations 1');",
+
+			"CALL DOLT_CHECKOUT('viol2');",
+			"INSERT INTO parent values (2);",
+			"CALL DOLT_COMMIT('-am', 'viol2 setup');",
+
+			"CALL DOLT_CHECKOUT('-b', 'other2');",
+			"INSERT into child values (2, 2);",
+			"CALL DOLT_COMMIT('-am', 'insert child of 2');",
+
+			"CALL DOLT_CHECKOUT('viol2');",
+			"DELETE FROM parent where pk = 2;",
+			"CALL DOLT_COMMIT('-am', 'delete 2');",
+			"CALL DOLT_MERGE('other2');",
+			"CALL DOLT_COMMIT('-afm', 'commit violations 2');",
+
+			"CALL DOLT_CHECKOUT('other3');",
+			"INSERT INTO PARENT VALUES (3);",
+			"CALL DOLT_COMMIT('-am', 'edit needed to trigger three-way merge');",
+
+			"CALL DOLT_CHECKOUT('viol1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT violation_type, pk, fk from dolt_constraint_violations_child;",
+				Expected: []sql.Row{{"foreign key", 1, 1}},
+			},
+			{
+				Query:    "SELECT pk, fk from child;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:    "SELECT * from parent;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('viol2');",
+				Expected: []sql.Row{{0, "Switched to branch 'viol2'"}},
+			},
+			{
+				Query:    "SELECT violation_type, pk, fk from dolt_constraint_violations_child;",
+				Expected: []sql.Row{{"foreign key", 2, 2}},
+			},
+			{
+				Query:    "SELECT pk, fk from child;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:    "SELECT * from parent;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('viol1');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			// the commit hashes for the above two violations change in this merge
+			{
+				Query:    "SELECT violation_type, fk, pk from dolt_constraint_violations_child;",
+				Expected: []sql.Row{{"foreign key", 1, 1}, {"foreign key", 2, 2}},
+			},
+			{
+				Query:    "SELECT pk, fk from child;",
+				Expected: []sql.Row{{1, 1}, {2, 2}},
+			},
+			{
+				Query:    "SELECT * from parent;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-afm', 'commit active merge');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:    "SET FOREIGN_KEY_CHECKS=0;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "UPDATE child set fk = 4;",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 0, Info: plan.UpdateInfo{Matched: 2, Updated: 2}}}},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-afm', 'update children to new value');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('other3');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query: "SELECT violation_type, pk, fk from dolt_constraint_violations_child;",
+				Expected: []sql.Row{
+					{"foreign key", 1, 1},
+					{"foreign key", 1, 4},
+					{"foreign key", 2, 2},
+					{"foreign key", 2, 4}},
+			},
+		},
+	}

@@ -1,0 +1,38 @@
+{
+		Name:    "merge error includes row count for foreign key violations",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE parent (pk int PRIMARY KEY);",
+			"CREATE TABLE child (pk int PRIMARY KEY, fk int, FOREIGN KEY (fk) REFERENCES parent(pk));",
+			"INSERT INTO parent VALUES (1);",
+			"INSERT INTO child VALUES (1, 1);",
+			"CALL DOLT_ADD('.')",
+			"CALL DOLT_COMMIT('-am', 'create tables');",
+
+			"CALL DOLT_CHECKOUT('-b', 'right');",
+			"INSERT INTO child VALUES (2, 1), (3, 1);",
+			"CALL DOLT_COMMIT('-am', 'add two children referencing parent');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"SET FOREIGN_KEY_CHECKS = 0;",
+			"DELETE FROM parent WHERE pk = 1;",
+			"SET FOREIGN_KEY_CHECKS = 1;",
+			"CALL DOLT_COMMIT('-am', 'delete parent');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "CALL DOLT_MERGE('right');",
+				ExpectedErrStr: dsess.ErrUnresolvedConstraintViolationsCommit.Error() + dsess.ConstraintViolationsListPrefix +
+					"\nType: Foreign Key Constraint Violation\n" +
+					"\tForeignKey: child_ibfk_1,\n" +
+					"\tTable: child,\n" +
+					"\tReferencedTable: parent,\n" +
+					"\tIndex: fk,\n" +
+					"\tReferencedIndex:  (3 row(s))",
+			},
+			{
+				Query:    "SELECT * from DOLT_CONSTRAINT_VIOLATIONS;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

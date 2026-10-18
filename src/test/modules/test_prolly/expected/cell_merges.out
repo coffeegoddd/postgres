@@ -1,0 +1,299 @@
+-- Rows both sides of a merge changed merge column by column, as in Dolt:
+-- a column one side changed takes that side's value, one both changed
+-- alike keeps it, and only a column they changed differently makes the
+-- row a conflict.
+CREATE SCHEMA cm VERSIONED;
+CREATE TABLE cm.t (pk int PRIMARY KEY, a int, b text, c int);
+INSERT INTO cm.t VALUES (1, 1, 'one', 1), (2, 2, 'two', 2), (3, 3, 'three', 3),
+	(4, 4, 'four', 4), (5, 5, 'five', 5), (6, 6, 'six', 6);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cm_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cm_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'cm_theirs'"}
+(1 row)
+
+UPDATE cm.t SET a = 10 WHERE pk = 1;			-- ours changes b
+UPDATE cm.t SET a = 20, b = 'TWO' WHERE pk = 2;	-- ours changes b alike, and c
+UPDATE cm.t SET a = 30 WHERE pk = 3;			-- ours changes a differently
+UPDATE cm.t SET b = NULL WHERE pk = 4;			-- ours changes c
+DELETE FROM cm.t WHERE pk = 5;					-- ours changes a
+UPDATE cm.t SET c = 60 WHERE pk = 6;			-- ours deletes it
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cm.t SET b = 'ONE' WHERE pk = 1;
+UPDATE cm.t SET b = 'TWO', c = 22 WHERE pk = 2;
+UPDATE cm.t SET a = 33 WHERE pk = 3;
+UPDATE cm.t SET c = 44 WHERE pk = 4;
+UPDATE cm.t SET a = 55 WHERE pk = 5;
+DELETE FROM cm.t WHERE pk = 6;
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('cm_theirs'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM cm.t ORDER BY pk;
+ pk | a  |   b   | c  
+----+----+-------+----
+  1 | 10 | ONE   |  1
+  2 | 20 | TWO   | 22
+  3 | 33 | three |  3
+  4 |  4 |       | 44
+  5 | 55 | five  |  5
+(5 rows)
+
+-- the rows changed differently, and a deletion against a change
+SELECT base_row, our_row, their_row, our_diff_type, their_diff_type
+FROM dolt_conflicts(NULL::cm.t) ORDER BY (base_row).pk;
+   base_row    |    our_row     |   their_row    | our_diff_type | their_diff_type 
+---------------+----------------+----------------+---------------+-----------------
+ (3,3,three,3) | (3,33,three,3) | (3,30,three,3) | modified      | modified
+ (5,5,five,5)  | (5,55,five,5)  |                | modified      | removed
+ (6,6,six,6)   |                | (6,6,six,60)   | removed       | modified
+(3 rows)
+
+-- resolved with theirs: those rows alone become theirs
+SELECT dolt_conflicts_resolve('--theirs', 'cm.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM cm.t ORDER BY pk;
+ pk | a  |   b   | c  
+----+----+-------+----
+  1 | 10 | ONE   |  1
+  2 | 20 | TWO   | 22
+  3 | 30 | three |  3
+  4 |  4 |       | 44
+  6 |  6 | six   | 60
+(5 rows)
+
+SELECT length(dolt_commit('-m', 'merged')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+-- Both directions merge the same columns.
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cm_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'cm_theirs'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM cm.t WHERE pk IN (1, 2, 4) ORDER BY pk;
+ pk | a  |  b  | c  
+----+----+-----+----
+  1 | 10 | ONE |  1
+  2 | 20 | TWO | 22
+  4 |  4 |     | 44
+(3 rows)
+
+SELECT (base_row).pk FROM dolt_conflicts(NULL::cm.t) ORDER BY 1;
+ pk 
+----
+  3
+  5
+  6
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- A merged row is written as one: one breaking a unique constraint is a
+-- violation, the row left as the branch had it.
+CREATE TABLE cm.u (pk int PRIMARY KEY, col1 int, col2 int, UNIQUE (col1, col2));
+INSERT INTO cm.u VALUES (1, 1, 1), (2, NULL, NULL);
+SELECT length(dolt_commit('-Am', 'unique')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cm_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE cm.u SET col1 = 1 WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('cm_right');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'cm_right'"}
+(1 row)
+
+UPDATE cm.u SET col2 = 1 WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('cm_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM cm.u ORDER BY pk;
+ pk | col1 | col2 
+----+------+------
+  1 |    1 |    1
+  2 |    1 |     
+(2 rows)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('cm.u');
+ violation_type |          violating_row          
+----------------+---------------------------------
+ unique index   | {"pk": 2, "col1": 1, "col2": 1}
+(1 row)
+
+ROLLBACK;
+-- Columns both set to NULL agree; one set to NULL and one changed don't.
+CREATE TABLE cm.n (pk int PRIMARY KEY, v int, w int);
+INSERT INTO cm.n VALUES (1, 1, 1), (2, 2, 2);
+SELECT length(dolt_commit('-Am', 'nulls')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cm_nulls');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE cm.n SET v = NULL;
+SELECT length(dolt_commit('-am', 'ours nulls')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('cm_nulls');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'cm_nulls'"}
+(1 row)
+
+UPDATE cm.n SET v = NULL, w = 10 WHERE pk = 1;
+UPDATE cm.n SET v = 20 WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'theirs nulls')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('cm_nulls'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM cm.n ORDER BY pk;
+ pk | v | w  
+----+---+----
+  1 |   | 10
+  2 |   |  2
+(2 rows)
+
+SELECT (base_row).pk FROM dolt_conflicts(NULL::cm.n);
+ pk 
+----
+  2
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'cm_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'cm_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'cm_nulls');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cm CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table cm.t
+drop cascades to table cm.u
+drop cascades to table cm.n

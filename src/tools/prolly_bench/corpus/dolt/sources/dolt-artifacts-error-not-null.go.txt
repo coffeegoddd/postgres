@@ -1,0 +1,29 @@
+{
+		Name: "merge error includes row count for null constraint violations",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk int PRIMARY KEY, c int);",
+			"INSERT INTO t VALUES (1, 1), (2, 2);",
+			"CALL DOLT_ADD('.')",
+			"CALL DOLT_COMMIT('-am', 'create table');",
+
+			"CALL DOLT_CHECKOUT('-b', 'right');",
+			"UPDATE t SET c = NULL WHERE pk IN (1, 2);",
+			"CALL DOLT_COMMIT('-am', 'set both to null');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"ALTER TABLE t MODIFY c int NOT NULL;",
+			"CALL DOLT_COMMIT('-am', 'add not null');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "CALL DOLT_MERGE('right');",
+				ExpectedErrStr: dsess.ErrUnresolvedConstraintViolationsCommit.Error() + dsess.ConstraintViolationsListPrefix +
+					"\nType: Null Constraint Violation,\n" +
+					"\tColumns: [c] (2 row(s))",
+			},
+			{
+				Query:    "SELECT * from DOLT_CONSTRAINT_VIOLATIONS;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

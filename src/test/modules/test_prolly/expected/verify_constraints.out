@@ -32,7 +32,7 @@ FROM dolt_constraint_violations('vc.t') ORDER BY violation_type;
   violation_type  |           violating_row            |                  violation_info                   
 ------------------+------------------------------------+---------------------------------------------------
  check constraint | {"pk": 2, "col1": 5, "col2": 5}    | {"Name": "t_chk", "Expression": "(col1 <> col2)"}
- not null         | {"pk": 3, "col1": 7, "col2": null} | {"Name": "t_col2_nn", "Columns": ["col2"]}
+ not null         | {"pk": 3, "col1": 7, "col2": null} | {"Columns": ["col2"]}
 (2 rows)
 
 ROLLBACK;

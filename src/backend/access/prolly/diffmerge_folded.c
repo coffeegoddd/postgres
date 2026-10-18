@@ -69,6 +69,7 @@
 #include "utils/array.h"
 #include "executor/spi.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_index.h"
 #include "access/xact.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
@@ -79,6 +80,7 @@
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
@@ -826,6 +828,72 @@ may_break_constraints(Relation rel)
  * (or exclusion) constraint isn't written, and is recorded instead.
  * Returns false if old isn't there.
  */
+/*
+ * What a row a merge couldn't write breaks (ed, the error writing it
+ * raised), as Dolt describes it: a unique index by its name and columns, a
+ * check constraint by its name and expression, a not-null constraint by
+ * its column.
+ */
+static char *
+constraint_info(Relation rel, const char *type, const ErrorData *ed)
+{
+	const char *name = ed->constraint_name ? ed->constraint_name : "";
+	StringInfoData s;
+
+	initStringInfo(&s);
+	if (strcmp(type, "not null") == 0)
+		appendStringInfo(&s, "{\"Columns\": [%s]}",
+						 quote_json(ed->column_name ? ed->column_name : ""));
+	else if (strcmp(type, "check constraint") == 0)
+	{
+		Oid			con = get_relation_constraint_oid(RelationGetRelid(rel), name, true);
+		char	   *expr = "";
+		HeapTuple	tup;
+
+		if (OidIsValid(con) &&
+			(tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(con))) != NULL)
+		{
+			bool		isnull;
+			Datum		bin = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conbin,
+											  &isnull);
+
+			if (!isnull)
+				expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+															   ObjectIdGetDatum(RelationGetRelid(rel))));
+			ReleaseSysCache(tup);
+		}
+		appendStringInfo(&s, "{\"Name\": %s, \"Expression\": %s}",
+						 quote_json(name), quote_json(expr));
+	}
+	else
+	{
+		Oid			index = get_relname_relid(name, RelationGetNamespace(rel));
+		HeapTuple	tup;
+		bool		first = true;
+
+		appendStringInfo(&s, "{\"Name\": %s, \"Columns\": [", quote_json(name));
+		if (OidIsValid(index) &&
+			(tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index))) != NULL)
+		{
+			Form_pg_index ix = (Form_pg_index) GETSTRUCT(tup);
+
+			/* (an expression's column has no name) */
+			for (int i = 0; i < ix->indnkeyatts; i++)
+			{
+				if (ix->indkey.values[i] == 0)
+					continue;
+				appendStringInfo(&s, "%s%s", first ? "" : ", ",
+								 quote_json(get_attname(RelationGetRelid(rel),
+														ix->indkey.values[i], false)));
+				first = false;
+			}
+			ReleaseSysCache(tup);
+		}
+		appendStringInfoString(&s, "]}");
+	}
+	return s.data;
+}
+
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 			TupleTableSlot *old, TupleTableSlot *row, const bool *keep)
@@ -857,6 +925,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	{
 		ErrorData  *ed;
 		const char *type;
+		char	   *info;
 		MemoryContext rec;
 
 		MemoryContextSwitchTo(cxt);
@@ -880,12 +949,11 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
+		info = constraint_info(rel, type, ed);
 		rec = MemoryContextSwitchTo(TopTransactionContext);
 		recorded = lappend(recorded,
 						   violation(RelationGetRelid(rel), type, row_json(row),
-									 psprintf("{\"Name\": %s}",
-											  quote_json(ed->constraint_name ?
-														 ed->constraint_name : ""))));
+									 pstrdup(info)));
 		MemoryContextSwitchTo(rec);
 		FreeErrorData(ed);
 	}
@@ -1347,11 +1415,90 @@ typedef struct KeyWrite
 	bool		in_place;		/* or old updated to row */
 } KeyWrite;
 
+/* Three versions of a row decoded, for merging it column by column. */
+typedef struct CellMerge
+{
+	TupleTableSlot *base;
+	TupleTableSlot *ours;
+	TupleTableSlot *theirs;
+	TupleTableSlot *merged;
+	StringInfoData row;
+} CellMerge;
+
+/*
+ * Merge a keyed row both sides changed, column by column, as Dolt does: a
+ * column one side changed takes that side's value, one both changed alike
+ * keeps it, and one they changed differently is a conflict (the row's).
+ * False on a conflict; else *merged is the merged row's tree value
+ * (palloc'd).
+ */
+static bool
+merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
+			const StringInfoData *ours, const StringInfoData *theirs,
+			const StringInfoData **merged)
+{
+	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
+	StringInfoData key;
+	StringInfo	value;
+	ProllyValue row;
+	ProllyHash	content;
+
+	(void) decode(c, base, cm->base);
+	(void) decode(c, ours, cm->ours);
+	(void) decode(c, theirs, cm->theirs);
+	slot_getallattrs(cm->base);
+	slot_getallattrs(cm->ours);
+	slot_getallattrs(cm->theirs);
+	ExecClearTuple(cm->merged);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		bn = cm->base->tts_isnull[i];
+		bool		on = cm->ours->tts_isnull[i];
+		bool		tn = cm->theirs->tts_isnull[i];
+		Datum		bv = cm->base->tts_values[i];
+		Datum		ov = cm->ours->tts_values[i];
+		Datum		tv = cm->theirs->tts_values[i];
+		bool		ours_changed;
+		bool		theirs_changed;
+
+		if (att->attisdropped)
+		{
+			cm->merged->tts_isnull[i] = true;
+			continue;
+		}
+		ours_changed = bn != on ||
+			(!bn && !datum_image_eq(bv, ov, att->attbyval, att->attlen));
+		theirs_changed = bn != tn ||
+			(!bn && !datum_image_eq(bv, tv, att->attbyval, att->attlen));
+		if (ours_changed && theirs_changed &&
+			(on != tn ||
+			 (!on && !datum_image_eq(ov, tv, att->attbyval, att->attlen))))
+			return false;
+		cm->merged->tts_isnull[i] = theirs_changed ? tn : on;
+		cm->merged->tts_values[i] = theirs_changed ? tv : ov;
+	}
+	ExecStoreVirtualTuple(cm->merged);
+	initStringInfo(&key);
+	resetStringInfo(&cm->row);
+	PROLLY_CALL(c->rd.kr, encode_row, c->rd.k, cm->merged, &key, &cm->row,
+				&content);
+	pfree(key.data);
+	row.data = (const uint8 *) cm->row.data;
+	row.len = cm->row.len;
+	value = palloc(sizeof(StringInfoData));
+	initStringInfo(value);
+	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
+	*merged = value;
+	return true;
+}
+
 /*
  * Walk theirs (table relid's changes from base to theirs) against ours
  * (base to ours, the session's head, which the branch still is), both in
  * key order, as mode says.  A key both sides changed to different rows is
- * a conflict; one they changed alike isn't.  A keyless table's row
+ * a conflict, unless the columns each changed merge (merge_cells()); one
+ * they changed alike isn't.  A keyless table's row
  * changed alike on both sides (by the same number of copies) is changed
  * once; otherwise it has the copies its base had, those either side
  * added, less the most either removed; it never conflicts.  Returns how
@@ -1380,6 +1527,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	bool	   *kept;
 	Bitmapset  *pk;
 	List	   *writes = NIL;
+	CellMerge	cm = {0};
 
 	require_readable(base);
 	require_readable(ours);
@@ -1467,7 +1615,32 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			row = t->after.len > 0 ? &t->after : &t->before;
 		}
 		else
+		{
 			conflict = o != NULL && !same_bytes(&o->after, &t->after);
+
+			/* both changed the row, neither removed it: column by column */
+			if (conflict && t->before.len > 0 && o->after.len > 0 &&
+				t->after.len > 0)
+			{
+				const StringInfoData *merged;
+
+				if (cm.merged == NULL)
+				{
+					cm.base = table_slot_create(rel, NULL);
+					cm.ours = table_slot_create(rel, NULL);
+					cm.theirs = table_slot_create(rel, NULL);
+					cm.merged = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+														 &TTSOpsVirtual);
+					initStringInfo(&cm.row);
+				}
+				if (merge_cells(&tc, &cm, &t->before, &o->after, &t->after,
+								&merged))
+				{
+					conflict = false;
+					row = merged;
+				}
+			}
+		}
 
 		if (conflict)
 		{
@@ -1487,7 +1660,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			want = (t->after.len > 0);
 		}
 		else if (mode != WALK_MERGE ||
-				 (!keyless && o != NULL && same_bytes(&o->after, &t->after)) ||
+				 (!keyless && o != NULL && same_bytes(&o->after, row)) ||
 				 (keyless && want == have))
 			continue;			/* listing; or the branch has it so already */
 
@@ -1573,6 +1746,13 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		PROLLY_CALL(ar, end, a);
 	ExecDropSingleTupleTableSlot(s1);
 	ExecDropSingleTupleTableSlot(s2);
+	if (cm.merged)
+	{
+		ExecDropSingleTupleTableSlot(cm.base);
+		ExecDropSingleTupleTableSlot(cm.ours);
+		ExecDropSingleTupleTableSlot(cm.theirs);
+		ExecDropSingleTupleTableSlot(cm.merged);
+	}
 	pfree(kept);
 	bms_free(pk);
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
@@ -2569,8 +2749,7 @@ unvalidated_violations(List *relids)
 			appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE c.%s IS NULL",
 							 only_unless_partitioned(con->conrelid), table,
 							 quote_identifier(name));
-			appendStringInfo(&info, "{\"Name\": %s, \"Columns\": [%s]}",
-							 quote_json(NameStr(con->conname)), quote_json(name));
+			appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
 			notnulls = lappend(notnulls, list_make3(q.data, info.data,
 													(void *) (uintptr_t) con->conrelid));
 		}

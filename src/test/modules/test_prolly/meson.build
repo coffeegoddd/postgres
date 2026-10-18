@@ -60,6 +60,7 @@ tests += {
       'applier',
       'move_heads',
       'merge',
+      'cell_merges',
       'cherry_pick',
       'merge_options',
       'revert_series',

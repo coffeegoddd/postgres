@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "id": "dolt-merge-unique-added-left",
+  "description": "Reviewed Dolt port: left adds a unique key constraint and resolves existing violations",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: left adds a unique key constraint and resolves existing violations"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, col1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 1), (2, 1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "base",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "table and data"
+      ],
+      "save": "base"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "checkout-right",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "right-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right edit"
+      ],
+      "save": "right"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "left-update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = 2 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "left-unique",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD CONSTRAINT col1_uniq UNIQUE (col1)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left adds a unique index"
+      ],
+      "save": "left"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "right"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "2"
+          ],
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

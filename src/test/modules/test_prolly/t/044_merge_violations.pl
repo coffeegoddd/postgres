@@ -60,7 +60,7 @@ is($s->query_safe(q{SELECT (dolt_merge('ahead'))[2:4]}), '{1,0,"merge successful
 is($s->query_safe(q{SELECT count(*) FROM cv.parent WHERE id = 3}), '1', 'and writes its rows');
 is($s->query_safe(q{SELECT dolt_reset('--hard')}), '{0}', 'a reset too');
 is($s->query_safe(q{BEGIN; SELECT (dolt_merge('feature'))[3:4]}),
-	'{1,"constraint violations found"}', 'and a merge records its violations');
+	'{1,"conflicts found"}', 'and a merge records its violations');
 is($s->query_safe(q{SELECT violation_type || ' ' || violating_row
 	FROM dolt_constraint_violations('cv.child'); ROLLBACK}),
 	'foreign key {"id": 2, "pid": 2}', 'just the one it left');

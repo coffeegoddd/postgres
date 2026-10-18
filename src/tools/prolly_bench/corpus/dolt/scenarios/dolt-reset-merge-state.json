@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "id": "dolt-reset-merge-state",
+  "description": "Reviewed Dolt port: CALL DOLT_RESET('--hard') should reset the merge state after uncommitted merge",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltResetTestScripts: CALL DOLT_RESET('--hard') should reset the merge state after uncommitted merge"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test1 (pk int NOT NULL, c1 int, c2 int, PRIMARY KEY (pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test1 VALUES (0,1,1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "added",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added table"
+      ],
+      "save": "added"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "merge_branch"
+      ]
+    },
+    {
+      "id": "checkout-branch",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "merge_branch"
+      ]
+    },
+    {
+      "id": "theirs",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test1 SET c1 = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "theirs-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "update pk 0 = 2,1 to test1"
+      ],
+      "save": "theirs"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "ours",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test1 SET c2 = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "ours-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "update pk 0 = 1,2 to test1"
+      ],
+      "save": "ours"
+    },
+    {
+      "id": "merge",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "merge_branch"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "reset",
+      "session": "a",
+      "op": "reset",
+      "args": [
+        "HEAD"
+      ]
+    },
+    {
+      "id": "abort",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT dolt_merge('--abort')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}
