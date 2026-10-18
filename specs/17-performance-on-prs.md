@@ -154,10 +154,24 @@ work rather than a time window (`pgbench -t`, sysbench `--events`,
 BenchBase with a fixed transaction count), fixed seeds, autovacuum off,
 timed checkpoints off (`checkpoint_timeout` at its maximum, a large
 `max_wal_size`, an explicit `CHECKPOINT` before the measured part), small
-sizes that fit `shared_buffers`. Workloads: S1, S2, S3, S4, S5, S7, S8,
-S10 (a subset of its tests), S13 (Q1–Q22 serial).
+sizes that fit `shared_buffers`. Workloads: S1, S2, S3, S4, S7, S8,
+S10 (a subset of its tests), S13 (Q1–Q22 serial). S5 (hot-row
+contention) isn't among them: at one client it exercises none of the
+lock module it is for, so it runs in layer 2, at 8 clients.
 
-**Counters, per unit of work** (per transaction, per row, per query):
+**Reading the counters.** Cumulative statistics are flushed by each
+backend lazily (about once a second) and at its exit, so a reading taken
+while the measured clients are connected can lag their work. The
+measured part's clients disconnect before the counters are read, and the
+collector waits until `pg_stat_activity` shows none of them, so every
+backend that did the work has flushed. WAL bytes come from the LSN
+difference, exact in any case. `pg_stat_io` is read for `client backend`
+rows only (the collector sums every backend type today: filtering it is
+new collector work, step 2), so the checkpointer's and background
+writer's I/O, which timing decides, stays out.
+
+**Counters, per unit of work** (per transaction, per row, per query;
+the gate's floors apply to the totals over the fixed work, below):
 
 | Counter | Source | Catches |
 |---|---|---|
@@ -168,29 +182,45 @@ S10 (a subset of its tests), S13 (Q1–Q22 serial).
 | Engine counters: nodes read and written, chunks appended, bytes hashed, fold rows, value-tree chunks | `pg_stat_prolly` (to build) | Prolly's own work |
 | Rows, answers | the invariants, TPC-H digests | That both did the same work |
 
-**Determinism check.** The candidate runs twice; a counter that differs
-between its own two runs is unstable and is reported, not gated (and is
-a finding: the run shape left something to chance). Instructions are
-the exception: they vary a little, so they get a tolerance from the
+**Determinism check.** Base and candidate each run twice. A counter
+that differs between a build's own two runs is unstable there. Unstable
+in the base, it is reported, not gated (a finding about the run shape).
+Stable in the base and unstable in the candidate, it fails: the pull
+request added something left to chance, and a regression must not hide
+behind it (overridable like any regression). Instructions are the
+exception: they vary a little, so they get a tolerance from the
 calibration (part 3.5) instead of exact equality.
 
 **Gate.** A counter regresses when the candidate is above base by more
-than 5% **and** by more than a floor per counter (8 events, 8 KB, or the
-calibrated instruction noise), doltlite's rule. Fewer is never a failure;
-it's listed as an improvement.
+than 5% **and**, in total over the run's fixed work, by more than a
+floor per counter (8 events, 8 KB, or the calibrated instruction noise),
+doltlite's rule. The floor is on totals so that a small per-transaction
+increase over many transactions still counts, while a one-off (one more
+extend in a run) doesn't. Fewer is never a failure; it's listed as an
+improvement.
 
-**Override.** A line in the pull request's description,
-`perf-accept: <workload> <counter|metric> <reason>`, outside code blocks,
-read fresh through the API when the gate runs, accepts one regression; the
-comment lists every accepted one with its reason, so a reviewer sees what
-was traded. A correctness fix that costs work is the expected use.
+**Override.** An entry added by the pull request to
+`src/tools/prolly_bench/configs/perf_accept.toml`, `<workload> <engine>
+<counter|metric> <reason>`, accepts one regression. Only entries the
+pull request's diff adds count (the file on the base is history), so an
+override applies to the pull request that made it. Being in the diff,
+it is reviewed like code: a new entry is a new commit, which re-runs the
+gate and dismisses stale approvals where that is set. The comment lists
+every accepted regression with its reason, so a reviewer sees what was
+traded. A correctness fix that costs work is the expected use.
 
 ### 3.2 Layer 2: paired timing (hosted for reporting; dedicated for the gate)
 
-**Builds.** One job builds the base (the pull request's base SHA, cached
-by SHA and toolchain, warmed on every push to `master`) and the
-candidate (the merge commit), both with `build_postgres.sh` (`-O2`, no
-cassert, provenance recorded). The candidate's harness drives both
+**Builds.** One job builds the base and the candidate, both with
+`build_postgres.sh` (`-O2`, no cassert, provenance recorded). The
+candidate is the merge commit; the base is that merge commit's first
+parent (on `merge_group`, the event's `base_sha`), not the event's
+`pull_request.base.sha`, which can be older than the tip the merge
+commit was made on, so the comparison holds exactly the pull request's
+changes. Builds are cached by SHA and toolchain, and every push to any
+branch builds and caches its head: a stack layer's base, the layer
+below's head, is then cached by that layer's push, as `master`'s is by
+its own. The candidate's harness drives both
 binaries, so a change to a workload script changes both arms alike.
 
 **Pairing by build.** `prolly_bench run S --pg-bin base=DIR,candidate=DIR
@@ -200,11 +230,16 @@ random order, paired seeds per repetition), and `table` gives each
 candidate cell's ratio to the same engine's base cell, with the paired
 bootstrap interval.
 
-**Run shape** (`configs/s_pr.toml`): S1, S2, S3, S4, S8, S10 (read-only,
-write-only, read-write), S9 (TPC-C, 4 warehouses); 1 and 8 clients;
-5 repetitions; 10 s warm-up, 30 s measured. Metrics gated: throughput and
-p50 latency; p99 is reported when it clears the sample floors, never
-gated on hosted runners.
+**Run shape** (`configs/s_pr.toml`): S1, S2, S5, S10 (read-write), S9
+(TPC-C, 4 warehouses); 8 clients; 3 repetitions; 5 s warm-up, 20 s
+measured. That is 5 workloads × 2 engines × 2 builds × 3 repetitions =
+60 cells of 25 s, 25 minutes, plus a fresh cluster and its load per cell
+(about 10 s each, more for S9's TPC-C load) and confirmation runs of the
+cells that regress: about 40 minutes per pull request. The fuller shape
+(S1–S4, S8, S10's three tests, S9; 1 and 8 clients; 5 repetitions; 10 s
+warm-up, 30 s measured: 360 cells, about 4 hours) runs nightly. Metrics
+gated: throughput and p50 latency; p99 is reported when it clears the
+sample floors, never gated on hosted runners.
 
 **Decision.** A cell regresses when its whole 95% interval is beyond the
 threshold in the worse direction; an interval that straddles it is
@@ -221,12 +256,22 @@ that changes code, queued by concurrency group, and its check is
 required once the host is reliably available; until then it runs on the
 merge queue (`merge_group`) only.
 
-**Durability.** Spec 06 never reports numbers with `fsync` off. The gate's
+**The dedicated host runs pull requests' code.** Today it runs only on
+`workflow_dispatch`. On pull requests, its job runs without approval only
+for pull requests from this repository's own branches; one from a fork
+waits for a maintainer, through a protected environment
+(`benchmark`, with required reviewers). The host keeps no secrets, runs
+the job as an unprivileged user, and keeps its data under
+`PBENCH_DATA_ROOT`, which each job empties before it runs.
+
+**Durability.** Spec 06 holds `fsync` and `synchronous_commit` on for
+every pairing, and reports no numbers with `fsync` off. The gate's
 numbers are a comparison, not a report: hosted timing runs with
 `synchronous_commit = off` (`fsync` on), because a hosted runner's disk
 flush time is noise that would bury the change being measured, and the
-cost of logging is caught exactly by layer 1's WAL counters. The dedicated
-host runs with both on, as spec 06 requires.
+cost of logging is caught exactly by layer 1's WAL counters; its numbers
+are never reported as spec 06's. The dedicated host runs with both on,
+as spec 06 requires.
 
 ### 3.3 Against heap, on every pull request (reported)
 
@@ -244,10 +289,10 @@ One sticky comment, `<!-- s-suite -->`, updated in place:
 ## S suite: PASS (counters), PASS (timing, dedicated host)
 Base <sha> · candidate <merge sha> · counters on ubuntu-24.04 · timing on prolly-benchmark
 
-### Counters (per transaction; a regression is > 5% and over its floor)
-| Workload | Engine | Counter | Base | Candidate | Δ | Result |
-| S1 | prolly | WAL bytes | 1,412 | 1,688 | +19.5% | FAIL |
-| S1 | prolly | WAL bytes | ... | | | accepted: "fix #210 logs the fold root" |
+### Counters (per transaction; a regression is > 5% and, in total, over its floor)
+| Workload | Engine | Counter | Base | Candidate | Δ | Total Δ (10,000 txns) | Result |
+| S1 | prolly | WAL bytes | 1,412 | 1,688 | +19.5% | +2.76 MB | FAIL |
+| S3 | prolly | WAL bytes | ... | | | | accepted: "fix #210 logs the fold root" |
 
 ### Timing (median ratio, 95% CI; regression if the CI clears 5%)
 | Workload | Clients | Engine | TPS ratio | p50 ratio | prolly/heap base → candidate | Result |
@@ -278,9 +323,10 @@ measurements are recorded here.
 1. **classify** (always runs; specs-only pull requests pass the checks
    without building, as in spec 16).
 2. **build**: base (cached) and candidate, uploaded as one artifact with
-   both SHAs, checked by every consumer.
+   both SHAs, checked by every consumer. On `push` (every branch), it
+   builds and caches the pushed head only.
 3. **counters** (hosted, matrix by workload group): base, candidate,
-   candidate again; `prolly_bench sgate counters`.
+   base again, candidate again; `prolly_bench sgate counters`.
 4. **timing-hosted** (hosted): the timing layer, reported.
 5. **timing-dedicated** (`prolly-benchmark`): the timing layer, gated
    (part 3.2).
@@ -326,9 +372,9 @@ harness, not performance); `controlled-performance` is replaced by
 | 2 | Fixed-work run shape (`s_counters.toml`): `pgbench -t`, sysbench events, BenchBase counts, checkpoint control; the instruction collector | Two runs of one build give identical counters (instructions within a measured tolerance) | #242 |
 | 3 | `--pg-bin base=…,candidate=…`: builds as a pairing axis in the runner and `table` | A/A gives ratios of 1 with intervals; a deliberately slowed candidate (a sleep in a hot path) is detected | #243 |
 | 4 | Calibration (part 3.5) on hosted runners and the dedicated host | Floors and thresholds recorded here, false-failure rate under 1% | #244 |
-| 5 | `sgate counters`, `sgate timing` with retry confirmation, `perf-accept` overrides; `sreport` | Tests from fixtures: regression, improvement, accepted, unstable, transient, confirmed | #245 |
-| 6 | `performance.yml`, `performance-comment.yml`; base build cache warmed on `master` | A pull request gets the comment; a deliberate regression in each layer fails the gate | #246 |
-| 7 | Required checks (with spec 16's branch protection); the dedicated host's timing check required once it is reliable | A pull request with a confirmed regression can't merge without a `perf-accept` line | #246 |
+| 5 | `sgate counters`, `sgate timing` with retry confirmation, `perf_accept.toml` overrides (entries the diff adds); `sreport` | Tests from fixtures: regression, improvement, accepted, unstable, transient, confirmed | #245 |
+| 6 | `performance.yml`, `performance-comment.yml`; build cache warmed on every branch's pushes; the `benchmark` environment for forks | A pull request gets the comment; a deliberate regression in each layer fails the gate | #246 |
+| 7 | Required checks (with spec 16's branch protection); the dedicated host's timing check required once it is reliable | A pull request with a confirmed regression can't merge without a `perf_accept.toml` entry | #246 |
 | 8 | Nightly on the dedicated host, history and the tracking issue | A seeded regression on `master` opens the issue | #247 |
 
 ## 6. Open questions
@@ -341,11 +387,14 @@ harness, not performance); `controlled-performance` is replaced by
    calibration shows intervals narrow enough for a 10% threshold.
 3. **The dedicated host on every pull request, or the merge queue only.**
    Recommended: every pull request that changes code, if the queue keeps
-   up (about 25 minutes per pull request at the run shape above);
+   up (about 40 minutes per pull request at the run shape above, so a
+   handful of pull requests a day; the fuller shape is nightly);
    otherwise the merge queue.
 4. **Ceilings on `prolly`/heap.** Spec 06 sets no target. Recommended:
    none on pull requests; nightly ceilings once targets are set per
    workload.
-5. **Who may write `perf-accept`.** Recommended: anyone, since the line is
-   in the reviewed pull request and the comment shows it; branch
-   protection's required review is the check.
+5. **Who may add a `perf_accept.toml` entry.** Recommended: anyone, since
+   the entry is in the reviewed diff and the comment shows it; branch
+   protection's required review (with stale approvals dismissed on new
+   commits) is the check. A CODEOWNERS entry for the file would make it a
+   maintainer's call.
