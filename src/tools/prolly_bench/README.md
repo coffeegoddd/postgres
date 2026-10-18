@@ -280,6 +280,30 @@ read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
 Its numbers only compare builds (`comparison_only`), so it may run with
 `synchronous_commit = off`; they are never reported as the procedure's.
 
+## The pull-request gate
+
+```sh
+# counters: base and candidate counter runs, twice each
+src/tools/prolly_bench/prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2 \
+    --accept configs/perf_accept.toml --accept-base base-perf_accept.toml --json counters.json
+# timing: a run of both builds (s_pr.toml), then retries of the cells that regressed
+src/tools/prolly_bench/prolly_bench sgate timing RUN [RETRY ...] --report-only --json timing.json
+src/tools/prolly_bench/prolly_bench sreport --counters counters.json --timing timing.json \
+    --head SHA --base SHA --out comment.md
+```
+
+A counter regresses when the candidate's is more than 5% above the base's
+and, in total over the fixed work, above its floor (`configs/s_gate.toml`);
+one that differs between the base's own two runs is reported, not gated, and
+one stable in the base but not in the candidate fails.  Fewer is listed as
+an improvement.  A timing cell regresses when its whole 95% interval clears
+the threshold; one that does in every one of 3 attempts is confirmed, else
+transient (hosted runners: reported only).  Missing or failed cells, and
+cells whose work differs, always fail.  An entry the pull request adds to
+`configs/perf_accept.toml` accepts one regression (entries on the base
+accept nothing); the file has a code owner.  `sreport` writes the sticky
+comment, marked `<!-- s-suite -->`.
+
 ## Calibrating the gate
 
 `prolly_bench scalibrate --counters RUN ... --timing RUN ...` measures the

@@ -14,6 +14,8 @@
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
   prolly_bench scounters RUN RUN2               S counter runs of one build: unstable counters
   prolly_bench scalibrate --counters ... --timing ...   S gate: the noise of A/A runs
+  prolly_bench sgate counters|timing RUN ...    S gate: a pull request against its base
+  prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
 """
 
 from __future__ import annotations
@@ -484,6 +486,33 @@ def main(argv=None) -> int:
     cal.add_argument("--out", type=Path, help="Markdown report")
     cal.add_argument("--json", type=Path)
     cal.set_defaults(fn=scalibrate.run)
+
+    from pbench import sgate
+    sg = sub.add_parser("sgate", help="S suite gate: a pull request's counters and timing against its base's")
+    sg.add_argument("layer", choices=["counters", "timing"])
+    sg.add_argument("runs", type=Path, nargs="+",
+                    help="counters: BASE BASE2 CANDIDATE CANDIDATE2; timing: RUN [RETRY ...]")
+    sg.add_argument("--accept", type=Path, help="perf_accept.toml, as the pull request has it")
+    sg.add_argument("--accept-base", type=Path,
+                    help="perf_accept.toml as the base has it: only entries the pull request adds count")
+    sg.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
+    sg.add_argument("--report-only", action="store_true", help="timing: report, never fail")
+    sg.add_argument("--json", type=Path, help="the findings, for sreport")
+    sg.set_defaults(fn=sgate.run)
+
+    from pbench import sreport
+    sr = sub.add_parser("sreport", help="S suite gate: the pull-request comment")
+    sr.add_argument("--counters", type=Path, action="append", default=[],
+                    help="sgate counters --json output (repeatable: one per group of workloads)")
+    sr.add_argument("--timing", type=Path, help="sgate timing --json output")
+    sr.add_argument("--head", required=True)
+    sr.add_argument("--base", required=True)
+    sr.add_argument("--runner", default="ubuntu-24.04")
+    sr.add_argument("--run-url")
+    sr.add_argument("--failed-job", action="append", default=[], metavar="NAME: RESULT")
+    sr.add_argument("--reproduce", help="a command that reproduces the run")
+    sr.add_argument("--out", type=Path, required=True)
+    sr.set_defaults(fn=sreport.run)
 
     from pbench import complexity
     growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")

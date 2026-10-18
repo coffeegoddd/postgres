@@ -1,0 +1,3 @@
+# An entry in perf_accept.toml accepts a performance regression the S suite
+# gate would otherwise fail a pull request on: a maintainer reviews it.
+/src/tools/prolly_bench/configs/perf_accept.toml @coffeegoddd
