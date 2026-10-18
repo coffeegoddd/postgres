@@ -1079,7 +1079,7 @@ copies (the one O(N) step: rows written to pages, indexes built).
 - **Shared dependencies** (part 1). **Decided by the user, 2026-10-17:**
   each commit records what its versioned objects need from outside
   them, and a clone installs the extensions and checks the rest before
-  anything is written. **Built** (#188, #189, and the moves' PR): as
+  anything is written. **Built** (#188, #189, #192): as
   below.
   - **Recorded at each commit:** an entry per dependency outside the
     versioned schemas, by kind and qualified name: an extension with its
@@ -1123,11 +1123,14 @@ copies (the one O(N) step: rows written to pages, indexes built).
     every branch's head, not only the default one's, against the
     database: each extension against `pg_available_extension_versions`
     and `pg_extension`, each object by its address. A clone missing any
-    refuses once, naming all of them (each object and extension, with
-    why: not installed on this server, not this version, in another
-    schema), before creating anything; only then are extensions created,
-    in their recorded schemas, each after the recorded ones it requires
-    (`CASCADE` makes only what no commit recorded). An extension recorded
+    refuses once, naming all of them: an object not in the database (an
+    object is looked up by its address alone); an extension not installed
+    on this server, not at this version, in another schema than recorded,
+    or recorded in schemas that differ across branches. Only then, before
+    anything else is created, are extensions created, in their recorded
+    schemas, each after the recorded ones it requires; `CASCADE` makes
+    what no commit recorded, at its default version and in the requiring
+    extension's schema. An extension recorded
     without a version needs any. A head that didn't record its
     dependencies isn't checked. Only a "not found" error means an object
     is missing: anything else (a cancel) is raised.
@@ -1162,9 +1165,12 @@ copies (the one O(N) step: rows written to pages, indexes built).
     Measured by recorded entries, a new use of something the base already
     needed isn't a new need; the copies failing still catches what the
     check can't see.
-  - **Not in diffs (as built):** `dolt_diff` and `dolt_status` compare
-    roots, and the dependencies are beside the root, so neither shows
-    them; a commit's are read with its other fields.
+  - **Not as decided: not in diffs.** The decision (above) had
+    `dolt_diff` and `dolt_status` show dependencies changing. As built
+    they compare roots, and the dependencies are beside the root, so
+    neither shows them; a commit's are read with its other fields. Not
+    built yet: a diff of two commits' dependency trees, for those
+    readers.
   - **The backstop:** `pg_depend` doesn't see what a function's body
     names (its source is text), so the list can't be complete; making the
     copies still fails, rolls back and names what it lacked, as before.
@@ -1364,8 +1370,11 @@ Not as designed, or not yet:
 - **Shared dependencies.** Built since (7.4): a clone checks every
   branch head's recorded dependencies before it makes anything, and makes
   the extensions the database lacks; a move to a commit refuses what the
-  database lacks. A head made before commits recorded them still fails
-  where its copies are made, naming what it lacked, and leaves nothing.
+  database lacks. A head made before commits recorded them isn't checked:
+  only the default branch's copies are made at clone, so a clone whose
+  default branch's head lacks something fails where its copies are made,
+  naming it, and leaves nothing, and one whose other branch's does
+  succeeds, that branch failing at its first checkout.
 - **A push moves the remote's head as it is reached,** not with the
   transaction: the remote-tracking branch moves with the transaction, so a
   push whose transaction aborts leaves it behind the remote until the
