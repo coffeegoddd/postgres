@@ -108,6 +108,7 @@ tests += {
       't/044_merge_violations.pl',
       't/045_remotes.pl',
       't/046_branch_crash.pl',
+      't/053_serve_snapshots.pl',
     ],
   },
 }
