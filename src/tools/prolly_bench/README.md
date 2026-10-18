@@ -142,6 +142,92 @@ exception. `cdiff` lists differences with the queries. Exceptions in
 `configs/c_exceptions.toml` must name the engine, exact actual-answer signatures,
 corpus file hash, owner, issue and expiry. Changed or stale exceptions fail.
 
+### Shards
+
+`run C --shard I/N` runs shard I of N, so the full corpus can run as N
+parallel jobs:
+
+```sh
+src/tools/prolly_bench/prolly_bench cshard --shards 4 --config CONFIG     # the plan
+src/tools/prolly_bench/prolly_bench run C --am heap,prolly --shard 2/4 --config CONFIG
+src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR       # the shard's workloads
+```
+
+Files are assigned largest first, each to the shard with the fewest bytes
+so far, so the plan depends only on the corpus's file names and sizes and
+every job computes the same one. C1 and C2 run whole on shard 1, so a
+shard runs only the workloads it has files of. A shard's `config.json`
+records `run.shard`, its workloads, and each workload's `shard_files`;
+`cgate` without `--workloads` gates the workloads the shard ran (an
+unsharded run still needs C1-C4). A shard's gate covers only its part:
+that the shards' files together are the whole corpus exactly once is for
+a gate over all of them to check, with `cshard.overlap_and_gaps`. A plan
+with an empty shard is refused. prolly_bench takes one run at a time per
+host, so shards run in parallel on separate hosts, or one after another
+with separate `--out` directories.
+
+### The heap baseline
+
+`cgate` compares an engine with heap from the same build, so a change to
+shared code (the planner, the executor, the fork's catalog changes) that
+breaks both alike passes it. `configs/c_heap_baseline.tsv.gz` holds heap's
+whole outcome on the pinned corpus: one line per record heap doesn't pass,
+sorted (`file line status sqlstate sorted-answer-digest`, `-` for an empty
+field), after a `# sqllogictest COMMIT` line.
+
+```sh
+src/tools/prolly_bench/prolly_bench cbaseline check HEAP_DIR...    # a run, or its shards
+src/tools/prolly_bench/prolly_bench cbaseline update HEAP_DIR...   # rewrite from a full run
+```
+
+`check` covers the files the run covered, so a shard checks its part. It
+fails, in both directions, on a heap failure the file doesn't list or lists
+differently (a regression in shared code), and on a listed record that now
+passes (update the file, so it stays exact). Records that timed out or
+didn't run are never written to the file; a run with any fails as
+**incomplete**, not as a regression. `update` refuses anything but a
+complete run of the whole corpus.
+
+The corpus pin is `configs/sqllogictest.commit`: CI checks out that commit,
+and `cbaseline` refuses a run of another one. **Bumping the pin
+regenerates the baseline in the same change:** run heap on the full corpus
+twice at the new commit, `cbaseline update` from the first, and `cbaseline
+check` the second against it (the two must agree). A change that alters
+heap's answers updates the file in the same commit, so the diff shows
+exactly which records moved.
+
+### The pull-request comment
+
+```sh
+src/tools/prolly_bench/prolly_bench creport SHARD_RESULTS... --shards N \
+    --base-baseline BASE_BASELINE --out comment.md [--json summary.json] \
+    [--engines prolly] [--head SHA --base SHA --run-url URL --wall-clock '14 min'] \
+    [--failed-job NAME]
+```
+
+`creport` reads every shard's result sets (heap and each engine) and
+writes the sticky comment CI posts, starting with the marker
+`<!-- c-suite -->`: a headline (corpus pin, full corpus or smoke, the merge
+it ran, records, shards, wall clock, PASS or FAIL), a row per engine (pass
+rate, change in failing records against the heap baseline at the base
+commit, counts by class, gate), then collapsed sections: new failures (25
+per class, each with its query and both sides), fixed records (baseline
+entries to remove), stale exceptions, time per cell, and the per-shard
+tables. It is cut at 65,000 characters with a notice.
+
+It is also the gate over the shards as a whole, and exits 1 when any shard
+1..N is missing or incomplete or lacks an engine of `--engines`, when the
+shards' files together aren't the whole corpus exactly once, when an
+engine differs from heap, or when heap differs from the baseline. Each
+row's gate column fails with the problems that name its engine. It reads
+each shard's comparisons where `cgate` left them, and recomputes one
+whose inputs changed. `--base-baseline` is the baseline file at the pull
+request's base (`git show BASE:src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz`),
+so a stacked pull request is compared with the one below it; when the
+base has none, or one for another corpus pin, "vs base" shows n/a and a
+note, and the report doesn't fail for it. Timeouts and records that didn't
+run don't count as failing records against the base.
+
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.
@@ -233,16 +319,31 @@ the cluster in `post`.
 
 ## Tests
 
-CI runs the C smoke corpus on heap and `prolly`, then calls:
+CI (`.github/workflows/correctness.yml`, on every pull request, every push
+to `master` and nightly) runs the full C corpus in shards: one build, then
+per shard heap and `prolly`, and
 
 ```sh
 src/tools/prolly_bench/prolly_bench cgate BASELINE_DIR ENGINE_DIR
+src/tools/prolly_bench/prolly_bench cbaseline check BASELINE_DIR
 ```
+
+then the **C suite gate** job runs `creport` over every shard and fails on
+any finding or on a missing shard. A pull request changing only `specs/`
+passes the gate without building, and its comment says the suite didn't
+run. The gate leaves the comment as an artifact, and
+`correctness-comment.yml` (a `workflow_run` workflow, with the only write
+permission) posts it or updates it in place, unless the run tested an
+older commit than the pull request's head. A cancelled run reports
+nothing. A failure on `master` or in the nightly run opens or updates one
+issue labelled `ci-failure`, and the next pass closes it. Both workflows
+use `.github/actions/specs-only` to decide what is specs-only.
 
 All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,
 incorrect AMs, stale exceptions, or differing answers. It requires C1-C4
-by default (`--workloads C1,C2` selects a smaller explicit set). Order-only
+by default, or a shard's workloads for a shard (`--workloads C1,C2`
+selects a smaller explicit set). Order-only
 findings also fail until reviewed. The comparator preserves the corpus sort
 mode and exact typed answers, independently of rounded corpus formatting.
 Documented exceptions and matching PostgreSQL/corpus differences remain

@@ -6,9 +6,6 @@ name: prolly
 
 on:
   pull_request:
-    # the specs are documentation; changing only them builds nothing
-    paths-ignore:
-      - 'specs/**'
   workflow_dispatch:
   schedule:
     - cron: '23 7 * * *'
@@ -16,11 +13,29 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run; any other run gets a
+# group of its own commit, so a master run is never cancelled.
 concurrency:
-  group: prolly-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: prolly-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The specs are documentation: a pull request changing only them builds
+  # nothing.  The jobs below are skipped rather than the workflow, so their
+  # checks still report (a skipped job counts as passing).
+  classify:
+    name: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/specs-only
+        id: classify
+
   sanitizers:
     name: nightly address and undefined-behavior checks
     if: github.event_name == 'schedule'
@@ -85,6 +100,8 @@ jobs:
   # release build broken
   release-build:
     name: build without assertions
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -138,6 +155,8 @@ jobs:
 
   build-and-test:
     name: build and test
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -303,30 +322,7 @@ jobs:
           done
           exit "$failed"
 
-      - name: Fetch pinned SQLLogicTest corpus
-        uses: actions/checkout@v5
-        with:
-          repository: dolthub/sqllogictest
-          ref: 04b0d198bf9dff62ddfbf0e5d04f5ae63a649ba3
-          path: slt-corpus
-
-      - name: SQLLogicTest smoke and strict heap comparison
-        run: |
-          src/tools/prolly_bench/prolly_bench run C --am heap,prolly \
-            --config src/tools/prolly_bench/configs/c_ci.toml \
-            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
-            --work-dir "$RUNNER_TEMP/c-suite" --out "$PWD/engine-results/c-suite"
-          src/tools/prolly_bench/prolly_bench cgate \
-            engine-results/c-suite/*-C-B0 engine-results/c-suite/*-C-prolly
-
-      - name: Full pinned SQLLogicTest corpus (nightly)
-        if: github.event_name == 'schedule'
-        run: |
-          src/tools/prolly_bench/prolly_bench run C --am heap,prolly \
-            --config src/tools/prolly_bench/configs/c_full_ci.toml \
-            --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
-            --work-dir "$RUNNER_TEMP/c-full" --out "$PWD/engine-results/c-full"
-
+      # (the C suite, SQL correctness, runs in correctness.yml)
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench
         run: python3 -m unittest discover -s tests

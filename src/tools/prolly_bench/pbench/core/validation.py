@@ -113,8 +113,12 @@ def comparison_identity(cfg: dict, env: dict) -> str:
     # AM, source revision and server build (with its psql and pgbench) may
     # differ: these are the independent variables. Their exact hashes are retained as provenance.
     # All workload, durability, build-mode and machine conditions must match.
+    config = {k: v for k, v in cfg.items() if k not in ("source", "tools")}
+    if "run" in config and not config["run"].get("shard", True):
+        # (an unsharded run identifies as it did before shards existed)
+        config["run"] = {k: v for k, v in config["run"].items() if k != "shard"}
     return fingerprint({
-        "config": {k: v for k, v in cfg.items() if k not in ("source", "tools")},
+        "config": config,
         "machine": {k: env.get(k) for k in (
             "hostname", "kernel", "memory_kb", "cpu_governors",
             "cpu_energy_preference", "cpu_boost", "filesystem", "block_device")},

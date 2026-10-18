@@ -22,6 +22,13 @@ from pbench.core.interfaces import Context, Outcome, Unavailable, Window, Worklo
 # Record statuses slt-runner reports (slt/merge.go).
 STATUSES = ["ok", "not_ok", "not_implemented", "crashed", "timeout",
             "did_not_run", "skipped"]
+# The suite's workloads: what a run and its gate cover unless told otherwise.
+WORKLOADS = ["C1", "C2", "C3", "C4"]
+
+
+def corpus_dir(tools: dict[str, str]) -> Path:
+    """The corpus's test/ directory, from a config's [tools]."""
+    return Path(tools.get("sqllogictest", "")).expanduser() / "test"
 
 
 class CWorkload(Workload):
@@ -33,7 +40,7 @@ class CWorkload(Workload):
         return [1]
 
     def _corpus(self, ctx: Context) -> Path:
-        return Path(ctx.tools.get("sqllogictest", "")).expanduser() / "test"
+        return corpus_dir(ctx.tools)
 
     def _runner(self, ctx: Context) -> Path:
         return Path(ctx.tools.get("slt_runner", ""))
@@ -47,17 +54,33 @@ class CWorkload(Workload):
     def prepare(self, ctx: Context) -> None:
         pass
 
-    def files(self, ctx: Context) -> list[str]:
-        """The test files or directories to run.  With sample =
-        "per_directory", the first file of each directory."""
-        roots = [self._corpus(ctx) / p for p in self.paths]
-        if ctx.params.get("sample", "all") == "all":
-            return [str(r) for r in roots]
+    @classmethod
+    def select_files(cls, corpus: Path, sample: str = "all") -> list[Path]:
+        """The workload's test files below corpus (the corpus's test/
+        directory), sorted.  With sample = "per_directory", the first file
+        of each directory."""
+        roots = [corpus / p for p in cls.paths]
+        missing = [str(r) for r in roots if not r.exists()]
+        if missing:
+            raise ValueError(f"not in the corpus: {', '.join(missing)}")
+        files = sorted(f for r in roots for f in (r.rglob("*.test") if r.is_dir() else [r]))
+        if sample == "all":
+            return files
         first: dict[Path, Path] = {}
-        for r in roots:
-            for f in sorted(r.rglob("*.test")) if r.is_dir() else [r]:
-                first.setdefault(f.parent, f)
-        return [str(f) for f in sorted(first.values())]
+        for f in files:
+            first.setdefault(f.parent, f)
+        return sorted(first.values())
+
+    def files(self, ctx: Context) -> list[str]:
+        """The test files or directories to run: on a shard (cshard.py), the
+        shard's files; else the whole part, or with sample =
+        "per_directory", the first file of each directory."""
+        corpus = self._corpus(ctx)
+        if "shard_files" in ctx.params:
+            return [str(corpus / f) for f in ctx.params["shard_files"]]
+        if ctx.params.get("sample", "all") == "all":
+            return [str(corpus / p) for p in self.paths]
+        return [str(f) for f in self.select_files(corpus, ctx.params["sample"])]
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
         target = targets.for_am(ctx.table_am)

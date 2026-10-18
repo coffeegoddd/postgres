@@ -11,8 +11,12 @@ engine's result set under compare/<baseline>/<workload>/, and renders it.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import gzip
+import hashlib
+import inspect
 import json
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -22,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from pbench.table import ResultSet
+from pbench.workloads import c_suite
 from pbench.core.validation import sha256, compatible
 
 HERE = Path(__file__).resolve().parents[1]
@@ -53,7 +58,16 @@ def runner_path(rs: ResultSet) -> Path:
 
 def corpus_path(rs: ResultSet) -> Path:
     cfg = json.loads((rs.path / "config.json").read_text())
-    return Path(cfg["tools"]["sqllogictest"]).expanduser() / "test"
+    return c_suite.corpus_dir(cfg["tools"])
+
+
+def run_workloads(rs: ResultSet) -> list[str]:
+    """The workloads cgate requires by default: a shard's own (those it has
+    files of, cshard.py), else all of the suite's."""
+    cfg = json.loads((rs.path / "config.json").read_text())
+    if cfg.get("run", {}).get("shard"):
+        return list(cfg["run"]["workloads"])
+    return list(c_suite.WORKLOADS)
 
 
 def exceptions_for(am: str, path: Path = EXCEPTIONS) -> list[dict[str, Any]]:
@@ -75,26 +89,9 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
     exc = exceptions_for(eng.table_am)
     out = {}
     for w in sorted(set(base_dirs) & set(eng_dirs)):
-        dest = eng.path / "compare" / base.path.name / w
+        dest = comparison_dir(base, eng) / w
         result = dest / "compare.json"
-        inputs = [base_dirs[w] / "records.jsonl.gz", eng_dirs[w] / "records.jsonl.gz"]
-        if runner.is_file():
-            inputs.append(runner)
-        if EXCEPTIONS.exists():
-            inputs.append(EXCEPTIONS)
-        stamp = dest / "inputs.json"
-        identity = {str(p): sha256(p) for p in inputs}
-        # (exceptions expire: a result is for the day it was computed)
-        identity["evaluated_on"] = dt.date.today().isoformat()
-        differences = dest / "diffs.jsonl.gz"
-        valid_cache = False
-        if result.exists() and stamp.exists() and differences.exists():
-            try:
-                valid_cache = json.loads(stamp.read_text()) == {
-                    "inputs": identity, "result": sha256(result), "diffs": sha256(differences)}
-            except ValueError:
-                pass
-        if not valid_cache:
+        if _stamp(base, eng, w) != _stamped(dest):
             with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
                 json.dump(exc, f)
                 f.flush()
@@ -103,14 +100,112 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
                                    capture_output=True, text=True, timeout=3600)
             if r.returncode != 0:
                 raise RuntimeError(f"slt-runner compare failed: {r.stderr[-2000:]}")
-            stamp.write_text(json.dumps({"inputs": identity, "result": sha256(result),
-                                        "diffs": sha256(differences)}, sort_keys=True))
+            seal_comparison(base, eng, w)
         out[w] = json.loads(result.read_text())
     return out
 
 
-def evidence(d: Path, am: str) -> tuple[list[str], dict]:
-    """Reconcile raw records against the plan and summary; never trust counts alone."""
+def comparison_dir(base: ResultSet, eng: ResultSet) -> Path:
+    return eng.path / "compare" / base.path.name
+
+
+def _stamp(base: ResultSet, eng: ResultSet, w: str) -> dict[str, Any]:
+    """What a comparison of workload w was computed from, by role rather
+    than path, so a result set's comparison stays valid when it is copied
+    (CI's gate job downloads the shards' result sets elsewhere)."""
+    identity = {"baseline": sha256(slt_dirs(base)[w] / "records.jsonl.gz"),
+                "engine": sha256(slt_dirs(eng)[w] / "records.jsonl.gz")}
+    runner = runner_path(eng)
+    if runner.is_file():
+        identity["runner"] = sha256(runner)
+    if EXCEPTIONS.exists():
+        identity["exceptions"] = sha256(EXCEPTIONS)
+    # (exceptions expire: a result is for the day it was computed)
+    identity["evaluated_on"] = dt.date.today().isoformat()
+    dest = comparison_dir(base, eng) / w
+    return {"inputs": identity, "result": sha256(dest / "compare.json") if
+            (dest / "compare.json").exists() else None,
+            "diffs": sha256(dest / "diffs.jsonl.gz") if (dest / "diffs.jsonl.gz").exists()
+            else None}
+
+
+def _stamped(dest: Path) -> Any:
+    try:
+        return json.loads((dest / "inputs.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def seal_comparison(base: ResultSet, eng: ResultSet, w: str) -> None:
+    """Record what the comparison now in eng's compare directory for w was
+    computed from."""
+    (comparison_dir(base, eng) / w / "inputs.json").write_text(
+        json.dumps(_stamp(base, eng, w), sort_keys=True))
+
+
+def is_status_problem(problem: str) -> bool:
+    """Whether a problem from evidence() is only a record that didn't run to
+    a result (one statuses=False leaves out)."""
+    return re.fullmatch(r"record \S+:\d+ \w+", problem) is not None
+
+
+# The files evidence() reads, and where it keeps its result for them.
+EVIDENCE_INPUTS = ("summary.json", "corpus.json", "planned.jsonl.gz", "records.jsonl.gz",
+                   "files.jsonl")
+EVIDENCE_CACHE = "evidence.json"
+
+
+@functools.cache
+def _evidence_version() -> str:
+    """The reconciliation's own code, so a cache from other code is never
+    used."""
+    return hashlib.sha256(inspect.getsource(_evidence).encode()).hexdigest()
+
+
+def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
+    """Reconcile raw records against the plan and summary; never trust counts alone.
+    With statuses, a record that didn't run to a result (crashed, timed out,
+    ...) is a problem too.
+
+    The full corpus is millions of records, and loading a result set,
+    cgate, cbaseline and creport each reconcile them; the result is kept
+    in d/evidence.json, keyed by the inputs' hashes, so the files are read
+    once until one of them changes, or the code that reconciles them does.
+    (The cache is as trustworthy as the result set it sits in: whoever can
+    rewrite one can rewrite the other.)"""
+    try:
+        inputs = {n: sha256(d / n) for n in EVIDENCE_INPUTS}
+    except OSError:
+        return _evidence(d, am, statuses)
+    key = f"{am}/{'statuses' if statuses else 'records'}"
+    cache = d / EVIDENCE_CACHE
+    kept: dict[str, Any] = {"results": {}, "corpus": None}
+    try:
+        found = json.loads(cache.read_text())
+        if (isinstance(found, dict) and found.get("version") == _evidence_version()
+                and found.get("inputs") == inputs and isinstance(found.get("results"), dict)
+                and isinstance(found.get("corpus"), dict)):
+            kept = found
+    except (OSError, ValueError):
+        pass
+    hit = kept["results"].get(key)
+    if isinstance(hit, list) and all(isinstance(p, str) for p in hit):
+        return hit, kept["corpus"]
+    problems, corpus = _evidence(d, am, statuses)
+    if kept["corpus"] not in (None, corpus):
+        kept["results"] = {}
+    kept["results"] = {k: v for k, v in kept["results"].items() if isinstance(v, list)}
+    kept["results"][key] = problems
+    try:
+        # (the corpus once: it is the same for every engine and mode)
+        cache.write_text(json.dumps({"version": _evidence_version(), "inputs": inputs,
+                                     "corpus": corpus, "results": kept["results"]}))
+    except OSError:
+        pass  # (a read-only copy: only slower)
+    return problems, corpus
+
+
+def _evidence(d: Path, am: str, statuses: bool) -> tuple[list[str], dict]:
     problems = []
     try:
         summary = json.loads((d / "summary.json").read_text())
@@ -132,8 +227,8 @@ def evidence(d: Path, am: str) -> tuple[list[str], dict]:
                     raise ValueError("duplicate, unordered, unplanned or legacy record")
                 if expected["skip"] != (status == "skipped"):
                     raise ValueError("unexpected skip or execution of excluded record")
-                if status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
-                    problems.append(f"{key}: {status}")
+                if statuses and status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
+                    problems.append(f"record {key[0]}:{key[1]} {status}")
                 # (a client-side error has only its message: a result, not
                 # missing evidence)
                 if status in ("ok", "not_ok") and not (
@@ -206,7 +301,12 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
 
 def diffs(base: ResultSet, eng: ResultSet) -> Iterator[dict[str, Any]]:
     compare(base, eng)
-    for d in sorted((eng.path / "compare" / base.path.name).glob("*/diffs.jsonl.gz")):
+    yield from compared_diffs(base, eng)
+
+
+def compared_diffs(base: ResultSet, eng: ResultSet) -> Iterator[dict[str, Any]]:
+    """The differences of the comparison compare() last left, streamed."""
+    for d in sorted(comparison_dir(base, eng).glob("*/diffs.jsonl.gz")):
         with gzip.open(d, "rt") as f:
             for line in f:
                 yield json.loads(line)
@@ -302,11 +402,18 @@ def to_markdown(sets: list[ResultSet]) -> str:
 # cdiff
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=8)
+def _test_lines(path: Path) -> Optional[tuple[str, ...]]:
+    try:
+        return tuple(path.read_text(errors="replace").splitlines())
+    except OSError:
+        return None
+
+
 def query_text(corpus: Path, file: str, line: int) -> str:
     """The SQL of the record whose SQL starts at line of file."""
-    try:
-        lines = (corpus / file).read_text(errors="replace").splitlines()
-    except OSError:
+    lines = _test_lines(corpus / file)
+    if lines is None:
         return "?"
     sql = []
     for text in lines[line - 1:]:

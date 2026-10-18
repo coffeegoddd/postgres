@@ -33,6 +33,8 @@ RUN_DEFAULTS: dict[str, Any] = {
     "seed": 1,
     "quality": "smoke",  # benchmark requires controlled conditions
     "required_collectors": [],
+    # C suite only: "I/N" runs shard I of N of the corpus (cshard.py).
+    "shard": "",
 }
 
 # Settings every S and V run requires: results are only comparable when
@@ -120,6 +122,14 @@ def validate(cfg: dict, suite: str) -> None:
         if type(run[name]) is not int:
             raise ConfigError(f"{name} must be an integer")
     number(run["latency_sampling_rate"], "latency_sampling_rate", 1e-12, 1)
+    if run["shard"]:
+        if suite != "C":
+            raise ConfigError("only the C suite runs in shards")
+        from pbench import cshard
+        try:
+            cshard.parse(str(run["shard"]))
+        except ValueError as e:
+            raise ConfigError(str(e)) from None
     if run["seed"] + run["repetitions"] > 2147483647:
         raise ConfigError("seed plus repetitions must fit BenchBase's positive 32-bit seed")
     for name in ("sizes", "clients", "sinks"):

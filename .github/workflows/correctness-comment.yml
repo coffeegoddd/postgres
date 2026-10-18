@@ -1,0 +1,95 @@
+# Posts a pull request's sticky comment from a finished run of another
+# workflow.  The run that tested the pull request's code had a read-only
+# token and left the comment as an artifact; this workflow runs from the
+# default branch with the write permission, and never runs that code.
+#
+# Generic: each workflow listed under workflow_run names, in the table
+# below, the artifact holding its comment and the marker that starts it.
+# The pull request comes from the event (or, for a fork, from the run's
+# head commit), never from the artifact, and only a comment of this bot's
+# that starts with the marker is ever edited.
+
+name: pull request comment
+
+on:
+  workflow_run:
+    workflows: [correctness]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  comment:
+    name: comment
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKFLOW: ${{ github.event.workflow_run.name }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      EVENT_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+    steps:
+      - name: Which comment
+        id: kind
+        run: |
+          case "$WORKFLOW" in
+            correctness) artifact=c-suite-comment; file=comment.md; marker='<!-- c-suite -->' ;;
+            *) echo "no comment is configured for workflow $WORKFLOW" >&2; exit 1 ;;
+          esac
+          { echo "artifact=$artifact"; echo "file=$file"; echo "marker=$marker"; } >> "$GITHUB_OUTPUT"
+
+      # (a cancelled run leaves none; a specs-only one leaves a short note)
+      - uses: actions/download-artifact@v5
+        id: download
+        continue-on-error: true
+        with:
+          name: ${{ steps.kind.outputs.artifact }}
+          path: ${{ runner.temp }}/comment
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Create or update the comment
+        if: steps.download.outcome == 'success'
+        env:
+          FILE: ${{ runner.temp }}/comment/${{ steps.kind.outputs.file }}
+          MARKER: ${{ steps.kind.outputs.marker }}
+        run: |
+          [ -f "$FILE" ] || { echo "the artifact has no comment"; exit 0; }
+          pr="$EVENT_PR"
+          if [ -z "$pr" ]; then
+            # A fork's run lists no pull requests: find the open one whose head
+            # is the commit the run tested.
+            pr=$(gh pr list --state open --search "$HEAD_SHA" --json number,headRefOid \
+              --jq "map(select(.headRefOid == env.HEAD_SHA))[0].number // empty")
+          fi
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "no open pull request has head $HEAD_SHA" >&2
+            exit 0
+          fi
+          # A run of an older commit (finished late, or re-run) doesn't
+          # replace the report on the pull request's current head.
+          current=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "#$pr is now at $current; this run tested $HEAD_SHA" >&2
+            exit 0
+          fi
+          # The body starts with the marker, so the next run finds it.  (The
+          # report keeps itself under GitHub's 65,536 characters; a longer
+          # one is refused by the API rather than cut mid-character here.)
+          body="$RUNNER_TEMP/body.md"
+          { echo "$MARKER"; grep -vxF -- "$MARKER" "$FILE"; } > "$body"
+          id=$(gh api --paginate "repos/$GH_REPO/issues/$pr/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith(env.MARKER))) | .id' \
+            | head -n 1)
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$id" -F "body=@$body" > /dev/null
+            echo "updated comment $id on #$pr"
+          else
+            gh api --method POST "repos/$GH_REPO/issues/$pr/comments" -F "body=@$body" > /dev/null
+            echo "commented on #$pr"
+          fi

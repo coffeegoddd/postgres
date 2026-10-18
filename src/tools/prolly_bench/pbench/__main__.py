@@ -3,6 +3,10 @@
   prolly_bench run S --am heap                  S suite against stock heap (B0)
   prolly_bench run V --am prolly                V suite against an engine
   prolly_bench run C --am heap,prolly           C suite (SQL correctness), heap first
+  prolly_bench run C --shard 2/4 ...            one shard of the C suite's corpus
+  prolly_bench cshard --shards 4                which files each shard runs
+  prolly_bench cbaseline check DIR...           C suite: heap against the checked-in baseline
+  prolly_bench creport DIR... --shards N ...    C suite: the pull-request comment
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
@@ -50,6 +54,8 @@ def _run(args: argparse.Namespace) -> int:
         over["run"]["measure_seconds"] = args.measure
     if args.no_fio:
         over["run"]["fio_baseline"] = False
+    if args.shard:
+        over["run"]["shard"] = args.shard
     for s in args.set:
         k, _, v = s.partition("=")
         over["postgres"][k] = v
@@ -58,10 +64,10 @@ def _run(args: argparse.Namespace) -> int:
     if not args.am:
         raise SystemExit("at least one --am is required")
 
-    # Paths in [tools] are relative to the repository root.
-    for k, v in list(cfg["tools"].items()):
-        p = Path(v).expanduser()
-        cfg["tools"][k] = str(p if p.is_absolute() else REPO / p)
+    _resolve_tools(cfg)
+    if cfg["run"]["shard"]:
+        from pbench import cshard
+        print(cshard.to_text([cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])]))
 
     # Each engine retains its result set; matched cells run as randomized pairs.
     ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
@@ -102,10 +108,37 @@ def _run(args: argparse.Namespace) -> int:
         print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
         sets = [table.load_set(d) for d in out_dirs]
         base = next((s for s in sets if s.table_am == "heap"), None)
+        from pbench.workloads.c_suite import WORKLOADS
         ok = ok and base is not None and all(not ccompare.gate(base, s,
-            cfg["run"]["workloads"] or ["C1", "C2", "C3", "C4"])
+            cfg["run"]["workloads"] or WORKLOADS)
             for s in sets if s is not base)
     return 0 if ok else 1
+
+
+def _resolve_tools(cfg: dict) -> None:
+    # Paths in [tools] are relative to the repository root.
+    for k, v in list(cfg["tools"].items()):
+        p = Path(v).expanduser()
+        cfg["tools"][k] = str(p if p.is_absolute() else REPO / p)
+
+
+def _corpus(cfg: dict) -> Path:
+    from pbench.workloads.c_suite import corpus_dir
+    return corpus_dir(cfg["tools"])
+
+
+def _cshard(args) -> int:
+    import json
+    from pbench import cshard
+    cfg = config_mod.load(args.config, {}, "C")
+    _resolve_tools(cfg)
+    shards = cshard.plan(_corpus(cfg), cfg, args.shards, cfg["run"]["workloads"])
+    if args.json:
+        print(json.dumps([{"shard": s.spec, "workloads": s.workloads, "bytes": s.bytes,
+                           "files": s.files} for s in shards], indent=1))
+    else:
+        print(cshard.to_text(shards))
+    return 0
 
 
 def _list(_args) -> int:
@@ -153,12 +186,51 @@ def _cdiff(args) -> int:
 
 def _cgate(args) -> int:
     from pbench import ccompare, table
-    problems = ccompare.gate(table.load_set(args.baseline), table.load_set(args.dir), args.workloads)
+    eng = table.load_set(args.dir)
+    problems = ccompare.gate(table.load_set(args.baseline), eng,
+                             args.workloads or ccompare.run_workloads(eng))
     for problem in problems:
         print(problem, file=sys.stderr)
     if not problems:
         print("C suite gate passed")
     return int(bool(problems))
+
+
+def _creport(args) -> int:
+    import json
+    from pbench import creport
+    report = creport.build(args.dirs, args.shards, args.base_baseline, corpus=args.corpus,
+                           head=args.head, base=args.base, base_ref=args.base_ref,
+                           run_url=args.run_url, wall_clock=args.wall_clock,
+                           failed_jobs=args.failed_job, engines=args.engines)
+    args.out.write_text(report.text)
+    if args.json:
+        args.json.write_text(json.dumps(report.summary, indent=1) + "\n")
+    for problem in report.problems:
+        print(problem, file=sys.stderr)
+    print(f"C suite: {'PASS' if report.passed else 'FAIL'}; written: {args.out}")
+    return int(not report.passed)
+
+
+def _cbaseline(args) -> int:
+    import json
+    from pbench import cbaseline, ccompare, table
+    sets = [table.load_set(d) for d in args.dirs]
+    commit = cbaseline.pin(args.pin)
+    if args.action == "update":
+        problems = cbaseline.update(sets, args.baseline, commit, ccompare.corpus_path(sets[0]))
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        if not problems:
+            print(f"written: {args.baseline}")
+        return int(bool(problems))
+    check = cbaseline.check(sets, cbaseline.read(args.baseline), commit)
+    if args.json:
+        args.json.write_text(json.dumps(check.to_json(), indent=1) + "\n")
+    for message in check.messages():
+        print(message, file=sys.stderr)
+    print(check.summary())
+    return int(not check.ok)
 
 
 def _gate(args) -> int:
@@ -237,6 +309,8 @@ def main(argv=None) -> int:
                    help="where clusters live: on the device under test")
     r.add_argument("--out", type=Path, default=REPO / "specs" / "results")
     r.add_argument("--no-fio", action="store_true", help="skip the fio device baseline")
+    r.add_argument("--shard", metavar="I/N",
+                   help="C suite: run shard I of N of the corpus (see cshard)")
     r.add_argument("--keep-failed", action="store_true",
                    help="keep the cluster of a cell that errors, for debugging")
     r.set_defaults(fn=_run)
@@ -274,8 +348,45 @@ def main(argv=None) -> int:
     gate = sub.add_parser("cgate", help="fail on incomplete or differing C-suite results")
     gate.add_argument("baseline", type=Path)
     gate.add_argument("dir", type=Path)
-    gate.add_argument("--workloads", type=_csv(str), default=["C1", "C2", "C3", "C4"])
+    gate.add_argument("--workloads", type=_csv(str),
+                      help="default: the workloads the run had (a shard's, or C1-C4)")
     gate.set_defaults(fn=_cgate)
+
+    sh = sub.add_parser("cshard", help="C suite: the files each of N shards runs")
+    sh.add_argument("--shards", type=int, required=True)
+    sh.add_argument("--config", type=Path, default=HERE / "configs" / "c_full_ci.toml")
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(fn=_cshard)
+
+    from pbench import cbaseline
+    hb = sub.add_parser("cbaseline", help="C suite: heap's results against the checked-in baseline")
+    hb.add_argument("action", choices=["check", "update"])
+    hb.add_argument("dirs", nargs="+", type=Path, help="heap result sets: a run or its shards")
+    hb.add_argument("--baseline", type=Path, default=cbaseline.BASELINE)
+    hb.add_argument("--pin", type=Path, default=cbaseline.PIN,
+                    help="the file holding the corpus commit")
+    hb.add_argument("--json", type=Path, help="check: also write the findings here")
+    hb.set_defaults(fn=_cbaseline)
+
+    cr = sub.add_parser("creport", help="C suite: the pull-request comment from all shards")
+    cr.add_argument("dirs", nargs="+", type=Path, help="every shard's result sets")
+    cr.add_argument("--shards", type=int, required=True, help="how many shards there should be")
+    cr.add_argument("--base-baseline", type=Path, required=True,
+                    help="the heap baseline at the base commit, for the change against it")
+    cr.add_argument("--out", type=Path, required=True, help="the comment, Markdown")
+    cr.add_argument("--json", type=Path, help="also a summary, JSON")
+    cr.add_argument("--corpus", type=Path, help="the corpus's test/ directory "
+                    "(default: as the result sets recorded it)")
+    cr.add_argument("--engines", type=_csv(str),
+                    help="the engines besides heap every shard must have (default: those found)")
+    cr.add_argument("--head", default="", help="the pull request's head commit")
+    cr.add_argument("--base", default="", help="the base commit")
+    cr.add_argument("--base-ref", default="master")
+    cr.add_argument("--run-url", default="", help="the CI run, for the artifacts")
+    cr.add_argument("--wall-clock", default="", help="e.g. '14 min'")
+    cr.add_argument("--failed-job", action="append", default=[],
+                    help="a CI job that failed (repeatable); fails the report")
+    cr.set_defaults(fn=_creport)
 
     evidence = sub.add_parser("gate", help="validate complete, intact execution evidence and optional baseline compatibility")
     evidence.add_argument("dirs", nargs="+", type=Path)

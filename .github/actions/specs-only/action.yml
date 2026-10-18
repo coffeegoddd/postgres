@@ -1,0 +1,29 @@
+# Whether a pull request changes anything outside specs/ (the specs are
+# documentation: a change to only them builds nothing).  Any other event
+# counts as code.  Needs a checkout with fetch-depth 2: for a pull request,
+# HEAD is the merge into the base, and its first parent is the base.
+
+name: specs only
+description: Whether a pull request changes anything outside specs/
+outputs:
+  code:
+    description: "'true' unless the pull request changes only specs/"
+    value: ${{ steps.classify.outputs.code }}
+runs:
+  using: composite
+  steps:
+    - name: Anything outside specs/?
+      id: classify
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+      run: |
+        code=true
+        if [ "$EVENT" = pull_request ]; then
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
+            code=false
+          fi
+        fi
+        echo "code=$code" | tee -a "$GITHUB_OUTPUT"

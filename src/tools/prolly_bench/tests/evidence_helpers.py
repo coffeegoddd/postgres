@@ -25,3 +25,47 @@ def seal(path: Path, suite="S", am="heap", label=None):
                planned_cells=[r["key"] for r in results],
                artifacts={n: sha256(path / n) for n in names})
     run_path.write_text(json.dumps(run))
+
+
+def c_result(path: Path, am: str, records: dict, config=None, commit="pin", label=None):
+    """A sealed C result set at path: records maps workload -> records
+    (file, line, status and any of sqlstate, s, msg), one cell each."""
+    import gzip
+    from pbench.table import ResultSet
+    results = []
+    for w, recs in sorted(records.items()):
+        raw = path / "raw" / w / "slt"
+        raw.mkdir(parents=True)
+        recs = sorted(({"version": 2, "o": "o", "s": "s", **r} if r["status"] == "ok"
+                       else {"version": 2, **r} for r in recs),
+                      key=lambda r: (r["file"], r["line"]))
+        with gzip.open(raw / "records.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps(r) + "\n" for r in recs)
+        with gzip.open(raw / "planned.jsonl.gz", "wt") as f:
+            f.writelines(json.dumps({"file": r["file"], "line": r["line"],
+                                     "skip": r["status"] == "skipped"}) + "\n" for r in recs)
+        files = sorted({r["file"] for r in recs})
+        (raw / "corpus.json").write_text(json.dumps({f: "hash-" + f for f in files}))
+        (raw / "files.jsonl").write_text("".join(json.dumps({"file": f, "tables": 1}) + "\n"
+                                                 for f in files))
+        counts = {}
+        for r in recs:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        (raw / "summary.json").write_text(json.dumps({
+            "total": len(recs), "files": len(files), "counts": counts, "wrong_am_files": [],
+            "unmatched_digests": 0, "unparsed_lines": 0, "am": am}))
+        ran = len(recs) - counts.get("skipped", 0)
+        metrics = {"records": len(recs), "skipped": counts.get("skipped", 0),
+                   "window_seconds": 1.5,
+                   "pass_percent": 100 * counts.get("ok", 0) / ran if ran else None}
+        for s in ("ok", "not_ok", "not_implemented", "crashed", "timeout", "did_not_run"):
+            metrics[s] = counts.get(s, 0)
+        results.append({"key": {"workload": w}, "status": "ok", "raw_dir": f"raw/{w}",
+                        "metrics": metrics})
+    (path / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results))
+    (path / "config.json").write_text(json.dumps(config or {"run": {}}))
+    (path / "environment.json").write_text(json.dumps({"sqllogictest": {"commit": commit,
+                                                                     "dirty_files": 0}}))
+    label = label or ("B0" if am == "heap" else am)
+    seal(path, "C", am, label)
+    return ResultSet(path, "C", label, am, "2026-10-18", results)
