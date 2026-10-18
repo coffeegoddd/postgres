@@ -32,6 +32,7 @@
 #include "access/prolly_transfer.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_valenc.h"
+#include "access/prolly_writers.h"
 
 /* The components a prolly table's rows' history is folded with. */
 typedef struct ProllyComponents
@@ -52,6 +53,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyMergeRoutine *diff_merge;
 	const ProllyCanonRoutine *canonicalizer;
 	const ProllyReclaimRoutine *reclamation;
+	const ProllyWritersRoutine *writers;
 } ProllyDatabaseComponents;
 
 /* Components for rel: a prolly table, or an index on one (an error otherwise). */

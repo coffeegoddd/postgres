@@ -1,0 +1,993 @@
+-- Writer modes: in the shared mode (the default) every session writes a
+-- branch; in the owned mode a dirty branch is one writer's (dolt.writer),
+-- claimed by its first write and given up when it is clean again.
+CREATE SCHEMA wm VERSIONED;
+CREATE TABLE wm.t (id int PRIMARY KEY, v text);
+INSERT INTO wm.t VALUES (1, 'base');
+CREATE ROLE wm_other;
+CREATE ROLE wm_carol;
+GRANT USAGE ON SCHEMA wm TO wm_other, wm_carol;
+GRANT ALL ON wm.t TO wm_other, wm_carol;
+CREATE SEQUENCE wm.s2;
+SELECT length(dolt_commit('-m', 'wm base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+-- Shared: writers mix, and nobody owns the branch.
+SET dolt.writer = 'alice';
+INSERT INTO wm.t VALUES (2, 'alice');
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+SELECT name, dirty, owner, owner_role FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner | owner_role 
+------+-------+-------+------------
+ main | t     |       | 
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- Owned: the first write claims the branch, as a catalog row of the
+-- transaction (gone if it aborts).
+SELECT dolt_writer_mode('owned');
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SET dolt.writer = 'alice';
+BEGIN;
+INSERT INTO wm.t VALUES (2, 'alice');
+ROLLBACK;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+INSERT INTO wm.t VALUES (2, 'alice');
+SELECT name, dirty, owner, owner_role = current_user AS owner_role
+FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner | owner_role 
+------+-------+-------+------------
+ main | t     | alice | t
+(1 row)
+
+-- The owner writes on; anyone else is refused at once, rows and
+-- definitions and sequences alike.
+UPDATE wm.t SET v = 'alice again' WHERE id = 2;
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+CREATE TABLE wm.u (id int);
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+CREATE SEQUENCE wm.s;
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT dolt_commit('-m', 'bob commits alice''s work');
+ERROR:  branch "main" has uncommitted changes by writer "alice"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "alice" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT * FROM wm.t ORDER BY id;
+ id |      v      
+----+-------------
+  1 | base
+  2 | alice again
+(2 rows)
+
+-- Reads and unversioned writes are anyone's.
+CREATE TABLE wm_plain (id int);
+INSERT INTO wm_plain VALUES (1);
+DROP TABLE wm_plain;
+-- A transaction is one writer's: it can't change writer once it has
+-- written.
+SET dolt.writer = 'alice';
+BEGIN;
+INSERT INTO wm.t VALUES (4, 'alice');
+SET LOCAL dolt.writer = 'bob';
+ERROR:  invalid value for parameter "dolt.writer": "bob"
+DETAIL:  The transaction has written as writer "alice".
+ROLLBACK;
+SET dolt.writer = 'not a writer!';
+ERROR:  invalid value for parameter "dolt.writer": "not a writer!"
+DETAIL:  A writer is made of letters, digits, and ".", "_", "-", "@" or "+".
+SET dolt.writer = 'a_writer_name_far_longer_than_thirty_two_bytes';
+ERROR:  invalid value for parameter "dolt.writer": "a_writer_name_far_longer_than_thirty_two_bytes"
+DETAIL:  A writer is at most 32 bytes.
+-- The owner's commit makes the branch clean, and anyone's to claim.
+SELECT length(dolt_commit('-m', 'alice''s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+SET dolt.writer = 'bob';
+INSERT INTO wm.t VALUES (3, 'bob');
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | bob
+(1 row)
+
+-- A reset by the owner discards the changes and the claim.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- A commit in the middle of a transaction gives the branch up, and the
+-- transaction's next write claims it again.
+BEGIN;
+INSERT INTO wm.t VALUES (30, 'bob');
+SELECT length(dolt_commit('-m', 'bob, mid-transaction')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | 
+(1 row)
+
+INSERT INTO wm.t VALUES (31, 'bob');
+COMMIT;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | t     | bob
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (taking a clean branch over takes nothing: the next write claims it)
+SELECT dolt_branch('--take', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | 
+(1 row)
+
+-- An aborted merge is a reset: the owner's, and it gives the branch up.
+SELECT dolt_branch('wm_c');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('wm_c');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_c'"}
+(1 row)
+
+UPDATE wm.t SET v = 'on c' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'wm c')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE wm.t SET v = 'on main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'wm main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('wm_c'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | bob
+(1 row)
+
+SET dolt.writer = 'alice';
+SELECT dolt_merge('--abort');
+ERROR:  branch "main" has uncommitted changes by writer "bob"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "bob" to commit, or take the changes over with dolt_branch('--take', 'main').
+SET dolt.writer = 'bob';
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_c');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A write that changes nothing still claims (the branch counts as dirty
+-- until a commit or reset says otherwise).
+INSERT INTO wm.t VALUES (5, 'gone');
+DELETE FROM wm.t WHERE id = 5;
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | bob
+(1 row)
+
+SET dolt.writer = 'alice';
+INSERT INTO wm.t VALUES (6, 'alice');
+ERROR:  branch "main" has uncommitted changes by writer "bob"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "bob" to commit, or take the changes over with dolt_branch('--take', 'main').
+SELECT dolt_reset('--hard');	-- (the database's owner discards bob's)
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- Another role can't write as a writer that is a role's, nor take a
+-- branch over without owning the database or being the role.
+SET ROLE wm_carol;
+SET dolt.writer = 'carol';
+INSERT INTO wm.t VALUES (7, 'carol');
+SET ROLE wm_other;
+INSERT INTO wm.t VALUES (8, 'carol, spoofed');
+ERROR:  writer "carol" of branch "main" is role "wm_carol"'s
+SELECT dolt_branch('--take', 'main');
+ERROR:  must be the database's owner or role "wm_carol" to take branch "main" over
+SET dolt.writer = 'dave';
+INSERT INTO wm.t VALUES (8, 'dave');
+ERROR:  branch "main" has uncommitted changes by writer "carol"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "carol" to commit, or take the changes over with dolt_branch('--take', 'main').
+RESET ROLE;
+-- The database's owner takes it over: carol's changes become dave's.
+SET dolt.writer = 'dave';
+SELECT dolt_branch('--take', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, owner FROM dolt_branches() WHERE name = 'main';
+ name | owner 
+------+-------
+ main | dave
+(1 row)
+
+INSERT INTO wm.t VALUES (8, 'dave');
+SELECT length(dolt_commit('-m', 'carol''s and dave''s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'main';
+ name | dirty | owner 
+------+-------+-------
+ main | f     | 
+(1 row)
+
+-- Branches are owned each on their own.
+SELECT dolt_checkout('-b', 'wm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_f'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (9, 'dave on f');
+SET dolt.writer = 'erin';
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (9, 'erin on main');
+SELECT name, owner FROM dolt_branches() WHERE name IN ('main', 'wm_f') ORDER BY name;
+ name | owner 
+------+-------
+ main | erin
+ wm_f | dave
+(2 rows)
+
+SELECT dolt_checkout('wm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_f'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (10, 'erin on f');
+ERROR:  branch "wm_f" has uncommitted changes by writer "dave"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "dave" to commit, or take the changes over with dolt_branch('--take', 'wm_f').
+SET dolt.writer = 'dave';
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET dolt.writer = 'erin';
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Branch-only: main is protected, written only by integrations, which
+-- commit as they change it.
+SELECT dolt_writer_mode('branch-only');
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+SET dolt.writer = 'frank';
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+ name | protected 
+------+-----------
+ main | t
+(1 row)
+
+INSERT INTO wm.t VALUES (11, 'frank on main');
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+CREATE TABLE wm.v (id int);
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+SELECT dolt_commit('-m', 'nothing on main');
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+SELECT dolt_checkout('-b', 'wm_frank');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'wm_frank'"}
+(1 row)
+
+SELECT name, protected FROM dolt_branches() WHERE name IN ('main', 'wm_frank') ORDER BY name;
+   name   | protected 
+----------+-----------
+ main     | t
+ wm_frank | f
+(2 rows)
+
+INSERT INTO wm.t VALUES (11, 'frank');
+SELECT (dolt_integrate('-m', 'frank''s first'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT dolt_hashof('main') = dolt_hashof('wm_frank') AS same_head,
+	(SELECT message FROM dolt_log('main') LIMIT 1) AS message;
+ same_head |    message    
+-----------+---------------
+ t         | frank's first
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name IN ('main', 'wm_frank') ORDER BY name;
+   name   | dirty | owner 
+----------+-------+-------
+ main     | f     | 
+ wm_frank | f     | 
+(2 rows)
+
+SELECT id, v FROM wm.t WHERE id = 11;
+ id |   v   
+----+-------
+ 11 | frank
+(1 row)
+
+-- Another writer's branch, from before; its change conflicts with
+-- frank's once frank's is in main.
+SELECT dolt_branch('wm_gina', 'main~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET dolt.writer = 'gina';
+SELECT dolt_checkout('wm_gina');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'wm_gina'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (11, 'gina');
+SELECT dolt_integrate('main', '-m', 'gina''s');
+ERROR:  branch "wm_gina" can't be integrated into "main": the merge has conflicts or constraint violations
+DETAIL:  Nothing was committed or merged.
+HINT:  Merge "main" into "wm_gina" with dolt_merge('main'), resolve them there, and integrate again.
+-- (all of it undone: gina's commit too, and gina is on her branch)
+SELECT active_branch();
+ active_branch 
+---------------
+ wm_gina
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name IN ('main', 'wm_gina') ORDER BY name;
+  name   | dirty | owner 
+---------+-------+-------
+ main    | f     | 
+ wm_gina | t     | gina
+(2 rows)
+
+SELECT (SELECT count(*) FROM dolt_log('wm_gina')) = (SELECT count(*) FROM dolt_log('main')) - 1 AS not_committed;
+ not_committed 
+---------------
+ t
+(1 row)
+
+-- (a merge into main that would stop with conflicts is refused, too)
+SELECT length(dolt_commit('-m', 'gina''s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT dolt_merge('wm_gina');
+ERROR:  a merge into protected branch "main" would leave it uncommitted
+DETAIL:  It has conflicts or constraint violations to resolve.
+HINT:  Merge "main" into a branch of your own and resolve them there, then integrate that.
+ROLLBACK;
+-- resolved on her branch, it integrates
+SELECT dolt_checkout('wm_gina');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'wm_gina'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', 'wm.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('-m', 'gina merges main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT (dolt_integrate('-m', 'gina''s, resolved'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT id, v FROM wm.t WHERE id = 11;
+ id |  v   
+----+------
+ 11 | gina
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT id, v FROM wm.t WHERE id = 11;
+ id |  v   
+----+------
+ 11 | gina
+(1 row)
+
+-- A reset of main is an integration too; dolt_integrate isn't run on
+-- the branch it integrates into.
+SELECT dolt_integrate('-m', 'on main');
+ERROR:  dolt_integrate runs on a branch of your own, not "main"
+HINT:  Check out a branch with dolt_checkout('-b', ...) first.
+SELECT dolt_reset('--hard', 'HEAD');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- An integration doesn't open the branch to the transaction's other writes;
+-- moving a protected branch to another commit is the database owner's.
+BEGIN;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO wm.t VALUES (13, 'after an integration');
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+ROLLBACK;
+SET ROLE wm_other;
+SELECT dolt_reset('--hard', 'HEAD~1');
+ERROR:  branch "main" is protected
+HINT:  Only the database's owner resets a protected branch to another commit.
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset_to_head;
+ reset_to_head 
+---------------
+ t
+(1 row)
+
+RESET ROLE;
+-- Once an integration is done, a checkout after it isn't undone if the
+-- transaction aborts.
+SELECT dolt_checkout('-b', 'wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (14, 'ivy');
+BEGIN;
+SELECT (dolt_integrate('-m', 'ivy''s'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT 1 / 0;
+ERROR:  division by zero
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+-- Protection by branch, in any mode: main unprotected, and others
+-- protected; only the database's owner sets it, and deletes a protected
+-- branch; a copy is protected as its source.
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO wm.t VALUES (12, 'gina on main');
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('--protect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('--protect', 'wm_frank');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-c', 'wm_frank', 'wm_frank2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_%' ORDER BY name;
+   name    | protected 
+-----------+-----------
+ wm_frank  | t
+ wm_frank2 | t
+ wm_gina   | f
+ wm_ivy    | f
+(4 rows)
+
+SET ROLE wm_other;
+SELECT dolt_branch('--unprotect', 'wm_frank');
+ERROR:  must be owner of database contrib_regression
+SELECT dolt_branch('-D', 'wm_frank');
+ERROR:  branch "wm_frank" is protected
+HINT:  Only the database's owner deletes a protected branch.
+RESET ROLE;
+SELECT dolt_branch('--protect', 'no_such_branch');
+ERROR:  branch "no_such_branch" does not exist
+-- (a branch with changes isn't protected: they'd be any integration's)
+SELECT dolt_checkout('wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (15, 'ivy, uncommitted');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('--protect', 'wm_ivy');
+ERROR:  branch "wm_ivy" has uncommitted changes
+HINT:  Commit or reset them before protecting it.
+SELECT dolt_checkout('wm_ivy');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'wm_ivy'"}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_ivy');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_frank', 'wm_frank2', 'wm_gina');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('wm_frank');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, protected FROM dolt_branches() WHERE name = 'wm_frank';
+   name   | protected 
+----------+-----------
+ wm_frank | f
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_frank');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (as the mode has it, a branch's protection is the mode's again)
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('--protect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_writer_mode('owned');
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+ name | protected 
+------+-----------
+ main | f
+(1 row)
+
+SELECT dolt_writer_mode('branch-only');
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+-- Branch-auto: a statement that writes on main first moves the session
+-- to its writer branch, forked from main; the move is undone with its
+-- transaction.
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'hank';
+BEGIN;
+INSERT INTO wm.t VALUES (20, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/hank/main
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+INSERT INTO wm.t VALUES (20, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/hank/main
+(1 row)
+
+SELECT name, kind, base, owner, protected FROM dolt_branches()
+WHERE name IN ('main', 'writer/hank/main') ORDER BY name;
+       name       |  kind  | base | owner | protected 
+------------------+--------+------+-------+-----------
+ main             | branch |      |       | t
+ writer/hank/main | writer | main | hank  | f
+(2 rows)
+
+UPDATE wm.t SET v = 'hank again' WHERE id = 20;
+CREATE TABLE wm.hank (id int);
+SELECT (dolt_integrate('-m', 'hank''s'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT active_branch(), dolt_hashof('main') = dolt_hashof('HEAD') AS integrated;
+  active_branch   | integrated 
+------------------+------------
+ writer/hank/main | t
+(1 row)
+
+-- (done with, it goes when the session leaves it)
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+SELECT id, v FROM wm.t WHERE id = 20;
+ id |     v      
+----+------------
+ 20 | hank again
+(1 row)
+
+SELECT to_regclass('wm.hank') IS NOT NULL AS hank_table;
+ hank_table 
+------------
+ t
+(1 row)
+
+-- one with changes of its own stays; a write isn't moved there (its
+-- definitions may not be main's); it is written there once checked out
+INSERT INTO wm.t VALUES (21, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT id FROM wm.t WHERE id = 21;
+ id 
+----
+(0 rows)
+
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
+ERROR:  writer branch "writer/hank/main" has changes of its own
+DETAIL:  A statement moves to a writer branch only while it is the base's as it is.
+HINT:  Write there with dolt_checkout('writer/hank/main'), or integrate it with dolt_integrate() first.
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT dolt_checkout('writer/hank/main');
+                dolt_checkout                
+---------------------------------------------
+ {0,"Switched to branch 'writer/hank/main'"}
+(1 row)
+
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
+SELECT id, v FROM wm.t WHERE id IN (20, 21) ORDER BY id;
+ id |      v      
+----+-------------
+ 20 | hank, later
+ 21 | hank
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- what writes no branch's objects doesn't move: a role, a temporary table
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE ROLE wm_nobody;
+DROP ROLE wm_nobody;
+CREATE TEMP TABLE wm_temp (id int);
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+-- a writer names its branches: a branch name's rules are its
+SET dolt.writer = 'x.lock';
+ERROR:  invalid value for parameter "dolt.writer": "x.lock"
+DETAIL:  A writer doesn't begin with "." or "-", hold "..", or end with ".lock".
+SET dolt.writer = 'a..b';
+ERROR:  invalid value for parameter "dolt.writer": "a..b"
+DETAIL:  A writer doesn't begin with "." or "-", hold "..", or end with ".lock".
+-- reads, and integrations, stay on main; a write a query makes is refused
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) > 0 AS read FROM wm.t;
+ read 
+------
+ t
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT nextval('wm.s2');
+ERROR:  branch "main" is protected
+DETAIL:  A write moves the session to its writer branch only at the start of a statement that writes, and this one doesn't (it is a query, or inside a function or procedure).
+HINT:  Write with INSERT, UPDATE, DELETE, MERGE, COPY or DDL first, or check out a branch of your own with dolt_checkout('-b', ...).
+-- writer branches' names are the database's; hank's, clean again, went
+-- when the session left it
+SELECT dolt_branch('writer/hank/other');
+ERROR:  branch names beginning "writer/" are reserved
+SELECT dolt_branch('-D', 'writer/hank/main');
+ERROR:  branch "writer/hank/main" does not exist
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+-- Only the database's owner sets the mode; and back to shared.
+SET ROLE wm_other;
+SELECT dolt_writer_mode('shared');
+ERROR:  must be owner of database contrib_regression
+RESET ROLE;
+SELECT dolt_writer_mode('nobody');
+ERROR:  unknown writer mode "nobody"
+HINT:  The writer modes are "shared", "owned", "branch-only" and "branch-auto".
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+RESET dolt.writer;
+REVOKE ALL ON wm.t FROM wm_other, wm_carol;
+REVOKE USAGE ON SCHEMA wm FROM wm_other, wm_carol;
+DROP ROLE wm_other;
+DROP ROLE wm_carol;

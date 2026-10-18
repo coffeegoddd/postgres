@@ -766,10 +766,11 @@ fold_saw(HeapTupleHeader t, bool *known)
 
 /*
  * Count a copy of the tuple's row, delta; false if its row can't be read
- * (an old version's value out of line may be gone).
+ * (a value out of line of an old page version's tuple, 'of_old', may be
+ * gone).
  */
 static bool
-add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
+add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta, bool of_old)
 {
 	ProllyHash	content;
 	MemoryContext old;
@@ -777,7 +778,7 @@ add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
 
 	ExecForceStoreHeapTuple(tup, f->rowslot, false);
 	slot_getallattrs(f->rowslot);
-	if (delta < 0)
+	if (of_old)
 	{
 		for (int i = 0; i < f->desc->natts; i++)
 			if (out_of_line(f->desc, i, f->rowslot->tts_values[i],
@@ -923,11 +924,11 @@ block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
 			kept = true;
 		}
 		if (!kept)
-			ok = add_copy(f, cs, &was->t[i], -1);
+			ok = add_copy(f, cs, &was->t[i], -1, true);
 	}
 	for (int j = 0; ok && j < is->n; j++)
 		if (is->t[j].t_data != NULL)
-			ok = add_copy(f, cs, &is->t[j], 1);
+			ok = add_copy(f, cs, &is->t[j], 1, false);
 	return ok;
 }
 
@@ -1430,6 +1431,217 @@ carried_tree(Finder *f, ProllyNodeRef *root)
 }
 
 /* ----------------------------------------------------------------
+ * A transaction's own changes
+ * ----------------------------------------------------------------
+ */
+
+static int
+tid_cmp(const void *a, const void *b)
+{
+	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
+}
+
+/*
+ * The tuple versions tids names, read where they are (the transaction's
+ * own versions aren't pruned while it runs): each it made and didn't
+ * replace, a copy +1; each it replaced and hadn't made, -1.
+ */
+static bool
+own_copies(Finder *f, Copies *cs, ItemPointerData *tids, int ntids)
+{
+	bool		ok = true;
+
+	if (ntids > 1)
+		qsort(tids, ntids, sizeof(ItemPointerData), tid_cmp);
+	for (int i = 0; i < ntids && ok; i++)
+	{
+		BlockNumber blkno = ItemPointerGetBlockNumber(&tids[i]);
+		Buffer		buf;
+		Page		page;
+		OffsetNumber off;
+		ItemId		lp;
+		HeapTupleData tup;
+		HeapTupleHeader t;
+		bool		made;
+		bool		replaced = false;
+		HeapTuple	copy;
+
+		if (i > 0 && ItemPointerEquals(&tids[i], &tids[i - 1]))
+			continue;
+		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		off = ItemPointerGetOffsetNumber(&tids[i]);
+		lp = off <= PageGetMaxOffsetNumber(page) ? PageGetItemId(page, off) : NULL;
+		if (lp == NULL || !ItemIdIsNormal(lp))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(f->rel);
+		tup.t_self = tids[i];
+		t = tup.t_data;
+		made = !HeapTupleHeaderXminFrozen(t) &&
+			!(t->t_infomask & HEAP_XMIN_INVALID) &&
+			TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(t));
+		if (!(t->t_infomask & HEAP_XMAX_INVALID) &&
+			!HEAP_XMAX_IS_LOCKED_ONLY(t->t_infomask))
+		{
+			TransactionId updater = HeapTupleHeaderGetUpdateXid(t);
+
+			replaced = TransactionIdIsValid(updater) &&
+				TransactionIdIsCurrentTransactionId(updater);
+		}
+		copy = (made != replaced) ? heap_copytuple(&tup) : NULL;
+		UnlockReleaseBuffer(buf);
+
+		/* (the table's own versions: their values out of line are there) */
+		if (copy)
+		{
+			ok = add_copy(f, cs, copy, made ? 1 : -1, false);
+			heap_freetuple(copy);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	return ok;
+}
+
+static bool
+pages_fold_rows(Relation rel, const ProllyTreeEnv *env,
+				const ProllyNodeRef *data_in, ItemPointerData *tids, int ntids,
+				ProllyNodeRef *data)
+{
+	Finder		f;
+	Copies		cs = {0};
+	ProllyEdit *edits;
+	int			nedits = 0;
+	ProllyTreeCursor *cur;
+	bool		ok;
+	MemoryContext cxt;
+	MemoryContext old;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "own rows",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	finder_open(&f, rel, env);
+	cs.cxt = cxt;
+	initStringInfo(&cs.key);
+	initStringInfo(&cs.row);
+	ok = own_copies(&f, &cs, tids, ntids);
+	if (ok && cs.n > 1)
+		qsort_arg(cs.c, cs.n, sizeof(Copy), copy_cmp, &f);
+
+	/*
+	 * A key's copies: with a key, the row it has now if the transaction
+	 * made one (it replaced the rest), else none; without, each row's
+	 * copies counted (a row's key is its content).
+	 */
+	edits = palloc_array(ProllyEdit, Max(cs.n, 1));
+	cur = PROLLY_CALL(f.tree, cursor_open, &f.env, data_in, CurrentMemoryContext);
+	for (int i = 0; ok && i < cs.n;)
+	{
+		Copy	   *c = &cs.c[i];
+		Copy	   *made = NULL;
+		int64		delta = 0;
+		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
+		ProllyEdit *e;
+		ProllyKey	hk;
+		ProllyValue hv;
+		bool		at_head;
+
+		while (i < cs.n && same_bytes(cs.c[i].key, cs.c[i].keylen, ck.data, ck.len))
+		{
+			if (cs.c[i].delta > 0)
+				made = &cs.c[i];
+			delta += cs.c[i++].delta;
+		}
+
+		/*
+		 * (keys the keying can't tell apart but the bytes can, among the
+		 * changes or against the head: the working set instead, as a fold
+		 * from the baseline would)
+		 */
+		if (i < cs.n)
+		{
+			ProllyKey	nk = {(const uint8 *) cs.c[i].key, cs.c[i].keylen};
+
+			if (keying_compare(&ck, &nk, &f) == 0)
+			{
+				ok = false;
+				break;
+			}
+		}
+		PROLLY_CALL(f.tree, cursor_seek, cur, &ck, ForwardScanDirection);
+		at_head = PROLLY_CALL(f.tree, cursor_next, cur, &hk, &hv) &&
+			keying_compare(&hk, &ck, &f) == 0;
+		if (at_head && !same_bytes(c->key, c->keylen, hk.data, hk.len))
+		{
+			ok = false;
+			break;
+		}
+		e = &edits[nedits];
+		e->key = ck;
+		if (!f.keyless)
+		{
+			e->is_delete = made == NULL;
+			if (made)
+			{
+				ProllyValue r = {(const uint8 *) made->row, made->rowlen};
+				StringInfoData value;
+
+				initStringInfo(&value);
+				PROLLY_CALL(f.kr, make_value, f.k, &r, 1, &value);
+				e->value.data = (const uint8 *) value.data;
+				e->value.len = value.len;
+			}
+			nedits++;
+		}
+		else if (delta != 0)
+		{
+			int64		count = 0;
+
+			if (at_head)
+			{
+				ProllyValue row;
+				uint64		had;
+
+				PROLLY_CALL(f.kr, parse_value, f.k, &hv, &row, &had);
+				count = (int64) had;
+			}
+			count += delta;
+			if (count < 0)
+				ok = false;
+			else
+			{
+				e->is_delete = count == 0;
+				if (count > 0)
+				{
+					ProllyValue r = {(const uint8 *) c->row, c->rowlen};
+					StringInfoData value;
+
+					initStringInfo(&value);
+					PROLLY_CALL(f.kr, make_value, f.k, &r, (uint64) count, &value);
+					e->value.data = (const uint8 *) value.data;
+					e->value.len = value.len;
+				}
+				nedits++;
+			}
+		}
+	}
+	PROLLY_CALL(f.tree, cursor_close, cur);
+	if (ok && nedits > 0)
+		PROLLY_CALL(f.tree, apply, &f.env, data_in, edits, nedits, data);
+	else if (ok)
+		*data = *data_in;
+	finder_close(&f);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return ok;
+}
+
+/* ----------------------------------------------------------------
  * Callbacks
  * ----------------------------------------------------------------
  */
@@ -1552,4 +1764,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.fold = pages_fold,
 	.walk = pages_walk,
 	.counters = pages_counters,
+	.fold_rows = pages_fold_rows,
 };

@@ -1,0 +1,71 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_rc a_insert b_begin b_insert b_commit a_commit c_log c_heads c_reset
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step a_insert: INSERT INTO vtc.t VALUES (1, 'a');
+step b_begin: BEGIN;
+step b_insert: INSERT INTO vtc.t VALUES (2, 'b');
+step b_commit: COMMIT;
+step a_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE message IN ('a', 'b');
+
+log
+---
+a,b
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM vtc.t) AS rows,
+		   (SELECT dirty FROM dolt_branches() WHERE name = 'main') AS dirty;
+
+rows   |dirty
+-------+-----
+1:a,2:b|f    
+(1 row)
+
+step c_reset: DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+
+
+starting permutation: a_rr a_read b_begin b_insert b_commit a_insert a_commit c_log c_heads c_reset
+step a_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step a_read: SELECT count(*) FROM vtc.t;
+count
+-----
+    0
+(1 row)
+
+step b_begin: BEGIN;
+step b_insert: INSERT INTO vtc.t VALUES (2, 'b');
+step b_commit: COMMIT;
+step a_insert: INSERT INTO vtc.t VALUES (1, 'a');
+step a_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE message IN ('a', 'b');
+
+log    
+-------
+a,b,a,b
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM vtc.t) AS rows,
+		   (SELECT dirty FROM dolt_branches() WHERE name = 'main') AS dirty;
+
+rows   |dirty
+-------+-----
+1:a,2:b|f    
+(1 row)
+
+step c_reset: DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied')::text) AS committed;
+committed
+---------
+       66
+(1 row)
+

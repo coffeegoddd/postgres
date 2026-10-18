@@ -182,7 +182,7 @@ INSERT INTO app.t (m) VALUES ('sad'), (DEFAULT);
 -- Another branch (made by hand: branches can't be made yet) sees none of
 -- main's versioned objects, and can make its own with the same names.
 SET allow_system_table_mods = on;
-INSERT INTO pg_branch VALUES (99999, 'other');
+INSERT INTO pg_branch (oid, brname, brownerrole) VALUES (99999, 'other', 0);
 RESET allow_system_table_mods;
 SELECT test_branch_switch('other');
  test_branch_switch 

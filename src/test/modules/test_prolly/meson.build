@@ -52,6 +52,9 @@ tests += {
       'branches',
       'fold',
       'commits',
+      'branch_writes',
+      'writer_modes',
+      'transaction_commits',
       'status_diff',
       'collations',
       'applier',
@@ -132,6 +135,7 @@ tests += {
       't/055_gc.pl',
       't/056_bmap_evict_lock.pl',
       't/057_large_values.pl',
+      't/058_transaction_commits.pl',
     ],
   },
 }

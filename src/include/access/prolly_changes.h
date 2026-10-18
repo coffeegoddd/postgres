@@ -41,6 +41,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "lib/stringinfo.h"
+#include "storage/itemptr.h"
 #include "utils/relcache.h"
 
 /* A table's baseline: its data tree at a fold, and the finder's state. */
@@ -71,11 +72,25 @@ typedef struct ProllyChangeFinderRoutine
 	void		(*walk) (const ProllyTreeEnv *env, const ProllyValue *state,
 						 ProllyTreeVisitNode visit, void *arg);
 	void		(*counters) (ProllyChangeCounters *counters, bool reset);
+
+	/*
+	 * The current transaction's own changes to rel, applied to data_in (a
+	 * commit's data tree of rel) into *data: of the tuple versions tids
+	 * names (in any order, repeated), those the transaction made and didn't
+	 * replace are put, those it replaced that it hadn't made deleted; those
+	 * of its subtransactions that aborted, neither.  False if they can't be
+	 * applied so (a keyless row's copies would go below none), *data then
+	 * undefined.  Needs an active snapshot.
+	 */
+	bool		(*fold_rows) (Relation rel, const ProllyTreeEnv *env,
+							  const ProllyNodeRef *data_in,
+							  ItemPointerData *tids, int ntids,
+							  ProllyNodeRef *data);
 } ProllyChangeFinderRoutine;
 
-#define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters"
+#define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK counters
+#define PROLLY_CHANGES_LAST_CALLBACK fold_rows
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

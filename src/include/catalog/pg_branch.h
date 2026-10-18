@@ -35,6 +35,17 @@ CATALOG(pg_branch,9424,BranchRelationId)
 {
 	Oid			oid;			/* oid: the branch id in catalog rows */
 	NameData	brname;			/* the branch's name */
+
+	/*
+	 * The role that claimed the branch for its owner; 0 when no owner is
+	 * recorded.
+	 */
+	Oid			brownerrole BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_authid);
+
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
+	/* the writer whose changes the branch's working set holds, if recorded */
+	text		browner BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+#endif
 } FormData_pg_branch;
 
 END_CATALOG_STRUCT
@@ -45,6 +56,8 @@ END_CATALOG_STRUCT
  * ----------------
  */
 typedef FormData_pg_branch *Form_pg_branch;
+
+DECLARE_TOAST(pg_branch, 9700, 9701);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_branch_oid_index, 9425, BranchOidIndexId, pg_branch, btree(oid oid_ops));
 DECLARE_UNIQUE_INDEX(pg_branch_name_index, 9426, BranchNameIndexId, pg_branch, btree(brname name_ops));

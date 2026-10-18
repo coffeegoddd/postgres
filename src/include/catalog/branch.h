@@ -17,6 +17,7 @@
 #include "access/htup.h"
 #include "access/transam.h"
 #include "executor/tuptable.h"
+#include "nodes/pg_list.h"
 #include "utils/relcache.h"
 
 /* a branch-aware catalog's branch column */
@@ -41,11 +42,82 @@ extern PGDLLIMPORT Oid CatalogBranchIndexTable;
 extern PGDLLIMPORT bool CatalogKeepRowBranch;
 
 /*
+ * While set, a branch is made on the session's behalf (its writer branch):
+ * without the role's privilege to make branches.
+ */
+extern PGDLLIMPORT bool BranchCreateOnBehalf;
+
+/*
  * While set, catalog scans return every branch's rows: for scans that
  * gather facts about all of them (oldest XIDs, what to vacuum) and build no
  * cache, since an OID can name a row on each branch.
  */
 extern PGDLLIMPORT bool CatalogAllBranches;
+
+/*
+ * Writes to a branch's versioned objects: rows of a versioned table or
+ * sequence, or a versioned object's catalog rows.  The first write of each
+ * branch in a transaction is noted (and again after a subtransaction that
+ * first wrote it aborts), and callbacks are told; a write made on the
+ * session's behalf while hushed (a branch's copies made, a branch moved to
+ * a commit) isn't the transaction's.  The callbacks' errors are the
+ * write's.
+ */
+typedef void (*BranchWriteCallback) (Oid branch, void *arg);
+
+extern void RegisterBranchWriteCallback(BranchWriteCallback callback,
+										void *arg);
+extern void branch_note_write(Oid branch);
+extern bool branch_written(Oid branch);
+
+/*
+ * A prolly table's tuple versions a write made (newtid) or replaced
+ * (oldtid), once it has: told to branch_tuple_hook, if set, unless hushed.
+ */
+typedef void (*BranchTupleHook) (Relation rel, const ItemPointerData *oldtid,
+								 const ItemPointerData *newtid);
+extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
+extern void branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
+							  const ItemPointerData *newtid);
+
+/*
+ * Whether the transaction wrote a versioned object's catalog row, and the
+ * versioned sequences whose values it changed (branch_note_sequence()),
+ * not hushed; both forgotten with the session's branch's writes.
+ */
+extern bool branch_catalog_written(void);
+extern void branch_note_sequence(Relation seqrel);
+extern List *branch_sequences_written(void);
+
+/* the branch's next write is noted (and told) again, as a first one */
+extern void branch_forget_written(Oid branch);
+extern List *branches_written(void);
+extern int	branch_writes_hush(void);
+extern void branch_writes_unhush(int depth);
+
+/*
+ * Run the statements hushed, unhushed however they end (an error caught
+ * without a subtransaction's abort leaves nothing hushed).
+ */
+#define BRANCH_WRITES_HUSHED(...) \
+	do { \
+		int			hush_depth_ = branch_writes_hush(); \
+		PG_TRY(_hushed); \
+		{ \
+			__VA_ARGS__; \
+		} \
+		PG_FINALLY(_hushed); \
+		{ \
+			branch_writes_unhush(hush_depth_); \
+		} \
+		PG_END_TRY(_hushed); \
+	} while (0)
+
+/*
+ * A catalog row of a versioned object is to be updated or deleted: its
+ * branch is written (as the new row's is, as it is stamped).
+ */
+extern void catalog_note_old_row(Relation rel, const ItemPointerData *tid);
 
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);
@@ -73,6 +145,14 @@ extern bool lock_branch_for_delete(Oid branch);
 
 /* note a branch the current subtransaction made */
 extern void note_new_branch(Oid branch);
+
+/*
+ * If the current (sub)transaction aborts, the session goes back to the branch
+ * it is on now; until branch_return_done() with the token returned, once
+ * the operation that asked has succeeded.
+ */
+extern int	branch_return_on_abort(void);
+extern void branch_return_done(int token);
 
 /* is this storage another branch's relation's (for logical decoding)? */
 extern bool relfilenumber_on_other_branch(Oid spcoid, RelFileNumber relnumber);

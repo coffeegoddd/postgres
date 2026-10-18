@@ -24,6 +24,7 @@
 #ifndef PROLLY_REFS_H
 #define PROLLY_REFS_H
 
+#include "access/prolly_canon.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
@@ -113,9 +114,12 @@ typedef struct ProllyRefsRoutine
 	 * Record a commit of the current branch's working root, as the current
 	 * transaction will commit it.  With a merge in progress, it is the
 	 * merge commit (both heads its parents), and every conflict must have
-	 * been resolved.
+	 * been resolved.  Unless allow_empty, a commit of the head alone that
+	 * would hold just what the head does makes no commit and returns false
+	 * (the branch's head and a merge in progress stay as they were).
 	 */
-	void		(*commit) (const char *message, ProllyHash *commit_id);
+	bool		(*commit) (const char *message, bool allow_empty,
+						   ProllyHash *commit_id);
 
 	/*
 	 * Resolve a branch name, commit id or HEAD (the session branch's head
@@ -272,7 +276,45 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*branch_move) (const char *name, const ProllyHash *expected,
 								const ProllyHash *head, bool force);
+
+	/*
+	 * The database's setting called name, as config_set() last set it (false
+	 * if it never was), and setting it (value NULL: unset), with the
+	 * transaction.  Settings are the database's own: clones and pushes
+	 * don't carry them.
+	 */
+	bool		(*config_get) (const char *name, StringInfo value);
+	void		(*config_set) (const char *name, const char *value);
+
+	/*
+	 * Open the refs now, if not yet: a transaction that will need them at
+	 * its end (prolly_refs_end_hook) opens them before it.
+	 */
+	void		(*open) (void);
+
+	/*
+	 * Commit the session's branch's head with the current transaction's own
+	 * row changes (and these sequences as they are now) applied: a commit
+	 * whose parent is the head as it is now, whatever the transaction's
+	 * snapshot saw; the refs held to transaction end; the branch's baseline
+	 * left as it is.  1 if committed, 0 if it would change nothing (no
+	 * commit), -1 if it can't be made so (the canonicalizer's fold_rows()
+	 * says why: then commit() it as the working set).
+	 */
+	int			(*commit_rows) (const char *message,
+								const ProllyRowChanges *changes, int nchanges,
+								const Oid *sequences, int nsequences,
+								ProllyHash *commit_id);
 } ProllyRefsRoutine;
+
+/*
+ * Called by the refs as the transaction they were opened in is about to
+ * commit (prepare: or be prepared), before the chunk store's own end of
+ * transaction, once the refs' own checks have passed: what it records then
+ * is the transaction's.
+ */
+typedef void (*ProllyRefsEndHook) (bool prepare);
+extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
@@ -281,9 +323,9 @@ typedef struct ProllyRefsRoutine
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
-	"branch_move"
+	"branch_move", "config_get", "config_set", "open", "commit_rows"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branch_move
+#define PROLLY_REFS_LAST_CALLBACK commit_rows
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -72,6 +72,74 @@ SELECT name, dirty FROM dolt_branches();
  main | t
 (1 row)
 
+-- A refused empty commit records nothing, even where its error is caught
+-- and the transaction goes on to commit.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT length(dolt_commit('-m', 'before empty')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT sum(chunks) AS chunks FROM test_chunk_segments() \gset
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_commit('-m', 'empty, refused');
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+ROLLBACK TO s;
+DO $$
+BEGIN
+	PERFORM dolt_commit('-m', 'empty, refused in a block');
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+	RAISE NOTICE 'refused: %', SQLERRM;
+END $$;
+NOTICE:  refused: nothing to commit
+COMMIT;
+SELECT sum(chunks) = :chunks AS nothing_appended FROM test_chunk_segments();
+ nothing_appended 
+------------------
+ t
+(1 row)
+
+SELECT message FROM dolt_log('main') LIMIT 1;
+   message    
+--------------
+ before empty
+(1 row)
+
+-- Emptiness is decided before anything is recorded, not undone after: the
+-- refs refuse it without an error, and the head stays.
+BEGIN;
+SELECT dolt_hashof('main') AS head \gset
+SELECT test_refs_commit('empty, refused by the refs', false) IS NULL AS refused;
+ refused 
+---------
+ t
+(1 row)
+
+SELECT dolt_hashof('main') = :'head' AS head_kept;
+ head_kept 
+-----------
+ t
+(1 row)
+
+SELECT test_refs_commit('empty, allowed', true) IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT message FROM dolt_log('main') LIMIT 2;
+    message     
+----------------
+ empty, allowed
+ before empty
+(2 rows)
+
+ROLLBACK;
 -- and includes the transaction's own writes
 BEGIN;
 INSERT INTO app.t VALUES (4, 'd');
@@ -83,12 +151,13 @@ SELECT length(dolt_commit('-m', 'third')::text) AS committed;
 
 COMMIT;
 SELECT message FROM dolt_log('main');
- message 
----------
+   message    
+--------------
  third
+ before empty
  second
  first
-(3 rows)
+(4 rows)
 
 SELECT name, dirty FROM dolt_branches();
  name | dirty 
@@ -355,6 +424,95 @@ SELECT dolt_branch('-d', 'feature/ok-name_1.2');
 DROP SCHEMA ca CASCADE;
 NOTICE:  drop cascades to table ca.t
 SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A cherry-pick resolved to nothing is refused as empty, by the refs
+-- before they record anything: the pick stays in progress, to be aborted.
+CREATE SCHEMA cp VERSIONED;
+CREATE TABLE cp.t (id int PRIMARY KEY, v text);
+INSERT INTO cp.t VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cp base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cp_src');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cp_src');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'cp_src'"}
+(1 row)
+
+UPDATE cp.t SET v = 'src' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp src')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cp.t SET v = 'main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_cherry_pick('cp_src'))[2] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', 'cp.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT test_refs_commit('cp resolved to nothing', false) IS NULL AS refused;
+ refused 
+---------
+ t
+(1 row)
+
+SELECT dolt_cherry_pick('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT v FROM cp.t;
+  v   
+------
+ main
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'cp_src');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cp CASCADE;
+NOTICE:  drop cascades to table cp.t
+SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;
  committed 
 -----------
         66

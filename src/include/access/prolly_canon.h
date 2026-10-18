@@ -65,6 +65,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "storage/itemptr.h"
 
 /* Visits one dependency a commit records: its name and its value. */
 typedef void (*ProllyCanonDependencyVisit) (const char *name,
@@ -99,6 +100,14 @@ typedef struct ProllyTableColumn
 	char	   *name;
 	char	   *type;			/* as format_type() writes it */
 } ProllyTableColumn;
+
+/* A transaction's own row changes to a table: its tuple versions' TIDs. */
+typedef struct ProllyRowChanges
+{
+	Oid			relid;
+	ItemPointerData *tids;
+	int			ntids;
+} ProllyRowChanges;
 
 typedef struct ProllyCanonRoutine
 {
@@ -181,6 +190,19 @@ typedef struct ProllyCanonRoutine
 	 * commit holds, which a move to a commit discards.
 	 */
 	void		(*discard_undescribed) (void);
+
+	/*
+	 * head with the current transaction's own row changes to these tables
+	 * applied (the change finder's fold_rows()), and these sequences as
+	 * they are now, into *root; everything else as head has it.  False if
+	 * it can't be made so: a table or sequence head doesn't have, or a
+	 * table head describes otherwise than it is now (its rows' encoding
+	 * would differ), or rows that can't be applied.
+	 */
+	bool		(*fold_rows) (const ProllyNodeRef *head,
+							  const ProllyRowChanges *changes, int nchanges,
+							  const Oid *sequences, int nsequences,
+							  ProllyNodeRef *root);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -188,9 +210,9 @@ typedef struct ProllyCanonRoutine
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
-	"in_format", "format", "walk_changes", "discard_undescribed"
+	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK discard_undescribed
+#define PROLLY_CANON_LAST_CALLBACK fold_rows
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

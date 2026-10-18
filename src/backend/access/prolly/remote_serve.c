@@ -28,6 +28,7 @@
 #include "access/prolly_config.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "catalog/branch.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -286,9 +287,13 @@ head_row(const char *name, const ProllyHash *head, void *arg)
 	Datum		values[2];
 	bool		nulls[2] = {0};
 
-	/* (a branch without commits, or a session's at a commit: not served) */
+	/*
+	 * (a branch without commits, a session's at a commit, or a writer's
+	 * branch, the database's own mechanism: not served)
+	 */
 	if (head->len == 0 ||
-		strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0 ||
+		strncmp(name, PROLLY_WRITER_PREFIX, strlen(PROLLY_WRITER_PREFIX)) == 0)
 		return;
 	values[0] = CStringGetTextDatum(name);
 	values[1] = PointerGetDatum(hash_bytea(head));
@@ -614,6 +619,7 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 	ProllyHash	expected = {0};
 	ProllyHash	head;
 	bool		has_head = !PG_ARGISNULL(2);
+	bool		moved;
 	StringInfoData mine;
 
 	check_serving(true);
@@ -626,6 +632,13 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 	if (VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_PP(1)) > 0)
 		bytea_hash(PG_GETARG_BYTEA_PP(1), &expected);
 	prolly_database_components(&dc);
+	/* (a push moving a protected branch integrates: the owner's to make) */
+	if (PROLLY_CALL(dc.writers, protected, branch) &&
+		!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("branch \"%s\" is protected", branch),
+				 errhint("Only the database's owner pushes to a protected branch.")));
 	initStringInfo(&mine);
 	PROLLY_CALL(dc.canonicalizer, format, &mine);
 	if (strcmp(text_to_cstring(PG_GETARG_TEXT_PP(3)), mine.data) != 0)
@@ -654,7 +667,14 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 			check_sent(&head);
 		(void) PROLLY_CALL(dc.transfer, receive, &spool_remote, NULL, &head, 1);
 	}
-	PG_RETURN_BOOL(PROLLY_CALL(dc.refs, branch_move, branch, &expected,
-							   has_head ? &head : NULL,
-							   PG_GETARG_BOOL(4)));
+	/* (the branch's rows, moved on the pusher's behalf) */
+	BRANCH_WRITES_HUSHED(moved = PROLLY_CALL(dc.refs, branch_move, branch,
+											 &expected,
+											 has_head ? &head : NULL,
+											 PG_GETARG_BOOL(4)));
+
+	/* (a protected branch deleted takes its protection with it) */
+	if (moved && !has_head && PROLLY_CALL(dc.writers, protected, branch))
+		PROLLY_CALL(dc.writers, set_protected, branch, PROLLY_PROTECT_DEFAULT);
+	PG_RETURN_BOOL(moved);
 }

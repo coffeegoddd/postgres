@@ -5364,6 +5364,154 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	}
 }
 
+/* (edits in key order, as the root's items are) */
+static int
+edit_key_cmp(const void *a, const void *b)
+{
+	return prolly_bytes_compare(&((const ProllyEdit *) a)->key,
+								&((const ProllyEdit *) b)->key, NULL);
+}
+
+/* An edit putting item it, as it is. */
+static void
+put_edit(ProllyEdit *edits, int *nedits, const CanonItem *it)
+{
+	ProllyEdit *e = &edits[(*nedits)++];
+
+	e->key.data = (const uint8 *) it->key.data;
+	e->key.len = it->key.len;
+	e->is_delete = false;
+	e->value.data = (const uint8 *) it->value.data;
+	e->value.len = it->value.len;
+}
+
+/*
+ * head's item named key into *v; false if head has none.
+ */
+static bool
+head_item(Canon *cn, const ProllyNodeRef *head, const StringInfoData *key,
+		  StringInfo v)
+{
+	ProllyKey	k = {(const uint8 *) key->data, key->len};
+
+	return PROLLY_CALL(cn->tree, get, &cn->env, head, &k, v);
+}
+
+static bool
+folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
+				 int nchanges, const Oid *sequences, int nsequences,
+				 ProllyNodeRef *root)
+{
+	Canon		cn;
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(nchanges + nsequences, 1));
+	int			nedits = 0;
+	int			save_nestlevel;
+	bool		ok = true;
+	StringInfoData v;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	cn.finder = prolly_changes_lookup("pages");
+	if (!root_in_format(&cn, head))
+		return false;
+	initStringInfo(&v);
+
+	/* (described as a commit describes them: every name qualified) */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		for (int i = 0; ok && i < nchanges; i++)
+		{
+			Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
+			CanonItem  *it;
+			StringInfoData desc;
+			ProllyKey	k;
+			ProllyValue hv;
+			ProllyNodeRef data;
+			ProllyValue described;
+			ProllyNodeRef rows;
+
+			if (rel == NULL)
+			{
+				ok = false;
+				break;
+			}
+			it = add_item(&cn, "t:", qualified(RelationGetNamespace(rel),
+											   RelationGetRelationName(rel)));
+			resetStringInfo(&v);
+			initStringInfo(&desc);
+			if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID ||
+				!head_item(&cn, head, &it->key, &v))
+				ok = false;
+			else
+			{
+				/* (rows encode by the table as it is: as head has it, only) */
+				describe_table(&cn, rel, &desc);
+				k.data = (const uint8 *) it->key.data;
+				k.len = it->key.len;
+				hv.data = (const uint8 *) v.data;
+				hv.len = v.len;
+				(void) tree_item(&k, &hv, &data, &described);
+				ok = described.len == (uint32) desc.len &&
+					memcmp(described.data, desc.data, desc.len) == 0 &&
+					PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &data,
+								changes[i].tids, changes[i].ntids, &rows);
+			}
+			if (ok)
+			{
+				put_hash(&it->value, &rows.hash);
+				appendBinaryStringInfo(&it->value, desc.data, desc.len);
+				pfree(desc.data);
+				put_edit(edits, &nedits, it);
+			}
+			table_close(rel, AccessShareLock);
+		}
+		for (int i = 0; ok && i < nsequences; i++)
+		{
+			HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(sequences[i]));
+			CanonItem  *it;
+			Form_pg_class form;
+
+			if (!HeapTupleIsValid(tup))
+			{
+				ok = false;
+				break;
+			}
+			form = (Form_pg_class) GETSTRUCT(tup);
+			describe_sequence(&cn, sequences[i], form->relnamespace,
+							  NameStr(form->relname));
+			ReleaseSysCache(tup);
+			it = llast(cn.items);
+			resetStringInfo(&v);
+			if (!head_item(&cn, head, &it->key, &v))
+				ok = false;
+			else
+			{
+				put_edit(edits, &nedits, it);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+		AtEOXact_GUC(false, save_nestlevel);
+	}
+	PG_END_TRY();
+	if (!ok)
+		return false;
+	if (nedits > 1)
+		qsort(edits, nedits, sizeof(ProllyEdit), edit_key_cmp);
+	if (nedits > 0)
+		PROLLY_CALL(cn.tree, apply, &cn.env, head, edits, nedits, root);
+	else
+		*root = *head;
+	return true;
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -5378,6 +5526,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
 	.discard_undescribed = folded_discard_undescribed,
+	.fold_rows = folded_fold_rows,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

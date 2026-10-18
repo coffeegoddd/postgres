@@ -25,6 +25,35 @@ ROLLBACK TO s;
 COMMIT;
 SELECT message FROM dolt_log('main');
 SELECT name, dirty FROM dolt_branches();
+-- A refused empty commit records nothing, even where its error is caught
+-- and the transaction goes on to commit.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT length(dolt_commit('-m', 'before empty')::text) AS committed;
+SELECT sum(chunks) AS chunks FROM test_chunk_segments() \gset
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_commit('-m', 'empty, refused');
+ROLLBACK TO s;
+DO $$
+BEGIN
+	PERFORM dolt_commit('-m', 'empty, refused in a block');
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+	RAISE NOTICE 'refused: %', SQLERRM;
+END $$;
+COMMIT;
+SELECT sum(chunks) = :chunks AS nothing_appended FROM test_chunk_segments();
+SELECT message FROM dolt_log('main') LIMIT 1;
+-- Emptiness is decided before anything is recorded, not undone after: the
+-- refs refuse it without an error, and the head stays.
+BEGIN;
+SELECT dolt_hashof('main') AS head \gset
+SELECT test_refs_commit('empty, refused by the refs', false) IS NULL AS refused;
+SELECT dolt_hashof('main') = :'head' AS head_kept;
+SELECT test_refs_commit('empty, allowed', true) IS NOT NULL AS committed;
+SELECT message FROM dolt_log('main') LIMIT 2;
+ROLLBACK;
 -- and includes the transaction's own writes
 BEGIN;
 INSERT INTO app.t VALUES (4, 'd');
@@ -113,3 +142,27 @@ SELECT dolt_hashof('feature/ok-name_1.2') = dolt_hashof('HEAD') AS resolves;
 SELECT dolt_branch('-d', 'feature/ok-name_1.2');
 DROP SCHEMA ca CASCADE;
 SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;
+
+-- A cherry-pick resolved to nothing is refused as empty, by the refs
+-- before they record anything: the pick stays in progress, to be aborted.
+CREATE SCHEMA cp VERSIONED;
+CREATE TABLE cp.t (id int PRIMARY KEY, v text);
+INSERT INTO cp.t VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cp base')::text) AS committed;
+SELECT dolt_branch('cp_src');
+SELECT dolt_checkout('cp_src');
+UPDATE cp.t SET v = 'src' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp src')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE cp.t SET v = 'main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp main')::text) AS committed;
+BEGIN;
+SELECT (dolt_cherry_pick('cp_src'))[2] AS conflicts;
+SELECT dolt_conflicts_resolve('--ours', 'cp.t');
+SELECT test_refs_commit('cp resolved to nothing', false) IS NULL AS refused;
+SELECT dolt_cherry_pick('--abort') IS NOT NULL AS aborted;
+SELECT v FROM cp.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'cp_src');
+DROP SCHEMA cp CASCADE;
+SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;

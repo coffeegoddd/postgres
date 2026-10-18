@@ -41,6 +41,7 @@
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "catalog/branch.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "commands/vacuum.h"
@@ -1986,6 +1987,26 @@ ReleaseBulkInsertStatePin(BulkInsertState bistate)
 	bistate->last_free = InvalidBlockNumber;
 }
 
+/*
+ * A write to a prolly table is a write to the session's branch: noted before
+ * anything is changed, so that what is told of it (and may refuse it) runs
+ * before the write.
+ */
+static inline void
+note_branch_write(Relation relation)
+{
+	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		branch_note_write(MyBranch);
+}
+
+/* ... and once made, the tuple versions it made (new) or replaced (old). */
+static inline void
+note_branch_tuple(Relation relation, const ItemPointerData *old,
+				  const ItemPointerData *new)
+{
+	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		branch_note_tuple(relation, old, new);
+}
 
 /*
  *	heap_insert		- insert tuple into a heap
@@ -2016,6 +2037,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		clear_all_visible = false;
 	bool		vmbuffer_modified = false;
+
+	note_branch_write(relation);
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -2210,6 +2233,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	/* Note: speculative insertions are counted too, even if aborted later */
 	pgstat_count_heap_insert(relation, 1);
+	note_branch_tuple(relation, NULL, &heaptup->t_self);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -2326,6 +2350,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+
+	note_branch_write(relation);
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2687,7 +2713,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* copy t_self fields back to the caller's slots */
 	for (i = 0; i < ntuples; i++)
+	{
 		slots[i]->tts_tid = heaptuples[i]->t_self;
+		note_branch_tuple(relation, NULL, &heaptuples[i]->t_self);
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -2783,6 +2812,8 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	bool		clear_all_visible = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
+
+	note_branch_write(relation);
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -3204,6 +3235,7 @@ l1:
 		UnlockTupleTuplock(relation, &(tp.t_self), LockTupleExclusive);
 
 	pgstat_count_heap_delete(relation);
+	note_branch_tuple(relation, tid, NULL);
 
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
@@ -3318,6 +3350,8 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 				infomask2_old_tuple,
 				infomask_new_tuple,
 				infomask2_new_tuple;
+
+	note_branch_write(relation);
 
 	Assert(ItemPointerIsValid(otid));
 
@@ -4347,6 +4381,7 @@ l2:
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
+	note_branch_tuple(relation, otid, &heaptup->t_self);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self

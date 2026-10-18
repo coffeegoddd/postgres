@@ -1,0 +1,84 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_rr a_read b_write b_integrate b_main a_insert a_rollback a_where
+mode       
+-----------
+branch-auto
+(1 row)
+
+step a_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step a_read: SELECT count(*) FROM vwb.t;
+count
+-----
+    1
+(1 row)
+
+step b_write: INSERT INTO vwb.t VALUES (2, 'bea');
+step b_integrate: SELECT (dolt_integrate('-m', 'bea'))[2] AS fast_forward;
+fast_forward
+------------
+           1
+(1 row)
+
+step b_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step a_insert: INSERT INTO vwb.t VALUES (3, 'ann');
+ERROR:  could not serialize access: branch "main" moved since this transaction's snapshot
+step a_rollback: ROLLBACK;
+step a_where: SELECT active_branch();
+active_branch
+-------------
+main         
+(1 row)
+
+
+starting permutation: a_rc a_read b_write b_integrate b_main a_insert a_rows a_commit a_main a_drop
+mode       
+-----------
+branch-auto
+(1 row)
+
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step a_read: SELECT count(*) FROM vwb.t;
+count
+-----
+    1
+(1 row)
+
+step b_write: INSERT INTO vwb.t VALUES (2, 'bea');
+step b_integrate: SELECT (dolt_integrate('-m', 'bea'))[2] AS fast_forward;
+fast_forward
+------------
+           1
+(1 row)
+
+step b_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step a_insert: INSERT INTO vwb.t VALUES (3, 'ann');
+step a_rows: SELECT string_agg(id || ':' || v, ',' ORDER BY id) AS rows, active_branch() FROM vwb.t;
+rows              |active_branch  
+------------------+---------------
+1:base,2:bea,3:ann|writer/ann/main
+(1 row)
+
+step a_commit: COMMIT;
+step a_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step a_drop: SELECT dolt_branch('-D', 'writer/ann/main');
+dolt_branch
+-----------
+{0}        
+(1 row)
+

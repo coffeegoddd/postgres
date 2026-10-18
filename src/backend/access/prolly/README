@@ -45,6 +45,7 @@ design choice can be changed later by writing a new implementation:
 	change_finder     prolly_changes.h        pages, stub
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
+	writers           prolly_writers.h        modes, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -114,6 +115,29 @@ reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
 
 
+Writers
+-------
+
+Every write to a branch is noted before it is made (branch_note_write(),
+catalog/branch.h): rows of prolly tables, versioned sequences, and
+versioned objects' catalog rows, unless made on the session's behalf by
+a version-control call.  The writers ("modes", writers_modes.c) decide
+whether the write may go ahead.  In the shared mode every session writes
+every branch, as in Dolt.  In the owned mode a dirty branch is one
+writer's (dolt.writer, by default the session): its pg_branch row records
+the owner, claimed by the first write and forgotten once a commit or
+reset leaves the branch clean, and anyone else's write is refused.  A
+protected branch (main in the branch-only mode, or any branch protected
+by name) has no writers: only integrations change it, a merge,
+cherry-pick, revert, reset or commit that commits as it changes it, as
+dolt_integrate merges a writer's branch in.  In the branch-auto mode a
+statement that writes, at the top level, on a protected branch first
+moves the session to its writer branch (writer/<writer>/<base>), forked
+from the base as the transaction's snapshot saw it and swept once it is
+clean and merged.  The mode, protections and writer branches are
+database settings kept in the refs.
+
+
 Commits
 -------
 
@@ -128,6 +152,19 @@ diffmerge_folded.c) compare canonical trees table by table, reading only
 subtrees that differ; moving a branch to another commit writes the
 differences back through the row applier (applier_replication.c), as
 logical replication's apply worker writes rows.
+
+With dolt.transaction_commit on, a transaction that changed a branch makes
+its commit as it commits: the refs, opened by its first write, call
+prolly_refs_end_hook at their pre-commit, before the chunk store's own, and
+the commit is made there (none if nothing changed since the head).  It is
+the transaction's own row changes on the head as it is then: heap reports
+the TIDs of the tuple versions each write made or replaced
+(branch_tuple_hook), and the change finder applies those the transaction
+made and didn't replace, or replaced and hadn't made, to the head's table
+trees (fold_rows), with no fold and no snapshot checked.  A transaction
+that changed definitions, or more rows than it keeps, or whose rows can't
+be applied so (a table the head describes otherwise), commits its working
+set instead.
 
 
 Remotes
