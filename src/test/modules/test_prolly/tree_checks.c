@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_datum.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "common/pg_prng.h"
@@ -1251,6 +1252,42 @@ big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	pfree(want.data);
 }
 
+/* Whether reading [offset, offset + len) of ref fails as corrupted. */
+static bool
+value_read_corrupt(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+				   const ProllyValue *ref, uint64 offset, uint64 len)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	StringInfoData got;
+	bool		corrupt = false;
+
+	initStringInfo(&got);
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		PROLLY_CALL(tr, value_read, env, ref, offset, len, &got);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		corrupt = edata->sqlerrcode == ERRCODE_DATA_CORRUPTED;
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	pfree(got.data);
+	return corrupt;
+}
+
 /*
  * A value tree on its own: a value of a few megabytes comes back whole and
  * by slices (any offset and length, past the end too), reading only the
@@ -1313,6 +1350,24 @@ value_trees(const ProllyTreeRoutine *tr, ProllyTreeEnv *env)
 	PROLLY_CALL(tr, value_read, env, &r, PG_UINT64_MAX - 1, 10, &got);
 	if (got.len != 0)
 		elog(ERROR, "a slice past a value's end read %d bytes", got.len);
+
+	/* A reference saying fewer or more bytes than its tree holds. */
+	for (int d = -1; d <= 1; d += 2)
+	{
+		StringInfoData bad;
+		ProllyValue b;
+
+		initStringInfo(&bad);
+		appendBinaryStringInfo(&bad, ref.data, 1 + (uint8) ref.data[0]);
+		prolly_put_varint(&bad, val.len + d);
+		b.data = (const uint8 *) bad.data;
+		b.len = bad.len;
+		if (!value_read_corrupt(tr, env, &b, 0, PG_UINT64_MAX) ||
+			!value_read_corrupt(tr, env, &b, 100, 10))
+			elog(ERROR, "a value tree of %d bytes read through a reference saying %d",
+				 val.len, val.len + d);
+		pfree(bad.data);
+	}
 
 	/* A byte inserted in the middle, then deleted. */
 	for (int pass = 0; pass < 2; pass++)

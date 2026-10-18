@@ -410,6 +410,7 @@ typedef struct ValueLevel
 typedef struct ValueBuilder
 {
 	const ProllyTreeEnv *env;
+	StringInfoData child;		/* a child's item, for its chunker */
 	ValueLevel	levels[MAX_LEVELS];
 } ValueBuilder;
 
@@ -456,7 +457,6 @@ static void
 value_add(ValueBuilder *vb, uint16 level, const ProllyHash *hash, uint64 count)
 {
 	ValueLevel *vl;
-	StringInfoData child;
 	ProllyKey	key = {hash->bytes, hash->len};
 	ProllyKey	nokey = {NULL, 0};
 	ProllyValue value;
@@ -474,14 +474,13 @@ value_add(ValueBuilder *vb, uint16 level, const ProllyHash *hash, uint64 count)
 		vl->hashes = palloc(sizeof(ProllyHash) * vl->max);
 		vl->counts = palloc(sizeof(uint64) * vl->max);
 	}
-	initStringInfo(&child);
-	encode_child(&child, hash, count);
-	value.data = (const uint8 *) child.data;
-	value.len = child.len;
+	resetStringInfo(&vb->child);
+	encode_child(&vb->child, hash, count);
+	value.data = (const uint8 *) vb->child.data;
+	value.len = vb->child.len;
 	d = PROLLY_CALL(vb->env->chunker, add, vl->chunker, &key, &value,
 					PROLLY_CALL(vb->env->chunk_format, item_space, level,
 								&nokey, &value));
-	pfree(child.data);
 	if (d == PROLLY_CHUNK_SPLIT_BEFORE)
 		value_flush(vb, level);
 	if (vl->n == vl->max)
@@ -530,6 +529,7 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 		buz_init();
 	value_env(env, &venv);
 	vb->env = &venv;
+	initStringInfo(&vb->child);
 	for (Size i = 0; i < len; i++)
 	{
 		Size		n = i - start + 1;	/* bytes in the chunk so far */
@@ -571,14 +571,18 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 		pfree(vl->hashes);
 		pfree(vl->counts);
 	}
+	pfree(vb->child.data);
 	pfree(vb);
 	encode_value_ref(out, &root.hash, len);
 }
 
-/* Append bytes [offset, offset + len) of the subtree at ref, len > 0. */
+/*
+ * Append bytes [offset, offset + len) of the subtree at ref, len > 0, which
+ * its parent (or the reference, for the root) says holds size bytes.
+ */
 static void
 read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
-				 uint64 offset, uint64 len, StringInfo out)
+				 uint64 size, uint64 offset, uint64 len, StringInfo out)
 {
 	TNode		node;
 
@@ -591,38 +595,40 @@ read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 
 		if (node.nitems > 0)
 			node_item(env, &node, 0, &k, &v, NULL);
-		if (node.nitems > 1 || offset + len > v.len)
+		if (node.nitems > 1 || v.len != size)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly value tree leaf holds %u bytes, its parent more",
-							v.len)));
+					 errmsg("prolly value tree leaf holds %u bytes, its parent says %llu",
+							v.len, (unsigned long long) size)));
 		appendBinaryStringInfo(out, (const char *) v.data + offset, (int) len);
 	}
 	else
 	{
-		for (int i = 0; i < node.nitems && len > 0; i++)
+		uint64		held = 0;
+
+		for (int i = 0; i < node.nitems; i++)
 		{
 			ProllyNodeRef child;
 			uint64		count;
+			uint64		take;
 
 			node_child(env, &node, i, &child, &count);
-			if (offset >= count)
+			held += count;
+			if (len == 0 || offset >= count)
 			{
-				offset -= count;
+				offset -= Min(offset, count);
 				continue;
 			}
-			{
-				uint64		take = Min(len, count - offset);
-
-				read_value_range(env, &child, offset, take, out);
-				len -= take;
-				offset = 0;
-			}
+			take = Min(len, count - offset);
+			read_value_range(env, &child, count, offset, take, out);
+			len -= take;
+			offset = 0;
 		}
-		if (len > 0)
+		if (held != size)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly value tree holds fewer bytes than its parent says")));
+					 errmsg("prolly value tree node holds %llu bytes, its parent or reference says %llu",
+							(unsigned long long) held, (unsigned long long) size)));
 	}
 	node_release(&node);
 }
@@ -650,7 +656,7 @@ read_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 				 errmsg("prolly value of %llu bytes is too large to read",
 						(unsigned long long) len)));
 	enlargeStringInfo(out, (int) len);
-	read_value_range(&venv, &root, offset, len, out);
+	read_value_range(&venv, &root, total, offset, len, out);
 }
 
 /* Append the bytes of the value a reference refers to. */
@@ -658,20 +664,6 @@ static void
 resolve_value(const ProllyTreeEnv *env, const ProllyValue *ref, StringInfo out)
 {
 	read_value(env, ref, 0, PG_UINT64_MAX, out);
-}
-
-static void
-cow_value_write(const ProllyTreeEnv *env, const uint8 *data, Size len,
-				StringInfo ref)
-{
-	write_value_tree(env, data, len, ref);
-}
-
-static void
-cow_value_read(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
-			   uint64 len, StringInfo out)
-{
-	read_value(env, ref, offset, len, out);
 }
 
 /*
@@ -2218,6 +2210,6 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.diff = cow_diff,
 	.diff_nodes = cow_diff_nodes,
 	.references = cow_references,
-	.value_write = cow_value_write,
-	.value_read = cow_value_read,
+	.value_write = write_value_tree,
+	.value_read = read_value,
 };
