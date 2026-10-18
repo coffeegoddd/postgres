@@ -1367,10 +1367,12 @@ RecordTransactionCommit(void)
 	bool		wrote_xlog;
 	char	   *chunk_root = NULL;
 	Size		chunk_root_len;
+	bool		chunk_writes;
 
 	/* a chunk store root this transaction moved goes with its commit record */
 	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
-	Assert(chunk_root_len == 0 || markXidCommitted);
+	chunk_writes = prolly_chunkstore_commit_writes();
+	Assert((chunk_root_len == 0 && !chunk_writes) || markXidCommitted);
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress
@@ -1557,15 +1559,16 @@ RecordTransactionCommit(void)
 	 */
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
-		forceSyncCommit || nrels > 0 || chunk_root_len > 0)
+		forceSyncCommit || nrels > 0 || chunk_root_len > 0 || chunk_writes)
 	{
 		XLogFlush(XactLastRecEnd);
 
 		/*
-		 * A chunk store's root moved: written now that the commit record is
-		 * flushed, still before a checkpoint can be taken (as for CLOG).
+		 * A chunk store's root moved, or its chunks: written now that the
+		 * commit record is flushed, still before a checkpoint can be taken
+		 * (as for CLOG).
 		 */
-		if (chunk_root_len > 0)
+		if (chunk_root_len > 0 || chunk_writes)
 			prolly_chunkstore_committed();
 
 		/*

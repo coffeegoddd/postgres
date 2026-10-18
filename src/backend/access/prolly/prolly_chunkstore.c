@@ -68,6 +68,14 @@ prolly_chunkstore_commit_payload(char **data)
 	return sizeof(uint16) + len;
 }
 
+bool
+prolly_chunkstore_commit_writes(void)
+{
+	const ProllyChunkStoreRoutine *store = prolly_chunk_store();
+
+	return PROLLY_CALL(store, commit_writes);
+}
+
 void
 prolly_chunkstore_committed(void)
 {

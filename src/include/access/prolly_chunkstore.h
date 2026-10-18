@@ -166,11 +166,15 @@ typedef struct ProllyChunkStoreRoutine
 
 	/*
 	 * Commit.  commit_payload() returns what the commit record carries for
-	 * the transaction's root move (0 bytes: none); committed() is called
-	 * once the commit record is flushed, inside the commit's critical
-	 * section; commit_redo() replays the payload.
+	 * the transaction's root move (0 bytes: none); commit_writes() whether
+	 * the transaction has bytes to write once its commit record is flushed
+	 * (so it is flushed at once, whatever synchronous_commit says);
+	 * committed() is called once the commit record is flushed, inside the
+	 * commit's critical section, if either; commit_redo() replays the
+	 * payload.
 	 */
 	Size		(*commit_payload) (char **data);
+	bool		(*commit_writes) (void);
 	void		(*committed) (void);
 	void		(*commit_redo) (const char *data, Size len);
 
@@ -227,7 +231,8 @@ typedef struct ProllyChunkStoreRoutine
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
-	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
+	"commit_writes", "committed", "commit_redo", "checkpoint", "redo", \
+	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire"
@@ -247,6 +252,7 @@ prolly_chunkstore_lookup(const char *name)
  */
 extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 extern Size prolly_chunkstore_commit_payload(char **data);
+extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
