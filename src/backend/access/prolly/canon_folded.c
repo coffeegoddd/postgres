@@ -931,6 +931,28 @@ describe_dependency(const ObjectAddress *addr)
 }
 
 /*
+ * Whether an object is one the fold covers, by collect()'s criteria: in a
+ * versioned schema (a table's default, trigger or rule, its table's), and
+ * not an extension's member.
+ */
+static bool
+depender_is_canonical(const ObjectAddress *object)
+{
+	Oid			nsp;
+
+	if (!object_is_versioned(object) ||
+		in_extension(object->classId, object->objectId))
+		return false;
+	if (object->classId == RelationRelationId)
+		nsp = get_rel_namespace(object->objectId);
+	else if (is_objectclass_supported(object->classId))
+		nsp = get_object_namespace(object);
+	else
+		nsp = InvalidOid;		/* (a default, trigger or rule: its table's) */
+	return !OidIsValid(nsp) || canon_namespace(nsp);
+}
+
+/*
  * The tree of what the versioned objects depend on outside the versioned
  * schemas, for a commit.  What initdb made (OIDs below FirstNormalObjectId)
  * every database has, and isn't recorded; an object an extension made, or
@@ -973,8 +995,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			d->objid < FirstNormalObjectId || d->refobjid < FirstNormalObjectId)
 			continue;
 		ObjectAddressSet(depender, d->classid, d->objid);
-		if (!object_is_versioned(&depender) ||
-			OidIsValid(getExtensionOfObject(d->classid, d->objid)))
+		if (!depender_is_canonical(&depender))
 			continue;
 		ObjectAddressSet(referenced, d->refclassid, d->refobjid);
 		if (object_is_versioned(&referenced))
