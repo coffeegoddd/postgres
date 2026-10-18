@@ -237,13 +237,15 @@ spool_get(ProllyRemote *remote, const ProllyHash *hash, StringInfo out)
 }
 
 /*
- * Never: what was sent isn't checked yet, and a remote that has a chunk
- * has all it references.  The receive reads what it needs with get().
+ * What the push sent: as a remote's has() answers a receive, whether it
+ * can give the chunk, which the receive checks when it reads it (a read
+ * a commit's has() leads to); nothing is added to the store until all of
+ * it is checked.
  */
 static bool
 spool_has(ProllyRemote *remote, const ProllyHash *hash)
 {
-	return false;
+	return spooled(hash) != NULL;
 }
 
 static const ProllyRemoteRoutine spool_remote = {
