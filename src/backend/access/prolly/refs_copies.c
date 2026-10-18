@@ -36,6 +36,10 @@
  * commit content has the same id in every database:
  *
  *	"author"	-> the author
+ *	"dependencies" -> what the versioned objects needed from outside
+ *				   the versioned schemas (length byte, hash of the
+ *				   canonicalizer's tree of them); a commit without it
+ *				   (one made before they were recorded) has them unknown
  *	"message"	-> the message
  *	"parents"	-> the parents' ids, each a length byte and the hash
  *	"root"		-> the commit's root (length byte, hash): the canonical
@@ -710,21 +714,33 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 	PROLLY_CALL(tree, build_add, b, &k, &v);
 }
 
-/* Write a commit's tree; its id is the root's hash. */
+/*
+ * Write a commit's tree; its id is the root's hash.  What its versioned
+ * objects need from outside is folded now, from the catalogs as the
+ * transaction sees them.
+ */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 			 const char *author, const char *message, TimestampTz at,
 			 ProllyHash *id)
 {
-	ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &env,
-									   CurrentMemoryContext);
+	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
+	ProllyNodeRef deps;
+	ProllyDatabaseComponents dc;
 
-	/* Keys in order: author, message, parents, root, time. */
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+
+	/* Keys in order: author, dependencies, message, parents, root, time. */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
+	resetStringInfo(&v);
+	put_hash(&v, &deps.hash);
+	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
 	appendStringInfoString(&v, message);
 	add_item(b, "message", &v);
@@ -784,6 +800,15 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 	resetStringInfo(&v);
 	(void) read_item(&ref, "message", &v);
 	info->message = pstrdup(v.data);
+	resetStringInfo(&v);
+	if (read_item(&ref, "dependencies", &v))
+	{
+		ProllyHash	deps;
+
+		(void) get_hash(v.data, v.data + v.len, &deps);
+		ref_of(&deps, &info->dependencies);
+		info->has_dependencies = true;
+	}
 	resetStringInfo(&v);
 	if (read_item(&ref, "time", &v) && v.len == 8)
 	{
@@ -1921,6 +1946,9 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
 			continue;
 		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
+		if (info.has_dependencies)
+			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, ws->visit,
+							   ws->arg);
 		for (int i = info.nparents - 1; i >= 0; i--)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));

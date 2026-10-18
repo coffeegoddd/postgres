@@ -47,6 +47,14 @@ typedef struct ProllyCommitInfo
 	TimestampTz committed_at;
 	char	   *author;			/* palloc'd */
 	char	   *message;		/* palloc'd */
+
+	/*
+	 * What the commit's versioned objects needed from outside the versioned
+	 * schemas when it was made (the canonicalizer's fold_dependencies());
+	 * has_dependencies false for a commit that didn't record them.
+	 */
+	bool		has_dependencies;
+	ProllyNodeRef dependencies;
 } ProllyCommitInfo;
 
 /*

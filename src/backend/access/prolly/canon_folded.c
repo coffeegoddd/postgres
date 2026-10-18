@@ -43,6 +43,25 @@
  * foreign tables, other types) makes a commit fail: never a hash that
  * might depend on history.
  *
+ * What the versioned objects depend on outside the versioned schemas
+ * isn't in the root, which is what they are: fold_dependencies() builds a
+ * tree of it for a commit to record beside its root (prolly_refs.h), keyed
+ * by kind and identity ("extension hstore", "type public.money2"):
+ * an extension valued by its version and the schema it is in (a text[]
+ * literal: the objects that use its members name them there), another
+ * object by its address (a
+ * text[] literal of its type and of text[] literals of its names and
+ * arguments, as pg_identify_object_as_address() gives them), which
+ * pg_get_object_address() finds again in another database.  Found
+ * through pg_depend: each object of an ordinary schema, as the extension
+ * with its version if an extension's member, and each extension a
+ * versioned object depends on explicitly (DEPENDS ON EXTENSION); not what
+ * every database has (objects made by initdb).  Not roles: owners and
+ * grants aren't part of the canonical form, as a database's dump doesn't
+ * make roles.  Each is described afresh at each commit, so an extension's
+ * update or an object's rename shows in the next.  A function's body is
+ * text, and what it names isn't in pg_depend: the list can't be complete.
+ *
  * Each collation that orders a table's keys is recorded, and a table whose
  * keys are ordered by a collation that differs now from what a root
  * recorded can't have that root's rows read: its tree's keys may be in
@@ -96,6 +115,7 @@
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "commands/extension.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
@@ -107,6 +127,7 @@
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -813,6 +834,230 @@ item_cmp(const ListCell *a, const ListCell *b)
 	ProllyKey	kb = {(const uint8 *) ib->key.data, ib->key.len};
 
 	return prolly_bytes_compare(&ka, &kb, NULL);
+}
+
+/* An extension's version, from its catalog row. */
+static char *
+extension_version(Oid extoid)
+{
+	Relation	rel = table_open(ExtensionRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	char	   *version = NULL;
+
+	ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(extoid));
+	scan = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, &key);
+	if ((tup = systable_getnext(scan)) != NULL)
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tup, Anum_pg_extension_extversion,
+									 RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+			version = TextDatumGetCString(d);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	if (version == NULL)
+		elog(ERROR, "cache lookup failed for extension %u", extoid);
+	return version;
+}
+
+/* A list of strings as a text[] literal. */
+static char *
+text_array_literal(List *strings)
+{
+	Datum	   *elems = palloc(sizeof(Datum) * Max(list_length(strings), 1));
+	int			n = 0;
+	ListCell   *lc;
+
+	foreach(lc, strings)
+		elems[n++] = CStringGetTextDatum(lfirst(lc));
+	/* (through fmgr: array_out keeps state in its flinfo) */
+	return OidOutputFunctionCall(F_ARRAY_OUT,
+								 PointerGetDatum(construct_array_builtin(elems, n, TEXTOID)));
+}
+
+static char *from_utf8(const uint8 *data, int len);
+
+/* A dependency, as a commit records it (UTF-8). */
+typedef struct Dependency
+{
+	StringInfoData key;
+	StringInfoData value;
+} Dependency;
+
+static int
+dependency_cmp(const ListCell *a, const ListCell *b)
+{
+	const Dependency *x = lfirst(a);
+	const Dependency *y = lfirst(b);
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
+
+	return prolly_bytes_compare(&kx, &ky, NULL);
+}
+
+/*
+ * Describe a dependency outside the versioned schemas: its key, kind and
+ * identity; its value, an extension's version and schema or another
+ * object's address.
+ */
+static Dependency *
+describe_dependency(const ObjectAddress *addr)
+{
+	Dependency *dep = palloc(sizeof(Dependency));
+	char	   *type = getObjectTypeDescription(addr, false);
+
+	initStringInfo(&dep->key);
+	initStringInfo(&dep->value);
+	append_utf8(&dep->key, psprintf("%s %s", type, getObjectIdentity(addr, false)));
+	if (addr->classId == ExtensionRelationId)
+	{
+		Oid			nsp = get_extension_schema(addr->objectId);
+
+		append_utf8(&dep->value,
+					text_array_literal(list_make2(extension_version(addr->objectId),
+												  get_namespace_name(nsp))));
+	}
+	else
+	{
+		List	   *names = NIL;
+		List	   *objargs = NIL;
+
+		(void) getObjectIdentityParts(addr, &names, &objargs, false);
+		append_utf8(&dep->value,
+					text_array_literal(list_make3(type,
+												  text_array_literal(names),
+												  text_array_literal(objargs))));
+	}
+	return dep;
+}
+
+/*
+ * Whether an object is one the fold covers, by collect()'s criteria: in a
+ * versioned schema (a table's default, trigger or rule, its table's), and
+ * not an extension's member.
+ */
+static bool
+depender_is_canonical(const ObjectAddress *object)
+{
+	Oid			nsp;
+
+	if (!object_is_versioned(object) ||
+		in_extension(object->classId, object->objectId))
+		return false;
+	if (object->classId == RelationRelationId)
+		nsp = get_rel_namespace(object->objectId);
+	else if (is_objectclass_supported(object->classId))
+		nsp = get_object_namespace(object);
+	else
+		nsp = InvalidOid;		/* (a default, trigger or rule: its table's) */
+	return !OidIsValid(nsp) || canon_namespace(nsp);
+}
+
+/*
+ * The tree of what the versioned objects depend on outside the versioned
+ * schemas, for a commit.  What initdb made (OIDs below FirstNormalObjectId)
+ * every database has, and isn't recorded; an object an extension made, or
+ * one in a versioned schema, doesn't depend on anything for the commit.
+ * Each dependency is described once, however many objects need it.
+ */
+static void
+folded_fold_dependencies(ProllyNodeRef *out)
+{
+	Canon		cn;
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	HASHCTL		ctl;
+	HTAB	   *seen;
+	List	   *deps = NIL;
+	ListCell   *lc;
+	ProllyTreeBuilder *b;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	ctl.keysize = sizeof(ObjectAddress);
+	ctl.entrysize = sizeof(ObjectAddress);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly dependencies", 64, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	rel = table_open(DependRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+		ObjectAddress depender;
+		ObjectAddress referenced;
+		Oid			ext;
+		bool		found;
+
+		/* (an extension's members are its own, not the commit's) */
+		if (d->deptype == DEPENDENCY_EXTENSION ||
+			d->objid < FirstNormalObjectId || d->refobjid < FirstNormalObjectId)
+			continue;
+		ObjectAddressSet(depender, d->classid, d->objid);
+		if (!depender_is_canonical(&depender))
+			continue;
+		ObjectAddressSet(referenced, d->refclassid, d->refobjid);
+		if (object_is_versioned(&referenced))
+			continue;
+		ext = getExtensionOfObject(referenced.classId, referenced.objectId);
+		if (OidIsValid(ext))
+			ObjectAddressSet(referenced, ExtensionRelationId, ext);
+		(void) hash_search(seen, &referenced, HASH_ENTER, &found);
+		if (!found)
+			deps = lappend(deps, describe_dependency(&referenced));
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	list_sort(deps, dependency_cmp);
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
+	foreach(lc, deps)
+	{
+		Dependency *dep = lfirst(lc);
+		ProllyKey	k = {(const uint8 *) dep->key.data, dep->key.len};
+		ProllyValue v = {(const uint8 *) dep->value.data, dep->value.len};
+
+		/* (two objects with one identity: the first) */
+		if (foreach_current_index(lc) > 0 &&
+			dependency_cmp(lc, list_nth_cell(deps, foreach_current_index(lc) - 1)) == 0)
+			continue;
+		PROLLY_CALL(cn.tree, build_add, b, &k, &v);
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, out);
+	hash_destroy(seen);
+}
+
+/* The dependencies a commit records: each, by its key and value. */
+static void
+folded_dependencies(const ProllyNodeRef *tree, ProllyCanonDependencyVisit visit,
+					void *arg)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, tree, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		char	   *name = from_utf8(k.data, k.len);
+		char	   *value = from_utf8(v.data, v.len);
+
+		visit(name, value, arg);
+		pfree(name);
+		pfree(value);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
 static void
@@ -3489,6 +3734,8 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.objects = folded_objects,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
+	.fold_dependencies = folded_fold_dependencies,
+	.dependencies = folded_dependencies,
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
 	.table_columns = folded_table_columns,

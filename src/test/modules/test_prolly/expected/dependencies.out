@@ -1,0 +1,450 @@
+-- What versioned objects need from outside the versioned schemas, recorded
+-- by each commit beside its root: an extension (with its version) for its
+-- members or named by DEPENDS ON EXTENSION, an object of an ordinary schema
+-- (with its address).  Not what initdb made (built-in types and functions),
+-- and not roles: owners and grants aren't versioned, so a role isn't a
+-- dependency.  Not part of the root: what changes outside (an extension's
+-- update) never makes a branch's working set differ from its head.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.deps(ref text DEFAULT 'HEAD') RETURNS SETOF text
+  LANGUAGE sql AS $$
+	SELECT replace(d, E'\t', ' | ')
+	  FROM unnest(test_commit_dependencies(dolt_hashof(ref))) d
+  $$;
+CREATE ROLE regress_dep_reader;
+CREATE EXTENSION citext VERSION '1.4';
+CREATE EXTENSION hstore;
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int	-- a tab in its name
+  LANGUAGE sql AS 'SELECT 7';
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+CREATE SCHEMA dep VERSIONED;
+CREATE TABLE dep.plain (id int PRIMARY KEY, n numeric, t text);
+SELECT length(dolt_commit('-Am', 'plain')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT test_commit_dependencies(dolt_hashof('HEAD'));	-- none: built-ins only
+ test_commit_dependencies 
+--------------------------
+ {}
+(1 row)
+
+CREATE TABLE dep.t (id int PRIMARY KEY, m dep_util.mood,
+					c citext DEFAULT dep_util.twice(1)::text);
+CREATE FUNCTION dep.seven() RETURNS int LANGUAGE sql
+  BEGIN ATOMIC SELECT dep_util.U&"tab\0009in"(); END;
+GRANT SELECT ON dep.t TO regress_dep_reader;		-- (not a dependency)
+CREATE FUNCTION dep.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+ALTER FUNCTION dep.f() DEPENDS ON EXTENSION hstore;
+SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM pg_temp.deps();
+                                     deps                                      
+-------------------------------------------------------------------------------
+ extension citext => {1.4,public}
+ extension hstore => {1.8,public}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
+(5 rows)
+
+-- a commit that didn't record them (as one made before they were): unknown
+SELECT test_commit_dependencies(test_commit_of(test_fold_root(), 'older'))
+  IS NULL AS unrecorded;
+ unrecorded 
+------------
+ t
+(1 row)
+
+-- an extension updated: no change to the branch; the next commit records it
+ALTER EXTENSION citext UPDATE TO '1.6';
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT name, dirty FROM dolt_branches ORDER BY name;
+ name | dirty 
+------+-------
+ main | f
+(1 row)
+
+SELECT dolt_commit('-Am', 'nothing');
+ERROR:  nothing to commit
+HINT:  Pass --allow-empty to commit anyway.
+SELECT length(dolt_commit('--allow-empty', '-Am', 'at 1.6')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM pg_temp.deps();
+                                     deps                                      
+-------------------------------------------------------------------------------
+ extension citext => {1.6,public}
+ extension hstore => {1.8,public}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
+(5 rows)
+
+-- a branch whose head recorded another version: clean when checked out
+SELECT dolt_branch('dep_side', 'HEAD~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dep_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'dep_side'"}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE TABLE dep.u (id int PRIMARY KEY, m dep_util.mood);
+SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM pg_temp.deps();					-- described now: citext 1.6
+                                     deps                                      
+-------------------------------------------------------------------------------
+ extension citext => {1.6,public}
+ extension hstore => {1.8,public}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ function dep_util.twice(integer) => {function,"{dep_util,twice}","{integer}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
+(5 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- merged over an extension's update, and dependencies that differ: no
+-- uncommitted change, no conflict; the merge's commit describes them afresh
+ALTER TABLE dep.t ALTER COLUMN c DROP DEFAULT;	-- the function no longer needed
+SELECT length(dolt_commit('-Am', 'no default')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER EXTENSION citext UPDATE TO '1.8';
+SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.deps();
+                                    deps                                     
+-----------------------------------------------------------------------------
+ extension citext => {1.8,public}
+ extension hstore => {1.8,public}
+ function dep_util."tab | in"() => {function,"{dep_util,\"tab | in\"}","{}"}
+ type dep_util.mood => {type,"{dep_util.mood}","{}"}
+(4 rows)
+
+-- A clone checks the dependencies every branch's head recorded before it
+-- makes anything, naming all that is missing; then makes the extensions
+-- the database lacks, at the newest version a branch recorded.
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/deps-' || txid_current() AS url \gset
+CREATE EXTENSION ltree VERSION '1.2';
+CREATE TABLE dep.c (id int PRIMARY KEY, p ltree);
+INSERT INTO dep.c VALUES (1, 'a.b');
+INSERT INTO dep.t (id, m) VALUES (1, 'ok');
+SELECT length(dolt_commit('-Am', 'ltree at 1.2')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('dep_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'dep_side'"}
+(1 row)
+
+ALTER EXTENSION ltree UPDATE TO '1.3';
+CREATE TABLE dep.c2 (id int PRIMARY KEY, p ltree);
+SELECT length(dolt_commit('-Am', 'ltree at 1.3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main'), dolt_push('origin', 'dep_side');
+         dolt_push         |             dolt_push             
+---------------------------+-----------------------------------
+ {0,"main -> origin/main"} | {0,"dep_side -> origin/dep_side"}
+(1 row)
+
+CREATE DATABASE regress_deps_a;
+\c regress_deps_a
+SELECT dolt_clone(:'url');					-- refused: the types and function
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+function dep_util."tab	in"(): not in this database
+function dep_util.twice(integer): not in this database
+type dep_util.mood: not in this database
+HINT:  Make what is missing, then try again.
+SELECT count(*) AS extensions FROM pg_extension WHERE extname <> 'plpgsql';
+ extensions 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS branches FROM dolt_branches WHERE hash <> '';
+ branches 
+----------
+        0
+(1 row)
+
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int LANGUAGE sql AS 'SELECT 7';
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT extname, extversion FROM pg_extension
+  WHERE extname <> 'plpgsql' ORDER BY extname;	-- the newest recorded
+ extname | extversion 
+---------+------------
+ citext  | 1.8
+ hstore  | 1.8
+ ltree   | 1.3
+(3 rows)
+
+SELECT id, p, dep.seven() FROM dep.c;
+ id |  p  | seven 
+----+-----+-------
+  1 | a.b |     7
+(1 row)
+
+\c :db
+DROP DATABASE regress_deps_a;
+-- an extension the database has at an older version: refused, never changed
+CREATE DATABASE regress_deps_b;
+\c regress_deps_b
+CREATE EXTENSION ltree VERSION '1.1';
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int LANGUAGE sql AS 'SELECT 7';
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+SELECT dolt_clone(:'url');
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension ltree: version 1.3, and the database has 1.1
+HINT:  Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.
+SELECT extversion FROM pg_extension WHERE extname = 'ltree';
+ extversion 
+------------
+ 1.1
+(1 row)
+
+-- at the version needed: used as it is
+ALTER EXTENSION ltree UPDATE TO '1.3';
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) FROM dep.c;
+ count 
+-------
+     1
+(1 row)
+
+\c :db
+DROP DATABASE regress_deps_b;
+-- What commits made elsewhere may record, checked directly (a commit
+-- recording given dependencies, checked as a clone checks its heads).
+CREATE DATABASE regress_deps_c;
+\c regress_deps_c
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SELECT test_fold_root() AS root \gset
+CREATE FUNCTION pg_temp.ext(text) RETURNS text LANGUAGE sql
+  AS $$ SELECT 'extension ' || $1 $$;
+-- an extension that requires another recorded one is made after it, at the
+-- recorded version (test_prolly_a sorts first, and requires test_prolly_b,
+-- whose default is 1.1)
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('test_prolly_a'), pg_temp.ext('test_prolly_b')],
+						   ARRAY['{1.0,public}', '{1.0,public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT extname, extversion FROM pg_extension
+  WHERE extname LIKE 'test_prolly_%' ORDER BY extname;
+    extname    | extversion 
+---------------+------------
+ test_prolly_a | 1.0
+ test_prolly_b | 1.0
+(2 rows)
+
+-- an extension the server has no control file for, at two versions: named
+-- with the rest, not an error of its own
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('no_such_ext'), 'type dep_util.mood'],
+						   ARRAY['{1.0,public}', '{type,"{dep_util.mood}","{}"}']) AS c1 \gset
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('no_such_ext')],
+						   ARRAY['{1.1,public}']) AS c2 \gset
+SELECT test_check_dependencies(ARRAY[:'c1', :'c2'], true);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension no_such_ext: versions 1.0, 1.1, not available on this server
+type dep_util.mood: not in this database
+HINT:  Make what is missing, then try again.
+-- an object whose address names a type of an extension to be made: the
+-- extension isn't missing (it would be made), the object is
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('ltree'), 'function dep_util.lf(public.ltree)'],
+						   ARRAY['{1.3,public}', '{function,"{dep_util,lf}","{public.ltree}"}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+function dep_util.lf(public.ltree): not in this database
+HINT:  Make what is missing, then try again.
+SELECT count(*) AS ltree FROM pg_extension WHERE extname = 'ltree';	-- (none made)
+ ltree 
+-------
+     0
+(1 row)
+
+-- an extension recorded without a version: any; made at its default
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('ltree')], ARRAY['{"",public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'ltree';
+ extversion 
+------------
+ 1.3
+(1 row)
+
+CREATE EXTENSION hstore VERSION '1.4';
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('hstore')], ARRAY['{"",public}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], false);	-- what it has will do
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'hstore';
+ extversion 
+------------
+ 1.4
+(1 row)
+
+-- an extension's schema: made there, which must exist; one the database
+-- has elsewhere, or that commits record in different schemas, refused
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext')], ARRAY['{1.8,dep_ext}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension citext: schema dep_ext, not in this database
+HINT:  Make what is missing, then try again.
+CREATE SCHEMA dep_ext;
+SELECT test_check_dependencies(ARRAY[:'c'], true);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'citext';
+ extnamespace 
+--------------
+ dep_ext
+(1 row)
+
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext')], ARRAY['{1.8,public}']) AS c2 \gset
+SELECT test_check_dependencies(ARRAY[:'c2'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension citext: in schema public, and the database has it in dep_ext
+HINT:  Make what is missing, then try again.
+SELECT test_check_dependencies(ARRAY[:'c', :'c2'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension citext: in schemas dep_ext, public, which differ
+HINT:  Make what is missing, then try again.
+-- an error other than "not found" while looking for an object is raised
+-- as it is, not taken for a missing object
+SELECT test_commit_needing(:'root', ARRAY['nonsense x'], ARRAY['{nonsense,"{x}","{}"}']) AS c \gset
+SELECT test_check_dependencies(ARRAY[:'c'], false);
+ERROR:  unrecognized object type "nonsense"
+CONTEXT:  SQL statement "SELECT pg_catalog.pg_get_object_address($1, $2::text[], $3::text[])"
+\c :db
+DROP DATABASE regress_deps_c;
+DROP SCHEMA dep CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table dep.plain
+drop cascades to table dep.t
+drop cascades to function dep.seven()
+drop cascades to function dep.f()
+drop cascades to table dep.u
+drop cascades to table dep.c
+SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('-D', 'dep_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dep_util CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to type dep_util.mood
+drop cascades to function dep_util."tab	in"()
+drop cascades to function dep_util.twice(integer)
+DROP EXTENSION citext;
+DROP EXTENSION hstore;
+DROP EXTENSION ltree;
+DROP ROLE regress_dep_reader;
