@@ -839,6 +839,26 @@ dolt_reset(PG_FUNCTION_ARGS)
 				 errmsg("dolt_reset only does hard resets"),
 				 errdetail("Prolly branches have no staging area to reset."),
 				 errhint("Pass --hard.")));
+	/*
+	 * What the target needs that the head doesn't, checked (a reset to the
+	 * head moves nothing new in, as an abort's doesn't).
+	 */
+	if (ref)
+	{
+		ProllyHash	head;
+		ProllyHash	target;
+		ProllyCommitInfo info;
+		ProllyCommitInfo before;
+		bool		has_head = PROLLY_CALL(refs(), resolve, "HEAD", &head);
+
+		if (PROLLY_CALL(refs(), resolve, ref, &target) &&
+			(!has_head || !same_hash(&head, &target)) &&
+			PROLLY_CALL(refs(), commit_get, &target, &info))
+			prolly_check_commit_dependencies(&info,
+											 has_head &&
+											 PROLLY_CALL(refs(), commit_get, &head, &before) ?
+											 &before : NULL, "reset");
+	}
 	PROLLY_CALL(refs(), reset, ref ? ref : "HEAD");
 	PG_RETURN_DATUM(text_array(1, result));
 }

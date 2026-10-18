@@ -16,6 +16,7 @@
 #ifndef PROLLY_DEPS_H
 #define PROLLY_DEPS_H
 
+#include "access/prolly_refs.h"
 #include "access/prolly_types.h"
 #include "nodes/pg_list.h"
 
@@ -34,5 +35,18 @@
  */
 extern void prolly_check_dependencies(List *trees, bool install,
 									  const char *what);
+
+/*
+ * Check what a commit records it needs before a move to it (what: "merge",
+ * "reset", ..., for messages), never installing: an extension is every
+ * branch's, so a move doesn't make or change one.  With since, only what
+ * the commit needs that since doesn't (a merge's incoming head against the
+ * merge base: what its changes bring in, not what it keeps of what the
+ * branch already let go).  A commit that didn't record its dependencies
+ * isn't checked; since one that didn't, as none.
+ */
+extern void prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
+											 const ProllyCommitInfo *since,
+											 const char *what);
 
 #endif							/* PROLLY_DEPS_H */

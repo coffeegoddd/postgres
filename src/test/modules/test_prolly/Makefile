@@ -18,7 +18,7 @@ EXTENSION = test_prolly test_prolly_a test_prolly_b
 DATA = test_prolly--1.0.sql test_prolly_a--1.0.sql test_prolly_b--1.0.sql \
 	test_prolly_b--1.0--1.1.sql test_prolly_b--1.1.sql
 
-REGRESS = test_prolly prolly_tables versioned_schemas catalog_branch_column branch_catalogs bmap_sharing bmap_copy_on_write bmap_folds branches fold commits status_diff collations applier move_heads merge cherry_pick schema_moves sequences schema_merges table_files incremental_folds checkpoints format_freeze dirty_merges constraint_violations redefined_merges type_moves detached_checkout branch_start keyless_moves head_only_branches clean_checkouts keyless_keys walks remotes remote_clone dependencies
+REGRESS = test_prolly prolly_tables versioned_schemas catalog_branch_column branch_catalogs bmap_sharing bmap_copy_on_write bmap_folds branches fold commits status_diff collations applier move_heads merge cherry_pick schema_moves sequences schema_merges table_files incremental_folds checkpoints format_freeze dirty_merges constraint_violations redefined_merges type_moves detached_checkout branch_start keyless_moves head_only_branches clean_checkouts keyless_keys walks remotes remote_clone dependencies dependency_moves
 TAP_TESTS = 1
 EXTRA_INSTALL = contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect \
 	contrib/pg_walinspect contrib/test_decoding \

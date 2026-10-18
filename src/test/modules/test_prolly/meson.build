@@ -79,6 +79,7 @@ tests += {
       'remotes',
       'remote_clone',
       'dependencies',
+      'dependency_moves',
     ],
   },
   'tap': {
