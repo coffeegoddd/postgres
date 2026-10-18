@@ -670,6 +670,43 @@ test_root_without_sequence_values(PG_FUNCTION_ARGS)
 }
 
 static void
+note_dependency_text(const char *name, const char *value, void *arg)
+{
+	ArrayBuildState **astate = arg;
+
+	*astate = accumArrayResult(*astate,
+							   CStringGetTextDatum(psprintf("%s => %s", name, value)),
+							   false, TEXTOID, CurrentMemoryContext);
+}
+
+/*
+ * test_commit_dependencies(commit): what a commit records its versioned
+ * objects needed from outside, each "name => value" (tabs as \t), in key
+ * order; NULL if it doesn't record them.
+ */
+PG_FUNCTION_INFO_V1(test_commit_dependencies);
+Datum
+test_commit_dependencies(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+	ArrayBuildState *astate = NULL;
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	if (!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+		elog(ERROR, "no such commit");
+	if (!info.has_dependencies)
+		PG_RETURN_NULL();
+	PROLLY_CALL(dc.canonicalizer, dependencies, &info.dependencies,
+				note_dependency_text, &astate);
+	if (astate == NULL)
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+	PG_RETURN_DATUM(makeArrayResult(astate, CurrentMemoryContext));
+}
+
+static void
 commit_item(const ProllyTreeRoutine *tree, ProllyTreeBuilder *b,
 			const char *key, const char *value, int len)
 {

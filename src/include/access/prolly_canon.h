@@ -34,6 +34,15 @@
  *   roots hold differently, in the canonical tree's order: by kind, then
  *   qualified name (a routine's with its argument types).  A sequence
  *   whose value differs, or a materialized view whose rows do, differs.
+ * - fold_dependencies() builds the tree of what the session branch's
+ *   versioned objects need from outside the versioned schemas, for a
+ *   commit to record beside its root: keyed by kind and identity
+ *   ("extension hstore"), an extension valued by its version, another
+ *   object by its address (type, names and arguments as
+ *   pg_identify_object_as_address() gives them, tab-separated).  Not
+ *   roles.  It is no part of the root, so what changes outside never makes
+ *   a branch's working set differ from its head.
+ * - dependencies() visits each item of such a tree, in key order.
  * - sequences() visits each sequence a folded root holds, in name order,
  *   with its value: its last value, and whether it was given out.
  * - merge_schema() merges three folded roots' definitions: each object as
@@ -61,6 +70,10 @@
  * Visits one sequence of a canonical root, with its value (one recorded
  * without one, unreadable where it was folded, isn't visited).
  */
+/* Visits one dependency a commit records: its name and its value. */
+typedef void (*ProllyCanonDependencyVisit) (const char *name,
+											const char *value, void *arg);
+
 typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 										  bool called, void *arg);
 
@@ -108,6 +121,9 @@ typedef struct ProllyCanonRoutine
 								void (*rows) (void *arg), void *arg);
 	void		(*sequences) (const ProllyNodeRef *root,
 							  ProllyCanonSequenceVisit visit, void *arg);
+	void		(*fold_dependencies) (ProllyNodeRef *tree);
+	void		(*dependencies) (const ProllyNodeRef *tree,
+								 ProllyCanonDependencyVisit visit, void *arg);
 	void		(*merge_schema) (const ProllyNodeRef *base,
 								 const ProllyNodeRef *ours,
 								 const ProllyNodeRef *theirs,
@@ -147,6 +163,7 @@ typedef struct ProllyCanonRoutine
 #define PROLLY_CANON_CALLBACK_NAMES \
 	"walk", "fold", "tables", \
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
+	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
 	"in_format", "format"
 #define PROLLY_CANON_FIRST_CALLBACK walk

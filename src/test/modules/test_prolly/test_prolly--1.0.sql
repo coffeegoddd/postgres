@@ -246,6 +246,12 @@ CREATE FUNCTION test_root_without_sequence_values(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- What a commit records its versioned objects needed from outside, each
+-- "name => value"; NULL if it doesn't record them.
+CREATE FUNCTION test_commit_dependencies(commit_id text)
+RETURNS text[]
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A commit with no parents naming root.
 CREATE FUNCTION test_commit_of(root text, message text)
 RETURNS text
