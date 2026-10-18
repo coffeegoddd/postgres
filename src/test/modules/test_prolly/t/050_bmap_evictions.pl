@@ -1,10 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Block-mapped pages evicted under pressure (few buffers): a change that
-# copies a page as of a fold extends the changes list while it holds the
-# map page of the page it changes, and the extension may evict a dirty
-# page of the same relation whose entry is on that map page.  The write
-# reads the map page as it is, rather than locking it again.
+# copies a page as of a fold extends the changes list, and the extension
+# may evict a dirty page of the same relation whose entry is on the map
+# page of the page it changes.  The write locks that map page to look the
+# page up, so the change locks it only after the list's pages.
 
 use strict;
 use warnings FATAL => 'all';

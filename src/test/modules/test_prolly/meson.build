@@ -127,6 +127,7 @@ tests += {
       't/053_serve_snapshots.pl',
       't/054_journal_segments.pl',
       't/055_gc.pl',
+      't/056_bmap_evict_lock.pl',
       't/057_large_values.pl',
     ],
   },
