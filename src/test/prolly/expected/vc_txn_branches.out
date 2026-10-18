@@ -1,0 +1,76 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_begin a_other_head b_on_other b_change b_dcommit b_main a_other_head a_commit
+step a_begin: BEGIN;
+step a_other_head: SELECT hash = dolt_hashof('main') AS other_at_base FROM dolt_branches WHERE name = 'vtb_other';
+other_at_base
+-------------
+t            
+(1 row)
+
+step b_on_other: SELECT (dolt_checkout('vtb_other'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step b_change: INSERT INTO vtb.t (v) VALUES (2);
+step b_dcommit: SELECT length((dolt_commit('-am', 'other moves'))[1]) = 64 AS committed;
+committed
+---------
+t        
+(1 row)
+
+step b_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step a_other_head: SELECT hash = dolt_hashof('main') AS other_at_base FROM dolt_branches WHERE name = 'vtb_other';
+other_at_base
+-------------
+f            
+(1 row)
+
+step a_commit: COMMIT;
+
+starting permutation: a_begin a_branches b_branch a_branches a_commit
+step a_begin: BEGIN;
+step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE name LIKE 'vtb_%';
+vtb_branches
+------------
+           1
+(1 row)
+
+step b_branch: SELECT dolt_branch('vtb_new');
+dolt_branch
+-----------
+{0}        
+(1 row)
+
+step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE name LIKE 'vtb_%';
+vtb_branches
+------------
+           2
+(1 row)
+
+step a_commit: COMMIT;
+
+starting permutation: a_begin b_begin a_insert b_insert a_commit b_commit
+step a_begin: BEGIN;
+step b_begin: BEGIN;
+step a_insert: INSERT INTO vtb.t (v) VALUES (1) RETURNING id;
+id
+--
+ 2
+(1 row)
+
+step b_insert: INSERT INTO vtb.t (v) VALUES (2) RETURNING id;
+id
+--
+ 3
+(1 row)
+
+step a_commit: COMMIT;
+step b_commit: COMMIT;

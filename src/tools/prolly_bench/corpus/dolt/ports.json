@@ -15069,6 +15069,238 @@
       "name": "dolt_revert() refuses when a disjoint table has staged changes",
       "source_sha256": "ed9a4a2bb43db36906e379d4e8a944668dbb0f6e401c97dc87dc93cdb6b11b6c",
       "reason": "Depends on the staging area (D1): Dolt refuses for a disjoint table's staged changes where it allows unstaged ones; prolly has no staged changes."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 0,
+      "name": "duplicate inserts, autocommit on",
+      "source_sha256": "38440b47e6cb25278ba0b3127cc188432a659e8aa9da3517cdf815c5577601f0",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate inserts, autocommit on: the second fails on the key."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 1,
+      "name": "duplicate inserts, autocommit off",
+      "source_sha256": "b0f76e2f4d353d4919c999515cdc5cf84fb96393eaefbcc94da25182c5b7ccc0",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate inserts in transactions: the second waits, then fails on the key the first committed."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 2,
+      "name": "conflicting inserts",
+      "source_sha256": "70fb7eee3dc08f763327ead1e243a44983de5cdb834c70059bc1780d25f51427",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, conflicting inserts: the second waits, then fails on the key."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 3,
+      "name": "duplicate updates, autocommit on",
+      "source_sha256": "9d9b7692eb883933cced625e5b0dc93656e6dab06099a77a1fa31257d6d97c34",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate updates: the second waits, then updates the row as committed."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 4,
+      "name": "duplicate updates, autocommit off",
+      "source_sha256": "53d55e26da8009566ca26609df531a893ed8f00e0f20cd257771dc440844a83c",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate updates in transactions: likewise."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 5,
+      "name": "conflicting updates",
+      "source_sha256": "37099830fc37c97ee9bb833bbe37ab3053890ac8255e2acb0e8a5d880841c4ef",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, conflicting updates: READ COMMITTED updates the committed row; REPEATABLE READ fails with a serialization failure."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 6,
+      "name": "non overlapping updates (diff rows)",
+      "source_sha256": "9f1ff610db4a45fdc027750e0fda7930d075dfef7ca8f54613a86c8b4a7d4358",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, non-overlapping updates of different rows: neither waits."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 7,
+      "name": "non overlapping updates (diff cols)",
+      "source_sha256": "0e028c1d7709d7d1523e56f069c03dfbef70e3d8af32da7c823788034231ca44",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, updates of different columns: the second waits, then both land, as Dolt's cell merge has it."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 8,
+      "name": "duplicate deletes, autocommit on",
+      "source_sha256": "713389822053a2e26abc8337045ec651132e6ebc922f4c5f9aa432973194cf99",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate deletes: the second waits, then finds no row."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 9,
+      "name": "duplicate deletes, autocommit off",
+      "source_sha256": "0ab9c71ffcd817d3de077cc1e535185fa91092fd575be875150a2296c0ae6ee5",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate deletes in transactions: likewise."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 10,
+      "name": "non overlapping deletes",
+      "source_sha256": "6a074e912858cc6af56dfb48b497822ab380cc5f46bf023d9c12d9c79dbf1609",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, non-overlapping deletes: neither waits."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 11,
+      "name": "conflicting delete and update",
+      "source_sha256": "22a0073ff6a012a95255c7f256df5be1635ea0caae70dc817829226cc722a428",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, a delete and an update of the row: the update waits, then finds no row."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 12,
+      "name": "delete in one client, insert into another",
+      "source_sha256": "47c4abc847593e8608840f6da8ae551148f45436174e60247ed42ec25e133ead",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, a delete in one session, the key inserted in another: the insert waits, then succeeds."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 0,
+      "name": "default behavior (rollback on commit conflict)",
+      "source_sha256": "27bf565cb402d0431a4c3cf39c6921edf555934fdde82f584480ec1c79efc8ad",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, a conflict at commit: the second insert of the key waits, then fails."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 1,
+      "name": "allow commit conflicts on, conflict on transaction commit",
+      "source_sha256": "2b1696aea4d6b44fc4670701e00e46f2d241907a6554454fb504a0b2046333a0",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with commit conflicts allowed: there is no commit-time merge to keep conflicts of."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 2,
+      "name": "force commit on, conflict on transaction commit (same as dolt_allow_commit_conflicts)",
+      "source_sha256": "b46c07d390dd1767fcfaa34e811e7547d7f5fb5a6126befb7a7226ca83d46c1d",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with dolt_force_transaction_commit."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 3,
+      "name": "allow commit conflicts on, conflict on dolt_merge",
+      "source_sha256": "3af8e7763b2957d52d2d2ba4ed438752f88d89dd61496fc0daae9b35a2d744db",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts in a transaction block, committed with dolt.allow_commit_conflicts on."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 4,
+      "name": "force commit on, conflict on dolt_merge (same as dolt_allow_commit_conflicts)",
+      "source_sha256": "8c0f21d09fdf9fb1d2fe8442291529c19528829bcff7fb0c6e902213097c3eac",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, likewise (dolt_force_transaction_commit as dolt.allow_commit_conflicts)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 5,
+      "name": "allow commit conflicts off, conflict on dolt_merge",
+      "source_sha256": "6a7212230bfcea9c6f6f668caeb6d347837ed86b6b1ed05d605fe2538cbe2b9b",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts not committed with it off."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 7,
+      "name": "transaction conflicts follows first-write-wins (a commits first)",
+      "source_sha256": "585c8cfb0269ce95e7d6bbbcd79bb1ba351ec0fc6385d89cda441f5066c0c4ef",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, first write wins: the second update waits, then updates the committed row; a keyless table's inserts all kept."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 8,
+      "name": "transaction conflicts follows first-write-wins (b commits first)",
+      "source_sha256": "8b3f6d712c6231eb462f185481ca8d5576853e1f25bff3512009aae5942c47ee",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise, the other session committing first."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltStoredProcedureTransactionTests",
+      "index": 1,
+      "name": "dolt_commit with one table, no merge conflict, no unstaged changes",
+      "source_sha256": "18f30c878557531111eef3ce970d1fae69728c89f5fcc114c7da047a5ee2eef0",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, two transactions' dolt_commits: the second waits, then commits on top (READ COMMITTED) or fails with a serialization failure (REPEATABLE READ)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltStoredProcedureTransactionTests",
+      "index": 2,
+      "name": "mix of dolt_commit and normal commit",
+      "source_sha256": "852f58117699c14db348d94fa8b1482e6ff3cad92582dd9b58ac38655e7e34bf",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a commit doesn't take another session's uncommitted writes."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltStoredProcedureTransactionTests",
+      "index": 8,
+      "name": "amend commit in transaction fails when another client moves the branch head",
+      "source_sha256": "5b1e82af3afb5312dfe25005602f44ed16477b4445e71a434cb68d75c359e541",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, the head moved by another session while a transaction holds changes: its commit goes on from the new head (dolt_commit --amend isn't prolly's)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 0,
+      "name": "Constraint violations created by concurrent writes should cause a rollback",
+      "source_sha256": "b86450047f598a750e626e8a20093550be0c0a2c0725021de00220b02011990b",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, violations by concurrent writes: the child's insert waits on the parent's delete, then fails; none is left."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 1,
+      "name": "Constraint violations created by DOLT_MERGE should cause a roll back",
+      "source_sha256": "dcdc8b07509ef0cc2dfe28f3a6a5aaf1825cb673f46d5f8ebf5ba9cb21c83e4a",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a merge's violations in a transaction block, not committed."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "BranchIsolationTests",
+      "index": 1,
+      "name": "clients can't see changes on other branch heads made since transaction start",
+      "source_sha256": "0c392148aeb5505897c8cffb74bce1846118915ec845f059496603957ecdbc69",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_branches.spec, another branch's head moved: seen moved in READ COMMITTED."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "BranchIsolationTests",
+      "index": 2,
+      "name": "dolt_branches table has consistent view",
+      "source_sha256": "4560bb91ab421daa7ff331bc55b49d1e1253f47de81ad8d49b0559cbc9bfe335",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_branches.spec, a branch made by another session: seen in READ COMMITTED."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "AutoIncrementTransactionTests",
+      "index": 0,
+      "name": "two auto increment values in two transactions",
+      "source_sha256": "48613cdd8ad8ecbf25c7de55ac96ee6d7fb308b5eb06e767580a6c4a062a8f77",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_branches.spec, two transactions' sequence values: different, neither waiting."
     }
   ]
 }
