@@ -150,10 +150,18 @@ prolly_keying_use_env(ProllyKeyingRefs *refs, const ProllyKeyingRoutine *routine
 	env->value_refs_arg = refs;
 }
 
-void
-prolly_keying_row_refs(const ProllyValue *value, void *arg, StringInfo refs)
+/* A value's references, the value an encoded row itself. */
+static void
+keying_row_refs(const ProllyValue *value, void *arg, StringInfo refs)
 {
 	ProllyKeyingRefs *r = arg;
 
 	PROLLY_CALL(r->routine, row_refs, r->keying, value, refs);
+}
+
+void
+prolly_keying_use_env_rows(ProllyKeyingRefs *refs, ProllyTreeEnv *env)
+{
+	env->value_refs = keying_row_refs;
+	env->value_refs_arg = refs;
 }

@@ -78,7 +78,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		5
+#define STATE_VERSION		6
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -305,8 +305,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->memenv.compare_arg = NULL;
 	prolly_keying_use_env(&f->krefs, f->kr, f->k, f->tree, &f->env);
 	/* (the carried keys' rows hold references too, if a key is long) */
-	f->memenv.value_refs = prolly_keying_row_refs;
-	f->memenv.value_refs_arg = &f->krefs;
+	prolly_keying_use_env_rows(&f->krefs, &f->memenv);
 	f->desc = RelationGetDescr(rel);
 	f->values = palloc_array(Datum, f->desc->natts);
 	f->isnull = palloc_array(bool, f->desc->natts);

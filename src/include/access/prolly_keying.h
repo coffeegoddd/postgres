@@ -120,8 +120,13 @@ extern void prolly_keying_use_env(ProllyKeyingRefs *refs,
 								  const struct ProllyTreeRoutine *tree,
 								  ProllyTreeEnv *env);
 
-/* A value_refs() for a tree whose values are encoded rows themselves. */
-extern void prolly_keying_row_refs(const ProllyValue *value, void *arg,
-								   StringInfo refs);
+/*
+ * Set up env, of another tree in the same chunk store whose values are
+ * rows encoded as refs' keying encodes them (not its tree values), to find
+ * the references they hold.  refs must have been set up by
+ * prolly_keying_use_env().
+ */
+extern void prolly_keying_use_env_rows(ProllyKeyingRefs *refs,
+									   ProllyTreeEnv *env);
 
 #endif							/* PROLLY_KEYING_H */

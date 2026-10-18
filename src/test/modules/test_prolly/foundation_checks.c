@@ -785,6 +785,33 @@ valenc_long_values(const ProllyImplInfo *impl)
 					 lens[l], got.len);
 			pfree(got.data);
 		}
+
+		/* a row with a byte after its values: refs() refuses it, as decode() */
+		{
+			StringInfoData bad;
+			ProllyValue badrow;
+
+			initStringInfo(&bad);
+			appendBinaryStringInfo(&bad, buf.data, buf.len);
+			appendStringInfoChar(&bad, '\x01');
+			badrow.data = (const uint8 *) bad.data;
+			badrow.len = bad.len;
+			failed = false;
+			PG_TRY();
+			{
+				PROLLY_CALL(ve, refs, enc, &badrow, &refs);
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(cxt);
+				FlushErrorState();
+				failed = true;
+			}
+			PG_END_TRY();
+			if (!failed)
+				elog(ERROR, "a row with a trailing byte listed its references");
+			pfree(bad.data);
+		}
 		PROLLY_CALL(ve, decode, enc, &row, dst);
 		check_same_row(src, dst, l);
 		PROLLY_CALL(ve, set_values, enc, NULL);

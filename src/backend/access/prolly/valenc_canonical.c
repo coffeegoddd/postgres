@@ -388,7 +388,8 @@ canonical_refs(ProllyValueEncoder *enc, const ProllyValue *row, StringInfo refs)
 	const char *nulls;
 	uint64		n = prolly_get_varint(&p, end);
 
-	if (n > (uint64) (end - p) * 8)
+	/* (a row of an earlier layout may have more columns than enc's) */
+	if ((uint64) (end - p) < (n + 7) / 8)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid canonical prolly row header")));
@@ -413,6 +414,11 @@ canonical_refs(ProllyValueEncoder *enc, const ProllyValue *row, StringInfo refs)
 			appendBinaryStringInfo(refs, p, (int) len);
 		p += len;
 	}
+	if (p != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row: %d trailing bytes",
+						(int) (end - p))));
 }
 
 static void

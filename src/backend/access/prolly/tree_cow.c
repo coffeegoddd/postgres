@@ -700,17 +700,28 @@ leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
 	item->flags = 0;
 	if (env->value_refs)
 	{
-		StringInfoData refs;
+		int			start = buf->len;
+		int			n;
 
-		initStringInfo(&refs);
-		env->value_refs(value, env->value_refs_arg, &refs);
-		if (refs.len > 0)
+		/* the references, then their length put before them */
+		env->value_refs(value, env->value_refs_arg, buf);
+		n = buf->len - start;
+		if (n > 0)
 		{
+			StringInfoData len;
+			char		lenbuf[16];
+
+			len.data = lenbuf;
+			len.len = 0;
+			len.maxlen = sizeof(lenbuf);
+			prolly_put_varint(&len, n);
+			enlargeStringInfo(buf, len.len);
+			memmove(buf->data + start + len.len, buf->data + start, n);
+			memcpy(buf->data + start, len.data, len.len);
+			buf->len += len.len;
+			buf->data[buf->len] = '\0';
 			item->flags |= PROLLY_ITEM_VALUE_REFS;
-			prolly_put_varint(buf, refs.len);
-			appendBinaryStringInfo(buf, refs.data, refs.len);
 		}
-		pfree(refs.data);
 	}
 	if (value->len > VALUE_INLINE_MAX)
 	{
@@ -750,18 +761,33 @@ item_payload(ProllyValue *value, uint8 flags, ProllyValue *refs)
 	}
 }
 
+/*
+ * A leaf value as read, without the references it leads with: if it is out
+ * of line, its bytes are appended to out (true); otherwise value is left
+ * pointing at them.
+ */
+static bool
+leaf_value_into(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
+				StringInfo out)
+{
+	ProllyValue refs;
+
+	item_payload(value, flags, &refs);
+	if (!(flags & PROLLY_ITEM_VALUE_REF))
+		return false;
+	resolve_value(env, value, out);
+	return true;
+}
+
 /* A leaf value as read: its bytes, from its value tree if out of line. */
 static void
 leaf_value(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
 		   StringInfo buf)
 {
-	ProllyValue refs;
-
-	item_payload(value, flags, &refs);
 	if (flags & PROLLY_ITEM_VALUE_REF)
-	{
 		resetStringInfo(buf);
-		resolve_value(env, value, buf);
+	if (leaf_value_into(env, value, flags, buf))
+	{
 		value->data = (const uint8 *) buf->data;
 		value->len = buf->len;
 	}
@@ -1220,12 +1246,7 @@ cow_get(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		node_item(env, &fr->node, i, &k, &v, &flags);
 		if (cmp_keys(env, &k, key) == 0)
 		{
-			ProllyValue refs;
-
-			item_payload(&v, flags, &refs);
-			if (flags & PROLLY_ITEM_VALUE_REF)
-				resolve_value(env, &v, value);
-			else
+			if (!leaf_value_into(env, &v, flags, value))
 				appendBinaryStringInfo(value, v.data, v.len);
 			found = true;
 		}
@@ -1333,6 +1354,8 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 			uint64		len;
 
 			node_item(env, &node, i, &k, &v, &flags);
+			if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+				continue;
 			item_payload(&v, flags, &refs);
 			value_env(env, &venv);
 			if (flags & PROLLY_ITEM_VALUE_REF)
@@ -2283,7 +2306,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.info = {
 		.iface = PROLLY_IFACE_TREE,
 		.impl_id = COW_IMPL_ID,
-		.format_version = 2,
+		.format_version = 3,
 		.name = "cow",
 		.description = "copy-on-write prolly trees in a chunk store",
 	},
