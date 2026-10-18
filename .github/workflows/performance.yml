@@ -411,20 +411,26 @@ jobs:
           STATUS: ${{ steps.report.outputs.status }}
         run: test "$STATUS" = 0
 
-  # Nightly: tonight's master against the previous night's, the 360-cell
-  # shape (configs/s_nightly.toml, about 4 hours), on a hosted runner, so
-  # its timing is reported with a shared machine's noise.  Each night's
-  # summary goes to the orphan perf-history branch (and the whole result
-  # set to an artifact); a confirmed regression opens or updates one issue
-  # labelled nightly-performance-regression, and the next clean night says
-  # it cleared.  Without hardware counters, Cachegrind counts the server's
-  # instructions on a reduced workload, reported.
+  # Nightly: tonight's master against the last clean night's (no confirmed
+  # regression; perf-history's CLEAN), at configs/s_nightly.toml's shape
+  # (360 cells, some 4 to 5 hours), on a hosted runner, so its timing is
+  # reported with a shared machine's noise.  Against the last clean night,
+  # not the last night: a regression stays in the comparison until it is
+  # fixed.  Each night's summary goes to the orphan perf-history branch (and
+  # the whole result set to an artifact); a confirmed regression opens or
+  # updates one issue labelled nightly-performance-regression, and a clean
+  # night says it cleared.  Without hardware counters, Cachegrind counts
+  # the server's instructions on a reduced workload, reported.  Master's
+  # only: run by hand on another branch it does nothing.
   nightly:
     name: nightly
     needs: build
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 355
+    concurrency:
+      group: performance-nightly
+      cancel-in-progress: false
     permissions:
       contents: write
       issues: write
@@ -433,11 +439,15 @@ jobs:
       GH_REPO: ${{ github.repository }}
       MARKER: '<!-- s-suite-nightly -->'
       LABEL: nightly-performance-regression
+      WATCHDOG_MARKER: '<!-- s-suite-nightly-watchdog -->'
+      WATCHDOG_LABEL: nightly-performance-watchdog
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # (the job's limit, as timeout-minutes; and what the steps after the
+      # runs need of it)
+      JOB_MINUTES: 355
+      REPORT_MINUTES: 30
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -449,59 +459,76 @@ jobs:
             bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench valgrind
           sudo sysctl -w kernel.perf_event_paranoid=-1 || true
 
-      - name: Tonight and the night before
+      - name: Tonight and the last clean night
         id: commits
         run: |
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
           candidate=$(git rev-parse HEAD)
           base=
-          if git fetch origin perf-history:perf-history 2>/dev/null; then
-            base=$(git show perf-history:LATEST 2>/dev/null || true)
+          if git fetch --depth 1 origin perf-history:perf-history 2>/dev/null; then
+            base=$(git show perf-history:CLEAN 2>/dev/null || true)
           fi
           # (the first night, or a base no longer fetchable: the build against itself)
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            base=$candidate
+          if [ -n "$base" ] && ! git fetch --depth 1 origin "$base" 2>/dev/null; then
+            base=
           fi
+          [ -n "$base" ] || base=$candidate
           { echo "base=$base"; echo "candidate=$candidate"; echo "image=$ImageOS-$ImageVersion"; \
             echo "date=$(date -u +%F)"; } | tee -a "$GITHUB_OUTPUT"
 
+      - name: Nothing new since the last clean night
+        if: steps.commits.outputs.base == steps.commits.outputs.candidate
+        run: echo "master is still at the last clean night's commit; the nightly compares nothing."
+
+      # (cached as performance.yml's build job caches: one path, by commit)
       - name: Cached tonight's build
         id: candidate-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: s-builds/candidate
+          path: ${{ runner.temp }}/s-cache
           key: s-server-${{ steps.commits.outputs.candidate }}-${{ steps.commits.outputs.image }}
 
-      - name: Cached last night's build
+      - name: Build tonight's
+        if: steps.candidate-cache.outputs.cache-hit != 'true'
+        run: |
+          bash "$BENCH/build_postgres.sh" --jobs 4 --build-dir "$RUNNER_TEMP/head" -- --with-openssl
+          mv "$RUNNER_TEMP/head/inst" "$RUNNER_TEMP/s-cache"
+
+      - name: Set tonight's aside
+        run: |
+          mkdir -p "$RUNNER_TEMP/s-builds"
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/candidate"
+
+      - name: Cached last clean night's build
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
         id: base-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: s-builds/base
+          path: ${{ runner.temp }}/s-cache
           key: s-server-${{ steps.commits.outputs.base }}-${{ steps.commits.outputs.image }}
 
-      - name: Build what isn't cached
+      - name: Build last clean night's
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.base-cache.outputs.cache-hit != 'true'
         env:
           BASE: ${{ steps.commits.outputs.base }}
-          CANDIDATE_HIT: ${{ steps.candidate-cache.outputs.cache-hit }}
-          BASE_HIT: ${{ steps.base-cache.outputs.cache-hit }}
         run: |
-          mkdir -p s-builds
-          if [ "$CANDIDATE_HIT" != true ]; then
-            bash "$BENCH/build_postgres.sh" --jobs 4 --build-dir "$RUNNER_TEMP/head" -- --with-openssl
-            mv "$RUNNER_TEMP/head/inst" s-builds/candidate
-          fi
-          if [ "$BASE_HIT" != true ]; then
-            git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
-            bash "$RUNNER_TEMP/base-src/$BENCH/build_postgres.sh" --jobs 4 \
-              --build-dir "$RUNNER_TEMP/base" -- --with-openssl
-            mv "$RUNNER_TEMP/base/inst" s-builds/base
-          fi
+          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
+          bash "$BENCH/build_postgres.sh" --source "$RUNNER_TEMP/base-src" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/base" -- --with-openssl
+          mv "$RUNNER_TEMP/base/inst" "$RUNNER_TEMP/s-cache"
+
+      - name: Set last clean night's aside
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        run: mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/base"
 
       - uses: actions/setup-java@v4
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
         with:
           distribution: temurin
           java-version: '23'
 
       - name: Cached BenchBase
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
         id: benchbase-cache
         uses: actions/cache@v4
         with:
@@ -509,7 +536,7 @@ jobs:
           key: benchbase-${{ env.BENCHBASE_COMMIT }}-${{ hashFiles('src/tools/prolly_bench/benchbase/**', 'src/tools/prolly_bench/build_benchbase.sh') }}
 
       - name: Fetch pinned BenchBase source
-        if: steps.benchbase-cache.outputs.cache-hit != 'true'
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.benchbase-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
           repository: dolthub/benchbase
@@ -517,48 +544,94 @@ jobs:
           path: benchbase-source
 
       - name: Build BenchBase
-        if: steps.benchbase-cache.outputs.cache-hit != 'true'
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.benchbase-cache.outputs.cache-hit != 'true'
         run: bash "$BENCH/build_benchbase.sh" "$PWD/benchbase-source"
 
       - name: The nightly shape, then the cells that regressed again
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
         env:
           BASE: ${{ steps.commits.outputs.base }}
           CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          STARTED: ${{ steps.commits.outputs.started }}
         run: |
-          bins="base=$PWD/s-builds/base/bin,candidate=$PWD/s-builds/candidate/bin"
+          bins="base=$RUNNER_TEMP/s-builds/base/bin,candidate=$RUNNER_TEMP/s-builds/candidate/bin"
           commits="base=$BASE,candidate=$CANDIDATE"
+          first=$(date +%s)
           "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_nightly.toml" \
             --pg-bin "$bins" --build-commit "$commits" \
             --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/attempt1" || true
+          first=$(( $(date +%s) - first ))
           runs=(nightly/attempt1)
           for attempt in 2 3; do
+            rm -f nightly/sgate.json
             "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
               --thresholds "$BENCH/configs/s_gate.toml" --json nightly/sgate.json || true
+            [ -f nightly/sgate.json ] || break
             rerun=$(python3 -c 'import json; print(",".join(json.load(open("nightly/sgate.json"))["rerun"]))')
             [ -n "$rerun" ] || break
+            # A retry only if the job has time for it (the first pass's
+            # time per workload, times the workloads to rerun), and for what
+            # comes after: one a timeout cut short would cost the night's
+            # report.
+            workloads=$(python3 -c 'import sys, tomllib; print(len(tomllib.load(open(sys.argv[1], "rb"))["run"]["workloads"]))' \
+              "$BENCH/configs/s_nightly.toml")
+            need=$(( first * $(echo "$rerun" | tr , '\n' | wc -l) / workloads / 60 ))
+            left=$(( JOB_MINUTES - REPORT_MINUTES - ($(date +%s) - STARTED) / 60 ))
+            if [ "$need" -ge "$left" ]; then
+              echo "no time to retry $rerun (about $need min, $left left): its cells are reported transient"
+              break
+            fi
             "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_nightly.toml" \
               --workloads "$rerun" --pg-bin "$bins" --build-commit "$commits" \
               --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/attempt$attempt" || true
             runs+=("nightly/attempt$attempt")
           done
+          rm -f nightly/sgate.json
           "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
             --thresholds "$BENCH/configs/s_gate.toml" --json nightly/sgate.json || true
-          test -f nightly/sgate.json
 
       - name: Instructions without hardware counters (Cachegrind, reduced)
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
         run: |
           if python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from pbench.collectors.instructions import probe; sys.exit(0 if probe()[0] else 1)' "$BENCH"; then
-            echo "hardware counters available: the counter runs count instructions"
+            echo "hardware counters: the nightly's instructions collector counted them"
             exit 0
           fi
           "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_cachegrind.toml" \
-            --pg-bin "$PWD/s-builds/candidate/bin" \
+            --pg-bin "$RUNNER_TEMP/s-builds/candidate/bin" \
             --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/cachegrind" || true
 
+      - name: Judge the night
+        id: judge
+        if: always() && steps.commits.outputs.base != steps.commits.outputs.candidate
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+        run: |
+          # clean: results, valid, nothing confirmed; regressed: something
+          # confirmed; none: no valid results (the watchdog's case)
+          verdict=none
+          if [ -f nightly/sgate.json ]; then
+            status=0
+            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
+              --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+              --run-url "$RUN_URL" --out "$RUNNER_TEMP/nightly.md" > /dev/null || status=$?
+            confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
+            if [ "$confirmed" != 0 ]; then
+              verdict=regressed
+            elif [ "$status" = 0 ]; then
+              verdict=clean
+            fi
+            cat "$RUNNER_TEMP/nightly.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
+
       - name: Summary on perf-history
+        if: always() && steps.judge.outputs.verdict != 'none' && steps.judge.outputs.verdict != ''
         env:
           DATE: ${{ steps.commits.outputs.date }}
           CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          VERDICT: ${{ steps.judge.outputs.verdict }}
         run: |
           instructions=()
           [ -d nightly/cachegrind ] && instructions=(--instructions nightly/cachegrind)
@@ -571,14 +644,20 @@ jobs:
             git worktree add --orphan -b perf-history "$RUNNER_TEMP/history"
           fi
           cd "$RUNNER_TEMP/history"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           mkdir -p nights
           cp "$RUNNER_TEMP/summary.json" "$name"
           echo "$CANDIDATE" > LATEST
-          git add "$name" LATEST
-          git -c user.name='github-actions[bot]' \
-            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -q -m "S suite nightly $DATE at ${CANDIDATE:0:10}"
-          git push origin perf-history
+          # (the base of the nights to come: the last night nothing regressed)
+          [ "$VERDICT" = clean ] && echo "$CANDIDATE" > CLEAN
+          git add -A nights LATEST $([ -f CLEAN ] && echo CLEAN)
+          git commit -q -m "S suite nightly $DATE at ${CANDIDATE:0:10}: $VERDICT"
+          for try in 1 2 3; do
+            git push origin HEAD:perf-history && exit 0
+            git pull -q --rebase origin perf-history || true
+          done
+          exit 1
 
       - uses: actions/upload-artifact@v5
         if: always()
@@ -589,40 +668,54 @@ jobs:
           if-no-files-found: ignore
 
       - name: Open, update or clear the regression issue
+        if: always() && (steps.judge.outputs.verdict == 'clean' || steps.judge.outputs.verdict == 'regressed')
         env:
           BASE: ${{ steps.commits.outputs.base }}
           CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          VERDICT: ${{ steps.judge.outputs.verdict }}
         run: |
-          "$BENCH/prolly_bench" sreport --timing nightly/sgate.json --nightly \
-            --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
-            --run-url "$RUN_URL" --out "$RUNNER_TEMP/nightly.md" > /dev/null || true
-          confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
           issue=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,body \
             --jq "map(select(.body | startswith(env.MARKER)))[0].number // empty")
-          if [ "$confirmed" = 0 ]; then
+          if [ "$VERDICT" = clean ]; then
             if [ -n "$issue" ]; then
-              gh issue comment "$issue" --body "The S suite nightly at $CANDIDATE confirms no regression: cleared. $RUN_URL"
+              gh issue comment "$issue" --body "The S suite nightly at $CANDIDATE, against $BASE, confirms no regression: cleared. $RUN_URL"
               gh issue close "$issue"
             fi
             exit 0
           fi
-          { echo "$MARKER"; echo "The S suite nightly confirmed $confirmed regressed cell(s) at $CANDIDATE against $BASE: $RUN_URL"; \
+          { echo "$MARKER"; echo "The S suite nightly confirmed a regression at $CANDIDATE against the last clean night, $BASE: $RUN_URL"; \
             echo; head -c 60000 "$RUNNER_TEMP/nightly.md"; } > body.md
           if [ -n "$issue" ]; then
             gh issue edit "$issue" --body-file body.md
-            gh issue comment "$issue" --body "Regressed again at $CANDIDATE: $RUN_URL"
+            gh issue comment "$issue" --body "Still regressed at $CANDIDATE: $RUN_URL"
           else
             gh label create "$LABEL" --color D93F0B \
               --description "A regression the S suite nightly confirmed" 2>/dev/null || true
             gh issue create --title "S suite nightly: performance regression" --label "$LABEL" --body-file body.md
           fi
 
-  # A nightly that fails or is cancelled before it has results opens (or
-  # adds to) a watchdog issue.
+      - name: A night without valid results fails (the watchdog reports it)
+        if: always() && steps.judge.outputs.verdict == 'none'
+        run: |
+          echo "the nightly produced no valid results" >&2
+          exit 1
+
+      - name: Close the watchdog issue
+        if: success()
+        run: |
+          issue=$(gh issue list --label "$WATCHDOG_LABEL" --state open --limit 100 --json number,body \
+            --jq "map(select(.body | startswith(env.WATCHDOG_MARKER)))[0].number // empty")
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "The S suite nightly finished again at $GITHUB_SHA: $RUN_URL"
+            gh issue close "$issue"
+          fi
+
+  # A nightly that fails, is cancelled or leaves no valid results opens (or
+  # adds to) a watchdog issue; the next night that finishes closes it.
   nightly-watchdog:
     name: nightly watchdog
     needs: [build, nightly]
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.nightly.result != 'success'
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && needs.nightly.result != 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

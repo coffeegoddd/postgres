@@ -44,7 +44,10 @@ def summarize(run: Path, timing: dict, date: str, instructions: dict | None = No
     out_sets = []
     for s in sets:
         run_json = json.loads((s.path / "run.json").read_text())
-        env = json.loads((s.path / "environment.json").read_text())
+        # (a set whose run stopped early may have no environment: kept,
+        # with its problems, and no commit)
+        env_file = s.path / "environment.json"
+        env = json.loads(env_file.read_text()) if env_file.exists() else {}
         provenance = env.get("postgres", {}).get("build_provenance") or {}
         commits[s.build] = provenance.get("commit")
         out_sets.append({"label": s.label, "build": s.build, "engine": s.table_am,

@@ -1,12 +1,15 @@
-# The S suite nightly: tonight's master (the candidate) against the previous
-# night's (the base), with --pg-bin base=DIR,candidate=DIR --am heap,prolly.
+# The S suite nightly: tonight's master (the candidate) against the last
+# clean night's (the base), with --pg-bin base=DIR,candidate=DIR
+# --am heap,prolly.
 #
-# S1-S4, S8, S10's three tests and S9; 1 and 8 clients; 5 repetitions;
-# 10 s warm-up and 30 s measured: about 340 cells, some 4 hours, within a
-# hosted job's 6.  (Not standard.toml, whose whole matrix would take about
-# 100.)  On a GitHub-hosted runner its timing carries a shared machine's
-# noise, and is reported as such; like a pull request's timing, it only
-# compares builds (comparison_only).
+# S1-S4, S5 (hot rows, which a pull request's timing leaves to it), S8,
+# S10's three tests and S9; 1 and 8 clients; 5 repetitions; 10 s warm-up
+# and 30 s measured: 360 cells (S5 at 8 clients only), some 4 to 5 hours,
+# within a hosted job's 6.
+# (Not standard.toml, whose whole matrix would take about 100.)  On a
+# GitHub-hosted runner its timing carries a shared machine's noise, and is
+# reported as such; like a pull request's timing, it only compares builds
+# (comparison_only).  Instructions are counted where the machine can.
 
 [run]
 quality = "smoke"
@@ -16,11 +19,11 @@ clients = [1, 8]
 warmup_seconds = 10
 measure_seconds = 30
 sizes = ["nightly"]
-workloads = ["S1", "S2", "S3", "S4", "S8", "S9", "S10"]
+workloads = ["S1", "S2", "S3", "S4", "S5", "S8", "S9", "S10"]
 fio_baseline = false
 seed = 1
 latency_sampling_rate = 1.0
-collectors = ["wal", "pg_stat_io", "cpu", "space", "engine_counters"]
+collectors = ["wal", "pg_stat_io", "cpu", "space", "engine_counters", "instructions"]
 required_collectors = ["wal", "pg_stat_io"]
 
 [postgres]
@@ -44,6 +47,10 @@ sysbench_table_size = 50000
 
 [workloads.S3]
 ranges = [100]
+
+[workloads.S5]
+hot_rows = 10
+clients = [8]                  # contention: one client has none
 
 [workloads.S8]
 percents = [1]

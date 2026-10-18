@@ -34,7 +34,9 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(run["clients"], [1, 8])
         self.assertEqual(run["repetitions"], 5)
         self.assertEqual((run["warmup_seconds"], run["measure_seconds"]), (10, 30))
-        self.assertEqual(set(run["workloads"]), {"S1", "S2", "S3", "S4", "S8", "S9", "S10"})
+        # (S5 and S9 are left to it by the pull request's timing)
+        self.assertEqual(set(run["workloads"]), {"S1", "S2", "S3", "S4", "S5", "S8", "S9", "S10"})
+        self.assertIn("instructions", run["collectors"])
         self.assertEqual(len(cfg["workloads"]["S10"]["tests"]), 3)
 
     def test_summary(self):
@@ -50,6 +52,14 @@ class NightlyTest(unittest.TestCase):
             self.assertEqual((cell["workload"], cell["clients"], cell["n"]), ("S1", 8, 5))
             self.assertTrue(s["confirmed"])
             json.dumps(s)                      # it is what goes to perf-history
+
+    def test_summary_keeps_a_set_without_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = night(Path(d), 1.0)
+            (run / "candidate-B0" / "environment.json").unlink()
+            s = shistory.summarize(run, {"cells": []}, "2026-10-18")
+            self.assertEqual(len(s["sets"]), 4)
+            self.assertIsNone(s["commits"]["candidate"])
 
     def test_report_opens_on_confirmed_and_clears(self):
         with tempfile.TemporaryDirectory() as d:

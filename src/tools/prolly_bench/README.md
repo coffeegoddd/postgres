@@ -305,8 +305,10 @@ accept nothing); the file has a code owner.  `sreport` writes the sticky
 comment, marked `<!-- s-suite -->`.
 
 The nightly (`performance.yml`'s nightly job) runs `configs/s_nightly.toml`,
-about 340 cells and 4 hours, with tonight's master against the previous
-night's, retries the cells that regress, and keeps a summary of each night
+360 cells and some 4 to 5 hours, with tonight's master against the last night
+no regression was confirmed on (so a regression stays in the comparison
+until it is fixed), retries the cells that regress while the job has time,
+and keeps a summary of each night
 (`prolly_bench shistory`: medians, ratios with their intervals, commits,
 comparison identities) on the orphan `perf-history` branch.
 
