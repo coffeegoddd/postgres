@@ -429,3 +429,92 @@ SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;
         66
 (1 row)
 
+-- A cherry-pick resolved to nothing is refused as empty, by the refs
+-- before they record anything: the pick stays in progress, to be aborted.
+CREATE SCHEMA cp VERSIONED;
+CREATE TABLE cp.t (id int PRIMARY KEY, v text);
+INSERT INTO cp.t VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cp base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cp_src');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cp_src');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'cp_src'"}
+(1 row)
+
+UPDATE cp.t SET v = 'src' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp src')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cp.t SET v = 'main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_cherry_pick('cp_src'))[2] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--ours', 'cp.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT test_refs_commit('cp resolved to nothing', false) IS NULL AS refused;
+ refused 
+---------
+ t
+(1 row)
+
+SELECT dolt_cherry_pick('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT v FROM cp.t;
+  v   
+------
+ main
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'cp_src');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cp CASCADE;
+NOTICE:  drop cascades to table cp.t
+SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

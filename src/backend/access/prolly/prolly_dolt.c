@@ -315,7 +315,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	   *author = NULL;
 	bool		allow_empty = false;
 	ProllyHash	id = {0};
-	volatile bool committed = false;
+	bool		committed = false;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)

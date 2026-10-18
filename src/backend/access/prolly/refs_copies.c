@@ -973,8 +973,11 @@ hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
 
 /*
  * Commit the session branch as it is, with these parents; the fold is the
- * branch's next baseline.  Unless allow_empty, a fold of one parent's root
- * records nothing and returns false.
+ * branch's next baseline.  Unless allow_empty, a commit of the branch's
+ * head alone whose root is the head's makes no commit and returns false
+ * (what its objects need from outside isn't a change: an extension's
+ * update alone isn't committed); the fold still advances the baseline, as
+ * a checkpoint's would.
  */
 static bool
 commit_branch(const char *message, const ProllyHash *parents, int nparents,
@@ -984,16 +987,23 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	ProllyNodeRef root;
 	ProllyNodeRef next;
 	ProllyNodeRef parent;
+	ProllyHash	head;
 	bool		pushed;
 
 	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
+
+	/* (the one parent is the head: a merge's first commit isn't empty) */
 	if (!allow_empty && nparents == 1 &&
+		branch_head(name, &head) && same_hash(&head, &parents[0]) &&
 		copies_commit_working_set(&parents[0], &parent) &&
 		same_hash(&parent.hash, &root.hash))
+	{
+		branch_set_baseline(name, &next, &root);
 		return false;
+	}
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);

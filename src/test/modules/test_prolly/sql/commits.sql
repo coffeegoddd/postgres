@@ -142,3 +142,27 @@ SELECT dolt_hashof('feature/ok-name_1.2') = dolt_hashof('HEAD') AS resolves;
 SELECT dolt_branch('-d', 'feature/ok-name_1.2');
 DROP SCHEMA ca CASCADE;
 SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;
+
+-- A cherry-pick resolved to nothing is refused as empty, by the refs
+-- before they record anything: the pick stays in progress, to be aborted.
+CREATE SCHEMA cp VERSIONED;
+CREATE TABLE cp.t (id int PRIMARY KEY, v text);
+INSERT INTO cp.t VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cp base')::text) AS committed;
+SELECT dolt_branch('cp_src');
+SELECT dolt_checkout('cp_src');
+UPDATE cp.t SET v = 'src' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp src')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE cp.t SET v = 'main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'cp main')::text) AS committed;
+BEGIN;
+SELECT (dolt_cherry_pick('cp_src'))[2] AS conflicts;
+SELECT dolt_conflicts_resolve('--ours', 'cp.t');
+SELECT test_refs_commit('cp resolved to nothing', false) IS NULL AS refused;
+SELECT dolt_cherry_pick('--abort') IS NOT NULL AS aborted;
+SELECT v FROM cp.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'cp_src');
+DROP SCHEMA cp CASCADE;
+SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;

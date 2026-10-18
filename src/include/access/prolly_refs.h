@@ -113,8 +113,9 @@ typedef struct ProllyRefsRoutine
 	 * Record a commit of the current branch's working root, as the current
 	 * transaction will commit it.  With a merge in progress, it is the
 	 * merge commit (both heads its parents), and every conflict must have
-	 * been resolved.  Unless allow_empty, a commit of one parent whose root
-	 * is that parent's records nothing and returns false.
+	 * been resolved.  Unless allow_empty, a commit of the head alone that
+	 * would hold just what the head does makes no commit and returns false
+	 * (the branch's head and a merge in progress stay as they were).
 	 */
 	bool		(*commit) (const char *message, bool allow_empty,
 						   ProllyHash *commit_id);
