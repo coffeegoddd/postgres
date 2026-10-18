@@ -20,6 +20,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_memo.h"
 #include "access/prolly_remote.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_tree.h"
@@ -1101,4 +1102,23 @@ test_walk_new_count(PG_FUNCTION_ARGS)
 	PROLLY_CALL(dc.refs, walk_commit, &to, note_node, &n);
 	hash_destroy(n.seen);
 	PG_RETURN_INT64(n.visited);
+}
+
+/* test_memo_counters(reset): the value memo's hits and misses. */
+PG_FUNCTION_INFO_V1(test_memo_counters);
+Datum
+test_memo_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	ProllyMemoCounters c;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(prolly_memo_lookup("shared"), counters, &c, PG_GETARG_BOOL(0));
+	values[0] = Int64GetDatum((int64) c.hits);
+	values[1] = Int64GetDatum((int64) c.misses);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }

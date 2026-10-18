@@ -686,6 +686,17 @@ resolve_value(const ProllyTreeEnv *env, const ProllyValue *ref, StringInfo out)
 	read_value(env, ref, 0, PG_UINT64_MAX, out);
 }
 
+/* (a tree's nodes go into the store before its root does) */
+static bool
+cow_value_present(const ProllyTreeEnv *env, const ProllyValue *ref)
+{
+	ProllyNodeRef root;
+	uint64		len;
+
+	decode_value_ref(ref, &root, &len);
+	return PROLLY_CALL(env->chunk_store, has, env->chunks, &root.hash);
+}
+
 /*
  * A leaf item for key and value: the value stored out of line if it is
  * long, and led by the references it holds if the environment finds any.
@@ -2343,4 +2354,5 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,
+	.value_present = cow_value_present,
 };

@@ -4,8 +4,8 @@
  *	  The prolly shared-memory subsystem and checkpoint hook.
  *
  * At postmaster startup this reserves a shared area for every registered
- * chunk store implementation whose shmem_size() is non-zero, named after
- * the implementation, and calls its shmem_init() with the area once.
+ * chunk store and value memo implementation whose shmem_size() is
+ * non-zero, named after the implementation, and calls its shmem_init() with the area once.
  * Every process finds the area again with prolly_shmem_area().
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_memo.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_shmem.h"
 #include "storage/shmem.h"
@@ -24,6 +25,7 @@
 /* Interfaces whose implementations may have shared state. */
 static const ProllyInterface shmem_interfaces[] = {
 	PROLLY_IFACE_CHUNK_STORE,
+	PROLLY_IFACE_VALUE_MEMO,
 };
 
 #define MAX_AREAS 64
@@ -50,6 +52,12 @@ impl_shmem_size(const ProllyImplInfo *impl)
 
 				return r->shmem_size ? r->shmem_size() : 0;
 			}
+		case PROLLY_IFACE_VALUE_MEMO:
+			{
+				const ProllyValueMemoRoutine *r = (const ProllyValueMemoRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
 		default:
 			return 0;
 	}
@@ -62,6 +70,9 @@ impl_shmem_init(const ProllyImplInfo *impl, void *area)
 	{
 		case PROLLY_IFACE_CHUNK_STORE:
 			PROLLY_CALL(((const ProllyChunkStoreRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_VALUE_MEMO:
+			PROLLY_CALL(((const ProllyValueMemoRoutine *) impl), shmem_init, area);
 			break;
 		default:
 			elog(ERROR, "prolly %s implementations have no shared memory",

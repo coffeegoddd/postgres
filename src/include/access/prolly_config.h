@@ -23,6 +23,7 @@
 #include "access/prolly_hash.h"
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
+#include "access/prolly_memo.h"
 #include "access/prolly_merge.h"
 #include "access/prolly_reclaim.h"
 #include "access/prolly_refs.h"
@@ -41,6 +42,7 @@ typedef struct ProllyComponents
 	const ProllyValueEncoderRoutine *value_encoder;
 	const ProllyTreeRoutine *tree;
 	const ProllyKeyingRoutine *keying;
+	const ProllyValueMemoRoutine *value_memo;
 } ProllyComponents;
 
 /* Database-wide components: version control. */

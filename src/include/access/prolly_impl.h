@@ -49,10 +49,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_TABLE_FILE = 25,
 	PROLLY_IFACE_CHANGE_FINDER = 26,
 	PROLLY_IFACE_REMOTE = 27,
+	PROLLY_IFACE_VALUE_MEMO = 28,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_CHUNKER
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_REMOTE
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_VALUE_MEMO
 
 /*
  * Identity of an implementation.  The first member of every routine struct.

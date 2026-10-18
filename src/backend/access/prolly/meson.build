@@ -18,6 +18,8 @@ backend_sources += files(
   'keyenc_stub.c',
   'keying_pkprefix.c',
   'keying_stub.c',
+  'memo_shared.c',
+  'memo_stub.c',
   'merge_stub.c',
   'prolly_chunkstore.c',
   'prolly_config.c',

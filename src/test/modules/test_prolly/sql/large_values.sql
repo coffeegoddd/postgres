@@ -96,6 +96,60 @@ SELECT dolt_reset('--hard', :'k1');
 SELECT length(k), v FROM lv.longkey ORDER BY v;
 SELECT dolt_reset('--hard', :'k2');
 
+-- A fold that meets a TOAST pointer it folded before writes the reference
+-- it made then, without reading the value (the memo): an UPDATE of a small
+-- column keeps the long one's pointer, and the next commit hits.  What a
+-- transaction remembers is forgotten if it rolls back.
+CREATE TABLE lv.memo (id int PRIMARY KEY, n int, body text);
+ALTER TABLE lv.memo ALTER COLUMN body SET STORAGE EXTERNAL;
+INSERT INTO lv.memo
+SELECT g, 0, string_agg(md5(g || '/' || i), '' ORDER BY i)
+FROM generate_series(1, 3) g, generate_series(1, 3000) i GROUP BY g;
+SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(body) IS NOT NULL) AS out_of_line
+FROM lv.memo;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+SELECT (dolt_commit('-Am', 'memo'))[1] AS m1 \gset
+SELECT hits, misses >= 3 AS each_body_read FROM test_memo_counters(true);
+UPDATE lv.memo SET n = n + 1;
+SELECT (dolt_commit('-am', 'memo counters'))[1] AS m2 \gset
+SELECT hits, misses FROM test_memo_counters(true);
+SELECT test_walk_new_count(:'m1', :'m2') <= 3 AS no_value_nodes;
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) AS memo_rows
+FROM lv.memo \gset
+-- (the commit's rows are the table's: read back from it)
+UPDATE lv.memo SET body = 'gone';
+SELECT dolt_reset('--hard', :'m2');
+SELECT md5(string_agg(id || ':' || n || ':' || body, ',' ORDER BY id)) = :'memo_rows'
+	AS from_history
+FROM lv.memo;
+-- a commit rolled back: what its fold remembered is forgotten (the
+-- reset above folded the rows it wrote, and remembered their values)
+INSERT INTO lv.memo
+SELECT 4, 0, string_agg(md5('4/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+BEGIN;
+SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
+ROLLBACK;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+SELECT (dolt_commit('-am', 'memo again'))[1] AS m3 \gset
+SELECT hits = 3 AS others_hit, misses = 1 AS rolled_back_missed
+FROM test_memo_counters(true);
+SELECT md5(body) AS body4 FROM lv.memo WHERE id = 4 \gset
+DELETE FROM lv.memo WHERE id = 4;
+SELECT dolt_reset('--hard', :'m3');
+SELECT md5(body) = :'body4' AS body4_from_history FROM lv.memo WHERE id = 4;
+-- a value whose first chunk is frozen isn't remembered (its xmin's age is
+-- unknown): every fold reads it
+INSERT INTO lv.memo
+SELECT 5, 0, string_agg(md5('5/' || i), '' ORDER BY i) FROM generate_series(1, 3000) i;
+VACUUM (FREEZE) lv.memo;
+SELECT count(*) AS reset FROM test_memo_counters(true);
+SELECT length(dolt_commit('-am', 'frozen')::text) AS committed;
+UPDATE lv.memo SET n = n + 1 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'frozen again')::text) AS committed;
+-- (the freeze made every row a candidate: the others hit in both folds)
+SELECT hits = 8 AS others_hit, misses = 2 AS frozen_read_twice
+FROM test_memo_counters(true);
+
 -- Pushed and cloned: a walk from a commit reaches every value tree its
 -- rows reference, so the clone reads them all.
 \getenv abs_builddir PG_ABS_BUILDDIR

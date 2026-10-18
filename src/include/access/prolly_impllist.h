@@ -37,6 +37,7 @@ PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_file)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgresql)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgres)
 PG_PROLLY_IMPL(ProllyReclaimRoutine, prolly_reclaim_copying)
+PG_PROLLY_IMPL(ProllyValueMemoRoutine, prolly_memo_shared)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
@@ -56,3 +57,4 @@ PG_PROLLY_IMPL(ProllyChangeFinderRoutine, prolly_changes_stub)
 PG_PROLLY_IMPL(ProllyCanonRoutine, prolly_canon_stub)
 PG_PROLLY_IMPL(ProllyTreeRoutine, prolly_tree_stub)
 PG_PROLLY_IMPL(ProllyKeyingRoutine, prolly_keying_stub)
+PG_PROLLY_IMPL(ProllyValueMemoRoutine, prolly_memo_stub)

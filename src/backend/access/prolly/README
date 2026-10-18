@@ -44,6 +44,7 @@ design choice can be changed later by writing a new implementation:
 	table_file        prolly_tablefile.h      basic, stub
 	change_finder     prolly_changes.h        pages, stub
 	remote            prolly_remote.h         file
+	value_memo        prolly_memo.h           shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -100,6 +101,18 @@ later conjoined into table files (tablefile_basic.c), with the store's root
 moved by commit records and its appends logged by the ProllyChunks WAL
 resource manager (prolly_xlog.h).
 
+Large values stay TOAST's in the working set.  A commit stores a column
+whose canonical bytes are longer than 2048 as a reference to a value tree
+of its own (valenc_canonical.c, through the tree's value_write()), so
+rows holding the same value share it, and a row that is still long goes
+out of line whole.  Value trees are cut by a rolling hash and addressed
+by byte counts, so an insertion rewrites the chunks around it and a
+slice reads only its own.  A leaf records the references its value
+holds, so walks reach those trees without knowing the rows' layout.  The
+value memo (memo_shared.c) maps a TOAST pointer a fold met to the
+reference it made, so the next fold that meets the pointer (an UPDATE of
+another column kept it) doesn't read the value again.
+
 
 Commits
 -------
@@ -137,7 +150,7 @@ Core hooks
 ----------
 
 prolly_shmem.c is a shared-memory subsystem (subsystemlist.h) reserving
-an area per chunk store implementation that asks for one, and
+an area per chunk store and value memo implementation that asks for one, and
 CheckPointProlly() runs in CheckPointGuts().  createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly

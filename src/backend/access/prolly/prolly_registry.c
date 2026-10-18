@@ -63,6 +63,7 @@ static const char *const applier_callbacks[] = {PROLLY_APPLIER_CALLBACK_NAMES};
 static const char *const tablefile_callbacks[] = {PROLLY_TABLEFILE_CALLBACK_NAMES};
 static const char *const changes_callbacks[] = {PROLLY_CHANGES_CALLBACK_NAMES};
 static const char *const remote_callbacks[] = {PROLLY_REMOTE_CALLBACK_NAMES};
+static const char *const memo_callbacks[] = {PROLLY_MEMO_CALLBACK_NAMES};
 
 /*
  * A routine's callbacks follow its info, one per name, in the names' order:
@@ -93,6 +94,7 @@ CHECK_ROUTINE(ProllyApplierRoutine, PROLLY_APPLIER_FIRST_CALLBACK, PROLLY_APPLIE
 CHECK_ROUTINE(ProllyTableFileRoutine, PROLLY_TABLEFILE_FIRST_CALLBACK, PROLLY_TABLEFILE_LAST_CALLBACK, tablefile_callbacks);
 CHECK_ROUTINE(ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, PROLLY_CHANGES_LAST_CALLBACK, changes_callbacks);
 CHECK_ROUTINE(ProllyRemoteRoutine, PROLLY_REMOTE_FIRST_CALLBACK, PROLLY_REMOTE_LAST_CALLBACK, remote_callbacks);
+CHECK_ROUTINE(ProllyValueMemoRoutine, PROLLY_MEMO_FIRST_CALLBACK, PROLLY_MEMO_LAST_CALLBACK, memo_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -132,6 +134,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("change_finder", ProllyChangeFinderRoutine, PROLLY_CHANGES_FIRST_CALLBACK, changes_callbacks),
 	[PROLLY_IFACE_REMOTE] =
 	IFACE("remote", ProllyRemoteRoutine, PROLLY_REMOTE_FIRST_CALLBACK, remote_callbacks),
+	[PROLLY_IFACE_VALUE_MEMO] =
+	IFACE("value_memo", ProllyValueMemoRoutine, PROLLY_MEMO_FIRST_CALLBACK, memo_callbacks),
 };
 
 static const ProllyInterfaceDesc *

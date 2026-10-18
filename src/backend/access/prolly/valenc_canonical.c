@@ -20,7 +20,12 @@
  * Whether a value goes out of line depends on its own bytes alone, never
  * on its row or its table: a value encodes alike wherever it is, and two
  * rows holding it share its tree.  A row without long values is the same
- * bytes as before references were.  Dropped columns are never
+ * bytes as before references were.
+ *
+ * A value TOAST stored out of line is looked up in the value store's memo
+ * by its pointer first: a fold that meets a pointer an UPDATE of another
+ * column kept writes the reference the fold before made, without reading
+ * the value.  A miss reads it, and remembers the reference made.  Dropped columns are never
  * stored, so a table that dropped a column encodes rows exactly as one that
  * never had it.  Trailing NULL columns are not stored, so adding a nullable
  * column without a default needs no rewrite.
@@ -55,6 +60,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 /* longer canonical bytes are stored out of line; part of the format */
 #define VALUE_INLINE_MAX	2048
@@ -242,16 +248,33 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	for (int j = 0; j < n; j++)
 	{
 		int			i = enc->live_attno[j];
+		Form_pg_attribute att = TupleDescAttr(enc->desc, i);
+		const void *toasted = NULL;
 		StringInfoData val;
+		StringInfoData ref;
 
 		if (enc->nulls[j])
 			continue;
+
+		/* A value TOAST stored out of line: its reference, if remembered. */
+		if (att->attlen == -1 && enc->values && enc->values->memo &&
+			VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(slot->tts_values[i])))
+		{
+			toasted = DatumGetPointer(slot->tts_values[i]);
+			initStringInfo(&ref);
+			if (PROLLY_CALL(enc->values->memo, lookup, enc->values, toasted,
+							att->atttypid, &ref))
+			{
+				prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+				appendBinaryStringInfo(out, ref.data, ref.len);
+				continue;
+			}
+		}
+
 		initStringInfo(&val);
 		prolly_datum_encode(enc->codecs[i], slot->tts_values[i], &val);
 		if (val.len > VALUE_INLINE_MAX)
 		{
-			StringInfoData ref;
-
 			if (enc->values == NULL)
 				no_values();
 			initStringInfo(&ref);
@@ -259,6 +282,13 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 						(const uint8 *) val.data, val.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
+			if (toasted)
+			{
+				ProllyValue r = {(const uint8 *) ref.data, ref.len};
+
+				PROLLY_CALL(enc->values->memo, remember, toasted,
+							att->atttypid, &r);
+			}
 		}
 		else
 		{

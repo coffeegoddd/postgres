@@ -102,12 +102,15 @@ typedef struct ProllyTreeEnv
 
 /*
  * Where values out of line are stored and read: a tree implementation's
- * value trees, in an environment's chunk store.
+ * value trees, in an environment's chunk store; and, optionally, a memo of
+ * the values TOAST stored out of line that were stored there before
+ * (prolly_memo.h).
  */
 typedef struct ProllyValueStore
 {
 	const struct ProllyTreeRoutine *tree;
 	const ProllyTreeEnv *env;
+	const struct ProllyValueMemoRoutine *memo;	/* NULL if none */
 } ProllyValueStore;
 
 /* One change for apply(): a put, or a delete if is_delete. */
@@ -224,14 +227,18 @@ typedef struct ProllyTreeRoutine
 								Size len, StringInfo ref);
 	void		(*value_read) (const ProllyTreeEnv *env, const ProllyValue *ref,
 							   uint64 offset, uint64 len, StringInfo out);
+
+	/* Whether the value tree a reference names is in the chunk store. */
+	bool		(*value_present) (const ProllyTreeEnv *env,
+								  const ProllyValue *ref);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
-	"walk", "diff", "diff_nodes", "references", "value_write", "value_read"
+	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", "value_present"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK value_read
+#define PROLLY_TREE_LAST_CALLBACK value_present
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

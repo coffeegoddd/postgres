@@ -317,3 +317,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_walk_new_count(from_commit text, to_commit text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- What the value memo's lookups found since the last reset.
+CREATE FUNCTION test_memo_counters(reset bool DEFAULT false, OUT hits int8,
+	OUT misses int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C;

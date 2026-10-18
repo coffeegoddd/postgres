@@ -30,6 +30,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_VALUE_ENCODER] = "canonical",
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",
 	[PROLLY_IFACE_TREE] = "cow",
+	[PROLLY_IFACE_VALUE_MEMO] = "shared",
 };
 
 /*
@@ -107,6 +108,8 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 		profile_impl(history_profile, PROLLY_IFACE_TREE);
 	components->keying = (const ProllyKeyingRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_TABLE_KEYING);
+	components->value_memo = (const ProllyValueMemoRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_VALUE_MEMO);
 }
 
 void
@@ -145,6 +148,8 @@ prolly_keying_use_env(ProllyKeyingRefs *refs, const ProllyKeyingRoutine *routine
 	refs->keying = k;
 	refs->values.tree = tree;
 	refs->values.env = env;
+	refs->values.memo = (const ProllyValueMemoRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_VALUE_MEMO);
 	PROLLY_CALL(routine, set_values, k, &refs->values);
 	env->value_refs = keying_value_refs;
 	env->value_refs_arg = refs;
