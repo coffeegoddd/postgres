@@ -74,10 +74,14 @@ SELECT dolt_branch('dep_side');
  {0}
 (1 row)
 
-REVOKE SELECT ON dep.t FROM regress_dep_reader;
-SELECT length(dolt_commit('-Am', 'no grant')::text) AS committed;
-ERROR:  nothing to commit
-HINT:  Pass --allow-empty to commit anyway.
+REVOKE SELECT ON dep.t FROM regress_dep_reader;	-- (not a dependency)
+ALTER TABLE dep.t ALTER COLUMN c DROP DEFAULT;	-- the function no longer needed
+SELECT length(dolt_commit('-Am', 'no default')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 SELECT dolt_checkout('dep_side');
             dolt_checkout            
 -------------------------------------
@@ -104,12 +108,11 @@ SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
 (1 row)
 
 SELECT * FROM pg_temp.deps();
-                  key                   |                     value                     
-----------------------------------------+-----------------------------------------------
- d:extension citext                     | 1.8
- d:function dep_util.double_it(integer) | function\x09{dep_util,double_it}\x09{integer}
- d:type dep_util.mood                   | type\x09{dep_util.mood}\x09{}
-(3 rows)
+         key          |             value             
+----------------------+-------------------------------
+ d:extension citext   | 1.8
+ d:type dep_util.mood | type\x09{dep_util.mood}\x09{}
+(2 rows)
 
 SELECT dolt_checkout('dep_side');
             dolt_checkout            

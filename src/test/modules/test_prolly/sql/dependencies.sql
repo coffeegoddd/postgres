@@ -40,8 +40,9 @@ SELECT length(dolt_commit('-Am', 'deps changed')::text) AS committed;
 -- a merge of branches whose dependencies differ: no schema conflict, and
 -- the merged commit's are described afresh
 SELECT dolt_branch('dep_side');
-REVOKE SELECT ON dep.t FROM regress_dep_reader;
-SELECT length(dolt_commit('-Am', 'no grant')::text) AS committed;
+REVOKE SELECT ON dep.t FROM regress_dep_reader;	-- (not a dependency)
+ALTER TABLE dep.t ALTER COLUMN c DROP DEFAULT;	-- the function no longer needed
+SELECT length(dolt_commit('-Am', 'no default')::text) AS committed;
 SELECT dolt_checkout('dep_side');
 CREATE TABLE dep.u (id int PRIMARY KEY, m dep_util.mood);
 SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
