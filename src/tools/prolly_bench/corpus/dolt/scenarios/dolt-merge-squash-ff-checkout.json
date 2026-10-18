@@ -1,0 +1,284 @@
+{
+  "version": 1,
+  "id": "dolt-merge-squash-ff-checkout",
+  "description": "Reviewed Dolt port: CALL DOLT_MERGE ff & squash with a checkout in between",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: CALL DOLT_MERGE ff & squash with a checkout in between"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0),(1),(2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "step1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "Step 1"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch($1)",
+      "params": [
+        "feature-branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout($1)",
+      "params": [
+        "feature-branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'feature-branch'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "insert3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET pk=1000 WHERE pk=0",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "ff-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "this is a ff"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout($1)",
+      "params": [
+        "main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'main'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1] = dolt_hashof('feature-branch'), m[2], m[3], m[4] FROM dolt_merge('feature-branch', '--squash') m",
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "1",
+            "0",
+            "merge successful"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('other')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout($1)",
+      "params": [
+        "other"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'other'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout($1)",
+      "params": [
+        "main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'main'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM test ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ],
+          [
+            "2"
+          ],
+          [
+            "3"
+          ],
+          [
+            "1000"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

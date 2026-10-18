@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "id": "dolt-merge-unique-deleted-rows",
+  "description": "Reviewed Dolt port: unique constraint checks do not consider deleted rows",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: unique constraint checks do not consider deleted rows"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE tableA (pk varchar(255) PRIMARY KEY, col1 varchar(255), CONSTRAINT unique1 UNIQUE (col1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO tableA VALUES ('B', '1'), ('C', 2), ('Y', '100')",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "create-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "creating table"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch($1)",
+      "params": [
+        "feature"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "update-b",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE tableA SET pk = 'A' WHERE pk = 'B'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "update-y",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE tableA SET pk = 'Z' WHERE pk = 'Y'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "update-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "update two rows"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "feature"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "update-c",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE tableA SET col1 = 'C' WHERE pk = 'C'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "feature-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "added row on branch feature"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1] = dolt_hashof('HEAD'), m[2], m[3], m[4] FROM dolt_merge('main') m",
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "merge successful"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations('tableA')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM tableA",
+      "expect": {
+        "rows": [
+          [
+            "A",
+            "1"
+          ],
+          [
+            "C",
+            "C"
+          ],
+          [
+            "Z",
+            "100"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

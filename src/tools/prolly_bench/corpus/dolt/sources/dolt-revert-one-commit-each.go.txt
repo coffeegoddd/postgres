@@ -1,0 +1,36 @@
+{
+		Name: "dolt_revert() multi-commit: one commit per revert",
+		SetUpScript: []string{
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(2,2),(3,3);",
+			"call dolt_commit('-Am', 'seed table');",
+			"insert into test values (4, 4);",
+			"call dolt_commit('-am', 'insert row 4');",
+			"insert into test values (5, 5);",
+			"call dolt_commit('-am', 'insert row 5');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select count(*) from dolt_log;",
+				Expected: []sql.Row{{5}},
+			},
+			{
+				// Reverting two commits should produce two separate commits.
+				Query:    "call dolt_revert('HEAD', 'HEAD~1');",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "select count(*) from dolt_log;",
+				Expected: []sql.Row{{7}},
+			},
+			{
+				Query:    "select message from dolt_log limit 2;",
+				Expected: []sql.Row{{`Revert "insert row 5"`}, {`Revert "insert row 4"`}},
+			},
+			{
+				// Both rows should be gone.
+				Query:    "select * from test order by pk;",
+				Expected: []sql.Row{{1, 1}, {2, 2}, {3, 3}},
+			},
+		},
+	}

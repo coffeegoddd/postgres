@@ -1,0 +1,33 @@
+{
+		Name: "CALL DOLT_MERGE ff & squash with a checkout in between",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int primary key)",
+			"call DOLT_ADD('.')",
+			"INSERT INTO test VALUES (0),(1),(2);",
+			"SET autocommit = 0",
+			"CALL DOLT_COMMIT('-a', '-m', 'Step 1');",
+			"CALL DOLT_CHECKOUT('-b', 'feature-branch')",
+			"INSERT INTO test VALUES (3);",
+			"UPDATE test SET pk=1000 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'this is a ff');",
+			"CALL DOLT_CHECKOUT('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('feature-branch', '--squash')",
+				Expected: []sql.Row{{doltCommit, 1, 0, "merge successful"}},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('-b', 'other')",
+				Expected: []sql.Row{{0, "Switched to branch 'other'"}},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('main')",
+				Expected: []sql.Row{{0, "Switched to branch 'main'"}},
+			},
+			{
+				Query:    "SELECT * FROM test order by pk",
+				Expected: []sql.Row{{1}, {2}, {3}, {1000}},
+			},
+		},
+	}

@@ -1,0 +1,52 @@
+{
+		// https://github.com/dolthub/dolt/issues/6329
+		Name: "Multiple foreign key violations for a given row reported",
+		SetUpScript: []string{
+			"SET dolt_force_transaction_commit = on;",
+			`
+			CREATE TABLE parent(
+			  pk int PRIMARY KEY, 
+			  col1 int, 
+			  col2 int, 
+			  INDEX par_col1_idx (col1), 
+			  INDEX par_col2_idx (col2)
+			);`,
+			`
+			CREATE TABLE child(
+			  pk int PRIMARY KEY,
+			  col1 int,
+			  col2 int,
+			  FOREIGN KEY (col1) REFERENCES parent(col1),
+			  FOREIGN KEY (col2) REFERENCES parent(col2)
+			);`,
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO parent VALUES (1, 1, 1);",
+			"CALL DOLT_COMMIT('-am', 'initial');",
+
+			"CALL DOLT_CHECKOUT('-b', 'right');",
+			"INSERT INTO CHILD VALUES (1, 1, 1);",
+			"CALL DOLT_COMMIT('-am', 'insert child');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"DELETE from parent where pk = 1;",
+			"CALL DOLT_COMMIT('-am', 'delete parent');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "SELECT * from dolt_constraint_violations;",
+				Expected: []sql.Row{{"child", uint64(2)}},
+			},
+			{
+				Query:    "SELECT * from parent;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT * from child;",
+				Expected: []sql.Row{{1, 1, 1}},
+			},
+		},
+	}

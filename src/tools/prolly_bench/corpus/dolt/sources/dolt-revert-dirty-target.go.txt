@@ -1,0 +1,16 @@
+{
+		Name: "dolt_revert() refuses when revert target table is dirty",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c0 int);",
+			"call dolt_commit('-Am', 'seed schema');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-am', 'add row to t');",
+			"insert into t values (99, 99);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_revert('HEAD');",
+				ExpectedErrStr: "error: Your local changes would be overwritten by revert.\nhint: Please commit your changes before you revert.",
+			},
+		},
+	}

@@ -136,7 +136,15 @@ SELECT dolt_revert(:'parent10');
 BEGIN;
 SELECT dolt_revert(:'parent10');
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
-ROLLBACK;
+-- dolt_commit refuses them, unless forced; the transaction still can't
+-- commit with them.
+SAVEPOINT s;
+SELECT dolt_commit('-am', 'not with violations');
+ROLLBACK TO s;
+SELECT length(dolt_commit('-afm', 'forced')::text) AS committed;
+SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::text) AS committed;
+COMMIT;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 
 -- Rows a parent's row security hides from its owner are seen anyway, as
 -- the foreign key's own checks see them.

@@ -1,0 +1,242 @@
+{
+  "version": 1,
+  "id": "dolt-merge-violations-persisted",
+  "description": "Reviewed Dolt port: Constraint violations are persisted",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: Constraint violations are persisted"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create-parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (pk int PRIMARY KEY, col1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (pk int PRIMARY KEY, parent_fk int, FOREIGN KEY (parent_fk) REFERENCES parent (pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-other",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE other (pk int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1, 1), (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "branch2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "delete",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM parent WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "delete-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "delete parent 1"
+      ],
+      "save": "deleted"
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "insert-child",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert child of parent 1"
+      ],
+      "save": "child"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('branch1') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'pk', violating_row->>'parent_fk' FROM dolt_constraint_violations('child')",
+      "expect": {
+        "rows": [
+          [
+            "foreign key",
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'pk', violating_row->>'parent_fk' FROM dolt_constraint_violations('CHILD')",
+      "expect": {
+        "rows": [
+          [
+            "foreign key",
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [
+          [
+            "public.child",
+            "f",
+            "constraint violation"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

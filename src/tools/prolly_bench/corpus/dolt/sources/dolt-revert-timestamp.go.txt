@@ -1,0 +1,18 @@
+{
+		Name: "dolt_revert() commit has current timestamp",
+		SetUpScript: []string{
+			"create table test (pk int primary key, c0 int)",
+			"insert into test values (1,1),(2,2),(3,3);",
+			"call dolt_commit('-Am', 'seed table');",
+			"update test set c0 = 42 where pk = 2;",
+			"call dolt_commit('-am', 'answer of the universe: 42');",
+			"call dolt_revert('HEAD');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// The revert commit must use the current system time, not the zero time (0001-01-01).
+				Query:    "select year(date) > 2000 from dolt_log limit 1;",
+				Expected: []sql.Row{{true}},
+			},
+		},
+	}

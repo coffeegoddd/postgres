@@ -1,0 +1,27 @@
+{
+		Name: "dolt_revert() detects constraint violations and returns violation counts",
+		SetUpScript: []string{
+			"set @@autocommit=0;",
+			"create table test2 (pk int primary key, c0 int)",
+			"insert into test2 values (1,1),(2,NULL),(3,3);",
+			"call dolt_commit('-Am', 'new table with NULL value');",
+			"delete from test2 where pk = 2;",
+			"call dolt_commit('-am', 'deleted row with NULL value');",
+			"alter table test2 modify c0 int not null",
+			"call dolt_commit('-am', 'modified column c0 to not null');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_revert('head~1');",
+				Expected: []sql.Row{{"", 0, 0, 1}},
+			},
+			{
+				Query:    "select `table` from dolt_constraint_violations;",
+				Expected: []sql.Row{{"test2"}},
+			},
+			{
+				Query:    "select violation_type, pk, c0 from dolt_constraint_violations_test2;",
+				Expected: []sql.Row{{"not null", 2, nil}},
+			},
+		},
+	}

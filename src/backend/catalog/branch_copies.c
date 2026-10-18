@@ -353,15 +353,22 @@ delete_here(void *arg)
 /*
  * Is name a branch's name by git's rules (git check-ref-format, as Dolt
  * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
- * refspec, and so on: a branch so named couldn't be named again.
+ * refspec, and so on: a branch so named couldn't be named again.  As in
+ * Dolt, a name is ASCII, and may begin with "-" (given after "--") but
+ * isn't "-" alone (git's previous branch); "HEAD", in any case, the
+ * session branch's head, isn't a branch's name.  (Nor is a commit's id:
+ * the refs, which know commits, refuse that.)
  */
 static bool
 branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
 
-	if (strcmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
-		name[0] == '-' || name[0] == '/' || name[len - 1] == '/' ||
+	if (len == 0 || len >= NAMEDATALEN || strcmp(name, "-") == 0)
+		return false;
+
+	if (pg_strcasecmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
+		name[0] == '/' || name[len - 1] == '/' ||
 		name[len - 1] == '.' || strstr(name, "..") != NULL ||
 		strstr(name, "@{") != NULL || strstr(name, "//") != NULL)
 		return false;
@@ -381,7 +388,7 @@ branch_name_ok(const char *name)
 	{
 		unsigned char c = (unsigned char) *p;
 
-		if (c <= ' ' || c == 0x7f || strchr("~^:?*[\\", c) != NULL)
+		if (c <= ' ' || c >= 0x7f || strchr("~^:?*[\\", c) != NULL)
 			return false;
 	}
 	return true;
@@ -392,11 +399,11 @@ copies_check_create(const char *name)
 {
 	AclResult	aclresult;
 
-	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN || !branch_name_ok(name))
+	if (!branch_name_ok(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" or \"@\"; not beginning with \"-\" or \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not \"-\" alone or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	/* (one made on the session's behalf is the database's mechanism, not the role's) */
 	if (BranchCreateOnBehalf)
@@ -499,6 +506,48 @@ copies_drop(const char *name)
 	table_close(brel, NoLock);
 }
 
+/*
+ * Renaming changes only the pg_branch row: copies, and sessions, know a
+ * branch by its id.  Not main, which every database has.
+ */
+static void
+copies_rename(const char *name, const char *newname, bool force)
+{
+	Relation	brel;
+	Oid			branch;
+	HeapTuple	tup;
+	NameData	brname;
+
+	copies_check_drop(name);
+	copies_check_create(newname);
+	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
+	branch = branch_oid(name, false);
+	if (branch == BRANCH_MAIN_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"main\" can't be renamed")));
+	if (OidIsValid(branch_oid(newname, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", newname)));
+	/* (the session's own lock on its branch doesn't conflict) */
+	if (!force && !lock_branch_for_delete(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is checked out in another session", name),
+				 errhint("Rename it anyway with -f.")));
+
+	tup = SearchSysCacheCopy1(BRANCHOID, ObjectIdGetDatum(branch));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for branch %u", branch);
+	namestrcpy(&brname, newname);
+	((Form_pg_branch) GETSTRUCT(tup))->brname = brname;
+	CatalogTupleUpdate(brel, &tup->t_self, tup);
+	heap_freetuple(tup);
+	CommandCounterIncrement();
+	table_close(brel, NoLock);
+}
+
 static void
 copies_checkout(const char *name)
 {
@@ -542,8 +591,10 @@ static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
 	.drop = copies_drop,
+	.rename = copies_rename,
 	.check_create = copies_check_create,
 	.check_drop = copies_check_drop,
+	.name_ok = branch_name_ok,
 	.make = copies_make,
 	.checkout = copies_checkout,
 	.current = copies_current,

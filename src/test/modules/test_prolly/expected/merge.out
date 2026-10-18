@@ -107,9 +107,9 @@ SELECT * FROM dolt_status();
 (0 rows)
 
 SELECT (dolt_merge('feature'))[2:4];		-- merged already
-          dolt_merge           
--------------------------------
- {0,0,"Everything up-to-date"}
+                            dolt_merge                            
+------------------------------------------------------------------
+ {0,0,"cannot fast forward from a to b. a is ahead of b already"}
 (1 row)
 
 -- Conflicts: both change row 5, differently; feature also changes row 6.
@@ -648,7 +648,7 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  t
 (1 row)
 
-UPDATE mgd.t SET a = 'uno';
+UPDATE mgd.t SET a = 'uno', c = 7;
 SELECT length(dolt_commit('-am', 'a is uno')::text) AS committed;
  committed 
 -----------
@@ -665,7 +665,7 @@ SELECT (dolt_merge('mgd_side'))[2:4];
 SELECT our_row, their_row FROM dolt_conflicts(NULL::mgd.t);
   our_row  | their_row 
 -----------+-----------
- (1,uno,5) | (1,one,)
+ (1,uno,7) | (1,one,)
 (1 row)
 
 ROLLBACK;

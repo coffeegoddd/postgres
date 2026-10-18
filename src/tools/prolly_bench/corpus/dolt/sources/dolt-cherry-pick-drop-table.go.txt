@@ -1,0 +1,27 @@
+{
+		Name: "schema change: DROP TABLE",
+		SetUpScript: []string{
+			"CREATE TABLE dropme (pk BIGINT PRIMARY KEY, v varchar(10));",
+			"INSERT INTO dropme VALUES (11, 'aa'), (22, 'ab');",
+			"call dolt_commit('-Am', 'create table dropme');",
+			"call dolt_checkout('-b', 'branch1');",
+			"drop table dropme;",
+			"call dolt_commit('-Am', 'drop table dropme');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{{"dropme"}},
+			},
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

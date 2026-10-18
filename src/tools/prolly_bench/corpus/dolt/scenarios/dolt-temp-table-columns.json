@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "id": "dolt-temp-table-columns",
+  "description": "Reviewed Dolt port: temporary table tag collision",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTempTableScripts: temporary table tag collision"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "on-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "note",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE note (a int, b int, userid int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TEMPORARY TABLE tmp_tbl (a int, b int, c int, d int, e int, f int, g int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    }
+  ]
+}

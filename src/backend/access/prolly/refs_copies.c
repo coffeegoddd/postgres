@@ -17,8 +17,11 @@
  *	'M' name	-> the branch's merge in progress: the merged head and the
  *				   common ancestor (hash length, hash each), the count of
  *				   tables with unresolved conflicts and their OIDs (4 bytes
- *				   each, big-endian), then, if it is a cherry-pick, the
- *				   picked commit's message
+ *				   each, big-endian), then, if it is a cherry-pick, 'p'
+ *				   and the picked commit's message, or, a revert's, 'r',
+ *				   the head before its series (hash length, hash), the
+ *				   count of commits still to revert and their ids (hash
+ *				   length, hash each), and its commit's message
  *	'V' name	-> the branch's constraint violations: for each, its
  *				   table's OID (4 bytes, big-endian), then its type, row and
  *				   what it violates, each a length (4 bytes, big-endian) and
@@ -200,7 +203,7 @@ check_merge_conflicts(const char *what)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
-					 errdetail("Table \"%s\" has a row that violates a %s constraint on branch \"%s\".",
+					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
 							   get_rel_name(((ProllyViolation *) linitial(v))->relid),
 							   ((ProllyViolation *) linitial(v))->type,
 							   (char *) lfirst(lc)),
@@ -868,9 +871,20 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 {
 	ProllyCommitInfo info;
 
-	/* HEAD: the session branch's head commit, as in Dolt. */
-	if (strcmp(refname, "HEAD") == 0)
+	/*
+	 * HEAD, in any case: the session branch's head commit, as in Dolt.  (A
+	 * branch so named, made before HEAD's other cases were refused, is
+	 * still itself.)
+	 */
+	if (pg_strcasecmp(refname, "HEAD") == 0 && !branch_exists(refname))
 		refname = branch_ops()->current();
+	/*
+	 * a branch by its full ref name, as in Dolt and git (unless a branch
+	 * is named so itself)
+	 */
+	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0' &&
+			 !branch_exists(refname))
+		refname += 11;
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
 	if (tracking_head(refname, commit_id))
@@ -934,7 +948,7 @@ copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 	return copies_commit_get(id, info);
 }
 
-/* The newest common ancestor of a and b, each commit visited once. */
+/* The best common ancestor of a and b (prolly_history_merge_base()). */
 static bool
 copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 {
@@ -1163,6 +1177,72 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
  * ------------------------------------------------------------------------
  */
 
+/*
+ * A branch whose name differs from name only by case, other than ignore:
+ * found into *arg.
+ */
+typedef struct OtherCase
+{
+	const char *name;
+	const char *ignore;
+	char	   *found;
+} OtherCase;
+
+static void
+find_other_case(const char *name, const ProllyHash *head, void *arg)
+{
+	OtherCase  *oc = arg;
+
+	if (oc->found == NULL && strcmp(name, oc->name) != 0 &&
+		(oc->ignore == NULL || strcmp(name, oc->ignore) != 0) &&
+		pg_strcasecmp(name, oc->name) == 0)
+		oc->found = pstrdup(name);
+}
+
+static void copies_branches(ProllyBranchVisit visit, void *arg);
+
+/*
+ * Refuse a new branch name that differs from a branch's, other than
+ * ignore's (a branch being renamed), only by case, as Dolt does: on a
+ * case-insensitive file system (or to a user) they're one.  Names are
+ * ASCII, folded as such.  (The hidden branches of sessions checked out at
+ * commits, named for them, aren't checked: no user names them.)  Every
+ * branch is visited: a create's cost grows with the branches there are.
+ */
+static void
+refuse_other_case(const char *name, const char *ignore)
+{
+	OtherCase	oc = {name, ignore, NULL};
+
+	if (strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		return;
+	copies_branches(find_other_case, &oc);
+	if (oc.found)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", oc.found),
+				 errdetail("Branch names that differ only by case name one branch.")));
+}
+
+/*
+ * Refuse a new branch name that is a commit's id (in any case, as ids are
+ * read): a branch so named would hide the commit wherever refs are read,
+ * branches being looked for first.  Checked before the name's other
+ * rules, whatever the length of the ids the hash makes.
+ */
+static void
+refuse_commit_name(const char *name)
+{
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	if (parse_commit_id(name, &id) && copies_commit_get(&id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("invalid branch name \"%s\"", name),
+				 errdetail("It is a commit's id.")));
+}
+
 static void
 copies_branch_create(const char *name, const char *start_point)
 {
@@ -1171,8 +1251,11 @@ copies_branch_create(const char *name, const char *start_point)
 	ProllyCommitInfo info;
 	bool		from_exists;
 
+	refs_init();
+	refuse_commit_name(name);
 	branch_ops()->check_create(name);
 	lock_refs();
+	refuse_other_case(name, NULL);
 	if (branch_exists(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -1255,6 +1338,93 @@ copies_branch_delete(const char *name, bool force)
 		names_key(&key, name);
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
+	}
+}
+
+/*
+ * Rename a branch: its catalog row (one with copies), then each of its
+ * entries, moved to the new name.  A rename to its own name changes
+ * nothing.
+ */
+static void
+copies_branch_rename(const char *name, const char *newname, bool force)
+{
+	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
+	TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	ListCell   *lc;
+
+	lock_refs();
+	if (!branch_exists(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" does not exist", name)));
+	if (strcmp(name, newname) == 0)
+		return;
+	refuse_commit_name(newname);
+	refuse_other_case(newname, name);
+
+	/*
+	 * Forced, it takes the place of a branch of the new name, as in Dolt;
+	 * not one whose name differs only by case, refused above either way:
+	 * the user named another branch.
+	 */
+	if (branch_exists(newname) && !force)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", newname),
+				 errhint("Replace it with -f.")));
+	if (branch_exists(newname))
+		copies_branch_delete(newname, true);
+	if (OidIsValid(branch_oid(name)))
+		branch_ops()->rename(name, newname, force);
+	else
+	{
+		/* (one with only a head: no session is on it) */
+		branch_ops()->check_drop(name);
+		branch_ops()->check_create(newname);
+	}
+	for (int i = 0; i < lengthof(tags); i++)
+	{
+		StringInfoData key;
+		StringInfoData v;
+
+		initStringInfo(&key);
+		initStringInfo(&v);
+		appendStringInfoChar(&key, tags[i]);
+		appendStringInfoString(&key, name);
+
+		/*
+		 * (what the source hasn't, the new name hasn't either: a branch it
+		 * replaced may have left its upstream there)
+		 */
+		if (refs_get(key.data, key.len, &v))
+		{
+			refs_put(key.data, key.len, NULL);
+			resetStringInfo(&key);
+			appendStringInfoChar(&key, tags[i]);
+			appendStringInfoString(&key, newname);
+			refs_put(key.data, key.len, &v);
+		}
+		else
+		{
+			resetStringInfo(&key);
+			appendStringInfoChar(&key, tags[i]);
+			appendStringInfoString(&key, newname);
+			refs_put(key.data, key.len, NULL);
+		}
+		pfree(key.data);
+		pfree(v.data);
+	}
+	/* (a merge state the transaction set is checked under the new name) */
+	foreach(lc, merge_changed)
+	{
+		if (strcmp(lfirst(lc), name) == 0)
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+			lfirst(lc) = pstrdup(newname);
+			MemoryContextSwitchTo(old);
+		}
 	}
 }
 
@@ -1684,9 +1854,25 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
 		for (int i = 0; i < state->ntables; i++, p += 4)
 			state->tables[i] = get_be32(p);
-		/* a cherry-pick's message */
+		/* a cherry-pick's message; a revert's series, then its message */
 		state->pick = p < end;
-		state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
+		if (state->pick && *p == 'r')
+		{
+			state->revert = true;
+			p = get_hash(p + 1, end, &state->series_head);
+			if (end - p < 4)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly refs hold an invalid merge state")));
+			state->npending = get_be32(p);
+			p += 4;
+			state->pending = palloc(sizeof(ProllyHash) * Max(state->npending, 1));
+			for (int i = 0; i < state->npending; i++)
+				p = get_hash(p, end, &state->pending[i]);
+			state->message = pnstrdup(p, end - p);
+		}
+		else
+			state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -1726,7 +1912,16 @@ copies_set_merge_state(const ProllyMergeState *state)
 		put_be32(&v, state->ntables);
 		for (int i = 0; i < state->ntables; i++)
 			put_be32(&v, state->tables[i]);
-		if (state->pick)
+		if (state->revert)
+		{
+			appendStringInfoChar(&v, 'r');
+			put_hash(&v, &state->series_head);
+			put_be32(&v, state->npending);
+			for (int i = 0; i < state->npending; i++)
+				put_hash(&v, &state->pending[i]);
+			appendStringInfoString(&v, state->message ? state->message : "");
+		}
+		else if (state->pick)
 		{
 			appendStringInfoChar(&v, 'p');
 			appendStringInfoString(&v, state->message ? state->message : "");
@@ -2507,4 +2702,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.config_set = copies_config_set,
 	.open = refs_init,
 	.commit_rows = copies_commit_rows,
+	.branch_rename = copies_branch_rename,
 };

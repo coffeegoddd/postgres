@@ -1,0 +1,39 @@
+{
+		Name: "VARCHAR to TEXT widening with right side modification",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE table t (pk int primary key, col1 varchar(10), col2 int);",
+			"INSERT into t values (1, '54321', 10);",
+			"alter table t add index idx1 (col1(10));",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 TEXT;",
+			"UPDATE t SET col2 = 40 WHERE col2 = 10",
+			"INSERT into t values (2, '43210000000', 20);",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (3, '321', 30);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query: "select * from t order by pk;",
+				Expected: []sql.Row{
+					{1, "54321", 40},
+					{2, "43210000000", 20},
+					{3, "321", 30},
+				},
+			},
+			{
+				Query: "select col1 from t order by col1;",
+				Expected: []sql.Row{
+					{"321"},
+					{"43210000000"},
+					{"54321"},
+				},
+			},
+		},
+	}

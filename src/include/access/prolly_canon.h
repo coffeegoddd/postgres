@@ -51,7 +51,13 @@
  * - move_schema() makes the session branch's objects defined as a folded
  *   root defines them, from as another (the branch folded now) does: it
  *   changes the definitions, then calls rows(), which writes the tables'
- *   rows, then adds what the rows must satisfy.
+ *   rows, then adds what the rows must satisfy.  A check, not-null or
+ *   foreign key constraint it adds to a table the rows written may break
+ *   is added unvalidated first, and breaking() (if given) called with them
+ *   (ProllyAddedConstraint *): it takes the rows that break a check or
+ *   NOT NULL away, which the move then validates, and checks a foreign
+ *   key itself (marking it validated), which the move validates only
+ *   without breaking().
  *
  * Provisional (v0).
  *
@@ -99,6 +105,7 @@ typedef struct ProllyTableColumn
 {
 	char	   *name;
 	char	   *type;			/* as format_type() writes it */
+	char	   *generated;		/* a generated column's expression, or NULL */
 } ProllyTableColumn;
 
 /* A transaction's own row changes to a table: its tuple versions' TIDs. */
@@ -108,6 +115,14 @@ typedef struct ProllyRowChanges
 	ItemPointerData *tids;
 	int			ntids;
 } ProllyRowChanges;
+
+/* A constraint a move adds: its table (qualified, quoted) and name. */
+typedef struct ProllyAddedConstraint
+{
+	char	   *table;
+	char	   *name;
+	bool		foreign_key;
+} ProllyAddedConstraint;
 
 typedef struct ProllyCanonRoutine
 {
@@ -133,7 +148,9 @@ typedef struct ProllyCanonRoutine
 	void		(*objects) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 							ProllyCanonObjectVisit visit, void *arg);
 	void		(*move_schema) (const ProllyNodeRef *from, const ProllyNodeRef *to,
-								void (*rows) (void *arg), void *arg);
+								void (*rows) (void *arg),
+								void (*breaking) (List *added, void *arg),
+								void *arg);
 	void		(*sequences) (const ProllyNodeRef *root,
 							  ProllyCanonSequenceVisit visit, void *arg);
 	void		(*fold_dependencies) (ProllyNodeRef *tree);

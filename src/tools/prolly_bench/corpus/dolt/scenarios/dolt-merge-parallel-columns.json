@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "id": "dolt-merge-parallel-columns",
+  "description": "Reviewed Dolt port: parallel column updates (repro issue #4547)",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: parallel column updates (repro issue #4547)"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "allow",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (rowId int NOT NULL, col1 varchar(255), col2 varchar(255), keyCol varchar(60), dataA varchar(255), dataB varchar(255), PRIMARY KEY (rowId), CONSTRAINT uniqKey UNIQUE (col1, col2, keyCol))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t (rowId, col1, col2, keyCol, dataA, dataB) VALUES (1, '1', '2', 'key-a', 'test1', 'test2')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "new",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table"
+      ],
+      "save": "new"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET dataA = 'other'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "update data other"
+      ],
+      "save": "other"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "main-update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET dataB = 'main'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "update on main"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "other"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations('t')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1",
+            "2",
+            "key-a",
+            "other",
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

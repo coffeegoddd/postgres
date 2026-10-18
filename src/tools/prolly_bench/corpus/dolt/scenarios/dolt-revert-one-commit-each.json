@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "id": "dolt-revert-one-commit-each",
+  "description": "Reviewed Dolt port: dolt_revert() multi-commit: one commit per revert",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() multi-commit: one commit per revert"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(2,2),(3,3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed table"
+      ],
+      "save": "seeded"
+    },
+    {
+      "id": "i4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (4, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "i4-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert row 4"
+      ],
+      "save": "row4"
+    },
+    {
+      "id": "i5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (5, 5)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "i5-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert row 5"
+      ],
+      "save": "row5"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_revert($1, $2) r",
+      "params": [
+        "HEAD",
+        "HEAD~1"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 2",
+      "expect": {
+        "rows": [
+          [
+            "Revert \"insert row 5\""
+          ],
+          [
+            "Revert \"insert row 4\""
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM test ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "2"
+          ],
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

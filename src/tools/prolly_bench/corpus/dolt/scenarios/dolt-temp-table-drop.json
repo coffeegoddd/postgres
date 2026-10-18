@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "id": "dolt-temp-table-drop",
+  "description": "Reviewed Dolt port: drop temporary table behavior",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTempTableScripts: drop temporary table behavior"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "on-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "t",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (i int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "tmp",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TEMPORARY TABLE tmp (i int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 AND table_schema = (SELECT nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE c.oid = $1::regclass) ORDER BY ordinal_position",
+      "params": [
+        "tmp"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "i",
+            "integer"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE pg_temp.tmp",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TEMPORARY TABLE t (i int, j int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 AND table_schema = (SELECT nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE c.oid = $1::regclass) ORDER BY ordinal_position",
+      "params": [
+        "t"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "i",
+            "integer"
+          ],
+          [
+            "j",
+            "integer"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE pg_temp.t",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 AND table_schema = (SELECT nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE c.oid = $1::regclass) ORDER BY ordinal_position",
+      "params": [
+        "t"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "i",
+            "integer"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE pg_temp.t",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    }
+  ]
+}

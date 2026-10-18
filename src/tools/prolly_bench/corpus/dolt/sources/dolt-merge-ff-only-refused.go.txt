@@ -1,0 +1,24 @@
+{
+		Name: "--ff-only flag failure when fast-forward is not possible",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20));",
+			"INSERT INTO t VALUES (1, 'main1'), (2, 'main2');",
+			"CALL dolt_commit('-Am', 'main commit');",
+			"CALL dolt_checkout('-b', 'feature');",
+			"INSERT INTO t VALUES (3, 'feature1');",
+			"CALL dolt_commit('-am', 'feature commit');",
+			"CALL dolt_checkout('main');",
+			"INSERT INTO t VALUES (4, 'main3');",
+			"CALL dolt_commit('-am', 'main commit 2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL dolt_merge('--ff-only', 'feature');",
+				ExpectedErrStr: "fatal: Not possible to fast-forward, aborting",
+			},
+			{
+				Query:    "SELECT * FROM t ORDER BY pk;",
+				Expected: []sql.Row{{1, "main1"}, {2, "main2"}, {4, "main3"}}, // No changes
+			},
+		},
+	}

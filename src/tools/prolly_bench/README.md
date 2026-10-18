@@ -314,18 +314,37 @@ cd src/tools/prolly_bench/slt && go test ./...
 
 `slt/internal/vcscenario` defines version 1 of the shared scenario format
 and an engine-adapter interface. A scenario has an ID, description, required
-capabilities (`sql`, optionally `vc.core`), named persistent sessions, and
-ordered steps. Imported cases can record their source repository, pinned
-revision, file and original case name. Unknown fields, operations,
-capabilities, sessions and forward commit references are errors.
+capabilities, named persistent sessions, and ordered steps. Imported cases
+can record their source repository, pinned revision, file and original case
+name. Unknown fields, operations, capabilities, sessions and forward commit
+references are errors.
+
+Capabilities are `sql` and the version-control groups in
+`vcscenario/capabilities.go`: `vc.core` (commit, branch, checkout, hard
+reset, log, status, hashof), `vc.merge`, `vc.conflicts`, `vc.violations`,
+`vc.cherrypick`, `vc.revert` and `vc.diff`. A scenario requires exactly what
+its steps need, no more.
 
 SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
-VC steps are `commit` (message), `branch` (name and optional start ref),
-`checkout` (branch), and `reset` (hard-reset ref). Arguments are in `args`;
-SQL bind parameters are in `params`. Successful commits require a unique
-`save` name. A later `{"ref":"base"}` resolves to that engine's captured
-identifier, including in query parameters and expected rows. No cross-engine
-hash equality is assumed. SQL strings remain explicitly dialect-specific.
+They may call `dolt_*` functions and views; such a step lists the
+capabilities its calls need in its own `requires`, which must match what its
+SQL names, outside string literals, quoted identifiers and comments (a
+`dolt_*` function no capability covers is an error; a table or column of
+the scenario's own named `dolt_...` isn't a call). Typed VC steps
+exist only where the adapter must capture a commit: `commit` (message, then
+optional Dolt flags such as `--allow-empty`), `branch` (name and optional
+start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
+`cherrypick` and `revert` (Dolt's arguments, flags included: `--no-ff`,
+`--abort`, `--continue`, ...). Their capability is implied. Arguments are in
+`args`; SQL bind parameters are in `params`. Successful commits require a
+unique `save` name; a merge, pick or revert may name one, and must then
+commit (a revert's is the last of its series): a merge with nothing to merge, or one
+that stops with conflicts, saves nothing and fails the step, its call's
+whole result in the trace. A later `{"ref":"base"}` resolves to
+that engine's captured identifier, including in query parameters and
+expected rows. No cross-engine hash equality is assumed. SQL strings remain
+explicitly dialect-specific. Merges inside a transaction block, and their
+conflicts, are query steps.
 
 Cells and parameters are strings, JSON null, or commit references. Numbers
 are strings so exact numerics do not pass through JSON floating point.
@@ -353,22 +372,26 @@ src/tools/prolly_bench/prolly_bench vc \
 ```
 
 The bundled fixtures are native harness acceptance cases, not imported Dolt
-coverage: one checks core history, the other checks SQL values, persistent
-sessions, transaction rollback and expected errors. Prolly (a versioned
-public schema) declares `sql` and `vc.core`; heap declares only `sql`. Each
+coverage: one checks core history, one merges, picks, reverts and aborts a
+conflicted merge, and one checks SQL values, persistent sessions,
+transaction rollback and expected errors. Prolly (a versioned public schema)
+declares every capability; heap declares only `sql`. Each
 case gets a new database and one persistent connection per named session.
 Operations run sequentially; these schedules do not exercise concurrent
 blocking queries. VC operations require an idle SQL transaction, since this
 adapter snapshots SQL-committed writes. One SQL statement is allowed per
-step, using extended-protocol bind parameters. Prepared-plan reuse, merge,
-schema history and crash injection are subsequent work. The first reviewed
+step, using extended-protocol bind parameters. Prepared-plan reuse, schema
+history and crash injection are subsequent work. The reviewed
 Dolt ports, pinned source inventory, assertion mappings, and execution coverage
 reports are described in [corpus/dolt/README.md](corpus/dolt/README.md).
 
 Before running a case, the adapter creates and drops a separate probe
 database. It verifies the actual AM (and prolly's table/index/TOAST block-map
-forks); for `vc.core`, it runs the built-in history scenario, including
-branch isolation and restoration. Case fixtures therefore start with fresh
+forks); for any version-control capability, it runs the built-in history scenario, including
+branch isolation and restoration, and for any beyond `vc.core` a second
+one (`cases/vc-probe.json`) that finds a merge base, merges, diffs, picks, reverts, and reads a
+conflict and a constraint violation, each checked by its effect: a claimed
+capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring
 that check until rollback if a SQL error aborted the transaction. Scenario
 tables belong in public; arbitrary other schemas are outside this check.
@@ -395,7 +418,7 @@ src/tools/prolly_bench/prolly_bench vc \
   --cases /tmp/vc-prolly/results/scenarios/core-history.json --out /tmp/vc-replay
 ```
 
-CI runs both fixtures on prolly and the SQL fixture on heap. Logs and
+CI runs every fixture on prolly and the SQL fixture on heap. Logs and
 coverage artifacts are uploaded with the existing engine results.
 
 

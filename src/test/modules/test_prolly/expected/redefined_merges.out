@@ -345,8 +345,8 @@ SELECT length(dolt_commit('-am', 'main: n of 1')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('feature', '-m', 'merged a rename'))[3:4];
-ERROR:  rows of table "t" can't be merged across column "n2" being renamed or replaced
-DETAIL:  One version has a column the table hasn't now, and the table has "n2", which that version hasn't.
+ERROR:  rows of table "t" can't be merged across column "n" being dropped or renamed
+DETAIL:  One side changed values of "n", which the other dropped or renamed: the changes would be lost.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------

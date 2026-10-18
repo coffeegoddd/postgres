@@ -1,0 +1,22 @@
+{
+		Name: "error cases: merge commits cannot be cherry-picked",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = dolt_hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL dolt_merge('--no-ff', 'branch1');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:          "CALL dolt_cherry_pick('HEAD');",
+				ExpectedErrStr: "cherry-picking a merge commit is not supported",
+			},
+		},
+	}

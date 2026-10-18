@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "id": "dolt-branch-copy",
+  "description": "Reviewed Dolt port: Copy branches from other branches using dolt_branch procedure",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltBranchScripts: Copy branches from other branches using dolt_branch procedure"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "make",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('myNewBranch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'myNewBranch1')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'myNewBranch2')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', '', '')",
+      "expect": {
+        "sqlstate": "42602"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'myNewBranch1', 'myNewBranch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_branches WHERE name = 'myNewBranch2'",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'myNewBranch1', 'myNewBranch2')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-cf', 'myNewBranch1', 'myNewBranch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-c', 'myNewBranch1', 'HEAD')",
+      "expect": {
+        "sqlstate": "42602"
+      }
+    }
+  ]
+}

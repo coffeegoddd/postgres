@@ -1,0 +1,30 @@
+{
+		Name: "dropping a foreign key",
+		AncSetUpScript: []string{
+			"create table parent (pk int primary key);",
+			"create table child (pk int primary key, p_fk int, CONSTRAINT parent_fk FOREIGN KEY (p_fk) REFERENCES parent (pk));",
+			"insert into parent values (1);",
+			"insert into child values (1, 1);",
+		},
+		RightSetUpScript: []string{
+			"alter table child drop constraint parent_fk;",
+			"delete from parent;",
+		},
+		LeftSetUpScript: []string{
+			"insert into child values (2, 1);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select * from parent;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from child;",
+				Expected: []sql.Row{{1, 1}, {2, 1}},
+			},
+		},
+	}

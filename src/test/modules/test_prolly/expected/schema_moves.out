@@ -493,6 +493,70 @@ SELECT length(dolt_commit('-Am', 'without sm8')::text) AS committed;
         66
 (1 row)
 
+-- A move to a commit whose column is NOT NULL, from a branch with NULLs in
+-- it: the NOT NULL is made once the commit's rows are written (the NULLs
+-- gone with them).  A primary key's columns keep theirs before.
+CREATE SCHEMA sm9 VERSIONED;
+CREATE TABLE sm9.t (pk int PRIMARY KEY, col1 int NOT NULL);
+INSERT INTO sm9.t VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sm9 not null')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sm9_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE sm9.t ALTER COLUMN col1 DROP NOT NULL;
+INSERT INTO sm9.t VALUES (3, NULL);
+SELECT length(dolt_commit('-Am', 'sm9 nullable')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('sm9_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'sm9_right'"}
+(1 row)
+
+SELECT * FROM sm9.t ORDER BY pk;
+ pk | col1 
+----+------
+  1 |    1
+(1 row)
+
+SELECT attnotnull FROM pg_attribute WHERE attrelid = 'sm9.t'::regclass AND attname = 'col1';
+ attnotnull 
+------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'sm9_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sm9 CASCADE;
+NOTICE:  drop cascades to table sm9.t
+SELECT length(dolt_commit('-Am', 'without sm9')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 DROP SCHEMA sm_full CASCADE;
 NOTICE:  drop cascades to table sm_full.u
 DROP SCHEMA sm_empty;

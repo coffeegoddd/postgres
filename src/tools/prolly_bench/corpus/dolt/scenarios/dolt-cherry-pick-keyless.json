@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "id": "dolt-cherry-pick-keyless",
+  "description": "Reviewed Dolt port: keyless table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
+    "case": "DoltCherryPickTests: keyless table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.cherrypick"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "checkout-main0",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE keyless (id int, name varchar(10))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit-create",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table keyless on main"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO keyless VALUES (1, '1'), (2, '3')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit-insert",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert rows into keyless table on branch1"
+      ],
+      "save": "branch1"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM keyless",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_cherry_pick($1) r",
+      "params": [
+        "branch1"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "0",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM keyless",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

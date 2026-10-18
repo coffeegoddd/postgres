@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "id": "dolt-branch-delete",
+  "description": "Reviewed Dolt port: Delete branches with dolt_branch procedure",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltBranchScripts: Delete branches with dolt_branch procedure"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "b1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('myNewBranch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "b2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('myNewBranch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "b3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('myNewBranch3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "bc",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('myNewBranchWithCommit')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-bc",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "myNewBranchWithCommit"
+      ]
+    },
+    {
+      "id": "empty-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "--allow-empty",
+        "-am",
+        "empty commit"
+      ],
+      "save": "empty"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', '')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'branchDoesNotExist')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'myNewBranch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_branches WHERE name = 'myNewBranch1'",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'myNewBranch2', 'myNewBranch3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'myNewBranchWithCommit')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-df', 'myNewBranchWithCommit')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

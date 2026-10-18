@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "id": "dolt-merge-fk-two-column",
+  "description": "Reviewed Dolt port: Merge foreign keys, 2 column key, dangling child violation",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: Merge foreign keys, 2 column key, dangling child violation"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (a varchar(256), b varchar(256), c varchar(256), PRIMARY KEY (b, a))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE UNIQUE INDEX idx_parent_on_a_b ON parent (a, b)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (d varchar(256), e varchar(256), f varchar(256), PRIMARY KEY (e, d), CONSTRAINT child_fk FOREIGN KEY (d, f) REFERENCES parent (a, b))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES ('abc','def', 'xyz')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES ('abc','123','def')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "c1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "1"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other_branch"
+      ]
+    },
+    {
+      "id": "child-row2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES ('abc','www','def')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "c2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "2"
+      ],
+      "save": "c2"
+    },
+    {
+      "id": "table3",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE table3 (table3_col1 varchar(256))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "c3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "3"
+      ],
+      "save": "c3"
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other_branch"
+      ]
+    },
+    {
+      "id": "delete-child",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM child WHERE e = '123'",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "delete-parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM parent WHERE a = 'abc'",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "c4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "4"
+      ],
+      "save": "c4"
+    },
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('main') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'d', violating_row->>'e', violating_row->>'f' FROM dolt_constraint_violations('child')",
+      "expect": {
+        "rows": [
+          [
+            "foreign key",
+            "abc",
+            "www",
+            "def"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

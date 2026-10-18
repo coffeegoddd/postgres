@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "id": "dolt-merge-left-deletes",
+  "description": "Reviewed Dolt port: Left deletes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: Left deletes"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE xyz (x int PRIMARY KEY, y int, z int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-y",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX y_idx ON xyz (y)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "create-z",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX z_idx ON xyz (z)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO xyz VALUES (0,0,0), (1,1,1), (2,2,2), (3,3,3)",
+      "expect": {
+        "tag": "INSERT 0 4"
+      }
+    },
+    {
+      "id": "make",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "make table"
+      ],
+      "save": "made"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "feature-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM xyz WHERE y = 3",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "feature-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "feature"
+      ],
+      "save": "feature"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "main-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM xyz WHERE y = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "feature"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT y FROM xyz WHERE y >= 0 ORDER BY 1",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ],
+          [
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT z FROM xyz WHERE y >= 0 ORDER BY 1",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ],
+          [
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

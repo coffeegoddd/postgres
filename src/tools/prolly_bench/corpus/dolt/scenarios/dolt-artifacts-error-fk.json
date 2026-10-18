@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "id": "dolt-artifacts-error-fk",
+  "description": "Reviewed Dolt port: merge error includes row count for foreign key violations",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeArtifactsScripts: merge error includes row count for foreign key violations"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (pk int PRIMARY KEY, fk int, FOREIGN KEY (fk) REFERENCES parent (pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "base",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create tables"
+      ],
+      "save": "base"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "checkout-right",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (2, 1), (3, 1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add two children referencing parent"
+      ],
+      "save": "rightc"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "left-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM parent WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "left-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "RESET session_replication_role",
+      "expect": {
+        "tag": "RESET"
+      }
+    },
+    {
+      "id": "left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "delete parent"
+      ],
+      "save": "leftc"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "right"
+      ],
+      "expect": {
+        "sqlstate": "40001"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

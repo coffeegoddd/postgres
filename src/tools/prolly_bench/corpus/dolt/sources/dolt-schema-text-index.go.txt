@@ -1,0 +1,49 @@
+{
+		Name: "TEXT index without schema change",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE TABLE t (pk INT NOT NULL PRIMARY KEY, col1 VARCHAR(255) NOT NULL, col2 text);",
+			"CREATE INDEX idx ON t (col2(255));",
+			"INSERT INTO t VALUES (1, 'aa01010aa', 'aa01010aa');",
+			"INSERT INTO t VALUES (2, 'bb01010bb', 'bb01010bb');",
+		},
+		RightSetUpScript: []string{
+			"INSERT INTO t VALUES (3, 'cc01010cc', 'cc01010cc');",
+		},
+		LeftSetUpScript: []string{
+			"INSERT INTO t VALUES (4, 'dd01010dd', 'dd01010dd');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query: "SELECT * FROM t WHERE (col2 LIKE '%01010%') ORDER BY col2;",
+				Expected: []sql.Row{
+					{1, "aa01010aa", "aa01010aa"},
+					{2, "bb01010bb", "bb01010bb"},
+					{3, "cc01010cc", "cc01010cc"},
+					{4, "dd01010dd", "dd01010dd"},
+				},
+			},
+			{
+				Query: "select * from t order by pk;",
+				Expected: []sql.Row{
+					{1, "aa01010aa", "aa01010aa"},
+					{2, "bb01010bb", "bb01010bb"},
+					{3, "cc01010cc", "cc01010cc"},
+					{4, "dd01010dd", "dd01010dd"},
+				},
+			},
+			{
+				Query: "select col1 from t order by col1;",
+				Expected: []sql.Row{
+					{"aa01010aa"},
+					{"bb01010bb"},
+					{"cc01010cc"},
+					{"dd01010dd"},
+				},
+			},
+		},
+	}

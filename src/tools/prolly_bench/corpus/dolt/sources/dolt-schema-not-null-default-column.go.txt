@@ -1,0 +1,34 @@
+{
+		Name: "adding a non-null column with a default value to one side",
+		AncSetUpScript: []string{
+			"set dolt_force_transaction_commit = on;",
+			"create table t (pk int primary key, col1 int);",
+			"insert into t values (1, 1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t add column col2 int not null default 0",
+			"alter table t add column col3 int;",
+			"insert into t values (2, 2, 2, null);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3, 3);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_preview_merge_conflicts_summary('main', 'right');",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1, 0, nil}, {2, 2, 2, nil}, {3, 3, 0, nil}},
+			},
+			{
+				Query:    "select pk, violation_type from dolt_constraint_violations_t",
+				Expected: []sql.Row{},
+			},
+		},
+	}

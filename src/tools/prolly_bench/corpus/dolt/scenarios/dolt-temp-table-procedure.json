@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "dolt-temp-table-procedure",
+  "description": "Reviewed Dolt port: temporary tables in stored procedures",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTempTableScripts: temporary tables in stored procedures"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "on-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "proc",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE PROCEDURE proc() LANGUAGE plpgsql AS $$ BEGIN CREATE TEMPORARY TABLE tmp (i int PRIMARY KEY); INSERT INTO tmp VALUES (1), (2), (3); END $$",
+      "expect": {
+        "tag": "CREATE PROCEDURE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CALL proc()",
+      "expect": {
+        "tag": "CALL"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM tmp",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ],
+          [
+            "2"
+          ],
+          [
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

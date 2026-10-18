@@ -1,0 +1,30 @@
+{
+		Name: "Pk convergent left and right adds",
+		SetUpScript: []string{
+			"create table xyz (x int primary key, y int, z int, key y_idx(y), key z_idx(z))",
+			"insert into xyz values (0,0,0)",
+			"call dolt_commit('-Am', 'make table')",
+
+			"call dolt_checkout('-b', 'feature')",
+			"insert into xyz values (1,1,1)",
+			"call dolt_commit('-am', 'adds')",
+
+			"call dolt_checkout('main')",
+			"insert into xyz values (1,1,1), (2,2,2)",
+			"call dolt_commit('-am', 'adds')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('feature');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select y from xyz where y >= 0",
+				Expected: []sql.Row{{0}, {1}, {2}},
+			},
+			{
+				Query:    "select z from xyz where y >= 0",
+				Expected: []sql.Row{{0}, {1}, {2}},
+			},
+		},
+	}

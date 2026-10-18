@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "id": "dolt-revert-abort-series",
+  "description": "Reviewed Dolt port: dolt_revert() --abort restores pre-revert state",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",
+    "case": "RevertScripts: dolt_revert() --abort restores pre-revert state"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.conflicts",
+    "vc.revert"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(2,2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "seed-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "seed table"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "insert3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (3,3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "insert3-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "insert 3,3"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "first",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 42 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "first-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "first change"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "second",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET c0 = 23 WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "second-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "second change"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT r[1], r[2], r[3], r[4] FROM dolt_revert('HEAD~2', 'HEAD~1') r",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "1",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT table_name FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.test"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "Revert \"insert 3,3\""
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.revert"
+      ],
+      "sql": "SELECT dolt_revert('--abort')",
+      "expect": {
+        "rows": [
+          [
+            "{\"\",0,0,0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT * FROM dolt_conflicts",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT c0 FROM test WHERE pk = 2",
+      "expect": {
+        "rows": [
+          [
+            "23"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "second change"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

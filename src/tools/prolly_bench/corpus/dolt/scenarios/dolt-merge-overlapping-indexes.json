@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "id": "dolt-merge-overlapping-indexes",
+  "description": "Reviewed Dolt port: Test concurrent merges with overlapping indexes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: Test concurrent merges with overlapping indexes"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE overlap_indexes (pk int PRIMARY KEY, v int, CONSTRAINT uniq UNIQUE (v))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX idx ON overlap_indexes (v)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO overlap_indexes VALUES (1,1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "base",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "base"
+      ],
+      "save": "base"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO overlap_indexes VALUES (2,2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "other"
+      ],
+      "save": "other"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "main-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO overlap_indexes VALUES (3,3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "merge",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "other"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM overlap_indexes ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "2"
+          ],
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1-plan",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET enable_seqscan = off",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT o.* FROM (SELECT 2 AS v) w JOIN overlap_indexes o ON w.v = o.v",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT o.* FROM (SELECT 3 AS v) w JOIN overlap_indexes o ON w.v = o.v",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

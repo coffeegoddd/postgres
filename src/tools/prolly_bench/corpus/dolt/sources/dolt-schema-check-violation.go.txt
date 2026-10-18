@@ -1,0 +1,29 @@
+{
+		Name: "check constraint violation - simple case, no schema changes",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE table t (pk int primary key, col1 int, col2 int, CHECK (col1 != col2));",
+			"INSERT into t values (1, 2, 3);",
+			"alter table t add index idx1 (pk, col2);",
+		},
+		RightSetUpScript: []string{
+			"update t set col2=4;",
+		},
+		LeftSetUpScript: []string{
+			"update t set col1=4;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "select * from dolt_constraint_violations;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query:    "select violation_type, pk, col1, col2, violation_info like '%NOT((`col1` = `col2`))%' from dolt_constraint_violations_t;",
+				Expected: []sql.Row{{"check constraint", 1, 4, 4, true}},
+			},
+		},
+	}

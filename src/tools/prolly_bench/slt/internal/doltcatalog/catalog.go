@@ -37,7 +37,98 @@ type Lock struct {
 	Scope      string `json:"scope"`
 	Counts     Counts `json:"counts"`
 	Files      []File `json:"files"`
+	// Sources other ports derive from, pinned by file hash only: Dolt's Go
+	// tests that don't run its engine (merge truth tables, merge bases,
+	// revision specs), at Revision, and Doltgres's Postgres-dialect tests.
+	GoTests  *Pin `json:"go_tests,omitempty"`
+	Doltgres *Pin `json:"doltgres,omitempty"`
 }
+
+// Pin is files of a repository at a commit, by hash.
+type Pin struct {
+	Repository string       `json:"repository"`
+	Revision   string       `json:"revision"`
+	Files      []PinnedFile `json:"files"`
+}
+type PinnedFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+// The pinned Dolt Go tests, and Doltgres's version-control tests.
+var GoTestFiles = []string{
+	"go/libraries/doltcore/merge/merge_test.go",
+	"go/libraries/doltcore/merge/row_merge_test.go",
+	"go/libraries/doltcore/merge/row_merge_policy_test.go",
+	"go/libraries/doltcore/merge/keyless_integration_test.go",
+	"go/libraries/doltcore/merge/schema_merge_test.go",
+	"go/libraries/doltcore/merge/integration_test.go",
+	"go/store/prolly/tree/three_way_differ_test.go",
+	"go/store/datas/commit_test.go",
+	"go/libraries/doltcore/doltdb/ancestor_spec_test.go",
+	"go/libraries/doltcore/doltdb/commit_spec_test.go",
+	"go/libraries/doltcore/doltdb/branch_case_test.go",
+	"go/libraries/doltcore/ref/branchname_test.go",
+	"go/libraries/doltcore/ref/ref_test.go",
+}
+
+const DoltgresRepository = "https://github.com/dolthub/doltgresql"
+
+var DoltgresFiles = []string{
+	"testing/go/auth_test.go",
+	"testing/go/conflicts_root_object_test.go",
+	"testing/go/cursor_test.go",
+	"testing/go/dolt_functions_test.go",
+	"testing/go/dolt_procedures_record_test.go",
+	"testing/go/dolt_tables_test.go",
+	"testing/go/foreign_keys_test.go",
+	"testing/go/information_schema_test.go",
+	"testing/go/merge_test.go",
+	"testing/go/pgcatalog_test.go",
+	"testing/go/root_object_collections_test.go",
+	"testing/go/schemas_test.go",
+	"testing/go/sequences_test.go",
+}
+
+// PinFiles hashes files of repo at revision, from Git objects.
+func PinFiles(repository, repo, revision string, paths []string) (*Pin, error) {
+	git, err := gitAt(repo, revision)
+	if err != nil {
+		return nil, err
+	}
+	p := &Pin{Repository: repository, Revision: revision}
+	for _, path := range paths {
+		b, err := git("show", revision+":"+path)
+		if err != nil {
+			return nil, err
+		}
+		p.Files = append(p.Files, PinnedFile{Path: path, SHA256: Hash(b)})
+	}
+	return p, nil
+}
+
+// gitAt runs git in repo, once revision is checked to name a commit exactly.
+func gitAt(repo, revision string) (func(...string) ([]byte, error), error) {
+	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(revision) {
+		return nil, fmt.Errorf("revision must be a full lowercase commit SHA")
+	}
+	git := func(args ...string) ([]byte, error) {
+		b, err := exec.Command("git", append([]string{"-C", repo}, args...)...).Output()
+		if err != nil {
+			return nil, fmt.Errorf("git %v: %w", args, err)
+		}
+		return b, nil
+	}
+	resolved, err := git("rev-parse", "--verify", revision+"^{commit}")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(resolved)) != revision {
+		return nil, fmt.Errorf("revision must name a commit directly")
+	}
+	return git, nil
+}
+
 type Flag struct {
 	Field      string `json:"field"`
 	Expression string `json:"expression"`
@@ -181,22 +272,9 @@ func Scan(path string, source []byte) ([]Case, error) {
 // Read uses Git objects at an exact commit, ignoring dirty working-tree files.
 func Read(repo, revision string) (Catalog, error) {
 	c := Catalog{Lock: Lock{Version: 1, Repository: Repository, Revision: revision, Scope: Scope}}
-	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(revision) {
-		return c, fmt.Errorf("revision must be a full lowercase commit SHA")
-	}
-	git := func(args ...string) ([]byte, error) {
-		b, err := exec.Command("git", append([]string{"-C", repo}, args...)...).Output()
-		if err != nil {
-			return nil, fmt.Errorf("git %v: %w", args, err)
-		}
-		return b, nil
-	}
-	resolved, err := git("rev-parse", "--verify", revision+"^{commit}")
+	git, err := gitAt(repo, revision)
 	if err != nil {
 		return c, err
-	}
-	if strings.TrimSpace(string(resolved)) != revision {
-		return c, fmt.Errorf("revision must name a commit directly")
 	}
 	paths, err := git("ls-tree", "-r", "--name-only", revision, "--", Directory)
 	if err != nil {
@@ -229,5 +307,6 @@ func Read(repo, revision string) (Catalog, error) {
 	if len(c.Cases) == 0 {
 		return c, fmt.Errorf("no cases found in pinned source")
 	}
-	return c, nil
+	c.Lock.GoTests, err = PinFiles(Repository, repo, revision, GoTestFiles)
+	return c, err
 }

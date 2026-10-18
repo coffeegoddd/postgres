@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,8 +22,10 @@ func EngineProfile(am string) (Profile, error) {
 	p := Profile{Engine: am}
 	switch am {
 	case "prolly":
-		p.Supported = []string{"sql", "vc.core"}
-		p.Limitations = "Versioned public schema: data commit/branch/hard-reset; no schema-merge or concurrency claim."
+		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"}
+		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist. " +
+			"Rows merge column by column, and a table's definition part by part (a column or constraint both sides changed differently is a schema conflict, an error: there is no dolt_schema_conflicts). " +
+			"No claim about concurrent sessions beyond sequential interleavings."
 	case "heap":
 		p.Supported = []string{"sql"}
 		p.Limitations = "Ordinary heap has no version-control capability."
@@ -54,28 +57,51 @@ func NewPostgres(dsn, am string, timeout time.Duration) (*Postgres, error) {
 func (p *Postgres) Name() string           { return p.profile.Engine }
 func (p *Postgres) Capabilities() []string { return p.profile.Supported }
 
-// The built-in target probe is also a reviewable scenario, interpreted by the
-// same executor as the corpus. Its database is dropped before the actual case.
+// The built-in target probes are also reviewable scenarios, interpreted by
+// the same executor as the corpus. Their databases are dropped before the
+// actual case. The first proves commits, branches and resets reach the
+// tables; the second, run when a case needs more, proves merges, diffs,
+// picks, reverts, conflicts and violations do: a claimed capability whose
+// calls don't work fails targeting, not the case's steps.
 //
 //go:embed cases/core-history.json
 var targetScenario []byte
 
-func (p *Postgres) Verify(ctx context.Context, requires []string) (err error) {
+//go:embed cases/vc-probe.json
+var capabilityScenario []byte
+
+func (p *Postgres) Verify(ctx context.Context, requires []string) error {
+	vc, beyond := false, false
+	for _, r := range requires {
+		if strings.HasPrefix(r, "vc.") {
+			vc = true
+			beyond = beyond || r != "vc.core"
+		}
+	}
+	if err := p.canary(ctx, targetScenario, vc, "VC canary"); err != nil {
+		return err
+	}
+	if beyond {
+		return p.canary(ctx, capabilityScenario, true, "VC capability canary")
+	}
+	return nil
+}
+
+// canary opens a probe database (checking its target), and runs scenario b
+// there if run.
+func (p *Postgres) canary(ctx context.Context, b []byte, run bool, what string) (err error) {
 	probe, _ := NewPostgres(p.dsn, p.Name(), p.timeout)
 	defer func() { err = errors.Join(err, probe.Close(context.Background())) }()
-	s, e := Parse(targetScenario)
+	s, e := Parse(b)
 	if e != nil {
 		return e
 	}
 	if e = probe.Open(ctx, s.Sessions); e != nil {
 		return e
 	}
-	for _, r := range requires {
-		if r == "vc.core" {
-			_, detail := execute(ctx, s, probe)
-			if detail != "" {
-				return fmt.Errorf("VC canary: %s", detail)
-			}
+	if run {
+		if _, detail := execute(ctx, s.Passes()[0], probe); detail != "" {
+			return fmt.Errorf("%s: %s", what, detail)
 		}
 	}
 	return nil
@@ -215,6 +241,9 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 	switch s.Op {
 	case "commit":
 		sql = "SELECT (dolt_commit('-m', $1))[1]"
+		if len(args) > 1 {
+			sql = "SELECT (dolt_commit(" + placeholders(len(args))[len("$1::text, "):] + ", '-m', $1))[1]"
+		}
 	case "branch":
 		sql = "SELECT dolt_branch($1)"
 		if len(args) == 2 {
@@ -224,12 +253,32 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		sql = "SELECT dolt_checkout($1)"
 	case "reset":
 		sql = "SELECT dolt_reset('--hard', $1)"
+	case "merge":
+		// the commit made or fast-forwarded to; none if nothing was merged
+		// (up to date, or the branch is ahead), or it stopped with conflicts
+		sql = "SELECT CASE WHEN r[3] = '0' AND r[1] <> '' AND r[4] NOT IN " +
+			"('Everything up-to-date', 'cannot fast forward from a to b. a is ahead of b already') " +
+			"THEN r[1] END, r::text FROM dolt_merge(" + placeholders(len(args)) + ") r"
+	case "cherrypick":
+		sql = "SELECT NULLIF(r[1], ''), r::text FROM dolt_cherry_pick(" + placeholders(len(args)) + ") r"
+	case "revert":
+		// the last commit of its series; none if one stopped it
+		sql = "SELECT NULLIF(r[1], ''), r::text FROM dolt_revert(" + placeholders(len(args)) + ") r"
 	default:
 		return Outcome{}, fmt.Errorf("unsupported operation %s", s.Op)
 	}
 	o, err := p.query(ctx, c, sql, args)
 	if err != nil || o.SQLState != "" {
 		return o, err
+	}
+	// The commit made, alone; the call's whole result in the tag, so a trace
+	// shows why there was none.
+	if s.Op == "merge" || s.Op == "cherrypick" || s.Op == "revert" {
+		if len(o.Rows) != 1 || len(o.Rows[0]) != 2 {
+			return o, fmt.Errorf("%s returned %d rows", ops[s.Op].function, len(o.Rows))
+		}
+		o.Tag = ops[s.Op].function + " returned " + *o.Rows[0][1]
+		o.Rows, o.Columns = [][]*string{{o.Rows[0][0]}}, o.Columns[:1]
 	}
 	if s.Op == "checkout" {
 		check, e := p.must(ctx, c, "SELECT active_branch()")
@@ -241,6 +290,15 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		}
 	}
 	return o, nil
+}
+
+// "$1::text, ..., $n::text": Dolt's arguments, for a variadic text call.
+func placeholders(n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("$%d::text", i+1)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (p *Postgres) CheckTarget(ctx context.Context, session string) error {

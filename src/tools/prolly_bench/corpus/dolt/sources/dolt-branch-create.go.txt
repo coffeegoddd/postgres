@@ -1,0 +1,22 @@
+{
+		Name: "Create branches from HEAD with dolt_branch procedure",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_BRANCH('myNewBranch1')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_BRANCHES WHERE NAME='myNewBranch1';",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				// Trying to recreate that branch fails without the force flag
+				Query:          "CALL DOLT_BRANCH('myNewBranch1')",
+				ExpectedErrStr: "fatal: A branch named 'myNewBranch1' already exists.",
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('-f', 'myNewBranch1')",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	}

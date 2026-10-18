@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "id": "dolt-branch-rename-sessions",
+  "description": "Reviewed Dolt port: Test multi-session behavior for renaming branches",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+    "case": "DoltBranchMultiSessionScriptTests: Test multi-session behavior for renaming branches"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "init-table",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "branch2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "branch1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "b",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'branch1', 'movedBranch1')",
+      "expect": {
+        "sqlstate": "55006"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-mf', 'branch1', 'movedBranch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'branch2', 'movedBranch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "moved-session",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "movedBranch1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

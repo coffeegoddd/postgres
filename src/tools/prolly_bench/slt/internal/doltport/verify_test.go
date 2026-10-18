@@ -39,12 +39,22 @@ func manifestAt(t *testing.T, root string) Manifest {
 	}
 	return m
 }
+
+// The reviewed corpus: a port added or deferred updates these.
+const (
+	reviewedPorts      = 123 // ported whole
+	reviewedPartial    = 24  // ported in part
+	reviewedAssertions = 446
+	reviewedOmitted    = 27 // assertions left out, each with its note
+	reviewedDeferred   = 29
+)
+
 func TestReviewedCorpus(t *testing.T) {
 	r, err := Verify(fixture, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != 3 || r.MappedAssertions != 23 || r.DeferredCases != 4 || r.UnreviewedCases != 1226 || len(r.Engines) != 0 {
+	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != reviewedPorts || r.PartialCases != reviewedPartial || r.MappedAssertions != reviewedAssertions || r.OmittedAssertions != reviewedOmitted || r.DeferredCases != reviewedDeferred || r.UnreviewedCases != 1233-reviewedPorts-reviewedPartial-reviewedDeferred || len(r.Engines) != 0 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -121,7 +131,7 @@ func TestExplicitOmissionIsPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.PortedCases != 2 || r.PartialCases != 1 || r.MappedAssertions != 22 || r.OmittedAssertions != 1 {
+	if r.PortedCases != reviewedPorts-1 || r.PartialCases != reviewedPartial+1 || r.MappedAssertions != reviewedAssertions-1 || r.OmittedAssertions != reviewedOmitted+1 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -145,9 +155,11 @@ func passing(t *testing.T) execution {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r := vcscenario.Result{ID: p.ID, Engine: "prolly", Status: "passed", Requires: s.Requires, PlannedSteps: len(s.Steps)}
-		for _, st := range s.Steps {
-			r.Steps = append(r.Steps, vcscenario.StepResult{ID: st.ID, Op: st.Op, Session: st.Session})
+		r := vcscenario.Result{ID: p.ID, Engine: "prolly", Status: "passed", Requires: s.Requires, PlannedSteps: s.PlannedSteps()}
+		for _, pass := range s.Passes() {
+			for _, st := range pass.Steps {
+				r.Steps = append(r.Steps, vcscenario.StepResult{ID: st.ID, Variant: pass.Variant, Op: st.Op, Session: st.Session})
+			}
 		}
 		e.Hashes[p.ID] = p.ScenarioSHA256
 		e.Results = append(e.Results, r)
@@ -155,15 +167,23 @@ func passing(t *testing.T) execution {
 	return e
 }
 func TestExecutionAccounting(t *testing.T) {
+	// what the first port earns when it passes
+	reviewed := reviewedPorts + reviewedPartial
+	first := 0
+	for _, a := range manifestAt(t, fixture).Ports[0].Assertions {
+		if len(a.Steps) > 0 {
+			first++
+		}
+	}
 	tests := []struct {
 		name                        string
 		mutate                      func(*execution)
 		wantErr                     bool
 		passed, credit, unsupported int
 	}{
-		{"all pass", func(*execution) {}, false, 3, 23, 0},
-		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, 2, 12, 1},
-		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, 2, 12, 0},
+		{"all pass", func(*execution) {}, false, reviewed, reviewedAssertions, 0},
+		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, reviewed - 1, reviewedAssertions - first, 1},
+		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, reviewed - 1, reviewedAssertions - first, 0},
 		{"missing case", func(e *execution) { e.Results = e.Results[1:] }, true, 0, 0, 0},
 		{"duplicate case", func(e *execution) { e.Results = append(e.Results, e.Results[0]) }, true, 0, 0, 0},
 		{"truncated pass", func(e *execution) { e.Results[0].Steps = nil }, true, 0, 0, 0},
@@ -188,6 +208,73 @@ func TestExecutionAccounting(t *testing.T) {
 			}
 			if len(r.Engines) != 1 || r.Engines[0].Passed != tt.passed || r.Engines[0].PassedMappedAssertions != tt.credit || r.Engines[0].Unsupported != tt.unsupported {
 				t.Fatalf("%+v", r)
+			}
+		})
+	}
+}
+
+func TestClassification(t *testing.T) {
+	r, err := Verify(fixture, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := r.Classes
+	if c.Portable+c.FeatureGated+c.NotApplicable != r.SourceCases || c.Portable == 0 || len(c.Features) == 0 {
+		t.Fatalf("%+v", c)
+	}
+	ported := 0
+	for _, a := range c.Areas {
+		if a.Ported+a.Partial+a.Deferred+a.NotStarted != a.Portable {
+			t.Fatalf("area doesn't add up: %+v", a)
+		}
+		ported += a.Ported + a.Partial
+	}
+	// (partial ports of F cases are counted under their features)
+	for _, f := range c.Features {
+		ported += f.PartiallyPorted
+	}
+	if ported != r.PortedCases+r.PartialCases {
+		t.Fatalf("ports counted %d times by area, %d ported", ported, r.PortedCases+r.PartialCases)
+	}
+	m := manifestAt(t, fixture)
+	first := classKey(m.Ports[0].Suite, m.Ports[0].Index)
+	tests := []struct {
+		name, want string
+		mutate     func(*Classification)
+	}{
+		{"unknown class", "unknown class", func(c *Classification) { c.Cases[0].Class = "X" }},
+		{"F without feature", "names the feature", func(c *Classification) { c.Cases[0].Class = "F"; c.Cases[0].Feature = "" }},
+		{"P with feature", "only F cases", func(c *Classification) { c.Cases[0].Class = "P"; c.Cases[0].Feature = "tags" }},
+		{"no reason", "a reason", func(c *Classification) { c.Cases[0].Reason = " " }},
+		{"duplicate", "classified twice", func(c *Classification) { c.Cases[1] = c.Cases[0] }},
+		{"missing", "classification has", func(c *Classification) { c.Cases = c.Cases[1:] }},
+		{"other revision", "another revision", func(c *Classification) { c.Revision = "0" }},
+		{"port of an N case", "full port must be of a P case", func(c *Classification) {
+			for i := range c.Cases {
+				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == first {
+					c.Cases[i].Class = "N"
+				}
+			}
+		}},
+		{"port classified from other source", "classified from other source", func(c *Classification) {
+			for i := range c.Cases {
+				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == first {
+					c.Cases[i].SHA256 = "0"
+				}
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := copyFixture(t)
+			var c Classification
+			if err := readJSON(filepath.Join(root, "classification.json"), &c); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(&c)
+			put(t, filepath.Join(root, "classification.json"), c)
+			if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %s, got %v", tt.want, err)
 			}
 		})
 	}

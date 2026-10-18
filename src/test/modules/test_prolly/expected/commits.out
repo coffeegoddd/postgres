@@ -366,43 +366,43 @@ SELECT message, committer = current_user AS session_user,
 -- or options would read otherwise is refused.
 SELECT dolt_branch('bad~name');
 ERROR:  invalid branch name "bad~name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad^name');
 ERROR:  invalid branch name "bad^name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad:name');
 ERROR:  invalid branch name "bad:name"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('two words');
 ERROR:  invalid branch name "two words"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a..b');
 ERROR:  invalid branch name "a..b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('HEAD');
 ERROR:  invalid branch name "HEAD"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('@');
 ERROR:  invalid branch name "@"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends.lock');
 ERROR:  invalid branch name "ends.lock"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('part.lock/b');
 ERROR:  invalid branch name "part.lock/b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('.hidden');
 ERROR:  invalid branch name ".hidden"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feat/.x');
 ERROR:  invalid branch name "feat/.x"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a//b');
 ERROR:  invalid branch name "a//b"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends/');
 ERROR:  invalid branch name "ends/"
-DETAIL:  A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" or "@"; not beginning with "-" or "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feature/ok-name_1.2');
  dolt_branch 
 -------------
@@ -416,6 +416,253 @@ SELECT dolt_hashof('feature/ok-name_1.2') = dolt_hashof('HEAD') AS resolves;
 (1 row)
 
 SELECT dolt_branch('-d', 'feature/ok-name_1.2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- As in Dolt: "HEAD" in any case is the head, not a branch; a name may
+-- begin with "-", given after "--"; and one differing from a branch's
+-- only by case names that branch, made, copied or renamed to.
+SELECT dolt_branch('head');
+ERROR:  invalid branch name "head"
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_hashof('head') = dolt_hashof('HEAD') AS head_any_case,
+	dolt_hashof('Head~0') = dolt_hashof('HEAD') AS with_steps;
+ head_any_case | with_steps 
+---------------+------------
+ t             | t
+(1 row)
+
+SELECT dolt_branch('--', '-dash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE name = '-dash';
+ name  
+-------
+ -dash
+(1 row)
+
+-- (and named after "--" to the others taking a branch or ref)
+SELECT dolt_checkout('-dash');
+ERROR:  dolt_checkout: "-dash" is not supported
+SELECT dolt_checkout('--', '-dash');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch '-dash'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ -dash
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('--', '-dash'))[4];
+      dolt_merge       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT dolt_reset('--hard', '--', '-dash');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_cherry_pick('--', '-dash');
+ERROR:  dolt_cherry_pick changes nothing on the branch
+HINT:  Pass --allow-empty to commit it anyway.
+SELECT dolt_branch('-D', '--', '-dash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('CASED');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT dolt_branch('-f', 'Cased');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT dolt_checkout('-b', 'CASED');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT dolt_branch('-c', 'cased', 'CASED');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-m', 'other', 'CASED');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT dolt_branch('-mf', 'other', 'CASED');
+ERROR:  branch "cased" already exists
+DETAIL:  Branch names that differ only by case name one branch.
+SELECT name FROM dolt_branches WHERE lower(name) = 'cased';
+ name  
+-------
+ cased
+(1 row)
+
+-- (a branch renamed to its own name in another case: still one)
+SELECT dolt_branch('-m', 'cased', 'Cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-m', 'Cased', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches WHERE lower(name) = 'cased';
+ name  
+-------
+ cased
+(1 row)
+
+-- Forced, a branch made or copied takes the place of one of its name
+-- (not the session's own).
+SELECT dolt_hashof('cased') AS cased_at \gset
+INSERT INTO ca.t VALUES (3);
+SELECT length(dolt_commit('-am', 'moved on')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cased');
+ERROR:  branch "cased" already exists
+SELECT dolt_branch('-f', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('cased') = dolt_hashof('HEAD') AS forced_to_head,
+	dolt_hashof('cased') <> :'cased_at' AS moved;
+ forced_to_head | moved 
+----------------+-------
+ t              | t
+(1 row)
+
+SELECT dolt_branch('-cf', 'other', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('cased') = dolt_hashof('other') AS copied;
+ copied 
+--------
+ t
+(1 row)
+
+-- moved, not made again: to a start point naming the branch itself, its
+-- uncommitted changes dropped; main, from another branch
+SELECT dolt_hashof('cased~1') AS back \gset
+SELECT dolt_branch('-f', 'cased', 'cased~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('cased') = :'back' AS moved_back;
+ moved_back 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('-cf', 'cased', 'cased');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cased');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'cased'"}
+(1 row)
+
+INSERT INTO ca.t VALUES (4);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-f', 'cased', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cased');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'cased'"}
+(1 row)
+
+SELECT id FROM ca.t ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT dolt_hashof('main') AS main_at \gset
+SELECT dolt_branch('-f', 'main', 'main~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('main') <> :'main_at' AS main_moved;
+ main_moved 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('-f', 'main', :'main_at');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-f', 'main');
+ERROR:  branch "main" is checked out
+HINT:  Check out another branch first.
+SELECT dolt_branch('-D', 'cased', 'other');
  dolt_branch 
 -------------
  {0}

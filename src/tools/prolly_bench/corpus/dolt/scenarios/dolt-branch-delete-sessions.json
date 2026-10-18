@@ -1,0 +1,193 @@
+{
+  "version": 1,
+  "id": "dolt-branch-delete-sessions",
+  "description": "Reviewed Dolt port: Test multi-session behavior for deleting branches",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+    "case": "DoltBranchMultiSessionScriptTests: Test multi-session behavior for deleting branches"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "b1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('branch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "b2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('branch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "b3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('branch3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('branch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'branch1'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "branch1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "b",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'branch1')",
+      "expect": {
+        "sqlstate": "55006"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('branch2')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'branch2'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'branch1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "b",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'branch2')",
+      "expect": {
+        "sqlstate": "55006"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "b",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-df', 'branch2')",
+      "expect": {
+        "sqlstate": "55006"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-d', 'branch3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

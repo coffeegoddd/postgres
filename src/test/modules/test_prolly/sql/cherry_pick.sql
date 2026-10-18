@@ -28,7 +28,7 @@ SELECT dolt_hashof('HEAD^2');		-- one parent
 SELECT * FROM dolt_status();
 
 -- Reverting it undoes them.
-SELECT dolt_revert('HEAD');
+SELECT (dolt_revert('HEAD'))[2:4];
 SELECT id, v FROM app.t WHERE id IN (1, 2, 5, 11) ORDER BY id;
 SELECT a, count(*) FROM app.k GROUP BY a;
 SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
@@ -103,17 +103,17 @@ COMMIT;
 SELECT dolt_cherry_pick('HEAD');		-- a merge commit
 SELECT dolt_revert('nope');
 
--- Several reverts are one commit, every ref named as the branch was
+-- Several reverts are a commit each, every ref named as the branch was
 -- before: HEAD~1 is r1, not the commit HEAD's revert makes.
 UPDATE app.t SET v = 'r1' WHERE id = 6;
 SELECT length(dolt_commit('-am', 'r1')::text) AS committed;
 UPDATE app.t SET v = 'r2' WHERE id = 7;
 SELECT length(dolt_commit('-am', 'r2')::text) AS committed;
 SELECT dolt_hashof('HEAD~2') AS before_r \gset
-SELECT dolt_revert('HEAD', 'HEAD~1');
+SELECT (dolt_revert('HEAD', 'HEAD~1'))[2:4];
 SELECT id, v FROM app.t WHERE id IN (6, 7) ORDER BY id;
-SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
-SELECT dolt_hashof('HEAD~3') = :'before_r' AS one_commit;
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 2;
+SELECT dolt_hashof('HEAD~4') = :'before_r' AS one_commit_each;
 
 -- Picking what the branch has already changes nothing: refused, unless
 -- --allow-empty.  A pick keeps its commit's author.

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "dolt-merge-ff-only-no-ff",
+  "description": "Reviewed Dolt port: --ff-only conflicts with --no-ff",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: --ff-only conflicts with --no-ff"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial commit"
+      ],
+      "save": "initial"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT dolt_merge('--ff-only', '--no-ff', 'feature')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    }
+  ]
+}

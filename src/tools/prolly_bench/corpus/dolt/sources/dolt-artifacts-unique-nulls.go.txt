@@ -1,0 +1,32 @@
+{
+		Name: "unique key violations should not be thrown for keys with null values",
+		SetUpScript: []string{
+			"create table t (col1 int not null, col2 int not null, col3 int, primary key (col1, col2));",
+			"alter table t add unique (col2, col3);",
+			"call dolt_commit('-Am', 'init');",
+
+			"call dolt_checkout('-b', 'right');",
+			"insert into t values (1, 2, null);",
+			"call dolt_commit('-Am', 'right');",
+
+			"call dolt_checkout('main');",
+			"insert into t values (2, 2, null);",
+			"call dolt_commit('-Am', 'left');",
+
+			"set dolt_force_transaction_commit = 1;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select count(*) from dolt_constraint_violations;",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 2, nil}, {2, 2, nil}},
+			},
+		},
+	}

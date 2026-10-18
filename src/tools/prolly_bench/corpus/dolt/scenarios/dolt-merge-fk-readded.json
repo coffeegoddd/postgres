@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "id": "dolt-merge-fk-readded",
+  "description": "Reviewed Dolt port: Merge does not panic when FK is dropped and re-added on one branch and child has composite PK with mixed types",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: Merge does not panic when FK is dropped and re-added on one branch and child has composite PK with mixed types"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (pk varchar(20) PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (pk1 int, pk2 bigint, fk_col varchar(20), PRIMARY KEY (pk1, pk2), CONSTRAINT fk1 FOREIGN KEY (fk_col) REFERENCES parent (pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES ('a')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1, 'a')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial setup"
+      ],
+      "save": "initial"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other_branch"
+      ]
+    },
+    {
+      "id": "drop-fk",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE child DROP CONSTRAINT fk1",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "drop-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "drop fk and its backing index"
+      ],
+      "save": "dropped"
+    },
+    {
+      "id": "add-fk",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE child ADD CONSTRAINT fk2 FOREIGN KEY (fk_col) REFERENCES parent (pk)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "add-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "re-add fk, creates new backing index fk2"
+      ],
+      "save": "added"
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other_branch"
+      ]
+    },
+    {
+      "id": "other-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 2, 'a')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add child row on other branch"
+      ],
+      "save": "other"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "main"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM parent ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk1, pk2, fk_col FROM child ORDER BY pk1, pk2",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1",
+            "a"
+          ],
+          [
+            "1",
+            "2",
+            "a"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (2, 1, 'z')",
+      "expect": {
+        "sqlstate": "23503"
+      }
+    }
+  ]
+}

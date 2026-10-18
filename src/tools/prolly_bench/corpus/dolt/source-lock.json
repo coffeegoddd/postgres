@@ -459,5 +459,121 @@
         "unresolved_fields": 0
       }
     }
-  ]
+  ],
+  "go_tests": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "files": [
+      {
+        "path": "go/libraries/doltcore/merge/merge_test.go",
+        "sha256": "e0d66d178ac442541162f5ea3a23dc4d62ad675e8a051763afe0ebc92187d1c4"
+      },
+      {
+        "path": "go/libraries/doltcore/merge/row_merge_test.go",
+        "sha256": "d0faef94d88d008fdc44a6fa1040a778f3482bacb6205670230e6c50f558a5e8"
+      },
+      {
+        "path": "go/libraries/doltcore/merge/row_merge_policy_test.go",
+        "sha256": "29acf90d8984e6f8c2f90a758353d6c7213badb343abe13c0132bded3f7863a6"
+      },
+      {
+        "path": "go/libraries/doltcore/merge/keyless_integration_test.go",
+        "sha256": "b375bfe265936314b241f1459b65702ec8cdbaa2bcd03857c6e626666bb2aad6"
+      },
+      {
+        "path": "go/libraries/doltcore/merge/schema_merge_test.go",
+        "sha256": "fbd86cebc5417b87671a0f0571983c531dece7208e84d091e5c593fd1085e128"
+      },
+      {
+        "path": "go/libraries/doltcore/merge/integration_test.go",
+        "sha256": "dbfe26e90d8bd1de02a1215956baeb806b1246838315148bbc0efe2a2d4488e9"
+      },
+      {
+        "path": "go/store/prolly/tree/three_way_differ_test.go",
+        "sha256": "7f3f1077aa77ebc22b4aec136dfb75eeddddc1dd4dcbcf7b2aa64b638df5cecb"
+      },
+      {
+        "path": "go/store/datas/commit_test.go",
+        "sha256": "6e0c934fe88dd6ecbfee846b2652f50d7367ae9213bbea3aff64f60374c2247b"
+      },
+      {
+        "path": "go/libraries/doltcore/doltdb/ancestor_spec_test.go",
+        "sha256": "6615459db2e3605d0a200107095be7cb25b447ccfc43d8242eb4a100130d3cb6"
+      },
+      {
+        "path": "go/libraries/doltcore/doltdb/commit_spec_test.go",
+        "sha256": "92fbd7f31327bf066c6accac4feb3137e8e4e472997897ab9fe23e752276d750"
+      },
+      {
+        "path": "go/libraries/doltcore/doltdb/branch_case_test.go",
+        "sha256": "a7dfd240865376858c79e1875bdca41a6c00214030dc829a43342728f767fefb"
+      },
+      {
+        "path": "go/libraries/doltcore/ref/branchname_test.go",
+        "sha256": "ea641e14642332f7b5ce3182bc3cfcf0b505212256f8a4fdcf6ba5244e4bafdc"
+      },
+      {
+        "path": "go/libraries/doltcore/ref/ref_test.go",
+        "sha256": "56df497bc35083b61fb0f7c43007bb7b314fc8b0fb390dd5b010245e3a5e7628"
+      }
+    ]
+  },
+  "doltgres": {
+    "repository": "https://github.com/dolthub/doltgresql",
+    "revision": "d5e05f46728e4a28116770eb683090c3ccd82ca4",
+    "files": [
+      {
+        "path": "testing/go/auth_test.go",
+        "sha256": "4604dbf5bab7d60cbad16cd90f8bedc0006fa939fb2b46f14f1411c05cea0722"
+      },
+      {
+        "path": "testing/go/conflicts_root_object_test.go",
+        "sha256": "3abcbc6f3abe5ba7ad862672f7b4173db6bd81171aad3c20bbedea3b6c8a1095"
+      },
+      {
+        "path": "testing/go/cursor_test.go",
+        "sha256": "b5b8fdf0ee7309a0364d7c9c39baadb002841b4316e9c5c4b6edd0a225215713"
+      },
+      {
+        "path": "testing/go/dolt_functions_test.go",
+        "sha256": "e5b3d2e925bc33a3fb79d72d9c218dc49994bb486d6a5b44769e92d56ada3f42"
+      },
+      {
+        "path": "testing/go/dolt_procedures_record_test.go",
+        "sha256": "4deb32ad3b32269bdda50b08d93b27d3905c64e08f4722c4aa6621701ab97065"
+      },
+      {
+        "path": "testing/go/dolt_tables_test.go",
+        "sha256": "e139e870f2afaef8417d2bb0a6084f9d978c8278981fb5bc57019e7ac52aa665"
+      },
+      {
+        "path": "testing/go/foreign_keys_test.go",
+        "sha256": "2754c45ba6cf12a1256ac75c3d077022114081fd27d66a330a7611e9a081b8c9"
+      },
+      {
+        "path": "testing/go/information_schema_test.go",
+        "sha256": "4eff94104a3a11cd4b93c25b5617027bfcfc2c8c576da4334c97e9450545be6e"
+      },
+      {
+        "path": "testing/go/merge_test.go",
+        "sha256": "1110591dda6cd2e5618167a8b57b2026afe18b9fd9f8d47d37ffac4b5598241e"
+      },
+      {
+        "path": "testing/go/pgcatalog_test.go",
+        "sha256": "71ad059f59444bf2ec0a9204daedfbc42d3f8f7cea645d8fc68203da9bd28f04"
+      },
+      {
+        "path": "testing/go/root_object_collections_test.go",
+        "sha256": "52e0a720b088e31ab6ef1a22ff5218dde4486d58598ab14be610f4709a1e32ce"
+      },
+      {
+        "path": "testing/go/schemas_test.go",
+        "sha256": "02b542989b720de10c65e8c9261cba584088280557586fd06dba69bedac4e864"
+      },
+      {
+        "path": "testing/go/sequences_test.go",
+        "sha256": "65651e8fc9e3ecb7ac0a90c077d7eafeebd51c29223aad8861517deb500ae1e2"
+      }
+    ]
+  }
 }

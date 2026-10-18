@@ -1,7 +1,7 @@
 -- Merges into a working set with uncommitted changes, as in Dolt: allowed
 -- when the merge changes none of the tables and sequences they changed,
--- and no definitions change; they stay uncommitted, left out of the
--- merge's commit.
+-- and no definitions change on both sides; they stay uncommitted, left
+-- out of the merge's commit.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -65,11 +65,46 @@ SELECT length(dolt_cherry_pick('feature')::text) > 0 AS picked;
 SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
 SELECT table_name FROM dolt_status;
 
--- Uncommitted changes of definitions aren't merged into.
+-- Uncommitted changes of tables' definitions are merged into when the
+-- merge changes neither those tables nor any definition: a table altered
+-- or made stays as it is, uncommitted.
 SELECT dolt_reset('--hard');
 ALTER TABLE dm.b ADD COLUMN w int;
+CREATE TABLE dm.made (id int PRIMARY KEY);
+SELECT (dolt_merge('feature'))[2:4];
+SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'b' ORDER BY ordinal_position;
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- not when the merge changes that table's rows, nor when it changes
+-- definitions too
+ALTER TABLE dm.a ADD COLUMN w int;
 SELECT (dolt_merge('feature'))[2:4];
 SELECT dolt_reset('--hard');
+SELECT dolt_checkout('feature');
+ALTER TABLE dm.a ADD COLUMN x int;
+SELECT length(dolt_commit('-am', 'feature alters a')::text) AS committed;
+SELECT dolt_checkout('main');
+CREATE TABLE dm.made (id int PRIMARY KEY);
+SELECT (dolt_merge('feature'))[2:4];
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_checkout('main');
+-- nor when it changes definitions over uncommitted rows of another table
+-- (here, makes one: their table isn't the base's), which stay
+SELECT dolt_checkout('feature');
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'feature makes a table')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE dm.b SET v = 'dirty' WHERE id = 5;
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_checkout('main');
 
 -- A merge that conflicts isn't made over uncommitted changes: its commit
 -- would take them in, and its abort (a reset) would lose them.
@@ -143,3 +178,25 @@ UPDATE pg_collation SET collicurules = NULL WHERE collname = 'dm_c_utf8';
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA dm CASCADE;
 DROP COLLATION public.dm_c_utf8;
+
+-- A fast-forward over an uncommitted foreign key whose rows it would
+-- break: refused, as a merge leaving violations over uncommitted changes
+-- is.
+CREATE SCHEMA dmf VERSIONED;
+CREATE TABLE dmf.a (id int PRIMARY KEY);
+CREATE TABLE dmf.b (id int PRIMARY KEY, aid int);
+INSERT INTO dmf.a VALUES (1), (2);
+INSERT INTO dmf.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'dmf base')::text) AS committed;
+SELECT dolt_branch('dmf_feature');
+SELECT dolt_checkout('dmf_feature');
+DELETE FROM dmf.a WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a row gone')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE dmf.b ADD FOREIGN KEY (aid) REFERENCES dmf.a;
+SELECT (dolt_merge('dmf_feature'))[2:4];
+SELECT id FROM dmf.a ORDER BY id;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dmf_feature');
+DROP SCHEMA dmf CASCADE;
+SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;

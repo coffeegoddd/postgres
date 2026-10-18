@@ -1,0 +1,600 @@
+-- Merge truth tables: the cases Dolt pins its merge semantics with in Go
+-- tests that don't depend on its SQL engine, as SQL on versioned schemas.
+-- Each three-way case runs in both directions (the branch merged and the
+-- branch merged into swapped); a row both sides changed alike, or one
+-- side changed, merges the same either way, and a conflicting row keeps
+-- the branch's own version.
+--   * the row-level action matrix (go/libraries/doltcore/merge/merge_test.go,
+--     TestMergeCommits)
+--   * cell-level merges (merge/row_merge_test.go, TestRowMerge)
+--   * the three-way diff taxonomy (go/store/prolly/tree/three_way_differ_test.go)
+--   * keyless merges (merge/keyless_integration_test.go), by prolly's
+--     rule for a keyless row: the same change on both sides is made once,
+--     copies either side added are each a row, and copies removed on both
+--     are removed once (Dolt calls the last two conflicts)
+--   * merge bases (go/store/datas/commit_test.go)
+--   * revision specs (go/libraries/doltcore/doltdb/commit_spec_test.go)
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+-- err(q): q's error, commit ids masked
+CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<id>', 'g');
+END $$;
+-- (with its detail)
+CREATE FUNCTION pg_temp.err_detail(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{64}', '<id>', 'g');
+END $$;
+
+-- ------------------------------------------------------------------------
+-- The row-level action matrix.  For each key: its base row (or none),
+-- what each side does (n: nothing, i: insert, u: update, d: delete) and
+-- to what, whether it conflicts, and the merged row; a conflicting row
+-- keeps the left (the branch merged into) version.
+-- ------------------------------------------------------------------------
+CREATE TEMP TABLE matrix (k int, b1 int, b2 int,
+	la char, l1 int, l2 int, ra char, r1 int, r2 int,
+	conflict bool, e1 int, e2 int);
+INSERT INTO matrix VALUES
+	(0, 0, 0, 'n', NULL, NULL, 'n', NULL, NULL, false, 0, 0),
+	(1, 1, 1, 'n', NULL, NULL, 'u', -1, -1, false, -1, -1),
+	(2, 2, 2, 'n', NULL, NULL, 'd', NULL, NULL, false, NULL, NULL),
+	(3, 3, 3, 'u', -3, -3, 'n', NULL, NULL, false, -3, -3),
+	(4, 4, 4, 'u', -4, -4, 'u', -4, -4, false, -4, -4),		-- identical update
+	(5, 5, 5, 'u', -5, 5, 'u', 0, 5, true, -5, 5),			-- conflicting update
+	(6, 6, 6, 'u', -6, 6, 'u', 6, -6, false, -6, -6),		-- disjoint columns
+	(62, 62, 62, 'u', -62, 62, 'u', 62, -62, false, -62, -62),
+	(7, 7, 7, 'u', -7, -7, 'd', NULL, NULL, true, -7, -7),
+	(8, 8, 8, 'd', NULL, NULL, 'n', NULL, NULL, false, NULL, NULL),
+	(9, 9, 9, 'd', NULL, NULL, 'u', -9, -9, true, NULL, NULL),
+	(10, 10, 10, 'd', NULL, NULL, 'd', NULL, NULL, false, NULL, NULL),
+	(11, NULL, NULL, 'n', NULL, NULL, 'n', NULL, NULL, false, NULL, NULL),
+	(12, NULL, NULL, 'n', NULL, NULL, 'i', 12, 12, false, 12, 12),
+	(13, NULL, NULL, 'i', 13, 13, 'n', NULL, NULL, false, 13, 13),
+	(14, NULL, NULL, 'i', 14, 14, 'i', 14, 14, false, 14, 14),	-- identical insert
+	(15, NULL, NULL, 'i', 15, 15, 'i', 15, -15, true, 15, 15);	-- conflicting insert
+
+-- The statements one side's actions make, on mt.t.
+CREATE FUNCTION pg_temp.side_sql(side text) RETURNS SETOF text LANGUAGE sql AS $$
+	SELECT CASE a
+		WHEN 'i' THEN format('INSERT INTO mt.t VALUES (%s, %s, %s)', k, v1, v2)
+		WHEN 'u' THEN format('UPDATE mt.t SET col1 = %s, col2 = %s WHERE id = %s', v1, v2, k)
+		WHEN 'd' THEN format('DELETE FROM mt.t WHERE id = %s', k)
+	END
+	FROM (SELECT k, CASE side WHEN 'left' THEN la ELSE ra END AS a,
+			CASE side WHEN 'left' THEN l1 ELSE r1 END AS v1,
+			CASE side WHEN 'left' THEN l2 ELSE r2 END AS v2
+		  FROM matrix) s
+	WHERE a <> 'n' ORDER BY k
+$$;
+
+CREATE SCHEMA mt VERSIONED;
+CREATE TABLE mt.t (id int PRIMARY KEY, col1 int NOT NULL, col2 int NOT NULL);
+INSERT INTO mt.t SELECT k, b1, b2 FROM matrix WHERE b1 IS NOT NULL;
+SELECT length(dolt_commit('-Am', 'matrix base')::text) AS committed;
+SELECT dolt_branch('mt_left');
+SELECT dolt_branch('mt_right');
+SELECT dolt_checkout('mt_left');
+SELECT * FROM pg_temp.side_sql('left') \gexec
+SELECT length(dolt_commit('-am', 'left')::text) AS committed;
+SELECT dolt_checkout('mt_right');
+SELECT * FROM pg_temp.side_sql('right') \gexec
+SELECT length(dolt_commit('-am', 'right')::text) AS committed;
+
+-- Right into left: the merged rows and conflicts match the matrix.
+SELECT dolt_checkout('mt_left');
+BEGIN;
+SELECT (dolt_merge('mt_right'))[2:4];
+SELECT m.k, m.e1, m.e2, t.col1, t.col2, m.conflict,
+	   c.id IS NOT NULL AS conflicted
+  FROM matrix m LEFT JOIN mt.t t ON t.id = m.k
+	   LEFT JOIN (SELECT coalesce((our_row).id, (their_row).id, (base_row).id) AS id
+				  FROM dolt_conflicts(NULL::mt.t)) c ON c.id = m.k
+ WHERE m.e1 IS DISTINCT FROM t.col1 OR m.e2 IS DISTINCT FROM t.col2
+	OR m.conflict <> (c.id IS NOT NULL);
+SELECT count(*) AS conflicts FROM dolt_conflicts(NULL::mt.t);
+ROLLBACK;
+
+-- Left into right: the same, the conflicting rows keeping right's version.
+SELECT dolt_checkout('mt_right');
+BEGIN;
+SELECT (dolt_merge('mt_left'))[2:4];
+SELECT m.k, t.col1, t.col2
+  FROM matrix m LEFT JOIN mt.t t ON t.id = m.k
+ WHERE CASE WHEN m.conflict
+			THEN (CASE m.ra WHEN 'd' THEN NULL ELSE coalesce(m.r1, m.b1) END) IS DISTINCT FROM t.col1
+			ELSE m.e1 IS DISTINCT FROM t.col1 OR m.e2 IS DISTINCT FROM t.col2 END;
+SELECT array_agg(coalesce((our_row).id, (their_row).id, (base_row).id) ORDER BY 1) AS conflicted
+  FROM dolt_conflicts(NULL::mt.t);
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'mt_left', 'mt_right');
+DROP SCHEMA mt CASCADE;
+SELECT length(dolt_commit('-Am', 'matrix done')::text) AS committed;
+
+-- ------------------------------------------------------------------------
+-- Cell-level merges.  ours, theirs and base rows of (c1, c2[, c3]),
+-- 0 for NULL; a side may add or drop column c3.
+-- ------------------------------------------------------------------------
+CREATE SCHEMA rc VERSIONED;
+-- (each case: a table with the base row (or none), main as ours, rc_theirs
+-- as theirs; merged in a transaction block, rolled back)
+
+-- modify rows without overlap: (2,1) / (1,2) from (1,1) -> (2,2)
+CREATE TABLE rc.t (id int PRIMARY KEY, c1 int, c2 int);
+INSERT INTO rc.t VALUES (1, 1, 1);
+SELECT length(dolt_commit('-Am', 'rc base 1')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+UPDATE rc.t SET c1 = 2;
+SELECT length(dolt_commit('-am', 'ours 1')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+UPDATE rc.t SET c2 = 2;
+SELECT length(dolt_commit('-am', 'theirs 1')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT * FROM rc.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+
+-- equal overlapping changes: (2,2,255) / (2,3,255) from (1,2,null)
+-- -> (2,3,255)
+DROP TABLE rc.t;
+CREATE TABLE rc.t (id int PRIMARY KEY, c1 int, c2 int, c3 int);
+INSERT INTO rc.t VALUES (1, 1, 2, NULL);
+SELECT length(dolt_commit('-Am', 'rc base 2')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+UPDATE rc.t SET c1 = 2, c3 = 255;
+SELECT length(dolt_commit('-am', 'ours 2')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+UPDATE rc.t SET c1 = 2, c2 = 3, c3 = 255;
+SELECT length(dolt_commit('-am', 'theirs 2')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT * FROM rc.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+
+-- differing overlapping changes: (2,2,128) / (1,3,255) from (1,2,null):
+-- a conflict
+UPDATE rc.t SET c1 = 1, c2 = 2, c3 = NULL;
+SELECT length(dolt_commit('-am', 'rc base 3')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+UPDATE rc.t SET c1 = 2, c3 = 128;
+SELECT length(dolt_commit('-am', 'ours 3')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+UPDATE rc.t SET c2 = 3, c3 = 255;
+SELECT length(dolt_commit('-am', 'theirs 3')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT * FROM rc.t;
+SELECT (base_row).*, (our_row).c3 AS our_c3, (their_row).c3 AS their_c3
+  FROM dolt_conflicts(NULL::rc.t);
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+
+-- one side adds a column: (2,2) / (1,3,255) from (1,2) -> (2,3,255)
+DROP TABLE rc.t;
+CREATE TABLE rc.t (id int PRIMARY KEY, c1 int, c2 int);
+INSERT INTO rc.t VALUES (1, 1, 2);
+SELECT length(dolt_commit('-Am', 'rc base 4')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+UPDATE rc.t SET c1 = 2;
+SELECT length(dolt_commit('-am', 'ours 4')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+ALTER TABLE rc.t ADD COLUMN c3 int;
+UPDATE rc.t SET c2 = 3, c3 = 255;
+SELECT length(dolt_commit('-am', 'theirs 4')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT * FROM rc.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+
+-- one side drops a column: (1,2,1) / (2,1) from (1,1,1) -> (2,2)
+DROP TABLE rc.t;
+CREATE TABLE rc.t (id int PRIMARY KEY, c1 int, c2 int, c3 int);
+INSERT INTO rc.t VALUES (1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'rc base 5')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+UPDATE rc.t SET c2 = 2;
+SELECT length(dolt_commit('-am', 'ours 5')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+ALTER TABLE rc.t DROP COLUMN c3;
+UPDATE rc.t SET c1 = 2;
+SELECT length(dolt_commit('-am', 'theirs 5')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT * FROM rc.t;
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+
+-- insert different rows: (1,2) / (2,3) from none: a conflict; delete vs
+-- modify, and delete vs every column set to NULL: conflicts
+DROP TABLE rc.t;
+CREATE TABLE rc.t (id int PRIMARY KEY, c1 int, c2 int, c3 int);
+INSERT INTO rc.t VALUES (2, 1, 2, NULL), (3, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'rc base 6')::text) AS committed;
+SELECT dolt_branch('rc_theirs');
+INSERT INTO rc.t VALUES (1, 1, 2, NULL);
+DELETE FROM rc.t WHERE id = 2;
+UPDATE rc.t SET c1 = NULL, c2 = NULL, c3 = NULL WHERE id = 3;
+SELECT length(dolt_commit('-am', 'ours 6')::text) AS committed;
+SELECT dolt_checkout('rc_theirs');
+INSERT INTO rc.t VALUES (1, 2, 3, NULL);
+UPDATE rc.t SET c2 = 3 WHERE id = 2;
+DELETE FROM rc.t WHERE id = 3;
+SELECT length(dolt_commit('-am', 'theirs 6')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('rc_theirs'))[2:4];
+SELECT coalesce((our_row).id, (their_row).id) AS id, our_diff_type, their_diff_type
+  FROM dolt_conflicts(NULL::rc.t) ORDER BY 1;
+ROLLBACK;
+SELECT dolt_branch('-D', 'rc_theirs');
+DROP SCHEMA rc CASCADE;
+SELECT length(dolt_commit('-Am', 'cells done')::text) AS committed;
+
+-- ------------------------------------------------------------------------
+-- The three-way diff taxonomy.  Each scenario's base, left and right
+-- tables (k, v[, w]); merged right into left, the rows not in conflict
+-- are compared with the expected merge, and the conflicting keys listed.
+-- ------------------------------------------------------------------------
+CREATE TEMP TABLE tw (sc text, side char, k int, v int, w int);
+CREATE TEMP TABLE tw_exp (sc text, k int, v int, w int);
+CREATE TEMP TABLE tw_conf (sc text, k int);
+INSERT INTO tw VALUES
+	('left adds', 'b', 1, 1, NULL), ('left adds', 'b', 2, 2, NULL),
+	('left adds', 'l', 1, 1, NULL), ('left adds', 'l', 2, 2, NULL), ('left adds', 'l', 3, 3, NULL),
+	('left adds', 'l', 4, 4, NULL), ('left adds', 'l', 5, 5, NULL), ('left adds', 'l', 6, 6, NULL),
+	('left adds', 'r', 1, 1, NULL), ('left adds', 'r', 2, 2, NULL), ('left adds', 'r', 4, 4, NULL),
+	('left deletes', 'b', 1, 1, NULL), ('left deletes', 'b', 2, 2, NULL), ('left deletes', 'b', 3, 3, NULL),
+	('left deletes', 'b', 4, 4, NULL), ('left deletes', 'b', 5, 5, NULL), ('left deletes', 'b', 6, 6, NULL),
+	('left deletes', 'l', 1, 1, NULL), ('left deletes', 'l', 2, 2, NULL),
+	('left deletes', 'r', 1, 1, NULL), ('left deletes', 'r', 2, 2, NULL), ('left deletes', 'r', 3, 3, NULL),
+	('left deletes', 'r', 5, 5, NULL), ('left deletes', 'r', 6, 6, NULL),
+	('left edits', 'b', 1, 1, NULL), ('left edits', 'b', 2, 2, NULL), ('left edits', 'b', 3, 3, NULL),
+	('left edits', 'b', 4, 4, NULL), ('left edits', 'b', 5, 5, NULL), ('left edits', 'b', 6, 6, NULL),
+	('left edits', 'l', 1, 1, NULL), ('left edits', 'l', 2, 3, NULL), ('left edits', 'l', 3, 3, NULL),
+	('left edits', 'l', 4, 5, NULL), ('left edits', 'l', 5, 6, NULL), ('left edits', 'l', 6, 7, NULL),
+	('left edits', 'r', 1, 1, NULL), ('left edits', 'r', 2, 2, NULL), ('left edits', 'r', 3, 3, NULL),
+	('left edits', 'r', 4, 5, NULL), ('left edits', 'r', 5, 5, NULL), ('left edits', 'r', 6, 6, NULL),
+	('delete conflicts', 'b', 1, 1, NULL), ('delete conflicts', 'b', 2, 2, NULL),
+	('delete conflicts', 'l', 1, 1, NULL),
+	('delete conflicts', 'r', 1, 1, NULL), ('delete conflicts', 'r', 2, 3, NULL),
+	('convergent edits', 'b', 1, 1, NULL), ('convergent edits', 'b', 4, 4, NULL),
+	('convergent edits', 'l', 1, 1, NULL), ('convergent edits', 'l', 2, 2, NULL), ('convergent edits', 'l', 3, 3, NULL),
+	('convergent edits', 'l', 4, 4, NULL), ('convergent edits', 'l', 5, 5, NULL),
+	('convergent edits', 'r', 1, 1, NULL), ('convergent edits', 'r', 2, 2, NULL), ('convergent edits', 'r', 3, 3, NULL),
+	('convergent edits', 'r', 4, 4, NULL), ('convergent edits', 'r', 5, 5, NULL),
+	('clash edits', 'b', 1, 1, NULL), ('clash edits', 'b', 4, 4, NULL),
+	('clash edits', 'l', 1, 1, NULL), ('clash edits', 'l', 2, 2, NULL), ('clash edits', 'l', 3, 3, NULL),
+	('clash edits', 'l', 4, 4, NULL), ('clash edits', 'l', 5, 5, NULL),
+	('clash edits', 'r', 1, 1, NULL), ('clash edits', 'r', 2, 3, NULL), ('clash edits', 'r', 3, 4, NULL),
+	('clash edits', 'r', 4, 4, NULL), ('clash edits', 'r', 5, 6, NULL),
+	('resolvable edits', 'b', 1, 1, 1), ('resolvable edits', 'b', 2, 2, 2), ('resolvable edits', 'b', 3, 3, 3),
+	('resolvable edits', 'b', 4, 4, 4), ('resolvable edits', 'b', 5, 5, 5),
+	('resolvable edits', 'l', 1, 1, 1), ('resolvable edits', 'l', 2, 2, 3), ('resolvable edits', 'l', 3, 3, 4),
+	('resolvable edits', 'l', 4, 4, 4), ('resolvable edits', 'l', 5, 5, 6),
+	('resolvable edits', 'r', 1, 1, 1), ('resolvable edits', 'r', 2, 3, 2), ('resolvable edits', 'r', 3, 4, 3),
+	('resolvable edits', 'r', 4, 4, 4), ('resolvable edits', 'r', 5, 6, 5),
+	('combine types', 'b', 1, 1, 1), ('combine types', 'b', 2, 2, 2), ('combine types', 'b', 3, 3, 3),
+	('combine types', 'b', 4, 4, 4), ('combine types', 'b', 5, 5, 5), ('combine types', 'b', 8, 8, 8),
+	('combine types', 'l', 1, 1, 1), ('combine types', 'l', 2, 2, 3), ('combine types', 'l', 3, 3, 4),
+	('combine types', 'l', 5, 5, 6), ('combine types', 'l', 6, 6, 6),
+	('combine types', 'r', 1, 1, 1), ('combine types', 'r', 2, 3, 4), ('combine types', 'r', 3, 4, 3),
+	('combine types', 'r', 4, 4, 4), ('combine types', 'r', 5, 6, 5), ('combine types', 'r', 7, 7, 7);
+-- (the right-hand scenarios are the left-hand ones with the sides swapped)
+INSERT INTO tw SELECT replace(sc, 'left', 'right'),
+	CASE side WHEN 'l' THEN 'r' WHEN 'r' THEN 'l' ELSE 'b' END, k, v, w
+  FROM tw WHERE sc LIKE 'left %';
+INSERT INTO tw_exp VALUES
+	('left adds', 1, 1, NULL), ('left adds', 2, 2, NULL), ('left adds', 3, 3, NULL),
+	('left adds', 4, 4, NULL), ('left adds', 5, 5, NULL), ('left adds', 6, 6, NULL),
+	('left deletes', 1, 1, NULL), ('left deletes', 2, 2, NULL),
+	('left edits', 1, 1, NULL), ('left edits', 2, 3, NULL), ('left edits', 3, 3, NULL),
+	('left edits', 4, 5, NULL), ('left edits', 5, 6, NULL), ('left edits', 6, 7, NULL),
+	('delete conflicts', 1, 1, NULL),
+	('convergent edits', 1, 1, NULL), ('convergent edits', 2, 2, NULL), ('convergent edits', 3, 3, NULL),
+	('convergent edits', 4, 4, NULL), ('convergent edits', 5, 5, NULL),
+	('clash edits', 1, 1, NULL), ('clash edits', 4, 4, NULL),
+	('resolvable edits', 1, 1, 1), ('resolvable edits', 2, 3, 3), ('resolvable edits', 3, 4, 4),
+	('resolvable edits', 4, 4, 4), ('resolvable edits', 5, 6, 6),
+	('combine types', 1, 1, 1), ('combine types', 3, 4, 4), ('combine types', 5, 6, 6),
+	('combine types', 6, 6, 6), ('combine types', 7, 7, 7);
+INSERT INTO tw_exp SELECT replace(sc, 'left', 'right'), k, v, w FROM tw_exp WHERE sc LIKE 'left %';
+INSERT INTO tw_conf VALUES ('delete conflicts', 2), ('clash edits', 2), ('clash edits', 3),
+	('clash edits', 5), ('combine types', 2);
+
+-- A scenario's statements, run in turn: its tables made, right merged
+-- into left in each direction (left's version of a conflicting row kept),
+-- the result checked.
+CREATE FUNCTION pg_temp.tw_script(scenario text) RETURNS SETOF text LANGUAGE sql AS $$
+	SELECT s FROM (VALUES
+		(1, 'CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)'),
+		(2, format('INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = %L AND side = %L', scenario, 'b')),
+		(3, 'SELECT length(dolt_commit(''-Am'', ''tw base'')::text) AS committed'),
+		(4, 'SELECT dolt_branch(''tw_right'')'),
+		(5, 'SELECT dolt_checkout(''tw_right'')'),
+		(6, 'DELETE FROM tw.t'),
+		(7, format('INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = %L AND side = %L', scenario, 'r')),
+		(8, 'SELECT length(dolt_commit(''-Am'', ''tw right'')::text) AS committed'),
+		(9, 'SELECT dolt_checkout(''main'')'),
+		(10, 'DELETE FROM tw.t'),
+		(11, format('INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = %L AND side = %L', scenario, 'l')),
+		(12, 'SELECT length(dolt_commit(''-Am'', ''tw left'')::text) AS committed'),
+		(13, 'BEGIN'),
+		(14, 'SELECT (dolt_merge(''tw_right''))[3:4]'),
+		(15, format($q$SELECT %L AS scenario,
+			(SELECT count(*) FROM ((SELECT k, v, w FROM tw_exp WHERE sc = %L
+									EXCEPT SELECT k, v, w FROM tw.t)
+								   UNION ALL
+								   (SELECT k, v, w FROM tw.t
+									WHERE k NOT IN (SELECT k FROM tw_conf WHERE sc = %L)
+									EXCEPT SELECT k, v, w FROM tw_exp WHERE sc = %L)) d) AS wrong_rows,
+			(SELECT count(*) FROM tw.t t JOIN tw l ON l.sc = %L AND l.side = 'l' AND l.k = t.k
+			 WHERE t.k IN (SELECT k FROM tw_conf WHERE sc = %L)
+			   AND (t.v, t.w) IS DISTINCT FROM (l.v, l.w)) AS conflicts_not_ours,
+			(SELECT array_agg(coalesce((our_row).k, (their_row).k) ORDER BY 1)
+			 FROM dolt_conflicts(NULL::tw.t)) AS conflicts$q$,
+			scenario, scenario, replace(scenario, 'right', 'left'), scenario, scenario,
+			replace(scenario, 'right', 'left'))),
+		(16, 'ROLLBACK'),
+		(17, 'SELECT dolt_branch(''-D'', ''tw_right'')'),
+		(18, 'DROP TABLE tw.t'),
+		(19, 'SELECT length(dolt_commit(''-Am'', ''tw done'')::text) AS committed')) AS v(n, s)
+	ORDER BY n
+$$;
+INSERT INTO tw_conf SELECT replace(sc, 'left', 'right'), k FROM tw_conf WHERE sc LIKE 'left %';
+CREATE SCHEMA tw VERSIONED;
+SELECT length(dolt_commit('-Am', 'tw schema')::text) AS committed;
+SELECT s FROM (SELECT DISTINCT sc FROM tw) d, pg_temp.tw_script(d.sc) s
+ ORDER BY d.sc \gexec
+DROP SCHEMA tw CASCADE;
+SELECT length(dolt_commit('-Am', 'taxonomy done')::text) AS committed;
+
+-- ------------------------------------------------------------------------
+-- Keyless merges: rows by content, each with its count of copies.
+-- ------------------------------------------------------------------------
+CREATE SCHEMA kl VERSIONED;
+CREATE TABLE kl.nokey (c1 int, c2 int);
+CREATE FUNCTION pg_temp.copies() RETURNS TABLE (copies bigint, c1 int, c2 int)
+LANGUAGE sql AS $$ SELECT count(*), c1, c2 FROM kl.nokey GROUP BY c1, c2 ORDER BY c1, c2 $$;
+-- fast-forward
+INSERT INTO kl.nokey VALUES (1, 2), (1, 2);
+SELECT length(dolt_commit('-Am', 'added rows')::text) AS committed;
+SELECT dolt_branch('kl_other');
+SELECT dolt_checkout('kl_other');
+INSERT INTO kl.nokey VALUES (3, 4);
+SELECT length(dolt_commit('-am', 'added rows on other')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+-- three-way
+INSERT INTO kl.nokey VALUES (5, 6);
+SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- three-way with duplicates
+SELECT dolt_checkout('kl_other');
+INSERT INTO kl.nokey VALUES (3, 4);
+SELECT length(dolt_commit('-am', 'another on other')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO kl.nokey VALUES (5, 6), (5, 6);
+SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('-D', 'kl_other');
+-- identical parallel inserts: made once (Dolt calls it a conflict, keeping
+-- the same rows)
+SELECT dolt_branch('kl_other');
+SELECT dolt_checkout('kl_other');
+INSERT INTO kl.nokey VALUES (3, 4);
+SELECT length(dolt_commit('-am', 'added rows on other')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO kl.nokey VALUES (3, 4);
+SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('-D', 'kl_other');
+-- asymmetric parallel deletes: the most removed (Dolt: a conflict, ours
+-- the same 2 copies)
+DELETE FROM kl.nokey;
+INSERT INTO kl.nokey VALUES (1, 2), (1, 2), (1, 2), (1, 2);
+SELECT length(dolt_commit('-am', 'four rows')::text) AS committed;
+SELECT dolt_branch('kl_other');
+SELECT dolt_checkout('kl_other');
+DELETE FROM kl.nokey WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 1);
+SELECT length(dolt_commit('-am', 'deleted 1 row on other')::text) AS committed;
+SELECT dolt_checkout('main');
+DELETE FROM kl.nokey WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 2);
+SELECT length(dolt_commit('-am', 'deleted 2 rows on main')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('-D', 'kl_other');
+-- asymmetric parallel updates: an update is a copy removed and one added;
+-- the copies removed on both are removed once, those added each a row
+-- (Dolt: two conflicts, ours 2 of each)
+SELECT dolt_branch('kl_other');
+SELECT dolt_checkout('kl_other');
+UPDATE kl.nokey SET c2 = 9 WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 1);
+SELECT length(dolt_commit('-am', 'updated 1 row on other')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE kl.nokey SET c2 = 9 WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 2);
+SELECT length(dolt_commit('-am', 'updated 2 rows on main')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('kl_other'))[2:4];
+SELECT * FROM pg_temp.copies();
+ROLLBACK;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('-D', 'kl_other');
+DROP SCHEMA kl CASCADE;
+SELECT length(dolt_commit('-Am', 'keyless done')::text) AS committed;
+
+-- ------------------------------------------------------------------------
+-- Merge bases, on a DAG of empty commits:
+--   a: a1 <- a2 <- a3 <- a4 <- a5 <- a6 (a6 merges b5)
+--   b:         a2 <- b3 <- b4 <- b5 (b5 merges a3)
+--   c:   a1 <- c2
+--   d:   d1 <- d2 (unrelated: no merge base with the others; Dolt's own
+--        merge of it into c, by its CLI, is refused as prolly's is)
+-- ------------------------------------------------------------------------
+CREATE FUNCTION pg_temp.empty_commit(message text) RETURNS text LANGUAGE sql AS $$
+	SELECT (dolt_commit('--allow-empty', '-m', message))[1]
+$$;
+SELECT dolt_checkout('-b', 'mb_a');
+SELECT pg_temp.empty_commit('a1') AS a1 \gset
+SELECT pg_temp.empty_commit('a2') AS a2 \gset
+SELECT dolt_branch('mb_c', :'a1');
+SELECT dolt_branch('mb_b');
+SELECT pg_temp.empty_commit('a3') AS a3 \gset
+SELECT pg_temp.empty_commit('a4') AS a4 \gset
+SELECT pg_temp.empty_commit('a5') AS a5 \gset
+SELECT dolt_checkout('mb_b');
+SELECT pg_temp.empty_commit('b3') AS b3 \gset
+SELECT pg_temp.empty_commit('b4') AS b4 \gset
+SELECT (dolt_merge('--no-ff', '-m', 'b5', :'a3'))[1] AS b5 \gset
+SELECT dolt_checkout('mb_a');
+SELECT (dolt_merge('--no-ff', '-m', 'a6', 'mb_b'))[1] AS a6 \gset
+SELECT dolt_checkout('mb_c');
+SELECT pg_temp.empty_commit('c2') AS c2 \gset
+SELECT test_commit_of(prolly_root_hash('HEAD'), 'd1') AS d1 \gset
+SELECT test_commit_chain(:'d1', 1) AS d2 \gset
+SELECT dolt_branch('mb_d', :'d2');
+SELECT pg_temp.err('SELECT dolt_merge(''--no-ff'', ''-m'', ''c3'', ''mb_d'')') AS unrelated;
+SELECT dolt_merge_base(:'a1', :'a1') = :'a1' AS all_self,
+	dolt_merge_base(:'a1', :'a2') = :'a1' AS one_side_self,
+	dolt_merge_base(:'a3', :'b3') = :'a2' AS common_parent,
+	dolt_merge_base(:'a4', :'b4') = :'a2' AS common_grandparent,
+	dolt_merge_base(:'a6', :'b5') = :'b5' AS merged_in,
+	dolt_merge_base(:'a6', :'c2') = :'a1' AS across_merges;
+SELECT pg_temp.err(format('SELECT dolt_merge_base(%L, %L)', :'d2', :'a6')) AS no_common_ancestor;
+-- A criss-cross: base; x1 and y1 on it; xy merges y1 into x1 and yx x1
+-- into y1.  Their maximal common ancestors are x1 and y1; the base found
+-- is one of them, the same every time, and either way round.
+SELECT pg_temp.empty_commit('cc base') AS ccbase \gset
+SELECT dolt_branch('cc_x');
+SELECT dolt_branch('cc_y');
+SELECT dolt_checkout('cc_x');
+SELECT pg_temp.empty_commit('x1') AS x1 \gset
+SELECT dolt_checkout('cc_y');
+SELECT pg_temp.empty_commit('y1') AS y1 \gset
+SELECT dolt_branch('cc_yx');
+SELECT dolt_checkout('cc_x');
+SELECT (dolt_merge('--no-ff', '-m', 'xy', 'cc_y'))[1] AS xy \gset
+SELECT dolt_checkout('cc_yx');
+SELECT (dolt_merge('--no-ff', '-m', 'yx', :'x1'))[1] AS yx \gset
+SELECT dolt_merge_base(:'xy', :'yx') IN (:'x1', :'y1') AS a_maximal_one,
+	dolt_merge_base(:'xy', :'yx') = dolt_merge_base(:'xy', :'yx') AS same_again,
+	dolt_merge_base(:'xy', :'yx') = dolt_merge_base(:'yx', :'xy') AS either_way;
+-- Of maximal ones of different heights (the most commits back to the
+-- root), the higher, as Dolt chooses: here y3, two above x1.
+SELECT dolt_checkout('cc_y');
+SELECT pg_temp.empty_commit('y2') AS y2 \gset
+SELECT pg_temp.empty_commit('y3') AS y3 \gset
+SELECT dolt_branch('cc_y3x');
+SELECT dolt_checkout('cc_x');
+SELECT dolt_branch('cc_xy3', :'x1');
+SELECT dolt_checkout('cc_xy3');
+SELECT (dolt_merge('--no-ff', '-m', 'xy3', :'y3'))[1] AS xy3 \gset
+SELECT dolt_checkout('cc_y3x');
+SELECT (dolt_merge('--no-ff', '-m', 'y3x', :'x1'))[1] AS y3x \gset
+SELECT dolt_merge_base(:'xy3', :'y3x') = :'y3' AS the_higher,
+	dolt_merge_base(:'y3x', :'xy3') = :'y3' AS either_way;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'mb_a', 'mb_b', 'mb_c', 'mb_d', 'cc_x', 'cc_y', 'cc_yx',
+				   'cc_y3x', 'cc_xy3');
+
+-- ------------------------------------------------------------------------
+-- Revision specs: a branch, its full ref name, HEAD in any case, and
+-- ancestry steps (~n: the nth first parent back; ^n: the nth parent),
+-- chained.
+-- ------------------------------------------------------------------------
+SELECT dolt_checkout('-b', 'rs');
+SELECT pg_temp.empty_commit('r1') AS r1 \gset
+SELECT pg_temp.empty_commit('r2') AS r2 \gset
+SELECT pg_temp.empty_commit('r3') AS r3 \gset
+SELECT pg_temp.empty_commit('r4') AS r4 \gset
+SELECT dolt_hashof('rs') = :'r4' AS branch,
+	dolt_hashof('refs/heads/rs') = :'r4' AS full_ref,
+	dolt_hashof('head') = :'r4' AS head_lower,
+	dolt_hashof('head^~2') = :'r1' AS caret_then_tilde,
+	dolt_hashof('HEAD~2^1') = :'r1' AS tilde_then_caret,
+	dolt_hashof('HEAD^^') = :'r2' AS carets,
+	dolt_hashof(:'r4' || '~3') = :'r1' AS from_a_commit;
+SELECT pg_temp.err('SELECT dolt_hashof(''HEAD^2'')') AS no_second_parent,
+	pg_temp.err('SELECT dolt_hashof(''HEAD~100000'')') AS past_the_first,
+	pg_temp.err('SELECT dolt_hashof(''refs/heads/'')') AS no_branch;
+-- a commit's id, in either case, is no branch's name; a branch named as
+-- a full ref name is itself
+SELECT pg_temp.err_detail(format('SELECT dolt_branch(%L)', :'r1')) AS commit_id,
+	pg_temp.err_detail(format('SELECT dolt_branch(%L)', upper(:'r1'))) AS upper_case;
+SELECT dolt_branch('refs/heads/rs', :'r2');
+SELECT dolt_hashof('refs/heads/rs') = :'r2' AS named_so,
+	dolt_hashof('refs/heads/refs/heads/rs') = :'r2' AS by_full_name;
+SELECT dolt_branch('-D', 'refs/heads/rs');
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'rs');
+
+-- ------------------------------------------------------------------------
+-- Branch names (go/libraries/doltcore/ref/branchname_test.go): git's
+-- rules for a ref's name, ASCII only, and not HEAD or "-".  Listed: each
+-- name whose validity differs from Dolt's (none).
+-- ------------------------------------------------------------------------
+CREATE FUNCTION pg_temp.valid_branch_name(name text) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM dolt_branch('--', name);
+	PERFORM dolt_branch('-D', '--', name);
+	RETURN true;
+EXCEPTION WHEN invalid_name THEN
+	RETURN false;
+END $$;
+SELECT name, valid FROM (VALUES
+	('t', true), ('user/in-progress/do-some-things', true),
+	('user/in-progress/{}', true), ('user/{/a.tt/}', true),
+	(U&'\2603\FE0F', false), ('', false),
+	('this-is-a-..-test', false), ('this-is-a-@{-test', false),
+	('this-is-a- -test', false), (E'this-is-a-\t-test', false),
+	('this-is-a-//-test', false), ('this-is-a-:-test', false),
+	('this-is-a-?-test', false), ('this-is-a-[-test', false),
+	(E'this-is-a-\\-test', false), ('this-is-a-^-test', false),
+	('this-is-a-~-test', false), ('this-is-a-*-test', false),
+	(E'this-is-a-\x01-test', false), (E'this-is-a-\x1f-test', false),
+	(E'this-is-a-\x7f-test', false), (E'this-is-a-\n-test', false),
+	('user/working/.tt', false), ('.user/working/a.tt', false),
+	('user/working/', false), ('/user/working/', false),
+	('user/working/mybranch.lock', false), ('mybranch.lock', false),
+	('user.lock/working/mybranch', false), ('HEAD', false), ('-', false))
+	AS v(name, valid)
+ WHERE pg_temp.valid_branch_name(name) <> valid;

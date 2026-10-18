@@ -1,0 +1,299 @@
+{
+  "version": 1,
+  "id": "dolt-merge-abort-clears",
+  "description": "Reviewed Dolt port: DOLT_MERGE(--abort) clears staged",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: DOLT_MERGE(--abort) clears staged"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create-test",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0),(1),(2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "create-one",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE one_pk (pk1 bigint NOT NULL, c1 bigint, c2 bigint, PRIMARY KEY (pk1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "tables-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "add tables"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch($1)",
+      "params": [
+        "feature-branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "feature-branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "main-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO one_pk (pk1,c1,c2) VALUES (0,0,0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "changed main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-feature2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "feature-branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "feature-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO one_pk (pk1,c1,c2) VALUES (0,1,1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "feature-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "changed feature branch"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-main2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "merge",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT (dolt_merge('feature-branch'))[2:4]",
+      "expect": {
+        "rows": [
+          [
+            "{0,1,\"conflicts found\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "abort",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT (dolt_merge('--abort'))[4]",
+      "expect": {
+        "rows": [
+          [
+            "merge aborted"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

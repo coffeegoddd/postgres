@@ -56,6 +56,7 @@
       "id": "assert-0",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof($1) = dolt_hashof($2)",
       "expect": {
         "rows": [
@@ -78,6 +79,7 @@
       "id": "assert-1",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof($1) = dolt_hashof('HEAD~1')",
       "expect": {
         "rows": [
@@ -97,6 +99,7 @@
       "id": "assert-2",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof($1) = dolt_hashof('HEAD')",
       "expect": {
         "rows": [
@@ -116,6 +119,7 @@
       "id": "assert-3",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof($1) = dolt_hashof('main')",
       "expect": {
         "rows": [
@@ -135,6 +139,7 @@
       "id": "assert-4",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof('non_branch')",
       "params": [],
       "expect": {
@@ -145,6 +150,7 @@
       "id": "assert-5",
       "session": "a",
       "op": "query",
+      "requires": ["vc.core"],
       "sql": "SELECT dolt_hashof(left($1,30))",
       "params": [
         {

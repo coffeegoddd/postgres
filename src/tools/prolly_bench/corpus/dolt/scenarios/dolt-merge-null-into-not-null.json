@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "id": "dolt-merge-null-into-not-null",
+  "description": "Reviewed Dolt port: try to merge a nullable field into a non-null column",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: try to merge a nullable field into a non-null column"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, c0 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1,1),(3,3)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "new",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table with NULL value"
+      ],
+      "save": "new"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (2,NULL)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserted null value"
+      ],
+      "save": "other"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "not-null",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE test ALTER COLUMN c0 SET NOT NULL",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "main-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (4,4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "modified column c0 to not null"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('other') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [
+          [
+            "public.test",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT violation_type, violating_row->>'pk', violation_info::text FROM dolt_constraint_violations('test')",
+      "expect": {
+        "rows": [
+          [
+            "not null",
+            "2",
+            "{\"Columns\": [\"c0\"]}"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

@@ -68,9 +68,9 @@ SELECT id FROM cv.child ORDER BY id;
 -- In one, it stops with them recorded.
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
-            dolt_merge             
------------------------------------
- {1,"constraint violations found"}
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
 (1 row)
 
 SELECT * FROM dolt_constraint_violations();
@@ -84,7 +84,7 @@ FROM dolt_constraint_violations('cv.child') ORDER BY violation_type;
  violation_type |          violating_row           |                                                             violation_info                                                             
 ----------------+----------------------------------+----------------------------------------------------------------------------------------------------------------------------------------
  foreign key    | {"id": 2, "pid": 2, "code": "b"} | {"Table": "cv.child", "Columns": ["pid"], "ForeignKey": "child_pid_fkey", "ReferencedTable": "cv.parent", "ReferencedColumns": ["id"]}
- unique index   | {"id": 4, "pid": 1, "code": "x"} | {"Name": "child_code_key"}
+ unique index   | {"id": 4, "pid": 1, "code": "x"} | {"Name": "child_code_key", "Columns": ["code"]}
 (2 rows)
 
 SELECT id, pid, code FROM cv.child ORDER BY id;
@@ -158,7 +158,7 @@ SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child')
 ROLLBACK;
 SELECT dolt_verify_constraints();	-- can't be committed
 ERROR:  cannot commit a transaction with constraint violations
-DETAIL:  Table "child" has a row that violates a foreign key constraint on branch "main".
+DETAIL:  Table "child" has a row with a foreign key violation on branch "main".
 HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
 SET dolt.allow_commit_conflicts = on;
 SELECT dolt_verify_constraints();	-- kept
@@ -227,9 +227,9 @@ SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
 
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
-            dolt_merge             
------------------------------------
- {1,"constraint violations found"}
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
 (1 row)
 
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
@@ -257,9 +257,9 @@ ROLLBACK;
 -- Violations kept stay through later merges that find none of their own.
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_merge('feature'))[3:4];
-            dolt_merge             
------------------------------------
- {1,"constraint violations found"}
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
 (1 row)
 
 SELECT length(dolt_commit('-am', 'merged, a violation kept')::text) AS committed;
@@ -420,7 +420,7 @@ BEGIN;
 SELECT dolt_revert(:'parent10');
  dolt_revert 
 -------------
- {1}
+ {"",0,0,1}
 (1 row)
 
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
@@ -429,7 +429,35 @@ SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child')
  foreign key    | {"id": 10, "pid": 10, "code": "ten"}
 (1 row)
 
-ROLLBACK;
+-- dolt_commit refuses them, unless forced; the transaction still can't
+-- commit with them.
+SAVEPOINT s;
+SELECT dolt_commit('-am', 'not with violations');
+ERROR:  cannot commit with constraint violations
+HINT:  Fix the rows and check them again with dolt_verify_constraints().
+ROLLBACK TO s;
+SELECT length(dolt_commit('-afm', 'forced')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with constraint violations
+DETAIL:  Table "child" has a row with a foreign key violation on branch "main".
+HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+   message   
+-------------
+ child of 10
+(1 row)
+
 -- Rows a parent's row security hides from its owner are seen anyway, as
 -- the foreign key's own checks see them.
 CREATE ROLE regress_cv_owner;

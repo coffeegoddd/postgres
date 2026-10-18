@@ -1,0 +1,37 @@
+{
+		// One branch makes a new column, deletes the old one, and renames.
+		// The other just has a data change.
+		Name: "creating new column to replace ancestor column",
+		AncSetUpScript: []string{
+			"CREATE table t (pk int primary key, col1 int);",
+			"INSERT into t values (1, 10), (2, 20);",
+		},
+		RightSetUpScript: []string{
+			"insert into t values (3, 30), (4, 40);",
+		},
+		LeftSetUpScript: []string{
+			"alter table t add column col2 int",
+			"update t set col2 = 10*col1",
+			"alter table t drop column col1;",
+			"alter table t rename column col2 to col1;",
+			"insert into t values (5, 50), (6, 60);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_preview_merge_conflicts_summary('main', 'right');",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query: "select * from t;",
+				Expected: []sql.Row{
+					{1, 100}, {2, 200},
+					{3, 30}, {4, 40},
+					{5, 50}, {6, 60},
+				},
+			},
+		},
+	}

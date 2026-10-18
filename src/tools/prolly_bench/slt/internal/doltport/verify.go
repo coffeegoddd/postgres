@@ -66,6 +66,7 @@ type Report struct {
 	DeferredCases          int              `json:"explicitly_deferred_cases"`
 	UnreviewedCases        int              `json:"unreviewed_cases"`
 	VerifiedAgainstCatalog bool             `json:"verified_against_catalog"`
+	Classes                ClassCoverage    `json:"classes"`
 	Engines                []EngineCoverage `json:"engines"`
 }
 
@@ -128,6 +129,7 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	report.Revision, report.Scope = lock.Revision, lock.Scope
 	report.SourceCases, report.SourceAssertions, report.UnresolvedFields = lock.Counts.Cases, lock.Counts.Assertions, lock.Counts.UnresolvedFields
 	sourceCases := map[string]doltcatalog.Case{}
+	partial := map[string]bool{}
 	if catalogPath != "" {
 		var catalog doltcatalog.Catalog
 		if err := readJSON(catalogPath, &catalog); err != nil {
@@ -223,6 +225,7 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		}
 		if setup != len(p.Setup) || assertions != len(p.Assertions) {
 			report.PartialCases++
+			partial[p.ID] = true
 		} else {
 			report.PortedCases++
 		}
@@ -250,6 +253,19 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	if report.UnreviewedCases < 0 {
 		return report, fmt.Errorf("more selected cases than source inventory")
 	}
+	var classes Classification
+	if err := readJSON(filepath.Join(root, "classification.json"), &classes); err != nil {
+		return report, err
+	}
+	var catalog map[string]doltcatalog.Case
+	if catalogPath != "" {
+		catalog = sourceCases
+	}
+	cov, err := checkClassification(classes, lock, catalog, manifest, partial)
+	if err != nil {
+		return report, err
+	}
+	report.Classes = cov
 	if resultsPath != "" {
 		engines, err := coverage(resultsPath, scenarios, hashes, credits)
 		if err != nil {
@@ -292,18 +308,25 @@ func coverage(path string, scenarios map[string]vcscenario.Scenario, hashes map[
 		s, ok := scenarios[r.ID]
 		e := engines[r.Engine]
 		k := r.Engine + "/" + r.ID
-		if !ok || e == nil || seen[k] || r.PlannedSteps != len(s.Steps) {
+		if !ok || e == nil || seen[k] || r.PlannedSteps != s.PlannedSteps() {
 			return nil, fmt.Errorf("unknown, duplicate or mismatched execution %s", k)
 		}
 		seen[k] = true
 		switch r.Status {
 		case "passed":
-			if r.Error != "" || r.Phase != "" || len(r.Missing) > 0 || len(r.Steps) != len(s.Steps) {
+			// every pass's steps, each variant's in turn
+			var planned []vcscenario.StepResult
+			for _, p := range s.Passes() {
+				for _, st := range p.Steps {
+					planned = append(planned, vcscenario.StepResult{ID: st.ID, Variant: p.Variant, Session: st.Session, Op: st.Op})
+				}
+			}
+			if r.Error != "" || r.Phase != "" || len(r.Missing) > 0 || len(r.Steps) != len(planned) {
 				return nil, fmt.Errorf("incomplete passing execution %s", k)
 			}
 			for i, step := range r.Steps {
-				expected := s.Steps[i]
-				if step.ID != expected.ID || step.Op != expected.Op || step.Session != expected.Session || step.Error != "" {
+				expected := planned[i]
+				if step.ID != expected.ID || step.Variant != expected.Variant || step.Op != expected.Op || step.Session != expected.Session || step.Error != "" {
 					return nil, fmt.Errorf("invalid passing trace %s", k)
 				}
 			}

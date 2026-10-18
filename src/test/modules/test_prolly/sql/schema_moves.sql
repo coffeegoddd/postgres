@@ -177,6 +177,25 @@ SELECT test_fold_root() = prolly_root_hash(:'sm8_base') AS same_root;
 DROP SCHEMA sm8 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm8')::text) AS committed;
 
+-- A move to a commit whose column is NOT NULL, from a branch with NULLs in
+-- it: the NOT NULL is made once the commit's rows are written (the NULLs
+-- gone with them).  A primary key's columns keep theirs before.
+CREATE SCHEMA sm9 VERSIONED;
+CREATE TABLE sm9.t (pk int PRIMARY KEY, col1 int NOT NULL);
+INSERT INTO sm9.t VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sm9 not null')::text) AS committed;
+SELECT dolt_branch('sm9_right');
+ALTER TABLE sm9.t ALTER COLUMN col1 DROP NOT NULL;
+INSERT INTO sm9.t VALUES (3, NULL);
+SELECT length(dolt_commit('-Am', 'sm9 nullable')::text) AS committed;
+SELECT dolt_checkout('sm9_right');
+SELECT * FROM sm9.t ORDER BY pk;
+SELECT attnotnull FROM pg_attribute WHERE attrelid = 'sm9.t'::regclass AND attname = 'col1';
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sm9_right');
+DROP SCHEMA sm9 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm9')::text) AS committed;
+
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;

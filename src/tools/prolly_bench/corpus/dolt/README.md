@@ -18,6 +18,8 @@ Reproduce it from a local Dolt clone (no Dolt build or network needed):
 cd src/tools/prolly_bench/slt
 go run ./cmd/dolt-catalog --repo ~/cursor_src/dolt \
   --revision 51cc4458b740ac132cb2302fe5394a2abbfba39d \
+  --doltgres-repo ~/cursor_src/doltgresql \
+  --doltgres-revision d5e05f46728e4a28116770eb683090c3ccd82ca4 \
   --check ../corpus/dolt/source-lock.json --out /tmp/dolt-catalog
 ```
 
@@ -27,6 +29,37 @@ literal bytes and SHA-256, setup/assertion counts, skip flags, and computed SQL
 expressions requiring review. It never executes or translates upstream Go.
 The smaller committed `source-lock.json` pins file hashes and counts; the full
 catalog is a generated artifact.
+
+The lock also pins, by file hash only, the other sources ports derive from:
+Dolt's Go tests that don't run its engine (`go_tests`: the merge truth
+tables, keyless and schema merges, merge bases, revision specs and branch
+names), at the same revision, and Doltgres's Postgres-dialect version-control
+tests (`doltgres`, at `d5e05f46`). Those ports are SQL regression tests, not
+scenarios; the pin makes an upstream change to their source visible.
+
+## Classification and coverage
+
+`classification.json` classifies every catalog case, with a reason:
+
+- **P**: version control prolly supports, by area (merge, schema-merge,
+  cherry-pick, revert, branch, checkout, reset, multisession, ...). Ported,
+  or to be. Multi-session cases encode Dolt's optimistic model and are
+  rederived under Postgres semantics rather than ported literally.
+- **F**: needs a feature prolly lacks, named (diff-tables, history, as-of,
+  preview-merge-conflicts, ...). Ported with the feature; where only one
+  assertion needs it, a partial port is allowed with a review note.
+- **N**: doesn't apply: MySQL-only syntax, types or variables, the staging
+  area, Dolt internals, or suites that aren't about version control.
+
+It was drafted by rules on each suite and on what each case's literal uses
+(the first matching feature decides), then reviewed; a case's class changes
+by editing its entry. The verifier checks that every catalog case is
+classified once and that a full port is of a P case (a partial one of a P
+or F case); with `--catalog`, as CI runs it, each entry's hash is checked
+against its case's literal too (offline, only the ported and deferred
+cases' hashes are). `dolt-corpus` reports P cases by area as
+ported, partial, deferred or not started, and F cases by feature; `--markdown`
+writes those tables, which CI adds to the job summary.
 
 Upstream source and derived scenarios retain Dolthub's Apache-2.0 license;
 see LICENSE. This catalog does not confer test coverage by itself.
@@ -41,28 +74,25 @@ zero-based mapping to scenario step IDs and a review note. An empty mapping
 requires a note and makes the case partial, never fully ported. All scenario
 steps must appear in the mapping.
 
-The first tranche preserves all 23 assertion entries from three cases:
+Ports adapt MySQL `CALL` and staging flags to prolly's commit-all
+operations (there is no staging area: `dolt_add` stages nothing), call
+`dolt_*` functions with `SELECT`, capture returned commit IDs instead of
+MySQL variables, use PostgreSQL DDL, and check PostgreSQL SQLSTATEs instead
+of Dolt's error text. Each adaptation that follows from an intended
+divergence from Dolt cites that divergence by its ID (D1 no staging area,
+D3 return shapes, D4 SQLSTATEs, D5 transactions, D6 merges and sequences,
+...).
+Upstream `SkipResultsCheck` becomes operation success plus a check of the
+resulting state (on checkout, the active branch); it is not propagated as a
+bypass.
 
-| Source behavior | Scenario |
-| --- | --- |
-| Three independent committed working sets | dolt-checkout-working-set |
-| Create, leave and revisit a branch | dolt-checkout-new-branch |
-| Distinct commits, HEAD/parent/main references and invalid refs | dolt-hashof |
-
-These ports explicitly adapt MySQL CALL/staging flags to native commit-all
-operations, capture returned commit IDs instead of MySQL variables, use
-PostgreSQL identity columns, and check PostgreSQL SQLSTATEs. Upstream
-`SkipResultsCheck` on checkout becomes operation success plus active-branch
-verification; it is not propagated as a bypass.
-
-The manifest also records four deferred cases with concrete reasons. One is
-an intended divergence: a hard reset restores a versioned schema's
-sequences to the commit's values (they are per branch and in each commit),
-where Dolt continues its auto-increment counter.
-An active-transaction reset, mixed reset/staging, and merge-state reset cannot
-be represented by the current adapter without changing the behavior under
-test. Another 1,226 catalog cases remain unreviewed. No subset pass is a claim
-of full Dolt compatibility.
+The manifest also records deferred cases, each with a concrete reason: an
+intended divergence (for example, a hard reset restores a versioned
+schema's sequences to the commit's values, since they are per branch and in
+each commit, where Dolt continues its auto-increment counter), a case that
+doesn't apply (a mixed reset needs the staging area), or a prolly behavior
+still to be fixed. The remaining catalog cases are unreviewed. No subset
+pass is a claim of full Dolt compatibility.
 
 Validate the mappings (omit `--catalog` for an offline excerpt check):
 
@@ -103,18 +133,17 @@ translation or execute arbitrary upstream Go.
 ## CI
 
 Each PR fetches the pinned Dolt source, regenerates the catalog and verifies
-the committed lock and mappings before running the imported scenarios on D1.
-The D1 execution and coverage commands must both exit successfully.
+the committed lock and mappings before running the imported scenarios on
+prolly. The prolly execution and coverage commands must both exit
+successfully.
 
-A separate contract check records the same cases as unsupported on heap,
-prolly, D2, D3a, D3b and D4. Both commands must exit with the expected
-incomplete-coverage status, and the generated ledger must contain exactly
-those six engines, every selected case unsupported, and zero passes, failures,
-not-run cases or credited assertions. This checks truthful capability
-reporting; it does not test VC correctness on those engines. Enabling VC on
-another engine requires moving it into the success gate and updating this
-explicit ledger expectation.
+A separate contract check records the same cases as unsupported on heap.
+Both commands must exit with the expected incomplete-coverage status, and
+the generated ledger must contain exactly that engine, every selected case
+unsupported, and zero passes, failures, not-run cases or credited
+assertions. This checks truthful capability reporting; it does not test VC
+correctness on heap.
 
 The existing `test-logs` artifact includes the generated source catalog,
-mapping review, saved scenarios and runner/server logs, plus separate D1 and
-unsupported-engine coverage reports under `engine-results/dolt-*`.
+mapping review, saved scenarios and runner/server logs, plus separate prolly
+and unsupported-engine coverage reports under `engine-results/dolt-*`.

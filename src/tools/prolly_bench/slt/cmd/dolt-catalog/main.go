@@ -16,13 +16,19 @@ func run() error {
 	revision := flag.String("revision", "", "full pinned commit SHA")
 	out := flag.String("out", "", "new output directory")
 	check := flag.String("check", "", "optional committed source-lock.json to compare")
+	doltgres := flag.String("doltgres-repo", "", "local Doltgres Git checkout")
+	doltgresRevision := flag.String("doltgres-revision", "", "full pinned Doltgres commit SHA")
 	flag.Parse()
-	if *repo == "" || *out == "" || flag.NArg() != 0 {
-		return fmt.Errorf("requires -repo, -revision and -out")
+	if *repo == "" || *revision == "" || *out == "" || *doltgres == "" || *doltgresRevision == "" || flag.NArg() != 0 {
+		return fmt.Errorf("requires -repo, -revision, -doltgres-repo, -doltgres-revision and -out")
 	}
 	c, err := doltcatalog.Read(*repo, *revision)
 	if err != nil {
 		return err
+	}
+	c.Lock.Doltgres, err = doltcatalog.PinFiles(doltcatalog.DoltgresRepository, *doltgres, *doltgresRevision, doltcatalog.DoltgresFiles)
+	if err != nil {
+		return fmt.Errorf("doltgres: %w", err)
 	}
 	lock, err := json.MarshalIndent(c.Lock, "", "  ")
 	if err != nil {

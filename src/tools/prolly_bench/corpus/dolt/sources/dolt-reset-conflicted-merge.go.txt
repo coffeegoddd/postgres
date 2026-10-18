@@ -1,0 +1,27 @@
+{
+		Name: "CALL DOLT_RESET('--hard') should reset the merge state after conflicting merge",
+		SetUpScript: []string{
+			"SET dolt_allow_commit_conflicts = on",
+			"CREATE TABLE test1 (pk int NOT NULL, c1 int, c2 int, PRIMARY KEY (pk));",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO test1 values (0,1,1);",
+			"CALL DOLT_COMMIT('-am', 'added table')",
+
+			"CALL DOLT_CHECKOUT('-b', 'merge_branch');",
+			"UPDATE test1 set c1 = 2, c2 = 2;",
+			"CALL DOLT_COMMIT('-am', 'update pk 0 = 2,2 to test1');",
+
+			"CALL DOLT_CHECKOUT('main');",
+			"UPDATE test1 set c1 = 3, c2 = 3;",
+			"CALL DOLT_COMMIT('-am', 'update pk 0 = 3,3 to test1');",
+
+			"CALL DOLT_MERGE('merge_branch');",
+			"CALL DOLT_RESET('--hard');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL DOLT_MERGE('--abort')",
+				ExpectedErrStr: "fatal: There is no merge to abort",
+			},
+		},
+	}

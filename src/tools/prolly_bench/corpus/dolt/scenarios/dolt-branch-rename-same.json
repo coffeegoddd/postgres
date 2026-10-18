@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "id": "dolt-branch-rename-same",
+  "description": "Reviewed Dolt port: renaming a branch to its own name preserves the branch and its data",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltBranchScripts: renaming a branch to its own name preserves the branch and its data"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (a int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'feature', 'feature')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-mf', 'feature', 'feature')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'nosuch', 'nosuch')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'feature', 'feature')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_branches WHERE name = 'feature'",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

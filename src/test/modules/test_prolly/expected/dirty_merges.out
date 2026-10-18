@@ -1,7 +1,7 @@
 -- Merges into a working set with uncommitted changes, as in Dolt: allowed
 -- when the merge changes none of the tables and sequences they changed,
--- and no definitions change; they stay uncommitted, left out of the
--- merge's commit.
+-- and no definitions change on both sides; they stay uncommitted, left
+-- out of the merge's commit.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -226,7 +226,9 @@ SELECT table_name FROM dolt_status;
  dm.b
 (1 row)
 
--- Uncommitted changes of definitions aren't merged into.
+-- Uncommitted changes of tables' definitions are merged into when the
+-- merge changes neither those tables nor any definition: a table altered
+-- or made stays as it is, uncommitted.
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -234,6 +236,74 @@ SELECT dolt_reset('--hard');
 (1 row)
 
 ALTER TABLE dm.b ADD COLUMN w int;
+CREATE TABLE dm.made (id int PRIMARY KEY);
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
+ b_left_out 
+------------
+          0
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status   
+------------+-----------
+ dm.b       | modified
+ dm.made    | new table
+(2 rows)
+
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'b' ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ v
+ w
+(3 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- not when the merge changes that table's rows, nor when it changes
+-- definitions too
+ALTER TABLE dm.a ADD COLUMN w int;
+SELECT (dolt_merge('feature'))[2:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "dm.a" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE dm.a ADD COLUMN x int;
+SELECT length(dolt_commit('-am', 'feature alters a')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TABLE dm.made (id int PRIMARY KEY);
 SELECT (dolt_merge('feature'))[2:4];
 ERROR:  cannot merge with uncommitted changes where definitions change
 HINT:  Commit the changes, or reset the branch, first.
@@ -241,6 +311,79 @@ SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
  {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- nor when it changes definitions over uncommitted rows of another table
+-- (here, makes one: their table isn't the base's), which stay
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'feature makes a table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE dm.b SET v = 'dirty' WHERE id = 5;
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+ERROR:  cannot merge with uncommitted changes where definitions change
+HINT:  Commit the changes, or reset the branch, first.
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dm.b       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
 (1 row)
 
 -- A merge that conflicts isn't made over uncommitted changes: its commit
@@ -490,3 +633,76 @@ drop cascades to sequence dm.s2
 drop cascades to materialized view dm.mv
 drop cascades to table dm.k
 DROP COLLATION public.dm_c_utf8;
+-- A fast-forward over an uncommitted foreign key whose rows it would
+-- break: refused, as a merge leaving violations over uncommitted changes
+-- is.
+CREATE SCHEMA dmf VERSIONED;
+CREATE TABLE dmf.a (id int PRIMARY KEY);
+CREATE TABLE dmf.b (id int PRIMARY KEY, aid int);
+INSERT INTO dmf.a VALUES (1), (2);
+INSERT INTO dmf.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'dmf base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dmf_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dmf_feature');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'dmf_feature'"}
+(1 row)
+
+DELETE FROM dmf.a WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a row gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE dmf.b ADD FOREIGN KEY (aid) REFERENCES dmf.a;
+SELECT (dolt_merge('dmf_feature'))[2:4];
+ERROR:  cannot merge with uncommitted changes when the merge conflicts
+DETAIL:  The fast-forward leaves 1 constraint violation.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT id FROM dmf.a ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dmf_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dmf CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table dmf.a
+drop cascades to table dmf.b
+SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

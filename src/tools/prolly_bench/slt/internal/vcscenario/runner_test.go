@@ -15,6 +15,7 @@ type fake struct {
 	caps                []string
 	verifyErr, closeErr error
 	opened, closed      bool
+	opens               int
 	steps               []Step
 	args                [][]*string
 	out                 []Outcome
@@ -24,7 +25,7 @@ type fake struct {
 func (f *fake) Name() string                              { return "fake" }
 func (f *fake) Capabilities() []string                    { return f.caps }
 func (f *fake) Verify(context.Context, []string) error    { return f.verifyErr }
-func (f *fake) Open(context.Context, []string) error      { f.opened = true; return nil }
+func (f *fake) Open(context.Context, []string) error      { f.opened = true; f.opens++; return nil }
 func (f *fake) Close(context.Context) error               { f.closed = true; return f.closeErr }
 func (f *fake) CheckTarget(context.Context, string) error { return nil }
 func (f *fake) Execute(_ context.Context, st Step, params, args []*string) (Outcome, error) {
@@ -144,6 +145,100 @@ func TestRejectMalformedOrAmbiguousScenarios(t *testing.T) {
 		var v Value
 		if json.Unmarshal([]byte(b), &v) == nil {
 			t.Fatalf("accepted %s", b)
+		}
+	}
+}
+
+const vcQuery = `{"version":1,"id":"caps","description":"capabilities","requires":["sql","vc.core","vc.merge"],"sessions":["a"],"steps":[{"id":"m","op":"merge","session":"a","args":["feature","--no-ff"],"save":"merged"},{"id":"q","op":"query","session":"a","requires":["vc.core"],"sql":"SELECT dolt_hashof('HEAD') = $1","params":[{"ref":"merged"}],"expect":{"rows":[["t"]],"order":"ordered"}}]}`
+
+func TestStepCapabilities(t *testing.T) {
+	s := parseTest(t, vcQuery)
+	f := &fake{caps: s.Requires, out: []Outcome{{Rows: [][]*string{{str("merge-id")}}}, {Rows: [][]*string{{str("t")}}}}}
+	if r := Run(context.Background(), s, f); r.Status != "passed" || *f.args[1][0] != "merge-id" {
+		t.Fatalf("%+v", r)
+	}
+	if r := Run(context.Background(), s, &fake{caps: []string{"sql", "vc.core"}}); r.Status != "unsupported" || len(r.Missing) != 1 || r.Missing[0] != "vc.merge" {
+		t.Fatalf("a missing capability ran: %+v", r)
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"untagged call", `"requires":["vc.core"],`, ``},
+		{"stale tag", `"requires":["vc.core"],`, `"requires":["vc.core","vc.merge"],`},
+		{"call no capability covers", `dolt_hashof('HEAD')`, `dolt_hashof_db()`},
+		{"call the scenario doesn't require", `"requires":["vc.core"],"sql":"SELECT dolt_hashof('HEAD')`, `"requires":["vc.revert"],"sql":"SELECT (dolt_revert('HEAD'))[1]`},
+		{"requirement no step needs", `"vc.merge"]`, `"vc.merge","vc.diff"]`},
+		{"tag on a typed operation", `"op":"merge",`, `"op":"merge","requires":["vc.merge"],`},
+		{"merge without arguments", `"args":["feature","--no-ff"]`, `"args":[]`},
+		{"save on a query", `"params":`, `"save":"x","params":`},
+		{"save from a failing merge", `"save":"merged"`, `"save":"merged","expect":{"sqlstate":"40001"}`},
+	} {
+		if _, err := Parse([]byte(strings.Replace(vcQuery, tc.from, tc.to, 1))); err == nil {
+			t.Fatalf("%s: accepted", tc.name)
+		}
+	}
+	// a pick and a revert may save what they committed; an abort needn't
+	for _, ok := range []string{
+		`{"version":1,"id":"p","description":"pick","requires":["sql","vc.cherrypick","vc.revert"],"sessions":["a"],"steps":[{"id":"p","op":"cherrypick","session":"a","args":["feature"],"save":"picked"},{"id":"r","op":"revert","session":"a","args":[{"ref":"picked"}],"save":"reverted"}]}`,
+		`{"version":1,"id":"a","description":"abort","requires":["sql","vc.merge"],"sessions":["a"],"steps":[{"id":"a","op":"merge","session":"a","args":["--abort"],"expect":{"sqlstate":"55000"}}]}`,
+	} {
+		if _, err := Parse([]byte(ok)); err != nil {
+			t.Fatalf("%v: %s", err, ok)
+		}
+	}
+}
+
+func TestSQLRequires(t *testing.T) {
+	for sql, want := range map[string]string{
+		"SELECT 1": "",
+		"SELECT DOLT_MERGE('b'), dolt_hashof('HEAD')": "vc.core,vc.merge",
+		"SELECT * FROM dolt_conflicts(NULL::t)":       "vc.conflicts",
+		"SET dolt.allow_commit_conflicts = on":        "vc.conflicts",
+		"SELECT active_branch()":                      "vc.core",
+		"SELECT x[1] FROM dolt_cherry_pick('main') x": "vc.cherrypick",
+		// names in literals, quoted identifiers and comments, and tables
+		// of the scenario's own, aren't calls
+		"SELECT 'dolt_merge failed', $$dolt_revert$$ -- dolt_diff(\n":     "",
+		`CREATE TABLE dolt_docs_copy ("dolt_hashof" int) /* dolt_gc() */`: "",
+		"INSERT INTO t VALUES ('it''s dolt_merge(')":                      "",
+	} {
+		got, err := SQLRequires(sql)
+		if err != nil || strings.Join(got, ",") != want {
+			t.Fatalf("%s: %v %v", sql, got, err)
+		}
+	}
+}
+
+const twoWays = `{"version":1,"id":"ways","description":"both directions","requires":["sql","vc.core"],"sessions":["a"],
+"variants":[{"name":"forward","vars":{"side":"right"}},{"name":"flipped","vars":{"side":"main"}}],
+"steps":[{"id":"co","op":"checkout","session":"a","args":[{"var":"side"}]},
+{"id":"q","op":"query","session":"a","sql":"SELECT $1","params":[{"var":"side"}],"expect":{"rows":[[{"var":"side"}]],"order":"ordered"}},
+{"id":"only","op":"query","session":"a","variants":["flipped"],"sql":"SELECT 1","expect":{"rows":[["1"]],"order":"ordered"}}]}`
+
+func TestVariants(t *testing.T) {
+	s := parseTest(t, twoWays)
+	if n := s.PlannedSteps(); n != 5 {
+		t.Fatalf("planned %d steps", n)
+	}
+	f := &fake{caps: s.Requires, out: []Outcome{{}, {Rows: [][]*string{{str("right")}}}, {}, {Rows: [][]*string{{str("main")}}}, {Rows: [][]*string{{str("1")}}}}}
+	r := Run(context.Background(), s, f)
+	if r.Status != "passed" || f.opens != 2 || len(r.Steps) != 5 || r.Steps[2].Variant != "flipped" || *f.args[0][0] != "right" || *f.args[2][0] != "main" {
+		t.Fatalf("%+v %d", r, f.opens)
+	}
+	// a failure in the second variant names it
+	f = &fake{caps: s.Requires, out: []Outcome{{}, {Rows: [][]*string{{str("right")}}}, {}, {Rows: [][]*string{{str("right")}}}, {}}}
+	if r = Run(context.Background(), s, f); r.Status != "failed" || !strings.HasPrefix(r.Error, "flipped: q:") {
+		t.Fatalf("%+v", r)
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"one variant", `,{"name":"flipped","vars":{"side":"main"}}`, ``},
+		{"duplicate variant", `"name":"flipped"`, `"name":"forward"`},
+		{"other variables", `{"side":"main"}`, `{"other":"main"}`},
+		{"undefined variable", `"params":[{"var":"side"}]`, `"params":[{"var":"nope"}]`},
+		{"unknown variant", `"variants":["flipped"]`, `"variants":["sideways"]`},
+		{"variable without variants", `"variants":[{"name":"forward","vars":{"side":"right"}},{"name":"flipped","vars":{"side":"main"}}],`, ``},
+		{"ref and var at once", `{"var":"side"}]}`, `{"var":"side","ref":"x"}]}`},
+	} {
+		if _, err := Parse([]byte(strings.Replace(twoWays, tc.from, tc.to, 1))); err == nil {
+			t.Fatalf("%s: accepted", tc.name)
 		}
 	}
 }

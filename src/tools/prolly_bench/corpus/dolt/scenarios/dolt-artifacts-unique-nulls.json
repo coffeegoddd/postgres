@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "id": "dolt-artifacts-unique-nulls",
+  "description": "Reviewed Dolt port: unique key violations should not be thrown for keys with null values",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeArtifactsScripts: unique key violations should not be thrown for keys with null values"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (col1 int NOT NULL, col2 int NOT NULL, col3 int, PRIMARY KEY (col1, col2))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "unique",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD UNIQUE (col2, col3)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "base",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "base"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "checkout-right",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 2, NULL)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right"
+      ],
+      "save": "rightc"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 2, NULL)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left"
+      ],
+      "save": "leftc"
+    },
+    {
+      "id": "force",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "right"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT count(*) FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            null
+          ],
+          [
+            "2",
+            "2",
+            null
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

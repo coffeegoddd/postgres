@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "id": "dolt-schema-duplicate-indexes",
+  "description": "Reviewed Dolt port: ",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+    "case": "SchemaChangeTestsBasicCases: "
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "variants": [
+    {
+      "name": "forward",
+      "vars": {
+        "right_side": "right",
+        "left_side": "main"
+      }
+    },
+    {
+      "name": "flipped",
+      "vars": {
+        "right_side": "main",
+        "left_side": "right"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "anc-0a",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (id char(36) PRIMARY KEY, time timestamp)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "anc-0b",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX i1 ON t (time DESC)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "anc-0c",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX i2 ON t (time)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "anc-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (gen_random_uuid(), now())",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "h-ancestor",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "ancestor commit"
+      ],
+      "save": "ancestor"
+    },
+    {
+      "id": "h-branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "h-right-side",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        {
+          "var": "right_side"
+        }
+      ]
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (gen_random_uuid(), now())",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "h-right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right commit"
+      ],
+      "save": "rightc"
+    },
+    {
+      "id": "h-left-side",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        {
+          "var": "left_side"
+        }
+      ]
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (gen_random_uuid(), now())",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "h-left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left commit"
+      ],
+      "save": "leftc"
+    },
+    {
+      "id": "h-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "right"
+      ],
+      "save": "merged"
+    }
+  ]
+}

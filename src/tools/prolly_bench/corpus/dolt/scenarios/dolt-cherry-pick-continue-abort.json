@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "id": "dolt-cherry-pick-continue-abort",
+  "description": "Reviewed Dolt port: cherry-pick --continue: mutually exclusive with --abort",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_cherry_pick.go",
+    "case": "DoltCherryPickTests: cherry-pick --continue: mutually exclusive with --abort"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.conflicts",
+    "vc.cherrypick"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, v varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit-create",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table t"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "change",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'branch1_value')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit-change",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add row from branch1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "main-insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'main_value')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add row from main"
+      ],
+      "save": "main"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT r[1], r[2], r[3], r[4] FROM dolt_cherry_pick($1) r",
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "",
+            "1",
+            "0",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT dolt_cherry_pick('--continue', '--abort')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.cherrypick"
+      ],
+      "sql": "SELECT dolt_cherry_pick('--abort', '--continue')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    }
+  ]
+}

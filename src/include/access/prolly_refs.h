@@ -70,6 +70,16 @@ typedef struct ProllyMergeState
 	Oid		   *tables;			/* with unresolved conflicts (palloc'd) */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
+
+	/*
+	 * A revert of a series of commits, one commit each, stopped at one (a
+	 * pick, of its undoing): the branch's head before the series, and the
+	 * commits still to revert after it, in order.
+	 */
+	bool		revert;
+	ProllyHash	series_head;
+	int			npending;
+	ProllyHash *pending;		/* (palloc'd) */
 } ProllyMergeState;
 
 /*
@@ -305,6 +315,15 @@ typedef struct ProllyRefsRoutine
 								const ProllyRowChanges *changes, int nchanges,
 								const Oid *sequences, int nsequences,
 								ProllyHash *commit_id);
+
+	/*
+	 * Call branch name newname, with its head, working set, merge in
+	 * progress, violations and upstream; refused if another session is on
+	 * it, or a branch is called newname, unless force (which deletes that
+	 * one).  With the transaction.
+	 */
+	void		(*branch_rename) (const char *name, const char *newname,
+								  bool force);
 } ProllyRefsRoutine;
 
 /*
@@ -323,14 +342,18 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
-	"branch_move", "config_get", "config_set", "open", "commit_rows"
+	"branch_move", "config_get", "config_set", "open", "commit_rows", \
+	"branch_rename"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK commit_rows
+#define PROLLY_REFS_LAST_CALLBACK branch_rename
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
- * no such commit), and the newest common ancestor of two commits, found
- * with it, each commit visited once.
+ * no such commit), and the best common ancestor of two commits (no other
+ * common one descending from it; of two such, the one furthest from the
+ * history's roots, then the least id), found with it.  The walks visit a
+ * commit at most once each: a's ancestors, b's down to the common ones,
+ * and, with several of those, theirs and the history beneath them.
  */
 typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
 									ProllyCommitInfo *info, void *arg);
