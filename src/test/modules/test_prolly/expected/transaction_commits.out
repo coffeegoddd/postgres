@@ -209,9 +209,9 @@ COMMIT;
 ERROR:  dolt.transaction_commit can't commit changes to a branch the session has left
 HINT:  Check the changed branch out again before committing.
 SELECT dolt_checkout('main');
-          dolt_checkout          
----------------------------------
- {0,"Switched to branch 'main'"}
+         dolt_checkout          
+--------------------------------
+ {0,"Already on branch 'main'"}
 (1 row)
 
 -- A branch committed by a version-control call is that call's: integrating

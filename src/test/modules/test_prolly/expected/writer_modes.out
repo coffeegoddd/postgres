@@ -939,9 +939,9 @@ ERROR:  invalid value for parameter "dolt.writer": "a..b"
 DETAIL:  A writer doesn't begin with "." or "-", hold "..", or end with ".lock".
 -- reads, and integrations, stay on main; a write a query makes is refused
 SELECT dolt_checkout('main');
-          dolt_checkout          
----------------------------------
- {0,"Switched to branch 'main'"}
+         dolt_checkout          
+--------------------------------
+ {0,"Already on branch 'main'"}
 (1 row)
 
 SELECT count(*) > 0 AS read FROM wm.t;

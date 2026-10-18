@@ -695,7 +695,6 @@ qualified_name(Oid relid)
  * ------------------------------------------------------------------------
  */
 
-static bool working_is_head(void);
 
 /*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
@@ -769,9 +768,6 @@ dolt_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit can't --allow-empty and --skip-empty at once")));
-	if (skip_empty && working_is_head())
-		PG_RETURN_NULL();
-
 	author_override = author;
 	commit_forced = force;
 	PG_TRY();
@@ -788,6 +784,11 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	/* Nothing changed: the root is its parent's, and nothing was recorded. */
+	if (!committed && skip_empty)
+	{
+		settled();				/* (clean: as the head has it) */
+		PG_RETURN_NULL();
+	}
 	if (!committed)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
