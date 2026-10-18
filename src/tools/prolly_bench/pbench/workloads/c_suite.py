@@ -22,6 +22,13 @@ from pbench.core.interfaces import Context, Outcome, Unavailable, Window, Worklo
 # Record statuses slt-runner reports (slt/merge.go).
 STATUSES = ["ok", "not_ok", "not_implemented", "crashed", "timeout",
             "did_not_run", "skipped"]
+# The suite's workloads: what a run and its gate cover unless told otherwise.
+WORKLOADS = ["C1", "C2", "C3", "C4"]
+
+
+def corpus_dir(tools: dict[str, str]) -> Path:
+    """The corpus's test/ directory, from a config's [tools]."""
+    return Path(tools.get("sqllogictest", "")).expanduser() / "test"
 
 
 class CWorkload(Workload):
@@ -33,7 +40,7 @@ class CWorkload(Workload):
         return [1]
 
     def _corpus(self, ctx: Context) -> Path:
-        return Path(ctx.tools.get("sqllogictest", "")).expanduser() / "test"
+        return corpus_dir(ctx.tools)
 
     def _runner(self, ctx: Context) -> Path:
         return Path(ctx.tools.get("slt_runner", ""))

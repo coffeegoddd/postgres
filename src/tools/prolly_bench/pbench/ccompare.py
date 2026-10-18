@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from pbench.table import ResultSet
+from pbench.workloads import c_suite
 from pbench.core.validation import sha256, compatible
 
 HERE = Path(__file__).resolve().parents[1]
@@ -53,14 +54,16 @@ def runner_path(rs: ResultSet) -> Path:
 
 def corpus_path(rs: ResultSet) -> Path:
     cfg = json.loads((rs.path / "config.json").read_text())
-    return Path(cfg["tools"]["sqllogictest"]).expanduser() / "test"
+    return c_suite.corpus_dir(cfg["tools"])
 
 
 def run_workloads(rs: ResultSet) -> list[str]:
-    """The workloads a run was asked for (a shard's are those it has files
-    of, cshard.py); all four when it named none."""
+    """The workloads cgate requires by default: a shard's own (those it has
+    files of, cshard.py), else all of the suite's."""
     cfg = json.loads((rs.path / "config.json").read_text())
-    return list(cfg.get("run", {}).get("workloads") or ["C1", "C2", "C3", "C4"])
+    if cfg.get("run", {}).get("shard"):
+        return list(cfg["run"]["workloads"])
+    return list(c_suite.WORKLOADS)
 
 
 def exceptions_for(am: str, path: Path = EXCEPTIONS) -> list[dict[str, Any]]:

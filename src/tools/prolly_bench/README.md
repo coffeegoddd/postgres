@@ -158,9 +158,13 @@ so far, so the plan depends only on the corpus's file names and sizes and
 every job computes the same one. C1 and C2 run whole on shard 1, so a
 shard runs only the workloads it has files of. A shard's `config.json`
 records `run.shard`, its workloads, and each workload's `shard_files`;
-`cgate` without `--workloads` gates the workloads the shard ran. The
-shards together cover the corpus once: a gate over all of them checks
-that their files' union is the whole corpus (`cshard.overlap_and_gaps`).
+`cgate` without `--workloads` gates the workloads the shard ran (an
+unsharded run still needs C1-C4). A shard's gate covers only its part:
+that the shards' files together are the whole corpus exactly once is for
+a gate over all of them to check, with `cshard.overlap_and_gaps`. A plan
+with an empty shard is refused. prolly_bench takes one run at a time per
+host, so shards run in parallel on separate hosts, or one after another
+with separate `--out` directories.
 
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on

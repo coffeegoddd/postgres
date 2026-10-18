@@ -9,7 +9,13 @@ far (the lowest-numbered on a tie), so the assignment depends only on the
 corpus's file names and sizes.  C1 and C2 are small and go whole to shard 1,
 ahead of the rest.  A shard's result set records the shard and its files in
 config.json, so a report can tell a file outside the shard from a file that
-is missing.
+is missing.  Each shard's own gate covers only its part; overlap_and_gaps
+is for the gate over all of them, which checks that their files are the
+whole corpus exactly once.
+
+prolly_bench takes one run at a time per host, so shards run in parallel
+on separate hosts (CI jobs), or one after another with separate --out
+directories.
 """
 
 from __future__ import annotations
@@ -57,7 +63,9 @@ def workload_files(corpus: Path, cfg: dict[str, Any],
     wanted = list(workloads) or [n for n, c in registry.workloads.items() if c.suite == "C"]
     out = {}
     for name in wanted:
-        cls = registry.workloads.get(name)
+        cls = dict(registry.workloads.items()).get(name)
+        if cls is None or cls.suite != "C":
+            raise ValueError(f"unknown C workloads: [{name!r}]")
         sample = cfg.get("workloads", {}).get(name, {}).get("sample", "all")
         out[name] = [str(f.relative_to(corpus)) for f in cls.select_files(corpus, sample)]
     return out
@@ -83,6 +91,10 @@ def assign(files: dict[str, list[str]], sizes: dict[str, int], count: int) -> li
         s = min(shards, key=lambda s: (s.bytes, s.index))
         s.files[owner[f]].append(f)
         s.bytes += sizes[f]
+    empty = [s.spec for s in shards if not s.workloads]
+    if empty:
+        raise ValueError(f"{count} shards for {len(owner)} files: shard {empty[0]} would "
+                         "have none; use fewer shards")
     for s in shards:
         for fs in s.files.values():
             fs.sort()

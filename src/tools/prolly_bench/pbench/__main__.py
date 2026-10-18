@@ -65,10 +65,7 @@ def _run(args: argparse.Namespace) -> int:
     _resolve_tools(cfg)
     if cfg["run"]["shard"]:
         from pbench import cshard
-        shard = cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])
-        if not shard.workloads:
-            raise SystemExit(f"shard {shard.spec} has no files")
-        print(cshard.to_text([shard]))
+        print(cshard.to_text([cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])]))
 
     # Each engine retains its result set; matched cells run as randomized pairs.
     ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
@@ -109,8 +106,9 @@ def _run(args: argparse.Namespace) -> int:
         print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
         sets = [table.load_set(d) for d in out_dirs]
         base = next((s for s in sets if s.table_am == "heap"), None)
+        from pbench.workloads.c_suite import WORKLOADS
         ok = ok and base is not None and all(not ccompare.gate(base, s,
-            cfg["run"]["workloads"] or ["C1", "C2", "C3", "C4"])
+            cfg["run"]["workloads"] or WORKLOADS)
             for s in sets if s is not base)
     return 0 if ok else 1
 
@@ -123,8 +121,8 @@ def _resolve_tools(cfg: dict) -> None:
 
 
 def _corpus(cfg: dict) -> Path:
-    """The C suite's corpus: the test/ directory of the sqllogictest checkout."""
-    return Path(cfg["tools"]["sqllogictest"]).expanduser() / "test"
+    from pbench.workloads.c_suite import corpus_dir
+    return corpus_dir(cfg["tools"])
 
 
 def _cshard(args) -> int:

@@ -100,6 +100,34 @@ class ShardTest(unittest.TestCase):
         ctx.params = {}
         self.assertEqual(C3().files(ctx), [str(self.corpus / "index")])
 
+    def test_unknown_workload_and_empty_shard_are_refused(self):
+        for name in ("C5", "S1"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "unknown C workloads"):
+                    cshard.plan(self.corpus, self.cfg, 2, [name])
+        # (8 files outside C1 and C2: shard 1 plus 8 others at most)
+        self.assertEqual(len(cshard.plan(self.corpus, self.cfg, 9)), 9)
+        with self.assertRaisesRegex(ValueError, "shard 10/10 would have none"):
+            cshard.plan(self.corpus, self.cfg, 10)
+
+    def test_unsharded_identity_is_unchanged(self):
+        from pbench.core.validation import comparison_identity
+        before = {"run": {"workloads": []}, "postgres": {}}
+        self.assertEqual(comparison_identity({**before, "run": {"workloads": [], "shard": ""}}, {}),
+                         comparison_identity(before, {}))
+        self.assertNotEqual(comparison_identity({**before, "run": {"workloads": [], "shard": "1/2"}}, {}),
+                            comparison_identity(before, {}))
+
+    def test_cgate_defaults(self):
+        from pbench import ccompare
+        path = Path(self.tmp.name) / "rs"
+        path.mkdir()
+        rs = SimpleNamespace(path=path)
+        (path / "config.json").write_text('{"run": {"workloads": ["C1"]}}')
+        self.assertEqual(ccompare.run_workloads(rs), ["C1", "C2", "C3", "C4"])
+        (path / "config.json").write_text('{"run": {"workloads": ["C3"], "shard": "2/4"}}')
+        self.assertEqual(ccompare.run_workloads(rs), ["C3"])
+
     def test_invalid_shards(self):
         for spec in ("0/4", "5/4", "1", "a/b", "1/0", ""):
             with self.subTest(spec=spec):
