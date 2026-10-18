@@ -1,0 +1,372 @@
+# The S suite on every pull request: the pull request (the candidate, its
+# merge commit) against its base (that merge commit's first parent), on
+# GitHub-hosted runners, in two layers:
+#
+# - counters: what each workload does over a fixed amount of work
+#   (configs/s_counters.toml), the base and the candidate each run twice;
+#   `sgate counters` fails on a regression no perf_accept.toml entry the
+#   pull request adds accepts;
+# - timing: the builds' paired, interleaved timing (configs/s_pr.toml),
+#   retried where a cell regresses; reported, not gated, on shared VMs.
+#
+# "S suite gate" always reports, so it can be a required check (it isn't
+# until the gate is calibrated: configs/s_gate.toml); it passes without
+# building for a pull request that changes only specs/.  It leaves the
+# pull-request comment (<!-- s-suite -->) as the s-suite-comment artifact
+# for the workflow_run commenter to post, so code from a pull request never
+# runs with a token that can write.
+#
+# Every push to any branch builds and caches its head, so a pull request's
+# base (a stack layer's base is the layer below's head) is usually cached.
+
+name: performance
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run; pushes each get their
+# own group (by commit), so none cancels another.
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BENCH: src/tools/prolly_bench
+  BENCHBASE_COMMIT: a3a748326f4d1e615fd12db4a6ae59a60190a6ee
+
+jobs:
+  classify:
+    name: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      base: ${{ steps.classify.outputs.base }}
+      candidate: ${{ steps.classify.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Anything outside specs/?
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          code=true
+          candidate=$(git rev-parse HEAD)
+          base=
+          if [ "$EVENT" = pull_request ]; then
+            # (HEAD is the merge into the base: its first parent is the base)
+            base=$(git rev-parse HEAD^1)
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            printf '%s\n' "$changed"
+            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
+              code=false
+            fi
+          fi
+          { echo "code=$code"; echo "base=$base"; echo "candidate=$candidate"; } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BASE: ${{ needs.classify.outputs.base }}
+      CANDIDATE: ${{ needs.classify.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync
+
+      # Builds are cached by commit and runner image (the toolchain).
+      - name: Runner image
+        id: image
+        run: echo "image=$ImageOS-$ImageVersion" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Cached base build
+        if: env.BASE != ''
+        id: base-cache
+        uses: actions/cache@v4
+        with:
+          path: s-builds/base
+          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
+
+      - name: Build the base
+        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
+          bash "$RUNNER_TEMP/base-src/$BENCH/build_postgres.sh" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/base-build" -- --with-openssl
+          mkdir -p s-builds
+          mv "$RUNNER_TEMP/base-build/inst" s-builds/base
+
+      - name: Cached head build
+        id: head-cache
+        uses: actions/cache@v4
+        with:
+          path: s-builds/candidate
+          key: s-server-${{ env.CANDIDATE }}-${{ steps.image.outputs.image }}
+
+      - name: Build the head
+        if: steps.head-cache.outputs.cache-hit != 'true'
+        run: |
+          bash "$BENCH/build_postgres.sh" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/head-build" -- --with-openssl
+          mkdir -p s-builds
+          mv "$RUNNER_TEMP/head-build/inst" s-builds/candidate
+
+      - name: Both builds are of their commits
+        if: github.event_name == 'pull_request'
+        run: |
+          for b in base candidate; do
+            want=$([ "$b" = base ] && echo "$BASE" || echo "$CANDIDATE")
+            got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' \
+              "s-builds/$b/pbench-build.json")
+            test "$got" = "$want" || { echo "$b build is of $got, not $want" >&2; exit 1; }
+          done
+          { echo "base=$BASE"; echo "candidate=$CANDIDATE"; } > s-builds/SHAS
+
+      - name: Cached BenchBase
+        if: github.event_name == 'pull_request'
+        id: benchbase-cache
+        uses: actions/cache@v4
+        with:
+          path: build-bench/benchbase/benchbase-postgres
+          key: benchbase-${{ env.BENCHBASE_COMMIT }}-${{ hashFiles('src/tools/prolly_bench/benchbase/**', 'src/tools/prolly_bench/build_benchbase.sh') }}
+
+      - uses: actions/setup-java@v4
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Fetch pinned BenchBase source
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/benchbase
+          ref: ${{ env.BENCHBASE_COMMIT }}
+          path: benchbase-source
+
+      - name: Build BenchBase
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        run: bash "$BENCH/build_benchbase.sh" "$PWD/benchbase-source"
+
+      - name: Pack both builds and BenchBase
+        if: github.event_name == 'pull_request'
+        run: tar -czf s-builds.tgz s-builds build-bench/benchbase/benchbase-postgres
+
+      - uses: actions/upload-artifact@v5
+        if: github.event_name == 'pull_request'
+        with:
+          name: s-builds
+          path: s-builds.tgz
+          retention-days: 3
+
+  counters:
+    name: counters (${{ matrix.workloads }})
+    needs: [classify, build]
+    if: github.event_name == 'pull_request' && needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        workloads: ['S1,S2,S3', 'S4,S7,S8', 'S10,S13']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: s-builds
+
+      - name: Unpack, install clients, and allow counting instructions
+        run: |
+          tar -xzf s-builds.tgz
+          cat s-builds/SHAS
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sysbench \
+            "linux-tools-$(uname -r)" linux-tools-common || \
+            sudo apt-get install -y --no-install-recommends sysbench
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Base, candidate, base again, candidate again
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: |
+          for run in base candidate base2 candidate2; do
+            build=${run%2}
+            # (a failed run leaves evidence the gate reports as an invariant)
+            "$BENCH/prolly_bench" run S --am heap,prolly \
+              --config "$BENCH/configs/s_counters.toml" --workloads "$WORKLOADS" \
+              --pg-bin "$PWD/s-builds/$build/bin" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/counters/$run" || true
+          done
+
+      - name: sgate counters
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: |
+          # Only the entries this pull request adds to perf_accept.toml count.
+          git show "HEAD^1:$BENCH/configs/perf_accept.toml" > "$RUNNER_TEMP/base-accept.toml" 2>/dev/null \
+            || : > "$RUNNER_TEMP/base-accept.toml"
+          name=$(echo "$WORKLOADS" | tr , -)
+          "$BENCH/prolly_bench" sgate counters \
+            counters/base counters/base2 counters/candidate counters/candidate2 \
+            --accept "$BENCH/configs/perf_accept.toml" --accept-base "$RUNNER_TEMP/base-accept.toml" \
+            --thresholds "$BENCH/configs/s_gate.toml" --json "counters/sgate-$name.json" || true
+          test -f "counters/sgate-$name.json"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-counters-${{ strategy.job-index }}
+          path: counters
+          retention-days: 7
+          if-no-files-found: ignore
+
+  timing-hosted:
+    name: timing (hosted, reported)
+    needs: [classify, build]
+    if: github.event_name == 'pull_request' && needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: s-builds
+
+      - name: Unpack and install clients
+        run: |
+          tar -xzf s-builds.tgz
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sysbench
+
+      - name: Paired timing, then the cells that regressed again
+        run: |
+          . s-builds/SHAS
+          bins="base=$PWD/s-builds/base/bin,candidate=$PWD/s-builds/candidate/bin"
+          commits="base=$base,candidate=$candidate"
+          "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_pr.toml" \
+            --pg-bin "$bins" --build-commit "$commits" \
+            --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt1" || true
+          runs=(timing/attempt1)
+          for attempt in 2 3; do
+            "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+              --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
+            rerun=$(python3 -c 'import json; print(",".join(json.load(open("timing/sgate.json"))["rerun"]))')
+            [ -n "$rerun" ] || break
+            "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_pr.toml" \
+              --workloads "$rerun" --pg-bin "$bins" --build-commit "$commits" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt$attempt" || true
+            runs+=("timing/attempt$attempt")
+          done
+          "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+            --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
+          test -f timing/sgate.json
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-timing
+          path: timing
+          retention-days: 7
+          if-no-files-found: ignore
+
+  gate:
+    name: S suite gate
+    needs: [classify, build, counters, timing-hosted]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Nothing to compare
+        if: needs.classify.result == 'success' && (needs.classify.outputs.code != 'true' || github.event_name != 'pull_request')
+        run: echo "A push, or a pull request that changes only specs/; the S suite doesn't compare anything."
+
+      - name: Classification failed
+        if: needs.classify.result != 'success'
+        run: |
+          echo "classify: ${{ needs.classify.result }}" >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        with:
+          pattern: s-counters-*
+          path: counters
+
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        with:
+          name: s-timing
+          path: timing
+
+      - name: Report
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        id: report
+        env:
+          BUILD: ${{ needs.build.result }}
+          COUNTERS: ${{ needs.counters.result }}
+          TIMING: ${{ needs.timing-hosted.result }}
+          BASE: ${{ needs.classify.outputs.base }}
+          HEAD_SHA: ${{ needs.classify.outputs.candidate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=()
+          [ "$BUILD" = success ] || failed+=(--failed-job "build: $BUILD")
+          [ "$COUNTERS" = success ] || failed+=(--failed-job "counters: $COUNTERS")
+          # (timing is reported on hosted runners: its failure is noted, not gated)
+          timing=()
+          [ -f timing/sgate.json ] && timing=(--timing timing/sgate.json)
+          counters=()
+          shopt -s nullglob
+          for f in counters/*/sgate-*.json; do counters+=(--counters "$f"); done
+          mkdir -p comment
+          status=0
+          "$BENCH/prolly_bench" sreport "${counters[@]}" "${timing[@]}" \
+            --head "$HEAD_SHA" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+            --run-url "$RUN_URL" "${failed[@]}" \
+            --reproduce "prolly_bench run S --am heap,prolly --config $BENCH/configs/s_counters.toml --pg-bin DIR (base and candidate, twice each); prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2" \
+            --out comment/comment.md || status=$?
+          [ "$TIMING" = success ] || echo "timing: $TIMING (reported only)" >> comment/comment.md
+          cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        with:
+          name: s-suite-comment
+          path: comment
+          if-no-files-found: ignore
+
+      - name: Verdict
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        env:
+          STATUS: ${{ steps.report.outputs.status }}
+        run: test "$STATUS" = 0
