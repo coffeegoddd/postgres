@@ -362,6 +362,84 @@ libpq_has(ProllyRemote *r, const ProllyHash *hash)
 	return has;
 }
 
+/* hashes as a bytea[] parameter, in binary */
+static void
+hashes_param(StringInfo out, const ProllyHash *hashes, int n)
+{
+	const ProllyHash **ptrs = palloc(sizeof(ProllyHash *) * Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+		ptrs[i] = &hashes[i];
+	bytea_array(out, ptrs, NULL, n);
+	pfree(ptrs);
+}
+
+static void
+libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
+			   ProllyRemoteChunkVisit visit, void *arg)
+{
+	StringInfoData param;
+	const char *values[1];
+	int			lengths[1];
+	int			formats[1] = {1};
+	Oid			types[1] = {BYTEAARRAYOID};
+	PGresult   *res;
+
+	initStringInfo(&param);
+	hashes_param(&param, hashes, n);
+	values[0] = param.data;
+	lengths[0] = param.len;
+	res = run(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)", 1,
+			  types, values, lengths, formats, 1, "reading chunks");
+	pfree(param.data);
+	PG_TRY();
+	{
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			ProllyHash	h;
+
+			result_hash(r, res, i, 0, &h);
+			visit(&h, PQgetvalue(res, i, 1), PQgetlength(res, i, 1), arg);
+		}
+	}
+	PG_FINALLY();
+	{
+		PQclear(res);
+	}
+	PG_END_TRY();
+}
+
+static void
+libpq_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	StringInfoData param;
+	const char *values[1];
+	int			lengths[1];
+	int			formats[1] = {1};
+	Oid			types[1] = {BYTEAARRAYOID};
+	PGresult   *res;
+
+	initStringInfo(&param);
+	hashes_param(&param, hashes, n);
+	values[0] = param.data;
+	lengths[0] = param.len;
+	res = run(r, "SELECT h FROM unnest(pg_catalog.dolt_serve_has($1)) WITH ORDINALITY AS a(h, i) "
+			  "ORDER BY i", 1, types, values, lengths, formats, 0,
+			  "asking for chunks");
+	pfree(param.data);
+	if (PQntuples(res) != n)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("remote %s answered for %d chunks of %d", r->where,
+						PQntuples(res), n)));
+	}
+	for (int i = 0; i < n; i++)
+		has[i] = strcmp(PQgetvalue(res, i, 0), "t") == 0;
+	PQclear(res);
+}
+
 /* Send a batch of a push's chunks. */
 static void
 send_batch(ProllyRemote *r, ProllyHash **hashes, StringInfoData **chunks, int n)
@@ -486,4 +564,6 @@ static const ProllyRemoteRoutine libpq_routine = {
 	.has = libpq_has,
 	.add_chunks = libpq_add_chunks,
 	.move_head = libpq_move_head,
+	.get_many = libpq_get_many,
+	.has_many = libpq_has_many,
 };

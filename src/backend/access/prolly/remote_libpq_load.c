@@ -90,6 +90,19 @@ libpq_move_head(ProllyRemote *remote, const char *branch,
 					   format, force);
 }
 
+static void
+libpq_get_many(ProllyRemote *remote, const ProllyHash *hashes, int n,
+			   ProllyRemoteChunkVisit visit, void *arg)
+{
+	PROLLY_CALL(libpq(), get_many, remote, hashes, n, visit, arg);
+}
+
+static void
+libpq_has_many(ProllyRemote *remote, const ProllyHash *hashes, int n, bool *has)
+{
+	PROLLY_CALL(libpq(), has_many, remote, hashes, n, has);
+}
+
 #define LIBPQ_CALLBACKS \
 	.check_url = libpq_check_url, \
 	.open = libpq_open, \
@@ -99,7 +112,9 @@ libpq_move_head(ProllyRemote *remote, const char *branch,
 	.get = libpq_get, \
 	.has = libpq_has, \
 	.add_chunks = libpq_add_chunks, \
-	.move_head = libpq_move_head
+	.move_head = libpq_move_head, \
+	.get_many = libpq_get_many, \
+	.has_many = libpq_has_many
 
 const ProllyRemoteRoutine prolly_remote_postgresql = {
 	.info = {

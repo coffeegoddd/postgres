@@ -59,6 +59,7 @@ typedef struct Receiving
 	BufFile    *spool;
 	uint64		spooled;		/* the spool's length */
 	ListCell   *next;			/* add_table_file()'s */
+	bool		hinting;		/* receive_hint() asking the store */
 } Receiving;
 
 /* A hash, zero-padded, as a hash table's key. */
@@ -84,8 +85,53 @@ spool_read(Receiving *rv, const Received *r, StringInfo out)
 }
 
 /*
+ * Keep a chunk the remote gave, checked against the address it was asked
+ * by first: what the walk follows is what the addresses say.
+ */
+static Received *
+keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len)
+{
+	ProllyHash	key;
+	ProllyHashCtx *ctx;
+	ProllyHash	actual;
+	Received   *r;
+	bool		found;
+
+	ctx = PROLLY_CALL(rv->hash, begin, CurrentMemoryContext);
+	PROLLY_CALL(rv->hash, update, ctx, (const uint8 *) data, len);
+	PROLLY_CALL(rv->hash, finish, ctx, &actual);
+	if (actual.len != hash->len ||
+		memcmp(actual.bytes, hash->bytes, hash->len) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s doesn't match its hash",
+						prolly_hash_hex(hash)),
+				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
+
+	hash_key(&key, hash);
+	r = hash_search(rv->received, &key, HASH_ENTER, &found);
+	if (found)
+		return r;
+	r->offset = rv->spooled;
+	r->len = len;
+	r->visited = false;
+
+	/* (at the end: a read since may have left the file elsewhere) */
+	if (BufFileSeek(rv->spool, 0, rv->spooled, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in a transfer's temporary file: %m")));
+	BufFileWrite(rv->spool, data, len);
+	rv->spooled += len;
+	rv->order = lappend(rv->order, r);
+	return r;
+}
+
+/*
  * The store's read_through() source: a chunk received already, or asked of
- * the remote, checked against its address and kept.
+ * the remote, checked against its address and kept.  A chunk the remote
+ * lacks is an error, so every reference resolves, in the store or in what
+ * was received.
  */
 static bool
 receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
@@ -93,10 +139,7 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 	Receiving  *rv = arg;
 	ProllyHash	key;
 	Received   *r;
-	bool		found PG_USED_FOR_ASSERTS_ONLY;
 	StringInfoData data;
-	ProllyHashCtx *ctx;
-	ProllyHash	actual;
 
 	hash_key(&key, hash);
 	r = hash_search(rv->received, &key, HASH_FIND, NULL);
@@ -107,41 +150,62 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 		return true;
 	}
 	if (out == NULL)
-		return PROLLY_CALL(rv->rr, has, rv->remote, hash);
+		return !rv->hinting && PROLLY_CALL(rv->rr, has, rv->remote, hash);
 	initStringInfo(&data);
 	if (!PROLLY_CALL(rv->rr, get, rv->remote, hash, &data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the remote lacks chunk %s, which it references",
 						prolly_hash_hex(hash))));
-	ctx = PROLLY_CALL(rv->hash, begin, CurrentMemoryContext);
-	PROLLY_CALL(rv->hash, update, ctx, (const uint8 *) data.data, data.len);
-	PROLLY_CALL(rv->hash, finish, ctx, &actual);
-	if (actual.len != hash->len ||
-		memcmp(actual.bytes, hash->bytes, hash->len) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the remote's chunk %s doesn't match its hash",
-						prolly_hash_hex(hash)),
-				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
-
-	r = hash_search(rv->received, &key, HASH_ENTER, &found);
-	Assert(!found);
-	r->offset = rv->spooled;
-	r->len = data.len;
-	r->visited = false;
-
-	/* (at the end: a read since may have left the file elsewhere) */
-	if (BufFileSeek(rv->spool, 0, rv->spooled, SEEK_SET) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not seek in a transfer's temporary file: %m")));
-	BufFileWrite(rv->spool, data.data, data.len);
-	rv->spooled += data.len;
-	rv->order = lappend(rv->order, r);
+	(void) keep_chunk(rv, hash, data.data, data.len);
 	appendBinaryStringInfo(out, data.data, data.len);
 	pfree(data.data);
 	return true;
+}
+
+static void
+receive_many_visit(const ProllyHash *hash, const char *data, int len, void *arg)
+{
+	(void) keep_chunk(arg, hash, data, len);
+}
+
+/*
+ * The store's hint: chunks the walk reads next, those neither the store
+ * nor the transfer has asked of the remote at once.  (One the remote
+ * lacks is found when the walk reads it.)
+ */
+static void
+receive_hint(void *arg, const ProllyHash *hashes, int n)
+{
+	Receiving  *rv = arg;
+	ProllyHash *ask;
+	int			nask = 0;
+
+	if (!PROLLY_HAS(rv->rr, get_many))
+		return;
+	ask = palloc(sizeof(ProllyHash) * n);
+	/* (the store's own has(), not the remote's through it) */
+	rv->hinting = true;
+	PG_TRY();
+	{
+		for (int i = 0; i < n; i++)
+		{
+			ProllyHash	key;
+
+			hash_key(&key, &hashes[i]);
+			if (hash_search(rv->received, &key, HASH_FIND, NULL) == NULL &&
+				!PROLLY_CALL(rv->cs, has, rv->store, &hashes[i]))
+				ask[nask++] = hashes[i];
+		}
+	}
+	PG_FINALLY();
+	{
+		rv->hinting = false;
+	}
+	PG_END_TRY();
+	if (nask > 0)
+		PROLLY_CALL(rv->rr, get_many, rv->remote, ask, nask, receive_many_visit, rv);
+	pfree(ask);
 }
 
 /* The walk's visitor: decline what the store has, or was received. */
@@ -269,7 +333,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	for (int i = 0; i < ncommits; i++)
 		walk[i] = !PROLLY_CALL(rv.cs, has, rv.store, &commits[i]);
 
-	PROLLY_CALL(rv.cs, read_through, rv.store, receive_chunk, &rv);
+	PROLLY_CALL(rv.cs, read_through, rv.store, receive_chunk, receive_hint, &rv);
 	PG_TRY();
 	{
 		for (int i = 0; i < ncommits; i++)
@@ -281,7 +345,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	}
 	PG_FINALLY();
 	{
-		PROLLY_CALL(rv.cs, read_through, rv.store, NULL, NULL);
+		PROLLY_CALL(rv.cs, read_through, rv.store, NULL, NULL, NULL);
 	}
 	PG_END_TRY();
 
@@ -302,9 +366,51 @@ typedef struct Sending
 	const ProllyChunkStoreRoutine *cs;
 	ProllyChunkStore *store;
 	HTAB	   *seen;			/* ProllyHash: visited */
+	HTAB	   *remote_has;		/* RemoteHas: has_many()'s answers */
 	List	   *order;			/* ProllyHash *, to send */
 	ListCell   *next;
 } Sending;
+
+typedef struct RemoteHas
+{
+	ProllyHash	hash;			/* the key */
+	bool		has;
+} RemoteHas;
+
+/*
+ * The store's hint: chunks the walk reads next, asked of the remote at
+ * once whether it has them.
+ */
+static void
+send_hint(void *arg, const ProllyHash *hashes, int n)
+{
+	Sending    *sd = arg;
+	ProllyHash *ask = palloc(sizeof(ProllyHash) * n);
+	bool	   *has = palloc(sizeof(bool) * n);
+	int			nask = 0;
+
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	key;
+
+		hash_key(&key, &hashes[i]);
+		if (hash_search(sd->seen, &key, HASH_FIND, NULL) == NULL &&
+			hash_search(sd->remote_has, &key, HASH_FIND, NULL) == NULL)
+			ask[nask++] = key;
+	}
+	if (nask > 0)
+	{
+		PROLLY_CALL(sd->rr, has_many, sd->remote, ask, nask, has);
+		for (int i = 0; i < nask; i++)
+		{
+			RemoteHas  *rh = hash_search(sd->remote_has, &ask[i], HASH_ENTER, NULL);
+
+			rh->has = has[i];
+		}
+	}
+	pfree(ask);
+	pfree(has);
+}
 
 static bool
 send_visit(const ProllyNodeRef *node, uint16 level, void *arg)
@@ -316,8 +422,14 @@ send_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 
 	hash_key(&key, &node->hash);
 	h = hash_search(sd->seen, &key, HASH_ENTER, &found);
-	if (found || PROLLY_CALL(sd->rr, has, sd->remote, &node->hash))
+	if (found)
 		return false;
+	{
+		RemoteHas  *rh = hash_search(sd->remote_has, &key, HASH_FIND, NULL);
+
+		if (rh ? rh->has : PROLLY_CALL(sd->rr, has, sd->remote, &node->hash))
+			return false;
+	}
 	sd->order = lappend(sd->order, h);
 	return true;
 }
@@ -358,12 +470,26 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	ctl.hcxt = CurrentMemoryContext;
 	sd.seen = hash_create("prolly chunks sent", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ctl.entrysize = sizeof(RemoteHas);
+	sd.remote_has = hash_create("prolly chunks the remote has", 1024, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	prolly_database_components(&dc);
-	for (int i = 0; i < ncommits; i++)
-		PROLLY_CALL(dc.refs, walk_commit, &commits[i], send_visit, &sd);
+	if (PROLLY_HAS(rr, has_many))
+		PROLLY_CALL(sd.cs, read_through, sd.store, NULL, send_hint, &sd);
+	PG_TRY();
+	{
+		for (int i = 0; i < ncommits; i++)
+			PROLLY_CALL(dc.refs, walk_commit, &commits[i], send_visit, &sd);
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(sd.cs, read_through, sd.store, NULL, NULL, NULL);
+	}
+	PG_END_TRY();
 	sd.next = list_head(sd.order);
 	PROLLY_CALL(rr, add_chunks, remote, sent_next, &sd);
 	hash_destroy(sd.seen);
+	hash_destroy(sd.remote_has);
 	return list_length(sd.order);
 }
 

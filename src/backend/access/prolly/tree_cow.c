@@ -976,6 +976,49 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
+/*
+ * Tell the store which chunks the walk reads next: an internal node's
+ * children, or a leaf's value trees (a source a store reads through can
+ * fetch them at once).
+ */
+static void
+prefetch_below(const ProllyTreeEnv *env, TNode *node)
+{
+	ProllyHash *hashes;
+	int			n = 0;
+
+	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
+		node->nitems == 0)
+		return;
+	hashes = palloc(sizeof(ProllyHash) * node->nitems);
+	for (int i = 0; i < node->nitems; i++)
+	{
+		ProllyNodeRef ref;
+
+		if (node->level > 0)
+		{
+			uint64		count;
+
+			node_child(env, node, i, &ref, &count);
+		}
+		else
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+			uint64		len;
+
+			node_item(env, node, i, &k, &v, &flags);
+			if (!(flags & PROLLY_ITEM_VALUE_REF))
+				continue;
+			decode_value_ref(&v, &ref, &len);
+		}
+		hashes[n++] = ref.hash;
+	}
+	PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
+	pfree(hashes);
+}
+
 /* Whether the visitor took the node. */
 static bool
 walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
@@ -987,6 +1030,8 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 	CHECK_FOR_INTERRUPTS();
 	node_read(env, ref, &node);
 	took = visit(&node.ref, node.level, arg);
+	if (took)
+		prefetch_below(env, &node);
 	if (!took)
 		;						/* the visitor has seen what is below */
 	else if (node.level == 0)

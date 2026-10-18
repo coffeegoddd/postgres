@@ -24,6 +24,9 @@
  *   all at once: none is found before every one is durable.  A remote
  *   that has a chunk has every chunk it references, so the caller sends
  *   what the remote lacks of a closed set.
+ * - get_many() visits each chunk of those it has, and has_many() answers
+ *   for each, in one exchange with a remote across a network (optional:
+ *   get() and has() each otherwise).
  * - move_head() moves branch from expected (an empty hash: the branch
  *   doesn't exist) to head (NULL: delete it), durably, as a compare-and-
  *   swap: false, changing nothing, if the branch isn't at expected.  The
@@ -46,6 +49,10 @@
 #include "lib/stringinfo.h"
 
 typedef struct ProllyRemote ProllyRemote;
+
+/* Visits a chunk a remote gave: its hash and its bytes, as stored. */
+typedef void (*ProllyRemoteChunkVisit) (const ProllyHash *hash,
+										const char *data, int len, void *arg);
 
 /* Visits a remote's branch and the commit it is at. */
 typedef void (*ProllyRemoteHeadVisit) (const char *branch,
@@ -73,13 +80,18 @@ typedef struct ProllyRemoteRoutine
 							  const ProllyHash *expected,
 							  const ProllyHash *head, const char *format,
 							  bool force);
+
+	void		(*get_many) (ProllyRemote *remote, const ProllyHash *hashes,
+							 int n, ProllyRemoteChunkVisit visit, void *arg);
+	void		(*has_many) (ProllyRemote *remote, const ProllyHash *hashes,
+							 int n, bool *has);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
 	"check_url", "open", "close", "format", "heads", "get", "has", \
-	"add_chunks", "move_head"
+	"add_chunks", "move_head", "get_many", "has_many"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
-#define PROLLY_REMOTE_LAST_CALLBACK move_head
+#define PROLLY_REMOTE_LAST_CALLBACK has_many
 
 /*
  * The implementation of remotes over a libpq connection, which the loadable
