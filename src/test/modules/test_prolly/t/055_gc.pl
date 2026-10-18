@@ -117,6 +117,65 @@ $w->{stderr} = '';
 $g->query_until(qr/done/, '');
 $g->quit;
 
+# A root moved to (an older one, say), that a swap since the transaction
+# began dropped, is refused, though the transaction puts nothing.
+sql("SELECT test_chunk_put('orphan root')");
+my $orphan3 = sql(q{SELECT encode(sha256('orphan root'), 'hex')});
+$w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan3')});
+$g = $node->background_psql('gcdb');
+$g->query_until(qr/started/, q{
+	\echo started
+	SELECT kept || ' ' || freed FROM test_chunk_gc(false);
+	\echo done
+});
+$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
+$w->query(qq{SELECT test_chunk_move_root('$root', '$orphan3'); COMMIT});
+like($w->{stderr}, qr/could not move the chunk store's root to [0-9a-f]+: it (is not in the chunk store|was collected while the transaction ran)/,
+	'a root move to a chunk the swap dropped is refused');
+$w->{stderr} = '';
+$g->query_until(qr/done/, '');
+$g->quit;
+is(sql('SELECT test_chunk_root()'), $root, 'and the root is where it was');
+
+# A second collection while one runs is refused, not left to wait (the
+# first waits for every transaction running at its swap).
+$g = $node->background_psql('gcdb');
+$g->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-gc-sealed', 'wait')});
+$g->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo done
+});
+$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-gc-sealed'}) or die 'the collection did not stop';
+my ($ret, $out, $err) = $node->psql('gcdb', 'SELECT test_chunk_gc(false)',
+	timeout => 30);
+like($err, qr/another collection of this database's chunk store is running/,
+	'a second collection is refused while one runs');
+sql(q{SELECT injection_points_wakeup('prolly-gc-sealed')});
+$g->query_until(qr/done/, '');
+$g->quit;
+
+# A collection that fails in a subtransaction is abandoned with it: the
+# transaction may collect again.
+my $sub = sql(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-gc-sealed', 'error');
+	DO $$
+	BEGIN
+		BEGIN
+			PERFORM test_chunk_gc(false);
+		EXCEPTION WHEN OTHERS THEN
+			RAISE NOTICE 'failed';
+		END;
+		PERFORM injection_points_detach('prolly-gc-sealed');
+		PERFORM test_chunk_gc(false);
+	END $$;
+	SELECT 'collected'});
+like($sub, qr/collected/, 'a collection failed in a subtransaction leaves the transaction free to collect');
+is(sql($reads), '20', 'and the live chunks read');
+
 # A writer that started before the swap and names nothing collected
 # commits.
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$root')});

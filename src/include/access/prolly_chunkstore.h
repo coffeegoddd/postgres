@@ -47,12 +47,13 @@
  *   oldest first.
  * - Garbage collection is the store's side of a collector's work
  *   (prolly_reclaim.h), in this order, in one transaction:
- *   gc_begin() holds off other collections, conjoins and new table files
- *   until the transaction ends, seals the journal, and numbers the chunks
- *   collected (slots 0 .. *nslots - 1): the sealed segments', and the table
- *   files' (with full all of them, else those not settled), each file's
- *   slots together, as gc_files() visits them; *root is the root as of the
- *   seal.  gc_find() gives a chunk's slot (-1: not collected), gc_read() a
+ *   gc_begin() holds off conjoins and new table files until the
+ *   transaction ends (another collection meanwhile is refused, as is one
+ *   in a transaction that used the store), seals the journal, and numbers
+ *   the chunks collected (slots 0 .. *nslots - 1): the sealed segments',
+ *   and the table files' (with full all of them, else those not settled),
+ *   each file's slots together, as gc_files() visits them; *root is the
+ *   root as of the seal.  gc_find() gives a chunk's slot (-1: not collected), gc_read() a
  *   slot's bytes.  gc_new() visits what is new since the seal, or since its
  *   last call: the root, and each chunk appended since; the first call waits
  *   for the transactions that appended to the sealed segments and were in
@@ -226,8 +227,8 @@ typedef struct ProllyChunkStoreRoutine
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
 	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
-	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", "gc_find", \
-	"gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire"
+	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
+	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retire
 

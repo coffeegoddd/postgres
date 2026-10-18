@@ -117,6 +117,17 @@ BEGIN READ ONLY;
 SELECT dolt_gc();
 ROLLBACK;
 
+-- Not in a transaction that has used the store: it would straddle its own
+-- swap (and wait on itself, had it appended).  One that hasn't may.
+BEGIN;
+SELECT test_chunk_put('gc used first') IS NOT NULL AS put;
+SELECT dolt_gc();
+ROLLBACK;
+BEGIN;
+SELECT dolt_gc();
+SELECT test_chunk_put('gc used after') IS NOT NULL AS put;
+COMMIT;
+
 \c postgres
 DROP DATABASE gc_db;
 DROP DATABASE gc_dolt;

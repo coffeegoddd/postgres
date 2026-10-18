@@ -335,6 +335,32 @@ BEGIN READ ONLY;
 SELECT dolt_gc();
 ERROR:  cannot execute dolt_gc() in a read-only transaction
 ROLLBACK;
+-- Not in a transaction that has used the store: it would straddle its own
+-- swap (and wait on itself, had it appended).  One that hasn't may.
+BEGIN;
+SELECT test_chunk_put('gc used first') IS NOT NULL AS put;
+ put 
+-----
+ t
+(1 row)
+
+SELECT dolt_gc();
+ERROR:  cannot collect the chunk store in a transaction that has used it
+ROLLBACK;
+BEGIN;
+SELECT dolt_gc();
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
+SELECT test_chunk_put('gc used after') IS NOT NULL AS put;
+ put 
+-----
+ t
+(1 row)
+
+COMMIT;
 \c postgres
 DROP DATABASE gc_db;
 DROP DATABASE gc_dolt;
