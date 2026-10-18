@@ -22,7 +22,7 @@
           "steps": [
             "setup-1"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         },
         {
           "index": 2,
@@ -50,7 +50,7 @@
           "steps": [
             "setup-5"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         },
         {
           "index": 6,
@@ -71,7 +71,7 @@
           "steps": [
             "setup-8"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         },
         {
           "index": 9,
@@ -92,7 +92,7 @@
           "steps": [
             "setup-11"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         },
         {
           "index": 12,
@@ -182,8 +182,8 @@
         }
       ],
       "adaptations": [
-        "MySQL CALL becomes typed native VC operations.",
-        "prolly commits all data without a staging area; no staging-specific assertion is present.",
+        "MySQL CALL becomes typed native VC operations. (D10)",
+        "prolly commits all data without a staging area; no staging-specific assertion is present. (D1)",
         "SQL result values are exact strings; unordered result multiplicity is preserved."
       ]
     },
@@ -215,7 +215,7 @@
           "steps": [
             "setup-2"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         },
         {
           "index": 3,
@@ -237,7 +237,7 @@
           "steps": [
             "setup-5"
           ],
-          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID."
+          "note": "Commit all current table data; -Am/-am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
         }
       ],
       "assertions": [
@@ -285,8 +285,8 @@
         }
       ],
       "adaptations": [
-        "MySQL CALL becomes typed native VC operations.",
-        "prolly commits all data without a staging area; no staging-specific assertion is present.",
+        "MySQL CALL becomes typed native VC operations. (D10)",
+        "prolly commits all data without a staging area; no staging-specific assertion is present. (D1)",
         "SQL result values are exact strings; unordered result multiplicity is preserved."
       ]
     },
@@ -318,7 +318,7 @@
           "steps": [
             "first"
           ],
-          "note": "A commit takes the whole working set (no staging area); the source dolt_add prepares the same first commit."
+          "note": "A commit takes the whole working set (no staging area); the source dolt_add prepares the same first commit. (D1)"
         },
         {
           "index": 3,
@@ -362,48 +362,48 @@
           "steps": [
             "assert-0"
           ],
-          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f. (D10)"
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f. (D10)"
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f. (D10)"
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f."
+          "note": "Preserved hash equality expectation; hashof maps to dolt_hashof, bound IDs replace MySQL variables, PostgreSQL boolean text is t/f. (D10)"
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching."
+          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching. (D4)"
         },
         {
           "index": 5,
           "steps": [
             "assert-5"
           ],
-          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching."
+          "note": "Invalid reference remains an error; native PostgreSQL undefined_object SQLSTATE 42704 replaces Dolt error-string matching. (D4)"
         }
       ],
       "adaptations": [
         "hashof alias maps to dolt_hashof. Native commit IDs are opaque and captured directly.",
         "Staging is absent in prolly; all-table commit preserves this case's snapshots.",
-        "PostgreSQL text booleans and error SQLSTATE replace MySQL booleans and error strings."
+        "PostgreSQL text booleans and error SQLSTATE replace MySQL booleans and error strings. (D4, D10)"
       ]
     },
     {
@@ -427,14 +427,14 @@
           "steps": [
             "create"
           ],
-          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints."
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
         },
         {
           "index": 2,
           "steps": [
             "add"
           ],
-          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op."
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
         },
         {
           "index": 3,
@@ -448,7 +448,7 @@
           "steps": [
             "added"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
         },
         {
           "index": 5,
@@ -470,7 +470,7 @@
           "steps": [
             "theirs-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
         },
         {
           "index": 8,
@@ -491,7 +491,7 @@
           "steps": [
             "ours-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id."
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
         },
         {
           "index": 11,
@@ -514,15 +514,15 @@
           "steps": [
             "abort"
           ],
-          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text."
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. (D4)"
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout.",
-        "dolt_allow_commit_conflicts is the dolt.allow_commit_conflicts setting.",
-        "No staging area: dolt_add stages nothing and commits take the whole working set.",
-        "The conflicting merge runs outside a transaction block and keeps its conflicts because dolt.allow_commit_conflicts is on; its result row is checked.",
-        "Dolt's 'fatal: There is no merge to abort' is checked as SQLSTATE 55000."
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "dolt_allow_commit_conflicts is the dolt.allow_commit_conflicts setting. (D5)",
+        "No staging area: dolt_add stages nothing and commits take the whole working set. (D1)",
+        "The conflicting merge runs outside a transaction block and keeps its conflicts because dolt.allow_commit_conflicts is on; its result row is checked. (D5)",
+        "Dolt's 'fatal: There is no merge to abort' is checked as SQLSTATE 55000. (D4)"
       ]
     }
   ],
@@ -533,7 +533,7 @@
       "index": 2,
       "name": "dolt_reset('--hard') commits the active SQL transaction",
       "source_sha256": "8b66b23de2450b01b85304fea5e8a7be99557bc2f161f52a7842a6691e3487b2",
-      "reason": "Intended divergence (dolt divergences: transactions): prolly's version-control operations are transactional and roll back with their transaction, so a hard reset doesn't commit the active SQL transaction as Dolt's does. The adapter runs typed operations only on idle sessions; a port would have to insert a COMMIT that erases the assertion."
+      "reason": "Intended divergence (D5): prolly's version-control operations are transactional and roll back with their transaction, so a hard reset doesn't commit the active SQL transaction as Dolt's does. The adapter runs typed operations only on idle sessions; a port would have to insert a COMMIT that erases the assertion."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
@@ -541,7 +541,7 @@
       "index": 5,
       "name": "dolt_reset(rev) moves HEAD, resets the index, and leaves the working tree alone",
       "source_sha256": "132b2fc5896a967ff25ff007594dffa9374f7649ae257724072f98acfad2bc90",
-      "reason": "Not applicable (dolt divergences: no staging area): a mixed reset moves HEAD and resets the index while keeping the working tree; prolly has no index and only does hard resets."
+      "reason": "Not applicable (D1): a mixed reset moves HEAD and resets the index while keeping the working tree; prolly has no index and only does hard resets."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
@@ -549,7 +549,7 @@
       "index": 11,
       "name": "hard reset inserted rows continues auto increment",
       "source_sha256": "cef0aa3b8c3c3014d5cf7b79d6c505619bb97e6305ceaa18794af7dcb3036bc8",
-      "reason": "Intended divergence: a versioned schema's sequences are per branch and recorded in each commit, so a hard reset restores the commit's value and the next generated key is 3, not Dolt's 5 (dolt divergences: sequences are per branch). Dolt keeps its auto-increment counter outside the working set."
+      "reason": "Intended divergence: a versioned schema's sequences are per branch and recorded in each commit, so a hard reset restores the commit's value and the next generated key is 3, not Dolt's 5 (D6). Dolt keeps its auto-increment counter outside the working set."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
