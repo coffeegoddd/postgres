@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
@@ -42,6 +43,7 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
@@ -64,6 +66,7 @@
 #include "utils/rls.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
+#include "storage/bmap.h"
 
 /* dolt.author's value; read through GetConfigOption so a placeholder works. */
 static char *dolt_author = NULL;
@@ -2174,6 +2177,23 @@ dolt_fetch(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Error unless the user owns the current database or is a member of
+ * pg_maintain, as VACUUM asks: to do what in it.
+ */
+static void
+check_maintain(const char *what)
+{
+	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
+		!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to %s in database \"%s\"",
+						what, get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+}
+
+/*
  * dolt_gc(VARIADIC args text[]) returns text[]: {status}
  *
  * --full: the database's chunk store collected (prolly_reclaim.h): what
@@ -2199,14 +2219,7 @@ dolt_gc(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_gc", args[i]);
 	}
-	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
-		!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to collect garbage in database \"%s\"",
-						get_database_name(MyDatabaseId)),
-				 errdetail("Only the database's owner or members of the \"%s\" role may.",
-						   "pg_maintain")));
+	check_maintain("collect garbage");
 	PreventCommandIfReadOnly("dolt_gc()");
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, full, &gc);
@@ -2222,6 +2235,56 @@ Datum
 dolt_gc_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_gc(fcinfo);
+}
+
+/*
+ * prolly_page_sweep(OUT freed int8, OUT recounted int8, OUT truncated int8)
+ *
+ * The current database's page stores swept (bmap_sweep()), in every
+ * tablespace that has one: blocks nothing holds freed, stuck reference
+ * counts rewritten exactly, the stores shortened.  Its owner, or a member
+ * of pg_maintain, as dolt_gc().
+ */
+Datum
+prolly_page_sweep(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	Datum		values[3] = {0};
+	bool		nulls[3] = {0};
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *spcs = NIL;
+	ListCell   *lc;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	check_maintain("sweep the page store");
+	PreventCommandIfReadOnly("prolly_page_sweep()");
+
+	rel = table_open(TableSpaceRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Oid			spc = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
+
+		if (spc != GLOBALTABLESPACE_OID)
+			spcs = lappend_oid(spcs, spc);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	foreach(lc, spcs)
+	{
+		BmapSweep	r;
+
+		bmap_sweep(lfirst_oid(lc), MyDatabaseId, &r);
+		values[0] = Int64GetDatum(DatumGetInt64(values[0]) + r.freed);
+		values[1] = Int64GetDatum(DatumGetInt64(values[1]) + r.recounted);
+		values[2] = Int64GetDatum(DatumGetInt64(values[2]) + r.truncated);
+	}
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /* The session branch's upstream, or an error naming how to set one. */

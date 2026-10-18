@@ -83,6 +83,15 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 (xlrec->flags & BMAP_UNREF_MAP) ? "; map" : "");
 				break;
 			}
+		case XLOG_BMAP_SHRINK:
+			{
+				xl_bmap_shrink *xlrec = (xl_bmap_shrink *) rec;
+
+				appendStringInfo(buf, "store %u/%u; hw %u -> %u",
+								 xlrec->locator.spcOid, xlrec->locator.dbOid,
+								 xlrec->old_hw, xlrec->new_hw);
+				break;
+			}
 		default:
 			break;
 	}
@@ -117,6 +126,8 @@ bmap_identify(uint8 info)
 			return "CHANGES";
 		case XLOG_BMAP_SHARE_CHANGES:
 			return "SHARE_CHANGES";
+		case XLOG_BMAP_SHRINK:
+			return "SHRINK";
 	}
 	return NULL;
 }

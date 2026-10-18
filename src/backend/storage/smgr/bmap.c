@@ -54,6 +54,19 @@
  * shared buffers (see read_node()), so a write never waits for these locks
  * and an extension may read buffers while holding them.
  *
+ * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
+ * three cases: a crash between a drop's commit and the records freeing its
+ * blocks, a crash part way through a prune, and a count stuck at 255 maps.
+ * A sweep counts exactly what every map (and changes list) of a database's
+ * page store holds, each relation's read under its header's lock, and
+ * frees the blocks allocated as it began that nothing holds, rewrites the
+ * stuck counts that now fit, and shortens the store to its last allocated
+ * block (SHRINK, which redo truncates by too).  Branch creation (a share,
+ * the one thing that adds holders) waits for it while it counts, and the
+ * allocator reuses no freed block while any sweep runs: one freed and taken
+ * again meanwhile could be held by a map the sweep read before.  A dropped
+ * relation's map stays until the next checkpoint, and counts until then.
+ *
  * WAL.  Every map and allocator change is logged (bmap_xlog.h), and the
  * page store is changed (zeroed, extended) before the record that maps the
  * blocks, so a data record for a new block always follows the record that
@@ -89,7 +102,9 @@
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
+#include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/subsystems.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -180,8 +195,11 @@ typedef struct BmapMeta
 #define CHANGE_PAGE(i)		((BlockNumber) (1 + (i) / BMAP_CHANGES_PER_PAGE))
 #define CHANGE_SLOT(i)		((uint32) ((i) % BMAP_CHANGES_PER_PAGE))
 
-/* a count that reaches this stays: the block is never freed */
+/* a count that reaches this stays, until a sweep counts it exactly */
 #define BMAP_REFS_STUCK		255
+
+/* the lock a sweep holds off branch creation with: an object no catalog has */
+#define BMAP_SWEEP_CLASSID	((Oid) 0x424D5357)
 
 /* reference-count pages one record changes at most */
 #define BMAP_REFS_PER_RECORD	24
@@ -211,6 +229,38 @@ typedef struct BmapMeta
 #define PageGetBmapChanges(page)	((BmapChange *) PageGetContents(page))
 
 static const PGIOAlignedBlock zero_block;
+
+/*
+ * Shared by every backend: the sweeps running, during which the allocator
+ * reuses no freed block (one freed and taken again meanwhile could be held
+ * by a map the sweep read before).
+ */
+typedef struct BmapShared
+{
+	pg_atomic_uint32 sweeps;
+} BmapShared;
+
+static BmapShared *bmap_shared = NULL;
+
+static void
+BmapShmemRequest(void *arg)
+{
+	ShmemRequestStruct(.name = "block map",
+					   .size = sizeof(BmapShared),
+					   .ptr = (void **) &bmap_shared,
+		);
+}
+
+static void
+BmapShmemInit(void *arg)
+{
+	pg_atomic_init_u32(&bmap_shared->sweeps, 0);
+}
+
+const ShmemCallbacks BmapShmemCallbacks = {
+	.request_fn = BmapShmemRequest,
+	.init_fn = BmapShmemInit,
+};
 
 static void list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
 					   uint32 epoch);
@@ -932,7 +982,8 @@ alloc_take(RelFileLocator rel, uint32 nneed, BlockNumber *taken,
 	new_nfree = meta->nfree;
 	new_hint = meta->hint;
 
-	if (nneed > 0 && meta->nfree > 0 && !RelFileLocatorSkippingWAL(rel))
+	if (nneed > 0 && meta->nfree > 0 && !RelFileLocatorSkippingWAL(rel) &&
+		pg_atomic_read_u32(&bmap_shared->sweeps) == 0)
 	{
 		for (uint32 k = 0; k < meta->nbitmap && ntaken < nneed &&
 			 a->nbits < BMAP_SCAN_PAGES; k++)
@@ -2404,6 +2455,7 @@ bmap_fold_prune(SMgrRelation reln, const BmapFold *keep)
 		END_CRIT_SECTION();
 	}
 	UnlockReleaseBuffer(headbuf);
+	INJECTION_POINT("bmap-pruned", NULL);
 
 	/* the blocks let go of, each once; one a kept entry holds too stays */
 	blocks = palloc_array(BlockNumber, Max(ndropped, 1));
@@ -2730,11 +2782,16 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	xl_bmap_header_delta ddelta;
 	xl_bmap_share xlrec;
 	XLogRecPtr	lsn;
+	LOCKTAG		sweeptag;
 
 	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
 		elog(ERROR, "block-mapped relation %s can't share the blocks of %s, in another page store",
 			 relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
 			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+
+	/* not while a sweep counts what the maps hold */
+	SET_LOCKTAG_OBJECT(sweeptag, srel.dbOid, BMAP_SWEEP_CLASSID, srel.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
 
 	/* every allocated block has a reference count */
 	metabuf = alloc_read(srel, 0);
@@ -2794,6 +2851,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	UnlockReleaseBuffer(dheader);
 	UnlockReleaseBuffer(sheader);
+	LockRelease(&sweeptag, ShareLock, false);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 
 	/*
@@ -3256,6 +3314,338 @@ drop_blocks(SMgrRelation reln)
 	ResourceOwnerDelete(owner);
 }
 
+/* ----------------------------------------------------------------
+ * The sweep
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Count, in holders[], each physical block a relation holds: its map's
+ * entries (those past its length too) and its changes list's old blocks.
+ * Its header is held exclusively meanwhile, so no extension, remap,
+ * truncation or prune of it runs: a block they allocated is mapped or
+ * listed by the time it is read.
+ */
+static void
+sweep_relation(SMgrRelation reln, uint32 *holders, BlockNumber hw)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BlockNumber mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
+	Buffer		headerbuf;
+	BmapChangesHead head;
+	uint32		nchanges;
+	BmapChange *changes;
+
+	if (mapnblocks == 0)
+		return;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
+	for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
+	{
+		Buffer		buf = map_read(rel, mapblk);
+		BmapEntry  *entries;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(BufferGetPage(buf)))
+		{
+			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+					   mapblk);
+			entries = PageGetBmapEntries(BufferGetPage(buf));
+			for (uint32 i = 0; i < BMAP_FANOUT; i++)
+				if (BlockNumberIsValid(entries[i].block) && entries[i].block < hw)
+					holders[entries[i].block]++;
+		}
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
+	if (changes != NULL)
+	{
+		BlockNumber *held = palloc_array(BlockNumber, Max(nchanges, 1));
+		uint32		nheld = changes_blocks(changes, nchanges, held);
+
+		for (uint32 i = 0; i < nheld; i++)
+			if (held[i] < hw)
+				holders[held[i]]++;
+		pfree(held);
+		pfree(changes);
+	}
+	UnlockReleaseBuffer(headerbuf);
+}
+
+/*
+ * Rewrite the counts of the blocks stuck[0 .. n), sorted: a stuck count
+ * whose holders fit a count now, and the count of a block nothing holds
+ * (zero, before it is freed).  A stuck count is changed only by a sweep,
+ * and nothing adds holders meanwhile, so the holders counted are the
+ * block's, or more (a map dropped since).
+ */
+static uint32
+sweep_recount(RelFileLocator rel, const BlockNumber *stuck, uint32 n,
+			  const uint32 *holders)
+{
+	uint32		i = 0;
+	uint32		recounted = 0;
+
+	while (i < n)
+	{
+		RefsPages	rp;
+		uint32		covered = refs_lock(rel, stuck + i, n - i, &rp);
+		bool		changed = false;
+
+		for (uint32 k = i; k < i + covered; k++)
+		{
+			uint32		h = holders[stuck[k]];
+
+			if (h > 0 && refs_get(&rp, stuck[k]) != BMAP_REFS_STUCK)
+				continue;
+			refs_set(&rp, stuck[k], (uint8) (h > 0 ? h - 1 : 0));
+			changed = true;
+			recounted += h > 0;
+		}
+		if (changed)
+		{
+			xl_bmap_unref xlrec;
+
+			xlrec.locator = rel;
+			xlrec.flags = 0;
+			log_refs_record(XLOG_BMAP_UNREF, &xlrec, sizeof(xlrec),
+							InvalidBuffer, NULL, 0, &rp);
+		}
+		refs_release(&rp);
+		i += covered;
+	}
+	return recounted;
+}
+
+/*
+ * Shorten the page store to its last allocated block: the high-water mark
+ * lowered and the file truncated, the record first.  Under the metapage's
+ * lock, so nothing is allocated meanwhile.
+ */
+static BlockNumber
+sweep_shrink(RelFileLocator rel)
+{
+	Buffer		metabuf = alloc_read(rel, 0);
+	BmapMeta   *meta;
+	BlockNumber hw;
+	BlockNumber new_hw;
+	xl_bmap_meta_delta mdelta;
+	xl_bmap_shrink xlrec;
+	XLogRecPtr	lsn;
+	SMgrRelation store = store_smgr(rel);
+
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	hw = new_hw = meta->hw;
+	while (new_hw > 0)
+	{
+		BlockNumber b = new_hw - 1;
+		uint32		pageno = b / BMAP_BITS_PER_PAGE;
+		uint32		bit = b % BMAP_BITS_PER_PAGE;
+		Buffer		buf;
+		bool		used;
+
+		if (pageno >= meta->nbitmap)
+			break;
+		buf = alloc_read(rel, meta->bitmap[pageno]);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel, MAIN_FORKNUM,
+				   meta->bitmap[pageno]);
+		used = (PageGetBmapBits(BufferGetPage(buf))[bit / 64] &
+				(UINT64CONST(1) << (bit % 64))) != 0;
+		UnlockReleaseBuffer(buf);
+		if (used)
+			break;
+		new_hw--;
+	}
+	if (new_hw == hw)
+	{
+		UnlockReleaseBuffer(metabuf);
+		return 0;
+	}
+
+	mdelta.kind = BMAP_DELTA_META;
+	mdelta.flags = 0;
+	mdelta.hw = new_hw;
+	mdelta.nfree = meta->nfree - (hw - new_hw);
+	mdelta.hint = Min(meta->hint, new_hw / BMAP_BITS_PER_PAGE);
+	mdelta.nbitmap_added = 0;
+	xlrec.locator = rel;
+	xlrec.old_hw = hw;
+	xlrec.new_hw = new_hw;
+
+	START_CRIT_SECTION();
+	apply_meta_delta(BufferGetPage(metabuf), &mdelta);
+	MarkBufferDirty(metabuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, metabuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &mdelta, sizeof(mdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_SHRINK);
+	PageSetLSN(BufferGetPage(metabuf), lsn);
+	END_CRIT_SECTION();
+
+	XLogFlush(lsn);
+	if (smgrnblocks(store, MAIN_FORKNUM) > new_hw)
+		smgrtruncate(store, &(ForkNumber) {MAIN_FORKNUM}, 1,
+					 &(BlockNumber) {smgrnblocks(store, MAIN_FORKNUM)},
+					 &new_hw);
+	UnlockReleaseBuffer(metabuf);
+	return hw - new_hw;
+}
+
+/*
+ * Sweep a database's page store in a tablespace: count exactly what every
+ * block-mapped relation there holds (every branch's copies, so every
+ * catalog row of every branch: their maps are files), then free the
+ * blocks allocated when the sweep began that nothing holds (left by a
+ * crash after a drop's commit or part way through a prune), rewrite the
+ * stuck counts whose holders now fit one, and shorten the store to its
+ * last allocated block.  Branch creation (bmapshare()) is held off while
+ * the maps are read and the counts rewritten; extensions and remaps go on,
+ * allocating blocks the sweep never frees.
+ */
+static void
+sweep_done(int code, Datum arg)
+{
+	pg_atomic_fetch_sub_u32(&bmap_shared->sweeps, 1);
+}
+
+static void sweep_store(RelFileLocator rel, const char *path,
+						BmapSweep *result);
+
+void
+bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	char	   *path = GetDatabasePath(dbOid, spcOid);
+
+	memset(result, 0, sizeof(*result));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot sweep a page store during recovery")));
+	if (!alloc_exists(rel))
+		return;
+	pg_atomic_fetch_add_u32(&bmap_shared->sweeps, 1);
+	PG_ENSURE_ERROR_CLEANUP(sweep_done, (Datum) 0);
+	{
+		sweep_store(rel, path, result);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(sweep_done, (Datum) 0);
+	sweep_done(0, (Datum) 0);
+	result->truncated = sweep_shrink(rel);
+	pfree(path);
+}
+
+static void
+sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
+{
+	Oid			spcOid = rel.spcOid;
+	Oid			dbOid = rel.dbOid;
+	LOCKTAG		tag;
+	Buffer		metabuf;
+	BmapMeta   *meta;
+	BlockNumber hw;
+	uint64	   *allocated;
+	uint32	   *holders;
+	DIR		   *dir;
+	struct dirent *de;
+	BlockNumber *tofree;
+	BlockNumber *stuck;
+	uint32		nfree = 0;
+	uint32		nstuck = 0;
+	BlockNumber nrefpages;
+
+	SET_LOCKTAG_OBJECT(tag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+
+	/* the blocks allocated as it begins: the only ones it may free */
+	metabuf = alloc_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	hw = meta->hw;
+	allocated = MemoryContextAllocHuge(CurrentMemoryContext,
+									   (hw / 64 + 1) * sizeof(uint64));
+	for (uint32 pageno = 0; pageno * BMAP_BITS_PER_PAGE < hw; pageno++)
+	{
+		Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
+		BlockNumber first = pageno * BMAP_BITS_PER_PAGE;
+		uint32		nbits = Min(BMAP_BITS_PER_PAGE, hw - first);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel, MAIN_FORKNUM,
+				   meta->bitmap[pageno]);
+		memcpy(allocated + first / 64, PageGetBmapBits(BufferGetPage(buf)),
+			   (nbits + 63) / 64 * sizeof(uint64));
+		UnlockReleaseBuffer(buf);
+	}
+	UnlockReleaseBuffer(metabuf);
+
+	/* what every relation holds */
+	holders = MemoryContextAllocHuge(CurrentMemoryContext,
+									 (hw + 1) * sizeof(uint32));
+	memset(holders, 0, (hw + 1) * sizeof(uint32));
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		char	   *end;
+		SMgrRelation reln;
+
+		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
+		if (end == de->d_name || strcmp(end, "_bmap") != 0)
+			continue;
+		reln = smgropen(with_relnumber(rel, relnumber), INVALID_PROC_NUMBER);
+		sweep_relation(reln, holders, hw);
+		result->relations++;
+	}
+	FreeDir(dir);
+
+	/* nothing holds them: freed; stuck counts that fit: rewritten */
+	tofree = MemoryContextAllocHuge(CurrentMemoryContext,
+									(hw + 1) * sizeof(BlockNumber));
+	stuck = MemoryContextAllocHuge(CurrentMemoryContext,
+								   (hw + 1) * sizeof(BlockNumber));
+	nrefpages = refs_nblocks(rel);
+	for (BlockNumber b = 0; b < hw; b++)
+	{
+		if ((allocated[b / 64] & (UINT64CONST(1) << (b % 64))) == 0)
+			continue;
+		if (holders[b] == 0)
+		{
+			tofree[nfree++] = b;
+			if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) != 0)
+				stuck[nstuck++] = b;
+		}
+		else if (holders[b] - 1 < BMAP_REFS_STUCK && REF_PAGE(b) < nrefpages &&
+				 lookup_ref(rel, b) == BMAP_REFS_STUCK)
+			stuck[nstuck++] = b;
+	}
+	INJECTION_POINT("bmap-sweep-counted", NULL);
+	result->recounted = sweep_recount(rel, stuck, nstuck, holders);
+	LockRelease(&tag, ExclusiveLock, false);
+
+	/* (a block nothing holds gets no new holder: freed after the lock) */
+	free_blocks(rel, tofree, nfree);
+	result->freed = nfree;
+
+	pfree(allocated);
+	pfree(holders);
+	pfree(tofree);
+	pfree(stuck);
+}
+
 /*
  * Remove a database's allocator and page store from the directory 'path'
  * of tablespace 'spcOid', if no block-mapped relation remains there (no map
@@ -3548,6 +3938,7 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	 * pages stay until the blocks are freed.
 	 */
 	DropRelationBuffers(reln, &fork, 1, &first);
+	INJECTION_POINT("bmap-predrop", NULL);
 	drop_blocks(reln);
 }
 
@@ -4122,6 +4513,19 @@ bmap_redo(XLogReaderState *record)
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
 				forget_cached_size(xlrec->locator);
+				break;
+			}
+		case XLOG_BMAP_SHRINK:
+			{
+				xl_bmap_shrink *xlrec = (xl_bmap_shrink *) XLogRecGetData(record);
+				SMgrRelation store = store_smgr(xlrec->locator);
+
+				redo_block(record, 0);
+				if (smgrexists(store, MAIN_FORKNUM) &&
+					smgrnblocks(store, MAIN_FORKNUM) > xlrec->new_hw)
+					smgrtruncate(store, &(ForkNumber) {MAIN_FORKNUM}, 1,
+								 &(BlockNumber) {smgrnblocks(store, MAIN_FORKNUM)},
+								 &xlrec->new_hw);
 				break;
 			}
 		case XLOG_BMAP_FREE:
