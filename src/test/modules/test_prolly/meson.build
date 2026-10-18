@@ -161,6 +161,7 @@ tests += {
       't/062_toast_folds.pl',
       't/063_toast_apply.pl',
       't/064_toast_decoding.pl',
+      't/065_toast_rewrites.pl',
     ],
   },
 }

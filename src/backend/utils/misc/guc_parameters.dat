@@ -2437,6 +2437,15 @@
   check_hook => 'check_primary_slot_name',
 },
 
+{ name => 'prolly_value_memo_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
+  short_desc => 'Sets how many values in versioned tables\' TOAST relations a fold remembers the history references of.',
+  long_desc => 'Values stored by content need no memo: a fold takes their references from their pointers.',
+  variable => 'prolly_value_memo_entries',
+  boot_val => '8192',
+  min => '64',
+  max => '16777216',
+},
+
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',
   short_desc => 'When generating SQL fragments, quote all identifiers.',
   variable => 'quote_all_identifiers',
