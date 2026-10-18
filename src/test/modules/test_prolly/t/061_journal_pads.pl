@@ -3,7 +3,9 @@
 # A commit in flight leaves a PAD in the journal, room for its ROOT record.
 # A session reading the store's root meanwhile notes the PAD, to see again
 # whether it became a ROOT; it keeps that note from one transaction to the
-# next, and reads it again in its next transaction.
+# next, and reads it again in its next transaction.  (A note kept in memory
+# its transaction freed reads wrong reliably where freed memory is wiped, as
+# in assert-enabled builds.)
 
 use strict;
 use warnings FATAL => 'all';
@@ -50,7 +52,8 @@ SKIP:
 			"a reader sees the root before the commit, transaction $i");
 	}
 
-	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('prolly-root-padded')});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('prolly-root-padded');
+		SELECT injection_points_wakeup('prolly-root-padded')});
 	$writer->query_until(qr/done/, '');
 	isnt($reader->query_safe(q{SELECT dolt_hashof('main')}), $base,
 		'and the commit once it is');
