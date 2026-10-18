@@ -127,6 +127,7 @@
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
@@ -138,7 +139,6 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
-#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 #define JOURNAL_FILE		"prolly_journal"	/* segment 0's */
@@ -3121,7 +3121,7 @@ struct ProllyChunkGc
 	uint8	   *copied;			/* slots gc_copy() wrote */
 	List	   *written;		/* ManifestFile *, the new files */
 	bool		window;
-	TimestampTz window_began;
+	instr_time	window_began;	/* (a monotonic clock) */
 	VirtualTransactionId *readers;	/* running at the swap */
 	int			nreaders;
 };
@@ -3619,7 +3619,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		INJECTION_POINT("prolly-gc-window", NULL);
 		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
 		gc->window = true;
-		gc->window_began = GetCurrentTimestamp();
+		INSTR_TIME_SET_CURRENT(gc->window_began);
 	}
 
 	scan_journal(s);
@@ -3891,7 +3891,13 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	LWLockRelease(ProllyJournalLock);
 	gc->window = false;
-	window_usec = GetCurrentTimestamp() - gc->window_began;
+	{
+		instr_time	now;
+
+		INSTR_TIME_SET_CURRENT(now);
+		INSTR_TIME_SUBTRACT(now, gc->window_began);
+		window_usec = INSTR_TIME_GET_MICROSEC(now);
+	}
 	unlock_manifest(s);
 	gc->readers = GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
 										&gc->nreaders);

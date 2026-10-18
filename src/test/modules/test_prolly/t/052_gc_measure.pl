@@ -50,9 +50,11 @@ my $base = sql($space);
 
 for my $b (1 .. $nbranches)
 {
+	# $changes rows from $lo, wrapping past the last
 	my $lo = ($b - 1) * $changes % $rows;
 	sql(qq{SELECT dolt_branch('b$b'); SELECT dolt_checkout('b$b');
-		UPDATE app.t SET v = md5(v) WHERE id > $lo AND id <= $lo + $changes;
+		UPDATE app.t SET v = md5(v)
+			WHERE (id > $lo AND id <= $lo + $changes) OR id <= $lo + $changes - $rows;
 		SELECT dolt_commit('-m', 'on b$b'); SELECT dolt_checkout('main')});
 }
 my $with = sql($space);
@@ -98,6 +100,8 @@ for my $w (1 .. 4)
 	});
 	push @writers, $s;
 }
+my $log = q{SELECT count(*) FROM dolt_log('w%d')};
+my @before = map { sql(sprintf($log, $_)) } 1 .. 4;
 my @windows;
 my @totals;
 for my $i (1 .. 10)
@@ -106,14 +110,23 @@ for my $i (1 .. 10)
 	push @windows, $win / 1000;
 	push @totals, $t * 1000;
 }
-my $commits = sql(q{SELECT count(*) FROM dolt_log('w1')});
+my @after = map { sql(sprintf($log, $_)) } 1 .. 4;
 $node->stop('immediate');
 eval { $_->quit; } for @writers;
+for my $w (1 .. 4)
+{
+	cmp_ok($after[$w - 1], '>', $before[$w - 1],
+		"writer $w kept committing while the collections ran");
+}
 @windows = sort { $a <=> $b } @windows;
 @totals = sort { $a <=> $b } @totals;
+sub median { return ($_[4] + $_[5]) / 2; }
 note(sprintf('under 4 committing sessions: window median %.2f ms, max %.2f ms; '
-	. 'collection median %.0f ms, max %.0f ms; %d commits on one writer\'s branch',
-	$windows[5], $windows[-1], $totals[5], $totals[-1], $commits));
+	. 'collection median %.0f ms, max %.0f ms; %d commits on one writer\'s branch '
+	. 'during them',
+	median(@windows), $windows[-1], median(@totals), $totals[-1],
+	$after[0] - $before[0]));
+cmp_ok($windows[0], '>', 0, 'a collection reports its window');
 cmp_ok($windows[-1], '<', $totals[-1], 'the window is a part of the collection');
 
 done_testing();
