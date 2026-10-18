@@ -171,8 +171,13 @@ DETAIL:  Needed from outside the versioned schemas:
 extension ltree: version 1.3, not installed
 HINT:  Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.
 -- another format: refused
-SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
-ERROR:  this database holds commits of canonical format 2, not 0
+DO $$
+BEGIN
+	PERFORM dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, 'format [0-9]+', 'format N');
+END $$;
+NOTICE:  refused: this database holds commits of canonical format N, not 0
 -- a chunk sent under a hash it doesn't have: refused when received, and
 -- nothing moved
 SELECT dolt_hashof('rs_b') AS rs_b \gset

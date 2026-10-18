@@ -58,7 +58,12 @@ SELECT test_commit_needing(test_fold_root(), ARRAY['extension ltree'],
 						   ARRAY['{1.3,public}']) AS lt \gset
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), decode(:'lt', 'hex'), :'fmt', false);
 -- another format: refused
-SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
+DO $$
+BEGIN
+	PERFORM dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('main'), '0', false);
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, 'format [0-9]+', 'format N');
+END $$;
 
 -- a chunk sent under a hash it doesn't have: refused when received, and
 -- nothing moved
