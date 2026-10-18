@@ -1200,6 +1200,7 @@ tree_nodes_are_valid(const ProllyImplInfo *impl)
  * the out-of-line values' nodes.
  */
 #define BIG_KEYS	40
+#define CHUNK_MIN_BYTES	512	/* the value trees' smallest chunk */
 
 static void
 big_value(int k, int version, StringInfo buf)
@@ -1248,6 +1249,100 @@ big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->values_ok &= after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+}
+
+/*
+ * A value tree on its own: a value of a few megabytes comes back whole and
+ * by slices (any offset and length, past the end too), reading only the
+ * nodes a slice needs; and inserting or deleting a byte in its middle
+ * writes O(depth) nodes, not one per chunk after it.
+ */
+static void
+value_trees(const ProllyTreeRoutine *tr, ProllyTreeEnv *env)
+{
+	ProllyNodeCounters counters = {0};
+	StringInfoData val;
+	StringInfoData ref;
+	StringInfoData got;
+	ProllyValue r;
+	uint64		x = 42;
+	static const uint64 offsets[] = {0, 1, 4095, 4096, 100000, 1999999, 2999999};
+	static const uint64 lens[] = {0, 1, 7, 5000, 70000};
+
+	initStringInfo(&val);
+	while (val.len < 3000000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&val, (char) (x >> 56));
+	}
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, env, (const uint8 *) val.data, val.len, &ref);
+	r.data = (const uint8 *) ref.data;
+	r.len = ref.len;
+
+	initStringInfo(&got);
+	PROLLY_CALL(tr, value_read, env, &r, 0, PG_UINT64_MAX, &got);
+	if (got.len != val.len || memcmp(got.data, val.data, val.len) != 0)
+		elog(ERROR, "a value tree of %d bytes read back otherwise", val.len);
+
+	for (int i = 0; i < lengthof(offsets); i++)
+	{
+		for (int j = 0; j < lengthof(lens); j++)
+		{
+			uint64		want = offsets[i] >= (uint64) val.len ? 0 :
+				Min(lens[j], (uint64) val.len - offsets[i]);
+
+			resetStringInfo(&got);
+			counters.nodes_read = 0;
+			env->counters = &counters;
+			PROLLY_CALL(tr, value_read, env, &r, offsets[i], lens[j], &got);
+			env->counters = NULL;
+			if ((uint64) got.len != want ||
+				memcmp(got.data, val.data + offsets[i], got.len) != 0)
+				elog(ERROR, "a slice of %llu bytes at %llu read %d bytes, or others",
+					 (unsigned long long) lens[j], (unsigned long long) offsets[i],
+					 got.len);
+			if (counters.nodes_read > 4 + lens[j] / CHUNK_MIN_BYTES)
+				elog(ERROR, "a slice of %llu bytes at %llu read %llu nodes",
+					 (unsigned long long) lens[j], (unsigned long long) offsets[i],
+					 (unsigned long long) counters.nodes_read);
+		}
+	}
+	resetStringInfo(&got);
+	PROLLY_CALL(tr, value_read, env, &r, val.len, 10, &got);
+	PROLLY_CALL(tr, value_read, env, &r, PG_UINT64_MAX - 1, 10, &got);
+	if (got.len != 0)
+		elog(ERROR, "a slice past a value's end read %d bytes", got.len);
+
+	/* A byte inserted in the middle, then deleted. */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		StringInfoData edited;
+		StringInfoData eref;
+		int			mid = val.len / 2;
+
+		initStringInfo(&edited);
+		appendBinaryStringInfo(&edited, val.data, mid);
+		if (pass == 0)
+			appendStringInfoChar(&edited, 'x');
+		appendBinaryStringInfo(&edited, val.data + mid + (pass == 0 ? 0 : 1),
+							   val.len - mid - (pass == 0 ? 0 : 1));
+		initStringInfo(&eref);
+		counters.nodes_written = 0;
+		env->counters = &counters;
+		PROLLY_CALL(tr, value_write, env, (const uint8 *) edited.data,
+					edited.len, &eref);
+		env->counters = NULL;
+		if (counters.nodes_written > 8)
+			elog(ERROR, "%s one byte in a %d-byte value wrote %llu nodes",
+				 pass == 0 ? "inserting" : "deleting", val.len,
+				 (unsigned long long) counters.nodes_written);
+		pfree(edited.data);
+		pfree(eref.data);
+	}
+	pfree(val.data);
+	pfree(ref.data);
+	pfree(got.data);
 }
 
 void
@@ -1367,7 +1462,34 @@ tree_large_values(const ProllyImplInfo *impl)
 	if (d.nchanges != 1 || d.key != 13 || !d.values_ok)
 		elog(ERROR, "diff of one changed large value reported %d changes (key %d, values %s)",
 			 d.nchanges, d.key, d.values_ok ? "right" : "wrong");
+
+	/* One byte inserted in the middle: still few nodes, as by byte counts. */
+	{
+		ProllyEdit	edit;
+		KeyBuf		kb;
+		StringInfoData ins;
+
+		big_value(17, 0, &vbuf);
+		initStringInfo(&ins);
+		appendBinaryStringInfo(&ins, vbuf.data, vbuf.len / 2);
+		appendStringInfoChar(&ins, '#');
+		appendBinaryStringInfo(&ins, vbuf.data + vbuf.len / 2,
+							   vbuf.len - vbuf.len / 2);
+		edit.key = key_of(17, &kb);
+		edit.value.data = (const uint8 *) ins.data;
+		edit.value.len = ins.len;
+		edit.is_delete = false;
+		counters.nodes_written = 0;
+		env.counters = &counters;
+		PROLLY_CALL(tr, apply, &env, &built, &edit, 1, &changed);
+		env.counters = NULL;
+		if (counters.nodes_written > 12)
+			elog(ERROR, "inserting one byte in a %u-byte value wrote %llu nodes",
+				 vbuf.len, (unsigned long long) counters.nodes_written);
+		pfree(ins.data);
+	}
 	pfree(vbuf.data);
+	value_trees(tr, &env);
 }
 
 /* The key of large_keys' item i: n bytes, all 'a' but its first few. */

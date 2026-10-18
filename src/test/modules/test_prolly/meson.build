@@ -90,6 +90,7 @@ tests += {
       'gc',
       'gc_full',
       'page_sweep',
+      'large_values',
     ],
   },
   'tap': {

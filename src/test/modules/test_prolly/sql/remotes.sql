@@ -181,7 +181,7 @@ SELECT pg_temp.err($$SELECT dolt_fetch('liar')$$);
 -- a remote of another canonical format
 SELECT dolt_remote('add', 'old', :'url_old');
 SELECT test_remote_set_head(:'url_old', 'main', :'fake', '1');
-SELECT dolt_fetch('old');
+SELECT replace(pg_temp.err($$SELECT dolt_fetch('old')$$), 'not ' || :'fmt', 'not <this build''s>');
 \c :db
 
 -- a role without the privileges of pg_read_server_files can't read one,

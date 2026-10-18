@@ -52,7 +52,7 @@ SELECT test_fold_root() = test_fold_root(true) AS folds_agree;
 
 -- the root says its format: one with another (or none) has its tables
 -- listed, their rows not read
-SELECT value AS format FROM test_fold_items() WHERE key = '!:format';
+SELECT value ~ '^[0-9]+$' AS has_format FROM test_fold_items() WHERE key = '!:format';
 
 -- a primary key WITHOUT OVERLAPS doesn't key the rows (the key encoder
 -- can't order it): across a change of definition they read, as keyless

@@ -491,8 +491,12 @@ SELECT test_remote_set_head(:'url_old', 'main', :'fake', '1');
  t
 (1 row)
 
-SELECT dolt_fetch('old');
-ERROR:  remote "old" holds commits of canonical format 1, not 3
+SELECT replace(pg_temp.err($$SELECT dolt_fetch('old')$$), 'not ' || :'fmt', 'not <this build''s>');
+                               replace                                
+----------------------------------------------------------------------
+ remote "old" holds commits of canonical format 1, not <this build's>
+(1 row)
+
 \c :db
 -- a role without the privileges of pg_read_server_files can't read one,
 -- nor push to one (a push reads it), whatever it may write

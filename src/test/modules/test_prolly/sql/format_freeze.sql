@@ -79,6 +79,18 @@ SELECT convert_from(decode(h, 'hex'), 'UTF8'), convert_from(decode(h || '21', 'h
 	jsonb_build_object(convert_from(decode(h, 'hex'), 'UTF8'), g)
 FROM unnest(ARRAY['c3a9', 'c39f', 'c3bc', 'c384', 'c3a96c6cc3a8', '6e61c3af7665']) WITH ORDINALITY u(h, g);
 
+-- Large values, out of line in value trees addressed by byte counts:
+-- rows of one long value, and of several medium ones over a node's
+-- inline limit together, from bytes that don't repeat.
+CREATE TABLE frozen.large (k int PRIMARY KEY, t text, b bytea);
+INSERT INTO frozen.large
+SELECT g, string_agg(md5(g::text || ':' || i), '' ORDER BY i), NULL
+FROM generate_series(1, 3) g, generate_series(1, 25 * g * g) i GROUP BY g;
+INSERT INTO frozen.large
+SELECT 10 + g, string_agg(md5(g::text || '-' || i), '' ORDER BY i),
+	decode(string_agg(md5(g::text || '+' || i), '' ORDER BY i), 'hex')
+FROM generate_series(1, 3) g, generate_series(1, 50) i GROUP BY g;
+
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
 

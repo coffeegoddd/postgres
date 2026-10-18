@@ -311,3 +311,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- How many nodes the refs' walk from commit "to" visits that the walk
+-- from commit "from" doesn't: what "to" added to the chunk store.
+CREATE FUNCTION test_walk_new_count(from_commit text, to_commit text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
