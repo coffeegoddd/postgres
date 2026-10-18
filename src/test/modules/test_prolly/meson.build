@@ -146,6 +146,7 @@ tests += {
       't/067_bmap_drop_flush.pl',
       't/060_keyless_unsettled.pl',
       't/061_journal_pads.pl',
+      't/062_long_history.pl',
     ],
   },
 }
