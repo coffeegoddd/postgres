@@ -973,25 +973,32 @@ hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
 
 /*
  * Commit the session branch as it is, with these parents; the fold is the
- * branch's next baseline.
+ * branch's next baseline.  Unless allow_empty, a fold of one parent's root
+ * records nothing and returns false.
  */
-static void
+static bool
 commit_branch(const char *message, const ProllyHash *parents, int nparents,
-			  ProllyHash *commit_id)
+			  bool allow_empty, ProllyHash *commit_id)
 {
 	char	   *name = branch_ops()->current();
 	ProllyNodeRef root;
 	ProllyNodeRef next;
+	ProllyNodeRef parent;
 	bool		pushed;
 
 	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
+	if (!allow_empty && nparents == 1 &&
+		copies_commit_working_set(&parents[0], &parent) &&
+		same_hash(&parent.hash, &root.hash))
+		return false;
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
+	return true;
 }
 
 /* ------------------------------------------------------------------------
@@ -1180,14 +1187,17 @@ copies_checkout(const char *name)
 
 /*
  * Commit the session's branch; ending a merge in progress, once its
- * conflicts are resolved, with both heads as parents.
+ * conflicts are resolved, with both heads as parents.  Emptiness is decided
+ * before anything is recorded, so a refused commit leaves the head, the
+ * baseline and a merge in progress as they were.
  */
-static void
-copies_commit(const char *message, ProllyHash *commit_id)
+static bool
+copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 {
 	ProllyHash	parents[2];
 	int			nparents = 0;
 	ProllyMergeState ms;
+	bool		merging;
 
 	lock_refs();
 	if (branch_head(branch_ops()->current(), &parents[0]))
@@ -1197,7 +1207,8 @@ copies_commit(const char *message, ProllyHash *commit_id)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot commit with constraint violations"),
 				 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
-	if (copies_merge_state(&ms))
+	merging = copies_merge_state(&ms);
+	if (merging)
 	{
 		if (ms.ntables > 0)
 			ereport(ERROR,
@@ -1208,9 +1219,12 @@ copies_commit(const char *message, ProllyHash *commit_id)
 					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
 		if (!ms.pick)
 			parents[nparents++] = ms.theirs;
-		copies_set_merge_state(NULL);
 	}
-	commit_branch(message, parents, nparents, commit_id);
+	if (!commit_branch(message, parents, nparents, allow_empty, commit_id))
+		return false;
+	if (merging)
+		copies_set_merge_state(NULL);
+	return true;
 }
 
 /*
@@ -1230,7 +1244,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 
 	if (working_set == NULL)
 	{
-		commit_branch(message, parents, nparents, commit_id);
+		(void) commit_branch(message, parents, nparents, true, commit_id);
 		return;
 	}
 	name = branch_ops()->current();

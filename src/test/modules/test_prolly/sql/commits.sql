@@ -25,6 +25,35 @@ ROLLBACK TO s;
 COMMIT;
 SELECT message FROM dolt_log('main');
 SELECT name, dirty FROM dolt_branches();
+-- A refused empty commit records nothing, even where its error is caught
+-- and the transaction goes on to commit.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT length(dolt_commit('-m', 'before empty')::text) AS committed;
+SELECT sum(chunks) AS chunks FROM test_chunk_segments() \gset
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_commit('-m', 'empty, refused');
+ROLLBACK TO s;
+DO $$
+BEGIN
+	PERFORM dolt_commit('-m', 'empty, refused in a block');
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+	RAISE NOTICE 'refused: %', SQLERRM;
+END $$;
+COMMIT;
+SELECT sum(chunks) = :chunks AS nothing_appended FROM test_chunk_segments();
+SELECT message FROM dolt_log('main') LIMIT 1;
+-- Emptiness is decided before anything is recorded, not undone after: the
+-- refs refuse it without an error, and the head stays.
+BEGIN;
+SELECT dolt_hashof('main') AS head \gset
+SELECT test_refs_commit('empty, refused by the refs', false) IS NULL AS refused;
+SELECT dolt_hashof('main') = :'head' AS head_kept;
+SELECT test_refs_commit('empty, allowed', true) IS NOT NULL AS committed;
+SELECT message FROM dolt_log('main') LIMIT 2;
+ROLLBACK;
 -- and includes the transaction's own writes
 BEGIN;
 INSERT INTO app.t VALUES (4, 'd');

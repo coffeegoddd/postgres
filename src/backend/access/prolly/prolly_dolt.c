@@ -315,7 +315,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	   *author = NULL;
 	bool		allow_empty = false;
 	ProllyHash	id = {0};
-	ProllyCommitInfo info;
+	volatile bool committed = false;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)
@@ -357,7 +357,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	author_override = author;
 	PG_TRY();
 	{
-		PROLLY_CALL(refs(), commit, message, &id);
+		committed = PROLLY_CALL(refs(), commit, message, allow_empty, &id);
 	}
 	PG_FINALLY();
 	{
@@ -365,19 +365,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 
-	/* Nothing changed: the root is its parent's. */
-	if (!allow_empty && PROLLY_CALL(refs(), commit_get, &id, &info) &&
-		info.nparents == 1)
-	{
-		ProllyCommitInfo parent;
-
-		if (PROLLY_CALL(refs(), commit_get, &info.parents[0], &parent) &&
-			same_hash(&parent.root.hash, &info.root.hash))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("nothing to commit"),
-					 errhint("Pass --allow-empty to commit anyway.")));
-	}
+	/* Nothing changed: the root is its parent's, and nothing was recorded. */
+	if (!committed)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("nothing to commit"),
+				 errhint("Pass --allow-empty to commit anyway.")));
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -688,20 +681,6 @@ abort_in_progress(const char *what)
 	PROLLY_CALL(refs(), reset, "HEAD");
 }
 
-/* Is the session branch's working set its head's? */
-static bool
-working_is_head(void)
-{
-	ProllyHash	head;
-	ProllyNodeRef working;
-	ProllyNodeRef committed;
-
-	return PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
-		PROLLY_CALL(refs(), working_set, NULL, &working) &&
-		PROLLY_CALL(refs(), commit_working_set, &head, &committed) &&
-		same_hash(&working.hash, &committed.hash);
-}
-
 /*
  * dolt_merge(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward, conflicts, message}
@@ -930,12 +909,11 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 			PG_RETURN_DATUM(text_array(4, result));
 		}
 		/* a pick resolved to nothing: as a pick of nothing is */
-		if (!allow_empty && working_is_head())
+		if (!PROLLY_CALL(refs(), commit, ms.message, allow_empty, &id))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("dolt_cherry_pick changes nothing on the branch"),
 					 errhint("Pass --allow-empty to commit it anyway.")));
-		PROLLY_CALL(refs(), commit, ms.message, &id);
 		result[0] = hash_hex(&id);
 		PG_RETURN_DATUM(text_array(4, result));
 	}

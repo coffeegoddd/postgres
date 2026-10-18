@@ -46,6 +46,10 @@ CREATE FUNCTION test_branch_switch(name text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_refs_commit(message text, allow_empty bool)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The session's branch.
 CREATE FUNCTION test_branch_current()
 RETURNS oid
