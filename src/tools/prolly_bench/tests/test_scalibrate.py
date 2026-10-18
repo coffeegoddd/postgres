@@ -50,6 +50,24 @@ class CalibrationTest(unittest.TestCase):
             self.assertAlmostEqual(suggested["instructions_tolerance"], 0.001)
             self.assertIn("Suggested gate settings", scalibrate.to_markdown(noise, None, suggested))
 
+    def test_jitter_is_not_instability(self):
+        # Hosted runners: S10's extends 33 vs 32, a page more or less; under
+        # the 8-event floor, so jitter, which the gate doesn't fail on.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runs = [counter_run(root, f"r{i}", {"io_extends": 32.0 + i % 2,
+                                                "wal_records": 10730.0 + (i % 2) * 900})
+                    for i in range(2)]
+            t = scounters.thresholds()
+            one, two = scalibrate._counter_runs(runs)
+            got = {m: v for (_, m), v in scounters.instability(one, two, t).items()}
+            self.assertEqual(got, {"io_extends": "jitter", "wal_records": "unstable"})
+            runs += [counter_run(root, f"r{i}", {"io_extends": 32.0 + i % 2,
+                                                 "wal_records": 10730.0}) for i in (2, 3)]
+            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs), t)
+            failing = {f["counter"] for f in noise["failing_counters"]}
+            self.assertNotIn("io_extends", failing)
+
     def test_timing_noise(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

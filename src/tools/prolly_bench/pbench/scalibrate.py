@@ -106,13 +106,14 @@ def _gate(t: dict, base: dict, base2: dict, cand: dict, cand2: dict):
     """The counters the gate would fail on (no build changed anything):
     (cell, counter, base, candidate) for each unstable only in the
     candidate, or regressed."""
-    tol = t["instructions_tolerance"]
+    in_base = scounters.instability(base, base2, t)
+    in_cand = scounters.instability(cand, cand2, t)
     for cid in set(base) & set(base2) & set(cand) & set(cand2):
-        b, b2, c, c2 = (r[cid].counters for r in (base, base2, cand, cand2))
-        for m in set(b) & set(b2) & set(c) & set(c2):
-            if scounters.differs(b[m], b2[m], m, tol):
+        b, c = base[cid].counters, cand[cid].counters
+        for m in set(b) & set(base2[cid].counters) & set(c) & set(cand2[cid].counters):
+            if in_base.get((cid, m)) == "unstable":
                 continue                      # unstable in the base: reported
-            if scounters.differs(c[m], c2[m], m, tol) or \
+            if in_cand.get((cid, m)) == "unstable" or \
                     scounters.change(m, b[m], c[m], t) == "regression":
                 yield cid, m, b[m], c[m]
 

@@ -142,6 +142,21 @@ def unstable(one: dict[CellId, CellCounters], two: dict[CellId, CellCounters],
     return out
 
 
+def instability(one: dict[CellId, CellCounters], two: dict[CellId, CellCounters],
+                t: dict) -> dict[tuple[CellId, str], str]:
+    """How two runs of one build disagree, by (cell, counter): "unstable"
+    where the difference is one the rule would call a change (or a counter
+    one run lacks), "jitter" where the counters differ by less (hosted
+    runners show a few such: a page extended or a record logged more)."""
+    out = {}
+    for cid, m, x, y in unstable(one, two, t["instructions_tolerance"]):
+        if x is None or y is None or kind(m) == "instructions" or change(m, x, y, t):
+            out[(cid, m)] = "unstable"
+        else:
+            out[(cid, m)] = "jitter"
+    return out
+
+
 def load(path: Path) -> dict[CellId, CellCounters]:
     from pbench import table
     rs = table.load_set(path)
