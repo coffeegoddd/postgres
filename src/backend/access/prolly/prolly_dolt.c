@@ -695,14 +695,17 @@ qualified_name(Oid relid)
  * ------------------------------------------------------------------------
  */
 
+static bool working_is_head(void);
+
 /*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
  * -m/--message message (required), --author "Name <email>", -a/-A/--all
  * (every change is always committed), --allow-empty (else a commit whose
- * root equals its parent's is refused), -f/--force (constraint violations
- * don't stop the commit, as in Dolt; the transaction still can't commit
- * with them unless dolt.allow_commit_conflicts is on).
+ * root equals its parent's is refused), --skip-empty (nothing to commit:
+ * no commit, and NULL), -f/--force (constraint violations don't stop the
+ * commit, as in Dolt; the transaction still can't commit with them unless
+ * dolt.allow_commit_conflicts is on).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -712,6 +715,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	   *message = NULL;
 	char	   *author = NULL;
 	bool		allow_empty = false;
+	bool		skip_empty = false;
 	bool		force = false;
 	ProllyHash	id = {0};
 	bool		committed = false;
@@ -729,6 +733,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 			continue;
 		else if (strcmp(a, "--allow-empty") == 0)
 			allow_empty = true;
+		else if (strcmp(a, "--skip-empty") == 0)
+			skip_empty = true;
 		else if (strcmp(a, "--force") == 0)
 			force = true;
 		else if (a[0] == '-' && a[1] != '-' && a[1] != '\0')
@@ -759,6 +765,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit needs a message"),
 				 errhint("Pass -m and a message.")));
+	if (allow_empty && skip_empty)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_commit can't --allow-empty and --skip-empty at once")));
+	if (skip_empty && working_is_head())
+		PG_RETURN_NULL();
 
 	author_override = author;
 	commit_forced = force;
@@ -1100,6 +1112,13 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	 */
 	if (create || !writer_branch_name(branch))
 		reserved_branch_name(branch);
+	if (!create && strcmp(branch, branch_ops()->current()) == 0)
+	{
+		sweep_detached(branch);
+		result[0] = "0";
+		result[1] = psprintf("Already on branch '%s'", branch);
+		PG_RETURN_DATUM(text_array(2, result));
+	}
 
 	/*
 	 * A commit's hash that names no branch: a detached session on it,
@@ -2836,8 +2855,28 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 }
 
 /*
+ * Does an object's name, as status lists it, name a schema: an identifier
+ * alone, no "." or argument list outside its quotes?
+ */
+static bool
+names_schema(const char *name)
+{
+	bool		quoted = false;
+
+	for (const char *c = name; *c; c++)
+	{
+		if (*c == '"')
+			quoted = !quoted;
+		else if (!quoted && (*c == '.' || *c == '('))
+			return false;
+	}
+	return true;
+}
+
+/*
  * A table, or another object, changed: its name, a tab, and its status.
- * Other objects take the tables' statuses, as in Doltgres.
+ * Other objects take the tables' statuses, as in Doltgres, but a schema
+ * made or dropped ("new schema", "deleted schema"), as in Dolt.
  */
 static void
 status_table(const char *name, ProllyDiffKind kind, void *arg)
@@ -2849,8 +2888,12 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 		[PROLLY_DIFF_NOT_COVERED] = "not covered",
 		[PROLLY_DIFF_MODIFIED] = "modified",
 	};
+	const char *status = statuses[kind];
 
-	*names = lappend(*names, psprintf("%s\t%s", name, statuses[kind]));
+	if ((kind == PROLLY_DIFF_ADDED || kind == PROLLY_DIFF_REMOVED) &&
+		names_schema(name))
+		status = kind == PROLLY_DIFF_ADDED ? "new schema" : "deleted schema";
+	*names = lappend(*names, psprintf("%s\t%s", name, status));
 }
 
 /*
@@ -3784,7 +3827,8 @@ may_maintain(void)
  * dolt_gc(VARIADIC args text[]) returns text[]: {status}
  *
  * --full: the database's chunk store collected (prolly_reclaim.h): what
- * was written since the last collection, or (full) all of it.  Commits go
+ * was written since the last collection (--shallow, Dolt's cheaper
+ * collection, too), or (full) all of it.  Commits go
  * on meanwhile but for a short final window; a transaction that read a
  * chunk collected meanwhile and then names it fails, to be retried.  The
  * database's owner, or a member of pg_maintain, as VACUUM asks.
@@ -3803,6 +3847,8 @@ dolt_gc(PG_FUNCTION_ARGS)
 	{
 		if (strcmp(args[i], "--full") == 0)
 			full = true;
+		else if (strcmp(args[i], "--shallow") == 0)
+			full = false;
 		else
 			unsupported("dolt_gc", args[i]);
 	}

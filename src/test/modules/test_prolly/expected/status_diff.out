@@ -580,9 +580,9 @@ DETAIL:  drop cascades to table sdv.t
 drop cascades to view sdv.v
 drop cascades to sequence sdv.s
 SELECT * FROM dolt_status ORDER BY table_name;
-   table_name   | staged | status  
-----------------+--------+---------
- sdv            | t      | deleted
+   table_name   | staged |     status     
+----------------+--------+----------------
+ sdv            | t      | deleted schema
  sdv.f(integer) | t      | deleted
  sdv.s          | t      | deleted
  sdv.t          | t      | deleted

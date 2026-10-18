@@ -343,9 +343,9 @@ SELECT dolt_branch('-D', 'ag_cases');
 (1 row)
 
 SELECT dolt_checkout('main');
-          dolt_checkout          
----------------------------------
- {0,"Switched to branch 'main'"}
+         dolt_checkout          
+--------------------------------
+ {0,"Already on branch 'main'"}
 (1 row)
 
 SELECT dolt_branch('-D', 'ag_reset');

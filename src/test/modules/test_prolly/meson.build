@@ -104,6 +104,9 @@ tests += {
       'gc_full',
       'page_sweep',
       'large_values',
+      'doltgres_vc',
+      'doltgres_objects',
+      'doltgres_fks_auth',
     ],
   },
   'tap': {

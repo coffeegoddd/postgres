@@ -59,6 +59,7 @@
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "parser/parse_type.h"
+#include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "catalog/versioned.h"
@@ -353,10 +354,27 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 static Oid
 rel_named(const char *name, LOCKMODE lockmode, bool missing_ok)
 {
-	List	   *names = stringToQualifiedNameList(name, NULL);
+	RangeVar   *rv = makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL));
+	Oid			nsp;
+	Oid			relid;
 
-	return RangeVarGetRelid(makeRangeVarFromNameList(names), lockmode,
-							missing_ok);
+	if (rv->schemaname == NULL)
+		return RangeVarGetRelid(rv, lockmode, missing_ok);
+
+	/*
+	 * (a version's table, named with its schema: found whatever the
+	 * session may use, as the fold that recorded it read every versioned
+	 * schema)
+	 */
+	nsp = get_namespace_oid(rv->schemaname, missing_ok);
+	relid = OidIsValid(nsp) ? get_relname_relid(rv->relname, nsp) : InvalidOid;
+	if (!OidIsValid(relid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation \"%s\" does not exist", name)));
+	if (OidIsValid(relid) && lockmode != NoLock)
+		LockRelationOid(relid, lockmode);
+	return relid;
 }
 
 static Oid
@@ -2899,7 +2917,7 @@ foreign_key_violations(List *relids)
 		appendStringInfoString(&info, "]}");
 		initStringInfo(&q);
 		appendStringInfo(&q,
-						 "SELECT row_to_json(c)::text FROM %s%s c WHERE "
+						 "SELECT row_to_json(c.*)::text FROM %s%s c WHERE "
 						 "NOT EXISTS (SELECT 1 FROM %s%s p WHERE %s) AND ",
 						 only_unless_partitioned(con->conrelid), child,
 						 only_unless_partitioned(con->confrelid), parent,
@@ -3005,10 +3023,10 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check
 		appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
 	}
 	if (removing)
-		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c)::text",
+		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c.*)::text",
 						 only_unless_partitioned(con->conrelid), table, cond);
 	else
-		appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE %s",
+		appendStringInfo(&q, "SELECT row_to_json(c.*)::text FROM %s%s c WHERE %s",
 						 only_unless_partitioned(con->conrelid), table, cond);
 	return list_make3(q.data, info.data, (void *) (uintptr_t) con->conrelid);
 }
