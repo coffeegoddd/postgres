@@ -160,7 +160,11 @@ note_need(const char *name, const char *value, void *arg)
 	}
 }
 
-/* Run a query with text parameters; the rows, in SPI_tuptable. */
+/*
+ * Run a query with text parameters; the rows, in SPI_tuptable.  Not
+ * read-only: each query takes a new snapshot, so it sees the extensions
+ * this transaction made (a clone's, before its moves check them).
+ */
 static void
 query(const char *sql, int nparams, const char **params)
 {
@@ -172,7 +176,7 @@ query(const char *sql, int nparams, const char **params)
 		types[i] = TEXTOID;
 		values[i] = CStringGetTextDatum(params[i]);
 	}
-	if (SPI_execute_with_args(sql, nparams, types, values, NULL, true, 0) != SPI_OK_SELECT)
+	if (SPI_execute_with_args(sql, nparams, types, values, NULL, false, 0) != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_with_args failed: %s", sql);
 }
 
@@ -491,7 +495,7 @@ object_exists(const char *address)
 		Oid			types[3] = {TEXTOID, TEXTOID, TEXTOID};
 
 		if (SPI_execute_with_args("SELECT pg_catalog.pg_get_object_address($1, $2::text[], $3::text[])",
-								  3, types, parts, NULL, true, 1) != SPI_OK_SELECT)
+								  3, types, parts, NULL, false, 1) != SPI_OK_SELECT)
 			elog(ERROR, "SPI_execute_with_args failed");
 		found = true;
 		ReleaseCurrentSubTransaction();
@@ -587,4 +591,12 @@ prolly_check_dependencies(List *trees, bool install, const char *what)
 	foreach(lc, installs)
 		create_extension(installs, lfirst(lc));
 	SPI_finish();
+}
+
+void
+prolly_check_commit_dependencies(const ProllyCommitInfo *commit, const char *what)
+{
+	if (commit->has_dependencies)
+		prolly_check_dependencies(list_make1((ProllyNodeRef *) &commit->dependencies),
+								  false, what);
 }

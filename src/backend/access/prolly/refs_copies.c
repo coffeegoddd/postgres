@@ -69,6 +69,7 @@
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -630,6 +631,7 @@ materialize(const char *name)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the head commit of branch \"%s\" is missing", name)));
+		prolly_check_commit_dependencies(&info, "checkout");
 		branch_ops()->make(name, NULL);
 		branch_set_baseline(name,
 							branch_baseline(branch_ops()->current(), &baseline) ?
@@ -1367,6 +1369,7 @@ copies_reset(const char *ref)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	prolly_check_commit_dependencies(&info, "reset");
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
 	move_settled(&info.root);

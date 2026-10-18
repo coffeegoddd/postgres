@@ -51,6 +51,7 @@
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "parser/parse_type.h"
@@ -2769,6 +2770,15 @@ merge_held(const char *branch, const char *message, int flags,
 		*commit_id = ours;
 		return 0;
 	}
+	{
+		ProllyCommitInfo info;
+
+		if (!PROLLY_CALL(dc.refs, commit_get, &theirs, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit is missing")));
+		prolly_check_commit_dependencies(&info, "merge");
+	}
 	commit_root(&base, &roots[0]);
 	commit_root(&ours, &roots[1]);
 	commit_root(&theirs, &roots[2]);
@@ -2889,6 +2899,9 @@ pick_held(const char *const *refs, int nrefs, bool revert, bool allow_empty,
 					 errmsg("%s of a commit with %d parents isn't supported", fn,
 							info[i].nparents),
 					 errdetail("Its changes are changes from one parent.")));
+		/* (a revert goes back to what the branch had) */
+		if (!revert)
+			prolly_check_commit_dependencies(&info[i], what);
 	}
 	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ours))
 		ereport(ERROR,
