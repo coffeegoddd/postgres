@@ -42,9 +42,11 @@ func manifestAt(t *testing.T, root string) Manifest {
 
 // The reviewed corpus: a port added or deferred updates these.
 const (
-	reviewedPorts      = 66
-	reviewedAssertions = 216
-	reviewedDeferred   = 7
+	reviewedPorts      = 93 // ported whole
+	reviewedPartial    = 23 // ported in part
+	reviewedAssertions = 333
+	reviewedOmitted    = 23 // assertions left out, each with its note
+	reviewedDeferred   = 20
 )
 
 func TestReviewedCorpus(t *testing.T) {
@@ -52,7 +54,7 @@ func TestReviewedCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != reviewedPorts || r.MappedAssertions != reviewedAssertions || r.DeferredCases != reviewedDeferred || r.UnreviewedCases != 1233-reviewedPorts-reviewedDeferred || len(r.Engines) != 0 {
+	if r.SourceCases != 1233 || r.SourceAssertions != 5820 || r.PortedCases != reviewedPorts || r.PartialCases != reviewedPartial || r.MappedAssertions != reviewedAssertions || r.OmittedAssertions != reviewedOmitted || r.DeferredCases != reviewedDeferred || r.UnreviewedCases != 1233-reviewedPorts-reviewedPartial-reviewedDeferred || len(r.Engines) != 0 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -129,7 +131,7 @@ func TestExplicitOmissionIsPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.PortedCases != reviewedPorts-1 || r.PartialCases != 1 || r.MappedAssertions != reviewedAssertions-1 || r.OmittedAssertions != 1 {
+	if r.PortedCases != reviewedPorts-1 || r.PartialCases != reviewedPartial+1 || r.MappedAssertions != reviewedAssertions-1 || r.OmittedAssertions != reviewedOmitted+1 {
 		t.Fatalf("%+v", r)
 	}
 }
@@ -153,9 +155,11 @@ func passing(t *testing.T) execution {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r := vcscenario.Result{ID: p.ID, Engine: "prolly", Status: "passed", Requires: s.Requires, PlannedSteps: len(s.Steps)}
-		for _, st := range s.Steps {
-			r.Steps = append(r.Steps, vcscenario.StepResult{ID: st.ID, Op: st.Op, Session: st.Session})
+		r := vcscenario.Result{ID: p.ID, Engine: "prolly", Status: "passed", Requires: s.Requires, PlannedSteps: s.PlannedSteps()}
+		for _, pass := range s.Passes() {
+			for _, st := range pass.Steps {
+				r.Steps = append(r.Steps, vcscenario.StepResult{ID: st.ID, Variant: pass.Variant, Op: st.Op, Session: st.Session})
+			}
 		}
 		e.Hashes[p.ID] = p.ScenarioSHA256
 		e.Results = append(e.Results, r)
@@ -164,6 +168,7 @@ func passing(t *testing.T) execution {
 }
 func TestExecutionAccounting(t *testing.T) {
 	// what the first port earns when it passes
+	reviewed := reviewedPorts + reviewedPartial
 	first := 0
 	for _, a := range manifestAt(t, fixture).Ports[0].Assertions {
 		if len(a.Steps) > 0 {
@@ -176,9 +181,9 @@ func TestExecutionAccounting(t *testing.T) {
 		wantErr                     bool
 		passed, credit, unsupported int
 	}{
-		{"all pass", func(*execution) {}, false, reviewedPorts, reviewedAssertions, 0},
-		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, reviewedPorts - 1, reviewedAssertions - first, 1},
-		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, reviewedPorts - 1, reviewedAssertions - first, 0},
+		{"all pass", func(*execution) {}, false, reviewed, reviewedAssertions, 0},
+		{"unsupported earns no credit", func(e *execution) { e.Results[0].Status = "unsupported"; e.Results[0].Steps = nil }, false, reviewed - 1, reviewedAssertions - first, 1},
+		{"failed earns no credit", func(e *execution) { e.Results[0].Status = "failed" }, false, reviewed - 1, reviewedAssertions - first, 0},
 		{"missing case", func(e *execution) { e.Results = e.Results[1:] }, true, 0, 0, 0},
 		{"duplicate case", func(e *execution) { e.Results = append(e.Results, e.Results[0]) }, true, 0, 0, 0},
 		{"truncated pass", func(e *execution) { e.Results[0].Steps = nil }, true, 0, 0, 0},

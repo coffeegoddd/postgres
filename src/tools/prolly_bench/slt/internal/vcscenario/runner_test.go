@@ -15,6 +15,7 @@ type fake struct {
 	caps                []string
 	verifyErr, closeErr error
 	opened, closed      bool
+	opens               int
 	steps               []Step
 	args                [][]*string
 	out                 []Outcome
@@ -24,7 +25,7 @@ type fake struct {
 func (f *fake) Name() string                              { return "fake" }
 func (f *fake) Capabilities() []string                    { return f.caps }
 func (f *fake) Verify(context.Context, []string) error    { return f.verifyErr }
-func (f *fake) Open(context.Context, []string) error      { f.opened = true; return nil }
+func (f *fake) Open(context.Context, []string) error      { f.opened = true; f.opens++; return nil }
 func (f *fake) Close(context.Context) error               { f.closed = true; return f.closeErr }
 func (f *fake) CheckTarget(context.Context, string) error { return nil }
 func (f *fake) Execute(_ context.Context, st Step, params, args []*string) (Outcome, error) {
@@ -202,6 +203,42 @@ func TestSQLRequires(t *testing.T) {
 		got, err := SQLRequires(sql)
 		if err != nil || strings.Join(got, ",") != want {
 			t.Fatalf("%s: %v %v", sql, got, err)
+		}
+	}
+}
+
+const twoWays = `{"version":1,"id":"ways","description":"both directions","requires":["sql","vc.core"],"sessions":["a"],
+"variants":[{"name":"forward","vars":{"side":"right"}},{"name":"flipped","vars":{"side":"main"}}],
+"steps":[{"id":"co","op":"checkout","session":"a","args":[{"var":"side"}]},
+{"id":"q","op":"query","session":"a","sql":"SELECT $1","params":[{"var":"side"}],"expect":{"rows":[[{"var":"side"}]],"order":"ordered"}},
+{"id":"only","op":"query","session":"a","variants":["flipped"],"sql":"SELECT 1","expect":{"rows":[["1"]],"order":"ordered"}}]}`
+
+func TestVariants(t *testing.T) {
+	s := parseTest(t, twoWays)
+	if n := s.PlannedSteps(); n != 5 {
+		t.Fatalf("planned %d steps", n)
+	}
+	f := &fake{caps: s.Requires, out: []Outcome{{}, {Rows: [][]*string{{str("right")}}}, {}, {Rows: [][]*string{{str("main")}}}, {Rows: [][]*string{{str("1")}}}}}
+	r := Run(context.Background(), s, f)
+	if r.Status != "passed" || f.opens != 2 || len(r.Steps) != 5 || r.Steps[2].Variant != "flipped" || *f.args[0][0] != "right" || *f.args[2][0] != "main" {
+		t.Fatalf("%+v %d", r, f.opens)
+	}
+	// a failure in the second variant names it
+	f = &fake{caps: s.Requires, out: []Outcome{{}, {Rows: [][]*string{{str("right")}}}, {}, {Rows: [][]*string{{str("right")}}}, {}}}
+	if r = Run(context.Background(), s, f); r.Status != "failed" || !strings.HasPrefix(r.Error, "flipped: q:") {
+		t.Fatalf("%+v", r)
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"one variant", `,{"name":"flipped","vars":{"side":"main"}}`, ``},
+		{"duplicate variant", `"name":"flipped"`, `"name":"forward"`},
+		{"other variables", `{"side":"main"}`, `{"other":"main"}`},
+		{"undefined variable", `"params":[{"var":"side"}]`, `"params":[{"var":"nope"}]`},
+		{"unknown variant", `"variants":["flipped"]`, `"variants":["sideways"]`},
+		{"variable without variants", `"variants":[{"name":"forward","vars":{"side":"right"}},{"name":"flipped","vars":{"side":"main"}}],`, ``},
+		{"ref and var at once", `{"var":"side"}]}`, `{"var":"side","ref":"x"}]}`},
+	} {
+		if _, err := Parse([]byte(strings.Replace(twoWays, tc.from, tc.to, 1))); err == nil {
+			t.Fatalf("%s: accepted", tc.name)
 		}
 	}
 }

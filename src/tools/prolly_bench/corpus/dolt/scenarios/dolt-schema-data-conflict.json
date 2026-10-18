@@ -1,0 +1,342 @@
+{
+  "version": 1,
+  "id": "dolt-schema-data-conflict",
+  "description": "Reviewed Dolt port: data conflict",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+    "case": "SchemaChangeTestsForDataConflicts: data conflict"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "variants": [
+    {
+      "name": "forward",
+      "vars": {
+        "right_side": "right",
+        "left_side": "main"
+      }
+    },
+    {
+      "name": "flipped",
+      "vars": {
+        "right_side": "main",
+        "left_side": "right"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "anc-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "anc-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, col1 int, col2 varchar(100), col3 varchar(50), col4 varchar(20), CONSTRAINT unique1 UNIQUE (col2, pk))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "anc-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 10, '100', '1', '11'), (2, 20, '200', '2', '22')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "anc-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX idx1 ON t (col4, col1)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "h-ancestor",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "ancestor commit"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "h-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('right')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "h-right-side",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        {
+          "var": "right_side"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP COLUMN col3",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "right-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = -100, col2 = '-100' WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "h-right-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "right commit"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "h-left-side",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        {
+          "var": "left_side"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = -1000 WHERE t.pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "h-left-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "params": [
+        "left commit"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "h-main",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "params": [
+        "main"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('right') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT * FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3-forward",
+      "session": "a",
+      "variants": [
+        "forward"
+      ],
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).col1, (base_row).col2, (base_row).col4, (our_row).pk, (our_row).col1, (our_row).col2, (our_row).col4, (their_row).pk, (their_row).col1, (their_row).col2, (their_row).col4 FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "10",
+            "100",
+            "11",
+            "1",
+            "-1000",
+            "100",
+            "11",
+            "1",
+            "-100",
+            "-100",
+            "11"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3-flipped",
+      "session": "a",
+      "variants": [
+        "flipped"
+      ],
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).col1, (base_row).col2, (base_row).col4, (our_row).pk, (our_row).col1, (our_row).col2, (our_row).col4, (their_row).pk, (their_row).col1, (their_row).col2, (their_row).col4 FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "10",
+            "100",
+            "11",
+            "1",
+            "-100",
+            "-100",
+            "11",
+            "1",
+            "-1000",
+            "100",
+            "11"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

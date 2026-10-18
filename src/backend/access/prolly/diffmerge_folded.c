@@ -65,9 +65,12 @@
 #include "access/htup_details.h"
 #include "access/genam.h"
 #include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/array.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "access/xact.h"
@@ -84,6 +87,7 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
+#include "rewrite/rewriteHandler.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -114,7 +118,9 @@ static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
 static List *foreign_key_violations(List *relids);
-static void violating_rows(List *queries, const char *type, List **found);
+static void violating_rows(List *queries, const char *type, bool removing,
+						   List **found);
+static void take_breaking_rows(List *added, void *arg);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
 						  const Table *now, ProllyDiffSink *sink);
 
@@ -1346,7 +1352,7 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 		rows_from(&working, target);	/* (folded already) */
 	else
 		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
-					(void *) target);
+					NULL, (void *) target);
 }
 
 /*
@@ -1851,10 +1857,10 @@ dup_bytes(const char *data, int len)
  *
  * For a merge ('strict'), refused where rel's rows can't faithfully come
  * from x's: when x lacks a column whose values each row was given as it
- * was added (an identity, a generated column, a default such as a
- * serial's), or when x has a column rel hasn't while rel has one x hasn't
- * (a column renamed reads, by name, as one dropped and one added).  A diff
- * shows those as null.
+ * was added (an identity, a default such as a serial's).  A diff shows
+ * those as null.  (A column x has that rel hasn't, dropped, or renamed,
+ * which reads by name as a drop and an add, is left out: a merge refuses
+ * first where that loses a change, refuse_lost_changes().)
  */
 static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
@@ -1885,7 +1891,10 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	int			i;
 	ProllyTreeBuilder *b;
 	ListCell   *lc;
-	bool		x_has_more = false;
+	EState	   *estate = NULL;	/* (computing generated columns) */
+	List	   *generated = NIL;	/* those added, and their expressions */
+	List	   *gen_exprs = NIL;
+	bool		keyed_now;
 	bool		keys_kept;
 	Bitmapset  *pk;
 	MemoryContext rowcxt;
@@ -1901,7 +1910,14 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	rd.kr = keying_of(rel);
 	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
 	cols = version_columns(x, &keyed);
-	if (keyed == PROLLY_CALL(rd.kr, keyless, rd.k))
+
+	/*
+	 * (a version with a primary key where the table has none now, or the
+	 * other way: its rows are keyed otherwise; one whose key the encoder
+	 * can't order is keyed by content as the table is)
+	 */
+	(void) version_columns(now, &keyed_now);
+	if (keyed != keyed_now)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rows of table \"%s\" can't be merged across a change of its primary key",
@@ -1925,16 +1941,6 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	out_fn = palloc0_array(FmgrInfo, md->natts);
 	in_fn = palloc0_array(Oid, md->natts);
 	in_param = palloc0_array(Oid, md->natts);
-	for (int j = 0; j < xd->natts; j++)
-	{
-		bool		has = false;
-
-		for (int a = 0; a < md->natts; a++)
-			has |= !TupleDescAttr(md, a)->attisdropped &&
-				strcmp(NameStr(TupleDescAttr(xd, j)->attname),
-					   NameStr(TupleDescAttr(md, a)->attname)) == 0;
-		x_has_more |= !has;
-	}
 	for (int a = 0; a < md->natts; a++)
 	{
 		Form_pg_attribute att = TupleDescAttr(md, a);
@@ -1945,6 +1951,22 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 		for (int j = 0; j < xd->natts; j++)
 			if (strcmp(NameStr(TupleDescAttr(xd, j)->attname), NameStr(att->attname)) == 0)
 				from[a] = j;
+		/*
+		 * (a stored generated column added is computed from the rest of
+		 * each row, as Postgres computed it; a virtual one isn't stored)
+		 */
+		if (from[a] < 0 && att->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		{
+			if (estate == NULL)
+				estate = CreateExecutorState();
+			generated = lappend_int(generated, a);
+			gen_exprs = lappend(gen_exprs,
+								ExecPrepareExpr((Expr *) build_generation_expression(rel, a + 1),
+												estate));
+			continue;
+		}
+		if (from[a] < 0 && att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			continue;
 		if (from[a] < 0 && strict &&
 			(att->attidentity || att->attgenerated ||
 			 (att->atthasdef && !att->atthasmissing)))
@@ -1953,13 +1975,6 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being added",
 							RelationGetRelationName(rel), NameStr(att->attname)),
 					 errdetail("Each row was given its own value as the column was added (an identity, a generated column, or a default such as a serial's), which rows from before it don't have.")));
-		if (from[a] < 0 && strict && x_has_more && !att->atthasmissing)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being renamed or replaced",
-							RelationGetRelationName(rel), NameStr(att->attname)),
-					 errdetail("One version has a column the table hasn't now, and the table has \"%s\", which that version hasn't.",
-							   NameStr(att->attname))));
 		if (from[a] >= 0 && TupleDescAttr(xd, from[a])->atttypid != att->atttypid)
 		{
 			Oid			outf;
@@ -2031,6 +2046,25 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 				ms->tts_values[a] = xs->tts_values[from[a]];
 		}
 		ExecStoreVirtualTuple(ms);
+		if (generated != NIL)
+		{
+			ExprContext *econtext = GetPerTupleExprContext(estate);
+			ListCell   *g;
+			ListCell   *e;
+
+			econtext->ecxt_scantuple = ms;
+			forboth(g, generated, e, gen_exprs)
+			{
+				int			a = lfirst_int(g);
+				Datum		d = ExecEvalExprSwitchContext(lfirst(e), econtext,
+														  &ms->tts_isnull[a]);
+
+				ms->tts_values[a] = ms->tts_isnull[a] ? (Datum) 0 :
+					datumCopy(d, TupleDescAttr(md, a)->attbyval,
+							  TupleDescAttr(md, a)->attlen);
+			}
+			ResetExprContext(econtext);
+		}
 		initStringInfo(&key);
 		initStringInfo(&crow);
 		PROLLY_CALL(rd.kr, encode_row, rd.k, ms, &key, &crow, &content);
@@ -2071,6 +2105,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(tree, cursor_close, cur);
+	if (estate)
+		FreeExecutorState(estate);
 	if (n > 1)
 		qsort_arg(rows, n, sizeof(ConvRow *), conv_row_cmp, &rd);
 
@@ -2109,6 +2145,155 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	PROLLY_CALL(rd.kr, close, rd.k);
 	return out;
 }
+
+/* A version's rows decoded: its columns, as its description has them. */
+typedef struct VersionReader
+{
+	ProllyValueEncoder *enc;
+	TupleTableSlot *slot;
+} VersionReader;
+
+static void
+version_reader(const Table *x, ProllyKeyingRefs *krefs, VersionReader *vr)
+{
+	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
+	bool		keyed;
+	List	   *cols = version_columns(x, &keyed);
+	TupleDesc	xd = CreateTemplateTupleDesc(list_length(cols));
+	ListCell   *lc;
+	int			i = 1;
+
+	foreach(lc, cols)
+	{
+		VersionColumn *c = lfirst(lc);
+
+		TupleDescInitEntry(xd, i++, c->name, c->type, c->typmod, 0);
+	}
+	TupleDescFinalize(xd);
+	vr->enc = PROLLY_CALL(ve, begin, xd, CurrentMemoryContext);
+	PROLLY_CALL(ve, set_values, vr->enc, &krefs->values);
+	vr->slot = MakeSingleTupleTableSlot(xd, &TTSOpsVirtual);
+}
+
+/* Column name's value in a version's row (its text form), or NULL. */
+static char *
+version_value(TupleTableSlot *slot, const char *name)
+{
+	TupleDesc	d = slot->tts_tupleDescriptor;
+
+	for (int a = 0; a < d->natts; a++)
+	{
+		Form_pg_attribute att = TupleDescAttr(d, a);
+		Oid			outf;
+		bool		varlena;
+
+		if (strcmp(NameStr(att->attname), name) != 0)
+			continue;
+		if (slot->tts_isnull[a])
+			return NULL;
+		getTypeOutputInfo(att->atttypid, &outf, &varlena);
+		return OidOutputFunctionCall(outf, slot->tts_values[a]);
+	}
+	return NULL;
+}
+
+/*
+ * For a merge: refused where side changed, in a row base had, the value of
+ * a column the table, as merged, hasn't: one the other side dropped, or
+ * renamed (a rename reads, by name, as a drop and an add).  The change
+ * would be lost: refused, not lost.  (Rows side added lose the column as
+ * every row does.)
+ */
+static void
+refuse_lost_changes(Relation rel, const Table *base, const Table *side,
+					const Table *now)
+{
+	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	bool		keyed;
+	List	   *base_cols;
+	List	   *now_cols;
+	List	   *gone = NIL;
+	ListCell   *lc;
+	Changes		c;
+	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
+	VersionReader br;
+	VersionReader sr;
+
+	if (base == NULL || side == NULL || now == NULL ||
+		same_hash(&base->data.hash, &side->data.hash) ||
+		same_description(side, now))
+		return;
+	base_cols = version_columns(base, &keyed);
+	now_cols = version_columns(now, &keyed);
+	foreach(lc, version_columns(side, &keyed))
+	{
+		VersionColumn *sc = lfirst(lc);
+		bool		in_base = false;
+		bool		in_now = false;
+		ListCell   *l2;
+
+		foreach(l2, base_cols)
+			in_base |= strcmp(((VersionColumn *) lfirst(l2))->name, sc->name) == 0;
+		foreach(l2, now_cols)
+			in_now |= strcmp(((VersionColumn *) lfirst(l2))->name, sc->name) == 0;
+		if (in_base && !in_now)
+			gone = lappend(gone, sc->name);
+	}
+	if (gone == NIL)
+		return;
+	require_readable(base);
+	require_readable(side);
+
+	memset(&c, 0, sizeof(c));
+	c.rd.kr = keying_of(rel);
+	c.rd.k = PROLLY_CALL(c.rd.kr, open, rel, CurrentMemoryContext);
+	chunk_env(&env);
+	env.compare = changes_compare;
+	env.compare_arg = &c;
+	prolly_keying_use_env(&krefs, c.rd.kr, c.rd.k, tree, &env);
+	PROLLY_CALL(tree, diff, &env, &base->data, &side->data, collect_change, &c);
+	version_reader(base, &krefs, &br);
+	version_reader(side, &krefs, &sr);
+	foreach(lc, c.list)
+	{
+		Change	   *ch = lfirst(lc);
+		ProllyValue v;
+		ProllyValue row;
+		uint64		count;
+		ListCell   *g;
+
+		if (ch->before.len == 0 || ch->after.len == 0)
+			continue;
+		v.data = (const uint8 *) ch->before.data;
+		v.len = ch->before.len;
+		PROLLY_CALL(c.rd.kr, parse_value, c.rd.k, &v, &row, &count);
+		ExecClearTuple(br.slot);
+		PROLLY_CALL(ve, decode, br.enc, &row, br.slot);
+		slot_getallattrs(br.slot);
+		v.data = (const uint8 *) ch->after.data;
+		v.len = ch->after.len;
+		PROLLY_CALL(c.rd.kr, parse_value, c.rd.k, &v, &row, &count);
+		ExecClearTuple(sr.slot);
+		PROLLY_CALL(ve, decode, sr.enc, &row, sr.slot);
+		slot_getallattrs(sr.slot);
+		foreach(g, gone)
+		{
+			char	   *bv = version_value(br.slot, lfirst(g));
+			char	   *sv = version_value(sr.slot, lfirst(g));
+
+			if ((bv == NULL) != (sv == NULL) || (bv && strcmp(bv, sv) != 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being dropped or renamed",
+								RelationGetRelationName(rel), (char *) lfirst(g)),
+						 errdetail("One side changed values of \"%s\", which the other dropped or renamed: the changes would be lost.",
+								   (char *) lfirst(g))));
+		}
+	}
+}
+
 
 /*
  * The rows of table relid that differ between two versions of it, each as
@@ -2315,6 +2500,8 @@ merge_rows(void *arg)
 				continue;
 			}
 			rel = table_open(relid, AccessShareLock);
+			refuse_lost_changes(rel, b, o, w);
+			refuse_lost_changes(rel, b, t, w);
 			(void) as_defined_now(rel, b, w, true, &bn);
 			(void) as_defined_now(rel, o, w, true, &on);
 			(void) as_defined_now(rel, t, w, true, &tn);
@@ -2455,7 +2642,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 	PG_TRY();
 	{
 		PROLLY_CALL(components().canonicalizer, move_schema, ours, merged,
-					merge_rows, mr);
+					merge_rows, take_breaking_rows, mr);
 	}
 	PG_CATCH();
 	{
@@ -2647,7 +2834,7 @@ foreign_key_violations(List *relids)
 	systable_endscan(scan);
 	table_close(pg_constraint, AccessShareLock);
 
-	violating_rows(queries, "foreign key", &found);
+	violating_rows(queries, "foreign key", false, &found);
 	return found;
 }
 
@@ -2656,10 +2843,11 @@ foreign_key_violations(List *relids)
  * row it returns (as JSON) to *found: with a snapshot that sees what was
  * written before (a merge's writes), as the table's owner, its rows and
  * those it references seen whatever their row security says, as a foreign
- * key's own checks see them.
+ * key's own checks see them.  Removing: the queries delete the rows they
+ * return.
  */
 static void
-violating_rows(List *queries, const char *type, List **found)
+violating_rows(List *queries, const char *type, bool removing, List **found)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ListCell   *lc;
@@ -2683,7 +2871,7 @@ violating_rows(List *queries, const char *type, List **found)
 							   SECURITY_NOFORCE_RLS);
 		ret = SPI_execute(linitial(qi), false, 0);
 		SetUserIdAndSecContext(save_userid, save_sec);
-		if (ret != SPI_OK_SELECT)
+		if (ret != (removing ? SPI_OK_DELETE_RETURNING : SPI_OK_SELECT))
 			elog(ERROR, "could not check a constraint: %s", (char *) linitial(qi));
 		for (uint64 r = 0; r < SPI_processed; r++)
 		{
@@ -2697,6 +2885,52 @@ violating_rows(List *queries, const char *type, List **found)
 		}
 	}
 	SPI_finish();
+}
+
+/*
+ * The query (sql, info, relid) finding the rows of con's table that break
+ * it, a check or not-null constraint, as JSON (removing: deleting them);
+ * *check: whether it's a check.
+ */
+static List *
+breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check)
+{
+	Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+	char	   *table = table_name(con->conrelid);
+	StringInfoData q;
+	StringInfoData info;
+	char	   *cond;
+
+	initStringInfo(&q);
+	initStringInfo(&info);
+	*check = con->contype == CONSTRAINT_CHECK;
+	if (*check)
+	{
+		bool		isnull;
+		Datum		bin = heap_getattr(tup, Anum_pg_constraint_conbin,
+									   RelationGetDescr(pg_constraint), &isnull);
+		char	   *expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+																   ObjectIdGetDatum(con->conrelid)));
+
+		cond = psprintf("NOT (%s)", expr);
+		appendStringInfo(&info, "{\"Name\": %s, \"Expression\": %s}",
+						 quote_json(NameStr(con->conname)), quote_json(expr));
+	}
+	else
+	{
+		AttrNumber	col = extractNotNullColumn(tup);
+		char	   *name = get_attname(con->conrelid, col, false);
+
+		cond = psprintf("c.%s IS NULL", quote_identifier(name));
+		appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
+	}
+	if (removing)
+		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c)::text",
+						 only_unless_partitioned(con->conrelid), table, cond);
+	else
+		appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE %s",
+						 only_unless_partitioned(con->conrelid), table, cond);
+	return list_make3(q.data, info.data, (void *) (uintptr_t) con->conrelid);
 }
 
 /*
@@ -2718,9 +2952,8 @@ unvalidated_violations(List *relids)
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
-		char	   *table;
-		StringInfoData q;
-		StringInfoData info;
+		List	   *qi;
+		bool		check;
 
 		/*
 		 * (a partition's inherited one is checked as its partitioned
@@ -2733,42 +2966,82 @@ unvalidated_violations(List *relids)
 			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
 			(relids != NIL && !list_member_oid(relids, con->conrelid)))
 			continue;
-		table = table_name(con->conrelid);
-		initStringInfo(&q);
-		initStringInfo(&info);
-		if (con->contype == CONSTRAINT_CHECK)
-		{
-			bool		isnull;
-			Datum		bin = heap_getattr(tup, Anum_pg_constraint_conbin,
-										   RelationGetDescr(pg_constraint), &isnull);
-			char	   *expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
-																	   ObjectIdGetDatum(con->conrelid)));
-
-			appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE NOT (%s)",
-							 only_unless_partitioned(con->conrelid), table, expr);
-			appendStringInfo(&info, "{\"Name\": %s, \"Expression\": %s}",
-							 quote_json(NameStr(con->conname)), quote_json(expr));
-			checks = lappend(checks, list_make3(q.data, info.data,
-												(void *) (uintptr_t) con->conrelid));
-		}
+		qi = breaking_query(pg_constraint, tup, false, &check);
+		if (check)
+			checks = lappend(checks, qi);
 		else
-		{
-			AttrNumber	col = extractNotNullColumn(tup);
-			char	   *name = get_attname(con->conrelid, col, false);
-
-			appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE c.%s IS NULL",
-							 only_unless_partitioned(con->conrelid), table,
-							 quote_identifier(name));
-			appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
-			notnulls = lappend(notnulls, list_make3(q.data, info.data,
-													(void *) (uintptr_t) con->conrelid));
-		}
+			notnulls = lappend(notnulls, qi);
 	}
 	systable_endscan(scan);
 	table_close(pg_constraint, AccessShareLock);
-	violating_rows(checks, "check constraint", &found);
-	violating_rows(notnulls, "not null", &found);
+	violating_rows(checks, "check constraint", false, &found);
+	violating_rows(notnulls, "not null", false, &found);
 	return found;
+}
+
+/*
+ * A merge's move's breaking(): the rows of its tables that break the
+ * checks and NOT NULLs it added (unvalidated, ProllyAddedConstraint *)
+ * taken away and recorded as violations, as the rows it couldn't write
+ * are, so that the constraints validate.  The rows breaking one may be the
+ * branch's own as well as those merged: Dolt records them either way.  (No
+ * trigger fires for the rows taken away, as none does for those written.)
+ * A foreign key it added is marked validated, its table's rows checked
+ * against it as the merge checks every foreign key of the tables it wrote:
+ * those breaking it stay, recorded.
+ */
+static void
+take_breaking_rows(List *added, void *arg)
+{
+	Relation	pg_constraint;
+	List	   *checks = NIL;
+	List	   *notnulls = NIL;
+	List	   *found = NIL;
+	ListCell   *lc;
+	int			save_nestlevel;
+	MemoryContext old;
+
+	Assert(recording);
+	pg_constraint = table_open(ConstraintRelationId, RowExclusiveLock);
+	foreach(lc, added)
+	{
+		ProllyAddedConstraint *ac = lfirst(lc);
+		RangeVar   *rv = makeRangeVarFromNameList(stringToQualifiedNameList(ac->table, NULL));
+		Oid			relid = RangeVarGetRelid(rv, NoLock, false);
+		char	   *name = strVal(linitial(stringToQualifiedNameList(ac->name, NULL)));
+		Oid			conoid = get_relation_constraint_oid(relid, name, false);
+		HeapTuple	tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(conoid));
+		List	   *qi;
+		bool		check;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for constraint %u", conoid);
+		note_written(relid);
+		if (ac->foreign_key)
+		{
+			((Form_pg_constraint) GETSTRUCT(tup))->convalidated = true;
+			CatalogTupleUpdate(pg_constraint, &tup->t_self, tup);
+			heap_freetuple(tup);
+			continue;
+		}
+		qi = breaking_query(pg_constraint, tup, true, &check);
+		heap_freetuple(tup);
+		if (check)
+			checks = lappend(checks, qi);
+		else
+			notnulls = lappend(notnulls, qi);
+	}
+	table_close(pg_constraint, RowExclusiveLock);
+	CommandCounterIncrement();
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("session_replication_role", "replica", PGC_SUSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	violating_rows(checks, "check constraint", true, &found);
+	violating_rows(notnulls, "not null", true, &found);
+	recorded = list_concat(recorded, found);
+	MemoryContextSwitchTo(old);
+	AtEOXact_GUC(true, save_nestlevel);
 }
 
 /*

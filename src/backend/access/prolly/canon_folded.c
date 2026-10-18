@@ -3131,7 +3131,12 @@ typedef struct SchemaMove
 								 * are made: tables made, columns added and
 								 * changed, keys added */
 	List	   *after;			/* and after */
+	List	   *added;			/* the checks, NOT NULLs and foreign keys
+								 * after and foreign_keys add unvalidated
+								 * (ProllyAddedConstraint *) */
+	List	   *validations;	/* validating the checks and NOT NULLs */
 	List	   *foreign_keys;	/* after, last */
+	List	   *fk_validations; /* validating the foreign keys */
 	List	   *rekeyed;		/* tables whose keys change in place */
 } SchemaMove;
 
@@ -3308,6 +3313,42 @@ constraint_def(const char *line)
 	if (tab == NULL)
 		elog(ERROR, "unexpected definition line \"%s\"", line);
 	return unescape_field(tab + 1);
+}
+
+/*
+ * Is column col one of table t's primary key's (its PRIMARY KEY line's
+ * column list, quoted as written)?
+ */
+static bool
+in_primary_key(const TableDef *t, const char *col)
+{
+	const char *q = quote_identifier(col);
+	ListCell   *lc;
+
+	foreach(lc, t->constraints)
+	{
+		const char *line = lfirst(lc);
+		char	   *def;
+		char	   *open;
+		char	   *close;
+
+		if (strstr(line, "\tPRIMARY KEY ") == NULL)
+			continue;
+		def = constraint_def(line);
+		open = strchr(def, '(');
+		close = open ? strchr(open, ')') : NULL;
+		if (open == NULL || close == NULL)
+			return true;		/* (unexpected: kept as a key's) */
+		*close = '\0';
+		for (char *c = strtok(open + 1, ","); c != NULL; c = strtok(NULL, ","))
+		{
+			while (*c == ' ')
+				c++;
+			if (strcmp(c, q) == 0)
+				return true;
+		}
+	}
+	return false;
 }
 
 /*
@@ -3833,6 +3874,33 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 						   first_field(line), constraint_def(line));
 
 			/*
+			 * A check, or a NOT NULL added after the rows, that the rows
+			 * written may break: added unvalidated, validated once the
+			 * caller has had them (not one unvalidated in to; nor a
+			 * partitioned table's or a partition's, which its partitions'
+			 * or parent's validation would reach).
+			 */
+			if ((strstr(line, "\tCHECK ") != NULL ||
+				 (not_null && from != &none &&
+				  (!list_has_string(from_names,
+									unescape_field(strstr(line, "\tNOT NULL ") + 10)) ||
+				   !in_primary_key(to, unescape_field(strstr(line, "\tNOT NULL ") + 10))))) &&
+				strstr(constraint_def(line), "NOT VALID") == NULL &&
+				to->partition_by == NULL && to->partition_of == NULL)
+			{
+				ProllyAddedConstraint *ac = palloc(sizeof(ProllyAddedConstraint));
+
+				ac->table = pstrdup(name);
+				ac->name = pstrdup(first_field(line));
+				ac->foreign_key = false;
+				sm->added = lappend(sm->added, ac);
+				sm->validations = lappend(sm->validations,
+										  psprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s",
+												   name, first_field(line)));
+				sql = psprintf("%s NOT VALID", sql);
+			}
+
+			/*
 			 * (an identity column, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
@@ -3844,16 +3912,36 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 							   quote_literal_cstr(sql));
 			/*
 			 * (a column added to a table with rows has none in it until
-			 * they are written: its NOT NULL after them)
+			 * they are written: its NOT NULL after them; so is one the
+			 * table had, whose NULLs the rows written may replace, unless
+			 * the primary key, which the rows are keyed by, needs it)
 			 */
 			if (not_null && from != &none &&
-				!list_has_string(from_names,
-								 unescape_field(strstr(line, "\tNOT NULL ") + 10)))
+				(!list_has_string(from_names,
+								  unescape_field(strstr(line, "\tNOT NULL ") + 10)) ||
+				 !in_primary_key(to, unescape_field(strstr(line, "\tNOT NULL ") + 10))))
 				sm->after = lappend(sm->after, sql);
 			else if (not_null || key)
 				sm->changes = lappend(sm->changes, sql);
 			else if (strstr(line, "\tFOREIGN KEY ") != NULL)
+			{
+				/* (likewise a foreign key, which the rows may break too) */
+				if (strstr(constraint_def(line), "NOT VALID") == NULL &&
+					to->partition_by == NULL && to->partition_of == NULL)
+				{
+					ProllyAddedConstraint *ac = palloc(sizeof(ProllyAddedConstraint));
+
+					ac->table = pstrdup(name);
+					ac->name = pstrdup(first_field(line));
+					ac->foreign_key = true;
+					sm->added = lappend(sm->added, ac);
+					sm->fk_validations = lappend(sm->fk_validations,
+												 psprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s",
+														  name, first_field(line)));
+					sql = psprintf("%s NOT VALID", sql);
+				}
 				sm->foreign_keys = lappend(sm->foreign_keys, sql);
+			}
 			else
 				sm->after = lappend(sm->after, sql);
 		}
@@ -4776,18 +4864,21 @@ type_moves(List *from, List *to)
 /*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
- * rows(arg), which writes them, then what they must satisfy; and, if
- * materialized views were made again, rows(arg) once more, for theirs.
+ * rows(arg), which writes them, then what they must satisfy (the checks,
+ * NOT NULLs and foreign keys they may break unvalidated, breaking(them,
+ * arg), their validation); and, if materialized views were made again,
+ * rows(arg) once more, for theirs.
  */
 static void
 folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
-				   void (*rows) (void *arg), void *arg)
+				   void (*rows) (void *arg),
+				   void (*breaking) (List *added, void *arg), void *arg)
 {
 	bool		matviews_made = false;
 	Canon		cn;
 	List	   *from;
 	List	   *to;
-	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL};
+	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL};
 	List	   *views = NIL;
 	List	   *view_drops = NIL;
 	List	   *matview_drops = NIL;
@@ -5233,6 +5324,18 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 	run_statements(sm.after);
 	run_statements(sm.foreign_keys);
+	if (breaking && sm.added != NIL)
+	{
+		MemoryContext spi;
+
+		CommandCounterIncrement();
+		spi = MemoryContextSwitchTo(caller);
+		breaking(sm.added, arg);
+		MemoryContextSwitchTo(spi);
+	}
+	run_statements(sm.validations);
+	if (breaking == NULL)
+		run_statements(sm.fk_validations);
 	make_views(views);
 	run_statements(policy_makes);
 	if (matviews_made)
@@ -5255,10 +5358,189 @@ unsupported:
 }
 
 /*
+ * A table's description in its sections (describe_table()'s), each a list
+ * of its lines as written (fields escaped).  The first five are always
+ * written; the others only when they have lines.
+ */
+static const char *const table_sections[] = {
+	"columns", "constraints", "indexes", "triggers", "rules", "policies",
+	"statistics", "partition by", "partition of"
+};
+#define NUM_TABLE_SECTIONS lengthof(table_sections)
+#define ALWAYS_WRITTEN_SECTIONS 5
+
+static bool
+split_table_def(const char *def, List **sections)
+{
+	char	   *copy = pstrdup(def);
+	int			s = -1;
+	char	   *line;
+	char	   *next;
+
+	for (int i = 0; i < NUM_TABLE_SECTIONS; i++)
+		sections[i] = NIL;
+	for (line = copy; line && *line; line = next)
+	{
+		bool		header = false;
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		/* (a section's lines can't be its header: a statement or a field) */
+		for (int i = s + 1; i < NUM_TABLE_SECTIONS && !header; i++)
+			if (strcmp(line, table_sections[i]) == 0)
+			{
+				s = i;
+				header = true;
+			}
+		if (header)
+			continue;
+		if (s < 0)
+			return false;
+		sections[s] = lappend(sections[s], line);
+	}
+	return true;
+}
+
+/* What a line of section s is the definition of: its name. */
+static char *
+table_line_key(int s, const char *line)
+{
+	switch (s)
+	{
+		case 2:
+			return unquoted(index_name(unescape_field(line)));
+		case 3:
+			return object_name(unescape_field(line), " TRIGGER ");
+		case 4:
+			return object_name(unescape_field(line), " RULE ");
+		case 5:
+			if (strcmp(line, ROW_SECURITY) == 0 ||
+				strcmp(line, FORCED_ROW_SECURITY) == 0)
+				return pstrdup(line);
+			return object_name(unescape_field(line), " POLICY ");
+		case 7:
+		case 8:
+			return pstrdup("");	/* (one line, the table's) */
+		default:
+			return pnstrdup(line, strcspn(line, "\t"));	/* its first field */
+	}
+}
+
+/* The line of lines (of section s) with key key, or NULL. */
+static const char *
+table_line(int s, List *lines, const char *key)
+{
+	ListCell   *lc;
+
+	foreach(lc, lines)
+		if (strcmp(table_line_key(s, lfirst(lc)), key) == 0)
+			return lfirst(lc);
+	return NULL;
+}
+
+static int
+index_line_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(table_line_key(2, lfirst(a)), table_line_key(2, lfirst(b)));
+}
+
+static int
+statement_line_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(unescape_field(lfirst(a)), unescape_field(lfirst(b)));
+}
+
+/* The row security lines first, then the policies, sorted. */
+static int
+policy_line_cmp(const ListCell *a, const ListCell *b)
+{
+	bool		ra = strcmp(table_line_key(5, lfirst(a)), lfirst(a)) == 0;
+	bool		rb = strcmp(table_line_key(5, lfirst(b)), lfirst(b)) == 0;
+
+	if (ra != rb)
+		return ra ? -1 : 1;
+	if (ra)
+		return strcmp(lfirst(a), ROW_SECURITY) == 0 ? -1 : 1;
+	return statement_line_cmp(a, b);
+}
+
+#define SAME_LINE(a, b) ((a) == NULL ? (b) == NULL : (b) != NULL && strcmp(a, b) == 0)
+
+/*
+ * A table's description as both sides changed it from base's, merged part
+ * by part, as Dolt merges a table's schema: each column, constraint, index
+ * (and trigger, rule, policy, statistics object; and its partitioning) as
+ * the side that changed it has it, both alike as they have it.  Columns
+ * come in ours' order, then those only theirs added, in theirs'.  NULL if
+ * both changed a part differently: a schema conflict.
+ */
+static char *
+merge_table_defs(const char *base, const char *ours, const char *theirs)
+{
+	List	   *sec[3][NUM_TABLE_SECTIONS];
+	StringInfoData out;
+
+	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
+		!split_table_def(theirs, sec[2]))
+		return NULL;
+	initStringInfo(&out);
+	for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
+	{
+		List	   *merged = NIL;
+		List	   *keys = NIL;
+		ListCell   *lc;
+
+		/* every part any side has: ours', then theirs', then base's */
+		for (int side = 1; side <= 3; side++)
+			foreach(lc, sec[side % 3][s])
+			{
+				char	   *key = table_line_key(s, lfirst(lc));
+
+				if (!list_has_string(keys, key))
+					keys = lappend(keys, key);
+			}
+		foreach(lc, keys)
+		{
+			const char *b = table_line(s, sec[0][s], lfirst(lc));
+			const char *o = table_line(s, sec[1][s], lfirst(lc));
+			const char *t = table_line(s, sec[2][s], lfirst(lc));
+			const char *m;
+
+			if (SAME_LINE(o, b))
+				m = t;
+			else if (SAME_LINE(t, b) || SAME_LINE(o, t))
+				m = o;
+			else
+				return NULL;
+			if (m)
+				merged = lappend(merged, unconstify(char *, m));
+		}
+		if (s == 1 || s == 6)
+			list_sort(merged, cstring_cmp);
+		else if (s == 2)
+			list_sort(merged, index_line_cmp);
+		else if (s == 3 || s == 4)
+			list_sort(merged, statement_line_cmp);
+		else if (s == 5)
+			list_sort(merged, policy_line_cmp);
+		if (merged == NIL && s >= ALWAYS_WRITTEN_SECTIONS)
+			continue;
+		appendStringInfo(&out, "%s\n", table_sections[s]);
+		foreach(lc, merged)
+			appendStringInfo(&out, "%s\n", (char *) lfirst(lc));
+	}
+	return out.data;
+}
+
+#undef SAME_LINE
+
+/*
  * The definitions of base, ours and theirs merged: each object as the side
- * that changed it since base has it (ours if neither, or both alike).  An
- * object both changed differently is a schema conflict, and fails; so is a
- * schema one side dropped that the other put objects in.  Only the
+ * that changed it since base has it (ours if neither, or both alike); a
+ * table both changed, part by part (merge_table_defs()).  An object both
+ * changed differently is a schema conflict, and fails; so is a schema one
+ * side dropped that the other put objects in.  Only the
  * definitions count: a table's item is the side's it was taken from, its
  * rows that side's, which the merge doesn't use (it merges the rows
  * itself).  Collations' items aren't definitions, but what the fold
@@ -5300,6 +5582,8 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		bool		has[3];
 		ProllyValue def[3];
 		const ProllyValue *take = NULL;
+		ProllyValue table;
+		char	   *merged_def = NULL;
 
 		/* the least key of the three, and which have it */
 		for (int i = 0; i < 3; i++)
@@ -5319,6 +5603,22 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
 		else if (least->data[0] == 'c')
 			take = has[1] ? &v[1] : &v[2];	/* (collations: as recorded) */
+		else if (least->data[0] == 't' && has[0] && has[1] && has[2] &&
+				 (merged_def = merge_table_defs(pnstrdup((const char *) def[0].data, def[0].len),
+												pnstrdup((const char *) def[1].data, def[1].len),
+												pnstrdup((const char *) def[2].data, def[2].len))) != NULL)
+		{
+			/* ours' item, its definition the merged one */
+			StringInfoData item;
+
+			initStringInfo(&item);
+			appendBinaryStringInfo(&item, (const char *) v[1].data,
+								   def[1].data - v[1].data);
+			appendStringInfoString(&item, merged_def);
+			table.data = (const uint8 *) item.data;
+			table.len = item.len;
+			take = &table;
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),

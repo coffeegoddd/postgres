@@ -96,7 +96,7 @@ func run() error {
 		}
 		sum.Profiles = append(sum.Profiles, p)
 		for _, s := range scenarios {
-			sum.Results = append(sum.Results, vcscenario.Result{ID: s.ID, Engine: am, Status: "not_run", Requires: s.Requires, PlannedSteps: len(s.Steps)})
+			sum.Results = append(sum.Results, vcscenario.Result{ID: s.ID, Engine: am, Status: "not_run", Requires: s.Requires, PlannedSteps: s.PlannedSteps()})
 		}
 	}
 	if err = os.Mkdir(*out, 0755); err != nil {

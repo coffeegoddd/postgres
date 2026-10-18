@@ -1,0 +1,216 @@
+{
+  "version": 1,
+  "id": "dolt-schema-replace-column",
+  "description": "Reviewed Dolt port: creating new column to replace ancestor column",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+    "case": "SchemaChangeTestsBasicCases: creating new column to replace ancestor column"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "variants": [
+    {
+      "name": "forward",
+      "vars": {
+        "right_side": "right",
+        "left_side": "main"
+      }
+    },
+    {
+      "name": "flipped",
+      "vars": {
+        "right_side": "main",
+        "left_side": "right"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "anc-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, col1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "anc-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 10), (2, 20)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "h-ancestor",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "ancestor commit"
+      ],
+      "save": "ancestor"
+    },
+    {
+      "id": "h-branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "right"
+      ]
+    },
+    {
+      "id": "h-right-side",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        {
+          "var": "right_side"
+        }
+      ]
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (3, 30), (4, 40)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "h-right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right commit"
+      ],
+      "save": "rightc"
+    },
+    {
+      "id": "h-left-side",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        {
+          "var": "left_side"
+        }
+      ]
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN col2 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "left-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col2 = 10*col1",
+      "expect": {
+        "tag": "UPDATE 2"
+      }
+    },
+    {
+      "id": "left-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP COLUMN col1",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "left-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t RENAME COLUMN col2 TO col1",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "left-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (5, 50), (6, 60)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "h-left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left commit"
+      ],
+      "save": "leftc"
+    },
+    {
+      "id": "h-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "right"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "100"
+          ],
+          [
+            "2",
+            "200"
+          ],
+          [
+            "3",
+            "30"
+          ],
+          [
+            "4",
+            "40"
+          ],
+          [
+            "5",
+            "50"
+          ],
+          [
+            "6",
+            "60"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+		Name: "TEXT index with prefix narrowing",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE table t (pk int primary key, col1 text);",
+			"INSERT into t values (1, '987654321');",
+			"alter table t add index idx1 (col1(10));",
+		},
+		RightSetUpScript: []string{
+			"DROP INDEX idx1 ON t;",
+			"alter table t add index idx1 (col1(5));",
+			"INSERT into t values (2, '87654321');",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (3, '7654321');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query: "select * from t order by pk;",
+				Expected: []sql.Row{
+					{1, "987654321"},
+					{2, "87654321"},
+					{3, "7654321"},
+				},
+			},
+			{
+				Query: "select col1 from t order by col1;",
+				Expected: []sql.Row{
+					{"7654321"},
+					{"87654321"},
+					{"987654321"},
+				},
+			},
+		},
+	}

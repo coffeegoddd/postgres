@@ -1,0 +1,42 @@
+{
+		Name: "VARCHAR to TEXT widening",
+		AncSetUpScript: []string{
+			"set autocommit = 0;",
+			"CREATE table t (pk int primary key, col1 varchar(10));",
+			"INSERT into t values (1, '54321');",
+			"alter table t add index idx1 (col1(10));",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column col1 TEXT;",
+			"INSERT into t values (2, '43210000000');",
+		},
+		LeftSetUpScript: []string{
+			"INSERT into t values (3, '321');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_preview_merge_conflicts_summary('main', 'right');",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query: "select * from t order by pk;",
+				Expected: []sql.Row{
+					{1, "54321"},
+					{2, "43210000000"},
+					{3, "321"},
+				},
+			},
+			{
+				Query: "select col1 from t order by col1;",
+				Expected: []sql.Row{
+					{"321"},
+					{"43210000000"},
+					{"54321"},
+				},
+			},
+		},
+	}

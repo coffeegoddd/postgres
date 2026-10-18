@@ -242,4 +242,125 @@ SELECT count(*) AS public_schemas FROM pg_namespace WHERE nspname = 'public';
 DROP DATABASE regress_public_merge;
 DROP SCHEMA sg_new CASCADE;
 DROP SCHEMA sg_new_empty;
+
+-- A table keyed by content though it has a primary key (one over a varchar
+-- column) merges across a column added on one side: its key didn't change.
+CREATE SCHEMA svk VERSIONED;
+CREATE TABLE svk.t (pk1 int, col1 int, pk2 varchar(100), CHECK (col1 IN (0, 1)), PRIMARY KEY (pk1, pk2));
+INSERT INTO svk.t VALUES (1, 0, '1');
+SELECT length(dolt_commit('-Am', 'svk base')::text) AS committed;
+SELECT dolt_branch('svk_right');
+SELECT dolt_checkout('svk_right');
+ALTER TABLE svk.t ADD COLUMN col2 varchar(100);
+INSERT INTO svk.t VALUES (2, 1, '2', 'hello');
+SELECT length(dolt_commit('-Am', 'svk right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO svk.t VALUES (3, 0, '3');
+SELECT length(dolt_commit('-Am', 'svk left')::text) AS committed;
+SELECT (dolt_merge('svk_right'))[2:4];
+SELECT * FROM svk.t ORDER BY pk1;
+SELECT dolt_branch('-D', 'svk_right');
+DROP SCHEMA svk CASCADE;
+
+-- A generated column added on one side: the other side's rows get it,
+-- computed (stored) or not stored at all (virtual).
+CREATE SCHEMA sgc VERSIONED;
+CREATE TABLE sgc.t (pk int PRIMARY KEY);
+INSERT INTO sgc.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'sgc base')::text) AS committed;
+SELECT dolt_branch('sgc_right');
+SELECT dolt_checkout('sgc_right');
+ALTER TABLE sgc.t ADD COLUMN s int GENERATED ALWAYS AS (pk * 10) STORED,
+	ADD COLUMN v int GENERATED ALWAYS AS (pk + 1);
+INSERT INTO sgc.t VALUES (3);
+SELECT length(dolt_commit('-Am', 'sgc right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO sgc.t VALUES (2);
+SELECT length(dolt_commit('-Am', 'sgc left')::text) AS committed;
+SELECT (dolt_merge('sgc_right'))[2:4];
+SELECT * FROM sgc.t ORDER BY pk;
+SELECT pk FROM sgc.t WHERE s = 20;
+SELECT dolt_branch('-D', 'sgc_right');
+DROP SCHEMA sgc CASCADE;
+
+-- A table both sides changed merges part by part: each side's columns,
+-- constraints and indexes, the other's rows given the columns they lack;
+-- a part both changed differently is a schema conflict.
+CREATE SCHEMA sbt VERSIONED;
+CREATE TABLE sbt.parent (id int PRIMARY KEY);
+INSERT INTO sbt.parent VALUES (1);
+CREATE TABLE sbt.t (pk int PRIMARY KEY, a int, gone int, p int);
+INSERT INTO sbt.t VALUES (1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'sbt base')::text) AS committed;
+SELECT dolt_branch('sbt_right');
+SELECT dolt_checkout('sbt_right');
+ALTER TABLE sbt.t ADD COLUMN r int DEFAULT 7, ADD CONSTRAINT a_pos CHECK (a > 0);
+CREATE INDEX t_r ON sbt.t (r);
+INSERT INTO sbt.t VALUES (2, 2, 2, 1, 20);
+SELECT length(dolt_commit('-Am', 'sbt right')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE sbt.t ADD COLUMN l text, DROP COLUMN gone,
+	ADD CONSTRAINT t_p_fk FOREIGN KEY (p) REFERENCES sbt.parent (id);
+INSERT INTO sbt.t VALUES (3, 3, 1, 'left');
+UPDATE sbt.t SET l = 'one' WHERE pk = 1;
+SELECT length(dolt_commit('-Am', 'sbt left')::text) AS committed;
+SELECT (dolt_merge('sbt_right'))[2:4];
+SELECT * FROM sbt.t ORDER BY pk;
+SELECT conname FROM pg_constraint WHERE conrelid = 'sbt.t'::regclass ORDER BY 1;
+SELECT indexname FROM pg_indexes WHERE schemaname = 'sbt' AND tablename = 't' ORDER BY 1;
+-- both change one column differently: a conflict
+SELECT dolt_branch('sbt_other');
+ALTER TABLE sbt.t ALTER COLUMN a TYPE bigint;
+SELECT length(dolt_commit('-am', 'a bigint')::text) AS committed;
+SELECT dolt_checkout('sbt_other');
+ALTER TABLE sbt.t ALTER COLUMN a TYPE numeric;
+SELECT length(dolt_commit('-am', 'a numeric')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_merge('sbt_other');
+-- a foreign key added on one side that the other's rows break: added,
+-- the rows kept and recorded
+SELECT dolt_branch('sbt_fk');
+INSERT INTO sbt.t (pk, a, p) VALUES (4, 4, 1);
+SELECT length(dolt_commit('-am', 'row 4')::text) AS committed;
+SELECT dolt_checkout('sbt_fk');
+DELETE FROM sbt.t WHERE a <> 1;
+ALTER TABLE sbt.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) REFERENCES sbt.parent (id);
+SELECT length(dolt_commit('-am', 'a fk')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('sbt_fk'))[2:4];
+SELECT pk, a FROM sbt.t ORDER BY pk;
+SELECT violation_type, violating_row->>'pk' AS pk FROM dolt_constraint_violations('sbt.t') ORDER BY 2;
+SELECT convalidated FROM pg_constraint WHERE conname = 't_a_fk';
+ROLLBACK;
+SELECT dolt_branch('-D', 'sbt_right');
+SELECT dolt_branch('-D', 'sbt_other');
+SELECT dolt_branch('-D', 'sbt_fk');
+DROP SCHEMA sbt CASCADE;
+
+-- A check and a NOT NULL added on one side that the other side's rows
+-- break: those rows are taken out of the table and recorded as violations,
+-- and the constraints hold, validated.
+CREATE SCHEMA snn VERSIONED;
+CREATE TABLE snn.t (pk int PRIMARY KEY, a int, b int);
+INSERT INTO snn.t VALUES (1, NULL, 1), (2, NULL, 1);
+SELECT length(dolt_commit('-Am', 'snn base')::text) AS committed;
+SELECT dolt_branch('snn_right');
+SELECT dolt_checkout('snn_right');
+UPDATE snn.t SET a = 0;
+ALTER TABLE snn.t ALTER COLUMN a SET NOT NULL, ADD CONSTRAINT b_small CHECK (b < 5);
+SELECT length(dolt_commit('-Am', 'snn right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO snn.t VALUES (3, NULL, 1), (4, 4, 9), (5, 5, 1);
+SELECT length(dolt_commit('-Am', 'snn left')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('snn_right'))[2:4];
+SELECT * FROM snn.t ORDER BY pk;
+SELECT violation_type, violating_row, violation_info
+  FROM dolt_constraint_violations('snn.t') ORDER BY violating_row->>'pk';
+SELECT conname, convalidated FROM pg_constraint
+  WHERE conrelid = 'snn.t'::regclass AND contype IN ('c', 'n') ORDER BY conname;
+ROLLBACK;
+SELECT dolt_branch('-D', 'snn_right');
+DROP SCHEMA snn CASCADE;
 DROP SCHEMA app CASCADE;

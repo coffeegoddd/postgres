@@ -9,11 +9,13 @@ import (
 	"regexp"
 )
 
-// Value is either exact SQL text, SQL NULL, or a previously captured commit.
-// Numbers are represented as strings to avoid JSON floating-point conversion.
+// Value is either exact SQL text, SQL NULL, a previously captured commit,
+// or a variant's variable. Numbers are represented as strings to avoid JSON
+// floating-point conversion.
 type Value struct {
 	Text *string
 	Ref  string
+	Var  string
 }
 
 func (v *Value) UnmarshalJSON(b []byte) error {
@@ -27,17 +29,21 @@ func (v *Value) UnmarshalJSON(b []byte) error {
 	v.Text = nil
 	var ref struct {
 		Ref string `json:"ref"`
+		Var string `json:"var"`
 	}
-	if err := decode(b, &ref); err != nil || ref.Ref == "" {
-		return fmt.Errorf("value must be a string, null, or {\"ref\":\"name\"}")
+	if err := decode(b, &ref); err != nil || (ref.Ref == "") == (ref.Var == "") {
+		return fmt.Errorf("value must be a string, null, {\"ref\":\"name\"} or {\"var\":\"name\"}")
 	}
-	v.Ref = ref.Ref
+	v.Ref, v.Var = ref.Ref, ref.Var
 	return nil
 }
 
 func (v Value) MarshalJSON() ([]byte, error) {
 	if v.Ref != "" {
 		return json.Marshal(map[string]string{"ref": v.Ref})
+	}
+	if v.Var != "" {
+		return json.Marshal(map[string]string{"var": v.Var})
 	}
 	return json.Marshal(v.Text)
 }
@@ -50,18 +56,73 @@ type Source struct {
 }
 
 type Scenario struct {
-	Version     int      `json:"version"`
-	ID          string   `json:"id"`
-	Description string   `json:"description"`
-	Source      *Source  `json:"source,omitempty"`
-	Requires    []string `json:"requires"`
-	Sessions    []string `json:"sessions"`
-	Steps       []Step   `json:"steps"`
+	Version     int       `json:"version"`
+	ID          string    `json:"id"`
+	Description string    `json:"description"`
+	Source      *Source   `json:"source,omitempty"`
+	Requires    []string  `json:"requires"`
+	Sessions    []string  `json:"sessions"`
+	Variants    []Variant `json:"variants,omitempty"`
+	Steps       []Step    `json:"steps"`
+}
+
+// Variant is one run of a scenario with variables set, as Dolt runs each
+// merge case once per direction: {"var":"name"} values take its values, and
+// a step that names variants runs in those alone (an asymmetry, recorded).
+// Each variant runs on fresh state.
+type Variant struct {
+	Name string            `json:"name"`
+	Vars map[string]string `json:"vars"`
+}
+
+// Pass is what one run of a scenario executes: its variant (none: "") and
+// the steps that run in it, in order.
+type Pass struct {
+	Variant string
+	Vars    map[string]string
+	Steps   []Step
+}
+
+// Passes are a scenario's runs: one per variant, or one of every step.
+func (s Scenario) Passes() []Pass {
+	if len(s.Variants) == 0 {
+		return []Pass{{Steps: s.Steps}}
+	}
+	var out []Pass
+	for _, v := range s.Variants {
+		p := Pass{Variant: v.Name, Vars: v.Vars}
+		for _, st := range s.Steps {
+			if len(st.Variants) == 0 || contains(st.Variants, v.Name) {
+				p.Steps = append(p.Steps, st)
+			}
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// PlannedSteps is how many steps all its passes execute.
+func (s Scenario) PlannedSteps() int {
+	n := 0
+	for _, p := range s.Passes() {
+		n += len(p.Steps)
+	}
+	return n
+}
+
+func contains(list []string, x string) bool {
+	for _, y := range list {
+		if y == x {
+			return true
+		}
+	}
+	return false
 }
 
 type Step struct {
 	ID       string    `json:"id"`
 	Session  string    `json:"session"`
+	Variants []string  `json:"variants,omitempty"`
 	Op       string    `json:"op"`
 	Requires []string  `json:"requires,omitempty"`
 	SQL      string    `json:"sql,omitempty"`
@@ -130,12 +191,58 @@ func (s Scenario) Validate() error {
 		}
 		sessions[n] = true
 	}
-	ids, bindings := map[string]bool{}, map[string]bool{}
+	// Variants: distinct names, each setting the same variables.
+	variants := map[string]bool{}
+	for _, v := range s.Variants {
+		if !identifier.MatchString(v.Name) || variants[v.Name] || len(v.Vars) != len(s.Variants[0].Vars) {
+			return fmt.Errorf("invalid or duplicate variant %q", v.Name)
+		}
+		for k := range v.Vars {
+			if _, ok := s.Variants[0].Vars[k]; !ok || !identifier.MatchString(k) {
+				return fmt.Errorf("variant %q sets variable %q the first doesn't", v.Name, k)
+			}
+		}
+		variants[v.Name] = true
+	}
+	if len(s.Variants) == 1 {
+		return fmt.Errorf("one variant is no variant; give two or more, or none")
+	}
+	ids := map[string]bool{}
 	for _, st := range s.Steps {
 		if !identifier.MatchString(st.ID) || ids[st.ID] || !sessions[st.Session] {
 			return fmt.Errorf("invalid step id or session: %s", st.ID)
 		}
 		ids[st.ID] = true
+		for _, v := range st.Variants {
+			if !variants[v] {
+				return fmt.Errorf("%s: unknown variant %q", st.ID, v)
+			}
+		}
+	}
+	for _, p := range s.Passes() {
+		if len(p.Steps) == 0 {
+			return fmt.Errorf("variant %q runs no step", p.Variant)
+		}
+		if err := validatePass(p, requires, used); err != nil {
+			if p.Variant != "" {
+				return fmt.Errorf("variant %s: %w", p.Variant, err)
+			}
+			return err
+		}
+	}
+	for _, r := range s.Requires {
+		if !used[r] {
+			return fmt.Errorf("requires %s, which no step needs", r)
+		}
+	}
+	return nil
+}
+
+// validatePass checks one pass's steps, in order: each step's form, and
+// the bindings and variables its values use.
+func validatePass(p Pass, requires, used map[string]bool) error {
+	bindings := map[string]bool{}
+	for _, st := range p.Steps {
 		isSQL := st.Op == "exec" || st.Op == "query"
 		if _, typed := ops[st.Op]; !isSQL && !typed {
 			return fmt.Errorf("%s: unknown operation %q", st.ID, st.Op)
@@ -182,7 +289,7 @@ func (s Scenario) Validate() error {
 				}
 			}
 			for _, a := range st.Args {
-				if a.Text == nil && a.Ref == "" {
+				if a.Text == nil && a.Ref == "" && a.Var == "" {
 					return fmt.Errorf("%s: VC arguments cannot be null", st.ID)
 				}
 			}
@@ -231,14 +338,12 @@ func (s Scenario) Validate() error {
 			if v.Ref != "" && (v.Text != nil || !bindings[v.Ref]) {
 				return fmt.Errorf("%s: invalid or undefined binding %q", st.ID, v.Ref)
 			}
+			if _, ok := p.Vars[v.Var]; v.Var != "" && !ok {
+				return fmt.Errorf("%s: undefined variable %q", st.ID, v.Var)
+			}
 		}
 		if st.Save != "" {
 			bindings[st.Save] = true
-		}
-	}
-	for _, r := range s.Requires {
-		if !used[r] {
-			return fmt.Errorf("requires %s, which no step needs", r)
 		}
 	}
 	return nil

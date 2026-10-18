@@ -1,0 +1,26 @@
+{
+		Name: "dropping a unique key",
+		AncSetUpScript: []string{
+			"create table t (pk int primary key, col1 int UNIQUE);",
+			"insert into t values (1, 1);",
+		},
+		RightSetUpScript: []string{
+			"alter table t drop col1;",
+			"alter table t add col1 int;",
+			"update t set col1 = 1 where pk = 1;",
+			"insert into t values (2, 1);",
+		},
+		LeftSetUpScript: []string{
+			"insert into t values (3, 3);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}, {2, 1}, {3, 3}},
+			},
+		},
+	}

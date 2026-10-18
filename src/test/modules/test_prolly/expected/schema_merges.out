@@ -881,6 +881,432 @@ DROP DATABASE regress_public_merge;
 DROP SCHEMA sg_new CASCADE;
 NOTICE:  drop cascades to table sg_new.u
 DROP SCHEMA sg_new_empty;
+-- A table keyed by content though it has a primary key (one over a varchar
+-- column) merges across a column added on one side: its key didn't change.
+CREATE SCHEMA svk VERSIONED;
+CREATE TABLE svk.t (pk1 int, col1 int, pk2 varchar(100), CHECK (col1 IN (0, 1)), PRIMARY KEY (pk1, pk2));
+INSERT INTO svk.t VALUES (1, 0, '1');
+SELECT length(dolt_commit('-Am', 'svk base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('svk_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('svk_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'svk_right'"}
+(1 row)
+
+ALTER TABLE svk.t ADD COLUMN col2 varchar(100);
+INSERT INTO svk.t VALUES (2, 1, '2', 'hello');
+SELECT length(dolt_commit('-Am', 'svk right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO svk.t VALUES (3, 0, '3');
+SELECT length(dolt_commit('-Am', 'svk left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('svk_right'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM svk.t ORDER BY pk1;
+ pk1 | col1 | pk2 | col2  
+-----+------+-----+-------
+   1 |    0 | 1   | 
+   2 |    1 | 2   | hello
+   3 |    0 | 3   | 
+(3 rows)
+
+SELECT dolt_branch('-D', 'svk_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA svk CASCADE;
+NOTICE:  drop cascades to table svk.t
+-- A generated column added on one side: the other side's rows get it,
+-- computed (stored) or not stored at all (virtual).
+CREATE SCHEMA sgc VERSIONED;
+CREATE TABLE sgc.t (pk int PRIMARY KEY);
+INSERT INTO sgc.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'sgc base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sgc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sgc_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'sgc_right'"}
+(1 row)
+
+ALTER TABLE sgc.t ADD COLUMN s int GENERATED ALWAYS AS (pk * 10) STORED,
+	ADD COLUMN v int GENERATED ALWAYS AS (pk + 1);
+INSERT INTO sgc.t VALUES (3);
+SELECT length(dolt_commit('-Am', 'sgc right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO sgc.t VALUES (2);
+SELECT length(dolt_commit('-Am', 'sgc left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('sgc_right'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM sgc.t ORDER BY pk;
+ pk | s  | v 
+----+----+---
+  1 | 10 | 2
+  2 | 20 | 3
+  3 | 30 | 4
+(3 rows)
+
+SELECT pk FROM sgc.t WHERE s = 20;
+ pk 
+----
+  2
+(1 row)
+
+SELECT dolt_branch('-D', 'sgc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sgc CASCADE;
+NOTICE:  drop cascades to table sgc.t
+-- A table both sides changed merges part by part: each side's columns,
+-- constraints and indexes, the other's rows given the columns they lack;
+-- a part both changed differently is a schema conflict.
+CREATE SCHEMA sbt VERSIONED;
+CREATE TABLE sbt.parent (id int PRIMARY KEY);
+INSERT INTO sbt.parent VALUES (1);
+CREATE TABLE sbt.t (pk int PRIMARY KEY, a int, gone int, p int);
+INSERT INTO sbt.t VALUES (1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'sbt base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sbt_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sbt_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'sbt_right'"}
+(1 row)
+
+ALTER TABLE sbt.t ADD COLUMN r int DEFAULT 7, ADD CONSTRAINT a_pos CHECK (a > 0);
+CREATE INDEX t_r ON sbt.t (r);
+INSERT INTO sbt.t VALUES (2, 2, 2, 1, 20);
+SELECT length(dolt_commit('-Am', 'sbt right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE sbt.t ADD COLUMN l text, DROP COLUMN gone,
+	ADD CONSTRAINT t_p_fk FOREIGN KEY (p) REFERENCES sbt.parent (id);
+INSERT INTO sbt.t VALUES (3, 3, 1, 'left');
+UPDATE sbt.t SET l = 'one' WHERE pk = 1;
+SELECT length(dolt_commit('-Am', 'sbt left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('sbt_right'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM sbt.t ORDER BY pk;
+ pk | a | p |  l   | r  
+----+---+---+------+----
+  1 | 1 | 1 | one  |  7
+  2 | 2 | 1 |      | 20
+  3 | 3 | 1 | left |  7
+(3 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'sbt.t'::regclass ORDER BY 1;
+    conname    
+---------------
+ a_pos
+ t_p_fk
+ t_pk_not_null
+ t_pkey
+(4 rows)
+
+SELECT indexname FROM pg_indexes WHERE schemaname = 'sbt' AND tablename = 't' ORDER BY 1;
+ indexname 
+-----------
+ t_pkey
+ t_r
+(2 rows)
+
+-- both change one column differently: a conflict
+SELECT dolt_branch('sbt_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE sbt.t ALTER COLUMN a TYPE bigint;
+SELECT length(dolt_commit('-am', 'a bigint')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('sbt_other');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'sbt_other'"}
+(1 row)
+
+ALTER TABLE sbt.t ALTER COLUMN a TYPE numeric;
+SELECT length(dolt_commit('-am', 'a numeric')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('sbt_other');
+ERROR:  schema conflict: sbt.t was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+-- a foreign key added on one side that the other's rows break: added,
+-- the rows kept and recorded
+SELECT dolt_branch('sbt_fk');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO sbt.t (pk, a, p) VALUES (4, 4, 1);
+SELECT length(dolt_commit('-am', 'row 4')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('sbt_fk');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'sbt_fk'"}
+(1 row)
+
+DELETE FROM sbt.t WHERE a <> 1;
+ALTER TABLE sbt.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) REFERENCES sbt.parent (id);
+SELECT length(dolt_commit('-am', 'a fk')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('sbt_fk'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT pk, a FROM sbt.t ORDER BY pk;
+ pk | a 
+----+---
+  1 | 1
+  4 | 4
+(2 rows)
+
+SELECT violation_type, violating_row->>'pk' AS pk FROM dolt_constraint_violations('sbt.t') ORDER BY 2;
+ violation_type | pk 
+----------------+----
+ foreign key    | 4
+(1 row)
+
+SELECT convalidated FROM pg_constraint WHERE conname = 't_a_fk';
+ convalidated 
+--------------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'sbt_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'sbt_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'sbt_fk');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sbt CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table sbt.parent
+drop cascades to table sbt.t
+-- A check and a NOT NULL added on one side that the other side's rows
+-- break: those rows are taken out of the table and recorded as violations,
+-- and the constraints hold, validated.
+CREATE SCHEMA snn VERSIONED;
+CREATE TABLE snn.t (pk int PRIMARY KEY, a int, b int);
+INSERT INTO snn.t VALUES (1, NULL, 1), (2, NULL, 1);
+SELECT length(dolt_commit('-Am', 'snn base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('snn_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('snn_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'snn_right'"}
+(1 row)
+
+UPDATE snn.t SET a = 0;
+ALTER TABLE snn.t ALTER COLUMN a SET NOT NULL, ADD CONSTRAINT b_small CHECK (b < 5);
+SELECT length(dolt_commit('-Am', 'snn right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO snn.t VALUES (3, NULL, 1), (4, 4, 9), (5, 5, 1);
+SELECT length(dolt_commit('-Am', 'snn left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('snn_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM snn.t ORDER BY pk;
+ pk | a | b 
+----+---+---
+  1 | 0 | 1
+  2 | 0 | 1
+  5 | 5 | 1
+(3 rows)
+
+SELECT violation_type, violating_row, violation_info
+  FROM dolt_constraint_violations('snn.t') ORDER BY violating_row->>'pk';
+  violation_type  |        violating_row         |                violation_info                
+------------------+------------------------------+----------------------------------------------
+ not null         | {"a": null, "b": 1, "pk": 3} | {"Columns": ["a"]}
+ check constraint | {"a": 4, "b": 9, "pk": 4}    | {"Name": "b_small", "Expression": "(b < 5)"}
+(2 rows)
+
+SELECT conname, convalidated FROM pg_constraint
+  WHERE conrelid = 'snn.t'::regclass AND contype IN ('c', 'n') ORDER BY conname;
+    conname    | convalidated 
+---------------+--------------
+ b_small       | t
+ t_a_not_null  | t
+ t_pk_not_null | t
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'snn_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA snn CASCADE;
+NOTICE:  drop cascades to table snn.t
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table app.t

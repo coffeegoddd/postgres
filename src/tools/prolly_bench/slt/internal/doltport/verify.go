@@ -308,18 +308,25 @@ func coverage(path string, scenarios map[string]vcscenario.Scenario, hashes map[
 		s, ok := scenarios[r.ID]
 		e := engines[r.Engine]
 		k := r.Engine + "/" + r.ID
-		if !ok || e == nil || seen[k] || r.PlannedSteps != len(s.Steps) {
+		if !ok || e == nil || seen[k] || r.PlannedSteps != s.PlannedSteps() {
 			return nil, fmt.Errorf("unknown, duplicate or mismatched execution %s", k)
 		}
 		seen[k] = true
 		switch r.Status {
 		case "passed":
-			if r.Error != "" || r.Phase != "" || len(r.Missing) > 0 || len(r.Steps) != len(s.Steps) {
+			// every pass's steps, each variant's in turn
+			var planned []vcscenario.StepResult
+			for _, p := range s.Passes() {
+				for _, st := range p.Steps {
+					planned = append(planned, vcscenario.StepResult{ID: st.ID, Variant: p.Variant, Session: st.Session, Op: st.Op})
+				}
+			}
+			if r.Error != "" || r.Phase != "" || len(r.Missing) > 0 || len(r.Steps) != len(planned) {
 				return nil, fmt.Errorf("incomplete passing execution %s", k)
 			}
 			for i, step := range r.Steps {
-				expected := s.Steps[i]
-				if step.ID != expected.ID || step.Op != expected.Op || step.Session != expected.Session || step.Error != "" {
+				expected := planned[i]
+				if step.ID != expected.ID || step.Variant != expected.Variant || step.Op != expected.Op || step.Session != expected.Session || step.Error != "" {
 					return nil, fmt.Errorf("invalid passing trace %s", k)
 				}
 			}

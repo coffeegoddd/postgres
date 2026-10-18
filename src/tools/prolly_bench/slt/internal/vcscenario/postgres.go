@@ -24,7 +24,7 @@ func EngineProfile(am string) (Profile, error) {
 	case "prolly":
 		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"}
 		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist. " +
-			"Rows merge column by column, and a table's definition merges as one object (both sides changing it is a schema conflict). " +
+			"Rows merge column by column, and a table's definition part by part (a column or constraint both sides changed differently is a schema conflict, an error: there is no dolt_schema_conflicts). " +
 			"No claim about concurrent sessions beyond sequential interleavings."
 	case "heap":
 		p.Supported = []string{"sql"}
@@ -100,7 +100,7 @@ func (p *Postgres) canary(ctx context.Context, b []byte, run bool, what string) 
 		return e
 	}
 	if run {
-		if _, detail := execute(ctx, s, probe); detail != "" {
+		if _, detail := execute(ctx, s.Passes()[0], probe); detail != "" {
 			return fmt.Errorf("%s: %s", what, detail)
 		}
 	}
