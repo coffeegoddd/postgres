@@ -576,6 +576,35 @@ built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
   versions.
 - **Exit:** space returns after branch deletion and GC; crash tests of GC.
 
+**Up to step 8 (user, 2026-10-17).** Decided as recommended, each group
+a stack of PRs, in this order:
+1. **The dependency check at moves** (part 7.4): checkout, merge, reset,
+   cherry-pick and pull refuse a commit needing what the database lacks,
+   naming all of it; a move never creates or alters an extension.
+2. **Names escaped in the canonical encoding.** The canonical text joins
+   fields with tabs and lines with newlines, and a name may hold either
+   (a type `"tab<TAB>in"` breaks a column's definition today). Every name
+   and other free text in an item is escaped; a clean break of format, as
+   #149's: a root records its format, and an older root's items aren't
+   read. Refusing such names was the alternative: they are legal
+   Postgres.
+3. **Network remotes** (7.8, items 4 and 5).
+4. **Reclamation** (step 7, 8.10).
+5. **Objects a commit refuses today:** aggregates, policies (row-level
+   security, with the table's `relrowsecurity`) and partitioned tables
+   (their partitions, bounds and keys) get canonical forms, moves and
+   merges. Foreign tables stay refused: their rows aren't the database's,
+   and a definition without its server would be a commit no other
+   database could check out.
+6. **Large values** (`14-large-values-and-toast.md`): the refusal of
+   `oid` columns, then B (B2, B1, B3, B4). C waits for step 8's
+   measurements and its own gates; for C, jsonb's canonical bytes are its
+   on-disk format with a version byte, and the pointer tags its hash
+   algorithm.
+
+The interfaces under the pages stay deferred (only smgr is one), and the
+correctness suite joins CI only once its baseline is clean.
+
 **Step 8. Measure.**
 - Gates 1–7 and the S and V suites for this design against stock heap and
   against D1, built from `cff08be5c3`, its last state; `10-complexity-requirements.md`

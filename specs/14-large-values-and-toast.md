@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Nothing here is built.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8). Nothing here is built yet.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with
@@ -349,8 +349,9 @@ kept while it holds OID pointers.
 1. **jsonb's canonical bytes.** Either its on-disk format (deterministic and
    version-tagged, so C folds it without decoding) or its text, as now
    (portable, so C rehashes jsonb). Recommended: on-disk, with the version
-   byte in the canonical encoding.
-2. **The hash in the pointer.** A tag per hash algorithm (C1). A profile
+   byte in the canonical encoding. **Decided (user, 2026-10-17): on-disk.**
+2. **The hash in the pointer.** **Decided (user, 2026-10-17): a tag per
+   algorithm, as below.** A tag per hash algorithm (C1). A profile
    change to another hash adds a tag; old pointers keep theirs and still
    name trees in the old hash. Recording only the hash's length would not
    do: two 32-byte hashes have the same length, and a variable-length
