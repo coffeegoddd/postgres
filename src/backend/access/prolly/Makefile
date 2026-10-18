@@ -36,6 +36,7 @@ OBJS = \
 	prolly_hashtext.o \
 	prolly_database.o \
 	prolly_datum.o \
+	prolly_deps.o \
 	prolly_registry.o \
 	prolly_shmem.o \
 	prolly_table.o \

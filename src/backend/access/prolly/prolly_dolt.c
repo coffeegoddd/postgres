@@ -31,6 +31,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_config.h"
+#include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -2453,9 +2454,10 @@ check_clone_target(const char *current)
  * the remote's main, master, or first by name), which makes its copies.
  * The session's own branch, if the remote has one of its name, is moved to
  * it; if not, it stays, empty (main, the database's, can't be deleted).
- * All in the transaction: a clone that fails (the remote's objects
- * depending on something this database lacks: an extension, a type or
- * function of an ordinary schema, a role) leaves nothing.
+ * Before any branch is made, what every branch's head needs from outside
+ * the versioned schemas is checked (prolly_deps.h), and the extensions the
+ * database lacks are made.  All in the transaction: a clone that fails
+ * leaves nothing.
  */
 Datum
 dolt_clone(PG_FUNCTION_ARGS)
@@ -2514,6 +2516,35 @@ dolt_clone(PG_FUNCTION_ARGS)
 		}
 		if (branch == NULL)
 			branch = linitial(h.branches);
+	}
+
+	/*
+	 * What every branch's head needs from outside the versioned schemas,
+	 * checked before anything is made; then the extensions the database
+	 * lacks, made.  (A head that didn't record them can't be checked: what
+	 * it lacks fails when its copies are made, as before.)
+	 */
+	{
+		List	   *trees = NIL;
+		ListCell   *hc;
+
+		foreach(hc, h.commits)
+		{
+			ProllyCommitInfo info;
+
+			if (!PROLLY_CALL(refs(), commit_get, lfirst(hc), &info))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a fetched commit is missing")));
+			if (info.has_dependencies)
+			{
+				ProllyNodeRef *tree = palloc(sizeof(ProllyNodeRef));
+
+				*tree = info.dependencies;
+				trees = lappend(trees, tree);
+			}
+		}
+		prolly_check_dependencies(trees, true, "clone");
 	}
 
 	foreach(lc, h.branches)

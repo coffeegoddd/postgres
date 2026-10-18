@@ -69,10 +69,63 @@ ALTER EXTENSION citext UPDATE TO '1.8';
 SELECT dolt_merge('dep_side') IS NOT NULL AS merged;
 SELECT * FROM pg_temp.deps();
 
+-- A clone checks the dependencies every branch's head recorded before it
+-- makes anything, naming all that is missing; then makes the extensions
+-- the database lacks, at the newest version a branch recorded.
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/deps-' || txid_current() AS url \gset
+CREATE EXTENSION ltree VERSION '1.2';
+CREATE TABLE dep.c (id int PRIMARY KEY, p ltree);
+INSERT INTO dep.c VALUES (1, 'a.b');
+INSERT INTO dep.t (id, m) VALUES (1, 'ok');
+SELECT length(dolt_commit('-Am', 'ltree at 1.2')::text) AS committed;
+SELECT dolt_checkout('dep_side');
+ALTER EXTENSION ltree UPDATE TO '1.3';
+CREATE TABLE dep.c2 (id int PRIMARY KEY, p ltree);
+SELECT length(dolt_commit('-Am', 'ltree at 1.3')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_remote('add', 'origin', :'url');
+SELECT dolt_push('origin', 'main'), dolt_push('origin', 'dep_side');
+
+CREATE DATABASE regress_deps_a;
+\c regress_deps_a
+SELECT dolt_clone(:'url');					-- refused: the types and function
+SELECT count(*) AS extensions FROM pg_extension WHERE extname <> 'plpgsql';
+SELECT count(*) AS branches FROM dolt_branches WHERE hash <> '';
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int LANGUAGE sql AS 'SELECT 7';
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+SELECT dolt_clone(:'url');
+SELECT extname, extversion FROM pg_extension
+  WHERE extname <> 'plpgsql' ORDER BY extname;	-- the newest recorded
+SELECT id, p, dep.seven() FROM dep.c;
+\c :db
+DROP DATABASE regress_deps_a;
+
+-- an extension the database has at an older version: refused, never changed
+CREATE DATABASE regress_deps_b;
+\c regress_deps_b
+CREATE EXTENSION ltree VERSION '1.1';
+CREATE SCHEMA dep_util;
+CREATE TYPE dep_util.mood AS ENUM ('ok', 'meh');
+CREATE FUNCTION dep_util.U&"tab\0009in"() RETURNS int LANGUAGE sql AS 'SELECT 7';
+CREATE FUNCTION dep_util.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+SELECT dolt_clone(:'url');
+SELECT extversion FROM pg_extension WHERE extname = 'ltree';
+-- at the version needed: used as it is
+ALTER EXTENSION ltree UPDATE TO '1.3';
+SELECT dolt_clone(:'url');
+SELECT count(*) FROM dep.c;
+\c :db
+DROP DATABASE regress_deps_b;
+
 DROP SCHEMA dep CASCADE;
 SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
 SELECT dolt_branch('-D', 'dep_side');
 DROP SCHEMA dep_util CASCADE;
 DROP EXTENSION citext;
 DROP EXTENSION hstore;
+DROP EXTENSION ltree;
 DROP ROLE regress_dep_reader;

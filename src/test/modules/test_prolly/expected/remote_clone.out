@@ -304,10 +304,10 @@ SELECT dolt_push('dep', 'main') AS pushed;
 CREATE DATABASE regress_clone_d;
 \c regress_clone_d
 SELECT dolt_clone(:'url_dep');
-ERROR:  type "public.cl_mood" does not exist
-LINE 1: CREATE TABLE cl.m (id integer, mood public.cl_mood)
-                                            ^
-QUERY:  CREATE TABLE cl.m (id integer, mood public.cl_mood)
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+type public.cl_mood: not in this database
+HINT:  Make what is missing, then try again.
 SELECT count(*) AS remotes FROM dolt_remotes;
  remotes 
 ---------
