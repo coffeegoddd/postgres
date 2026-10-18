@@ -25,6 +25,17 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
 	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<id>', 'g');
 END $$;
+-- (with its detail)
+CREATE FUNCTION pg_temp.err_detail(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{64}', '<id>', 'g');
+END $$;
 -- ------------------------------------------------------------------------
 -- The row-level action matrix.  For each key: its base row (or none),
 -- what each side does (n: nothing, i: insert, u: update, d: delete) and
@@ -2113,13 +2124,63 @@ SELECT dolt_merge_base(:'xy', :'yx') IN (:'x1', :'y1') AS a_maximal_one,
  t             | t          | t
 (1 row)
 
+-- Of maximal ones of different heights (the most commits back to the
+-- root), the higher, as Dolt chooses: here y3, two above x1.
+SELECT dolt_checkout('cc_y');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cc_y'"}
+(1 row)
+
+SELECT pg_temp.empty_commit('y2') AS y2 \gset
+SELECT pg_temp.empty_commit('y3') AS y3 \gset
+SELECT dolt_branch('cc_y3x');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cc_x');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cc_x'"}
+(1 row)
+
+SELECT dolt_branch('cc_xy3', :'x1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cc_xy3');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'cc_xy3'"}
+(1 row)
+
+SELECT (dolt_merge('--no-ff', '-m', 'xy3', :'y3'))[1] AS xy3 \gset
+SELECT dolt_checkout('cc_y3x');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'cc_y3x'"}
+(1 row)
+
+SELECT (dolt_merge('--no-ff', '-m', 'y3x', :'x1'))[1] AS y3x \gset
+SELECT dolt_merge_base(:'xy3', :'y3x') = :'y3' AS the_higher,
+	dolt_merge_base(:'y3x', :'xy3') = :'y3' AS either_way;
+ the_higher | either_way 
+------------+------------
+ t          | t
+(1 row)
+
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
  {0,"Switched to branch 'main'"}
 (1 row)
 
-SELECT dolt_branch('-D', 'mb_a', 'mb_b', 'mb_c', 'mb_d', 'cc_x', 'cc_y', 'cc_yx');
+SELECT dolt_branch('-D', 'mb_a', 'mb_b', 'mb_c', 'mb_d', 'cc_x', 'cc_y', 'cc_yx',
+				   'cc_y3x', 'cc_xy3');
  dolt_branch 
 -------------
  {0}
@@ -2160,11 +2221,32 @@ SELECT pg_temp.err('SELECT dolt_hashof(''HEAD^2'')') AS no_second_parent,
  prolly ref "HEAD^2" does not exist | prolly ref "HEAD~100000" does not exist | prolly ref "refs/heads/" does not exist
 (1 row)
 
--- a commit's id is no branch's name
-SELECT pg_temp.err(format('SELECT dolt_branch(%L)', :'r1')) AS commit_id;
-         commit_id          
-----------------------------
- invalid branch name "<id>"
+-- a commit's id, in either case, is no branch's name; a branch named as
+-- a full ref name is itself
+SELECT pg_temp.err_detail(format('SELECT dolt_branch(%L)', :'r1')) AS commit_id,
+	pg_temp.err_detail(format('SELECT dolt_branch(%L)', upper(:'r1'))) AS upper_case;
+                     commit_id                     |                    upper_case                     
+---------------------------------------------------+---------------------------------------------------
+ invalid branch name "<id>" (It is a commit's id.) | invalid branch name "<id>" (It is a commit's id.)
+(1 row)
+
+SELECT dolt_branch('refs/heads/rs', :'r2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('refs/heads/rs') = :'r2' AS named_so,
+	dolt_hashof('refs/heads/refs/heads/rs') = :'r2' AS by_full_name;
+ named_so | by_full_name 
+----------+--------------
+ t        | t
+(1 row)
+
+SELECT dolt_branch('-D', 'refs/heads/rs');
+ dolt_branch 
+-------------
+ {0}
 (1 row)
 
 SELECT dolt_checkout('main');

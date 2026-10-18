@@ -27,6 +27,17 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
 	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<id>', 'g');
 END $$;
+-- (with its detail)
+CREATE FUNCTION pg_temp.err_detail(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{64}', '<id>', 'g');
+END $$;
 
 -- ------------------------------------------------------------------------
 -- The row-level action matrix.  For each key: its base row (or none),
@@ -507,8 +518,23 @@ SELECT (dolt_merge('--no-ff', '-m', 'yx', :'x1'))[1] AS yx \gset
 SELECT dolt_merge_base(:'xy', :'yx') IN (:'x1', :'y1') AS a_maximal_one,
 	dolt_merge_base(:'xy', :'yx') = dolt_merge_base(:'xy', :'yx') AS same_again,
 	dolt_merge_base(:'xy', :'yx') = dolt_merge_base(:'yx', :'xy') AS either_way;
+-- Of maximal ones of different heights (the most commits back to the
+-- root), the higher, as Dolt chooses: here y3, two above x1.
+SELECT dolt_checkout('cc_y');
+SELECT pg_temp.empty_commit('y2') AS y2 \gset
+SELECT pg_temp.empty_commit('y3') AS y3 \gset
+SELECT dolt_branch('cc_y3x');
+SELECT dolt_checkout('cc_x');
+SELECT dolt_branch('cc_xy3', :'x1');
+SELECT dolt_checkout('cc_xy3');
+SELECT (dolt_merge('--no-ff', '-m', 'xy3', :'y3'))[1] AS xy3 \gset
+SELECT dolt_checkout('cc_y3x');
+SELECT (dolt_merge('--no-ff', '-m', 'y3x', :'x1'))[1] AS y3x \gset
+SELECT dolt_merge_base(:'xy3', :'y3x') = :'y3' AS the_higher,
+	dolt_merge_base(:'y3x', :'xy3') = :'y3' AS either_way;
 SELECT dolt_checkout('main');
-SELECT dolt_branch('-D', 'mb_a', 'mb_b', 'mb_c', 'mb_d', 'cc_x', 'cc_y', 'cc_yx');
+SELECT dolt_branch('-D', 'mb_a', 'mb_b', 'mb_c', 'mb_d', 'cc_x', 'cc_y', 'cc_yx',
+				   'cc_y3x', 'cc_xy3');
 
 -- ------------------------------------------------------------------------
 -- Revision specs: a branch, its full ref name, HEAD in any case, and
@@ -530,8 +556,14 @@ SELECT dolt_hashof('rs') = :'r4' AS branch,
 SELECT pg_temp.err('SELECT dolt_hashof(''HEAD^2'')') AS no_second_parent,
 	pg_temp.err('SELECT dolt_hashof(''HEAD~100000'')') AS past_the_first,
 	pg_temp.err('SELECT dolt_hashof(''refs/heads/'')') AS no_branch;
--- a commit's id is no branch's name
-SELECT pg_temp.err(format('SELECT dolt_branch(%L)', :'r1')) AS commit_id;
+-- a commit's id, in either case, is no branch's name; a branch named as
+-- a full ref name is itself
+SELECT pg_temp.err_detail(format('SELECT dolt_branch(%L)', :'r1')) AS commit_id,
+	pg_temp.err_detail(format('SELECT dolt_branch(%L)', upper(:'r1'))) AS upper_case;
+SELECT dolt_branch('refs/heads/rs', :'r2');
+SELECT dolt_hashof('refs/heads/rs') = :'r2' AS named_so,
+	dolt_hashof('refs/heads/refs/heads/rs') = :'r2' AS by_full_name;
+SELECT dolt_branch('-D', 'refs/heads/rs');
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'rs');
 

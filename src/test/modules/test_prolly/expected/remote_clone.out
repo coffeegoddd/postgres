@@ -248,8 +248,9 @@ SELECT name FROM dolt_remotes;
 
 \c :db
 DROP DATABASE regress_clone_c;
--- a remote's branch whose name isn't one here (with "..") is refused,
--- by the rule every branch made is checked by
+-- a remote's branch whose name isn't one here (with "..", or made under
+-- older rules) isn't made a branch, with a warning: its commits are
+-- fetched, its tracking branch there to make one of it
 SELECT dolt_remote('add', 'oddname', :'url_odd');
  dolt_remote 
 -------------
@@ -271,8 +272,32 @@ SELECT test_remote_set_head(:'url_odd', 'odd..name', dolt_hashof('main'), :'fmt'
 CREATE DATABASE regress_clone_g;
 \c regress_clone_g
 SELECT dolt_clone(:'url_odd');
-ERROR:  invalid branch name "odd..name"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case), "@" or a commit id; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+WARNING:  remote branch "odd..name" isn't cloned as a branch
+DETAIL:  Its name isn't a branch's by this database's rules.
+HINT:  Its commits are fetched: dolt_branch(name, 'origin/odd..name') makes a branch of it under another name.
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_branches ORDER BY 1;
+ name 
+------
+ main
+(1 row)
+
+SELECT dolt_branch('odd_name', 'origin/odd..name');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('odd_name') = dolt_hashof('main') AS tracked;
+ tracked 
+---------
+ t
+(1 row)
+
 \c :db
 DROP DATABASE regress_clone_g;
 SELECT dolt_remote('remove', 'oddname');

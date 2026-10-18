@@ -4212,8 +4212,15 @@ dolt_clone(PG_FUNCTION_ARGS)
 			else if (strcmp(lfirst(lc), "master") == 0 && branch == NULL)
 				branch = "master";
 		}
+		foreach(lc, h.branches)
+		{
+			if (branch == NULL && branch_ops()->name_ok(lfirst(lc)))
+				branch = lfirst(lc);
+		}
 		if (branch == NULL)
-			branch = linitial(h.branches);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_NAME),
+					 errmsg("the remote has no branches whose names are a branch's here")));
 	}
 
 	/*
@@ -4250,6 +4257,20 @@ dolt_clone(PG_FUNCTION_ARGS)
 		char	   *b = lfirst(lc);
 		char	   *tracking = psprintf("%s/%s", remote, b);
 
+		/*
+		 * (a remote branch whose name this database's rules refuse, made
+		 * under older ones: tracked, not made here)
+		 */
+		if (!branch_ops()->name_ok(b))
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_NAME),
+					 errmsg("remote branch \"%s\" isn't cloned as a branch", b),
+					 errdetail("Its name isn't a branch's by this database's rules."),
+					 errhint("Its commits are fetched: dolt_branch(name, '%s') makes a branch of it under another name.",
+							 tracking)));
+			continue;
+		}
 		/* (the session's branch, empty, moved to the remote's) */
 		if (strcmp(b, current) == 0)
 		{

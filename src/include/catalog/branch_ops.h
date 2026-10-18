@@ -54,6 +54,9 @@ typedef struct BranchOpsRoutine
 	void		(*check_create) (const char *name);
 	void		(*check_drop) (const char *name);
 
+	/* Whether check_create would take name as a branch's (its rules alone). */
+	bool		(*name_ok) (const char *name);
+
 	/*
 	 * Make a branch as create does, without its checks of the session: the
 	 * copies of one that exists already in all but them, which its first

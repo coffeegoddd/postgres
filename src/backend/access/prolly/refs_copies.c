@@ -878,8 +878,12 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	 */
 	if (pg_strcasecmp(refname, "HEAD") == 0 && !branch_exists(refname))
 		refname = branch_ops()->current();
-	/* a branch by its full ref name, as in Dolt and git */
-	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0')
+	/*
+	 * a branch by its full ref name, as in Dolt and git (unless a branch
+	 * is named so itself)
+	 */
+	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0' &&
+			 !branch_exists(refname))
 		refname += 11;
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
@@ -1220,6 +1224,25 @@ refuse_other_case(const char *name, const char *ignore)
 				 errdetail("Branch names that differ only by case name one branch.")));
 }
 
+/*
+ * Refuse a new branch name that is a commit's id (in any case, as ids are
+ * read): a branch so named would hide the commit wherever refs are read,
+ * branches being looked for first.  Checked before the name's other
+ * rules, whatever the length of the ids the hash makes.
+ */
+static void
+refuse_commit_name(const char *name)
+{
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	if (parse_commit_id(name, &id) && copies_commit_get(&id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("invalid branch name \"%s\"", name),
+				 errdetail("It is a commit's id.")));
+}
+
 static void
 copies_branch_create(const char *name, const char *start_point)
 {
@@ -1228,6 +1251,8 @@ copies_branch_create(const char *name, const char *start_point)
 	ProllyCommitInfo info;
 	bool		from_exists;
 
+	refs_init();
+	refuse_commit_name(name);
 	branch_ops()->check_create(name);
 	lock_refs();
 	refuse_other_case(name, NULL);
@@ -1335,6 +1360,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 				 errmsg("branch \"%s\" does not exist", name)));
 	if (strcmp(name, newname) == 0)
 		return;
+	refuse_commit_name(newname);
 	refuse_other_case(newname, name);
 
 	/*

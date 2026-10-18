@@ -355,18 +355,16 @@ delete_here(void *arg)
  * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
  * refspec, and so on: a branch so named couldn't be named again.  As in
  * Dolt, a name is ASCII, and may begin with "-" (given after "--") but
- * isn't "-" alone (git's previous branch); and neither "HEAD", in any
- * case, the session branch's head, nor a commit's id (64 hex digits) is a
- * branch's name.
+ * isn't "-" alone (git's previous branch); "HEAD", in any case, the
+ * session branch's head, isn't a branch's name.  (Nor is a commit's id:
+ * the refs, which know commits, refuse that.)
  */
 static bool
 branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
 
-	if (len == 64 && strspn(name, "0123456789abcdef") == len)
-		return false;
-	if (strcmp(name, "-") == 0)
+	if (len == 0 || len >= NAMEDATALEN || strcmp(name, "-") == 0)
 		return false;
 
 	if (pg_strcasecmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
@@ -401,11 +399,11 @@ copies_check_create(const char *name)
 {
 	AclResult	aclresult;
 
-	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN || !branch_name_ok(name))
+	if (!branch_name_ok(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case), \"@\" or a commit id; not \"-\" alone or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not \"-\" alone or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	/* (one made on the session's behalf is the database's mechanism, not the role's) */
 	if (BranchCreateOnBehalf)
@@ -596,6 +594,7 @@ static const BranchOpsRoutine branch_copies = {
 	.rename = copies_rename,
 	.check_create = copies_check_create,
 	.check_drop = copies_check_drop,
+	.name_ok = branch_name_ok,
 	.make = copies_make,
 	.checkout = copies_checkout,
 	.current = copies_current,

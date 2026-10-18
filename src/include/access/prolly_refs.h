@@ -350,8 +350,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 /*
  * For refs implementations: a commit's info by its id (false if there is
  * no such commit), and the best common ancestor of two commits (no other
- * common one descending from it; of two such, the least id), found with
- * it, each commit visited once.
+ * common one descending from it; of two such, the one furthest from the
+ * history's roots, then the least id), found with it.  The walks visit a
+ * commit at most once each: a's ancestors, b's down to the common ones,
+ * and, with several of those, theirs and the history beneath them.
  */
 typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
 									ProllyCommitInfo *info, void *arg);

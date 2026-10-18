@@ -2,7 +2,7 @@
  *
  * refs_history.c
  *	  Walks of a commit graph that refs implementations share: each commit
- *	  visited once, however many paths reach it.
+ *	  visited once per walk, however many paths reach it.
  *
  * A history of merges reaches a commit along many paths (each merge
  * doubles them), so a walk that doesn't remember what it visited takes
@@ -40,39 +40,56 @@ id_set(const char *name)
 	return hash_create(name, 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
+/* What a walk does at a commit. */
+typedef enum WalkStep
+{
+	WALK_ON,					/* on to its parents */
+	WALK_PAST,					/* not on to its parents */
+	WALK_STOP,					/* the walk ends here */
+} WalkStep;
+
 /*
- * Breadth first from start, each commit once: visit(id, arg) for each, in
- * order, until it returns true (then *found gets that id and true is
- * returned).
+ * Breadth first from the commits of starts, each commit once: visit(id,
+ * arg) for each, in order, until it says to stop (then *found gets that
+ * id and true is returned).
  */
 static bool
-walk(const ProllyHash *start, ProllyCommitLookup lookup, void *lookup_arg,
-	 bool (*visit) (const ProllyHash *id, void *arg), void *arg,
-	 ProllyHash *found)
+walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
+		  void *lookup_arg, WalkStep (*visit) (const ProllyHash *id, void *arg),
+		  void *arg, ProllyHash *found)
 {
 	HTAB	   *seen = id_set("prolly history walk");
 	ProllyHash *queue;
 	int			head = 0;
 	int			tail = 0;
-	int			cap = 64;
+	int			cap = Max(64, nstarts);
 	bool		hit = false;
 
 	queue = palloc_array(ProllyHash, cap);
-	id_key(start, &queue[tail++]);
-	(void) hash_search(seen, &queue[0], HASH_ENTER, NULL);
+	for (int i = 0; i < nstarts; i++)
+	{
+		bool		known;
+
+		id_key(&starts[i], &queue[tail]);
+		(void) hash_search(seen, &queue[tail], HASH_ENTER, &known);
+		if (!known)
+			tail++;
+	}
 	while (head < tail)
 	{
 		ProllyHash	id = queue[head++];
 		ProllyCommitInfo info;
+		WalkStep	step;
 
 		CHECK_FOR_INTERRUPTS();
-		if (visit(&id, arg))
+		step = visit(&id, arg);
+		if (step == WALK_STOP)
 		{
 			*found = id;
 			hit = true;
 			break;
 		}
-		if (!lookup(&id, &info, lookup_arg))
+		if (step == WALK_PAST || !lookup(&id, &info, lookup_arg))
 			continue;
 		for (int i = 0; i < info.nparents; i++)
 		{
@@ -96,64 +113,140 @@ walk(const ProllyHash *start, ProllyCommitLookup lookup, void *lookup_arg,
 	return hit;
 }
 
-static bool
+static WalkStep
 add_ancestor(const ProllyHash *id, void *arg)
 {
 	(void) hash_search((HTAB *) arg, id, HASH_ENTER, NULL);
-	return false;
+	return WALK_ON;
+}
+
+/* first_common()'s walk: a's ancestors, and the common ones met. */
+typedef struct FirstCommon
+{
+	HTAB	   *ofa;
+	ProllyHash *found;
+	int			nfound;
+	int			cap;
+} FirstCommon;
+
+static WalkStep
+note_common(const ProllyHash *id, void *arg)
+{
+	FirstCommon *fc = arg;
+
+	if (hash_search(fc->ofa, id, HASH_FIND, NULL) == NULL)
+		return WALK_ON;
+	if (fc->nfound == fc->cap)
+	{
+		fc->cap *= 2;
+		fc->found = repalloc_array(fc->found, ProllyHash, fc->cap);
+	}
+	fc->found[fc->nfound++] = *id;
+	return WALK_PAST;
 }
 
 /*
  * Breadth first from b, the common ancestors of it and a met first on each
- * path (ofa: a's ancestors): every maximal one is among them, since a
- * walk past one reaches only its own ancestors.
+ * path (ofa: a's ancestors), into *found: every maximal one is among
+ * them, since a walk past one reaches only its own ancestors.
  */
-static List *
+static int
 first_common(const ProllyHash *b, HTAB *ofa, ProllyCommitLookup lookup,
-			 void *lookup_arg)
+			 void *lookup_arg, ProllyHash **found)
 {
-	HTAB	   *seen = id_set("prolly merge base walk");
-	List	   *queue = NIL;
-	List	   *found = NIL;
-	ProllyHash *start = palloc(sizeof(ProllyHash));
+	FirstCommon fc = {ofa, palloc_array(ProllyHash, 4), 0, 4};
+	ProllyHash	unused;
 
-	id_key(b, start);
-	(void) hash_search(seen, start, HASH_ENTER, NULL);
-	queue = lappend(queue, start);
-	while (queue != NIL)
+	(void) walk_from(b, 1, lookup, lookup_arg, note_common, &fc, &unused);
+	*found = fc.found;
+	return fc.nfound;
+}
+
+/*
+ * A commit's height, the most commits on a path from it to a root of its
+ * history (a root's is 1), as Dolt keeps one in each commit: heights,
+ * keyed by id, holds those known.  Found depth first, each commit once,
+ * without recursion.
+ */
+typedef struct Height
+{
+	ProllyHash	id;				/* (the key) */
+	int64		height;			/* 0: being found */
+} Height;
+
+static int64
+commit_height(const ProllyHash *id, HTAB *heights, ProllyCommitLookup lookup,
+			  void *lookup_arg)
+{
+	ProllyHash	key;
+	ProllyHash *stack;
+	int			depth = 0;
+	int			cap = 64;
+	Height	   *h;
+	bool		known;
+
+	id_key(id, &key);
+	h = hash_search(heights, &key, HASH_FIND, NULL);
+	if (h != NULL && h->height > 0)
+		return h->height;
+	stack = palloc_array(ProllyHash, cap);
+	stack[depth++] = key;
+	while (depth > 0)
 	{
-		ProllyHash *id = linitial(queue);
+		ProllyHash	top = stack[depth - 1];
 		ProllyCommitInfo info;
+		int64		height = 1;
+		bool		ready = true;
 
-		queue = list_delete_first(queue);
 		CHECK_FOR_INTERRUPTS();
-		if (hash_search(ofa, id, HASH_FIND, NULL) != NULL)
+		h = hash_search(heights, &top, HASH_ENTER, &known);
+		if (known && h->height > 0)
 		{
-			found = lappend(found, id);
+			depth--;
 			continue;
 		}
-		if (!lookup(id, &info, lookup_arg))
-			continue;
-		for (int i = 0; i < info.nparents; i++)
+		h->height = 0;
+		if (lookup(&top, &info, lookup_arg))
 		{
-			ProllyHash *key = palloc(sizeof(ProllyHash));
-			bool		known;
+			for (int i = 0; i < info.nparents; i++)
+			{
+				ProllyHash	pk;
+				Height	   *ph;
 
-			id_key(&info.parents[i], key);
-			(void) hash_search(seen, key, HASH_ENTER, &known);
-			if (!known)
-				queue = lappend(queue, key);
+				id_key(&info.parents[i], &pk);
+				ph = hash_search(heights, &pk, HASH_FIND, NULL);
+				if (ph != NULL && ph->height > 0)
+					height = Max(height, ph->height + 1);
+				else
+				{
+					/* (a parent not found yet: found first) */
+					if (depth == cap)
+					{
+						cap *= 2;
+						stack = repalloc_array(stack, ProllyHash, cap);
+					}
+					stack[depth++] = pk;
+					ready = false;
+				}
+			}
+		}
+		if (ready)
+		{
+			h = hash_search(heights, &top, HASH_FIND, NULL);
+			h->height = height;
+			depth--;
 		}
 	}
-	hash_destroy(seen);
-	return found;
+	pfree(stack);
+	h = hash_search(heights, &key, HASH_FIND, NULL);
+	return h->height;
 }
 
 /*
  * The best common ancestor of a and b: of those no other common ancestor
- * descends from (two, in a criss-cross merge's history), the one with the
- * least id, so the same whichever way round they're asked for.  False if
- * they have none.
+ * descends from (two or more, in a criss-cross merge's history), the one
+ * of the greatest height, then the least id, as Dolt chooses, so the same
+ * whichever way round they're asked for.  False if they have none.
  */
 bool
 prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
@@ -161,41 +254,68 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 						  ProllyHash *base)
 {
 	HTAB	   *ofa = id_set("prolly merge base");
-	HTAB	   *beneath = id_set("prolly merge base, beneath another");
+	HTAB	   *beneath = NULL;
+	HTAB	   *heights = NULL;
 	ProllyHash	unused;
-	List	   *common;
-	ListCell   *lc;
+	ProllyHash *common;
+	int			ncommon;
+	int64		best_height = 0;
 	bool		found = false;
 
-	(void) walk(a, lookup, lookup_arg, add_ancestor, ofa, &unused);
-	common = first_common(b, ofa, lookup, lookup_arg);
+	(void) walk_from(a, 1, lookup, lookup_arg, add_ancestor, ofa, &unused);
+	ncommon = first_common(b, ofa, lookup, lookup_arg, &common);
 
-	/* each one's ancestors (itself aside) aren't the best */
-	if (list_length(common) > 1)
+	/*
+	 * Of several, what's beneath one (its ancestors, itself aside) isn't
+	 * the best: one walk from all their parents.
+	 */
+	if (ncommon > 1)
 	{
-		foreach(lc, common)
+		ProllyHash *parents = palloc_array(ProllyHash, ncommon * PROLLY_MAX_PARENTS);
+		int			nparents = 0;
+		HASHCTL		ctl;
+
+		for (int i = 0; i < ncommon; i++)
 		{
 			ProllyCommitInfo info;
 
-			if (!lookup(lfirst(lc), &info, lookup_arg))
+			if (!lookup(&common[i], &info, lookup_arg))
 				continue;
-			for (int i = 0; i < info.nparents; i++)
-				(void) walk(&info.parents[i], lookup, lookup_arg, add_ancestor,
-							beneath, &unused);
+			for (int p = 0; p < info.nparents; p++)
+				parents[nparents++] = info.parents[p];
 		}
+		beneath = id_set("prolly merge base, beneath another");
+		(void) walk_from(parents, nparents, lookup, lookup_arg, add_ancestor,
+						 beneath, &unused);
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(Height);
+		ctl.hcxt = CurrentMemoryContext;
+		heights = hash_create("prolly commit heights", 256, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	foreach(lc, common)
+	for (int i = 0; i < ncommon; i++)
 	{
-		ProllyHash *id = lfirst(lc);
+		ProllyHash *id = &common[i];
+		int64		height = 0;
 
-		if (hash_search(beneath, id, HASH_FIND, NULL) != NULL)
+		if (beneath != NULL && hash_search(beneath, id, HASH_FIND, NULL) != NULL)
 			continue;
-		if (!found || id->len < base->len ||
-			(id->len == base->len && memcmp(id->bytes, base->bytes, id->len) < 0))
+		if (heights != NULL)
+			height = commit_height(id, heights, lookup, lookup_arg);
+		if (!found || height > best_height ||
+			(height == best_height &&
+			 (id->len < base->len ||
+			  (id->len == base->len && memcmp(id->bytes, base->bytes, id->len) < 0))))
+		{
 			*base = *id;
+			best_height = height;
+		}
 		found = true;
 	}
-	hash_destroy(beneath);
+	if (heights)
+		hash_destroy(heights);
+	if (beneath)
+		hash_destroy(beneath);
 	hash_destroy(ofa);
 	return found;
 }
