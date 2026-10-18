@@ -128,6 +128,28 @@ SELECT count(*) AS all_rows FROM po.t;
 (1 row)
 
 RESET row_security;
+-- history isn't filtered by policies: its readers refuse a table whose
+-- row security applies to them; its owner reads it
+SET ROLE regress_pol_reader;
+SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::po.t);
+ERROR:  dolt_diff can't read "t": row security applies to you
+DETAIL:  Other commits' rows aren't filtered by its policies.
+HINT:  The table's owner, or a role that bypasses row security, can read them.
+SELECT count(*) FROM dolt_conflicts(NULL::po.t);
+ERROR:  dolt_conflicts can't read "t": row security applies to you
+DETAIL:  Other commits' rows aren't filtered by its policies.
+HINT:  The table's owner, or a role that bypasses row security, can read them.
+SELECT count(*) FROM dolt_constraint_violations('po.t'::regclass);
+ERROR:  dolt_constraint_violations can't read "t": row security applies to you
+DETAIL:  Other commits' rows aren't filtered by its policies.
+HINT:  The table's owner, or a role that bypasses row security, can read them.
+RESET ROLE;
+SELECT count(*) AS owner_reads FROM dolt_diff('HEAD', 'WORKING', NULL::po.t);
+ owner_reads 
+-------------
+           0
+(1 row)
+
 -- a merge brings them; changed, the change is listed and moves
 SELECT dolt_checkout('po_merge');
             dolt_checkout            
@@ -231,6 +253,121 @@ SELECT * FROM pg_temp.show();
  rls false false
 (3 rows)
 
+-- what a move changes under policies: a column's type, a view, a table,
+-- a type they use, a column dropped with its policy (each a commit, a
+-- branch at the one before reset to it and back)
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TYPE po.mood AS ENUM ('sad', 'happy');
+CREATE TABLE po.c (id int PRIMARY KEY, v int, owner text, m po.mood);
+CREATE TABLE po.ref (id int PRIMARY KEY);
+CREATE VIEW po.cv AS SELECT id FROM po.c WHERE id > 0;
+CREATE POLICY small ON po.c USING (v < 9);
+CREATE POLICY viewed ON po.c USING (id IN (SELECT id FROM po.cv));
+CREATE POLICY refd ON po.c USING (EXISTS (SELECT FROM po.ref r WHERE r.id = c.id));
+CREATE POLICY moody ON po.c USING (m = 'happy'::po.mood);
+CREATE POLICY owned ON po.c USING (owner = 'x');
+SELECT length(dolt_commit('-Am', 'policies over things')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('pc_cases');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP POLICY small ON po.c;
+ALTER TABLE po.c ALTER COLUMN v TYPE bigint;
+CREATE POLICY small ON po.c USING (v < 9);
+ALTER TYPE po.mood ADD VALUE 'meh';
+DROP POLICY owned ON po.c;
+ALTER TABLE po.c DROP COLUMN owner;
+DROP POLICY refd ON po.c;
+DROP TABLE po.ref;
+SELECT length(dolt_commit('-Am', 'things changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('pc_cases');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'pc_cases'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT polname, pg_get_expr(polqual, polrelid) FROM pg_policy
+ WHERE polrelid = 'po.c'::regclass ORDER BY 1;
+ polname |      pg_get_expr       
+---------+------------------------
+ moody   | (m = 'happy'::po.mood)
+ small   | (v < 9)
+ viewed  | (id IN ( SELECT cv.id +
+         |    FROM po.cv))
+(3 rows)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+ WHERE attrelid = 'po.c'::regclass AND attname = 'v';
+ format_type 
+-------------
+ bigint
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT polname, pg_get_expr(polqual, polrelid) FROM pg_policy
+ WHERE polrelid = 'po.c'::regclass ORDER BY 1;
+ polname |       pg_get_expr       
+---------+-------------------------
+ moody   | (m = 'happy'::po.mood)
+ owned   | (owner = 'x'::text)
+ refd    | (EXISTS ( SELECT       +
+         |    FROM po.ref r       +
+         |   WHERE (r.id = c.id)))
+ small   | (v < 9)
+ viewed  | (id IN ( SELECT cv.id  +
+         |    FROM po.cv))
+(5 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'pc_cases');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
@@ -250,9 +387,12 @@ SELECT dolt_branch('-D', 'po_merge');
 (1 row)
 
 DROP SCHEMA po CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table po.t
 drop cascades to table po.other
+drop cascades to type po.mood
+drop cascades to table po.c
+drop cascades to view po.cv
 SELECT length(dolt_commit('-Am', 'po gone')::text) AS committed;
  committed 
 -----------

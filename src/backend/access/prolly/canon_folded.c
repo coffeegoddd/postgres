@@ -787,13 +787,23 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	append_sorted_defs(out, RewriteRelationId, Anum_pg_rewrite_ev_class,
 					   RewriteRelRulenameIndexId, RelationGetRelid(rel));
 
-	/* Row security: whether it is on (and forced), then policies by name. */
-	appendStringInfoString(out, "policies\n");
-	if (rel->rd_rel->relrowsecurity)
-		appendStringInfoString(out, ROW_SECURITY "\n");
-	if (rel->rd_rel->relforcerowsecurity)
-		appendStringInfoString(out, FORCED_ROW_SECURITY "\n");
-	append_policies(out, rel);
+	/*
+	 * Row security: whether it is on (and forced), then policies by name.
+	 * (A table with none has no section, as before policies were held: its
+	 * description is the same.)
+	 */
+	{
+		StringInfoData policies;
+
+		initStringInfo(&policies);
+		if (rel->rd_rel->relrowsecurity)
+			appendStringInfoString(&policies, ROW_SECURITY "\n");
+		if (rel->rd_rel->relforcerowsecurity)
+			appendStringInfoString(&policies, FORCED_ROW_SECURITY "\n");
+		append_policies(&policies, rel);
+		if (policies.len > 0)
+			appendStringInfo(out, "policies\n%s", policies.data);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -2416,7 +2426,9 @@ typedef struct TableDef
 	List	   *indexes;		/* statements */
 	List	   *triggers;		/* statements */
 	List	   *rules;			/* statements */
-	List	   *policies;		/* ROW_SECURITY lines, then statements */
+	List	   *policies;		/* statements */
+	bool		row_security;	/* (and forced) */
+	bool		forced_row_security;
 } TableDef;
 
 typedef struct SchemaMove
@@ -2511,6 +2523,10 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->rules;
 		else if (strcmp(line, "policies") == 0)
 			section = &td->policies;
+		else if (section == &td->policies && strcmp(line, ROW_SECURITY) == 0)
+			td->row_security = true;
+		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
+			td->forced_row_security = true;
 		else if (section == &td->columns || section == &td->constraints)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
@@ -2584,24 +2600,39 @@ constraint_def(const char *line)
 	return unescape_field(tab + 1);
 }
 
+/*
+ * Where the identifier p begins with ends, as written: quoted (spaces,
+ * doubled quotes and all) or up to a space.  value, if given, gets it
+ * unquoted.
+ */
+static const char *
+scan_identifier(const char *p, StringInfo value)
+{
+	if (*p != '"')
+	{
+		size_t		n = strcspn(p, " ");
+
+		if (value)
+			appendBinaryStringInfo(value, p, n);
+		return p + n;
+	}
+	for (p++; *p; p++)
+	{
+		if (*p == '"' && p[1] != '"')
+			return p + 1;
+		if (*p == '"')
+			p++;				/* (a doubled quote) */
+		if (value)
+			appendStringInfoChar(value, *p);
+	}
+	return p;
+}
+
 /* The identifier p begins with, as written: quoted (spaces and all) or not. */
 static char *
 leading_identifier(const char *p)
 {
-	const char *end = p;
-
-	if (*end != '"')
-		return pnstrdup(p, strcspn(p, " "));
-	for (end++; *end; end++)
-	{
-		if (*end == '"')
-		{
-			if (end[1] != '"')
-				break;
-			end++;				/* (a doubled quote) */
-		}
-	}
-	return pnstrdup(p, end + (*end ? 1 : 0) - p);
+	return pnstrdup(p, scan_identifier(p, NULL) - p);
 }
 
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
@@ -2928,12 +2959,6 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sm->before = lappend(sm->before,
 								 psprintf("DROP RULE %s ON %s",
 										  object_name(lfirst(lc), "CREATE RULE "), name));
-	foreach(lc, from->policies)
-		if (strncmp(lfirst(lc), "CREATE POLICY ", 14) == 0 &&
-			!list_has_string(to->policies, lfirst(lc)))
-			sm->before = lappend(sm->before,
-								 psprintf("DROP POLICY IF EXISTS %s ON %s",
-										  object_name(lfirst(lc), "CREATE POLICY "), name));
 	foreach(lc, from->constraints)
 	{
 		char	   *sql;
@@ -3028,26 +3053,15 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
-	foreach(lc, to->policies)
-		if (strncmp(lfirst(lc), "CREATE POLICY ", 14) == 0 &&
-			!list_has_string(from->policies, lfirst(lc)))
-			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
-	{
-		static const char *const flags[2] = {ROW_SECURITY, FORCED_ROW_SECURITY};
-		static const char *const on[2] = {"ENABLE", "FORCE"};
-		static const char *const off[2] = {"DISABLE", "NO FORCE"};
-
-		for (int i = 0; i < 2; i++)
-		{
-			bool		was = list_has_string(from->policies, flags[i]);
-			bool		is = list_has_string(to->policies, flags[i]);
-
-			if (was != is)
-				sm->after = lappend(sm->after,
-									psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
-											 is ? on[i] : off[i]));
-		}
-	}
+	/* (policies: every move's, in move_schema) */
+	if (from->row_security != to->row_security)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
+									 to->row_security ? "ENABLE" : "DISABLE"));
+	if (from->forced_row_security != to->forced_row_security)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE %s %s ROW LEVEL SECURITY", name,
+									 to->forced_row_security ? "FORCE" : "NO FORCE"));
 	return remake;
 }
 
@@ -3223,14 +3237,7 @@ unquoted(const char *ident)
 	if (ident[0] != '"')
 		return pstrdup(ident);
 	initStringInfo(&out);
-	for (const char *p = ident + 1; *p; p++)
-	{
-		if (*p == '"' && p[1] == '"')
-			p++;
-		else if (*p == '"')
-			break;
-		appendStringInfoChar(&out, *p);
-	}
+	(void) scan_identifier(ident, &out);
 	return out.data;
 }
 
@@ -3710,6 +3717,8 @@ type_moves(List *from, List *to)
 				}
 				else if (d->classid == RewriteRelationId)
 					handled = true; /* (a view's: it goes, and comes again) */
+				else if (d->classid == PolicyRelationId)
+					handled = true; /* (a policy's: every move's go, and come) */
 				if (!handled)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3760,6 +3769,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *routines = NIL;
 	List	   *aggregates_made = NIL;
+	List	   *policy_drops = NIL;
+	List	   *policy_makes = NIL;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
@@ -4053,6 +4064,36 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	/* Run them as deparsed: names qualified, routines' bodies unchecked. */
 	save_nestlevel = NewGUCNestLevel();
+	/*
+	 * Policies: every one goes first and comes last, as views do, as they
+	 * may use any table, view, column, type or function the move changes.
+	 */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		TableDef	td;
+		ListCell   *pc;
+
+		if (f->kind != 't')
+			continue;
+		parse_table_def(f->def, &td);
+		foreach(pc, td.policies)
+			policy_drops = lappend(policy_drops,
+								   psprintf("DROP POLICY IF EXISTS %s ON %s",
+											object_name(lfirst(pc), "CREATE POLICY "),
+											f->name));
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		TableDef	td;
+
+		if (t->kind != 't')
+			continue;
+		parse_table_def(t->def, &td);
+		policy_makes = list_concat(policy_makes, td.policies);
+	}
+
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	(void) set_config_option("check_function_bodies", "off", PGC_USERSET,
@@ -4061,6 +4102,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
+	run_statements(policy_drops);
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
 
 	/*
@@ -4088,6 +4130,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(sm.after);
 	run_statements(sm.foreign_keys);
 	make_views(views);
+	run_statements(policy_makes);
 	if (matviews_made)
 	{
 		MemoryContext spi;
