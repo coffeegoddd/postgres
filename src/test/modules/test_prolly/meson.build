@@ -118,6 +118,7 @@ tests += {
       't/046_branch_crash.pl',
       't/047_network_remotes.pl',
       't/048_network_batches.pl',
+      't/050_bmap_evictions.pl',
       't/053_serve_snapshots.pl',
       't/054_journal_segments.pl',
       't/055_gc.pl',

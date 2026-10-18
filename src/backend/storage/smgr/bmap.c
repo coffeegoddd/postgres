@@ -739,6 +739,20 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 			return;
 		}
 		buf = r.recent_buffer;
+
+		/*
+		 * A write evicting a page while this backend changes the map page
+		 * holding its entry (a change's copy, extending the changes list):
+		 * the page is ours, and not mid-change (that is a critical
+		 * section), and the entry wanted isn't changing.
+		 */
+		if (BufferIsLockedByMe(buf))
+		{
+			check_page(BufferGetPage(buf), type, rel, BMAP_FORKNUM, blk);
+			memcpy(dst, BufferGetPage(buf), BLCKSZ);
+			ReleaseBuffer(buf);
+			return;
+		}
 	}
 	else
 		buf = map_read(rel, blk);
