@@ -112,6 +112,13 @@ typedef struct ProllyValueStore
 	const struct ProllyTreeRoutine *tree;
 	const ProllyTreeEnv *env;
 	const struct ProllyValueMemoRoutine *memo;	/* NULL if none */
+
+	/*
+	 * Decoding gives a long value a hash pointer can name as that pointer,
+	 * unread (prolly_toast_pointer()): for rows written back to a table,
+	 * which then hold the tree history has.  Other readers get values.
+	 */
+	bool		pointers;
 } ProllyValueStore;
 
 /* One change for apply(): a put, or a delete if is_delete. */

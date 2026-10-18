@@ -1149,6 +1149,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
 	prolly_keying_use_env(&krefs, ap.c.rd.kr, ap.c.rd.k, tree, &env);
+	/* (a keyless row is matched by its values: read once, not by pointer) */
+	krefs.values.pointers = !ap.keyless;
 
 	ap.slot = table_slot_create(ap.rel, NULL);
 	ap.old = table_slot_create(ap.rel, NULL);
@@ -1584,6 +1586,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	env.compare = changes_compare;
 	env.compare_arg = &tc;
 	prolly_keying_use_env(&krefs, tc.rd.kr, tc.rd.k, tree, &env);
+	krefs.values.pointers = !keyless;
 	PROLLY_CALL(tree, diff, &env, &base->data, &theirs->data, collect_change,
 				&tc);
 	PROLLY_CALL(tree, diff, &env, &base->data, &ours->data, collect_change,

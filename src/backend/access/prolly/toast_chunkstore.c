@@ -128,6 +128,36 @@ toast_form(Oid typid)
 	return form < 0 ? PROLLY_TOAST_FORM_BYTES : form;
 }
 
+/* A hash pointer: to a tree (root, len bytes) of a form, of a raw size */
+static varlena *
+make_pointer(const ProllyHash *root, uint64 len, int form, Size rawsize)
+{
+	varatt_external_hash p;
+	varlena    *result;
+
+	Assert(root->len == sizeof(p.va_hash));
+	p.va_rawsize = rawsize;
+	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
+	memcpy(p.va_hash, root->bytes, sizeof(p.va_hash));
+	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(p));
+	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_SHA256);
+	memcpy(VARDATA_EXTERNAL(result), &p, sizeof(p));
+	return result;
+}
+
+/* A hash pointer's form, and its tree's root and length (*root, *len) */
+static int
+pointer_root(const varlena *pointer, ProllyHash *root, uint64 *len)
+{
+	varatt_external_hash p;
+
+	VARATT_EXTERNAL_GET_POINTER(p, pointer);
+	root->len = sizeof(p.va_hash);
+	memcpy(root->bytes, p.va_hash, sizeof(p.va_hash));
+	*len = VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo);
+	return p.va_extinfo >> VARLENA_EXTSIZE_BITS;
+}
+
 /* The longest string an encoding conversion takes */
 #define CONVERTIBLE_MAX		(MaxAllocSize / MAX_CONVERSION_GROWTH - 1)
 
@@ -241,12 +271,7 @@ prolly_toast_store(Datum value, Oid typid)
 		elog(ERROR, "a value tree's root isn't a SHA-256 hash pointer's");
 	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root);
 
-	p.va_rawsize = VARSIZE_ANY_EXHDR(plain) + VARHDRSZ;
-	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
-	memcpy(p.va_hash, root.bytes, sizeof(p.va_hash));
-	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(p));
-	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_SHA256);
-	memcpy(VARDATA_EXTERNAL(result), &p, sizeof(p));
+	result = make_pointer(&root, len, form, VARSIZE_ANY_EXHDR(plain) + VARHDRSZ);
 
 	pfree(ref.data);
 	pfree(canonical.data);
@@ -260,13 +285,11 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 					   const ProllyValueStore *values, StringInfo ref,
 					   uint64 *len)
 {
-	varatt_external_hash p;
 	ProllyHash	root;
 
 	Assert(VARATT_IS_EXTERNAL_ONDISK_HASH(pointer));
 	ensure_env();
-	VARATT_EXTERNAL_GET_POINTER(p, pointer);
-	if ((int) (p.va_extinfo >> VARLENA_EXTSIZE_BITS) != canonical_form(typid))
+	if (pointer_root(pointer, &root, len) != canonical_form(typid))
 		return false;
 
 	/* the trees of history's value store are these, in this store */
@@ -275,11 +298,8 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 		return false;
 
 	/* (a tree that isn't there is an error when the value is read) */
-	root.len = sizeof(p.va_hash);
-	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
 	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, &root))
 		return false;
-	*len = VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo);
 	(void) prolly_toast_reference(pointer, ref);
 	return true;
 }
@@ -287,55 +307,30 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 varlena *
 prolly_toast_pointer(const ProllyHash *root, uint64 len, Oid typid)
 {
-	Oid			base = getBaseType(typid);
-	varatt_external_hash p;
-	varlena    *result;
-	int			form;
-	Size		rawsize;
-
 	/*
-	 * In another encoding, text and jsonb are stored converted, and their
-	 * size is only known once converted back.
+	 * Only a value stored as its bytes: one converted (text in another
+	 * encoding, jsonb) has its size known only once converted back, and a
+	 * jsonb document from history is checked as it is decoded.
 	 */
-	if (base == BYTEAOID ||
-		(text_like(base) && GetDatabaseEncoding() == PG_UTF8))
-	{
-		form = PROLLY_TOAST_FORM_BYTES;
-		rawsize = len + VARHDRSZ;
-	}
-	else if (base == JSONBOID && GetDatabaseEncoding() == PG_UTF8 && len > 1)
-	{
-		/* (the canonical bytes: a version byte, then the document) */
-		form = PROLLY_TOAST_FORM_JSONB;
-		rawsize = len - 1 + VARHDRSZ;
-	}
-	else
+	if (canonical_form(typid) != PROLLY_TOAST_FORM_BYTES ||
+		root->len != sizeof(((varatt_external_hash *) NULL)->va_hash) ||
+		len > FETCHABLE_MAX)
 		return NULL;
-	if (root->len != sizeof(p.va_hash) || len > VARLENA_EXTSIZE_MASK)
-		return NULL;
-	p.va_rawsize = rawsize;
-	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
-	memcpy(p.va_hash, root->bytes, sizeof(p.va_hash));
-	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(p));
-	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_SHA256);
-	memcpy(VARDATA_EXTERNAL(result), &p, sizeof(p));
-	return result;
+	return make_pointer(root, len, PROLLY_TOAST_FORM_BYTES, len + VARHDRSZ);
 }
 
 int
 prolly_toast_reference(const varlena *pointer, StringInfo ref)
 {
-	varatt_external_hash p;
 	ProllyHash	root;
+	uint64		len;
+	int			form;
 
 	Assert(VARATT_IS_EXTERNAL_ONDISK_HASH(pointer));
 	ensure_env();
-	VARATT_EXTERNAL_GET_POINTER(p, pointer);
-	root.len = sizeof(p.va_hash);
-	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
-	PROLLY_CALL(tree, value_reference, &root,
-				VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo), ref);
-	return p.va_extinfo >> VARLENA_EXTSIZE_BITS;
+	form = pointer_root(pointer, &root, &len);
+	PROLLY_CALL(tree, value_reference, &root, len, ref);
+	return form;
 }
 
 bool
@@ -561,18 +556,15 @@ chunkstore_save(Relation rel, Datum value, Oid typid)
 static bool
 chunkstore_reference(Relation rel, varlena *pointer, Oid typid)
 {
-	varatt_external_hash p;
 	ProllyHash	root;
+	uint64		len;
 	int			form;
 
 	ensure_env();
-	VARATT_EXTERNAL_GET_POINTER(p, pointer);
-	form = p.va_extinfo >> VARLENA_EXTSIZE_BITS;
+	form = pointer_root(pointer, &root, &len);
 	if (form != toast_form(typid) &&
 		!(form == PROLLY_TOAST_FORM_BYTES && toast_form(typid) == PROLLY_TOAST_FORM_UTF8))
 		return false;
-	root.len = sizeof(p.va_hash);
-	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
 	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root);
 	return true;
 }
