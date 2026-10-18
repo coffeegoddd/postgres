@@ -84,6 +84,7 @@ tests += {
       'canonical_escapes',
       'aggregates',
       'policies',
+      'partitions',
     ],
   },
   'tap': {

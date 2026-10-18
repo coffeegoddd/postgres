@@ -1,0 +1,337 @@
+-- Partitioned tables in versioned schemas: a partitioned table held with
+-- its key (no rows of its own), each partition as a table with its parent
+-- and bound, its rows folded as any table's; a move makes a partitioned
+-- table before its partitions, and what a partition has of its parent
+-- (columns, keys, indexes, row triggers) comes with it.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA pt VERSIONED;
+CREATE TABLE pt.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('pt_reset');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('pt_merge');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE TABLE pt.p (id int, region text, v text, PRIMARY KEY (id, region))
+  PARTITION BY LIST (region);
+CREATE TABLE pt.p_east PARTITION OF pt.p FOR VALUES IN ('east');
+CREATE TABLE pt.p_west PARTITION OF pt.p FOR VALUES IN ('west')
+  PARTITION BY RANGE (id);
+CREATE TABLE pt.p_west_lo PARTITION OF pt.p_west FOR VALUES FROM (MINVALUE) TO (100);
+CREATE TABLE pt.p_west_hi PARTITION OF pt.p_west FOR VALUES FROM (100) TO (MAXVALUE);
+CREATE TABLE pt.p_rest PARTITION OF pt.p DEFAULT;
+CREATE INDEX p_v ON pt.p (v);
+CREATE FUNCTION pt.stamp() RETURNS trigger LANGUAGE plpgsql
+  AS $$ BEGIN NEW.v := coalesce(NEW.v, 'stamped'); RETURN NEW; END $$;
+CREATE TRIGGER p_stamp BEFORE INSERT ON pt.p FOR EACH ROW EXECUTE FUNCTION pt.stamp();
+INSERT INTO pt.p VALUES (1, 'east', 'a'), (2, 'west', 'b'), (150, 'west', 'c'),
+  (3, 'north', NULL);
+SELECT length(dolt_commit('-Am', 'partitioned')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
+	SELECT 'part ' || c.relname || ' of ' || p.relname || ' ' ||
+		   pg_get_expr(c.relpartbound, c.oid)
+	  FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+	  JOIN pg_class p ON p.oid = i.inhparent
+	  WHERE c.relnamespace = 'pt'::regnamespace AND c.relkind IN ('r', 'p')
+	UNION ALL
+	SELECT 'key ' || relname || ' ' || pg_get_partkeydef(oid) FROM pg_class
+	  WHERE relnamespace = 'pt'::regnamespace AND relkind = 'p'
+	UNION ALL
+	SELECT 'index ' || indexname || ' on ' || tablename FROM pg_indexes
+	  WHERE schemaname = 'pt' AND tablename <> 'base'
+	UNION ALL
+	SELECT 'row ' || tableoid::regclass || ' ' || id || ' ' || region || ' ' || v FROM pt.p
+	ORDER BY 1
+$$;
+SELECT * FROM pg_temp.show();
+                             show                             
+--------------------------------------------------------------
+ index p_east_pkey on p_east
+ index p_east_v_idx on p_east
+ index p_pkey on p
+ index p_rest_pkey on p_rest
+ index p_rest_v_idx on p_rest
+ index p_v on p
+ index p_west_hi_pkey on p_west_hi
+ index p_west_hi_v_idx on p_west_hi
+ index p_west_lo_pkey on p_west_lo
+ index p_west_lo_v_idx on p_west_lo
+ index p_west_pkey on p_west
+ index p_west_v_idx on p_west
+ key p LIST (region)
+ key p_west RANGE (id)
+ part p_east of p FOR VALUES IN ('east')
+ part p_rest of p DEFAULT
+ part p_west of p FOR VALUES IN ('west')
+ part p_west_hi of p_west FOR VALUES FROM (100) TO (MAXVALUE)
+ part p_west_lo of p_west FOR VALUES FROM (MINVALUE) TO (100)
+ row pt.p_east 1 east a
+ row pt.p_rest 3 north stamped
+ row pt.p_west_hi 150 west c
+ row pt.p_west_lo 2 west b
+(23 rows)
+
+-- a reset from a branch without them makes them from the commit
+SELECT dolt_checkout('pt_reset');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'pt_reset'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM pg_temp.show();
+                             show                             
+--------------------------------------------------------------
+ index p_east_pkey on p_east
+ index p_east_v_idx on p_east
+ index p_pkey on p
+ index p_rest_pkey on p_rest
+ index p_rest_v_idx on p_rest
+ index p_v on p
+ index p_west_hi_pkey on p_west_hi
+ index p_west_hi_v_idx on p_west_hi
+ index p_west_lo_pkey on p_west_lo
+ index p_west_lo_v_idx on p_west_lo
+ index p_west_pkey on p_west
+ index p_west_v_idx on p_west
+ key p LIST (region)
+ key p_west RANGE (id)
+ part p_east of p FOR VALUES IN ('east')
+ part p_rest of p DEFAULT
+ part p_west of p FOR VALUES IN ('west')
+ part p_west_hi of p_west FOR VALUES FROM (100) TO (MAXVALUE)
+ part p_west_lo of p_west FOR VALUES FROM (MINVALUE) TO (100)
+ row pt.p_east 1 east a
+ row pt.p_rest 3 north stamped
+ row pt.p_west_hi 150 west c
+ row pt.p_west_lo 2 west b
+(23 rows)
+
+INSERT INTO pt.p (id, region) VALUES (4, 'east');	-- (the trigger, cloned)
+SELECT v FROM pt.p WHERE id = 4;
+    v    
+---------
+ stamped
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- a row changed in a partition: listed by the partition, merged
+SELECT dolt_checkout('pt_merge');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'pt_merge'"}
+(1 row)
+
+SELECT dolt_merge('main') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+UPDATE pt.p SET v = 'changed' WHERE id = 150;
+SELECT * FROM dolt_status;
+  table_name  | staged |  status  
+--------------+--------+----------
+ pt.p_west_hi | t      | modified
+(1 row)
+
+SELECT diff_type, (from_row).v, (to_row).v FROM dolt_diff('HEAD', 'WORKING', NULL::pt.p_west_hi);
+ diff_type | v |    v    
+-----------+---+---------
+ modified  | c | changed
+(1 row)
+
+SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('pt_merge') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT v FROM pt.p WHERE id = 150;
+    v    
+---------
+ changed
+(1 row)
+
+-- a partition added, one dropped, one bound changed: each moved
+CREATE TABLE pt.p_south PARTITION OF pt.p FOR VALUES IN ('south');
+INSERT INTO pt.p VALUES (5, 'south', 'd');
+DROP TABLE pt.p_rest;
+ALTER TABLE pt.p DETACH PARTITION pt.p_east;
+ALTER TABLE pt.p ATTACH PARTITION pt.p_east FOR VALUES IN ('east', 'far east');
+INSERT INTO pt.p VALUES (6, 'far east', 'e');
+SELECT * FROM dolt_status;
+ table_name | staged |  status   
+------------+--------+-----------
+ pt.p_east  | t      | modified
+ pt.p_rest  | t      | deleted
+ pt.p_south | t      | new table
+(3 rows)
+
+SELECT length(dolt_commit('-Am', 'repartitioned')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('pt_reset');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'pt_reset'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM pg_temp.show();
+                             show                             
+--------------------------------------------------------------
+ index p_east_pkey on p_east
+ index p_east_v_idx on p_east
+ index p_pkey on p
+ index p_south_pkey on p_south
+ index p_south_v_idx on p_south
+ index p_v on p
+ index p_west_hi_pkey on p_west_hi
+ index p_west_hi_v_idx on p_west_hi
+ index p_west_lo_pkey on p_west_lo
+ index p_west_lo_v_idx on p_west_lo
+ index p_west_pkey on p_west
+ index p_west_v_idx on p_west
+ key p LIST (region)
+ key p_west RANGE (id)
+ part p_east of p FOR VALUES IN ('east', 'far east')
+ part p_south of p FOR VALUES IN ('south')
+ part p_west of p FOR VALUES IN ('west')
+ part p_west_hi of p_west FOR VALUES FROM (100) TO (MAXVALUE)
+ part p_west_lo of p_west FOR VALUES FROM (MINVALUE) TO (100)
+ row pt.p_east 1 east a
+ row pt.p_east 6 far east e
+ row pt.p_south 5 south d
+ row pt.p_west_hi 150 west changed
+ row pt.p_west_lo 2 west b
+(24 rows)
+
+-- and back
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM pg_temp.show();
+                             show                             
+--------------------------------------------------------------
+ index p_east_pkey on p_east
+ index p_east_v_idx on p_east
+ index p_pkey on p
+ index p_rest_pkey on p_rest
+ index p_rest_v_idx on p_rest
+ index p_v on p
+ index p_west_hi_pkey on p_west_hi
+ index p_west_hi_v_idx on p_west_hi
+ index p_west_lo_pkey on p_west_lo
+ index p_west_lo_v_idx on p_west_lo
+ index p_west_pkey on p_west
+ index p_west_v_idx on p_west
+ key p LIST (region)
+ key p_west RANGE (id)
+ part p_east of p FOR VALUES IN ('east')
+ part p_rest of p DEFAULT
+ part p_west of p FOR VALUES IN ('west')
+ part p_west_hi of p_west FOR VALUES FROM (100) TO (MAXVALUE)
+ part p_west_lo of p_west FOR VALUES FROM (MINVALUE) TO (100)
+ row pt.p_east 1 east a
+ row pt.p_rest 3 north stamped
+ row pt.p_west_hi 150 west changed
+ row pt.p_west_lo 2 west b
+(23 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'pt_reset');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'pt_merge');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA pt CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table pt.base
+drop cascades to table pt.p
+drop cascades to function pt.stamp()
+SELECT length(dolt_commit('-Am', 'pt gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

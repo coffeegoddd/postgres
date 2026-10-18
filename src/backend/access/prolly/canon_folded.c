@@ -126,6 +126,7 @@
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/partition.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -584,7 +585,8 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 		{
 			Form_pg_trigger trg = (Form_pg_trigger) GETSTRUCT(tup);
 
-			if (trg->tgisinternal)
+			/* (a partition's clone of its parent's: the parent's) */
+			if (trg->tgisinternal || OidIsValid(trg->tgparentid))
 				continue;
 			def = DirectFunctionCall1(pg_get_triggerdef, ObjectIdGetDatum(trg->oid));
 		}
@@ -803,6 +805,35 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		append_policies(&policies, rel);
 		if (policies.len > 0)
 			appendStringInfo(out, "policies\n%s", policies.data);
+	}
+
+	/* A partitioned table's key; a partition's parent and bound. */
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		appendStringInfoString(out, "partition by\n");
+		append_field(out, TextDatumGetCString(DirectFunctionCall1(pg_get_partkeydef,
+																  ObjectIdGetDatum(RelationGetRelid(rel)))));
+		appendStringInfoChar(out, '\n');
+	}
+	if (rel->rd_rel->relispartition)
+	{
+		Oid			parent = get_partition_parent(RelationGetRelid(rel), false);
+		HeapTuple	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+		bool		isnull;
+		Datum		bound;
+
+		if (!HeapTupleIsValid(ctup))
+			elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
+		bound = SysCacheGetAttr(RELOID, ctup, Anum_pg_class_relpartbound, &isnull);
+		if (isnull)
+			elog(ERROR, "partition %u has no bound", RelationGetRelid(rel));
+		appendStringInfoString(out, "partition of\n");
+		append_field(out, qualified(get_rel_namespace(parent), get_rel_name(parent)));
+		appendStringInfoChar(out, '\t');
+		append_field(out, TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bound,
+																  ObjectIdGetDatum(RelationGetRelid(rel)))));
+		appendStringInfoChar(out, '\n');
+		ReleaseSysCache(ctup);
 	}
 }
 
@@ -1345,13 +1376,6 @@ collect(Canon *cn)
 		switch (form->relkind)
 		{
 			case RELKIND_RELATION:
-				/* (a partition goes with its partitioned table) */
-				if (form->relispartition)
-				{
-					(void) uncovered(cn, "partitions of partitioned tables",
-									 qualified(form->relnamespace, name));
-					break;
-				}
 				if (form->relam == PROLLY_TABLE_AM_OID)
 				{
 					Relation	rel = table_open(form->oid, AccessShareLock);
@@ -1412,9 +1436,26 @@ collect(Canon *cn)
 				(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name));
 				break;
 			case RELKIND_PARTITIONED_TABLE:
-			case RELKIND_PARTITIONED_INDEX:
-				(void) uncovered(cn, "partitioned tables", qualified(form->relnamespace, name));
+				{
+					/* (its rows are its partitions': an empty data tree) */
+					Relation	rel = table_open(form->oid, AccessShareLock);
+					CanonItem  *it = add_item(cn, "t:", qualified(form->relnamespace, name));
+					ProllyTreeBuilder *b = PROLLY_CALL(cn->tree, build_begin, &cn->env,
+													   CurrentMemoryContext);
+					ProllyNodeRef root;
+					StringInfoData desc;
+
+					PROLLY_CALL(cn->tree, build_finish, b, &root);
+					initStringInfo(&desc);
+					describe_table(cn, rel, &desc);
+					put_hash(&it->value, &root.hash);
+					appendBinaryStringInfo(&it->value, desc.data, desc.len);
+					pfree(desc.data);
+					table_close(rel, AccessShareLock);
+				}
 				break;
+			case RELKIND_PARTITIONED_INDEX:
+				break;			/* with its table */
 		}
 	}
 	systable_endscan(scan);
@@ -2429,6 +2470,8 @@ typedef struct TableDef
 	List	   *policies;		/* statements */
 	bool		row_security;	/* (and forced) */
 	bool		forced_row_security;
+	char	   *partition_by;	/* a partitioned table's key, or NULL */
+	char	   *partition_of;	/* a partition's parent and bound (escaped), or NULL */
 } TableDef;
 
 typedef struct SchemaMove
@@ -2527,6 +2570,20 @@ parse_table_def(const char *def, TableDef *td)
 			td->row_security = true;
 		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
 			td->forced_row_security = true;
+		else if (strcmp(line, "partition by") == 0 ||
+				 strcmp(line, "partition of") == 0)
+		{
+			char	  **field = line[10] == 'b' ? &td->partition_by : &td->partition_of;
+
+			section = NULL;
+			if (next == NULL || *next == '\0')
+				elog(ERROR, "unexpected table definition: \"%s\" ends it", line);
+			line = next;
+			next = strchr(line, '\n');
+			if (next)
+				*next++ = '\0';
+			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
+		}
 		else if (section == &td->columns || section == &td->constraints)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
@@ -2633,6 +2690,21 @@ static char *
 leading_identifier(const char *p)
 {
 	return pnstrdup(p, scan_identifier(p, NULL) - p);
+}
+
+/*
+ * An index statement made IF NOT EXISTS: a partition's index its
+ * partitioned table's made for it, when the partition was.
+ */
+static char *
+if_not_exists_index(const char *stmt)
+{
+	const char *p = strstr(stmt, " INDEX ");
+
+	if (p == NULL)
+		elog(ERROR, "unexpected index definition \"%s\"", stmt);
+	p += strlen(" INDEX ");
+	return psprintf("%.*sIF NOT EXISTS %s", (int) (p - stmt), stmt, p);
 }
 
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
@@ -2806,6 +2878,16 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	memset(&none, 0, sizeof(none));
 	if (to == NULL)
 	{
+		/*
+		 * A partition goes before its partitioned table, which takes its
+		 * partitions with it (and so, IF EXISTS); a partition's sequences
+		 * are its parent's.
+		 */
+		if (from->partition_of)
+		{
+			sm->before = lcons(psprintf("DROP TABLE IF EXISTS %s", name), sm->before);
+			return true;
+		}
 		/* (its foreign keys first, as other tables' may point at it) */
 		foreach(lc, from->constraints)
 			if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
@@ -2868,6 +2950,19 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 				remake = true;
 		}
 	}
+	if (from != NULL && !same_strings(from->partition_by, to->partition_by))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s is partitioned differently at the commit", name),
+				 errdetail("Postgres can't change how a table is partitioned; a move can't either.")));
+	/* (a partition's columns are its partitioned table's) */
+	if (from != NULL && from->partition_of && to->partition_of)
+		remake = false;
+	if (remake && to->partition_by)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("partitioned table %s has its columns in another order at the commit", name),
+				 errdetail("Making it again would take its partitions with it.")));
 	if (from == NULL || remake)
 	{
 		StringInfoData sql;
@@ -2875,11 +2970,19 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
 		initStringInfo(&sql);
-		appendStringInfo(&sql, "CREATE TABLE %s (", name);
-		foreach(lc, to->columns)
-			appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
-							 column_sql(lfirst(lc)));
-		appendStringInfoChar(&sql, ')');
+		if (to->partition_of)
+			appendStringInfo(&sql, "CREATE TABLE %s PARTITION OF %s %s", name,
+							 first_field(to->partition_of), constraint_def(to->partition_of));
+		else
+		{
+			appendStringInfo(&sql, "CREATE TABLE %s (", name);
+			foreach(lc, to->columns)
+				appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
+								 column_sql(lfirst(lc)));
+			appendStringInfoChar(&sql, ')');
+		}
+		if (to->partition_by)
+			appendStringInfo(&sql, " PARTITION BY %s", to->partition_by);
 		sm->changes = lappend(sm->changes, sql.data);
 
 		/* sequences its defaults draw from, that no column owns: its own */
@@ -2899,6 +3002,30 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 									   quote_literal_cstr(name), quote_literal_cstr(name)));
 		from = &none;
 	}
+	else if (from->partition_of && to->partition_of)
+	{
+		/*
+		 * A partition's columns come with its partitioned table's; moved to
+		 * another parent or bound, it is detached before the rows are
+		 * written and attached after (which checks them against the bound).
+		 */
+		if (strcmp(from->partition_of, to->partition_of) != 0)
+		{
+			sm->before = lappend(sm->before,
+								 psprintf("ALTER TABLE %s DETACH PARTITION %s",
+										  first_field(from->partition_of), name));
+			sm->after = lappend(sm->after,
+								psprintf("ALTER TABLE %s ATTACH PARTITION %s %s",
+										 first_field(to->partition_of), name,
+										 constraint_def(to->partition_of)));
+		}
+	}
+	else if (from->partition_of || to->partition_of)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s is %s partition at the commit", name,
+						to->partition_of ? "a" : "no longer a"),
+				 errdetail("A move doesn't make a table a partition, or a partition a table.")));
 	else
 	{
 		/* Columns dropped, added, changed. */
@@ -3012,8 +3139,11 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sql = psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", name,
 						   first_field(line), constraint_def(line));
 
-			/* (an identity column, or a key, may have made it already) */
-			if (not_null)
+			/*
+			 * (an identity column, or a key, may have made it already; a
+			 * partition's partitioned table, its own)
+			 */
+			if (not_null || to->partition_of)
 				sql = psprintf("DO $move$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint "
 							   "WHERE conrelid = %s::pg_catalog.regclass AND "
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
@@ -3045,7 +3175,9 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			if (strcmp(first_field(lfirst(c)), idx) == 0)
 				owned = true;
 		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
-			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+			sm->after = lappend(sm->after,
+								to->partition_of ? if_not_exists_index(lfirst(lc)) :
+								pstrdup(lfirst(lc)));
 	}
 	foreach(lc, to->triggers)
 		if (!list_has_string(from->triggers, lfirst(lc)))
@@ -4010,15 +4142,44 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			sm.before = lappend(sm.before, t->def);
 		}
 	}
-	foreach(lc, to)
+	/* Tables made: a partition after its partitioned table. */
 	{
-		MoveItem   *t = lfirst(lc);
-		TableDef	td;
+		List	   *pending = NIL;
+		List	   *made = NIL;
 
-		if (t->kind != 't' || find_item(from, 't', t->name) != NULL)
-			continue;
-		parse_table_def(t->def, &td);
-		move_table(&sm, t->name, NULL, &td);
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+
+			if (t->kind == 't' && find_item(from, 't', t->name) == NULL)
+				pending = lappend(pending, t);
+		}
+		while (pending != NIL)
+		{
+			List	   *later = NIL;
+
+			foreach(lc, pending)
+			{
+				MoveItem   *t = lfirst(lc);
+				TableDef	td;
+				char	   *parent;
+
+				parse_table_def(t->def, &td);
+				parent = td.partition_of ? first_field(td.partition_of) : NULL;
+				if (parent && !list_has_string(made, parent) &&
+					find_item(from, 't', parent) == NULL &&
+					find_item(to, 't', parent) != NULL)
+				{
+					later = lappend(later, t);
+					continue;
+				}
+				move_table(&sm, t->name, NULL, &td);
+				made = lappend(made, t->name);
+			}
+			if (list_length(later) == list_length(pending))
+				elog(ERROR, "partitions of %s can't be made", ((MoveItem *) linitial(later))->name);
+			pending = later;
+		}
 	}
 	/* (aggregates after the tables, whose row types they may use) */
 	sm.changes = list_concat(sm.changes, aggregates_made);

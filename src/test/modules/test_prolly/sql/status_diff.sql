@@ -97,21 +97,18 @@ SELECT * FROM dolt_status ORDER BY table_name;
 DROP DATABASE sd_win1251;
 
 -- Reading what changed doesn't need what a commit does: objects the
--- canonical form doesn't describe yet (a partitioned table, a foreign
--- table) are left out of status and diff, and only a commit refuses them.
+-- canonical form doesn't describe (a foreign table) are left out of status
+-- and diff, and only a commit refuses them.
 CREATE FOREIGN DATA WRAPPER sd_fdw;
 CREATE SERVER sd_srv FOREIGN DATA WRAPPER sd_fdw;
 CREATE SCHEMA sdu VERSIONED;
 CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
--- They are changes a commit can't hold: listed as not covered (a
--- partition with its partitioned table, not as a table of its own), and
--- the branch is dirty with them alone.
-CREATE TABLE sdu.p (id int) PARTITION BY RANGE (id);
-CREATE TABLE sdu.p1 PARTITION OF sdu.p FOR VALUES FROM (1) TO (10);
+-- They are changes a commit can't hold: listed as not covered, and the
+-- branch is dirty with them alone.
+CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
-CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
 INSERT INTO sdu.t VALUES (1, 'one');
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdu.t);
