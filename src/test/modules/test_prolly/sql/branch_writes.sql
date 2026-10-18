@@ -135,6 +135,22 @@ BEGIN;
 SELECT dolt_commit('-m', 'nothing', '--allow-empty') IS NOT NULL AS committed;
 SELECT test_branches_written() AS written;
 ROLLBACK;
+-- (a merge aborted resets the branch as a reset does)
+SELECT dolt_branch('bw_m');
+SELECT dolt_checkout('bw_m');
+UPDATE bw.t SET v = 'on m' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'bw m')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE bw.t SET v = 'on main' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'bw main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('bw_m'))[3] AS conflicts;
+RESET dolt.allow_commit_conflicts;
+BEGIN;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+SELECT test_branches_written() AS written;
+COMMIT;
+SELECT dolt_branch('-D', 'bw_m');
 
 -- Nothing lasts past the transaction.
 BEGIN;

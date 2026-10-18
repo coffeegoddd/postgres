@@ -339,6 +339,7 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 	TU_UpdateIndexes updateIndexes = TU_All;
 	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
+	catalog_note_old_row(heapRel, otid);
 	CatalogTupleCheckConstraints(heapRel, wtup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -365,6 +366,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 	TU_UpdateIndexes updateIndexes = TU_All;
 	HeapTuple	wtup = catalog_row_with_branch(heapRel, tup);
 
+	catalog_note_old_row(heapRel, otid);
 	CatalogTupleCheckConstraints(heapRel, wtup);
 
 	simple_heap_update(heapRel, otid, wtup, &updateIndexes);
@@ -391,6 +393,6 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 void
 CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
 {
-	catalog_note_delete(heapRel, tid);
+	catalog_note_old_row(heapRel, tid);
 	simple_heap_delete(heapRel, tid);
 }

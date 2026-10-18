@@ -612,6 +612,7 @@ materialize(const char *name)
 	ProllyCommitInfo info;
 	ProllyNodeRef baseline;
 	bool		was_read_only = XactReadOnly;
+	int			hush;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -636,7 +637,7 @@ materialize(const char *name)
 	 * session may make or write, as it is.
 	 */
 	XactReadOnly = false;
-	branch_writes_hush();
+	hush = branch_writes_hush();
 	PG_TRY();
 	{
 		/* (with the refs held: no other session makes or deletes it meanwhile) */
@@ -662,7 +663,7 @@ done:
 	}
 	PG_FINALLY();
 	{
-		branch_writes_unhush();
+		branch_writes_unhush(hush);
 		XactReadOnly = was_read_only;
 	}
 	PG_END_TRY();

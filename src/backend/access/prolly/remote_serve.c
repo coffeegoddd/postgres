@@ -28,6 +28,7 @@
 #include "access/prolly_config.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "catalog/branch.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -614,6 +615,7 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 	ProllyHash	expected = {0};
 	ProllyHash	head;
 	bool		has_head = !PG_ARGISNULL(2);
+	bool		moved;
 	StringInfoData mine;
 
 	check_serving(true);
@@ -654,7 +656,10 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 			check_sent(&head);
 		(void) PROLLY_CALL(dc.transfer, receive, &spool_remote, NULL, &head, 1);
 	}
-	PG_RETURN_BOOL(PROLLY_CALL(dc.refs, branch_move, branch, &expected,
-							   has_head ? &head : NULL,
-							   PG_GETARG_BOOL(4)));
+	/* (the branch's rows, moved on the pusher's behalf) */
+	BRANCH_WRITES_HUSHED(moved = PROLLY_CALL(dc.refs, branch_move, branch,
+											 &expected,
+											 has_head ? &head : NULL,
+											 PG_GETARG_BOOL(4)));
+	PG_RETURN_BOOL(moved);
 }

@@ -64,11 +64,32 @@ extern void RegisterBranchWriteCallback(BranchWriteCallback callback,
 extern void branch_note_write(Oid branch);
 extern bool branch_written(Oid branch);
 extern List *branches_written(void);
-extern void branch_writes_hush(void);
-extern void branch_writes_unhush(void);
+extern int	branch_writes_hush(void);
+extern void branch_writes_unhush(int depth);
 
-/* a catalog row of a versioned object is to be deleted: its branch is written */
-extern void catalog_note_delete(Relation rel, const ItemPointerData *tid);
+/*
+ * Run the statements hushed, unhushed however they end (an error caught
+ * without a subtransaction's abort leaves nothing hushed).
+ */
+#define BRANCH_WRITES_HUSHED(...) \
+	do { \
+		int			hush_depth_ = branch_writes_hush(); \
+		PG_TRY(_hushed); \
+		{ \
+			__VA_ARGS__; \
+		} \
+		PG_FINALLY(_hushed); \
+		{ \
+			branch_writes_unhush(hush_depth_); \
+		} \
+		PG_END_TRY(_hushed); \
+	} while (0)
+
+/*
+ * A catalog row of a versioned object is to be updated or deleted: its
+ * branch is written (as the new row's is, as it is stamped).
+ */
+extern void catalog_note_old_row(Relation rel, const ItemPointerData *tid);
 
 /* the catalog's branch column, or NULL if it has none */
 extern const CatalogBranchInfo *catalog_branch_info(Oid relid);

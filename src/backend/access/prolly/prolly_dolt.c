@@ -121,7 +121,7 @@ prolly_session_ready(void)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.refs, checkout, connect_branch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(dc.refs, checkout, connect_branch));
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pfree(connect_branch);
@@ -358,9 +358,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		branch_note_write(MyBranch);
-		branch_writes_hush();
-		committed = PROLLY_CALL(refs(), commit, message, allow_empty, &id);
-		branch_writes_unhush();
+		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, message,
+													 allow_empty, &id));
 	}
 	PG_FINALLY();
 	{
@@ -416,9 +415,7 @@ create_branch(const char *name, const char *from)
 		XactReadOnly = false;
 	PG_TRY();
 	{
-		branch_writes_hush();
-		PROLLY_CALL(refs(), branch_create, name, from);
-		branch_writes_unhush();
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_create, name, from));
 	}
 	PG_FINALLY();
 	{
@@ -441,9 +438,7 @@ checkout_branch(const char *name)
 		XactReadOnly = false;
 	PG_TRY();
 	{
-		branch_writes_hush();
-		PROLLY_CALL(refs(), checkout, name);
-		branch_writes_unhush();
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), checkout, name));
 	}
 	PG_FINALLY();
 	{
@@ -494,9 +489,8 @@ sweep_detached(char *current)
 		MemoryContextSwitchTo(cxt);
 		PG_TRY();
 		{
-			branch_writes_hush();
-			PROLLY_CALL(refs(), branch_delete, (char *) lfirst(lc), true);
-			branch_writes_unhush();
+			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
+											 (char *) lfirst(lc), true));
 			ReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
@@ -655,10 +649,10 @@ dolt_branch(PG_FUNCTION_ARGS)
 	{
 		ListCell   *lc;
 
-		branch_writes_hush();
-		foreach(lc, names)
-			PROLLY_CALL(refs(), branch_delete, (char *) lfirst(lc), force);
-		branch_writes_unhush();
+		BRANCH_WRITES_HUSHED(
+			foreach(lc, names)
+				PROLLY_CALL(refs(), branch_delete, (char *) lfirst(lc), force);
+		);
 	}
 	else
 	{
@@ -689,9 +683,8 @@ dolt_branch(PG_FUNCTION_ARGS)
 static void
 abort_in_progress(const char *what)
 {
-	branch_writes_hush();
-	PROLLY_CALL(refs(), reset, "HEAD");
-	branch_writes_unhush();
+	branch_note_write(MyBranch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, "HEAD"));
 }
 
 /*
@@ -764,9 +757,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
 	known = list_length(PROLLY_CALL(refs(), violations));
 	branch_note_write(MyBranch);
-	branch_writes_hush();
-	conflicts = PROLLY_CALL(diff_merge(), merge, branch, message, flags, &id);
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
+												 message, flags, &id));
 	if (conflicts > 0)
 	{
 		/* (the violations it found, besides those the branch had) */
@@ -861,9 +853,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 											 &before : NULL, "reset");
 	}
 	branch_note_write(MyBranch);
-	branch_writes_hush();
-	PROLLY_CALL(refs(), reset, ref ? ref : "HEAD");
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -930,9 +920,8 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		}
 		/* a pick resolved to nothing: as a pick of nothing is */
 		branch_note_write(MyBranch);
-		branch_writes_hush();
-		committed = PROLLY_CALL(refs(), commit, ms.message, allow_empty, &id);
-		branch_writes_unhush();
+		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, ms.message,
+													 allow_empty, &id));
 		if (!committed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -947,10 +936,9 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 				 errmsg("dolt_cherry_pick needs a commit")));
 	known = list_length(PROLLY_CALL(refs(), violations));
 	branch_note_write(MyBranch);
-	branch_writes_hush();
-	conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1, false, allow_empty,
-							&id);
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+												 &ref, 1, false, allow_empty,
+												 &id));
 	if (conflicts > 0)
 	{
 		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
@@ -1010,10 +998,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 				 errmsg("dolt_revert needs a commit")));
 	known = list_length(PROLLY_CALL(refs(), violations));
 	branch_note_write(MyBranch);
-	branch_writes_hush();
-	nviolations = PROLLY_CALL(diff_merge(), cherry_pick,
-							  (const char *const *) args, nargs, true, false, &id);
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(nviolations = PROLLY_CALL(diff_merge(), cherry_pick,
+												   (const char *const *) args,
+												   nargs, true, false, &id));
 
 	/*
 	 * Rows it couldn't write, or left breaking a foreign key: the revert in
@@ -1752,9 +1739,7 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 		if (relids != NIL && !list_member_oid(relids, pv->relid))
 			kept = lappend(kept, pv);
 	}
-	branch_writes_hush();
-	found = PROLLY_CALL(diff_merge(), verify, relids);
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(found = PROLLY_CALL(diff_merge(), verify, relids));
 	if (relids != NIL)
 	{
 		/* (a table's own foreign keys, not those of tables referencing it) */
@@ -1896,10 +1881,10 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_conflicts_resolve needs --ours or --theirs")));
 	branch_note_write(MyBranch);
-	branch_writes_hush();
-	foreach(lc, tables)
-		PROLLY_CALL(diff_merge(), resolve, lfirst_oid(lc), side == 2);
-	branch_writes_unhush();
+	BRANCH_WRITES_HUSHED(
+		foreach(lc, tables)
+			PROLLY_CALL(diff_merge(), resolve, lfirst_oid(lc), side == 2);
+	);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -2721,9 +2706,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 		/* (the session's branch, empty, moved to the remote's) */
 		if (strcmp(b, current) == 0)
 		{
-			branch_writes_hush();
-			PROLLY_CALL(remote_refs(), reset, tracking);
-			branch_writes_unhush();
+			BRANCH_WRITES_HUSHED(PROLLY_CALL(remote_refs(), reset, tracking));
 		}
 		else
 			create_branch(b, tracking);

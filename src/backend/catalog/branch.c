@@ -483,14 +483,20 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 	branch_note_write(branch);
 }
 
+/*
+ * (a versioned row of another branch is changed only on the session's
+ * behalf, hushed: what's left is the session's branch, so once that is
+ * noted the row needn't be read)
+ */
 void
-catalog_note_delete(Relation rel, const ItemPointerData *tid)
+catalog_note_old_row(Relation rel, const ItemPointerData *tid)
 {
 	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
 	HeapTupleData tup;
 	Buffer		buf;
 
-	if (info == NULL || hushes != NIL || !database_has_versioned_schemas())
+	if (info == NULL || hushes != NIL || last_written == MyBranch ||
+		!database_has_versioned_schemas() || branch_written(MyBranch))
 		return;
 	tup.t_self = *tid;
 	if (heap_fetch(rel, SnapshotAny, &tup, &buf, false))
@@ -777,22 +783,25 @@ branches_written(void)
 	return branches;
 }
 
-void
+int
 branch_writes_hush(void)
 {
 	MemoryContext old;
+	int			depth = list_length(hushes);
 
 	register_branch_callbacks();
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	hushes = lappend_int(hushes, (int) GetCurrentSubTransactionId());
 	MemoryContextSwitchTo(old);
+	return depth;
 }
 
+/* (back to depth: a hush inside, left by an error, goes too) */
 void
-branch_writes_unhush(void)
+branch_writes_unhush(int depth)
 {
-	Assert(hushes != NIL);
-	hushes = list_delete_last(hushes);
+	Assert(list_length(hushes) > depth);
+	hushes = list_truncate(hushes, depth);
 }
 
 static void
