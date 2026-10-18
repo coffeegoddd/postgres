@@ -193,6 +193,54 @@ SET dolt.transaction_commit = on;
 DELETE FROM tc.bag WHERE v = 'outside again';
 SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
 
+-- A dolt_commit() undone by a rollback to a savepoint: what came before it
+-- is the transaction's again.
+BEGIN;
+INSERT INTO tc.t VALUES (50, 'before');
+SAVEPOINT s;
+SELECT length(dolt_commit('-Am', 'undone')::text) AS committed;
+ROLLBACK TO s;
+INSERT INTO tc.t VALUES (51, 'after');
+COMMIT;
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+
+-- Two tables' names swapped by a writer outside the mode: rows written to
+-- one aren't committed to the other.
+CREATE TABLE tc.sa (id int, v text);
+CREATE TABLE tc.sb (id int, v text);
+INSERT INTO tc.sa VALUES (100, 'sa');
+INSERT INTO tc.sb VALUES (200, 'sb');
+SET dolt.transaction_commit = off;
+ALTER TABLE tc.sa RENAME TO sx;
+ALTER TABLE tc.sb RENAME TO sa;
+ALTER TABLE tc.sx RENAME TO sb;
+SET dolt.transaction_commit = on;
+INSERT INTO tc.sa VALUES (1, 'was sb');
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+
+-- Keys equal to the keying but not in their bytes (numeric's scale).
+CREATE TABLE tc.num (id numeric PRIMARY KEY);
+CREATE TABLE tc.nbag (v numeric);
+INSERT INTO tc.num VALUES (1.0);
+INSERT INTO tc.nbag VALUES (1.0), (1.0);
+UPDATE tc.num SET id = 1.00 WHERE id = 1.0;
+INSERT INTO tc.nbag VALUES (1.00);
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+SELECT id::text FROM tc.num;
+SELECT v::text, count(*) FROM tc.nbag GROUP BY v::text ORDER BY 1;
+
+-- The most row changes counts the versions made: one insert is one.
+SET dolt.transaction_commit = off;
+INSERT INTO tc.t VALUES (60, 'outside');
+SET dolt.transaction_commit = on;
+SET dolt.transaction_commit_max_changes = 1;
+INSERT INTO tc.t VALUES (61, 'own');
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+RESET dolt.transaction_commit_max_changes;
+SET dolt.transaction_commit = off;
+SELECT length(dolt_commit('-Am', 'outside')::text) AS committed;
+SET dolt.transaction_commit = on;
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');

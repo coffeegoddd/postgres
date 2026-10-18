@@ -110,6 +110,16 @@ static bool own_changes_over = false;
 
 static void forget_own_changes(void);
 
+/*
+ * The last settle, by its subtransaction: one undone with it (a rollback to
+ * a savepoint) undoes the commit or reset too, and the changes it had made
+ * the transaction forget are the branch's again; the transaction then
+ * commits its working set.
+ */
+static LocalTransactionId settled_lxid = InvalidLocalTransactionId;
+static SubTransactionId settled_subid = InvalidSubTransactionId;
+static bool settle_undone = false;
+
 static void transaction_commit_at_end(bool prepare);
 static void note_own_change(Relation rel, const ItemPointerData *oldtid,
 							const ItemPointerData *newtid);
@@ -168,7 +178,7 @@ prolly_session_init(const char *branch)
 								   0,
 								   check_commit_message, NULL, NULL);
 		DefineCustomIntVariable("dolt.transaction_commit_max_changes",
-								"The most row changes a transaction's commit records by themselves.",
+								"The most row versions a transaction's commit records by themselves (an update is two).",
 								"Past them, dolt.transaction_commit commits the branch's working set.",
 								&dolt_transaction_commit_max_changes,
 								100000, 0, INT_MAX,
@@ -436,6 +446,9 @@ settled(void)
 	PROLLY_CALL(writers(), settled, MyBranch);
 	branch_forget_written(MyBranch);
 	forget_own_changes();
+	settled_lxid = MyProc->vxid.lxid;
+	settled_subid = GetCurrentSubTransactionId();
+	settle_undone = false;		/* (one undone before is in this one) */
 }
 
 /* (a transaction's own changes: none yet, as it begins) */
@@ -494,7 +507,9 @@ note_own_change(Relation rel, const ItemPointerData *oldtid,
 		own_changes_n = 0;
 		own_changes_over = false;
 	}
-	if (own_changes_n + 2 > dolt_transaction_commit_max_changes)
+	/* (an update is two: the version it replaced, and the one it made) */
+	if (own_changes_n + (oldtid != NULL) + (newtid != NULL) >
+		dolt_transaction_commit_max_changes)
 	{
 		own_changes_over = true;
 		return;
@@ -518,13 +533,18 @@ static void
 transaction_commit_at_end(bool prepare)
 {
 	List	   *branches;
+	bool		undone;
 	ProllyMergeState ms;
 	ProllyHash	id;
 	bool		pushed;
 
 	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on)
 		return;
+	undone = settled_lxid == MyProc->vxid.lxid && settle_undone;
+	settle_undone = false;
 	branches = branches_written();
+	if (branches == NIL && undone)
+		branches = list_make1_oid(MyBranch);
 	if (branches == NIL)
 		return;
 	if (prepare)
@@ -557,7 +577,7 @@ transaction_commit_at_end(bool prepare)
 	 * definitions, or more rows than it keeps, or they can't be applied so
 	 * (then the working set, as its snapshot sees it).
 	 */
-	if (!branch_catalog_written() &&
+	if (!undone && !branch_catalog_written() &&
 		!(own_changes_lxid == MyProc->vxid.lxid && own_changes_over))
 	{
 		ProllyRowChanges *changes = NULL;
@@ -1647,6 +1667,13 @@ static void
 writer_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						SubTransactionId parentSubid, void *arg)
 {
+	if (settled_lxid == MyProc->vxid.lxid && settled_subid == mySubid)
+	{
+		if (event == SUBXACT_EVENT_ABORT_SUB)
+			settle_undone = true;
+		else if (event == SUBXACT_EVENT_COMMIT_SUB)
+			settled_subid = parentSubid;
+	}
 	if (moved_lxid != MyProc->vxid.lxid || moved_subid != mySubid)
 		return;
 	if (event == SUBXACT_EVENT_ABORT_SUB)

@@ -766,10 +766,11 @@ fold_saw(HeapTupleHeader t, bool *known)
 
 /*
  * Count a copy of the tuple's row, delta; false if its row can't be read
- * (an old version's value out of line may be gone).
+ * (a value out of line of an old page version's tuple, 'of_old', may be
+ * gone).
  */
 static bool
-add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
+add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta, bool of_old)
 {
 	ProllyHash	content;
 	MemoryContext old;
@@ -777,7 +778,7 @@ add_copy(Finder *f, Copies *cs, HeapTuple tup, int64 delta)
 
 	ExecForceStoreHeapTuple(tup, f->rowslot, false);
 	slot_getallattrs(f->rowslot);
-	if (delta < 0)
+	if (of_old)
 	{
 		for (int i = 0; i < f->desc->natts; i++)
 			if (out_of_line(f->desc, i, f->rowslot->tts_values[i],
@@ -923,11 +924,11 @@ block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
 			kept = true;
 		}
 		if (!kept)
-			ok = add_copy(f, cs, &was->t[i], -1);
+			ok = add_copy(f, cs, &was->t[i], -1, true);
 	}
 	for (int j = 0; ok && j < is->n; j++)
 		if (is->t[j].t_data != NULL)
-			ok = add_copy(f, cs, &is->t[j], 1);
+			ok = add_copy(f, cs, &is->t[j], 1, false);
 	return ok;
 }
 
@@ -1495,37 +1496,11 @@ own_copies(Finder *f, Copies *cs, ItemPointerData *tids, int ntids)
 		}
 		copy = (made != replaced) ? heap_copytuple(&tup) : NULL;
 		UnlockReleaseBuffer(buf);
+
+		/* (the table's own versions: their values out of line are there) */
 		if (copy)
 		{
-			ExecForceStoreHeapTuple(copy, f->rowslot, false);
-			slot_getallattrs(f->rowslot);
-			resetStringInfo(&cs->key);
-			resetStringInfo(&cs->row);
-			{
-				ProllyHash	content;
-				MemoryContext old;
-				Copy	   *c;
-
-				PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &cs->key,
-							&cs->row, &content);
-				old = MemoryContextSwitchTo(cs->cxt);
-				if (cs->n == cs->max)
-				{
-					cs->max = Max(64, cs->max * 2);
-					cs->c = cs->c ? repalloc_array(cs->c, Copy, cs->max) :
-						palloc_array(Copy, cs->max);
-				}
-				c = &cs->c[cs->n++];
-				c->keylen = cs->key.len;
-				c->key = palloc(Max(c->keylen, 1));
-				memcpy(c->key, cs->key.data, c->keylen);
-				c->rowlen = cs->row.len;
-				c->row = palloc(Max(c->rowlen, 1));
-				memcpy(c->row, cs->row.data, c->rowlen);
-				c->delta = made ? 1 : -1;
-				MemoryContextSwitchTo(old);
-			}
-			ExecClearTuple(f->rowslot);
+			ok = add_copy(f, cs, copy, made ? 1 : -1, false);
 			heap_freetuple(copy);
 		}
 		CHECK_FOR_INTERRUPTS();
@@ -1572,12 +1547,39 @@ pages_fold_rows(Relation rel, const ProllyTreeEnv *env,
 		int64		delta = 0;
 		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
 		ProllyEdit *e;
+		ProllyKey	hk;
+		ProllyValue hv;
+		bool		at_head;
 
 		while (i < cs.n && same_bytes(cs.c[i].key, cs.c[i].keylen, ck.data, ck.len))
 		{
 			if (cs.c[i].delta > 0)
 				made = &cs.c[i];
 			delta += cs.c[i++].delta;
+		}
+
+		/*
+		 * (keys the keying can't tell apart but the bytes can, among the
+		 * changes or against the head: the working set instead, as a fold
+		 * from the baseline would)
+		 */
+		if (i < cs.n)
+		{
+			ProllyKey	nk = {(const uint8 *) cs.c[i].key, cs.c[i].keylen};
+
+			if (keying_compare(&ck, &nk, &f) == 0)
+			{
+				ok = false;
+				break;
+			}
+		}
+		PROLLY_CALL(f.tree, cursor_seek, cur, &ck, ForwardScanDirection);
+		at_head = PROLLY_CALL(f.tree, cursor_next, cur, &hk, &hv) &&
+			keying_compare(&hk, &ck, &f) == 0;
+		if (at_head && !same_bytes(c->key, c->keylen, hk.data, hk.len))
+		{
+			ok = false;
+			break;
 		}
 		e = &edits[nedits];
 		e->key = ck;
@@ -1598,18 +1600,14 @@ pages_fold_rows(Relation rel, const ProllyTreeEnv *env,
 		}
 		else if (delta != 0)
 		{
-			ProllyKey	k;
-			ProllyValue v;
 			int64		count = 0;
 
-			PROLLY_CALL(f.tree, cursor_seek, cur, &ck, ForwardScanDirection);
-			if (PROLLY_CALL(f.tree, cursor_next, cur, &k, &v) &&
-				same_bytes(c->key, c->keylen, k.data, k.len))
+			if (at_head)
 			{
 				ProllyValue row;
 				uint64		had;
 
-				PROLLY_CALL(f.kr, parse_value, f.k, &v, &row, &had);
+				PROLLY_CALL(f.kr, parse_value, f.k, &hv, &row, &had);
 				count = (int64) had;
 			}
 			count += delta;

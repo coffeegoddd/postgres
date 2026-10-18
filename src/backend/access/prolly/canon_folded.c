@@ -5372,6 +5372,19 @@ edit_key_cmp(const void *a, const void *b)
 								&((const ProllyEdit *) b)->key, NULL);
 }
 
+/* An edit putting item it, as it is. */
+static void
+put_edit(ProllyEdit *edits, int *nedits, const CanonItem *it)
+{
+	ProllyEdit *e = &edits[(*nedits)++];
+
+	e->key.data = (const uint8 *) it->key.data;
+	e->key.len = it->key.len;
+	e->is_delete = false;
+	e->value.data = (const uint8 *) it->value.data;
+	e->value.len = it->value.len;
+}
+
 /*
  * head's item named key into *v; false if head has none.
  */
@@ -5452,12 +5465,8 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 			{
 				put_hash(&it->value, &rows.hash);
 				appendBinaryStringInfo(&it->value, desc.data, desc.len);
-				edits[nedits].key.data = (const uint8 *) it->key.data;
-				edits[nedits].key.len = it->key.len;
-				edits[nedits].is_delete = false;
-				edits[nedits].value.data = (const uint8 *) it->value.data;
-				edits[nedits].value.len = it->value.len;
-				nedits++;
+				pfree(desc.data);
+				put_edit(edits, &nedits, it);
 			}
 			table_close(rel, AccessShareLock);
 		}
@@ -5482,12 +5491,7 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 				ok = false;
 			else
 			{
-				edits[nedits].key.data = (const uint8 *) it->key.data;
-				edits[nedits].key.len = it->key.len;
-				edits[nedits].is_delete = false;
-				edits[nedits].value.data = (const uint8 *) it->value.data;
-				edits[nedits].value.len = it->value.len;
-				nedits++;
+				put_edit(edits, &nedits, it);
 			}
 		}
 	}

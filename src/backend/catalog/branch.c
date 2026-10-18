@@ -845,7 +845,10 @@ branch_note_sequence(Relation seqrel)
 {
 	Oid			branch = seqrel->rd_rel->relbranch;
 
+	/* (the last noted first: a statement's values are one sequence's) */
 	if (OidIsValid(branch) && hushes == NIL &&
+		(sequences_written == NIL ||
+		 llast_oid(sequences_written) != RelationGetRelid(seqrel)) &&
 		!list_member_oid(sequences_written, RelationGetRelid(seqrel)))
 	{
 		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);

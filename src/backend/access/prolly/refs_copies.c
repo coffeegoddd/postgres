@@ -72,15 +72,21 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
 #include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -94,6 +100,7 @@
 #define TAG_UPSTREAM	'U'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 #define TAG_CONFIG		'C'	/* a database setting */
+#define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
 
 static bool ready = false;
 
@@ -980,6 +987,136 @@ hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
 	return see_head(name);
 }
 
+static int
+line_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(lfirst(a), lfirst(b));
+}
+
+/*
+ * The session's prolly tables, each "relid name" on a line, by relid: as
+ * the branch's catalog names them now.
+ */
+static void
+table_names(StringInfo out)
+{
+	Relation	rel = table_open(RelationRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
+			lines = lappend(lines, psprintf("%010u %s.%s", c->oid,
+											get_namespace_name(c->relnamespace),
+											NameStr(c->relname)));
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	list_sort(lines, line_cmp);
+	foreach(lc, lines)
+	{
+		appendStringInfoString(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
+}
+
+/*
+ * The tables of the branch's head, as named by the commit that made it of
+ * the working set: the head's hash on the first line, then table_names().
+ * A commit of a transaction's own rows can tell by it a table renamed since
+ * (by a writer whose change no commit holds yet) from the one the head has
+ * under that name.
+ */
+static void
+names_key(StringInfo key, const char *name)
+{
+	appendStringInfoChar(key, TAG_NAMES);
+	appendStringInfoString(key, name);
+}
+
+static void
+note_head_names(const char *name, const ProllyHash *head)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex = prolly_hash_hex(head);
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	appendStringInfo(&v, "%s\n", hex);
+	table_names(&v);
+	refs_put(key.data, key.len, &v);
+	pfree(hex);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
+ * The head names its tables as the record says, if the record is of head:
+ * their names in it, from the first line on (with it, after the hash).
+ */
+static char *
+head_names(const char *name, const ProllyHash *head)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex = prolly_hash_hex(head);
+	char	   *lines = NULL;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	if (refs_get(key.data, key.len, &v) &&
+		strncmp(v.data, hex, strlen(hex)) == 0 && v.data[strlen(hex)] == '\n')
+		lines = pstrdup(v.data + strlen(hex));
+	pfree(hex);
+	pfree(key.data);
+	pfree(v.data);
+	return lines;
+}
+
+/* The record of head, now of next (a commit that renamed nothing). */
+static void
+carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *next)
+{
+	char	   *lines = head_names(name, head);
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex;
+
+	if (lines == NULL)
+		return;
+	hex = prolly_hash_hex(next);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	appendStringInfo(&v, "%s%s", hex, lines);
+	refs_put(key.data, key.len, &v);
+	pfree(hex);
+	pfree(lines);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* Are rel's name now and its name at head the same? */
+static bool
+named_as_at_head(const char *lines, Relation rel)
+{
+	char	   *line = psprintf("\n%010u %s.%s\n", RelationGetRelid(rel),
+								get_namespace_name(RelationGetNamespace(rel)),
+								RelationGetRelationName(rel));
+	bool		same = strstr(lines, line) != NULL;
+
+	pfree(line);
+	return same;
+}
+
 /*
  * Commit the session branch as it is, with these parents; the fold is the
  * branch's next baseline.  Unless allow_empty, a commit of the branch's
@@ -1017,6 +1154,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
+	note_head_names(name, commit_id);
 	return true;
 }
 
@@ -1113,6 +1251,9 @@ copies_branch_delete(const char *name, bool force)
 			violations_key(&key, name);
 			refs_put(key.data, key.len, NULL);
 		}
+		resetStringInfo(&key);
+		names_key(&key, name);
+		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
 }
@@ -1263,6 +1404,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	ProllyMergeState ms;
 	ProllyNodeRef root;
 	ProllyDatabaseComponents dc;
+	char	   *names;
 
 	lock_refs();
 	if (!branch_head(name, &head) || !copies_commit_get(&head, &info) ||
@@ -1273,6 +1415,20 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot commit with constraint violations"),
 				 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
+	/* (each table named as the head has it: else, renamed since, the working set) */
+	names = head_names(name, &head);
+	if (names == NULL)
+		return -1;
+	for (int i = 0; i < nchanges; i++)
+	{
+		Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
+		bool		same = rel != NULL && named_as_at_head(names, rel);
+
+		if (rel)
+			table_close(rel, AccessShareLock);
+		if (!same)
+			return -1;
+	}
 	prolly_database_components(&dc);
 	if (!PROLLY_CALL(dc.canonicalizer, fold_rows, &info.root, changes, nchanges,
 					 sequences, nsequences, &root))
@@ -1282,6 +1438,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
 				 GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
+	carry_head_names(name, &head, commit_id);
 	return 1;
 }
 
@@ -1314,6 +1471,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 				 message, GetCurrentTransactionStartTimestamp(), commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
+	note_head_names(name, commit_id);
 }
 
 static void
