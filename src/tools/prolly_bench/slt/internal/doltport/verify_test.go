@@ -207,3 +207,66 @@ func TestExecutionAccounting(t *testing.T) {
 		})
 	}
 }
+
+func TestClassification(t *testing.T) {
+	r, err := Verify(fixture, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := r.Classes
+	if c.Portable+c.FeatureGated+c.NotApplicable != r.SourceCases || c.Portable == 0 || len(c.Features) == 0 {
+		t.Fatalf("%+v", c)
+	}
+	ported := 0
+	for _, a := range c.Areas {
+		if a.Ported+a.Partial+a.Deferred+a.NotStarted != a.Portable {
+			t.Fatalf("area doesn't add up: %+v", a)
+		}
+		ported += a.Ported + a.Partial
+	}
+	if ported != r.PortedCases+r.PartialCases {
+		t.Fatalf("ports counted %d times by area, %d ported", ported, r.PortedCases+r.PartialCases)
+	}
+	m := manifestAt(t, fixture)
+	first := classKey(m.Ports[0].Suite, m.Ports[0].Index)
+	tests := []struct {
+		name, want string
+		mutate     func(*Classification)
+	}{
+		{"unknown class", "unknown class", func(c *Classification) { c.Cases[0].Class = "X" }},
+		{"F without feature", "names the feature", func(c *Classification) { c.Cases[0].Class = "F"; c.Cases[0].Feature = "" }},
+		{"P with feature", "only F cases", func(c *Classification) { c.Cases[0].Class = "P"; c.Cases[0].Feature = "tags" }},
+		{"no reason", "a reason", func(c *Classification) { c.Cases[0].Reason = " " }},
+		{"duplicate", "classified twice", func(c *Classification) { c.Cases[1] = c.Cases[0] }},
+		{"missing", "classification has", func(c *Classification) { c.Cases = c.Cases[1:] }},
+		{"other revision", "another revision", func(c *Classification) { c.Revision = "0" }},
+		{"port of an N case", "full port must be of a P case", func(c *Classification) {
+			for i := range c.Cases {
+				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == first {
+					c.Cases[i].Class = "N"
+				}
+			}
+		}},
+		{"port classified from other source", "classified from other source", func(c *Classification) {
+			for i := range c.Cases {
+				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == first {
+					c.Cases[i].SHA256 = "0"
+				}
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := copyFixture(t)
+			var c Classification
+			if err := readJSON(filepath.Join(root, "classification.json"), &c); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(&c)
+			put(t, filepath.Join(root, "classification.json"), c)
+			if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %s, got %v", tt.want, err)
+			}
+		})
+	}
+}

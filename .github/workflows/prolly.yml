@@ -210,7 +210,21 @@ jobs:
           repository: dolthub/dolt
           ref: 51cc4458b740ac132cb2302fe5394a2abbfba39d
           path: dolt-vc-source
-          sparse-checkout: go/libraries/doltcore/sqle/enginetest
+          sparse-checkout: |
+            go/libraries/doltcore/sqle/enginetest
+            go/libraries/doltcore/merge
+            go/libraries/doltcore/doltdb
+            go/libraries/doltcore/ref
+            go/store/prolly/tree
+            go/store/datas
+
+      - name: Fetch pinned Doltgres test source
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/doltgresql
+          ref: d5e05f46728e4a28116770eb683090c3ccd82ca4
+          path: doltgres-vc-source
+          sparse-checkout: testing/go
 
       - name: Verify Dolt source inventory and reviewed mappings
         working-directory: src/tools/prolly_bench/slt
@@ -218,11 +232,15 @@ jobs:
           go run ./cmd/dolt-catalog \
             --repo "$GITHUB_WORKSPACE/dolt-vc-source" \
             --revision 51cc4458b740ac132cb2302fe5394a2abbfba39d \
+            --doltgres-repo "$GITHUB_WORKSPACE/doltgres-vc-source" \
+            --doltgres-revision d5e05f46728e4a28116770eb683090c3ccd82ca4 \
             --check ../corpus/dolt/source-lock.json \
             --out "$GITHUB_WORKSPACE/engine-results/dolt-catalog"
           go run ./cmd/dolt-corpus --root ../corpus/dolt \
             --catalog "$GITHUB_WORKSPACE/engine-results/dolt-catalog/catalog.json" \
-            --out "$GITHUB_WORKSPACE/engine-results/dolt-port-review.json"
+            --out "$GITHUB_WORKSPACE/engine-results/dolt-port-review.json" \
+            --markdown "$GITHUB_WORKSPACE/engine-results/dolt-coverage.md"
+          cat "$GITHUB_WORKSPACE/engine-results/dolt-coverage.md" >> "$GITHUB_STEP_SUMMARY"
           go build -o "$GITHUB_WORKSPACE/build-bench/vc/dolt-corpus" ./cmd/dolt-corpus
 
       - name: Imported Dolt scenarios

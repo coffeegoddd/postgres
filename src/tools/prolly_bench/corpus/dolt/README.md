@@ -18,6 +18,8 @@ Reproduce it from a local Dolt clone (no Dolt build or network needed):
 cd src/tools/prolly_bench/slt
 go run ./cmd/dolt-catalog --repo ~/cursor_src/dolt \
   --revision 51cc4458b740ac132cb2302fe5394a2abbfba39d \
+  --doltgres-repo ~/cursor_src/doltgresql \
+  --doltgres-revision d5e05f46728e4a28116770eb683090c3ccd82ca4 \
   --check ../corpus/dolt/source-lock.json --out /tmp/dolt-catalog
 ```
 
@@ -27,6 +29,35 @@ literal bytes and SHA-256, setup/assertion counts, skip flags, and computed SQL
 expressions requiring review. It never executes or translates upstream Go.
 The smaller committed `source-lock.json` pins file hashes and counts; the full
 catalog is a generated artifact.
+
+The lock also pins, by file hash only, the other sources ports derive from:
+Dolt's Go tests that don't run its engine (`go_tests`: the merge truth
+tables, keyless and schema merges, merge bases, revision specs and branch
+names), at the same revision, and Doltgres's Postgres-dialect version-control
+tests (`doltgres`, at `d5e05f46`). Those ports are SQL regression tests, not
+scenarios; the pin makes an upstream change to their source visible.
+
+## Classification and coverage
+
+`classification.json` classifies every catalog case, with a reason:
+
+- **P**: version control prolly supports, by area (merge, schema-merge,
+  cherry-pick, revert, branch, checkout, reset, multisession, ...). Ported,
+  or to be. Multi-session cases encode Dolt's optimistic model and are
+  rederived under Postgres semantics rather than ported literally.
+- **F**: needs a feature prolly lacks, named (diff-tables, history, as-of,
+  preview-merge-conflicts, ...). Ported with the feature; where only one
+  assertion needs it, a partial port is allowed with a review note.
+- **N**: doesn't apply: MySQL-only syntax, types or variables, the staging
+  area, Dolt internals, or suites that aren't about version control.
+
+It was drafted by rules on each suite and on what each case's literal uses
+(the first matching feature decides), then reviewed; a case's class changes
+by editing its entry. The verifier checks that every catalog case is
+classified once, by its literal's hash, and that a full port is of a P case
+(a partial one of a P or F case). `dolt-corpus` reports P cases by area as
+ported, partial, deferred or not started, and F cases by feature; `--markdown`
+writes those tables, which CI adds to the job summary.
 
 Upstream source and derived scenarios retain Dolthub's Apache-2.0 license;
 see LICENSE. This catalog does not confer test coverage by itself.

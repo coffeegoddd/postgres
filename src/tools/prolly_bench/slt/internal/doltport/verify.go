@@ -66,6 +66,7 @@ type Report struct {
 	DeferredCases          int              `json:"explicitly_deferred_cases"`
 	UnreviewedCases        int              `json:"unreviewed_cases"`
 	VerifiedAgainstCatalog bool             `json:"verified_against_catalog"`
+	Classes                ClassCoverage    `json:"classes"`
 	Engines                []EngineCoverage `json:"engines"`
 }
 
@@ -128,6 +129,7 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	report.Revision, report.Scope = lock.Revision, lock.Scope
 	report.SourceCases, report.SourceAssertions, report.UnresolvedFields = lock.Counts.Cases, lock.Counts.Assertions, lock.Counts.UnresolvedFields
 	sourceCases := map[string]doltcatalog.Case{}
+	partial := map[string]bool{}
 	if catalogPath != "" {
 		var catalog doltcatalog.Catalog
 		if err := readJSON(catalogPath, &catalog); err != nil {
@@ -223,6 +225,7 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		}
 		if setup != len(p.Setup) || assertions != len(p.Assertions) {
 			report.PartialCases++
+			partial[p.ID] = true
 		} else {
 			report.PortedCases++
 		}
@@ -250,6 +253,19 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	if report.UnreviewedCases < 0 {
 		return report, fmt.Errorf("more selected cases than source inventory")
 	}
+	var classes Classification
+	if err := readJSON(filepath.Join(root, "classification.json"), &classes); err != nil {
+		return report, err
+	}
+	var catalog map[string]doltcatalog.Case
+	if catalogPath != "" {
+		catalog = sourceCases
+	}
+	cov, err := checkClassification(classes, lock, catalog, manifest, partial)
+	if err != nil {
+		return report, err
+	}
+	report.Classes = cov
 	if resultsPath != "" {
 		engines, err := coverage(resultsPath, scenarios, hashes, credits)
 		if err != nil {
