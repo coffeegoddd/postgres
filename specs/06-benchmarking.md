@@ -87,7 +87,7 @@ larger than RAM.
 | V1 | Branch create / checkout | Root install cost |
 | V2 | Dolt-style commit after N row changes, N swept | Hashing cost (deferred-hashing engines D2–D4 pay here) |
 | V3 | Diff and three-way merge between two branches with controlled change sets (size, locality, conflicts) | Structural sharing; canonicalization cost for D3/D4 |
-| V4 | Clone / push / fetch between two local instances | Chunk export path |
+| V4 | Clone / push / fetch between two local instances (over a `postgresql://` network remote) | Chunk export path |
 | V5 | Sparse diff: one changed row in a large table | Work proportional to the change (subtree skipping), not to the table |
 
 Each V workload is also run with an S workload in the background (S1 by

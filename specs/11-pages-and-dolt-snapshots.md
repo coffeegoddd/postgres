@@ -586,7 +586,8 @@ fails without its fix), and Postgres's suites keep passing after each one.
     ("cannot merge with uncommitted changes where definitions change").
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
-built (#171, #172, #174, #175; 7.11); network remotes and V4 not yet.
+built (#171, #172, #174, #175; 7.11); network remotes, batching, the
+transfer from known heads and V4 built in the network-remotes stack (7.12).
 - File remotes first, then network remotes over libpq: fetch, push,
   clone, pull; a cloned branch's copies made on first use from its head
   commit; the check for shared dependencies (part 1, built: 7.4).
@@ -1423,7 +1424,8 @@ Not as designed, or not yet:
 
 - **The walk isn't batched or overlapped.** It asks the remote for a chunk
   at a time, as the walks read them; over a file remote that is a read.
-  Batching (7.1) matters over the network and comes with it.
+  Batching (7.1) matters over the network and comes with it (7.12: batched
+  by node, not overlapped).
 - **Clone walks** rather than copying the remote's files whole and then
   checking them (7.4): the same bound, O(B); the whole-file copy waits for
   V4 to say what it saves.
@@ -1452,7 +1454,66 @@ Not as designed, or not yet:
 - **Not built:** network remotes over libpq, the transfer from known
   heads, `pg_prolly_fetch` and `pg_prolly_push` (they guard the remote
   functions, which come with them), deleting a remote's branch (so
-  `dolt_fetch --prune` too), resuming, and V4.
+  `dolt_fetch --prune` too), resuming, and V4. (All but deleting and
+  resuming since: 7.12.)
+
+### 7.12 As built (network remotes)
+
+Built: decision (A) of 7.5, behind the remote interface.
+
+- **Serving.** A database serves as a remote through `dolt_serve_*`
+  functions: its format and heads (each branch with a commit), `has` and
+  `get` of a batch of hashes, and for a push `receive` (batches of chunks
+  kept in a temporary file for the remote's transaction) and `move_head`.
+  The move receives what was sent as a fetch receives (the transfer's
+  receive, through the remote interface over that file: each chunk
+  re-hashed, every reference resolved, the commit of this build's format)
+  before anything is added, then moves the branch with the refs' new
+  `branch_move()`: a compare-and-swap of its head; a branch it hasn't made
+  with only its head; one with copies moved there, its rows written,
+  refused over uncommitted changes unless `--force` (which drops them),
+  as 7.3 decided; a merge in progress there ended, as a reset ends one.
+  A branch without commits whose working set holds anything (an empty
+  versioned schema included) counts as changed. A push's move checks what the commit needs that the branch's head
+  doesn't (7.4), as a move does; a branch read as of its head first (a
+  snapshot older than it refuses, or is renewed).
+- **Privileges (7.6).** The predefined roles `pg_prolly_fetch` and
+  `pg_prolly_push`; the functions' EXECUTE is granted only to them (and a
+  push's role may fetch too), and each checks the database's owner or
+  either role. So an owner who isn't a superuser needs one of the roles,
+  or EXECUTE granted, to be fetched from: a revoked EXECUTE can't be
+  given to "the owner of the current database".
+- **The client.** URLs `postgresql://` and `postgres://` (libpq's), served
+  by a loadable module, `prolly_remote_libpq`, as replication's
+  `libpqwalreceiver` is: core doesn't link libpq. A role that isn't a
+  superuser must give a password in the URL and the connection must use
+  it, as dblink asks. A remote's errors come back with their SQLSTATE.
+  One remote opened is one transaction there; a push's `move_head`
+  commits it. TLS is the connection's (`sslmode`), tested against a
+  server that takes TLS only.
+- **Batching (7.1), by node.** A tree walk tells the chunk store what it
+  reads next (a node's children, a leaf's value trees: `prefetch()`), and
+  a store reading through a source passes it on (`read_through()`'s
+  hint): a receive asks the remote at once for those it lacks
+  (`get_many()`), a send at once which of them it has (`has_many()`). A
+  batch is a node's fan-out, not 7.1's 64K breadth-first frontier, and
+  checks aren't overlapped with fetches: a clone of 324 chunks took 8
+  requests (`t/048`).
+- **From known heads (7.1).** The receiver names every head it has
+  (branches and remote-tracking heads), and a remote that runs this code
+  (`get_since()`, `dolt_serve_since()`) streams the commits from the
+  wanted down to those, each with its own chunks and what its root changed
+  from its first parent's (the tree's `diff_nodes()`, the canonicalizer's
+  `walk_changes()`: equal subtrees skipped). It is kept as anything
+  received is, and the walk then runs as before and asks for what wasn't
+  sent: 30 commits in a line came in one exchange and no other request
+  (`t/048`). A file remote tells nothing (it runs no code).
+- **V4** (`06-benchmarking.md`): a second local instance clones over
+  `postgresql://`, fetches a commit the origin made since, and pushes one
+  back to a new branch; each timed. Measured in step 8.
+- **Still not built:** deleting a remote's branch (so `dolt_fetch
+  --prune`), resuming a transfer, a bounded seen set, the whole-file
+  clone.
 
 ## 8. Step 7 design: reclamation
 
