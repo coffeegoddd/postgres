@@ -125,6 +125,8 @@
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "catalog/versioned.h"
@@ -1125,6 +1127,104 @@ folded_dependencies(const ProllyNodeRef *tree, ProllyCanonDependencyVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+/* A function, by its qualified name (an aggregate's support function). */
+static char *
+qualified_function(Oid fn)
+{
+	return quote_qualified_identifier(get_namespace_name(get_func_namespace(fn)),
+									  get_func_name(fn));
+}
+
+/*
+ * An aggregate's definition, as CREATE OR REPLACE AGGREGATE writes it: every
+ * option, defaults too, so a change in any of them changes the commit.
+ * (Postgres has no deparser for aggregates; pg_dump writes them so.)
+ */
+static char *
+aggregate_def(Form_pg_proc proc)
+{
+	HeapTuple	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(proc->oid));
+	Form_pg_aggregate agg;
+	StringInfoData def;
+	Datum		d;
+	bool		isnull;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for aggregate %u", proc->oid);
+	agg = (Form_pg_aggregate) GETSTRUCT(tup);
+	initStringInfo(&def);
+	appendStringInfo(&def, "CREATE OR REPLACE AGGREGATE %s(%s) (\n SFUNC = %s,\n STYPE = %s",
+					 quote_qualified_identifier(get_namespace_name(proc->pronamespace),
+												NameStr(proc->proname)),
+					 TextDatumGetCString(DirectFunctionCall1(pg_get_function_arguments,
+															 ObjectIdGetDatum(proc->oid))),
+					 qualified_function(agg->aggtransfn),
+					 format_type_be_qualified(agg->aggtranstype));
+	if (agg->aggtransspace != 0)
+		appendStringInfo(&def, ",\n SSPACE = %d", agg->aggtransspace);
+	if (OidIsValid(agg->aggfinalfn))
+	{
+		appendStringInfo(&def, ",\n FINALFUNC = %s", qualified_function(agg->aggfinalfn));
+		if (agg->aggfinalextra)
+			appendStringInfoString(&def, ",\n FINALFUNC_EXTRA");
+	}
+	appendStringInfo(&def, ",\n FINALFUNC_MODIFY = %s",
+					 agg->aggfinalmodify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
+					 agg->aggfinalmodify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE");
+	if (OidIsValid(agg->aggcombinefn))
+		appendStringInfo(&def, ",\n COMBINEFUNC = %s", qualified_function(agg->aggcombinefn));
+	if (OidIsValid(agg->aggserialfn))
+		appendStringInfo(&def, ",\n SERIALFUNC = %s", qualified_function(agg->aggserialfn));
+	if (OidIsValid(agg->aggdeserialfn))
+		appendStringInfo(&def, ",\n DESERIALFUNC = %s", qualified_function(agg->aggdeserialfn));
+	d = SysCacheGetAttr(AGGFNOID, tup, Anum_pg_aggregate_agginitval, &isnull);
+	if (!isnull)
+		appendStringInfo(&def, ",\n INITCOND = %s",
+						 quote_literal_cstr(TextDatumGetCString(d)));
+	if (OidIsValid(agg->aggmtransfn))
+	{
+		appendStringInfo(&def, ",\n MSFUNC = %s,\n MINVFUNC = %s,\n MSTYPE = %s",
+						 qualified_function(agg->aggmtransfn),
+						 qualified_function(agg->aggminvtransfn),
+						 format_type_be_qualified(agg->aggmtranstype));
+		if (agg->aggmtransspace != 0)
+			appendStringInfo(&def, ",\n MSSPACE = %d", agg->aggmtransspace);
+		if (OidIsValid(agg->aggmfinalfn))
+		{
+			appendStringInfo(&def, ",\n MFINALFUNC = %s", qualified_function(agg->aggmfinalfn));
+			if (agg->aggmfinalextra)
+				appendStringInfoString(&def, ",\n MFINALFUNC_EXTRA");
+		}
+		appendStringInfo(&def, ",\n MFINALFUNC_MODIFY = %s",
+						 agg->aggmfinalmodify == AGGMODIFY_READ_ONLY ? "READ_ONLY" :
+						 agg->aggmfinalmodify == AGGMODIFY_SHAREABLE ? "SHAREABLE" : "READ_WRITE");
+		d = SysCacheGetAttr(AGGFNOID, tup, Anum_pg_aggregate_aggminitval, &isnull);
+		if (!isnull)
+			appendStringInfo(&def, ",\n MINITCOND = %s",
+							 quote_literal_cstr(TextDatumGetCString(d)));
+	}
+	if (OidIsValid(agg->aggsortop))
+	{
+		HeapTuple	op = SearchSysCache1(OPEROID, ObjectIdGetDatum(agg->aggsortop));
+		Form_pg_operator opform;
+
+		if (!HeapTupleIsValid(op))
+			elog(ERROR, "cache lookup failed for operator %u", agg->aggsortop);
+		opform = (Form_pg_operator) GETSTRUCT(op);
+		appendStringInfo(&def, ",\n SORTOP = OPERATOR(%s.%s)",
+						 quote_identifier(get_namespace_name(opform->oprnamespace)),
+						 NameStr(opform->oprname));
+		ReleaseSysCache(op);
+	}
+	if (agg->aggkind == AGGKIND_HYPOTHETICAL)
+		appendStringInfoString(&def, ",\n HYPOTHETICAL");
+	appendStringInfo(&def, ",\n PARALLEL = %s\n)",
+					 proc->proparallel == PROPARALLEL_SAFE ? "SAFE" :
+					 proc->proparallel == PROPARALLEL_RESTRICTED ? "RESTRICTED" : "UNSAFE");
+	ReleaseSysCache(tup);
+	return def.data;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -1279,14 +1379,17 @@ collect(Canon *cn)
 							qualified(proc->pronamespace, NameStr(proc->proname)),
 							TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
 																	ObjectIdGetDatum(proc->oid))));
-			if (proc->prokind != PROKIND_FUNCTION &&
-				proc->prokind != PROKIND_PROCEDURE &&
-				uncovered(cn, "aggregates and window functions", name))
+			/* (a window function is written in C: none to hold) */
+			if (proc->prokind == PROKIND_WINDOW &&
+				uncovered(cn, "window functions", name))
 				continue;
 			it = add_item(cn, "f:", name);
-			append_utf8(&it->value,
-						TextDatumGetCString(DirectFunctionCall1(pg_get_functiondef,
-																ObjectIdGetDatum(proc->oid))));
+			if (proc->prokind == PROKIND_AGGREGATE)
+				append_utf8(&it->value, aggregate_def(proc));
+			else
+				append_utf8(&it->value,
+							TextDatumGetCString(DirectFunctionCall1(pg_get_functiondef,
+																	ObjectIdGetDatum(proc->oid))));
 		}
 		systable_endscan(scan);
 		table_close(pg_proc, AccessShareLock);
@@ -2899,13 +3002,21 @@ sequence_options_sql(const char *def)
 					strcmp(cycle, "cycle") == 0 ? "CYCLE" : "NO CYCLE");
 }
 
-/* DROP FUNCTION or DROP PROCEDURE, as the definition says. */
+/* Is a routine's definition an aggregate's? */
+static bool
+is_aggregate(const MoveItem *it)
+{
+	return strncmp(it->def, "CREATE OR REPLACE AGGREGATE", 27) == 0;
+}
+
+/* DROP FUNCTION, PROCEDURE or AGGREGATE, as the definition says. */
 static char *
 drop_routine_sql(const MoveItem *it)
 {
 	return psprintf("DROP %s IF EXISTS %s",
 					strstr(it->def, "CREATE OR REPLACE PROCEDURE") == it->def ?
-					"PROCEDURE" : "FUNCTION", it->name);
+					"PROCEDURE" : is_aggregate(it) ? "AGGREGATE" : "FUNCTION",
+					it->name);
 }
 
 /*
@@ -3564,8 +3675,11 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		switch (f->kind)
 		{
 			case 'f':
+				/* (an aggregate before the functions it uses) */
 				if (t == NULL)
-					routines = lappend(routines, drop_routine_sql(f));
+					routines = is_aggregate(f) ?
+						lcons(drop_routine_sql(f), routines) :
+						lappend(routines, drop_routine_sql(f));
 				break;
 			case 'y':
 			case 'm':
@@ -3699,17 +3813,30 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v')
 			goto unsupported;
 	}
-	foreach(lc, to)
 	{
-		MoveItem   *t = lfirst(lc);
-		MoveItem   *f = find_item(from, t->kind, t->name);
+		List	   *aggregates = NIL;
 
-		if (t->kind != 'f' || (f && strcmp(t->def, f->def) == 0))
-			continue;
-		/* (CREATE OR REPLACE can't change what a routine returns) */
-		if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
-			sm.before = lappend(sm.before, drop_routine_sql(f));
-		sm.before = lappend(sm.before, t->def);
+		foreach(lc, to)
+		{
+			MoveItem   *t = lfirst(lc);
+			MoveItem   *f = find_item(from, t->kind, t->name);
+
+			if (t->kind != 'f' || (f && strcmp(t->def, f->def) == 0))
+				continue;
+			/* (an aggregate after the functions it uses) */
+			if (is_aggregate(t))
+			{
+				if (f)
+					sm.before = lappend(sm.before, drop_routine_sql(f));
+				aggregates = lappend(aggregates, t->def);
+				continue;
+			}
+			/* (CREATE OR REPLACE can't change what a routine returns) */
+			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+				sm.before = lappend(sm.before, drop_routine_sql(f));
+			sm.before = lappend(sm.before, t->def);
+		}
+		sm.before = list_concat(sm.before, aggregates);
 	}
 	foreach(lc, to)
 	{
