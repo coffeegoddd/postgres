@@ -75,11 +75,15 @@
 #include "storage/lock.h"
 #include "storage/smgr.h"
 #include "utils/lsyscache.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #define STATE_VERSION		7
+
+/* carried pages a fold keeps, whatever the table's size (past an eighth of it) */
+#define CARRIED_BLOCKS_MIN	1024
 #define STATE_UNSETTLED		0x01	/* rows the fold didn't see as settled,
 									 * whose keys it couldn't carry */
 
@@ -149,6 +153,7 @@ typedef struct Finder
 	BlockNumber *cblocks;		/* without a key: the blocks carried */
 	int			ncblocks;
 	int			maxcblocks;
+	MemoryContext foldcxt;		/* the fold's: what lasts all of it */
 	ProllyChangeCounters work;	/* what this fold read, counted once it's done */
 } Finder;
 
@@ -299,6 +304,7 @@ static void
 finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 {
 	memset(f, 0, sizeof(*f));
+	f->foldcxt = CurrentMemoryContext;
 	f->rel = rel;
 	f->snap = GetActiveSnapshot();
 	f->tree = prolly_tree_lookup("cow");
@@ -425,13 +431,31 @@ add_candidate(Candidate **arr, int *n, int *max, const StringInfoData *key,
 /* Is the value of column i (0-based) stored out of line? */
 /*
  * A table without a key carries the blocks of tuples the snapshot doesn't
- * see as settled, to read again next time.
+ * see as settled, to read again next time: unless the tuple is the fold's
+ * own transaction's (written in this command or since, or by a
+ * subtransaction its snapshot is older than), which the next fold, judging
+ * by the snapshot, couldn't tell from one it saw; then the table is read
+ * in full next time.
  */
 static void
-carry_block(Finder *f, BlockNumber blkno)
+carry_tuple(Finder *f, HeapTuple tup)
 {
+	HeapTupleHeader t = tup->t_data;
+	BlockNumber blkno = ItemPointerGetBlockNumber(&tup->t_self);
+	MemoryContext old;
+
+	if ((!HeapTupleHeaderXminFrozen(t) && !(t->t_infomask & HEAP_XMIN_INVALID) &&
+		 TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(t))) ||
+		(!(t->t_infomask & HEAP_XMAX_INVALID) &&
+		 !HEAP_XMAX_IS_LOCKED_ONLY(t->t_infomask) &&
+		 TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(t))))
+	{
+		f->unsettled = true;
+		return;
+	}
 	if (f->ncblocks > 0 && f->cblocks[f->ncblocks - 1] == blkno)
 		return;
+	old = MemoryContextSwitchTo(f->foldcxt);
 	if (f->ncblocks == f->maxcblocks)
 	{
 		f->maxcblocks = Max(64, f->maxcblocks * 2);
@@ -439,6 +463,7 @@ carry_block(Finder *f, BlockNumber blkno)
 			palloc_array(BlockNumber, f->maxcblocks);
 	}
 	f->cblocks[f->ncblocks++] = blkno;
+	MemoryContextSwitchTo(old);
 }
 
 static bool
@@ -526,7 +551,7 @@ page_tuple(Finder *f, HeapTuple tup, void *arg)
 	if (f->keyless)
 	{
 		if (unsettled)
-			carry_block(f, ItemPointerGetBlockNumber(&tup->t_self));
+			carry_tuple(f, tup);
 		return true;
 	}
 	if (!tuple_key(f, tup, &pv->key, &pv->keyrow))
@@ -550,8 +575,8 @@ page_tuple(Finder *f, HeapTuple tup, void *arg)
  * The tuples on a version of page blkno.  With 'candidates', each names a
  * candidate, visible or not (a key out of line gives up).  Of the version
  * the table has now ('current'), keys of tuples the snapshot doesn't see
- * as settled are carried (a key out of line, or a keyless table's tuple,
- * marks the table unsettled instead).
+ * as settled are carried (a key out of line marks the table unsettled
+ * instead; a keyless table's tuple carries its block).
  */
 static void
 page_tuples(Finder *f, Page page, BlockNumber blkno, bool current,
@@ -687,10 +712,11 @@ block_cmp(const void *a, const void *b)
 /* ----------------------------------------------------------------
  * Tables without a primary key
  *
- * Every tuple on a page the baseline's fold saw was settled for it (else
- * the baseline is marked unsettled), so a tuple of a listed page's old
- * version was visible to the fold exactly when its transactions committed
- * as they did; a page not listed holds what it held.  A page's first
+ * A page the baseline's fold saw tuples on that weren't settled for it
+ * (in flight then) is carried, to be read again; whether the fold saw a
+ * tuple of an old version is told by the fold's snapshot (base_saw()), not
+ * by whether its transaction committed since.  A page not listed holds
+ * what it held then.  A page's first
  * listed old version is the page as the fold saw it: it was copied at the
  * page's first change since, and nothing changed it before.  (A later one,
  * from a fold that began an epoch and never became a baseline, can hold
@@ -899,7 +925,7 @@ now_tuple(Finder *f, HeapTuple tup, void *arg)
 	NowVisit   *nv = arg;
 
 	if (tuple_unsettled(f, tup->t_data))
-		carry_block(f, ItemPointerGetBlockNumber(&tup->t_self));
+		carry_tuple(f, tup);
 	if (HeapTupleSatisfiesVisibility(tup, f->snap, nv->buf))
 		nv->ct->t[nv->ct->n++] = *heap_copytuple(tup);
 	return true;
@@ -919,14 +945,13 @@ same_data(const HeapTupleData *a, const HeapTupleData *b)
 
 /*
  * The copies on page blkno: those the fold saw on its old version (if
- * old_block is valid; or, unchanged, if 'unchanged', the version now),
- * counted -1, and those the snapshot sees on its version now (if 'now'),
- * counted +1.  A tuple on both, the same row, cancels unread.  False to
- * fold in full instead.
+ * old_block is valid), counted -1, and those the snapshot sees on its
+ * version now (if 'now'), counted +1.  A tuple on both, the same row,
+ * cancels unread.  False to fold in full instead.
  */
 static bool
 block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
-			 BlockNumber old_block, bool unchanged, bool now)
+			 BlockNumber old_block, bool now)
 {
 	Counted    *was = &bs->was;
 	Counted    *is = &bs->is;
@@ -935,22 +960,12 @@ block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
 
 	was->n = is->n = 0;
 	MemoryContextReset(bs->cxt);
-	if (BlockNumberIsValid(old_block) || unchanged)
+	if (BlockNumberIsValid(old_block))
 	{
 		OldVisit	ov = {was, true};
 
-		if (unchanged)
-		{
-			Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
-												 RBM_NORMAL, NULL);
-
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			memcpy(bs->oldpage.data, BufferGetPage(buf), BLCKSZ);
-			UnlockReleaseBuffer(buf);
-		}
-		else
-			bmap_read_old(RelationGetSmgr(f->rel), blkno, old_block,
-						  bs->oldpage.data);
+		bmap_read_old(RelationGetSmgr(f->rel), blkno, old_block,
+					  bs->oldpage.data);
 
 		/* (the statuses of its transactions, while they are kept) */
 		LWLockAcquire(XactTruncationLock, LW_SHARED);
@@ -996,6 +1011,67 @@ block_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno,
 		if (is->t[j].t_data != NULL)
 			ok = add_copy(f, cs, &is->t[j], 1, false);
 	return ok;
+}
+
+/*
+ * The copies on a carried page unchanged since the fold: it is as the fold
+ * saw it, so each tuple counts once, by whether the fold saw it and whether
+ * the snapshot does: -1 if only the fold, +1 if only the snapshot.  (One
+ * read of the page, under its share lock; the tuples counted are copied,
+ * and encoded after.)
+ */
+static bool
+unchanged_copies(Finder *f, Copies *cs, BlockScratch *bs, BlockNumber blkno)
+{
+	Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
+										 RBM_NORMAL, NULL);
+	Page		page;
+	OffsetNumber maxoff;
+	bool		known = true;
+	bool		ok = true;
+	MemoryContext old;
+	int64	   *deltas = palloc_array(int64, MaxHeapTuplesPerPage);
+	int			n = 0;
+
+	MemoryContextReset(bs->cxt);
+	old = MemoryContextSwitchTo(bs->cxt);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	LWLockAcquire(MultiXactTruncationLock, LW_SHARED);
+	page = BufferGetPage(buf);
+	f->work.pages++;
+	maxoff = PageIsNew(page) ? InvalidOffsetNumber : PageGetMaxOffsetNumber(page);
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff && known; off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+		HeapTupleData tup;
+		bool		saw;
+		bool		sees;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(f->rel);
+		ItemPointerSet(&tup.t_self, blkno, off);
+		if (tuple_unsettled(f, tup.t_data))
+			carry_tuple(f, &tup);
+		saw = fold_saw(f, tup.t_data, &known);
+		sees = HeapTupleSatisfiesVisibility(&tup, f->snap, buf);
+		if (saw != sees)
+		{
+			bs->is.t[n] = *heap_copytuple(&tup);
+			deltas[n++] = sees ? 1 : -1;
+		}
+	}
+	LWLockRelease(MultiXactTruncationLock);
+	LWLockRelease(XactTruncationLock);
+	UnlockReleaseBuffer(buf);
+	MemoryContextSwitchTo(old);
+	for (int i = 0; ok && known && i < n; i++)
+		ok = add_copy(f, cs, &bs->is.t[i], deltas[i], deltas[i] < 0);
+	pfree(deltas);
+	return ok && known;
 }
 
 static bool
@@ -1120,9 +1196,10 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 	 */
 	for (int i = 0; ok && i < npages; i++)
 	{
-		ok = block_copies(f, &cs, bs, pages[i].blkno, pages[i].old_block,
-						  !BlockNumberIsValid(pages[i].old_block),
-						  pages[i].blkno < nblocks);
+		ok = BlockNumberIsValid(pages[i].old_block) ?
+			block_copies(f, &cs, bs, pages[i].blkno, pages[i].old_block,
+						 pages[i].blkno < nblocks) :
+			unchanged_copies(f, &cs, bs, pages[i].blkno);
 		CHECK_FOR_INTERRUPTS();
 	}
 	for (BlockNumber blk = low; ok && blk < nblocks; blk++)
@@ -1131,7 +1208,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 			p++;
 		if (p < npages && pages[p].blkno == blk)
 			continue;
-		ok = block_copies(f, &cs, bs, blk, InvalidBlockNumber, false, true);
+		ok = block_copies(f, &cs, bs, blk, InvalidBlockNumber, true);
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (!ok)
@@ -1784,6 +1861,7 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 			if (have)
 				bmap_fold_prune(RelationGetSmgr(rel), &st.fold);
 			bmap_fold_begin(RelationGetSmgr(rel), &fold);
+			INJECTION_POINT("prolly-fold-begun", NULL);
 		}
 		if (!have || !fold_changed(&f, baseline, &st, next != NULL, data))
 		{
@@ -1820,6 +1898,17 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 					if (f.cblocks[i] != f.cblocks[u - 1])
 						f.cblocks[u++] = f.cblocks[i];
 				f.ncblocks = u;
+			}
+
+			/*
+			 * (more pages carried than reading the table in full would cost
+			 * much more than: the table is read in full next time)
+			 */
+			if (f.ncblocks > CARRIED_BLOCKS_MIN &&
+				f.ncblocks > RelationGetNumberOfBlocks(rel) / 8)
+			{
+				ns.flags |= STATE_UNSETTLED;
+				f.ncblocks = 0;
 			}
 			ns.nblocks_carried = f.ncblocks;
 			ns.blocks_carried = f.cblocks;
