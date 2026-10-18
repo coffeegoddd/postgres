@@ -47,5 +47,35 @@ SELECT test_chunk_put('ac missing') = :'missing' AS now_present;
 SELECT test_chunk_put_node(1, ARRAY[:'present', :'missing']) = :'dangling1' AS same;
 SELECT test_chunk_has(:'dangling1');
 
+-- A subtransaction that aborts takes the chunks it put with it: one
+-- naming a missing chunk fails nothing once it is rolled back.  What the
+-- transaction put before, or in a subtransaction that committed, stays.
+SELECT encode(sha256('ac missing in savepoint'), 'hex') AS missing_sp \gset
+BEGIN;
+SELECT test_chunk_put('ac before savepoint') AS before_sp \gset
+SAVEPOINT a;
+SELECT test_chunk_put('ac released') AS released \gset
+RELEASE SAVEPOINT a;
+SAVEPOINT b;
+SELECT test_chunk_put_node(1, ARRAY[:'missing_sp']) AS rolled_back \gset
+SAVEPOINT c;
+SELECT test_chunk_put_node(0, ARRAY[:'missing_sp']) AS rolled_back_inner \gset
+RELEASE SAVEPOINT c;
+ROLLBACK TO SAVEPOINT b;
+SELECT test_chunk_put('ac after savepoint') AS after_sp \gset
+COMMIT;
+SELECT test_chunk_has(:'before_sp') AS before_sp, test_chunk_has(:'released') AS released,
+	test_chunk_has(:'after_sp') AS after_sp, test_chunk_has(:'rolled_back') AS rolled_back,
+	test_chunk_has(:'rolled_back_inner') AS rolled_back_inner;
+-- Likewise past a batch appended in the subtransaction: what it appended
+-- stays, the rest goes.
+BEGIN;
+SAVEPOINT a;
+SELECT test_chunk_put(convert_to(repeat('ac sp batch', 120000), 'UTF8')) AS sp_batch \gset
+SELECT test_chunk_put_node(1, ARRAY[:'missing_sp']) AS rolled_back2 \gset
+ROLLBACK TO SAVEPOINT a;
+COMMIT;
+SELECT test_chunk_has(:'sp_batch') AS sp_batch, test_chunk_has(:'rolled_back2') AS rolled_back2;
+
 -- A chunk that isn't a node names nothing.
 SELECT test_chunk_has(test_chunk_put('\x01010000'::bytea));

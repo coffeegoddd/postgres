@@ -232,6 +232,8 @@ struct ProllyChunkStore
 	bool		moving;
 	ProllyHash	new_root;
 	List	   *saved;			/* MoveSave *, innermost last */
+	List	   *pending_saved;	/* PendingSave *, innermost last */
+	uint64		flushes;		/* times pending was appended */
 	uint64		pad_offset;		/* 0: no PAD yet */
 	/* the ROOT record, made before the commit's critical section */
 	char		root_rec[RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN];
@@ -248,6 +250,19 @@ typedef struct MoveSave
 	bool		moving;
 	ProllyHash	new_root;
 } MoveSave;
+
+/*
+ * The pending chunks as they were before a subtransaction (at nesting
+ * level 'level') first put one, to go back to if it aborts: pending's
+ * length then, unless it was appended since (flushes moved), when all of
+ * pending is the subtransaction's.
+ */
+typedef struct PendingSave
+{
+	int			level;
+	uint64		flushes;
+	int			len;
+} PendingSave;
 
 extern const ProllyChunkStoreRoutine prolly_chunkstore_journal;
 
@@ -677,6 +692,22 @@ static bool tables_get(ProllyChunkStore *s, const ProllyHash *hash,
 					   StringInfo out);
 static void load_tables(ProllyChunkStore *s, bool force);
 
+/*
+ * Is the chunk (its key) in the store's files?  Without reading through:
+ * what the store itself holds.
+ */
+static bool
+stored_has(ProllyChunkStore *s, const ProllyHash *key)
+{
+	if (index_has(s->index, key) || tables_get(s, key, NULL))
+		return true;
+	scan_journal(s);
+	if (index_has(s->index, key))
+		return true;
+	load_tables(s, false);
+	return tables_get(s, key, NULL);
+}
+
 /* a pending chunk whose references are being checked */
 typedef struct RefCheck
 {
@@ -698,14 +729,7 @@ check_reference(const ProllyHash *ref, void *arg)
 
 	hash_key(&key, ref);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		index_has(s->index, &key) ||
-		tables_get(s, &key, NULL))
-		return;
-	scan_journal(s);
-	if (index_has(s->index, &key))
-		return;
-	load_tables(s, false);
-	if (tables_get(s, &key, NULL))
+		stored_has(s, &key))
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -764,6 +788,24 @@ flush_pending(ProllyChunkStore *s)
 		hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
 	}
 	resetStringInfo(&s->pending);
+	s->flushes++;
+}
+
+/* Forget the pending chunks from offset len on. */
+static void
+pending_truncate(ProllyChunkStore *s, int len)
+{
+	HASH_SEQ_STATUS status;
+	IndexEntry *e;
+
+	hash_seq_init(&status, s->pending_index);
+	while ((e = hash_seq_search(&status)) != NULL)
+	{
+		if (e->offset >= len)
+			hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
+	}
+	s->pending.len = len;
+	s->pending.data[len] = '\0';
 }
 
 static void
@@ -822,6 +864,7 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->moving = false;
 			s->pad_offset = 0;
 			s->saved = NIL;
+			s->pending_saved = NIL;
 			s->through = NULL;
 			s->through_hint = NULL;
 			break;
@@ -829,6 +872,7 @@ journal_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 			discard_pending(s);
 			s->saved = NIL;
+			s->pending_saved = NIL;
 			s->through = NULL;
 			s->through_hint = NULL;
 			break;
@@ -836,9 +880,44 @@ journal_xact_callback(XactEvent event, void *arg)
 }
 
 /*
+ * A subtransaction's pending chunks go with it: an aborted one's are
+ * forgotten (one naming a chunk the store lacks would fail its parent's
+ * every append), a committed one's are its parent's.  What it appended
+ * already passed the check, and may stay, unreachable.
+ */
+static void
+pending_subxact(ProllyChunkStore *s, SubXactEvent event, int level)
+{
+	PendingSave *last;
+
+	if (s->pending_saved == NIL)
+		return;
+	last = llast(s->pending_saved);
+	if (last->level < level)
+		return;
+	Assert(last->level == level);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		pending_truncate(s, last->flushes == s->flushes ? last->len : 0);
+		s->pending_saved = list_delete_last(s->pending_saved);
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		/* the parent's saved state, if it has one, is the older */
+		if (level - 1 <= 1 ||
+			(list_length(s->pending_saved) > 1 &&
+			 ((PendingSave *) list_nth(s->pending_saved,
+									   list_length(s->pending_saved) - 2))->level == level - 1))
+			s->pending_saved = list_delete_last(s->pending_saved);
+		else
+			last->level = level - 1;
+	}
+}
+
+/*
  * A subtransaction's root moves go with it: an aborted one's are undone
  * (its lock on the root, if it took it, is released with it); a committed
- * one's are its parent's.  Its chunks may stay, unreachable.
+ * one's are its parent's.  Its chunks too (pending_subxact()).
  */
 static void
 journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
@@ -848,7 +927,10 @@ journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	int			level = GetCurrentTransactionNestLevel();
 	MoveSave   *last;
 
-	if (s == NULL || s->saved == NIL)
+	if (s == NULL)
+		return;
+	pending_subxact(s, event, level);
+	if (s->saved == NIL)
 		return;
 	last = llast(s->saved);
 	if (last->level < level)
@@ -1705,6 +1787,7 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	Size		headlen;
 	uint64		at;
 	TransactionId xid;
+	int			level;
 
 	if (hash->len == 0 || hash->len > PROLLY_HASH_MAX_LEN)
 		elog(ERROR, "invalid chunk hash length %u", hash->len);
@@ -1720,6 +1803,22 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		index_has(s->index, &key) ||
 		tables_get(s, &key, NULL))
 		return;
+
+	/* pending as it was, if a subtransaction puts its first */
+	level = GetCurrentTransactionNestLevel();
+	if (level > 1 &&
+		(s->pending_saved == NIL ||
+		 ((PendingSave *) llast(s->pending_saved))->level < level))
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		PendingSave *save = palloc(sizeof(PendingSave));
+
+		save->level = level;
+		save->flushes = s->flushes;
+		save->len = s->pending.len;
+		s->pending_saved = lappend(s->pending_saved, save);
+		MemoryContextSwitchTo(old);
+	}
 
 	/* an XCHUNK: the transaction's until it ends */
 	xid = GetTopTransactionId();
@@ -1795,14 +1894,7 @@ journal_has(ProllyChunkStore *s, const ProllyHash *hash)
 
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		index_has(s->index, &key) ||
-		tables_get(s, &key, NULL))
-		return true;
-	scan_journal(s);
-	if (index_has(s->index, &key))
-		return true;
-	load_tables(s, false);
-	if (tables_get(s, &key, NULL))
+		stored_has(s, &key))
 		return true;
 	return s->through != NULL && s->through(s->through_arg, hash, NULL);
 }

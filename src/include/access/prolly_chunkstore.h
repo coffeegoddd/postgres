@@ -19,9 +19,11 @@
  *   when it reaches the store's files (in batches, and the rest before the
  *   transaction commits), each chunk it names found among them or in the
  *   store, or the transaction fails with a serialization failure (the
- *   chunk named was collected after the transaction read it).  Every change to the store's files is
- *   WAL-logged, so recovery, standbys and base backups carry the history,
- *   and a database made from another (CREATE DATABASE) gets a copy of it.
+ *   chunk named was collected after the transaction read it); a
+ *   subtransaction that aborts takes the chunks it put with it.  Every
+ *   change to the store's files is WAL-logged, so recovery, standbys and
+ *   base backups carry the history, and a database made from another
+ *   (CREATE DATABASE) gets a copy of it.
  * - get() appends a chunk's bytes to out; false if the store has none by
  *   that hash.  has() answers without reading the chunk.
  * - root() is the root as last committed (or as moved by the calling
