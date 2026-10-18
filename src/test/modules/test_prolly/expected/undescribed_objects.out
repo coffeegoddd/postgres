@@ -69,6 +69,83 @@ SELECT length(dolt_commit('-Am', 'an enum')::text) AS committed;
         66
 (1 row)
 
+-- only a commit refuses them: a move discards them as uncommitted work
+-- (a reset), or leaves them on their branch (a checkout); a branch's first
+-- use doesn't take them from the branch it was copied from
+CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
+CREATE FOREIGN DATA WRAPPER ud_fdw;
+CREATE SERVER ud_srv FOREIGN DATA WRAPPER ud_fdw;
+CREATE FOREIGN TABLE ud.ft (a int) SERVER ud_srv;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+ operators 
+-----------
+         0
+(1 row)
+
+SELECT count(*) AS foreign_tables FROM pg_class WHERE relnamespace = 'ud'::regnamespace
+  AND relkind = 'f';
+ foreign_tables 
+----------------
+              0
+(1 row)
+
+SELECT dolt_branch('ud_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
+SELECT dolt_checkout('ud_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'ud_other'"}
+(1 row)
+
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+ operators 
+-----------
+         0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+ operators 
+-----------
+         1
+(1 row)
+
+SELECT * FROM dolt_status WHERE status = 'not covered';
+ table_name | staged |   status    
+------------+--------+-------------
+ ud."==="   | f      | not covered
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'ud_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SERVER ud_srv;
+DROP FOREIGN DATA WRAPPER ud_fdw;
 DROP SCHEMA ud CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table ud.t

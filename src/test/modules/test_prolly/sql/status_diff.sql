@@ -131,10 +131,11 @@ INSERT INTO sdl.t VALUES (1, 'one', 16400);
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdl.%' ORDER BY table_name;
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdl.t);
 SELECT dolt_commit('-am', 'a large object');
--- a reset folds the working set as a commit does, so it is refused too
--- until the column is dropped
+-- only a commit refuses it: a reset discards the column, as any
+-- uncommitted change
 SELECT dolt_reset('--hard');
-ALTER TABLE sdl.t DROP COLUMN doc;
+SELECT count(*) AS doc_columns FROM pg_attribute
+  WHERE attrelid = 'sdl.t'::regclass AND attname = 'doc';
 CREATE TABLE sdl.u (id int PRIMARY KEY, o oid, c regclass, r oid[], p sdl.pair,
 	x oid8);
 SELECT dolt_commit('-Am', 'oids');

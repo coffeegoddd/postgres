@@ -106,8 +106,14 @@ typedef struct ProllyCanonRoutine
 
 	void		(*walk) (const ProllyNodeRef *root, ProllyTreeVisitNode visit,
 						 void *arg);
+	/*
+	 * The session branch's versioned schemas folded.  For a commit, objects
+	 * the canonical form doesn't describe are refused; otherwise (a move's
+	 * fold, a checkpoint's) they are left out of root, as read_fold() leaves
+	 * them.
+	 */
 	void		(*fold) (const ProllyNodeRef *baseline, ProllyNodeRef *root,
-						 ProllyNodeRef *next_baseline);
+						 ProllyNodeRef *next_baseline, bool commit);
 
 	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
 						   void *arg);
@@ -168,6 +174,13 @@ typedef struct ProllyCanonRoutine
 	void		(*walk_changes) (const ProllyNodeRef *from,
 								 const ProllyNodeRef *to,
 								 ProllyTreeVisitNode visit, void *arg);
+
+	/*
+	 * Drop the objects of the session branch's versioned schemas that the
+	 * canonical form doesn't describe (and what depends on them): work no
+	 * commit holds, which a move to a commit discards.
+	 */
+	void		(*discard_undescribed) (void);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -175,9 +188,9 @@ typedef struct ProllyCanonRoutine
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
-	"in_format", "format", "walk_changes"
+	"in_format", "format", "walk_changes", "discard_undescribed"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK walk_changes
+#define PROLLY_CANON_LAST_CALLBACK discard_undescribed
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

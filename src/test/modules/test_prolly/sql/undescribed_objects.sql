@@ -43,5 +43,28 @@ DROP STATISTICS ud.st;
 SELECT * FROM dolt_status WHERE status = 'not covered';
 SELECT length(dolt_commit('-Am', 'an enum')::text) AS committed;
 
+-- only a commit refuses them: a move discards them as uncommitted work
+-- (a reset), or leaves them on their branch (a checkout); a branch's first
+-- use doesn't take them from the branch it was copied from
+CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
+CREATE FOREIGN DATA WRAPPER ud_fdw;
+CREATE SERVER ud_srv FOREIGN DATA WRAPPER ud_fdw;
+CREATE FOREIGN TABLE ud.ft (a int) SERVER ud_srv;
+SELECT dolt_reset('--hard');
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+SELECT count(*) AS foreign_tables FROM pg_class WHERE relnamespace = 'ud'::regnamespace
+  AND relkind = 'f';
+SELECT dolt_branch('ud_other');
+CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
+SELECT dolt_checkout('ud_other');
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+SELECT dolt_checkout('main');
+SELECT count(*) AS operators FROM pg_operator WHERE oprnamespace = 'ud'::regnamespace;
+SELECT * FROM dolt_status WHERE status = 'not covered';
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'ud_other');
+DROP SERVER ud_srv;
+DROP FOREIGN DATA WRAPPER ud_fdw;
+
 DROP SCHEMA ud CASCADE;
 SELECT length(dolt_commit('-Am', 'ud gone')::text) AS committed;

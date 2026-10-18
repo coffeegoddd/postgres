@@ -115,7 +115,7 @@ static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
 									  ProllyNodeRef *root);
 static bool copies_working_set(const char *branch, ProllyNodeRef *root);
-static void fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next);
+static void fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit);
 static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;
 
@@ -565,7 +565,9 @@ static void fold_as_baseline(void *arg);
  * Move the session's branch to a commit's root, every move (a reset, a
  * fast-forward, a branch's first use): its rows written, unless its
  * working set is the root already; then folded from there, so no fold
- * after reads the pages the move wrote again and again.
+ * after reads the pages the move wrote again and again.  Objects no
+ * commit could hold (the canonical form doesn't describe them) are
+ * uncommitted work the move discards, as it does any other.
  */
 static void
 move_settled(void *arg)
@@ -574,10 +576,11 @@ move_settled(void *arg)
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef working;
 
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
 	fold(&working);
 	if (same_hash(&working.hash, &target->hash))
 		return;
-	prolly_database_components(&dc);
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
 	fold_as_baseline(NULL);
 }
@@ -591,7 +594,7 @@ fold_as_baseline(void *arg)
 	ProllyNodeRef root;
 	ProllyNodeRef next;
 
-	fold_from_baseline(&root, &next);
+	fold_from_baseline(&root, &next, false);
 	branch_set_baseline(branch_ops()->current(), &next, &root);
 }
 
@@ -925,23 +928,25 @@ copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 
 /*
  * The session branch's versioned schemas, folded from its baseline; with
- * next, a new baseline begun.
+ * next, a new baseline begun.  Only a commit's fold refuses objects the
+ * canonical form doesn't describe; others leave them out.
  */
 static void
-fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next)
+fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef baseline;
 	bool		have = branch_baseline(branch_ops()->current(), &baseline);
 
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, fold, have ? &baseline : NULL, root, next);
+	PROLLY_CALL(dc.canonicalizer, fold, have ? &baseline : NULL, root, next,
+				commit);
 }
 
 static void
 fold(ProllyNodeRef *root)
 {
-	fold_from_baseline(root, NULL);
+	fold_from_baseline(root, NULL, false);
 }
 
 /*
@@ -980,7 +985,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	bool		pushed;
 
 	pushed = hold_for_commit(name, parents, nparents);
-	fold_from_baseline(&root, &next);
+	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
@@ -1110,7 +1115,7 @@ copies_checkpoint(ProllyNodeRef *root)
 
 	lock_refs();
 	pushed = see_head(name);
-	fold_from_baseline(root, &next);
+	fold_from_baseline(root, &next, false);
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_baseline(name, &next, root);
@@ -1165,7 +1170,7 @@ copies_checkout(const char *name)
 			lock_refs();
 			if (!head_moved_unseen(current))
 			{
-				fold_from_baseline(&working, &next);
+				fold_from_baseline(&working, &next, false);
 				branch_set_baseline(current, &next, &working);
 			}
 		}
@@ -1230,7 +1235,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	}
 	name = branch_ops()->current();
 	pushed = hold_for_commit(name, parents, nparents);
-	fold_from_baseline(&root, &next);
+	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),

@@ -204,8 +204,10 @@ typedef struct Canon
 	List	   *next;			/* CanonItem *, the next baseline's */
 	bool		reading;		/* objects not described are left out */
 	List	   *left_out;		/* (reading) their names */
+	List	   *left_addrs;		/* (reading) ObjectAddress *: the same */
 	List	   *refused;		/* (committing) Refused *: the same */
 	Oid			only;			/* valid: only this table's rows folded */
+	bool		no_rows;		/* no table's rows folded (objects only) */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
@@ -335,14 +337,25 @@ typedef struct Refused
 
 /*
  * An object the canonical form doesn't describe: left out (true).  When
- * reading, its name is noted; when committing, it is refused once every
- * object has been read (check_refused()).
+ * reading, its name is noted, and its address if it is left out whole (a
+ * move may discard it); when committing, it is refused once every object
+ * has been read (check_refused()).
  */
 static bool
-uncovered(Canon *cn, const char *what, const char *name)
+uncovered(Canon *cn, const char *what, const char *name,
+		  const ObjectAddress *addr)
 {
 	if (cn->reading)
+	{
 		cn->left_out = lappend(cn->left_out, pstrdup(name));
+		if (addr)
+		{
+			ObjectAddress *a = palloc(sizeof(ObjectAddress));
+
+			*a = *addr;
+			cn->left_addrs = lappend(cn->left_addrs, a);
+		}
+	}
 	else
 	{
 		Refused    *r = palloc(sizeof(Refused));
@@ -541,7 +554,8 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		tf.state.len = bt->state.len;
 	}
 	/* (when reading another table: its rows as the baseline has them) */
-	if (OidIsValid(cn->only) && RelationGetRelid(rel) != cn->only)
+	if (cn->no_rows ||
+		(OidIsValid(cn->only) && RelationGetRelid(rel) != cn->only))
 	{
 		if (bt)
 			*root = bt->data;
@@ -921,21 +935,23 @@ describe_range(Canon *cn, Form_pg_type typ)
 	Form_pg_range rng;
 	char	   *name = qualified(typ->typnamespace, NameStr(typ->typname));
 	CanonItem  *it;
+	ObjectAddress self;
 
+	ObjectAddressSet(self, TypeRelationId, typ->oid);
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for range type %u", typ->oid);
 	rng = (Form_pg_range) GETSTRUCT(tup);
 	if (OidIsValid(rng->rngcanonical))
 	{
 		ReleaseSysCache(tup);
-		(void) uncovered(cn, "range types with a canonical function", name);
+		(void) uncovered(cn, "range types with a canonical function", name, &self);
 		return;
 	}
 	if (OidIsValid(rng->rngsubdiff) &&
 		canon_namespace(get_func_namespace(rng->rngsubdiff)))
 	{
 		ReleaseSysCache(tup);
-		(void) uncovered(cn, "range types whose subtype difference function is versioned", name);
+		(void) uncovered(cn, "range types whose subtype difference function is versioned", name, &self);
 		return;
 	}
 	{
@@ -949,7 +965,7 @@ describe_range(Canon *cn, Form_pg_type typ)
 			 canon_namespace(get_object_namespace(&coll))))
 		{
 			ReleaseSysCache(tup);
-			(void) uncovered(cn, "range types whose operator class or collation is versioned", name);
+			(void) uncovered(cn, "range types whose operator class or collation is versioned", name, &self);
 			return;
 		}
 	}
@@ -1112,10 +1128,14 @@ describe_type(Canon *cn, Form_pg_type typ)
 		return;					/* (with its range type) */
 	else if (typ->typtype == TYPTYPE_BASE)
 	{
+		ObjectAddress self;
+
 		/* Array types of covered types come with them. */
 		if (OidIsValid(typ->typelem) && typ->typcategory == TYPCATEGORY_ARRAY)
 			return;
-		(void) uncovered(cn, "this type", qualified(typ->typnamespace, NameStr(typ->typname)));
+		ObjectAddressSet(self, TypeRelationId, typ->oid);
+		(void) uncovered(cn, "this type", qualified(typ->typnamespace, NameStr(typ->typname)),
+						 &self);
 	}
 }
 
@@ -1523,6 +1543,9 @@ column_names(Oid relid)
 static bool
 partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 {
+	ObjectAddress self;
+
+	ObjectAddressSet(self, RelationRelationId, form->oid);
 	if (form->relispartition)
 	{
 		Oid			parent = get_partition_parent(form->oid, false);
@@ -1533,14 +1556,14 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 
 		if (!canon_namespace(get_rel_namespace(parent)))
 			return uncovered(cn, "partitions of tables outside versioned schemas",
-							 qualified(form->relnamespace, name));
+							 qualified(form->relnamespace, name), &self);
 		if (list_length(own) != list_length(its))
 			return uncovered(cn, "partitions with columns their partitioned table lacks",
-							 qualified(form->relnamespace, name));
+							 qualified(form->relnamespace, name), &self);
 		forboth(a, own, b, its)
 			if (strcmp(lfirst(a), lfirst(b)) != 0)
 				return uncovered(cn, "partitions with their columns in another order than their partitioned table's",
-								 qualified(form->relnamespace, name));
+								 qualified(form->relnamespace, name), &self);
 	}
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
 	{
@@ -1548,8 +1571,9 @@ partition_uncovered(Canon *cn, Form_pg_class form, const char *name)
 
 		foreach(lc, find_inheritance_children(form->oid, AccessShareLock))
 			if (!canon_namespace(get_rel_namespace(lfirst_oid(lc))))
+				/* (not discarded: its partitions outside are every branch's) */
 				return uncovered(cn, "partitioned tables with partitions outside versioned schemas",
-								 qualified(form->relnamespace, name));
+								 qualified(form->relnamespace, name), NULL);
 	}
 	return false;
 }
@@ -1634,7 +1658,8 @@ oid_columns(Canon *cn, Relation rel)
 						 psprintf("%s.%s",
 								  qualified(RelationGetNamespace(rel),
 											RelationGetRelationName(rel)),
-								  quote_identifier(NameStr(att->attname))));
+								  quote_identifier(NameStr(att->attname))),
+						 NULL);	/* (when reading, its table is read whole) */
 		any = true;
 	}
 	return any;
@@ -1735,7 +1760,13 @@ collect(Canon *cn)
 				}
 				break;
 			case RELKIND_FOREIGN_TABLE:
-				(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name));
+				{
+					ObjectAddress self;
+
+					ObjectAddressSet(self, RelationRelationId, form->oid);
+					(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name),
+									 &self);
+				}
 				break;
 			case RELKIND_PARTITIONED_TABLE:
 				{
@@ -1827,9 +1858,14 @@ collect(Canon *cn)
 							TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
 																	ObjectIdGetDatum(proc->oid))));
 			/* (a window function is written in C: none to hold) */
-			if (proc->prokind == PROKIND_WINDOW &&
-				uncovered(cn, "window functions", name))
+			if (proc->prokind == PROKIND_WINDOW)
+			{
+				ObjectAddress self;
+
+				ObjectAddressSet(self, ProcedureRelationId, proc->oid);
+				(void) uncovered(cn, "window functions", name, &self);
 				continue;
+			}
 			it = add_item(cn, "f:", name);
 			if (proc->prokind == PROKIND_AGGREGATE)
 				append_utf8(&it->value, aggregate_def(proc));
@@ -1892,7 +1928,12 @@ refuse_undescribed(Canon *cn)
 
 			if (!canon_namespace(nsp) || in_extension(kinds[k].classid, oid))
 				continue;
-			(void) uncovered(cn, kinds[k].what, qualified(nsp, NameStr(*name)));
+			{
+				ObjectAddress self;
+
+				ObjectAddressSet(self, kinds[k].classid, oid);
+				(void) uncovered(cn, kinds[k].what, qualified(nsp, NameStr(*name)), &self);
+			}
 		}
 		systable_endscan(scan);
 		table_close(rel, AccessShareLock);
@@ -1915,10 +1956,12 @@ refuse_undescribed(Canon *cn)
 		if (part_of_type(CastRelationId, c->oid) ||
 			in_extension(CastRelationId, c->oid))
 			continue;
+		ObjectAddressSet(src, CastRelationId, c->oid);
 		(void) uncovered(cn, "casts",
 						 psprintf("(%s AS %s)",
 								  format_type_extended(c->castsource, -1, FORMAT_TYPE_FORCE_QUALIFY),
-								  format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)));
+								  format_type_extended(c->casttarget, -1, FORMAT_TYPE_FORCE_QUALIFY)),
+						 &src);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
@@ -2246,9 +2289,47 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 
 static void
 folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
-			ProllyNodeRef *next_baseline)
+			ProllyNodeRef *next_baseline, bool commit)
 {
-	(void) fold_canon(baseline, root, next_baseline, false, InvalidOid);
+	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid);
+}
+
+/*
+ * Drop the objects of the session branch's versioned schemas that the
+ * canonical form doesn't describe, and what depends on them: work no
+ * commit holds, which a move to a commit discards.  (Objects only: no
+ * table's rows are folded.)
+ */
+static void
+folded_discard_undescribed(void)
+{
+	Canon		cn;
+	ObjectAddresses *addrs;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	cn.no_rows = true;
+	canon_env(&cn);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		collect(&cn);
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	if (cn.left_addrs == NIL)
+		return;
+	addrs = new_object_addresses();
+	foreach(lc, cn.left_addrs)
+		add_exact_object_address(lfirst(lc), addrs);
+	performMultipleDeletions(addrs, DROP_CASCADE, 0);
+	free_object_addresses(addrs);
+	CommandCounterIncrement();
 }
 
 static void
@@ -4966,6 +5047,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk_changes = folded_walk_changes,
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
+	.discard_undescribed = folded_discard_undescribed,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
