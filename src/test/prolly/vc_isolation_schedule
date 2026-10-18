@@ -2,3 +2,4 @@
 test: vc_branch_sessions
 test: vc_branch_make
 test: vc_writer_claims
+test: vc_writer_branches

@@ -8,6 +8,7 @@ CREATE ROLE wm_other;
 CREATE ROLE wm_carol;
 GRANT USAGE ON SCHEMA wm TO wm_other, wm_carol;
 GRANT ALL ON wm.t TO wm_other, wm_carol;
+CREATE SEQUENCE wm.s2;
 SELECT length(dolt_commit('-m', 'wm base')::text) AS committed;
 SELECT dolt_writer_mode();
 
@@ -253,6 +254,49 @@ SELECT dolt_branch('--protect', 'main');
 SELECT dolt_writer_mode('owned');
 SELECT name, protected FROM dolt_branches() WHERE name = 'main';
 SELECT dolt_writer_mode('branch-only');
+
+-- Branch-auto: a statement that writes on main first moves the session
+-- to its writer branch, forked from main; the move is undone with its
+-- transaction.
+SELECT dolt_writer_mode('branch-auto');
+SET dolt.writer = 'hank';
+BEGIN;
+INSERT INTO wm.t VALUES (20, 'hank');
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+INSERT INTO wm.t VALUES (20, 'hank');
+SELECT active_branch();
+SELECT name, kind, base, owner, protected FROM dolt_branches()
+WHERE name IN ('main', 'writer/hank/main') ORDER BY name;
+UPDATE wm.t SET v = 'hank again' WHERE id = 20;
+CREATE TABLE wm.hank (id int);
+SELECT (dolt_integrate('-m', 'hank''s'))[2] AS fast_forward;
+SELECT active_branch(), dolt_hashof('main') = dolt_hashof('HEAD') AS integrated;
+-- (done with, it goes when the session leaves it)
+SELECT dolt_checkout('main');
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+SELECT id, v FROM wm.t WHERE id = 20;
+SELECT to_regclass('wm.hank') IS NOT NULL AS hank_table;
+-- one with changes stays, and the next write goes there again
+INSERT INTO wm.t VALUES (21, 'hank');
+SELECT dolt_checkout('main');
+SELECT id FROM wm.t WHERE id = 21;
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
+SELECT active_branch();
+SELECT id, v FROM wm.t WHERE id IN (20, 21) ORDER BY id;
+SELECT dolt_reset('--hard');
+-- reads, and integrations, stay on main; a write a query makes is refused
+SELECT dolt_checkout('main');
+SELECT count(*) > 0 AS read FROM wm.t;
+SELECT active_branch();
+SELECT nextval('wm.s2');
+-- writer branches' names are the database's; hank's, clean again, went
+-- when the session left it
+SELECT dolt_branch('writer/hank/other');
+SELECT dolt_branch('-D', 'writer/hank/main');
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
 
 -- Only the database's owner sets the mode; and back to shared.
 SET ROLE wm_other;

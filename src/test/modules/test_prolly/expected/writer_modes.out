@@ -8,6 +8,7 @@ CREATE ROLE wm_other;
 CREATE ROLE wm_carol;
 GRANT USAGE ON SCHEMA wm TO wm_other, wm_carol;
 GRANT ALL ON wm.t TO wm_other, wm_carol;
+CREATE SEQUENCE wm.s2;
 SELECT length(dolt_commit('-m', 'wm base')::text) AS committed;
  committed 
 -----------
@@ -775,6 +776,171 @@ SELECT dolt_writer_mode('branch-only');
  branch-only
 (1 row)
 
+-- Branch-auto: a statement that writes on main first moves the session
+-- to its writer branch, forked from main; the move is undone with its
+-- transaction.
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'hank';
+BEGIN;
+INSERT INTO wm.t VALUES (20, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/hank/main
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+INSERT INTO wm.t VALUES (20, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/hank/main
+(1 row)
+
+SELECT name, kind, base, owner, protected FROM dolt_branches()
+WHERE name IN ('main', 'writer/hank/main') ORDER BY name;
+       name       |  kind  | base | owner | protected 
+------------------+--------+------+-------+-----------
+ main             | branch |      |       | t
+ writer/hank/main | writer | main | hank  | f
+(2 rows)
+
+UPDATE wm.t SET v = 'hank again' WHERE id = 20;
+CREATE TABLE wm.hank (id int);
+SELECT (dolt_integrate('-m', 'hank''s'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT active_branch(), dolt_hashof('main') = dolt_hashof('HEAD') AS integrated;
+  active_branch   | integrated 
+------------------+------------
+ writer/hank/main | t
+(1 row)
+
+-- (done with, it goes when the session leaves it)
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+SELECT id, v FROM wm.t WHERE id = 20;
+ id |     v      
+----+------------
+ 20 | hank again
+(1 row)
+
+SELECT to_regclass('wm.hank') IS NOT NULL AS hank_table;
+ hank_table 
+------------
+ t
+(1 row)
+
+-- one with changes stays, and the next write goes there again
+INSERT INTO wm.t VALUES (21, 'hank');
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT id FROM wm.t WHERE id = 21;
+ id 
+----
+(0 rows)
+
+UPDATE wm.t SET v = 'hank, later' WHERE id = 20;
+NOTICE:  writing on branch "writer/hank/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/hank/main
+(1 row)
+
+SELECT id, v FROM wm.t WHERE id IN (20, 21) ORDER BY id;
+ id |      v      
+----+-------------
+ 20 | hank, later
+ 21 | hank
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- reads, and integrations, stay on main; a write a query makes is refused
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) > 0 AS read FROM wm.t;
+ read 
+------
+ t
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT nextval('wm.s2');
+ERROR:  branch "main" is protected
+DETAIL:  A write moves the session to its writer branch only at the start of a statement that writes, and this one doesn't (it is a query, or inside a function or procedure).
+HINT:  Write with INSERT, UPDATE, DELETE, MERGE, COPY or DDL first, or check out a branch of your own with dolt_checkout('-b', ...).
+-- writer branches' names are the database's; hank's, clean again, went
+-- when the session left it
+SELECT dolt_branch('writer/hank/other');
+ERROR:  branch names beginning "writer/" are reserved
+SELECT dolt_branch('-D', 'writer/hank/main');
+ERROR:  branch "writer/hank/main" does not exist
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
 -- Only the database's owner sets the mode; and back to shared.
 SET ROLE wm_other;
 SELECT dolt_writer_mode('shared');
@@ -782,7 +948,7 @@ ERROR:  must be owner of database contrib_regression
 RESET ROLE;
 SELECT dolt_writer_mode('nobody');
 ERROR:  unknown writer mode "nobody"
-HINT:  The writer modes are "shared", "owned" and "branch-only".
+HINT:  The writer modes are "shared", "owned", "branch-only" and "branch-auto".
 SELECT dolt_writer_mode('shared');
  dolt_writer_mode 
 ------------------

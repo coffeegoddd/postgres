@@ -398,6 +398,9 @@ copies_check_create(const char *name)
 				 errmsg("invalid branch name \"%s\"", name),
 				 errdetail("A branch's name follows git's rules for one: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" or \"@\"; not beginning with \"-\" or \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
+	/* (one made on the session's behalf is the database's mechanism, not the role's) */
+	if (BranchCreateOnBehalf)
+		return;
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
 								ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)

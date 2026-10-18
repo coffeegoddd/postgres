@@ -42,6 +42,12 @@ extern PGDLLIMPORT Oid CatalogBranchIndexTable;
 extern PGDLLIMPORT bool CatalogKeepRowBranch;
 
 /*
+ * While set, a branch is made on the session's behalf (its writer branch):
+ * without the role's privilege to make branches.
+ */
+extern PGDLLIMPORT bool BranchCreateOnBehalf;
+
+/*
  * While set, catalog scans return every branch's rows: for scans that
  * gather facts about all of them (oldest XIDs, what to vacuum) and build no
  * cache, since an OID can name a row on each branch.

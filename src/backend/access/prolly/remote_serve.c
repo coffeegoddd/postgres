@@ -287,9 +287,13 @@ head_row(const char *name, const ProllyHash *head, void *arg)
 	Datum		values[2];
 	bool		nulls[2] = {0};
 
-	/* (a branch without commits, or a session's at a commit: not served) */
+	/*
+	 * (a branch without commits, a session's at a commit, or a writer's
+	 * branch, the database's own mechanism: not served)
+	 */
 	if (head->len == 0 ||
-		strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0 ||
+		strncmp(name, PROLLY_WRITER_PREFIX, strlen(PROLLY_WRITER_PREFIX)) == 0)
 		return;
 	values[0] = CStringGetTextDatum(name);
 	values[1] = PointerGetDatum(hash_bytea(head));

@@ -86,6 +86,9 @@ static const char *const mode_names[] = {PROLLY_WRITER_MODE_NAMES};
 static LocalTransactionId mode_lxid = InvalidLocalTransactionId;
 static ProllyWriterMode mode_read;
 
+/* the setting that keeps a writer branch's writer, base and role */
+#define WRITER_BRANCH_SETTING "writer branch/"
+
 /*
  * The setting that keeps branches' protections, where set: a line for each,
  * the branch's name, a space, and "on" or "off".
@@ -204,12 +207,54 @@ modes_set_mode(ProllyWriterMode mode)
 	mode_read = mode;
 }
 
-/* as the mode has it: main, in the branch-only mode */
+/* as the mode has it: main, in the branch modes */
 static bool
 protected_by_default(const char *name)
 {
-	return strcmp(name, "main") == 0 &&
-		modes_mode() == PROLLY_WRITERS_BRANCH_ONLY;
+	ProllyWriterMode mode;
+
+	if (strcmp(name, "main") != 0)
+		return false;
+	mode = modes_mode();
+	return mode == PROLLY_WRITERS_BRANCH_ONLY ||
+		mode == PROLLY_WRITERS_BRANCH_AUTO;
+}
+
+/* (as "role writer base": neither a writer nor a branch name has a space) */
+static bool
+modes_writer_branch(const char *name, char **writer, char **base, Oid *role)
+{
+	StringInfoData v;
+	char	   *key = psprintf(WRITER_BRANCH_SETTING "%s", name);
+	bool		found;
+
+	initStringInfo(&v);
+	found = PROLLY_CALL(refs(), config_get, key, &v);
+	if (found)
+	{
+		char	   *w = strchr(v.data, ' ') + 1;
+		char	   *b = strchr(w, ' ') + 1;
+
+		*role = (Oid) strtoul(v.data, NULL, 10);
+		*writer = pnstrdup(w, b - 1 - w);
+		*base = pstrdup(b);
+	}
+	pfree(v.data);
+	pfree(key);
+	return found;
+}
+
+static void
+modes_set_writer_branch(const char *name, const char *writer, const char *base)
+{
+	StringInfoData v;
+
+	initStringInfo(&v);
+	if (writer)
+		appendStringInfo(&v, "%u %s %s", GetUserId(), writer, base);
+	PROLLY_CALL(refs(), config_set, psprintf(WRITER_BRANCH_SETTING "%s", name),
+				writer ? v.data : NULL);
+	pfree(v.data);
 }
 
 /* (read once a transaction, as the mode is) */
@@ -510,6 +555,12 @@ modes_note_write(Oid branch, bool integration)
 	 */
 	if (name != NULL && modes_protected(name))
 	{
+		if (!integration && modes_mode() == PROLLY_WRITERS_BRANCH_AUTO)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" is protected", name),
+					 errdetail("A write moves the session to its writer branch only at the start of a statement that writes, and this one doesn't (it is a query, or inside a function or procedure)."),
+					 errhint("Write with INSERT, UPDATE, DELETE, MERGE, COPY or DDL first, or check out a branch of your own with dolt_checkout('-b', ...).")));
 		if (!integration)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -606,4 +657,6 @@ const ProllyWritersRoutine prolly_writers_modes = {
 	.set_mode = modes_set_mode,
 	.protected = modes_protected,
 	.set_protected = modes_set_protected,
+	.writer_branch = modes_writer_branch,
+	.set_writer_branch = modes_set_writer_branch,
 };

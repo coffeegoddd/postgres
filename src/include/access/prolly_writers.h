@@ -13,9 +13,12 @@
  * or taken over).  A protected branch has no writers at all: it changes
  * only by operations that make their commit in the same transaction
  * (integrations: a merge, cherry-pick, revert, reset or commit), so its
- * working set is its head at every snapshot.  In the branch-only mode
- * main is protected unless unprotected; any branch can be protected in
- * any mode.
+ * working set is its head at every snapshot.  In the branch-only and
+ * branch-auto modes main is protected unless unprotected; any branch can
+ * be protected in any mode.  In the branch-auto mode a session that
+ * writes on a protected branch is moved to its writer branch for it
+ * first: a branch of the writer's own, forked from the protected one,
+ * whose writer, base and role the writers keep.
  *
  * Contract:
  * - note_write() is called before the transaction first changes a branch
@@ -35,6 +38,9 @@
  *   protected() and set_protected() a branch's protection (by name: a
  *   branch with only a head has one too); setting either needs the
  *   database's ownership.
+ * - writer_branch() says whether name is a writer branch, and whose (its
+ *   writer, the branch it was forked from, and the role that made it);
+ *   set_writer_branch() records one (writer NULL: forgets it).
  *
  * Provisional (v0).
  *
@@ -52,13 +58,15 @@ typedef enum ProllyWriterMode
 	PROLLY_WRITERS_SHARED,		/* every session writes the branch */
 	PROLLY_WRITERS_OWNED,		/* one writer per dirty branch */
 	PROLLY_WRITERS_BRANCH_ONLY, /* owned, and main protected */
+	PROLLY_WRITERS_BRANCH_AUTO, /* branch-only, writing on writer branches */
 } ProllyWriterMode;
 
 /* the modes' names, by ProllyWriterMode */
 #define PROLLY_WRITER_MODE_NAMES \
 	[PROLLY_WRITERS_SHARED] = "shared", \
 	[PROLLY_WRITERS_OWNED] = "owned", \
-	[PROLLY_WRITERS_BRANCH_ONLY] = "branch-only"
+	[PROLLY_WRITERS_BRANCH_ONLY] = "branch-only", \
+	[PROLLY_WRITERS_BRANCH_AUTO] = "branch-auto"
 
 /* a branch's protection, as set */
 typedef enum ProllyBranchProtection
@@ -86,13 +94,20 @@ typedef struct ProllyWritersRoutine
 	bool		(*protected) (const char *name);
 	void		(*set_protected) (const char *name,
 								  ProllyBranchProtection protection);
+	bool		(*writer_branch) (const char *name, char **writer, char **base,
+								  Oid *role);
+	void		(*set_writer_branch) (const char *name, const char *writer,
+									  const char *base);
 } ProllyWritersRoutine;
 
 #define PROLLY_WRITERS_CALLBACK_NAMES \
 	"note_write", "settled", "take", "mode", "set_mode", "protected", \
-	"set_protected"
+	"set_protected", "writer_branch", "set_writer_branch"
 #define PROLLY_WRITERS_FIRST_CALLBACK note_write
-#define PROLLY_WRITERS_LAST_CALLBACK set_protected
+#define PROLLY_WRITERS_LAST_CALLBACK set_writer_branch
+
+/* writer branches' names: PROLLY_WRITER_PREFIX writer "/" base */
+#define PROLLY_WRITER_PREFIX "writer/"
 
 /* the session's writer: dolt.writer, or one of the session's own */
 extern char *prolly_current_writer(void);

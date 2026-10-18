@@ -48,9 +48,13 @@
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -64,6 +68,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
@@ -76,6 +81,7 @@ static bool dolt_allow_commit_conflicts = false;
 static const char *author_override = NULL;
 
 static void writers_note_write(Oid branch, void *arg);
+static void writer_branch_hooks(void);
 
 /* a branch to check out once the backend processes normally */
 static char *connect_branch = NULL;
@@ -98,6 +104,7 @@ prolly_session_init(const char *branch)
 		prolly_autovacuum_init();
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
+		writer_branch_hooks();
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
 								 "Lets a transaction commit with unresolved merge conflicts.",
 								 "They stay to be resolved later; until then the branch can't commit.",
@@ -459,6 +466,12 @@ detached_branch(const char *name)
 	return strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0;
 }
 
+static bool
+writer_branch_name(const char *name)
+{
+	return strncmp(name, PROLLY_WRITER_PREFIX, strlen(PROLLY_WRITER_PREFIX)) == 0;
+}
+
 static void
 reserved_branch_name(const char *name)
 {
@@ -466,6 +479,10 @@ reserved_branch_name(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
+	if (writer_branch_name(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_WRITER_PREFIX)));
 }
 
 /* Does what's checked out name a commit by its hash (a prefix of it)? */
@@ -523,6 +540,40 @@ checkout_branch(const char *name)
 	PG_END_TRY();
 }
 
+/*
+ * A writer branch done with: clean (no owner) and merged into its base (its
+ * head an ancestor of the base's, or the base's itself).
+ */
+static bool
+done_writer_branch(const char *name, const ProllyHash *head)
+{
+	char	   *writer;
+	char	   *base;
+	Oid			role;
+	ProllyHash	base_head;
+	ProllyHash	merge_base;
+	HeapTuple	tup;
+	bool		owned = false;
+
+	if (!writer_branch_name(name) ||
+		!PROLLY_CALL(writers(), writer_branch, name, &writer, &base, &role) ||
+		head->len == 0 ||
+		!PROLLY_CALL(refs(), resolve, base, &base_head) ||
+		!PROLLY_CALL(refs(), merge_base, head, &base_head, &merge_base) ||
+		!same_hash(&merge_base, head))
+		return false;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+	if (HeapTupleIsValid(tup))
+	{
+		bool		isnull;
+
+		(void) SysCacheGetAttr(BRANCHNAME, tup, Anum_pg_branch_browner, &isnull);
+		owned = !isnull;
+		ReleaseSysCache(tup);
+	}
+	return !owned;
+}
+
 typedef struct DetachedBranches
 {
 	List	   *names;
@@ -534,7 +585,9 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 {
 	DetachedBranches *db = arg;
 
-	if (detached_branch(name) && strcmp(name, db->current) != 0)
+	if (strcmp(name, db->current) == 0)
+		return;
+	if (detached_branch(name) || done_writer_branch(name, head))
 		db->names = lappend(db->names, pstrdup(name));
 }
 
@@ -567,6 +620,9 @@ sweep_detached(char *current)
 		{
 			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
 											 (char *) lfirst(lc), true));
+			if (writer_branch_name((char *) lfirst(lc)))
+				PROLLY_CALL(writers(), set_writer_branch, (char *) lfirst(lc),
+							NULL, NULL);
 			ReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
@@ -801,6 +857,12 @@ dolt_branch(PG_FUNCTION_ARGS)
 		);
 		foreach(lc, names)
 		{
+			if (writer_branch_name((char *) lfirst(lc)))
+				PROLLY_CALL(writers(), set_writer_branch, (char *) lfirst(lc),
+							NULL, NULL);
+		}
+		foreach(lc, names)
+		{
 			if (object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 				PROLLY_CALL(writers(), set_protected, (char *) lfirst(lc),
 							PROLLY_PROTECT_DEFAULT);
@@ -959,6 +1021,233 @@ dolt_merge(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(text_array(4, result));
 }
 
+/* ----------------------------------------------------------------
+ * Writer branches: in the branch-auto mode, a statement that writes, on a
+ * protected branch, first moves the session to its writer branch for it.
+ * ----------------------------------------------------------------
+ */
+
+static ExecutorStart_hook_type prev_executor_start = NULL;
+static ExecutorRun_hook_type prev_executor_run = NULL;
+static ExecutorFinish_hook_type prev_executor_finish = NULL;
+static ProcessUtility_hook_type prev_process_utility = NULL;
+
+/* how deep in statements the session is: 0 at the top, a client's own */
+static int	statement_depth = 0;
+
+/* a transaction found not to move from a branch: needn't look again there */
+static LocalTransactionId stays_lxid = InvalidLocalTransactionId;
+static Oid	stays_branch = InvalidOid;
+
+/* a transaction that moved, which can't be prepared */
+static LocalTransactionId moved_lxid = InvalidLocalTransactionId;
+
+/*
+ * Move the session to its writer branch, if the statement about to run
+ * writes on a protected branch in the branch-auto mode (true if it moved).
+ * A branch made now forks from the protected branch's head as the
+ * transaction's snapshot saw it (one that can't see a newer head fails, to
+ * be retried; read committed takes a newer snapshot).  The move is undone
+ * if the transaction aborts.
+ */
+static bool
+move_to_writer_branch(void)
+{
+	char	   *base;
+	char	   *writer;
+	char	   *name;
+	char	   *w;
+	char	   *b;
+	Oid			role;
+	ProllyHash	head;
+
+	if (!IsTransactionState() || RecoveryInProgress() ||
+		(MyProc->vxid.lxid == stays_lxid && MyBranch == stays_branch) ||
+		!database_has_versioned_schemas() ||
+		branch_written(MyBranch))
+		return false;
+	base = pstrdup(branch_ops()->current());
+	if (detached_branch(base) || writer_branch_name(base) ||
+		PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_BRANCH_AUTO ||
+		!PROLLY_CALL(writers(), protected, base))
+	{
+		stays_lxid = MyProc->vxid.lxid;
+		stays_branch = MyBranch;
+		return false;
+	}
+	writer = prolly_current_writer();
+	name = psprintf("%s%s/%s", PROLLY_WRITER_PREFIX, writer, base);
+	if (strlen(name) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("writer branch \"%s\" would be too long a name", name),
+				 errhint("Set a shorter dolt.writer.")));
+
+	branch_return_on_abort();
+	if (PROLLY_CALL(writers(), writer_branch, name, &w, &b, &role))
+	{
+		/* (a writer's branch is its role's: another can't write as it) */
+		if (!has_privs_of_role(GetUserId(), role) &&
+			!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("writer branch \"%s\" is role \"%s\"'s", name,
+							GetUserNameFromId(role, false))));
+	}
+	else if (PROLLY_CALL(refs(), resolve, base, &head))
+	{
+		bool		pushed = PROLLY_CALL(refs(), hold);
+
+		BranchCreateOnBehalf = true;
+		PG_TRY();
+		{
+			create_branch(name, base);
+		}
+		PG_FINALLY();
+		{
+			BranchCreateOnBehalf = false;
+		}
+		PG_END_TRY();
+		PROLLY_CALL(writers(), set_writer_branch, name, writer, base);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	checkout_branch(name);
+	CommandCounterIncrement();
+	moved_lxid = MyProc->vxid.lxid;
+	ereport(NOTICE,
+			(errmsg("writing on branch \"%s\"", name),
+			 errdetail("Branch \"%s\" is protected.", base),
+			 errhint("Integrate the writes with dolt_integrate('-m', ...).")));
+	return true;
+}
+
+/* Does a planned statement write?  (A query's writes are inside functions.) */
+static bool
+plan_writes(PlannedStmt *stmt)
+{
+	return stmt->commandType != CMD_SELECT || stmt->hasModifyingCTE;
+}
+
+static void
+writer_executor_start(QueryDesc *queryDesc, int eflags)
+{
+	if (statement_depth == 0 && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
+		plan_writes(queryDesc->plannedstmt) && move_to_writer_branch())
+	{
+		ListCell   *lc;
+
+		/*
+		 * The plan's relations are the writer branch's now: locked there as
+		 * the plan locked them, and its copies, just made, seen.
+		 */
+		foreach(lc, queryDesc->plannedstmt->rtable)
+		{
+			RangeTblEntry *rte = lfirst(lc);
+
+			if (rte->rtekind == RTE_RELATION && rte->rellockmode != NoLock)
+				LockRelationOid(rte->relid, rte->rellockmode);
+		}
+		/*
+		 * (the statement's snapshot is its portal's own copy, registered by
+		 * it: it sees the copies at the command they were made in)
+		 */
+		queryDesc->snapshot->curcid = GetCurrentCommandId(false);
+	}
+	if (prev_executor_start)
+		prev_executor_start(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+writer_executor_run(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	statement_depth++;
+	PG_TRY();
+	{
+		if (prev_executor_run)
+			prev_executor_run(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		statement_depth--;
+	}
+	PG_END_TRY();
+}
+
+static void
+writer_executor_finish(QueryDesc *queryDesc)
+{
+	statement_depth++;
+	PG_TRY();
+	{
+		if (prev_executor_finish)
+			prev_executor_finish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_FINALLY();
+	{
+		statement_depth--;
+	}
+	PG_END_TRY();
+}
+
+static void
+writer_process_utility(PlannedStmt *pstmt, const char *queryString,
+					   bool readOnlyTree, ProcessUtilityContext context,
+					   ParamListInfo params, QueryEnvironment *queryEnv,
+					   DestReceiver *dest, QueryCompletion *qc)
+{
+	LogStmtLevel level = GetCommandLogLevel(pstmt->utilityStmt);
+
+	if (statement_depth == 0 && context == PROCESS_UTILITY_TOPLEVEL &&
+		(level == LOGSTMT_DDL || level == LOGSTMT_MOD))
+		(void) move_to_writer_branch();
+	statement_depth++;
+	PG_TRY();
+	{
+		if (prev_process_utility)
+			prev_process_utility(pstmt, queryString, readOnlyTree, context,
+								 params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		statement_depth--;
+	}
+	PG_END_TRY();
+}
+
+/* (a move is the session's: one in a prepared transaction couldn't be undone) */
+static void
+writer_xact_callback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_PRE_PREPARE && moved_lxid == MyProc->vxid.lxid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot prepare a transaction that moved the session to its writer branch")));
+}
+
+static void
+writer_branch_hooks(void)
+{
+	prev_executor_start = ExecutorStart_hook;
+	ExecutorStart_hook = writer_executor_start;
+	prev_executor_run = ExecutorRun_hook;
+	ExecutorRun_hook = writer_executor_run;
+	prev_executor_finish = ExecutorFinish_hook;
+	ExecutorFinish_hook = writer_executor_finish;
+	prev_process_utility = ProcessUtility_hook;
+	ProcessUtility_hook = writer_process_utility;
+	RegisterXactCallback(writer_xact_callback, NULL);
+}
+
 /*
  * dolt_integrate(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward}
@@ -1008,9 +1297,17 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_integrate needs a message"),
 				 errhint("Pass -m and a message.")));
-	if (target == NULL)
-		target = "main";
 	mine = pstrdup(branch_ops()->current());
+	if (target == NULL)
+	{
+		char	   *writer;
+		Oid			role;
+
+		/* (a writer branch's is its base) */
+		if (!writer_branch_name(mine) ||
+			!PROLLY_CALL(writers(), writer_branch, mine, &writer, &target, &role))
+			target = "main";
+	}
 	if (strcmp(mine, target) == 0 || detached_branch(mine))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1493,8 +1790,11 @@ static void
 branch_row(const char *name, const ProllyHash *head, void *arg)
 {
 	BranchRows *br = arg;
-	Datum		values[10];
-	bool		nulls[10] = {0};
+	Datum		values[12];
+	bool		nulls[12] = {0};
+	char	   *writer;
+	char	   *base;
+	Oid			writer_role;
 	HeapTuple	tup;
 	ProllyCommitInfo info;
 	ProllyNodeRef ws;
@@ -1559,6 +1859,18 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 		ReleaseSysCache(tup);
 	}
 	values[9] = BoolGetDatum(PROLLY_CALL(writers(), protected, name));
+	/* (a writer branch's base: the branch it writes for) */
+	if (writer_branch_name(name) &&
+		PROLLY_CALL(writers(), writer_branch, name, &writer, &base, &writer_role))
+	{
+		values[10] = CStringGetTextDatum("writer");
+		values[11] = CStringGetTextDatum(base);
+	}
+	else
+	{
+		values[10] = CStringGetTextDatum("branch");
+		nulls[11] = true;
+	}
 	tuplestore_putvalues(br->rsinfo->setResult, br->rsinfo->setDesc, values,
 						 nulls);
 }
@@ -1588,8 +1900,10 @@ dolt_branches(PG_FUNCTION_ARGS)
  * (dolt_writer_mode_noargs).
  * dolt_writer_mode(mode text) returns text: sets it (the database's owner
  * only): "shared" (every session writes every branch), "owned" (a dirty
- * branch is one writer's), or "branch-only" (owned, and main protected: it
- * changes only by integrations, as dolt_integrate makes).
+ * branch is one writer's), "branch-only" (owned, and main protected: it
+ * changes only by integrations, as dolt_integrate makes), or "branch-auto"
+ * (branch-only, a session writing on a protected branch moved to its writer
+ * branch first).
  */
 Datum
 dolt_writer_mode(PG_FUNCTION_ARGS)
@@ -1610,7 +1924,7 @@ dolt_writer_mode(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("unknown writer mode \"%s\"", mode),
-					 errhint("The writer modes are \"shared\", \"owned\" and \"branch-only\".")));
+					 errhint("The writer modes are \"shared\", \"owned\", \"branch-only\" and \"branch-auto\".")));
 		PROLLY_CALL(writers(), set_mode, (ProllyWriterMode) m);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(names[PROLLY_CALL(writers(), mode)]));

@@ -130,8 +130,12 @@ reset leaves the branch clean, and anyone else's write is refused.  A
 protected branch (main in the branch-only mode, or any branch protected
 by name) has no writers: only integrations change it, a merge,
 cherry-pick, revert, reset or commit that commits as it changes it, as
-dolt_integrate merges a writer's branch in.  The mode and protections
-are database settings kept in the refs.
+dolt_integrate merges a writer's branch in.  In the branch-auto mode a
+statement that writes, at the top level, on a protected branch first
+moves the session to its writer branch (writer/<writer>/<base>), forked
+from the base as the transaction's snapshot saw it and swept once it is
+clean and merged.  The mode, protections and writer branches are
+database settings kept in the refs.
 
 
 Commits

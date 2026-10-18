@@ -91,6 +91,7 @@ Oid			MyBranch = BRANCH_MAIN_OID;
 bool		MyBranchReadOnly = false;
 Oid			CatalogBranchIndexTable = InvalidOid;
 bool		CatalogKeepRowBranch = false;
+bool		BranchCreateOnBehalf = false;
 
 /*
  * The branches the transaction has written, each with the subtransaction
