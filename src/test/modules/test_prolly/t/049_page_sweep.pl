@@ -18,10 +18,7 @@ if ($ENV{enable_injection_points} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('sweep');
 $node->init(allows_streaming => 1);
-# (shared buffers enough that no backend evicts a dirty page as it reads,
-# writing the WAL out to the page's LSN)
-$node->append_conf('postgresql.conf', qq{autovacuum = off
-shared_buffers = 32MB});
+$node->append_conf('postgresql.conf', 'autovacuum = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE DATABASE sw');
 $node->safe_psql('sw', q{
@@ -44,10 +41,9 @@ my $rel = sql(q{SELECT pg_relation_filenode('cow.t')});
 
 # A prune stopped by a crash after its list let go of the old pages,
 # before it freed them: the sweep frees them.  The crash keeps only the
-# WAL written out before it, and the prune doesn't write its records out:
-# whether the WAL writer, the background writer or a backend evicting the
-# list's page got to them before the crash was luck.  The writers are
-# stopped, and the records are flushed, and waited for, before the crash.
+# WAL written out before it, and the prune doesn't write its records out
+# (the WAL writer, the background writer or a backend evicting the list's
+# page might, or not yet): they are flushed before the crash.
 my ($lineage, $e1) = split /\|/, sql(qq{SELECT lineage, epoch FROM test_bmap_fold_begin($rel)});
 sql(q{UPDATE cow.t SET b = b + 1 WHERE a % 100 = 0});
 my $e2 = sql(qq{SELECT epoch FROM test_bmap_fold_begin($rel)});
@@ -55,9 +51,6 @@ my $listed = sql(qq{SELECT count(DISTINCT old_block)
 	FROM test_bmap_fold_changes($rel, $lineage, $e1) WHERE kind = 'copy'});
 cmp_ok($listed, '>', 0, 'the changes list holds old pages');
 $want = sql($sum);
-my @writers = split /\n/, sql(q{SELECT pid FROM pg_stat_activity
-	WHERE backend_type IN ('walwriter', 'background writer')});
-kill 'STOP', @writers unless $windows_os;
 my $p = $node->background_psql('sw', on_error_stop => 0);
 $p->query_safe(q{SELECT injection_points_set_local();
 	SELECT injection_points_attach('bmap-pruned', 'wait')});
@@ -69,9 +62,8 @@ $node->poll_query_until('sw', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'bmap-pruned'}) or die 'the prune did not stop';
 my $pruned = sql('SELECT pg_current_wal_insert_lsn()');
 sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
-$node->poll_query_until('sw', qq{SELECT pg_current_wal_flush_lsn() >= '$pruned'})
-  or die 'the prune\'s records were not flushed';
-kill 'KILL', @writers unless $windows_os;
+is(sql(qq{SELECT pg_current_wal_flush_lsn() >= '$pruned'}), 't',
+	'the prune\'s records are flushed');
 $node->stop('immediate');
 eval { $p->quit; };
 $node->start;
