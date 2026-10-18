@@ -1763,6 +1763,16 @@ held_hint(void *arg, const ProllyHash *hashes, int n)
 	}
 }
 
+/* A chunk's reference, into a HashSet. */
+static void
+held_reference(const ProllyHash *ref, void *arg)
+{
+	ProllyNodeRef node = {0};
+
+	node.hash = *ref;
+	(void) collect_node(&node, 0, arg);
+}
+
 /* Whether set holds the root of the value tree ref names. */
 static bool
 holds_ref(const HashSet *set, const StringInfo ref)
@@ -1791,6 +1801,7 @@ tree_held_references(const ProllyImplInfo *impl)
 	ProllyValue value;
 	HashSet		visited = {0};
 	HashSet		heard = {0};
+	HashSet		named = {0};
 	HashSet		diffed = {0};
 	HeldDiff	d = {refs, 0, true};
 	int			calls = 0;
@@ -1887,8 +1898,31 @@ tree_held_references(const ProllyImplInfo *impl)
 	PROLLY_CALL(tr, walk, &env, &built, collect_node, &visited);
 	if (PROLLY_HAS(env.chunk_store, read_through))
 		PROLLY_CALL(env.chunk_store, read_through, env.chunks, NULL, NULL, NULL);
+	/*
+	 * And so does what the tree says its nodes' chunks name, read from the
+	 * chunks alone (as the chunk store checks what it stores, and collects).
+	 */
+	if (PROLLY_HAS(tr, references))
+	{
+		StringInfoData chunk;
+
+		initStringInfo(&chunk);
+		for (int j = 0; j < visited.n; j++)
+		{
+			resetStringInfo(&chunk);
+			if (!PROLLY_CALL(env.chunk_store, get, env.chunks, &visited.hashes[j],
+							 &chunk))
+				elog(ERROR, "a node a walk visited isn't in the store");
+			PROLLY_CALL(tr, references, env.chunk_format, chunk.data, chunk.len,
+						held_reference, &named);
+		}
+		pfree(chunk.data);
+	}
 	for (int i = 0; i < 8; i++)
 	{
+		if (PROLLY_HAS(tr, references) && !holds_ref(&named, refs[i]))
+			elog(ERROR, "no node's chunk names value tree %d, which values reference",
+				 i);
 		if (!holds_ref(&visited, refs[i]))
 			elog(ERROR, "a walk didn't reach value tree %d, which values reference",
 				 i);

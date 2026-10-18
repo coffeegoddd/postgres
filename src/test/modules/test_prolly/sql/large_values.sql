@@ -80,6 +80,22 @@ SELECT length(k), v FROM lv.longkey ORDER BY v;
 SELECT dolt_reset('--hard', :'k2');
 SELECT length(k), v FROM lv.longkey ORDER BY v;
 
+-- A full collection of the chunk store keeps every value tree the
+-- commits' rows reference (each leaf names them, as walks find them), so
+-- history still reads back whole.
+SELECT md5(string_agg(id || ':' || n || ':' || md5(body), ',' ORDER BY id)) AS docs_gc
+FROM lv.doc \gset
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+DELETE FROM lv.doc;
+UPDATE lv.longkey SET v = 0;
+SELECT dolt_reset('--hard', :'d3');
+SELECT md5(string_agg(id || ':' || n || ':' || md5(body), ',' ORDER BY id)) = :'docs_gc'
+	AS docs_after_gc
+FROM lv.doc;
+SELECT dolt_reset('--hard', :'k1');
+SELECT length(k), v FROM lv.longkey ORDER BY v;
+SELECT dolt_reset('--hard', :'k2');
+
 -- Pushed and cloned: a walk from a commit reaches every value tree its
 -- rows reference, so the clone reads them all.
 \getenv abs_builddir PG_ABS_BUILDDIR
