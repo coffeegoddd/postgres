@@ -46,4 +46,11 @@ extern varlena *prolly_toast_store(Datum value, Oid typid);
  */
 extern int	prolly_toast_reference(const varlena *pointer, StringInfo ref);
 
+/*
+ * Whether this backend may read the value a hash pointer names now (its
+ * tree's root is in the chunk store, and not only a transaction's in
+ * progress).
+ */
+extern bool prolly_toast_readable(const varlena *pointer);
+
 #endif							/* PROLLY_TOAST_H */

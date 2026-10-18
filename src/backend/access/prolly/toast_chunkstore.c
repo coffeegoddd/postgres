@@ -228,6 +228,20 @@ prolly_toast_reference(const varlena *pointer, StringInfo ref)
 	return p.va_extinfo >> VARLENA_EXTSIZE_BITS;
 }
 
+bool
+prolly_toast_readable(const varlena *pointer)
+{
+	varatt_external_hash p;
+	ProllyHash	root;
+
+	Assert(VARATT_IS_EXTERNAL_ONDISK_HASH(pointer));
+	ensure_env();
+	VARATT_EXTERNAL_GET_POINTER(p, pointer);
+	root.len = sizeof(p.va_hash);
+	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
+	return PROLLY_CALL(env.chunk_store, has, env.chunks, &root);
+}
+
 /* a varlena of n bytes, its header made, its data to fill */
 static varlena *
 new_varlena(Size n)

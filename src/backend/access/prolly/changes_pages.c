@@ -59,6 +59,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_toast.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "access/tableam.h"
@@ -467,15 +468,20 @@ carry_tuple(Finder *f, HeapTuple tup)
 }
 
 /*
- * Is the value of column i (0-based) in its TOAST relation?  Its row's
- * old version may outlive it there.  (A hash pointer's value doesn't go
- * with its row.)
+ * Is the value of column i (0-based) out of line where it may not be read?
+ * One in its TOAST relation: its row's old version may outlive it there.
+ * A hash pointer's value doesn't go with its row, but one a transaction in
+ * progress stored isn't anyone else's to read yet.
  */
 static bool
 out_of_line(TupleDesc desc, int i, Datum value, bool isnull)
 {
-	return !isnull && TupleDescAttr(desc, i)->attlen == -1 &&
-		VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value));
+	varlena    *v = (varlena *) DatumGetPointer(value);
+
+	if (isnull || TupleDescAttr(desc, i)->attlen != -1)
+		return false;
+	return VARATT_IS_EXTERNAL_ONDISK(v) ||
+		(VARATT_IS_EXTERNAL_ONDISK_HASH(v) && !prolly_toast_readable(v));
 }
 
 /* Visits a tuple of a page version; false stops the walk. */
