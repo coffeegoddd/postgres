@@ -712,6 +712,73 @@ SELECT length(dolt_commit('-Am', 'without mr')::text) AS committed;
         66
 (1 row)
 
+-- a routine with several arguments kept by a merge (its signature,
+-- "ma.add(integer, integer)", isn't a qualified name)
+CREATE SCHEMA ma VERSIONED;
+CREATE FUNCTION ma.add(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+CREATE TABLE ma.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'ma')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('-b', 'ma_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+CREATE TABLE ma.s (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'side table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE ma.m (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'main table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('ma_side') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT ma.add(1, 2);
+ add 
+-----
+   3
+(1 row)
+
+SELECT dolt_branch('-D', 'ma_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA ma CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to function ma.add(integer,integer)
+drop cascades to table ma.t
+drop cascades to table ma.m
+drop cascades to table ma.s
+SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 DROP SCHEMA sg_new CASCADE;
 NOTICE:  drop cascades to table sg_new.u
 DROP SCHEMA sg_new_empty;

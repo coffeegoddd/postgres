@@ -2268,11 +2268,28 @@ list_has_string(List *list, const char *s)
 	return false;
 }
 
-/* The schema of a qualified name, as written. */
+/*
+ * The schema of a qualified name, as written; a routine's (its signature,
+ * "s.f(integer, text)") without its arguments.
+ */
 static char *
 schema_of(const char *qualified_name)
 {
-	List	   *names = stringToQualifiedNameList(qualified_name, NULL);
+	char	   *copy = pstrdup(qualified_name);
+	bool		quoted = false;
+	List	   *names;
+
+	for (char *c = copy; *c; c++)
+	{
+		if (*c == '"')
+			quoted = !quoted;
+		else if (*c == '(' && !quoted)
+		{
+			*c = '\0';
+			break;
+		}
+	}
+	names = stringToQualifiedNameList(copy, NULL);
 
 	return list_length(names) > 1 ? pstrdup(quote_identifier(strVal(linitial(names)))) :
 		pstrdup("public");

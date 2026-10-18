@@ -192,6 +192,23 @@ SELECT dolt_merge('mr_side');
 SELECT dolt_branch('-D', 'mr_side');
 DROP SCHEMA mr CASCADE;
 SELECT length(dolt_commit('-Am', 'without mr')::text) AS committed;
+-- a routine with several arguments kept by a merge (its signature,
+-- "ma.add(integer, integer)", isn't a qualified name)
+CREATE SCHEMA ma VERSIONED;
+CREATE FUNCTION ma.add(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+CREATE TABLE ma.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'ma')::text) AS committed;
+SELECT dolt_checkout('-b', 'ma_side') IS NOT NULL AS on_side;
+CREATE TABLE ma.s (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'side table')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE ma.m (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'main table')::text) AS committed;
+SELECT dolt_merge('ma_side') IS NOT NULL AS merged;
+SELECT ma.add(1, 2);
+SELECT dolt_branch('-D', 'ma_side');
+DROP SCHEMA ma CASCADE;
+SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
 DROP SCHEMA sg_new CASCADE;
 DROP SCHEMA sg_new_empty;
 DROP SCHEMA app CASCADE;
