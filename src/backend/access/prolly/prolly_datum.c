@@ -15,8 +15,10 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -32,6 +34,7 @@ typedef enum CodecKind
 	CODEC_ARRAY,
 	CODEC_COMPOSITE,
 	CODEC_ANYARRAY,
+	CODEC_JSONB,
 	CODEC_SEND,
 } CodecKind;
 
@@ -262,6 +265,9 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 			break;
 		case ANYARRAYOID:
 			c->kind = CODEC_ANYARRAY;
+			return c;
+		case JSONBOID:
+			c->kind = CODEC_JSONB;
 			return c;
 		case RECORDOID:
 			ereport(ERROR,
@@ -570,6 +576,248 @@ decode_anyarray(ProllyDatumCodec *c, const char **p, const char *end)
 }
 
 /* ------------------------------------------------------------------------
+ * jsonb
+ *
+ * A version byte, then the document as jsonb stores it (after the varlena
+ * header), its strings in UTF-8.  jsonb's format is deterministic (an
+ * object's keys sorted and unique, an offset every JB_OFFSET_STRIDE
+ * children, zeros for padding), so equal documents have equal bytes, and
+ * in a UTF-8 database a document's canonical bytes are the ones it holds.
+ * In another encoding the document is rebuilt with its strings converted
+ * (which can reorder its keys), going in and coming out.  Bytes decoded may
+ * come from another server, so they are checked to be such a document
+ * first.
+ * ------------------------------------------------------------------------
+ */
+
+#define JSONB_CANONICAL_VERSION	1
+
+/* A string's bytes in another encoding; s itself if they are the same. */
+typedef char *(*JsonbConvert) (const char *s, int len, int *outlen);
+
+static char *
+jsonb_to_utf8(const char *s, int len, int *outlen)
+{
+	char	   *r = pg_server_to_any(s, len, PG_UTF8);
+
+	*outlen = (r == s) ? len : strlen(r);
+	return r;
+}
+
+static char *
+jsonb_from_utf8(const char *s, int len, int *outlen)
+{
+	char	   *r = pg_any_to_server(s, len, PG_UTF8);
+
+	*outlen = (r == s) ? len : strlen(r);
+	return r;
+}
+
+/* jb rebuilt with every string, key or value, converted */
+static Jsonb *
+jsonb_convert(Jsonb *jb, JsonbConvert convert)
+{
+	JsonbIterator *it = JsonbIteratorInit(&jb->root);
+	JsonbInState state;
+	JsonbIteratorToken tok;
+	JsonbValue	v;
+
+	memset(&state, 0, sizeof(state));
+	while ((tok = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+	{
+		bool		scalar = (tok == WJB_KEY || tok == WJB_VALUE ||
+							  tok == WJB_ELEM);
+
+		if (scalar && v.type == jbvString)
+		{
+			int			len;
+
+			v.val.string.val = convert(v.val.string.val, v.val.string.len,
+									   &len);
+			v.val.string.len = len;
+		}
+		/* (a raw scalar's array says so in v) */
+		pushJsonbValue(&state, tok,
+					   scalar || (tok == WJB_BEGIN_ARRAY &&
+								  v.val.array.rawScalar) ? &v : NULL);
+	}
+	return JsonbValueToJsonb(state.result);
+}
+
+static void
+encode_jsonb(Datum value, StringInfo out)
+{
+	Jsonb	   *jb = DatumGetJsonbP(value);
+	Jsonb	   *u = jb;
+
+	if (GetDatabaseEncoding() != PG_UTF8)
+		u = jsonb_convert(jb, jsonb_to_utf8);
+	appendStringInfoChar(out, JSONB_CANONICAL_VERSION);
+	appendBinaryStringInfo(out, VARDATA(u), VARSIZE(u) - VARHDRSZ);
+	if (u != jb)
+		pfree(u);
+	if ((Pointer) jb != DatumGetPointer(value))
+		pfree(jb);
+}
+
+static void
+bad_jsonb(const char *what)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("invalid canonical prolly jsonb value: %s", what)));
+}
+
+/*
+ * The zeros padding doc[at, ...) to a 4-byte boundary of the document,
+ * within end; their count.  (The document starts at one: its varlena
+ * header is 4 bytes.)
+ */
+static uint32
+jsonb_padding(const char *doc, uint32 at, uint32 end)
+{
+	uint32		pad = INTALIGN(at) - at;
+
+	if (pad > end - at)
+		bad_jsonb("padding runs past its entry");
+	for (uint32 i = 0; i < pad; i++)
+		if (doc[at + i] != 0)
+			bad_jsonb("padding that isn't zeros");
+	return pad;
+}
+
+/* Child i's entry of the container at doc + at. */
+static JEntry
+jsonb_entry(const char *doc, uint32 at, uint32 i)
+{
+	JEntry		e;
+
+	memcpy(&e, doc + at + sizeof(uint32) + i * sizeof(JEntry), sizeof(e));
+	return e;
+}
+
+/*
+ * Check the container at doc[at, end) is one jsonb builds: entries within
+ * it, an offset every JB_OFFSET_STRIDE children and lengths between,
+ * keys sorted and unique, strings in UTF-8, numerics whole, padding zeros,
+ * nothing after its last child.
+ */
+static void
+check_jsonb_container(const char *doc, uint32 at, uint32 end, bool top)
+{
+	uint32		header;
+	uint32		count;
+	uint32		nchildren;
+	uint32		data;
+	uint32		prev = 0;		/* the previous child's end */
+	uint32		key_start = 0;
+	uint32		key_len = 0;
+	bool		object;
+
+	check_stack_depth();
+	if (end - at < sizeof(uint32))
+		bad_jsonb("a container without a header");
+	memcpy(&header, doc + at, sizeof(uint32));
+	count = header & JB_CMASK;
+	object = (header & JB_FOBJECT) != 0;
+	if ((header & ~(JB_CMASK | JB_FSCALAR | JB_FOBJECT | JB_FARRAY)) != 0 ||
+		object == ((header & JB_FARRAY) != 0))
+		bad_jsonb("a container neither an object nor an array");
+	if ((header & JB_FSCALAR) != 0 && (!top || object || count != 1))
+		bad_jsonb("a scalar where a container belongs");
+	nchildren = object ? count * 2 : count;
+	if ((uint64) nchildren * sizeof(JEntry) > end - at - sizeof(uint32))
+		bad_jsonb("more entries than the container holds");
+	data = at + sizeof(uint32) + nchildren * sizeof(JEntry);
+
+	for (uint32 i = 0; i < nchildren; i++)
+	{
+		JEntry		e = jsonb_entry(doc, at, i);
+		uint32		start = prev;
+		uint32		stop;
+		uint32		from = data + start;
+
+		if (JBE_HAS_OFF(e) != (i % JB_OFFSET_STRIDE == 0))
+			bad_jsonb("an offset where a length belongs, or a length where an offset does");
+		stop = JBE_HAS_OFF(e) ? JBE_OFFLENFLD(e) : start + JBE_OFFLENFLD(e);
+		if (stop < start || stop > end - data)
+			bad_jsonb("an entry outside its container");
+		if (object && i < count)
+		{
+			uint32		len = stop - start;
+
+			if ((e & JENTRY_TYPEMASK) != JENTRY_ISSTRING)
+				bad_jsonb("a key that isn't a string");
+			/* jsonb's order: shorter first, then by bytes */
+			if (i > 0 &&
+				(len < key_len ||
+				 (len == key_len &&
+				  memcmp(doc + data + key_start, doc + from, len) >= 0)))
+				bad_jsonb("keys out of order, or a key twice");
+			key_start = start;
+			key_len = len;
+		}
+		switch (e & JENTRY_TYPEMASK)
+		{
+			case JENTRY_ISSTRING:
+				if (!pg_verify_mbstr(PG_UTF8, doc + from, stop - start, true))
+					bad_jsonb("a string that isn't UTF-8");
+				break;
+			case JENTRY_ISNUMERIC:
+				{
+					uint32		pad = jsonb_padding(doc, from, data + stop);
+					const char *num = doc + from + pad;
+					uint32		len = stop - start - pad;
+
+					if (len < VARHDRSZ + sizeof(uint16) ||
+						!VARATT_IS_4B_U(num) || VARSIZE(num) != len)
+						bad_jsonb("a numeric that isn't whole");
+					break;
+				}
+			case JENTRY_ISBOOL_FALSE:
+			case JENTRY_ISBOOL_TRUE:
+			case JENTRY_ISNULL:
+				if (stop != start)
+					bad_jsonb("a scalar with bytes");
+				break;
+			case JENTRY_ISCONTAINER:
+				if ((header & JB_FSCALAR) != 0)
+					bad_jsonb("a container as a scalar");
+				check_jsonb_container(doc,
+									  from + jsonb_padding(doc, from, data + stop),
+									  data + stop, false);
+				break;
+			default:
+				bad_jsonb("an entry of no kind jsonb has");
+		}
+		prev = stop;
+	}
+	if (data + prev != end)
+		bad_jsonb("bytes after a container's last child");
+}
+
+static Datum
+decode_jsonb(const char *data, int len)
+{
+	Jsonb	   *jb;
+
+	if (len < 1 || (uint8) data[0] != JSONB_CANONICAL_VERSION)
+		bad_jsonb("a version this server doesn't know");
+	jb = palloc(VARHDRSZ + len - 1);
+	SET_VARSIZE(jb, VARHDRSZ + len - 1);
+	memcpy(VARDATA(jb), data + 1, len - 1);
+	check_jsonb_container(VARDATA(jb), 0, len - 1, true);
+	if (GetDatabaseEncoding() != PG_UTF8)
+	{
+		Jsonb	   *s = jsonb_convert(jb, jsonb_from_utf8);
+
+		pfree(jb);
+		jb = s;
+	}
+	return JsonbPGetDatum(jb);
+}
+
+/* ------------------------------------------------------------------------
  * Encode and decode
  * ------------------------------------------------------------------------
  */
@@ -608,6 +856,9 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 			break;
 		case CODEC_ANYARRAY:
 			encode_anyarray(c, value, out);
+			break;
+		case CODEC_JSONB:
+			encode_jsonb(value, out);
 			break;
 		case CODEC_SEND:
 			{
@@ -656,6 +907,8 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 		case CODEC_ANYARRAY:
 			result = decode_anyarray(c, &p, end);
 			break;
+		case CODEC_JSONB:
+			return decode_jsonb(data, len);
 		case CODEC_SEND:
 			return recv_utf8(c, data, len);
 		default:

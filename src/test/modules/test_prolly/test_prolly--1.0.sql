@@ -35,6 +35,11 @@ CREATE FUNCTION prolly_canonical_round_trip(anyelement)
 RETURNS anyelement
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The value of the given type whose canonical bytes are these.
+CREATE FUNCTION prolly_canonical_decode(bytea, anyelement)
+RETURNS anyelement
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- Check that catalog rows formed with a null branch column don't leak the
 -- rows written in their place.  Inserts into pg_description; roll back.
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)

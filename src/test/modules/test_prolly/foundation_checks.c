@@ -1008,6 +1008,7 @@ valenc_missing_values(const ProllyImplInfo *impl)
 
 PG_FUNCTION_INFO_V1(prolly_canonical_value);
 PG_FUNCTION_INFO_V1(prolly_canonical_round_trip);
+PG_FUNCTION_INFO_V1(prolly_canonical_decode);
 
 Datum
 prolly_canonical_value(PG_FUNCTION_ARGS)
@@ -1031,6 +1032,20 @@ prolly_canonical_round_trip(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	prolly_datum_encode(codec, PG_GETARG_DATUM(0), &buf);
 	PG_RETURN_DATUM(prolly_datum_decode(codec, buf.data, buf.len));
+}
+
+Datum
+prolly_canonical_decode(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	ProllyDatumCodec *codec = prolly_datum_codec(type, -1, CurrentMemoryContext);
+	bytea	   *b;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	b = PG_GETARG_BYTEA_PP(0);
+	PG_RETURN_DATUM(prolly_datum_decode(codec, VARDATA_ANY(b),
+										VARSIZE_ANY_EXHDR(b)));
 }
 
 /*
