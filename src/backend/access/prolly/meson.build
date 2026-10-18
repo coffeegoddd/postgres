@@ -45,6 +45,7 @@ backend_sources += files(
   'transfer_stub.c',
   'tablefile_basic.c',
   'tablefile_stub.c',
+  'toast_chunkstore.c',
   'tree_cow.c',
   'tree_stub.c',
   'valenc_canonical.c',

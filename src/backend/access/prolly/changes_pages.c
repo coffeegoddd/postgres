@@ -471,7 +471,8 @@ static bool
 out_of_line(TupleDesc desc, int i, Datum value, bool isnull)
 {
 	return !isnull && TupleDescAttr(desc, i)->attlen == -1 &&
-		VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value));
+		(VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)) ||
+		 VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(value)));
 }
 
 /* Visits a tuple of a page version; false stops the walk. */

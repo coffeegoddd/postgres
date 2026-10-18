@@ -17,6 +17,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
+#include "access/toast_destination.h"
 #include "access/toast_internals.h"
 #include "common/int.h"
 #include "common/pg_lzcompress.h"
@@ -53,6 +54,13 @@ detoast_external_attr(varlena *attr)
 		 * This is an external stored plain value
 		 */
 		result = toast_fetch_datum(attr);
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+	{
+		/*
+		 * A value named by content --- its destination has it, uncompressed
+		 */
+		result = toast_pointer_destination(attr)->fetch(attr, 0, -1);
 	}
 	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
 	{
@@ -130,6 +138,13 @@ detoast_attr(varlena *attr)
 			attr = toast_decompress_datum(tmp);
 			pfree(tmp);
 		}
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+	{
+		/*
+		 * A value named by content --- its destination has it, uncompressed
+		 */
+		attr = toast_pointer_destination(attr)->fetch(attr, 0, -1);
 	}
 	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
 	{
@@ -223,6 +238,11 @@ detoast_attr_slice(varlena *attr,
 		slicelimit = -1;
 	else if (pg_add_s32_overflow(sliceoffset, slicelength, &slicelimit))
 		slicelength = slicelimit = -1;
+
+	/* a value named by content is uncompressed: its destination slices it */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+		return toast_pointer_destination(attr)->fetch(attr, sliceoffset,
+													   slicelength);
 
 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
@@ -559,7 +579,15 @@ toast_raw_datum_size(Datum value)
 	varlena    *attr = (varlena *) DatumGetPointer(value);
 	Size		result;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+	{
+		/* va_rawsize is the size of the original datum -- including header */
+		varatt_external_hash toast_pointer;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		result = toast_pointer.va_rawsize;
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		/* va_rawsize is the size of the original datum -- including header */
 		toast_external_data toast_ext_data;
@@ -615,7 +643,15 @@ toast_datum_size(Datum value)
 	varlena    *attr = (varlena *) DatumGetPointer(value);
 	Size		result;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+	{
+		/* the size of the tree that holds it */
+		varatt_external_hash toast_pointer;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		result = VARATT_EXTINFO_GET_EXTSIZE(toast_pointer.va_extinfo);
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		/*
 		 * Attribute is stored externally - return the extsize whether

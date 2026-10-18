@@ -40,6 +40,17 @@ CREATE FUNCTION prolly_canonical_decode(bytea, anyelement)
 RETURNS anyelement
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- A value stored in the chunk store, as the hash pointer that names it;
+-- and a hash pointer's form, raw and stored sizes and root (NULL if the
+-- value isn't one).
+CREATE FUNCTION test_toast_hash_pointer(anyelement)
+RETURNS anyelement
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_toast_pointer(anyelement,
+	OUT form int, OUT rawsize int, OUT stored int, OUT root text)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Check that catalog rows formed with a null branch column don't leak the
 -- rows written in their place.  Inserts into pg_description; roll back.
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)

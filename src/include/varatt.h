@@ -65,6 +65,33 @@ StaticAssertDecl((sizeof(int32) + 3 * sizeof(uint32) + sizeof(Oid)) ==
 				 sizeof(varatt_external_oid8),
 				 "varatt_external_oid8 should have no padding");
 
+/*
+ * varatt_external_hash is a "TOAST pointer" that names its value by
+ * content: the root of a tree of the value's bytes in a store that holds
+ * such trees (a versioned table's chunk store), found by a TOAST
+ * destination (access/toast_destination.h).  It names no relation, so any
+ * row of any table may hold it.  One tag per hash algorithm:
+ * VARTAG_ONDISK_SHA256 for a SHA-256 root.
+ *
+ * va_rawsize is the original data size (header included), as for the other
+ * pointers.  va_extinfo's low VARLENA_EXTSIZE_BITS are the tree's length,
+ * its two high bits the form the tree holds the value in (its
+ * destination's to define): the value is never compressed in the tree.
+ *
+ * This struct must not contain any padding, because we sometimes compare
+ * these pointers using memcmp.
+ */
+typedef struct varatt_external_hash
+{
+	int32		va_rawsize;		/* Original data size (includes header) */
+	uint32		va_extinfo;		/* The tree's length and form */
+	uint8		va_hash[32];	/* The tree's root */
+} varatt_external_hash;
+
+StaticAssertDecl(sizeof(int32) + sizeof(uint32) + 32 ==
+				 sizeof(varatt_external_hash),
+				 "varatt_external_hash should have no padding");
+
 /* Get/set the 64-bit value ID from the lo/hi halves */
 static inline Oid8
 VARATT_EXTERNAL_OID8_GET_VALUEID(varatt_external_oid8 toast_pointer)
@@ -130,6 +157,7 @@ typedef enum vartag_external
 	VARTAG_EXPANDED_RO = 2,
 	VARTAG_EXPANDED_RW = 3,
 	VARTAG_ONDISK_OID8 = 4,
+	VARTAG_ONDISK_SHA256 = 5,
 	VARTAG_ONDISK_OID = 18
 } vartag_external;
 
@@ -153,6 +181,8 @@ VARTAG_SIZE(vartag_external tag)
 		return sizeof(varatt_external_oid);
 	else if (tag == VARTAG_ONDISK_OID8)
 		return sizeof(varatt_external_oid8);
+	else if (tag == VARTAG_ONDISK_SHA256)
+		return sizeof(varatt_external_hash);
 	else
 	{
 		Assert(false);
@@ -412,6 +442,17 @@ VARATT_IS_EXTERNAL_ONDISK(const void *PTR)
 		return false;
 	tag = VARTAG_EXTERNAL(PTR);
 	return (tag == VARTAG_ONDISK_OID || tag == VARTAG_ONDISK_OID8);
+}
+
+/*
+ * Is varlena datum a pointer to a value named by content?  Not "on disk" in
+ * VARATT_IS_EXTERNAL_ONDISK's sense: it has no value ID or TOAST relation.
+ */
+static inline bool
+VARATT_IS_EXTERNAL_ONDISK_HASH(const void *PTR)
+{
+	return VARATT_IS_EXTERNAL(PTR) &&
+		VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK_SHA256;
 }
 
 /* Is varlena datum an indirect pointer? */

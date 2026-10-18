@@ -108,6 +108,7 @@ tests += {
       'doltgres_objects',
       'doltgres_fks_auth',
       'jsonb_canonical',
+      'hash_pointers',
     ],
   },
   'tap': {

@@ -690,6 +690,21 @@ resolve_value(const ProllyTreeEnv *env, const ProllyValue *ref, StringInfo out)
 	read_value(env, ref, 0, PG_UINT64_MAX, out);
 }
 
+static void
+cow_value_reference(const ProllyHash *root, uint64 len, StringInfo ref)
+{
+	encode_value_ref(ref, root, len);
+}
+
+static void
+cow_value_root(const ProllyValue *ref, ProllyHash *root, uint64 *len)
+{
+	ProllyNodeRef r;
+
+	decode_value_ref(ref, &r, len);
+	*root = r.hash;
+}
+
 /* (a tree's nodes go into the store before its root does) */
 static bool
 cow_value_present(const ProllyTreeEnv *env, const ProllyValue *ref)
@@ -2358,5 +2373,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,
+	.value_reference = cow_value_reference,
+	.value_root = cow_value_root,
 	.value_present = cow_value_present,
 };

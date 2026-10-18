@@ -1322,6 +1322,19 @@ value_trees(const ProllyTreeRoutine *tr, ProllyTreeEnv *env)
 	if (got.len != val.len || memcmp(got.data, val.data, val.len) != 0)
 		elog(ERROR, "a value tree of %d bytes read back otherwise", val.len);
 
+	/* a reference is its root and length, and is made back from them */
+	{
+		ProllyHash	root;
+		uint64		len;
+
+		PROLLY_CALL(tr, value_root, &r, &root, &len);
+		resetStringInfo(&got);
+		PROLLY_CALL(tr, value_reference, &root, len, &got);
+		if (len != (uint64) val.len || got.len != ref.len ||
+			memcmp(got.data, ref.data, ref.len) != 0)
+			elog(ERROR, "a value tree's reference isn't made back from its root and length");
+	}
+
 	for (int i = 0; i < lengthof(offsets); i++)
 	{
 		for (int j = 0; j < lengthof(lens); j++)
