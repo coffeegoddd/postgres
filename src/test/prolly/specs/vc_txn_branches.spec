@@ -33,7 +33,7 @@ teardown
 session a
 step a_begin	{ BEGIN; }
 step a_other_head { SELECT hash = dolt_hashof('main') AS other_at_base FROM dolt_branches WHERE name = 'vtb_other'; }
-step a_branches	{ SELECT count(*) AS vtb_branches FROM dolt_branches WHERE name LIKE 'vtb_%'; }
+step a_branches	{ SELECT count(*) AS vtb_branches FROM dolt_branches WHERE starts_with(name, 'vtb_'); }
 step a_insert	{ INSERT INTO vtb.t (v) VALUES (1) RETURNING id; }
 step a_commit	{ COMMIT; }
 

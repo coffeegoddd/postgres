@@ -37,7 +37,7 @@ step a_commit: COMMIT;
 
 starting permutation: a_begin a_branches b_branch a_branches a_commit
 step a_begin: BEGIN;
-step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE name LIKE 'vtb_%';
+step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE starts_with(name, 'vtb_');
 vtb_branches
 ------------
            1
@@ -49,7 +49,7 @@ dolt_branch
 {0}        
 (1 row)
 
-step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE name LIKE 'vtb_%';
+step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE starts_with(name, 'vtb_');
 vtb_branches
 ------------
            2

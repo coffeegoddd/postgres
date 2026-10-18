@@ -49,6 +49,33 @@ rows
 (1 row)
 
 
+starting permutation: a_begin b_begin b_allow a_ins2 b_ins2_other a_commit b_rollback b_read
+step a_begin: BEGIN;
+step b_begin: BEGIN;
+step b_allow: SET LOCAL dolt.allow_commit_conflicts = on;
+step a_ins2: INSERT INTO vtr.t VALUES (3, 3, 3);
+step b_ins2_other: INSERT INTO vtr.t VALUES (3, 30, 30); <waiting ...>
+step a_commit: COMMIT;
+step b_ins2_other: <... completed>
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+step b_rollback: ROLLBACK;
+step b_read: SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t;
+rows             
+-----------------
+1:1:1,2:2:2,3:3:3
+(1 row)
+
+
+starting permutation: a_upd_y b_upd_y b_read
+step a_upd_y: UPDATE vtr.t SET y = 10 WHERE x = 1;
+step b_upd_y: UPDATE vtr.t SET y = 10 WHERE x = 1;
+step b_read: SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t;
+rows        
+------------
+1:10:1,2:2:2
+(1 row)
+
+
 starting permutation: a_begin b_begin a_upd_y b_upd_y a_commit b_commit b_read
 step a_begin: BEGIN;
 step b_begin: BEGIN;
@@ -121,6 +148,16 @@ step b_read: SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS row
 rows       
 -----------
 1:2:3,2:2:3
+(1 row)
+
+
+starting permutation: a_del1 b_del1 b_read
+step a_del1: DELETE FROM vtr.t WHERE x = 1;
+step b_del1: DELETE FROM vtr.t WHERE x = 1;
+step b_read: SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t;
+rows 
+-----
+2:2:2
 (1 row)
 
 
@@ -206,7 +243,22 @@ copies
 (1 row)
 
 
-starting permutation: a_begin b_begin a_del_parent b_ins_child a_commit b_rollback b_status
+starting permutation: a_begin b_begin b_upd_y_other a_upd_y b_commit a_commit b_read
+step a_begin: BEGIN;
+step b_begin: BEGIN;
+step b_upd_y_other: UPDATE vtr.t SET y = 20 WHERE x = 1;
+step a_upd_y: UPDATE vtr.t SET y = 10 WHERE x = 1; <waiting ...>
+step b_commit: COMMIT;
+step a_upd_y: <... completed>
+step a_commit: COMMIT;
+step b_read: SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t;
+rows        
+------------
+1:10:1,2:2:2
+(1 row)
+
+
+starting permutation: a_begin b_begin a_del_parent b_ins_child a_commit b_rollback b_status b_violations
 step a_begin: BEGIN;
 step b_begin: BEGIN;
 step a_del_parent: DELETE FROM vtr.parent WHERE pk = 1;
@@ -219,5 +271,11 @@ step b_status: SELECT count(*) AS changed FROM dolt_status WHERE table_name LIKE
 changed
 -------
       1
+(1 row)
+
+step b_violations: SELECT count(*) AS violations FROM dolt_constraint_violations() WHERE table_name LIKE 'vtr.%';
+violations
+----------
+         0
 (1 row)
 

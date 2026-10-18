@@ -15100,7 +15100,7 @@
       "index": 3,
       "name": "duplicate updates, autocommit on",
       "source_sha256": "9d9b7692eb883933cced625e5b0dc93656e6dab06099a77a1fa31257d6d97c34",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate updates: the second waits, then updates the row as committed."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate updates, autocommit on: each runs alone, the second finding the row as the first left it."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15140,7 +15140,7 @@
       "index": 8,
       "name": "duplicate deletes, autocommit on",
       "source_sha256": "713389822053a2e26abc8337045ec651132e6ebc922f4c5f9aa432973194cf99",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate deletes: the second waits, then finds no row."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, duplicate deletes, autocommit on: the second deletes nothing."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15188,7 +15188,7 @@
       "index": 1,
       "name": "allow commit conflicts on, conflict on transaction commit",
       "source_sha256": "2b1696aea4d6b44fc4670701e00e46f2d241907a6554454fb504a0b2046333a0",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with commit conflicts allowed: there is no commit-time merge to keep conflicts of."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with dolt.allow_commit_conflicts on: there is no commit-time merge to keep conflicts of, the setting changes nothing."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15196,7 +15196,7 @@
       "index": 2,
       "name": "force commit on, conflict on transaction commit (same as dolt_allow_commit_conflicts)",
       "source_sha256": "b46c07d390dd1767fcfaa34e811e7547d7f5fb5a6126befb7a7226ca83d46c1d",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with dolt_force_transaction_commit."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise with dolt_force_transaction_commit, as dolt.allow_commit_conflicts: the same permutation."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15204,7 +15204,7 @@
       "index": 3,
       "name": "allow commit conflicts on, conflict on dolt_merge",
       "source_sha256": "3af8e7763b2957d52d2d2ba4ed438752f88d89dd61496fc0daae9b35a2d744db",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts in a transaction block, committed with dolt.allow_commit_conflicts on."
+      "reason": "Classified F, for editing dolt_conflicts_<table> rows (conflict-tables), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts in a transaction block, committed with dolt.allow_commit_conflicts on."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15212,7 +15212,7 @@
       "index": 4,
       "name": "force commit on, conflict on dolt_merge (same as dolt_allow_commit_conflicts)",
       "source_sha256": "8c0f21d09fdf9fb1d2fe8442291529c19528829bcff7fb0c6e902213097c3eac",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, likewise (dolt_force_transaction_commit as dolt.allow_commit_conflicts)."
+      "reason": "Classified F, for editing dolt_conflicts_<table> rows (conflict-tables), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_commits.spec, likewise (dolt_force_transaction_commit as dolt.allow_commit_conflicts)."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15220,7 +15220,7 @@
       "index": 5,
       "name": "allow commit conflicts off, conflict on dolt_merge",
       "source_sha256": "6a7212230bfcea9c6f6f668caeb6d347837ed86b6b1ed05d605fe2538cbe2b9b",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts not committed with it off."
+      "reason": "Classified F, for dolt_preview_merge_conflicts (preview-merge-conflicts), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_commits.spec, a merge's conflicts not committed with it off."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15228,7 +15228,7 @@
       "index": 7,
       "name": "transaction conflicts follows first-write-wins (a commits first)",
       "source_sha256": "585c8cfb0269ce95e7d6bbbcd79bb1ba351ec0fc6385d89cda441f5066c0c4ef",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, first write wins: the second update waits, then updates the committed row; a keyless table's inserts all kept."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, Dolt's first write wins: here the second writer waits, then overwrites the committed row (the last write wins in READ COMMITTED); a keyless table's inserts all kept."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15236,7 +15236,7 @@
       "index": 8,
       "name": "transaction conflicts follows first-write-wins (b commits first)",
       "source_sha256": "8b3f6d712c6231eb462f185481ca8d5576853e1f25bff3512009aae5942c47ee",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise, the other session committing first."
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, likewise, the second writer committing first: the permutation where b writes and commits first."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15252,7 +15252,7 @@
       "index": 2,
       "name": "mix of dolt_commit and normal commit",
       "source_sha256": "852f58117699c14db348d94fa8b1482e6ff3cad92582dd9b58ac38655e7e34bf",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, a commit doesn't take another session's uncommitted writes."
+      "reason": "Classified F, for Dolt's diff tables (diff-tables), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_commits.spec, a commit doesn't take another session's uncommitted writes."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15260,7 +15260,7 @@
       "index": 8,
       "name": "amend commit in transaction fails when another client moves the branch head",
       "source_sha256": "5b1e82af3afb5312dfe25005602f44ed16477b4445e71a434cb68d75c359e541",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_commits.spec, the head moved by another session while a transaction holds changes: its commit goes on from the new head (dolt_commit --amend isn't prolly's)."
+      "reason": "Classified F, for dolt_commit --amend (amend), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_commits.spec, the head moved by another session while a transaction holds changes: its commit goes on from the new head (dolt_commit --amend isn't prolly's)."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
@@ -15284,7 +15284,7 @@
       "index": 1,
       "name": "clients can't see changes on other branch heads made since transaction start",
       "source_sha256": "0c392148aeb5505897c8cffb74bce1846118915ec845f059496603957ecdbc69",
-      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_branches.spec, another branch's head moved: seen moved in READ COMMITTED."
+      "reason": "Classified F, for AS OF and revision databases (as-of), which prolly lacks; the multi-session behavior around it is rederived under Postgres semantics instead: src/test/prolly/specs/vc_txn_branches.spec, another branch's head moved: seen moved in READ COMMITTED."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",

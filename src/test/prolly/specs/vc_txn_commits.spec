@@ -1,5 +1,5 @@
 # Dolt's multi-session commit tests (DoltStoredProcedureTransactionTests
-# 1-2 and 7-8, DoltConflictHandlingTests 3-6, DoltConstraintViolation-
+# 1-2 and 8, DoltConflictHandlingTests 3-5, DoltConstraintViolation-
 # TransactionTests 1), rederived under Postgres semantics, with savepoints
 # around version-control calls.  A prolly commit is of the branch's
 # working set as the committing transaction sees it: another session's
@@ -83,7 +83,7 @@ permutation a_begin a_tim b_jim b_dcommit b_head_users a_commit b_status a_log
 permutation a_begin b_begin a_tim b_jim a_dcommit b_dcommit a_commit b_commit a_log a_read b_head_users
 permutation a_begin b_rr a_tim b_jim a_dcommit b_dcommit a_commit b_commit a_log a_read b_head_users
 # the head moved by another session while a transaction holds changes
-# (7, 8): its later commit waits for nothing and goes on from the new head
+# (8): its later commit waits for nothing and goes on from the new head
 permutation a_begin a_tim b_jim b_dcommit a_dcommit a_commit a_log b_status
 # a merge's conflicts in a transaction block (DoltConflictHandlingTests
 # 3-5): listed; not committed unless dolt.allow_commit_conflicts is on
