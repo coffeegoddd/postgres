@@ -96,7 +96,7 @@ WHERE name LIKE 'frozen.%' ORDER BY name;
  frozen.bool_keys | d04d885b23f1fc97cb3a0b562d78b9e06e3dc27d40f6912859590c77017d37c8 | 
  frozen.composite | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
  frozen.keyless   | b5ef3d66d0a49c160542af1794d03a1493a4a0256c0181782b3eac7c76ba1d0d | 
- frozen.large     | 8d2a1554e0a30b45e2b631dac16acbb626eb490d18db4bc119dbdd9eb5f6deec | 
+ frozen.large     | 0358a81e973ee335bd03364304062146a27611383d5b505807236bb0677739a3 | 
  frozen.non_ascii | efa7d18e1a1a60c9fdce43ac8557fe6cd9226777440ee27d9c6a635259e1decd | 
  frozen.scalars   | d528770538ba46b234fd863614f1ff5936ca642802030d74bc138b6c8f59e4ab | 
  frozen.sent_keys | 8bb2334d74f996b153d6c002289e2504480ced23f8d7efd0589ff1e0a53a0c7c | 

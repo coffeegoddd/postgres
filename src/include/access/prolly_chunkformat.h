@@ -10,7 +10,9 @@
  * Contract:
  * - Items are (key, value, flags) in key order; in internal nodes (level
  *   > 0) the value is an encoded child reference.  An item's flags say
- *   whether its value refers to a value tree (PROLLY_ITEM_VALUE_REF).
+ *   whether its value refers to a value tree (PROLLY_ITEM_VALUE_REF), and
+ *   whether it lists references to value trees that it holds
+ *   (PROLLY_ITEM_VALUE_REFS); what they mean is the tree's.
  * - encode() depends only on the level and the items: the same node is
  *   the same bytes on every machine.
  * - open() checks a chunk is a node of this format and reads its header;
@@ -33,6 +35,8 @@
 
 /* Item flags. */
 #define PROLLY_ITEM_VALUE_REF	0x01	/* the value refers to a value tree */
+#define PROLLY_ITEM_VALUE_REFS	0x02	/* the value begins with the references
+										 * to value trees it holds */
 
 /* A node read from a chunk: points into the chunk's bytes. */
 typedef struct ProllyChunkNode

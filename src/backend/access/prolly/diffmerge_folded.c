@@ -308,6 +308,7 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
 	RowDiff		rd;
 	Relation	rel;
 	ProllyNodeRef empty;
@@ -325,6 +326,7 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 	chunk_env(&env);
 	env.compare = keying_compare;
 	env.compare_arg = &rd;
+	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	PROLLY_CALL(tree, build_finish, b, &empty);
 	PROLLY_CALL(tree, diff, &env, from ? &from->data : &empty,
@@ -938,6 +940,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
 	Applying	ap;
 
 	require_readable(from);
@@ -954,6 +957,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
+	prolly_keying_use_env(&krefs, ap.c.rd.kr, ap.c.rd.k, tree, &env);
 
 	ap.slot = table_slot_create(ap.rel, NULL);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
@@ -1263,6 +1267,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	Relation	rel = table_open(relid, mode == WALK_LIST ? AccessShareLock :
 								 RowExclusiveLock);
 	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
 	Changes		oc;
 	Changes		tc;
 	ProllyApplier *a = NULL;
@@ -1287,6 +1292,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &tc;
+	prolly_keying_use_env(&krefs, tc.rd.kr, tc.rd.k, tree, &env);
 	PROLLY_CALL(tree, diff, &env, &base->data, &theirs->data, collect_change,
 				&tc);
 	PROLLY_CALL(tree, diff, &env, &base->data, &ours->data, collect_change,
@@ -1552,6 +1558,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	Oid		   *in_param;
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
 	ProllyTreeCursor *cur;
 	ProllyKey	k;
 	ProllyValue v;
@@ -1661,6 +1668,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	chunk_env(&env);
 	env.compare = keying_compare;
 	env.compare_arg = &rd;
+	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
+	PROLLY_CALL(ve, set_values, enc, &krefs.values);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
 								   ALLOCSET_DEFAULT_SIZES);

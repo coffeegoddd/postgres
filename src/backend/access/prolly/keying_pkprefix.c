@@ -54,6 +54,8 @@ struct ProllyKeying
 	TupleDesc	alt_desc;
 	ProllyValueEncoder *alt_valenc;
 
+	const ProllyValueStore *values; /* values out of line; NULL if none */
+
 	/* Primary key, if any. */
 	bool		keyless;
 	const ProllyKeyEncoderRoutine *keyenc_routine;
@@ -294,6 +296,9 @@ pkprefix_decode_row(ProllyKeying *k, const ProllyValue *row,
 				PROLLY_CALL(k->valenc_routine, end, k->alt_valenc);
 			k->alt_valenc = PROLLY_CALL(k->valenc_routine, begin_layout, sd,
 										&layout, k->mcxt);
+			if (k->values)
+				PROLLY_CALL(k->valenc_routine, set_values, k->alt_valenc,
+							k->values);
 			k->alt_desc = sd;
 		}
 		enc = k->alt_valenc;
@@ -312,6 +317,21 @@ pkprefix_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 	if (r != 0)
 		return r;
 	return (a->len > b->len) - (a->len < b->len);
+}
+
+static void
+pkprefix_set_values(ProllyKeying *k, const ProllyValueStore *values)
+{
+	k->values = values;
+	PROLLY_CALL(k->valenc_routine, set_values, k->valenc, values);
+	if (k->alt_valenc)
+		PROLLY_CALL(k->valenc_routine, set_values, k->alt_valenc, values);
+}
+
+static void
+pkprefix_row_refs(ProllyKeying *k, const ProllyValue *row, StringInfo refs)
+{
+	PROLLY_CALL(k->valenc_routine, refs, k->valenc, row, refs);
 }
 
 static void
@@ -344,4 +364,6 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.decode_row = pkprefix_decode_row,
 	.compare = pkprefix_compare,
 	.close = pkprefix_close,
+	.set_values = pkprefix_set_values,
+	.row_refs = pkprefix_row_refs,
 };

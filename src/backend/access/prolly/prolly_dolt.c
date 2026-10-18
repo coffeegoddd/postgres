@@ -1425,6 +1425,8 @@ typedef struct Rows
 	ProllyKeying *keying;
 	bool		keyless;
 	TupleTableSlot *slot;
+	ProllyTreeEnv env;			/* where values out of line are read */
+	ProllyKeyingRefs refs;
 } Rows;
 
 static void
@@ -1434,6 +1436,8 @@ rows_begin(Rows *r, Relation rel)
 	/* (a table's trees are its folds, rows as a rewrite has them) */
 	r->keying = PROLLY_CALL(r->c.keying, open, rel, CurrentMemoryContext);
 	r->keyless = PROLLY_CALL(r->c.keying, keyless, r->keying);
+	prolly_folded_tree_env(&r->env);
+	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 }
 

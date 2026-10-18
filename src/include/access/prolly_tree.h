@@ -86,7 +86,29 @@ typedef struct ProllyTreeEnv
 	const ProllyChunkFormatRoutine *chunk_format;
 	const ProllyChunkStoreRoutine *chunk_store;
 	ProllyChunkStore *chunks;	/* opened by the caller */
+
+	/*
+	 * Optional, for a tree whose leaf values hold references to value trees
+	 * of their own (value_write()'s): appends the references a value holds
+	 * to refs, one after another.  A leaf records them, so walks reach those
+	 * value trees from the nodes alone, without knowing how values are laid
+	 * out.  Every tree written with values that hold references must have
+	 * it set.
+	 */
+	void		(*value_refs) (const ProllyValue *value, void *arg,
+							   StringInfo refs);
+	void	   *value_refs_arg;
 } ProllyTreeEnv;
+
+/*
+ * Where values out of line are stored and read: a tree implementation's
+ * value trees, in an environment's chunk store.
+ */
+typedef struct ProllyValueStore
+{
+	const struct ProllyTreeRoutine *tree;
+	const ProllyTreeEnv *env;
+} ProllyValueStore;
 
 /* One change for apply(): a put, or a delete if is_delete. */
 typedef struct ProllyEdit

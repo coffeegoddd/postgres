@@ -10,9 +10,17 @@
  *	varint n		number of live (not dropped) columns stored
  *	null bitmap		n bits, 1 = NULL
  *	values			each non-NULL column as varint length + its canonical
- *					bytes (prolly_datum.h)
+ *					bytes (prolly_datum.h), or, if those are longer than
+ *					VALUE_INLINE_MAX, as varint VALUE_INLINE_MAX + 1 + the
+ *					length of a reference to a value tree holding them, and
+ *					the reference
  *
- * over the live columns in attribute order.  Dropped columns are never
+ * over the live columns in attribute order.  No value stored inline is
+ * longer than VALUE_INLINE_MAX, so a length past it marks a reference.
+ * Whether a value goes out of line depends on its own bytes alone, never
+ * on its row or its table: a value encodes alike wherever it is, and two
+ * rows holding it share its tree.  A row without long values is the same
+ * bytes as before references were.  Dropped columns are never
  * stored, so a table that dropped a column encodes rows exactly as one that
  * never had it.  Trailing NULL columns are not stored, so adding a nullable
  * column without a default needs no rewrite.
@@ -48,6 +56,9 @@
 #include "access/prolly_datum.h"
 #include "utils/memutils.h"
 
+/* longer canonical bytes are stored out of line; part of the format */
+#define VALUE_INLINE_MAX	2048
+
 struct ProllyValueEncoder
 {
 	TupleDesc	desc;
@@ -62,7 +73,16 @@ struct ProllyValueEncoder
 	bool		decode_only;
 	int			nextra;
 	int		   *extra_attno;
+
+	const ProllyValueStore *values; /* values out of line; NULL if none */
+	StringInfoData scratch;		/* a value read from out of line */
 };
+
+static void
+no_values(void)
+{
+	elog(ERROR, "a prolly row has a value out of line, and no value store was given");
+}
 
 /*
  * An encoder over the given 0-based attribute indexes (NULL: the live
@@ -85,6 +105,12 @@ begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt
 	enc->nulls = MemoryContextAlloc(mcxt, sizeof(bool) * Max(ncols, 1));
 	enc->extra_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(natts, 1));
 	enc->decode_only = (attnos != NULL);
+	{
+		MemoryContext old = MemoryContextSwitchTo(mcxt);
+
+		initStringInfo(&enc->scratch);
+		MemoryContextSwitchTo(old);
+	}
 
 	for (int j = 0; j < ncols; j++)
 	{
@@ -222,8 +248,23 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 			continue;
 		initStringInfo(&val);
 		prolly_datum_encode(enc->codecs[i], slot->tts_values[i], &val);
-		prolly_put_varint(out, val.len);
-		appendBinaryStringInfo(out, val.data, val.len);
+		if (val.len > VALUE_INLINE_MAX)
+		{
+			StringInfoData ref;
+
+			if (enc->values == NULL)
+				no_values();
+			initStringInfo(&ref);
+			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
+						(const uint8 *) val.data, val.len, &ref);
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+			appendBinaryStringInfo(out, ref.data, ref.len);
+		}
+		else
+		{
+			prolly_put_varint(out, val.len);
+			appendBinaryStringInfo(out, val.data, val.len);
+		}
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(enc->tmpcxt);
@@ -271,14 +312,31 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 		if (!enc->nulls[j])
 		{
 			uint64		len = prolly_get_varint(&p, end);
+			bool		out_of_line = len > VALUE_INLINE_MAX;
 
+			if (out_of_line)
+				len -= VALUE_INLINE_MAX + 1;
 			if (len > (uint64) (end - p))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("invalid canonical prolly row: value runs past the end")));
 
 			/* No codec: the column was dropped after the row was encoded. */
-			if (enc->codecs[i] != NULL)
+			if (enc->codecs[i] != NULL && out_of_line)
+			{
+				ProllyValue ref = {(const uint8 *) p, (uint32) len};
+
+				if (enc->values == NULL)
+					no_values();
+				resetStringInfo(&enc->scratch);
+				PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
+							&ref, 0, PG_UINT64_MAX, &enc->scratch);
+				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
+														  enc->scratch.data,
+														  enc->scratch.len);
+				slot->tts_isnull[i] = false;
+			}
+			else if (enc->codecs[i] != NULL)
 			{
 				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i], p, (int) len);
 				slot->tts_isnull[i] = false;
@@ -305,6 +363,56 @@ canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 	ExecStoreVirtualTuple(slot);
 	ExecMaterializeSlot(slot);	/* copy values out of tmpcxt */
 	MemoryContextReset(enc->tmpcxt);
+	if (enc->scratch.maxlen > 64 * 1024)
+	{
+		/* (a long value's buffer isn't kept for the rows after it) */
+		MemoryContext cxt = MemoryContextSwitchTo(GetMemoryChunkContext(enc));
+
+		pfree(enc->scratch.data);
+		initStringInfo(&enc->scratch);
+		MemoryContextSwitchTo(cxt);
+	}
+}
+
+static void
+canonical_set_values(ProllyValueEncoder *enc, const ProllyValueStore *values)
+{
+	enc->values = values;
+}
+
+static void
+canonical_refs(ProllyValueEncoder *enc, const ProllyValue *row, StringInfo refs)
+{
+	const char *p = (const char *) row->data;
+	const char *end = p + row->len;
+	const char *nulls;
+	uint64		n = prolly_get_varint(&p, end);
+
+	if (n > (uint64) (end - p) * 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row header")));
+	nulls = p;
+	p += (n + 7) / 8;
+	for (uint64 j = 0; j < n; j++)
+	{
+		uint64		len;
+		bool		out_of_line;
+
+		if (((uint8) nulls[j / 8] >> (j % 8)) & 1)
+			continue;
+		len = prolly_get_varint(&p, end);
+		out_of_line = len > VALUE_INLINE_MAX;
+		if (out_of_line)
+			len -= VALUE_INLINE_MAX + 1;
+		if (len > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid canonical prolly row: value runs past the end")));
+		if (out_of_line)
+			appendBinaryStringInfo(refs, p, (int) len);
+		p += len;
+	}
 }
 
 static void
@@ -316,6 +424,7 @@ canonical_end(ProllyValueEncoder *enc)
 	pfree(enc->has_missing);
 	pfree(enc->nulls);
 	pfree(enc->extra_attno);
+	pfree(enc->scratch.data);
 	pfree(enc);
 }
 
@@ -323,10 +432,10 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.info = {
 		.iface = PROLLY_IFACE_VALUE_ENCODER,
 		.impl_id = 2,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "canonical",
 		.description = "portable rows of live columns, trailing NULLs omitted, "
-		"no local OIDs",
+		"no local OIDs, long values out of line",
 	},
 	.begin = canonical_begin,
 	.layout = canonical_layout,
@@ -334,4 +443,6 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.encode = canonical_encode,
 	.decode = canonical_decode,
 	.end = canonical_end,
+	.set_values = canonical_set_values,
+	.refs = canonical_refs,
 };

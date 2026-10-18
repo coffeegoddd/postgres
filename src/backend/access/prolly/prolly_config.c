@@ -123,3 +123,37 @@ prolly_database_components(ProllyDatabaseComponents *components)
 	components->reclamation = (const ProllyReclaimRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_RECLAMATION);
 }
+
+/* A data tree value's references: its row's. */
+static void
+keying_value_refs(const ProllyValue *value, void *arg, StringInfo refs)
+{
+	ProllyKeyingRefs *r = arg;
+	ProllyValue row;
+	uint64		count;
+
+	PROLLY_CALL(r->routine, parse_value, r->keying, value, &row, &count);
+	PROLLY_CALL(r->routine, row_refs, r->keying, &row, refs);
+}
+
+void
+prolly_keying_use_env(ProllyKeyingRefs *refs, const ProllyKeyingRoutine *routine,
+					  ProllyKeying *k, const ProllyTreeRoutine *tree,
+					  ProllyTreeEnv *env)
+{
+	refs->routine = routine;
+	refs->keying = k;
+	refs->values.tree = tree;
+	refs->values.env = env;
+	PROLLY_CALL(routine, set_values, k, &refs->values);
+	env->value_refs = keying_value_refs;
+	env->value_refs_arg = refs;
+}
+
+void
+prolly_keying_row_refs(const ProllyValue *value, void *arg, StringInfo refs)
+{
+	ProllyKeyingRefs *r = arg;
+
+	PROLLY_CALL(r->routine, row_refs, r->keying, value, refs);
+}

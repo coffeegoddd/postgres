@@ -1660,3 +1660,233 @@ tree_large_keys(const ProllyImplInfo *impl)
 		elog(ERROR, "a tree of keys of 40000 bytes was built");
 	pfree(kbuf.data);
 }
+
+/*
+ * Values that hold references to value trees of their own (value_write()'s),
+ * which the environment's value_refs() finds: they read back as they were
+ * put, from get, cursors and diff, long ones too; a tree built at once and
+ * one built by edits are the same; and a walk reaches every value tree a
+ * value references, from the nodes alone, with no value_refs() set.
+ *
+ * A held value here is a byte, the number of references, then each
+ * reference, then filler.
+ */
+#define HELD_KEYS	30
+
+static void
+held_refs(const ProllyValue *value, void *arg, StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+	int			n = (uint8) *p++;
+
+	(*(int *) arg)++;
+	for (int i = 0; i < n; i++)
+	{
+		const char *start = p;
+
+		p += 1 + (uint8) *p;
+		(void) prolly_get_varint(&p, end);
+		appendBinaryStringInfo(refs, start, p - start);
+	}
+}
+
+/* Blob b's bytes: random, 5 to 40 KB. */
+static void
+held_blob(int b, StringInfo buf)
+{
+	uint64		x = 977 * (uint64) b + 3;
+	int			len = 5000 + b * 7919 % 35000;
+
+	resetStringInfo(buf);
+	while (buf->len < len)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(buf, (char) (x >> 56));
+	}
+}
+
+/* Key k's value at version v, its references taken from refs. */
+static void
+held_value(int k, int v, StringInfo *refs, StringInfo buf)
+{
+	int			n = (k + v) % 3;
+
+	resetStringInfo(buf);
+	appendStringInfoChar(buf, (char) n);
+	for (int i = 0; i < n; i++)
+	{
+		StringInfo	r = refs[(k * 2 + i + v) % 8];
+
+		appendBinaryStringInfo(buf, r->data, r->len);
+	}
+	/* every fifth value long, stored out of line itself */
+	for (int i = 0; i < (k % 5 == 0 ? 3000 : 20); i++)
+		appendStringInfoChar(buf, (char) ('a' + (k + i) % 26));
+}
+
+typedef struct HeldDiff
+{
+	StringInfo *refs;
+	int			nchanges;
+	bool		ok;
+} HeldDiff;
+
+static void
+held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
+				const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	HeldDiff   *d = arg;
+	StringInfoData want;
+
+	d->nchanges++;
+	initStringInfo(&want);
+	held_value(key_int(key), 0, d->refs, &want);
+	d->ok &= before && before->len == want.len &&
+		memcmp(before->data, want.data, want.len) == 0;
+	held_value(key_int(key), 1, d->refs, &want);
+	d->ok &= after && after->len == want.len &&
+		memcmp(after->data, want.data, want.len) == 0;
+	pfree(want.data);
+}
+
+void
+tree_held_references(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	StringInfo	refs[8];
+	StringInfoData vbuf;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef built;
+	ProllyNodeRef edited;
+	ProllyNodeRef changed;
+	ProllyTreeCursor *c;
+	ProllyKey	key;
+	ProllyValue value;
+	HashSet		visited = {0};
+	HeldDiff	d = {refs, 0, true};
+	int			calls = 0;
+	int			n = 0;
+
+	make_env(&env);
+	initStringInfo(&vbuf);
+	for (int i = 0; i < 8; i++)
+	{
+		refs[i] = makeStringInfo();
+		held_blob(i, &vbuf);
+		PROLLY_CALL(tr, value_write, &env, (const uint8 *) vbuf.data, vbuf.len,
+					refs[i]);
+	}
+	env.value_refs = held_refs;
+	env.value_refs_arg = &calls;
+
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	for (int k = 0; k < HELD_KEYS; k++)
+	{
+		KeyBuf		kb;
+
+		key = key_of(k, &kb);
+		held_value(k, 0, refs, &vbuf);
+		value.data = (const uint8 *) vbuf.data;
+		value.len = vbuf.len;
+		PROLLY_CALL(tr, build_add, b, &key, &value);
+	}
+	PROLLY_CALL(tr, build_finish, b, &built);
+	if (calls != HELD_KEYS)
+		elog(ERROR, "value_refs() was called %d times for %d values", calls,
+			 HELD_KEYS);
+
+	/* By edits, in two batches. */
+	b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tr, build_finish, b, &edited);
+	for (int half = 0; half < 2; half++)
+	{
+		ProllyEdit	edits[HELD_KEYS];
+		KeyBuf		kbs[HELD_KEYS];
+		StringInfoData bufs[HELD_KEYS];
+		int			m = 0;
+
+		for (int k = half; k < HELD_KEYS; k += 2)
+		{
+			initStringInfo(&bufs[m]);
+			held_value(k, 0, refs, &bufs[m]);
+			edits[m].key = key_of(k, &kbs[m]);
+			edits[m].value.data = (const uint8 *) bufs[m].data;
+			edits[m].value.len = bufs[m].len;
+			edits[m].is_delete = false;
+			m++;
+		}
+		PROLLY_CALL(tr, apply, &env, &edited, edits, m, &edited);
+	}
+	if (!same_hash(&built, &edited))
+		elog(ERROR, "a tree of values holding references built at once and by edits differ");
+
+	/* Read back as put. */
+	for (int k = 0; k < HELD_KEYS; k++)
+	{
+		KeyBuf		kb;
+		StringInfoData got;
+
+		key = key_of(k, &kb);
+		initStringInfo(&got);
+		held_value(k, 0, refs, &vbuf);
+		if (!PROLLY_CALL(tr, get, &env, &built, &key, &got) ||
+			got.len != vbuf.len || memcmp(got.data, vbuf.data, got.len) != 0)
+			elog(ERROR, "get of key %d returned another value", k);
+		pfree(got.data);
+	}
+	c = PROLLY_CALL(tr, cursor_open, &env, &built, CurrentMemoryContext);
+	PROLLY_CALL(tr, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tr, cursor_next, c, &key, &value))
+	{
+		held_value(key_int(&key), 0, refs, &vbuf);
+		if (value.len != vbuf.len || memcmp(value.data, vbuf.data, value.len) != 0)
+			elog(ERROR, "a cursor returned another value for key %d", key_int(&key));
+		n++;
+	}
+	PROLLY_CALL(tr, cursor_close, c);
+	if (n != HELD_KEYS)
+		elog(ERROR, "a cursor returned %d of %d keys", n, HELD_KEYS);
+
+	/* A walk, with nothing to say how values are laid out, reaches them all. */
+	env.value_refs = NULL;
+	PROLLY_CALL(tr, walk, &env, &built, collect_node, &visited);
+	for (int i = 0; i < 8; i++)
+	{
+		ProllyHash	h;
+
+		memset(&h, 0, sizeof(h));
+		h.len = (uint8) refs[i]->data[0];
+		memcpy(h.bytes, refs[i]->data + 1, h.len);
+		if (!in_set(&visited, &h))
+			elog(ERROR, "a walk didn't reach value tree %d, which values reference",
+				 i);
+	}
+
+	/* Every other value changed: diff reports them as put. */
+	env.value_refs = held_refs;
+	{
+		ProllyEdit	edits[HELD_KEYS];
+		KeyBuf		kbs[HELD_KEYS];
+		StringInfoData bufs[HELD_KEYS];
+		int			m = 0;
+
+		for (int k = 0; k < HELD_KEYS; k += 2)
+		{
+			initStringInfo(&bufs[m]);
+			held_value(k, 1, refs, &bufs[m]);
+			edits[m].key = key_of(k, &kbs[m]);
+			edits[m].value.data = (const uint8 *) bufs[m].data;
+			edits[m].value.len = bufs[m].len;
+			edits[m].is_delete = false;
+			m++;
+		}
+		PROLLY_CALL(tr, apply, &env, &built, edits, m, &changed);
+	}
+	PROLLY_CALL(tr, diff, &env, &built, &changed, held_diff_visit, &d);
+	if (d.nchanges != HELD_KEYS / 2 || !d.ok)
+		elog(ERROR, "diff of values holding references reported %d changes (values %s)",
+			 d.nchanges, d.ok ? "right" : "wrong");
+	pfree(vbuf.data);
+}

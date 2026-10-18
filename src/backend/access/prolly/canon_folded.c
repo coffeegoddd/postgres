@@ -167,15 +167,16 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "4", value trees addressed by byte
- * counts; "3" keyed their chunks by offset, and was the first with its
+ * The format a folded root is in: "5", a row's long values each out of
+ * line in a value tree of its own; "4" had only long rows out of line;
+ * "3" keyed value trees' chunks by offset, and was the first with its
  * definitions' fields escaped (append_field()); "2" was keyless rows keyed
  * by their first bytes and their hash, and a root without the item keyed
  * them by the hash alone.  A root in another has its tables' rows
  * unreadable here, and is neither moved to nor merged: its definitions'
  * text isn't this format's.
  */
-#define FOLDED_FORMAT	"4"
+#define FOLDED_FORMAT	"5"
 
 typedef struct Canon
 {

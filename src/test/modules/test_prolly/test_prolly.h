@@ -28,6 +28,7 @@ extern void tablefile_rejects_other_bytes(const ProllyImplInfo *impl);
 extern void keyenc_order_matches_opclass(const ProllyImplInfo *impl);
 extern void keyenc_desc_and_nulls(const ProllyImplInfo *impl);
 extern void valenc_round_trip(const ProllyImplInfo *impl);
+extern void valenc_long_values(const ProllyImplInfo *impl);
 extern void valenc_platform_independent(const ProllyImplInfo *impl);
 extern void valenc_independent_of_history(const ProllyImplInfo *impl);
 extern void valenc_independent_of_session(const ProllyImplInfo *impl);
@@ -49,6 +50,7 @@ extern void tree_diff_across_heights(const ProllyImplInfo *impl);
 extern void tree_seeks_in_order(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 extern void tree_large_values(const ProllyImplInfo *impl);
+extern void tree_held_references(const ProllyImplInfo *impl);
 
 /* keying_checks.c */
 extern void keying_round_trip(const ProllyImplInfo *impl);
