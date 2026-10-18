@@ -103,6 +103,43 @@ SELECT count(*) AS left FROM dolt_branches WHERE name = 'rs_new';
     0
 (1 row)
 
+-- deleted again: already gone, as asked
+SELECT dolt_serve_move_head('rs_new', '', NULL, :'fmt', false) AS again;
+ again 
+-------
+ t
+(1 row)
+
+-- another branch with uncommitted changes: its delete refused unless
+-- forced, whether or not it is merged into this session's branch
+SELECT dolt_checkout('-b', 'rs_dirty') IS NOT NULL AS on_dirty;
+ on_dirty 
+----------
+ t
+(1 row)
+
+INSERT INTO rs.t VALUES (40, 'uncommitted');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_serve_move_head('rs_dirty', pg_temp.h('rs_dirty'), NULL, :'fmt', false);
+ERROR:  branch "rs_dirty" has uncommitted changes
+HINT:  Commit or reset them there, or push with --force, which drops them.
+SELECT dolt_serve_move_head('rs_dirty', pg_temp.h('rs_dirty'), NULL, :'fmt', true) AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT count(*) AS left FROM dolt_branches WHERE name = 'rs_dirty';
+ left 
+------
+    0
+(1 row)
+
 -- the session's branch with uncommitted changes: refused unless forced
 INSERT INTO rs.t VALUES (3, 'three');
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fmt', false);

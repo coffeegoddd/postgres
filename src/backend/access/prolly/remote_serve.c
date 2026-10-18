@@ -178,18 +178,31 @@ the_spool(void)
 		RegisterXactCallback(spool_xact_callback, NULL);
 		callback_registered = true;
 	}
-	old = MemoryContextSwitchTo(TopTransactionContext);
-	spool = palloc0(sizeof(Spool));
-	ctl.keysize = sizeof(ProllyHash);
-	ctl.entrysize = sizeof(SpooledChunk);
-	ctl.hcxt = TopTransactionContext;
-	spool->chunks = hash_create("prolly pushed chunks", 1024, &ctl,
-								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	/* (the transaction's, not the call's: it outlives this one) */
-	CurrentResourceOwner = TopTransactionResourceOwner;
-	spool->file = BufFileCreateTemp(false);
-	CurrentResourceOwner = owner;
-	MemoryContextSwitchTo(old);
+	{
+		Spool	   *made;
+
+		old = MemoryContextSwitchTo(TopTransactionContext);
+		made = palloc0(sizeof(Spool));
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(SpooledChunk);
+		ctl.hcxt = TopTransactionContext;
+		made->chunks = hash_create("prolly pushed chunks", 1024, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		/* (the transaction's, not the call's: it outlives this one) */
+		CurrentResourceOwner = TopTransactionResourceOwner;
+		PG_TRY();
+		{
+			made->file = BufFileCreateTemp(false);
+		}
+		PG_FINALLY();
+		{
+			CurrentResourceOwner = owner;
+		}
+		PG_END_TRY();
+		MemoryContextSwitchTo(old);
+		/* (only once it is whole: a failure above leaves none) */
+		spool = made;
+	}
 	return spool;
 }
 
@@ -223,10 +236,14 @@ spool_get(ProllyRemote *remote, const ProllyHash *hash, StringInfo out)
 	return true;
 }
 
+/*
+ * Never: what was sent isn't checked yet, and a remote that has a chunk
+ * has all it references.  The receive reads what it needs with get().
+ */
 static bool
 spool_has(ProllyRemote *remote, const ProllyHash *hash)
 {
-	return spooled(hash) != NULL;
+	return false;
 }
 
 static const ProllyRemoteRoutine spool_remote = {
@@ -380,20 +397,47 @@ dolt_serve_receive(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("a chunk can't be null")));
-		c = hash_search(s->chunks, &hashes[i], HASH_ENTER, &found);
-		if (found)
+		if (hash_search(s->chunks, &hashes[i], HASH_FIND, NULL) != NULL)
 			continue;
+		/* (the bytes first: an entry is only ever for what was written) */
 		chunk = DatumGetByteaPP(chunks[i]);
-		c->offset = s->len;
-		c->len = VARSIZE_ANY_EXHDR(chunk);
 		if (BufFileSeek(s->file, 0, s->len, SEEK_SET) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not seek in a push's temporary file: %m")));
-		BufFileWrite(s->file, VARDATA_ANY(chunk), c->len);
+		BufFileWrite(s->file, VARDATA_ANY(chunk), VARSIZE_ANY_EXHDR(chunk));
+		c = hash_search(s->chunks, &hashes[i], HASH_ENTER, &found);
+		c->offset = s->len;
+		c->len = VARSIZE_ANY_EXHDR(chunk);
 		s->len += c->len;
 	}
 	PG_RETURN_VOID();
+}
+
+/* A chunk the push sent, checked against its address. */
+static void
+check_sent(const ProllyHash *hash)
+{
+	const ProllyHashRoutine *hr = prolly_hash_lookup("sha256");
+	StringInfoData data;
+	ProllyHashCtx *ctx;
+	ProllyHash	actual;
+
+	initStringInfo(&data);
+	if (!spool_get(NULL, hash, &data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the push didn't send commit %s", prolly_hash_hex(hash))));
+	ctx = PROLLY_CALL(hr, begin, CurrentMemoryContext);
+	PROLLY_CALL(hr, update, ctx, (const uint8 *) data.data, data.len);
+	PROLLY_CALL(hr, finish, ctx, &actual);
+	if (actual.len != hash->len || memcmp(actual.bytes, hash->bytes, hash->len) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s doesn't match its hash",
+						prolly_hash_hex(hash)),
+				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
+	pfree(data.data);
 }
 
 /*
@@ -431,9 +475,25 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("this database holds commits of canonical format %s, not %s",
 						mine.data, text_to_cstring(PG_GETARG_TEXT_PP(3)))));
+	/*
+	 * (a branch already elsewhere than expected: false before anything is
+	 * received, as the move would say after)
+	 */
+	{
+		ProllyHash	at = {0};
+		ProllyBranchId id;
+
+		if (PROLLY_CALL(dc.refs, branch_lookup, branch, &id))
+			(void) PROLLY_CALL(dc.refs, resolve, branch, &at);
+		if (at.len != expected.len || memcmp(at.bytes, expected.bytes, at.len) != 0)
+			PG_RETURN_BOOL(false);
+	}
 	if (has_head)
 	{
 		bytea_hash(PG_GETARG_BYTEA_PP(2), &head);
+		/* (the head the store lacks: sent, and its bytes its address's) */
+		if (!PROLLY_CALL(prolly_chunk_store(), has, store(), &head))
+			check_sent(&head);
 		(void) PROLLY_CALL(dc.transfer, receive, &spool_remote, NULL, &head, 1);
 	}
 	PG_RETURN_BOOL(PROLLY_CALL(dc.refs, branch_move, branch, &expected,

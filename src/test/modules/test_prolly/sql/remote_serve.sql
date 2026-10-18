@@ -37,6 +37,16 @@ SELECT dolt_hashof('rs_new') = dolt_hashof('HEAD~1') AS made;
 -- deleted
 SELECT dolt_serve_move_head('rs_new', pg_temp.h('rs_new'), NULL, :'fmt', false);
 SELECT count(*) AS left FROM dolt_branches WHERE name = 'rs_new';
+-- deleted again: already gone, as asked
+SELECT dolt_serve_move_head('rs_new', '', NULL, :'fmt', false) AS again;
+-- another branch with uncommitted changes: its delete refused unless
+-- forced, whether or not it is merged into this session's branch
+SELECT dolt_checkout('-b', 'rs_dirty') IS NOT NULL AS on_dirty;
+INSERT INTO rs.t VALUES (40, 'uncommitted');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_serve_move_head('rs_dirty', pg_temp.h('rs_dirty'), NULL, :'fmt', false);
+SELECT dolt_serve_move_head('rs_dirty', pg_temp.h('rs_dirty'), NULL, :'fmt', true) AS deleted;
+SELECT count(*) AS left FROM dolt_branches WHERE name = 'rs_dirty';
 -- the session's branch with uncommitted changes: refused unless forced
 INSERT INTO rs.t VALUES (3, 'three');
 SELECT dolt_serve_move_head('main', pg_temp.h('main'), pg_temp.h('HEAD~1'), :'fmt', false);
