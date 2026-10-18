@@ -29,11 +29,20 @@ def instructions(path: Path) -> int:
 
 
 def children(pid: int) -> set[int]:
-    try:
-        text = Path(f"/proc/{pid}/task/{pid}/children").read_text()
-    except OSError:
-        return set()
-    return {int(p) for p in text.split()}
+    """The processes pid forked that run now (the kernel's children list)."""
+    return {int(p) for p in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()}
+
+
+def written(counts_dir: Path) -> dict[Path, tuple[int, int]]:
+    """Each count file's (modification time, size)."""
+    out = {}
+    for f in counts_dir.glob("cachegrind.out.*"):
+        try:
+            st = f.stat()
+        except FileNotFoundError:
+            continue
+        out[f] = (st.st_mtime_ns, st.st_size)
+    return out
 
 
 @registry.collectors.register("cachegrind")
@@ -43,11 +52,15 @@ class CachegrindCollector(Collector):
     def check(self, ctx):
         if not hasattr(ctx.cluster, "counts_dir"):
             raise Unavailable("needs the cachegrind cluster ([run] cluster = \"cachegrind\")")
+        try:
+            children(postmaster_pid(ctx.cluster.data_dir))
+        except OSError as e:
+            raise Unavailable(f"can't list the server's processes: {e}")
 
     def start(self, ctx):
         self.pid = postmaster_pid(ctx.cluster.data_dir)
         self.resident = children(self.pid)   # the server's own processes
-        self.before = set(ctx.cluster.counts_dir.glob("cachegrind.out.*"))
+        self.before = written(ctx.cluster.counts_dir)
 
     def stop(self, ctx):
         # Every process the window forked has ended and written its count.
@@ -56,7 +69,9 @@ class CachegrindCollector(Collector):
             if time.monotonic() > deadline:
                 raise RuntimeError("server processes of the window did not end")
             time.sleep(0.05)
-        self.files = sorted(set(ctx.cluster.counts_dir.glob("cachegrind.out.*")) - self.before)
+        # (written since the window began: new, or a reused pid's rewritten)
+        self.files = sorted(f for f, stamp in written(ctx.cluster.counts_dir).items()
+                            if self.before.get(f) != stamp)
 
     def results(self, ctx, outcome):
         if not self.files:

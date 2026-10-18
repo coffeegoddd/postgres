@@ -153,6 +153,9 @@ def validate(cfg: dict, suite: str) -> None:
         raise ConfigError("benchmark quality requires runtime environment monitoring")
     if type(run["settled_counters"]) is not bool:
         raise ConfigError("settled_counters must be true or false")
+    if run["settled_counters"] and suite == "S" and (not run["workloads"] or "S6" in run["workloads"]):
+        raise ConfigError("settled_counters waits until no other client is connected, and S6 "
+                          "holds a session open for its whole window: leave S6 out")
     if not set(run["required_collectors"]) <= set(run["collectors"]):
         raise ConfigError("required_collectors must be enabled")
     for label, sizes in cfg["sizes"].items():

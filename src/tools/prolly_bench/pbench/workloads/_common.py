@@ -52,6 +52,11 @@ class PgbenchResult:
     client_cpu_seconds: float = 0.0
     output: str = ""
 
+    def attempted(self) -> float:
+        """Transactions pgbench took on, each counting toward -t: those it
+        processed, those that failed, and those --latency-limit skipped."""
+        return self.transactions + self.failed + self.skipped
+
     def metrics(self) -> dict[str, Optional[float]]:
         def ms(us):
             return None if us is None else us / 1000.0
@@ -172,8 +177,8 @@ def run_pgbench(ctx: Context, *, seconds: int, builtin: Optional[str] = None,
     res.tps = parsed["tps"]
     if res.transactions <= 0 or res.tps is None or res.tps <= 0:
         raise RuntimeError("pgbench completed no useful work or omitted throughput")
-    if transactions and res.transactions + res.failed != transactions * clients:
-        raise RuntimeError(f"pgbench ran {res.transactions + res.failed:.0f} transactions, "
+    if transactions and res.attempted() != transactions * clients:
+        raise RuntimeError(f"pgbench ran {res.attempted():.0f} transactions, "
                            f"not the {transactions * clients} asked for")
     if log_latency:
         failed_samples = parse_pgbench_logs(ctx.scratch_dir, log_prefix, res.latency)

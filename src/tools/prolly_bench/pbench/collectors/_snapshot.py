@@ -36,6 +36,11 @@ def settled(ctx) -> bool:
     return bool(ctx.params.get("settled_counters"))
 
 
+def wait_for_clients(ctx, timeout_seconds: int = 120) -> None:
+    """Wait until no other client backend is connected."""
+    ctx.cluster.sql(_WAIT.format(tries=timeout_seconds * 100))
+
+
 def snapshot(ctx, sql: str, *, dbname: str = "postgres", timeout_seconds: int = 120) -> str:
     """sql's single result, read as the counters' runs need it."""
     if not settled(ctx):

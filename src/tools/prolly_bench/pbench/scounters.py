@@ -19,12 +19,14 @@ from typing import Optional
 
 # Totals that count work, exactly, in a counter run.
 EXACT = ("wal_bytes", "wal_records", "wal_fpi", "wal_fpi_bytes",
-         "io_hits", "io_reads", "io_writes", "io_extends",
+         "io_hits", "io_reads", "io_writes", "io_extends", "io_evictions", "io_fsyncs",
+         "io_read_bytes", "io_write_bytes",
          "relation_bytes", "chunk_store_bytes")
 # Instruction counts: close, never exact.
 INSTRUCTIONS = ("instructions_user", "instructions_kernel", "cachegrind_instructions")
 # Each counter's unit and floor kind (events, bytes or instructions).
 _BYTES = {"wal_bytes", "wal_fpi_bytes", "relation_bytes", "chunk_store_bytes",
+          "io_read_bytes", "io_write_bytes",
           "engine.chunk_bytes_appended", "engine.bytes_hashed"}
 
 

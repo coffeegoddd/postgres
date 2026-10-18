@@ -403,7 +403,7 @@ def main(argv=None) -> int:
     sc.set_defaults(fn=scounters.run)
 
     from pbench import complexity
-    growth =sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")
+    growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")
     growth.add_argument("dir", type=Path)
     growth.add_argument("--workload", choices=["V1", "V2", "V3", "V4"], default="V2")
     growth.add_argument("--operation", default="dolt_commit")

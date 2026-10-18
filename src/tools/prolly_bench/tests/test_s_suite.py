@@ -70,6 +70,39 @@ class CounterShapeTest(unittest.TestCase):
         self.assertEqual(parse_perf_stat(text),
                          {"instructions:u": 123456.0, "instructions:k": None})
 
+    def test_perf_stat_hybrid_pmus_summed(self):
+        text = ("100,,cpu_core/instructions:u/,1000,100.00,,\n"
+                "<not counted>,,cpu_atom/instructions:u/,0,0.00,,\n"
+                "<not supported>,,cpu_core/instructions:k/,0,100.00,,\n")
+        self.assertEqual(parse_perf_stat(text),
+                         {"instructions:u": 100.0, "instructions:k": None})
+
+    def test_skipped_transactions_count_toward_fixed_work(self):
+        from pbench.workloads._common import PgbenchResult
+        res = PgbenchResult(transactions=1990, failed=0, skipped=10)
+        self.assertEqual(res.attempted(), 2000)
+
+    def test_settled_counters_refuse_s6(self):
+        for workloads in ([], ["S1", "S6"]):
+            with self.assertRaises(config.ConfigError, msg=workloads):
+                config.load(HERE / "configs" / "s_counters.toml",
+                            {"run": {"workloads": workloads}})
+
+    def test_every_io_counter_is_compared(self):
+        for m in ("io_evictions", "io_fsyncs", "io_read_bytes", "io_write_bytes"):
+            self.assertTrue(is_counter(m), m)
+        self.assertEqual(kind("io_read_bytes"), "bytes")
+
+    def test_cachegrind_counts_a_reused_pid(self):
+        from pbench.collectors.cachegrind import written
+        with tempfile.TemporaryDirectory() as d:
+            counts = Path(d)
+            f = counts / "cachegrind.out.123"
+            f.write_text("summary: 1\n")
+            before = written(counts)
+            f.write_text("summary: 22\n")   # pid 123 again, in the window
+            self.assertNotEqual(written(counts)[f], before[f])
+
     def test_cachegrind_summary(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "cachegrind.out.1"

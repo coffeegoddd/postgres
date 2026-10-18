@@ -8,11 +8,14 @@ from pbench.core.interfaces import Collector, NotApplicable
 from pathlib import Path
 
 # The database's chunk store: its journal segments, manifest and table
-# files, prolly_* in the database's directory (none for heap).
-CHUNK_STORE_SQL = """SELECT coalesce(sum((pg_stat_file(d || '/' || f)).size), 0)
+# files in the database's directory (none for heap); not the files it
+# writes and renames or removes as it goes (the manifest's .tmp, a
+# collection's dropped lists), and none that goes while it is read.
+CHUNK_STORE_SQL = """SELECT coalesce(sum((pg_stat_file(d || '/' || f, true)).size), 0)
 FROM (SELECT 'base/' || oid AS d FROM pg_database
       WHERE datname = current_database()) db,
-     LATERAL pg_ls_dir(d) f WHERE f LIKE 'prolly\\_%'"""
+     LATERAL pg_ls_dir(d, true, false) f
+WHERE f ~ '^prolly_(journal(_[0-9a-f]+)?|manifest|table_[0-9a-f]+)$'"""
 
 
 def physical_size(root: Path) -> tuple[int, int]:
