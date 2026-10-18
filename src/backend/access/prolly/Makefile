@@ -42,6 +42,7 @@ OBJS = \
 	prolly_table.o \
 	prolly_dolt.o \
 	prolly_vcs.o \
+	prolly_autovacuum.o \
 	reclaim_copying.o \
 	reclaim_stub.o \
 	remote_file.o \

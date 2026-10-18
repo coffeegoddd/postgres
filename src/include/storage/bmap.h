@@ -126,9 +126,11 @@ typedef struct BmapSweep
 	uint64		freed;			/* blocks nothing held */
 	uint64		recounted;		/* stuck counts rewritten */
 	uint64		truncated;		/* blocks the store was shortened by */
+	uint64		stuck;			/* counts left stuck: past what one holds */
 } BmapSweep;
 
 extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
+extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
 
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);

@@ -29,8 +29,8 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -43,7 +43,6 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_database_d.h"
-#include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
@@ -66,7 +65,6 @@
 #include "utils/rls.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
-#include "storage/bmap.h"
 
 /* dolt.author's value; read through GetConfigOption so a placeholder works. */
 static char *dolt_author = NULL;
@@ -93,6 +91,7 @@ prolly_session_init(const char *branch)
 								   PGC_USERSET,
 								   0,
 								   NULL, NULL, NULL);
+		prolly_autovacuum_init();
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
 								 "Lets a transaction commit with unresolved merge conflicts.",
 								 "They stay to be resolved later; until then the branch can't commit.",
@@ -2249,13 +2248,9 @@ Datum
 prolly_page_sweep(PG_FUNCTION_ARGS)
 {
 	TupleDesc	desc;
-	Datum		values[3] = {0};
+	Datum		values[3];
 	bool		nulls[3] = {0};
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tup;
-	List	   *spcs = NIL;
-	ListCell   *lc;
+	BmapSweep	r;
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -2267,28 +2262,10 @@ prolly_page_sweep(PG_FUNCTION_ARGS)
 				 errdetail("Only the database's owner or members of the \"%s\" role may.",
 						   "pg_maintain")));
 	PreventCommandIfReadOnly("prolly_page_sweep()");
-
-	rel = table_open(TableSpaceRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(rel, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Oid			spc = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
-
-		if (spc != GLOBALTABLESPACE_OID)
-			spcs = lappend_oid(spcs, spc);
-	}
-	table_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	foreach(lc, spcs)
-	{
-		BmapSweep	r;
-
-		bmap_sweep(lfirst_oid(lc), MyDatabaseId, &r);
-		values[0] = Int64GetDatum(DatumGetInt64(values[0]) + r.freed);
-		values[1] = Int64GetDatum(DatumGetInt64(values[1]) + r.recounted);
-		values[2] = Int64GetDatum(DatumGetInt64(values[2]) + r.truncated);
-	}
+	prolly_sweep_page_stores(false, &r);
+	values[0] = Int64GetDatum((int64) r.freed);
+	values[1] = Int64GetDatum((int64) r.recounted);
+	values[2] = Int64GetDatum((int64) r.truncated);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

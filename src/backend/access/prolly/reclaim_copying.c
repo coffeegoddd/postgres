@@ -12,7 +12,9 @@
  * from twice: before the window, after which the store copies what is
  * marked to new files, and in it, appends held off, for what came since.
  * The store swaps the manifest, and retires what wasn't kept once whoever
- * may read it has ended.
+ * may read it has ended.  Reading is paced by the cost-based vacuum delay
+ * where one is active (autovacuum's), a chunk read costing a page missed;
+ * never in the window, where interrupts are held.
  *
  * What a chunk names is found without knowing what kind of chunk it is:
  * the store's chunks write every reference as the hash's length, then the
@@ -40,6 +42,7 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
@@ -114,7 +117,11 @@ drain(Mark *mk)
 		resetStringInfo(&mk->buf);
 		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
 		mark_named(mk, mk->buf.data, mk->buf.len);
-		CHECK_FOR_INTERRUPTS();
+
+		/* (a chunk read costs as a page missed, where a delay is active) */
+		if (VacuumCostActive)
+			VacuumCostBalance += VacuumCostPageMiss;
+		vacuum_delay_point(false);
 	}
 	mk->head = mk->tail = 0;
 }

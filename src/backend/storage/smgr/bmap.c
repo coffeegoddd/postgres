@@ -241,6 +241,16 @@ static const PGIOAlignedBlock zero_block;
  * of a page store being swept reuses no freed block (one freed and taken
  * again meanwhile could be held by a map the sweep read before).
  */
+/* page stores swept since the server started, remembered at most */
+#define BMAP_SWEPT_MAX		64
+
+typedef struct BmapSwept
+{
+	Oid			spcOid;
+	Oid			dbOid;
+	uint64		stuck;			/* counts the sweep left stuck */
+} BmapSwept;
+
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
@@ -248,6 +258,8 @@ typedef struct BmapShared
 	int			nlisted;
 	Oid			listed[BMAP_SWEEPS_LISTED][2];	/* tablespace, database */
 	int			unlisted;		/* past the most listed: every store is */
+	int			nswept;
+	BmapSwept	swept[BMAP_SWEPT_MAX];
 } BmapShared;
 
 static BmapShared *bmap_shared = NULL;
@@ -268,6 +280,7 @@ BmapShmemInit(void *arg)
 	SpinLockInit(&bmap_shared->mutex);
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
+	bmap_shared->nswept = 0;
 }
 
 /* Is a sweep of rel's page store running? */
@@ -325,6 +338,37 @@ sweep_note(RelFileLocator rel, bool begin)
 		pg_atomic_fetch_add_u32(&bmap_shared->sweeps, 1);
 	else
 		pg_atomic_fetch_sub_u32(&bmap_shared->sweeps, 1);
+}
+
+/*
+ * Was the page store of rel swept since the server started, and with how
+ * many counts left stuck (*stuck)?  With note, it is, with stuck left.
+ */
+static bool
+swept_since_start(RelFileLocator rel, bool note, uint64 *stuck)
+{
+	BmapSwept  *found = NULL;
+	bool		swept;
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	for (int i = 0; i < bmap_shared->nswept && found == NULL; i++)
+		if (bmap_shared->swept[i].spcOid == rel.spcOid &&
+			bmap_shared->swept[i].dbOid == rel.dbOid)
+			found = &bmap_shared->swept[i];
+	if (found == NULL && note && bmap_shared->nswept < BMAP_SWEPT_MAX)
+	{
+		found = &bmap_shared->swept[bmap_shared->nswept++];
+		found->spcOid = rel.spcOid;
+		found->dbOid = rel.dbOid;
+	}
+	if (found != NULL && note)
+		found->stuck = *stuck;
+	/* (past the most remembered, every store counts as swept) */
+	swept = found != NULL || bmap_shared->nswept == BMAP_SWEPT_MAX;
+	if (found != NULL && !note)
+		*stuck = found->stuck;
+	SpinLockRelease(&bmap_shared->mutex);
+	return swept;
 }
 
 const ShmemCallbacks BmapShmemCallbacks = {
@@ -3685,7 +3729,47 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	PG_END_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
 	sweep_done(0, PointerGetDatum(&rel));
 	result->truncated = sweep_shrink(rel);
+	(void) swept_since_start(rel, true, &result->stuck);
 	pfree(path);
+}
+
+/*
+ * Is a sweep of a database's page store in a tablespace due?  Once after
+ * the server starts (a crash before may have leaked blocks: a drop's or a
+ * prune's), and whenever the stuck counts aren't those the last sweep left
+ * (counted from the count pages, a page for every BMAP_REFS_PER_PAGE
+ * blocks): one left stuck still has more holders than a count holds.
+ */
+bool
+bmap_sweep_due(Oid spcOid, Oid dbOid)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	BlockNumber nrefpages;
+	uint64		left = 0;
+	uint64		stuck = 0;
+
+	if (!alloc_exists(rel))
+		return false;
+	if (!swept_since_start(rel, false, &left))
+		return true;
+	nrefpages = refs_nblocks(rel);
+	for (BlockNumber blk = 0; blk < nrefpages; blk++)
+	{
+		Buffer		buf = refs_read(rel, blk);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(BufferGetPage(buf)))
+		{
+			uint8	   *counts = PageGetBmapRefs(BufferGetPage(buf));
+
+			check_refs_page(BufferGetPage(buf), rel, blk);
+			for (uint32 i = 0; i < BMAP_REFS_PER_PAGE; i++)
+				stuck += counts[i] == BMAP_REFS_STUCK;
+		}
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	return stuck != left;
 }
 
 static void
@@ -3763,9 +3847,13 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 			if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) != 0)
 				block_list_add(&stuck, b);
 		}
-		else if (holders[b] - 1 < BMAP_REFS_STUCK && REF_PAGE(b) < nrefpages &&
-				 lookup_ref(rel, b) == BMAP_REFS_STUCK)
-			block_list_add(&stuck, b);
+		else if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) == BMAP_REFS_STUCK)
+		{
+			if (holders[b] - 1 < BMAP_REFS_STUCK)
+				block_list_add(&stuck, b);
+			else
+				result->stuck++;
+		}
 	}
 	INJECTION_POINT("bmap-sweep-counted", NULL);
 	result->recounted = sweep_recount(rel, stuck.blocks, stuck.n, holders);

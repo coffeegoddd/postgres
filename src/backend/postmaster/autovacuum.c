@@ -69,6 +69,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/prolly_autovacuum.h"
 #include "access/multixact.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
@@ -2750,6 +2751,9 @@ deleted:
 
 	/* Finally close out the last transaction. */
 	CommitTransactionCommand();
+
+	/* Prolly's stores: the chunk store collected, page stores swept, if due */
+	prolly_autovacuum();
 }
 
 /*
