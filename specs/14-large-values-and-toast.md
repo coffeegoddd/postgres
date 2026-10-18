@@ -1,6 +1,6 @@
 # 14. Large values: keeping TOAST, versioned
 
-**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided; questions 3 (C's gates) and 4 (the hybrid) stay open until those gates are measured. Nothing here is built yet.**
+**Status: proposed 2026-10-17, on `64c9001f9a`; revised from review the same day. Decided by the user the same day, as recommended: the `oid` refusal and B are built before step 8's measurements, C after them (part 8), with C7's questions 1 and 2 decided; questions 3 (C's gates) and 4 (the hybrid) stay open until those gates are measured. The refusal and B built 2026-10-17 (#217–#221, one stack), with what differs from the design marked "Not as designed" under "As built" in parts 5 and 7. C isn't built.**
 This compares how stock Postgres, Dolt and versioned prolly tables store
 large values, and proposes two steps that keep as much of TOAST as possible
 while Dolt's invariants hold: B, stock TOAST in the working set with
@@ -16,7 +16,7 @@ and are only touched in part 7.
 | What decides | Per row, per column: the toaster runs when a row is over 2032 bytes and works down to `toast_tuple_target` | Per row, per column: a row over `target_row_size` (2048) moves columns out | Per row, the whole row: an encoded row over `VALUE_INLINE_MAX` (2048) goes out of line |
 | Which column first | The largest eligible (`toast_tuple_find_biggest_attribute`), in four passes by storage strategy | The one saving the most bytes | — |
 | Compression | pglz or lz4, per column (`attcompression`), before moving out | None | None: canonical bytes are uncompressed (question 48) |
-| Out-of-line form | Rows of `pg_toast_N (chunk_id, chunk_seq, chunk_data)`, 1996-byte chunks, value named by an OID | A blob tree, fixed 4000-byte leaves, named by its hash | A value tree, buzhash chunks of 512–4096 bytes keyed by byte offset, named by its hash (`tree_cow.c:560-608`) |
+| Out-of-line form | Rows of `pg_toast_N (chunk_id, chunk_seq, chunk_data)`, 1996-byte chunks, value named by an OID | A blob tree, fixed 4000-byte leaves, named by its hash | A value tree, buzhash chunks of 512–4096 bytes keyed by byte offset, named by its hash (`tree_cow.c:560-608`); since B, addressed by byte counts and one per long column (part 5) |
 | Sharing | None: one owner per value; an unchanged value keeps its pointer on UPDATE | Identical values are one tree | Identical rows are one tree |
 | Slice reads | Uncompressed values fetch only the chunks they need; pglz fetches a prefix | None | None |
 | Deletion | With its row; VACUUM of the TOAST table reclaims | `dolt gc` | No chunk-store reclamation yet |
@@ -106,6 +106,37 @@ refolds the base in the new one first. (The alternative is #149's: a clean
 break, older roots' tables not read. It is simpler, and right only while
 nobody has history worth keeping.)
 
+**As built (#219).**
+- `T` is 2048 (`valenc_canonical.c`). A reference's length prefix is
+  2048 + 1 + the reference's length, which no inline value's can be, then
+  the reference (the tree's: hash length, hash, value length). A row
+  without long values is the same bytes as before, so `format_freeze`'s
+  pinned trees changed only for its table of large values.
+- References are written and read through the tree interface's new
+  `value_write()` and `value_read()`. The value encoder gets them from a
+  value store (`ProllyValueStore`: the tree, its environment, and B3's
+  memo) given by `set_values()`; the keying passes it on, and
+  `prolly_keying_use_env()` sets a data tree's environment and a keying up
+  for each other. Encoding or decoding a long value without a store is an
+  error. Every keying that encodes or decodes rows is set up (fold, diff,
+  merge, apply, `dolt_diff`, rows read as defined now).
+- Walks find per-column references without the catalog (invariant 3;
+  the design didn't say how): a tree environment gets an optional
+  `value_refs()`, which the keying's `row_refs()` answers as each item is
+  put, and a leaf item that holds references leads with them, flagged
+  `PROLLY_ITEM_VALUE_REFS`. Fetch, push, clone and reclamation follow
+  them from the nodes alone; reads return the value without them.
+- **Not as designed:** the format change is a clean break, #149's, not
+  the cross-format comparison above (the user's choice for this work):
+  the value encoder's format goes to 2 and the folded roots' `!:format`
+  to 5 (4 was B2's, after #195's 3), and a root of an older format has
+  its tables listed, their rows not read, and is neither moved to nor
+  merged.
+- Measured (`large_values`): with a 960 KB document in a row, the commit
+  of an UPDATE of the row's int adds 3 nodes (the commit, its root, the
+  table's leaf) and none of the document's tree; copying the document
+  into another row and another table adds 4.
+
 ### B2. Value trees addressed by byte counts
 
 Value-tree leaves hold chunk bytes with no key; internal nodes record
@@ -115,6 +146,21 @@ above them, and a slice is found by descending through byte counts (C uses
 this for `substr`). Existing tests to extend: `large_values` (a one-byte
 insertion in the middle writes O(depth) nodes) and
 `016_d1_large_values.pl`'s cases moved to versioned tables.
+
+**As built (#218).** Each buzhash chunk is the one item of a leaf node,
+with no key; an internal node's items have no key either and record each
+child's reference and byte count. The levels above the leaves are cut by
+the chunker, given each child's hash as its item's key, so a changed
+chunk moves at most the boundaries next to it. `value_read()` reads a
+slice by descending through the byte counts, O(depth + its length)
+nodes (the tree conformance check `large_values` checks slices at every
+kind of offset and length). The tree's format version goes to 2.
+Measured: a one-byte insertion or deletion in the middle of a 3 MB value
+writes at most 8 nodes (conformance); three bytes inserted into a 192 KB
+value of a versioned table commit 8 new nodes (`large_values`, SQL).
+D1's `016_d1_large_values.pl` cases are `052_large_values.pl` on
+versioned tables (#221): through a crash, and on a standby through
+`dolt_diff`.
 
 ### B3. A memo from TOAST pointers to content
 
@@ -154,6 +200,31 @@ are durable and visible:
   than 2^31 transactions ago are dropped, so a reused value ID with a
   reused xmin can't match an old entry.
 
+**As built (#220).** The memo is an interface of its own, `value_memo`
+(`prolly_memo.h`, interface 28), part of the value store, so the
+canonical encoder looks a column's on-disk TOAST pointer up before
+reading it and remembers the reference it made on a miss. Implementation
+"shared" (`memo_shared.c`): 8192 entries in shared memory under a
+spinlock, eight probed per key, the oldest replaced; the key also holds
+the database and the column's type (whose encoding made the reference).
+Entries are kept in the backend until `XACT_EVENT_COMMIT` and forgotten
+on an abort, or on the abort of the subtransaction that made them; a hit
+asks the chunk store for the tree's root (the tree's new
+`value_present()`).
+- **Not as designed:** a value whose first chunk is frozen when it would
+  be remembered isn't. The 2^31 rule alone leaves a case: a first chunk
+  whose xmin is already more than 2^31 transactions old when its entry is
+  filled could see its value removed and another given its ID and the
+  same raw xmin while the entry lives. An unfrozen xmin is younger than
+  2^31 transactions, so it can't; a frozen one's age is unknown. Folds
+  read frozen values every time.
+- As designed, values TOAST kept inline compressed aren't memoized (they
+  have no pointer): their cost 3 stays.
+- Measured (`large_values`, three 96 KB bodies stored EXTERNAL): the
+  commit after an UPDATE of the rows' counter hits all three and misses
+  none, and adds 3 nodes; a commit rolled back leaves its values to be
+  read again; a frozen value misses at every fold.
+
 ### B4. Apply keeps a row's own pointer
 
 When the applier updates a row and a large column's new reference equals
@@ -172,6 +243,31 @@ deleting a row deletes its TOAST chunks (`heap_toast_delete`), so giving
 another live row the same pointer would leave that row dangling when the
 first is deleted. Sharing across rows needs C.
 
+**As built (#221).**
+- **Not as designed:** the applier didn't update rows. A reset,
+  fast-forward or merge removed every changed row and inserted its new
+  version, all removals first, so a unique constraint both sides satisfy
+  isn't broken on the way (two rows swapping a value). Now, where a table
+  has no unique or exclusion index but its primary key's (nothing to
+  swap), a keyed row that changed is updated in place; otherwise it is
+  written as before, its values stored anew.
+- The comparison is by the rows' references, not the memo: the current
+  row as the branch folded now and the row written. The value encoder's
+  new `decode_kept()` (the keying's `decode_row_kept()`) leaves each
+  column out of line with the same reference in both unread and marks
+  it, and the applier's `update()` takes a keep mask and gives those
+  columns the found row's stored values. The old version, which only
+  finds the row, is decoded the same way, whole if a kept column is in
+  the primary key. A materialized view's update deletes and inserts, so
+  its kept values are read into the new row.
+- A merge's in-place update that breaks a constraint while violations
+  are recorded is rolled back in its subtransaction, leaving the row as
+  it was.
+- Measured (`large_values`): a reset to a commit that differs in a
+  counter only, and a merge of a counter change, leave the rows' bodies
+  their TOAST chunk IDs; a table with another unique index gets new ones;
+  a body that changed is stored anew.
+
 ### B results
 
 - Invariants: all hold; history never sees TOAST.
@@ -181,6 +277,12 @@ first is deleted. Sharing across rows needs C.
   stored twice (compressed in TOAST, uncompressed in chunks); historical
   reads have no slice reads; merge still re-toasts a value that moves
   between rows.
+- **As measured (#217–#221):** cost 1 (`large_values`: an int's update
+  next to a 960 KB document commits 3 nodes; copies share the document's
+  tree) and cost 2 (an insertion commits 8 nodes) are fixed; cost 3 for
+  values TOAST stored out of line whose first chunk isn't frozen; cost 4
+  for keyed rows of tables without another unique or exclusion index.
+  Cost 5 (jsonb as text) and 6 are untouched, as designed.
 
 ## 6. C: TOAST pointers that name content
 
@@ -374,9 +476,22 @@ itself); that isn't built, and should come before B. Versioning them
 later can reuse C: an object's pages as one value tree, and an `lo`
 reference carrying its hash.
 
+**As built (#217).** A commit refuses a table or materialized view with a
+column whose type holds OIDs: `oid`, `oid8`, the `reg*` types, and the
+domains (contrib's `lo`), arrays, composites and ranges made of them.
+Status and diff list each such column (`schema.table.column`) as not
+covered and still fold its table, so its other changes show.
+- **Not as designed:** the `reg*` types are refused too. Question 35
+  decided portable codecs for them (by qualified name); those aren't
+  built, and their send functions send the OID, so until they are a
+  commit refuses them rather than hashing a local identifier. Unknown
+  extension types aren't refused: they are stored as their text output
+  (question 35, decided 2026-10-15).
+
 ## 8. Order
 
 1. Question 35's refusal of `oid` columns, so large-object references
-   aren't silently versioned as numbers.
-2. B2, then B1 (B1's references use B2's trees), then B3 and B4.
+   aren't silently versioned as numbers. Built (#217).
+2. B2, then B1 (B1's references use B2's trees), then B3 and B4. Built
+   (#218, #219, #220, #221).
 3. C's gates (part 6, question 3), then C.

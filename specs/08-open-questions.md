@@ -335,6 +335,12 @@ the record of what was decided for it. D1 is removed by #177, #178 and
       known OID-free encoding (`oid` itself, unknown extension types), with
       a clear error, rather than hashing a local identifier.
       **Decided (user, 2026-10-14):** as recommended.
+      **Built (#217, 2026-10-17), the refusal:** a commit refuses a column
+      whose type holds OIDs: `oid`, `oid8` and the `reg*` types (refused
+      until their portable codecs are built), and the domains (contrib's
+      `lo`), arrays, composites and ranges made of them; status and diff
+      list each such column as not covered (`14-large-values-and-toast.md`
+      part 7).
     - Types with no binary send format (`aclitem`, user and extension
       types declared with text I/O only). **Decided (user, 2026-10-15):**
       stored as their text output, with the settings that affect output
@@ -538,6 +544,13 @@ the record of what was decided for it. D1 is removed by #177, #178 and
     method's version; compressing pages is a later storage choice.
     **Built (4f.1):** in the tree layer, for every tree; chunks keyed by
     offset for now.
+    **Changed (#218–#221, 2026-10-17):** value trees are addressed by byte
+    counts; a column whose canonical bytes are longer than 2 KB is stored
+    as a reference to a value tree of its own, the whole row out of line
+    only when still long; leaves record the references their values hold,
+    so walks find them; a memo from TOAST pointers to references spares a
+    fold reading unchanged values; apply keeps a row's own TOAST pointer
+    for a value that didn't change (`14-large-values-and-toast.md` part 5).
 49. **What reclamation must keep.** Reachability from branch heads alone
     isn't enough.
     **Recommended (2026-10-14), for 4f:** the live roots are every

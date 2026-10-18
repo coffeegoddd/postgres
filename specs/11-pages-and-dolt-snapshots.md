@@ -214,14 +214,19 @@ carries over; only what assumed chunks live in 8 KB pages changes:
   `prolly_datum.h`), as built: types' binary send formats, portable
   arrays and composites, no local OIDs. Types without a binary send
   format are refused or stored as text (question 35; pending since step
-  4h).
+  4h). Columns whose values are local OIDs (`oid`, `reg*`, a large
+  object's `lo`) are refused (#217). A column's value longer than 2 KB is
+  a reference to a value tree of its own (#219,
+  `14-large-values-and-toast.md`).
 - **Chunker:** the byte-based rule already planned for step 5 (a key-only
   boundary hash salted by level, a Weibull rule around 4 KB, a minimum of
   512 bytes), with the maximum no longer tied to `BLCKSZ`: chunks live in
   the store's files, not in pages (question 45 goes away).
 - **Node format:** `nodeformat_basic.c` loses its page header and becomes a
   variable-length chunk.
-- **Large values:** value trees (#18), as built.
+- **Large values:** value trees (#18), as built; addressed by byte counts
+  since #218, and one per long column since #219
+  (`14-large-values-and-toast.md`).
 - **Schema and identity:** the canonicalizer (#23): identity by name,
   canonical schema derived from the catalogs, as built.
 
