@@ -107,6 +107,23 @@ $node->poll_query_until('sw', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event_type = 'Lock' AND query LIKE '%test_bmap_share%'})
   or die 'the share did not wait';
 pass('a share waits for the sweep');
+
+# Meanwhile another database's page store reuses its free blocks: only
+# the store being swept holds off reuse.
+$node->safe_psql('postgres', 'CREATE DATABASE sw2');
+$node->safe_psql('sw2', q{
+	CREATE EXTENSION test_prolly;
+	CREATE SCHEMA cow VERSIONED;
+	CREATE TABLE cow.x (a int8);
+	INSERT INTO cow.x SELECT g FROM generate_series(1, 5000) g;
+	DROP TABLE cow.x;
+});
+my $free2 = $node->safe_psql('sw2', 'SELECT test_bmap_free_blocks()');
+cmp_ok($free2, '>', 0, 'the other store has free blocks');
+$node->safe_psql('sw2', q{CREATE TABLE cow.y (a int8);
+	INSERT INTO cow.y SELECT g FROM generate_series(1, 5000) g});
+cmp_ok($node->safe_psql('sw2', 'SELECT test_bmap_free_blocks()'), '<', $free2,
+	'and reuses them while this store is swept');
 sql(q{SELECT injection_points_wakeup('bmap-sweep-counted')});
 $s->query_until(qr/done/, '');
 like($b->query_until(qr/done/, ''), qr/t/, 'and goes on after it');

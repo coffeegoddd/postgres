@@ -2177,20 +2177,14 @@ dolt_fetch(PG_FUNCTION_ARGS)
 }
 
 /*
- * Error unless the user owns the current database or is a member of
- * pg_maintain, as VACUUM asks: to do what in it.
+ * Does the user own the current database, or is a member of pg_maintain,
+ * as VACUUM asks?
  */
-static void
-check_maintain(const char *what)
+static bool
+may_maintain(void)
 {
-	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
-		!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to %s in database \"%s\"",
-						what, get_database_name(MyDatabaseId)),
-				 errdetail("Only the database's owner or members of the \"%s\" role may.",
-						   "pg_maintain")));
+	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN);
 }
 
 /*
@@ -2219,7 +2213,13 @@ dolt_gc(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_gc", args[i]);
 	}
-	check_maintain("collect garbage");
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to collect garbage in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
 	PreventCommandIfReadOnly("dolt_gc()");
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, full, &gc);
@@ -2259,7 +2259,13 @@ prolly_page_sweep(PG_FUNCTION_ARGS)
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	check_maintain("sweep the page store");
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to sweep the page store in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
 	PreventCommandIfReadOnly("prolly_page_sweep()");
 
 	rel = table_open(TableSpaceRelationId, AccessShareLock);

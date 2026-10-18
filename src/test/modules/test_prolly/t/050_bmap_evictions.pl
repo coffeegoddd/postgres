@@ -14,7 +14,8 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('evictions');
 $node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', qq{autovacuum = off
+shared_buffers = 16});
 $node->start;
 $node->safe_psql('postgres', 'CREATE DATABASE ev');
 $node->safe_psql('ev', q{
