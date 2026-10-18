@@ -84,7 +84,36 @@ SELECT * FROM cm.n ORDER BY pk;
 SELECT (base_row).pk FROM dolt_conflicts(NULL::cm.n);
 ROLLBACK;
 
+-- A stored generated column isn't compared: it follows the columns
+-- merged, each side's change to its own.
+CREATE TABLE cm.g (pk int PRIMARY KEY, a int, b int,
+	g int GENERATED ALWAYS AS (a + b) STORED);
+INSERT INTO cm.g VALUES (1, 1, 1);
+SELECT length(dolt_commit('-Am', 'generated')::text) AS committed;
+SELECT dolt_branch('cm_gen');
+UPDATE cm.g SET a = 2;
+SELECT length(dolt_commit('-am', 'ours a')::text) AS committed;
+SELECT dolt_checkout('cm_gen');
+UPDATE cm.g SET b = 5;
+SELECT length(dolt_commit('-am', 'theirs b')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('cm_gen'))[2:4];
+SELECT * FROM cm.g;
+ROLLBACK;
+
+-- Violations of a table dropped since: not listed (nor its status).
+BEGIN;
+SET LOCAL dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('cm_right'))[2:4];
+SELECT * FROM dolt_constraint_violations();
+DROP TABLE cm.u;
+SELECT * FROM dolt_constraint_violations();
+SELECT table_name, status FROM dolt_status WHERE table_name LIKE 'cm.%';
+ROLLBACK;
+
 SELECT dolt_branch('-D', 'cm_theirs');
 SELECT dolt_branch('-D', 'cm_right');
 SELECT dolt_branch('-D', 'cm_nulls');
+SELECT dolt_branch('-D', 'cm_gen');
 DROP SCHEMA cm CASCADE;

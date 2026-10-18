@@ -823,12 +823,6 @@ may_break_constraints(Relation rel)
 }
 
 /*
- * Write a row as a merge does: insert it, or update old to it.  While a
- * merge records violations, a row that breaks a unique, check or not-null
- * (or exclusion) constraint isn't written, and is recorded instead.
- * Returns false if old isn't there.
- */
-/*
  * What a row a merge couldn't write breaks (ed, the error writing it
  * raised), as Dolt describes it: a unique index by its name and columns, a
  * check constraint by its name and expression, a not-null constraint by
@@ -894,6 +888,14 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 	return s.data;
 }
 
+/*
+ * Write a row as a merge does: insert it, or update old to it.  While a
+ * merge records violations, a row that breaks a unique, check or not-null
+ * (or exclusion) constraint isn't written, and is recorded instead: a
+ * row the merge made of both sides' columns too, the branch's kept (a
+ * table holds no row breaking a constraint, unlike Dolt's).
+ * Returns false if old isn't there.
+ */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 			TupleTableSlot *old, TupleTableSlot *row, const bool *keep)
@@ -1422,6 +1424,7 @@ typedef struct CellMerge
 	TupleTableSlot *ours;
 	TupleTableSlot *theirs;
 	TupleTableSlot *merged;
+	StringInfoData key;
 	StringInfoData row;
 } CellMerge;
 
@@ -1429,8 +1432,10 @@ typedef struct CellMerge
  * Merge a keyed row both sides changed, column by column, as Dolt does: a
  * column one side changed takes that side's value, one both changed alike
  * keeps it, and one they changed differently is a conflict (the row's).
- * False on a conflict; else *merged is the merged row's tree value
- * (palloc'd).
+ * A stored generated column isn't compared: written, the row's is
+ * computed again from the rest.  False on a conflict; else *merged is the
+ * merged row's tree value (palloc'd).  (Only rows both sides changed are
+ * decoded.)
  */
 static bool
 merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
@@ -1438,7 +1443,6 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 			const StringInfoData **merged)
 {
 	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
-	StringInfoData key;
 	StringInfo	value;
 	ProllyValue row;
 	ProllyHash	content;
@@ -1467,6 +1471,12 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 			cm->merged->tts_isnull[i] = true;
 			continue;
 		}
+		if (att->attgenerated)
+		{
+			cm->merged->tts_isnull[i] = on;
+			cm->merged->tts_values[i] = ov;
+			continue;
+		}
 		ours_changed = bn != on ||
 			(!bn && !datum_image_eq(bv, ov, att->attbyval, att->attlen));
 		theirs_changed = bn != tn ||
@@ -1479,11 +1489,10 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 		cm->merged->tts_values[i] = theirs_changed ? tv : ov;
 	}
 	ExecStoreVirtualTuple(cm->merged);
-	initStringInfo(&key);
+	resetStringInfo(&cm->key);
 	resetStringInfo(&cm->row);
-	PROLLY_CALL(c->rd.kr, encode_row, c->rd.k, cm->merged, &key, &cm->row,
+	PROLLY_CALL(c->rd.kr, encode_row, c->rd.k, cm->merged, &cm->key, &cm->row,
 				&content);
-	pfree(key.data);
 	row.data = (const uint8 *) cm->row.data;
 	row.len = cm->row.len;
 	value = palloc(sizeof(StringInfoData));
@@ -1631,6 +1640,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 					cm.theirs = table_slot_create(rel, NULL);
 					cm.merged = MakeSingleTupleTableSlot(RelationGetDescr(rel),
 														 &TTSOpsVirtual);
+					initStringInfo(&cm.key);
 					initStringInfo(&cm.row);
 				}
 				if (merge_cells(&tc, &cm, &t->before, &o->after, &t->after,

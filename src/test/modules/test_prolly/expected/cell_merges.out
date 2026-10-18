@@ -274,6 +274,91 @@ SELECT (base_row).pk FROM dolt_conflicts(NULL::cm.n);
 (1 row)
 
 ROLLBACK;
+-- A stored generated column isn't compared: it follows the columns
+-- merged, each side's change to its own.
+CREATE TABLE cm.g (pk int PRIMARY KEY, a int, b int,
+	g int GENERATED ALWAYS AS (a + b) STORED);
+INSERT INTO cm.g VALUES (1, 1, 1);
+SELECT length(dolt_commit('-Am', 'generated')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cm_gen');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE cm.g SET a = 2;
+SELECT length(dolt_commit('-am', 'ours a')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('cm_gen');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'cm_gen'"}
+(1 row)
+
+UPDATE cm.g SET b = 5;
+SELECT length(dolt_commit('-am', 'theirs b')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('cm_gen'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM cm.g;
+ pk | a | b | g 
+----+---+---+---
+  1 | 2 | 5 | 7
+(1 row)
+
+ROLLBACK;
+-- Violations of a table dropped since: not listed (nor its status).
+BEGIN;
+SET LOCAL dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('cm_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ cm.u       |              1
+(1 row)
+
+DROP TABLE cm.u;
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+(0 rows)
+
+SELECT table_name, status FROM dolt_status WHERE table_name LIKE 'cm.%';
+ table_name | status  
+------------+---------
+ cm.u       | deleted
+(1 row)
+
+ROLLBACK;
 SELECT dolt_branch('-D', 'cm_theirs');
  dolt_branch 
 -------------
@@ -292,8 +377,15 @@ SELECT dolt_branch('-D', 'cm_nulls');
  {0}
 (1 row)
 
+SELECT dolt_branch('-D', 'cm_gen');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA cm CASCADE;
-NOTICE:  drop cascades to 3 other objects
+NOTICE:  drop cascades to 4 other objects
 DETAIL:  drop cascades to table cm.t
 drop cascades to table cm.u
 drop cascades to table cm.n
+drop cascades to table cm.g

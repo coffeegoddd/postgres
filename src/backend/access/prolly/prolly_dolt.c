@@ -664,11 +664,16 @@ split_author(const char *author, char **name, char **email)
 	}
 }
 
+/* NULL for one dropped (as a table whose violations are kept may be) */
 static char *
 qualified_name(Oid relid)
 {
+	char	   *name = get_rel_name(relid);
+
+	if (name == NULL)
+		return NULL;
 	return quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
-									  get_rel_name(relid));
+									  name);
 }
 
 /* ------------------------------------------------------------------------
@@ -2698,14 +2703,18 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 
 /*
  * names ("name<tab>status") with table relid's status status, in place of
- * any it had
+ * any it had (none for a table dropped)
  */
 static List *
 with_status(List *names, Oid relid, const char *status)
 {
 	char	   *name = qualified_name(relid);
-	size_t		len = strlen(name);
+	size_t		len;
 	ListCell   *lc;
+
+	if (name == NULL)
+		return names;
+	len = strlen(name);
 
 	foreach(lc, names)
 	{
@@ -2741,10 +2750,14 @@ dolt_status(PG_FUNCTION_ARGS)
 
 	ProllyMergeState ms;
 	List	   *conflicted = NIL;
+	List	   *violated = NIL;
 
 	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
 		return (Datum) 0;
+	foreach(lc, PROLLY_CALL(refs(), violations))
+		violated = list_append_unique_oid(violated,
+										  ((ProllyViolation *) lfirst(lc))->relid);
 
 	/*
 	 * Tables by name, so ones made or dropped since the head are too; a
@@ -2755,9 +2768,8 @@ dolt_status(PG_FUNCTION_ARGS)
 		PROLLY_CALL(diff_merge(), tables, "HEAD", "WORKING", status_table,
 					&names);
 		/* (a table with conflicts and violations shows its conflicts) */
-		foreach(lc, PROLLY_CALL(refs(), violations))
-			names = with_status(names, ((ProllyViolation *) lfirst(lc))->relid,
-								"constraint violation");
+		foreach(lc, violated)
+			names = with_status(names, lfirst_oid(lc), "constraint violation");
 		if (PROLLY_CALL(refs(), merge_state, &ms))
 		{
 			for (int i = 0; i < ms.ntables; i++)
@@ -2775,16 +2787,21 @@ dolt_status(PG_FUNCTION_ARGS)
 				s.relids = list_append_unique_oid(s.relids, ms.tables[i]);
 			}
 		}
+		foreach(lc, violated)
+			s.relids = list_append_unique_oid(s.relids, lfirst_oid(lc));
 		foreach(lc, s.relids)
 		{
 			Oid			relid = lfirst_oid(lc);
+			char	   *name = qualified_name(relid);
 
+			if (name == NULL)
+				continue;
 			/* Name, then a tab and the status, to sort by name. */
 			names = lappend(names,
-							psprintf("%s\t%s",
-									 qualified_name(relid),
-									 list_member_oid(conflicted, relid) ?
-									 "conflict" : "modified"));
+							psprintf("%s\t%s", name,
+									 list_member_oid(conflicted, relid) ? "conflict" :
+									 list_member_oid(violated, relid) ?
+									 "constraint violation" : "modified"));
 		}
 	}
 	list_sort(names, status_cmp);
@@ -3058,6 +3075,8 @@ dolt_constraint_violations_summary(PG_FUNCTION_ARGS)
 		Datum		values[2];
 		bool		nulls[2] = {0};
 
+		if (qualified_name(relid) == NULL)
+			continue;			/* (dropped) */
 		foreach(lc, vs)
 			if (((ProllyViolation *) lfirst(lc))->relid == relid)
 				n++;
