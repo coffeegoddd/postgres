@@ -72,6 +72,8 @@ control; this project's premise is that we should not have to.
 | [12-correctness-suite.md](12-correctness-suite.md) | **Decided (2026-10-15):** the C suite, sqllogictest against heap and every engine from `prolly_bench`, judged by agreement with heap; runner, comparison classes, gate, plan |
 | [13-keyless-tables.md](13-keyless-tables.md) | **Measured (2026-10-17):** tables without a primary key in heap, page-based prolly and Dolt: how each keeps them, what writes, commits, diffs, moves and merges cost, how merges treat them, and what to change in prolly |
 | [14-large-values-and-toast.md](14-large-values-and-toast.md) | **Proposed (2026-10-17):** large values in stock Postgres (TOAST, large objects), Dolt (adaptive encoding) and prolly; keeping TOAST while history stays canonical: B, per-column value trees and a TOAST memo (#180), then C, content-addressed TOAST pointers in the chunk store (#181) |
+| [15-transaction-commits.md](15-transaction-commits.md) | **Proposed (2026-10-18):** a Dolt commit for every SQL transaction, as Dolt's `@@dolt_transaction_commit`: what Dolt does, phase 1 folding at pre-commit (#228), phase 2 committing only the transaction's own row changes (#229) |
+| [16-correctness-on-prs.md](16-correctness-on-prs.md) | **Proposed (2026-10-18):** C suite results on every pull request and a gate that blocks regressions: how Dolt, Doltgres and doltlite do it, a heap baseline checked both ways, the full corpus in shards, a sticky comment, branch protection (#234) |
 
 ## Related local repositories
 
