@@ -122,12 +122,21 @@ SELECT pg_temp.committed('-A', '-m', 'initial');
 SELECT dolt_commit('-m', 'should_error');
 ERROR:  nothing to commit
 HINT:  Pass --allow-empty to commit anyway.
+SELECT dolt_hashof('HEAD') AS before_skip \gset
 SELECT dolt_commit('--skip-empty', '-m', 'should_error');
  dolt_commit 
 -------------
  
 (1 row)
 
+SELECT dolt_hashof('HEAD') = :'before_skip' AS no_commit_recorded;
+ no_commit_recorded 
+--------------------
+ t
+(1 row)
+
+SELECT dolt_commit('--allow-empty', '--skip-empty', '-m', 'both');
+ERROR:  dolt_commit can't --allow-empty and --skip-empty at once
 SELECT pg_temp.committed('--allow-empty', '-m', 'initial');
  committed 
 -----------
@@ -683,6 +692,8 @@ SELECT dolt_gc('--shallow');
  {0}
 (1 row)
 
+SELECT dolt_gc('--full', '--shallow');
+ERROR:  dolt_gc can't --full and --shallow at once
 SELECT (SELECT count(*) FROM dolt_log('main')) - (SELECT count(*) FROM dolt_log('dg_gc_original'))
 	AS main_ahead;
  main_ahead 

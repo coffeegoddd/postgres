@@ -99,9 +99,12 @@ struct ProllyConflictSink
 							 const ProllyValue *theirs);
 };
 
-/* Visits one table that differs between two refs. */
+/*
+ * Visits one table, or other object, that differs between two refs; object
+ * is its kind (PROLLY_OBJECT_*).
+ */
 typedef void (*ProllyTableChangeVisit) (const char *name, ProllyDiffKind kind,
-										void *arg);
+										char object, void *arg);
 
 typedef struct ProllyMergeRoutine
 {

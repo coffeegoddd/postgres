@@ -102,16 +102,24 @@ CREATE SCHEMA dgk_auth VERSIONED;
 CREATE TABLE dgk_auth.test_table (v int);
 INSERT INTO dgk_auth.test_table VALUES (1);
 SELECT pg_temp.committed('-Am', 'add test table');
-CREATE ROLE dgk_basic;
+CREATE ROLE regress_dgk_basic;
 SELECT current_database() AS db \gset
-GRANT USAGE, CREATE ON SCHEMA dgk_auth TO dgk_basic;
-GRANT SELECT, INSERT, DELETE, UPDATE ON dgk_auth.test_table TO dgk_basic;
-SET ROLE dgk_basic;
+-- (errors naming the database, by another name: it differs between runs)
+CREATE FUNCTION pg_temp.fails(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE q;
+  RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+  RETURN replace(SQLERRM, current_database(), 'DB');
+END $$;
+GRANT USAGE, CREATE ON SCHEMA dgk_auth TO regress_dgk_basic;
+GRANT SELECT, INSERT, DELETE, UPDATE ON dgk_auth.test_table TO regress_dgk_basic;
+SET ROLE regress_dgk_basic;
 SET search_path = dgk_auth;
-SELECT dolt_checkout('-b', 'dgk_test');
+SELECT pg_temp.fails($$SELECT dolt_checkout('-b', 'dgk_test')$$);
 RESET ROLE;
-GRANT CREATE ON DATABASE :db TO dgk_basic;
-SET ROLE dgk_basic;
+GRANT CREATE ON DATABASE :db TO regress_dgk_basic;
+SET ROLE regress_dgk_basic;
 SELECT dolt_checkout('-b', 'dgk_test');
 SELECT dolt_branch('dgk_new_branch');
 INSERT INTO test_table VALUES (2);
@@ -131,20 +139,42 @@ SELECT dolt_conflicts_resolve('--theirs', 'test_table');
 SELECT pg_temp.committed('-am', 'resolve conflicts');
 RESET dolt.allow_commit_conflicts;
 SELECT * FROM test_table ORDER BY v;
-SELECT dolt_gc();
+SELECT pg_temp.fails($$SELECT dolt_gc()$$);
 SELECT dolt_remote('add', 'dgk_origin', 'file:///nonexistent');
 SELECT dolt_verify_constraints('--all');
+-- A merge that changes a definition replays it as its DDL would run, as
+-- the role: a check another branch added, on a table the role may write
+-- but in a versioned schema it can't use, needs the schema's USAGE (and,
+-- as ALTER TABLE does, the table's ownership); refused, the merge leaves
+-- nothing behind.
+RESET ROLE;
+CREATE SCHEMA dgk_hidden VERSIONED;
+CREATE TABLE dgk_hidden.h (id int PRIMARY KEY, v int);
+INSERT INTO dgk_hidden.h VALUES (1, 5), (2, -5);
+GRANT SELECT, INSERT, UPDATE, DELETE ON dgk_hidden.h TO regress_dgk_basic;
+SELECT pg_temp.committed('-Am', 'hidden table');
+SELECT dolt_checkout('-b', 'dgk_hidden_check');
+DELETE FROM dgk_hidden.h WHERE id = 2;
+ALTER TABLE dgk_hidden.h ADD CONSTRAINT h_positive CHECK (v > 0);
+SELECT pg_temp.committed('-Am', 'positive');
+SELECT dolt_checkout('main');
+SET ROLE regress_dgk_basic;
+SELECT (dolt_merge('dgk_hidden_check'))[3:4];
+RESET ROLE;
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+SELECT dolt_reset('--hard');
+SET ROLE regress_dgk_basic;
 SELECT dolt_checkout('dgk_test');
 SELECT dolt_checkout('main');
 RESET search_path;
 RESET ROLE;
-SELECT dolt_branch('-D', 'dgk_test', 'dgk_new_branch', 'dgk_conflict');
+SELECT dolt_branch('-D', 'dgk_test', 'dgk_new_branch', 'dgk_conflict', 'dgk_hidden_check');
 SELECT dolt_remote('remove', 'dgk_origin');
-REVOKE CREATE ON DATABASE :db FROM dgk_basic;
+REVOKE CREATE ON DATABASE :db FROM regress_dgk_basic;
 
 SET client_min_messages = warning;
-DROP SCHEMA dgk_parent, dgk_child, dgk_fake, dgk_merge, dgk_types, dgk_auth CASCADE;
-DROP OWNED BY dgk_basic;
-DROP ROLE dgk_basic;
+DROP SCHEMA dgk_parent, dgk_child, dgk_fake, dgk_merge, dgk_types, dgk_auth, dgk_hidden CASCADE;
+DROP OWNED BY regress_dgk_basic;
+DROP ROLE regress_dgk_basic;
 RESET client_min_messages;
 SELECT pg_temp.committed('-Am', 'doltgres foreign keys and auth done');

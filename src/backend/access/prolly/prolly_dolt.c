@@ -67,6 +67,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -718,6 +719,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		force = false;
 	ProllyHash	id = {0};
 	bool		committed = false;
+	ProllyMergeState ms;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)
@@ -784,7 +786,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	/* Nothing changed: the root is its parent's, and nothing was recorded. */
-	if (!committed && skip_empty)
+	if (!committed && skip_empty && !PROLLY_CALL(refs(), merge_state, &ms))
 	{
 		settled();				/* (clean: as the head has it) */
 		PG_RETURN_NULL();
@@ -1113,7 +1115,10 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	 */
 	if (create || !writer_branch_name(branch))
 		reserved_branch_name(branch);
-	if (!create && strcmp(branch, branch_ops()->current()) == 0)
+	/* (the session's branch, as it still is: else checked out, to fail so) */
+	AcceptInvalidationMessages();
+	if (!create && strcmp(branch, branch_ops()->current()) == 0 &&
+		PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 	{
 		sweep_detached(branch);
 		result[0] = "0";
@@ -2856,31 +2861,12 @@ status_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 }
 
 /*
- * Does an object's name, as status lists it, name a schema: an identifier
- * alone, no "." or argument list outside its quotes?
- */
-static bool
-names_schema(const char *name)
-{
-	bool		quoted = false;
-
-	for (const char *c = name; *c; c++)
-	{
-		if (*c == '"')
-			quoted = !quoted;
-		else if (!quoted && (*c == '.' || *c == '('))
-			return false;
-	}
-	return true;
-}
-
-/*
  * A table, or another object, changed: its name, a tab, and its status.
  * Other objects take the tables' statuses, as in Doltgres, but a schema
  * made or dropped ("new schema", "deleted schema"), as in Dolt.
  */
 static void
-status_table(const char *name, ProllyDiffKind kind, void *arg)
+status_table(const char *name, ProllyDiffKind kind, char object, void *arg)
 {
 	List	  **names = arg;
 	static const char *const statuses[] = {
@@ -2892,7 +2878,7 @@ status_table(const char *name, ProllyDiffKind kind, void *arg)
 	const char *status = statuses[kind];
 
 	if ((kind == PROLLY_DIFF_ADDED || kind == PROLLY_DIFF_REMOVED) &&
-		names_schema(name))
+		object == PROLLY_OBJECT_SCHEMA)
 		status = kind == PROLLY_DIFF_ADDED ? "new schema" : "deleted schema";
 	*names = lappend(*names, psprintf("%s\t%s", name, status));
 }
@@ -3840,6 +3826,7 @@ dolt_gc(PG_FUNCTION_ARGS)
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
 	bool		full = false;
+	bool		shallow = false;
 	const char *result[1] = {"0"};
 	ProllyDatabaseComponents dc;
 	ProllyGcResult gc;
@@ -3849,10 +3836,14 @@ dolt_gc(PG_FUNCTION_ARGS)
 		if (strcmp(args[i], "--full") == 0)
 			full = true;
 		else if (strcmp(args[i], "--shallow") == 0)
-			full = false;
+			shallow = true;
 		else
 			unsupported("dolt_gc", args[i]);
 	}
+	if (full && shallow)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_gc can't --full and --shallow at once")));
 	if (!may_maintain())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

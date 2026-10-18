@@ -88,7 +88,10 @@ SELECT pg_temp.status_of('dg_commit') AS status_rows;
 INSERT INTO t_simple VALUES (4);
 SELECT pg_temp.committed('-A', '-m', 'initial');
 SELECT dolt_commit('-m', 'should_error');
+SELECT dolt_hashof('HEAD') AS before_skip \gset
 SELECT dolt_commit('--skip-empty', '-m', 'should_error');
+SELECT dolt_hashof('HEAD') = :'before_skip' AS no_commit_recorded;
+SELECT dolt_commit('--allow-empty', '--skip-empty', '-m', 'both');
 SELECT pg_temp.committed('--allow-empty', '-m', 'initial');
 RESET search_path;
 
@@ -212,6 +215,7 @@ SELECT pg_temp.dg_changes();
 SELECT pg_temp.committed('-A', '-m', 'initial');
 SELECT dolt_gc();
 SELECT dolt_gc('--shallow');
+SELECT dolt_gc('--full', '--shallow');
 SELECT (SELECT count(*) FROM dolt_log('main')) - (SELECT count(*) FROM dolt_log('dg_gc_original'))
 	AS main_ahead;
 SELECT dolt_branch('-D', 'dg_gc_original');
