@@ -33,8 +33,9 @@
  *   error.  A long leaf value goes out of line, into a value tree.
  * - If env->counters is set, every node an operation reads from the chunk
  *   store adds one to nodes_read, and every node it writes (not one the
- *   store already had) one to nodes_written, so callers can check an
- *   operation's cost by counting.
+ *   store already had) one to nodes_written, and to value_nodes_written
+ *   too if it is a value tree's, so callers can check an operation's cost
+ *   by counting.
  * - references() visits the chunks a node's chunk names: an internal
  *   node's children, a leaf's values stored out of line (their trees'
  *   roots).  It reads nothing but the chunk; one that isn't a node of the

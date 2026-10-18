@@ -97,6 +97,7 @@ tests += {
       'range_types',
       'undescribed_objects',
       'statistics_casts',
+      'stat_prolly',
       'append_check',
       'journal_segments',
       'gc',

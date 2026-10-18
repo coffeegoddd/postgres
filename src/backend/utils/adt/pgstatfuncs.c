@@ -1922,6 +1922,34 @@ pg_stat_get_slru(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * Returns the prolly storage engine's work counters in the current
+ * database, one (name, value) row each; zeros if it has counted nothing.
+ */
+Datum
+pg_stat_get_prolly(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_PROLLY_COLS	2
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	PgStat_ProllyStats *stats;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stats = pgstat_fetch_stat_prolly(MyDatabaseId);
+
+	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+	{
+		Datum		values[PG_STAT_GET_PROLLY_COLS] = {0};
+		bool		nulls[PG_STAT_GET_PROLLY_COLS] = {0};
+
+		values[0] = CStringGetTextDatum(pgstat_prolly_counter_name(i));
+		values[1] = Int64GetDatum(stats ? stats->counts[i] : 0);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
 #define PG_STAT_GET_XACT_RELENTRY_INT64(member, stat)	\
 Datum													\
 CppConcat(pg_stat_get_xact_,stat)(PG_FUNCTION_ARGS)		\
@@ -2096,6 +2124,7 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER);
 		pgstat_reset_of_kind(PGSTAT_KIND_IO);
 		pgstat_reset_of_kind(PGSTAT_KIND_LOCK);
+		pgstat_reset_of_kind(PGSTAT_KIND_PROLLY);
 		XLogPrefetchResetStats();
 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
 		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
@@ -2115,6 +2144,8 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		pgstat_reset_of_kind(PGSTAT_KIND_IO);
 	else if (strcmp(target, "lock") == 0)
 		pgstat_reset_of_kind(PGSTAT_KIND_LOCK);
+	else if (strcmp(target, "prolly") == 0)
+		pgstat_reset_of_kind(PGSTAT_KIND_PROLLY);
 	else if (strcmp(target, "recovery_prefetch") == 0)
 		XLogPrefetchResetStats();
 	else if (strcmp(target, "slru") == 0)
@@ -2125,7 +2156,7 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unrecognized reset target: \"%s\"", target),
-				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"lock\", \"recovery_prefetch\", \"slru\", or \"wal\".")));
+				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"lock\", \"prolly\", \"recovery_prefetch\", \"slru\", or \"wal\".")));
 
 	PG_RETURN_VOID();
 }

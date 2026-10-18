@@ -544,6 +544,7 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 	ProllyNodeRef root;
 	Size		start = 0;
 	uint32		h = 0;
+	uint64		written = env->counters ? env->counters->nodes_written : 0;
 
 	if (!buz_ready)
 		buz_init();
@@ -594,6 +595,9 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 	pfree(vb->child.data);
 	pfree(vb);
 	encode_value_ref(out, &root.hash, len);
+	if (env->counters)
+		env->counters->value_nodes_written +=
+			env->counters->nodes_written - written;
 }
 
 /*

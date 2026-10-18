@@ -515,6 +515,22 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_all_cb = pgstat_wal_reset_all_cb,
 		.snapshot_cb = pgstat_wal_snapshot_cb,
 	},
+
+	/* the prolly storage engine's, one entry per database */
+
+	[PGSTAT_KIND_PROLLY] = {
+		.name = "prolly",
+
+		.fixed_amount = false,
+		.write_to_file = true,
+
+		.shared_size = sizeof(PgStatShared_Prolly),
+		.shared_data_off = offsetof(PgStatShared_Prolly, stats),
+		.shared_data_len = sizeof(((PgStatShared_Prolly *) 0)->stats),
+
+		.flush_static_cb = pgstat_prolly_flush_cb,
+		.reset_timestamp_cb = pgstat_prolly_reset_timestamp_cb,
+	},
 };
 
 /*

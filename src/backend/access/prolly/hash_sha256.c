@@ -22,6 +22,7 @@
 #include "access/prolly_builtins.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
+#include "pgstat.h"
 
 struct ProllyHashCtx
 {
@@ -53,6 +54,7 @@ sha256_begin(MemoryContext mcxt)
 static void
 sha256_update(ProllyHashCtx *hctx, const uint8 *data, Size len)
 {
+	pgstat_count_prolly(PGSTAT_PROLLY_BYTES_HASHED, len);
 	if (pg_cryptohash_update(hctx->ctx, data, len) < 0)
 		sha256_error(hctx->ctx, "update");
 }

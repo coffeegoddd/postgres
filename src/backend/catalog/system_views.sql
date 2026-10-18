@@ -1003,6 +1003,12 @@ CREATE VIEW pg_stat_slru AS
             s.stats_reset
     FROM pg_stat_get_slru() s;
 
+CREATE VIEW pg_stat_prolly AS
+    SELECT
+            p.name,
+            p.value
+    FROM pg_stat_get_prolly() p;
+
 CREATE VIEW pg_stat_lock AS
     SELECT
             l.locktype,

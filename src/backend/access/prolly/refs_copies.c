@@ -84,6 +84,7 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -145,6 +146,7 @@ refs_init(void)
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
 	env.compare = prolly_bytes_compare;
+	env.counters = pgstat_prolly_tree_counters();
 	RegisterXactCallback(refs_xact_callback, NULL);
 	ready = true;
 }
@@ -412,6 +414,8 @@ branch_set_head(const char *name, const ProllyHash *head)
 	refs_put(key.data, key.len, head ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
+	if (head)
+		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
 }
 
 /*
@@ -795,6 +799,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	PROLLY_CALL(tree, build_finish, b, &ref);
 	*id = ref.hash;
 	pfree(v.data);
+	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
 }
 
 static bool

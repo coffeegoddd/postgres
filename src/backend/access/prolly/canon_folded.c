@@ -160,6 +160,7 @@
 #include "executor/tuptable.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -231,6 +232,7 @@ prolly_folded_tree_env(ProllyTreeEnv *env)
 	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
 							  MyDatabaseTableSpace);
 	env->compare = prolly_bytes_compare;
+	env->counters = pgstat_prolly_tree_counters();
 }
 
 static void
