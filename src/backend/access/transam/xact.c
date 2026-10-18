@@ -1342,6 +1342,12 @@ AtSubStart_ResourceOwner(void)
  */
 
 /*
+ * Whether the committing transaction has chunk store bytes to write once
+ * its commit record is flushed (reserved by CommitTransaction).
+ */
+static bool xact_chunk_writes = false;
+
+/*
  *	RecordTransactionCommit
  *
  * Returns latest XID among xact and its children, or InvalidTransactionId
@@ -1367,13 +1373,10 @@ RecordTransactionCommit(void)
 	bool		wrote_xlog;
 	char	   *chunk_root = NULL;
 	Size		chunk_root_len;
-	bool		chunk_writes;
+	bool		chunk_writes = xact_chunk_writes;
 
-	/*
-	 * The chunks this transaction has left to write, reserved now; and a
-	 * chunk store root it moved, which goes with its commit record.
-	 */
-	chunk_writes = prolly_chunkstore_commit_writes();
+	/* a chunk store root this transaction moved goes with its commit record */
+	xact_chunk_writes = false;
 	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
 	Assert((chunk_root_len == 0 && !chunk_writes) || markXidCommitted);
 
@@ -2423,6 +2426,13 @@ CommitTransaction(void)
 	 */
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
+
+	/*
+	 * The chunks this transaction has left to write, reserved now that
+	 * nothing more puts any, and while an error still aborts it as any.
+	 */
+	xact_chunk_writes = !is_parallel_worker &&
+		prolly_chunkstore_commit_writes();
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();

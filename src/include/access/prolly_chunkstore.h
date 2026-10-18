@@ -165,10 +165,10 @@ typedef struct ProllyChunkStoreRoutine
 							  const ProllyHash *root);
 
 	/*
-	 * Commit.  commit_writes() is called first, as the commit record is
-	 * about to be written (after everything else that runs before it, and
-	 * outside its critical section: it may raise an error, which aborts
-	 * the transaction): it readies what the transaction has left to write
+	 * Commit.  commit_writes() is called first, late in the commit, after
+	 * everything else that may put chunks (and while an error still aborts
+	 * the transaction as any): it readies what the transaction has left to
+	 * write
 	 * and returns whether it has bytes to write once its commit record is
 	 * flushed (so it is flushed at once, whatever synchronous_commit
 	 * says).  commit_payload() returns what the commit record carries for
