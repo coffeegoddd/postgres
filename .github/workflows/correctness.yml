@@ -29,7 +29,7 @@ concurrency:
 
 env:
   # The shard count; classify turns it into the shard matrix.
-  SHARDS: 4
+  SHARDS: 6
   CONFIG: src/tools/prolly_bench/configs/c_full_ci.toml
   PIN_FILE: src/tools/prolly_bench/configs/sqllogictest.commit
 
