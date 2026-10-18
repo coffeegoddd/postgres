@@ -16,6 +16,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
@@ -209,15 +210,16 @@ test_chunk_conjoin(PG_FUNCTION_ARGS)
 }
 
 static void
-file_row(const char *name, int nchunks, uint64 size, void *arg)
+file_row(const char *name, int nchunks, uint64 size, bool settled, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 
 	values[0] = CStringGetTextDatum(name);
 	values[1] = Int32GetDatum(nchunks);
 	values[2] = Int64GetDatum((int64) size);
+	values[3] = BoolGetDatum(settled);
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -230,6 +232,27 @@ test_chunk_table_files(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	PROLLY_CALL(cs(), table_files, store(), file_row, rsinfo);
 	return (Datum) 0;
+}
+
+/* The journal's segments, oldest first. */
+PG_FUNCTION_INFO_V1(test_chunk_segments);
+Datum
+test_chunk_segments(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	PROLLY_CALL(cs(), segments, store(), true, file_row, rsinfo);
+	return (Datum) 0;
+}
+
+/* Seal the journal's segment: appends go on to a new one. */
+PG_FUNCTION_INFO_V1(test_chunk_seal);
+Datum
+test_chunk_seal(PG_FUNCTION_ARGS)
+{
+	PROLLY_CALL(cs(), seal, store());
+	PG_RETURN_VOID();
 }
 
 /*
@@ -952,4 +975,74 @@ test_walk_commit_count(PG_FUNCTION_ARGS)
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.refs, walk_commit, &id, count_node, &d);
 	PG_RETURN_INT64(d.visited);
+}
+
+/*
+ * Put a tree node naming chunks: at level 0 a leaf whose values are stored
+ * out of line in them, above it an internal node of them as children.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_put_node);
+Datum
+test_chunk_put_node(PG_FUNCTION_ARGS)
+{
+	int			level = PG_GETARG_INT32(0);
+	ArrayType  *refs = PG_GETARG_ARRAYTYPE_P(1);
+	const ProllyChunkFormatRoutine *fmt = prolly_chunkformat_lookup("basic");
+	Datum	   *elems;
+	int			n;
+	ProllyKey  *keys;
+	ProllyValue *values;
+	uint8	   *flags;
+	StringInfoData node;
+	ProllyHash	h;
+
+	deconstruct_array_builtin(refs, TEXTOID, &elems, NULL, &n);
+	keys = palloc(sizeof(ProllyKey) * Max(n, 1));
+	values = palloc(sizeof(ProllyValue) * Max(n, 1));
+	flags = palloc(sizeof(uint8) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		StringInfoData v;
+		ProllyHash	ref;
+
+		text_hash(DatumGetTextPP(elems[i]), &ref);
+		initStringInfo(&v);
+		appendStringInfoChar(&v, (char) ref.len);
+		appendBinaryStringInfo(&v, ref.bytes, ref.len);
+		prolly_put_varint(&v, 1);
+		keys[i].data = (const uint8 *) psprintf("k%04d", i);
+		keys[i].len = 5;
+		values[i].data = (const uint8 *) v.data;
+		values[i].len = v.len;
+		flags[i] = level == 0 ? PROLLY_ITEM_VALUE_REF : 0;
+	}
+	initStringInfo(&node);
+	PROLLY_CALL(fmt, encode, (uint16) level, n, keys, values, flags, &node);
+	sha256(node.data, node.len, &h);
+	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
+	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/* Collect the store's garbage: what was kept and freed. */
+PG_FUNCTION_INFO_V1(test_chunk_gc);
+Datum
+test_chunk_gc(PG_FUNCTION_ARGS)
+{
+	bool		full = PG_GETARG_BOOL(0);
+	ProllyDatabaseComponents dc;
+	ProllyGcResult r;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, &r);
+	values[0] = Int64GetDatum((int64) r.chunks_kept);
+	values[1] = Int64GetDatum((int64) r.chunks_freed);
+	values[2] = Int64GetDatum((int64) r.bytes_freed);
+	values[3] = Int64GetDatum((int64) r.window_usec);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }

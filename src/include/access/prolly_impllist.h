@@ -36,6 +36,7 @@ PG_PROLLY_IMPL(ProllyTransferRoutine, prolly_transfer_chunks)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_file)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgresql)
 PG_PROLLY_IMPL(ProllyRemoteRoutine, prolly_remote_postgres)
+PG_PROLLY_IMPL(ProllyReclaimRoutine, prolly_reclaim_copying)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)

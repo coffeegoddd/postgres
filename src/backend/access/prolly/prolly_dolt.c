@@ -30,6 +30,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -40,8 +41,11 @@
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_authid_d.h"
+#include "catalog/pg_database_d.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -87,6 +91,7 @@ prolly_session_init(const char *branch)
 								   PGC_USERSET,
 								   0,
 								   NULL, NULL, NULL);
+		prolly_autovacuum_init();
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
 								 "Lets a transaction commit with unresolved merge conflicts.",
 								 "They stay to be resolved later; until then the branch can't commit.",
@@ -2168,6 +2173,102 @@ dolt_fetch(PG_FUNCTION_ARGS)
 	}
 	fetch_remote(remote ? remote : "origin", branches, NULL, NULL);
 	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/*
+ * Does the user own the current database, or is a member of pg_maintain,
+ * as VACUUM asks?
+ */
+static bool
+may_maintain(void)
+{
+	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN);
+}
+
+/*
+ * dolt_gc(VARIADIC args text[]) returns text[]: {status}
+ *
+ * --full: the database's chunk store collected (prolly_reclaim.h): what
+ * was written since the last collection, or (full) all of it.  Commits go
+ * on meanwhile but for a short final window; a transaction that read a
+ * chunk collected meanwhile and then names it fails, to be retried.  The
+ * database's owner, or a member of pg_maintain, as VACUUM asks.
+ */
+Datum
+dolt_gc(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		full = false;
+	const char *result[1] = {"0"};
+	ProllyDatabaseComponents dc;
+	ProllyGcResult gc;
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (strcmp(args[i], "--full") == 0)
+			full = true;
+		else
+			unsupported("dolt_gc", args[i]);
+	}
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to collect garbage in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+	PreventCommandIfReadOnly("dolt_gc()");
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, &gc);
+	ereport(DEBUG1,
+			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+							 (unsigned long long) gc.chunks_kept,
+							 (unsigned long long) gc.chunks_freed,
+							 (unsigned long long) gc.bytes_freed,
+							 (unsigned long long) gc.window_usec)));
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+Datum
+dolt_gc_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_gc(fcinfo);
+}
+
+/*
+ * prolly_page_sweep(OUT freed int8, OUT recounted int8, OUT truncated int8)
+ *
+ * The current database's page stores swept (bmap_sweep()), in every
+ * tablespace that has one: blocks nothing holds freed, stuck reference
+ * counts rewritten exactly, the stores shortened.  Its owner, or a member
+ * of pg_maintain, as dolt_gc().
+ */
+Datum
+prolly_page_sweep(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+	BmapSweep	r;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to sweep the page store in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+	PreventCommandIfReadOnly("prolly_page_sweep()");
+	prolly_sweep_page_stores(false, &r);
+	values[0] = Int64GetDatum((int64) r.freed);
+	values[1] = Int64GetDatum((int64) r.recounted);
+	values[2] = Int64GetDatum((int64) r.truncated);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /* The session branch's upstream, or an error naming how to set one. */

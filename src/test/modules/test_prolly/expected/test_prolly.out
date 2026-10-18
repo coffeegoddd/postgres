@@ -19,6 +19,7 @@ FROM prolly_implementations();
  key_encoder   | stub         |       0 |              0
  value_encoder | canonical    |       2 |              1
  value_encoder | stub         |       0 |              0
+ reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
  refs          | copies       |       2 |              1
  refs          | stub         |       0 |              0
@@ -43,7 +44,7 @@ FROM prolly_implementations();
  remote        | file         |       1 |              1
  remote        | postgresql   |       2 |              1
  remote        | postgres     |       3 |              1
-(34 rows)
+(35 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -91,6 +92,10 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
  value_encoder | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
  value_encoder | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ reclamation   | copying        | identity                       | pass
+ reclamation   | copying        | live_chunks_never_freed        | no checks yet
+ reclamation   | copying        | keeps_what_writers_reference   | no checks yet
+ reclamation   | copying        | complete                       | pass
  reclamation   | stub           | identity                       | pass
  reclamation   | stub           | live_chunks_never_freed        | not implemented (missing collect)
  reclamation   | stub           | keeps_what_writers_reference   | not implemented (missing collect)
@@ -152,7 +157,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
  tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff)
- tree          | stub           | complete                       | not implemented (13 of 13 callbacks missing)
+ tree          | stub           | complete                       | not implemented (14 of 14 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass
@@ -184,7 +189,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_file    | stub           | identity                       | pass
  table_file    | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
  table_file    | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
- table_file    | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ table_file    | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  change_finder | pages          | identity                       | pass
  change_finder | pages          | complete                       | pass
  change_finder | stub           | identity                       | pass
@@ -198,7 +203,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  remote        | postgres       | identity                       | pass
  remote        | postgres       | heads_and_chunks               | no checks yet
  remote        | postgres       | complete                       | pass
-(147 rows)
+(151 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

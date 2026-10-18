@@ -76,6 +76,10 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_bmap_sweep_due()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_unlink(relnumber oid)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -164,8 +168,19 @@ RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 CREATE FUNCTION test_chunk_table_files(OUT name text, OUT chunks int,
-	OUT bytes bigint)
+	OUT bytes bigint, OUT settled boolean)
 RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The journal's segments, oldest first (settled is always false).
+CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
+	OUT bytes bigint, OUT settled boolean)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Seal the journal's segment: appends go on to a new one.
+CREATE FUNCTION test_chunk_seal()
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The canonical root of the session branch's versioned schemas, folded
@@ -282,4 +297,17 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- How many nodes the refs' walk from one commit visits.
 CREATE FUNCTION test_walk_commit_count(commit_id text)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Put a tree node naming chunks (level 0: values stored out of line in
+-- them; above: children); its hash.
+CREATE FUNCTION test_chunk_put_node(level int, refs text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Collect the chunk store's garbage (full: all of it): the chunks kept and
+-- freed of those collected, the bytes freed, and how long (microseconds)
+-- appends were held off.
+CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
+	OUT bytes_freed int8, OUT window_usec int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

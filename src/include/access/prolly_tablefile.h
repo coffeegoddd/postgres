@@ -21,7 +21,8 @@
  *   whole file of the format.  find() says where a chunk's bytes are in the
  *   file (false: not in it); decode() turns those bytes back into the chunk,
  *   appended to out, failing on corruption.
- * - count() and entry() list the file's chunks, in hash order.
+ * - count() and entry() list the file's chunks, in hash order; locate()
+ *   gives a chunk's place in that order (-1: not in the file).
  *
  * Provisional (v0).
  *
@@ -62,13 +63,14 @@ typedef struct ProllyTableFileRoutine
 	void		(*entry) (ProllyTableFile *tf, int i, ProllyHash *hash,
 						  uint64 *offset, uint32 *len);
 	void		(*close) (ProllyTableFile *tf);
+	int			(*locate) (ProllyTableFile *tf, const ProllyHash *hash);
 } ProllyTableFileRoutine;
 
 #define PROLLY_TABLEFILE_CALLBACK_NAMES \
 	"write_begin", "write_add", "write_finish", "open", "find", "decode", \
-	"count", "entry", "close"
+	"count", "entry", "close", "locate"
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
-#define PROLLY_TABLEFILE_LAST_CALLBACK close
+#define PROLLY_TABLEFILE_LAST_CALLBACK locate
 
 static inline const ProllyTableFileRoutine *
 prolly_tablefile_lookup(const char *name)

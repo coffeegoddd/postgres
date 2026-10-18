@@ -115,6 +115,23 @@ extern uint32 bmap_inspect_epoch(SMgrRelation reln);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
 
+/*
+ * The sweep: what a database's page store in a tablespace holds counted
+ * exactly, blocks nothing holds freed, stuck counts rewritten, the store
+ * shortened.
+ */
+typedef struct BmapSweep
+{
+	uint64		relations;		/* maps read */
+	uint64		freed;			/* blocks nothing held */
+	uint64		recounted;		/* stuck counts rewritten */
+	uint64		truncated;		/* blocks the store was shortened by */
+	uint64		stuck;			/* counts left stuck: past what one holds */
+} BmapSweep;
+
+extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
+extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
+
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);
 

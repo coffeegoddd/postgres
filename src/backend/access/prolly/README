@@ -31,7 +31,7 @@ design choice can be changed later by writing a new implementation:
 	content_hash      prolly_hash.h           sha256, stub
 	key_encoder       prolly_keyenc.h         ordered, stub
 	value_encoder     prolly_valenc.h         canonical, stub
-	reclamation       prolly_reclaim.h        stub
+	reclamation       prolly_reclaim.h        copying, stub
 	refs              prolly_refs.h           copies, stub
 	transfer          prolly_transfer.h       chunks, stub
 	diff_merge        prolly_merge.h          folded, stub

@@ -30,6 +30,8 @@ backend_sources += files(
   'prolly_table.c',
   'prolly_dolt.c',
   'prolly_vcs.c',
+  'prolly_autovacuum.c',
+  'reclaim_copying.c',
   'reclaim_stub.c',
   'remote_file.c',
   'remote_libpq_load.c',

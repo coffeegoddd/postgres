@@ -57,6 +57,11 @@ locality = ["clustered"]
 changes = [100]
 background = ["none"]
 
+[workloads.V6]
+branches = [3]
+changes = [100]
+background = ["none"]
+
 [tools]
 benchbase = "build-bench/benchbase/benchbase-postgres"
 benchbase_source = "~/cursor_src/benchbase"

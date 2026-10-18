@@ -70,6 +70,7 @@
 #define XLOG_BMAP_FOLD			0xA0
 #define XLOG_BMAP_CHANGES		0xB0
 #define XLOG_BMAP_SHARE_CHANGES	0xC0
+#define XLOG_BMAP_SHRINK		0xD0
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
@@ -95,6 +96,18 @@ typedef struct xl_bmap_unref
 	RelFileLocator locator;
 	uint32		flags;
 } xl_bmap_unref;
+
+/*
+ * SHRINK's main data: the page store, its high-water mark before and after
+ * (the blocks between free).  The metapage's delta comes as block 0; redo
+ * truncates the store too.
+ */
+typedef struct xl_bmap_shrink
+{
+	RelFileLocator locator;
+	BlockNumber old_hw;
+	BlockNumber new_hw;
+} xl_bmap_shrink;
 
 /*
  * REMAP's main data: the relation, the logical block copied, the block it

@@ -538,6 +538,22 @@ ResolveRecoveryConflictWithSnapshotFullXid(FullTransactionId snapshotConflictHor
 	}
 }
 
+/*
+ * Cancel the queries of waitlist (an InvalidVirtualTransactionId at its
+ * end), those running when files they may read stopped being named, before
+ * the files are removed: after max_standby_streaming_delay, as a snapshot
+ * conflict.  For storage whose files are replaced whole (prolly's chunk
+ * store).
+ */
+void
+ResolveRecoveryConflictWithFileReaders(VirtualTransactionId *waitlist)
+{
+	ResolveRecoveryConflictWithVirtualXIDs(waitlist,
+										   RECOVERY_CONFLICT_SNAPSHOT,
+										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
+										   true);
+}
+
 void
 ResolveRecoveryConflictWithTablespace(Oid tsid)
 {

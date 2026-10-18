@@ -89,6 +89,7 @@ larger than RAM.
 | V3 | Diff and three-way merge between two branches with controlled change sets (size, locality, conflicts) | Structural sharing; canonicalization cost for D3/D4 |
 | V4 | Clone / push / fetch between two local instances (over a `postgresql://` network remote) | Chunk export path |
 | V5 | Sparse diff: one changed row in a large table | Work proportional to the change (subtree skipping), not to the table |
+| V6 | Space and collection after deleting branches: branches changing rows, `dolt_gc()`, the branches deleted, `dolt_gc()` (space read), `dolt_gc('--full')` (space read), and `dolt_gc('--full')` again with everything live (#223) | Space returned, and a collection's cost against what changed and against the store |
 
 Each V workload is also run with an S workload in the background (S1 by
 default), to measure how version-control operations and ordinary traffic affect
@@ -111,7 +112,7 @@ each other.
 | GC / vacuum cost | Time and I/O of the engine's reclamation pass |
 | Bytes by structure | Canonical bytes (data and index trees), allocated pages (node occupancy), TID-map bytes, and WAL, reported separately; tree operations measured apart from SQL execution |
 | Commit-lock hold time | Time a commit holds the branch's commit lock |
-| Version-control op latency (V suite) | V1–V4 wall time |
+| Version-control op latency (V suite) | V1–V4 and V6 wall time |
 
 ## Environment
 
