@@ -1635,8 +1635,21 @@ cmp_block(const void *a, const void *b)
 }
 
 /*
+ * At most this many of one bitmap page's bits are freed in one record: a
+ * record holds no more than UINT16_MAX bytes of one page's data, and a
+ * page's bits are many more.
+ */
+#define BMAP_FREE_BITS_MAX	8192
+
+StaticAssertDecl(sizeof(xl_bmap_bits_delta) + BMAP_FREE_BITS_MAX * sizeof(uint32) <= UINT16_MAX,
+				 "a bitmap page's freed bits must fit one record's data for the page");
+
+/*
  * Clear the allocator's bits of the physical blocks blocks[0 .. n), sorted,
- * in records of a few bitmap pages each.
+ * in records of a few bitmap pages each (a page with many, in several).
+ * The records aren't one: a crash between them leaves the blocks not yet
+ * freed allocated, held by nothing, until a page sweep (bmap_sweep())
+ * frees what no map holds.
  */
 static void
 free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
@@ -1667,12 +1680,20 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 			uint64	   *words;
 			Buffer		buf;
 			uint32		end = i;
+			bool		full = false;
 
 			if (pageno >= meta->nbitmap || blocks[i] >= meta->hw)
 				elog(ERROR, "block-mapped storage of database %u frees block %u past its end",
 					 rel.dbOid, blocks[i]);
 			while (end < n && blocks[end] / BMAP_BITS_PER_PAGE == pageno)
+			{
+				if (end - i == BMAP_FREE_BITS_MAX)
+				{
+					full = true;
+					break;
+				}
 				end++;
+			}
 			buf = alloc_read(rel, meta->bitmap[pageno]);
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 			check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel, MAIN_FORKNUM,
@@ -1691,6 +1712,8 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 				}
 			}
 			hint = Min(hint, pageno);
+			if (full)
+				break;			/* (the rest of this page, in the next record) */
 		}
 
 		mdelta.kind = BMAP_DELTA_META;

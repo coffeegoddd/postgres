@@ -142,6 +142,7 @@ tests += {
       't/056_bmap_evict_lock.pl',
       't/057_large_values.pl',
       't/058_transaction_commits.pl',
+      't/059_bmap_free_many.pl',
     ],
   },
 }
