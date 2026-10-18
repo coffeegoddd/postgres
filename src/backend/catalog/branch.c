@@ -108,6 +108,10 @@ typedef struct WrittenBranch
 static List *written_branches = NIL;	/* of WrittenBranch */
 static Oid	last_written = InvalidOid;	/* (the last noted, still noted) */
 static List *hushes = NIL;		/* subtransaction of each hush in effect */
+static bool catalog_written = false;	/* a versioned catalog row, too */
+static List *sequences_written = NIL;	/* of Oid: versioned sequences */
+
+static void note_catalog_write(Oid branch);
 
 typedef struct BranchWriteCallbackItem
 {
@@ -444,7 +448,7 @@ catalog_row_with_branch(Relation rel, HeapTuple tup)
 		return tup;
 
 	branch = row_branch(rel, tup);
-	branch_note_write(branch);
+	note_catalog_write(branch);
 
 	/*
 	 * A row formed with the column null (callers that start from all-null
@@ -481,7 +485,7 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 	branch = row_branch(rel, tup);
 	heap_freetuple(tup);
 	slot->tts_values[info->attnum - 1] = ObjectIdGetDatum(branch);
-	branch_note_write(branch);
+	note_catalog_write(branch);
 }
 
 /*
@@ -502,7 +506,7 @@ catalog_note_old_row(Relation rel, const ItemPointerData *tid)
 	tup.t_self = *tid;
 	if (heap_fetch(rel, SnapshotAny, &tup, &buf, false))
 	{
-		branch_note_write(catalog_row_branch(info, &tup));
+		note_catalog_write(catalog_row_branch(info, &tup));
 		ReleaseBuffer(buf);
 	}
 }
@@ -819,6 +823,54 @@ branch_note_write(Oid branch)
 	}
 }
 
+BranchTupleHook branch_tuple_hook = NULL;
+
+/* A versioned object's catalog row written: the branch's, and noted so. */
+static void
+note_catalog_write(Oid branch)
+{
+	if (OidIsValid(branch) && hushes == NIL)
+		catalog_written = true;
+	branch_note_write(branch);
+}
+
+bool
+branch_catalog_written(void)
+{
+	return catalog_written;
+}
+
+void
+branch_note_sequence(Relation seqrel)
+{
+	Oid			branch = seqrel->rd_rel->relbranch;
+
+	if (OidIsValid(branch) && hushes == NIL &&
+		!list_member_oid(sequences_written, RelationGetRelid(seqrel)))
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		sequences_written = lappend_oid(sequences_written,
+										RelationGetRelid(seqrel));
+		MemoryContextSwitchTo(old);
+	}
+	branch_note_write(branch);
+}
+
+List *
+branch_sequences_written(void)
+{
+	return sequences_written;
+}
+
+void
+branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
+				  const ItemPointerData *newtid)
+{
+	if (branch_tuple_hook && hushes == NIL)
+		branch_tuple_hook(rel, oldtid, newtid);
+}
+
 void
 branch_forget_written(Oid branch)
 {
@@ -835,6 +887,12 @@ branch_forget_written(Oid branch)
 		}
 	}
 	last_written = InvalidOid;
+	if (branch == MyBranch)
+	{
+		catalog_written = false;
+		list_free(sequences_written);
+		sequences_written = NIL;
+	}
 }
 
 bool
@@ -886,6 +944,14 @@ static void
 forget_written(SubTransactionId subid)
 {
 	ListCell   *lc;
+
+	/* (a transaction's end: what it wrote, gone; a subtransaction's: kept, as more) */
+	if (subid == InvalidSubTransactionId)
+	{
+		catalog_written = false;
+		list_free(sequences_written);
+		sequences_written = NIL;
+	}
 
 	foreach(lc, written_branches)
 	{

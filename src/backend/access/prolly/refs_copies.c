@@ -1247,6 +1247,45 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 }
 
 /*
+ * The head with the transaction's own row changes: no snapshot is checked
+ * (heap's row locks, unique indexes and isolation level have decided which
+ * changes commit together), and the baseline isn't advanced (the next full
+ * fold reads the pages changed since it).
+ */
+static int
+copies_commit_rows(const char *message, const ProllyRowChanges *changes,
+				   int nchanges, const Oid *sequences, int nsequences,
+				   ProllyHash *commit_id)
+{
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	ProllyCommitInfo info;
+	ProllyMergeState ms;
+	ProllyNodeRef root;
+	ProllyDatabaseComponents dc;
+
+	lock_refs();
+	if (!branch_head(name, &head) || !copies_commit_get(&head, &info) ||
+		copies_merge_state(&ms))
+		return -1;
+	if (!prolly_allow_commit_conflicts() && copies_violations() != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit with constraint violations"),
+				 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
+	prolly_database_components(&dc);
+	if (!PROLLY_CALL(dc.canonicalizer, fold_rows, &info.root, changes, nchanges,
+					 sequences, nsequences, &root))
+		return -1;
+	if (same_hash(&root.hash, &info.root.hash))
+		return 0;
+	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
+				 GetCurrentTransactionStartTimestamp(), commit_id);
+	branch_set_head(name, commit_id);
+	return 1;
+}
+
+/*
  * The working set: the branch as it is (the transaction sees it), or, if
  * given, a root to commit instead; the branch's fold is its next baseline
  * either way.
@@ -2309,4 +2348,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.config_get = copies_config_get,
 	.config_set = copies_config_set,
 	.open = refs_init,
+	.commit_rows = copies_commit_rows,
 };

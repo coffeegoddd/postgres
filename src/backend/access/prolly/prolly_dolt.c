@@ -88,7 +88,31 @@ static char *dolt_transaction_commit_message = NULL;
 static LocalTransactionId txn_commit_lxid = InvalidLocalTransactionId;
 static bool txn_commit_on = false;
 
+/*
+ * Its own row changes, as it makes them (the TIDs of the versions each
+ * write made or replaced), by table; up to dolt.transaction_commit_max_changes,
+ * past which it commits its working set instead.
+ */
+static int	dolt_transaction_commit_max_changes = 100000;
+
+typedef struct OwnChanges
+{
+	Oid			relid;			/* hash key */
+	ItemPointerData *tids;
+	int			n;
+	int			max;
+} OwnChanges;
+
+static HTAB *own_changes = NULL;	/* in TopTransactionContext */
+static LocalTransactionId own_changes_lxid = InvalidLocalTransactionId;
+static int	own_changes_n = 0;
+static bool own_changes_over = false;
+
+static void forget_own_changes(void);
+
 static void transaction_commit_at_end(bool prepare);
+static void note_own_change(Relation rel, const ItemPointerData *oldtid,
+							const ItemPointerData *newtid);
 
 /* (a commit's message isn't empty, as dolt_commit's isn't) */
 static bool
@@ -143,6 +167,15 @@ prolly_session_init(const char *branch)
 								   PGC_USERSET,
 								   0,
 								   check_commit_message, NULL, NULL);
+		DefineCustomIntVariable("dolt.transaction_commit_max_changes",
+								"The most row changes a transaction's commit records by themselves.",
+								"Past them, dolt.transaction_commit commits the branch's working set.",
+								&dolt_transaction_commit_max_changes,
+								100000, 0, INT_MAX,
+								PGC_USERSET,
+								0,
+								NULL, NULL, NULL);
+		branch_tuple_hook = note_own_change;
 		prolly_refs_end_hook = transaction_commit_at_end;
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
@@ -402,6 +435,74 @@ settled(void)
 {
 	PROLLY_CALL(writers(), settled, MyBranch);
 	branch_forget_written(MyBranch);
+	forget_own_changes();
+}
+
+/* (a transaction's own changes: none yet, as it begins) */
+static void
+forget_own_changes(void)
+{
+	own_changes = NULL;
+	own_changes_lxid = InvalidLocalTransactionId;
+	own_changes_n = 0;
+	own_changes_over = false;
+}
+
+static void
+add_own_change(Relation rel, const ItemPointerData *tid)
+{
+	OwnChanges *oc;
+	bool		found;
+	Oid			relid = RelationGetRelid(rel);
+
+	oc = hash_search(own_changes, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		oc->tids = NULL;
+		oc->n = oc->max = 0;
+	}
+	if (oc->n == oc->max)
+	{
+		oc->max = Max(64, oc->max * 2);
+		oc->tids = oc->tids ?
+			repalloc_array(oc->tids, ItemPointerData, oc->max) :
+			MemoryContextAlloc(TopTransactionContext,
+							   sizeof(ItemPointerData) * oc->max);
+	}
+	oc->tids[oc->n++] = *tid;
+	own_changes_n++;
+}
+
+/* A write's tuple versions, kept if the transaction is to commit by them. */
+static void
+note_own_change(Relation rel, const ItemPointerData *oldtid,
+				const ItemPointerData *newtid)
+{
+	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on ||
+		(own_changes_lxid == MyProc->vxid.lxid && own_changes_over))
+		return;
+	if (own_changes_lxid != MyProc->vxid.lxid)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(OwnChanges);
+		ctl.hcxt = TopTransactionContext;
+		own_changes = hash_create("own row changes", 16, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		own_changes_lxid = MyProc->vxid.lxid;
+		own_changes_n = 0;
+		own_changes_over = false;
+	}
+	if (own_changes_n + 2 > dolt_transaction_commit_max_changes)
+	{
+		own_changes_over = true;
+		return;
+	}
+	if (oldtid)
+		add_own_change(rel, oldtid);
+	if (newtid)
+		add_own_change(rel, newtid);
 }
 
 /*
@@ -450,6 +551,54 @@ transaction_commit_at_end(bool prepare)
 	pushed = !ActiveSnapshotSet();
 	if (pushed)
 		PushActiveSnapshot(GetTransactionSnapshot());
+
+	/*
+	 * Its own row changes, on the head as it is: unless it changed
+	 * definitions, or more rows than it keeps, or they can't be applied so
+	 * (then the working set, as its snapshot sees it).
+	 */
+	if (!branch_catalog_written() &&
+		!(own_changes_lxid == MyProc->vxid.lxid && own_changes_over))
+	{
+		ProllyRowChanges *changes = NULL;
+		int			nchanges = 0;
+		List	   *seqs = branch_sequences_written();
+		Oid		   *seqids = palloc_array(Oid, Max(list_length(seqs), 1));
+		int			nseqs = 0;
+		ListCell   *lc;
+		int			r;
+
+		if (own_changes_lxid == MyProc->vxid.lxid && own_changes)
+		{
+			HASH_SEQ_STATUS hs;
+			OwnChanges *oc;
+
+			changes = palloc_array(ProllyRowChanges,
+								   Max(hash_get_num_entries(own_changes), 1));
+			hash_seq_init(&hs, own_changes);
+			while ((oc = hash_seq_search(&hs)) != NULL)
+			{
+				changes[nchanges].relid = oc->relid;
+				changes[nchanges].tids = oc->tids;
+				changes[nchanges].ntids = oc->n;
+				nchanges++;
+			}
+		}
+		foreach(lc, seqs)
+			seqids[nseqs++] = lfirst_oid(lc);
+		BRANCH_WRITES_HUSHED(r = PROLLY_CALL(refs(), commit_rows,
+											 dolt_transaction_commit_message,
+											 changes, nchanges, seqids, nseqs,
+											 &id));
+		if (r >= 0)
+		{
+			/* (committed or not, the branch may be clean: its owner given up) */
+			settled();
+			if (pushed)
+				PopActiveSnapshot();
+			return;
+		}
+	}
 	BRANCH_WRITES_HUSHED((void) PROLLY_CALL(refs(), commit,
 											dolt_transaction_commit_message,
 											false, &id));

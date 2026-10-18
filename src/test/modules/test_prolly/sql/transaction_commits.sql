@@ -132,6 +132,67 @@ RESET dolt.allow_commit_conflicts;
 SELECT pg_temp.commits() - :before AS commits;
 SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
 
+-- A transaction's commit is its own row changes on the head: nothing is
+-- folded, and rows another writer committed outside the mode (in the
+-- working set, not yet in a commit) aren't in it.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT length(dolt_commit('-Am', 'tc clean', '--allow-empty')::text) AS committed;
+SET dolt.transaction_commit = off;
+INSERT INTO tc.t VALUES (20, 'outside the mode');
+SET dolt.transaction_commit = on;
+SELECT test_fold_counters(true) IS NOT NULL AS reset;
+INSERT INTO tc.t VALUES (21, 'mine');
+UPDATE tc.t SET v = 'mine, updated' WHERE id = 21;
+SELECT pages, full_tables FROM test_fold_counters();
+BEGIN;
+INSERT INTO tc.t VALUES (22, 'kept');
+SAVEPOINT s;
+INSERT INTO tc.t VALUES (23, 'rolled back');
+ROLLBACK TO s;
+SAVEPOINT r;
+UPDATE tc.t SET v = 'kept, released' WHERE id = 22;
+RELEASE r;
+DELETE FROM tc.t WHERE id = 1;
+COMMIT;
+SELECT pages, full_tables FROM test_fold_counters();
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+-- (the head has the mode's rows; the working set, the other writer's too)
+SET dolt.transaction_commit = off;
+SELECT dolt_reset('--hard');
+SELECT id, v FROM tc.t WHERE id IN (1, 20, 21, 22, 23) ORDER BY id;
+SET dolt.transaction_commit = on;
+
+-- A table without a key: its rows' copies counted.
+CREATE TABLE tc.bag (v text);
+SELECT test_fold_counters(true) IS NOT NULL AS reset;
+INSERT INTO tc.bag VALUES ('a'), ('a'), ('b');
+DELETE FROM tc.bag WHERE ctid = (SELECT min(ctid) FROM tc.bag WHERE v = 'a');
+UPDATE tc.bag SET v = 'c' WHERE v = 'b';
+SELECT pages, full_tables FROM test_fold_counters();
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+SELECT v, count(*) FROM tc.bag GROUP BY v ORDER BY v;
+
+-- What can't be committed so is committed as the working set: definitions
+-- changed, a table the head doesn't have, a keyless row the head never had.
+BEGIN;
+ALTER TABLE tc.bag ADD COLUMN n int;
+INSERT INTO tc.bag VALUES ('d', 1);
+COMMIT;
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+SET dolt.transaction_commit = off;
+CREATE TABLE tc.later (id int PRIMARY KEY);
+INSERT INTO tc.bag VALUES ('outside', 2);
+SET dolt.transaction_commit = on;
+INSERT INTO tc.later VALUES (1);
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+SET dolt.transaction_commit = off;
+INSERT INTO tc.bag VALUES ('outside again', 3);
+SET dolt.transaction_commit = on;
+DELETE FROM tc.bag WHERE v = 'outside again';
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');

@@ -45,23 +45,22 @@ step b_insert: INSERT INTO vtc.t VALUES (2, 'b');
 step b_commit: COMMIT;
 step a_insert: INSERT INTO vtc.t VALUES (1, 'a');
 step a_commit: COMMIT;
-ERROR:  could not serialize access: branch "main" moved since this transaction's snapshot
 step c_log: 
 	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
 	  FROM dolt_log('main') WHERE message IN ('a', 'b');
 
-log  
------
-b,a,b
+log    
+-------
+a,b,a,b
 (1 row)
 
 step c_heads: 
 	SELECT (SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM vtc.t) AS rows,
 		   (SELECT dirty FROM dolt_branches() WHERE name = 'main') AS dirty;
 
-rows|dirty
-----+-----
-2:b |f    
+rows   |dirty
+-------+-----
+1:a,2:b|f    
 (1 row)
 
 step c_reset: DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied')::text) AS committed;

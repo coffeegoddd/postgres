@@ -1999,6 +1999,15 @@ note_branch_write(Relation relation)
 		branch_note_write(MyBranch);
 }
 
+/* ... and once made, the tuple versions it made (new) or replaced (old). */
+static inline void
+note_branch_tuple(Relation relation, const ItemPointerData *old,
+				  const ItemPointerData *new)
+{
+	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		branch_note_tuple(relation, old, new);
+}
+
 /*
  *	heap_insert		- insert tuple into a heap
  *
@@ -2224,6 +2233,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	/* Note: speculative insertions are counted too, even if aborted later */
 	pgstat_count_heap_insert(relation, 1);
+	note_branch_tuple(relation, NULL, &heaptup->t_self);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -2703,7 +2713,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* copy t_self fields back to the caller's slots */
 	for (i = 0; i < ntuples; i++)
+	{
 		slots[i]->tts_tid = heaptuples[i]->t_self;
+		note_branch_tuple(relation, NULL, &heaptuples[i]->t_self);
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -3222,6 +3235,7 @@ l1:
 		UnlockTupleTuplock(relation, &(tp.t_self), LockTupleExclusive);
 
 	pgstat_count_heap_delete(relation);
+	note_branch_tuple(relation, tid, NULL);
 
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
@@ -4367,6 +4381,7 @@ l2:
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
+	note_branch_tuple(relation, otid, &heaptup->t_self);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self

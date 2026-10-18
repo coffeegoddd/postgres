@@ -1,8 +1,8 @@
 # Version control, dolt.transaction_commit: with every writer in the mode,
 # each committed transaction makes one commit, in commit order, holding its
-# own rows.  At read committed a commit after another's sees its head; at
-# repeatable read, one whose snapshot predates a newer head fails, to be
-# retried, and leaves no commit.
+# own rows, on the head as it is when it commits: at read committed and at
+# repeatable read alike (a snapshot older than the head is no failure; the
+# heap's row locks have decided what commits together).
 
 setup		{ CREATE SCHEMA vtc VERSIONED; }
 setup		{ CREATE TABLE vtc.t (id int PRIMARY KEY, v text); }
@@ -47,5 +47,5 @@ step c_reset	{ DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied'
 # read committed: b commits first, then a, each one commit
 permutation a_rc a_insert b_begin b_insert b_commit a_commit c_log c_heads c_reset
 
-# repeatable read: a's snapshot predates b's head; a fails, and leaves none
+# repeatable read: a's snapshot predates b's head; a commits on it anyway
 permutation a_rr a_read b_begin b_insert b_commit a_insert a_commit c_log c_heads c_reset

@@ -1430,6 +1430,220 @@ carried_tree(Finder *f, ProllyNodeRef *root)
 }
 
 /* ----------------------------------------------------------------
+ * A transaction's own changes
+ * ----------------------------------------------------------------
+ */
+
+static int
+tid_cmp(const void *a, const void *b)
+{
+	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
+}
+
+/*
+ * The tuple versions tids names, read where they are (the transaction's
+ * own versions aren't pruned while it runs): each it made and didn't
+ * replace, a copy +1; each it replaced and hadn't made, -1.
+ */
+static bool
+own_copies(Finder *f, Copies *cs, ItemPointerData *tids, int ntids)
+{
+	bool		ok = true;
+
+	if (ntids > 1)
+		qsort(tids, ntids, sizeof(ItemPointerData), tid_cmp);
+	for (int i = 0; i < ntids && ok; i++)
+	{
+		BlockNumber blkno = ItemPointerGetBlockNumber(&tids[i]);
+		Buffer		buf;
+		Page		page;
+		OffsetNumber off;
+		ItemId		lp;
+		HeapTupleData tup;
+		HeapTupleHeader t;
+		bool		made;
+		bool		replaced = false;
+		HeapTuple	copy;
+
+		if (i > 0 && ItemPointerEquals(&tids[i], &tids[i - 1]))
+			continue;
+		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		off = ItemPointerGetOffsetNumber(&tids[i]);
+		lp = off <= PageGetMaxOffsetNumber(page) ? PageGetItemId(page, off) : NULL;
+		if (lp == NULL || !ItemIdIsNormal(lp))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(f->rel);
+		tup.t_self = tids[i];
+		t = tup.t_data;
+		made = !HeapTupleHeaderXminFrozen(t) &&
+			!(t->t_infomask & HEAP_XMIN_INVALID) &&
+			TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(t));
+		if (!(t->t_infomask & HEAP_XMAX_INVALID) &&
+			!HEAP_XMAX_IS_LOCKED_ONLY(t->t_infomask))
+		{
+			TransactionId updater = HeapTupleHeaderGetUpdateXid(t);
+
+			replaced = TransactionIdIsValid(updater) &&
+				TransactionIdIsCurrentTransactionId(updater);
+		}
+		copy = (made != replaced) ? heap_copytuple(&tup) : NULL;
+		UnlockReleaseBuffer(buf);
+		if (copy)
+		{
+			ExecForceStoreHeapTuple(copy, f->rowslot, false);
+			slot_getallattrs(f->rowslot);
+			resetStringInfo(&cs->key);
+			resetStringInfo(&cs->row);
+			{
+				ProllyHash	content;
+				MemoryContext old;
+				Copy	   *c;
+
+				PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &cs->key,
+							&cs->row, &content);
+				old = MemoryContextSwitchTo(cs->cxt);
+				if (cs->n == cs->max)
+				{
+					cs->max = Max(64, cs->max * 2);
+					cs->c = cs->c ? repalloc_array(cs->c, Copy, cs->max) :
+						palloc_array(Copy, cs->max);
+				}
+				c = &cs->c[cs->n++];
+				c->keylen = cs->key.len;
+				c->key = palloc(Max(c->keylen, 1));
+				memcpy(c->key, cs->key.data, c->keylen);
+				c->rowlen = cs->row.len;
+				c->row = palloc(Max(c->rowlen, 1));
+				memcpy(c->row, cs->row.data, c->rowlen);
+				c->delta = made ? 1 : -1;
+				MemoryContextSwitchTo(old);
+			}
+			ExecClearTuple(f->rowslot);
+			heap_freetuple(copy);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	return ok;
+}
+
+static bool
+pages_fold_rows(Relation rel, const ProllyTreeEnv *env,
+				const ProllyNodeRef *data_in, ItemPointerData *tids, int ntids,
+				ProllyNodeRef *data)
+{
+	Finder		f;
+	Copies		cs = {0};
+	ProllyEdit *edits;
+	int			nedits = 0;
+	ProllyTreeCursor *cur;
+	bool		ok;
+	MemoryContext cxt;
+	MemoryContext old;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "own rows",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	finder_open(&f, rel, env);
+	cs.cxt = cxt;
+	initStringInfo(&cs.key);
+	initStringInfo(&cs.row);
+	ok = own_copies(&f, &cs, tids, ntids);
+	if (ok && cs.n > 1)
+		qsort_arg(cs.c, cs.n, sizeof(Copy), copy_cmp, &f);
+
+	/*
+	 * A key's copies: with a key, the row it has now if the transaction
+	 * made one (it replaced the rest), else none; without, each row's
+	 * copies counted (a row's key is its content).
+	 */
+	edits = palloc_array(ProllyEdit, Max(cs.n, 1));
+	cur = PROLLY_CALL(f.tree, cursor_open, &f.env, data_in, CurrentMemoryContext);
+	for (int i = 0; ok && i < cs.n;)
+	{
+		Copy	   *c = &cs.c[i];
+		Copy	   *made = NULL;
+		int64		delta = 0;
+		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
+		ProllyEdit *e;
+
+		while (i < cs.n && same_bytes(cs.c[i].key, cs.c[i].keylen, ck.data, ck.len))
+		{
+			if (cs.c[i].delta > 0)
+				made = &cs.c[i];
+			delta += cs.c[i++].delta;
+		}
+		e = &edits[nedits];
+		e->key = ck;
+		if (!f.keyless)
+		{
+			e->is_delete = made == NULL;
+			if (made)
+			{
+				ProllyValue r = {(const uint8 *) made->row, made->rowlen};
+				StringInfoData value;
+
+				initStringInfo(&value);
+				PROLLY_CALL(f.kr, make_value, f.k, &r, 1, &value);
+				e->value.data = (const uint8 *) value.data;
+				e->value.len = value.len;
+			}
+			nedits++;
+		}
+		else if (delta != 0)
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			int64		count = 0;
+
+			PROLLY_CALL(f.tree, cursor_seek, cur, &ck, ForwardScanDirection);
+			if (PROLLY_CALL(f.tree, cursor_next, cur, &k, &v) &&
+				same_bytes(c->key, c->keylen, k.data, k.len))
+			{
+				ProllyValue row;
+				uint64		had;
+
+				PROLLY_CALL(f.kr, parse_value, f.k, &v, &row, &had);
+				count = (int64) had;
+			}
+			count += delta;
+			if (count < 0)
+				ok = false;
+			else
+			{
+				e->is_delete = count == 0;
+				if (count > 0)
+				{
+					ProllyValue r = {(const uint8 *) c->row, c->rowlen};
+					StringInfoData value;
+
+					initStringInfo(&value);
+					PROLLY_CALL(f.kr, make_value, f.k, &r, (uint64) count, &value);
+					e->value.data = (const uint8 *) value.data;
+					e->value.len = value.len;
+				}
+				nedits++;
+			}
+		}
+	}
+	PROLLY_CALL(f.tree, cursor_close, cur);
+	if (ok && nedits > 0)
+		PROLLY_CALL(f.tree, apply, &f.env, data_in, edits, nedits, data);
+	else if (ok)
+		*data = *data_in;
+	finder_close(&f);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return ok;
+}
+
+/* ----------------------------------------------------------------
  * Callbacks
  * ----------------------------------------------------------------
  */
@@ -1552,4 +1766,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.fold = pages_fold,
 	.walk = pages_walk,
 	.counters = pages_counters,
+	.fold_rows = pages_fold_rows,
 };

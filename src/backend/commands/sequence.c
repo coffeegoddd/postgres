@@ -664,7 +664,7 @@ DeleteSequenceTuple(Oid relid)
 static void
 note_sequence_write(Relation seqrel)
 {
-	branch_note_write(seqrel->rd_rel->relbranch);
+	branch_note_sequence(seqrel);
 }
 
 /*

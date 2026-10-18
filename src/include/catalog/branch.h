@@ -70,6 +70,25 @@ extern void RegisterBranchWriteCallback(BranchWriteCallback callback,
 extern void branch_note_write(Oid branch);
 extern bool branch_written(Oid branch);
 
+/*
+ * A prolly table's tuple versions a write made (newtid) or replaced
+ * (oldtid), once it has: told to branch_tuple_hook, if set, unless hushed.
+ */
+typedef void (*BranchTupleHook) (Relation rel, const ItemPointerData *oldtid,
+								 const ItemPointerData *newtid);
+extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
+extern void branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
+							  const ItemPointerData *newtid);
+
+/*
+ * Whether the transaction wrote a versioned object's catalog row, and the
+ * versioned sequences whose values it changed (branch_note_sequence()),
+ * not hushed; both forgotten with the session's branch's writes.
+ */
+extern bool branch_catalog_written(void);
+extern void branch_note_sequence(Relation seqrel);
+extern List *branch_sequences_written(void);
+
 /* the branch's next write is noted (and told) again, as a first one */
 extern void branch_forget_written(Oid branch);
 extern List *branches_written(void);
