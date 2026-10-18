@@ -53,6 +53,7 @@
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "varatt.h"
@@ -230,6 +231,40 @@ prolly_toast_store(Datum value, Oid typid)
 	return result;
 }
 
+bool
+prolly_toast_canonical(const varlena *pointer, Oid typid, ProllyHash *root,
+					   uint64 *len)
+{
+	varatt_external_hash p;
+	Oid			base = getBaseType(typid);
+	bool		canonical;
+
+	Assert(VARATT_IS_EXTERNAL_ONDISK_HASH(pointer));
+	VARATT_EXTERNAL_GET_POINTER(p, pointer);
+	switch (p.va_extinfo >> VARLENA_EXTSIZE_BITS)
+	{
+		case PROLLY_TOAST_FORM_BYTES:
+			/* (in another encoding, text is stored converted) */
+			canonical = base == BYTEAOID ||
+				(text_like(base) && GetDatabaseEncoding() == PG_UTF8);
+			break;
+		case PROLLY_TOAST_FORM_UTF8:
+			canonical = text_like(base) && GetDatabaseEncoding() != PG_UTF8;
+			break;
+		case PROLLY_TOAST_FORM_JSONB:
+			canonical = base == JSONBOID;
+			break;
+		default:
+			canonical = false;
+	}
+	if (!canonical)
+		return false;
+	root->len = sizeof(p.va_hash);
+	memcpy(root->bytes, p.va_hash, sizeof(p.va_hash));
+	*len = VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo);
+	return true;
+}
+
 int
 prolly_toast_reference(const varlena *pointer, StringInfo ref)
 {
@@ -299,6 +334,7 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
 	varlena    *whole;
 	varlena    *result;
 
+	INJECTION_POINT("prolly-toast-fetch", NULL);
 	initStringInfo(&ref);
 	form = prolly_toast_reference(attr, &ref);
 	r.data = (const uint8 *) ref.data;

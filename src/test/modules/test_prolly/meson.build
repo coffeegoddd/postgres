@@ -110,6 +110,7 @@ tests += {
       'jsonb_canonical',
       'hash_pointers',
       'toast_by_content',
+      'toast_folds',
     ],
   },
   'tap': {
@@ -157,6 +158,7 @@ tests += {
       't/059_journal_appends.pl',
       't/060_journal_move.pl',
       't/061_gc_roots.pl',
+      't/062_toast_folds.pl',
     ],
   },
 }

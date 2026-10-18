@@ -56,6 +56,14 @@ extern int	prolly_toast_reference(const varlena *pointer, StringInfo ref);
 extern bool prolly_toast_readable(const varlena *pointer);
 
 /*
+ * Whether a hash pointer's tree holds the canonical bytes of a value of
+ * type typid (prolly_datum.h): then its root and length (*root, *len) are
+ * a value tree of the column's in history, without reading the value.
+ */
+extern bool prolly_toast_canonical(const varlena *pointer, Oid typid,
+								   ProllyHash *root, uint64 *len);
+
+/*
  * Visit the root of every value tree a hash pointer on a page of the
  * current database's page stores names: every page, its items dead or
  * alive (shared buffers written first).  Conservative: bytes anywhere in an

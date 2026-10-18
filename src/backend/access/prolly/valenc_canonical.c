@@ -22,7 +22,11 @@
  * rows holding it share its tree.  A row without long values is the same
  * bytes as before references were.
  *
- * A value TOAST stored out of line is looked up in the value store's memo
+ * A value stored by content (a hash pointer, prolly_toast.h) whose tree
+ * holds its canonical bytes is that tree: its reference is written from
+ * the pointer, and the value isn't read (one short enough to be inline is,
+ * and is stored inline).  A value TOAST stored out of line in a TOAST
+ * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
  * the value.  A miss reads it, and remembers the reference made.  Dropped columns are never
@@ -59,6 +63,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_toast.h"
 #include "utils/memutils.h"
 #include "varatt.h"
 
@@ -255,6 +260,28 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 
 		if (enc->nulls[j])
 			continue;
+
+		/*
+		 * A value stored by content: its tree is the column's, when it holds
+		 * the canonical bytes and is too long to be inline.  Not read.
+		 */
+		if (att->attlen == -1 && enc->values &&
+			VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(slot->tts_values[i])))
+		{
+			ProllyHash	root;
+			uint64		len;
+
+			if (prolly_toast_canonical((varlena *) DatumGetPointer(slot->tts_values[i]),
+									   att->atttypid, &root, &len) &&
+				len > VALUE_INLINE_MAX)
+			{
+				initStringInfo(&ref);
+				PROLLY_CALL(enc->values->tree, value_reference, &root, len, &ref);
+				prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+				appendBinaryStringInfo(out, ref.data, ref.len);
+				continue;
+			}
+		}
 
 		/* A value TOAST stored out of line: its reference, if remembered. */
 		if (att->attlen == -1 && enc->values && enc->values->memo &&
