@@ -25,6 +25,7 @@
 #define PROLLY_TOAST_H
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_tree.h"
 #include "access/toast_destination.h"
 #include "lib/stringinfo.h"
 
@@ -56,12 +57,16 @@ extern int	prolly_toast_reference(const varlena *pointer, StringInfo ref);
 extern bool prolly_toast_readable(const varlena *pointer);
 
 /*
- * Whether a hash pointer's tree holds the canonical bytes of a value of
- * type typid (prolly_datum.h): then its root and length (*root, *len) are
- * a value tree of the column's in history, without reading the value.
+ * Whether a hash pointer's tree is the column's value tree in history,
+ * without reading the value: whether it holds the canonical bytes of a
+ * value of type typid (prolly_datum.h), is the tree implementation's and
+ * chunk store's that values (history's value store) writes, and is
+ * there.  Then its reference is appended to ref, and the value's
+ * canonical length is *len.
  */
 extern bool prolly_toast_canonical(const varlena *pointer, Oid typid,
-								   ProllyHash *root, uint64 *len);
+								   const ProllyValueStore *values,
+								   StringInfo ref, uint64 *len);
 
 /*
  * Visit the root of every value tree a hash pointer on a page of the

@@ -85,23 +85,44 @@ jsonb(void)
 }
 
 /*
- * The form a value of type typid is stored in, if it can be: its bytes,
- * unless converting them to the canonical bytes changes more than their
- * form (text-like in another encoding than UTF-8, jsonb).
+ * The form whose tree holds the canonical bytes (prolly_datum.h) of a value
+ * of type typid, -1 if none does: bytea's bytes; text-like values' bytes in
+ * UTF-8, or in UTF-8 converted from another encoding (SQL_ASCII's bytes
+ * are no encoding's); a jsonb document's canonical bytes.
+ */
+static int
+canonical_form(Oid typid)
+{
+	Oid			base = getBaseType(typid);
+
+	switch (base)
+	{
+		case BYTEAOID:
+			return PROLLY_TOAST_FORM_BYTES;
+		case JSONBOID:
+			return PROLLY_TOAST_FORM_JSONB;
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+			if (GetDatabaseEncoding() == PG_UTF8)
+				return PROLLY_TOAST_FORM_BYTES;
+			if (GetDatabaseEncoding() != PG_SQL_ASCII)
+				return PROLLY_TOAST_FORM_UTF8;
+			return -1;
+	}
+	return -1;
+}
+
+/*
+ * The form a value of type typid is stored in, if it can be: its canonical
+ * form, else its bytes.
  */
 static int
 toast_form(Oid typid)
 {
-	Oid			base = getBaseType(typid);
+	int			form = canonical_form(typid);
 
-	if (base == JSONBOID)
-		return PROLLY_TOAST_FORM_JSONB;
-	/* (SQL_ASCII's bytes are no encoding's: kept as they are) */
-	if ((base == TEXTOID || base == VARCHAROID || base == BPCHAROID) &&
-		GetDatabaseEncoding() != PG_UTF8 &&
-		GetDatabaseEncoding() != PG_SQL_ASCII)
-		return PROLLY_TOAST_FORM_UTF8;
-	return PROLLY_TOAST_FORM_BYTES;
+	return form < 0 ? PROLLY_TOAST_FORM_BYTES : form;
 }
 
 /* The longest string an encoding conversion takes */
@@ -232,36 +253,31 @@ prolly_toast_store(Datum value, Oid typid)
 }
 
 bool
-prolly_toast_canonical(const varlena *pointer, Oid typid, ProllyHash *root,
+prolly_toast_canonical(const varlena *pointer, Oid typid,
+					   const ProllyValueStore *values, StringInfo ref,
 					   uint64 *len)
 {
 	varatt_external_hash p;
-	Oid			base = getBaseType(typid);
-	bool		canonical;
+	ProllyHash	root;
 
 	Assert(VARATT_IS_EXTERNAL_ONDISK_HASH(pointer));
+	ensure_env();
 	VARATT_EXTERNAL_GET_POINTER(p, pointer);
-	switch (p.va_extinfo >> VARLENA_EXTSIZE_BITS)
-	{
-		case PROLLY_TOAST_FORM_BYTES:
-			/* (in another encoding, text is stored converted) */
-			canonical = base == BYTEAOID ||
-				(text_like(base) && GetDatabaseEncoding() == PG_UTF8);
-			break;
-		case PROLLY_TOAST_FORM_UTF8:
-			canonical = text_like(base) && GetDatabaseEncoding() != PG_UTF8;
-			break;
-		case PROLLY_TOAST_FORM_JSONB:
-			canonical = base == JSONBOID;
-			break;
-		default:
-			canonical = false;
-	}
-	if (!canonical)
+	if ((int) (p.va_extinfo >> VARLENA_EXTSIZE_BITS) != canonical_form(typid))
 		return false;
-	root->len = sizeof(p.va_hash);
-	memcpy(root->bytes, p.va_hash, sizeof(p.va_hash));
+
+	/* the trees of history's value store are these, in this store */
+	if (values->tree != tree || values->env->chunk_store != env.chunk_store ||
+		values->env->chunks != env.chunks)
+		return false;
+
+	/* (a tree that isn't there is an error when the value is read) */
+	root.len = sizeof(p.va_hash);
+	memcpy(root.bytes, p.va_hash, sizeof(p.va_hash));
+	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, &root))
+		return false;
 	*len = VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo);
+	(void) prolly_toast_reference(pointer, ref);
 	return true;
 }
 

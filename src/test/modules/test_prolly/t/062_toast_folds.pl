@@ -35,6 +35,20 @@ sub commit_unread
 	return $ret == 0 ? 'committed' : ($err =~ /prolly-toast-fetch/ ? 'read' : $err);
 }
 
+# Commit, counting the fetches of values by content.
+sub commit_fetches
+{
+	my ($db, $msg) = @_;
+	my ($ret, $out, $err) = $node->psql($db, qq{
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-toast-fetch', 'notice');
+		SELECT length(dolt_commit('-Am', '$msg')::text) > 0;
+	});
+	return $err if $ret != 0;
+	my @n = ($err =~ /notice triggered for injection point prolly-toast-fetch/g);
+	return scalar(@n);
+}
+
 for my $db ('postgres', 'latin1')
 {
 	$node->safe_psql($db, q{
@@ -60,8 +74,12 @@ for my $db ('postgres', 'latin1')
 			   string_agg(md5(i::text || 'b'), ''), string_agg(md5(i::text || 'c'), '')
 		FROM generate_series(1, 120) i;
 	});
-	is(commit_unread($db, 'short'), 'read', "$db: a commit reads a short value");
-	$node->safe_psql($db, q{SELECT length(dolt_commit('-Am', 'short')::text)});
+	is($node->safe_psql($db, q{SELECT (test_toast_pointer(a) IS NOT NULL)::int
+		  + (test_toast_pointer(b) IS NOT NULL)::int
+		  + (test_toast_pointer(c) IS NOT NULL)::int FROM f.short}), '3',
+		"$db: the short value and both long ones moved out");
+	is(commit_fetches($db, 'short'), 1,
+		"$db: a commit reads the short value, not the long ones");
 
 	# a type whose canonical bytes aren't what the tree holds is read
 	$node->safe_psql($db, q{
@@ -69,8 +87,7 @@ for my $db ('postgres', 'latin1')
 		INSERT INTO f.arrays
 		SELECT 1, array_agg(md5(i::text)) FROM generate_series(1, 3000) i;
 	});
-	is(commit_unread($db, 'arrays'), 'read', "$db: a commit reads an array");
-	$node->safe_psql($db, q{SELECT length(dolt_commit('-Am', 'arrays')::text)});
+	is(commit_fetches($db, 'arrays'), 1, "$db: a commit reads an array");
 
 	# what was committed reads back
 	is($node->safe_psql($db, q{

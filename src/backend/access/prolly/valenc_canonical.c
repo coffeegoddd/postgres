@@ -268,15 +268,13 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 		if (att->attlen == -1 && enc->values &&
 			VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(slot->tts_values[i])))
 		{
-			ProllyHash	root;
 			uint64		len;
 
+			initStringInfo(&ref);
 			if (prolly_toast_canonical((varlena *) DatumGetPointer(slot->tts_values[i]),
-									   att->atttypid, &root, &len) &&
+									   att->atttypid, enc->values, &ref, &len) &&
 				len > VALUE_INLINE_MAX)
 			{
-				initStringInfo(&ref);
-				PROLLY_CALL(enc->values->tree, value_reference, &root, len, &ref);
 				prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 				appendBinaryStringInfo(out, ref.data, ref.len);
 				continue;
