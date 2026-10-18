@@ -4,7 +4,11 @@
 # evict a dirty page of the relation being changed.  Writing that page
 # looks it up on its map page, share-locking it if cached, so a change
 # reads every buffer it needs (the changes list's, the reference counts')
-# before it locks the map page.
+# before it locks the map page.  Whether a read here evicts such a page
+# depends on timing; an assert-enabled build fails at any read made while
+# a map page is locked for a change, so each path below (a page's first
+# change after a fold, an extension over entries a truncation left) checks
+# the order on every run.
 
 use strict;
 use warnings FATAL => 'all';

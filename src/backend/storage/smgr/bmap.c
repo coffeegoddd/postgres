@@ -47,15 +47,20 @@
  * past it are reused by a later extension, or freed with the relation.
  *
  * Locking.  Lookups read the header and a map page under share locks, one
- * at a time.  Extension takes the header's exclusive lock (serializing the
- * relation's extensions and its map fork's growth), then the map page's,
- * then the allocator's metapage and bitmap pages.  Truncation takes the
- * header's.  Writing a page looks it up without loading map pages into
- * shared buffers (see read_node()), so a write never waits for these locks
- * and an extension may read buffers while holding them.  It does share-lock
- * a map page it finds cached, so a map page is always locked last, after
- * every buffer its change reads: the read may evict one of the relation's
- * pages, and the write would look it up on that map page, locked already.
+ * at a time.  Extension holds the header exclusively (serializing the
+ * relation's extensions and its map fork's growth): it reads the map page,
+ * takes blocks under the allocator's metapage and bitmap pages' locks, and
+ * then locks the map page exclusively.  Truncation takes the header's.
+ * Writing a page out looks it up without loading map pages into shared
+ * buffers (see read_node()), but share-locks a map page it finds cached,
+ * so a write may wait for a change of that page.  Any buffer read may be
+ * the eviction that writes a page out, so a backend holding a map page
+ * locked for a change reads no buffer: a change reads every buffer it
+ * needs (the changes list's, the reference counts', the allocator's)
+ * first and locks the map page last (map_lock(), which assert-enabled
+ * builds check at every read).  The one exception is a map page just
+ * added, or found all zeroes: it maps no page a write could look up, so an
+ * extension keeps it locked while it allocates.
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
  * three cases: a crash between a drop's commit and the records freeing its
@@ -493,9 +498,96 @@ check_page(Page page, uint16 type, RelFileLocator rel, ForkNumber fork,
 						blkno, relpathperm(rel, fork).str)));
 }
 
+/*
+ * A map page locked for a change, and the rule that comes with it: while a
+ * backend holds one locked it reads no buffer, as any read may evict a page
+ * the map page maps, whose write would look it up there (read_node()).  A
+ * map page just added, or found all zeroes, maps nothing, and is exempt.
+ * Assert-enabled builds check the rule at each of this file's buffer reads,
+ * whether or not a read happens to evict such a page; the resource owner
+ * forgets the lock if an error releases it.
+ */
+#ifdef USE_ASSERT_CHECKING
+static Buffer map_locked = InvalidBuffer;
+static bool map_locked_new = false;
+
+static void
+map_locked_release(Datum res)
+{
+	map_locked = InvalidBuffer;
+}
+
+static const ResourceOwnerDesc map_locked_desc = {
+	.name = "block map page locked for a change",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_FIRST,
+	.ReleaseResource = map_locked_release,
+	.DebugPrint = NULL
+};
+#endif
+
+static void
+map_lock(Buffer buf, bool isnew)
+{
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_ASSERT_CHECKING
+	Assert(!BufferIsValid(map_locked));
+	if (CurrentResourceOwner)
+	{
+		ResourceOwnerEnlarge(CurrentResourceOwner);
+		ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buf),
+							  &map_locked_desc);
+		map_locked = buf;
+		map_locked_new = isnew;
+	}
+#endif
+}
+
+/* (a page map_new_page() returned, locked already) */
+static void
+map_locked_as_new(Buffer buf)
+{
+#ifdef USE_ASSERT_CHECKING
+	Assert(!BufferIsValid(map_locked));
+	if (CurrentResourceOwner)
+	{
+		ResourceOwnerEnlarge(CurrentResourceOwner);
+		ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buf),
+							  &map_locked_desc);
+		map_locked = buf;
+		map_locked_new = true;
+	}
+#endif
+}
+
+static void
+map_unlock(Buffer buf)
+{
+#ifdef USE_ASSERT_CHECKING
+	if (BufferIsValid(map_locked))
+	{
+		Assert(map_locked == buf);
+		ResourceOwnerForget(CurrentResourceOwner, Int32GetDatum(buf),
+							&map_locked_desc);
+		map_locked = InvalidBuffer;
+	}
+#endif
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+}
+
+/* a buffer read: no map page may be locked for a change (map_lock()) */
+static inline void
+check_may_read(void)
+{
+#ifdef USE_ASSERT_CHECKING
+	Assert(!BufferIsValid(map_locked) || map_locked_new);
+#endif
+}
+
 static Buffer
 map_read(RelFileLocator rel, BlockNumber blkno)
 {
+	check_may_read();
 	return ReadBufferWithoutRelcache(rel, BMAP_FORKNUM, blkno, RBM_NORMAL,
 									 NULL, true);
 }
@@ -503,6 +595,7 @@ map_read(RelFileLocator rel, BlockNumber blkno)
 static Buffer
 alloc_read(RelFileLocator rel, BlockNumber blkno)
 {
+	check_may_read();
 	return ReadBufferWithoutRelcache(with_relnumber(rel, BMAP_ALLOC_RELNUMBER),
 									 MAIN_FORKNUM, blkno, RBM_NORMAL, NULL,
 									 true);
@@ -516,6 +609,7 @@ alloc_read(RelFileLocator rel, BlockNumber blkno)
 static Buffer
 refs_read(RelFileLocator rel, BlockNumber blkno)
 {
+	check_may_read();
 	return ReadBufferWithoutRelcache(with_relnumber(rel, BMAP_REFS_RELNUMBER),
 									 MAIN_FORKNUM, blkno, RBM_NORMAL, NULL,
 									 true);
@@ -537,6 +631,7 @@ page_ref(Page page, BlockNumber phys)
 static Buffer
 map_new_page(SMgrRelation reln)
 {
+	check_may_read();
 	return ExtendBufferedRel(BMR_SMGR(reln, RELPERSISTENCE_PERMANENT),
 							 BMAP_FORKNUM, NULL,
 							 EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -549,6 +644,7 @@ map_new_page(SMgrRelation reln)
 static Buffer
 alloc_new_page(RelFileLocator rel)
 {
+	check_may_read();
 	return ExtendBufferedRel(BMR_SMGR(alloc_smgr(rel), RELPERSISTENCE_PERMANENT),
 							 MAIN_FORKNUM, NULL,
 							 EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -811,6 +907,7 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
 		smgrcreate(rsrel, MAIN_FORKNUM, false);
 		log_smgrcreate(&rloc, MAIN_FORKNUM);
 	}
+	check_may_read();
 	if (need > 0 && smgrnblocks(rsrel, MAIN_FORKNUM) < need)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
@@ -897,6 +994,26 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 }
 
 /*
+ * Copy map page 'blk' of 'rel', pinned in 'buf', into 'dst' under a share
+ * lock.  A page of zeroes (an extension's whose record a crash lost) is
+ * copied as such if 'new_ok' (returning false), else fails verification.
+ */
+static bool
+copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
+		  uint16 type, bool new_ok)
+{
+	bool		isnew;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	isnew = new_ok && PageIsNew(BufferGetPage(buf));
+	if (!isnew)
+		check_page(BufferGetPage(buf), type, rel, BMAP_FORKNUM, blk);
+	memcpy(dst, BufferGetPage(buf), BLCKSZ);
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	return !isnew;
+}
+
+/*
  * Copy map page 'blk' of 'reln' into 'dst' (I/O-aligned).
  *
  * Writing a block-mapped page looks the page up, and a write may be the
@@ -940,14 +1057,20 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 			return;
 		}
 		buf = r.recent_buffer;
+
+		/*
+		 * A change locks a map page only after its reads (map_lock()); one
+		 * that didn't would wait here on its own lock, forever.
+		 */
+		if (BufferIsLockedByMe(buf))
+			elog(ERROR, "map page %u of \"%s\" is locked by the backend writing a page it maps",
+				 blk, relpathperm(rel, MAIN_FORKNUM).str);
 	}
 	else
 		buf = map_read(rel, blk);
 
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), type, rel, BMAP_FORKNUM, blk);
-	memcpy(dst, BufferGetPage(buf), BLCKSZ);
-	UnlockReleaseBuffer(buf);
+	(void) copy_node(rel, buf, blk, dst, type, false);
+	ReleaseBuffer(buf);
 }
 
 static BlockNumber
@@ -1304,8 +1427,9 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	 * read: a read may write out one of this relation's pages, which looks
 	 * it up on this map page.  Its entries in [from, to) can't change
 	 * meanwhile, since the header serializes the relation's extensions.  A
-	 * new page is referenced by nothing yet, so holding it locked is
-	 * harmless.
+	 * new page (or one of zeroes) maps no page a write could look up, so it
+	 * stays locked while the allocator's pages are read: the exception
+	 * map_lock() allows.
 	 */
 	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
 	mapnew = mapnblocks <= mapblk;
@@ -1317,6 +1441,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
 				 mapnblocks, from);
 		mapbuf = map_new_page(reln);
+		map_locked_as_new(mapbuf);
 		if (BufferGetBlockNumber(mapbuf) != mapblk)
 			elog(ERROR, "map of \"%s\" extended to block %u, expected %u",
 				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
@@ -1330,12 +1455,12 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		 * A page added to the map fork by an extension whose record a crash
 		 * lost is all zeroes; nothing refers to it, so it is used as new.
 		 */
-		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		map_lock(mapbuf, true);
 		if (PageIsNew(BufferGetPage(mapbuf)))
 			mapnew = true;
 		else
 		{
-			LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
+			map_unlock(mapbuf);
 			LockBuffer(mapbuf, BUFFER_LOCK_SHARE);
 			check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel,
 					   BMAP_FORKNUM, mapblk);
@@ -1374,7 +1499,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 
 	/* every read is done; now the map page can be locked for the update */
 	if (!mapnew)
-		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		map_lock(mapbuf, false);
 
 	/* the page store before the record */
 	prepare_store(rel, old_hw, new_hw, reused, nreused, false);
@@ -1440,7 +1565,8 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	END_CRIT_SECTION();
 
 	alloc_release(&alloc);
-	UnlockReleaseBuffer(mapbuf);
+	map_unlock(mapbuf);
+	ReleaseBuffer(mapbuf);
 	pfree(ndelta);
 }
 
@@ -1872,6 +1998,7 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BlockNumber mapblk = MAP_PAGE(from);
 	Buffer		mapbuf;
+	PGIOAlignedBlock copy;
 	BmapEntry	stale[BMAP_PIECE];
 	SlotEntry	items[BMAP_PIECE];
 	BlockNumber phys[BMAP_PIECE];
@@ -1882,16 +2009,13 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 	if (mapblk >= mdnblocks(reln, BMAP_FORKNUM))
 		return;
 	mapbuf = map_read(rel, mapblk);
-	LockBuffer(mapbuf, BUFFER_LOCK_SHARE);
-	if (PageIsNew(BufferGetPage(mapbuf)))
+	if (!copy_node(rel, mapbuf, mapblk, copy.data, BMAP_PAGE_NODE, true))
 	{
-		UnlockReleaseBuffer(mapbuf);
+		ReleaseBuffer(mapbuf);
 		return;
 	}
-	check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM, mapblk);
-	memcpy(stale, &PageGetBmapEntries(BufferGetPage(mapbuf))[MAP_SLOT(from)],
+	memcpy(stale, &PageGetBmapEntries(copy.data)[MAP_SLOT(from)],
 		   (to - from) * sizeof(BmapEntry));
-	LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
 	for (BlockNumber blk = from; blk < to; blk++)
 	{
 		BmapEntry  *e = &stale[blk - from];
@@ -1944,7 +2068,7 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 		else
 			/* blocks past the counts' pages count zero: all claimed */
 			covered = nitems - i;
-		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		map_lock(mapbuf, false);
 
 		for (uint32 k = i; k < i + covered; k++)
 		{
@@ -1974,7 +2098,7 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 		log_refs_record(XLOG_BMAP_UNREF, &xlrec, sizeof(xlrec),
 						mapbuf, ndelta, 0, &rp);
 
-		LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
+		map_unlock(mapbuf);
 		refs_release(&rp);
 		pfree(ndelta);
 		i += covered;
@@ -2012,6 +2136,7 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 static Buffer
 chg_read(RelFileLocator rel, BlockNumber blkno)
 {
+	check_may_read();
 	return ReadBufferWithoutRelcache(rel, BMAP_CHANGES_FORKNUM, blkno,
 									 RBM_NORMAL, NULL, true);
 }
@@ -2026,6 +2151,7 @@ chg_exists(SMgrRelation reln)
 static Buffer
 chg_new_page(SMgrRelation reln)
 {
+	check_may_read();
 	return ExtendBufferedRel(BMR_SMGR(reln, RELPERSISTENCE_PERMANENT),
 							 BMAP_CHANGES_FORKNUM, NULL,
 							 EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -2225,7 +2351,7 @@ list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
 	c.old_block = old_block;
 	c.kind = BMAP_CHANGE_COPY;
 	changes_append_lock(reln, &ca, &c);
-	LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+	map_lock(mapbuf, false);
 
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
@@ -2250,7 +2376,7 @@ list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
 	PageSetLSN(BufferGetPage(mapbuf), lsn);
 	END_CRIT_SECTION();
-	LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
+	map_unlock(mapbuf);
 	changes_append_finish(&ca, lsn);
 	pfree(ndelta);
 }
@@ -2862,6 +2988,7 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 
 	/* the copy's maps are added in order, so this is its next page */
 	mapbuf = map_new_page(dst);
+	map_locked_as_new(mapbuf);
 	if (BufferGetBlockNumber(mapbuf) != mapblk)
 		elog(ERROR, "map of \"%s\" extended to block %u, expected %u",
 			 relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
@@ -2907,7 +3034,8 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 		i += covered;
 		first = false;
 	}
-	UnlockReleaseBuffer(mapbuf);
+	map_unlock(mapbuf);
+	ReleaseBuffer(mapbuf);
 	pfree(items);
 	pfree(phys);
 }
@@ -3185,7 +3313,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		/* no other map holds it: claim it */
 		ent->block = old_block;
 		mapbuf = map_read(rel, MAP_PAGE(blkno));
-		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		map_lock(mapbuf, false);
 		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
 				   MAP_PAGE(blkno));
 
@@ -3252,7 +3380,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		}
 
 		mapbuf = map_read(rel, MAP_PAGE(blkno));
-		LockBuffer(mapbuf, BUFFER_LOCK_EXCLUSIVE);
+		map_lock(mapbuf, false);
 		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
 				   MAP_PAGE(blkno));
 
@@ -3310,7 +3438,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			pfree(rdelta);
 	}
 
-	UnlockReleaseBuffer(mapbuf);
+	map_unlock(mapbuf);
+	ReleaseBuffer(mapbuf);
 	if (BufferIsValid(refbuf))
 		UnlockReleaseBuffer(refbuf);
 	UnlockReleaseBuffer(headerbuf);
