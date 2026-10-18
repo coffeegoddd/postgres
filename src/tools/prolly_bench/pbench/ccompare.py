@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import gzip
 import json
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -119,6 +120,12 @@ def compare(base: ResultSet, eng: ResultSet) -> dict[str, dict[str, Any]]:
     return out
 
 
+def is_status_problem(problem: str) -> bool:
+    """Whether a problem from evidence() is only a record that didn't run to
+    a result (one statuses=False leaves out)."""
+    return re.fullmatch(r"record \S+:\d+ \w+", problem) is not None
+
+
 def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
     """Reconcile raw records against the plan and summary; never trust counts alone.
     With statuses, a record that didn't run to a result (crashed, timed out,
@@ -145,7 +152,7 @@ def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
                 if expected["skip"] != (status == "skipped"):
                     raise ValueError("unexpected skip or execution of excluded record")
                 if statuses and status not in ("ok", "not_ok", "skipped") and len(problems) < 20:
-                    problems.append(f"{key}: {status}")
+                    problems.append(f"record {key[0]}:{key[1]} {status}")
                 # (a client-side error has only its message: a result, not
                 # missing evidence)
                 if status in ("ok", "not_ok") and not (

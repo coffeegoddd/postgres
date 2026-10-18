@@ -61,7 +61,8 @@ def c_result(path: Path, am: str, records: dict, config=None, commit="pin", labe
                                     "pass_percent": 100 * counts.get("ok", 0) / ran if ran else None}})
     (path / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results))
     (path / "config.json").write_text(json.dumps(config or {"run": {}}))
-    (path / "environment.json").write_text(json.dumps({"sqllogictest": {"commit": commit}}))
+    (path / "environment.json").write_text(json.dumps({"sqllogictest": {"commit": commit,
+                                                                     "dirty_files": 0}}))
     label = label or ("B0" if am == "heap" else am)
     seal(path, "C", am, label)
     return ResultSet(path, "C", label, am, "2026-10-18", results)

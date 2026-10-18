@@ -31,6 +31,8 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -73,11 +75,16 @@ def read(path: Path = BASELINE) -> Baseline:
         if header[:2] != ["#", "sqllogictest"] or len(header) != 3:
             raise ValueError(f"{path}: no '# sqllogictest COMMIT' first line")
         entries = {}
+        previous = None
         for n, line in enumerate(f, 2):
             parts = line.rstrip("\n").split("\t")
             if len(parts) != 5:
                 raise ValueError(f"{path}:{n}: expected 5 tab-separated fields")
-            entries[(parts[0], int(parts[1]))] = (parts[2], parts[3], parts[4])
+            key = (parts[0], int(parts[1]))
+            if previous is not None and key <= previous:
+                raise ValueError(f"{path}:{n}: duplicate or out of order")
+            entries[key] = (parts[2], parts[3], parts[4])
+            previous = key
     return Baseline(header[2], entries)
 
 
@@ -86,8 +93,11 @@ def write(path: Path, commit: str, entries: dict[tuple[str, int], tuple[str, str
     text.write(f"# sqllogictest {commit}\n")
     for (file, line), sig in sorted(entries.items()):
         text.write("\t".join([file, str(line), *sig]) + "\n")
-    # (no name or time in the header: the same outcome gives the same bytes)
-    path.write_bytes(gzip.compress(text.getvalue().encode(), mtime=0))
+    # (no name or time in the header: the same outcome gives the same bytes;
+    # written beside and renamed, so an interrupted update leaves the old file)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(gzip.compress(text.getvalue().encode(), mtime=0))
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -150,9 +160,27 @@ def _records(d: Path) -> Iterator[dict[str, Any]]:
             yield json.loads(line)
 
 
-def _corpus_commit(rs: ResultSet) -> str:
-    env = json.loads((rs.path / "environment.json").read_text())
-    return (env.get("sqllogictest") or {}).get("commit", "")
+def _corpus_state(rs: ResultSet) -> tuple[str, int]:
+    """The corpus checkout a run used: its commit and how many files differ
+    from it (-1 if unknown)."""
+    try:
+        env = json.loads((rs.path / "environment.json").read_text())
+        checkout = env.get("sqllogictest") or {}
+        return str(checkout.get("commit", "")), int(checkout.get("dirty_files", -1))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "", -1
+
+
+def _checkout_state(corpus: Path) -> tuple[str, int]:
+    """The commit of the corpus checkout holding corpus (its test/
+    directory), and how many files differ from it."""
+    def run(*args: str) -> str:
+        r = subprocess.run(["git", "-C", str(corpus.parent), *args],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise ValueError(f"{corpus.parent}: not a checkout of the corpus")
+        return r.stdout
+    return run("rev-parse", "HEAD").strip(), len(run("status", "--porcelain").splitlines())
 
 
 def check(sets: Iterable[ResultSet], baseline: Baseline, commit: str) -> Check:
@@ -167,10 +195,19 @@ def check(sets: Iterable[ResultSet], baseline: Baseline, commit: str) -> Check:
         if rs.suite != "C" or rs.table_am != "heap":
             c.problems.append(f"{rs.path.name}: not a C suite run on heap")
             continue
-        run_commit = _corpus_commit(rs)
+        # (the result set's own validation; records that didn't run are this
+        # check's to report, as incomplete)
+        invalid = [p for p in rs.problems if not ccompare.is_status_problem(p)]
+        if invalid:
+            c.problems += [f"{rs.path.name}: {p}" for p in invalid]
+            continue
+        run_commit, dirty = _corpus_state(rs)
         if run_commit != commit:
             c.problems.append(f"{rs.path.name}: ran sqllogictest {run_commit[:12] or '?'}, "
                               f"the pin is {commit[:12]}")
+        elif dirty != 0:
+            c.problems.append(f"{rs.path.name}: ran a corpus checkout with local changes "
+                              f"({dirty if dirty > 0 else 'unknown'} files)")
         dirs = ccompare.slt_dirs(rs)
         wanted = ccompare.run_workloads(rs)
         c.workloads += [w for w in wanted if w in dirs]
@@ -188,9 +225,10 @@ def check(sets: Iterable[ResultSet], baseline: Baseline, commit: str) -> Check:
             c.files |= corpus.keys()
             for r in _records(d):
                 key = (r["file"], r["line"])
-                seen.add(key)
                 c.records += 1
                 listed = baseline.entries.get(key)
+                if listed:
+                    seen.add(key)
                 where = {"file": r["file"], "line": r["line"], "workload": w}
                 if r["status"] in INCOMPLETE:
                     c.incomplete.append({**where, "status": r["status"]})
@@ -220,9 +258,18 @@ def update(sets: list[ResultSet], path: Path, commit: str, corpus: Path) -> list
     problems = list(c.problems)
     if c.incomplete:
         problems.append(_incomplete(c.incomplete))
-    full = cshard.workload_files(corpus, {"workloads": {}})
-    if {f for fs in full.values() for f in fs} != c.files:
-        problems.append("not a full run of the corpus: the baseline is written from every file")
+    try:
+        # (the checkout is listed as it is now: it must still be the pin)
+        head, dirty = _checkout_state(corpus)
+        if head != commit or dirty:
+            problems.append(f"the corpus at {corpus.parent} is at {head[:12]} with {dirty} "
+                            f"changed files, not the pin {commit[:12]}")
+        full = cshard.workload_files(corpus, {"workloads": {}})
+        if {f for fs in full.values() for f in fs} != c.files:
+            problems.append("not a full run of the corpus: the baseline is written from "
+                            "every file")
+    except (OSError, ValueError) as e:
+        problems.append(f"cannot list the corpus: {e}")
     if problems:
         return problems
     write(path, commit, {(d["file"], d["line"]): tuple(d["now"]) for d in c.new})

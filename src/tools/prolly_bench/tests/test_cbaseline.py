@@ -1,9 +1,12 @@
 import gzip
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pbench import cbaseline
+from pbench.table import load_set
 from evidence_helpers import c_result
 
 SHARD = {"run": {"shard": "1/1", "workloads": ["C3"]}}
@@ -89,14 +92,49 @@ class BaselineTest(unittest.TestCase):
         self.assertTrue(any("regenerate it" in p for p in c.problems))
 
     def test_missing_workload_is_incomplete(self):
-        c = self.check(records(), config={"run": {"workloads": ["C3", "C4"]}})
+        c = self.check(records(), config={"run": {"shard": "1/2", "workloads": ["C3", "C4"]}})
         self.assertIn("incomplete: no records for C4", c.problems[0])
+        # (an unsharded run is all four workloads)
+        c = self.check(records(), config={"run": {"workloads": ["C3"]}})
+        self.assertIn("incomplete: no records for C1", c.problems[0])
+
+    def test_result_set_validation_counts(self):
+        rs = c_result(self.root / "sealed", "heap", {"C3": records(l5={"status": "timeout"})}, SHARD)
+        c = cbaseline.check([load_set(rs.path)], cbaseline.read(self.path), "pin")
+        # (a record that timed out is incomplete, not an invalid result set)
+        self.assertEqual(c.problems, [])
+        self.assertEqual(len(c.incomplete), 1)
+        (rs.path / "config.json").write_text("{}")
+        c = cbaseline.check([load_set(rs.path)], cbaseline.read(self.path), "pin")
+        self.assertTrue(any("artifact changed: config.json" in p for p in c.problems), c.problems)
+        self.assertEqual(c.records, 0)
+
+    def test_changed_or_unknown_corpus_checkout(self):
+        rs = c_result(self.root / "dirty", "heap", {"C3": records()}, SHARD)
+        for git, text in (({"commit": "pin", "dirty_files": 3}, "local changes (3 files)"),
+                          ({"commit": "pin"}, "local changes (unknown files)")):
+            (rs.path / "environment.json").write_text(json.dumps({"sqllogictest": git}))
+            c = cbaseline.check([rs], cbaseline.read(self.path), "pin")
+            self.assertTrue(any(text in p for p in c.problems), c.problems)
+        (rs.path / "environment.json").unlink()
+        c = cbaseline.check([rs], cbaseline.read(self.path), "pin")
+        self.assertTrue(any("ran sqllogictest ?" in p for p in c.problems), c.problems)
+
+    def test_read_refuses_duplicate_or_unsorted_lines(self):
+        for lines in (["a.test\t5\tnot_ok\t-\t-", "a.test\t5\tnot_ok\t-\t-"],
+                      ["b.test\t1\tnot_ok\t-\t-", "a.test\t1\tnot_ok\t-\t-"]):
+            self.path.write_bytes(gzip.compress(
+                ("# sqllogictest pin\n" + "\n".join(lines) + "\n").encode()))
+            with self.assertRaisesRegex(ValueError, "duplicate or out of order"):
+                cbaseline.read(self.path)
 
     def test_listed_record_missing_from_its_file(self):
         c = self.check([r for r in records() if r["line"] != 9])
         self.assertTrue(any("baseline records aren't in the run's files" in p for p in c.problems))
 
     def test_update_round_trips_and_refuses_partial_runs(self):
+        checkout = self.enterContext(
+            patch.object(cbaseline, "_checkout_state", return_value=("pin", 0)))
         corpus = self.root / "corpus" / "test"
         full = {"C1": [f"select{i}.test" for i in range(1, 6)], "C2": ["evidence/in1.test"],
                 "C3": ["index/a.test"], "C4": ["random/r.test"]}
@@ -114,6 +152,7 @@ class BaselineTest(unittest.TestCase):
         others["C1"] = [{"file": f, "line": 1, "status": "ok"} for f in full["C1"]]
         rs = c_result(self.root / "full2", "heap", {**others, "C3": records()})
         self.assertEqual(cbaseline.update([rs], out, "pin", corpus), [])
+        self.assertEqual(sorted(p.name for p in self.root.glob("new*")), ["new.tsv.gz"])
         with gzip.open(out, "rt") as f:
             self.assertEqual(f.read(), "# sqllogictest pin\nindex/a.test\t9\tnot_ok\t42883\tdigest-9\n")
         first = out.read_bytes()
@@ -129,6 +168,13 @@ class BaselineTest(unittest.TestCase):
         problems = cbaseline.update([slow], out, "pin", corpus)
         self.assertTrue(problems[0].startswith("incomplete: 1 records"))
         self.assertEqual(out.read_bytes(), first)
+        # (the checkout is listed as it is now, so it must still be the pin)
+        for state in (("other", 0), ("pin", 2)):
+            checkout.return_value = state
+            self.assertTrue(any("not the pin" in p for p in cbaseline.update([rs], out, "pin", corpus)))
+        checkout.side_effect = ValueError("not a checkout of the corpus")
+        self.assertTrue(any("cannot list the corpus" in p
+                            for p in cbaseline.update([rs], out, "pin", corpus)))
 
     def test_checked_in_baseline_matches_the_pin(self):
         self.assertEqual(cbaseline.read().commit, cbaseline.pin())

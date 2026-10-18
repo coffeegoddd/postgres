@@ -332,6 +332,7 @@ jobs:
             --config src/tools/prolly_bench/configs/c_full_ci.toml \
             --pg-bin "$PWD/tmp_install/usr/local/pgsql/bin" \
             --work-dir "$RUNNER_TEMP/c-full" --out "$PWD/engine-results/c-full"
+          src/tools/prolly_bench/prolly_bench cbaseline check engine-results/c-full/*-C-B0
 
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench
