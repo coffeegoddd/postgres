@@ -147,10 +147,48 @@ def is_status_problem(problem: str) -> bool:
     return re.fullmatch(r"record \S+:\d+ \w+", problem) is not None
 
 
+# The files evidence() reads, and where it keeps its result for them.
+EVIDENCE_INPUTS = ("summary.json", "corpus.json", "planned.jsonl.gz", "records.jsonl.gz",
+                   "files.jsonl")
+EVIDENCE_CACHE = "evidence.json"
+EVIDENCE_VERSION = 1
+
+
 def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
     """Reconcile raw records against the plan and summary; never trust counts alone.
     With statuses, a record that didn't run to a result (crashed, timed out,
-    ...) is a problem too."""
+    ...) is a problem too.
+
+    The full corpus is millions of records, and loading a result set,
+    cgate, cbaseline and creport each reconcile them; the result is kept
+    in d/evidence.json, keyed by the inputs' hashes, so the files are read
+    once until one of them changes."""
+    try:
+        inputs = {n: sha256(d / n) for n in EVIDENCE_INPUTS}
+    except OSError:
+        return _evidence(d, am, statuses)
+    key = f"{am}/{'statuses' if statuses else 'records'}"
+    cache = d / EVIDENCE_CACHE
+    try:
+        kept = json.loads(cache.read_text())
+        if kept.get("version") != EVIDENCE_VERSION or kept.get("inputs") != inputs:
+            kept = {}
+    except (OSError, ValueError, AttributeError):
+        kept = {}
+    if key in kept.get("results", {}):
+        found = kept["results"][key]
+        return found["problems"], found["corpus"]
+    problems, corpus = _evidence(d, am, statuses)
+    results = {**kept.get("results", {}), key: {"problems": problems, "corpus": corpus}}
+    try:
+        cache.write_text(json.dumps({"version": EVIDENCE_VERSION, "inputs": inputs,
+                                     "results": results}))
+    except OSError:
+        pass  # (a read-only copy: only slower)
+    return problems, corpus
+
+
+def _evidence(d: Path, am: str, statuses: bool) -> tuple[list[str], dict]:
     problems = []
     try:
         summary = json.loads((d / "summary.json").read_text())

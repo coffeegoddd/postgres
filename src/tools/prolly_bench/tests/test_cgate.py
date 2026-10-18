@@ -121,6 +121,35 @@ class GateTest(unittest.TestCase):
                     ccompare.compare(self.base, self.engine)
         self.assertEqual(len(runs), 2)
 
+    def test_evidence_is_reconciled_once_until_its_files_change(self):
+        raw = self.engine.path / "raw" / "slt"
+        real = ccompare._evidence
+        calls = []
+
+        def counted(*args):
+            calls.append(args)
+            return real(*args)
+        with patch.object(ccompare, "_evidence", side_effect=counted):
+            first = ccompare.evidence(raw, "prolly")
+            self.assertEqual(ccompare.evidence(raw, "prolly"), first)
+            self.assertEqual(len(calls), 1)
+            # (another engine or mode is another result)
+            ccompare.evidence(raw, "prolly", statuses=False)
+            ccompare.evidence(raw, "heap")
+            self.assertEqual(len(calls), 3)
+            summary = json.loads((raw / "summary.json").read_text())
+            (raw / "summary.json").write_text(json.dumps({**summary, "unparsed_lines": 1}))
+            errors, _ = ccompare.evidence(raw, "prolly")
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(errors)
+            # (a cache that can't be written is only slower)
+            (raw / "evidence.json").unlink()
+            raw.chmod(0o500)
+            try:
+                self.assertEqual(ccompare.evidence(raw, "prolly")[0], errors)
+            finally:
+                raw.chmod(0o700)
+
     def test_client_side_error_is_a_result_not_missing_evidence(self):
         raw = self.engine.path / "raw" / "slt"
         with gzip.open(raw / "records.jsonl.gz", "rt") as f:
