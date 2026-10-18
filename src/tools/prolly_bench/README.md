@@ -330,11 +330,14 @@ src/tools/prolly_bench/prolly_bench cbaseline check BASELINE_DIR
 
 then the **C suite gate** job runs `creport` over every shard and fails on
 any finding or on a missing shard. A pull request changing only `specs/`
-passes the gate without building. The gate leaves the comment as an
-artifact, and `correctness-comment.yml` (a `workflow_run` workflow, with
-the only write permission) posts it or updates it in place. A failure on
-`master` or in the nightly run opens or updates one issue labelled
-`ci-failure`, and the next pass closes it.
+passes the gate without building, and its comment says the suite didn't
+run. The gate leaves the comment as an artifact, and
+`correctness-comment.yml` (a `workflow_run` workflow, with the only write
+permission) posts it or updates it in place, unless the run tested an
+older commit than the pull request's head. A cancelled run reports
+nothing. A failure on `master` or in the nightly run opens or updates one
+issue labelled `ci-failure`, and the next pass closes it. Both workflows
+use `.github/actions/specs-only` to decide what is specs-only.
 
 All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,

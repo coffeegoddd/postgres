@@ -13,6 +13,8 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import gzip
+import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -151,7 +153,13 @@ def is_status_problem(problem: str) -> bool:
 EVIDENCE_INPUTS = ("summary.json", "corpus.json", "planned.jsonl.gz", "records.jsonl.gz",
                    "files.jsonl")
 EVIDENCE_CACHE = "evidence.json"
-EVIDENCE_VERSION = 1
+
+
+@functools.cache
+def _evidence_version() -> str:
+    """The reconciliation's own code, so a cache from other code is never
+    used."""
+    return hashlib.sha256(inspect.getsource(_evidence).encode()).hexdigest()
 
 
 def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
@@ -162,27 +170,36 @@ def evidence(d: Path, am: str, statuses: bool = True) -> tuple[list[str], dict]:
     The full corpus is millions of records, and loading a result set,
     cgate, cbaseline and creport each reconcile them; the result is kept
     in d/evidence.json, keyed by the inputs' hashes, so the files are read
-    once until one of them changes."""
+    once until one of them changes, or the code that reconciles them does.
+    (The cache is as trustworthy as the result set it sits in: whoever can
+    rewrite one can rewrite the other.)"""
     try:
         inputs = {n: sha256(d / n) for n in EVIDENCE_INPUTS}
     except OSError:
         return _evidence(d, am, statuses)
     key = f"{am}/{'statuses' if statuses else 'records'}"
     cache = d / EVIDENCE_CACHE
+    kept: dict[str, Any] = {"results": {}, "corpus": None}
     try:
-        kept = json.loads(cache.read_text())
-        if kept.get("version") != EVIDENCE_VERSION or kept.get("inputs") != inputs:
-            kept = {}
-    except (OSError, ValueError, AttributeError):
-        kept = {}
-    if key in kept.get("results", {}):
-        found = kept["results"][key]
-        return found["problems"], found["corpus"]
+        found = json.loads(cache.read_text())
+        if (isinstance(found, dict) and found.get("version") == _evidence_version()
+                and found.get("inputs") == inputs and isinstance(found.get("results"), dict)
+                and isinstance(found.get("corpus"), dict)):
+            kept = found
+    except (OSError, ValueError):
+        pass
+    hit = kept["results"].get(key)
+    if isinstance(hit, list) and all(isinstance(p, str) for p in hit):
+        return hit, kept["corpus"]
     problems, corpus = _evidence(d, am, statuses)
-    results = {**kept.get("results", {}), key: {"problems": problems, "corpus": corpus}}
+    if kept["corpus"] not in (None, corpus):
+        kept["results"] = {}
+    kept["results"] = {k: v for k, v in kept["results"].items() if isinstance(v, list)}
+    kept["results"][key] = problems
     try:
-        cache.write_text(json.dumps({"version": EVIDENCE_VERSION, "inputs": inputs,
-                                     "results": results}))
+        # (the corpus once: it is the same for every engine and mode)
+        cache.write_text(json.dumps({"version": _evidence_version(), "inputs": inputs,
+                                     "corpus": corpus, "results": kept["results"]}))
     except OSError:
         pass  # (a read-only copy: only slower)
     return problems, corpus

@@ -142,6 +142,16 @@ class GateTest(unittest.TestCase):
             errors, _ = ccompare.evidence(raw, "prolly")
             self.assertEqual(len(calls), 4)
             self.assertTrue(errors)
+            # (a malformed cache, or one from other reconciliation code, is
+            # recomputed, not trusted or fatal)
+            cache = raw / "evidence.json"
+            kept = json.loads(cache.read_text())
+            for bad in ({**kept, "results": []}, {**kept, "results": {"prolly/statuses": {}}},
+                        {**kept, "corpus": "x"}, [], {**kept, "version": "older code"}):
+                cache.write_text(json.dumps(bad))
+                before = len(calls)
+                self.assertEqual(ccompare.evidence(raw, "prolly")[0], errors)
+                self.assertEqual(len(calls), before + 1, bad)
             # (a cache that can't be written is only slower)
             (raw / "evidence.json").unlink()
             raw.chmod(0o500)

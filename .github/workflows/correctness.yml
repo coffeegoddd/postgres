@@ -45,21 +45,14 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 2
-      - name: Anything outside specs/?
+      - uses: ./.github/actions/specs-only
+        id: specs
+      - name: Classify
         id: classify
         env:
-          EVENT: ${{ github.event_name }}
+          CODE: ${{ steps.specs.outputs.code }}
         run: |
-          code=true
-          if [ "$EVENT" = pull_request ]; then
-            # (HEAD is the merge into the base: its first parent is the base)
-            changed=$(git diff --name-only HEAD^1 HEAD)
-            printf '%s\n' "$changed"
-            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
-              code=false
-            fi
-          fi
-          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+          echo "code=$CODE" | tee -a "$GITHUB_OUTPUT"
           echo "shards=[$(seq -s , 1 "$SHARDS")]" | tee -a "$GITHUB_OUTPUT"
 
   build:
@@ -126,7 +119,7 @@ jobs:
 
       - name: Cached corpus
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: slt-corpus
           key: sqllogictest-${{ steps.corpus.outputs.commit }}
@@ -138,6 +131,15 @@ jobs:
           repository: dolthub/sqllogictest
           ref: ${{ steps.corpus.outputs.commit }}
           path: slt-corpus
+
+      # (saved now, so a shard that fails later still leaves it for the next run)
+      - name: Cache the corpus
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: slt-corpus
+          key: sqllogictest-${{ steps.corpus.outputs.commit }}
 
       - name: Heap and prolly on the shard, then cgate and the heap baseline
         env:
@@ -160,25 +162,34 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # (not on cancellation: a newer push cancelled this run, and its own gate
+  # reports)
   gate:
     name: C suite gate
     needs: [classify, build, shard]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
       actions: read
     steps:
-      - name: Specs only
-        if: needs.classify.result == 'success' && needs.classify.outputs.code != 'true'
-        run: echo "This pull request changes only specs/; the C suite doesn't run."
-
       - name: Classification failed
         if: needs.classify.result != 'success'
         run: |
           echo "classify: ${{ needs.classify.result }}" >&2
           exit 1
+
+      # (a comment still, so an earlier one doesn't stand for this commit)
+      - name: Specs only
+        if: needs.classify.result == 'success' && needs.classify.outputs.code != 'true'
+        run: |
+          mkdir -p comment
+          { echo '<!-- c-suite -->'
+            echo '## C suite: not run'
+            echo
+            echo "This pull request changes only specs/ at ${{ github.event.pull_request.head.sha }}; the C suite doesn't run."
+          } > comment/comment.md
 
       - uses: actions/checkout@v5
         if: needs.classify.outputs.code == 'true'
@@ -202,7 +213,7 @@ jobs:
       - name: Cached corpus
         if: needs.classify.outputs.code == 'true'
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: slt-corpus
           key: sqllogictest-${{ steps.corpus.outputs.commit }}
@@ -232,28 +243,39 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          baseline=src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz
-          # The base: for a pull request, the first parent of the merge it ran.
-          base=$(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)
-          git show "$base:$baseline" > "$RUNNER_TEMP/base-baseline.tsv.gz" 2>/dev/null \
-            || cp "$baseline" "$RUNNER_TEMP/base-baseline.tsv.gz"
-          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at)
-          minutes=$(( ($(date +%s) - $(date -d "$started" +%s)) / 60 ))
-          failed=()
-          [ "$BUILD" = success ] || failed+=(--failed-job "build: $BUILD")
-          [ "$SHARD_JOBS" = success ] || failed+=(--failed-job "shards: $SHARD_JOBS")
           mkdir -p comment
           status=0
-          src/tools/prolly_bench/prolly_bench creport shards/c-shard-*/*-C-* \
-            --shards "$SHARDS" --base-baseline "$RUNNER_TEMP/base-baseline.tsv.gz" \
-            --corpus "$PWD/slt-corpus/test" --head "$HEAD_SHA" --base "$base" \
-            --base-ref "$BASE_REF" --run-url "$RUN_URL" --wall-clock "$minutes min" \
-            "${failed[@]}" --out comment/comment.md --json comment/summary.json || status=$?
+          {
+            baseline=src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz
+            # The base: for a pull request, the first parent of the merge it ran.
+            base=$(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)
+            git show "$base:$baseline" > "$RUNNER_TEMP/base-baseline.tsv.gz" 2>/dev/null \
+              || : > "$RUNNER_TEMP/base-baseline.tsv.gz"
+            started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at)
+            minutes=$(( ($(date +%s) - $(date -d "$started" +%s)) / 60 ))
+            failed=()
+            [ "$BUILD" = success ] || failed+=(--failed-job "build: $BUILD")
+            [ "$SHARD_JOBS" = success ] || failed+=(--failed-job "shards: $SHARD_JOBS")
+            src/tools/prolly_bench/prolly_bench creport shards/c-shard-*/*-C-* \
+              --shards "$SHARDS" --engines prolly \
+              --base-baseline "$RUNNER_TEMP/base-baseline.tsv.gz" \
+              --corpus "$PWD/slt-corpus/test" --head "$HEAD_SHA" --base "$base" \
+              --base-ref "$BASE_REF" --run-url "$RUN_URL" --wall-clock "$minutes min" \
+              "${failed[@]}" --out comment/comment.md --json comment/summary.json
+          } || status=$?
+          # (a report that couldn't be written still replaces an earlier one)
+          if [ "$status" != 0 ] && [ ! -s comment/comment.md ]; then
+            { echo '<!-- c-suite -->'
+              echo "## C suite: FAIL"
+              echo
+              echo "The report couldn't be written (exit $status): $RUN_URL"
+            } > comment/comment.md
+          fi
           cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v5
-        if: always() && needs.classify.outputs.code == 'true'
+        if: always()
         with:
           name: c-suite-comment
           path: comment
@@ -266,11 +288,13 @@ jobs:
         run: test "$STATUS" = 0
 
   # A failure on master or in the nightly run opens (or updates) one tracking
-  # issue; the next passing run closes it.
+  # issue; the next passing run closes it.  A cancelled run says nothing.
   master:
     name: track master
     needs: gate
-    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    if: >-
+      !cancelled() && needs.gate.result != 'cancelled' && needs.gate.result != 'skipped'
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -300,12 +324,14 @@ jobs:
             fi
             exit 0
           fi
+          # (creport keeps the report under 65,000 characters, within an
+          # issue body's limit with these two lines)
           {
             echo "$MARKER"
             echo "The C suite failed on master at $GITHUB_SHA ($GITHUB_EVENT_NAME): $RUN_URL"
             echo
             if [ -f comment/comment.md ]; then
-              head -c 60000 comment/comment.md
+              cat comment/comment.md
             else
               echo "No report: the gate didn't get as far as writing one (gate: $GATE)."
             fi

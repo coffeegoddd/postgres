@@ -43,7 +43,7 @@ jobs:
           esac
           { echo "artifact=$artifact"; echo "file=$file"; echo "marker=$marker"; } >> "$GITHUB_OUTPUT"
 
-      # (a run that didn't build, e.g. a specs-only pull request, leaves none)
+      # (a cancelled run leaves none; a specs-only one leaves a short note)
       - uses: actions/download-artifact@v5
         id: download
         continue-on-error: true
@@ -71,10 +71,18 @@ jobs:
             echo "no open pull request has head $HEAD_SHA" >&2
             exit 0
           fi
-          # The body starts with the marker, so the next run finds it; at most
-          # GitHub's 65,536 characters.
+          # A run of an older commit (finished late, or re-run) doesn't
+          # replace the report on the pull request's current head.
+          current=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "#$pr is now at $current; this run tested $HEAD_SHA" >&2
+            exit 0
+          fi
+          # The body starts with the marker, so the next run finds it.  (The
+          # report keeps itself under GitHub's 65,536 characters; a longer
+          # one is refused by the API rather than cut mid-character here.)
           body="$RUNNER_TEMP/body.md"
-          { echo "$MARKER"; grep -vxF -- "$MARKER" "$FILE" | head -c 65000; } > "$body"
+          { echo "$MARKER"; grep -vxF -- "$MARKER" "$FILE"; } > "$body"
           id=$(gh api --paginate "repos/$GH_REPO/issues/$pr/comments" \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith(env.MARKER))) | .id' \
             | head -n 1)
