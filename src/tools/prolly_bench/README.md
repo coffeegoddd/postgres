@@ -196,6 +196,31 @@ check` the second against it (the two must agree). A change that alters
 heap's answers updates the file in the same commit, so the diff shows
 exactly which records moved.
 
+### The pull-request comment
+
+```sh
+src/tools/prolly_bench/prolly_bench creport SHARD_RESULTS... --shards N \
+    --base-baseline BASE_BASELINE --out comment.md [--json summary.json] \
+    [--head SHA --base SHA --run-url URL --wall-clock '14 min' --failed-job NAME]
+```
+
+`creport` reads every shard's result sets (heap and each engine) and
+writes the sticky comment CI posts, starting with the marker
+`<!-- c-suite -->`: a headline (corpus pin, full corpus or smoke, the merge
+it ran, records, shards, wall clock, PASS or FAIL), a row per engine (pass
+rate, change in failing records against the heap baseline at the base
+commit, counts by class, gate), then collapsed sections: new failures (25
+per class, each with its query and both sides), fixed records (baseline
+entries to remove), stale exceptions, time per cell, and the per-shard
+tables. It is cut at 65,000 characters with a notice.
+
+It is also the gate over the shards as a whole, and exits 1 when any shard
+1..N is missing or incomplete, when the shards' files together aren't the
+whole corpus exactly once, when an engine differs from heap, or when heap
+differs from the baseline. `--base-baseline` is the baseline file at the
+pull request's base (`git show BASE:src/tools/prolly_bench/configs/c_heap_baseline.tsv.gz`),
+so a stacked pull request is compared with the one below it.
+
 C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.

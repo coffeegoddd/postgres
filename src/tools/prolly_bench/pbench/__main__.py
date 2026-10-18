@@ -6,6 +6,7 @@
   prolly_bench run C --shard 2/4 ...            one shard of the C suite's corpus
   prolly_bench cshard --shards 4                which files each shard runs
   prolly_bench cbaseline check DIR...           C suite: heap against the checked-in baseline
+  prolly_bench creport DIR... --shards N ...    C suite: the pull-request comment
   prolly_bench list                             workloads, collectors, sinks
   prolly_bench report DIR                       rewrite DIR/README.md
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
@@ -195,6 +196,22 @@ def _cgate(args) -> int:
     return int(bool(problems))
 
 
+def _creport(args) -> int:
+    import json
+    from pbench import creport
+    report = creport.build(args.dirs, args.shards, args.base_baseline, corpus=args.corpus,
+                           head=args.head, base=args.base, base_ref=args.base_ref,
+                           run_url=args.run_url, wall_clock=args.wall_clock,
+                           failed_jobs=args.failed_job)
+    args.out.write_text(report.text)
+    if args.json:
+        args.json.write_text(json.dumps(report.summary, indent=1) + "\n")
+    for problem in report.problems:
+        print(problem, file=sys.stderr)
+    print(f"C suite: {'PASS' if report.passed else 'FAIL'}; written: {args.out}")
+    return int(not report.passed)
+
+
 def _cbaseline(args) -> int:
     import json
     from pbench import cbaseline, ccompare, table
@@ -350,6 +367,24 @@ def main(argv=None) -> int:
                     help="the file holding the corpus commit")
     hb.add_argument("--json", type=Path, help="check: also write the findings here")
     hb.set_defaults(fn=_cbaseline)
+
+    cr = sub.add_parser("creport", help="C suite: the pull-request comment from all shards")
+    cr.add_argument("dirs", nargs="+", type=Path, help="every shard's result sets")
+    cr.add_argument("--shards", type=int, required=True, help="how many shards there should be")
+    cr.add_argument("--base-baseline", type=Path, required=True,
+                    help="the heap baseline at the base commit, for the change against it")
+    cr.add_argument("--out", type=Path, required=True, help="the comment, Markdown")
+    cr.add_argument("--json", type=Path, help="also a summary, JSON")
+    cr.add_argument("--corpus", type=Path, help="the corpus's test/ directory "
+                    "(default: as the result sets recorded it)")
+    cr.add_argument("--head", default="", help="the pull request's head commit")
+    cr.add_argument("--base", default="", help="the base commit")
+    cr.add_argument("--base-ref", default="master")
+    cr.add_argument("--run-url", default="", help="the CI run, for the artifacts")
+    cr.add_argument("--wall-clock", default="", help="e.g. '14 min'")
+    cr.add_argument("--failed-job", action="append", default=[],
+                    help="a CI job that failed (repeatable); fails the report")
+    cr.set_defaults(fn=_creport)
 
     evidence = sub.add_parser("gate", help="validate complete, intact execution evidence and optional baseline compatibility")
     evidence.add_argument("dirs", nargs="+", type=Path)

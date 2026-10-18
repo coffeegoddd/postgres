@@ -55,10 +55,13 @@ def c_result(path: Path, am: str, records: dict, config=None, commit="pin", labe
             "total": len(recs), "files": len(files), "counts": counts, "wrong_am_files": [],
             "unmatched_digests": 0, "unparsed_lines": 0, "am": am}))
         ran = len(recs) - counts.get("skipped", 0)
+        metrics = {"records": len(recs), "skipped": counts.get("skipped", 0),
+                   "window_seconds": 1.5,
+                   "pass_percent": 100 * counts.get("ok", 0) / ran if ran else None}
+        for s in ("ok", "not_ok", "not_implemented", "crashed", "timeout", "did_not_run"):
+            metrics[s] = counts.get(s, 0)
         results.append({"key": {"workload": w}, "status": "ok", "raw_dir": f"raw/{w}",
-                        "metrics": {"records": len(recs), "skipped": counts.get("skipped", 0),
-                                    "ok": counts.get("ok", 0), "window_seconds": 1.5,
-                                    "pass_percent": 100 * counts.get("ok", 0) / ran if ran else None}})
+                        "metrics": metrics})
     (path / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results))
     (path / "config.json").write_text(json.dumps(config or {"run": {}}))
     (path / "environment.json").write_text(json.dumps({"sqllogictest": {"commit": commit,
