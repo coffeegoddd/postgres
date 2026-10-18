@@ -328,7 +328,9 @@ its steps need, no more.
 SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
 They may call `dolt_*` functions and views; such a step lists the
 capabilities its calls need in its own `requires`, which must match what its
-SQL names (a `dolt_*` name no capability covers is an error). Typed VC steps
+SQL names, outside string literals, quoted identifiers and comments (a
+`dolt_*` function no capability covers is an error; a table or column of
+the scenario's own named `dolt_...` isn't a call). Typed VC steps
 exist only where the adapter must capture a commit: `commit` (message, then
 optional Dolt flags such as `--allow-empty`), `branch` (name and optional
 start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
@@ -336,7 +338,9 @@ start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
 `--abort`, `--continue`, ...). Their capability is implied. Arguments are in
 `args`; SQL bind parameters are in `params`. Successful commits require a
 unique `save` name; a merge, pick or revert may name one, and must then
-commit (a revert's is the new head). A later `{"ref":"base"}` resolves to
+commit (a revert's is the new head): a merge with nothing to merge, or one
+that stops with conflicts, saves nothing and fails the step, its call's
+whole result in the trace. A later `{"ref":"base"}` resolves to
 that engine's captured identifier, including in query parameters and
 expected rows. No cross-engine hash equality is assumed. SQL strings remain
 explicitly dialect-specific. Merges inside a transaction block, and their
@@ -384,7 +388,10 @@ reports are described in [corpus/dolt/README.md](corpus/dolt/README.md).
 Before running a case, the adapter creates and drops a separate probe
 database. It verifies the actual AM (and prolly's table/index/TOAST block-map
 forks); for any version-control capability, it runs the built-in history scenario, including
-branch isolation and restoration. Case fixtures therefore start with fresh
+branch isolation and restoration, and for any beyond `vc.core` a second
+one (`cases/vc-probe.json`) that merges, diffs, picks, reverts, and reads a
+conflict and a constraint violation, each checked by its effect: a claimed
+capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring
 that check until rollback if a SQL error aborted the transaction. Scenario
 tables belong in public; arbitrary other schemas are outside this check.

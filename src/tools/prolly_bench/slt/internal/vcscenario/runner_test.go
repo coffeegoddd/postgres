@@ -193,6 +193,11 @@ func TestSQLRequires(t *testing.T) {
 		"SET dolt.allow_commit_conflicts = on":        "vc.conflicts",
 		"SELECT active_branch()":                      "vc.core",
 		"SELECT x[1] FROM dolt_cherry_pick('main') x": "vc.cherrypick",
+		// names in literals, quoted identifiers and comments, and tables
+		// of the scenario's own, aren't calls
+		"SELECT 'dolt_merge failed', $$dolt_revert$$ -- dolt_diff(\n":     "",
+		`CREATE TABLE dolt_docs_copy ("dolt_hashof" int) /* dolt_gc() */`: "",
+		"INSERT INTO t VALUES ('it''s dolt_merge(')":                      "",
 	} {
 		got, err := SQLRequires(sql)
 		if err != nil || strings.Join(got, ",") != want {

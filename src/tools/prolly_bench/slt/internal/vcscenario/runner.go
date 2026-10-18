@@ -179,7 +179,7 @@ func execute(ctx context.Context, s Scenario, a Adapter) ([]StepResult, string) 
 		}
 		if err == nil && st.Save != "" {
 			if len(o.Rows) != 1 || len(o.Rows[0]) != 1 || o.Rows[0][0] == nil || *o.Rows[0][0] == "" {
-				err = fmt.Errorf("commit did not return one nonempty identifier")
+				err = fmt.Errorf("%s made no commit to save (%s)", st.Op, o.Tag)
 			} else {
 				bindings[st.Save] = o.Rows[0][0]
 			}

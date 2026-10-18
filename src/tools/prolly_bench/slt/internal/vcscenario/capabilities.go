@@ -48,28 +48,48 @@ var callCapability = map[string]string{
 	"dolt_diff":                   "vc.diff",
 }
 
-// What each typed operation needs.
-var opCapability = map[string]string{
-	"commit":     "vc.core",
-	"branch":     "vc.core",
-	"checkout":   "vc.core",
-	"reset":      "vc.core",
-	"merge":      "vc.merge",
-	"cherrypick": "vc.cherrypick",
-	"revert":     "vc.revert",
+// A typed operation: the capability it needs, the dolt_* function it calls,
+// and whether it may save the commit it makes.
+type opSpec struct {
+	capability string
+	function   string
+	saves      bool
 }
 
-var callName = regexp.MustCompile(`(?i)\b(dolt_[a-z0-9_]+|active_branch|dolt\.[a-z_]+)\b`)
+var ops = map[string]opSpec{
+	"commit":     {"vc.core", "dolt_commit", true},
+	"branch":     {"vc.core", "dolt_branch", false},
+	"checkout":   {"vc.core", "dolt_checkout", false},
+	"reset":      {"vc.core", "dolt_reset", false},
+	"merge":      {"vc.merge", "dolt_merge", true},
+	"cherrypick": {"vc.cherrypick", "dolt_cherry_pick", true},
+	"revert":     {"vc.revert", "dolt_revert", true},
+}
 
-// SQLRequires is what a SQL text's dolt_* calls need, sorted.
+var callName = regexp.MustCompile(`(?i)(?:\b([a-z]+)\s+)?\b(dolt_[a-z0-9_]+|active_branch|dolt\.[a-z_]+)\b(\s*\()?`)
+
+// Words before a name and a parenthesis that make it a table's, not a call
+// (CREATE TABLE x (...), INSERT INTO x (...), REFERENCES x (...)).
+var tableWords = map[string]bool{"table": true, "into": true, "references": true, "exists": true, "on": true}
+
+// Text SQLRequires doesn't look in: string literals (standard, E” and
+// dollar-quoted), quoted identifiers and comments.
+var quoted = regexp.MustCompile(`(?s)'(?:[^']|'')*'|"(?:[^"]|"")*"|--[^\n]*|/\*.*?\*/|\$([a-zA-Z_]*)\$.*?\$([a-zA-Z_]*)\$`)
+
+// SQLRequires is what a SQL text's dolt_* calls, views and settings need,
+// sorted. A name a capability covers counts; another dolt_* name called
+// as a function is an error (no capability claims it); one that isn't
+// called is a table or column of the scenario's own, and doesn't count.
 func SQLRequires(sql string) ([]string, error) {
 	set := map[string]bool{}
-	for _, m := range callName.FindAllString(sql, -1) {
-		c, ok := callCapability[strings.ToLower(m)]
-		if !ok {
-			return nil, fmt.Errorf("no capability covers %s", m)
+	for _, m := range callName.FindAllStringSubmatch(quoted.ReplaceAllString(sql, " "), -1) {
+		c, ok := callCapability[strings.ToLower(m[2])]
+		if !ok && m[3] != "" && !tableWords[strings.ToLower(m[1])] {
+			return nil, fmt.Errorf("no capability covers %s", m[2])
 		}
-		set[c] = true
+		if ok {
+			set[c] = true
+		}
 	}
 	out := make([]string, 0, len(set))
 	for c := range set {
@@ -83,11 +103,11 @@ func SQLRequires(sql string) ([]string, error) {
 // what its SQL calls. A SQL step must list exactly that as its requires, so
 // a reviewer sees it and a stale tag can't hide a call.
 func stepRequires(st Step) ([]string, error) {
-	if c, ok := opCapability[st.Op]; ok {
+	if op, ok := ops[st.Op]; ok {
 		if len(st.Requires) != 0 {
 			return nil, fmt.Errorf("%s: a typed operation's requirement is implied", st.ID)
 		}
-		return []string{c}, nil
+		return []string{op.capability}, nil
 	}
 	need, err := SQLRequires(st.SQL)
 	if err != nil {

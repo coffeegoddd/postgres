@@ -137,7 +137,7 @@ func (s Scenario) Validate() error {
 		}
 		ids[st.ID] = true
 		isSQL := st.Op == "exec" || st.Op == "query"
-		if _, typed := opCapability[st.Op]; !isSQL && !typed {
+		if _, typed := ops[st.Op]; !isSQL && !typed {
 			return fmt.Errorf("%s: unknown operation %q", st.ID, st.Op)
 		}
 		need, err := stepRequires(st)
@@ -190,7 +190,7 @@ func (s Scenario) Validate() error {
 		errExpected := st.Expect != nil && st.Expect.SQLState != ""
 		// A commit's id is always captured; a merge's, pick's or revert's
 		// when the scenario names it (they can end without a commit).
-		saves := st.Op == "commit" || st.Op == "merge" || st.Op == "cherrypick" || st.Op == "revert"
+		saves := ops[st.Op].saves
 		if st.Op == "commit" && !errExpected && st.Save == "" {
 			return fmt.Errorf("%s: commit needs a unique save binding", st.ID)
 		}
@@ -236,7 +236,7 @@ func (s Scenario) Validate() error {
 			bindings[st.Save] = true
 		}
 	}
-	for r := range requires {
+	for _, r := range s.Requires {
 		if !used[r] {
 			return fmt.Errorf("requires %s, which no step needs", r)
 		}

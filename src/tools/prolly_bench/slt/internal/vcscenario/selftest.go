@@ -9,7 +9,11 @@ import (
 
 type claimedVC struct{ *Postgres }
 
-func (p claimedVC) Capabilities() []string { return []string{"sql", "vc.core"} }
+// (every capability prolly claims, claimed falsely)
+func (p claimedVC) Capabilities() []string {
+	prolly, _ := EngineProfile("prolly")
+	return prolly.Supported
+}
 
 // SelfTest proves that native adapter failures on engine am cannot be
 // reported as passes or silently excluded as unsupported. These are separate
