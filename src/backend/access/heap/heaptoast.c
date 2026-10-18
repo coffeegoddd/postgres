@@ -109,6 +109,7 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	Datum		toast_oldvalues[MaxHeapAttributeNumber];
 	ToastAttrInfo toast_attr[MaxHeapAttributeNumber];
 	ToastTupleContext ttc;
+	bool		has_destination;
 
 	/*
 	 * Ignore the INSERT_SPECULATIVE option. Speculative insertions/super
@@ -155,6 +156,8 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	}
 	ttc.ttc_attr = toast_attr;
 	toast_tuple_init(&ttc);
+	has_destination = ttc.ttc_destination != NULL ||
+		rel->rd_rel->reltoastrelid != InvalidOid;
 
 	/* ----------
 	 * Compress and/or save external until data fits into target length
@@ -212,19 +215,18 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 		 *
 		 * XXX maybe the threshold should be less than maxDataLen?
 		 */
-		if (toast_attr[biggest_attno].tai_size > maxDataLen &&
-			rel->rd_rel->reltoastrelid != InvalidOid)
+		if (toast_attr[biggest_attno].tai_size > maxDataLen && has_destination)
 			toast_tuple_externalize(&ttc, biggest_attno, options);
 	}
 
 	/*
 	 * Second we look for attributes of attstorage EXTENDED or EXTERNAL that
 	 * are still inline, and make them external.  But skip this if there's no
-	 * toast table to push them to.
+	 * toast table (or other destination) to push them to.
 	 */
 	while (heap_compute_data_size(tupleDesc,
 								  toast_values, toast_isnull) > maxDataLen &&
-		   rel->rd_rel->reltoastrelid != InvalidOid)
+		   has_destination)
 	{
 		int			biggest_attno;
 
@@ -259,7 +261,7 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 
 	while (heap_compute_data_size(tupleDesc,
 								  toast_values, toast_isnull) > maxDataLen &&
-		   rel->rd_rel->reltoastrelid != InvalidOid)
+		   has_destination)
 	{
 		int			biggest_attno;
 

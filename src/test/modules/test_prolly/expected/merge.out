@@ -1200,7 +1200,7 @@ SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
  0
 (1 row)
 
-SELECT length(big), left(big, 1), pg_column_toast_chunk_id(big) IS NOT NULL AS out_of_line
+SELECT length(big), left(big, 1), test_toast_pointer(big) IS NOT NULL AS out_of_line
   FROM mt.t WHERE id = 1;
  length | left | out_of_line 
 --------+------+-------------

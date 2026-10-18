@@ -109,6 +109,7 @@ tests += {
       'doltgres_fks_auth',
       'jsonb_canonical',
       'hash_pointers',
+      'toast_by_content',
     ],
   },
   'tap': {

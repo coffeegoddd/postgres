@@ -99,7 +99,10 @@ SELECT dolt_reset('--hard', :'k2');
 -- A fold that meets a TOAST pointer it folded before writes the reference
 -- it made then, without reading the value (the memo): an UPDATE of a small
 -- column keeps the long one's pointer, and the next commit hits.  What a
--- transaction remembers is forgotten if it rolls back.
+-- transaction remembers is forgotten if it rolls back.  (Values in a TOAST
+-- relation, as before values were stored by content; the setting puts
+-- them there.)
+SET debug_toast_relation = on;
 CREATE TABLE lv.memo (id int PRIMARY KEY, n int, body text);
 ALTER TABLE lv.memo ALTER COLUMN body SET STORAGE EXTERNAL;
 INSERT INTO lv.memo
@@ -219,6 +222,7 @@ SELECT t, id, a.n, a.chunk = b.chunk AS same_pointer, a.body = b.body AS same_bo
 FROM lv.toasted a JOIN before_reset b USING (t, id) WHERE t = 'keep' ORDER BY id;
 SELECT dolt_branch('-D', 'counting');
 DROP TABLE before_reset;
+RESET debug_toast_relation;
 
 -- Pushed and cloned: a walk from a commit reaches every value tree its
 -- rows reference, so the clone reads them all.

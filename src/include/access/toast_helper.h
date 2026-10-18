@@ -14,6 +14,7 @@
 #ifndef TOAST_HELPER_H
 #define TOAST_HELPER_H
 
+#include "access/toast_destination.h"
 #include "utils/rel.h"
 
 /*
@@ -30,6 +31,8 @@
 typedef struct
 {
 	varlena    *tai_oldexternal;
+	varlena    *tai_uncompressed;	/* a compressed value's, kept for a
+									 * destination (NULL if none) */
 	int32		tai_size;
 	uint8		tai_colflags;
 	char		tai_compression;
@@ -60,6 +63,9 @@ typedef struct
 	 */
 	uint8		ttc_flags;
 	ToastAttrInfo *ttc_attr;
+
+	/* set by toast_tuple_init: where values go out of line (NULL: TOAST) */
+	const ToastDestinationRoutine *ttc_destination;
 } ToastTupleContext;
 
 /*
@@ -95,11 +101,15 @@ typedef struct
  *
  * TOASTCOL_INCOMPRESSIBLE indicates that this column has been found to
  * be incompressible, but could be moved out-of-line.
+ *
+ * TOASTCOL_FREE_UNCOMPRESSED indicates that tai_uncompressed needs to be
+ * freed.
  */
 #define TOASTCOL_NEEDS_DELETE_OLD			TOAST_NEEDS_DELETE_OLD
 #define TOASTCOL_NEEDS_FREE					TOAST_NEEDS_FREE
 #define TOASTCOL_IGNORE						0x0010
 #define TOASTCOL_INCOMPRESSIBLE				0x0020
+#define TOASTCOL_FREE_UNCOMPRESSED			0x0040
 
 extern void toast_tuple_init(ToastTupleContext *ttc);
 extern int	toast_tuple_find_biggest_attribute(ToastTupleContext *ttc,

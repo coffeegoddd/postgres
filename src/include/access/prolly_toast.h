@@ -33,6 +33,7 @@
 #define PROLLY_TOAST_FORM_UTF8		1	/* a text-like value's, in UTF-8 */
 #define PROLLY_TOAST_FORM_JSONB		2	/* a document's canonical bytes */
 
+/* the destination of the prolly access method's tables */
 extern PGDLLIMPORT const ToastDestinationRoutine prolly_toast_chunkstore;
 
 /*

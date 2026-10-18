@@ -21,6 +21,10 @@
  * type, the tree holds the value's bytes, which are not its canonical
  * bytes: a fold reads such a value rather than take its tree.
  *
+ * The toaster stores the values it moves out of a versioned table's rows
+ * here (save()), the table's access method choosing this destination, and
+ * keeps a hash pointer a row is given as it is.
+ *
  * A tree is the chunk store's, not a row's: nothing deletes it with the
  * rows that name it.  A collection of the store keeps every tree a hash
  * pointer on a page names (prolly_toast_roots()), and each tree stored is
@@ -448,6 +452,14 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	list_free(spcs);
 }
 
+/* A versioned table's value moved out of line by the toaster. */
+static varlena *
+chunkstore_save(Relation rel, Datum value, Oid typid)
+{
+	return prolly_toast_store(value, typid);
+}
+
 const ToastDestinationRoutine prolly_toast_chunkstore = {
+	.save = chunkstore_save,
 	.fetch = chunkstore_fetch,
 };
