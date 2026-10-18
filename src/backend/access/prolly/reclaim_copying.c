@@ -22,6 +22,15 @@
  * by a collected chunk's hash, that chunk is marked.  Bytes that happen to
  * spell one can keep a chunk nothing names; nothing named is ever lost.
  *
+ * A default collection stops at settled files (the store doesn't collect
+ * them, so marking ends there): it costs what changed since the last.  A
+ * full one collects every file, marks through all of them, then keeps
+ * whole each settled file whose garbage is at most REWRITE_GARBAGE of its
+ * chunks, rewriting only the rest: a full collection of a mostly live
+ * store writes little.  A file kept whole keeps its garbage too, and with
+ * it the store's closure: whatever its chunks name, live or not, is marked
+ * (and copied from the files rewritten).
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/reclaim_copying.c
  *
@@ -32,6 +41,9 @@
 #include "access/prolly_builtins.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+
+/* a settled file with no more garbage than this is kept whole */
+#define REWRITE_GARBAGE		0.5
 
 typedef struct Mark
 {
@@ -127,6 +139,48 @@ count_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 	(*(int *) arg)++;
 }
 
+/* a full collection's choice of the files it keeps whole */
+typedef struct Keep
+{
+	Mark	   *mk;
+	bool	   *keep;
+} Keep;
+
+/* A settled file with little garbage is kept whole. */
+static void
+choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
+			void *arg)
+{
+	Keep	   *k = arg;
+	uint64		live = 0;
+
+	if (!settled || nslots == 0)
+		return;
+	for (uint64 slot = first; slot < first + nslots; slot++)
+		live += (k->mk->marks[slot / 8] >> (slot % 8)) & 1;
+	k->keep[file] = (double) (nslots - live) <= REWRITE_GARBAGE * nslots;
+}
+
+/* What a file kept whole names, live or not, is kept with it. */
+static void
+mark_from_kept(int file, uint64 first, uint64 nslots, bool settled,
+			   uint64 size, void *arg)
+{
+	Keep	   *k = arg;
+	Mark	   *mk = k->mk;
+
+	if (!k->keep[file])
+		return;
+	for (uint64 slot = first; slot < first + nslots; slot++)
+	{
+		resetStringInfo(&mk->buf);
+		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
+		mark_named(mk, mk->buf.data, mk->buf.len);
+		CHECK_FOR_INTERRUPTS();
+	}
+	drain(mk);
+}
+
 static void
 copying_collect(bool full, ProllyGcResult *result)
 {
@@ -137,11 +191,6 @@ copying_collect(bool full, ProllyGcResult *result)
 	ProllyHash	root;
 	int			nfiles = 0;
 	bool	   *keep;
-
-	if (full)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a full collection is not supported by reclamation \"copying\" yet")));
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
@@ -160,9 +209,20 @@ copying_collect(bool full, ProllyGcResult *result)
 		mark_hash(&mk, &root);
 	drain(&mk);
 
-	/* what is new since, before the window: then copied */
+	/* what is new since, before the window */
 	PROLLY_CALL(cs, gc_new, mk.gc, false, mark_new, &mk);
 	drain(&mk);
+
+	/* the settled files kept whole, and what they name */
+	if (full)
+	{
+		Keep		k = {&mk, keep};
+
+		PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
+		PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+	}
+
+	/* copied, before the window */
 	PROLLY_CALL(cs, gc_copy, mk.gc, mk.marks, keep);
 
 	/* in the window: what came since */

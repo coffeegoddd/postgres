@@ -88,6 +88,7 @@ tests += {
       'append_check',
       'journal_segments',
       'gc',
+      'gc_full',
     ],
   },
   'tap': {
