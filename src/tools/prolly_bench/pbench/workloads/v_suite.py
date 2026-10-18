@@ -256,31 +256,70 @@ class V4(VWorkload):
         return [(f"n{n}", {"changes": int(n)})
                 for n in params.get("changes", [1000])]
 
+    def prepare(self, ctx):
+        # Only the V data is committed: what a clone copies is the same with
+        # or without a background workload (whose tables stay uncommitted).
+        ctx.cluster.sql(f"""
+            CREATE TABLE vc_data (id bigint PRIMARY KEY, payload text NOT NULL);
+            INSERT INTO vc_data SELECT g, md5(g::text) FROM generate_series(1, {self.rows(ctx)}) g;
+        """, dbname=ctx.dbname, options=ctx.session_options())
+        timed_session(ctx, [VC_SQL.commit("initial data")], "prepare-commit")
+        if ctx.params["background"] == "S1":
+            pgbench_init(ctx, int(ctx.size_params["pgbench_scale"]))
+
     def measure(self, ctx, window):
-        remote = ctx.make_cluster("v4-remote")
+        if ctx.params["changes"] > self.rows(ctx):
+            raise ValueError("V4 changes exceed the dataset; refusing to clamp the workload")
+        if ctx.make_cluster is None:
+            raise NotImplementedByEngine("V4 needs a second instance, which this runner can't make")
+        self._remote = ctx.make_cluster("v4-remote")
         try:
-            remote.sql(f"CREATE DATABASE {ctx.dbname}")
+            self._remote.sql(f"CREATE DATABASE {ctx.dbname}")
             # (the clone makes the versioned schema; its search path is the
             # origin's, as the target's setup sets it)
             schema = targets.for_am(ctx.table_am).schema
             if schema:
-                remote.sql(f"ALTER DATABASE {ctx.dbname} SET search_path = {schema}, public")
-            with self.background(ctx) as bg:
-                with window:
-                    outcome = self.operations(ctx, remote)
-            if bg is not None:
-                outcome.metrics["background_tps"] = bg.tps()
+                self._remote.sql(f"ALTER DATABASE {ctx.dbname} SET search_path = {schema}, public")
+            outcome = super().measure(ctx, window)
+            outcome.notes.append("the window also holds the origin's and the clone's "
+                                 "changes of n rows and their commits, made for the "
+                                 "fetch and the push")
+            self._check_moved(ctx)
             return outcome
         finally:
-            remote.destroy()
+            try:
+                self._save_log(ctx)
+            finally:
+                self._remote.destroy()
+                self._remote = None
 
-    def operations(self, ctx, remote=None):
+    def _save_log(self, ctx):
+        log = getattr(self._remote, "log_file", None)
+        if log is not None and log.exists():
+            (ctx.raw_dir / "v4-remote-server.log").write_text(log.read_text())
+
+    def _check_moved(self, ctx):
+        """The fetch and the push moved what they were timed moving."""
+        remote, db = self._remote, ctx.dbname
+        fetched = remote.scalar("SELECT dolt_hashof('origin/v4_origin')", dbname=db)
+        made = ctx.cluster.scalar("SELECT dolt_hashof('v4_origin')", dbname=db)
+        if fetched != made:
+            raise RuntimeError(f"V4's fetch didn't bring v4_origin ({fetched} != {made})")
+        pushed = ctx.cluster.scalar("SELECT dolt_hashof('v4_pushed')", dbname=db)
+        sent = remote.scalar("SELECT dolt_hashof('v4_pushed')", dbname=db)
+        if pushed != sent:
+            raise RuntimeError(f"V4's push didn't make v4_pushed ({pushed} != {sent})")
+
+    def operations(self, ctx):
+        remote = self._remote
+        assert remote is not None, "V4's operations run inside its measure()"
         n = ctx.params["changes"]
-        if n > self.rows(ctx):
-            raise ValueError("V4 changes exceed the dataset; refusing to clamp the workload")
         url = ctx.cluster.libpq_url(ctx.dbname)
         clone = timed_session(ctx, [f"SELECT dolt_clone('{url}')"], "v4-clone",
                               cluster=remote)
+        wrong = targets.for_am(ctx.table_am).wrong_am(remote, ctx.dbname, ["vc_data"])
+        if wrong:
+            raise RuntimeError(f"V4's clone made vc_data on another access method: {wrong}")
         # a commit at the origin, on a branch of its own, for the fetch
         timed_session(ctx, [VC_SQL.branch("v4_origin"), VC_SQL.checkout("v4_origin"),
                             f"UPDATE vc_data SET payload = md5(payload) WHERE id <= {n}",
