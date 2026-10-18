@@ -6,6 +6,8 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (this build's canonical format, for a remote's head set by hand)
+SELECT value AS fmt FROM test_fold_items() WHERE key = '!:format' \gset
 
 SELECT current_database() AS db \gset
 \getenv abs_builddir PG_ABS_BUILDDIR
@@ -88,7 +90,7 @@ DROP DATABASE regress_clone_c;
 -- by the rule every branch made is checked by
 SELECT dolt_remote('add', 'oddname', :'url_odd');
 SELECT dolt_push('oddname', 'main') AS pushed;
-SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), '2');
+SELECT test_remote_set_head(:'url_odd', '-flag', dolt_hashof('main'), :'fmt');
 CREATE DATABASE regress_clone_g;
 \c regress_clone_g
 SELECT dolt_clone(:'url_odd');

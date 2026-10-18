@@ -1351,7 +1351,8 @@ dolt_status(PG_FUNCTION_ARGS)
 				{
 					char	   *n = lfirst(lc);
 
-					if (strncmp(n, name, len) == 0 && n[len] == '\t')
+					/* (the status is after the last tab: a name may hold one) */
+					if (strrchr(n, '\t') == n + len && strncmp(n, name, len) == 0)
 						names = foreach_delete_current(names, lc);
 				}
 				names = lappend(names, psprintf("%s\tconflict", name));
@@ -1386,7 +1387,7 @@ dolt_status(PG_FUNCTION_ARGS)
 	{
 		Datum		values[3];
 		bool		nulls[3] = {0};
-		char	   *tab = strchr(lfirst(lc), '\t');
+		char	   *tab = strrchr(lfirst(lc), '\t');	/* (a name may hold one) */
 
 		*tab = '\0';
 		values[0] = CStringGetTextDatum(lfirst(lc));

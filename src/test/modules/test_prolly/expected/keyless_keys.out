@@ -94,7 +94,7 @@ SELECT test_fold_root() = test_fold_root(true) AS folds_agree;
 SELECT value AS format FROM test_fold_items() WHERE key = '!:format';
  format 
 --------
- 2
+ 3
 (1 row)
 
 -- a primary key WITHOUT OVERLAPS doesn't key the rows (the key encoder
