@@ -48,6 +48,9 @@ the record of what was decided for it. D1 is removed by #177, #178 and
 | Complexity of version-control operations | Required by the user 2026-10-14: at worst Dolt's time and space bounds, ideally better (`10-complexity-requirements.md`, gate 7) |
 | Steps 2–5's remaining decisions (2026-10-16) | Decided by the user: branch-aware locks; branch privileges; LZ4 table files; collation versions refused on mismatch; `dolt_commit` inside its transaction; checkpoints on request and branch switch; format freeze at the end of step 4; keyless O(N) diff fallback; Dolt's working-set behavior for reset and merge; no triggers on applied rows; Dolt's schema merge; read-only detached commits; sequences merged to the larger value (`11-pages-and-dolt-snapshots.md`, steps 2–5) |
 | SQL correctness suite (C) | Decided by the user 2026-10-15: sqllogictest from `prolly_bench`, judged by agreement with heap; `prolly` runs it in a versioned schema; engines heap and `prolly` (`12-correctness-suite.md`, gate 8) |
+| Dolt test parity scope (#164) | Decided by the user: every Dolt version-control feature is in scope except the staging area (`dolt_workspace_*`, `dolt_rm`, soft and mixed reset, `--cached`); MySQL-only syntax and types and Dolt's storage internals aren't ported (`18-dolt-divergences.md`) |
+| Round 1 of the issue queue (2026-10-18) | Decided by the user, each as recommended. **Writer modes** (#148): "dirty" is "has an owner", set at the claim and cleared by `dolt_commit`, a hard reset or an integration commit; the mode stored per database and changed by a `dolt_*` call that takes owning the database; `branch-auto` switching at the start of the first writing statement; a push, fetch or `dolt_branch` moving a protected branch allowed for the database's owner (`11-pages-and-dolt-snapshots.md` 6.2, 7.6). **Transaction commits** (#228, #229): a commit per autocommitted statement; conflicts with `dolt.allow_commit_conflicts` commit the SQL transaction without a Dolt commit, with a warning; objects a commit can't hold fail `COMMIT`; phase 2 doesn't wait for phase 1's numbers (`15-transaction-commits.md` part 8). **Test parity** (#153): ports of what prolly runs now plus small features (revert `--abort`/`--continue`, merge `--ff-only`/`--squash`/`--no-commit`, `dolt_branch -m`, `dolt_merge_base()`, `dolt_verify_constraints()` beyond foreign keys), large features as issues of their own; a classification and coverage report, ports by hand; divergences fixed to match Dolt unless Postgres forces them, then recorded in spec 18 (`11-pages-and-dolt-snapshots.md` part 4). **Large values C** (#181): a throwaway prototype measures the gates first; a clean format break is acceptable until step 8 (`14-large-values-and-toast.md` C7). **C suite on PRs** (#234): settings applied by Claude with `gh api` after asking; no merge queue, no up-to-date rule, a tracking issue on `master` failures; only the C suite gate required at first (`16-correctness-on-prs.md` part 7). **S suite on PRs** (#240): no dedicated host, so hosted runners only and timing reported, not gated (`17-performance-on-prs.md` part 7). #155 and #180 closed as done |
+| Default writer (#148) | **Open:** whether `dolt.writer` defaults to the session or the role; revisited with data from the `owned` mode's use (`11-pages-and-dolt-snapshots.md` 6.2) |
 
 ## Questions
 
@@ -567,7 +570,15 @@ the record of what was decided for it. D1 is removed by #177, #178 and
     versions and TIDs. Automatic reclamation is later.
     **Built (4f.2):** `prolly_gc()`, mark and sweep from every live root
     the commit pipeline holds, freed blocks reused once older snapshots
-    end; writers and it are kept apart by a store lock.
+    end; writers and it are kept apart by a store lock. **(D1)** All of
+    this went with D1 (#183).
+    **For the page design (step 7, decided 2026-10-17, built by
+    2026-10-18):** a copying collector of the chunk store
+    (`reclaim_copying.c`) from the refs' roots (`11-pages-and-dolt-snapshots.md`
+    8.1), run by `dolt_gc()` and started by autovacuum, with transactions'
+    in-memory chunks kept by a horizon and every appended batch's
+    references checked; spec 14's C will add the versioned heaps' hash
+    pointers and replication slots' chunks as roots.
 50. **Row lock identity (K1).** Postgres's lock manager names a lock by a
     fixed-size tag, so a row key that doesn't fit must be reduced.
     **Decided (user, 2026-10-14):** the tag is (database, relation, 64-bit

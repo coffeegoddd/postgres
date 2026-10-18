@@ -439,6 +439,12 @@ and pending-write memory (unbounded). The rest are met by design and
 checked when built (4g, V4); engines expose node read and write counters so
 tests can assert the bounds (gate 7).
 
+**Note (2026-10-18):** 4e was D1-specific: root-carrying snapshots, K1's
+row locks and the commit pipeline served trees as primary storage. The
+page design has Postgres's MVCC and row locks (locks per branch, #91),
+and how many writers a branch's working set has is the writer modes'
+question (`11-pages-and-dolt-snapshots.md` 6.2).
+
 **Plan (2026-10-14, user): 4e in five stacked PRs, riskiest dependencies
 first.**
 
@@ -670,6 +676,10 @@ Not yet: keys by offset mean an insertion in the middle of a large value
 rewrites the value tree after it; Dolt's value trees, which are addressed
 by byte counts rather than keys, avoid that, and step 5 settles the
 format.
+**Superseded (2026-10-18):** for the page design, value trees addressed
+by byte counts are spec 14's B2 (#218), and content-addressed TOAST
+pointers, the next step for large values, are its C
+(`14-large-values-and-toast.md` part 6, #181).
 
 **Status (2026-10-14): 4f.2 built.** `prolly_gc()` reclaims the node
 store's unreachable nodes (question 49; decided: explicit, as `dolt gc`).
@@ -700,6 +710,10 @@ prepared transaction; a crash; a standby; privileges). Not yet: blocks
 written but never published (a crash between the two) aren't found;
 reclamation runs only when asked; `prolly_gc()` holds every writer off for
 its whole run.
+**Superseded (2026-10-18):** `prolly_gc()` and `mark_sweep` were removed
+with D1 (#183); the page design's reclamation is spec 11's step 7
+(`11-pages-and-dolt-snapshots.md` part 8: a copying collector,
+`dolt_gc()`, autovacuum).
 
 **Status (2026-10-14): 4f.3 built; 4f is done.** VACUUM of a prolly
 table removes row versions no snapshot can still see, as heap removes dead

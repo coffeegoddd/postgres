@@ -1,7 +1,8 @@
 # 15. A Dolt commit for every SQL transaction
 
-**Status: proposed 2026-10-18; code references at `1603edcaa2`. Nothing
-here is built.**
+**Status: proposed 2026-10-18; decided by the user the same day, as
+recommended (part 8 lists the decisions); code references at
+`8faba578f9`. Nothing here is built.**
 Dolt's `@@dolt_transaction_commit` makes every SQL `COMMIT` that changed
 data also make a Dolt commit. This describes exactly what Dolt does, and
 proposes the same mode for versioned schemas in two phases: phase 1
@@ -66,12 +67,12 @@ one write.
   moves the chunk store's root to itself, so commits are serialized
   **per database**), then folds the session branch from its baseline
   under a snapshot that sees the head (`commit_branch()`,
-  `refs_copies.c:974-990`).
+  `refs_copies.c:979-998`; `copies_commit()`, 1186-1215).
 - If another transaction moved the head since this one's snapshot,
   `see_head()` takes a newer snapshot under read committed, and fails the
   transaction with a serialization failure under repeatable read and
   serializable (`head_moved_unseen()` and `see_head()`,
-  `refs_copies.c:406-444`).
+  `refs_copies.c:406-445`).
 - The commit's tree is written with the transaction; the commit record
   carries the new root; a rollback, or a rollback to a savepoint taken
   before the commit, undoes it.
@@ -82,7 +83,22 @@ one write.
 - There is no staging (user decision, 2026-10-17): a commit commits
   everything in the working set.
 - `dolt.author` and `dolt.allow_commit_conflicts` are the existing
-  settings (`prolly_dolt.c:69-107`).
+  settings, both `USERSET`, defined in `prolly_session_init()`
+  (`prolly_dolt.c:80-104`).
+- `copies_commit()` refuses a merge's unresolved conflicts whatever the
+  settings say (`refs_copies.c:1197-1205`). `dolt.allow_commit_conflicts`
+  only lets the SQL transaction commit with them present
+  (`check_merge_conflicts()`, `refs_copies.c:169-199`, run from the refs'
+  pre-commit callback), and skips the constraint-violations check there.
+- `dolt_commit()` records the commit through `refs->commit` first and
+  checks for "nothing to commit" after (`prolly_dolt.c:360-379`); when
+  that error is caught, the subtransaction's rollback is what undoes the
+  commit (#146).
+- The `prolly` table AM is heap's routine, returned unchanged
+  (`prolly_table.c:34`): nothing sees a write to a versioned table as it
+  happens.
+- A detached checkout makes the session read-only (`XactReadOnly`), so a
+  transaction on a detached head never writes.
 
 ## 3. The mode
 
@@ -90,33 +106,75 @@ one write.
 - `dolt.transaction_commit` (boolean, default off; settable per
   database, role and session, so `ALTER ROLE app SET
   dolt.transaction_commit = on` puts one application in the mode).
-- `dolt.transaction_commit_message` (default `Transaction commit`).
-  `SET LOCAL` gives one transaction its own message.
+- `dolt.transaction_commit_message` (default `Transaction commit`), fixed
+  text with no placeholders. `SET LOCAL` gives one transaction its own
+  message.
+- Both are `USERSET`, defined in `prolly_session_init()` beside
+  `dolt.author`. A transaction's values are captured at its first write
+  to a versioned schema, so a `SET` later in the transaction doesn't
+  change whether, or with what message, it commits.
 
-**At commit**, from a pre-commit hook that runs after deferred triggers
-and before the chunk store's own pre-commit work (callbacks run in the
-reverse of their registration order, so the mode registers after the
-chunk store or the chunk store calls it):
+**Seeing writes.** Phase 1 needs the `prolly` table AM to stop returning
+heap's routine unchanged: it becomes a copy with the write callbacks
+wrapped. Heap's two checks that compare a routine's address
+(`heapam.c:1451`, `repack.c:994`) learn to accept it; spec 14's C picks
+its TOAST destination by a hook, not by this routine, so the two don't
+conflict. One hook, shared with the writer modes' `branch_note_write()`
+(spec 11, 6.2), is called from:
+
+- the AM's write paths: `tuple_insert`, `multi_insert`, `tuple_update`,
+  `tuple_delete`, and what rewrites or truncates a table (`TRUNCATE`,
+  `CLUSTER`, `VACUUM FULL`, a rewriting `ALTER TABLE`);
+- the helpers that stamp a branch on a catalog row
+  (`catalog_row_with_branch()` and `catalog_slot_set_branch()`,
+  `branch.c:407-440`), so DDL in a versioned schema counts;
+- `nextval()` on a versioned sequence.
+
+It is not called from the lock path: `LOCK TABLE`, `VACUUM` and `ANALYZE`
+change no row. It sets a "changed" flag **per branch**, so a transaction
+that wrote two branches is seen. The first flagged write in a
+transaction calls `refs_init()`: the refs register their transaction
+callback lazily, and refs first opened during pre-commit would run after
+the chunk store's callback has already run for that transaction.
+
+**At commit**, inside the refs' own pre-commit callback
+(`refs_xact_callback()`, `XACT_EVENT_PRE_COMMIT`), after
+`check_merge_conflicts()`. That runs after deferred triggers and before
+the chunk store's pre-commit work: callbacks run in the reverse of their
+registration order, and `refs_init()` registers the refs' callback after
+the chunk store's journal registers its own. The hook pushes a snapshot
+if none is active.
 
 1. The transaction changed nothing in a versioned schema: no commit.
-   "Changed" is a flag set by the `prolly` table AM's write paths
-   (`tuple_insert`, `multi_insert`, `tuple_update`, `tuple_delete`, and
-   what rewrites or truncates a table) and where a branch-aware catalog
-   row is written, never by page changes a read makes (pruning, hint
-   bits, visibility-map bits), so read-only and unversioned transactions
-   pay nothing.
+   Page changes a read makes (pruning, hint bits, visibility-map bits)
+   never set the flag, so read-only and unversioned transactions pay
+   nothing. A transaction that only ran DDL in a versioned schema did
+   change something, and commits.
 2. It changed more than one branch (it checked out another and wrote
    there): the commit fails, as Dolt's does.
-3. On a detached head: the commit fails, as Dolt's does.
-4. Unresolved merge conflicts or constraint violations: the commit fails
-   as `dolt_commit()` does, unless `dolt.allow_commit_conflicts` is set.
-5. A merge in progress: the commit is the merge commit, with both
+3. Unresolved merge conflicts or constraint violations: the commit fails,
+   as `dolt_commit()`'s does. With `dolt.allow_commit_conflicts` on, the
+   SQL transaction commits, no Dolt commit is made, and a `WARNING` says
+   so: `copies_commit()` refuses conflicts whatever the setting says, and
+   the setting only lets the SQL transaction keep them.
+4. A merge in progress: the commit is the merge commit, with both
    parents, as `copies_commit()` makes it.
+5. Objects a commit can't hold (`dolt_status`'s "not covered"): the
+   commit fails, naming them, as `dolt_commit()`'s does (the fold
+   refuses them, `fold_from_baseline()` with `commit` set).
 6. Otherwise a Dolt commit is made by phase 1's or phase 2's rule, with
    the message, `dolt.author`, and the transaction's start time, as
    `dolt_commit()` uses.
 7. A commit that would hold no change (the transaction inserted a row and
-   deleted it) is not made, and the transaction commits.
+   deleted it) is not made, and the transaction commits. Emptiness is
+   decided before anything is recorded: `refs->commit` takes an
+   `allow_empty` argument and decides after the fold, before the commit
+   is written, the merge state cleared or the head moved. It is the same
+   call `dolt_commit()` makes once #146 is fixed. A merge commit is never
+   refused as empty.
+
+There is no rule for a detached head, as Dolt has: a detached session is
+read-only (part 2), so it never writes.
 
 Any error fails the `COMMIT`, which rolls the transaction back: the SQL
 transaction and its Dolt commit are always both made or both not.
@@ -137,13 +195,16 @@ do now, and the rows the applier writes for them are not the
 transaction's changes (phase 2 doesn't record them).
 
 **Two-phase commit.** `PREPARE TRANSACTION` is refused when the mode
-would make a commit. Supporting it means holding the refs from `PREPARE`
-to `COMMIT PREPARED` and carrying the root in the latter's record; that
+would make a commit (a "changed" flag is set). Supporting it means
+holding the refs from `PREPARE` to `COMMIT PREPARED` and carrying the
+root in the latter's record; that
 is a later decision, shared with `dolt_commit()` in a prepared
 transaction.
 
 **Autocommit.** As in Dolt, every autocommitted statement that writes a
-versioned schema makes a commit. Recommend explicit transactions.
+versioned schema makes a commit (user, 2026-10-18). The cost, a commit
+per statement, is documented and measured (part 6); explicit
+transactions are recommended.
 
 ## 4. Phase 1: fold at pre-commit
 
@@ -155,7 +216,7 @@ What it gives, by how the branch is written:
 
 | Writers on the branch | Read committed | Repeatable read, serializable |
 |---|---|---|
-| One (spec #148's `owned` and branch modes) | Exactly the transaction's changes | Same: only the writer moves the head |
+| One (the writer modes `owned`, `branch-only`, `branch-auto`: spec 11, 6.2) | Exactly the transaction's changes | Same: only the writer moves the head |
 | Many, all in the mode | Exactly the transaction's changes: everything committed before is already in the head | A transaction fails at `COMMIT` with a serialization failure if another committed to the branch since its snapshot |
 | Many, some not in the mode | The transaction's changes and the others' committed changes | As above, and the others' changes are captured |
 
@@ -176,8 +237,8 @@ throughput ceiling to measure first.
 The commit is the head the transaction finds when it holds the refs,
 plus the transaction's own row changes, wherever its snapshot was.
 
-**Recording changes.** The `prolly` table AM, a wrapper over heap's
-routine, records the TID of every tuple version its transaction makes
+**Recording changes.** The `prolly` table AM's wrapped write paths
+(part 3) also record the TID of every tuple version its transaction makes
 through `tuple_insert`, `multi_insert` and `tuple_update`, and the old
 TID of every update and delete, in a per-transaction list that spills to
 a tuplestore. At commit, entries whose `xmin` (new versions) or update
@@ -189,7 +250,10 @@ the delta is built: the same TID can be recorded twice and pass the
 filter both times (an old version updated in a subtransaction rolled
 back, then updated again; an aborted version's slot pruned and reused by
 a later insert of the transaction), and counting it twice would put a
-keyless table's count, or a delete, in history twice.
+keyless table's count, or a delete, in history twice. Then a version
+both made and deleted by the transaction (recorded as a new version and
+as an old one) is dropped from both: no one else ever saw it, so it is
+no change.
 
 **The delta.** For each table: old versions are deletes of their key,
 new versions are puts of key and canonical row. A key both deleted and
@@ -225,14 +289,19 @@ table (or the branch) as phase 1 does:
   uncommitted-to-history copy was deleted. The fold commits that table as
   the transaction sees it.
 - A merge in progress: the merge commit commits the working set.
-- A recorded change list over a size limit: the fold is cheaper.
+- A recorded change list over `dolt.transaction_commit_max_changes`
+  entries (default 100,000; `USERSET`): the fold is cheaper.
 
-**The baseline.** Phase 2 commits don't advance the branch's baseline:
-the next full fold (`dolt_commit()`, `dolt_status`, a checkout's clean
-check) reads every page changed since the last full fold, finds the rows
-already in the head unchanged, and advances it. Advancing the baseline
-from a delta commit, when nothing outside the mode wrote the branch
-since, is an open question.
+`CLUSTER`, `VACUUM FULL`, a rewriting `ALTER TABLE` and `TRUNCATE` move
+or drop rows without recording them; they set the "changed" flag, and
+their tables fall back to the fold.
+
+**The baseline.** Phase 2 commits don't advance the branch's baseline
+(user, 2026-10-18): the next full fold (`dolt_commit()`, `dolt_status`,
+a checkout's clean check) reads every page changed since the last full
+fold, finds the rows already in the head unchanged, and advances it.
+Advancing it from a delta commit would need proof that nothing outside
+the mode wrote the branch since; it isn't done.
 
 **What it gives.** The commit holds exactly the transaction's row
 changes, at every isolation level, whoever else writes the branch. In a
@@ -263,9 +332,54 @@ foreign keys are not rechecked against the head, as Dolt doesn't, and
 - Crash after the commit record and before the head is visible; a
   standby's log.
 - Throughput: pgbench (TPC-B-like and a select-only control) with the
-  mode off and on, 1 to 64 clients, phase 1 and phase 2.
+  mode off and on, 1 to 64 clients, phase 1 and phase 2; and
+  autocommitted statements, one commit each, against explicit
+  transactions.
+- In the mode: DDL only; `TRUNCATE`, `CLUSTER` and `VACUUM FULL`; objects
+  a commit can't hold; `PREPARE TRANSACTION`; a `SET` of the settings
+  after the first write; conflicts with `dolt.allow_commit_conflicts`
+  on (the warning, no commit).
 
-## 7. Open questions
+## 7. Sequencing, and the writer modes
+
+Phase 1 first (#228), then phase 2 (#229). Phase 2 doesn't wait for
+phase 1's pgbench numbers (user, 2026-10-18); only narrowing the refs
+lock (part 8, question 1) waits for them.
+
+The writer modes (spec 11, 6.2) combine with this mode as they are, and
+the combination is documented: in `owned`, `branch-only` and
+`branch-auto` a branch's working set has one writer, so phase 1 already
+commits exactly the transaction's changes (part 4's first row), and in
+`branch-auto` each transaction is a commit on its writer branch. Phase 2
+matters mainly for `shared`, where many writers share a working set.
+Whether integration into a protected branch is automatic is the writer
+modes' question, not this one's.
+
+## 8. Decisions and open questions
+
+Decided by the user 2026-10-18, as recommended:
+
+1. **Autocommit:** one Dolt commit per autocommitted statement, its cost
+   documented and measured (part 3).
+2. **`dolt.allow_commit_conflicts` with conflicts present:** the SQL
+   transaction commits, no Dolt commit is made, and a `WARNING` says so
+   (part 3, rule 3).
+3. **Objects a commit can't hold** fail `COMMIT` in the mode, as they
+   fail `dolt_commit()` (rule 5).
+4. **Phase 2 starts without waiting** for phase 1's measurements (part 7).
+5. With them, as recommended: the "changed" flag per branch from the
+   AM's write paths, the catalog stamp helpers and `nextval()`, one hook
+   shared with the writer modes; the hook inside the refs' pre-commit
+   callback, after the conflicts check; `refs_init()` at the first
+   flagged write; DDL-only transactions commit; no detached-head rule;
+   fixed message text, `SET LOCAL` per transaction; `USERSET` settings
+   captured at the first write; emptiness decided before anything is
+   recorded (rule 7, shared with #146's fix); in phase 2, deduplication
+   by TID and role, then versions both made and deleted dropped, rewrites
+   falling back to the fold, `dolt.transaction_commit_max_changes` at
+   100,000, and no baseline advance from delta commits.
+
+Still open:
 
 1. **Commit throughput.** The refs are per database and held to
    transaction end, so every writing transaction in the mode serializes
@@ -273,9 +387,5 @@ foreign keys are not rechecked against the head, as Dolt doesn't, and
    measurement says it matters: a narrower lock per branch with the root
    move alone serialized, or group commit (a leader moving the root once
    for a chain of queued transactions' commits).
-2. **Baseline advance after phase 2 commits** (part 5).
-3. **Two-phase commit** (part 3).
-4. **With #148's modes.** `branch-auto` puts each writer on its own
-   branch; in this mode each of its transactions is then a commit on
-   that branch. Whether integration into `main` (`dolt_integrate`) should
-   also be automatic is #148's question, not this one's.
+   Measured first; nothing changes until the numbers ask for it.
+2. **Two-phase commit** (part 3).
