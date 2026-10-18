@@ -37,7 +37,7 @@ class CalibrationTest(unittest.TestCase):
                                                 "instructions_user": 1e8 * (1 + i / 10000)})
                     for i in range(4)]
             t = scounters.thresholds()
-            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs), t)
+            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs)[0], t)
             self.assertEqual(noise["runs"], 4)
             self.assertEqual(noise["stable"], 1)                 # wal_bytes
             self.assertEqual([s["counter"] for s in noise["unstable"]], ["io_extends"])
@@ -59,14 +59,43 @@ class CalibrationTest(unittest.TestCase):
                                                 "wal_records": 10730.0 + (i % 2) * 900})
                     for i in range(2)]
             t = scounters.thresholds()
-            one, two = scalibrate._counter_runs(runs)
+            (_, one), (_, two) = scalibrate._counter_runs(runs)[0]
             got = {m: v for (_, m), v in scounters.instability(one, two, t).items()}
             self.assertEqual(got, {"io_extends": "jitter", "wal_records": "unstable"})
             runs += [counter_run(root, f"r{i}", {"io_extends": 32.0 + i % 2,
                                                  "wal_records": 10730.0}) for i in (2, 3)]
-            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs), t)
+            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs)[0], t)
             failing = {f["counter"] for f in noise["failing_counters"]}
             self.assertNotIn("io_extends", failing)
+
+    def test_runs_by_runner_and_bad_evidence_left_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runs = [counter_run(root, f"counters-{r}-{i}", {"wal_bytes": 1000.0 + r})
+                    for r in (1, 2) for i in range(1, 5)]
+            broken = counter_run(root, "counters-3-1", {"wal_bytes": 1.0})
+            (broken / "x-S-prolly" / "results.jsonl").write_text("")   # evidence changed
+            named, left_out = scalibrate._counter_runs(runs + [broken])
+            self.assertEqual(len(named), 8)
+            self.assertEqual(len(left_out), 1)
+            t = scounters.thresholds()
+            noise = scalibrate.counter_noise(named, t)
+            self.assertEqual(noise["runners"], 2)
+            self.assertEqual(noise["trials"], 48)          # 24 per runner
+            self.assertEqual(noise["failing_trials"], 0)   # each runner agrees with itself
+            self.assertEqual(noise["stable"], 0)           # ... but not with the other
+
+    def test_a_counter_missing_from_the_candidate_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            full = {"wal_bytes": 1000.0, "io_extends": 40.0}
+            runs = [counter_run(root, f"r{i}", full if i else {"wal_bytes": 1000.0})
+                    for i in range(4)]
+            noise = scalibrate.counter_noise(scalibrate._counter_runs(runs)[0], scounters.thresholds())
+            self.assertGreater(noise["failing_trials"], 0)
+            self.assertEqual({f["why"] for f in noise["failing_counters"]}, {"unstable"})
+            # (an instability isn't a reason to raise the floors)
+            self.assertEqual(noise["largest_failing_difference"], {"events": 0.0, "bytes": 0.0})
 
     def test_timing_noise(self):
         with tempfile.TemporaryDirectory() as d:
@@ -76,7 +105,7 @@ class CalibrationTest(unittest.TestCase):
             noise = [1000.0, 1010.0, 990.0, 1005.0, 995.0]
             build_set(run, "base", "heap", noise)
             build_set(run, "candidate", "heap", noise[::-1])
-            timing = scalibrate.timing_noise([run])
+            timing = scalibrate.timing_noise([run], scounters.thresholds())
             self.assertEqual(timing["runs"], 1)
             self.assertEqual(timing["runs_with_a_regressed_cell"], {"5%": 0, "10%": 0})
             cell = next(c for c in timing["cells"] if c["metric"] == "throughput")

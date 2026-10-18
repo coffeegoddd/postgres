@@ -41,7 +41,13 @@ jobs:
         id: runs
         env:
           RUNS: ${{ github.event.inputs.runs || '10' }}
-        run: echo "runs=[$(seq -s , 1 "$RUNS")]" | tee -a "$GITHUB_OUTPUT"
+        run: |
+          # (a matrix holds at most 256 jobs)
+          if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || [ "$RUNS" -lt 1 ] || [ "$RUNS" -gt 256 ]; then
+            echo "runs must be 1 to 256, not '$RUNS'" >&2
+            exit 1
+          fi
+          echo "runs=[$(seq -s , 1 "$RUNS")]" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
@@ -124,7 +130,7 @@ jobs:
               --config src/tools/prolly_bench/configs/s_counters.toml --pg-bin "$bin" \
               --work-dir "$RUNNER_TEMP/work" --out "$PWD/aa/counters-${{ matrix.run }}-$i"
           done
-          cp "$RUNNER_TEMP/probe.txt" aa/
+          cp "$RUNNER_TEMP/probe.txt" "aa/probe-${{ matrix.run }}.txt"
 
       - name: Timing, the build against itself
         run: |
@@ -144,13 +150,15 @@ jobs:
   summary:
     name: calibration summary
     needs: a-a
-    if: always()
+    # (whatever runs finished, even if some failed; not if none ran)
+    if: always() && needs.a-a.result != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/download-artifact@v5
+        continue-on-error: true
         with:
           pattern: s-calibration-[0-9]*
           path: runs
@@ -158,10 +166,21 @@ jobs:
 
       - name: Measure the noise
         run: |
+          shopt -s nullglob
           mkdir -p calibration
-          cat runs/probe.txt > calibration/probe.txt || true
-          src/tools/prolly_bench/prolly_bench scalibrate \
-            --counters runs/counters-* --timing runs/timing-* \
+          for f in runs/probe-*.txt; do
+            echo "runner ${f#runs/probe-}: $(cat "$f")"
+          done | sort -V > calibration/probe.txt
+          counters=(runs/counters-*)
+          timing=(runs/timing-*)
+          args=()
+          [ ${#counters[@]} -eq 0 ] || args+=(--counters "${counters[@]}")
+          [ ${#timing[@]} -eq 0 ] || args+=(--timing "${timing[@]}")
+          if [ ${#args[@]} -eq 0 ]; then
+            echo "No A/A run left results." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          src/tools/prolly_bench/prolly_bench scalibrate "${args[@]}" \
             --thresholds src/tools/prolly_bench/configs/s_gate.toml \
             --out calibration/calibration.md --json calibration/calibration.json
           { echo '```'; cat calibration/probe.txt; echo '```'; cat calibration/calibration.md; } \

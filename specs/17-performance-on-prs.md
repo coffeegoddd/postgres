@@ -490,7 +490,8 @@ Cachegrind on a reduced workload, reported (part 3.1's fallback).
 **Counters** (run 39155625916: 40 counter runs of one build, four on
 each of ten runners, heap and prolly, `s_counters.toml` with S13):
 
-- 305 of 350 exact counters took the same value in every run.
+- 385 of 430 exact counters (every `pg_stat_io` counter included) took
+  the same value in every run.
 - The rest jitter by a page or a few records: S7's (GiST's random
   tie-breaking), S10's read-write and update-index tests' extends,
   relation size and WAL (up to 25% of a handful of extends, about 1% of
@@ -500,9 +501,11 @@ each of ten runners, heap and prolly, `s_counters.toml` with S13):
   gates failed.  So a build's runs now disagree (unstable) only by what
   the rule would call a change, more than 5% and over the floor; smaller
   differences are jitter, gated as usual and listed.
-- With that, 0 of 2,000 simulated gates (four distinct runs as base, base
-  again, candidate, candidate again) failed; the same held for an earlier
-  set of 40 runs (run 39153335247).  The floors stay 8 events and 8 KB.
+- With that, no simulated gate (four distinct runs as base, base again,
+  candidate, candidate again) failed: 0 of 240 within a runner, as a pull
+  request's runs are, and 0 of 2,000 across runners; the same held for an
+  earlier set of 40 runs (run 39153335247).  The floors stay 8 events and
+  8 KB.
 - A pull request's own run (#274, the candidate's engine code identical
   to its base's) passed the counter gate with 36 jittering counters listed.
 
