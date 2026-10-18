@@ -290,9 +290,8 @@ basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 	return tf;
 }
 
-static bool
-basic_find(ProllyTableFile *tf, const ProllyHash *hash, uint64 *offset,
-		   uint32 *len)
+static int
+basic_locate(ProllyTableFile *tf, const ProllyHash *hash)
 {
 	int			lo = 0;
 	int			hi = tf->n - 1;
@@ -303,17 +302,26 @@ basic_find(ProllyTableFile *tf, const ProllyHash *hash, uint64 *offset,
 		int			c = hash_cmp(&tf->entries[mid].hash, hash);
 
 		if (c == 0)
-		{
-			*offset = tf->entries[mid].offset;
-			*len = tf->entries[mid].len;
-			return true;
-		}
+			return mid;
 		if (c < 0)
 			lo = mid + 1;
 		else
 			hi = mid - 1;
 	}
-	return false;
+	return -1;
+}
+
+static bool
+basic_find(ProllyTableFile *tf, const ProllyHash *hash, uint64 *offset,
+		   uint32 *len)
+{
+	int			i = basic_locate(tf, hash);
+
+	if (i < 0)
+		return false;
+	*offset = tf->entries[i].offset;
+	*len = tf->entries[i].len;
+	return true;
 }
 
 static void
@@ -410,5 +418,6 @@ const ProllyTableFileRoutine prolly_tablefile_basic = {
 	.decode = basic_decode,
 	.count = basic_count,
 	.entry = basic_entry,
+	.locate = basic_locate,
 	.close = basic_close,
 };

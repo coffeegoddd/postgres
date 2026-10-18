@@ -6,8 +6,8 @@
  * A prolly table's rows are in pages; the components its rows' history is
  * folded with (keying, encoders, hash, and trees of chunks) are its
  * access method's profile.  A database's version control (refs, transfer,
- * diff and merge, canonical form) is its branches' as copies of its
- * versioned schemas.
+ * diff and merge, canonical form, reclamation) is its branches' as copies
+ * of its versioned schemas.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_config.c
@@ -41,6 +41,7 @@ static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_TRANSFER] = "chunks",
 	[PROLLY_IFACE_DIFF_MERGE] = "folded",
 	[PROLLY_IFACE_CANONICALIZER] = "folded",
+	[PROLLY_IFACE_RECLAMATION] = "copying",
 };
 
 static const ProllyImplInfo *
@@ -119,4 +120,6 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(copies_profile, PROLLY_IFACE_DIFF_MERGE);
 	components->canonicalizer = (const ProllyCanonRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_CANONICALIZER);
+	components->reclamation = (const ProllyReclaimRoutine *)
+		profile_impl(copies_profile, PROLLY_IFACE_RECLAMATION);
 }

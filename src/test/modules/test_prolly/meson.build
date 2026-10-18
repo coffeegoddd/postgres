@@ -87,6 +87,7 @@ tests += {
       'partitions',
       'append_check',
       'journal_segments',
+      'gc',
     ],
   },
   'tap': {
@@ -118,6 +119,7 @@ tests += {
       't/048_network_batches.pl',
       't/053_serve_snapshots.pl',
       't/054_journal_segments.pl',
+      't/055_gc.pl',
     ],
   },
 }

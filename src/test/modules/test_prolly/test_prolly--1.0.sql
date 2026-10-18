@@ -300,3 +300,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_put_node(level int, refs text[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Collect the chunk store's garbage (full: all of it): the chunks kept and
+-- freed of those collected, and the bytes freed.
+CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
+	OUT bytes_freed int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

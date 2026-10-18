@@ -1022,3 +1022,26 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
 	PG_RETURN_TEXT_P(hash_text(&h));
 }
+
+/* Collect the store's garbage: what was kept and freed. */
+PG_FUNCTION_INFO_V1(test_chunk_gc);
+Datum
+test_chunk_gc(PG_FUNCTION_ARGS)
+{
+	bool		full = PG_GETARG_BOOL(0);
+	ProllyDatabaseComponents dc;
+	ProllyGcResult r;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, &r);
+	values[0] = Int64GetDatum((int64) r.chunks_kept);
+	values[1] = Int64GetDatum((int64) r.chunks_freed);
+	values[2] = Int64GetDatum((int64) r.bytes_freed);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}

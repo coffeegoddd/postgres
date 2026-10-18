@@ -50,6 +50,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyTransferRoutine *transfer;
 	const ProllyMergeRoutine *diff_merge;
 	const ProllyCanonRoutine *canonicalizer;
+	const ProllyReclaimRoutine *reclamation;
 } ProllyDatabaseComponents;
 
 /* Components for rel: a prolly table, or an index on one (an error otherwise). */

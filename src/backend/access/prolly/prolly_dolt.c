@@ -40,8 +40,11 @@
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_authid_d.h"
+#include "catalog/pg_database_d.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -2168,6 +2171,57 @@ dolt_fetch(PG_FUNCTION_ARGS)
 	}
 	fetch_remote(remote ? remote : "origin", branches, NULL, NULL);
 	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/*
+ * dolt_gc(VARIADIC args text[]) returns text[]: {status}
+ *
+ * --full: the database's chunk store collected (prolly_reclaim.h): what
+ * was written since the last collection, or (full) all of it.  Commits go
+ * on meanwhile but for a short final window; a transaction that read a
+ * chunk collected meanwhile and then names it fails, to be retried.  The
+ * database's owner, or a member of pg_maintain, as VACUUM asks.
+ */
+Datum
+dolt_gc(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		full = false;
+	const char *result[1] = {"0"};
+	ProllyDatabaseComponents dc;
+	ProllyGcResult gc;
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (strcmp(args[i], "--full") == 0)
+			full = true;
+		else
+			unsupported("dolt_gc", args[i]);
+	}
+	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
+		!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to collect garbage in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+	PreventCommandIfReadOnly("dolt_gc()");
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, &gc);
+	ereport(DEBUG1,
+			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed",
+							 (unsigned long long) gc.chunks_kept,
+							 (unsigned long long) gc.chunks_freed,
+							 (unsigned long long) gc.bytes_freed)));
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+Datum
+dolt_gc_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_gc(fcinfo);
 }
 
 /* The session branch's upstream, or an error naming how to set one. */
