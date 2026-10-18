@@ -123,12 +123,16 @@ def run_pgbench(ctx: Context, *, seconds: int, builtin: Optional[str] = None,
                 scripts: Optional[list[tuple[str, int]]] = None,
                 defines: Optional[dict[str, object]] = None,
                 clients: Optional[int] = None, tag: str = "measure",
-                log_latency: bool = True, window=None) -> PgbenchResult:
-    """Run pgbench for seconds; tag names the raw output files."""
+                log_latency: bool = True, window=None,
+                transactions: Optional[int] = None) -> PgbenchResult:
+    """Run pgbench for seconds, or (transactions) that many transactions per
+    client, a fixed amount of work; tag names the raw output files."""
     clients = clients or ctx.key.clients
     threads = max(1, min(clients, os.cpu_count() or 1))
+    amount = ["-t", str(transactions)] if transactions else ["-T", str(seconds)]
+    timeout = int(ctx.params.get("timeout_seconds", 7200)) if transactions else seconds + 120
     args = [ctx.cluster.bin("pgbench"), "-n", "-c", str(clients), "-j", str(threads),
-            "-T", str(seconds), "--random-seed", str(ctx.params.get("seed", 1)),
+            *amount, "--random-seed", str(ctx.params.get("seed", 1)),
             "-M", str(ctx.params.get("protocol", "prepared"))]
     if builtin:
         args += ["-b", builtin]
@@ -151,7 +155,7 @@ def run_pgbench(ctx: Context, *, seconds: int, builtin: Optional[str] = None,
 
     with window or nullcontext():
         cpu0 = children_cpu_seconds()
-        r = process.run(args, capture_output=True, text=True, timeout=seconds + 120,
+        r = process.run(args, capture_output=True, text=True, timeout=timeout,
                            env=ctx.cluster.client_env(ctx.session_options()))
         client_cpu = children_cpu_seconds() - cpu0
     res = PgbenchResult(client_cpu_seconds=client_cpu,
@@ -168,6 +172,9 @@ def run_pgbench(ctx: Context, *, seconds: int, builtin: Optional[str] = None,
     res.tps = parsed["tps"]
     if res.transactions <= 0 or res.tps is None or res.tps <= 0:
         raise RuntimeError("pgbench completed no useful work or omitted throughput")
+    if transactions and res.transactions + res.failed != transactions * clients:
+        raise RuntimeError(f"pgbench ran {res.transactions + res.failed:.0f} transactions, "
+                           f"not the {transactions * clients} asked for")
     if log_latency:
         failed_samples = parse_pgbench_logs(ctx.scratch_dir, log_prefix, res.latency)
         if rate == 1.0 and (res.latency.count != res.transactions

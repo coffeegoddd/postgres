@@ -5,6 +5,7 @@ completed unit of work."""
 
 from __future__ import annotations
 
+from pbench.collectors._snapshot import snapshot
 from pbench.core import registry
 from pbench.core.interfaces import Collector, NotApplicable, NotImplementedByEngine
 from pbench.core.stats import counter_delta, per
@@ -34,8 +35,8 @@ class EngineCountersCollector(Collector):
             raise NotImplementedByEngine(f"no {VIEW} view")
 
     def _snap(self, ctx):
-        rows = ctx.cluster.scalar(f"SELECT name || '=' || value FROM {VIEW}",
-                                  dbname=ctx.dbname)
+        rows = snapshot(ctx, f"SELECT string_agg(name || '=' || value, E'\\n') FROM {VIEW}",
+                        dbname=ctx.dbname)
         return {k: float(v) for k, v in (r.split("=", 1) for r in rows.splitlines() if r)}
 
     def start(self, ctx):

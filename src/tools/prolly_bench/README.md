@@ -232,6 +232,28 @@ C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.
 
+## Counter runs
+
+`configs/s_counters.toml` runs the S workloads as a fixed amount of work
+(`pgbench -t`, sysbench `--events`, the TPC-H serial pass) with one client,
+fixed seeds, autovacuum and timed checkpoints off, so two runs of one build
+count the same: WAL bytes, records and full-page images, `pg_stat_io` for
+client backends, relation and chunk-store bytes, `pg_stat_prolly`, and
+instructions where the machine has hardware counters (`instructions`, by
+`perf stat`).  Counters are read once the measured clients have exited
+(`settled_counters`), so each has flushed its statistics.
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_counters.toml --out A
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_counters.toml --out B
+src/tools/prolly_bench/prolly_bench scounters A/*-S-prolly B/*-S-prolly   # which counters differ
+```
+
+S7's counters vary a little: GiST breaks ties between pages at random.
+Without hardware counters, `configs/s_cachegrind.toml` counts instructions
+with the server under Cachegrind (the `cachegrind` cluster and collector),
+on a reduced workload.
+
 ## Targets
 
 `prolly` tables exist only in versioned schemas, and with `prolly` as the
@@ -307,9 +329,9 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Workload` | S1-S10 and S13, V1-V4 and V6, C1-C4 | `pbench/workloads/` |
-| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, perf, vacuum, recovery | `pbench/collectors/` |
+| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
-| `Cluster` | local | `pbench/clusters/` |
+| `Cluster` | local, cachegrind | `pbench/clusters/` |
 
 A workload creates its data in `prepare`, may warm up in `warmup`, and does
 the measured work inside the window it is given in `measure`, returning an

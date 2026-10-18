@@ -7,6 +7,13 @@ from pbench.core import registry
 from pbench.core.interfaces import Collector, NotApplicable
 from pathlib import Path
 
+# The database's chunk store: its journal segments, manifest and table
+# files, prolly_* in the database's directory (none for heap).
+CHUNK_STORE_SQL = """SELECT coalesce(sum((pg_stat_file(d || '/' || f)).size), 0)
+FROM (SELECT 'base/' || oid AS d FROM pg_database
+      WHERE datname = current_database()) db,
+     LATERAL pg_ls_dir(d) f WHERE f LIKE 'prolly\\_%'"""
+
 
 def physical_size(root: Path) -> tuple[int, int]:
     """Apparent and allocated bytes, counted once per inode (including WAL)."""
@@ -49,4 +56,6 @@ class SpaceCollector(Collector):
                 "cluster_apparent_bytes_including_wal": apparent,
                 "cluster_allocated_bytes_including_wal": allocated,
                 "database_bytes": float(ctx.cluster.scalar(
-                    "SELECT pg_database_size(current_database())", dbname=ctx.dbname))}
+                    "SELECT pg_database_size(current_database())", dbname=ctx.dbname)),
+                "chunk_store_bytes": float(ctx.cluster.scalar(CHUNK_STORE_SQL,
+                                                              dbname=ctx.dbname))}

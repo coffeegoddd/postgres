@@ -12,6 +12,7 @@
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
   prolly_bench table [DIR ...]                  engines side by side, per metric
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
+  prolly_bench scounters RUN RUN2               S counter runs of one build: unstable counters
 """
 
 from __future__ import annotations
@@ -393,8 +394,16 @@ def main(argv=None) -> int:
     evidence.add_argument("--baseline", type=Path)
     evidence.set_defaults(fn=_gate)
 
+    from pbench import scounters
+    sc = sub.add_parser("scounters", help="S counter runs: counters two runs of one build disagree on")
+    sc.add_argument("one", type=Path)
+    sc.add_argument("two", type=Path)
+    sc.add_argument("--instructions-tolerance", type=float, default=0.01,
+                    help="relative difference instruction counts may have (default 0.01)")
+    sc.set_defaults(fn=scounters.run)
+
     from pbench import complexity
-    growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")
+    growth =sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")
     growth.add_argument("dir", type=Path)
     growth.add_argument("--workload", choices=["V1", "V2", "V3", "V4"], default="V2")
     growth.add_argument("--operation", default="dolt_commit")

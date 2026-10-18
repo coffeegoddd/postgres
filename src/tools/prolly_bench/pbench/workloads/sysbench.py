@@ -113,14 +113,19 @@ class S10(Workload):
                 ctx.cluster.sql("CHECKPOINT")
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
+        # (a fixed amount of work: that many events, in all, however long)
+        events = ctx.params.get("transactions")
+        amount = [f"--events={events}", "--time=0"] if events else \
+            [f"--time={ctx.measure_seconds}"]
         with window:
             cpu0 = children_cpu_seconds()
             out = self._sysbench(ctx, "run", "measure",
-                                 [f"--time={ctx.measure_seconds}", "--histogram=on",
-                                  "--percentile=99"])
+                                 [*amount, "--histogram=on", "--percentile=99"])
             client_cpu = children_cpu_seconds() - cpu0
         hist = LatencyHistogram()
         parsed = parse_sysbench_output(out, hist)
+        if events and parsed["events"] != events:
+            raise RuntimeError(f"sysbench ran {parsed['events']} events, not the {events} asked for")
         save_histogram(ctx, "measure", hist)
 
         def ms(us):

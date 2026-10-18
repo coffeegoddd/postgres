@@ -197,6 +197,7 @@ class Runner:
                             merged = {"latency_sampling_rate":
                                       run["latency_sampling_rate"], "seed": run["seed"] + rep,
                                       "quality": run["quality"],
+                                      "settled_counters": run["settled_counters"],
                                       **params, **vparams}
                             yield key, {"workload": w, "params": merged}
 
