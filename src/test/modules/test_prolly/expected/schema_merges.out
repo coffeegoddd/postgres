@@ -712,6 +712,172 @@ SELECT length(dolt_commit('-Am', 'without mr')::text) AS committed;
         66
 (1 row)
 
+-- a routine with several arguments kept by a merge (its signature,
+-- "ma.add(integer, integer)", isn't a qualified name)
+CREATE SCHEMA ma VERSIONED;
+CREATE FUNCTION ma.add(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+CREATE TABLE ma.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'ma')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('-b', 'ma_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+CREATE TABLE ma.s (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'side table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE ma.m (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'main table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('ma_side') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT ma.add(1, 2);
+ add 
+-----
+   3
+(1 row)
+
+SELECT dolt_branch('-D', 'ma_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- dropped on one side, given such a routine on the other: a conflict
+SELECT dolt_checkout('-b', 'ma_drop') IS NOT NULL AS on_drop;
+ on_drop 
+---------
+ t
+(1 row)
+
+DROP SCHEMA ma CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to function ma.add(integer,integer)
+drop cascades to table ma.t
+drop cascades to table ma.m
+drop cascades to table ma.s
+SELECT length(dolt_commit('-Am', 'ma dropped')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE FUNCTION ma.mul(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 * $2 * $3';
+SELECT length(dolt_commit('-Am', 'ma.mul')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('ma_drop');
+ERROR:  schema conflict: schema ma was dropped on one side and given ma.mul(integer, integer, integer) on the other
+DETAIL:  Dropping it would drop what the other side made in it.
+SELECT dolt_branch('-D', 'ma_drop');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA ma CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to function ma.add(integer,integer)
+drop cascades to table ma.t
+drop cascades to table ma.m
+drop cascades to table ma.s
+drop cascades to function ma.mul(integer,integer,integer)
+SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- a versioned public dropped on one side: what has no schema (the root's
+-- format) isn't taken for public's
+SELECT current_database() AS db \gset
+CREATE DATABASE regress_public_merge;
+\c regress_public_merge
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE TABLE public.t (id int PRIMARY KEY);
+CREATE SCHEMA other VERSIONED;
+CREATE TABLE other.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'public')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('-b', 'no_public') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+DROP SCHEMA public CASCADE;
+NOTICE:  drop cascades to table t
+SELECT length(dolt_commit('-Am', 'public dropped')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+INSERT INTO other.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'a row elsewhere')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('no_public') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS public_schemas FROM pg_namespace WHERE nspname = 'public';
+ public_schemas 
+----------------
+              0
+(1 row)
+
+\c :db
+DROP DATABASE regress_public_merge;
 DROP SCHEMA sg_new CASCADE;
 NOTICE:  drop cascades to table sg_new.u
 DROP SCHEMA sg_new_empty;

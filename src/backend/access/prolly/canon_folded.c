@@ -8,7 +8,8 @@
  * The canonical root is a tree keyed (by memcmp) by kind and qualified
  * name, every string in UTF-8:
  *
- *	"!:format"			-> the format its data trees are in, FOLDED_FORMAT
+ *	"!:format"			-> the format its items and data trees are in,
+ *						   FOLDED_FORMAT
  *	"c:" collation		-> its provider, locale, ICU rules, whether it is
  *						   deterministic and its library's version, a line
  *						   each ("default": the database's)
@@ -31,7 +32,17 @@
  * prints them.  Names are qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
- * order, dropped columns) reaches the hash.  A table's rows are folded
+ * order, dropped columns) reaches the hash.
+ *
+ * A collation's, a table's schema and a type's definition are split into
+ * lines (by newline) and fields (by tab), and every name, type, expression
+ * or definition in them is escaped (a backslash, tab or newline as \\, \t
+ * or \n: append_field()), as a quoted name or a string literal may hold
+ * one; so a raw tab or newline is only a separator, and a field is read
+ * back (unescape_field()) where it is used.  A function's, view's or
+ * materialized view's definition is never split, and is kept as it is.
+ *
+ * A table's rows are folded
  * into its data tree (keyed by the table keying, sorted, a tree in the
  * chunk store), and the canonical tree is kept there too.
  *
@@ -147,11 +158,13 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root's data trees are in: "2", keyless rows keyed by
- * their first bytes and their hash.  A root in another (one without the
- * item was keyed by the hash alone) has its tables' rows unreadable here.
+ * The format a folded root is in: "3", its definitions' fields escaped
+ * (append_field()); "2" was keyless rows keyed by their first bytes and
+ * their hash, and a root without the item keyed them by the hash alone.
+ * A root in another has its tables' rows unreadable here, and is neither
+ * moved to nor merged: its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"2"
+#define FOLDED_FORMAT	"3"
 
 typedef struct Canon
 {
@@ -204,6 +217,51 @@ append_utf8(StringInfo out, const char *s)
 	appendStringInfoString(out, u);
 	if (u != s)
 		pfree(u);
+}
+
+/*
+ * Append s in UTF-8 as a field of a value split into lines and fields: a
+ * backslash, tab or newline in it escaped (\\, \t, \n), so that a raw tab
+ * or newline is only ever a separator.  unescape_field() reads it back.
+ */
+static void
+append_field(StringInfo out, const char *s)
+{
+	char	   *u = pg_server_to_any(s, strlen(s), PG_UTF8);
+
+	for (const char *c = u; *c; c++)
+	{
+		if (*c == '\\')
+			appendStringInfoString(out, "\\\\");
+		else if (*c == '\t')
+			appendStringInfoString(out, "\\t");
+		else if (*c == '\n')
+			appendStringInfoString(out, "\\n");
+		else
+			appendStringInfoChar(out, *c);
+	}
+	if (u != s)
+		pfree(u);
+}
+
+/* A field append_field() wrote, as it was (any part of one: no separators). */
+static char *
+unescape_field(const char *s)
+{
+	StringInfoData out;
+
+	initStringInfo(&out);
+	for (const char *c = s; *c; c++)
+	{
+		if (*c == '\\' && (c[1] == '\\' || c[1] == 't' || c[1] == 'n'))
+		{
+			c++;
+			appendStringInfoChar(&out, *c == 't' ? '\t' : *c == 'n' ? '\n' : '\\');
+		}
+		else
+			appendStringInfoChar(&out, *c);
+	}
+	return out.data;
 }
 
 static CanonItem *
@@ -535,13 +593,16 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 				continue;
 			def = DirectFunctionCall1(pg_get_ruledef, ObjectIdGetDatum(rw->oid));
 		}
-		defs = lappend(defs, psprintf("%s\n", TextDatumGetCString(def)));
+		defs = lappend(defs, TextDatumGetCString(def));
 	}
 	systable_endscan(scan);
 	table_close(crel, AccessShareLock);
 	list_sort(defs, cstring_cmp);
 	foreach(lc, defs)
-		append_utf8(out, lfirst(lc));
+	{
+		append_field(out, lfirst(lc));
+		appendStringInfoChar(out, '\n');
+	}
 }
 
 static void
@@ -563,18 +624,18 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 		if (att->attisdropped)
 			continue;
-		append_utf8(out, quote_identifier(NameStr(att->attname)));
+		append_field(out, quote_identifier(NameStr(att->attname)));
 		appendStringInfoChar(out, '\t');
-		append_utf8(out, format_type_extended(att->atttypid, att->atttypmod,
-											  FORMAT_TYPE_TYPEMOD_GIVEN |
-											  FORMAT_TYPE_FORCE_QUALIFY));
+		append_field(out, format_type_extended(att->atttypid, att->atttypmod,
+											   FORMAT_TYPE_TYPEMOD_GIVEN |
+											   FORMAT_TYPE_FORCE_QUALIFY));
 		if (att->attnotnull)
 			appendStringInfoString(out, "\tnot null");
 		if (OidIsValid(att->attcollation) &&
 			att->attcollation != get_typcollation(att->atttypid))
 		{
 			appendStringInfoString(out, "\tcollate ");
-			append_utf8(out, generate_collation_name(att->attcollation));
+			append_field(out, generate_collation_name(att->attcollation));
 		}
 		if (att->atthasdef && desc->constr)
 		{
@@ -590,7 +651,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 					appendStringInfoString(out, att->attgenerated ?
 										   "\tgenerated " : "\tdefault ");
-					append_utf8(out, TextDatumGetCString(txt));
+					append_field(out, TextDatumGetCString(txt));
 				}
 			}
 		}
@@ -613,10 +674,10 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
 		StringInfo	line = makeStringInfo();
 
-		append_utf8(line, quote_identifier(NameStr(con->conname)));
+		append_field(line, quote_identifier(NameStr(con->conname)));
 		appendStringInfoChar(line, '\t');
-		append_utf8(line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
-																  ObjectIdGetDatum(con->oid))));
+		append_field(line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
+																   ObjectIdGetDatum(con->oid))));
 		appendStringInfoChar(line, '\n');
 		cons = lappend(cons, line->data);
 	}
@@ -634,7 +695,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	{
 		Oid			idx = lfirst_oid(lc);
 
-		append_utf8(out, pg_get_indexdef_string(idx));
+		append_field(out, pg_get_indexdef_string(idx));
 		appendStringInfoChar(out, '\n');
 	}
 
@@ -704,7 +765,7 @@ describe_type(Canon *cn, Form_pg_type typ)
 		appendStringInfoString(&it->value, "enum\n");
 		for (int i = 0; i < n; i++)
 		{
-			append_utf8(&it->value, quote_literal_cstr(arr[i].name));
+			append_field(&it->value, quote_literal_cstr(arr[i].name));
 			appendStringInfoChar(&it->value, '\n');
 		}
 	}
@@ -712,10 +773,10 @@ describe_type(Canon *cn, Form_pg_type typ)
 	{
 		it = add_item(cn, "y:", qualified(typ->typnamespace, NameStr(typ->typname)));
 		appendStringInfoString(&it->value, "domain\n");
-		append_utf8(&it->value, format_type_extended(typ->typbasetype,
-													 typ->typtypmod,
-													 FORMAT_TYPE_TYPEMOD_GIVEN |
-													 FORMAT_TYPE_FORCE_QUALIFY));
+		append_field(&it->value, format_type_extended(typ->typbasetype,
+													  typ->typtypmod,
+													  FORMAT_TYPE_TYPEMOD_GIVEN |
+													  FORMAT_TYPE_FORCE_QUALIFY));
 		if (typ->typnotnull)
 			appendStringInfoString(&it->value, "\tnot null");
 		appendStringInfoChar(&it->value, '\n');
@@ -736,17 +797,21 @@ describe_type(Canon *cn, Form_pg_type typ)
 			while ((tup = systable_getnext(scan)) != NULL)
 			{
 				Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+				StringInfoData line;
 
-				cons = lappend(cons, psprintf("%s\t%s\n",
-											  quote_identifier(NameStr(con->conname)),
-											  TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
-																					  ObjectIdGetDatum(con->oid)))));
+				initStringInfo(&line);
+				append_field(&line, quote_identifier(NameStr(con->conname)));
+				appendStringInfoChar(&line, '\t');
+				append_field(&line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
+																			ObjectIdGetDatum(con->oid))));
+				appendStringInfoChar(&line, '\n');
+				cons = lappend(cons, line.data);
 			}
 			systable_endscan(scan);
 			table_close(conrel, AccessShareLock);
 			list_sort(cons, cstring_cmp);
 			foreach(lc, cons)
-				append_utf8(&it->value, lfirst(lc));
+				appendStringInfoString(&it->value, lfirst(lc));
 		}
 	}
 	else if (typ->typtype == TYPTYPE_COMPOSITE &&
@@ -763,12 +828,12 @@ describe_type(Canon *cn, Form_pg_type typ)
 
 			if (att->attisdropped)
 				continue;
-			append_utf8(&it->value, quote_identifier(NameStr(att->attname)));
+			append_field(&it->value, quote_identifier(NameStr(att->attname)));
 			appendStringInfoChar(&it->value, '\t');
-			append_utf8(&it->value, format_type_extended(att->atttypid,
-														 att->atttypmod,
-														 FORMAT_TYPE_TYPEMOD_GIVEN |
-														 FORMAT_TYPE_FORCE_QUALIFY));
+			append_field(&it->value, format_type_extended(att->atttypid,
+														  att->atttypmod,
+														  FORMAT_TYPE_TYPEMOD_GIVEN |
+														  FORMAT_TYPE_FORCE_QUALIFY));
 			appendStringInfoChar(&it->value, '\n');
 		}
 		relation_close(crel, AccessShareLock);
@@ -1304,12 +1369,12 @@ collation_version(Oid coll, StringInfo name, StringInfo value)
 	if (version == NULL)
 		return false;
 	appendStringInfo(value, "%c\n", provider);
-	append_utf8(value, locale);
+	append_field(value, locale);
 	appendStringInfoChar(value, '\n');
 	if (rules)
-		append_utf8(value, rules);
+		append_field(value, rules);
 	appendStringInfo(value, "\n%c\n", deterministic ? 't' : 'f');
-	append_utf8(value, version);
+	append_field(value, version);
 	return true;
 }
 
@@ -1355,9 +1420,10 @@ describe_collation(const char *value, int len)
 	if (f[4] == NULL)
 		return quote_literal_cstr(value);
 	return psprintf("provider %s, locale %s%s%s, %sdeterministic, version %s",
-					f[0], quote_literal_cstr(f[1]),
-					f[2][0] ? ", rules " : "", f[2][0] ? quote_literal_cstr(f[2]) : "",
-					f[3][0] == 't' ? "" : "not ", quote_literal_cstr(f[4]));
+					f[0], quote_literal_cstr(unescape_field(f[1])),
+					f[2][0] ? ", rules " : "",
+					f[2][0] ? quote_literal_cstr(unescape_field(f[2])) : "",
+					f[3][0] == 't' ? "" : "not ", quote_literal_cstr(unescape_field(f[4])));
 }
 
 /* The collation a root's "c:" item names: "default", or a qualified name. */
@@ -1692,6 +1758,20 @@ root_in_format(Canon *cn, const ProllyNodeRef *root)
 		memcmp(v.data, FOLDED_FORMAT, v.len) == 0;
 	PROLLY_CALL(cn->tree, cursor_close, c);
 	return current;
+}
+
+/*
+ * Refuse a root of another format: its definitions' text isn't this
+ * format's, so it is neither moved to nor merged (how: "moved to").
+ */
+static void
+check_format(Canon *cn, const ProllyNodeRef *root, const char *how)
+{
+	if (!root_in_format(cn, root))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a commit made in an older format of prolly's history can't be %s", how),
+				 errhint("Commit the branch to write it in the current one.")));
 }
 
 static bool
@@ -2153,20 +2233,10 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->triggers;
 		else if (strcmp(line, "rules") == 0)
 			section = &td->rules;
-		else if (section && *section != NIL && strchr(line, '\t') == NULL &&
-				 (section == &td->columns || section == &td->constraints))
-		{
-			/*
-			 * A column's or constraint's line is its name, a tab and the
-			 * rest: one without a tab goes on the one before (an
-			 * expression's literal with a newline in it).
-			 */
-			ListCell   *last = list_last_cell(*section);
-
-			lfirst(last) = psprintf("%s\n%s", (char *) lfirst(last), line);
-		}
+		else if (section == &td->columns || section == &td->constraints)
+			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
-			*section = lappend(*section, pstrdup(line));
+			*section = lappend(*section, unescape_field(line));
 	}
 }
 
@@ -2218,7 +2288,22 @@ folded_table_columns(const ProllyValue *description, bool *keyed)
 static char *
 first_field(const char *line)
 {
-	return pnstrdup(line, strcspn(line, "\t"));
+	char	   *field = pnstrdup(line, strcspn(line, "\t"));
+	char	   *name = unescape_field(field);
+
+	pfree(field);
+	return name;
+}
+
+/* A line's fields after its first, as one (a constraint's definition, an attribute's type). */
+static char *
+constraint_def(const char *line)
+{
+	const char *tab = strchr(line, '\t');
+
+	if (tab == NULL)
+		elog(ERROR, "unexpected definition line \"%s\"", line);
+	return unescape_field(tab + 1);
 }
 
 /* An index statement's name: CREATE [UNIQUE] INDEX name ON ... */
@@ -2268,14 +2353,24 @@ list_has_string(List *list, const char *s)
 	return false;
 }
 
-/* The schema of a qualified name, as written. */
+/*
+ * The schema of a qualified name as an item's key writes it (quoted as
+ * needed, a routine's followed by its arguments): what is before its
+ * first unquoted '.'; NULL for a name without one (the root's format).
+ */
 static char *
 schema_of(const char *qualified_name)
 {
-	List	   *names = stringToQualifiedNameList(qualified_name, NULL);
+	bool		quoted = false;
 
-	return list_length(names) > 1 ? pstrdup(quote_identifier(strVal(linitial(names)))) :
-		pstrdup("public");
+	for (const char *c = qualified_name; *c; c++)
+	{
+		if (*c == '"')
+			quoted = !quoted;
+		else if (*c == '.' && !quoted)
+			return pnstrdup(qualified_name, c - qualified_name);
+	}
+	return NULL;
 }
 
 /* A column, as CREATE TABLE and ADD COLUMN write it. */
@@ -2293,14 +2388,18 @@ column_sql(const char *line)
 	char		stored = 's';
 	StringInfoData sql;
 
+	if (name == NULL || type == NULL)
+		elog(ERROR, "unexpected column line \"%s\"", line);
+	name = unescape_field(name);
+	type = unescape_field(type);
 	while ((f = strtok(NULL, "\t")) != NULL)
 	{
 		if (strncmp(f, "collate ", 8) == 0)
-			collate = f + 8;
+			collate = unescape_field(f + 8);
 		else if (strncmp(f, "default ", 8) == 0)
-			def = f + 8;
+			def = unescape_field(f + 8);
 		else if (strncmp(f, "generated ", 10) == 0)
-			generated = f + 10;
+			generated = unescape_field(f + 10);
 		else if (strncmp(f, "identity ", 9) == 0)
 			identity = f[9];
 		else if (strncmp(f, "stored ", 7) == 0)
@@ -2331,7 +2430,7 @@ column_attr(const char *line, const char *prefix)
 
 	while ((f = strtok(NULL, "\t")) != NULL)
 		if (strncmp(f, prefix, strlen(prefix)) == 0)
-			return f + strlen(prefix);
+			return unescape_field(f + strlen(prefix));
 	return NULL;
 }
 
@@ -2345,7 +2444,10 @@ column_type_sql(const char *line)
 
 	(void) strtok(copy, "\t");
 	type = strtok(NULL, "\t");
-	return collate ? psprintf("%s COLLATE %s", type, collate) : pstrdup(type);
+	if (type == NULL)
+		elog(ERROR, "unexpected column line \"%s\"", line);
+	type = unescape_field(type);
+	return collate ? psprintf("%s COLLATE %s", type, collate) : type;
 }
 
 static bool
@@ -2578,7 +2680,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 				(pass == 0) != not_null)
 				continue;
 			sql = psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", name,
-						   first_field(line), strchr(line, '\t') + 1);
+						   first_field(line), constraint_def(line));
 
 			/* (an identity column, or a key, may have made it already) */
 			if (not_null)
@@ -2592,7 +2694,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			 * they are written: its NOT NULL after them)
 			 */
 			if (not_null && from != &none &&
-				!list_has_string(from_names, strstr(line, "\tNOT NULL ") + 10))
+				!list_has_string(from_names,
+								 unescape_field(strstr(line, "\tNOT NULL ") + 10)))
 				sm->after = lappend(sm->after, sql);
 			else if (not_null || key)
 				sm->changes = lappend(sm->changes, sql);
@@ -2639,7 +2742,7 @@ create_type_sql(const char *name, const char *def)
 		appendStringInfo(&sql, "CREATE TYPE %s AS ENUM (", name);
 		while ((line = strtok(NULL, "\n")) != NULL)
 		{
-			appendStringInfo(&sql, "%s%s", first ? "" : ", ", line);
+			appendStringInfo(&sql, "%s%s", first ? "" : ", ", unescape_field(line));
 			first = false;
 		}
 		appendStringInfoChar(&sql, ')');
@@ -2649,10 +2752,8 @@ create_type_sql(const char *name, const char *def)
 		appendStringInfo(&sql, "CREATE TYPE %s AS (", name);
 		while ((line = strtok(NULL, "\n")) != NULL)
 		{
-			char	   *tab = strchr(line, '\t');
-
-			*tab = ' ';
-			appendStringInfo(&sql, "%s%s", first ? "" : ", ", line);
+			appendStringInfo(&sql, "%s%s %s", first ? "" : ", ",
+							 first_field(line), constraint_def(line));
 			first = false;
 		}
 		appendStringInfoChar(&sql, ')');
@@ -2667,16 +2768,14 @@ create_type_sql(const char *name, const char *def)
 		/* (a NOT NULL constraint line names it: not said twice) */
 		if (tab && strstr(def, "\tNOT NULL\n") == NULL &&
 			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
-			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s NOT NULL", name, base);
+			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s NOT NULL", name,
+							 unescape_field(base));
 		else
-			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s", name, base);
+			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s", name,
+							 unescape_field(base));
 		while ((line = strtok(NULL, "\n")) != NULL)
-		{
-			char	   *t = strchr(line, '\t');
-
-			*t = '\0';
-			appendStringInfo(&sql, " CONSTRAINT %s %s", line, t + 1);
-		}
+			appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
+							 constraint_def(line));
 	}
 	return sql.data;
 }
@@ -2863,11 +2962,7 @@ composite_attributes(const char *def)
 
 	while ((line = strtok(NULL, "\n")) != NULL)
 	{
-		char	   *tab = strchr(line, '\t');
-
-		if (tab)
-			*tab = '\0';
-		names = lappend(names, pstrdup(line));
+		names = lappend(names, first_field(line));
 	}
 	return names;
 }
@@ -2885,7 +2980,8 @@ composite_attribute_types(const char *def)
 		char	   *tab = strchr(line, '\t');
 		char	   *end = tab ? strchr(tab + 1, '\t') : NULL;
 
-		types = lappend(types, tab ? (end ? pnstrdup(tab + 1, end - tab - 1) : pstrdup(tab + 1)) :
+		types = lappend(types, tab ? unescape_field(end ? pnstrdup(tab + 1, end - tab - 1) :
+													tab + 1) :
 						pstrdup(""));
 	}
 	return types;
@@ -3213,7 +3309,7 @@ type_moves(List *from, List *to)
 						if (same_table_line(ft, tt, 'k', cname))
 							tm.after = lappend(tm.after,
 											   psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", tname, cname,
-														strchr(table_def_line(tt, 'k', cname), '\t') + 1));
+														constraint_def(table_def_line(tt, 'k', cname))));
 						handled = true;
 					}
 					ReleaseSysCache(ct);
@@ -3331,6 +3427,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
+	check_format(&cn, to_root, "moved to");
 	from = move_items(&cn, from_root);
 	to = move_items(&cn, to_root);
 	tm = type_moves(from, to);
@@ -3431,7 +3528,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					sm.foreign_keys = lappend(sm.foreign_keys,
 											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
 													   f->name, first_field(line),
-													   strchr(line, '\t') + 1));
+													   constraint_def(line)));
 				break;
 			}
 		}
@@ -3646,6 +3743,10 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
+	/* (a merge base too: its definitions are what both sides changed from) */
+	check_format(&cn, base_root, "merged");
+	check_format(&cn, ours_root, "merged");
+	check_format(&cn, theirs_root, "merged");
 	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, base_root, CurrentMemoryContext);
 	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, ours_root, CurrentMemoryContext);
 	cur[2] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, theirs_root, CurrentMemoryContext);
@@ -3707,13 +3808,22 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
 
 	/* a schema dropped on one side, given objects on the other */
-	foreach(lc, kept)
-		if (list_has_string(dropped, schema_of(lfirst(lc))))
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
-							schema_of(lfirst(lc)), (char *) lfirst(lc)),
-					 errdetail("Dropping it would drop what the other side made in it.")));
+	if (dropped != NIL)
+	{
+		foreach(lc, kept)
+		{
+			char	   *schema = schema_of(lfirst(lc));
+
+			if (schema && list_has_string(dropped, schema))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
+								schema, (char *) lfirst(lc)),
+						 errdetail("Dropping it would drop what the other side made in it.")));
+			if (schema)
+				pfree(schema);
+		}
+	}
 }
 
 const ProllyCanonRoutine prolly_canon_folded = {

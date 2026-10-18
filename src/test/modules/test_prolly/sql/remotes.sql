@@ -7,6 +7,8 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (this build's canonical format, for a remote's head set by hand)
+SELECT value AS fmt FROM test_fold_items() WHERE key = '!:format' \gset
 
 SELECT current_database() AS db \gset
 \getenv abs_builddir PG_ABS_BUILDDIR
@@ -129,7 +131,7 @@ SELECT test_root_without_format(test_fold_root()) AS oldroot \gset
 SELECT test_commit_of(:'oldroot', 'old format') AS oldcommit \gset
 SELECT test_remote_put(:'url_a', :'oldroot', test_chunk_get(:'oldroot'));
 SELECT test_remote_put(:'url_a', :'oldcommit', test_chunk_get(:'oldcommit'));
-SELECT test_remote_set_head(:'url_a', 'old', :'oldcommit', '2');
+SELECT test_remote_set_head(:'url_a', 'old', :'oldcommit', :'fmt');
 \c regress_remotes_b
 CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
@@ -149,7 +151,7 @@ SELECT dolt_remote('add', 'bad', :'url_bad');
 SELECT test_chunk_get(dolt_hashof('main')) AS commit_bytes \gset
 SELECT test_remote_put(:'url_bad', dolt_hashof('main'), :'commit_bytes');
 SELECT encode(sha256('not a commit'::bytea), 'hex') AS fake \gset
-SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), '2');
+SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), :'fmt');
 
 -- (fetched into a third database, which has none of the chunks)
 CREATE DATABASE regress_remotes_c;
@@ -173,7 +175,7 @@ SELECT count(*) AS table_files FROM test_chunk_table_files();
 -- a chunk that doesn't match its hash
 SELECT dolt_remote('add', 'liar', :'url_bad' || '-liar');
 SELECT test_remote_put(:'url_bad' || '-liar', :'fake', '\x01020304');
-SELECT test_remote_set_head(:'url_bad' || '-liar', 'main', :'fake', '2');
+SELECT test_remote_set_head(:'url_bad' || '-liar', 'main', :'fake', :'fmt');
 SELECT pg_temp.err($$SELECT dolt_fetch('liar')$$);
 
 -- a remote of another canonical format
@@ -205,7 +207,7 @@ DROP OWNED BY regress_remote_user;
 DROP ROLE regress_remote_user;
 
 -- a remote's branch of any name's length
-SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), '2');
+SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), :'fmt');
 SELECT dolt_fetch();
 SELECT length(name) AS long_name FROM dolt_remote_branches WHERE name LIKE '%xxxx%';
 

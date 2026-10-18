@@ -80,6 +80,7 @@ tests += {
       'remote_clone',
       'dependencies',
       'dependency_moves',
+      'canonical_escapes',
     ],
   },
   'tap': {

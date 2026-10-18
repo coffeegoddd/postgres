@@ -6,6 +6,8 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (this build's canonical format, for a remote's head set by hand)
+SELECT value AS fmt FROM test_fold_items() WHERE key = '!:format' \gset
 SELECT current_database() AS db \gset
 \getenv abs_builddir PG_ABS_BUILDDIR
 \set dir :abs_builddir '/tmp_check/remotes'
@@ -358,7 +360,7 @@ SELECT test_remote_put(:'url_a', :'oldcommit', test_chunk_get(:'oldcommit'));
  
 (1 row)
 
-SELECT test_remote_set_head(:'url_a', 'old', :'oldcommit', '2');
+SELECT test_remote_set_head(:'url_a', 'old', :'oldcommit', :'fmt');
  test_remote_set_head 
 ----------------------
  t
@@ -407,7 +409,7 @@ SELECT test_remote_put(:'url_bad', dolt_hashof('main'), :'commit_bytes');
 (1 row)
 
 SELECT encode(sha256('not a commit'::bytea), 'hex') AS fake \gset
-SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), '2');
+SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), :'fmt');
  test_remote_set_head 
 ----------------------
  t
@@ -464,7 +466,7 @@ SELECT test_remote_put(:'url_bad' || '-liar', :'fake', '\x01020304');
  
 (1 row)
 
-SELECT test_remote_set_head(:'url_bad' || '-liar', 'main', :'fake', '2');
+SELECT test_remote_set_head(:'url_bad' || '-liar', 'main', :'fake', :'fmt');
  test_remote_set_head 
 ----------------------
  t
@@ -490,7 +492,7 @@ SELECT test_remote_set_head(:'url_old', 'main', :'fake', '1');
 (1 row)
 
 SELECT dolt_fetch('old');
-ERROR:  remote "old" holds commits of canonical format 1, not 2
+ERROR:  remote "old" holds commits of canonical format 1, not 3
 \c :db
 -- a role without the privileges of pg_read_server_files can't read one,
 -- nor push to one (a push reads it), whatever it may write
@@ -524,7 +526,7 @@ RESET ROLE;
 DROP OWNED BY regress_remote_user;
 DROP ROLE regress_remote_user;
 -- a remote's branch of any name's length
-SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), '2');
+SELECT test_remote_set_head(:'url_a', repeat('x', 1500), dolt_hashof('main'), :'fmt');
  test_remote_set_head 
 ----------------------
  t

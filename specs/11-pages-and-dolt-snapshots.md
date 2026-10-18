@@ -509,6 +509,27 @@ fails without its fix), and Postgres's suites keep passing after each one.
   tables), `dolt_status` lists them as "not covered" and unstaged, a branch
   with them is dirty, only a commit refuses them, and a diff of one table
   folds that table alone.
+- **As built:** a table's schema, a type's definition and a collation's
+  description are text split into lines and fields, and the names and
+  expressions in them were written as they were: a quoted name or string
+  literal with a tab or newline (and every rule's definition, which
+  Postgres prints over several lines) was read back wrongly by a move or
+  merge, or crashed it. Since format 3 of the root's `"!:format"` item
+  (`FOLDED_FORMAT`; not the canonicalizer's `format_version`, a
+  separate number) every such field is escaped (a backslash, tab or
+  newline as `\\`, `\t`, `\n`) and read back where it is used (#195);
+  functions', views' and materialized views' definitions, never split,
+  are kept as they are. A sequence's definition is split too, but holds
+  only its type (one of three built-in names) and numbers: nothing to
+  escape, and a field added that could hold a name must be. A clean
+  break, as format 2 was (user, 2026-10-17, choosing escaping over
+  refusing such names, which are legal Postgres): an older root's rows
+  aren't read, and it is neither moved to nor merged, a merge base
+  included ("commit the branch" to write it anew); between an older root
+  and a current one, `dolt_diff` and `dolt_status` may list an object
+  whose definition holds a backslash, tab or newline as modified, as its
+  text was re-escaped. `dolt_status` splits its rows at the last tab and
+  sorts them by name, a table's name holding a tab included.
 
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and

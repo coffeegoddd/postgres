@@ -1265,10 +1265,17 @@ dolt_branches(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* dolt_status's rows ("name\tstatus") by name, which may hold a tab. */
 static int
-name_cmp(const ListCell *a, const ListCell *b)
+status_cmp(const ListCell *a, const ListCell *b)
 {
-	return strcmp(lfirst(a), lfirst(b));
+	const char *x = lfirst(a);
+	const char *y = lfirst(b);
+	size_t		xl = strrchr(x, '\t') - x;
+	size_t		yl = strrchr(y, '\t') - y;
+	int			c = memcmp(x, y, Min(xl, yl));
+
+	return c != 0 ? c : xl < yl ? -1 : xl > yl ? 1 : strcmp(x + xl, y + yl);
 }
 
 typedef struct StatusSink
@@ -1351,7 +1358,8 @@ dolt_status(PG_FUNCTION_ARGS)
 				{
 					char	   *n = lfirst(lc);
 
-					if (strncmp(n, name, len) == 0 && n[len] == '\t')
+					/* (the status is after the last tab: a name may hold one) */
+					if (strrchr(n, '\t') == n + len && strncmp(n, name, len) == 0)
 						names = foreach_delete_current(names, lc);
 				}
 				names = lappend(names, psprintf("%s\tconflict", name));
@@ -1381,12 +1389,12 @@ dolt_status(PG_FUNCTION_ARGS)
 									 "conflict" : "modified"));
 		}
 	}
-	list_sort(names, name_cmp);
+	list_sort(names, status_cmp);
 	foreach(lc, names)
 	{
 		Datum		values[3];
 		bool		nulls[3] = {0};
-		char	   *tab = strchr(lfirst(lc), '\t');
+		char	   *tab = strrchr(lfirst(lc), '\t');	/* (a name may hold one) */
 
 		*tab = '\0';
 		values[0] = CStringGetTextDatum(lfirst(lc));
