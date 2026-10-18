@@ -110,6 +110,7 @@ tests += {
       't/045_remotes.pl',
       't/046_branch_crash.pl',
       't/047_network_remotes.pl',
+      't/048_network_batches.pl',
       't/053_serve_snapshots.pl',
     ],
   },
