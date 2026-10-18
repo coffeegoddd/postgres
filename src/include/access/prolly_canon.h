@@ -105,6 +105,7 @@ typedef struct ProllyTableColumn
 {
 	char	   *name;
 	char	   *type;			/* as format_type() writes it */
+	char	   *generated;		/* a generated column's expression, or NULL */
 } ProllyTableColumn;
 
 /* A transaction's own row changes to a table: its tuple versions' TIDs. */

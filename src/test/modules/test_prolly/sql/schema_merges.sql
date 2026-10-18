@@ -363,4 +363,132 @@ SELECT conname, convalidated FROM pg_constraint
 ROLLBACK;
 SELECT dolt_branch('-D', 'snn_right');
 DROP SCHEMA snn CASCADE;
+
+-- A row taken out for breaking a check the merge added, which another
+-- table's rows reference: those rows stay, recorded as breaking their
+-- foreign key (no trigger fires for the row taken out).
+CREATE SCHEMA sfk VERSIONED;
+CREATE TABLE sfk.parent (id int PRIMARY KEY, v int);
+CREATE TABLE sfk.child (id int PRIMARY KEY, pid int REFERENCES sfk.parent ON DELETE CASCADE);
+INSERT INTO sfk.parent VALUES (1, 1), (2, 2);
+INSERT INTO sfk.child VALUES (10, 1), (20, 2);
+SELECT length(dolt_commit('-Am', 'sfk base')::text) AS committed;
+SELECT dolt_branch('sfk_right');
+SELECT dolt_checkout('sfk_right');
+ALTER TABLE sfk.parent ADD CONSTRAINT v_pos CHECK (v > 0);
+SELECT length(dolt_commit('-Am', 'sfk right')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE sfk.parent SET v = -1 WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'sfk left')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('sfk_right'))[2:4];
+SELECT * FROM sfk.parent ORDER BY id;
+SELECT * FROM sfk.child ORDER BY id;
+SELECT 'parent' AS t, violation_type, violating_row FROM dolt_constraint_violations('sfk.parent')
+UNION ALL
+SELECT 'child', violation_type, violating_row FROM dolt_constraint_violations('sfk.child')
+ORDER BY 1;
+ROLLBACK;
+SELECT dolt_branch('-D', 'sfk_right');
+DROP SCHEMA sfk CASCADE;
+
+-- Two sides' primary keys, or NOT NULLs of one column, named differently:
+-- a table can't have both, a schema conflict.
+CREATE SCHEMA spk VERSIONED;
+CREATE TABLE spk.t (a int, b int, c int);
+SELECT length(dolt_commit('-Am', 'spk base')::text) AS committed;
+SELECT dolt_branch('spk_right');
+SELECT dolt_branch('spk_nn');
+SELECT dolt_checkout('spk_right');
+ALTER TABLE spk.t ADD CONSTRAINT pk2 PRIMARY KEY (b);
+SELECT length(dolt_commit('-Am', 'spk right')::text) AS committed;
+SELECT dolt_checkout('spk_nn');
+ALTER TABLE spk.t ADD CONSTRAINT c_set NOT NULL c;
+SELECT length(dolt_commit('-Am', 'spk nn')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE spk.t ADD PRIMARY KEY (a), ALTER COLUMN c SET NOT NULL;
+SELECT length(dolt_commit('-Am', 'spk left')::text) AS committed;
+SELECT dolt_merge('spk_right');
+SELECT dolt_merge('spk_nn');
+SELECT dolt_branch('-D', 'spk_right');
+SELECT dolt_branch('-D', 'spk_nn');
+DROP SCHEMA spk CASCADE;
+
+-- A foreign key added referencing a partitioned table: validated, as are
+-- the constraints Postgres made for it for each partition.
+CREATE SCHEMA sfp VERSIONED;
+CREATE TABLE sfp.parted (id int PRIMARY KEY) PARTITION BY RANGE (id);
+CREATE TABLE sfp.parted_1 PARTITION OF sfp.parted FOR VALUES FROM (0) TO (100);
+CREATE TABLE sfp.parted_2 PARTITION OF sfp.parted FOR VALUES FROM (100) TO (200);
+INSERT INTO sfp.parted VALUES (1), (150);
+CREATE TABLE sfp.t (id int PRIMARY KEY, x int);
+INSERT INTO sfp.t VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sfp base')::text) AS committed;
+SELECT dolt_branch('sfp_right');
+SELECT dolt_checkout('sfp_right');
+ALTER TABLE sfp.t ADD CONSTRAINT t_x_fk FOREIGN KEY (x) REFERENCES sfp.parted;
+SELECT length(dolt_commit('-Am', 'sfp right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO sfp.t VALUES (2, 150), (3, 999);
+SELECT length(dolt_commit('-Am', 'sfp left')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('sfp_right'))[2:4];
+SELECT conrelid::regclass, confrelid::regclass, convalidated FROM pg_constraint
+  WHERE conname LIKE 't_x_fk%' ORDER BY 2::text;
+SELECT violation_type, violating_row FROM dolt_constraint_violations('sfp.t');
+ROLLBACK;
+SELECT dolt_branch('-D', 'sfp_right');
+DROP SCHEMA sfp CASCADE;
+
+-- A key over a column named in quotes, added on one side: moved and merged.
+CREATE SCHEMA sqk VERSIONED;
+CREATE TABLE sqk.t ("MyCol" int, v int);
+INSERT INTO sqk.t VALUES (1, 1), (2, 2);
+SELECT length(dolt_commit('-Am', 'sqk base')::text) AS committed;
+SELECT dolt_branch('sqk_right');
+SELECT dolt_checkout('sqk_right');
+ALTER TABLE sqk.t ADD PRIMARY KEY ("MyCol");
+SELECT length(dolt_commit('-Am', 'sqk right')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_checkout('sqk_right');
+SELECT conname, contype, convalidated FROM pg_constraint
+  WHERE conrelid = 'sqk.t'::regclass ORDER BY 1;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sqk_right');
+DROP SCHEMA sqk CASCADE;
+
+-- A generated column's expression changed on one side, rows written on
+-- the other: their values computed by the expression as merged.
+CREATE SCHEMA sge VERSIONED;
+CREATE TABLE sge.t (pk int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2) STORED);
+INSERT INTO sge.t (pk, a) VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sge base')::text) AS committed;
+SELECT dolt_branch('sge_right');
+SELECT dolt_checkout('sge_right');
+ALTER TABLE sge.t ALTER COLUMN g SET EXPRESSION AS (a * 3);
+SELECT length(dolt_commit('-Am', 'sge right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO sge.t (pk, a) VALUES (2, 2);
+SELECT length(dolt_commit('-Am', 'sge left')::text) AS committed;
+SELECT (dolt_merge('sge_right'))[2:4];
+SELECT * FROM sge.t ORDER BY pk;
+SELECT dolt_branch('-D', 'sge_right');
+DROP SCHEMA sge CASCADE;
+
+-- A column one side dropped and the other changed, the table's key
+-- dropped too: refused for the key, not misread.
+CREATE SCHEMA slk VERSIONED;
+CREATE TABLE slk.t (pk int PRIMARY KEY, a int, c int);
+INSERT INTO slk.t VALUES (1, 1, 1);
+SELECT length(dolt_commit('-Am', 'slk base')::text) AS committed;
+SELECT dolt_branch('slk_right');
+SELECT dolt_checkout('slk_right');
+UPDATE slk.t SET c = 2;
+SELECT length(dolt_commit('-Am', 'slk right')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE slk.t DROP CONSTRAINT t_pkey, DROP COLUMN c;
+SELECT length(dolt_commit('-Am', 'slk left')::text) AS committed;
+SELECT dolt_merge('slk_right');
+SELECT dolt_branch('-D', 'slk_right');
+DROP SCHEMA slk CASCADE;
 DROP SCHEMA app CASCADE;

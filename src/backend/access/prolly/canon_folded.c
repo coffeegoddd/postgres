@@ -154,6 +154,7 @@
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
+#include "common/int.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -731,6 +732,27 @@ append_policies(StringInfo out, Relation rel)
 	}
 }
 
+/*
+ * Is con a foreign key Postgres made for one of the table's own, for a
+ * partition of the partitioned table it references?  It comes and goes
+ * with that one, which describes it.
+ */
+static bool
+foreign_key_clone(Form_pg_constraint con)
+{
+	HeapTuple	tup;
+	bool		clone;
+
+	if (!OidIsValid(con->conparentid))
+		return false;
+	tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(con->conparentid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for constraint %u", con->conparentid);
+	clone = ((Form_pg_constraint) GETSTRUCT(tup))->conrelid == con->conrelid;
+	ReleaseSysCache(tup);
+	return clone;
+}
+
 static void
 describe_table(Canon *cn, Relation rel, StringInfo out)
 {
@@ -802,6 +824,9 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 		/* (a partition's from its partitioned table: the table's) */
 		if (rel->rd_rel->relispartition && !con->conislocal)
+			continue;
+		/* (one Postgres made for a referenced table's partition: its foreign key's) */
+		if (con->contype == CONSTRAINT_FOREIGN && foreign_key_clone(con))
 			continue;
 		line = makeStringInfo();
 		append_field(line, quote_identifier(NameStr(con->conname)));
@@ -3254,8 +3279,8 @@ static char *unquoted(const char *ident);
 
 /*
  * A table's description read back: its columns (each line's first field,
- * its name, and second, its type), and whether a primary key, not
- * deferrable, is among its constraints.
+ * its name, and second, its type, and a generated column's expression),
+ * and whether a primary key, not deferrable, is among its constraints.
  */
 static List *
 folded_table_columns(const ProllyValue *description, bool *keyed)
@@ -3269,10 +3294,13 @@ folded_table_columns(const ProllyValue *description, bool *keyed)
 	{
 		const char *line = lfirst(lc);
 		const char *type = strchr(line, '\t');
+		const char *generated = strstr(line, "\tgenerated ");
 		ProllyTableColumn *c = palloc0(sizeof(ProllyTableColumn));
 
 		c->name = unquoted(first_field(line));
 		c->type = type ? first_field(type + 1) : pstrdup("");
+		if (generated)
+			c->generated = first_field(generated + 11);
 		cols = lappend(cols, c);
 	}
 	*keyed = false;
@@ -3316,13 +3344,12 @@ constraint_def(const char *line)
 }
 
 /*
- * Is column col one of table t's primary key's (its PRIMARY KEY line's
- * column list, quoted as written)?
+ * Is column col (quoted as written) one of table t's primary key's (its
+ * PRIMARY KEY line's column list)?
  */
 static bool
 in_primary_key(const TableDef *t, const char *col)
 {
-	const char *q = quote_identifier(col);
 	ListCell   *lc;
 
 	foreach(lc, t->constraints)
@@ -3344,7 +3371,7 @@ in_primary_key(const TableDef *t, const char *col)
 		{
 			while (*c == ' ')
 				c++;
-			if (strcmp(c, q) == 0)
+			if (strcmp(c, col) == 0)
 				return true;
 		}
 	}
@@ -3865,6 +3892,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			const char *line = lfirst(lc);
 			bool		not_null = strstr(line, "\tNOT NULL ") != NULL;
 			bool		key = strstr(line, "\tPRIMARY KEY ") != NULL;
+			bool		after_rows;
 			char	   *sql;
 
 			if (list_has_string(from->constraints, line) ||
@@ -3874,17 +3902,28 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 						   first_field(line), constraint_def(line));
 
 			/*
+			 * A NOT NULL goes after the rows: a column added to a table with
+			 * rows has none in it until they are written; so is one the table
+			 * had, whose NULLs the rows written may replace, unless the
+			 * primary key, which the rows are keyed by, needs it.
+			 */
+			if (not_null && from != &none)
+			{
+				char	   *col = unescape_field(strstr(line, "\tNOT NULL ") + 10);
+
+				after_rows = !list_has_string(from_names, col) || !in_primary_key(to, col);
+			}
+			else
+				after_rows = false;
+
+			/*
 			 * A check, or a NOT NULL added after the rows, that the rows
 			 * written may break: added unvalidated, validated once the
 			 * caller has had them (not one unvalidated in to; nor a
 			 * partitioned table's or a partition's, which its partitions'
 			 * or parent's validation would reach).
 			 */
-			if ((strstr(line, "\tCHECK ") != NULL ||
-				 (not_null && from != &none &&
-				  (!list_has_string(from_names,
-									unescape_field(strstr(line, "\tNOT NULL ") + 10)) ||
-				   !in_primary_key(to, unescape_field(strstr(line, "\tNOT NULL ") + 10))))) &&
+			if ((strstr(line, "\tCHECK ") != NULL || after_rows) &&
 				strstr(constraint_def(line), "NOT VALID") == NULL &&
 				to->partition_by == NULL && to->partition_of == NULL)
 			{
@@ -3910,16 +3949,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
 							   quote_literal_cstr(name), quote_literal_cstr(first_field(line)),
 							   quote_literal_cstr(sql));
-			/*
-			 * (a column added to a table with rows has none in it until
-			 * they are written: its NOT NULL after them; so is one the
-			 * table had, whose NULLs the rows written may replace, unless
-			 * the primary key, which the rows are keyed by, needs it)
-			 */
-			if (not_null && from != &none &&
-				(!list_has_string(from_names,
-								  unescape_field(strstr(line, "\tNOT NULL ") + 10)) ||
-				 !in_primary_key(to, unescape_field(strstr(line, "\tNOT NULL ") + 10))))
+			if (after_rows)
 				sm->after = lappend(sm->after, sql);
 			else if (not_null || key)
 				sm->changes = lappend(sm->changes, sql);
@@ -5427,45 +5457,139 @@ table_line_key(int s, const char *line)
 	}
 }
 
-/* The line of lines (of section s) with key key, or NULL. */
-static const char *
-table_line(int s, List *lines, const char *key)
+/*
+ * A line of a section of a table's description, with what it's the
+ * definition of (its key), where it comes in its side's section, and what
+ * the merged section is sorted by.
+ */
+typedef struct TableLine
 {
+	const char *line;
+	char	   *key;
+	int			pos;
+	int			rank;			/* (policies: row security lines first) */
+	char	   *sort;
+} TableLine;
+
+static int
+table_line_key_cmp(const void *a, const void *b)
+{
+	return strcmp(((const TableLine *) a)->key, ((const TableLine *) b)->key);
+}
+
+static int
+table_line_pos_cmp(const void *a, const void *b)
+{
+	return pg_cmp_s32(((const TableLine *) a)->pos, ((const TableLine *) b)->pos);
+}
+
+static int
+table_line_sort_cmp(const void *a, const void *b)
+{
+	const TableLine *x = a;
+	const TableLine *y = b;
+
+	if (x->rank != y->rank)
+		return pg_cmp_s32(x->rank, y->rank);
+	return strcmp(x->sort, y->sort);
+}
+
+/* Section s's lines, each with its key computed once, sorted by key. */
+static TableLine *
+table_lines(int s, List *lines)
+{
+	TableLine  *tl = palloc_array(TableLine, list_length(lines) + 1);
 	ListCell   *lc;
 
 	foreach(lc, lines)
-		if (strcmp(table_line_key(s, lfirst(lc)), key) == 0)
-			return lfirst(lc);
-	return NULL;
+	{
+		TableLine  *l = &tl[foreach_current_index(lc)];
+
+		l->line = lfirst(lc);
+		l->key = table_line_key(s, l->line);
+		l->pos = foreach_current_index(lc);
+		l->rank = 0;
+		l->sort = NULL;
+	}
+	qsort(tl, list_length(lines), sizeof(TableLine), table_line_key_cmp);
+	return tl;
 }
 
-static int
-index_line_cmp(const ListCell *a, const ListCell *b)
+/*
+ * How a merged section is sorted, as its description has it: constraints
+ * and statistics objects by their lines, indexes by name, triggers and
+ * rules by their statements, policies by theirs after the row security
+ * lines; columns, and the partitioning, as they come.
+ */
+static void
+set_table_line_sort(int s, TableLine *l)
 {
-	return strcmp(table_line_key(2, lfirst(a)), table_line_key(2, lfirst(b)));
+	switch (s)
+	{
+		case 1:
+		case 6:
+			l->sort = unconstify(char *, l->line);
+			break;
+		case 2:
+			l->sort = l->key;
+			break;
+		case 5:
+			if (strcmp(l->key, l->line) == 0)
+			{
+				l->rank = strcmp(l->line, ROW_SECURITY) == 0 ? 0 : 1;
+				l->sort = "";
+				break;
+			}
+			l->rank = 2;
+			pg_fallthrough;
+		case 3:
+		case 4:
+			l->sort = unescape_field(l->line);
+			break;
+		default:
+			l->sort = "";
+			break;
+	}
 }
 
-static int
-statement_line_cmp(const ListCell *a, const ListCell *b)
+/*
+ * Whether merged constraints could stand together on one table: no more
+ * than one primary key, nor one column with two NOT NULLs.  Merged by
+ * name, two sides' keys or NOT NULLs named differently would both be
+ * kept.
+ */
+static bool
+constraints_compatible(TableLine *merged, int n)
 {
-	return strcmp(unescape_field(lfirst(a)), unescape_field(lfirst(b)));
+	List	   *not_null = NIL;
+	int			keys = 0;
+
+	for (int i = 0; i < n; i++)
+	{
+		const char *nn = strstr(merged[i].line, "\tNOT NULL ");
+
+		if (strstr(merged[i].line, "\tPRIMARY KEY ") != NULL && ++keys > 1)
+			return false;
+		if (nn != NULL)
+		{
+			char	   *col = unescape_field(nn + 10);
+
+			if (list_has_string(not_null, col))
+				return false;
+			not_null = lappend(not_null, col);
+		}
+	}
+	return true;
 }
 
-/* The row security lines first, then the policies, sorted. */
-static int
-policy_line_cmp(const ListCell *a, const ListCell *b)
+/* Whether two sides have a part alike: both the same line, or neither one. */
+static bool
+same_line(const TableLine *a, const TableLine *b)
 {
-	bool		ra = strcmp(table_line_key(5, lfirst(a)), lfirst(a)) == 0;
-	bool		rb = strcmp(table_line_key(5, lfirst(b)), lfirst(b)) == 0;
-
-	if (ra != rb)
-		return ra ? -1 : 1;
-	if (ra)
-		return strcmp(lfirst(a), ROW_SECURITY) == 0 ? -1 : 1;
-	return statement_line_cmp(a, b);
+	if (a == NULL || b == NULL)
+		return a == b;
+	return strcmp(a->line, b->line) == 0;
 }
-
-#define SAME_LINE(a, b) ((a) == NULL ? (b) == NULL : (b) != NULL && strcmp(a, b) == 0)
 
 /*
  * A table's description as both sides changed it from base's, merged part
@@ -5487,53 +5611,66 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 	initStringInfo(&out);
 	for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
 	{
-		List	   *merged = NIL;
-		List	   *keys = NIL;
-		ListCell   *lc;
+		TableLine  *tl[3];
+		int			len[3];
+		int			at[3] = {0, 0, 0};
+		TableLine  *merged;
+		int			n = 0;
 
-		/* every part any side has: ours', then theirs', then base's */
-		for (int side = 1; side <= 3; side++)
-			foreach(lc, sec[side % 3][s])
-			{
-				char	   *key = table_line_key(s, lfirst(lc));
-
-				if (!list_has_string(keys, key))
-					keys = lappend(keys, key);
-			}
-		foreach(lc, keys)
+		for (int side = 0; side < 3; side++)
 		{
-			const char *b = table_line(s, sec[0][s], lfirst(lc));
-			const char *o = table_line(s, sec[1][s], lfirst(lc));
-			const char *t = table_line(s, sec[2][s], lfirst(lc));
-			const char *m;
+			tl[side] = table_lines(s, sec[side][s]);
+			len[side] = list_length(sec[side][s]);
+		}
+		merged = palloc_array(TableLine, len[0] + len[1] + len[2] + 1);
 
-			if (SAME_LINE(o, b))
-				m = t;
-			else if (SAME_LINE(t, b) || SAME_LINE(o, t))
-				m = o;
+		/* every part any side has, the three sides' lines walked by key */
+		for (;;)
+		{
+			const char *key = NULL;
+			const TableLine *x[3] = {NULL, NULL, NULL};
+			const TableLine *m;
+
+			for (int side = 0; side < 3; side++)
+				if (at[side] < len[side] &&
+					(key == NULL || strcmp(tl[side][at[side]].key, key) < 0))
+					key = tl[side][at[side]].key;
+			if (key == NULL)
+				break;
+			for (int side = 0; side < 3; side++)
+				if (at[side] < len[side] && strcmp(tl[side][at[side]].key, key) == 0)
+					x[side] = &tl[side][at[side]++];
+			if (same_line(x[1], x[0]))
+				m = x[2];
+			else if (same_line(x[2], x[0]) || same_line(x[1], x[2]))
+				m = x[1];
 			else
 				return NULL;
-			if (m)
-				merged = lappend(merged, unconstify(char *, m));
+			if (m == NULL)
+				continue;
+
+			/* (where it comes: as ours has it, then theirs, then base) */
+			merged[n] = *m;
+			merged[n].pos = x[1] ? x[1]->pos :
+				x[2] ? len[1] + x[2]->pos : len[1] + len[2] + x[0]->pos;
+			set_table_line_sort(s, &merged[n]);
+			n++;
 		}
-		if (s == 1 || s == 6)
-			list_sort(merged, cstring_cmp);
-		else if (s == 2)
-			list_sort(merged, index_line_cmp);
-		else if (s == 3 || s == 4)
-			list_sort(merged, statement_line_cmp);
-		else if (s == 5)
-			list_sort(merged, policy_line_cmp);
-		if (merged == NIL && s >= ALWAYS_WRITTEN_SECTIONS)
+		if (s == 0 || s >= 7)
+			qsort(merged, n, sizeof(TableLine), table_line_pos_cmp);
+		else
+			qsort(merged, n, sizeof(TableLine), table_line_sort_cmp);
+		if (s == 1 && !constraints_compatible(merged, n))
+			return NULL;
+		if (n == 0 && s >= ALWAYS_WRITTEN_SECTIONS)
 			continue;
 		appendStringInfo(&out, "%s\n", table_sections[s]);
-		foreach(lc, merged)
-			appendStringInfo(&out, "%s\n", (char *) lfirst(lc));
+		for (int i = 0; i < n; i++)
+			appendStringInfo(&out, "%s\n", merged[i].line);
 	}
 	return out.data;
 }
 
-#undef SAME_LINE
 
 /*
  * The definitions of base, ours and theirs merged: each object as the side

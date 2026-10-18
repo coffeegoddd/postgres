@@ -64,6 +64,7 @@
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
+#include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/json.h"
@@ -1795,6 +1796,7 @@ typedef struct VersionColumn
 	char	   *name;
 	Oid			type;
 	int32		typmod;
+	char	   *generated;		/* a generated column's expression, or NULL */
 } VersionColumn;
 
 /*
@@ -1815,10 +1817,61 @@ version_columns(const Table *x, bool *keyed)
 		VersionColumn *c = palloc0(sizeof(VersionColumn));
 
 		c->name = tc->name;
+		c->generated = tc->generated;
 		(void) parseTypeString(tc->type, &c->type, &c->typmod, NULL);
 		cols = lappend(cols, c);
 	}
 	return cols;
+}
+
+/*
+ * A version's rows decoded: its columns, as its description has them, and
+ * whether it has a primary key.
+ */
+typedef struct VersionReader
+{
+	ProllyValueEncoder *enc;
+	TupleTableSlot *slot;
+	List	   *cols;			/* VersionColumn * */
+	bool		keyed;
+} VersionReader;
+
+static void
+version_reader(const Table *x, ProllyKeyingRefs *krefs, VersionReader *vr)
+{
+	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
+	TupleDesc	xd;
+	ListCell   *lc;
+	int			i = 1;
+
+	vr->cols = version_columns(x, &vr->keyed);
+	xd = CreateTemplateTupleDesc(list_length(vr->cols));
+	foreach(lc, vr->cols)
+	{
+		VersionColumn *c = lfirst(lc);
+
+		TupleDescInitEntry(xd, i++, c->name, c->type, c->typmod, 0);
+	}
+	TupleDescFinalize(xd);
+	vr->enc = PROLLY_CALL(ve, begin, xd, CurrentMemoryContext);
+	PROLLY_CALL(ve, set_values, vr->enc, &krefs->values);
+	vr->slot = MakeSingleTupleTableSlot(xd, &TTSOpsVirtual);
+}
+
+/* Column name's generation expression among cols, or "" (none, or no such column). */
+static const char *
+generation_of(List *cols, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, cols)
+	{
+		VersionColumn *c = lfirst(lc);
+
+		if (strcmp(c->name, name) == 0)
+			return c->generated ? c->generated : "";
+	}
+	return "";
 }
 
 typedef struct ConvRow
@@ -1867,12 +1920,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 			   Table *out)
 {
 	RowDiff		rd;
-	bool		keyed;
-	List	   *cols;
+	VersionReader vr;
+	List	   *now_cols;
 	TupleDesc	xd;
 	TupleDesc	md = RelationGetDescr(rel);
 	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
-	ProllyValueEncoder *enc;
 	TupleTableSlot *xs;
 	TupleTableSlot *ms;
 	int		   *from;
@@ -1890,9 +1942,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	int			max = 0;
 	int			i;
 	ProllyTreeBuilder *b;
-	ListCell   *lc;
 	EState	   *estate = NULL;	/* (computing generated columns) */
-	List	   *generated = NIL;	/* those added, and their expressions */
+	List	   *generated = NIL;	/* those computed, and their expressions */
 	List	   *gen_exprs = NIL;
 	bool		keyed_now;
 	bool		keys_kept;
@@ -1909,31 +1960,26 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 
 	rd.kr = keying_of(rel);
 	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
-	cols = version_columns(x, &keyed);
+	chunk_env(&env);
+	env.compare = keying_compare;
+	env.compare_arg = &rd;
+	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
+	version_reader(x, &krefs, &vr);
+	now_cols = version_columns(now, &keyed_now);
 
 	/*
 	 * (a version with a primary key where the table has none now, or the
 	 * other way: its rows are keyed otherwise; one whose key the encoder
 	 * can't order is keyed by content as the table is)
 	 */
-	(void) version_columns(now, &keyed_now);
-	if (keyed != keyed_now)
+	if (vr.keyed != keyed_now)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rows of table \"%s\" can't be merged across a change of its primary key",
 						RelationGetRelationName(rel))));
 
-	xd = CreateTemplateTupleDesc(list_length(cols));
-	i = 1;
-	foreach(lc, cols)
-	{
-		VersionColumn *c = lfirst(lc);
-
-		TupleDescInitEntry(xd, i++, c->name, c->type, c->typmod, 0);
-	}
-	TupleDescFinalize(xd);
-	enc = PROLLY_CALL(ve, begin, xd, CurrentMemoryContext);
-	xs = MakeSingleTupleTableSlot(xd, &TTSOpsVirtual);
+	xs = vr.slot;
+	xd = xs->tts_tupleDescriptor;
 	ms = MakeSingleTupleTableSlot(md, &TTSOpsVirtual);
 
 	/* each column of rel's: which of x's it comes from, and how */
@@ -1952,10 +1998,14 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 			if (strcmp(NameStr(TupleDescAttr(xd, j)->attname), NameStr(att->attname)) == 0)
 				from[a] = j;
 		/*
-		 * (a stored generated column added is computed from the rest of
-		 * each row, as Postgres computed it; a virtual one isn't stored)
+		 * (a stored generated column added, or one x computed otherwise, is
+		 * computed from the rest of each row, as Postgres computed it; a
+		 * virtual one isn't stored)
 		 */
-		if (from[a] < 0 && att->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		if (att->attgenerated == ATTRIBUTE_GENERATED_STORED &&
+			(from[a] < 0 ||
+			 strcmp(generation_of(vr.cols, NameStr(att->attname)),
+					generation_of(now_cols, NameStr(att->attname))) != 0))
 		{
 			if (estate == NULL)
 				estate = CreateExecutorState();
@@ -1992,16 +2042,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	 * first.
 	 */
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
-	keys_kept = keyed;
+	keys_kept = vr.keyed;
 	for (int a = 0; a < md->natts && keys_kept; a++)
 		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
 			keys_kept = from[a] >= 0 && !OidIsValid(in_fn[a]);
 
-	chunk_env(&env);
-	env.compare = keying_compare;
-	env.compare_arg = &rd;
-	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
-	PROLLY_CALL(ve, set_values, enc, &krefs.values);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
 								   ALLOCSET_DEFAULT_SIZES);
@@ -2018,7 +2063,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 		outer = MemoryContextSwitchTo(rowcxt);
 		PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
 		ExecClearTuple(xs);
-		PROLLY_CALL(ve, decode, enc, &row, xs);
+		PROLLY_CALL(ve, decode, vr.enc, &row, xs);
 		slot_getallattrs(xs);
 		ExecClearTuple(ms);
 		for (int a = 0; a < md->natts; a++)
@@ -2120,7 +2165,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 		/* (rows that become the same: copies of one, or a key twice) */
 		while (j < n && conv_row_cmp(&rows[i], &rows[j], &rd) == 0)
 		{
-			if (keyed)
+			if (vr.keyed)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
@@ -2139,62 +2184,103 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	MemoryContextDelete(rowcxt);
 	out->text = now->text;
 	out->textlen = now->textlen;
-	PROLLY_CALL(ve, end, enc);
+	PROLLY_CALL(ve, end, vr.enc);
 	ExecDropSingleTupleTableSlot(xs);
 	ExecDropSingleTupleTableSlot(ms);
 	PROLLY_CALL(rd.kr, close, rd.k);
 	return out;
 }
 
-/* A version's rows decoded: its columns, as its description has them. */
-typedef struct VersionReader
+
+/* A column of each of two versions, by attribute index in its reader's slot. */
+typedef struct GoneColumn
 {
-	ProllyValueEncoder *enc;
-	TupleTableSlot *slot;
-} VersionReader;
+	char	   *name;
+	int			base;
+	int			side;
+	FmgrInfo	base_out;		/* (text forms compared: types differ) */
+	FmgrInfo	side_out;
+	bool		by_text;
+} GoneColumn;
 
-static void
-version_reader(const Table *x, ProllyKeyingRefs *krefs, VersionReader *vr)
+/* refuse_lost_changes()'s diff: base's rows and side's, checked as they come. */
+typedef struct LostChanges
 {
-	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
-	bool		keyed;
-	List	   *cols = version_columns(x, &keyed);
-	TupleDesc	xd = CreateTemplateTupleDesc(list_length(cols));
-	ListCell   *lc;
-	int			i = 1;
+	Changes		c;				/* (first: changes_compare() reads it) */
+	Relation	rel;
+	VersionReader br;
+	VersionReader sr;
+	List	   *gone;			/* GoneColumn * */
+	MemoryContext rowcxt;
+} LostChanges;
 
-	foreach(lc, cols)
-	{
-		VersionColumn *c = lfirst(lc);
-
-		TupleDescInitEntry(xd, i++, c->name, c->type, c->typmod, 0);
-	}
-	TupleDescFinalize(xd);
-	vr->enc = PROLLY_CALL(ve, begin, xd, CurrentMemoryContext);
-	PROLLY_CALL(ve, set_values, vr->enc, &krefs->values);
-	vr->slot = MakeSingleTupleTableSlot(xd, &TTSOpsVirtual);
-}
-
-/* Column name's value in a version's row (its text form), or NULL. */
-static char *
-version_value(TupleTableSlot *slot, const char *name)
+static int
+version_attno(VersionReader *vr, const char *name)
 {
-	TupleDesc	d = slot->tts_tupleDescriptor;
+	TupleDesc	d = vr->slot->tts_tupleDescriptor;
 
 	for (int a = 0; a < d->natts; a++)
-	{
-		Form_pg_attribute att = TupleDescAttr(d, a);
-		Oid			outf;
-		bool		varlena;
+		if (strcmp(NameStr(TupleDescAttr(d, a)->attname), name) == 0)
+			return a;
+	elog(ERROR, "column \"%s\" missing from its version", name);
+	return -1;					/* keep compiler quiet */
+}
 
-		if (strcmp(NameStr(att->attname), name) != 0)
-			continue;
-		if (slot->tts_isnull[a])
-			return NULL;
-		getTypeOutputInfo(att->atttypid, &outf, &varlena);
-		return OidOutputFunctionCall(outf, slot->tts_values[a]);
+/* A tree value's row into a version reader's slot. */
+static void
+decode_version_row(LostChanges *lc, VersionReader *vr, const ProllyValue *v)
+{
+	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
+	ProllyValue row;
+	uint64		count;
+
+	PROLLY_CALL(lc->c.rd.kr, parse_value, lc->c.rd.k, v, &row, &count);
+	ExecClearTuple(vr->slot);
+	PROLLY_CALL(ve, decode, vr->enc, &row, vr->slot);
+	slot_getallattrs(vr->slot);
+}
+
+static void
+check_lost_change(ProllyDiffKind kind, const ProllyKey *key,
+				  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	LostChanges *lc = arg;
+	MemoryContext old;
+	ListCell   *g;
+
+	/* (a row side added or deleted loses the column as every row does) */
+	if (before == NULL || after == NULL)
+		return;
+	old = MemoryContextSwitchTo(lc->rowcxt);
+	decode_version_row(lc, &lc->br, before);
+	decode_version_row(lc, &lc->sr, after);
+	foreach(g, lc->gone)
+	{
+		GoneColumn *gc = lfirst(g);
+		TupleTableSlot *bs = lc->br.slot;
+		TupleTableSlot *ss = lc->sr.slot;
+		Form_pg_attribute att = TupleDescAttr(bs->tts_tupleDescriptor, gc->base);
+		bool		same;
+
+		if (bs->tts_isnull[gc->base] || ss->tts_isnull[gc->side])
+			same = bs->tts_isnull[gc->base] && ss->tts_isnull[gc->side];
+		else if (gc->by_text)
+			same = strcmp(OutputFunctionCall(&gc->base_out, bs->tts_values[gc->base]),
+						  OutputFunctionCall(&gc->side_out, ss->tts_values[gc->side])) == 0;
+		else
+			same = datumIsEqual(bs->tts_values[gc->base], ss->tts_values[gc->side],
+								att->attbyval, att->attlen);
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being dropped or renamed",
+							RelationGetRelationName(lc->rel), gc->name),
+					 errdetail("One side changed values of \"%s\", which the other dropped or renamed: the changes would be lost.",
+							   gc->name)));
 	}
-	return NULL;
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(lc->rowcxt);
+	CHECK_FOR_INTERRUPTS();
 }
 
 /*
@@ -2202,32 +2288,33 @@ version_value(TupleTableSlot *slot, const char *name)
  * a column the table, as merged, hasn't: one the other side dropped, or
  * renamed (a rename reads, by name, as a drop and an add).  The change
  * would be lost: refused, not lost.  (Rows side added lose the column as
- * every row does.)
+ * every row does.)  The rows are checked as the diff finds them, the
+ * first change lost refused.  Versions keyed otherwise than the table now
+ * are left to as_defined_now(), which refuses them.
  */
 static void
 refuse_lost_changes(Relation rel, const Table *base, const Table *side,
 					const Table *now)
 {
-	const ProllyValueEncoderRoutine *ve = prolly_valenc_lookup("canonical");
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
-	bool		keyed;
+	bool		keyed_base;
+	bool		keyed_side;
+	bool		keyed_now;
 	List	   *base_cols;
 	List	   *now_cols;
 	List	   *gone = NIL;
 	ListCell   *lc;
-	Changes		c;
+	LostChanges lost;
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
-	VersionReader br;
-	VersionReader sr;
 
 	if (base == NULL || side == NULL || now == NULL ||
 		same_hash(&base->data.hash, &side->data.hash) ||
 		same_description(side, now))
 		return;
-	base_cols = version_columns(base, &keyed);
-	now_cols = version_columns(now, &keyed);
-	foreach(lc, version_columns(side, &keyed))
+	base_cols = version_columns(base, &keyed_base);
+	now_cols = version_columns(now, &keyed_now);
+	foreach(lc, version_columns(side, &keyed_side))
 	{
 		VersionColumn *sc = lfirst(lc);
 		bool		in_base = false;
@@ -2241,57 +2328,50 @@ refuse_lost_changes(Relation rel, const Table *base, const Table *side,
 		if (in_base && !in_now)
 			gone = lappend(gone, sc->name);
 	}
-	if (gone == NIL)
+	if (gone == NIL || keyed_base != keyed_now || keyed_side != keyed_now)
 		return;
 	require_readable(base);
 	require_readable(side);
 
-	memset(&c, 0, sizeof(c));
-	c.rd.kr = keying_of(rel);
-	c.rd.k = PROLLY_CALL(c.rd.kr, open, rel, CurrentMemoryContext);
+	memset(&lost, 0, sizeof(lost));
+	lost.rel = rel;
+	lost.c.rd.kr = keying_of(rel);
+	lost.c.rd.k = PROLLY_CALL(lost.c.rd.kr, open, rel, CurrentMemoryContext);
 	chunk_env(&env);
 	env.compare = changes_compare;
-	env.compare_arg = &c;
-	prolly_keying_use_env(&krefs, c.rd.kr, c.rd.k, tree, &env);
-	PROLLY_CALL(tree, diff, &env, &base->data, &side->data, collect_change, &c);
-	version_reader(base, &krefs, &br);
-	version_reader(side, &krefs, &sr);
-	foreach(lc, c.list)
+	env.compare_arg = &lost.c;
+	prolly_keying_use_env(&krefs, lost.c.rd.kr, lost.c.rd.k, tree, &env);
+	version_reader(base, &krefs, &lost.br);
+	version_reader(side, &krefs, &lost.sr);
+	foreach(lc, gone)
 	{
-		Change	   *ch = lfirst(lc);
-		ProllyValue v;
-		ProllyValue row;
-		uint64		count;
-		ListCell   *g;
+		GoneColumn *gc = palloc0(sizeof(GoneColumn));
+		Oid			bt;
+		Oid			st;
 
-		if (ch->before.len == 0 || ch->after.len == 0)
-			continue;
-		v.data = (const uint8 *) ch->before.data;
-		v.len = ch->before.len;
-		PROLLY_CALL(c.rd.kr, parse_value, c.rd.k, &v, &row, &count);
-		ExecClearTuple(br.slot);
-		PROLLY_CALL(ve, decode, br.enc, &row, br.slot);
-		slot_getallattrs(br.slot);
-		v.data = (const uint8 *) ch->after.data;
-		v.len = ch->after.len;
-		PROLLY_CALL(c.rd.kr, parse_value, c.rd.k, &v, &row, &count);
-		ExecClearTuple(sr.slot);
-		PROLLY_CALL(ve, decode, sr.enc, &row, sr.slot);
-		slot_getallattrs(sr.slot);
-		foreach(g, gone)
+		gc->name = lfirst(lc);
+		gc->base = version_attno(&lost.br, gc->name);
+		gc->side = version_attno(&lost.sr, gc->name);
+		bt = TupleDescAttr(lost.br.slot->tts_tupleDescriptor, gc->base)->atttypid;
+		st = TupleDescAttr(lost.sr.slot->tts_tupleDescriptor, gc->side)->atttypid;
+		gc->by_text = bt != st;
+		if (gc->by_text)
 		{
-			char	   *bv = version_value(br.slot, lfirst(g));
-			char	   *sv = version_value(sr.slot, lfirst(g));
+			Oid			outf;
+			bool		varlena;
 
-			if ((bv == NULL) != (sv == NULL) || (bv && strcmp(bv, sv) != 0))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being dropped or renamed",
-								RelationGetRelationName(rel), (char *) lfirst(g)),
-						 errdetail("One side changed values of \"%s\", which the other dropped or renamed: the changes would be lost.",
-								   (char *) lfirst(g))));
+			getTypeOutputInfo(bt, &outf, &varlena);
+			fmgr_info(outf, &gc->base_out);
+			getTypeOutputInfo(st, &outf, &varlena);
+			fmgr_info(outf, &gc->side_out);
 		}
+		lost.gone = lappend(lost.gone, gc);
 	}
+	lost.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "lost change check",
+										ALLOCSET_DEFAULT_SIZES);
+	PROLLY_CALL(tree, diff, &env, &base->data, &side->data, check_lost_change, &lost);
+	MemoryContextDelete(lost.rowcxt);
+	PROLLY_CALL(lost.c.rd.kr, close, lost.c.rd.k);
 }
 
 
@@ -2980,6 +3060,38 @@ unvalidated_violations(List *relids)
 }
 
 /*
+ * Mark foreign key conoid validated, and the constraints Postgres made for
+ * it (those for a partitioned table's partitions, referencing or
+ * referenced), as VALIDATE CONSTRAINT would.
+ */
+static void
+mark_foreign_key_validated(Relation pg_constraint, Oid conoid)
+{
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *clones = NIL;
+	ListCell   *lc;
+
+	tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(conoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for constraint %u", conoid);
+	((Form_pg_constraint) GETSTRUCT(tup))->convalidated = true;
+	CatalogTupleUpdate(pg_constraint, &tup->t_self, tup);
+	heap_freetuple(tup);
+
+	ScanKeyInit(&skey, Anum_pg_constraint_conparentid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(conoid));
+	scan = systable_beginscan(pg_constraint, ConstraintParentIndexId, true,
+							  NULL, 1, &skey);
+	while ((tup = systable_getnext(scan)) != NULL)
+		clones = lappend_oid(clones, ((Form_pg_constraint) GETSTRUCT(tup))->oid);
+	systable_endscan(scan);
+	foreach(lc, clones)
+		mark_foreign_key_validated(pg_constraint, lfirst_oid(lc));
+}
+
+/*
  * A merge's move's breaking(): the rows of its tables that break the
  * checks and NOT NULLs it added (unvalidated, ProllyAddedConstraint *)
  * taken away and recorded as violations, as the rows it couldn't write
@@ -3010,20 +3122,19 @@ take_breaking_rows(List *added, void *arg)
 		Oid			relid = RangeVarGetRelid(rv, NoLock, false);
 		char	   *name = strVal(linitial(stringToQualifiedNameList(ac->name, NULL)));
 		Oid			conoid = get_relation_constraint_oid(relid, name, false);
-		HeapTuple	tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(conoid));
+		HeapTuple	tup;
 		List	   *qi;
 		bool		check;
 
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for constraint %u", conoid);
 		note_written(relid);
 		if (ac->foreign_key)
 		{
-			((Form_pg_constraint) GETSTRUCT(tup))->convalidated = true;
-			CatalogTupleUpdate(pg_constraint, &tup->t_self, tup);
-			heap_freetuple(tup);
+			mark_foreign_key_validated(pg_constraint, conoid);
 			continue;
 		}
+		tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(conoid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for constraint %u", conoid);
 		qi = breaking_query(pg_constraint, tup, true, &check);
 		heap_freetuple(tup);
 		if (check)
