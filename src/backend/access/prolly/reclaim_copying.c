@@ -258,6 +258,10 @@ copying_collect(bool full, ProllyGcResult *result)
 	PROLLY_CALL(cs, gc_new, mk.gc, false, mark_new, &mk);
 	drain(&mk);
 
+	/* what the store keeps for its own reasons */
+	PROLLY_CALL(cs, gc_retained, mk.gc, mark_new, &mk);
+	drain(&mk);
+
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
 	INJECTION_POINT("prolly-gc-roots-scanned", NULL);

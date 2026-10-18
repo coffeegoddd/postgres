@@ -150,6 +150,7 @@
 #include "storage/condition_variable.h"
 #include "storage/procarray.h"
 #include "storage/spin.h"
+#include "replication/slot.h"
 #include "storage/standby.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
@@ -161,7 +162,8 @@
 #define MANIFEST_FILE		"prolly_manifest"
 #define MANIFEST_TEMP		"prolly_manifest.tmp"
 #define MANIFEST_MAGIC		"PRLYMAN1"
-#define MANIFEST_VERSION	2
+#define MANIFEST_VERSION	3
+#define MANIFEST_V2			2	/* no LSN a segment was sealed at */
 #define MANIFEST_V1			1	/* no segments (segment 0 alone), no flags */
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
@@ -253,6 +255,9 @@ typedef struct Manifest
 	ManifestFile *files;
 	int			nsegments;		/* at least one */
 	uint64	   *segments;		/* oldest first; appends go to the last */
+	XLogRecPtr *sealed_at;		/* each one's: the WAL's insert position as
+								 * it was sealed, after every append to it
+								 * (invalid: the last, or unknown) */
 	int			nretiring;
 	uint64	   *retiring;		/* table files and segments no longer named,
 								 * kept until those who may read them end */
@@ -495,6 +500,7 @@ static void standby_readers_resolve(Oid dboid);
 static void check_dropped(ProllyChunkStore *s, const ProllyHash *root);
 static void gc_abort(ProllyChunkGc *gc);
 static void gc_abort_sub(ProllyChunkGc *gc, int level);
+static XLogRecPtr logical_horizon(Oid dboid);
 
 /* ----------------------------------------------------------------
  * Records
@@ -2248,7 +2254,10 @@ manifest_bytes(const Manifest *m, StringInfo out)
 	}
 	append_le(out, m->nsegments, 4);
 	for (int i = 0; i < m->nsegments; i++)
+	{
 		append_le(out, m->segments[i], 8);
+		append_le(out, m->sealed_at ? m->sealed_at[i] : InvalidXLogRecPtr, 8);
+	}
 	append_le(out, m->nretiring, 4);
 	for (int i = 0; i < m->nretiring; i++)
 		append_le(out, m->retiring[i], 8);
@@ -2280,6 +2289,7 @@ manifest_segment_zero(Manifest *m)
 {
 	m->nsegments = 1;
 	m->segments = palloc0(sizeof(uint64));
+	m->sealed_at = palloc0(sizeof(XLogRecPtr));
 }
 
 /*
@@ -2339,7 +2349,8 @@ read_manifest_at(const char *path, Manifest *m)
 	p += 8;
 	version = (uint32) read_le(p, 4);
 	p += 4;
-	if (version != MANIFEST_VERSION && version != MANIFEST_V1)
+	if (version != MANIFEST_VERSION && version != MANIFEST_V2 &&
+		version != MANIFEST_V1)
 		goto corrupt;
 	m->gc_generation = (uint32) read_le(p, 4);
 	p += 4;
@@ -2377,19 +2388,23 @@ read_manifest_at(const char *path, Manifest *m)
 	{
 		uint32		nsegs;
 		uint32		nretiring;
+		Size		segentry = version == MANIFEST_V2 ? 8 : 16;
 
 		if (end - p < 4)
 			goto corrupt;
 		nsegs = (uint32) read_le(p, 4);
 		p += 4;
-		if (nsegs < 1 || (Size) (end - p) < (Size) nsegs * 8 + 4)
+		if (nsegs < 1 || (Size) (end - p) < (Size) nsegs * segentry + 4)
 			goto corrupt;
 		m->nsegments = nsegs;
 		m->segments = palloc(sizeof(uint64) * nsegs);
+		m->sealed_at = palloc0(sizeof(XLogRecPtr) * nsegs);
 		for (uint32 i = 0; i < nsegs; i++)
 		{
 			m->segments[i] = read_le(p, 8);
-			p += 8;
+			if (version != MANIFEST_V2)
+				m->sealed_at[i] = read_le(p + 8, 8);
+			p += segentry;
 		}
 		nretiring = (uint32) read_le(p, 4);
 		p += 4;
@@ -3758,15 +3773,21 @@ seal_segment(ProllyChunkStore *s, Manifest *m)
 {
 	uint64		id = m->last_id + 1;
 	uint64	   *segs = palloc(sizeof(uint64) * (m->nsegments + 1));
+	XLogRecPtr *sealed = palloc0(sizeof(XLogRecPtr) * (m->nsegments + 1));
 
 	memcpy(segs, m->segments, sizeof(uint64) * m->nsegments);
+	if (m->sealed_at)
+		memcpy(sealed, m->sealed_at, sizeof(XLogRecPtr) * m->nsegments);
 	segs[m->nsegments] = id;
 	scan_journal(s);
 	m->root = s->root;
 	m->last_id = id;
 	m->segments = segs;
+	m->sealed_at = sealed;
 	m->nsegments++;
 	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	/* after every append to it: each reserved its range under this lock */
+	sealed[m->nsegments - 2] = GetXLogInsertRecPtr();
 	segment_header(s->dboid, s->spcoid, id);
 	INJECTION_POINT("prolly-segment-made", NULL);
 	replace_manifest(s, m, XLOG_CHUNKS_SEAL);
@@ -3899,6 +3920,9 @@ struct ProllyChunkGc
 	Segment    *appended;		/* the segment appended to from the seal */
 	int			keep;			/* its KeepSet, -1 once let go */
 	bool		keep_all;		/* it had none */
+	int			nretained;		/* sealed segments not collected: a logical */
+	uint64	   *retained;		/* slot may still decode what was appended */
+	XLogRecPtr *retained_at;	/* to them (their sealed_at) */
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
@@ -4172,6 +4196,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	HASHCTL		ctl;
 	int			n = 0;
 	uint64		slot = 0;
+	XLogRecPtr	horizon;
 
 	if (s->gc != NULL)
 		elog(ERROR, "a chunk store collection is running in this transaction");
@@ -4248,11 +4273,27 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	gc->files = palloc0(sizeof(GcFile) * (gc->m.nsegments + gc->m.nfiles));
 
-	/* every segment but the one appends go to now */
+	/*
+	 * Every segment but the one appends go to now, but those sealed after
+	 * the oldest position a logical replication slot of the database may
+	 * decode from: kept as they are, their chunks roots (gc_retained()).
+	 */
+	horizon = logical_horizon(s->dboid);
+	gc->retained = palloc(sizeof(uint64) * gc->m.nsegments);
+	gc->retained_at = palloc(sizeof(XLogRecPtr) * gc->m.nsegments);
 	for (int i = 0; i < gc->m.nsegments - 1; i++)
 	{
-		GcFile	   *f = &gc->files[n++];
+		GcFile	   *f;
 
+		if (XLogRecPtrIsValid(horizon) &&
+			(!XLogRecPtrIsValid(gc->m.sealed_at[i]) ||
+			 gc->m.sealed_at[i] > horizon))
+		{
+			gc->retained[gc->nretained] = gc->m.segments[i];
+			gc->retained_at[gc->nretained++] = gc->m.sealed_at[i];
+			continue;
+		}
+		f = &gc->files[n++];
 		f->segment = true;
 		f->id = gc->m.segments[i];
 		f->first = slot;
@@ -4392,6 +4433,96 @@ journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out)
  * left, and their chunks committed or not, for good.  With window, appends
  * are held off from here until the swap.
  */
+/*
+ * The oldest position a logical replication slot of database dboid may
+ * decode from (invalid: it has none).
+ */
+static XLogRecPtr
+logical_horizon(Oid dboid)
+{
+	XLogRecPtr	horizon = InvalidXLogRecPtr;
+
+	if (max_replication_slots <= 0)
+		return InvalidXLogRecPtr;
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (int i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
+		XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+		if (!slot->in_use)
+			continue;
+		SpinLockAcquire(&slot->mutex);
+		if (SlotIsLogical(slot) && slot->data.database == dboid)
+			lsn = slot->data.restart_lsn;
+		SpinLockRelease(&slot->mutex);
+		if (XLogRecPtrIsValid(lsn) &&
+			(!XLogRecPtrIsValid(horizon) || lsn < horizon))
+			horizon = lsn;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	return horizon;
+}
+
+/*
+ * Visit every chunk of the sealed segments a collection keeps as they are
+ * (a logical replication slot may still decode what names them): roots.
+ */
+static void
+journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
+{
+	ProllyChunkStore *s = gc->s;
+
+	for (int i = 0; i < gc->nretained; i++)
+	{
+		Segment		g;
+		uint64		size;
+		uint64		offset = JOURNAL_HEADER_SIZE;
+		char	   *rec = NULL;
+		Size		reclen = 0;
+
+		memset(&g, 0, sizeof(g));
+		g.id = gc->retained[i];
+		g.path = segment_path(s->dboid, s->spcoid, g.id);
+		g.file = -1;
+		if (!open_segment(&g))
+			continue;
+		size = FileSize(g.file);
+		while (offset + RECORD_OVERHEAD <= size)
+		{
+			uint32		len;
+			uint8		kind;
+			ProllyHash	h;
+			Size		after;
+			TransactionId xid;
+
+			CHECK_FOR_INTERRUPTS();
+			read_exact(&g, (char *) &len, sizeof(len), offset);
+			if (len < RECORD_OVERHEAD || offset + len > size)
+				break;
+			if (len > reclen)
+			{
+				reclen = Max(len, 8192);
+				rec = rec ? repalloc(rec, reclen) : palloc(reclen);
+			}
+			read_exact(&g, rec, len, offset);
+			if (!record_valid(rec, len))
+				break;
+			kind = (uint8) rec[sizeof(uint32)];
+			if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
+				record_hash_xid(rec, len, &h, &after, &xid))
+				visit(&h, rec + after, len - after - sizeof(uint32), arg);
+			else if (kind == KIND_ROOT && record_hash(rec, len, &h, &after))
+				visit(&h, NULL, 0, arg);
+			offset += len;
+		}
+		FileClose(g.file);
+		if (rec)
+			pfree(rec);
+		pfree(g.path);
+	}
+}
+
 static void
 journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			   void *arg)
@@ -4701,8 +4832,12 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 		nm.retiring[nm.nretiring++] = gc->files[j].id;
 		freed_bytes += gc->files[j].size;
 	}
-	nm.nsegments = 1;
-	nm.segments = &gc->segment;
+	nm.nsegments = gc->nretained + 1;
+	nm.segments = palloc(sizeof(uint64) * nm.nsegments);
+	nm.sealed_at = palloc0(sizeof(XLogRecPtr) * nm.nsegments);
+	memcpy(nm.segments, gc->retained, sizeof(uint64) * gc->nretained);
+	memcpy(nm.sealed_at, gc->retained_at, sizeof(XLogRecPtr) * gc->nretained);
+	nm.segments[gc->nretained] = gc->segment;
 	scan_journal(s);
 	nm.root = s->root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
@@ -5122,4 +5257,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.gc_retire = journal_gc_retire,
 	.keep = journal_keep,
 	.gc_kept = journal_gc_kept,
+	.gc_retained = journal_gc_retained,
 };

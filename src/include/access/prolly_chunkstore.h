@@ -79,6 +79,10 @@
  *   of since it began (false: too many to remember, and the collector must
  *   keep every chunk collected).  keep() fails (a serialization failure)
  *   if a swap dropped the chunk before it was told.
+ *   gc_retained() visits the chunks a collection keeps whatever names
+ *   them, the store's own reasons (a logical replication slot may still
+ *   decode a row naming what was appended after its position): roots, as
+ *   gc_new()'s.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -259,6 +263,13 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*keep) (ProllyChunkStore *store, const ProllyHash *hash);
 	bool		(*gc_kept) (ProllyChunkGc *gc, ProllyChunkRefVisit visit,
 							void *arg);
+
+	/*
+	 * The chunks a collection keeps for the store's own reasons, roots
+	 * (with their bytes, as gc_new()'s).
+	 */
+	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
+								void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -268,9 +279,9 @@ typedef struct ProllyChunkStoreRoutine
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept"
+	"keep", "gc_kept", "gc_retained"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_kept
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retained
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

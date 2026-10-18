@@ -160,6 +160,7 @@ tests += {
       't/061_gc_roots.pl',
       't/062_toast_folds.pl',
       't/063_toast_apply.pl',
+      't/064_toast_decoding.pl',
     ],
   },
 }
