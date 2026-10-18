@@ -7,10 +7,12 @@ its base's.
 Each counter run is a directory of result sets of configs/s_counters.toml
 (one per engine), the base's and the candidate's each run twice:
 
-- A counter that differs between a build's own two runs is unstable.
-  Unstable in the base, it is reported and not gated (a finding about the
-  run shape); stable in the base and unstable in the candidate, it fails:
-  the pull request left something to chance.
+- A counter that differs between a build's own two runs by what the rule
+  would call a change is unstable.  Unstable in the base, it is reported
+  and not gated (a finding about the run shape); stable in the base and
+  unstable in the candidate, it fails: the pull request left something to
+  chance.  One that differs by less (jitter: hosted runners extend a page
+  more now and then) is gated as usual and listed.
 - A counter regresses when the candidate's is more than 5% above the
   base's and, in total over the run's fixed work, above its floor (8
   events, 8 KB, or the calibrated instruction noise).  Instructions are
@@ -101,7 +103,8 @@ class Finding:
     engine: str
     counter: str
     result: str                # regression, improvement, unstable_base,
-                               # unstable_candidate, accepted, invariant
+                               # unstable_candidate, jitter, accepted,
+                               # invariant
     base: Optional[float] = None
     candidate: Optional[float] = None
     units: Optional[float] = None
@@ -167,11 +170,8 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
             findings.append(Finding("-", engine, "comparison", "invariant", detail=p))
         c = {n: scounters.counters(table.load_set(s[engine]).results, engine)
              for n, s in runs.items()}
-        unstable_base = {(cid, m) for cid, m, *_ in
-                         scounters.unstable(c["base"], c["base2"], t["instructions_tolerance"])}
-        unstable_cand = {(cid, m) for cid, m, *_ in
-                         scounters.unstable(c["candidate"], c["candidate2"],
-                                            t["instructions_tolerance"])}
+        in_base = scounters.instability(c["base"], c["base2"], t)
+        in_cand = scounters.instability(c["candidate"], c["candidate2"], t)
         for cid in sorted(set(c["base"]) | set(c["candidate"]), key=str):
             b, k = c["base"].get(cid), c["candidate"].get(cid)
             w = _workload(cid)
@@ -186,14 +186,16 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
             for m in sorted(set(b.counters) | set(k.counters)):
                 x, y = b.counters.get(m), k.counters.get(m)
                 f = Finding(w, engine, m, "", x, y, k.units, k.unit)
-                if (cid, m) in unstable_base:
+                if in_base.get((cid, m)) == "unstable":
                     f.result = "unstable_base"
-                elif (cid, m) in unstable_cand:
+                elif in_cand.get((cid, m)) == "unstable":
                     f.result, f.detail = "unstable_candidate", "differs between the candidate's two runs"
                 elif x is None or y is None:
                     continue           # a counter one build has: nothing to compare
                 else:
                     f.result = scounters.change(m, x, y, t)
+                    if not f.result and ((cid, m) in in_base or (cid, m) in in_cand):
+                        f.result = "jitter"   # differs within a build, by less than a change
                 if not f.result:
                     continue
                 if f.fails:

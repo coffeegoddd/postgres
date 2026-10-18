@@ -69,9 +69,21 @@ class CountersGateTest(unittest.TestCase):
         self.assertFalse(f[0].fails)
 
     def test_unstable_in_candidate_only_fails(self):
-        f = self.gate(BASE, BASE, cand2={**BASE, "io_extends": 41.0})
+        f = self.gate(BASE, BASE, cand2={**BASE, "io_extends": 60.0})
         self.assertEqual(self.results(f), {("io_extends", "unstable_candidate")})
         self.assertTrue(f[0].fails)
+
+    def test_jitter_is_listed_not_failed(self):
+        # (a page more in one of the candidate's runs, as hosted runners do)
+        f = self.gate(BASE, BASE, cand2={**BASE, "io_extends": 41.0})
+        self.assertEqual(self.results(f), {("io_extends", "jitter")})
+        self.assertFalse(f[0].fails)
+        text, passed = sreport.render(
+            {"thresholds": scounters.thresholds(), "passed": True, "accepted": [],
+             "findings": [vars(x) for x in f]},
+            None, head="c", base="b", runner="x")
+        self.assertTrue(passed)
+        self.assertIn("by less than a change (1)", text)
 
     def test_different_work_is_an_invariant(self):
         runs = [counter_run(self.root, n, BASE) for n in ("b", "b2", "c")]

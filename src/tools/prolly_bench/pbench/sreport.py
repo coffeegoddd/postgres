@@ -161,6 +161,9 @@ def render(counters: Optional[dict], timing: Optional[dict], *, head: str, base:
 
     details(f"Unstable counters in the base ({len(unstable)}; reported, not gated)",
             _counter_rows(unstable) if unstable else [])
+    jitter = [f for f in findings if f["result"] == "jitter"]
+    details(f"Counters that differ between a build's own runs by less than a change "
+            f"({len(jitter)})", _counter_rows(jitter) if jitter else [])
     transient = [c for c in cells if c["result"] in ("transient", "confirmed")]
     details(f"Cells that regressed, and their attempts ({len(transient)})",
             [f"- {c['workload']} c{c['clients']} {c['engine']} {c['metric']}: {c['result']} "
