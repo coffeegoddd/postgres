@@ -14,7 +14,12 @@
  *   the transaction at once, and by others once the transaction commits;
  *   a chunk of a transaction that aborts may stay, unreachable, until
  *   reclamation.  Putting a chunk the store has is allowed (the store may
- *   keep one copy or several).  Every change to the store's files is
+ *   keep one copy or several).  A store that has a chunk has every chunk it
+ *   names (prolly_chunk_references()): what a transaction puts is checked
+ *   when it reaches the store's files (in batches, and the rest before the
+ *   transaction commits), each chunk it names found among them or in the
+ *   store, or the transaction fails with a serialization failure (the
+ *   chunk named was collected after the transaction read it).  Every change to the store's files is
  *   WAL-logged, so recovery, standbys and base backups carry the history,
  *   and a database made from another (CREATE DATABASE) gets a copy of it.
  * - get() appends a chunk's bytes to out; false if the store has none by
@@ -60,6 +65,9 @@
 #include "lib/stringinfo.h"
 
 typedef struct ProllyChunkStore ProllyChunkStore;
+
+/* Visits a chunk another chunk names. */
+typedef void (*ProllyChunkRefVisit) (const ProllyHash *ref, void *arg);
 
 /* The next chunk to add, in hash and data; false when there are no more. */
 typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
@@ -162,5 +170,9 @@ extern Size prolly_chunkstore_commit_payload(char **data);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
+
+/* The chunks a chunk names, as the server's trees lay their nodes out. */
+extern void prolly_chunk_references(const void *data, Size len,
+									ProllyChunkRefVisit visit, void *arg);
 
 #endif							/* PROLLY_CHUNKSTORE_H */

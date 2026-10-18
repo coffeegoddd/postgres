@@ -1953,6 +1953,42 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	side_close(&b);
 }
 
+/*
+ * An internal node's children, a leaf's value trees: read from the chunk
+ * alone, so the chunk store can check what it names before it is anyone's.
+ */
+static void
+cow_references(const ProllyChunkFormatRoutine *format, const void *data,
+			   Size len, ProllyChunkRefVisit visit, void *arg)
+{
+	ProllyChunkNode node;
+
+	if (!PROLLY_CALL(format, open, data, len, &node))
+		return;
+	for (int i = 0; i < node.nitems; i++)
+	{
+		ProllyKey	k;
+		ProllyValue v;
+		uint8		flags;
+		ProllyHash	ref;
+		uint64		n;
+
+		PROLLY_CALL(format, item_get, &node, i, &k, &v, &flags);
+		if (node.level > 0)
+			decode_child(&v, &ref, &n);
+		else if (flags & PROLLY_ITEM_VALUE_REF)
+		{
+			ProllyNodeRef root;
+
+			decode_value_ref(&v, &root, &n);
+			ref = root.hash;
+		}
+		else
+			continue;
+		visit(&ref, arg);
+	}
+}
+
 const ProllyTreeRoutine prolly_tree_cow = {
 	.info = {
 		.iface = PROLLY_IFACE_TREE,
@@ -1974,4 +2010,5 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.walk = cow_walk,
 	.diff = cow_diff,
 	.diff_nodes = cow_diff_nodes,
+	.references = cow_references,
 };

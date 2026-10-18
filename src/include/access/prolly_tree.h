@@ -35,6 +35,10 @@
  *   store adds one to nodes_read, and every node it writes (not one the
  *   store already had) one to nodes_written, so callers can check an
  *   operation's cost by counting.
+ * - references() visits the chunks a node's chunk names: an internal
+ *   node's children, a leaf's values stored out of line (their trees'
+ *   roots).  It reads nothing but the chunk; one that isn't a node of the
+ *   format names none.
  *
  * Provisional (v0).
  *
@@ -178,14 +182,19 @@ typedef struct ProllyTreeRoutine
 	void		(*diff_nodes) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 							   const ProllyNodeRef *to,
 							   ProllyTreeVisitNode visit, void *arg);
+
+	/* The chunks a node's chunk names, in the chunk format. */
+	void		(*references) (const ProllyChunkFormatRoutine *format,
+							   const void *data, Size len,
+							   ProllyChunkRefVisit visit, void *arg);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
-	"walk", "diff", "diff_nodes"
+	"walk", "diff", "diff_nodes", "references"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff_nodes
+#define PROLLY_TREE_LAST_CALLBACK references
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

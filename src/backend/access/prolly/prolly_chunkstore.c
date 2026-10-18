@@ -16,10 +16,15 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_tree.h"
 #include "access/prolly_xlog.h"
 
 /* the implementation the server's stores use */
 #define CHUNK_STORE_IMPL	"journal"
+
+/* the trees, and the node format, of the chunks they keep */
+#define CHUNK_TREE_IMPL		"cow"
+#define CHUNK_FORMAT_IMPL	"basic"
 
 const ProllyChunkStoreRoutine *
 prolly_chunk_store(void)
@@ -104,4 +109,19 @@ prolly_chunks_redo(XLogReaderState *record)
 	memcpy(&hdr, XLogRecGetData(record), SizeOfProllyHeader);
 	store = store_by_id(hdr.impl_id);
 	PROLLY_CALL(store, redo, record);
+}
+
+void
+prolly_chunk_references(const void *data, Size len, ProllyChunkRefVisit visit,
+						void *arg)
+{
+	static const ProllyTreeRoutine *tree = NULL;
+	static const ProllyChunkFormatRoutine *format = NULL;
+
+	if (tree == NULL)
+	{
+		format = prolly_chunkformat_lookup(CHUNK_FORMAT_IMPL);
+		tree = prolly_tree_lookup(CHUNK_TREE_IMPL);
+	}
+	PROLLY_CALL(tree, references, format, data, len, visit, arg);
 }

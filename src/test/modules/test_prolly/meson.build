@@ -85,6 +85,7 @@ tests += {
       'aggregates',
       'policies',
       'partitions',
+      'append_check',
     ],
   },
   'tap': {

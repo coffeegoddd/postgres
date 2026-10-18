@@ -21,7 +21,10 @@
  * batch's bytes are WAL-logged, the log is flushed, and only then are they
  * written at the file's end.  So the file never holds a byte the WAL
  * doesn't, and redo rewrites whatever a crash lost.  A checkpoint waits for
- * an append in progress (DELAY_CHKPT_START) and fsyncs the journals.
+ * an append in progress (DELAY_CHKPT_START) and fsyncs the journals.  A
+ * batch is checked first: every chunk its chunks name is in the batch or
+ * the store, or the transaction fails with a serialization failure, so the
+ * store never has a chunk without the chunks it names.
  *
  * Reading.  Each backend indexes the records by hash in memory, scanning
  * the file from where it left off when a lookup misses or the root is
@@ -670,6 +673,75 @@ scan_journal(ProllyChunkStore *s)
  * ----------------------------------------------------------------
  */
 
+static bool tables_get(ProllyChunkStore *s, const ProllyHash *hash,
+					   StringInfo out);
+static void load_tables(ProllyChunkStore *s, bool force);
+
+/* a pending chunk whose references are being checked */
+typedef struct RefCheck
+{
+	ProllyChunkStore *s;
+	const ProllyHash *chunk;
+} RefCheck;
+
+/*
+ * A chunk a pending one names must be pending too, or the store's: has()
+ * without reading through, and without waiting (a chunk another
+ * transaction hasn't committed is one this one can't have read).
+ */
+static void
+check_reference(const ProllyHash *ref, void *arg)
+{
+	RefCheck   *rc = arg;
+	ProllyChunkStore *s = rc->s;
+	ProllyHash	key;
+
+	hash_key(&key, ref);
+	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
+		index_has(s->index, &key) ||
+		tables_get(s, &key, NULL))
+		return;
+	scan_journal(s);
+	if (index_has(s->index, &key))
+		return;
+	load_tables(s, false);
+	if (tables_get(s, &key, NULL))
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("could not store chunk %s: chunk %s, which it names, is not in the chunk store",
+					prolly_hash_hex(rc->chunk), prolly_hash_hex(ref)),
+			 errdetail("A garbage collection may have removed it after the transaction read it."),
+			 errhint("Try the transaction again.")));
+}
+
+/*
+ * Every chunk the pending ones name is pending or in the store: so the
+ * store never holds a chunk without what it names.
+ */
+static void
+check_pending(ProllyChunkStore *s)
+{
+	HASH_SEQ_STATUS status;
+	IndexEntry *e;
+
+	hash_seq_init(&status, s->pending_index);
+	while ((e = hash_seq_search(&status)) != NULL)
+	{
+		const char *rec = s->pending.data + e->offset;
+		ProllyHash	h;
+		Size		after;
+		RefCheck	rc;
+
+		if (!record_hash(rec, e->len, &h, &after))
+			elog(ERROR, "corrupt pending chunk record");
+		rc.s = s;
+		rc.chunk = &h;
+		prolly_chunk_references(rec + after, e->len - after - sizeof(uint32),
+								check_reference, &rc);
+	}
+}
+
 /* Append the transaction's pending chunks. */
 static void
 flush_pending(ProllyChunkStore *s)
@@ -680,6 +752,7 @@ flush_pending(ProllyChunkStore *s)
 
 	if (s->pending.len == 0)
 		return;
+	check_pending(s);
 	(void) ensure_journal(s, true);
 	base = append_bytes(s, s->pending.data, s->pending.len, false);
 

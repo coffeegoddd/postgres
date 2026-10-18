@@ -283,3 +283,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_walk_commit_count(commit_id text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Put a tree node naming chunks (level 0: values stored out of line in
+-- them; above: children); its hash.
+CREATE FUNCTION test_chunk_put_node(level int, refs text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
