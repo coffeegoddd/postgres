@@ -86,10 +86,12 @@ one write.
   settings, both `USERSET`, defined in `prolly_session_init()`
   (`prolly_dolt.c:80-104`).
 - `copies_commit()` refuses a merge's unresolved conflicts whatever the
-  settings say (`refs_copies.c:1197-1205`). `dolt.allow_commit_conflicts`
-  only lets the SQL transaction commit with them present
-  (`check_merge_conflicts()`, `refs_copies.c:169-199`, run from the refs'
-  pre-commit callback), and skips the constraint-violations check there.
+  settings say (`refs_copies.c:1206-1213`), and its constraint
+  violations only while `dolt.allow_commit_conflicts` is off
+  (1197-1201): with it on, a commit holds them, as Dolt's does. At the
+  SQL `COMMIT`, the setting lets the transaction commit with conflicts
+  or violations present (`check_merge_conflicts()`,
+  `refs_copies.c:169-199`, run from the refs' pre-commit callback).
 - `dolt_commit()` records the commit through `refs->commit` first and
   checks for "nothing to commit" after (`prolly_dolt.c:360-379`); when
   that error is caught, the subtransaction's rollback is what undoes the
@@ -110,9 +112,11 @@ one write.
   text with no placeholders. `SET LOCAL` gives one transaction its own
   message.
 - Both are `USERSET`, defined in `prolly_session_init()` beside
-  `dolt.author`. A transaction's values are captured at its first write
-  to a versioned schema, so a `SET` later in the transaction doesn't
-  change whether, or with what message, it commits.
+  `dolt.author`. Whether the mode is on is captured at the transaction's
+  first write to a versioned schema, so a `SET` later doesn't change
+  whether it commits; the message is read at `COMMIT`, as Dolt reads its
+  variable, so `SET LOCAL dolt.transaction_commit_message` just before
+  `COMMIT` names that commit.
 
 **Seeing writes.** Phase 1 needs the `prolly` table AM to stop returning
 heap's routine unchanged: it becomes a copy with the write callbacks
@@ -132,7 +136,13 @@ conflict. One hook, shared with the writer modes' `branch_note_write()`
 
 It is not called from the lock path: `LOCK TABLE`, `VACUUM` and `ANALYZE`
 change no row. It sets a "changed" flag **per branch**, so a transaction
-that wrote two branches is seen. The first flagged write in a
+that wrote two branches is seen. Writes that a version-control call
+commits itself don't leave a flag: the applier's rows for a merge,
+reset, cherry-pick or revert aren't the transaction's changes, and
+`dolt_commit()` (and `dolt_integrate()`'s commits) reset the flag of the
+branch they commit. So `dolt_integrate()`, which writes a writer branch
+and its target and commits both, leaves nothing for the mode to commit.
+(The branches a transaction writes are noted in #251, not merged.) The first flagged write in a
 transaction calls `refs_init()`: the refs register their transaction
 callback lazily, and refs first opened during pre-commit would run after
 the chunk store's callback has already run for that transaction.
@@ -153,10 +163,13 @@ if none is active.
 2. It changed more than one branch (it checked out another and wrote
    there): the commit fails, as Dolt's does.
 3. Unresolved merge conflicts or constraint violations: the commit fails,
-   as `dolt_commit()`'s does. With `dolt.allow_commit_conflicts` on, the
-   SQL transaction commits, no Dolt commit is made, and a `WARNING` says
-   so: `copies_commit()` refuses conflicts whatever the setting says, and
-   the setting only lets the SQL transaction keep them.
+   as `dolt_commit()`'s does. With `dolt.allow_commit_conflicts` on:
+   - conflicts: the SQL transaction commits, no Dolt commit is made, and
+     a `WARNING` says so, since `copies_commit()` refuses conflicts
+     whatever the setting says;
+   - constraint violations alone: the Dolt commit is made and holds
+     them, as `dolt_commit()`'s does with the setting on (and Dolt's),
+     and `dolt_constraint_violations` still lists them.
 4. A merge in progress: the commit is the merge commit, with both
    parents, as `copies_commit()` makes it.
 5. Objects a commit can't hold (`dolt_status`'s "not covered"): the
@@ -170,8 +183,10 @@ if none is active.
    decided before anything is recorded: `refs->commit` takes an
    `allow_empty` argument and decides after the fold, before the commit
    is written, the merge state cleared or the head moved. It is the same
-   call `dolt_commit()` makes once #146 is fixed. A merge commit is never
-   refused as empty.
+   call `dolt_commit()` makes once #146 is fixed (#249, not merged). A
+   merge commit is never refused as empty. A refused fold still advances
+   the branch's baseline, and a change of an extension's version alone
+   is no change (spec 11, step 4's decisions).
 
 There is no rule for a detached head, as Dolt has: a detached session is
 read-only (part 2), so it never writes.
@@ -216,7 +231,7 @@ What it gives, by how the branch is written:
 
 | Writers on the branch | Read committed | Repeatable read, serializable |
 |---|---|---|
-| One (the writer modes `owned`, `branch-only`, `branch-auto`: spec 11, 6.2) | Exactly the transaction's changes | Same: only the writer moves the head |
+| One backend (the writer modes `owned`, `branch-only`, `branch-auto` with a session's writer: spec 11, 6.2) | Exactly the transaction's changes | Same: only the writer moves the head |
 | Many, all in the mode | Exactly the transaction's changes: everything committed before is already in the head | A transaction fails at `COMMIT` with a serialization failure if another committed to the branch since its snapshot |
 | Many, some not in the mode | The transaction's changes and the others' committed changes | As above, and the others' changes are captured |
 
@@ -336,9 +351,13 @@ foreign keys are not rechecked against the head, as Dolt doesn't, and
   autocommitted statements, one commit each, against explicit
   transactions.
 - In the mode: DDL only; `TRUNCATE`, `CLUSTER` and `VACUUM FULL`; objects
-  a commit can't hold; `PREPARE TRANSACTION`; a `SET` of the settings
-  after the first write; conflicts with `dolt.allow_commit_conflicts`
-  on (the warning, no commit).
+  a commit can't hold; `PREPARE TRANSACTION`; a `SET` of
+  `dolt.transaction_commit` after the first write (no effect) and a
+  `SET LOCAL` of the message just before `COMMIT` (used); conflicts with
+  `dolt.allow_commit_conflicts` on (the warning, no commit), and
+  violations alone with it on (a commit holding them); `dolt_integrate()`
+  in the mode (no extra commit); a branch's owner cleared by the mode's
+  commit.
 
 ## 7. Sequencing, and the writer modes
 
@@ -348,10 +367,16 @@ lock (part 8, question 1) waits for them.
 
 The writer modes (spec 11, 6.2) combine with this mode as they are, and
 the combination is documented: in `owned`, `branch-only` and
-`branch-auto` a branch's working set has one writer, so phase 1 already
-commits exactly the transaction's changes (part 4's first row), and in
-`branch-auto` each transaction is a commit on its writer branch. Phase 2
-matters mainly for `shared`, where many writers share a working set.
+`branch-auto` a branch's working set has one writer. When that writer is
+one backend (the default: a session), phase 1 already commits exactly
+the transaction's changes (part 4's first row); a writer of many
+backends (`ALTER ROLE … SET dolt.writer`) shares its working set among
+them, so its commits are part 4's second and third rows, and phase 2 is
+what narrows them. In `branch-auto` each transaction is a commit on its
+writer branch. Each commit the mode makes clears the branch's owner, as
+`dolt_commit()` does (under the same rule: no other backend of the
+writer writing it). Phase 2 matters mainly for `shared` and for writers
+of many backends.
 Whether integration into a protected branch is automatic is the writer
 modes' question, not this one's.
 
@@ -363,7 +388,7 @@ Decided by the user 2026-10-18, as recommended:
    documented and measured (part 3).
 2. **`dolt.allow_commit_conflicts` with conflicts present:** the SQL
    transaction commits, no Dolt commit is made, and a `WARNING` says so
-   (part 3, rule 3).
+   (part 3, rule 3). With violations alone, the commit holds them.
 3. **Objects a commit can't hold** fail `COMMIT` in the mode, as they
    fail `dolt_commit()` (rule 5).
 4. **Phase 2 starts without waiting** for phase 1's measurements (part 7).
@@ -372,8 +397,9 @@ Decided by the user 2026-10-18, as recommended:
    shared with the writer modes; the hook inside the refs' pre-commit
    callback, after the conflicts check; `refs_init()` at the first
    flagged write; DDL-only transactions commit; no detached-head rule;
-   fixed message text, `SET LOCAL` per transaction; `USERSET` settings
-   captured at the first write; emptiness decided before anything is
+   fixed message text, `SET LOCAL` per transaction; `USERSET` settings,
+   on or off captured at the first write and the message read at
+   `COMMIT`; emptiness decided before anything is
    recorded (rule 7, shared with #146's fix); in phase 2, deduplication
    by TID and role, then versions both made and deleted dropped, rewrites
    falling back to the fold, `dolt.transaction_commit_max_changes` at

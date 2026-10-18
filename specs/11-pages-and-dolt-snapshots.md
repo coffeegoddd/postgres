@@ -3,8 +3,8 @@
 **Status: steps 0–7 built and merged (2026-10-18), with the gaps each
 step's notes list, and with them everything part 4's "Up to step 8"
 lists; step 8 (measurement) not started. Decided by the user 2026-10-18
-and not built: writer modes (6.2) and the Dolt test-parity program
-(part 4, after step 8).** This replaces the design in
+and not merged: writer modes (6.2, built in open pull requests) and the
+Dolt test-parity program (part 4, after step 8).** This replaces the design in
 which prolly trees are a table's primary storage (engines D1–D4,
 `04-candidate-designs.md`). The decisions below marked "user" were made on
 the dates given; everything else is a recommendation to be settled before
@@ -491,6 +491,12 @@ fails without its fix), and Postgres's suites keep passing after each one.
   - `dolt_commit` in an open transaction folds that transaction's own
     writes too, and the Dolt commit is part of the transaction: it is
     gone if the transaction rolls back.
+  - (Since #249, not merged.) A commit is refused as empty before
+    anything is recorded; the refused fold still advances the branch's
+    baseline, since what it read is the head's. A change of an
+    extension's version alone is not a change: the dependencies are
+    beside the root, not in it (part 7.4), so `dolt_commit` refuses it as
+    nothing to commit.
   - Working-set checkpoints are taken when asked for and when a session
     leaves a branch with changes, nothing automatic until measured.
   - The canonical format (hash, keys, rows, nodes) freezes at the end of
@@ -1092,7 +1098,9 @@ into it, and `dolt_commit` commits all of it, its own changes and every
 other session's SQL-committed ones. That is Dolt's model, and it stays
 the default. Writer modes make one writer per working set an invariant
 when a database asks for it, so a commit is one writer's work, and can
-keep `main` changed only by merges. Not built.
+keep `main` changed only by merges. Built in pull requests not yet
+merged (#251, #256, #262, #265); "As built" at the end of this part says
+where they depart from it.
 
 | Mode | `main` | Other branches | For |
 |---|---|---|---|
@@ -1101,8 +1109,9 @@ keep `main` changed only by merges. Not built.
 | `branch-only` | protected: writes refused, with a hint to `dolt_checkout('-b', …)` | one writer each | reviewed changes: branch, commit, merge |
 | `branch-auto` | protected: a write moves the session to its writer branch | one writer each | agents and many independent writers who shouldn't manage branches |
 
-- **The mode** is stored per database and changed by a `dolt_*` call
-  that takes owning the database; it is not a setting a session or role
+- **The mode** is stored per database (a setting in the refs) and
+  changed by `dolt_writer_mode(mode)`, which takes owning the database;
+  `dolt_writer_mode()` returns it. It is not a setting a session or role
   can change.
 - **A protect flag per branch**, `dolt_branch('--protect' | '--unprotect',
   name)`, takes owning the database. It protects release or integration
@@ -1113,8 +1122,9 @@ keep `main` changed only by merges. Not built.
   (`USERSET`), by default unique to the backend (`s<pid>.<backend start
   time>`), so a writer is a session unless set. `ALTER ROLE app SET
   dolt.writer = 'app'` makes an application's connections one writer.
-  An id of 63 bytes or more, or one that isn't a valid branch-name part,
-  is refused. Changing it in a transaction that has written is refused.
+  An id is at most 32 bytes of letters, digits and `.`, `_`, `-`, `@`,
+  `+`, so a writer branch's name has room for its base. Changing it in a
+  transaction that has written is refused.
 
 **The invariant** (`owned`, `branch-only`, `branch-auto`): every change
 in a branch's working set since its head was made by one writer, the
@@ -1129,23 +1139,33 @@ it, `oid`), a catalog version change. A claim is an MVCC row update, not
 a refs edit: the refs are held per database to transaction end
 (`lock_refs()`), which would serialize every claiming transaction. The
 owner is set at the claim (a writer's first write to a clean branch) and
-cleared by `dolt_commit`, `dolt_reset('--hard')` and an integration
-commit; "dirty", for the modes, is "has an owner". That costs O(1) and
-errs toward dirty (changes undone by hand still leave an owner until a
-commit or a reset). `dolt_commit` clears the owner only if no other
-backend of the same writer holds the ownership lock, since that
-backend's changes aren't in the commit's snapshot.
+cleared by what makes the working set its head: `dolt_commit`,
+`dolt_reset('--hard')`, an integration commit, and the commit spec 15's
+`dolt.transaction_commit` makes at `COMMIT`. "Dirty", for the modes, is
+"has an owner". That costs O(1) and errs toward dirty (changes undone by
+hand still leave an owner until a commit or a reset). The owner is
+cleared only if no other backend of the same writer holds the ownership
+lock (that backend's changes aren't in the commit's snapshot) and the
+working set, read with a new snapshot, is still the head's; otherwise it
+stays, which only makes another writer wait for the owner's next commit.
+`brownerrole` has no `pg_shdepend` entry: dropping a role that owns a
+dirty branch isn't refused, and the owner's role then shows as `?`.
 
-**The ownership lock** is a lock tag of its own, built as
-`SET_LOCKTAG_OBJECT` builds one, on the default lock method:
-transaction-scoped, so it moves to a prepared transaction with the
-owner record. (The branch lock above is session-level and stops
+**The ownership lock** is an object lock on the branch's `pg_branch`
+row (`LockDatabaseObject()`, a sub-object of its own), on the default
+lock method: transaction-scoped, so it moves to a prepared transaction
+with the owner record. (The branch lock above is session-level and stops
 deletion; it is a different lock.)
 
 **Claiming**, at a transaction's first write to branch B by writer W:
 
-1. B's owner is W: take B's ownership lock in `ShareLock` and proceed.
-   W's backends write B concurrently, with row locks as on any table.
+1. B's owner is W: take B's ownership lock in `ShareLock`, then look
+   again with a new snapshot. Still W, and proceed: W's backends write B
+   concurrently, with row locks as on any table. No owner now (another
+   backend of W committed meanwhile), and this is case 3, claiming alone
+   in `ExclusiveLock`; another owner, case 2's error. Without the second
+   look, a backend of W could write after the commit cleared the owner,
+   and another writer could then claim a branch holding W's changes.
 2. B has another owner: fail at once, `branch "B" has uncommitted
    changes by writer "X"`, with hints (`dolt_checkout('-b', …)`, ask X to
    commit, `dolt_branch('--take', …)`). Waiting couldn't change it.
@@ -1192,7 +1212,9 @@ build a branch's state at its head, which leaves it clean.
   commit; fast-forward the writer branch to the target's new head. On a
   conflict it fails and everything rolls back, the first commit too; the
   error names the tables and suggests merging the target into the writer
-  branch to resolve them there.
+  branch to resolve them there. It writes two branches, but commits each
+  itself, so under `dolt.transaction_commit` neither counts as changed
+  (spec 15, part 3) and its transaction makes no further commit.
 
 **Writer branches** (`branch-auto`). A session on protected branch P
 moves to its writer branch for P at the start of its first writing
@@ -1214,19 +1236,22 @@ statement or check out the writer branch first.
   back when the branch was made in the aborted transaction, and is
   extended to a writer branch that already existed.
 - **Named** `writer/<writer>/<base>`, reserved as `detached/` is
-  (`reserved_branch_name()`, `prolly_dolt.c:392`). The writer and base,
-  and every branch's protect flag, are kept in the branch's refs entry
-  (as the head's mover is, `TAG_MOVER`), not in `pg_branch`, so a
+  (`reserved_branch_name()`, `prolly_dolt.c:392`). A name that wouldn't
+  fit a branch name (`NAMEDATALEN`) is refused at the switch, with an
+  error naming it, rather than cut. The writer and base, and every
+  branch's protect flag, are kept in the refs, not in `pg_branch`, so a
   head-only branch has them, they travel with a push and a clone, and the
   name is never parsed.
 - **Privileges.** Making a writer branch doesn't take `CREATE` on the
   database; reusing one (a later session with the same `dolt.writer`)
   takes the role that made it.
 - **Reuse and cleanup.** A writer branch persists and goes stale as P
-  advances; `dolt_integrate` fast-forwards it. Writer branches that are
-  clean, merged into P and not checked out are swept as detached ones are
-  (`sweep_detached()`, `prolly_dolt.c:479`), and a session's own at its
-  exit. Remote listings leave them out, as they leave out `detached/`.
+  advances; `dolt_integrate` fast-forwards it, and reusing it doesn't
+  refresh it (`dolt_merge('<P>')` does). Writer branches that are clean,
+  merged into P and not checked out are swept as detached ones are
+  (`sweep_detached()`, `prolly_dolt.c:479`); there is no sweep at a
+  session's exit. Remote listings leave them out, as they leave out
+  `detached/`.
 - `dolt_branch('-c', …)` copies the protect flag, never the owner.
 
 **Visibility and administration.** `dolt_branches` gains `kind`
@@ -1245,9 +1270,12 @@ owners and stays read-only; `branch-auto` never forks there.
 - Dirty merges (step 5's notes): in the other modes, the uncommitted
   changes are the merging writer's own.
 - With `dolt.transaction_commit` (spec 15) the modes combine as they are,
-  documented there (part 7): with one writer per working set phase 1
-  already commits exactly the transaction's changes, and phase 2 matters
-  mainly for `shared`.
+  documented there (part 7): when the writer is one backend (the default,
+  a session) phase 1 commits exactly the transaction's changes; a writer
+  of many backends (`ALTER ROLE … SET dolt.writer`) shares its working
+  set among them, as `shared` does among sessions, and phase 2 is what
+  narrows each commit to its transaction. The commit the mode makes
+  clears the owner, as `dolt_commit` does.
 
 **Phases**, each a stack of PRs with its tests: `owned` (`dolt.writer`,
 the owner record, the ownership lock, `branch_note_write()`, the
@@ -1256,6 +1284,23 @@ protected branches, `dolt_integrate`); then `branch-auto` (writer
 branches, the switch and its rollback, reuse, the sweep). Still open
 (`08-open-questions.md`): whether the default writer is the session or
 the role, revisited with data from `owned`'s use.
+
+**As built** (#251, #256, #262, #265, not merged), where it departs from
+or settles the above:
+- `dolt_writer_mode([mode])` reads and sets the mode, kept as a setting
+  in the refs.
+- `dolt_branches` gains `owner`, `owner_role`, `protected`, `kind` and
+  `base`.
+- A branch's protection is stored only where it differs from what the
+  mode gives it (`main` protected in the `branch-*` modes); a setting
+  equal to the mode's default is removed, so a change of mode moves
+  every branch left at its default.
+- Writer branches' records (writer, base, the role that made them) are
+  settings in the refs, not part of a head's entry.
+- No sweep at a session's exit, and no refresh of a stale writer branch
+  when it is reused (both above).
+- `brownerrole` has no `pg_shdepend` entry; a dropped role shows as `?`
+  (above).
 
 ### 6.3 Branch-aware catalogs
 

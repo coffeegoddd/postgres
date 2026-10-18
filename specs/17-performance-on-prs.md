@@ -200,15 +200,19 @@ the gate's floors apply to the totals over the fixed work, below):
 | Rows, answers | the invariants, TPC-H digests | That both did the same work |
 
 **`pg_stat_prolly`.** A built-in cumulative statistics kind, per
-database and variable-numbered, as `pg_stat_io` is fed: backends count in
-local memory and flush through pgstat, so the hot path costs an
-increment. The view's shape is `(name, value)`, one row per counter, so
+database and variable-numbered (one entry per database): backends
+count in local memory and flush through pgstat, so the hot path costs
+an increment. The view's shape is `(name, value)`, one row per counter, so
 a counter is added without changing the view. The counters are #241's
 list (nodes read and written, chunks appended and their bytes, bytes
 hashed, fold rows read and written, value-tree chunks written, commits,
 head moves), the value memo's hits and misses, and the change finder's
 counts; the tree environment's `counters` pointer is set so trees count
-into them. `pg_stat_reset_shared('prolly')` resets them.
+into them. A variable-numbered kind isn't one `pg_stat_reset_shared()`
+resets (that takes only fixed-numbered, cluster-wide kinds):
+`pg_stat_reset()` resets them with the rest of the current database's
+statistics, and `pg_stat_reset_prolly()` resets them alone, by resetting
+the kind's entry for the current database.
 
 **Instructions.** The collector probes for hardware counters (`perf stat
 -e instructions:u,instructions:k`). Where there are none, as may be so
@@ -242,7 +246,11 @@ it is reviewed like code: a new entry is a new commit, which re-runs the
 gate and dismisses stale approvals where that is set. The comment lists
 every accepted regression with its reason, so a reviewer sees what was
 traded. A correctness fix that costs work is the expected use. The
-file has a CODEOWNERS entry, so an entry needs a maintainer's review.
+file has a CODEOWNERS entry, which asks its owner for review; it
+enforces nothing unless branch protection requires code owners'
+review, which spec 16's settings don't (one maintainer, whose own pull
+requests it would block). The check is the comment's list of accepted
+regressions.
 
 ### 3.2 Layer 2: paired timing (hosted, reported)
 
@@ -360,15 +368,19 @@ suite gate** runs and comments but isn't a required check.
 
 ### 3.6 Workflows
 
-`.github/workflows/performance.yml`, on `pull_request`, `push` and a
-nightly `schedule` (no `merge_group`: the repository has no merge queue,
-spec 16):
+`.github/workflows/performance.yml`, on `pull_request`, `push` to
+`master` and a nightly `schedule` (no `merge_group`: the repository has
+no merge queue, spec 16). A push to any other branch runs only a
+build-and-cache job (a workflow of its own, `performance-cache.yml`), so
+a stack layer's base is cached without running the suite twice per
+push:
 
 1. **classify** (always runs; specs-only pull requests pass the checks
    without building, as in spec 16).
 2. **build**: base (cached) and candidate, uploaded as one artifact with
-   both SHAs, checked by every consumer. On `push` (every branch), it
-   builds and caches the pushed head only.
+   both SHAs, checked by every consumer. On `push` to `master`, it
+   builds and caches the pushed head, then runs the suite against its
+   parent.
 3. **counters** (hosted, matrix by workload group): base, candidate,
    base again, candidate again; `prolly_bench sgate counters`.
 4. **timing-hosted** (hosted): the timing layer, reported.
@@ -449,8 +461,8 @@ Decided by the user 2026-10-18, as recommended:
 2. With it: `pg_stat_prolly` as a built-in per-database, variable-numbered
    pgstat kind with a `(name, value)` view, its counters #241's list plus
    the memo's hits and misses and the change finder's counts, the tree
-   environment's counters wired, reset by
-   `pg_stat_reset_shared('prolly')`; the instruction collector probing
+   environment's counters wired, reset with the database's statistics
+   or alone; the instruction collector probing
    for hardware counters and, without them, leaving instructions out of
    the hosted gate for a nightly Cachegrind run of the server's processes;
    the pull request's timing shape fewer workloads at five repetitions;
@@ -458,5 +470,6 @@ Decided by the user 2026-10-18, as recommended:
    an orphan `perf-history` branch and in artifacts; the **S suite gate**
    not required until calibration is done; #241 and #242 prerequisites
    of spec 11's step 8; one generic comment workflow, spec 16's, for
-   both suites; `perf_accept.toml` under CODEOWNERS; the nightly the
+   both suites; `perf_accept.toml` under CODEOWNERS (a review request,
+   not enforced); the nightly the
    360-cell shape, not `standard.toml`.
