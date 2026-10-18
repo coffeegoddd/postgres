@@ -243,8 +243,9 @@ doesn't go stale.
 **Gate.** Gate 8 in `06-benchmarking.md`: an engine passes the C suite
 when it has no `regression`, `hidden_regression`, `crashed` or `unmatched`
 records outside the exceptions, and no tables on another AM.
-`order_only`, `not_implemented` and timeouts are reported but don't fail
-it.
+As built, `cgate` is stricter: every class but `agree`,
+`postgres_semantics` and listed exceptions fails it, `order_only`,
+`not_implemented` and timeouts included.
 
 ## Plan
 
@@ -280,4 +281,9 @@ or comments.
    the results layout. The C suite has no timed window or collectors, so its
    cells skip both.
 5. **CI.** Recommended: not yet. Once the baseline is clean, `c_smoke.toml`
-   on `prolly` would fit the lean CI.
+   on `prolly` would fit the lean CI. (Since built: `c_ci.toml`, the smoke
+   files with CI's settings (256 MB of shared buffers, 4 workers, the
+   pinned corpus's path), and `cgate` run on every pull request that
+   changes more than specs, the full corpus nightly; spec 16 proposes the
+   full corpus on every pull request, a heap baseline and a results
+   comment.)
