@@ -143,7 +143,7 @@ tests += {
       't/057_large_values.pl',
       't/058_transaction_commits.pl',
       't/059_bmap_free_many.pl',
-      't/067_bmap_drop_database_flush.pl',
+      't/067_bmap_drop_flush.pl',
     ],
   },
 }

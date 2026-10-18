@@ -4938,6 +4938,39 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	}
 }
 
+/*
+ * Writing out a page may read buffers of another fork of its relation
+ * (smgrwritesread()), and a page being written out meanwhile, by the
+ * checkpointer say, must find them.  So a scan dropping every fork's
+ * buffers drops those forks' in a second pass, once the first has dropped
+ * every page that could need them, waiting for any being written out; and
+ * only if the first passed some by.
+ */
+typedef struct DropPasses
+{
+	bool		last[MAX_FORKNUM + 1];	/* dropped in the second pass */
+} DropPasses;
+
+static void
+drop_passes_init(DropPasses *passes)
+{
+	for (ForkNumber forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		passes->last[forknum] = smgrwritesread(forknum);
+}
+
+/*
+ * Is a buffer of fork 'forknum' dropped in pass 'pass'?  An unlocked
+ * precheck may see a tag changing meanwhile, with no valid fork: that
+ * buffer is no longer the one being dropped.
+ */
+static inline bool
+drop_in_pass(const DropPasses *passes, ForkNumber forknum, int pass)
+{
+	if (forknum < 0 || forknum > MAX_FORKNUM)
+		return false;
+	return passes->last[forknum] == (pass == 1);
+}
+
 /* ---------------------------------------------------------------------
  *		DropRelationsAllBuffers
  *
@@ -4957,6 +4990,8 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	RelFileLocator *locators;
 	bool		cached = true;
 	bool		use_bsearch;
+	DropPasses	passes;
+	bool		deferred = false;
 
 	if (nlocators == 0)
 		return;
@@ -5059,48 +5094,62 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	if (use_bsearch)
 		qsort(locators, n, sizeof(RelFileLocator), rlocator_comparator);
 
-	for (i = 0; i < NBuffers; i++)
+	drop_passes_init(&passes);
+	for (int pass = 0; pass < 2 && (pass == 0 || deferred); pass++)
 	{
-		RelFileLocator *rlocator = NULL;
-		BufferDesc *bufHdr = GetBufferDescriptor(i);
-
-		/*
-		 * As in DropRelationBuffers, an unlocked precheck should be safe and
-		 * saves some cycles.
-		 */
-
-		if (!use_bsearch)
+		for (i = 0; i < NBuffers; i++)
 		{
-			int			j;
+			RelFileLocator *rlocator = NULL;
+			BufferDesc *bufHdr = GetBufferDescriptor(i);
 
-			for (j = 0; j < n; j++)
+			/*
+			 * As in DropRelationBuffers, an unlocked precheck should be safe
+			 * and saves some cycles.
+			 */
+
+			if (!use_bsearch)
 			{
-				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &locators[j]))
+				int			j;
+
+				for (j = 0; j < n; j++)
 				{
-					rlocator = &locators[j];
-					break;
+					if (BufTagMatchesRelFileLocator(&bufHdr->tag, &locators[j]))
+					{
+						rlocator = &locators[j];
+						break;
+					}
 				}
 			}
+			else
+			{
+				RelFileLocator locator;
+
+				locator = BufTagGetRelFileLocator(&bufHdr->tag);
+				rlocator = bsearch(&locator,
+								   locators, n, sizeof(RelFileLocator),
+								   rlocator_comparator);
+			}
+
+			/*
+			 * buffer doesn't belong to any of the given relfilelocators;
+			 * skip it
+			 */
+			if (rlocator == NULL)
+				continue;
+			if (!drop_in_pass(&passes, BufTagGetForkNum(&bufHdr->tag), pass))
+			{
+				if (pass == 0)
+					deferred = true;
+				continue;
+			}
+
+			LockBufHdr(bufHdr);
+			if (BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator) &&
+				drop_in_pass(&passes, BufTagGetForkNum(&bufHdr->tag), pass))
+				InvalidateBuffer(bufHdr);	/* releases spinlock */
+			else
+				UnlockBufHdr(bufHdr);
 		}
-		else
-		{
-			RelFileLocator locator;
-
-			locator = BufTagGetRelFileLocator(&bufHdr->tag);
-			rlocator = bsearch(&locator,
-							   locators, n, sizeof(RelFileLocator),
-							   rlocator_comparator);
-		}
-
-		/* buffer doesn't belong to any of the given relfilelocators; skip it */
-		if (rlocator == NULL)
-			continue;
-
-		LockBufHdr(bufHdr);
-		if (BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
-		else
-			UnlockBufHdr(bufHdr);
 	}
 
 	pfree(locators);
@@ -5180,45 +5229,37 @@ void
 DropDatabaseBuffers(Oid dbid)
 {
 	int			i;
-	bool		last[MAX_FORKNUM + 1];
+	DropPasses	passes;
+	bool		deferred = false;
 
 	/*
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.
 	 */
 
-	/*
-	 * Writing out a page may read buffers of another fork of its relation
-	 * (smgrwritesread()), and a page being written out meanwhile, by the
-	 * checkpointer say, must find them.  So those forks' buffers are
-	 * dropped in a second pass, once the first has dropped every page that
-	 * could need them, waiting for any being written out.
-	 */
-	for (ForkNumber forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-		last[forknum] = smgrwritesread(forknum);
-
-	for (int pass = 0; pass < 2; pass++)
+	drop_passes_init(&passes);
+	for (int pass = 0; pass < 2 && (pass == 0 || deferred); pass++)
 	{
 		for (i = 0; i < NBuffers; i++)
 		{
 			BufferDesc *bufHdr = GetBufferDescriptor(i);
-			ForkNumber	forknum;
 
 			/*
 			 * As in DropRelationBuffers, an unlocked precheck should be safe
-			 * and saves some cycles.  (A tag changing meanwhile may give no
-			 * valid fork; such a buffer is no longer this database's.)
+			 * and saves some cycles.
 			 */
 			if (bufHdr->tag.dbOid != dbid)
 				continue;
-			forknum = BufTagGetForkNum(&bufHdr->tag);
-			if (forknum < 0 || forknum > MAX_FORKNUM ||
-				last[forknum] != (pass == 1))
+			if (!drop_in_pass(&passes, BufTagGetForkNum(&bufHdr->tag), pass))
+			{
+				if (pass == 0)
+					deferred = true;
 				continue;
+			}
 
 			LockBufHdr(bufHdr);
 			if (bufHdr->tag.dbOid == dbid &&
-				last[BufTagGetForkNum(&bufHdr->tag)] == (pass == 1))
+				drop_in_pass(&passes, BufTagGetForkNum(&bufHdr->tag), pass))
 				InvalidateBuffer(bufHdr);	/* releases spinlock */
 			else
 				UnlockBufHdr(bufHdr);

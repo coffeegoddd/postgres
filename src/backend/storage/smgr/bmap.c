@@ -1132,6 +1132,50 @@ lookup(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	return lookup_ext(reln, blkno, maxrun, run, false, false);
 }
 
+/*
+ * As lookup_ext() with 'missing_ok', but only from a map page that is
+ * cached: InvalidBlockNumber if it isn't.  For hints, which may come after
+ * the map's buffers were dropped without being written (a dropped
+ * database's), when the map page on disk may be stale or all zeroes.
+ */
+static BlockNumber
+lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
+			  BlockNumber *run)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	PGIOAlignedBlock copy;
+	BmapEntry  *entries = PageGetBmapEntries(copy.data);
+	uint32		slot = MAP_SLOT(blkno);
+	PrefetchBufferResult r;
+	BlockNumber phys;
+	BlockNumber n;
+
+	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, MAP_PAGE(blkno));
+	if (!BufferIsValid(r.recent_buffer) ||
+		!ReadRecentBuffer(rel, BMAP_FORKNUM, MAP_PAGE(blkno), r.recent_buffer))
+		return InvalidBlockNumber;
+
+	/* a change keeping the page locked (map_lock()) can't be waited for */
+	if (BufferIsLockedByMe(r.recent_buffer) ||
+		!copy_node(rel, r.recent_buffer, MAP_PAGE(blkno), copy.data,
+				   BMAP_PAGE_NODE, true))
+	{
+		ReleaseBuffer(r.recent_buffer);
+		return InvalidBlockNumber;
+	}
+	ReleaseBuffer(r.recent_buffer);
+
+	phys = entries[slot].block;
+	if (!BlockNumberIsValid(phys))
+		return InvalidBlockNumber;
+	n = 1;
+	while (n < maxrun && slot + n < BMAP_FANOUT &&
+		   entries[slot + n].block == phys + n)
+		n++;
+	*run = n;
+	return phys;
+}
+
 /* ----------------------------------------------------------------
  * Allocation
  * ----------------------------------------------------------------
@@ -4581,14 +4625,17 @@ bmapwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		mdwriteback(reln, forknum, blocknum, nblocks);
 		return;
 	}
+	INJECTION_POINT("bmap-writeback", NULL);
 	ssrel = store_smgr(reln->smgr_rlocator.locator);
 	while (nblocks > 0)
 	{
 		BlockNumber run;
-		BlockNumber phys = lookup_ext(reln, blocknum, nblocks, &run, true,
-									  true);
+		BlockNumber phys = lookup_cached(reln, blocknum, nblocks, &run);
 
-		/* writeback is a hint; blocks without an entry are skipped */
+		/*
+		 * Writeback is a hint; blocks without an entry, or whose map page
+		 * isn't cached, are skipped.
+		 */
 		if (!BlockNumberIsValid(phys))
 			return;
 		mdwriteback(ssrel, MAIN_FORKNUM, phys, run);
