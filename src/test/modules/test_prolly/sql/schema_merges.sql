@@ -511,7 +511,8 @@ SELECT dolt_checkout('main');
 INSERT INTO stc.t VALUES (3, 'x', 'y', 3);
 SELECT length(dolt_commit('-Am', 'stc left')::text) AS committed;
 SELECT (dolt_merge('stc_right'))[2:4];
-SELECT * FROM stc.t ORDER BY pk;
+-- (ours' rows trimmed as the cast from char trims them, as ALTER did theirs')
+SELECT *, octet_length(c) AS c_len FROM stc.t ORDER BY pk;
 SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
 WHERE attrelid IN ('stc.t'::regclass, 'stc.u'::regclass) AND attnum > 1
 ORDER BY attrelid::regclass::text, attnum;

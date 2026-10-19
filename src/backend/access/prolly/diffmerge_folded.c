@@ -58,6 +58,8 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
@@ -1961,24 +1963,131 @@ dup_bytes(const char *data, int len)
 }
 
 /*
+ * How as_defined_now() reads a version's rows: for a diff, for a merge,
+ * or for a merge's base (whose rows are only compared, never written).
+ */
+typedef enum ReadFor
+{
+	READ_FOR_DIFF,
+	READ_FOR_MERGE,
+	READ_FOR_MERGE_BASE,
+} ReadFor;
+
+/*
+ * The value of column j of xd (a version's row) as rel's column att has
+ * it: through the column's assignment cast, with its typmod, as ALTER
+ * TABLE ... TYPE without USING converts rows; where there's none, through
+ * the explicit cast a move's ALTER converts them with (canon_folded.c's
+ * move_table()).  A diff (not 'strict') reads them through the explicit
+ * cast alone, so a version's value that doesn't fit the column now (too
+ * long: deleted before it narrowed) reads cut to fit, not as an error.
+ */
+static Expr *
+column_conversion(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
+				  bool strict)
+{
+	Form_pg_attribute xa = TupleDescAttr(xd, j);
+	Node	   *var = (Node *) makeVar(1, j + 1, xa->atttypid, xa->atttypmod,
+									   xa->attcollation, 0);
+	Node	   *e = NULL;
+
+	if (strict)
+		e = coerce_to_target_type(NULL, var, xa->atttypid,
+								  att->atttypid, att->atttypmod,
+								  COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+	if (e == NULL)
+		e = coerce_to_target_type(NULL, var, xa->atttypid,
+								  att->atttypid, att->atttypmod,
+								  COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
+	if (e == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("rows of table \"%s\" can't be read across column \"%s\" changing type from %s to %s",
+						RelationGetRelationName(rel), NameStr(att->attname),
+						format_type_with_typemod(xa->atttypid, xa->atttypmod),
+						format_type_with_typemod(att->atttypid, att->atttypmod))));
+	assign_expr_collations(NULL, e);
+	return (Expr *) e;
+}
+
+/*
+ * A merge base's value of a column whose typmod changed, through conv
+ * (evaluated in econtext over its row), into *d and *isnull, in the
+ * current memory context.  False, leaving them be, where the value
+ * doesn't fit the column now (value too long, numeric field overflow):
+ * each side that redefined the column changed or deleted that row to
+ * make it fit, so the caller keeps the value as base had it, a value no
+ * side has, as a merge compared it before a typmod change was converted.
+ * Other errors are raised.
+ */
+static bool
+base_value_fits(ExprState *conv, ExprContext *econtext, Form_pg_attribute att,
+				Datum *d, bool *isnull)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	volatile bool fits = true;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		bool		n;
+		Datum		v = ExecEvalExprSwitchContext(conv, econtext, &n);
+
+		*isnull = n;
+		*d = n ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+			PG_RE_THROW();
+		FlushErrorState();
+		FreeErrorData(ed);
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		fits = false;
+	}
+	PG_END_TRY();
+	return fits;
+}
+
+/*
  * A version x of table rel's rows as rel defines them now (now: the
  * version that defines it so), into *out: each row decoded with x's
  * definition and made a row of rel's by column name, a column x hasn't
- * taking its missing value (or null), one of another type converted
- * through its text form.  x itself if it defines the table so already, or
- * if now is NULL (the working set has no such table); NULL if x is.
+ * taking its missing value (or null), one of another type or typmod
+ * converted through its cast (column_conversion()).  x itself if it
+ * defines the table so already, or if now is NULL (the working set has no
+ * such table); NULL if x is.
  *
- * For a merge ('strict'), refused where rel's rows can't faithfully come
- * from x's: when x lacks a column whose values each row was given as it
- * was added (an identity, a default such as a serial's).  A diff shows
- * those as null.  (A column x has that rel hasn't, dropped, or renamed,
- * which reads by name as a drop and an add, is left out: a merge refuses
- * first where that loses a change, refuse_lost_changes().)
+ * A merge's base (READ_FOR_MERGE_BASE) is read as its other versions
+ * are, but a value too big for a column whose typmod changed is kept as
+ * base had it (base_value_fits()), not an error.  Only a change both
+ * sides made alike can narrow a column (another is a schema conflict:
+ * check_type_changes() in canon_folded.c), so each side changed or
+ * deleted that row; kept, it's a value neither side has.
+ *
+ * For a merge (not READ_FOR_DIFF), refused where rel's rows can't
+ * faithfully come from x's: when x lacks a column whose values each row
+ * was given as it was added (an identity, a default such as a serial's).
+ * A diff shows those as null.  (A column x has that rel hasn't, dropped,
+ * or renamed, which reads by name as a drop and an add, is left out: a
+ * merge refuses first where that loses a change, refuse_lost_changes().)
  */
 static Table *
-as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
+as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			   Table *out)
 {
+	bool		strict = read != READ_FOR_DIFF;
 	RowDiff		rd;
 	VersionReader vr;
 	List	   *now_cols;
@@ -1988,9 +2097,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	TupleTableSlot *xs;
 	TupleTableSlot *ms;
 	int		   *from;
-	FmgrInfo   *out_fn;
-	Oid		   *in_fn;
-	Oid		   *in_param;
+	ExprState **conv;
+	bool	   *keep_unfit;
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
@@ -2002,7 +2110,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	int			max = 0;
 	int			i;
 	ProllyTreeBuilder *b;
-	EState	   *estate = NULL;	/* (computing generated columns) */
+	EState	   *estate = NULL;	/* (casts, and generated columns computed) */
 	List	   *generated = NIL;	/* those computed, and their expressions */
 	List	   *gen_exprs = NIL;
 	bool		keyed_now;
@@ -2044,9 +2152,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 
 	/* each column of rel's: which of x's it comes from, and how */
 	from = palloc_array(int, md->natts);
-	out_fn = palloc0_array(FmgrInfo, md->natts);
-	in_fn = palloc0_array(Oid, md->natts);
-	in_param = palloc0_array(Oid, md->natts);
+	conv = palloc0_array(ExprState *, md->natts);
+	keep_unfit = palloc0_array(bool, md->natts);
 	for (int a = 0; a < md->natts; a++)
 	{
 		Form_pg_attribute att = TupleDescAttr(md, a);
@@ -2085,14 +2192,16 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 					 errmsg("rows of table \"%s\" can't be merged across column \"%s\" being added",
 							RelationGetRelationName(rel), NameStr(att->attname)),
 					 errdetail("Each row was given its own value as the column was added (an identity, a generated column, or a default such as a serial's), which rows from before it don't have.")));
-		if (from[a] >= 0 && TupleDescAttr(xd, from[a])->atttypid != att->atttypid)
+		if (from[a] >= 0 &&
+			(TupleDescAttr(xd, from[a])->atttypid != att->atttypid ||
+			 TupleDescAttr(xd, from[a])->atttypmod != att->atttypmod))
 		{
-			Oid			outf;
-			bool		varlena;
-
-			getTypeOutputInfo(TupleDescAttr(xd, from[a])->atttypid, &outf, &varlena);
-			fmgr_info(outf, &out_fn[a]);
-			getTypeInputInfo(att->atttypid, &in_fn[a], &in_param[a]);
+			if (estate == NULL)
+				estate = CreateExecutorState();
+			conv[a] = ExecPrepareExpr(column_conversion(rel, xd, from[a], att, strict),
+									  estate);
+			keep_unfit[a] = read == READ_FOR_MERGE_BASE &&
+				TupleDescAttr(xd, from[a])->atttypid == att->atttypid;
 		}
 	}
 
@@ -2105,7 +2214,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 	keys_kept = vr.keyed;
 	for (int a = 0; a < md->natts && keys_kept; a++)
 		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
-			keys_kept = from[a] >= 0 && !OidIsValid(in_fn[a]);
+			keys_kept = from[a] >= 0 && conv[a] == NULL;
 
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
@@ -2142,11 +2251,26 @@ as_defined_now(Relation rel, const Table *x, const Table *now, bool strict,
 			if (xs->tts_isnull[from[a]])
 				continue;
 			ms->tts_isnull[a] = false;
-			if (OidIsValid(in_fn[a]))
-				ms->tts_values[a] =
-					OidInputFunctionCall(in_fn[a],
-										 OutputFunctionCall(&out_fn[a], xs->tts_values[from[a]]),
-										 in_param[a], att->atttypmod);
+			if (conv[a])
+			{
+				ExprContext *econtext = GetPerTupleExprContext(estate);
+				Datum		d;
+
+				econtext->ecxt_scantuple = xs;
+				if (keep_unfit[a])
+				{
+					if (!base_value_fits(conv[a], econtext, att,
+										 &ms->tts_values[a], &ms->tts_isnull[a]))
+						ms->tts_values[a] = xs->tts_values[from[a]];
+				}
+				else
+				{
+					d = ExecEvalExprSwitchContext(conv[a], econtext, &ms->tts_isnull[a]);
+					ms->tts_values[a] = ms->tts_isnull[a] ? (Datum) 0 :
+						datumCopy(d, att->attbyval, att->attlen);
+				}
+				ResetExprContext(econtext);
+			}
 			else
 				ms->tts_values[a] = xs->tts_values[from[a]];
 		}
@@ -2461,8 +2585,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	fp = as_defined_now(rel, from, now, false, &f);
-	tp = as_defined_now(rel, to, now, false, &t);
+	fp = as_defined_now(rel, from, now, READ_FOR_DIFF, &f);
+	tp = as_defined_now(rel, to, now, READ_FOR_DIFF, &t);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, sink);
 }
@@ -2642,9 +2766,9 @@ merge_rows(void *arg)
 			rel = table_open(relid, AccessShareLock);
 			refuse_lost_changes(rel, b, o, w);
 			refuse_lost_changes(rel, b, t, w);
-			(void) as_defined_now(rel, b, w, true, &bn);
-			(void) as_defined_now(rel, o, w, true, &on);
-			(void) as_defined_now(rel, t, w, true, &tn);
+			(void) as_defined_now(rel, b, w, READ_FOR_MERGE_BASE, &bn);
+			(void) as_defined_now(rel, o, w, READ_FOR_MERGE, &on);
+			(void) as_defined_now(rel, t, w, READ_FOR_MERGE, &tn);
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
 				apply_rows(relid, w, &on);
@@ -4728,11 +4852,17 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("a merge is in progress on a branch with no commit")));
-	/* (each as the table is defined now, if one defines it otherwise) */
+	/*
+	 * (each as the table is defined now, if one defines it otherwise, read
+	 * as the merge read them, so its conflicts are the ones it found)
+	 */
 	rel = table_open(relid, AccessShareLock);
-	bp = as_defined_now(rel, find_table(tables_at(&ms->base), name), now, false, &b);
-	op = as_defined_now(rel, find_table(tables_at(&ours), name), now, false, &o);
-	tp = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now, false, &t);
+	bp = as_defined_now(rel, find_table(tables_at(&ms->base), name), now,
+						READ_FOR_MERGE_BASE, &b);
+	op = as_defined_now(rel, find_table(tables_at(&ours), name), now,
+						READ_FOR_MERGE, &o);
+	tp = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now,
+						READ_FOR_MERGE, &t);
 	table_close(rel, AccessShareLock);
 
 	/*

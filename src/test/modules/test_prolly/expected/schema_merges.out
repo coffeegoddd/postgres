@@ -1791,12 +1791,13 @@ SELECT (dolt_merge('stc_right'))[2:4];
  {0,0,"merge successful"}
 (1 row)
 
-SELECT * FROM stc.t ORDER BY pk;
- pk |   s    |  c  | i 
-----+--------+-----+---
-  1 | a      | b   | 1
-  2 | longer | cc  | 2
-  3 | x      | y   | 3
+-- (ours' rows trimmed as the cast from char trims them, as ALTER did theirs')
+SELECT *, octet_length(c) AS c_len FROM stc.t ORDER BY pk;
+ pk |   s    | c  | i | c_len 
+----+--------+----+---+-------
+  1 | a      | b  | 1 |     1
+  2 | longer | cc | 2 |     2
+  3 | x      | y  | 3 |     1
 (3 rows)
 
 SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
