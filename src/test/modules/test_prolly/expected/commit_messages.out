@@ -1,0 +1,215 @@
+-- A commit's message and author, wherever they're given: neither is empty
+-- (as Dolt's commits refuse an empty message, author name or email).  An
+-- author is "Name <email>", or a name alone, as the session user is.
+CREATE SCHEMA cm VERSIONED;
+CREATE TABLE cm.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'cm base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS base \gset
+INSERT INTO cm.t VALUES (1);
+-- dolt_commit: an empty message, an empty author, an author without a
+-- name or with an empty email.  (--allow-empty: each one would commit.)
+SELECT dolt_commit('-Am', '');
+ERROR:  dolt_commit needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_commit('--allow-empty', '--message', '');
+ERROR:  dolt_commit needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_commit('--allow-empty', '-Am', 'by nobody', '--author', '');
+ERROR:  dolt_commit: "" is not an author
+HINT:  An author is "Name <email>", or a name alone.
+SELECT dolt_commit('--allow-empty', '-Am', 'by nobody', '--author', ' <ada@example.com>');
+ERROR:  dolt_commit: " <ada@example.com>" is not an author
+HINT:  An author is "Name <email>", or a name alone.
+SELECT dolt_commit('--allow-empty', '-Am', 'by nobody', '--author', 'Ada <>');
+ERROR:  dolt_commit: "Ada <>" is not an author
+HINT:  An author is "Name <email>", or a name alone.
+SELECT dolt_hashof('HEAD') = :'base' AS nothing_committed;
+ nothing_committed 
+-------------------
+ t
+(1 row)
+
+-- An author with an email, or a name alone.
+SELECT length(dolt_commit('-Am', 'by ada', '--author', 'Ada <ada@example.com>')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO cm.t VALUES (2);
+SELECT length(dolt_commit('-Am', 'by bob', '--author', 'Bob')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT committer, email, message FROM dolt_log('main') LIMIT 2;
+ committer |      email      | message 
+-----------+-----------------+---------
+ Bob       |                 | by bob
+ Ada       | ada@example.com | by ada
+(2 rows)
+
+-- dolt.author: empty is the session user; otherwise an author too.
+SET dolt.author = ' <ada@example.com>';
+ERROR:  invalid value for parameter "dolt.author": " <ada@example.com>"
+DETAIL:  An author is "Name <email>", or a name alone.
+SET dolt.author = 'Ada <>';
+ERROR:  invalid value for parameter "dolt.author": "Ada <>"
+DETAIL:  An author is "Name <email>", or a name alone.
+SET dolt.author = 'Ada <ada@example.com>';
+RESET dolt.author;
+-- dolt_merge's and dolt_pull's -m, dolt_integrate's, dolt_revert's
+-- --author.
+SELECT dolt_branch('cm_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cm_f'"}
+(1 row)
+
+INSERT INTO cm.t VALUES (3);
+SELECT length(dolt_commit('-Am', 'on cm_f')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('cm_f', '-m', '');
+ERROR:  dolt_merge needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_merge('--no-ff', '--message', '', 'cm_f');
+ERROR:  dolt_merge needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_pull('-m', '', 'origin', 'main');
+ERROR:  dolt_pull needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_integrate('main', '-m', '');
+ERROR:  dolt_integrate needs a message
+DETAIL:  A commit's message can't be empty.
+SELECT dolt_revert('--author', '', 'HEAD');
+ERROR:  dolt_revert: "" is not an author
+HINT:  An author is "Name <email>", or a name alone.
+SELECT dolt_revert('--author', 'Ada <>', 'HEAD');
+ERROR:  dolt_revert: "Ada <>" is not an author
+HINT:  An author is "Name <email>", or a name alone.
+SELECT dolt_hashof('HEAD') = :'before_merge' AS nothing_merged;
+ nothing_merged 
+----------------
+ t
+(1 row)
+
+SELECT r[2:4] FROM dolt_revert('--author', 'Ada <ada@example.com>', 'HEAD') r;
+    r    
+---------
+ {0,0,0}
+(1 row)
+
+SELECT committer, email, message FROM dolt_log('main') LIMIT 1;
+ committer |      email      |     message     
+-----------+-----------------+-----------------
+ Ada       | ada@example.com | Revert "by bob"
+(1 row)
+
+-- An abort makes no commit: dolt_merge's -m and dolt_revert's --author
+-- are ignored with --abort (as Dolt ignores -m), even empty.
+CREATE TABLE cm.c (id int PRIMARY KEY, v text);
+INSERT INTO cm.c VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cm.c')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('cm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cm_f'"}
+(1 row)
+
+SELECT dolt_merge('main') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+UPDATE cm.c SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cm.c SET v = 'ours';
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_abort \gset
+BEGIN;
+SELECT (dolt_merge('cm_f'))[2:4] AS conflicted;
+       conflicted        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT (dolt_merge('--abort', '-m', ''))[2:4] AS aborted;
+        aborted        
+-----------------------
+ {0,0,"merge aborted"}
+(1 row)
+
+COMMIT;
+SELECT dolt_hashof('HEAD') = :'before_abort' AS back, v FROM cm.c;
+ back |  v   
+------+------
+ t    | ours
+(1 row)
+
+SELECT dolt_revert('--abort', '--author', '');	-- (no revert to abort)
+ERROR:  there is no revert in progress
+-- (a transaction's commit message isn't empty either)
+SET dolt.transaction_commit_message = '';
+ERROR:  invalid value for parameter "dolt.transaction_commit_message": ""
+DETAIL:  A commit needs a message.
+SELECT dolt_branch('-D', 'cm_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cm CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table cm.t
+drop cascades to table cm.c
+SELECT length(dolt_commit('-Am', 'cm gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

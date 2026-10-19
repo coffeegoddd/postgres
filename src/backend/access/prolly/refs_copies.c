@@ -117,6 +117,11 @@ static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
+static void merge_tables_left(const char *branch, ProllyMergeState *state,
+							  char **name);
+static List *violations_left(const char *branch, List *violations,
+							 char **name);
+static Oid	branch_oid(const char *name);
 static void merge_key(StringInfo key, const char *branch);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
@@ -175,9 +180,66 @@ note_merge_changed(const char *branch)
 	}
 }
 
+typedef struct TablesExist
+{
+	int			n;
+	const Oid  *relids;
+	bool	   *exists;			/* out: whether each is a table there */
+	char	  **name;			/* out, if not NULL: the first one's name */
+} TablesExist;
+
+static void
+tables_exist_here(void *arg)
+{
+	TablesExist *te = arg;
+
+	if (te->name)
+		*te->name = NULL;
+	for (int i = 0; i < te->n; i++)
+	{
+		te->exists[i] = SearchSysCacheExists1(RELOID,
+											  ObjectIdGetDatum(te->relids[i]));
+		if (te->exists[i] && te->name && *te->name == NULL)
+			*te->name = get_rel_name(te->relids[i]);
+	}
+}
+
+/*
+ * Which of relids are tables on branch, as its own catalog has them: a
+ * merge state, or violations, of a branch other than the session's names
+ * tables of that branch, which the session's branch may not have (or may
+ * have dropped, where that one still has them).  A branch with only a head
+ * has no catalog of its own yet, and so nothing dropped from it.
+ */
+static void
+tables_exist_on(const char *branch, int n, const Oid *relids, bool *exists,
+				char **name)
+{
+	TablesExist te = {n, relids, exists, name};
+
+	if (n == 0)
+	{
+		if (name)
+			*name = NULL;
+		return;
+	}
+	if (strcmp(branch, branch_ops()->current()) == 0)
+		tables_exist_here(&te);
+	else if (OidIsValid(branch_oid(branch)))
+		branch_ops()->run_on(branch, tables_exist_here, &te);
+	else
+	{
+		for (int i = 0; i < n; i++)
+			exists[i] = true;
+		if (name)
+			*name = get_rel_name(relids[0]);
+	}
+}
+
 /*
  * Unresolved conflicts, or constraint violations, of a merge the
- * transaction made aren't committed.
+ * transaction made aren't committed: on each branch it made one on, as
+ * that branch has its tables (a checkout since doesn't hide them).
  */
 static void
 check_merge_conflicts(const char *what)
@@ -188,27 +250,29 @@ check_merge_conflicts(const char *what)
 		return;
 	foreach(lc, merge_changed)
 	{
+		const char *branch = lfirst(lc);
 		ProllyMergeState ms;
-
 		List	   *v;
+		char	   *name = NULL;
 
-		if (merge_state_of(lfirst(lc), &ms) && ms.ntables > 0)
+		if (merge_state_of(branch, &ms))
+			merge_tables_left(branch, &ms, &name);
+		if (ms.ntables > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
 					 errdetail("Table \"%s\" has conflicts on branch \"%s\".",
-							   get_rel_name(ms.tables[0]),
-							   (char *) lfirst(lc)),
+							   name, branch),
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
-		v = violations_of(lfirst(lc));
+		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
 					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
-							   get_rel_name(((ProllyViolation *) linitial(v))->relid),
+							   name,
 							   ((ProllyViolation *) linitial(v))->type,
-							   (char *) lfirst(lc)),
+							   branch),
 					 errhint("Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.")));
 	}
 }
@@ -1866,7 +1930,11 @@ merge_key(StringInfo key, const char *branch)
 	appendStringInfoString(key, branch);
 }
 
-/* The merge in progress on branch, if there is one. */
+/*
+ * The merge in progress on branch, if there is one, as the refs hold it:
+ * its conflicted tables, as merge_tables_left() has them, may include some
+ * since dropped.
+ */
 static bool
 merge_state_of(const char *branch, ProllyMergeState *state)
 {
@@ -1925,10 +1993,34 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 	return found;
 }
 
+/*
+ * Leave out of a branch's merge state the conflicted tables the branch has
+ * since dropped (as Dolt, dropping a table drops its conflicts); name: the
+ * first one left's name, if wanted.
+ */
+static void
+merge_tables_left(const char *branch, ProllyMergeState *state, char **name)
+{
+	bool	   *exists = palloc(sizeof(bool) * Max(state->ntables, 1));
+	int			n = 0;
+
+	tables_exist_on(branch, state->ntables, state->tables, exists, name);
+	for (int i = 0; i < state->ntables; i++)
+		if (exists[i])
+			state->tables[n++] = state->tables[i];
+	state->ntables = n;
+	pfree(exists);
+}
+
 static bool
 copies_merge_state(ProllyMergeState *state)
 {
-	return merge_state_of(branch_ops()->current(), state);
+	char	   *branch = branch_ops()->current();
+
+	if (!merge_state_of(branch, state))
+		return false;
+	merge_tables_left(branch, state, NULL);
+	return true;
 }
 
 /* (NULL: none) */
@@ -2017,8 +2109,8 @@ corrupt:
 }
 
 /*
- * The constraint violations a merge left on branch: those of tables since
- * dropped left out (a dropped table has no rows to fix).
+ * The constraint violations a merge left on branch, as the refs hold them:
+ * violations_left() leaves out those of tables since dropped.
  */
 static List *
 violations_of(const char *branch)
@@ -2049,8 +2141,7 @@ violations_of(const char *branch)
 			pv->type = get_text(&p, end);
 			pv->row = get_text(&p, end);
 			pv->info = get_text(&p, end);
-			if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(pv->relid)))
-				list = lappend(list, pv);
+			list = lappend(list, pv);
 		}
 	}
 	pfree(key.data);
@@ -2058,10 +2149,37 @@ violations_of(const char *branch)
 	return list;
 }
 
+/*
+ * Of a branch's constraint violations, those of tables it still has (a
+ * dropped table has no rows to fix); name: the first one's table's name,
+ * if wanted.
+ */
+static List *
+violations_left(const char *branch, List *violations, char **name)
+{
+	int			n = list_length(violations);
+	Oid		   *relids = palloc(sizeof(Oid) * Max(n, 1));
+	bool	   *exists = palloc(sizeof(bool) * Max(n, 1));
+	List	   *left = NIL;
+	ListCell   *lc;
+
+	foreach(lc, violations)
+		relids[foreach_current_index(lc)] = ((ProllyViolation *) lfirst(lc))->relid;
+	tables_exist_on(branch, n, relids, exists, name);
+	foreach(lc, violations)
+		if (exists[foreach_current_index(lc)])
+			left = lappend(left, lfirst(lc));
+	pfree(relids);
+	pfree(exists);
+	return left;
+}
+
 static List *
 copies_violations(void)
 {
-	return violations_of(branch_ops()->current());
+	char	   *branch = branch_ops()->current();
+
+	return violations_left(branch, violations_of(branch), NULL);
 }
 
 static void
