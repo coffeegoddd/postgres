@@ -3630,6 +3630,13 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		bool		reused;
 		ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
 
+		/*
+		 * This record restores the page before the caller's change.  If
+		 * that change skips WAL, commit must log the final page contents;
+		 * an fsync alone would let redo overwrite them with this image.
+		 */
+		RelFileLocatorForceWALAtCommit(rel);
+
 		/* the old block gets what other maps should read, if only buffered */
 		if (BufferIsDirty(buffer))
 			FlushOneBuffer(buffer);

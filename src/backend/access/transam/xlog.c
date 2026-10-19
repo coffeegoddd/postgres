@@ -6788,6 +6788,8 @@ StartupXLOG(void)
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	TransamVariables->latestCompletedXid = TransamVariables->nextXid;
 	FullTransactionIdRetreat(&TransamVariables->latestCompletedXid);
+	/* Hot standby backends must not reuse snapshots with the old xmax. */
+	TransamVariables->xactCompletionCount++;
 	LWLockRelease(ProcArrayLock);
 
 	/*
@@ -6930,6 +6932,8 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+
+	INJECTION_POINT("promotion-after-recovery-state", NULL);
 
 	/*
 	 * Wake up the checkpointer process as there might be a request to disable

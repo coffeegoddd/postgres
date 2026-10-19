@@ -730,6 +730,7 @@ typedef struct UnsureRows
 {
 	int			n;
 	UnsureRow **rows;
+	bool		alternative;	/* a key or keyless row has two readings */
 } UnsureRows;
 
 static int
@@ -854,11 +855,12 @@ count_of(Changes *c, const StringInfoData *value)
 }
 
 /*
- * While a merge (or pick) runs: the constraint violations it records, and
- * the tables it wrote to, whose foreign keys are checked after; and the
- * last table whose rows a merge wrote, whether a row written may break a
- * constraint there, and its columns whose values a domain's constraint
- * may reject, with how each is checked (DomainPlan).
+ * Constraint state for merges (including picks) and conflict resolution:
+ * the violations a merge records, the tables it wrote to whose foreign
+ * keys are checked after, and the last table whose rows a merge or
+ * resolution checked, whether a row written may break a constraint there,
+ * and its columns whose values a domain's constraint may reject, with how
+ * each is checked (DomainPlan).
  */
 static bool recording = false;
 static List *recorded = NIL;	/* ProllyViolation * */
@@ -870,6 +872,22 @@ static struct DomainPlan **domain_plans = NULL; /* by attnum - 1 */
 static struct Removed *removed = NULL;	/* removed_begin() */
 
 static bool checks_domains(Relation rel);
+
+/*
+ * Start a merge or resolution without state from an earlier transaction.
+ * Every entry point must call this before consulting the cached state or
+ * calling note_constraints(): its pointers may outlive their transaction
+ * or subtransaction, on success or error.  Forget them without freeing or
+ * dereferencing them; their owning memory context reclaims the allocations.
+ */
+static void
+reset_constraints(void)
+{
+	breakable_relid = InvalidOid;
+	breakable_domains = NULL;
+	domain_plans = NULL;
+	removed = NULL;
+}
 
 static void
 note_written(Oid relid)
@@ -896,10 +914,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	recording = true;
 	recorded = NIL;
 	written = NIL;
-	breakable_relid = InvalidOid;
-	breakable_domains = NULL;
-	domain_plans = NULL;
-	removed = NULL;
+	reset_constraints();
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -1433,6 +1448,35 @@ row_domain_refusal(Relation rel, TupleTableSlot *row, const bool *keep,
 		}
 	}
 	return NULL;
+}
+
+/* Identify the table and primary key of a row refused during resolution. */
+static void
+describe_resolution_refusal(ErrorData *ed, Relation rel, TupleTableSlot *row)
+{
+	Relation	index;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	char	   *key;
+	char	   *detail;
+	char	   *name;
+
+	index = index_open(RelationGetPrimaryKeyIndex(rel, true), AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
+		values[i] = slot_getattr(row, index->rd_index->indkey.values[i],
+								 &isnull[i]);
+	key = BuildIndexValueDescription(index, values, isnull);
+	index_close(index, AccessShareLock);
+
+	ed->table_name = pstrdup(RelationGetRelationName(rel));
+	ed->schema_name = get_namespace_name(RelationGetNamespace(rel));
+	name = quote_qualified_identifier(ed->schema_name, ed->table_name);
+	if (key)
+		detail = psprintf("Key %s in table %s violates a domain constraint.",
+						  key, name);
+	else
+		detail = psprintf("A row in table %s violates a domain constraint.", name);
+	ed->detail = ed->detail ? psprintf("%s\n%s", ed->detail, detail) : detail;
 }
 
 /*
@@ -2207,8 +2251,17 @@ typedef enum WalkMode
 {
 	WALK_MERGE,					/* write it, unless it conflicts */
 	WALK_LIST,					/* report it if it conflicts */
+	WALK_PLAN,					/* collect outcomes without writing rows */
 	WALK_TAKE_THEIRS			/* if it conflicts, make the row theirs */
 } WalkMode;
+
+/* A merge's outcome at one key; omitted keys keep ours' value. */
+typedef struct MergeOutcome
+{
+	ProllyKey	key;
+	StringInfoData value;
+	bool		conflict;
+} MergeOutcome;
 
 static const ProllyValue *
 value_or_null(const StringInfoData *s, ProllyValue *v)
@@ -2748,16 +2801,17 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
  * merge in progress): a conflict's row on the branch is its row there,
  * none if it was deleted since, not ours'.  unsure, if not NULL, is base's
  * rows with an unsure value (as_defined_now()): each side that has such a
- * row changed it, in those columns.  Returns how many keys conflict.
+ * row changed it, in those columns.  WALK_PLAN collects outcomes in *plan
+ * without applying or recording writes.  Returns how many keys conflict.
  */
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
 			const Table *theirs, WalkMode mode, ProllyConflictSink *sink,
-			const Table *current, const UnsureRows *unsure)
+			const Table *current, const UnsureRows *unsure, List **plan)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
-	Relation	rel = table_open(relid, mode == WALK_LIST ? AccessShareLock :
+	Relation	rel = table_open(relid, (mode == WALK_LIST || mode == WALK_PLAN) ? AccessShareLock :
 								 RowExclusiveLock);
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
@@ -2791,7 +2845,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	in_place = !keyless && updates_in_place(rel);
-	if (recording)
+	if (recording && mode != WALK_PLAN)
 		note_constraints(rel, keyless);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	unread = palloc0_array(bool, RelationGetDescr(rel)->natts);
@@ -2816,7 +2870,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 
 	s1 = table_slot_create(rel, NULL);
 	s2 = table_slot_create(rel, NULL);
-	if (mode != WALK_LIST)
+	if (mode == WALK_MERGE || mode == WALK_TAKE_THEIRS)
 		a = PROLLY_CALL(ar, begin, rel);
 	lo = list_head(oc.list);
 	foreach(lt, tc.list)
@@ -2917,6 +2971,28 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			}
 		}
 
+		if (mode == WALK_PLAN)
+		{
+			MergeOutcome *out = palloc0(sizeof(MergeOutcome));
+
+			out->key.len = tk.len;
+			out->key.data = (const uint8 *) palloc(tk.len);
+			memcpy(unconstify(uint8 *, out->key.data), tk.data, tk.len);
+			out->conflict = conflict;
+			initStringInfo(&out->value);
+			if (!conflict && want > 0)
+			{
+				ProllyValue value = {(const uint8 *) row->data, row->len};
+				ProllyValue decoded;
+				uint64		count;
+
+				PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &value, &decoded, &count);
+				PROLLY_CALL(tc.rd.kr, make_value, tc.rd.k, &decoded, want, &out->value);
+			}
+			*plan = lappend(*plan, out);
+			continue;
+		}
+
 		if (conflict)
 		{
 			ProllyValue bv,
@@ -2998,19 +3074,37 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		kw.put_back = puts_back(rel, keyless);
 
 		/*
-		 * (rows --theirs takes, checked against the columns' typmods
-		 * before any is written)
+		 * Rows --theirs takes are checked against the columns' typmods
+		 * and domains before any is written.  Resolution doesn't run
+		 * inside merge_recording(), so start its constraint state here.
+		 * Compare with the branch's row now: an unchanged value allowed
+		 * by a NOT VALID domain constraint needn't be checked again.
 		 */
 		if (mode == WALK_TAKE_THEIRS)
 		{
+			reset_constraints();
+			note_constraints(rel, keyless);
 			foreach(lt, writes)
 			{
 				KeyWrite   *w = lfirst(lt);
+				TupleTableSlot *was = NULL;
+				ErrorData  *ed;
 
 				if (w->nrow == 0)
 					continue;
 				(void) decode(&tc, w->row, s2);
 				check_fits(&fits, rel, s2, NULL);
+				if (w->nold > 0)
+				{
+					(void) decode(&tc, w->old, s1);
+					was = s1;
+				}
+				ed = row_domain_refusal(rel, s2, NULL, was, NULL);
+				if (ed)
+				{
+					describe_resolution_refusal(ed, rel, s2);
+					ThrowErrorData(ed);
+				}
 			}
 		}
 		removed_begin(rel, keyless);
@@ -3036,6 +3130,76 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
 	table_close(rel, NoLock);
 	return conflicts;
+}
+
+/*
+ * Compare two interpretations before writing anything.  A conflict under
+ * the text reading already preserves both sides for resolution.  Everywhere
+ * else the cast reading must produce the same row and copy count, without
+ * a new conflict.  A missing outcome means the row stays as ours has it.
+ */
+static void
+check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
+					 const Table *ours, const Table *theirs,
+					 const UnsureRows *text_unsure, const UnsureRows *cast_unsure)
+{
+	List	   *text_plan = NIL;
+	List	   *cast_plan = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	Relation	rel = table_open(relid, AccessShareLock);
+	RowDiff		rd;
+	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	StringInfoData unchanged;
+
+	(void) merge_table(relid, text_base, ours, theirs, WALK_PLAN, NULL, NULL,
+					   text_unsure, &text_plan);
+	(void) merge_table(relid, cast_base, ours, theirs, WALK_PLAN, NULL, NULL,
+					   cast_unsure, &cast_plan);
+	rd.kr = keying_of(rel);
+	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
+	chunk_env(&env);
+	env.compare = keying_compare;
+	env.compare_arg = &rd;
+	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
+	initStringInfo(&unchanged);
+	a = list_head(text_plan);
+	b = list_head(cast_plan);
+	while (a || b)
+	{
+		MergeOutcome *x = a ? lfirst(a) : NULL;
+		MergeOutcome *y = b ? lfirst(b) : NULL;
+		int			cmp = !x ? 1 : !y ? -1 : keying_compare(&x->key, &y->key, &rd);
+		const ProllyKey *key = cmp <= 0 ? &x->key : &y->key;
+
+		if (cmp <= 0)
+			a = lnext(text_plan, a);
+		else
+			x = NULL;
+		if (cmp >= 0)
+			b = lnext(cast_plan, b);
+		else
+			y = NULL;
+		if (x && x->conflict)
+			continue;
+		resetStringInfo(&unchanged);
+		if (!x || !y)
+			(void) PROLLY_CALL(tree, get, &env, &ours->data, key, &unchanged);
+		if ((y && y->conflict) ||
+			!same_bytes(x ? &x->value : &unchanged, y ? &y->value : &unchanged))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("rows of table \"%s\" can't be merged across an ambiguous type change",
+							RelationGetRelationName(rel)),
+					 errdetail("Reading the merge base through the cast or through its text form gives different merge results."),
+					 errhint("Merge the row changes before changing the column types.")));
+		CHECK_FOR_INTERRUPTS();
+	}
+	pfree(unchanged.data);
+	PROLLY_CALL(rd.kr, close, rd.k);
+	table_close(rel, AccessShareLock);
 }
 
 /* ------------------------------------------------------------------------
@@ -3161,7 +3325,9 @@ dup_bytes(const char *data, int len)
  *
  * Only a written value has to be one the column could hold now, and it's
  * converted as ALTER TABLE ... TYPE without USING converted the side's
- * own rows.  A value shown or compared is made the column's only where
+ * own rows.  Shown or compared values use domains' base types, with their
+ * typmods: a historical value needn't meet a domain's constraints now.
+ * A value shown or compared is made the column's only where
  * nothing is lost: it's cast, and the cast kept only if casting it back
  * gives the value again.  A lossy cast (rounding, cutting to fit) could
  * make two of base's keys one, or make a side's change look like none
@@ -3188,22 +3354,22 @@ dup_bytes(const char *data, int len)
  * it (as_defined_now()'s *unsure).  In a key, or a table without one,
  * nothing can say which side changed it: the merge is refused.
  *
- * A column both sides retyped is compared as master compared it: both
- * ALTERs may have had a USING (upper(code), rpad(name, 5)) that the cast
- * misses, and a side's edit back to the cast's value would look like
- * none.  Of the same type, base's cast is trusted only where it gives
- * the stored value, which is otherwise kept (char(3) to char(10): the
- * padding is a change, so a plain one made on both sides conflicts on a
- * row a side also edited, as on master).  Of another type, base's value
- * is its text form read as the new type, whatever the cast gives; only
- * where that fails (where master failed) is it unsure, or refused where
- * it can't be.
+ * Within one type, a column both sides retyped keeps base's stored value
+ * unless the cast produces that same value.  Across types, read base both
+ * through its text form and through the cast: a USING expression isn't
+ * recorded, and either reading alone can disguise a side's later edit as
+ * unchanged.  Where both readings succeed but differ, a non-key column is
+ * unsure.  For keys and keyless rows, compare the merge outcomes under
+ * both readings before writing: retain the text reading's conflicts, but
+ * refuse a differing nonconflicting result.  Identical outcomes still
+ * merge.  A failed text reading retains the existing unsure/refusal rule.
  */
 typedef enum ReadFor
 {
 	READ_SHOWN,
 	READ_WRITTEN,
 	READ_COMPARED,
+	READ_ALTERNATIVE,			/* compared, with keys read through the cast */
 } ReadFor;
 
 /*
@@ -3230,10 +3396,14 @@ typedef struct ColumnRead
 	bool		match_stored;	/* kept only as the stored value itself */
 	bool		blank_padded;	/* compared back without trailing blanks */
 	bool		by_text;		/* checked against the text form too, */
-	bool		text_only;		/* or read as the text form alone: */
+	bool		text_only;		/* or read as the text form: */
+	bool		compare_cast;	/* compare that text reading with the cast */
+	bool		cast_guarded;	/* that cast may fail on a value */
+	bool		cast_key;		/* use the cast for an ambiguous key */
 	FmgrInfo	out;			/* the old type's output */
 	Oid			in;				/* the new type's input */
 	Oid			in_param;
+	int32		in_typmod;		/* including a domain's base typmod */
 	CastLoss	loss;
 } ColumnRead;
 
@@ -3307,24 +3477,46 @@ is_bit_type(Oid type)
  * (canon_folded.c's move_table()).  One shown or compared goes through
  * the explicit cast (which cuts a string to fit rather than failing),
  * checked by casting it back unless the cast is a widening, or a relabel
- * of a type stored alike, which loses nothing.
+ * of a type stored alike, which loses nothing.  For these reads, strip
+ * domains from both ends of the cast (including the cast back): their
+ * constraints don't apply to values only shown or compared.
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 			ReadFor read, bool key, bool keyless, bool both, EState *estate,
 			ColumnRead *cr)
 {
-	Form_pg_attribute xa = TupleDescAttr(xd, j);
+	FormData_pg_attribute source = *TupleDescAttr(xd, j);
+	FormData_pg_attribute target = *att;
+	Form_pg_attribute xa = &source;
 	Node	   *var = (Node *) makeVar(1, j + 1, xa->atttypid, xa->atttypmod,
 									   xa->attcollation, 0);
 	Node	   *e = NULL;
 	Node	   *back;
-	bool		same = xa->atttypid == att->atttypid;
-	bool		alike = same ||
+	bool		compared = read == READ_COMPARED || read == READ_ALTERNATIVE;
+	bool		same;
+	bool		alike;
+
+	if (read != READ_WRITTEN)
+	{
+		source.atttypid = getBaseTypeAndTypmod(source.atttypid,
+											   &source.atttypmod);
+		target.atttypid = getBaseTypeAndTypmod(target.atttypid,
+											   &target.atttypmod);
+		/* The Var must still match the version's tuple descriptor. */
+		if (source.atttypid != TupleDescAttr(xd, j)->atttypid)
+			var = (Node *) makeRelabelType((Expr *) var, source.atttypid,
+										   source.atttypmod, source.attcollation,
+										   COERCE_IMPLICIT_CAST);
+	}
+	att = &target;
+	same = xa->atttypid == att->atttypid;
+	alike = same ||
 		(get_typtype(att->atttypid) != TYPTYPE_DOMAIN &&
 		 IsBinaryCoercible(xa->atttypid, att->atttypid));
 
 	memset(cr, 0, sizeof(ColumnRead));
+	cr->in_typmod = att->atttypmod;
 	if (read == READ_WRITTEN)
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
@@ -3335,11 +3527,11 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 								  COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
 
 	/*
-	 * (compared, retyped by both sides: as master compared it, base's
-	 * stored value for the same type, the cast trusted only where it gives
-	 * that; for another type its text form read as the new type)
+	 * Compared, retyped by both sides: keep the stored value within one
+	 * type.  Across types compare the text reading with the cast, since
+	 * either could be what the unrecorded USING expression produced.
 	 */
-	if (read == READ_COMPARED && both)
+	if (compared && both)
 	{
 		if (same)
 		{
@@ -3355,24 +3547,31 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 			Oid			outf;
 			bool		varlena;
 
-			/*
-			 * (the text form is what master compared, whether or not the
-			 * cast agrees; only where it doesn't read as the new type,
-			 * where master failed, is the value unsure, or refused)
-			 */
+			/* Failed text input stays unsure, or refuses an unreadable key. */
 			cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
 			cr->text_only = true;
+			cr->compare_cast = true;
+			cr->cast_key = read == READ_ALTERNATIVE && (key || keyless);
+			if (e != NULL)
+			{
+				assign_expr_collations(NULL, e);
+				cr->conv = ExecPrepareExpr((Expr *) e, estate);
+			}
 			getTypeOutputInfo(xa->atttypid, &outf, &varlena);
 			fmgr_info(outf, &cr->out);
 			getTypeInputInfo(att->atttypid, &cr->in, &cr->in_param);
 			cr->guarded = !(is_string_type(xa->atttypid) &&
 							is_string_type(att->atttypid) &&
 							att->atttypmod < 0);
+			/* (as below: the explicit cast only cuts, pads or trims) */
+			cr->cast_guarded =
+				!((is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+				  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
 		}
 		return;
 	}
 
-	if (e == NULL && read == READ_COMPARED && !key && !keyless)
+	if (e == NULL && compared && !key && !keyless)
 	{
 		/* (no cast at all: every value of base's is unsure) */
 		cr->loss = LOSS_UNSURE;
@@ -3399,7 +3598,7 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		cr->blank_padded = att->atttypid == BPCHAROID &&
 			xa->atttypid != BPCHAROID && !key;
 	}
-	else if (read == READ_COMPARED)
+	else if (compared)
 	{
 		cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
 		if (!(is_string_type(xa->atttypid) && is_string_type(att->atttypid)))
@@ -3456,18 +3655,23 @@ same_but_trailing_blanks(Datum a, Datum b)
  * Column cr's value of xs's attribute j (att's type before: xatt), read
  * into *d and *isnull, in the current memory context, through cr->conv
  * (evaluated in econtext), or as its text form read as the new type
- * (cr->text_only).  False where the value doesn't come back from
+ * (cr->text_only).  A disagreement with its cast marks a non-key value
+ * unsure; a key sets *alternative, or takes the cast for READ_ALTERNATIVE.
+ * False where the value doesn't come back from
  * it (cr->back; or there's no cast back where one's needed), or differs
- * from the value's text form read as the new type (cr->by_text), or the
- * cast or that read fails with a data exception (value too long,
- * numeric field overflow, invalid input) where it's guarded; *d and
- * *isnull are then the cast's value if it gave one, else null.  Other
- * errors are raised.
+ * from the value's text form read as the new type (cr->by_text), or, read
+ * as its text form, disagrees with its cast where that makes it unsure, or
+ * the cast or that read fails with a data exception (value too long,
+ * numeric field overflow, invalid input) or an integrity constraint
+ * violation (a domain nested in an array, composite or range) where it's
+ * guarded (written reads never are).  *d and *isnull are then the value
+ * read if there was one (the cast's, or the text reading's where
+ * cr->text_only), else null.  Other errors are raised.
  */
 static bool
 read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 		   int j, Form_pg_attribute att, Form_pg_attribute xatt,
-		   Datum *d, bool *isnull)
+		   Datum *d, bool *isnull, bool *alternative)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
@@ -3475,6 +3679,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 
 	*isnull = true;
 	*d = (Datum) 0;
+	*alternative = false;
 	if (cr->conv == NULL && !cr->text_only)
 		return false;
 	econtext->ecxt_scantuple = xs;
@@ -3494,8 +3699,31 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 												  xs->tts_values[j]);
 
 			*d = OidInputFunctionCall(cr->in, text, cr->in_param,
-									  att->atttypmod);
+									  cr->in_typmod);
 			*isnull = false;
+			if (cr->compare_cast && cr->conv != NULL)
+			{
+				ColumnRead	cast = *cr;
+				Datum		cv;
+				bool		cn;
+				bool		unused;
+
+				cast.text_only = false;
+				cast.guarded = cr->cast_guarded;
+				if (read_value(&cast, econtext, xs, j, att, xatt, &cv, &cn, &unused) &&
+					(cn || !datum_image_eq(cv, *d, att->attbyval, att->attlen)))
+				{
+					if (cr->loss == LOSS_UNSURE)
+						kept = false;
+					else if (cr->cast_key)
+					{
+						*d = cv;
+						*isnull = cn;
+					}
+					else
+						*alternative = true;
+				}
+			}
 			goto done;
 		}
 		v = ExecEvalExprSwitchContext(cr->conv, econtext, &n);
@@ -3521,7 +3749,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 			char	   *text = OutputFunctionCall((FmgrInfo *) &cr->out,
 												  xs->tts_values[j]);
 			Datum		t = OidInputFunctionCall(cr->in, text, cr->in_param,
-												 att->atttypmod);
+												 cr->in_typmod);
 
 			kept = datum_image_eq(t, *d, att->attbyval, att->attlen);
 		}
@@ -3541,7 +3769,8 @@ done:
 			PG_RE_THROW();
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION &&
+			ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION)
 			PG_RE_THROW();
 		FlushErrorState();
 		FreeErrorData(ed);
@@ -3624,10 +3853,12 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  * Read for comparing (a merge's base), only the columns named in retyped
  * (those a side retyped: retyped_columns()) are; others are read as
  * shown, as the sides' are.  Those in both_retyped, which both sides
- * retyped, are trusted through the cast only where it gives what master
- * compared (see ReadFor).  *unsure (if not NULL) gets the rows (keyed)
- * with a value that's unsure (see ReadFor): a side has changed them,
- * where it has them (merge_table()).  It's left empty otherwise.
+ * retyped, compare the text and cast readings (see ReadFor).  *unsure
+ * (if not NULL) gets the rows (keyed) with a value that's unsure (see
+ * ReadFor): a side has changed them, where it has them (merge_table()).
+ * Its alternative flag requests a
+ * second reading for ambiguous keys or keyless rows.  READ_ALTERNATIVE
+ * uses that cast reading, leaving non-key columns' uncertainty unchanged.
  *
  * Where refuse (a merge), refused where rel's rows can't faithfully come
  * from x's: when x lacks a column whose values each row was given as it
@@ -3758,7 +3989,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			if (estate == NULL)
 				estate = CreateExecutorState();
 			column_read(rel, xd, from[a], att,
-						read == READ_COMPARED &&
+						(read == READ_COMPARED || read == READ_ALTERNATIVE) &&
 						!name_listed(retyped, NameStr(att->attname)) ?
 						READ_SHOWN : read,
 						bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk),
@@ -3801,6 +4032,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		for (int a = 0; a < md->natts; a++)
 		{
 			Form_pg_attribute att = TupleDescAttr(md, a);
+			bool		alternative = false;
 
 			ms->tts_isnull[a] = true;
 			if (att->attisdropped)
@@ -3817,7 +4049,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			if (converted[a] &&
 				!read_value(&reads[a], GetPerTupleExprContext(estate), xs,
 							from[a], att, TupleDescAttr(xd, from[a]),
-							&ms->tts_values[a], &ms->tts_isnull[a]))
+							&ms->tts_values[a], &ms->tts_isnull[a], &alternative))
 			{
 				/* (the cast lost the value, or failed) */
 				if (reads[a].loss == LOSS_KEEP_STORED)
@@ -3840,6 +4072,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			}
 			else if (!converted[a])
 				ms->tts_values[a] = xs->tts_values[from[a]];
+			if (alternative && unsure)
+				unsure->alternative = true;
 		}
 		ExecStoreVirtualTuple(ms);
 		if (generated != NIL)
@@ -4529,7 +4763,7 @@ merge_rows(void *arg)
 					apply_rows(relid, w, o);
 				row_conflicts(mr, relid,
 							  merge_table(relid, b, o, t, WALK_MERGE, NULL, NULL,
-										  NULL));
+										  NULL, NULL));
 				continue;
 			}
 		}
@@ -4572,6 +4806,23 @@ merge_rows(void *arg)
 								  true, &bn, &unsure);
 			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, NIL, true, &on, NULL);
 			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, NIL, true, &tn, NULL);
+			if (unsure.alternative)
+			{
+				Table		alternative;
+				UnsureRows	alternative_unsure;
+				MemoryContext check = AllocSetContextCreate(CurrentMemoryContext,
+															"merge readings check",
+															ALLOCSET_DEFAULT_SIZES);
+				MemoryContext old = MemoryContextSwitchTo(check);
+
+				/* (all of it freed after: only an ERROR comes out of it) */
+				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, retyped, both_retyped,
+									  true, &alternative, &alternative_unsure);
+				check_merge_readings(relid, &bn, &alternative, &on, &tn,
+									 &unsure, &alternative_unsure);
+				MemoryContextSwitchTo(old);
+				MemoryContextDelete(check);
+			}
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
 				apply_rows(relid, w, &on);
@@ -4583,7 +4834,7 @@ merge_rows(void *arg)
 			else
 				row_conflicts(mr, relid,
 							  merge_table(relid, &bn, &on, &tn, WALK_MERGE, NULL, NULL,
-										  &unsure));
+										  &unsure, NULL));
 			continue;
 		}
 		else
@@ -6761,7 +7012,7 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 		no_rows(bp, &nt);
 		tp = &nt;
 	}
-	(void) merge_table(relid, bp, op, tp, mode, sink, now, &unsure);
+	(void) merge_table(relid, bp, op, tp, mode, sink, now, &unsure, NULL);
 }
 
 static void
