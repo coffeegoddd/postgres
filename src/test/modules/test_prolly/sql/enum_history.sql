@@ -66,6 +66,8 @@ CREATE TABLE eh.adds (id int PRIMARY KEY, e eh.added);
 INSERT INTO eh.adds VALUES (1, 'a');
 SELECT (dolt_commit('-Am', 'before addition'))[1] AS add_base \gset
 ALTER TYPE eh.added ADD VALUE 'x' BEFORE 'a';
+-- (only the type changed: its tables' rows read the same)
+SELECT * FROM dolt_status();
 SELECT length(dolt_commit('-Am', 'addition')::text) AS committed;
 SELECT count(*) AS changed FROM dolt_diff(:'add_base', 'HEAD', NULL::eh.adds);
 

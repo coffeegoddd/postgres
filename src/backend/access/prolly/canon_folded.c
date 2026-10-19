@@ -3258,6 +3258,35 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 
 static char *from_utf8(const uint8 *data, int len);
 
+/*
+ * A literal's value, as quote_literal_cstr() wrote it: quotes doubled, and
+ * backslashes too if it begins E.
+ */
+static char *
+literal_value(const char *literal)
+{
+	bool		e = literal[0] == 'E';
+	const char *p = literal + (e ? 1 : 0);
+	StringInfoData out;
+
+	if (*p++ != '\'')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	initStringInfo(&out);
+	for (; *p; p++)
+	{
+		if (*p == '\'' && p[1] == '\'')
+			p++;
+		else if (*p == '\'')
+			break;
+		else if (e && *p == '\\' && p[1] == '\\')
+			p++;
+		appendStringInfoChar(&out, *p);
+	}
+	if (*p != '\'' || p[1] != '\0')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	return out.data;
+}
+
 /* Saved type definitions accompany historical rows; labels are not OIDs. */
 static List *
 folded_type_definitions(const ProllyNodeRef *root)
@@ -3278,10 +3307,7 @@ folded_type_definitions(const ProllyNodeRef *root)
 	while (PROLLY_CALL(cn.tree, cursor_next, cur, &k, &v))
 	{
 		ProllyTypeDefinition *e;
-		StringInfoData sql;
 		char	   *line;
-		bool		first = true;
-		RawStmt    *raw;
 
 		if (k.len < 2 || memcmp(k.data, "y:", 2) != 0)
 			break;
@@ -3291,23 +3317,18 @@ folded_type_definitions(const ProllyNodeRef *root)
 		types = lappend(types, e);
 		if (v.len < 5 || memcmp(v.data, "enum\n", 5) != 0)
 			continue;
-		line = from_utf8(v.data + 5, v.len - 5);
-		initStringInfo(&sql);
-		appendStringInfoString(&sql, "CREATE TYPE historical_enum AS ENUM (");
+		line = e->definition + 5;
 		while (*line)
 		{
 			char	   *next = strchr(line, '\n');
+			char	   *field;
 
 			if (next == NULL)
 				elog(ERROR, "invalid canonical enum definition");
-			*next++ = '\0';
-			appendStringInfo(&sql, "%s%s", first ? "" : ", ", unescape_field(line));
-			first = false;
-			line = next;
+			field = unescape_field(pnstrdup(line, next - line));
+			e->labels = lappend(e->labels, makeString(literal_value(field)));
+			line = next + 1;
 		}
-		appendStringInfoChar(&sql, ')');
-		raw = linitial_node(RawStmt, raw_parser(sql.data, RAW_PARSE_DEFAULT));
-		e->labels = castNode(CreateEnumStmt, raw->stmt)->vals;
 	}
 	PROLLY_CALL(cn.tree, cursor_close, cur);
 	return types;

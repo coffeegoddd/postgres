@@ -105,6 +105,18 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/*
+ * A root's named types, shared by its tables, with the enums renamed
+ * between it and the root last compared with (by serial: lists come and go).
+ */
+typedef struct TypeDefs
+{
+	List	   *types;			/* ProllyTypeDefinition *, from the root */
+	uint64		serial;
+	uint64		renamed_from;	/* the other's serial, or 0 */
+	List	   *renamed;		/* names of the enums renamed between them */
+} TypeDefs;
+
 /* A table as one version has it. */
 typedef struct Table
 {
@@ -114,14 +126,14 @@ typedef struct Table
 	ProllyNodeRef data;
 	char	   *text;			/* the definition, as described */
 	int			textlen;
-	List	   *types;			/* ProllyTypeDefinition *, from its root */
+	TypeDefs   *types;			/* its root's named types */
 	char	   *unreadable;		/* why its rows can't be read here, or NULL */
 } Table;
 
 typedef struct Tables
 {
 	List	   *tables;			/* Table *, in name order */
-	List	   *types;
+	TypeDefs   *types;			/* the root's named types, for its tables */
 } Tables;
 
 static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
@@ -265,10 +277,21 @@ add_table(const char *name, const ProllyNodeRef *data,
 	ts->tables = lappend(ts->tables, t);
 }
 
+static TypeDefs *
+type_defs(const ProllyNodeRef *root)
+{
+	static uint64 serial = 0;
+	TypeDefs   *td = palloc0(sizeof(TypeDefs));
+
+	td->types = PROLLY_CALL(components().canonicalizer, type_definitions, root);
+	td->serial = ++serial;
+	return td;
+}
+
 static void
 read_tables(const ProllyNodeRef *root, Tables *ts)
 {
-	ts->types = PROLLY_CALL(components().canonicalizer, type_definitions, root);
+	ts->types = type_defs(root);
 	PROLLY_CALL(components().canonicalizer, tables, root, add_table, ts);
 }
 
@@ -3138,16 +3161,45 @@ type_uses_enums(Oid type, List *names, List *seen)
 	return false;
 }
 
+/* Whether labels are among others, in the same order. */
 static bool
-same_table_enums(const Table *a, const Table *b)
+labels_among(List *labels, List *others)
 {
-	List	   *changed = NIL;
+	ListCell   *o = list_head(others);
 	ListCell   *lc;
-	ProllyValue d = {(const uint8 *) a->text, a->textlen};
-	bool		keyed;
 
-	if (a->types == b->types)
-		return true;
+	foreach(lc, labels)
+	{
+		while (o != NULL && strcmp(strVal(lfirst(lc)), strVal(lfirst(o))) != 0)
+			o = lnext(others, o);
+		if (o == NULL)
+			return false;
+		o = lnext(others, o);
+	}
+	return true;
+}
+
+/*
+ * Whether an enum's labels were renamed between two definitions: neither
+ * has all the other's, in order.  (Labels added alone read the same: an old
+ * value's label is still the new type's, in the same order to the others.)
+ */
+static bool
+enum_renamed(const ProllyTypeDefinition *a, const ProllyTypeDefinition *b)
+{
+	return strcmp(a->definition, b->definition) != 0 &&
+		!labels_among(a->labels, b->labels) && !labels_among(b->labels, a->labels);
+}
+
+/* The enums renamed between two roots' types, by name; worked out once. */
+static List *
+renamed_enums(TypeDefs *a, TypeDefs *b)
+{
+	ListCell   *lc;
+
+	if (a->renamed_from == b->serial)
+		return a->renamed;
+	a->renamed = NIL;
 	foreach(lc, a->types)
 	{
 		ProllyTypeDefinition *e = lfirst(lc);
@@ -3156,17 +3208,28 @@ same_table_enums(const Table *a, const Table *b)
 		if (strncmp(e->definition, "enum\n", 5) != 0)
 			continue;
 		other = find_type_definition(b->types, e->name);
-		if (other == NULL || !equal(e->labels, other->labels))
-			changed = lappend(changed, e->name);
+		if (other != NULL && enum_renamed(e, other))
+			a->renamed = lappend(a->renamed, e->name);
 	}
-	foreach(lc, b->types)
-	{
-		ProllyTypeDefinition *e = lfirst(lc);
+	a->renamed_from = b->serial;
+	return a->renamed;
+}
 
-		if (strncmp(e->definition, "enum\n", 5) == 0 &&
-			find_type_definition(a->types, e->name) == NULL)
-			changed = lappend(changed, e->name);
-	}
+/*
+ * Whether a table's rows read the same by both roots' types: none of its
+ * columns uses an enum renamed between them.
+ */
+static bool
+same_table_enums(const Table *a, const Table *b)
+{
+	List	   *changed;
+	ListCell   *lc;
+	ProllyValue d = {(const uint8 *) a->text, a->textlen};
+	bool		keyed;
+
+	if (a->types == b->types)
+		return true;
+	changed = renamed_enums(a->types, b->types);
 	if (changed == NIL)
 		return true;
 	foreach(lc, PROLLY_CALL(components().canonicalizer, table_columns, &d, &keyed))
@@ -3186,7 +3249,7 @@ enum_mappings(const Table *from, const Table *to)
 	List	   *maps = NIL;
 	ListCell   *lc;
 
-	foreach(lc, from->types)
+	foreach(lc, from->types->types)
 	{
 		ProllyTypeDefinition *e = lfirst(lc);
 		ProllyTypeDefinition *other;
@@ -3195,8 +3258,8 @@ enum_mappings(const Table *from, const Table *to)
 
 		if (strncmp(e->definition, "enum\n", 5) != 0)
 			continue;
-		other = find_type_definition(to->types, e->name);
-		if (other == NULL || equal(e->labels, other->labels))
+		other = find_type_definition(to->types->types, e->name);
+		if (other == NULL || !enum_renamed(e, other))
 			continue;
 		type = LookupTypeNameOid(NULL, typeStringToTypeName(e->name, NULL), true);
 		if (!OidIsValid(type) || get_typtype(type) != TYPTYPE_ENUM)
@@ -3226,8 +3289,8 @@ check_enum_layout(Oid type, const Table *from, const Table *to, List *seen)
 	if (get_typtype(type) == TYPTYPE_ENUM)
 		return;
 	name = format_type_be_qualified(type);
-	before = find_type_definition(from->types, name);
-	after = find_type_definition(to->types, name);
+	before = find_type_definition(from->types->types, name);
+	after = find_type_definition(to->types->types, name);
 	if (before && after && strcmp(before->definition, after->definition) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4460,7 +4523,7 @@ matviews_in_root(const ProllyNodeRef *root)
 {
 	Tables		ts = {NIL};
 
-	ts.types = PROLLY_CALL(components().canonicalizer, type_definitions, root);
+	ts.types = type_defs(root);
 	PROLLY_CALL(components().canonicalizer, materialized_views, root,
 				add_table, &ts);
 	return ts.tables;

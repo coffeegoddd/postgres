@@ -70,7 +70,8 @@ adapts.
   Historical enum values are translated using the saved type definitions
   into that current row type (#387). A pure rename preserves each label's
   position; surviving names must keep their positions. Additions preserve
-  existing labels by name and order. A label-only rename therefore produces
+  existing labels by name and order, so a type that only gained labels
+  leaves its tables' rows reading as they did (no table changes with it). A label-only rename therefore produces
   no typed row diff; the enum's definition still changes. Actual row edits,
   additions, deletions and conflicts use the current labels on both sides.
   This includes domains, arrays, unchanged composites, enum keys and keyless
