@@ -977,8 +977,9 @@ SELECT dolt_branch('-D', 'feature');
 -- within one type, the cast trusted only where it gives base's stored
 -- value; across types (strings too), base's text form.  A USING that pads
 -- or folds otherwise than the cast can't then hide theirs' edit back to
--- the cast's value: code and tags conflict, and name, whose rpad ALTER
--- made base's text form 'gh   ', takes theirs' 'gh'.  (A plain char(3)
+-- the cast's value: code and tags conflict.  Name conflicts too: the
+-- history cannot distinguish rpad from a plain cast and an edit on ours.
+-- (A plain char(3)
 -- to char(10) on both sides is a conflict on a row a side edited too, as
 -- on master: padding changes base's stored value.)
 CREATE TABLE rt.up (id int PRIMARY KEY, code char(3), tags char(2)[], name char(5));
@@ -1042,14 +1043,15 @@ SELECT our_row, their_row FROM dolt_conflicts(NULL::rt.up) ORDER BY 1;
 ----------------------------------------+----------------------------------------
  (1,"AB        ","{""AB   ""}","ab   ") | (1,"ab        ","{""AB   ""}","ab   ")
  (2,"CD        ","{""EF   ""}","cd   ") | (2,"CD        ","{""ef   ""}","cd   ")
-(2 rows)
+ (3,"GH        ","{""GH   ""}","gh   ") | (3,"GH        ","{""GH   ""}",gh)
+(3 rows)
 
 SELECT id, '"' || name || '"' AS name FROM rt.up ORDER BY id;
  id |  name   
 ----+---------
   1 | "ab   "
   2 | "cd   "
-  3 | "gh"
+  3 | "gh   "
   4 | "x"
 (4 rows)
 
@@ -1061,11 +1063,12 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 -- Where the cast and the text form differ but the text form reads as the
--- new type, base is read as its text form, as master read it, not
--- refused: char(5) key 'cd   ' as text is 'cd   ', a key neither side
+-- new type, compare both outcomes.  The text reading's conflict stays:
+-- char(5) key 'cd   ' as text is 'cd   ', a key neither side
 -- has (they trimmed it), so base's rows read as deleted on both sides and
 -- theirs' edited row against ours' is a conflict; keyless, base's rows
--- are copies neither side has, and both sides' inserts merge.
+-- are copies neither side has, and both sides' inserts merge.  The cast
+-- reading produces the same keyless rows, so those merges stay supported.
 CREATE TABLE rt.ck (k char(5) PRIMARY KEY, v int);
 CREATE TABLE rt.cl (c char(5), v int);
 CREATE TABLE rt.bl (f boolean, v int);
@@ -1166,8 +1169,598 @@ SELECT dolt_branch('-D', 'feature');
  {0}
 (1 row)
 
+-- Both sides' plain casts give C, but theirs edits back to the old type's
+-- text reading T: boolean true -> 'true' -> 't', and char padding trimmed
+-- then restored.  Neither reading can identify the unchanged side, so all
+-- three rows conflict.  Agreeing and NULL values still merge, as does an
+-- independent edit in another column of a row with an ambiguous base.
+CREATE TABLE rt.amb (id int PRIMARY KEY, f boolean, c char(5), v char(5), note int);
+INSERT INTO rt.amb VALUES (1, true, NULL, NULL, 0), (2, NULL, 'ab', NULL, 0),
+  (3, NULL, NULL, 'ab', 0), (4, false, 'cd', 'ef', 0), (5, NULL, NULL, NULL, 0);
+SELECT dolt_commit('-Am', 'ambiguous base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.amb ALTER COLUMN f TYPE text, ALTER COLUMN c TYPE text, ALTER COLUMN v TYPE varchar;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.amb ALTER COLUMN f TYPE text, ALTER COLUMN c TYPE text, ALTER COLUMN v TYPE varchar;
+UPDATE rt.amb SET f = 't' WHERE id = 1;
+UPDATE rt.amb SET c = 'ab   ' WHERE id = 2;
+UPDATE rt.amb SET v = 'ab   ' WHERE id = 3;
+UPDATE rt.amb SET note = 7 WHERE id IN (4, 5);
+SELECT dolt_commit('-Am', 'theirs text forms') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.amb) ORDER BY 1;
+    base_row     |   our_row    |    their_row    
+-----------------+--------------+-----------------
+ (1,t,,,0)       | (1,true,,,0) | (1,t,,,0)
+ (2,,"ab   ",,0) | (2,,ab,,0)   | (2,,"ab   ",,0)
+ (3,,,"ab   ",0) | (3,,,ab,0)   | (3,,,"ab   ",0)
+(3 rows)
+
+SELECT * FROM rt.amb ORDER BY id;
+ id |   f   | c  | v  | note 
+----+-------+----+----+------
+  1 | true  |    |    |    0
+  2 |       | ab |    |    0
+  3 |       |    | ab |    0
+  4 | false | cd | ef |    7
+  5 |       |    |    |    7
+(5 rows)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rt.amb');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT id, f, octet_length(c), octet_length(v), note FROM rt.amb ORDER BY id;
+ id |   f   | octet_length | octet_length | note 
+----+-------+--------------+--------------+------
+  1 | t     |              |              |    0
+  2 |       |            5 |              |    0
+  3 |       |              |            5 |    0
+  4 | false |            2 |            2 |    7
+  5 |       |              |              |    7
+(5 rows)
+
+ROLLBACK;
+-- Swapping sides must not silently discard either interpretation either.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.amb) ORDER BY 1;
+    base_row     |     our_row     |  their_row   
+-----------------+-----------------+--------------
+ (1,t,,,0)       | (1,t,,,0)       | (1,true,,,0)
+ (2,,"ab   ",,0) | (2,,"ab   ",,0) | (2,,ab,,0)
+ (3,,,"ab   ",0) | (3,,,"ab   ",0) | (3,,,ab,0)
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- amb_key: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_key (k char(5) PRIMARY KEY, v int);
+INSERT INTO rt.amb_key VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_key base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.amb_key ALTER COLUMN k TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.amb_key ALTER COLUMN k TYPE text;
+DELETE FROM rt.amb_key WHERE k = 'cd';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+ERROR:  rows of table "amb_key" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(k), v FROM rt.amb_key ORDER BY 1;
+ quote_literal | v 
+---------------+---
+ 'ab'          | 1
+ 'cd'          | 2
+(2 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+ERROR:  rows of table "amb_key" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(k), v FROM rt.amb_key ORDER BY 1;
+ quote_literal | v 
+---------------+---
+ 'ab'          | 1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- amb_char: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_char (c char(5), v int);
+INSERT INTO rt.amb_char VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_char base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.amb_char ALTER COLUMN c TYPE varchar(10);
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.amb_char ALTER COLUMN c TYPE varchar(10);
+DELETE FROM rt.amb_char WHERE c = 'cd';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+ERROR:  rows of table "amb_char" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(c), v FROM rt.amb_char ORDER BY 1;
+ quote_literal | v 
+---------------+---
+ 'ab'          | 1
+ 'cd'          | 2
+(2 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+ERROR:  rows of table "amb_char" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(c), v FROM rt.amb_char ORDER BY 1;
+ quote_literal | v 
+---------------+---
+ 'ab'          | 1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- amb_bool: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_bool (f boolean, v int);
+INSERT INTO rt.amb_bool VALUES (true, 1), (false, 2);
+SELECT dolt_commit('-Am', 'amb_bool base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.amb_bool ALTER COLUMN f TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.amb_bool ALTER COLUMN f TYPE text;
+DELETE FROM rt.amb_bool WHERE f = 'false';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+ERROR:  rows of table "amb_bool" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM rt.amb_bool ORDER BY v;
+   f   | v 
+-------+---
+ true  | 1
+ false | 2
+(2 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+ERROR:  rows of table "amb_bool" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM rt.amb_bool ORDER BY v;
+  f   | v 
+------+---
+ true | 1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- amb_copies: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_copies (c char(5), v int);
+INSERT INTO rt.amb_copies VALUES ('ab', 1), ('cd', 2), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_copies base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.amb_copies ALTER COLUMN c TYPE varchar(10);
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.amb_copies ALTER COLUMN c TYPE varchar(10);
+DELETE FROM rt.amb_copies WHERE ctid = (SELECT ctid FROM rt.amb_copies WHERE c = 'cd' LIMIT 1);
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+ERROR:  rows of table "amb_copies" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+ quote_literal | v | count 
+---------------+---+-------
+ 'ab'          | 1 |     1
+ 'cd'          | 2 |     2
+(2 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+ERROR:  rows of table "amb_copies" can't be merged across an ambiguous type change
+DETAIL:  Reading the merge base through the cast or through its text form gives different merge results.
+HINT:  Merge the row changes before changing the column types.
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+ quote_literal | v | count 
+---------------+---+-------
+ 'ab'          | 1 |     1
+ 'cd'          | 2 |     1
+(2 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- Both sides removing one copy agrees under both readings and is safe.
+DELETE FROM rt.amb_copies WHERE ctid = (SELECT ctid FROM rt.amb_copies WHERE c = 'cd' LIMIT 1);
+SELECT dolt_commit('-Am', 'ours deleted too') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+ quote_literal | v | count 
+---------------+---+-------
+ 'ab'          | 1 |     1
+ 'cd'          | 2 |     1
+(2 rows)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA rt CASCADE;
-NOTICE:  drop cascades to 18 other objects
+NOTICE:  drop cascades to 23 other objects
 DETAIL:  drop cascades to table rt.c
 drop cascades to table rt.n
 drop cascades to table rt.o
@@ -1186,3 +1779,8 @@ drop cascades to table rt.up
 drop cascades to table rt.ck
 drop cascades to table rt.cl
 drop cascades to table rt.bl
+drop cascades to table rt.amb
+drop cascades to table rt.amb_key
+drop cascades to table rt.amb_char
+drop cascades to table rt.amb_bool
+drop cascades to table rt.amb_copies

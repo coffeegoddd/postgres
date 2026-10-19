@@ -664,6 +664,18 @@ fails without its fix), and Postgres's suites keep passing after each one.
     text) made no shorter; any other change of type, int to bigint
     included, is a schema conflict.  A table the other side didn't change
     takes the change whatever it is.)
+  - Both sides retyping a column to the same different type can leave an
+    ambiguous base (#391): its text form read as the new type and its SQL
+    cast need not agree, and history does not record USING expressions.
+    A non-key value with two successful but different readings is treated
+    as changed on both sides, conflicting if the sides differ. For keys
+    and keyless rows, compare the outcomes under both readings before
+    applying rows. Keep a text-reading conflict for resolution; otherwise
+    refuse if the rows, copy counts, or conflict status differ. Matching
+    outcomes still merge. This prevents an edit to the old text form or a
+    deletion from silently disappearing without rejecting insert-only
+    merges whose outcomes agree. Failed text readings retain the existing
+    uncertainty/refusal rules; ordinary diffs still show historical values.
   - Checking out a commit (not a branch) gives a detached, read-only
     session; changing anything takes a branch made from it.
   - A merge gives each sequence the larger of its two values.
