@@ -2045,6 +2045,15 @@ GetSnapshotDataReuse(Snapshot snapshot)
 		return false;
 
 	/*
+	 * Promotion switches snapshot construction from KnownAssignedXids to
+	 * ProcArray before recovery transaction tracking is shut down (which
+	 * advances xactCompletionCount).  A recovery snapshot cannot be reused
+	 * across that switch, even if the completion count has not changed yet.
+	 */
+	if (snapshot->takenDuringRecovery && !RecoveryInProgress())
+		return false;
+
+	/*
 	 * If the current xactCompletionCount is still the same as it was at the
 	 * time the snapshot was built, we can be sure that rebuilding the
 	 * contents of the snapshot the hard way would result in the same snapshot

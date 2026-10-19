@@ -72,13 +72,18 @@ extern bool branch_written(Oid branch);
 
 /*
  * A prolly table's tuple versions a write made (newtid) or replaced
- * (oldtid), once it has: told to branch_tuple_hook, if set, unless hushed.
+ * (oldtid), or a speculative insertion took back (oldtid), once it has:
+ * told to the table's change log, and to branch_tuple_hook, if set, unless
+ * hushed.
  */
 typedef void (*BranchTupleHook) (Relation rel, const ItemPointerData *oldtid,
 								 const ItemPointerData *newtid);
 extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
 extern void branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 							  const ItemPointerData *newtid);
+/* ... or of the versions a write made, in hand */
+extern void branch_note_made(Relation rel, const ItemPointerData *oldtid,
+							 HeapTuple *made, int nmade);
 
 /*
  * Whether the transaction wrote a versioned object's catalog row, and the

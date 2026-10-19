@@ -24,6 +24,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -945,8 +946,35 @@ void
 branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 				  const ItemPointerData *newtid)
 {
+	/*
+	 * The change log is told of every write, the session's own or not;
+	 * not of a TOAST relation's versions, or a change log's (they are its
+	 * table's).  A change log's entries are bookkeeping, no change of the
+	 * session's: the hook isn't told of them either.
+	 */
+	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+		prolly_note_change(rel, oldtid, newtid);
+	else if (prolly_is_change_log(rel))
+		return;
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
+}
+
+/*
+ * As branch_note_tuple, of the versions a write made in hand (an insertion
+ * of many rows, or one) and the one it replaced, if any.
+ */
+void
+branch_note_made(Relation rel, const ItemPointerData *oldtid,
+				 HeapTuple *made, int nmade)
+{
+	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+		prolly_note_made(rel, oldtid, made, nmade);
+	else if (prolly_is_change_log(rel))
+		return;
+	if (branch_tuple_hook && hushes == NIL)
+		for (int i = 0; i < nmade; i++)
+			branch_tuple_hook(rel, i == 0 ? oldtid : NULL, &made[i]->t_self);
 }
 
 void

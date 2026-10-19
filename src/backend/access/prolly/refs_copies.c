@@ -791,9 +791,18 @@ static void
 empty_copy(Relation rel)
 {
 	Oid			toastrelid = rel->rd_rel->reltoastrelid;
+	ProllyComponents c;
 
 	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
 	CommandCounterIncrement();
+
+	/* (and its change log: its entries are of rows the copy no longer has) */
+	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+	{
+		prolly_components_for_relation(rel, &c);
+		if (c.change_log)
+			PROLLY_CALL(c.change_log, reset, rel);
+	}
 	foreach_oid(indexid, RelationGetIndexList(rel))
 	{
 		Relation	index = index_open(indexid, RowExclusiveLock);

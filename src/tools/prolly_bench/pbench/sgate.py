@@ -150,6 +150,28 @@ def _invariants(label: str, sets: dict[str, table.ResultSet]) -> list[Finding]:
     return out
 
 
+def _collectors_lost(loaded: dict, engine: str) -> list[Finding]:
+    """A collector that ran in a cell of both base runs and not in that cell
+    of a candidate run: its counters would otherwise just go missing, and a
+    counter only one build has is skipped as nothing to compare."""
+    def statuses(rs):
+        return {scounters.CellId(r["key"]["workload"], r["key"].get("variant", ""),
+                                 r["key"]["size"], r["key"]["clients"], engine):
+                r.get("collector_status", {}) for r in rs.results if r.get("status") == "ok"}
+    s = {n: statuses(sets[engine]) for n, sets in loaded.items()}
+    out = []
+    for cid in s["base"]:
+        if cid not in s["base2"]:
+            continue
+        for run in ("candidate", "candidate2"):
+            for name, (status, reason) in sorted(s[run].get(cid, {}).items()):
+                if name in s["base"][cid] or name in s["base2"][cid]:
+                    continue        # it didn't run in the base either
+                out.append(Finding(_workload(cid), engine, f"collector {name}", "invariant",
+                                   detail=f"ran in the base, {status} in the {run}: {reason}"))
+    return out
+
+
 def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
                   accept: list[Acceptance], t: dict) -> list[Finding]:
     runs = {name: run_sets(p) for name, p in
@@ -171,6 +193,7 @@ def gate_counters(base: Path, base2: Path, cand: Path, cand2: Path,
         for p in problems:
             findings.append(Finding("-", engine, "comparison", "invariant", detail=p))
         c = {n: scounters.counters(s[engine].results, engine) for n, s in loaded.items()}
+        findings += _collectors_lost(loaded, engine)
         in_base = scounters.instability(c["base"], c["base2"], t)
         in_cand = scounters.instability(c["candidate"], c["candidate2"], t)
         for cid in sorted(set(c["base"]) | set(c["candidate"]), key=str):

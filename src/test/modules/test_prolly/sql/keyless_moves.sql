@@ -46,7 +46,7 @@ SELECT dolt_branch('kk');
 SELECT dolt_checkout('kk') IS NOT NULL AS on_kk;
 SELECT count(*) AS reset FROM test_fold_counters(true);
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
-SELECT pages AS pages_read, full_tables FROM test_fold_counters(true);
+SELECT pages AS pages_read, candidates, full_tables FROM test_fold_counters(true);
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'kk');
 

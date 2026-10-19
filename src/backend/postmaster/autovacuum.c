@@ -71,6 +71,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/multixact.h"
+#include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -384,6 +385,9 @@ static void autovac_recalculate_workers_for_balance(void);
 static void do_autovacuum(void);
 static void FreeWorkerInfo(int code, Datum arg);
 
+static void remember_change_log_options(HTAB *table_toast_map,
+										Form_pg_class classForm,
+										const StdRdOptions *relopts);
 static autovac_table *table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 											TupleDesc pg_class_desc,
 											int effective_multixact_freeze_max_age);
@@ -2197,6 +2201,9 @@ do_autovacuum(void)
 				/* hash_search already filled in the key */
 				memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
 			}
+			/* ... and a prolly table's change log, taking its options too */
+			if (relopts)
+				remember_change_log_options(table_toast_map, classForm, relopts);
 
 			/* Release stuff to avoid per-relation leakage */
 			if (relopts)
@@ -2864,6 +2871,28 @@ deleted2:
 		pfree(cur_nspname);
 	if (cur_relname)
 		pfree(cur_relname);
+}
+
+/*
+ * A prolly table's change log (a TOAST-kind relation, but not its table's
+ * reltoastrelid) takes the table's autovacuum options, as its TOAST table
+ * does: remember them under the log's OID.
+ */
+static void
+remember_change_log_options(HTAB *table_toast_map, Form_pg_class classForm,
+							const StdRdOptions *relopts)
+{
+	Oid			logid = prolly_change_log_relid(classForm->oid,
+												 classForm->relam);
+	av_relkey	key = {logid, classForm->relbranch};
+	av_relation *hentry;
+	bool		found;
+
+	if (!OidIsValid(logid))
+		return;
+	hentry = hash_search(table_toast_map, &key, HASH_ENTER, &found);
+	Assert(!found);				/* a log is one table's */
+	memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
 }
 
 /*
@@ -3746,12 +3775,16 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 			continue;
 		if (form->relpersistence == RELPERSISTENCE_TEMP)
 			continue;
-		if (!OidIsValid(form->reltoastrelid))
-			continue;
 
 		relopts = (StdRdOptions *) extractRelOptions(tup, RelationGetDescr(rel), NULL);
 		if (!relopts)
 			continue;
+		remember_change_log_options(table_toast_map, form, relopts);
+		if (!OidIsValid(form->reltoastrelid))
+		{
+			pfree(relopts);
+			continue;
+		}
 
 		key.toastrelid = form->reltoastrelid;
 		key.branch = form->relbranch;

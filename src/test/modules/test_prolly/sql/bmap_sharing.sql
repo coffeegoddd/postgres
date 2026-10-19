@@ -12,6 +12,9 @@ CREATE TABLE cow.t (a int8, b int8, c int8, d int8);
 INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(1, 20000) g;
 SELECT pg_relation_filenode('cow.t') AS src \gset
 SELECT pg_relation_size('cow.t') / 8192 AS nblocks \gset
+-- (and its change log's, its own)
+SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) / 8192
+	AS tlog \gset
 
 -- A copy reads the same pages, from the same blocks, each now counted once.
 SELECT test_bmap_share(:src) AS copy \gset
@@ -23,17 +26,18 @@ SELECT count(*) = :nblocks AS all_shared
 SELECT test_bmap_epoch(:src) AS src_epoch, test_bmap_epoch(:copy) AS copy_epoch;
 SELECT bool_and(epoch < 1) AS entries_older FROM test_bmap_map(:copy);
 
--- Dropping the source frees nothing: the copy holds every block.
+-- Dropping the source frees none of its blocks, which the copy holds (only
+-- its change log's).
 SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT test_bmap_digest(:copy) AS copy_digest \gset
 DROP TABLE cow.t;
-SELECT test_bmap_free_blocks() = :free_before AS nothing_freed;
+SELECT test_bmap_free_blocks() - :free_before = :tlog AS nothing_freed;
 SELECT test_bmap_digest(:copy) = :'copy_digest' AS copy_intact;
 SELECT bool_and(refs = 0) AS copy_holds_alone FROM test_bmap_map(:copy);
 
 -- Dropping the copy, the last holder, frees them.
 SELECT test_bmap_unlink(:copy);
-SELECT test_bmap_free_blocks() - :free_before = :nblocks AS all_freed;
+SELECT test_bmap_free_blocks() - :free_before = :nblocks + :tlog AS all_freed;
 
 -- A copy of a copy: three maps hold the blocks.
 CREATE TABLE cow.u (v text);
