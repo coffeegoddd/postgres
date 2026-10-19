@@ -20,6 +20,7 @@
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/multixact.h"
+#include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
@@ -6095,6 +6096,12 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 RecentXmin,
 							 ReadNextMultiXactId(),
 							 persistence);
+
+			/*
+			 * (a table made a prolly table by SET ACCESS METHOD: its log,
+			 * made only now, as its TOAST table was made while it was heap)
+			 */
+			prolly_make_change_log(tab->relid, AccessExclusiveLock);
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}

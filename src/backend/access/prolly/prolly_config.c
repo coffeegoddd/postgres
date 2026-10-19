@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
+#include "miscadmin.h"
 #include "utils/guc_hooks.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -124,13 +125,30 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 /* (empty: the profile's) */
 char	   *debug_prolly_change_finder = NULL;
 
+/*
+ * A change finder that folds: one an extension registers is known only
+ * once shared_preload_libraries is loaded, so a name set before then (in
+ * postgresql.conf) is taken on trust, and a fold errors if it is none.
+ */
 bool
 check_debug_prolly_change_finder(char **newval, void **extra, GucSource source)
 {
-	if (**newval != '\0' &&
-		prolly_lookup_impl(PROLLY_IFACE_CHANGE_FINDER, *newval) == NULL)
+	const ProllyChangeFinderRoutine *finder;
+
+	if (**newval == '\0')
+		return true;
+	finder = (const ProllyChangeFinderRoutine *)
+		prolly_lookup_impl(PROLLY_IFACE_CHANGE_FINDER, *newval);
+	if (finder == NULL)
 	{
+		if (!process_shared_preload_libraries_done)
+			return true;
 		GUC_check_errdetail("There is no change finder named \"%s\".", *newval);
+		return false;
+	}
+	if (finder->fold == NULL)
+	{
+		GUC_check_errdetail("Change finder \"%s\" cannot fold.", *newval);
 		return false;
 	}
 	return true;
@@ -145,7 +163,11 @@ prolly_change_finder(void)
 		profile_impl(history_profile, PROLLY_IFACE_CHANGE_FINDER);
 }
 
-/* The profile's change log, looked up once: told of every write. */
+/*
+ * The profile's change log, looked up once: told of every write.  Asked in
+ * critical sections too (prolly_is_change_log), so it neither errors nor
+ * allocates: the profile's log is built in, so the lookup finds it.
+ */
 static const ProllyChangeLogRoutine *
 change_log(void)
 {
@@ -154,20 +176,35 @@ change_log(void)
 
 	if (!looked_up)
 	{
-		routine = (const ProllyChangeLogRoutine *)
-			profile_impl(history_profile, PROLLY_IFACE_CHANGE_LOG);
+		if (history_profile[PROLLY_IFACE_CHANGE_LOG] != NULL)
+			routine = (const ProllyChangeLogRoutine *)
+				prolly_lookup_impl(PROLLY_IFACE_CHANGE_LOG,
+								   history_profile[PROLLY_IFACE_CHANGE_LOG]);
 		looked_up = true;
 	}
 	return routine;
 }
 
+/*
+ * Make relid's change log if it is a prolly table (or materialized view)
+ * that has none.  Only under a lock writers wait for: a log made under a
+ * weaker one (an ALTER's ShareUpdateExclusiveLock) isn't seen by a writer
+ * whose transaction is open, whose rows would then be in no entry once a
+ * fold had trusted the new log; it is made at the next ALTER that takes
+ * one.
+ */
 void
 prolly_make_change_log(Oid relid, LOCKMODE lockmode)
 {
 	const ProllyChangeLogRoutine *log = change_log();
 	Relation	rel;
+	char		relkind;
 
-	if (log == NULL || get_rel_relam(relid) != PROLLY_TABLE_AM_OID)
+	if (log == NULL || lockmode < ShareLock ||
+		get_rel_relam(relid) != PROLLY_TABLE_AM_OID)
+		return;
+	relkind = get_rel_relkind(relid);
+	if (relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW)
 		return;
 	rel = table_open(relid, lockmode);
 	if (PROLLY_CALL(log, identity, rel) == 0)
@@ -188,12 +225,13 @@ prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 		PROLLY_CALL(log, note, rel, oldtid, newtid);
 }
 
+/* (in critical sections too: no error, no allocation) */
 bool
 prolly_is_change_log(Relation rel)
 {
 	const ProllyChangeLogRoutine *log = change_log();
 
-	return log != NULL && PROLLY_CALL(log, is_log, rel);
+	return log != NULL && log->is_log != NULL && log->is_log(rel);
 }
 
 void

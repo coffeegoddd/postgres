@@ -24,7 +24,9 @@
  *   snapshot doesn't see as they will be committed (written by
  *   transactions it doesn't see) stay as they were in *data, and the next
  *   fold looks at them again.
- * - walk() visits the nodes a state keeps alive, for reclamation.
+ * - walk() visits the nodes a state keeps alive, for reclamation.  It is
+ *   asked of every state, whichever finder wrote it, and passes over those
+ *   it didn't write.
  * - counters() reports (and with reset, zeroes) what the session's folds
  *   have read: pages, candidate rows, and tables folded in full.
  *

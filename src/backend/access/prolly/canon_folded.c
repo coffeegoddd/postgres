@@ -2950,19 +2950,25 @@ folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root,
 		*left_out = list_concat(*left_out, l);
 }
 
-/* A baseline's tree, its tables' data trees and the finder's states. */
+/*
+ * A baseline's tree, its tables' data trees and the finders' states.  Each
+ * state is walked by every change finder, not the one configured now: the
+ * one that wrote it may be another (a fold under another setting, or before
+ * the default changed), and each passes over states it didn't write.
+ */
 static void
 folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 					 void *arg)
 {
 	Canon		cn;
+	List	   *finders;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	cn.finder = prolly_change_finder();
 	/* (a baseline the visitor declines: it has seen the trees it names) */
 	if (!PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg))
 		return;
+	finders = prolly_list_impls(PROLLY_IFACE_CHANGE_FINDER);
 	load_baseline(&cn, baseline);
 	for (int i = 0; i < cn.nbase; i++)
 	{
@@ -2970,8 +2976,13 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 		cn.base[i].state.len};
 
 		PROLLY_CALL(cn.tree, walk, &cn.env, &cn.base[i].data, visit, arg);
-		PROLLY_CALL(cn.finder, walk, &cn.env, &state, visit, arg);
+		foreach_ptr(const ProllyChangeFinderRoutine, finder, finders)
+		{
+			if (finder->walk != NULL)
+				finder->walk(&cn.env, &state, visit, arg);
+		}
 	}
+	list_free(finders);
 }
 
 /*

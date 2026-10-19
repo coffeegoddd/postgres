@@ -42,7 +42,8 @@
  *   the entries before are of rows it no longer has.
  * - is_log() says whether rel is a change log: its rows are no table's, and
  *   logical decoding passes over them.  Asked of any TOAST-kind relation,
- *   so it is quick.
+ *   in critical sections too (RelationIsLogicallyLogged), so it is quick
+ *   and must neither error nor allocate.
  * - consume() deletes the entries of rel's log the snapshot sees: called
  *   once a fold that read the log by this snapshot is to be the table's
  *   baseline (if the transaction aborts, they come back with the old

@@ -946,11 +946,13 @@ void
 branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 				  const ItemPointerData *newtid)
 {
-	/* (a TOAST relation's versions, or a change log's, are its table's) */
-	if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
-		return;
-	/* (the change log is told of every write, the session's own or not) */
-	prolly_note_change(rel, oldtid, newtid);
+	/*
+	 * The change log is told of every write, the session's own or not;
+	 * not of a TOAST relation's versions, or a change log's (they are its
+	 * table's).
+	 */
+	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+		prolly_note_change(rel, oldtid, newtid);
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }

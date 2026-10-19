@@ -272,12 +272,11 @@ SELECT dolt_checkout('main');
 SELECT * FROM pg_temp.fold();
 
 -- Which change finder folds is configuration: a name that isn't one is
--- refused, and one that can't fold says so.
+-- refused, and so is one that can't fold.
 SET debug_prolly_change_finder = 'nonesuch';
 SET debug_prolly_change_finder = 'stub';
-\set VERBOSITY terse
+SET debug_prolly_change_finder = 'pages';
 SELECT * FROM pg_temp.fold();
-\set VERBOSITY default
 RESET debug_prolly_change_finder;
 SELECT * FROM pg_temp.fold();
 

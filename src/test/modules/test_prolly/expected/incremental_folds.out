@@ -733,15 +733,20 @@ SELECT * FROM pg_temp.fold();
 (1 row)
 
 -- Which change finder folds is configuration: a name that isn't one is
--- refused, and one that can't fold says so.
+-- refused, and so is one that can't fold.
 SET debug_prolly_change_finder = 'nonesuch';
 ERROR:  invalid value for parameter "debug_prolly_change_finder": "nonesuch"
 DETAIL:  There is no change finder named "nonesuch".
 SET debug_prolly_change_finder = 'stub';
-\set VERBOSITY terse
+ERROR:  invalid value for parameter "debug_prolly_change_finder": "stub"
+DETAIL:  Change finder "stub" cannot fold.
+SET debug_prolly_change_finder = 'pages';
 SELECT * FROM pg_temp.fold();
-ERROR:  change_finder implementation "stub" does not implement counters
-\set VERBOSITY default
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     0 |          0 |           0 | t
+(1 row)
+
 RESET debug_prolly_change_finder;
 SELECT * FROM pg_temp.fold();
  pages | candidates | full_tables | same_as_full 
