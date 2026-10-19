@@ -326,8 +326,9 @@ SELECT dolt_branch('-D', 'feature');
 -- within one type, the cast trusted only where it gives base's stored
 -- value; across types (strings too), base's text form.  A USING that pads
 -- or folds otherwise than the cast can't then hide theirs' edit back to
--- the cast's value: code and tags conflict, and name, whose rpad ALTER
--- made base's text form 'gh   ', takes theirs' 'gh'.  (A plain char(3)
+-- the cast's value: code and tags conflict.  Name conflicts too: the
+-- history cannot distinguish rpad from a plain cast and an edit on ours.
+-- (A plain char(3)
 -- to char(10) on both sides is a conflict on a row a side edited too, as
 -- on master: padding changes base's stored value.)
 CREATE TABLE rt.up (id int PRIMARY KEY, code char(3), tags char(2)[], name char(5));
@@ -357,11 +358,12 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
 -- Where the cast and the text form differ but the text form reads as the
--- new type, base is read as its text form, as master read it, not
--- refused: char(5) key 'cd   ' as text is 'cd   ', a key neither side
+-- new type, compare both outcomes.  The text reading's conflict stays:
+-- char(5) key 'cd   ' as text is 'cd   ', a key neither side
 -- has (they trimmed it), so base's rows read as deleted on both sides and
 -- theirs' edited row against ours' is a conflict; keyless, base's rows
--- are copies neither side has, and both sides' inserts merge.
+-- are copies neither side has, and both sides' inserts merge.  The cast
+-- reading produces the same keyless rows, so those merges stay supported.
 CREATE TABLE rt.ck (k char(5) PRIMARY KEY, v int);
 CREATE TABLE rt.cl (c char(5), v int);
 CREATE TABLE rt.bl (f boolean, v int);
@@ -394,6 +396,7 @@ SELECT '"' || c || '"' AS c, v FROM rt.cl ORDER BY 1;
 SELECT f, v FROM rt.bl ORDER BY 1;
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
+
 
 -- A domain's constraints don't apply to historical values only compared
 -- or shown.  Both sides retype to a checked domain after fixing or deleting
@@ -585,5 +588,256 @@ SELECT length(dolt_commit('-Am', 'source domain base')::text) AS committed;
 ALTER TABLE rt.domain_source ALTER COLUMN v TYPE varchar(10);
 SELECT length(dolt_commit('-am', 'source domain removed')::text) AS committed;
 SELECT count(*) AS changed FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.domain_source);
+
+-- Both sides' plain casts give C, but theirs edits back to the old type's
+-- text reading T: boolean true -> 'true' -> 't', and char padding trimmed
+-- then restored.  Neither reading can identify the unchanged side, so all
+-- three rows conflict.  Agreeing and NULL values still merge, as does an
+-- independent edit in another column of a row with an ambiguous base.
+CREATE TABLE rt.amb (id int PRIMARY KEY, f boolean, c char(5), v char(5), note int);
+INSERT INTO rt.amb VALUES (1, true, NULL, NULL, 0), (2, NULL, 'ab', NULL, 0),
+  (3, NULL, NULL, 'ab', 0), (4, false, 'cd', 'ef', 0), (5, NULL, NULL, NULL, 0);
+SELECT dolt_commit('-Am', 'ambiguous base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb ALTER COLUMN f TYPE text, ALTER COLUMN c TYPE text, ALTER COLUMN v TYPE varchar;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb ALTER COLUMN f TYPE text, ALTER COLUMN c TYPE text, ALTER COLUMN v TYPE varchar;
+UPDATE rt.amb SET f = 't' WHERE id = 1;
+UPDATE rt.amb SET c = 'ab   ' WHERE id = 2;
+UPDATE rt.amb SET v = 'ab   ' WHERE id = 3;
+UPDATE rt.amb SET note = 7 WHERE id IN (4, 5);
+SELECT dolt_commit('-Am', 'theirs text forms') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.amb) ORDER BY 1;
+SELECT * FROM rt.amb ORDER BY id;
+SELECT dolt_conflicts_resolve('--theirs', 'rt.amb');
+SELECT id, f, octet_length(c), octet_length(v), note FROM rt.amb ORDER BY id;
+ROLLBACK;
+-- Swapping sides must not silently discard either interpretation either.
+SELECT dolt_checkout('feature');
+BEGIN;
+SELECT (dolt_merge('main'))[2:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.amb) ORDER BY 1;
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_key: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_key (k char(5) PRIMARY KEY, v int);
+INSERT INTO rt.amb_key VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_key base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_key ALTER COLUMN k TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_key ALTER COLUMN k TYPE text;
+DELETE FROM rt.amb_key WHERE k = 'cd';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(k), v FROM rt.amb_key ORDER BY 1;
+SELECT dolt_checkout('feature');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(k), v FROM rt.amb_key ORDER BY 1;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_char: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_char (c char(5), v int);
+INSERT INTO rt.amb_char VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_char base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_char ALTER COLUMN c TYPE varchar(10);
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_char ALTER COLUMN c TYPE varchar(10);
+DELETE FROM rt.amb_char WHERE c = 'cd';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(c), v FROM rt.amb_char ORDER BY 1;
+SELECT dolt_checkout('feature');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(c), v FROM rt.amb_char ORDER BY 1;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_bool: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_bool (f boolean, v int);
+INSERT INTO rt.amb_bool VALUES (true, 1), (false, 2);
+SELECT dolt_commit('-Am', 'amb_bool base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_bool ALTER COLUMN f TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_bool ALTER COLUMN f TYPE text;
+DELETE FROM rt.amb_bool WHERE f = 'false';
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT * FROM rt.amb_bool ORDER BY v;
+SELECT dolt_checkout('feature');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT * FROM rt.amb_bool ORDER BY v;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_copies: text and cast readings disagree about a deletion (or copy count).
+-- Refuse atomically in both directions; the successful insert-only and
+-- pre-existing conflict cases above remain supported.
+CREATE TABLE rt.amb_copies (c char(5), v int);
+INSERT INTO rt.amb_copies VALUES ('ab', 1), ('cd', 2), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_copies base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_copies ALTER COLUMN c TYPE varchar(10);
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_copies ALTER COLUMN c TYPE varchar(10);
+DELETE FROM rt.amb_copies WHERE ctid = (SELECT ctid FROM rt.amb_copies WHERE c = 'cd' LIMIT 1);
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+SELECT dolt_checkout('feature');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('main');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+SELECT dolt_checkout('main');
+-- Both sides removing one copy agrees under both readings and is safe.
+DELETE FROM rt.amb_copies WHERE ctid = (SELECT ctid FROM rt.amb_copies WHERE c = 'cd' LIMIT 1);
+SELECT dolt_commit('-Am', 'ours deleted too') IS NOT NULL AS committed;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT quote_literal(c), v, count(*) FROM rt.amb_copies GROUP BY c, v ORDER BY 1;
+SELECT * FROM dolt_status();
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_mix: an ambiguous key beside an unsure non-key column.  The cast
+-- reading keeps f unsure, so theirs' 't' and ours' 'true' differ either
+-- way, but the readings still disagree about theirs' deletion of 'cd'.
+CREATE TABLE rt.amb_mix (k char(5) PRIMARY KEY, f boolean, v int);
+INSERT INTO rt.amb_mix VALUES ('ab', true, 1), ('cd', false, 2);
+SELECT dolt_commit('-Am', 'amb_mix base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_mix ALTER COLUMN k TYPE text, ALTER COLUMN f TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_mix ALTER COLUMN k TYPE text, ALTER COLUMN f TYPE text;
+UPDATE rt.amb_mix SET f = 't' WHERE k = 'ab';
+DELETE FROM rt.amb_mix WHERE k = 'cd';
+SELECT dolt_commit('-Am', 'theirs edited and deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(k), f, v FROM rt.amb_mix ORDER BY 1;
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_upd: keyless, ours updates a row and theirs inserts one.  Read as
+-- text, base's rows are copies neither side has, so theirs' unchanged
+-- ('ab', 1) would come back beside ours' ('ab', 10); read through the
+-- cast, ours' update stands.  The readings differ: refused.
+CREATE TABLE rt.amb_upd (c char(5), v int);
+INSERT INTO rt.amb_upd VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_upd base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_upd ALTER COLUMN c TYPE varchar(10);
+UPDATE rt.amb_upd SET v = 10 WHERE c = 'ab';
+SELECT dolt_commit('-Am', 'ours cast and updated') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_upd ALTER COLUMN c TYPE varchar(10);
+INSERT INTO rt.amb_upd VALUES ('ef', 3);
+SELECT dolt_commit('-Am', 'theirs inserted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(c), v FROM rt.amb_upd ORDER BY 1, 2;
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_comp: a composite key with one of its columns retyped.
+CREATE TABLE rt.amb_comp (k char(5), n int, v int, PRIMARY KEY (k, n));
+INSERT INTO rt.amb_comp VALUES ('ab', 1, 1), ('cd', 2, 2);
+SELECT dolt_commit('-Am', 'amb_comp base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_comp ALTER COLUMN k TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_comp ALTER COLUMN k TYPE text;
+DELETE FROM rt.amb_comp WHERE k = 'cd' AND n = 2;
+SELECT dolt_commit('-Am', 'theirs deleted') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_merge \gset
+SELECT dolt_merge('feature');
+SELECT dolt_hashof('HEAD') = :'before_merge' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(k), n, v FROM rt.amb_comp ORDER BY 1, 2;
+SELECT dolt_branch('-D', 'feature');
+
+-- amb_pick: a cherry-pick refuses the same way, its commit's parent the
+-- base.
+CREATE TABLE rt.amb_pick (k char(5) PRIMARY KEY, v int);
+INSERT INTO rt.amb_pick VALUES ('ab', 1), ('cd', 2);
+SELECT dolt_commit('-Am', 'amb_pick base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.amb_pick ALTER COLUMN k TYPE text;
+SELECT dolt_commit('-Am', 'ours cast') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.amb_pick ALTER COLUMN k TYPE text;
+DELETE FROM rt.amb_pick WHERE k = 'cd';
+SELECT dolt_commit('-Am', 'theirs cast and deleted') IS NOT NULL AS committed;
+SELECT dolt_hashof('HEAD') AS pick \gset
+SELECT dolt_checkout('main');
+SELECT dolt_hashof('HEAD') AS before_pick \gset
+SELECT dolt_cherry_pick(:'pick');
+SELECT dolt_hashof('HEAD') = :'before_pick' AND
+  test_fold_root() = prolly_root_hash('HEAD') AS unchanged;
+SELECT * FROM dolt_status();
+SELECT quote_literal(k), v FROM rt.amb_pick ORDER BY 1;
+SELECT dolt_branch('-D', 'feature');
 
 DROP SCHEMA rt CASCADE;
