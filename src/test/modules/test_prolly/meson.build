@@ -56,6 +56,7 @@ tests += {
       'writer_modes',
       'transaction_commits',
       'status_diff',
+      'diff_memory',
       'collations',
       'applier',
       'move_heads',
