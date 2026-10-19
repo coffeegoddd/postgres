@@ -389,6 +389,45 @@ SELECT active_branch();
 ROLLBACK;
 SELECT active_branch();
 SELECT count(*) AS on_main FROM wm.sp;
+-- A transaction found to stay on its branch looks again once the branch is
+-- protected, however it is: a write after it moves to the writer branch.
+SELECT dolt_checkout('wm_sp');
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_branch('--protect', 'wm_sp');
+INSERT INTO wm.sp VALUES (5);
+SELECT active_branch();
+ROLLBACK;
+SELECT dolt_checkout('wm_sp');
+SELECT dolt_branch('wm_sp_prot');
+SELECT dolt_branch('--protect', 'wm_sp_prot');
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
+SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_sp%';
+INSERT INTO wm.sp VALUES (6);
+SELECT active_branch();
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'wm_sp_prot');
+-- And once the mode is branch-auto.
+SELECT dolt_writer_mode('owned');
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_writer_mode('branch-auto');
+INSERT INTO wm.sp VALUES (7);
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+-- A subtransaction that set nothing, aborted, leaves what was set.
+BEGIN;
+SELECT dolt_branch('--unprotect', 'main');
+SAVEPOINT s;
+SELECT 1 / 0;
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (8);
+SELECT active_branch();
+ROLLBACK;
 SELECT dolt_writer_mode('shared');
 RESET dolt.writer;
 SELECT dolt_branch('-D', 'wm_sp');

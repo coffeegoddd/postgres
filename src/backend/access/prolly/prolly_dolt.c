@@ -124,11 +124,12 @@ static bool settle_undone = false;
 
 /*
  * a transaction found not to move from a branch: needn't look again there
- * (unless the mode or a protection changes, or a subtransaction that may
- * have changed them aborts)
+ * while the writers' generation is the same (no mode or protection set, or
+ * undone)
  */
 static LocalTransactionId stays_lxid = InvalidLocalTransactionId;
 static Oid	stays_branch = InvalidOid;
+static uint64 stays_gen = 0;
 
 static void transaction_commit_at_end(bool prepare);
 static void note_own_change(Relation rel, const ItemPointerData *oldtid,
@@ -1202,6 +1203,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	ProllyBranchProtection protection = PROLLY_PROTECT_DEFAULT;
 	bool		options = true;
 	bool		was_protected;
+	bool		replaces_protected;
 	List	   *names = NIL;
 	const char *result[1] = {"0"};
 
@@ -1273,7 +1275,6 @@ dolt_branch(PG_FUNCTION_ARGS)
 						 errmsg("branch \"%s\" does not exist", (char *) lfirst(lc))));
 			PROLLY_CALL(writers(), set_protected, (char *) lfirst(lc), protection);
 		}
-		stays_lxid = InvalidLocalTransactionId;
 		PG_RETURN_DATUM(text_array(1, result));
 	}
 	if (take)
@@ -1329,15 +1330,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a writer's branch can't be renamed")));
 		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
+		/* (the branch a forced rename replaces) */
+		replaces_protected = strcmp(linitial(names), lsecond(names)) != 0 &&
+			PROLLY_CALL(refs(), resolve, lsecond(names), &(ProllyHash) {0}) &&
+			PROLLY_CALL(writers(), protected, lsecond(names));
 		for (int i = 0; i < 2; i++)
 		{
 			char	   *n = list_nth(names, i);
-			ProllyHash	head;
 
-			/* (the second, if it is: the branch a forced rename replaces) */
-			if ((i == 0 ? was_protected :
-				 PROLLY_CALL(refs(), resolve, n, &head) &&
-				 PROLLY_CALL(writers(), protected, n)) &&
+			if ((i == 0 ? was_protected : replaces_protected) &&
 				!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -1350,6 +1351,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		{
 			PROLLY_CALL(writers(), set_protected, linitial(names),
 						PROLLY_PROTECT_DEFAULT);
+			PROLLY_CALL(writers(), set_protected, lsecond(names),
+						PROLLY_PROTECT_ON);
+		}
+		else if (replaces_protected)
+		{
+			/*
+			 * (the renamed branch is protected by its new name, as the one it
+			 * replaced was: set so, since its protection changes with it)
+			 */
 			PROLLY_CALL(writers(), set_protected, lsecond(names),
 						PROLLY_PROTECT_ON);
 		}
@@ -1658,7 +1668,8 @@ move_to_writer_branch(bool *same)
 
 	*same = false;
 	if (!IsTransactionState() || RecoveryInProgress() ||
-		(MyProc->vxid.lxid == stays_lxid && MyBranch == stays_branch) ||
+		(MyProc->vxid.lxid == stays_lxid && MyBranch == stays_branch &&
+		 PROLLY_CALL(writers(), generation) == stays_gen) ||
 		!database_has_versioned_schemas() ||
 		branch_written(MyBranch))
 		return false;
@@ -1669,6 +1680,7 @@ move_to_writer_branch(bool *same)
 	{
 		stays_lxid = MyProc->vxid.lxid;
 		stays_branch = MyBranch;
+		stays_gen = PROLLY_CALL(writers(), generation);
 		return false;
 	}
 	*same = true;
@@ -1948,8 +1960,6 @@ static void
 writer_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						SubTransactionId parentSubid, void *arg)
 {
-	if (event == SUBXACT_EVENT_ABORT_SUB)
-		stays_lxid = InvalidLocalTransactionId;
 	if (settled_lxid == MyProc->vxid.lxid && settled_subid == mySubid)
 	{
 		if (event == SUBXACT_EVENT_ABORT_SUB)
@@ -2828,7 +2838,6 @@ dolt_writer_mode(PG_FUNCTION_ARGS)
 					 errmsg("unknown writer mode \"%s\"", mode),
 					 errhint("The writer modes are \"shared\", \"owned\", \"branch-only\" and \"branch-auto\".")));
 		PROLLY_CALL(writers(), set_mode, (ProllyWriterMode) m);
-		stays_lxid = InvalidLocalTransactionId;
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(names[PROLLY_CALL(writers(), mode)]));
 }
