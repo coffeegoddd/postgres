@@ -144,6 +144,7 @@ tests += {
       't/058_transaction_commits.pl',
       't/059_bmap_free_many.pl',
       't/067_bmap_drop_flush.pl',
+      't/060_keyless_unsettled.pl',
     ],
   },
 }
