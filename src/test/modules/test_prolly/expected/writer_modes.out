@@ -1208,6 +1208,84 @@ SELECT count(*) AS on_main FROM wm.sp;
        0
 (1 row)
 
+-- A set released into an outer savepoint is undone with that one.
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO wm.sp VALUES (9);
+RELEASE b;
+ROLLBACK TO a;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+ name | protected 
+------+-----------
+ main | t
+(1 row)
+
+INSERT INTO wm.sp VALUES (10);
+NOTICE:  writing on branch "writer/sp/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+ active_branch  
+----------------
+ writer/sp/main
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+RELEASE b;
+ROLLBACK TO a;
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+ROLLBACK;
+-- A set in the transaction stays when a later one in a savepoint is undone.
+BEGIN;
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SAVEPOINT s;
+SELECT dolt_branch('--protect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ROLLBACK TO s;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+ name | protected 
+------+-----------
+ main | f
+(1 row)
+
+INSERT INTO wm.sp VALUES (11);
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+ROLLBACK;
 -- A transaction found to stay on its branch looks again once the branch is
 -- protected, however it is: a write after it moves to the writer branch.
 SELECT dolt_checkout('wm_sp');
@@ -1253,6 +1331,14 @@ SELECT dolt_branch('--protect', 'wm_sp_prot');
  {0}
 (1 row)
 
+-- (a branch with changes, renamed onto a protected name, isn't protected
+-- by it, as it wouldn't be protected itself)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
+ERROR:  branch "wm_sp" has uncommitted changes
+HINT:  Commit or reset them before protecting it.
+ROLLBACK;
 BEGIN;
 UPDATE wm.sp SET id = id WHERE false;
 SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');

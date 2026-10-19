@@ -389,6 +389,36 @@ SELECT active_branch();
 ROLLBACK;
 SELECT active_branch();
 SELECT count(*) AS on_main FROM wm.sp;
+-- A set released into an outer savepoint is undone with that one.
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_branch('--unprotect', 'main');
+INSERT INTO wm.sp VALUES (9);
+RELEASE b;
+ROLLBACK TO a;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.sp VALUES (10);
+SELECT active_branch();
+ROLLBACK;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_writer_mode('shared');
+RELEASE b;
+ROLLBACK TO a;
+SELECT dolt_writer_mode();
+ROLLBACK;
+-- A set in the transaction stays when a later one in a savepoint is undone.
+BEGIN;
+SELECT dolt_branch('--unprotect', 'main');
+SAVEPOINT s;
+SELECT dolt_branch('--protect', 'main');
+ROLLBACK TO s;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.sp VALUES (11);
+SELECT active_branch();
+ROLLBACK;
 -- A transaction found to stay on its branch looks again once the branch is
 -- protected, however it is: a write after it moves to the writer branch.
 SELECT dolt_checkout('wm_sp');
@@ -401,6 +431,12 @@ ROLLBACK;
 SELECT dolt_checkout('wm_sp');
 SELECT dolt_branch('wm_sp_prot');
 SELECT dolt_branch('--protect', 'wm_sp_prot');
+-- (a branch with changes, renamed onto a protected name, isn't protected
+-- by it, as it wouldn't be protected itself)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
+ROLLBACK;
 BEGIN;
 UPDATE wm.sp SET id = id WHERE false;
 SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');

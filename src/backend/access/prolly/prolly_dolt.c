@@ -1345,21 +1345,24 @@ dolt_branch(PG_FUNCTION_ARGS)
 						 errmsg("branch \"%s\" is protected", n),
 						 errhint("Only the database's owner renames or replaces a protected branch.")));
 		}
+
+		/*
+		 * (the renamed branch is protected by its new name, as the one it
+		 * replaces was: protected so first, which a branch with changes, or
+		 * an owner, isn't)
+		 */
+		if (replaces_protected && !was_protected)
+		{
+			PROLLY_CALL(writers(), set_protected, linitial(names),
+						PROLLY_PROTECT_ON);
+			was_protected = true;
+		}
 		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_rename, linitial(names),
 										 lsecond(names), force));
 		if (was_protected)
 		{
 			PROLLY_CALL(writers(), set_protected, linitial(names),
 						PROLLY_PROTECT_DEFAULT);
-			PROLLY_CALL(writers(), set_protected, lsecond(names),
-						PROLLY_PROTECT_ON);
-		}
-		else if (replaces_protected)
-		{
-			/*
-			 * (the renamed branch is protected by its new name, as the one it
-			 * replaced was: set so, since its protection changes with it)
-			 */
 			PROLLY_CALL(writers(), set_protected, lsecond(names),
 						PROLLY_PROTECT_ON);
 		}
