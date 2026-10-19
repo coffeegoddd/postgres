@@ -20,15 +20,6 @@
 #include "nodes/pg_list.h"
 #include "utils/hsearch.h"
 
-/* A commit id as a hash table's key: its bytes past its length zeroed. */
-static void
-id_key(const ProllyHash *id, ProllyHash *key)
-{
-	memset(key, 0, sizeof(*key));
-	key->len = id->len;
-	memcpy(key->bytes, id->bytes, id->len);
-}
-
 static HTAB *
 id_set(const char *name)
 {
@@ -70,7 +61,7 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 	{
 		bool		known;
 
-		id_key(&starts[i], &queue[tail]);
+		queue[tail] = prolly_hash_key(&starts[i]);
 		(void) hash_search(seen, &queue[tail], HASH_ENTER, &known);
 		if (!known)
 			tail++;
@@ -96,7 +87,7 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 			ProllyHash	key;
 			bool		known;
 
-			id_key(&info.parents[i], &key);
+			key = prolly_hash_key(&info.parents[i]);
 			(void) hash_search(seen, &key, HASH_ENTER, &known);
 			if (known)
 				continue;
@@ -174,9 +165,21 @@ typedef struct Height
 	int64		height;			/* 0: being found */
 } Height;
 
-static int64
-commit_height(const ProllyHash *id, HTAB *heights, ProllyCommitLookup lookup,
-			  void *lookup_arg)
+HTAB *
+prolly_history_heights(void)
+{
+	HASHCTL		ctl;
+
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(Height);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create("prolly commit heights", 256, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+int64
+prolly_history_height(const ProllyHash *id, HTAB *heights,
+					  ProllyCommitLookup lookup, void *lookup_arg)
 {
 	ProllyHash	key;
 	ProllyHash *stack;
@@ -185,7 +188,7 @@ commit_height(const ProllyHash *id, HTAB *heights, ProllyCommitLookup lookup,
 	Height	   *h;
 	bool		known;
 
-	id_key(id, &key);
+	key = prolly_hash_key(id);
 	h = hash_search(heights, &key, HASH_FIND, NULL);
 	if (h != NULL && h->height > 0)
 		return h->height;
@@ -213,7 +216,7 @@ commit_height(const ProllyHash *id, HTAB *heights, ProllyCommitLookup lookup,
 				ProllyHash	pk;
 				Height	   *ph;
 
-				id_key(&info.parents[i], &pk);
+				pk = prolly_hash_key(&info.parents[i]);
 				ph = hash_search(heights, &pk, HASH_FIND, NULL);
 				if (ph != NULL && ph->height > 0)
 					height = Max(height, ph->height + 1);
@@ -273,7 +276,6 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 	{
 		ProllyHash *parents = palloc_array(ProllyHash, ncommon * PROLLY_MAX_PARENTS);
 		int			nparents = 0;
-		HASHCTL		ctl;
 
 		for (int i = 0; i < ncommon; i++)
 		{
@@ -287,11 +289,7 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 		beneath = id_set("prolly merge base, beneath another");
 		(void) walk_from(parents, nparents, lookup, lookup_arg, add_ancestor,
 						 beneath, &unused);
-		ctl.keysize = sizeof(ProllyHash);
-		ctl.entrysize = sizeof(Height);
-		ctl.hcxt = CurrentMemoryContext;
-		heights = hash_create("prolly commit heights", 256, &ctl,
-							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		heights = prolly_history_heights();
 	}
 	for (int i = 0; i < ncommon; i++)
 	{
@@ -301,7 +299,7 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 		if (beneath != NULL && hash_search(beneath, id, HASH_FIND, NULL) != NULL)
 			continue;
 		if (heights != NULL)
-			height = commit_height(id, heights, lookup, lookup_arg);
+			height = prolly_history_height(id, heights, lookup, lookup_arg);
 		if (!found || height > best_height ||
 			(height == best_height &&
 			 (id->len < base->len ||

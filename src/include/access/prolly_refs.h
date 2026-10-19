@@ -362,4 +362,17 @@ extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 									  ProllyCommitLookup lookup, void *lookup_arg,
 									  ProllyHash *base);
 
+/*
+ * A commit's height: the most commits on a path from it to a root of its
+ * history (a root's is 1, and one that isn't found is taken for a root), so
+ * each commit's is greater than its parents'.  heights, a table
+ * prolly_history_heights() makes, keeps those found, so each commit's
+ * height is found once however many are asked for; lookup may be asked
+ * twice for a commit (before its parents' heights are found, and after),
+ * so one whose reads cost should remember them.
+ */
+extern struct HTAB *prolly_history_heights(void);
+extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,
+								   ProllyCommitLookup lookup, void *lookup_arg);
+
 #endif							/* PROLLY_REFS_H */
