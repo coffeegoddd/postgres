@@ -495,22 +495,21 @@ since_commit(SinceWalk *sw, const ProllyHash *id)
 	return c;
 }
 
-/* A commit's parents for its height, as since_commit() read them. */
+/*
+ * A commit's parents for its height: read, not kept (most commits a height
+ * reaches are never walked, and keep only their heights' entries).
+ */
 static bool
 since_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 {
-	SinceCommit *c = since_commit((SinceWalk *) arg, id);
+	SinceWalk  *sw = arg;
+	MemoryContext old = MemoryContextSwitchTo(sw->scratch);
+	bool		found = PROLLY_CALL(sw->dc.refs, commit_get, id, info);
 
-	if (!c->found)
-		return false;
-	memset(info, 0, sizeof(*info));
-	info->id = c->id;
-	info->root = c->root;
-	info->nparents = c->nparents;
-	for (int p = 0; p < c->nparents; p++)
-		info->parents[p] = c->parents[p];
-	info->committed_at = c->committed_at;
-	return true;
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(sw->scratch);
+	info->author = info->message = NULL;
+	return found;
 }
 
 /*
@@ -547,7 +546,8 @@ since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
  * and of each, its own chunks and what its root changed from its first
  * parent's (each tree diffed, equal subtrees skipped).  The trees walked
  * are the new commits' and what they changed, not the history's; the
- * commits beneath them are read (each once) for their heights.  The
+ * commits beneath them are read for their heights, each keeping only its
+ * height's entry for the call (until commits record their heights).  The
  * receiver checks all it is sent, and reads what it still lacks as it
  * would without this.
  *
