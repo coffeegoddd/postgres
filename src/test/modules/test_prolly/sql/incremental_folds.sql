@@ -208,6 +208,59 @@ INSERT INTO inc.keyless VALUES (1, 'one');
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'rewritten')::text) AS committed;
 
+-- TRUNCATE where the table's storage was made in the transaction, after a
+-- commit in it folded the table: the storage is made anew, as a TRUNCATE
+-- elsewhere makes it, not cut in place, which the next fold wouldn't see
+-- (it reads only the pages listed).  The commit keeps the rows, for a
+-- branch made from it and a hard reset.
+BEGIN;
+CREATE TABLE inc.made (id int PRIMARY KEY, v text);
+INSERT INTO inc.made SELECT g, 'x' || g FROM generate_series(1, 5000) g;
+SELECT length(dolt_commit('-Am', 'made')::text) AS committed;
+SELECT dolt_branch('made');
+SELECT pg_relation_filenode('inc.made') AS made \gset
+TRUNCATE inc.made;
+SELECT pg_relation_filenode('inc.made') <> :made AS made_anew;
+COMMIT;
+SELECT * FROM pg_temp.fold();
+SELECT table_name, status FROM dolt_status;
+SELECT dolt_checkout('made');
+SELECT count(*) FROM inc.made;
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard');
+SELECT count(*) FROM inc.made;
+-- storage made anew in the transaction, and rows inserted after the
+-- TRUNCATE: the working set has just those
+BEGIN;
+TRUNCATE inc.made;
+INSERT INTO inc.made SELECT g, 'y' || g FROM generate_series(1, 5000) g;
+SELECT length(dolt_commit('-am', 'made again')::text) AS committed;
+SELECT dolt_branch('made_again');
+TRUNCATE inc.made;
+INSERT INTO inc.made SELECT g, 'z' || g FROM generate_series(1, 10) g;
+COMMIT;
+SELECT * FROM pg_temp.fold();
+SELECT count(*), min(v), max(v) FROM inc.made;
+SELECT diff_type, count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::inc.made)
+  GROUP BY 1 ORDER BY 1;
+SELECT dolt_checkout('made_again');
+SELECT count(*), count(*) FILTER (WHERE v LIKE 'y%') AS made_again FROM inc.made;
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard');
+SELECT count(*), count(*) FILTER (WHERE v LIKE 'y%') AS made_again FROM inc.made;
+-- storage made in the transaction and not folded is still cut in place
+BEGIN;
+CREATE TABLE inc.unfolded (id int);
+INSERT INTO inc.unfolded SELECT generate_series(1, 1000);
+SELECT pg_relation_filenode('inc.unfolded') AS unfolded \gset
+TRUNCATE inc.unfolded;
+SELECT pg_relation_filenode('inc.unfolded') = :unfolded AS in_place;
+COMMIT;
+SELECT dolt_branch('-D', 'made');
+SELECT dolt_branch('-D', 'made_again');
+DROP TABLE inc.made, inc.unfolded;
+SELECT length(dolt_commit('-Am', 'made gone')::text) AS committed;
+
 -- A branch starts from its source's baseline.
 SELECT dolt_branch('other');
 SELECT dolt_checkout('other');
