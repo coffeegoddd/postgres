@@ -672,6 +672,7 @@ move_settled(void *arg)
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+static bool commit_time(const ProllyHash *id, TimestampTz *at);
 
 /* The session's branch folded, as a commit's fold would be: its baseline. */
 static void
@@ -824,19 +825,33 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 /*
  * Write a commit's tree; its id is the root's hash.  What its versioned
  * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.
+ * transaction sees them.  It is dated now, as Dolt's are, not at the
+ * transaction's start, so a parent another session committed since then is
+ * older than it; and never at or before a parent's date (the clock may have
+ * stepped back, or a parent come from a remote whose clock runs ahead), so
+ * along history the dates only rise.  (A parent dated outside timestamp's
+ * range, or at its last microsecond, which only a foreign or corrupt commit
+ * could be, leaves the date as it is.)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, TimestampTz at,
-			 ProllyHash *id)
+			 const char *author, const char *message, ProllyHash *id)
 {
+	TimestampTz at = GetCurrentTimestamp();
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
 	ProllyNodeRef deps;
 	ProllyDatabaseComponents dc;
 
+	for (int i = 0; i < nparents; i++)
+	{
+		TimestampTz parent_at;
+
+		if (commit_time(&parents[i], &parent_at) && at <= parent_at &&
+			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
+			at = parent_at + 1;
+	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
@@ -874,6 +889,20 @@ read_item(const ProllyNodeRef *commit, const char *key, StringInfo out)
 	ProllyKey	k = {(const uint8 *) key, strlen(key)};
 
 	return PROLLY_CALL(tree, get, &env, commit, &k, out);
+}
+
+/* A commit's "time" item, as write_commit puts it; false if it isn't one. */
+static bool
+get_time(const StringInfoData *v, TimestampTz *at)
+{
+	uint64		t = 0;
+
+	if (v->len != 8)
+		return false;
+	for (int i = 0; i < 8; i++)
+		t = (t << 8) | (uint8) v->data[i];
+	*at = (TimestampTz) t;
+	return true;
 }
 
 static bool
@@ -918,16 +947,28 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		info->has_dependencies = true;
 	}
 	resetStringInfo(&v);
-	if (read_item(&ref, "time", &v) && v.len == 8)
-	{
-		uint64		t = 0;
-
-		for (int i = 0; i < 8; i++)
-			t = (t << 8) | (uint8) v.data[i];
-		info->committed_at = (TimestampTz) t;
-	}
+	if (read_item(&ref, "time", &v))
+		(void) get_time(&v, &info->committed_at);
 	pfree(v.data);
 	return true;
+}
+
+/* Just the date of commit id, which is read only for it. */
+static bool
+commit_time(const ProllyHash *id, TimestampTz *at)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+		return false;
+	ref_of(id, &ref);
+	initStringInfo(&v);
+	found = read_item(&ref, "time", &v) && get_time(&v, at);
+	pfree(v.data);
+	return found;
 }
 
 /* A commit id in hex; false if refname isn't one. */
@@ -1236,7 +1277,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		return false;
 	}
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -1689,7 +1730,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
 	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 GetCurrentTransactionStartTimestamp(), commit_id);
+				 commit_id);
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	return 1;
@@ -1721,7 +1762,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
