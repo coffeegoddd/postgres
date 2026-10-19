@@ -404,3 +404,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- not refused for their keys' length, as the row applier's aren't.
 CREATE FUNCTION test_write_held_rows(sql text) RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The bytes the "basic" table file format keeps in memory for each chunk
+-- of an open file of n chunks named by 20-byte hashes.
+CREATE FUNCTION test_tablefile_bytes_per_chunk(n int)
+RETURNS float8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

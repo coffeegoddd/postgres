@@ -38,7 +38,7 @@ FROM prolly_implementations();
  chunk_format  | basic        |       1 |              1
  row_applier   | replication  |       1 |              1
  row_applier   | stub         |       0 |              0
- table_file    | basic        |       1 |              1
+ table_file    | basic        |       1 |              2
  table_file    | stub         |       0 |              0
  change_finder | pages        |       1 |              8
  change_finder | log          |       2 |              2
@@ -201,10 +201,12 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_file    | basic          | identity                       | pass
  table_file    | basic          | round_trip                     | pass
  table_file    | basic          | rejects_other_bytes            | pass
+ table_file    | basic          | shared_prefixes                | pass
  table_file    | basic          | complete                       | pass
  table_file    | stub           | identity                       | pass
  table_file    | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
  table_file    | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
+ table_file    | stub           | shared_prefixes                | not implemented (missing write_begin, write_add, write_finish, open, find, decode, close)
  table_file    | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  change_finder | pages          | identity                       | pass
  change_finder | pages          | complete                       | pass
@@ -233,7 +235,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (9 of 9 callbacks missing)
-(173 rows)
+(175 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

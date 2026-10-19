@@ -43,6 +43,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/typcache.h"
 
 /* ------------------------------------------------------------------------
@@ -1420,6 +1421,79 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 }
 
 /*
+ * A 20-byte hash for shared_prefixes: group g's first 8 bytes (all zero,
+ * all 0xff, or one in between), then member m in its last 12.
+ */
+static void
+prefix_hash(int g, int m, ProllyHash *h)
+{
+	memset(h, 0, sizeof(*h));
+	h->len = 20;
+	memset(h->bytes, g == 0 ? 0x00 : g == 1 ? 0xff : 0x40 + g, 8);
+	h->bytes[18] = (uint8) (m >> 8);
+	h->bytes[19] = (uint8) m;
+}
+
+/*
+ * Chunks whose hashes share their first bytes, at the ends of the hash
+ * space and between: every one is found, and hashes between them (or
+ * past them) that weren't added aren't.
+ */
+void
+tablefile_shared_prefixes(const ProllyImplInfo *impl)
+{
+	const ProllyTableFileRoutine *tf = (const ProllyTableFileRoutine *) impl;
+	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
+	StringInfoData file;
+	MemFile		mf;
+	ProllyTableFile *f;
+	int			ngroups = 5;
+	int			nmembers = 40;
+
+	initStringInfo(&file);
+	/* (added out of hash order; members 2, 4, 6, ... only) */
+	for (int m = nmembers; m > 0; m--)
+		for (int g = 0; g < ngroups; g++)
+		{
+			ProllyHash	h;
+			char		data[16];
+
+			prefix_hash(g, m * 2, &h);
+			snprintf(data, sizeof(data), "%d.%d", g, m * 2);
+			PROLLY_CALL(tf, write_add, w, &h, data, strlen(data), &file);
+		}
+	PROLLY_CALL(tf, write_finish, w, &file);
+	mf.data = file.data;
+	mf.len = file.len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, file.len, CurrentMemoryContext);
+	if (f == NULL)
+		elog(ERROR, "a table file of shared prefixes doesn't open");
+	for (int g = 0; g < ngroups; g++)
+		for (int m = 0; m <= nmembers * 2 + 1; m++)
+		{
+			ProllyHash	h;
+			uint64		offset;
+			uint32		len;
+			bool		added = m > 0 && m <= nmembers * 2 && m % 2 == 0;
+			StringInfoData out;
+			char		data[16];
+
+			prefix_hash(g, m, &h);
+			if (PROLLY_CALL(tf, find, f, &h, &offset, &len) != added)
+				elog(ERROR, "chunk %d.%d is %sfound", g, m, added ? "not " : "");
+			if (!added)
+				continue;
+			initStringInfo(&out);
+			PROLLY_CALL(tf, decode, f, file.data + offset, len, &out);
+			snprintf(data, sizeof(data), "%d.%d", g, m);
+			if (strcmp(out.data, data) != 0)
+				elog(ERROR, "chunk %d.%d reads as \"%s\"", g, m, out.data);
+			pfree(out.data);
+		}
+	PROLLY_CALL(tf, close, f);
+}
+
+/*
  * Bytes that aren't a whole table file don't open as one, and a chunk's
  * bytes changed don't decode.
  */
@@ -1476,4 +1550,47 @@ tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
 	if (!failed)
 		elog(ERROR, "a changed chunk decodes");
 	PROLLY_CALL(tf, close, f);
+}
+
+/*
+ * The bytes the "basic" table file format keeps in memory for each chunk
+ * of an open file of n chunks named by 20-byte hashes.
+ */
+PG_FUNCTION_INFO_V1(test_tablefile_bytes_per_chunk);
+Datum
+test_tablefile_bytes_per_chunk(PG_FUNCTION_ARGS)
+{
+	int32		n = PG_GETARG_INT32(0);
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
+	MemoryContext cxt;
+	StringInfoData file;
+	MemFile		mf;
+	ProllyTableFile *f;
+	Size		used;
+
+	initStringInfo(&file);
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	h;
+		uint32		x = (uint32) i * 2654435761u;
+
+		memset(&h, 0, sizeof(h));
+		h.len = 20;
+		for (int j = 0; j < 20; j++, x = x * 1103515245u + 12345)
+			h.bytes[j] = (uint8) (x >> 24);
+		PROLLY_CALL(tf, write_add, w, &h, "c", 1, &file);
+	}
+	PROLLY_CALL(tf, write_finish, w, &file);
+	mf.data = file.data;
+	mf.len = file.len;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "table file",
+								ALLOCSET_DEFAULT_SIZES);
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, file.len, cxt);
+	if (f == NULL)
+		elog(ERROR, "the table file doesn't open");
+	used = MemoryContextMemAllocated(cxt, true);
+	PROLLY_CALL(tf, close, f);
+	MemoryContextDelete(cxt);
+	PG_RETURN_FLOAT8((double) used / n);
 }

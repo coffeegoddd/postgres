@@ -25,6 +25,7 @@ extern void chunkformat_items_round_trip(const ProllyImplInfo *impl);
 extern void chunkformat_rejects_other_bytes(const ProllyImplInfo *impl);
 extern void tablefile_round_trip(const ProllyImplInfo *impl);
 extern void tablefile_rejects_other_bytes(const ProllyImplInfo *impl);
+extern void tablefile_shared_prefixes(const ProllyImplInfo *impl);
 extern void keyenc_order_matches_opclass(const ProllyImplInfo *impl);
 extern void keyenc_desc_and_nulls(const ProllyImplInfo *impl);
 extern void valenc_round_trip(const ProllyImplInfo *impl);

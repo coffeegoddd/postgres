@@ -82,6 +82,9 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_TABLE_FILE, "rejects_other_bytes",
 	"write_begin write_add write_finish open entry decode close",
 	tablefile_rejects_other_bytes},
+	{PROLLY_IFACE_TABLE_FILE, "shared_prefixes",
+	"write_begin write_add write_finish open find decode close",
+	tablefile_shared_prefixes},
 
 	/* content hash */
 	{PROLLY_IFACE_CONTENT_HASH, "deterministic", "begin update finish",

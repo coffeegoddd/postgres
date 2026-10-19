@@ -7,15 +7,24 @@
  *
  *		chunk	uint8 codec (0: as is, 1: LZ4), uint32 length of the chunk,
  *				the bytes stored, uint32 CRC-32C of everything before it
- *		index	for each chunk, in hash order: its hash, uint64 offset and
- *				uint32 length of its bytes in the file
+ *		index	laid out as Dolt's table files' are: for each chunk in hash
+ *				order, its hash's first 8 bytes (a big-endian uint64, the
+ *				prefix) and its ordinal (uint32: its place among the
+ *				chunks); then for each chunk by ordinal, the uint32 length
+ *				of its bytes in the file; then for each by ordinal, the
+ *				rest of its hash (the suffix)
  *		footer	uint64 offset of the index, uint32 chunk count, uint8 hash
  *				length, three zero bytes, uint32 CRC-32C of the index,
- *				uint32 version (1), "PRLYTBL1"
+ *				uint32 version (2), "PRLYTBL1"
  *
- * integers little-endian.  A chunk is compressed with LZ4 when the server
- * is built with it and that makes the chunk smaller; a server built
- * without LZ4 reads the other chunks and refuses those.
+ * integers little-endian, but the prefixes.  A chunk is compressed with LZ4
+ * when the server is built with it and that makes the chunk smaller; a
+ * server built without LZ4 reads the other chunks and refuses those.
+ *
+ * A reader keeps the index as the file has it, the lengths made offsets:
+ * about 32 bytes a chunk for 20-byte hashes.  A lookup interpolates on the
+ * prefixes, which are uniform, then compares the suffixes of the chunks
+ * with its prefix.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/tablefile_basic.c
@@ -32,19 +41,22 @@
 #include "port/pg_crc32c.h"
 #include "utils/memutils.h"
 
-#define FORMAT_VERSION	1
+#define FORMAT_VERSION	2
 #define MAGIC			"PRLYTBL1"
 #define FOOTER_SIZE		32
 #define CHUNK_HEADER	5		/* codec, length */
 #define CHUNK_OVERHEAD	(CHUNK_HEADER + 4)
+#define PREFIX_LEN		8		/* a hash's bytes in its prefix */
+#define PREFIX_ENTRY	12		/* a prefix and an ordinal */
 
 #define CODEC_NONE		0
 #define CODEC_LZ4		1
 
+/* a chunk the writer added: its hash, and where its bytes are */
 typedef struct Entry
 {
 	ProllyHash	hash;
-	uint64		offset;
+	uint32		ordinal;		/* the order it was added in */
 	uint32		len;
 } Entry;
 
@@ -60,8 +72,13 @@ struct ProllyTableFileWriter
 
 struct ProllyTableFile
 {
-	Entry	   *entries;		/* in hash order */
 	int			n;
+	uint8		hash_len;
+	int			suffix_len;		/* hash_len past the prefix */
+	uint64	   *prefixes;		/* in hash order */
+	uint32	   *ordinals;		/* likewise: each one's place in the file */
+	uint64	   *offsets;		/* by ordinal, and the chunks' end last */
+	uint8	   *suffixes;		/* by ordinal, suffix_len bytes each */
 };
 
 static void
@@ -177,10 +194,37 @@ basic_write_add(ProllyTableFileWriter *w, const ProllyHash *hash,
 			MemoryContextAllocHuge(w->cxt, sizeof(Entry) * w->max);
 	}
 	w->entries[w->n].hash = *hash;
-	w->entries[w->n].offset = w->offset;
+	w->entries[w->n].ordinal = (uint32) w->n;
 	w->entries[w->n].len = out->len - start;
 	w->n++;
 	w->offset += out->len - start;
+}
+
+/* A hash's prefix: its first bytes, as a big-endian number. */
+static uint64
+hash_prefix(const uint8 *bytes, uint8 hash_len)
+{
+	uint64		v = 0;
+
+	for (int i = 0; i < PREFIX_LEN; i++)
+		v = (v << 8) | (i < hash_len ? bytes[i] : 0);
+	return v;
+}
+
+static void
+put_prefix(char *p, uint64 v)
+{
+	for (int i = PREFIX_LEN - 1; i >= 0; i--)
+	{
+		p[i] = (char) (v & 0xff);
+		v >>= 8;
+	}
+}
+
+static uint64
+get_prefix(const char *p)
+{
+	return hash_prefix((const uint8 *) p, PREFIX_LEN);
 }
 
 static void
@@ -188,22 +232,42 @@ basic_write_finish(ProllyTableFileWriter *w, StringInfo out)
 {
 	uint64		index_offset = w->offset;
 	int			index_start = out->len;
+	int			suffix_len = Max(w->hash_len - PREFIX_LEN, 0);
+	uint32	   *lens;
 	char		footer[FOOTER_SIZE];
 	pg_crc32c	crc;
 
+	/* lengths and suffixes are by ordinal: the order the chunks came in */
+	lens = palloc_extended(sizeof(uint32) * Max(w->n, 1), MCXT_ALLOC_HUGE);
+	for (int i = 0; i < w->n; i++)
+		lens[i] = w->entries[i].len;
 	if (w->n > 1)
 		qsort(w->entries, w->n, sizeof(Entry), entry_cmp);
 	for (int i = 0; i < w->n; i++)
 	{
-		char		loc[12];
+		char		pre[PREFIX_ENTRY];
 
 		if (i > 0 && hash_cmp(&w->entries[i - 1].hash, &w->entries[i].hash) == 0)
 			elog(ERROR, "a chunk added to a table file twice");
-		put_u64(loc, w->entries[i].offset);
-		put_u32(loc + 8, w->entries[i].len);
-		appendBinaryStringInfo(out, w->entries[i].hash.bytes, w->hash_len);
-		appendBinaryStringInfo(out, loc, sizeof(loc));
+		put_prefix(pre, hash_prefix(w->entries[i].hash.bytes, w->hash_len));
+		put_u32(pre + PREFIX_LEN, w->entries[i].ordinal);
+		appendBinaryStringInfo(out, pre, sizeof(pre));
 	}
+	for (int i = 0; i < w->n; i++)
+	{
+		char		len[4];
+
+		put_u32(len, lens[i]);
+		appendBinaryStringInfo(out, len, sizeof(len));
+	}
+	/* (each suffix by ordinal: entries[] is in hash order now) */
+	enlargeStringInfo(out, (Size) w->n * suffix_len);
+	for (int i = 0; i < w->n; i++)
+		memcpy(out->data + out->len + (Size) w->entries[i].ordinal * suffix_len,
+			   w->entries[i].hash.bytes + PREFIX_LEN, suffix_len);
+	out->len += w->n * suffix_len;
+	out->data[out->len] = '\0';
+	pfree(lens);
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, out->data + index_start, out->len - index_start);
 	FIN_CRC32C(crc);
@@ -222,6 +286,39 @@ basic_write_finish(ProllyTableFileWriter *w, StringInfo out)
 	pfree(w);
 }
 
+static void
+basic_close(ProllyTableFile *tf)
+{
+	if (tf->prefixes)
+		pfree(tf->prefixes);
+	if (tf->ordinals)
+		pfree(tf->ordinals);
+	if (tf->offsets)
+		pfree(tf->offsets);
+	if (tf->suffixes)
+		pfree(tf->suffixes);
+	pfree(tf);
+}
+
+/* chunk i's suffix, in hash order */
+static const uint8 *
+suffix_of(ProllyTableFile *tf, int i)
+{
+	return tf->suffixes + (Size) tf->ordinals[i] * tf->suffix_len;
+}
+
+/*
+ * Compare chunk i (in hash order) with a hash of the file's length and the
+ * given prefix: the prefixes, then the suffixes.
+ */
+static int
+cmp_at(ProllyTableFile *tf, int i, uint64 prefix, const uint8 *suffix)
+{
+	if (tf->prefixes[i] != prefix)
+		return tf->prefixes[i] < prefix ? -1 : 1;
+	return memcmp(suffix_of(tf, i), suffix, tf->suffix_len);
+}
+
 static ProllyTableFile *
 basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 {
@@ -229,11 +326,15 @@ basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 	uint64		index_offset;
 	uint32		n;
 	uint8		hash_len;
+	int			suffix_len;
 	Size		entry_size;
 	Size		index_len;
 	char	   *index;
+	const char *p;
 	pg_crc32c	crc;
 	ProllyTableFile *tf;
+	bool	   *seen;
+	uint64		offset;
 
 	if (size < FOOTER_SIZE || !read(arg, size - FOOTER_SIZE, footer, FOOTER_SIZE) ||
 		memcmp(footer + 24, MAGIC, 8) != 0 ||
@@ -243,9 +344,11 @@ basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 	n = get_u32(footer + 8);
 	hash_len = (uint8) footer[12];
 	/* (a file of no chunks has no hash length) */
-	if ((hash_len == 0) != (n == 0) || hash_len > PROLLY_HASH_MAX_LEN)
+	if ((hash_len == 0) != (n == 0) || hash_len > PROLLY_HASH_MAX_LEN ||
+		n > (uint32) PG_INT32_MAX)
 		return NULL;
-	entry_size = hash_len + 12;
+	suffix_len = Max(hash_len - PREFIX_LEN, 0);
+	entry_size = PREFIX_ENTRY + 4 + suffix_len;
 	if (index_offset > size - FOOTER_SIZE ||
 		(size - FOOTER_SIZE - index_offset) / entry_size != n ||
 		(size - FOOTER_SIZE - index_offset) % entry_size != 0)
@@ -268,48 +371,115 @@ basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 
 	tf = MemoryContextAllocZero(cxt, sizeof(*tf));
 	tf->n = n;
-	tf->entries = MemoryContextAllocHuge(cxt, sizeof(Entry) * Max(n, 1));
-	for (uint32 i = 0; i < n; i++)
-	{
-		const char *e = index + (Size) i * entry_size;
-		Entry	   *en = &tf->entries[i];
+	tf->hash_len = hash_len;
+	tf->suffix_len = suffix_len;
+	tf->prefixes = MemoryContextAllocHuge(cxt, sizeof(uint64) * Max(n, 1));
+	tf->ordinals = MemoryContextAllocHuge(cxt, sizeof(uint32) * Max(n, 1));
+	tf->offsets = MemoryContextAllocHuge(cxt, sizeof(uint64) * (n + 1));
+	tf->suffixes = MemoryContextAllocHuge(cxt, Max((Size) n * suffix_len, 1));
+	seen = palloc_extended(Max(n, 1), MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 
-		memset(&en->hash, 0, sizeof(en->hash));
-		en->hash.len = hash_len;
-		memcpy(en->hash.bytes, e, hash_len);
-		en->offset = get_u64(e + hash_len);
-		en->len = get_u32(e + hash_len + 8);
-		if (en->len < CHUNK_OVERHEAD || en->offset > index_offset ||
-			en->len > index_offset - en->offset ||
-			(i > 0 && hash_cmp(&tf->entries[i - 1].hash, &en->hash) >= 0))
-		{
-			pfree(index);
-			pfree(tf->entries);
-			pfree(tf);
-			return NULL;
-		}
+	p = index;
+	for (uint32 i = 0; i < n; i++, p += PREFIX_ENTRY)
+	{
+		tf->prefixes[i] = get_prefix(p);
+		tf->ordinals[i] = get_u32(p + PREFIX_LEN);
+		if (tf->ordinals[i] >= n || seen[tf->ordinals[i]])
+			goto bad;
+		seen[tf->ordinals[i]] = true;
 	}
+	offset = 0;
+	for (uint32 i = 0; i < n; i++, p += 4)
+	{
+		uint32		len = get_u32(p);
+
+		if (len < CHUNK_OVERHEAD || len > index_offset - offset)
+			goto bad;
+		tf->offsets[i] = offset;
+		offset += len;
+	}
+	tf->offsets[n] = offset;
+	if (offset != index_offset)
+		goto bad;
+	memcpy(tf->suffixes, p, (Size) n * suffix_len);
+	/* in hash order, each once */
+	for (uint32 i = 1; i < n; i++)
+	{
+		if (cmp_at(tf, i - 1, tf->prefixes[i], suffix_of(tf, i)) >= 0)
+			goto bad;
+	}
+	pfree(seen);
 	pfree(index);
 	return tf;
+
+bad:
+	pfree(seen);
+	pfree(index);
+	basic_close(tf);
+	return NULL;
 }
 
+/*
+ * The first chunk (in hash order) whose prefix is prefix, or -1: by
+ * interpolation, as the prefixes of content hashes are uniform, narrowed
+ * by bisection when a guess lands badly.
+ */
 static int
-basic_locate(ProllyTableFile *tf, const ProllyHash *hash)
+find_prefix(ProllyTableFile *tf, uint64 prefix)
 {
 	int			lo = 0;
 	int			hi = tf->n - 1;
 
 	while (lo <= hi)
 	{
-		int			mid = lo + (hi - lo) / 2;
-		int			c = hash_cmp(&tf->entries[mid].hash, hash);
+		uint64		plo = tf->prefixes[lo];
+		uint64		phi = tf->prefixes[hi];
+		int			mid;
+
+		if (prefix < plo || prefix > phi)
+			return -1;
+		if (phi == plo)
+			mid = lo;
+		else
+		{
+			long double f = (long double) (prefix - plo) / (long double) (phi - plo);
+
+			mid = lo + (int) (f * (hi - lo));
+			mid = Max(lo, Min(hi, mid));
+		}
+		if (tf->prefixes[mid] < prefix)
+			lo = mid + 1;
+		else if (tf->prefixes[mid] > prefix)
+			hi = mid - 1;
+		else
+		{
+			while (mid > 0 && tf->prefixes[mid - 1] == prefix)
+				mid--;
+			return mid;
+		}
+	}
+	return -1;
+}
+
+static int
+basic_locate(ProllyTableFile *tf, const ProllyHash *hash)
+{
+	uint64		prefix;
+	int			i;
+
+	if (tf->n == 0 || hash->len != tf->hash_len)
+		return -1;
+	prefix = hash_prefix(hash->bytes, hash->len);
+	for (i = find_prefix(tf, prefix); i >= 0 && i < tf->n &&
+		 tf->prefixes[i] == prefix; i++)
+	{
+		int			c = memcmp(suffix_of(tf, i), hash->bytes + PREFIX_LEN,
+							   tf->suffix_len);
 
 		if (c == 0)
-			return mid;
-		if (c < 0)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
+			return i;
+		if (c > 0)
+			break;
 	}
 	return -1;
 }
@@ -319,11 +489,13 @@ basic_find(ProllyTableFile *tf, const ProllyHash *hash, uint64 *offset,
 		   uint32 *len)
 {
 	int			i = basic_locate(tf, hash);
+	uint32		ord;
 
 	if (i < 0)
 		return false;
-	*offset = tf->entries[i].offset;
-	*len = tf->entries[i].len;
+	ord = tf->ordinals[i];
+	*offset = tf->offsets[ord];
+	*len = (uint32) (tf->offsets[ord + 1] - tf->offsets[ord]);
 	return true;
 }
 
@@ -390,18 +562,19 @@ static void
 basic_entry(ProllyTableFile *tf, int i, ProllyHash *hash, uint64 *offset,
 			uint32 *len)
 {
+	uint32		ord;
+	char		pre[PREFIX_LEN];
+
 	if (i < 0 || i >= tf->n)
 		elog(ERROR, "table file entry %d out of range", i);
-	*hash = tf->entries[i].hash;
-	*offset = tf->entries[i].offset;
-	*len = tf->entries[i].len;
-}
-
-static void
-basic_close(ProllyTableFile *tf)
-{
-	pfree(tf->entries);
-	pfree(tf);
+	ord = tf->ordinals[i];
+	memset(hash, 0, sizeof(*hash));
+	hash->len = tf->hash_len;
+	put_prefix(pre, tf->prefixes[i]);
+	memcpy(hash->bytes, pre, Min(tf->hash_len, PREFIX_LEN));
+	memcpy(hash->bytes + PREFIX_LEN, suffix_of(tf, i), tf->suffix_len);
+	*offset = tf->offsets[ord];
+	*len = (uint32) (tf->offsets[ord + 1] - tf->offsets[ord]);
 }
 
 const ProllyTableFileRoutine prolly_tablefile_basic = {
