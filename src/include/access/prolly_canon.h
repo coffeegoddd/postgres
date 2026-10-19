@@ -84,9 +84,16 @@ typedef void (*ProllyCanonDependencyVisit) (const char *name,
 typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 										  bool called, void *arg);
 
-/* Visits one object (not a table) two canonical roots hold differently. */
+/*
+ * Visits one object (not a table) two canonical roots hold differently;
+ * object is its kind, its canonical key's first byte (PROLLY_OBJECT_*).
+ */
 typedef void (*ProllyCanonObjectVisit) (const char *name, ProllyDiffKind kind,
-										void *arg);
+										char object, void *arg);
+
+#define PROLLY_OBJECT_TABLE		't'
+#define PROLLY_OBJECT_SCHEMA	'n'
+#define PROLLY_OBJECT_UNKNOWN	'\0'	/* (one a read left out) */
 
 /*
  * Visits one table of a canonical root.  unreadable is NULL, or why its

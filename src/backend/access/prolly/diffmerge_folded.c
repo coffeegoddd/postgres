@@ -59,6 +59,7 @@
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "parser/parse_type.h"
+#include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "catalog/versioned.h"
@@ -351,18 +352,39 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 
 /* A versioned table of the session branch's, by qualified name. */
 static Oid
-rel_named(const char *name, LOCKMODE lockmode, bool missing_ok)
+rel_named(const char *name, bool missing_ok)
 {
-	List	   *names = stringToQualifiedNameList(name, NULL);
+	RangeVar   *rv = makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL));
+	Oid			nsp;
+	Oid			relid;
 
-	return RangeVarGetRelid(makeRangeVarFromNameList(names), lockmode,
-							missing_ok);
+	if (rv->catalogname != NULL &&
+		strcmp(rv->catalogname, get_database_name(MyDatabaseId)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cross-database references are not implemented: \"%s\"",
+						name)));
+	if (rv->schemaname == NULL)
+		return RangeVarGetRelid(rv, NoLock, missing_ok);
+
+	/*
+	 * (a version's table, named with its schema: found whatever the
+	 * session may use, as the fold that recorded it read every versioned
+	 * schema)
+	 */
+	nsp = get_namespace_oid(rv->schemaname, missing_ok);
+	relid = OidIsValid(nsp) ? get_relname_relid(rv->relname, nsp) : InvalidOid;
+	if (!OidIsValid(relid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation \"%s\" does not exist", name)));
+	return relid;
 }
 
 static Oid
 table_named(const char *name)
 {
-	return rel_named(name, NoLock, true);
+	return rel_named(name, true);
 }
 
 static char *
@@ -520,7 +542,7 @@ typedef struct ObjectChanges
 } ObjectChanges;
 
 static void
-object_change(const char *name, ProllyDiffKind kind, void *arg)
+object_change(const char *name, ProllyDiffKind kind, char object, void *arg)
 {
 	ObjectChanges *oc = arg;
 	ListCell   *lc;
@@ -528,7 +550,7 @@ object_change(const char *name, ProllyDiffKind kind, void *arg)
 	foreach(lc, oc->left_out)
 		if (strcmp(lfirst(lc), name) == 0)
 			return;
-	oc->visit(name, kind, oc->arg);
+	oc->visit(name, kind, object, oc->arg);
 }
 
 static void
@@ -564,19 +586,19 @@ folded_tables(const char *from_ref, const char *to_ref,
 
 		if (c < 0)
 		{
-			visit(ta->name, PROLLY_DIFF_REMOVED, arg);
+			visit(ta->name, PROLLY_DIFF_REMOVED, PROLLY_OBJECT_TABLE, arg);
 			a = lnext(from, a);
 		}
 		else if (c > 0)
 		{
-			visit(tb->name, PROLLY_DIFF_ADDED, arg);
+			visit(tb->name, PROLLY_DIFF_ADDED, PROLLY_OBJECT_TABLE, arg);
 			b = lnext(to, b);
 		}
 		else
 		{
 			if (!same_hash(&ta->data.hash, &tb->data.hash) ||
 				!same_description(ta, tb))
-				visit(ta->name, PROLLY_DIFF_MODIFIED, arg);
+				visit(ta->name, PROLLY_DIFF_MODIFIED, PROLLY_OBJECT_TABLE, arg);
 			a = lnext(from, a);
 			b = lnext(to, b);
 		}
@@ -598,7 +620,7 @@ folded_tables(const char *from_ref, const char *to_ref,
 	{
 		if (foreach_current_index(lc) == 0 ||
 			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
-			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, arg);
+			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
 	}
 }
 
@@ -1231,7 +1253,7 @@ sequence_increment(Oid relid)
 static void
 set_sequence(const Sequence *sq)
 {
-	RestoreSequenceState(rel_named(sq->name, NoLock, false), sq->last,
+	RestoreSequenceState(rel_named(sq->name, false), sq->last,
 						 sq->called);
 }
 
@@ -1377,7 +1399,7 @@ merge_sequences(const ProllyNodeRef *base, const ProllyNodeRef *ours,
 
 		if (bs && same_sequence(bs, t))
 			continue;
-		relid = rel_named(t->name, NoLock, true);
+		relid = rel_named(t->name, true);
 		if (!OidIsValid(relid))
 			continue;			/* the merged definitions dropped it */
 		if (os == NULL || further(t, os, sequence_increment(relid)))
@@ -2899,7 +2921,7 @@ foreign_key_violations(List *relids)
 		appendStringInfoString(&info, "]}");
 		initStringInfo(&q);
 		appendStringInfo(&q,
-						 "SELECT row_to_json(c)::text FROM %s%s c WHERE "
+						 "SELECT row_to_json(c.*)::text FROM %s%s c WHERE "
 						 "NOT EXISTS (SELECT 1 FROM %s%s p WHERE %s) AND ",
 						 only_unless_partitioned(con->conrelid), child,
 						 only_unless_partitioned(con->confrelid), parent,
@@ -3005,10 +3027,10 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check
 		appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
 	}
 	if (removing)
-		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c)::text",
+		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c.*)::text",
 						 only_unless_partitioned(con->conrelid), table, cond);
 	else
-		appendStringInfo(&q, "SELECT row_to_json(c)::text FROM %s%s c WHERE %s",
+		appendStringInfo(&q, "SELECT row_to_json(c.*)::text FROM %s%s c WHERE %s",
 						 only_unless_partitioned(con->conrelid), table, cond);
 	return list_make3(q.data, info.data, (void *) (uintptr_t) con->conrelid);
 }
@@ -3118,8 +3140,7 @@ take_breaking_rows(List *added, void *arg)
 	foreach(lc, added)
 	{
 		ProllyAddedConstraint *ac = lfirst(lc);
-		RangeVar   *rv = makeRangeVarFromNameList(stringToQualifiedNameList(ac->table, NULL));
-		Oid			relid = RangeVarGetRelid(rv, NoLock, false);
+		Oid			relid = rel_named(ac->table, false);
 		char	   *name = strVal(linitial(stringToQualifiedNameList(ac->name, NULL)));
 		Oid			conoid = get_relation_constraint_oid(relid, name, false);
 		HeapTuple	tup;

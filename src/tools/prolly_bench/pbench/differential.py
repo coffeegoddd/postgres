@@ -1,4 +1,6 @@
-"""Seeded SQL correctness runs on an isolated, durable local cluster."""
+"""Seeded SQL correctness runs on an isolated, durable local cluster:
+transaction histories compared with heap, and version-control histories
+checked against a reference model."""
 
 from __future__ import annotations
 
@@ -18,6 +20,29 @@ from pbench.core.runner import free_port
 def run(args) -> int:
     if args.seeds < 1 or args.steps < 1 or args.reduce < 0:
         raise SystemExit("seeds and steps must be positive; reduce must be nonnegative")
+    options = ["-am", args.am, "-seed", str(args.seed), "-seeds", str(args.seeds),
+               "-steps", str(args.steps), "-reduce", str(args.reduce)]
+    if args.replay:
+        options += ["-replay", str(args.replay.resolve())]
+    if args.self_test:
+        options += ["-self-test"]
+    return run_on_cluster(args, args.am, options)
+
+
+def run_vc(args) -> int:
+    if args.seeds < 1 or args.steps < 1 or args.reduce < 0 or args.sessions < 0:
+        raise SystemExit("seeds and steps must be positive; reduce and sessions must be nonnegative")
+    options = ["-seed", str(args.seed), "-seeds", str(args.seeds), "-steps", str(args.steps),
+               "-sessions", str(args.sessions), "-reduce", str(args.reduce)]
+    if args.replay:
+        options += ["-replay", args.replay]
+    if args.self_test:
+        options += ["-self-test"]
+    return run_on_cluster(args, "prolly", options)
+
+
+def run_on_cluster(args, engine: str, options: list[str]) -> int:
+    """Run the runner against a fresh cluster, recording its environment."""
     runner = args.runner.resolve()
     if not runner.is_file():
         raise SystemExit(f"missing {runner}; run build_diff.sh first")
@@ -33,7 +58,7 @@ def run(args) -> int:
                               text=True, capture_output=True, check=True).stdout.strip()
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     (out / "environment.json").write_text(json.dumps({
-        "revision": revision, "dirty": bool(dirty), "engine": args.am, "settings": settings,
+        "revision": revision, "dirty": bool(dirty), "engine": engine, "settings": settings,
         "pg_bin": str(args.pg_bin.resolve()),
         "postgres_version": subprocess.check_output(
             [str(args.pg_bin.resolve() / "postgres"), "--version"], text=True).strip(),
@@ -46,14 +71,7 @@ def run(args) -> int:
         try:
             cluster.create(settings)
             cluster.start()
-            command = [str(runner), "-dsn", cluster.conninfo(), "-am", args.am,
-                       "-seed", str(args.seed), "-seeds", str(args.seeds),
-                       "-steps", str(args.steps), "-reduce", str(args.reduce),
-                       "-out", str(out / "cases")]
-            if args.replay:
-                command += ["-replay", str(args.replay.resolve())]
-            if args.self_test:
-                command += ["-self-test"]
+            command = [str(runner), "-dsn", cluster.conninfo(), *options, "-out", str(out / "cases")]
             with (out / "runner.log").open("w") as log:
                 result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
             print((out / "runner.log").read_text(), end="")

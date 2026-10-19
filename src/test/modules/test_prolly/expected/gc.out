@@ -329,8 +329,15 @@ SELECT dolt_gc();
 (1 row)
 
 RESET ROLE;
+SELECT dolt_gc('--nope');
+ERROR:  dolt_gc: "--nope" is not supported
+-- (--shallow, Dolt's cheaper collection, collects what was written since)
 SELECT dolt_gc('--shallow');
-ERROR:  dolt_gc: "--shallow" is not supported
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
 BEGIN READ ONLY;
 SELECT dolt_gc();
 ERROR:  cannot execute dolt_gc() in a read-only transaction

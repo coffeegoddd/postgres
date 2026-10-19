@@ -187,9 +187,9 @@ SELECT dolt_checkout('HEAD');
 ERROR:  branch "HEAD" does not exist
 -- (and one nobody is on any more goes, with the next checkout that keeps)
 SELECT (dolt_checkout('main'))[2];
-       dolt_checkout       
----------------------------
- Switched to branch 'main'
+      dolt_checkout       
+--------------------------
+ Already on branch 'main'
 (1 row)
 
 SELECT count(*) AS hidden_left FROM pg_branch WHERE brname LIKE 'detached/%';

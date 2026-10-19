@@ -3101,7 +3101,7 @@ object_pair(const ProllyKey *ka, const ProllyValue *va,
 	else
 		return true;
 	name = from_utf8(k->data + 2, k->len - 2);
-	w->visit(name, kind, w->arg);
+	w->visit(name, kind, (char) k->data[0], w->arg);
 	pfree(name);
 	return true;
 }

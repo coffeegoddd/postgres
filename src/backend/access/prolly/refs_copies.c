@@ -2525,7 +2525,7 @@ count_table(const char *name, const ProllyNodeRef *data,
 }
 
 static void
-count_object(const char *name, ProllyDiffKind kind, void *arg)
+count_object(const char *name, ProllyDiffKind kind, char object, void *arg)
 {
 	(*(int *) arg)++;
 }

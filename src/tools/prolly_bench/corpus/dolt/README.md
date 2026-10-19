@@ -35,7 +35,11 @@ Dolt's Go tests that don't run its engine (`go_tests`: the merge truth
 tables, keyless and schema merges, merge bases, revision specs and branch
 names), at the same revision, and Doltgres's Postgres-dialect version-control
 tests (`doltgres`, at `d5e05f46`). Those ports are SQL regression tests, not
-scenarios; the pin makes an upstream change to their source visible.
+scenarios; the pin makes an upstream change to their source visible. They
+are in `src/test/modules/test_prolly/sql`: `merge_truth.sql` (the Go tests),
+and `doltgres_vc.sql`, `doltgres_objects.sql` and `doltgres_fks_auth.sql`
+(Doltgres's), each saying which upstream file and script it follows and
+where prolly's answer differs.
 
 ## Classification and coverage
 

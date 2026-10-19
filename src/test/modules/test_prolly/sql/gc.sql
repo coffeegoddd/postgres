@@ -112,6 +112,8 @@ GRANT pg_maintain TO gc_user;
 SET ROLE gc_user;
 SELECT dolt_gc();
 RESET ROLE;
+SELECT dolt_gc('--nope');
+-- (--shallow, Dolt's cheaper collection, collects what was written since)
 SELECT dolt_gc('--shallow');
 BEGIN READ ONLY;
 SELECT dolt_gc();

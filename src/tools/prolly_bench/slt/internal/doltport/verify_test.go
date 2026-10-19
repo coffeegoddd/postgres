@@ -46,7 +46,7 @@ const (
 	reviewedPartial    = 24  // ported in part
 	reviewedAssertions = 446
 	reviewedOmitted    = 27 // assertions left out, each with its note
-	reviewedDeferred   = 29
+	reviewedDeferred   = 58
 )
 
 func TestReviewedCorpus(t *testing.T) {
