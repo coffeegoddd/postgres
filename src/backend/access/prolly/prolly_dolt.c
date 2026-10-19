@@ -879,25 +879,27 @@ force_branch(const char *name, const char *from)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
-	branch_ops()->check_create(name);
 
-	/*
-	 * (no commit to move to, or from: a branch without commits, made again
-	 * as a copy of the start point as it is)
-	 */
-	if (!PROLLY_CALL(refs(), resolve, from ? from : "HEAD", &head) ||
-		!PROLLY_CALL(refs(), resolve, name, &at))
-	{
-		PROLLY_CALL(refs(), branch_delete, name, true);
-		create_branch(name, from);
-		return;
-	}
 	/* (another branch's rows written, as a create makes its copies) */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
 	{
-		moved = PROLLY_CALL(refs(), branch_move, name, &at, &head, true);
+		branch_ops()->check_create(name);
+
+		/*
+		 * (no commit to move to, or from: a branch without commits, made
+		 * again as a copy of the start point as it is)
+		 */
+		if (!PROLLY_CALL(refs(), resolve, from ? from : "HEAD", &head) ||
+			!PROLLY_CALL(refs(), resolve, name, &at))
+		{
+			PROLLY_CALL(refs(), branch_delete, name, true);
+			create_branch(name, from);
+			moved = true;
+		}
+		else
+			moved = PROLLY_CALL(refs(), branch_move, name, &at, &head, true);
 	}
 	PG_FINALLY();
 	{
@@ -909,13 +911,6 @@ force_branch(const char *name, const char *from)
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("branch \"%s\" changed while it was moved", name),
 				 errhint("Try again.")));
-	/* (its uncommitted changes gone: a writer that owned it for them doesn't) */
-	{
-		Oid			oid = get_branch_oid(name, true);
-
-		if (OidIsValid(oid))
-			PROLLY_CALL(writers(), settled, oid);
-	}
 }
 
 /*

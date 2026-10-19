@@ -91,13 +91,31 @@ is(o('postgres', q{SELECT string_agg(id::text, ',' ORDER BY id) FROM n.t WHERE i
 	'201,203', 'forced: the push\'s rows, the uncommitted ones gone');
 is(o('postgres', q{SELECT coalesce(owner, '') FROM dolt_branches() WHERE name = 'main'}),
 	'', 'forced: the uncommitted changes\' writer owns the branch no more');
-is(o('postgres', q{
+($ret, $out, $err) = $origin->psql('postgres', q{
 	SET dolt.writer = 'bob';
 	INSERT INTO n.t VALUES (204, 'bob');
 	SELECT owner FROM dolt_branches() WHERE name = 'main';
-	SELECT dolt_reset('--hard');
-	SELECT dolt_writer_mode('shared');
-}), "bob\n{0}\nshared", 'and another writer claims it');
+});
+is($out, 'bob', 'and another writer claims it') or diag($err);
+o('postgres', q{SET dolt.writer = 'bob'; SELECT dolt_reset('--hard')});
+
+# a push that isn't forced keeps a claim: alice's, her changes undone
+o('postgres', q{
+	SET dolt.writer = 'alice';
+	INSERT INTO n.t VALUES (205, 'undone');
+	DELETE FROM n.t WHERE id = 205;
+});
+l('c', q{
+	INSERT INTO n.t VALUES (206, 'five');
+	SELECT dolt_commit('-am', 'five');
+	SELECT dolt_push('origin', 'main');
+});
+is(o('postgres', q{SELECT dolt_hashof('main')}), l('c', q{SELECT dolt_hashof('main')}),
+	'pushed onto a branch with an owner, but clean');
+is(o('postgres', q{SELECT coalesce(owner, '') FROM dolt_branches() WHERE name = 'main'}),
+	'alice', 'not forced: its writer keeps the claim');
+o('postgres', q{SET dolt.writer = 'alice'; SELECT dolt_reset('--hard')});
+o('postgres', q{SELECT dolt_writer_mode('shared')});
 
 # a push into a database with no history yet
 o('postgres', 'CREATE DATABASE fresh');
@@ -108,7 +126,7 @@ l('c', qq{
 });
 is(o('fresh', q{SELECT dolt_hashof('main')}), l('c', q{SELECT dolt_hashof('main')}),
 	'pushed into a database without history');
-is(o('fresh', 'SELECT count(*) FROM n.t'), '202', 'with its rows');
+is(o('fresh', 'SELECT count(*) FROM n.t'), '203', 'with its rows');
 
 # a role that isn't a superuser: a password, used, and pg_prolly_fetch
 o('postgres', q{CREATE ROLE alice LOGIN PASSWORD 'secret'});

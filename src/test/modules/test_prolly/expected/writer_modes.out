@@ -450,6 +450,53 @@ SELECT dolt_branch('-D', 'wm_g');
  {0}
 (1 row)
 
+-- And from a session on a commit, read-only for it: the move, and the
+-- claim given up with it.
+SET dolt.writer = 'dave';
+SELECT dolt_checkout('-b', 'wm_h');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_h'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (12, 'dave on h');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('main') AS wm_head \gset
+SELECT dolt_checkout(:'wm_head') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT dolt_branch('-f', 'wm_h', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'wm_h';
+ name | dirty | owner 
+------+-------+-------
+ wm_h | f     | 
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_h');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Branch-only: main is protected, written only by integrations, which
 -- commit as they change it.
 SELECT dolt_writer_mode('branch-only');

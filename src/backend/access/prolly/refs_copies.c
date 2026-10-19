@@ -2592,6 +2592,7 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	ProllyHash	at;
 	ProllyCommitInfo info;
 	bool		pushed = false;
+	Oid			oid;
 
 	lock_refs();
 	AcceptInvalidationMessages();
@@ -2620,7 +2621,8 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	 * uncommitted changes unless forced, then moved, its rows written, or
 	 * deleted.
 	 */
-	if (OidIsValid(branch_oid(name)))
+	oid = branch_oid(name);
+	if (OidIsValid(oid))
 	{
 		pushed = see_head(name);
 		PG_TRY();
@@ -2661,6 +2663,18 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	}
 	branch_set_head(name, head);
 	end_merge(name);	/* (a move ends a merge in progress there, as a reset does) */
+
+	/*
+	 * (forced, its uncommitted changes are gone: a writer that owned it for
+	 * them doesn't any more)
+	 */
+	if (force && OidIsValid(oid))
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		PROLLY_CALL(dc.writers, settled, oid);
+	}
 	return true;
 }
 

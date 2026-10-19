@@ -68,8 +68,8 @@
 #include "utils/syscache.h"
 
 /* the id of the branch called name; InvalidOid if none and missing_ok */
-Oid
-get_branch_oid(const char *name, bool missing_ok)
+static Oid
+branch_oid(const char *name, bool missing_ok)
 {
 	HeapTuple	tup;
 	Oid			oid;
@@ -427,11 +427,11 @@ copies_make(const char *name, const char *start_point)
 	HeapTuple	tup;
 
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
-	if (OidIsValid(get_branch_oid(name, true)))
+	if (OidIsValid(branch_oid(name, true)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", name)));
-	source = start_point ? get_branch_oid(start_point, false) : MyBranch;
+	source = start_point ? branch_oid(start_point, false) : MyBranch;
 
 	branch = GetNewOidWithIndex(brel, BranchOidIndexId, Anum_pg_branch_oid);
 	namestrcpy(&brname, name);
@@ -480,7 +480,7 @@ copies_drop(const char *name)
 
 	copies_check_drop(name);
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
-	branch = get_branch_oid(name, false);
+	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -521,12 +521,12 @@ copies_rename(const char *name, const char *newname, bool force)
 	copies_check_drop(name);
 	copies_check_create(newname);
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
-	branch = get_branch_oid(name, false);
+	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"main\" can't be renamed")));
-	if (OidIsValid(get_branch_oid(newname, true)))
+	if (OidIsValid(branch_oid(newname, true)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", newname)));
@@ -551,7 +551,7 @@ copies_rename(const char *name, const char *newname, bool force)
 static void
 copies_checkout(const char *name)
 {
-	if (!check_out_branch(get_branch_oid(name, false)))
+	if (!check_out_branch(branch_oid(name, false)))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" does not exist", name)));
@@ -584,7 +584,7 @@ copies_branches(BranchVisit visit, void *arg)
 static void
 copies_run_on(const char *name, void (*fn) (void *arg), void *arg)
 {
-	on_branch(get_branch_oid(name, false), fn, arg);
+	on_branch(branch_oid(name, false), fn, arg);
 }
 
 static const BranchOpsRoutine branch_copies = {

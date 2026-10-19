@@ -673,17 +673,6 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 											 has_head ? &head : NULL,
 											 PG_GETARG_BOOL(4)));
 
-	/*
-	 * (forced, its uncommitted changes are gone: a writer that owned it for
-	 * them doesn't any more)
-	 */
-	if (moved && has_head)
-	{
-		Oid			oid = get_branch_oid(branch, true);
-
-		if (OidIsValid(oid))
-			PROLLY_CALL(dc.writers, settled, oid);
-	}
 	/* (a protected branch deleted takes its protection with it) */
 	if (moved && !has_head && PROLLY_CALL(dc.writers, protected, branch))
 		PROLLY_CALL(dc.writers, set_protected, branch, PROLLY_PROTECT_DEFAULT);
