@@ -399,3 +399,105 @@ SELECT dolt_conflicts_resolve('--ours', 'mt.t');
 SELECT dolt_branch('-D', 'mt_side');
 DROP SCHEMA mt CASCADE;
 SELECT length(dolt_commit('-Am', 'without mt')::text) AS committed;
+
+-- A table dropped in a merge with conflicts takes its conflicts with it:
+-- the listing, the status and the commit check leave it out.
+CREATE SCHEMA dc VERSIONED;
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+CREATE TABLE dc.b (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+INSERT INTO dc.b VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc base')::text) AS committed;
+SELECT dolt_branch('dc_side');
+UPDATE dc.a SET v = 'main';
+UPDATE dc.b SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main')::text) AS committed;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+UPDATE dc.a SET v = 'side';
+UPDATE dc.b SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+SELECT * FROM dolt_conflicts() ORDER BY 1;
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts() ORDER BY 1;
+SELECT table_name, staged, status FROM dolt_status() WHERE table_name LIKE 'dc.%'
+  ORDER BY 1, 2;
+SELECT dolt_conflicts_resolve('--ours', 'dc.b');
+SELECT * FROM dolt_conflicts();
+SELECT length(dolt_commit('-Am', 'dc merged without a')::text) AS committed;
+COMMIT;
+SELECT dolt_status();
+
+-- (and with the conflicts kept, a commit after the drop goes through)
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc a again')::text) AS committed;
+SELECT dolt_branch('-D', 'dc_side');
+SELECT dolt_branch('dc_side');
+UPDATE dc.a SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main 2')::text) AS committed;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+UPDATE dc.a SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side 2')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+RESET dolt.allow_commit_conflicts;
+SELECT * FROM dolt_conflicts();
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts();
+SELECT length(dolt_commit('-Am', 'dc merged after drop')::text) AS committed;
+SELECT dolt_status();
+
+-- Whether a branch's conflicted table is dropped is up to that branch's
+-- catalog, not the one the session is on when the transaction commits: a
+-- checkout to a branch without dc.a doesn't let its conflicts through ...
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc a a third time')::text) AS committed;
+SELECT dolt_branch('-D', 'dc_side');
+SELECT dolt_branch('dc_side');
+SELECT dolt_branch('dc_none');
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+DROP TABLE dc.a;
+SELECT length(dolt_commit('-Am', 'dc_none without a')::text) AS committed;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+UPDATE dc.a SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side 3')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE dc.a SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main 3')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM dolt_conflicts();
+-- ... nor does one to a branch that has it hide a drop on the merge's
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+DROP TABLE dc.a;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM dolt_conflicts();
+SELECT to_regclass('dc.a') AS a;
+SELECT dolt_merge('--abort');
+-- and a drop rolled back gives the conflicts back
+SELECT dolt_reset('--hard');
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+SAVEPOINT s;
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts();
+ROLLBACK TO s;
+SELECT * FROM dolt_conflicts();
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'dc_side');
+SELECT dolt_branch('-D', 'dc_none');
+DROP SCHEMA dc CASCADE;
+SELECT length(dolt_commit('-Am', 'without dc')::text) AS committed;
