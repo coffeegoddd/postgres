@@ -1,0 +1,18 @@
+{
+		Name:        "verify-constraints: FK violations: --all named tables",
+		SetUpScript: verifyConstraintsFkViolationsSetupScript,
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "SET DOLT_FORCE_TRANSACTION_COMMIT = 1;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('--all', 'child3', 'child4');",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT * from dolt_constraint_violations;",
+				Expected: []sql.Row{{"child3", uint64(2)}, {"child4", uint64(2)}},
+			},
+		},
+	}

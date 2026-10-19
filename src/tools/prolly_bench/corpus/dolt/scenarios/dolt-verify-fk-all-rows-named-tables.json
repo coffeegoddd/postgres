@@ -1,0 +1,298 @@
+{
+  "version": 1,
+  "id": "dolt-verify-fk-all-rows-named-tables",
+  "description": "Reviewed Dolt port: verify-constraints: FK violations: --all named tables",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_verify_constraints.go",
+    "case": "DoltVerifyConstraintsTestScripts: verify-constraints: FK violations: --all named tables"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent3",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent3 (pk bigint PRIMARY KEY, v1 bigint UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child3",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child3 (pk bigint PRIMARY KEY, v1 bigint, CONSTRAINT fk_name1 FOREIGN KEY (v1) REFERENCES parent3 (v1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent4",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent4 (pk bigint PRIMARY KEY, v1 bigint UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child4",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child4 (pk bigint PRIMARY KEY, v1 bigint, CONSTRAINT fk_name2 FOREIGN KEY (v1) REFERENCES parent4 (v1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "parent3-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent3 VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "parent4-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent4 VALUES (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "checks-off",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "child3-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child3 VALUES (1, 1), (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "child4-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child4 VALUES (1, 1), (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "checks-on",
+      "session": "a",
+      "op": "exec",
+      "sql": "RESET session_replication_role",
+      "expect": {
+        "tag": "RESET"
+      }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "has fk violations",
+        "-f"
+      ],
+      "save": "commit"
+    },
+    {
+      "id": "parent1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent1 (pk bigint PRIMARY KEY, v1 bigint UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent2 (pk bigint PRIMARY KEY, v1 bigint UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child1 (pk bigint PRIMARY KEY, parent1_v1 bigint, parent2_v1 bigint, CONSTRAINT child1_parent1 FOREIGN KEY (parent1_v1) REFERENCES parent1 (v1), CONSTRAINT child1_parent2 FOREIGN KEY (parent2_v1) REFERENCES parent2 (v1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child2 (pk bigint PRIMARY KEY, parent2_v1 bigint, CONSTRAINT child2_parent2 FOREIGN KEY (parent2_v1) REFERENCES parent2 (v1))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent1-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent1 VALUES (1, 1), (2, 2), (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "parent2-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent2 VALUES (1, 1), (2, 2), (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "child1-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child1 VALUES (1, 1, 1), (2, 2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "child2-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child2 VALUES (2, 2), (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "checks-off-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "child3-new",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child3 VALUES (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child4-new",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child4 VALUES (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "checks-on-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "RESET session_replication_role",
+      "expect": {
+        "tag": "RESET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT dolt_verify_constraints('--all', 'child3', 'child4')",
+      "expect": {
+        "rows": [
+          [
+            "{1}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [
+          [
+            "public.child3",
+            "2"
+          ],
+          [
+            "public.child4",
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

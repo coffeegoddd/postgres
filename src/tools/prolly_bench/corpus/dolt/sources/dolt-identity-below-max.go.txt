@@ -1,0 +1,49 @@
+{
+		Name: "set auto-increment below current max value",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"insert into t (b) values (1), (2), (3), (4)",
+			"call dolt_commit('-am', 'two values on main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "alter table t auto_increment = 2",
+				SkipResultsCheck: true,
+			},
+			{
+				// previous update was ignored
+				Query:    "insert into t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 5}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 1},
+					{2, 2},
+					{3, 3},
+					{4, 4},
+					{5, 5},
+					{6, 6},
+				},
+			},
+			{
+				Query:    "insert into t (a, b) values (100, 100)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, InsertID: 100}}},
+			},
+			{
+				Query:            "alter table t auto_increment = 50",
+				SkipResultsCheck: true,
+			},
+			{
+				// previous update was ignored, value still below max on that table
+				Query:    "insert into t (b) values (101)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, InsertID: 101}}},
+			},
+			{
+				Query:    "select * from t where a >= 100 order by a",
+				Expected: []sql.Row{{100, 100}, {101, 101}},
+			},
+		},
+	}

@@ -50,3 +50,49 @@ var T = []queries.ScriptTest{{Name:"a", SetUpScript:nil, Assertions:shared}}`))
 		t.Fatalf("%+v", cases)
 	}
 }
+
+func TestSharedSetups(t *testing.T) {
+	src := []byte(`package fixture
+var shared = []string{
+	"create table t (x int)",
+	"insert into t values (1)",
+}
+var computed = []string{"select 1", fmt.Sprint(2)}
+var unused = []string{"select 3"}
+var T = []queries.ScriptTest{{Name:"a", SetUpScript:shared}, {Name:"b", SetUpScript:computed}, {Name:"c", SetUpScript:append(shared, "x")}}
+`)
+	cases, err := Scan("fixture.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := SharedSetupNames(cases)
+	if len(names) != 2 || !names["shared"] || !names["computed"] {
+		t.Fatalf("%v", names)
+	}
+	setups, computed, err := ScanSetups("fixture.go", src, names)
+	if err != nil || len(computed) != 0 {
+		t.Fatal(err, computed)
+	}
+	if len(setups) != 2 || setups[0].Name != "shared" || setups[0].Statements != 2 || setups[0].SQLExpressions != 0 ||
+		setups[1].Name != "computed" || setups[1].SQLExpressions != 1 {
+		t.Fatalf("%+v", setups)
+	}
+	if setups[0].SHA256 != Hash([]byte(setups[0].Source)) || !strings.HasPrefix(setups[0].Source, "[]string{") || !strings.Contains(string(src), setups[0].Source) {
+		t.Fatal("setup bytes were changed")
+	}
+	// A computed setup is reported, not an error, and not a setup: the
+	// catalog records it unresolved, as it does a name no file declares.
+	setups, computed, err = ScanSetups("fixture.go", []byte("package fixture\nvar shared = makeSetup()\n"), names)
+	if err != nil || len(setups) != 0 || len(computed) != 1 || computed[0] != "shared" {
+		t.Fatalf("computed shared setup: %v %+v %v", err, setups, computed)
+	}
+	// (one declared without a value, set elsewhere, is computed too)
+	setups, computed, err = ScanSetups("fixture.go", []byte("package fixture\nvar shared []string\nvar a, local = []string{}, []string{\"x\"}\n"), names)
+	if err != nil || len(setups) != 0 || len(computed) != 1 || computed[0] != "shared" {
+		t.Fatalf("shared setup without a value: %v %+v %v", err, setups, computed)
+	}
+	gaps := Undeclared(map[string]bool{"shared": true, "local": true, "a": true}, map[string]bool{"shared": true})
+	if len(gaps) != 2 || gaps[0] != (Flag{"a", SetupUndeclared}) || gaps[1] != (Flag{"local", SetupUndeclared}) {
+		t.Fatalf("undeclared: %+v", gaps)
+	}
+}

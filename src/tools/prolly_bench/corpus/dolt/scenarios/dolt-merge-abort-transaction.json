@@ -1,0 +1,325 @@
+{
+  "version": 1,
+  "id": "dolt-merge-abort-transaction",
+  "description": "Reviewed Dolt port: CALL DOLT_MERGE with conflicts can be aborted when autocommit is off",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: CALL DOLT_MERGE with conflicts can be aborted when autocommit is off"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY, val int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0, 0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "autocommit",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "step1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-am', 'Step 1'))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('-b', 'feature-branch')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'feature-branch'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "insert1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "update-feature",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET val=1000 WHERE pk=0",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "feature-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-am', 'this is a normal commit'))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'main'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "update-main",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET val=1001 WHERE pk=0",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-am', 'update a value'))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('feature-branch', '-m', 'this is a merge') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [
+          [
+            "public.test",
+            "f",
+            "conflict"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT count(*) FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('--abort') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "0",
+            "merge aborted"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM test ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "1001"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('-b', 'other-branch')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'other-branch'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
+    }
+  ]
+}

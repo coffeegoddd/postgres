@@ -1,0 +1,20 @@
+{
+		// See https://github.com/dolthub/dolt/issues/10903
+		Name: "UPDATE on table with composite BINARY primary key and foreign key",
+		SetUpScript: []string{
+			"CREATE TABLE parent (id INT NOT NULL PRIMARY KEY);",
+			"CREATE TABLE child (id1 BINARY(8) NOT NULL, id2 BINARY(8) NOT NULL, parent_id INT, val INT, PRIMARY KEY (id1, id2), CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id));",
+			"INSERT INTO parent VALUES (1);",
+			"INSERT INTO child VALUES (0x0000000000000001, 0x0000000000000002, 1, 10);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "UPDATE child SET val = 20 WHERE id1 = 0x0000000000000001 AND id2 = 0x0000000000000002;",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}}},
+			},
+			{
+				Query:    "SELECT val FROM child WHERE id1 = 0x0000000000000001 AND id2 = 0x0000000000000002;",
+				Expected: []sql.Row{{int32(20)}},
+			},
+		},
+	}

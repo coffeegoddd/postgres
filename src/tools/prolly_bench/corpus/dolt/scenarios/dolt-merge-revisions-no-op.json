@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "id": "dolt-merge-revisions-no-op",
+  "description": "Reviewed Dolt port: CALL DOLT_MERGE when current or ahead results in a no-op",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: CALL DOLT_MERGE when current or ahead results in a no-op"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "initial"
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit"
+      ],
+      "save": "commit"
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('HEAD~1') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "0",
+            "cannot fast forward from a to b. a is ahead of b already"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('HEAD') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "0",
+            "Everything up-to-date"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

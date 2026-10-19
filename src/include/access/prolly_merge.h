@@ -31,6 +31,9 @@
  * - conflicts() reports a table's unresolved conflicts of the merge in
  *   progress, in key order, each row as the common ancestor, the current
  *   branch and the merged branch have it (NULL where it doesn't exist).
+ *   A table it can't read them for as it is now (renamed or moved since
+ *   the merge began) is an error, or, if the sink has unreadable, is
+ *   reported there instead.
  * - resolve() resolves them, keeping the current rows or taking the merged
  *   branch's.
  * - tables() reports each table that differs between two refs (its rows or
@@ -50,7 +53,11 @@
  * - verify() checks the session branch's tables of relids (NIL: every
  *   one) against their foreign keys, and against their check and not-null
  *   constraints not validated yet (Postgres keeps the others), and returns
- *   the violations found.
+ *   the violations found.  With all, every row is checked; without, only
+ *   the rows changed since the head commit (matched by key), and, for a
+ *   foreign key, those referencing a row the referenced table removed or
+ *   changed since; a table with violations recorded, or one whose rows
+ *   can't be matched by key, whole.
  * - cherry_pick() commits refs' changes (each from its parent) again on
  *   the current branch, merging each three-way with the branch as the
  *   ones before left it, every ref resolved first, and returns the one
@@ -97,6 +104,8 @@ struct ProllyConflictSink
 							 const ProllyValue *base,
 							 const ProllyValue *ours,
 							 const ProllyValue *theirs);
+	/* (if set: why the table's conflicts can't be read, not an error) */
+	void		(*unreadable) (ProllyConflictSink *self, const char *why);
 };
 
 /*
@@ -127,7 +136,7 @@ typedef struct ProllyMergeRoutine
 	void		(*move_to) (const ProllyNodeRef *root, const ProllyNodeRef *working);
 	int			(*cherry_pick) (const char *const *refs, int nrefs,
 								bool allow_empty, ProllyHash *commit_id);
-	List	   *(*verify) (List *relids);
+	List	   *(*verify) (List *relids, bool all);
 	int			(*revert) (const char *const *refs, int nrefs,
 						   const ProllyHash *series_head,
 						   ProllyHash *commit_id);

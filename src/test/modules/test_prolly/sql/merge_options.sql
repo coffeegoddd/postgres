@@ -16,6 +16,33 @@ SELECT dolt_checkout('main');
 SELECT dolt_merge('--ff-only', '--no-ff', 'mo_feature');
 SELECT dolt_merge('--ff-only', '--squash', 'mo_feature');
 SELECT dolt_merge('--squash', '--no-ff', 'mo_feature');
+-- (a long option with one dash too, as Dolt's parser takes it)
+SELECT dolt_merge('-ff-only', '-no-ff', 'mo_feature');
+SELECT dolt_merge('-squash', '-no-ff', '-message', 'x', 'mo_feature');
+SELECT dolt_merge('-nope', 'mo_feature');
+-- (a short option with two dashes, and every function's options so)
+SELECT dolt_merge('--squash', '--no-ff', '--m', 'x', 'mo_feature');
+SELECT dolt_pull('-no-ff', '-message', 'x', 'mo_nope');
+SELECT dolt_push('-force', '--u', 'mo_nope');
+SELECT dolt_branch('-copy', '-force', 'mo_feature', 'mo_copy');
+SELECT dolt_branch('-delete', '-force', 'mo_copy');
+SELECT dolt_checkout('--b', 'mo_two_dash') IS NOT NULL AS created;
+SELECT dolt_checkout('main') IS NOT NULL AS back;
+SELECT dolt_branch('-D', 'mo_two_dash');
+BEGIN;
+INSERT INTO mo.u VALUES (1);
+SELECT length(dolt_commit('-allow-empty', '--m', 'one dash, two')::text) AS committed;
+SELECT dolt_reset('-hard', 'HEAD~1');
+-- (short flags that go together, one with two dashes)
+SELECT length(dolt_commit('--A', '--allow-empty', '-m', 'two-dash flag')::text) AS committed;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('mo_short');
+SELECT dolt_branch('--m', 'mo_short', 'mo_short2');
+SELECT dolt_branch('--D', 'mo_short2');
+SELECT count(*) AS left FROM dolt_branches WHERE name LIKE 'mo_short%';
+SELECT dolt_verify_constraints('--a', '--o');
+SELECT count(*) AS reset FROM mo.u;
+ROLLBACK;
 
 -- The merge base of two refs is the commit a merge of them starts from.
 SELECT dolt_merge_base('main', 'mo_feature') = dolt_hashof('main') AS base_is_main;

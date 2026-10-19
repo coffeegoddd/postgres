@@ -21,16 +21,28 @@ type Mapping struct {
 	Note  string   `json:"note"`
 }
 type Port struct {
-	ID             string    `json:"id"`
-	Path           string    `json:"path"`
-	Suite          string    `json:"suite"`
-	Index          int       `json:"index"`
-	Name           string    `json:"name"`
-	SourceSHA256   string    `json:"source_sha256"`
-	ScenarioSHA256 string    `json:"scenario_sha256"`
-	Setup          []Mapping `json:"setup"`
-	Assertions     []Mapping `json:"assertions"`
-	Adaptations    []string  `json:"adaptations"`
+	ID             string `json:"id"`
+	Path           string `json:"path"`
+	Suite          string `json:"suite"`
+	Index          int    `json:"index"`
+	Name           string `json:"name"`
+	SourceSHA256   string `json:"source_sha256"`
+	ScenarioSHA256 string `json:"scenario_sha256"`
+	// The shared setup (by ID) the case names as its SetUpScript, if it
+	// does; its statements are the case's setup, mapped as its own are.
+	SharedSetup string    `json:"shared_setup,omitempty"`
+	Setup       []Mapping `json:"setup"`
+	Assertions  []Mapping `json:"assertions"`
+	Adaptations []string  `json:"adaptations"`
+}
+
+// SharedSetup is a setup script cases share (a top-level []string literal
+// upstream), retained once in sources/<id>.go.txt and pinned by hash.
+type SharedSetup struct {
+	ID           string `json:"id"`
+	Path         string `json:"path"`
+	Name         string `json:"name"`
+	SourceSHA256 string `json:"source_sha256"`
 }
 type Deferred struct {
 	Path         string `json:"path"`
@@ -41,9 +53,10 @@ type Deferred struct {
 	Reason       string `json:"reason"`
 }
 type Manifest struct {
-	Version  int        `json:"version"`
-	Ports    []Port     `json:"ports"`
-	Deferred []Deferred `json:"deferred"`
+	Version  int           `json:"version"`
+	Setups   []SharedSetup `json:"setups,omitempty"`
+	Ports    []Port        `json:"ports"`
+	Deferred []Deferred    `json:"deferred"`
 }
 type EngineCoverage struct {
 	Engine                 string `json:"engine"`
@@ -129,6 +142,8 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	report.Revision, report.Scope = lock.Revision, lock.Scope
 	report.SourceCases, report.SourceAssertions, report.UnresolvedFields = lock.Counts.Cases, lock.Counts.Assertions, lock.Counts.UnresolvedFields
 	sourceCases := map[string]doltcatalog.Case{}
+	var catalogSetups map[string]doltcatalog.Setup
+	var unresolvedSetups map[string]string
 	partial := map[string]bool{}
 	if catalogPath != "" {
 		var catalog doltcatalog.Catalog
@@ -149,7 +164,20 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 			return report, fmt.Errorf("catalog case count mismatch")
 		}
 		report.VerifiedAgainstCatalog = true
+		catalogSetups = map[string]doltcatalog.Setup{}
+		for _, st := range catalog.Setups {
+			catalogSetups[st.Path+"/"+st.Name] = st
+		}
+		unresolvedSetups = map[string]string{}
+		for _, u := range catalog.UnresolvedSetups {
+			unresolvedSetups[u.Field] = u.Expression
+		}
 	}
+	setups, err := sharedSetups(root, manifest, lock, catalogSetups, unresolvedSetups)
+	if err != nil {
+		return report, err
+	}
+	used := map[string]bool{}
 	selected := map[string]bool{}
 	scenarios := map[string]vcscenario.Scenario{}
 	hashes := map[string]string{}
@@ -187,8 +215,22 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		if err != nil {
 			return report, err
 		}
-		if len(cases) != 1 || cases[0].Name != p.Name || len(cases[0].Unresolved) != 0 {
-			return report, fmt.Errorf("%s: invalid or unresolved source excerpt", p.ID)
+		if len(cases) != 1 || cases[0].Name != p.Name {
+			return report, fmt.Errorf("%s: invalid source excerpt", p.ID)
+		}
+		// A shared setup the case names stands for its SetUpScript; nothing
+		// else may be unresolved.
+		setupCount := cases[0].Setup
+		if p.SharedSetup != "" {
+			st, ok := setups[p.SharedSetup]
+			u := cases[0].Unresolved
+			if !ok || len(u) != 1 || u[0].Field != "SetUpScript" || u[0].Expression != st.Name || filepath.Dir(st.Path) != filepath.Dir(p.Path) {
+				return report, fmt.Errorf("%s: shared setup %q isn't the case's SetUpScript", p.ID, p.SharedSetup)
+			}
+			used[p.SharedSetup] = true
+			setupCount += st.Statements
+		} else if len(cases[0].Unresolved) != 0 {
+			return report, fmt.Errorf("%s: unresolved source excerpt", p.ID)
 		}
 		b, err := os.ReadFile(filepath.Join(root, "scenarios", p.ID+".json"))
 		if err != nil {
@@ -208,19 +250,19 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		if s.ID != p.ID || !reflect.DeepEqual(s.Source, expectedSource) || len(p.Adaptations) == 0 {
 			return report, fmt.Errorf("%s: scenario provenance or adaptation notes missing/mismatched", p.ID)
 		}
-		steps, used := map[string]bool{}, map[string]bool{}
+		steps, usedSteps := map[string]bool{}, map[string]bool{}
 		for _, st := range s.Steps {
 			steps[st.ID] = true
 		}
-		setup, err := mappings(p.Setup, cases[0].Setup, steps, used)
+		setup, err := mappings(p.Setup, setupCount, steps, usedSteps)
 		if err != nil {
 			return report, fmt.Errorf("%s setup: %w", p.ID, err)
 		}
-		assertions, err := mappings(p.Assertions, cases[0].Assertions, steps, used)
+		assertions, err := mappings(p.Assertions, cases[0].Assertions, steps, usedSteps)
 		if err != nil {
 			return report, fmt.Errorf("%s assertions: %w", p.ID, err)
 		}
-		if len(used) != len(steps) {
+		if len(usedSteps) != len(steps) {
 			return report, fmt.Errorf("%s: scenario contains unmapped steps", p.ID)
 		}
 		if setup != len(p.Setup) || assertions != len(p.Assertions) {
@@ -232,6 +274,15 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		report.MappedAssertions += assertions
 		report.OmittedAssertions += len(p.Assertions) - assertions
 		scenarios[s.ID], hashes[s.ID], credits[s.ID] = s, p.ScenarioSHA256, assertions
+	}
+	if len(used) != len(setups) {
+		var unused []string
+		for _, st := range manifest.Setups {
+			if !used[st.ID] {
+				unused = append(unused, st.ID)
+			}
+		}
+		return report, fmt.Errorf("shared setups no port uses: %s", strings.Join(unused, ", "))
 	}
 	files, err := filepath.Glob(filepath.Join(root, "scenarios", "*.json"))
 	if err != nil {
@@ -274,6 +325,61 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		report.Engines = engines
 	}
 	return report, nil
+}
+
+// sharedSetups checks the manifest's shared setups, by ID: each retained
+// excerpt's bytes are a []string literal of its hash, in a file the lock
+// pins, every statement literal SQL; with the catalog, the pinned source's
+// literal of that name has the same hash. Only the catalog ties the name to
+// the bytes: an excerpt holds the literal alone, so without --catalog one
+// setup's bytes under another's name (hash and all) pass. CI always
+// verifies with --catalog. unresolved holds the catalog's reasons, by name,
+// for named setups no literal stands for.
+func sharedSetups(root string, m Manifest, lock doltcatalog.Lock, catalog map[string]doltcatalog.Setup, unresolved map[string]string) (map[string]doltcatalog.Setup, error) {
+	pinned := map[string]bool{}
+	for _, f := range lock.Files {
+		pinned[f.Path] = true
+	}
+	ids := map[string]bool{}
+	for _, p := range m.Ports {
+		ids[p.ID] = true
+	}
+	out := map[string]doltcatalog.Setup{}
+	named := map[string]bool{}
+	for _, st := range m.Setups {
+		if strings.ContainsAny(st.ID, "/\\.") || st.ID == "" || ids[st.ID] || out[st.ID].Name != "" {
+			return nil, fmt.Errorf("invalid or duplicate shared setup id %q", st.ID)
+		}
+		if !pinned[st.Path] || named[st.Path+"/"+st.Name] {
+			return nil, fmt.Errorf("shared setup %s: unpinned path or duplicate", st.ID)
+		}
+		named[st.Path+"/"+st.Name] = true
+		raw, err := os.ReadFile(filepath.Join(root, "sources", st.ID+".go.txt"))
+		if err != nil {
+			return nil, err
+		}
+		if doltcatalog.Hash(raw) != st.SourceSHA256 {
+			return nil, fmt.Errorf("%s: source excerpt hash mismatch", st.ID)
+		}
+		found, computed, err := doltcatalog.ScanSetups(st.Path, []byte("package excerpt\nvar "+st.Name+" = "+string(raw)+"\n"), map[string]bool{st.Name: true})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", st.ID, err)
+		}
+		if len(computed) != 0 || len(found) != 1 || found[0].Source != string(raw) || found[0].SQLExpressions != 0 {
+			return nil, fmt.Errorf("%s: invalid or computed shared setup excerpt", st.ID)
+		}
+		if catalog != nil {
+			c, ok := catalog[st.Path+"/"+st.Name]
+			if reason, gap := unresolved[st.Name]; !ok && gap {
+				return nil, fmt.Errorf("source identity drift: shared setup %s: the pinned %s is %s", st.ID, st.Name, reason)
+			}
+			if !ok || c.SHA256 != st.SourceSHA256 {
+				return nil, fmt.Errorf("source identity drift: shared setup %s", st.ID)
+			}
+		}
+		out[st.ID] = found[0]
+	}
+	return out, nil
 }
 
 // Count only complete, passed executions with matching saved scenario hashes.

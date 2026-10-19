@@ -1,0 +1,17 @@
+[]string{
+	"create table t (pk int primary key, col1 int);",
+	"call dolt_commit('-Am', 'create table');",
+	"call dolt_checkout('-b', 'other');",
+
+	"insert into t values (1, 100);",
+	"insert into t values (2, 200);",
+	"call dolt_commit('-Am', 'other commit');",
+
+	"call dolt_checkout('main');",
+	"insert into t values (1, -100);",
+	"insert into t values (2, -200);",
+	"call dolt_commit('-Am', 'main commit');",
+
+	"set dolt_allow_commit_conflicts = on;",
+	"call dolt_merge('other');",
+}

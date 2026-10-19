@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "id": "dolt-verify-fk-ignores-null",
+  "description": "Reviewed Dolt port: verify-constraints: FK violations: ignores null",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_verify_constraints.go",
+    "case": "DoltVerifyConstraintsTestScripts: verify-constraints: FK violations: ignores null"
+  },
+  "requires": [
+    "sql",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (id bigint PRIMARY KEY, v1 bigint, v2 bigint, UNIQUE (v1, v2))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (id bigint PRIMARY KEY, v1 bigint, v2 bigint, FOREIGN KEY (v1, v2) REFERENCES parent (v1, v2))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1, 1, 1), (2, 2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "child-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1, 1), (2, 90, NULL)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "allow",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT dolt_verify_constraints('child')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (3, 30, 30)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "RESET session_replication_role",
+      "expect": {
+        "tag": "RESET"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT dolt_verify_constraints('child')",
+      "expect": {
+        "rows": [
+          [
+            "{1}"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

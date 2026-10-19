@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "id": "dolt-merge-delete-keeps-conflicts",
+  "description": "Reviewed Dolt port: `Delete from table` should keep artifacts - conflicts",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: `Delete from table` should keep artifacts - conflicts"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, col1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table"
+      ],
+      "save": "create-commit"
+    },
+    {
+      "id": "branch-other",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "checkout-other",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "other-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 100)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 200)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "other-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "other commit"
+      ],
+      "save": "other-commit"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "main-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, -100)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, -200)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main commit"
+      ],
+      "save": "main-commit"
+    },
+    {
+      "id": "allow",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "merge",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "other"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).col1, (our_row).pk, (our_row).col1, (their_row).pk, (their_row).col1 FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            "1",
+            "-100",
+            "1",
+            "100"
+          ],
+          [
+            null,
+            null,
+            "2",
+            "-200",
+            "2",
+            "200"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t",
+      "expect": {
+        "tag": "DELETE 2"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).col1, (our_row).pk, (our_row).col1, (their_row).pk, (their_row).col1 FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null,
+            "1",
+            "100"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            "2",
+            "200"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

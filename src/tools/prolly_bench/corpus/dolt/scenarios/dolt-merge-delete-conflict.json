@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "id": "dolt-merge-delete-conflict",
+  "description": "Reviewed Dolt port: delete conflict",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: delete conflict"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge",
+    "vc.conflicts"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "allow",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE xyz (x int PRIMARY KEY, y int, z int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "y-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX y_idx ON xyz (y)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "z-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX z_idx ON xyz (z)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO xyz VALUES (0,0,0), (1,1,1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "make",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "make table"
+      ],
+      "save": "make"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "right",
+      "session": "a",
+      "op": "exec",
+      "sql": "delete from xyz where y = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "right-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "right delete"
+      ],
+      "save": "right-commit"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "left",
+      "session": "a",
+      "op": "exec",
+      "sql": "update xyz set y = 2 where y = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "left-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "left update"
+      ],
+      "save": "left-commit"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM dolt_merge('feature') m",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (our_row).y, our_diff_type, (their_row).y, their_diff_type FROM dolt_conflicts(NULL::xyz)",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "modified",
+            null,
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

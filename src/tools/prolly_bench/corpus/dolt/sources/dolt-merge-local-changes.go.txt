@@ -1,0 +1,34 @@
+{
+		Name: "CALL DOLT_MERGE complains when a merge overrides local changes",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int primary key, val int)",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO test VALUES (0, 0)",
+			"SET autocommit = 0",
+			"CALL DOLT_COMMIT('-a', '-m', 'Step 1');",
+			"CALL DOLT_CHECKOUT('-b', 'feature-branch')",
+			"INSERT INTO test VALUES (1, 1);",
+			"UPDATE test SET val=1000 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'this is a normal commit');",
+			"CALL DOLT_CHECKOUT('main');",
+			"UPDATE test SET val=1001 WHERE pk=0;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts_summary('main', 'feature-branch')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts('main', 'feature-branch', 'test')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:          "CALL DOLT_MERGE('feature-branch', '-m', 'this is a merge')",
+				ExpectedErrStr: "error: local changes would be stomped by merge:\n\ttest\n Please commit your changes before you merge.",
+			},
+			{
+				Query:    "SELECT is_merging, source, target, unmerged_tables FROM DOLT_MERGE_STATUS;",
+				Expected: []sql.Row{{false, nil, nil, nil}},
+			},
+		},
+	}

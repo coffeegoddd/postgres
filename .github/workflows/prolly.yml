@@ -296,9 +296,16 @@ jobs:
           assert set(engines) == {"heap"}
           planned = report["ported_cases"] + report["partial_cases"]
           assert planned > 0
+          # A port that needs only SQL runs on heap too; every port that
+          # needs version control must be reported unsupported, not run.
+          scenarios = Path("src/tools/prolly_bench/corpus/dolt/scenarios").glob("*.json")
+          sql_only = sum(1 for f in scenarios
+                         if not any(r.startswith("vc.") for r in json.loads(f.read_text())["requires"]))
+          assert planned - sql_only > 0
           for engine in engines.values():
-              assert engine["unsupported"] == planned, engine
-              assert engine["passed"] == engine["failed"] == engine["not_run"] == engine["passed_mapped_assertions"] == 0, engine
+              assert engine["unsupported"] == planned - sql_only, engine
+              assert engine["passed"] == sql_only, engine
+              assert engine["failed"] == engine["not_run"] == 0, engine
           PY
 
       - name: Seeded differential histories

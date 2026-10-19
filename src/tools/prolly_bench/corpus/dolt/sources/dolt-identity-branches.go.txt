@@ -1,0 +1,54 @@
+{
+		Name: "insert on different branches",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"call dolt_branch('branch1')",
+			"call dolt_branch('branch2')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "insert into t (b) values (1), (2)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
+			},
+			{
+				Query:    "call dolt_commit('-am', 'two values on main')",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:            "call dolt_checkout('branch1')",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "insert into t (b) values (3), (4)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 3}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{3, 3},
+					{4, 4},
+				},
+			},
+			{
+				Query:    "call dolt_commit('-am', 'two values on branch1')",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:            "call dolt_checkout('branch2')",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "insert into t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 5}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{5, 5},
+					{6, 6},
+				},
+			},
+		},
+	}

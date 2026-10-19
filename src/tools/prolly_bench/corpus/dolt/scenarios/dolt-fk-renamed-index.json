@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "id": "dolt-fk-renamed-index",
+  "description": "Reviewed Dolt port: renaming an index keeps foreign keys backed by that index valid",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_foreign_keys.go",
+    "case": "DoltForeignKeyTests: renaming an index keeps foreign keys backed by that index valid"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (id int NOT NULL PRIMARY KEY, u int, CONSTRAINT u_idx UNIQUE (u))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (id int NOT NULL PRIMARY KEY, a int NOT NULL, b int, CONSTRAINT a_fk FOREIGN KEY (a) REFERENCES parent (id), CONSTRAINT b_fk FOREIGN KEY (b) REFERENCES parent (u))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "a-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX a_idx ON child (a)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "b-idx",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX b_idx ON child (b)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "parent-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1, 10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER INDEX A_IDX RENAME TO a_idx_new",
+      "expect": {
+        "tag": "ALTER INDEX"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER INDEX u_idx RENAME TO u_idx_new",
+      "expect": {
+        "tag": "ALTER INDEX"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renamed indexes"
+      ],
+      "save": "assert-2"
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1, 10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (2, 2, 10)",
+      "expect": {
+        "sqlstate": "23503"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (3, 1, 20)",
+      "expect": {
+        "sqlstate": "23503"
+      }
+    }
+  ]
+}

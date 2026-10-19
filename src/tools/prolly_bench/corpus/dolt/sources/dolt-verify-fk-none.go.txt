@@ -1,0 +1,22 @@
+{
+		Name:        "verify-constraints: no FK violations",
+		SetUpScript: verifyConstraintsFkViolationsSetupScript,
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('child1')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * from dolt_constraint_violations",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('--all', 'child1');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * from dolt_constraint_violations",
+				Expected: []sql.Row{},
+			},
+		},
+	}

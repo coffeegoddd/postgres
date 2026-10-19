@@ -1,0 +1,34 @@
+{
+		Name: "CALL DOLT_MERGE when current or ahead results in a no-op",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int primary key)",
+			"CALL DOLT_ADD('.')",
+			"CALL DOLT_COMMIT('-A', '-m', 'commit');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts_summary('HEAD', 'HEAD~1')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts('HEAD', 'HEAD~1', 'test')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('HEAD~1')",
+				Expected: []sql.Row{{"", 0, 0, "cannot fast forward from a to b. a is ahead of b already"}},
+			},
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts_summary('HEAD', 'HEAD')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts('HEAD', 'HEAD', 'test')",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('HEAD')",
+				Expected: []sql.Row{{"", 0, 0, "Everything up-to-date"}},
+			},
+		},
+	}

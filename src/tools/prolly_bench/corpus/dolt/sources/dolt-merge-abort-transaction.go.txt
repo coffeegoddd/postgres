@@ -1,0 +1,55 @@
+{
+		Name: "CALL DOLT_MERGE with conflicts can be aborted when autocommit is off",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int primary key, val int)",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO test VALUES (0, 0)",
+			"SET autocommit = 0",
+			"CALL DOLT_COMMIT('-a', '-m', 'Step 1');",
+			"CALL DOLT_CHECKOUT('-b', 'feature-branch')",
+			"INSERT INTO test VALUES (1, 1);",
+			"UPDATE test SET val=1000 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'this is a normal commit');",
+			"CALL DOLT_CHECKOUT('main');",
+			"UPDATE test SET val=1001 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'update a value');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('feature-branch', '-m', 'this is a merge')",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "SELECT * from dolt_status",
+				Expected: []sql.Row{{"test", byte(0), "modified"}, {"test", byte(0), "conflict"}},
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM dolt_conflicts",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('--abort')",
+				Expected: []sql.Row{{"", 0, 0, "merge aborted"}},
+			},
+			{
+				Query:    "SELECT is_merging, source, target, unmerged_tables FROM DOLT_MERGE_STATUS;",
+				Expected: []sql.Row{{false, nil, nil, nil}},
+			},
+			{
+				Query:    "SELECT * from dolt_status",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM dolt_log",
+				Expected: []sql.Row{{4}},
+			},
+			{
+				Query:    "SELECT * FROM test ORDER BY pk",
+				Expected: []sql.Row{{0, 1001}},
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('-b', 'other-branch')",
+				Expected: []sql.Row{{0, "Switched to branch 'other-branch'"}},
+			},
+		},
+	}

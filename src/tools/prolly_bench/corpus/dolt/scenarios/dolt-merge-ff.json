@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "id": "dolt-merge-ff",
+  "description": "Reviewed Dolt port: CALL DOLT_MERGE ff",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "MergeScripts: CALL DOLT_MERGE ff"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0),(1),(2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "step1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Step 1"
+      ],
+      "save": "step1"
+    },
+    {
+      "id": "branch",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature-branch"
+      ]
+    },
+    {
+      "id": "checkout-feature",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature-branch"
+      ]
+    },
+    {
+      "id": "insert3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "update",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test SET pk=1000 WHERE pk=0",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "ff-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "this is a ff"
+      ],
+      "save": "ff-commit"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.merge"
+      ],
+      "sql": "SELECT m[1] = dolt_hashof('feature-branch'), m[2], m[3], m[4] FROM dolt_merge('feature-branch') m",
+      "expect": {
+        "rows": [
+          [
+            "t",
+            "1",
+            "0",
+            "merge successful"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('-b', 'new-branch')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Switched to branch 'new-branch'\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    }
+  ]
+}
