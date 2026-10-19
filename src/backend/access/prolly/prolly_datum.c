@@ -13,11 +13,13 @@
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -323,6 +325,67 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		fmgr_info_cxt(recv, &c->recv, mcxt);
 	}
 	return c;
+}
+
+void
+prolly_datum_definition(Oid typid, StringInfo out)
+{
+	Oid			base = getBaseType(typid);
+	Oid			elemtype;
+
+	check_stack_depth();
+	appendBinaryStringInfo(out, (const char *) &base, sizeof(base));
+	elemtype = get_element_type(base);
+	if (OidIsValid(elemtype))
+	{
+		prolly_datum_definition(elemtype, out);
+		return;
+	}
+	switch (get_typtype(base))
+	{
+		case TYPTYPE_ENUM:
+			{
+				/* (each label by its OID, which rows hold: renamed, sent otherwise) */
+				CatCList   *labels = SearchSysCacheList1(ENUMTYPOIDNAME,
+														 ObjectIdGetDatum(base));
+
+				prolly_put_varint(out, labels->n_members);
+				for (int i = 0; i < labels->n_members; i++)
+				{
+					Form_pg_enum e = (Form_pg_enum) GETSTRUCT(&labels->members[i]->tuple);
+					const char *label = NameStr(e->enumlabel);
+
+					appendBinaryStringInfo(out, (const char *) &e->oid, sizeof(e->oid));
+					prolly_put_varint(out, strlen(label));
+					appendStringInfoString(out, label);
+				}
+				ReleaseSysCacheList(labels);
+			}
+			break;
+		case TYPTYPE_COMPOSITE:
+			{
+				/* (its attributes by number, dropped ones as such) */
+				TupleDesc	desc = lookup_rowtype_tupdesc(base, -1);
+
+				prolly_put_varint(out, desc->natts);
+				for (int i = 0; i < desc->natts; i++)
+				{
+					Form_pg_attribute att = TupleDescAttr(desc, i);
+
+					appendStringInfoChar(out, att->attisdropped ? 'd' : 'a');
+					if (!att->attisdropped)
+						prolly_datum_definition(att->atttypid, out);
+				}
+				ReleaseTupleDesc(desc);
+			}
+			break;
+		case TYPTYPE_RANGE:
+			prolly_datum_definition(get_range_subtype(base), out);
+			break;
+		case TYPTYPE_MULTIRANGE:
+			prolly_datum_definition(get_multirange_range(base), out);
+			break;
+	}
 }
 
 /* ------------------------------------------------------------------------

@@ -66,6 +66,16 @@ extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,
 extern Datum prolly_datum_decode(ProllyDatumCodec *codec, const char *data,
 								 int len);
 
+/*
+ * What values of typid encode by besides their type: the definitions their
+ * canonical bytes depend on that the catalog can change without rewriting
+ * the rows holding them (an enum's labels, a composite's attributes, and
+ * those of the types they hold), appended to out.  Local, not canonical
+ * (OIDs and attribute numbers): for telling whether bytes encoded before
+ * are still the ones values encode to.
+ */
+extern void prolly_datum_definition(Oid typid, StringInfo out);
+
 /* Unsigned LEB128, the minimal encoding. */
 extern void prolly_put_varint(StringInfo out, uint64 v);
 extern uint64 prolly_get_varint(const char **p, const char *end);

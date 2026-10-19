@@ -312,6 +312,13 @@ commit or checkpoint all use it.
   unless another branch shares it (then it is copied for that reason
   alone, and not listed). Candidates come from every tuple of an old
   version, so a page changed in place this way loses none.
+- **Changes to rows that change no page read the table again.** A
+  baseline's tree is kept for the table's description and what its rows
+  encode by without being rewritten: the columns' numbers (a column
+  dropped and one of the same name and type added reads as NULL) and the
+  definitions of their types (an enum's label renamed, a composite's
+  attribute dropped). Any of these changed, the next fold reads the
+  table in full (#322, #323).
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and

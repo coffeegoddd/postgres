@@ -114,6 +114,7 @@
 #include "access/prolly_applier.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -426,7 +427,7 @@ struct BaseTable
 {
 	StringInfoData key;			/* its item's key */
 	ProllyNodeRef data;
-	ProllyHash	description;	/* of its definition */
+	ProllyHash	description;	/* of its definition (baseline_hash()) */
 	StringInfoData state;		/* the change finder's */
 };
 
@@ -532,11 +533,44 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
+ * What a baseline's tree is kept for: the table's description, and what
+ * its rows' canonical bytes depend on that changes no page (so no change
+ * the finder would see).  The columns rows are read over, by number: a
+ * column dropped and one of the same name and type added describe the
+ * table alike, but its rows read as NULL.  And the definitions of the
+ * columns' types (prolly_datum_definition()): an enum's label renamed, a
+ * composite's attribute dropped, encode the same rows otherwise.
+ */
+static void
+baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
+			  ProllyHash *h)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	StringInfoData match;
+
+	initStringInfo(&match);
+	appendBinaryStringInfo(&match, description->data, description->len);
+	appendStringInfoChar(&match, '\0');
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		appendBinaryStringInfo(&match, (const char *) &att->attnum,
+							   sizeof(att->attnum));
+		prolly_datum_definition(att->atttypid, &match);
+	}
+	sha256(cn, match.data, match.len, h);
+	pfree(match.data);
+}
+
+/*
  * A table's data tree, folded from its rows as the transaction sees them by
  * the change finder: from its baseline if it has one for this definition
- * (described in 'description'); with a next baseline being made, its entry
- * there too.  The same rows give the same tree whatever pages, order or
- * history they come from.
+ * (described in 'description', its rows as baseline_hash() has them); with
+ * a next baseline being made, its entry there too.  The same rows give the
+ * same tree whatever pages, order or history they come from.
  */
 static void
 table_root(Canon *cn, CanonItem *it, Relation rel,
@@ -562,7 +596,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		index_close(pk, AccessShareLock);
 	}
 
-	sha256(cn, description->data, description->len, &dh);
+	baseline_hash(cn, rel, description, &dh);
 	bt = find_base_table(cn, &it->key);
 	if (bt && (bt->description.len != dh.len ||
 			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))

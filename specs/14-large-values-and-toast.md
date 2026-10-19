@@ -212,7 +212,10 @@ canonical encoder looks a column's on-disk TOAST pointer up before
 reading it and remembers the reference it made on a miss. Implementation
 "shared" (`memo_shared.c`): 8192 entries in shared memory under a
 spinlock, eight probed per key, the oldest replaced; the key also holds
-the database and the column's type (whose encoding made the reference).
+the database and the column's type (whose encoding made the reference),
+and a hash of that type's definition (`prolly_datum_definition()`: an
+enum's labels, a composite's attributes, those of the types they hold),
+which `ALTER TYPE` can change without touching the value (#323).
 Entries are kept in the backend, one per key and at most as many as the
 shared table holds, until `XACT_EVENT_COMMIT`, and forgotten on an abort,
 on the abort of the subtransaction that made them (or of one it was
