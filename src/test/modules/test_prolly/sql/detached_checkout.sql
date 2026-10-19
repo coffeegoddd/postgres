@@ -107,7 +107,8 @@ SELECT dolt_hashof('ro_made') = :'c1' AS made_there;
 SELECT (dolt_checkout('main'))[2];
 SELECT dolt_branch('-D', 'ro_made', 'ro_chained');
 -- (a transaction chained to one that checked out a commit is read-only
--- for it, as one begun there is)
+-- for it, as one begun there is: it makes a branch there, and one chained
+-- to it after a checkout of a branch writes)
 BEGIN;
 SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
 COMMIT AND CHAIN;
@@ -115,6 +116,19 @@ SHOW transaction_read_only;
 INSERT INTO dc.t VALUES (7, 'seven');
 ROLLBACK;
 SELECT (dolt_checkout('main'))[2];
+BEGIN;
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+COMMIT AND CHAIN;
+SELECT dolt_branch('ro_chained_made');
+COMMIT AND CHAIN;
+SELECT (dolt_checkout('main'))[2];
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+INSERT INTO dc.t VALUES (7, 'seven');
+ROLLBACK;
+SELECT active_branch();
+SELECT dolt_hashof('ro_chained_made') = :'c1' AS made_there;
+SELECT dolt_branch('-D', 'ro_chained_made');
 -- (a hidden branch isn't checked out by name, nor HEAD as a commit)
 SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
 SELECT dolt_checkout('HEAD');

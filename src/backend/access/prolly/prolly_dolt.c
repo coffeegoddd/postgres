@@ -1156,6 +1156,8 @@ dolt_checkout(PG_FUNCTION_ARGS)
 					 errmsg("the hidden branch of commit %s has moved off it", hash_hex(&id))));
 		checkout_branch(hidden);
 		MyBranchReadOnly = true;
+		if (!XactReadOnly)
+			XactReadOnlyFromBranch = true;
 		XactReadOnly = true;
 		result[0] = "0";
 		result[1] = psprintf("HEAD is now at %s (detached, read-only)", hash_hex(&id));
