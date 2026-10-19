@@ -32,7 +32,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
-#include "lib/binaryheap.h"
+#include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "storage/buffile.h"
 #include "utils/acl.h"
@@ -384,14 +384,11 @@ static bool
 send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	Since	   *sn = arg;
-	ProllyHash	key;
+	ProllyHash	key = prolly_hash_key(&node->hash);
 	bool		found;
 	Datum		values[2];
 	bool		nulls[2] = {0};
 
-	memset(&key, 0, sizeof(key));
-	key.len = node->hash.len;
-	memcpy(key.bytes, node->hash.bytes, key.len);
 	(void) hash_search(sn->sent, &key, HASH_ENTER, &found);
 	if (found)
 		return false;
@@ -412,9 +409,10 @@ send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 }
 
 /*
- * A commit dolt_serve_since() reached: from the wanted, the known, or both
- * (what reaches it is painted on it, as git's negotiation does), and
- * whether it is waiting in the queue.
+ * A commit dolt_serve_since() reached: what the store has of it, its height
+ * (the walk's order), what reaches it, from the wanted, the known or both
+ * (painted on it, as git's negotiation does), and whether it is waiting in
+ * the queue.
  */
 #define SINCE_WANTED	0x01
 #define SINCE_KNOWN		0x02
@@ -422,76 +420,119 @@ send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 typedef struct SinceCommit
 {
 	ProllyHash	id;				/* (the key) */
+	bool		found;			/* the store has it */
 	uint8		paint;
 	uint8		walked;			/* the paint it was walked with */
 	bool		queued;
-	bool		found;			/* the store has it */
+	int64		height;			/* 0: not found yet */
 	TimestampTz committed_at;
 	int			nparents;
 	ProllyHash	parents[PROLLY_MAX_PARENTS];
+	ProllyNodeRef root;
+	bool		has_dependencies;
+	ProllyNodeRef dependencies;
+	pairingheap_node node;
 } SinceCommit;
 
 typedef struct SinceWalk
 {
 	ProllyDatabaseComponents dc;
 	HTAB	   *commits;
-	binaryheap *queue;			/* by committed_at, the latest first */
+	HTAB	   *heights;
+	pairingheap queue;			/* the highest first */
 	int			wanted_queued;	/* queued, painted wanted only */
+	MemoryContext scratch;		/* (what a commit's read allocates) */
 } SinceWalk;
 
+/*
+ * The highest first: each commit is higher than its parents, so it is
+ * walked after every commit it is reached from.  Of commits as high, the
+ * latest, then the least id, so that what is sent is sent in one order.
+ */
 static int
-since_cmp(Datum a, Datum b, void *arg)
+since_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	SinceCommit *x = (SinceCommit *) DatumGetPointer(a);
-	SinceCommit *y = (SinceCommit *) DatumGetPointer(b);
+	const SinceCommit *x = pairingheap_const_container(SinceCommit, node, a);
+	const SinceCommit *y = pairingheap_const_container(SinceCommit, node, b);
 
+	if (x->height != y->height)
+		return x->height < y->height ? -1 : 1;
 	if (x->committed_at != y->committed_at)
 		return x->committed_at < y->committed_at ? -1 : 1;
-	return 0;
+	if (x->id.len != y->id.len)
+		return x->id.len > y->id.len ? -1 : 1;
+	return -memcmp(x->id.bytes, y->id.bytes, x->id.len);
 }
 
-/* Paint commit id, and queue it if that's new paint on it. */
-static void
-since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
+/* Commit id as reached: read from the store once, its strings not kept. */
+static SinceCommit *
+since_commit(SinceWalk *sw, const ProllyHash *id)
 {
-	ProllyHash	key = {0};
+	ProllyHash	key = prolly_hash_key(id);
 	SinceCommit *c;
 	bool		found;
 
-	key.len = id->len;
-	memcpy(key.bytes, id->bytes, id->len);
 	c = hash_search(sw->commits, &key, HASH_ENTER, &found);
 	if (!found)
 	{
 		ProllyCommitInfo info;
+		MemoryContext old = MemoryContextSwitchTo(sw->scratch);
 
+		c->found = PROLLY_CALL(sw->dc.refs, commit_get, id, &info);
+		MemoryContextSwitchTo(old);
 		c->paint = c->walked = 0;
 		c->queued = false;
-		c->found = PROLLY_CALL(sw->dc.refs, commit_get, id, &info);
+		c->height = 0;
 		c->committed_at = c->found ? info.committed_at : DT_NOBEGIN;
 		c->nparents = c->found ? info.nparents : 0;
 		for (int p = 0; p < c->nparents; p++)
 			c->parents[p] = info.parents[p];
+		c->root = c->found ? info.root : (ProllyNodeRef) {0};
+		c->has_dependencies = c->found && info.has_dependencies;
+		c->dependencies = c->has_dependencies ? info.dependencies : (ProllyNodeRef) {0};
+		MemoryContextReset(sw->scratch);
 	}
-	if ((c->paint | paint) == c->paint)
+	return c;
+}
+
+/* A commit's parents for its height, as since_commit() read them. */
+static bool
+since_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	SinceCommit *c = since_commit((SinceWalk *) arg, id);
+
+	if (!c->found)
+		return false;
+	memset(info, 0, sizeof(*info));
+	info->id = c->id;
+	info->root = c->root;
+	info->nparents = c->nparents;
+	for (int p = 0; p < c->nparents; p++)
+		info->parents[p] = c->parents[p];
+	info->committed_at = c->committed_at;
+	return true;
+}
+
+/*
+ * Paint commit id, and queue it if that's new paint on it.  One the store
+ * hasn't isn't queued: nothing of it can be sent, nor told of its parents.
+ */
+static void
+since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
+{
+	SinceCommit *c = since_commit(sw, id);
+
+	if (!c->found || (c->paint | paint) == c->paint)
 		return;
 	if (c->queued && c->paint == SINCE_WANTED)
 		sw->wanted_queued--;
 	c->paint |= paint;
 	if (!c->queued && (c->paint & ~c->walked) != 0)
 	{
-		if (sw->queue->bh_size == sw->queue->bh_space)
-		{
-			binaryheap *bigger = binaryheap_allocate(sw->queue->bh_space * 2,
-													 since_cmp, NULL);
-
-			for (int i = 0; i < sw->queue->bh_size; i++)
-				binaryheap_add_unordered(bigger, sw->queue->bh_nodes[i]);
-			binaryheap_build(bigger);
-			binaryheap_free(sw->queue);
-			sw->queue = bigger;
-		}
-		binaryheap_add(sw->queue, PointerGetDatum(c));
+		if (c->height == 0)
+			c->height = prolly_history_height(&c->id, sw->heights,
+											  since_lookup, sw);
+		pairingheap_add(&sw->queue, &c->node);
 		c->queued = true;
 	}
 	if (c->queued && c->paint == SINCE_WANTED)
@@ -504,17 +545,20 @@ since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
  * (and all they reach) lacks of the wanted ones, as best it can be told in
  * one go: the commits the wanted reach and the known don't (by parents),
  * and of each, its own chunks and what its root changed from its first
- * parent's (each tree diffed, equal subtrees skipped).  O(new commits and
- * what they changed), not the history.  The receiver checks all it is
- * sent, and reads what it still lacks as it would without this.
+ * parent's (each tree diffed, equal subtrees skipped).  The trees walked
+ * are the new commits' and what they changed, not the history's; the
+ * commits beneath them are read (each once) for their heights.  The
+ * receiver checks all it is sent, and reads what it still lacks as it
+ * would without this.
  *
  * The commits are told apart as git's negotiation tells them: walked from
- * the wanted and the known together, the latest first, each painted with
+ * the wanted and the known together, the highest first, each painted with
  * what reaches it and its parents with its paint, until no commit waiting
- * is reached from the wanted only.  The latest first, a commit is mostly
- * walked once its descendants have painted it; where commit times are out
- * of order, one may be sent that the receiver has (never one left out
- * that it lacks: only the known's ancestors are painted known).
+ * is reached from the wanted only.  A commit is higher than its parents,
+ * so each is walked after all it is reached from have painted it: those
+ * sent are just the ones the known don't reach, whatever the commits'
+ * times (a transaction's start, the same for all it commits, and earlier
+ * than its parents' for one begun before they were committed).
  */
 Datum
 dolt_serve_since(PG_FUNCTION_ARGS)
@@ -547,8 +591,11 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	ctl.entrysize = sizeof(SinceCommit);
 	sw.commits = hash_create("prolly commits since", 64, &ctl,
 							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	sw.queue = binaryheap_allocate(64, since_cmp, NULL);
+	sw.heights = prolly_history_heights();
+	pairingheap_initialize(&sw.queue, since_cmp, NULL);
 	sw.wanted_queued = 0;
+	sw.scratch = AllocSetContextCreate(CurrentMemoryContext, "prolly since read",
+									   ALLOCSET_DEFAULT_SIZES);
 	per_commit = AllocSetContextCreate(CurrentMemoryContext, "prolly since commit",
 									   ALLOCSET_DEFAULT_SIZES);
 
@@ -559,10 +606,10 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 
 	while (sw.wanted_queued > 0)
 	{
-		SinceCommit *c = (SinceCommit *) DatumGetPointer(binaryheap_remove_first(sw.queue));
+		SinceCommit *c = pairingheap_container(SinceCommit, node,
+											   pairingheap_remove_first(&sw.queue));
 		uint8		paint = c->paint;
-		ProllyCommitInfo info;
-		ProllyCommitInfo parent;
+		SinceCommit *parent;
 		ProllyNodeRef commit;
 		MemoryContext old;
 
@@ -573,28 +620,23 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 		c->walked = paint;
 		for (int p = 0; p < c->nparents; p++)
 			since_paint(&sw, &c->parents[p], paint);
-		/* (one it hasn't: the receiver's walk asks) */
-		if (paint != SINCE_WANTED || !c->found)
+		if (paint != SINCE_WANTED)
 			continue;
 
 		/* (what one commit's walks allocate, gone after it) */
 		old = MemoryContextSwitchTo(per_commit);
-		if (!PROLLY_CALL(sw.dc.refs, commit_get, &c->id, &info))
-			elog(ERROR, "commit %s went missing", prolly_hash_hex(&c->id));
 		memset(&commit, 0, sizeof(commit));
 		commit.hash = c->id;
 		(void) PROLLY_CALL(tree, walk, &env, &commit, send_since, &sn);
-		if (info.has_dependencies)
-			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, send_since, &sn);
+		if (c->has_dependencies)
+			(void) PROLLY_CALL(tree, walk, &env, &c->dependencies, send_since, &sn);
+		parent = c->nparents > 0 ? since_commit(&sw, &c->parents[0]) : NULL;
 		PROLLY_CALL(sw.dc.canonicalizer, walk_changes,
-					info.nparents > 0 &&
-					PROLLY_CALL(sw.dc.refs, commit_get, &info.parents[0], &parent) ?
-					&parent.root : NULL,
-					&info.root, send_since, &sn);
+					parent != NULL && parent->found ? &parent->root : NULL,
+					&c->root, send_since, &sn);
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(per_commit);
 	}
-	binaryheap_free(sw.queue);
 	return (Datum) 0;
 }
 

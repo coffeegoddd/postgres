@@ -134,3 +134,49 @@ SELECT pg_temp.since(ARRAY[:'rsm_m1']) * 4 < pg_temp.since('{}') AS far_fewer,
 SELECT dolt_branch('-D', 'rsm_f');
 DROP SCHEMA rsm CASCADE;
 SELECT length(dolt_commit('-Am', 'rsm gone')::text) AS committed;
+
+-- what changed since known commits, whatever the commits' times: a
+-- commit's time is its transaction's start, the same for all one
+-- transaction commits, and earlier than its parent's for one begun before
+-- the parent was committed (here made by hand, with the earliest time)
+CREATE SCHEMA rst VERSIONED;
+CREATE TABLE rst.t (id int PRIMARY KEY, v text);
+INSERT INTO rst.t SELECT g, 'v' || g FROM generate_series(1, 5000) g;
+SELECT (dolt_commit('-Am', 'rst b'))[1] AS rst_b \gset
+CREATE FUNCTION pg_temp.since_of(wanted text, known text[]) RETURNS bigint LANGUAGE sql
+  AS $$ SELECT count(*) FROM dolt_serve_since(ARRAY[decode(wanted, 'hex')],
+		 ARRAY(SELECT decode(k, 'hex') FROM unnest(known) k)) $$;
+-- a known commit older than its parent: the parent isn't sent, nor what's
+-- beneath it
+SELECT test_commit_chain(:'rst_b', 3) AS rst_k \gset
+UPDATE rst.t SET v = 'w' WHERE id = 1;
+SELECT (dolt_commit('-Am', 'rst w'))[1] AS rst_w \gset
+SELECT pg_temp.since_of(:'rst_w', ARRAY[:'rst_k']) = pg_temp.since_of(:'rst_w', ARRAY[:'rst_b']) AS older_known,
+	   pg_temp.since_of(:'rst_k', ARRAY[:'rst_b']) AS older_wanted,
+	   pg_temp.since_of(:'rst_w', ARRAY[:'rst_w', :'rst_k']) AS none;
+-- commits of one time: the known side's longer, its fork point not sent
+BEGIN;
+UPDATE rst.t SET v = 'p' WHERE id = 2;
+SELECT (dolt_commit('-Am', 'rst p'))[1] AS rst_p \gset
+SELECT dolt_branch('rst_f');
+UPDATE rst.t SET v = 'k1' WHERE id = 3;
+SELECT length(dolt_commit('-Am', 'rst k1')::text) AS committed;
+UPDATE rst.t SET v = 'k2' WHERE id = 4;
+SELECT length(dolt_commit('-Am', 'rst k2')::text) AS committed;
+UPDATE rst.t SET v = 'k3' WHERE id = 5;
+SELECT (dolt_commit('-Am', 'rst k3'))[1] AS rst_k3 \gset
+SELECT dolt_checkout('rst_f') IS NOT NULL AS on_f;
+UPDATE rst.t SET v = 'x' WHERE id = 6;
+SELECT (dolt_commit('-Am', 'rst x'))[1] AS rst_x \gset
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT pg_temp.since_of(:'rst_x', ARRAY[:'rst_k3']) = pg_temp.since_of(:'rst_x', ARRAY[:'rst_p']) AS tied_known,
+	   pg_temp.since_of(:'rst_x', ARRAY[:'rst_p']) > 0 AS some;
+-- a wanted commit the store hasn't: nothing of it, nor of the walk
+SELECT pg_temp.since_of(repeat('ab', 32), ARRAY[:'rst_b']) AS unknown_wanted,
+	   (SELECT count(*) FROM dolt_serve_since(ARRAY[decode(repeat('ab', 32), 'hex'), decode(:'rst_w', 'hex')],
+											  ARRAY[decode(:'rst_b', 'hex')]))
+	   = pg_temp.since_of(:'rst_w', ARRAY[:'rst_b']) AS with_unknown_wanted;
+SELECT dolt_branch('-D', 'rst_f');
+DROP SCHEMA rst CASCADE;
+SELECT length(dolt_commit('-Am', 'rst gone')::text) AS committed;
