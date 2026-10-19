@@ -688,6 +688,13 @@ fails without its fix), and Postgres's suites keep passing after each one.
     Dolt, it is also refused whenever definitions change, whether
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
+  - A materialized view's rows merge as a REFRESH made them: those of
+    the side that refreshed it since the merge base (ours if neither), or
+    of the side whose query the merged one is; if both refreshed it to
+    other rows, neither's are what its query reads after the merge, and
+    it is refreshed from the merged rows (refused over uncommitted rows,
+    which it would read). A fast-forward over uncommitted changes brings
+    theirs' rows too (#320).
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the

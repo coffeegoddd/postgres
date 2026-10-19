@@ -78,6 +78,7 @@ tests += {
       'constraint_violations',
       'verify_constraints',
       'redefined_merges',
+      'matview_merges',
       'type_moves',
       'detached_checkout',
       'branch_start',

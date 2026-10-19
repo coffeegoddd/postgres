@@ -1,0 +1,566 @@
+-- A materialized view's rows in a three-way merge: a REFRESH is a change
+-- of them, so the side that refreshed it gives them, as a table's rows
+-- come from the side that changed them; refreshed on both sides
+-- differently, it is refreshed again, from the merged rows.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA mm VERSIONED;
+CREATE TABLE mm.t (pk int PRIMARY KEY);
+CREATE TABLE mm.o (pk int PRIMARY KEY);
+CREATE MATERIALIZED VIEW mm.mv AS SELECT coalesce(sum(pk), 0) AS c FROM mm.t;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('mm_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Theirs refreshed it, ours didn't: theirs' rows.
+INSERT INTO mm.o VALUES (1);
+SELECT length(dolt_commit('-am', 'ours: o')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (1);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'theirs refreshed'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS theirs_refresh FROM mm.mv;
+ theirs_refresh 
+----------------
+              1
+(1 row)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
+-- and a fast-forward of theirs to the merge keeps it
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT c AS still_theirs_refresh FROM mm.mv;
+ still_theirs_refresh 
+----------------------
+                    1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- Ours refreshed it, theirs didn't: ours' rows.
+INSERT INTO mm.t VALUES (2);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+INSERT INTO mm.o VALUES (2);
+SELECT length(dolt_commit('-am', 'theirs: o')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'ours refreshed'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS ours_refresh FROM mm.mv;
+ ours_refresh 
+--------------
+            3
+(1 row)
+
+-- Both refreshed it, to other rows: refreshed from the merged rows.
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO mm.t VALUES (3);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (4), (5);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'both refreshed'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS refreshed_from_merged, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ refreshed_from_merged | t_sum 
+-----------------------+-------
+                    15 |    15
+(1 row)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
+-- Both refreshed it alike: those rows.
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DELETE FROM mm.t WHERE pk = 5;
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: a row of t gone, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DELETE FROM mm.t WHERE pk IN (1, 4);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'ours: others gone, refreshed alike')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'refreshed alike'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS refreshed_alike, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ refreshed_alike | t_sum 
+-----------------+-------
+              10 |     5
+(1 row)
+
+-- Definitions change in the merge (ours adds a table): theirs' refresh
+-- still comes.
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO mm.t VALUES (6);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TABLE mm.n (pk int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'ours: a table')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'theirs refreshed, ours defined'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS theirs_refresh, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ theirs_refresh | t_sum 
+----------------+-------
+             11 |    11
+(1 row)
+
+-- and both refreshed it, with definitions changing (theirs adds a
+-- table): refreshed from the merged rows.
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE mm.n2 (pk int PRIMARY KEY);
+INSERT INTO mm.t VALUES (20);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-Am', 'theirs: a table, t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (21);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'both refreshed, theirs defined'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS refreshed_from_merged, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ refreshed_from_merged | t_sum 
+-----------------------+-------
+                    52 |    52
+(1 row)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
+DELETE FROM mm.t WHERE pk IN (20, 21);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'back to 11')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Ours redefines another materialized view, so the merge makes them all
+-- again: each still has the rows its side's refresh gave it, not those
+-- its query reads now.
+CREATE MATERIALIZED VIEW mm.mv2 AS SELECT count(*) AS c FROM mm.o;
+SELECT length(dolt_commit('-Am', 'a second view')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO mm.t VALUES (7);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP MATERIALIZED VIEW mm.mv2;
+CREATE MATERIALIZED VIEW mm.mv2 AS SELECT count(*) + 100 AS c FROM mm.o;
+INSERT INTO mm.t VALUES (8);
+SELECT length(dolt_commit('-Am', 'ours: t, the second view redefined')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT c AS theirs_mv_before FROM mm.mv;
+ theirs_mv_before 
+------------------
+               11
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'theirs refreshed, ours redefined'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS theirs_refresh, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ theirs_refresh | t_sum 
+----------------+-------
+             18 |    26
+(1 row)
+
+SELECT c AS ours_mv2 FROM mm.mv2;
+ ours_mv2 
+----------
+      102
+(1 row)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
+-- Into uncommitted rows, a merge that would refresh it is refused (they
+-- would be among the rows it reads); one taking theirs' refresh, a
+-- fast-forward's too, isn't, and leaves them uncommitted.
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO mm.t VALUES (9);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (10);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO mm.o VALUES (10);
+SELECT (dolt_merge('mm_other'))[2:4];
+ERROR:  cannot merge with uncommitted changes where both sides refreshed a materialized view
+DETAIL:  Materialized view "mm.mv" would be refreshed from the merged rows, the uncommitted ones among them.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (a fast-forward over them)
+INSERT INTO mm.o VALUES (10);
+SELECT (dolt_merge('mm_other'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT c AS theirs_refresh, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ theirs_refresh | t_sum 
+----------------+-------
+             35 |    35
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY table_name;
+ table_name |  status  
+------------+----------
+ mm.o       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (a three-way merge over them)
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (11);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO mm.n VALUES (1);
+SELECT length(dolt_commit('-am', 'ours: n')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO mm.o VALUES (10);
+SELECT (dolt_merge('mm_other', '-m', 'over uncommitted rows'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT c AS theirs_refresh, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ theirs_refresh | t_sum 
+----------------+-------
+             46 |    46
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY table_name;
+ table_name |  status  
+------------+----------
+ mm.o       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mm_other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mm CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table mm.t
+drop cascades to table mm.o
+drop cascades to materialized view mm.mv
+drop cascades to table mm.n
+drop cascades to table mm.n2
+drop cascades to materialized view mm.mv2
+SELECT length(dolt_commit('-Am', 'mm gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

@@ -121,6 +121,7 @@ static bool same_description(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
+static List *matviews_in_root(const ProllyNodeRef *root);
 static List *foreign_key_violations(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
 						   List **found);
@@ -2480,6 +2481,8 @@ typedef struct MergeRows
 	int			conflicts;
 	List	   *now;			/* the tables as the branch has them, if
 								 * known (NIL: folded when needed) */
+	const ProllyNodeRef *roots; /* base, ours, theirs */
+	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
 } MergeRows;
 
 
@@ -2528,6 +2531,80 @@ row_conflicts(MergeRows *mr, Oid relid, int n)
 	{
 		mr->conflicts += n;
 		*mr->conflicted = lappend_oid(*mr->conflicted, relid);
+	}
+}
+
+static List *
+matviews_in_root(const ProllyNodeRef *root)
+{
+	Tables		ts = {NIL};
+
+	PROLLY_CALL(components().canonicalizer, materialized_views, root,
+				add_table, &ts);
+	return ts.tables;
+}
+
+/*
+ * Each materialized view's rows, the tables' merged: a REFRESH changes
+ * them, as a write does a table's, so they're those of the side that
+ * refreshed it since base (ours if neither); of the side whose query the
+ * merged one is, if only one's is; refreshed again, from the merged rows,
+ * if both refreshed it (or made it) to other rows, as neither side's are
+ * the rows its query reads now.  One the merge makes again (made with the
+ * rows as they are) is given them too.
+ */
+static void
+merge_matviews(MergeRows *mr)
+{
+	List	   *base = matviews_in_root(&mr->roots[0]);
+	List	   *ours = matviews_in_root(&mr->roots[1]);
+	List	   *theirs = matviews_in_root(&mr->roots[2]);
+	List	   *now;
+	ListCell   *lc;
+
+	if (mr->now_root)
+		now = matviews_in_root(mr->now_root);
+	else
+	{
+		ProllyNodeRef working;
+
+		(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
+		now = matviews_in_root(&working);
+	}
+	foreach(lc, now)
+	{
+		Table	   *w = lfirst(lc);
+		Table	   *b = find_table(base, w->name);
+		Table	   *o = find_table(ours, w->name);
+		Table	   *t = find_table(theirs, w->name);
+		const Table *want;
+
+		/* (only rows of the query it has now fit it) */
+		if (b && !same_description(b, w))
+			b = NULL;
+		if (o && !same_description(o, w))
+			o = NULL;
+		if (t && !same_description(t, w))
+			t = NULL;
+		if (o == NULL || t == NULL)
+			want = o ? o : t;
+		else if (same_hash(&o->data.hash, &t->data.hash) ||
+				 (b && same_hash(&t->data.hash, &b->data.hash)))
+			want = o;
+		else if (b && same_hash(&o->data.hash, &b->data.hash))
+			want = t;
+		else
+		{
+			/* (as the session would, its owner's query reading the merged rows) */
+			SPI_connect();
+			if (SPI_execute(psprintf("REFRESH MATERIALIZED VIEW %s", w->name),
+							false, 0) != SPI_OK_UTILITY)
+				elog(ERROR, "could not refresh materialized view %s", w->name);
+			SPI_finish();
+			continue;
+		}
+		if (want && !same_hash(&w->data.hash, &want->data.hash))
+			apply_rows(table_named(w->name), w, want);
 	}
 }
 
@@ -2667,6 +2744,7 @@ merge_rows(void *arg)
 		if (!same_hash(&w->data.hash, &want->data.hash))
 			apply_rows(relid, w, want);
 	}
+	merge_matviews(mr);
 }
 
 /*
@@ -2837,7 +2915,7 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0, NIL};
+		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
@@ -2850,7 +2928,8 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	{
 		/* (the branch has ours' rows, every table defined alike) */
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0, ours_tables};
+		fail_on_conflict, what, name, conflicted, 0, ours_tables, roots,
+		&roots[1]};
 
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		merge_rows(&mr);
@@ -4120,6 +4199,32 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 							   name, what),
 					 errhint("Commit the changes, or reset the branch, first.")));
 	}
+	/*
+	 * one both sides refreshed: refreshed from the merged rows
+	 * (merge_matviews()), which the uncommitted rows would be among
+	 */
+	if (l->tables != NIL)
+	{
+		List	   *bm = matviews_in_root(base);
+		List	   *om = matviews_in_root(ours);
+
+		foreach(lc, matviews_in_root(theirs))
+		{
+			Table	   *t = lfirst(lc);
+			Table	   *b = find_table(bm, t->name);
+			Table	   *o = find_table(om, t->name);
+
+			if (!same_hash(&t->data.hash, &b->data.hash) &&
+				!same_hash(&o->data.hash, &b->data.hash) &&
+				!same_hash(&o->data.hash, &t->data.hash))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot %s with uncommitted changes where both sides refreshed a materialized view", what),
+						 errdetail("Materialized view \"%s\" would be refreshed from the merged rows, the uncommitted ones among them.",
+								   t->name),
+						 errhint("Commit the changes, or reset the branch, first.")));
+		}
+	}
 }
 
 /*
@@ -4184,6 +4289,18 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 			apply_rows(relid, h, t);
 			relids = lappend_oid(relids, relid);
 		}
+	}
+	/* materialized views theirs refreshed (check_local(): not these) */
+	ht.tables = tt.tables = NIL;
+	PROLLY_CALL(dc.canonicalizer, materialized_views, &l->head, add_table, &ht);
+	PROLLY_CALL(dc.canonicalizer, materialized_views, &target, add_table, &tt);
+	foreach(lc, tt.tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *h = find_table(ht.tables, t->name);
+
+		if (h && !same_hash(&h->data.hash, &t->data.hash))
+			apply_rows(table_named(t->name), h, t);
 	}
 	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
 		ereport(ERROR,
