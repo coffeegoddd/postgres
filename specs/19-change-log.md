@@ -1,7 +1,8 @@
 # 19. Change finder "log": a change log per table
 
 **Status: decided by the user 2026-10-19; built as a stack of pull
-requests (part 3). Code references at `9ac631831e`.** Folds find a
+requests (part 3), `log` the profile's change finder. Code references at
+`39de7462e5`.** Folds find a
 table's changes from a log of the rows each write changed, instead of
 from old versions of pages.
 

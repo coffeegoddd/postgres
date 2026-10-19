@@ -55,11 +55,11 @@ SELECT name, value FROM pg_stat_prolly;
  nodes_written        |    14
  value_nodes_written  |     0
  chunks_appended      |    14
- chunk_bytes_appended | 25813
- bytes_hashed         | 44922
+ chunk_bytes_appended | 25800
+ bytes_hashed         | 44909
  fold_rows_read       |  1000
  fold_rows_written    |  1000
- fold_pages           |     6
+ fold_pages           |     0
  fold_candidates      |  1000
  fold_full_tables     |     0
  commits              |     1
@@ -79,9 +79,8 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
  t                 | t
 (1 row)
 
--- One row changed: the fold reads its page's rows and writes the one.
--- Its page is full, so the new version goes to another: both pages are
--- copied, to keep them as the last fold saw them.
+-- One row changed: the fold reads the one row the change log names, and
+-- writes it.  No page is kept as the last fold saw it, so none is copied.
 SELECT pg_stat_reset_shared('prolly');
  pg_stat_reset_shared 
 ----------------------
@@ -110,7 +109,7 @@ WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves',
  fold_full_tables   |     0
  commits            |     1
  head_moves         |     1
- page_copies_fold   |     2
+ page_copies_fold   |     0
  page_copies_shared |     0
 (6 rows)
 

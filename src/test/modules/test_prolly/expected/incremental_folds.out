@@ -1,6 +1,8 @@
--- A commit folds only what changed since the branch's last commit: the
--- rows on the pages its tables list as changed.  The tree is always the
--- one a fold of every row gives, and what it read is counted.
+-- A commit folds only what changed since the branch's last commit, by
+-- the change finder "pages": the rows on the pages its tables list as
+-- changed.  The tree is always the one a fold of every row gives, and what
+-- it read is counted.
+SET debug_prolly_change_finder = pages;
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -740,14 +742,6 @@ DETAIL:  There is no change finder named "nonesuch".
 SET debug_prolly_change_finder = 'stub';
 ERROR:  invalid value for parameter "debug_prolly_change_finder": "stub"
 DETAIL:  Change finder "stub" cannot fold.
-SET debug_prolly_change_finder = 'pages';
-SELECT * FROM pg_temp.fold();
- pages | candidates | full_tables | same_as_full 
--------+------------+-------------+--------------
-     0 |          0 |           0 | t
-(1 row)
-
-RESET debug_prolly_change_finder;
 SELECT * FROM pg_temp.fold();
  pages | candidates | full_tables | same_as_full 
 -------+------------+-------------+--------------

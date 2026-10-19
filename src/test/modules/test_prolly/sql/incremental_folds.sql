@@ -1,6 +1,8 @@
--- A commit folds only what changed since the branch's last commit: the
--- rows on the pages its tables list as changed.  The tree is always the
--- one a fold of every row gives, and what it read is counted.
+-- A commit folds only what changed since the branch's last commit, by
+-- the change finder "pages": the rows on the pages its tables list as
+-- changed.  The tree is always the one a fold of every row gives, and what
+-- it read is counted.
+SET debug_prolly_change_finder = pages;
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -275,9 +277,6 @@ SELECT * FROM pg_temp.fold();
 -- refused, and so is one that can't fold.
 SET debug_prolly_change_finder = 'nonesuch';
 SET debug_prolly_change_finder = 'stub';
-SET debug_prolly_change_finder = 'pages';
-SELECT * FROM pg_temp.fold();
-RESET debug_prolly_change_finder;
 SELECT * FROM pg_temp.fold();
 
 DROP SCHEMA inc CASCADE;

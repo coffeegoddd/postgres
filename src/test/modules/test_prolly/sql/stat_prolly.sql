@@ -27,9 +27,8 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') >=
 	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS each_chunk_hashed;
 
--- One row changed: the fold reads its page's rows and writes the one.
--- Its page is full, so the new version goes to another: both pages are
--- copied, to keep them as the last fold saw them.
+-- One row changed: the fold reads the one row the change log names, and
+-- writes it.  No page is kept as the last fold saw it, so none is copied.
 SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
