@@ -52,7 +52,8 @@ All amounts are summed over the collector's **write-accounting
 interval**:
 
 - **Start.** As the window opens. Before it, the collector waits for
-  autovacuum workers to exit and then checkpoints.
+  autovacuum workers to exit, has prolly fold its working set, and
+  checkpoints.
 - **End, for WAL.** After the post-window flush (part 3.2), before its
   final `CHECKPOINT`.
 - **End, for pages and the chunk store.** After that checkpoint, and after
@@ -134,20 +135,31 @@ counter run's S1 writes 470 kB.
 
 ### Measured
 
-S1, scale 5, 4 clients, a 5 s window, one repetition. This is a smoke run,
-not a ranking, and it predates the block-map counter split (part 3.4):
+S1, scale 5, 4 clients, a 5 s window, one repetition, as built. This is a
+smoke run, not a ranking:
 
 | | heap | prolly |
 |---|---:|---:|
 | logical bytes per transaction | 236 | 236 |
-| `wa_wal` | 23.3 | 44.8 |
-| `wa_pages` | 22.5 | 23.1 |
-| `wa_tree` | n/a | 20.9 |
-| `wa_server` | 45.8 | 88.8 |
+| `wa_wal` | 23.8 | 36.2 |
+| `wa_pages` | 23.1 | 38.6 |
+| `wa_tree` | n/a | 13.0 |
+| `wa_server` | 47.0 | 87.8 |
 
-Prolly's extra WAL is the `ProllyChunks` records: 4,935 bytes per
-transaction, the same bytes its journal then holds. Its journal adds 1.1%
-framing to the 59 MB of chunks the fold wrote.
+Prolly's extra amplification has two sources:
+
+- **Chunk WAL.** The `ProllyChunks` records hold the 36 MB of chunks the
+  window's fold wrote, and the journal then holds the same bytes again.
+- **Copy-on-write remaps.** These are 47 MB: after a fold, a page's first
+  write copies it into a new block of the page store.
+
+Read-only S2 writes 8 kB of WAL on heap and 75 kB on prolly, and no
+ratios.
+
+The first version folded only after the window. Nothing folds between
+the load and the window, so that fold wrote the trees of the whole load:
+59 MB of chunks charged to S1's 5 s window, and 23 MB of WAL to read-only
+S2.
 
 ## 3. What is built
 
@@ -170,8 +182,11 @@ What the collector does at each step:
   `contrib/pg_walinspect` and attests its hash.
 - **`before_window`.**
   1. Wait for autovacuum workers to exit.
-  2. Create a physical slot, if `wal_level` is not `minimal`.
-  3. `CHECKPOINT`.
+  2. Fold prolly's working set (`prolly_checkpoint()`, with the same
+     setting as part 3.2), so the fold after the window writes only the
+     window's changes.
+  3. Create a physical slot, if `wal_level` is not `minimal`.
+  4. `CHECKPOINT`.
 
   It doesn't wait for client backends. S6's snapshot holder and the V
   suite's background S1 connect before the window opens. The first
