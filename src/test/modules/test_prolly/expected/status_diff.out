@@ -665,3 +665,159 @@ SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;
 
 DROP SERVER sd_srv;
 DROP FOREIGN DATA WRAPPER sd_fdw;
+-- Before the branch's first commit: its changes against the empty root,
+-- as Dolt's are against its initial commit (dolt_log('HEAD') has none).
+SELECT current_database() AS db \gset
+CREATE DATABASE regress_status_unborn;
+\c regress_status_unborn
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'one'), (2, 'two');
+SELECT name, hash, dirty FROM dolt_branches;
+ name | hash | dirty 
+------+------+-------
+ main |      | t
+(1 row)
+
+SELECT count(*) AS commits FROM dolt_log();
+ commits 
+---------
+       0
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY table_name;
+ table_name | staged |   status   
+------------+--------+------------
+ app        | t      | new schema
+ app.t      | t      | new table
+(2 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ added     |          | (1,one)
+ added     |          | (2,two)
+(2 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('WORKING', 'head', NULL::app.t) ORDER BY from_row;
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ removed   | (1,one)  | 
+ removed   | (2,two)  | 
+(2 rows)
+
+SELECT count(*) FROM dolt_diff('HEAD', 'HEAD', NULL::app.t);
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM dolt_diff('HEAD~1', 'WORKING', NULL::app.t);	-- (no commit to step back from)
+ERROR:  prolly ref "HEAD~1" does not exist
+SELECT * FROM dolt_diff('nope', 'WORKING', NULL::app.t);
+ERROR:  prolly ref "nope" does not exist
+-- the branch by name, or by its full ref name, as HEAD
+SELECT diff_type, to_row FROM dolt_diff('main', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('refs/heads/main', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT * FROM dolt_diff('main~1', 'WORKING', NULL::app.t);
+ERROR:  prolly ref "main~1" does not exist
+SELECT * FROM dolt_diff('refs/heads/nope', 'WORKING', NULL::app.t);
+ERROR:  prolly ref "refs/heads/nope" does not exist
+-- a branch made before the first commit: unborn too, by any of its names
+SELECT dolt_branch('unborn');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, hash FROM dolt_branches ORDER BY name;
+  name  | hash 
+--------+------
+ main   | 
+ unborn | 
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('unborn', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT count(*) FROM dolt_diff('unborn', 'main', NULL::app.t);
+ count 
+-------
+     0
+(1 row)
+
+SELECT dolt_checkout('unborn');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'unborn'"}
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY table_name;
+ table_name | staged |   status   
+------------+--------+------------
+ app        | t      | new schema
+ app.t      | t      | new table
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('main', 'WORKING', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- unborn stays so after main's first commit: still the empty root
+SELECT diff_type, to_row FROM dolt_diff('unborn', 'main', NULL::app.t) ORDER BY to_row;
+ diff_type | to_row  
+-----------+---------
+ added     | (1,one)
+ added     | (2,two)
+(2 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+\c :db
+DROP DATABASE regress_status_unborn;

@@ -5118,9 +5118,24 @@ bmap_redo(XLogReaderState *record)
 					redo_block(record, id);
 				if (zeroed)
 				{
-					/* zeroes in its buffer too, without an LSN, as a new page */
-					Buffer		buf = XLogInitBufferForRedo(record, last);
+					/*
+					 * zeroes in its buffer too, without an LSN, as a new
+					 * page.  A buffer already valid (the old block's page,
+					 * read before) is only locked, not zeroed: zeroed here,
+					 * under a cleanup lock, as a standby's scan may hold a
+					 * pin on it and read its tuples without a content lock.
+					 * A buffer of zeroes stays clean: the block has zeroes.
+					 */
+					Buffer		buf;
 
+					(void) XLogReadBufferForRedoExtended(record, last,
+														 RBM_ZERO_AND_CLEANUP_LOCK,
+														 true, &buf);
+					if (!pg_memory_is_all_zeros(BufferGetPage(buf), BLCKSZ))
+					{
+						memset(BufferGetPage(buf), 0, BLCKSZ);
+						MarkBufferDirty(buf);
+					}
 					UnlockReleaseBuffer(buf);
 				}
 				else
