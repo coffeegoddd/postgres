@@ -473,8 +473,8 @@ SELECT * FROM mr.both ORDER BY k;
  2
 (2 rows)
 
--- The other side's rows, taken into a table one side redefined, must fit
--- it as it is defined now: ours narrows a column, theirs adds a row too
+-- A column one side narrows, where the other side changed the table too, is
+-- a schema conflict, as in Dolt: ours narrows it, theirs adds a row too
 -- long for it.
 SELECT dolt_branch('-D', 'mr_side');
  dolt_branch 
@@ -516,7 +516,8 @@ SELECT length(dolt_commit('-Am', 'narrowed')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('mr_side'))[2:4];
-ERROR:  value too long for type character varying(5)
+ERROR:  schema conflict: column v of mr.t changed type from pg_catalog.text to character varying(5) on one side, and the other side changed the table
+DETAIL:  A change of type merges with the other side's changes only as a string type made no shorter.
 SELECT max(length(v)) FROM mr.t;
  max 
 -----
@@ -1735,6 +1736,134 @@ SELECT dolt_branch('-D', 'slk_right');
 
 DROP SCHEMA slk CASCADE;
 NOTICE:  drop cascades to table slk.t
+-- A column one side changed type merges with the other side's changes to
+-- the table only as Dolt merges it: a string type (varchar, char, text)
+-- made no shorter.  Others are schema conflicts; a table the other side
+-- didn't change takes the change whatever it is.
+CREATE SCHEMA stc VERSIONED;
+CREATE TABLE stc.t (pk int PRIMARY KEY, s varchar(5), c char(3), i int);
+CREATE TABLE stc.u (pk int PRIMARY KEY, i int);
+INSERT INTO stc.t VALUES (1, 'a', 'b', 1);
+INSERT INTO stc.u VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'stc base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('stc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('stc_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'stc_right'"}
+(1 row)
+
+ALTER TABLE stc.t ALTER COLUMN s TYPE text, ALTER COLUMN c TYPE varchar(3);
+ALTER TABLE stc.u ALTER COLUMN i TYPE varchar(10);
+INSERT INTO stc.t VALUES (2, 'longer', 'cc', 2);
+SELECT length(dolt_commit('-Am', 'stc right')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO stc.t VALUES (3, 'x', 'y', 3);
+SELECT length(dolt_commit('-Am', 'stc left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('stc_right'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM stc.t ORDER BY pk;
+ pk |   s    |  c  | i 
+----+--------+-----+---
+  1 | a      | b   | 1
+  2 | longer | cc  | 2
+  3 | x      | y   | 3
+(3 rows)
+
+SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid IN ('stc.t'::regclass, 'stc.u'::regclass) AND attnum > 1
+ORDER BY attrelid::regclass::text, attnum;
+ attname |      format_type      
+---------+-----------------------
+ s       | text
+ c       | character varying(3)
+ i       | integer
+ i       | character varying(10)
+(4 rows)
+
+SELECT dolt_branch('-D', 'stc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('stc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('stc_right');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'stc_right'"}
+(1 row)
+
+ALTER TABLE stc.t ALTER COLUMN i TYPE bigint;
+SELECT length(dolt_commit('-Am', 'stc right: bigint')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE stc.t SET i = 30 WHERE pk = 3;
+SELECT length(dolt_commit('-Am', 'stc left: a row')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_merge('stc_right');
+ERROR:  schema conflict: column i of stc.t changed type from integer to bigint on one side, and the other side changed the table
+DETAIL:  A change of type merges with the other side's changes only as a string type made no shorter.
+SELECT dolt_merge('stc_right', '--squash');
+ERROR:  schema conflict: column i of stc.t changed type from integer to bigint on one side, and the other side changed the table
+DETAIL:  A change of type merges with the other side's changes only as a string type made no shorter.
+SELECT dolt_branch('-D', 'stc_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA stc CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table stc.t
+drop cascades to table stc.u
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table app.t

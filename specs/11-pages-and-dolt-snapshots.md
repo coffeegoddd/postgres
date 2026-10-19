@@ -646,7 +646,12 @@ fails without its fix), and Postgres's suites keep passing after each one.
     rows, as Dolt does.
   - Schema merge follows Dolt: additive changes merge, the same object
     changed differently on both sides is a schema conflict, and a
-    conflicting column type change fails the merge.
+    conflicting column type change fails the merge.  (User, 2026-10-18,
+    #159: as Dolt's, a column one side changed type merges with the other
+    side's changes to the table only as a string type (varchar, char,
+    text) made no shorter; any other change of type, int to bigint
+    included, is a schema conflict.  A table the other side didn't change
+    takes the change whatever it is.)
   - Checking out a commit (not a branch) gives a detached, read-only
     session; changing anything takes a branch made from it.
   - A merge gives each sequence the larger of its two values.

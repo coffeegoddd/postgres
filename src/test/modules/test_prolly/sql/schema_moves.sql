@@ -196,6 +196,75 @@ SELECT dolt_branch('-D', 'sm9_right');
 DROP SCHEMA sm9 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm9')::text) AS committed;
 
+-- Expressions Postgres doesn't print as they read back (an IN list over a
+-- varchar prints with its array's cast, read back as a cast of each
+-- element) are described as they read back: a branch moved by making them
+-- again from their text is defined as the commit is.  sm10_right is first
+-- used after main changed each of them, so its move makes them again.
+CREATE SCHEMA sm10 VERSIONED;
+CREATE DOMAIN sm10.d AS varchar(10) CHECK (VALUE IN ('a', 'b'));
+CREATE TABLE sm10.t (pk int PRIMARY KEY, c1 varchar(10) CHECK (c1 IN ('a', 'b')),
+	g bool GENERATED ALWAYS AS (c1 IN ('x', 'y')) STORED,
+	f bool DEFAULT ('q'::varchar IN ('a', 'b')), d sm10.d);
+CREATE POLICY p ON sm10.t USING (c1 IN ('a', 'b'));
+INSERT INTO sm10.t (pk, c1) VALUES (1, 'a');
+SELECT (dolt_commit('-Am', 'sm10 base'))[1] AS sm10_base \gset
+SELECT dolt_branch('sm10_right');
+ALTER DOMAIN sm10.d DROP CONSTRAINT d_check;
+ALTER DOMAIN sm10.d ADD CONSTRAINT d_check CHECK (VALUE IN ('a', 'b', 'c'));
+ALTER TABLE sm10.t DROP CONSTRAINT t_c1_check, ALTER COLUMN f SET DEFAULT true,
+	ADD CONSTRAINT t_c1_check CHECK (c1 IN ('a', 'b', 'c'));
+ALTER TABLE sm10.t ALTER COLUMN g SET EXPRESSION AS (c1 IN ('x', 'y', 'z'));
+DROP POLICY p ON sm10.t;
+CREATE POLICY p ON sm10.t USING (c1 IN ('a', 'b', 'c'));
+SELECT length(dolt_commit('-Am', 'sm10 main')::text) AS committed;
+SELECT dolt_checkout('sm10_right');
+SELECT test_fold_root() = prolly_root_hash(:'sm10_base') AS same_root;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sm10_right');
+DROP SCHEMA sm10 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm10')::text) AS committed;
+
+-- A move to a commit whose column has another type, from rows that don't
+-- cast to it (or cast to values its unique index refuses): every row is
+-- the commit's, so the branch's go first, with no trigger fired and no
+-- foreign key's action taken, and the table is kept (its privileges and
+-- comment with it).
+CREATE SCHEMA sm11 VERSIONED;
+CREATE TABLE sm11.log (n text);
+CREATE TABLE sm11.p (pk int PRIMARY KEY, col1 int UNIQUE);
+CREATE TABLE sm11.c (id int PRIMARY KEY, p int REFERENCES sm11.p ON DELETE CASCADE);
+CREATE FUNCTION sm11.f() RETURNS trigger LANGUAGE plpgsql
+	AS $$BEGIN INSERT INTO sm11.log VALUES ('fired'); RETURN OLD; END$$;
+CREATE TRIGGER tr BEFORE DELETE ON sm11.p FOR EACH ROW EXECUTE FUNCTION sm11.f();
+INSERT INTO sm11.p VALUES (1, 10), (2, 20);
+INSERT INTO sm11.c VALUES (1, 1), (2, 2);
+GRANT SELECT ON sm11.p TO PUBLIC;
+COMMENT ON TABLE sm11.p IS 'the p';
+SELECT 'sm11.p'::regclass::oid AS sm11_p \gset
+SELECT length(dolt_commit('-Am', 'sm11 base')::text) AS committed;
+SELECT dolt_branch('sm11_right');
+ALTER TABLE sm11.p ALTER COLUMN col1 TYPE varchar(100);
+INSERT INTO sm11.p VALUES (3, 'thirty'), (4, '03');
+UPDATE sm11.p SET col1 = '3' WHERE pk = 2;
+SELECT length(dolt_commit('-Am', 'sm11 main')::text) AS committed;
+SELECT dolt_checkout('sm11_right');
+SELECT * FROM sm11.p ORDER BY pk;
+SELECT * FROM sm11.c ORDER BY id;
+SELECT count(*) AS fired FROM sm11.log;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'sm11.p'::regclass AND attname = 'col1';
+SELECT 'sm11.p'::regclass::oid = :sm11_p AS same_table,
+	has_table_privilege('public', 'sm11.p', 'SELECT') AS granted,
+	obj_description('sm11.p'::regclass, 'pg_class') AS comment;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_checkout('main');
+SELECT * FROM sm11.p ORDER BY pk;
+SELECT dolt_branch('-D', 'sm11_right');
+DROP SCHEMA sm11 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
+
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;

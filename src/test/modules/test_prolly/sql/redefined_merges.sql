@@ -30,16 +30,29 @@ SELECT count(*) AS clean FROM dolt_status;
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rm.t)
 ORDER BY (coalesce(to_row, from_row)).id;
 
--- Ours retypes and drops a column; theirs changes rows.
+-- Ours drops a column; theirs changes rows.
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'main');
 UPDATE rm.t SET v = 'feature again' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'feature: a row')::text) AS committed;
 SELECT dolt_checkout('main');
-ALTER TABLE rm.t ALTER COLUMN n TYPE bigint, DROP COLUMN w;
+ALTER TABLE rm.t DROP COLUMN w;
 UPDATE rm.t SET n = 400 WHERE id = 4;
-SELECT length(dolt_commit('-am', 'main: n bigint, no w')::text) AS committed;
+SELECT length(dolt_commit('-am', 'main: no w')::text) AS committed;
 SELECT (dolt_merge('feature', '-m', 'merged again'))[3:4];
+SELECT * FROM rm.t ORDER BY id;
+
+-- Ours retypes a column theirs's rows changed under: a schema conflict, as
+-- in Dolt (only a string type made no shorter merges across the other
+-- side's changes), and the merge doesn't happen.
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main');
+UPDATE rm.t SET n = 30 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: n of a row')::text) AS committed;
+SELECT dolt_checkout('main');
+ALTER TABLE rm.t ALTER COLUMN n TYPE bigint;
+SELECT length(dolt_commit('-am', 'main: n bigint')::text) AS committed;
+SELECT (dolt_merge('feature', '-m', 'not merged'))[3:4];
 SELECT * FROM rm.t ORDER BY id;
 
 -- A row both changed is a conflict, listed as now defined.

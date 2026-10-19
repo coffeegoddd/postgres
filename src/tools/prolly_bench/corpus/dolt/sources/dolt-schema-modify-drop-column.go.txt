@@ -1,0 +1,28 @@
+{
+		// https://github.com/dolthub/dolt/issues/2973
+		Name: "modifying a column on one side of a merge, and deleting it on the other",
+		AncSetUpScript: []string{
+			"set @@autocommit=0;",
+			"create table t(i int primary key, j int);",
+		},
+		RightSetUpScript: []string{
+			"alter table t drop column j;",
+		},
+		LeftSetUpScript: []string{
+			"alter table t modify column j varchar(24);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_preview_merge_conflicts_summary('main', 'right');",
+				Expected: []sql.Row{{"t", nil, uint64(1)}},
+			},
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "select table_name from dolt_schema_conflicts",
+				Expected: []sql.Row{{"t"}},
+			},
+		},
+	}
