@@ -143,6 +143,9 @@ extern bool check_out_branch(Oid branch);
 /* lock a branch to delete it; false if a session is on it */
 extern bool lock_branch_for_delete(Oid branch);
 
+/* and against prepared transactions that were on it; error if one was */
+extern void lock_branch_unprepared(Oid branch, const char *name);
+
 /* note a branch the current subtransaction made */
 extern void note_new_branch(Oid branch);
 
