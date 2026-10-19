@@ -847,11 +847,12 @@ count_of(Changes *c, const StringInfoData *value)
 }
 
 /*
- * While a merge (or pick) runs: the constraint violations it records, and
- * the tables it wrote to, whose foreign keys are checked after; and the
- * last table whose rows a merge wrote, whether a row written may break a
- * constraint there, and its columns whose values a domain's constraint
- * may reject, with how each is checked (DomainPlan).
+ * Constraint state for merges (including picks) and conflict resolution:
+ * the violations a merge records, the tables it wrote to whose foreign
+ * keys are checked after, and the last table whose rows a merge or
+ * resolution checked, whether a row written may break a constraint there,
+ * and its columns whose values a domain's constraint may reject, with how
+ * each is checked (DomainPlan).
  */
 static bool recording = false;
 static List *recorded = NIL;	/* ProllyViolation * */
@@ -863,6 +864,22 @@ static struct DomainPlan **domain_plans = NULL; /* by attnum - 1 */
 static struct Removed *removed = NULL;	/* removed_begin() */
 
 static bool checks_domains(Relation rel);
+
+/*
+ * Start a merge or resolution without state from an earlier transaction.
+ * Every entry point must call this before consulting the cached state or
+ * calling note_constraints(): its pointers may outlive their transaction
+ * or subtransaction, on success or error.  Forget them without freeing or
+ * dereferencing them; their owning memory context reclaims the allocations.
+ */
+static void
+reset_constraints(void)
+{
+	breakable_relid = InvalidOid;
+	breakable_domains = NULL;
+	domain_plans = NULL;
+	removed = NULL;
+}
 
 static void
 note_written(Oid relid)
@@ -889,10 +906,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	recording = true;
 	recorded = NIL;
 	written = NIL;
-	breakable_relid = InvalidOid;
-	breakable_domains = NULL;
-	domain_plans = NULL;
-	removed = NULL;
+	reset_constraints();
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -1426,6 +1440,35 @@ row_domain_refusal(Relation rel, TupleTableSlot *row, const bool *keep,
 		}
 	}
 	return NULL;
+}
+
+/* Identify the table and primary key of a row refused during resolution. */
+static void
+describe_resolution_refusal(ErrorData *ed, Relation rel, TupleTableSlot *row)
+{
+	Relation	index;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	char	   *key;
+	char	   *detail;
+	char	   *name;
+
+	index = index_open(RelationGetPrimaryKeyIndex(rel, true), AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
+		values[i] = slot_getattr(row, index->rd_index->indkey.values[i],
+								 &isnull[i]);
+	key = BuildIndexValueDescription(index, values, isnull);
+	index_close(index, AccessShareLock);
+
+	ed->table_name = pstrdup(RelationGetRelationName(rel));
+	ed->schema_name = get_namespace_name(RelationGetNamespace(rel));
+	name = quote_qualified_identifier(ed->schema_name, ed->table_name);
+	if (key)
+		detail = psprintf("Key %s in table %s violates a domain constraint.",
+						  key, name);
+	else
+		detail = psprintf("A row in table %s violates a domain constraint.", name);
+	ed->detail = ed->detail ? psprintf("%s\n%s", ed->detail, detail) : detail;
 }
 
 /*
@@ -2991,19 +3034,37 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		kw.put_back = puts_back(rel, keyless);
 
 		/*
-		 * (rows --theirs takes, checked against the columns' typmods
-		 * before any is written)
+		 * Rows --theirs takes are checked against the columns' typmods
+		 * and domains before any is written.  Resolution doesn't run
+		 * inside merge_recording(), so start its constraint state here.
+		 * Compare with the branch's row now: an unchanged value allowed
+		 * by a NOT VALID domain constraint needn't be checked again.
 		 */
 		if (mode == WALK_TAKE_THEIRS)
 		{
+			reset_constraints();
+			note_constraints(rel, keyless);
 			foreach(lt, writes)
 			{
 				KeyWrite   *w = lfirst(lt);
+				TupleTableSlot *was = NULL;
+				ErrorData  *ed;
 
 				if (w->nrow == 0)
 					continue;
 				(void) decode(&tc, w->row, s2);
 				check_fits(&fits, rel, s2, NULL);
+				if (w->nold > 0)
+				{
+					(void) decode(&tc, w->old, s1);
+					was = s1;
+				}
+				ed = row_domain_refusal(rel, s2, NULL, was, NULL);
+				if (ed)
+				{
+					describe_resolution_refusal(ed, rel, s2);
+					ThrowErrorData(ed);
+				}
 			}
 		}
 		removed_begin(rel, keyless);
@@ -3154,7 +3215,9 @@ dup_bytes(const char *data, int len)
  *
  * Only a written value has to be one the column could hold now, and it's
  * converted as ALTER TABLE ... TYPE without USING converted the side's
- * own rows.  A value shown or compared is made the column's only where
+ * own rows.  Shown or compared values use domains' base types, with their
+ * typmods: a historical value needn't meet a domain's constraints now.
+ * A value shown or compared is made the column's only where
  * nothing is lost: it's cast, and the cast kept only if casting it back
  * gives the value again.  A lossy cast (rounding, cutting to fit) could
  * make two of base's keys one, or make a side's change look like none
@@ -3227,6 +3290,7 @@ typedef struct ColumnRead
 	FmgrInfo	out;			/* the old type's output */
 	Oid			in;				/* the new type's input */
 	Oid			in_param;
+	int32		in_typmod;		/* including a domain's base typmod */
 	CastLoss	loss;
 } ColumnRead;
 
@@ -3300,24 +3364,45 @@ is_bit_type(Oid type)
  * (canon_folded.c's move_table()).  One shown or compared goes through
  * the explicit cast (which cuts a string to fit rather than failing),
  * checked by casting it back unless the cast is a widening, or a relabel
- * of a type stored alike, which loses nothing.
+ * of a type stored alike, which loses nothing.  For these reads, strip
+ * domains from both ends of the cast (including the cast back): their
+ * constraints don't apply to values only shown or compared.
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 			ReadFor read, bool key, bool keyless, bool both, EState *estate,
 			ColumnRead *cr)
 {
-	Form_pg_attribute xa = TupleDescAttr(xd, j);
+	FormData_pg_attribute source = *TupleDescAttr(xd, j);
+	FormData_pg_attribute target = *att;
+	Form_pg_attribute xa = &source;
 	Node	   *var = (Node *) makeVar(1, j + 1, xa->atttypid, xa->atttypmod,
 									   xa->attcollation, 0);
 	Node	   *e = NULL;
 	Node	   *back;
-	bool		same = xa->atttypid == att->atttypid;
-	bool		alike = same ||
+	bool		same;
+	bool		alike;
+
+	if (read != READ_WRITTEN)
+	{
+		source.atttypid = getBaseTypeAndTypmod(source.atttypid,
+											   &source.atttypmod);
+		target.atttypid = getBaseTypeAndTypmod(target.atttypid,
+											   &target.atttypmod);
+		/* The Var must still match the version's tuple descriptor. */
+		if (source.atttypid != TupleDescAttr(xd, j)->atttypid)
+			var = (Node *) makeRelabelType((Expr *) var, source.atttypid,
+										   source.atttypmod, source.attcollation,
+										   COERCE_IMPLICIT_CAST);
+	}
+	att = &target;
+	same = xa->atttypid == att->atttypid;
+	alike = same ||
 		(get_typtype(att->atttypid) != TYPTYPE_DOMAIN &&
 		 IsBinaryCoercible(xa->atttypid, att->atttypid));
 
 	memset(cr, 0, sizeof(ColumnRead));
+	cr->in_typmod = att->atttypmod;
 	if (read == READ_WRITTEN)
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
@@ -3453,9 +3538,10 @@ same_but_trailing_blanks(Datum a, Datum b)
  * it (cr->back; or there's no cast back where one's needed), or differs
  * from the value's text form read as the new type (cr->by_text), or the
  * cast or that read fails with a data exception (value too long,
- * numeric field overflow, invalid input) where it's guarded; *d and
- * *isnull are then the cast's value if it gave one, else null.  Other
- * errors are raised.
+ * numeric field overflow, invalid input) or an integrity constraint
+ * violation (a domain nested in an array, composite or range) where it's
+ * guarded (written reads never are); *d and *isnull are then the cast's
+ * value if it gave one, else null.  Other errors are raised.
  */
 static bool
 read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
@@ -3487,7 +3573,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 												  xs->tts_values[j]);
 
 			*d = OidInputFunctionCall(cr->in, text, cr->in_param,
-									  att->atttypmod);
+									  cr->in_typmod);
 			*isnull = false;
 			goto done;
 		}
@@ -3514,7 +3600,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 			char	   *text = OutputFunctionCall((FmgrInfo *) &cr->out,
 												  xs->tts_values[j]);
 			Datum		t = OidInputFunctionCall(cr->in, text, cr->in_param,
-												 att->atttypmod);
+												 cr->in_typmod);
 
 			kept = datum_image_eq(t, *d, att->attbyval, att->attlen);
 		}
@@ -3534,7 +3620,8 @@ done:
 			PG_RE_THROW();
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION &&
+			ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION)
 			PG_RE_THROW();
 		FlushErrorState();
 		FreeErrorData(ed);
