@@ -125,3 +125,39 @@ SELECT dolt_branch('-D', 'side');
 DROP SCHEMA cl CASCADE;
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
 DROP TYPE public.cl_mood;
+
+-- a history whose public is versioned, cloned into a new database: its
+-- public, the default one, unversioned and empty, is replaced; one with
+-- objects in it is refused, named, and the clone leaves nothing
+\set url_pub :run '/pub'
+CREATE DATABASE regress_clone_p;
+\c regress_clone_p
+SET default_table_access_method = prolly;
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public VERSIONED;
+CREATE TABLE t (id int PRIMARY KEY);
+INSERT INTO t VALUES (1);
+SELECT length(dolt_commit('-Am', 'p 1')::text) AS committed;
+SELECT dolt_remote('add', 'origin', :'url_pub');
+SELECT dolt_push('origin', 'main') AS pushed;
+CREATE DATABASE regress_clone_q;
+\c regress_clone_q
+SELECT dolt_clone(:'url_pub');
+SELECT id FROM t;
+SELECT nspversioned FROM pg_namespace WHERE nspname = 'public';
+SELECT count(*) AS uncommitted FROM dolt_status;
+\c regress_clone_p
+DROP DATABASE regress_clone_q;
+CREATE DATABASE regress_clone_r;
+\c regress_clone_r
+CREATE TABLE public.mine (id int);
+SELECT dolt_clone(:'url_pub');
+SELECT count(*) AS remotes FROM dolt_remotes;
+SELECT nspversioned, (SELECT count(*) FROM pg_class WHERE relnamespace = n.oid) AS objects
+FROM pg_namespace n WHERE nspname = 'public';
+DROP TABLE public.mine;
+SELECT dolt_clone(:'url_pub');
+SELECT id FROM t;
+\c :db
+DROP DATABASE regress_clone_r;
+DROP DATABASE regress_clone_p;

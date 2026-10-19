@@ -4223,6 +4223,48 @@ collation_in_use(Oid coll)
 	return used;
 }
 
+/*
+ * A schema the move makes, name (quoted) as a commit has it: the statements
+ * making it.  An ordinary schema of its name is in the way: where the branch
+ * has no versioned schemas yet (a new database's first history, cloned or
+ * pushed into it), one with nothing in it, as a new database's public, is
+ * replaced; otherwise the move is refused, naming it.
+ */
+static List *
+make_schema(const char *name, bool first)
+{
+	char	   *plain = strVal(linitial(stringToQualifiedNameList(name, NULL)));
+	Oid			nsp = get_namespace_oid(plain, true);
+	char	   *create = psprintf("CREATE SCHEMA %s VERSIONED", name);
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		used;
+
+	if (!OidIsValid(nsp))
+		return list_make1(create);
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(nsp));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	used = systable_getnext(scan) != NULL;
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	if (!first || used)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+				 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+				 first ?
+				 errdetail("The commit's schema \"%s\" is versioned, and this one has objects in it.",
+						   plain) :
+				 errdetail("The commit's schema \"%s\" is versioned.", plain),
+				 errhint("Drop it, or rename it, and try again.")));
+	/* (no CASCADE: nothing is in it) */
+	return list_make2(psprintf("DROP SCHEMA %s", name), create);
+}
+
 /* A cast, as described (its method, then its context). */
 static char *
 create_cast_sql(const char *name, const char *def)
@@ -5096,6 +5138,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				   bool rewritten)
 {
 	bool		matviews_made = false;
+	bool		first = true;	/* the branch's first versioned schemas */
 	Canon		cn;
 	List	   *from;
 	List	   *to;
@@ -5306,13 +5349,17 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * options are set after.
 	 */
 	identities = identity_sequences(from, to, remade);
+	foreach(lc, from)
+	{
+		if (((MoveItem *) lfirst(lc))->kind == 'n')
+			first = false;
+	}
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'n' && find_item(from, 'n', t->name) == NULL)
-			schemas = lappend(schemas,
-							  psprintf("CREATE SCHEMA %s VERSIONED", t->name));
+			schemas = list_concat(schemas, make_schema(t->name, first));
 	}
 	foreach(lc, to)
 	{
