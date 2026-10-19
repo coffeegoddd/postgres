@@ -26,6 +26,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
+#include "access/twophase.h"
 #include "catalog/branch.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_aggregate.h"
@@ -625,6 +626,16 @@ set_session_branch(Oid branch)
  * locks are of the user lock method, as advisory locks are: an aborted
  * transaction releases a session's locks of the default one.
  *
+ * A prepared transaction outlives its session's stay on a branch, and may
+ * have rows there that only it can commit: a branch it was on, or wrote,
+ * would leave them on no branch at all if deleted.  So a transaction being
+ * prepared locks each such branch itself (AccessShareLock on it as an
+ * object, of the default method: PREPARE TRANSACTION passes it on, and a
+ * restart keeps it) before the session's own locks on the branches it left
+ * go, and deleting a branch takes AccessExclusiveLock there too.  A deletion
+ * doesn't wait for one, as it doesn't for a session: a prepared
+ * transaction may be finished only days later.
+ *
  * A branch made in the transaction disappears if the transaction (or the
  * subtransaction that made it) aborts: a session checked out on it goes
  * back to the branch it came from.
@@ -665,6 +676,70 @@ lock_branch_for_delete(Oid branch)
 	branch_locktag(&tag, branch);
 	return LockAcquire(&tag, AccessExclusiveLock, false, true) !=
 		LOCKACQUIRE_NOT_AVAIL;
+}
+
+/* (a transaction's lock on a branch, kept by it once prepared) */
+static void
+branch_xact_locktag(LOCKTAG *tag, Oid branch)
+{
+	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, BranchRelationId, branch, 0);
+}
+
+/*
+ * Lock a branch to delete or move it, until the transaction ends, against
+ * the prepared transactions that were on it: an error, naming one, if any
+ * is.
+ */
+void
+lock_branch_unprepared(Oid branch, const char *name)
+{
+	LOCKTAG		tag;
+	VirtualTransactionId *holders;
+	char		gid[GIDSIZE];
+
+	branch_xact_locktag(&tag, branch);
+	if (LockAcquire(&tag, AccessExclusiveLock, false, true) !=
+		LOCKACQUIRE_NOT_AVAIL)
+		return;
+
+	/* (none named if the one holding it is still being prepared) */
+	holders = GetLockConflicts(&tag, AccessExclusiveLock, NULL);
+	for (; VirtualTransactionIdIsValid(*holders); holders++)
+	{
+		if (TwoPhaseGetGidByVirtualXID(*holders, gid))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("branch \"%s\" has a prepared transaction on it",
+							name),
+					 errdetail("Prepared transaction \"%s\" was on it.", gid),
+					 errhint("Finish it with COMMIT PREPARED or ROLLBACK PREPARED first.")));
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_IN_USE),
+			 errmsg("branch \"%s\" has a prepared transaction on it", name),
+			 errhint("Finish it with COMMIT PREPARED or ROLLBACK PREPARED first.")));
+}
+
+/*
+ * The transaction being prepared locks the branches it was on or wrote,
+ * as a deletion sees (main, never deleted, isn't locked).
+ */
+static void
+lock_prepared_branches(void)
+{
+	List	   *branches = list_concat_unique_oid(list_copy(locked_branches),
+												  branches_written());
+
+	foreach_oid(branch, branches)
+	{
+		LOCKTAG		tag;
+
+		if (branch == BRANCH_MAIN_OID)
+			continue;
+		branch_xact_locktag(&tag, branch);
+		(void) LockAcquire(&tag, AccessShareLock, false, false);
+	}
+	list_free(branches);
 }
 
 /* go back from branches the (sub)transaction 'subid' made (all: invalid) */
@@ -986,6 +1061,9 @@ branch_xact_callback(XactEvent event, void *arg)
 			undo_returns(InvalidSubTransactionId);
 			release_left_branches();
 			forget_written(InvalidSubTransactionId);
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+			lock_prepared_branches();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
