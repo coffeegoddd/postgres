@@ -53,6 +53,7 @@ the record of what was decided for it. D1 is removed by #177, #178 and
 | Write amplification (`20-write-amplification.md`) | Decided by the user 2026-10-19, as recommended: per cell, for heap and prolly, over an interval that flushes deferred page and tree writes; WAL by resource manager; prolly's chunk-store and block-map bytes from `pg_stat_prolly`. **Open:** deleted rows' logical bytes, an exact row-byte counter, and counting bulk writes in `pg_stat_io` (part 4) |
 | Default writer (#148) | **Open:** whether `dolt.writer` defaults to the session or the role; revisited with data from the `owned` mode's use (`11-pages-and-dolt-snapshots.md` 6.2) |
 | Change finder "log" (2026-10-19) | Decided by the user: folds find changes from a change log per table, an entry per changed tuple version written with it, instead of from old page versions (`19-change-log.md`); built, "log" the default |
+| Schema diffs (#439) | Decided by the user 2026-10-19, as recommended (`21-schema-diffs.md` part 7): `dolt_diff_summary` and `dolt_schema_diff` over every object kind a commit holds; `''` for a missing side, as Doltgres; row diffs read columns by name, with no row changes where the data trees' hashes match (#437); no `alter` column; built before spec 11's step 8 |
 
 ## Questions
 
