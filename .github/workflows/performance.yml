@@ -406,7 +406,8 @@ jobs:
             --head "$HEAD_SHA" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
             --run-url "$RUN_URL" "${failed[@]}" \
             --reproduce "prolly_bench run S --am heap,prolly --config $BENCH/configs/s_counters.toml --pg-bin DIR (base and candidate, twice each); prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2" \
-            --out comment/comment.md || status=$?
+            --out comment/comment.md --report-output comment/report \
+            --results counters --results timing || status=$?
           [ "$TIMING" = success ] || echo "timing: $TIMING (reported only)" >> comment/comment.md
           cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
           echo "status=$status" >> "$GITHUB_OUTPUT"
@@ -416,6 +417,18 @@ jobs:
         with:
           name: s-suite-comment
           path: comment
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        with:
+          name: s-suite-report
+          path: |
+            comment/report.html
+            comment/report.md
+            counters
+            timing
+          retention-days: 30
           if-no-files-found: ignore
 
       - name: Verdict
@@ -628,14 +641,20 @@ jobs:
             status=0
             "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
               --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
-              --run-url "$RUN_URL" --out "$RUNNER_TEMP/nightly.md" > /dev/null || status=$?
+              --run-url "$RUN_URL" --out nightly/comment.md --report-output nightly/report \
+              --results nightly > /dev/null || status=$?
             confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
             if [ "$confirmed" != 0 ]; then
               verdict=regressed
             elif [ "$status" = 0 ]; then
               verdict=clean
             fi
-            cat "$RUNNER_TEMP/nightly.md" >> "$GITHUB_STEP_SUMMARY"
+            cat nightly/comment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            mkdir -p nightly
+            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
+              --head "$CANDIDATE" --base "$BASE" --run-url "$RUN_URL" \
+              --out nightly/comment.md --report-output nightly/report --results nightly > /dev/null || true
           fi
           echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
 

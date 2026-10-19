@@ -309,6 +309,16 @@ def _creport(args) -> int:
                            run_url=args.run_url, wall_clock=args.wall_clock,
                            failed_jobs=args.failed_job, engines=args.engines)
     args.out.write_text(report.text)
+    from pbench import finding_reports, presentation
+    from pbench.presentation import Section, link
+    output = args.report_output or args.out.with_name(args.out.stem + "-full")
+    document = finding_reports.correctness(report.summary,
+        {"base": args.base, "head": args.head, "base_ref": args.base_ref,
+         "run_url": args.run_url, "wall_clock": args.wall_clock}, report.details)
+    document.sections.append(Section("Source artifacts", ["Result set", "Report", "Evidence"],
+        [[p.name, link(p / "index.html", output.parent, "HTML report") if (p / "index.html").exists() else "unavailable",
+          link(p, output.parent, "run evidence")] for p in args.dirs]))
+    presentation.write(document, output)
     if args.json:
         args.json.write_text(json.dumps(report.summary, indent=1) + "\n")
     for problem in report.problems:
@@ -470,6 +480,7 @@ def main(argv=None) -> int:
                     help="the heap baseline at the base commit, for the change against it")
     cr.add_argument("--out", type=Path, required=True, help="the comment, Markdown")
     cr.add_argument("--json", type=Path, help="also a summary, JSON")
+    cr.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
     cr.add_argument("--corpus", type=Path, help="the corpus's test/ directory "
                     "(default: as the result sets recorded it)")
     cr.add_argument("--engines", type=_csv(str),
@@ -505,6 +516,7 @@ def main(argv=None) -> int:
     cal.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
     cal.add_argument("--out", type=Path, help="Markdown report")
     cal.add_argument("--json", type=Path)
+    cal.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
     cal.set_defaults(fn=scalibrate.run)
 
     from pbench import sgate
@@ -532,6 +544,8 @@ def main(argv=None) -> int:
     sr.add_argument("--failed-job", action="append", default=[], metavar="NAME: RESULT")
     sr.add_argument("--reproduce", help="a command that reproduces the run")
     sr.add_argument("--out", type=Path, required=True)
+    sr.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
+    sr.add_argument("--results", type=Path, action="append", default=[], help="retained result roots to link (repeatable)")
     sr.add_argument("--nightly", action="store_true",
                     help="a night against the night before: timing only")
     sr.set_defaults(fn=sreport.run)

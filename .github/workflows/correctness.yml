@@ -261,7 +261,8 @@ jobs:
               --base-baseline "$RUNNER_TEMP/base-baseline.tsv.gz" \
               --corpus "$PWD/slt-corpus/test" --head "$HEAD_SHA" --base "$base" \
               --base-ref "$BASE_REF" --run-url "$RUN_URL" --wall-clock "$minutes min" \
-              "${failed[@]}" --out comment/comment.md --json comment/summary.json
+              "${failed[@]}" --out comment/comment.md --json comment/summary.json \
+              --report-output comment/report
           } || status=$?
           # (a report that couldn't be written still replaces an earlier one)
           if [ "$status" != 0 ] && [ ! -s comment/comment.md ]; then
@@ -279,6 +280,18 @@ jobs:
         with:
           name: c-suite-comment
           path: comment
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true'
+        with:
+          name: c-suite-report
+          path: |
+            comment/report.html
+            comment/report.md
+            comment/summary.json
+            shards
+          retention-days: 30
           if-no-files-found: ignore
 
       - name: Verdict

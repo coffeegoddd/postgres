@@ -497,6 +497,18 @@ interruption marks execution `interrupted`; other execution errors mark it
 Reports show the original plan and missing cells. A lock-rejected process does
 not write reports or the catalog.
 
+`sreport`, `creport`, and `scalibrate` also save full HTML and Markdown
+artifacts alongside their existing comments/reports (the output stem
+defaults to `<out-stem>-full`; override it with `--report-output STEM`).
+Full reports use the same gate findings and have no comment character limit.
+C failure examples retain the analyzer's sampling limit; complete differences
+remain in linked evidence. CI uploads `s-suite-report`, `c-suite-report`, and
+`s-calibration-report` bundles containing reports plus their source evidence.
+Open `comment/report.html` for PR runs or `calibration/report.html` for
+calibration after unpacking. Nightly artifacts contain `report.html` at their
+root. Existing sticky comment markers, size limits and gate policies are
+unchanged.
+
 `specs/results/<date>-<suite>-<label>/`:
 
 | File | Contents |
