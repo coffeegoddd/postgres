@@ -88,6 +88,10 @@
  *   them, the store's own reasons (a logical replication slot may still
  *   decode a row naming what was appended after its position): roots, as
  *   gc_new()'s.
+ * - sync_file() fsyncs a file of a store a sync request names (one it
+ *   made with SYNC_HANDLER_PROLLY_CHUNKS, its impl_id the tag's forknum),
+ *   for a checkpoint: 0, or -1 with errno set and path the file's.  A file
+ *   gone since (a collection retired it) is no error.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -119,6 +123,7 @@
 #include "lib/stringinfo.h"
 
 typedef struct ProllyChunkStore ProllyChunkStore;
+struct FileTag;
 
 /* Visits a chunk another chunk names. */
 typedef void (*ProllyChunkRefVisit) (const ProllyHash *ref, void *arg);
@@ -286,6 +291,9 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
 								void *arg);
 
+	/* Checkpoints: a file a sync request names, fsynced (optional). */
+	int			(*sync_file) (const struct FileTag *ftag, char *path);
+
 	/*
 	 * The roots the store was moved to, oldest first, each with when (the
 	 * reflog): those whose moves it still records, which a garbage
@@ -302,7 +310,7 @@ typedef struct ProllyChunkStoreRoutine
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept", "gc_retained", "roots"
+	"keep", "gc_kept", "gc_retained", "sync_file", "roots"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK roots
 
@@ -323,6 +331,11 @@ extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
+
+/* The sync handler of the stores' files (storage/sync.h). */
+extern int	prolly_chunks_syncfiletag(const struct FileTag *ftag, char *path);
+extern bool prolly_chunks_filetagmatches(const struct FileTag *ftag,
+										 const struct FileTag *candidate);
 
 /* The chunks a chunk names, as the server's trees lay their nodes out. */
 extern void prolly_chunk_references(const void *data, Size len,

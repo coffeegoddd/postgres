@@ -167,6 +167,7 @@
 #include "storage/spin.h"
 #include "replication/slot.h"
 #include "storage/standby.h"
+#include "storage/sync.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -375,6 +376,12 @@ typedef struct JournalShared
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
 	pg_atomic_uint64 keeps_begun;	/* keep sets begun */
+
+	/*
+	 * A sync request the checkpointer's queue refused: the next checkpoint
+	 * fsyncs every store's files instead.
+	 */
+	pg_atomic_uint32 sync_all;
 
 	/* a process's own, by proc number: ranges, then (touches()) touches */
 	int			nranges;
@@ -1001,6 +1008,37 @@ open_segment(Segment *g)
 	return true;
 }
 
+/* what a sync request names, in its tag's relNumber */
+#define SYNC_SEGMENT		0
+#define SYNC_TABLE_FILE		1
+
+static JournalShared *shared(void);
+
+/*
+ * Ask the next checkpoint to fsync a segment (or a table file) about to be
+ * written: before the write's WAL record, so a checkpoint whose redo point
+ * follows that record has the request; the checkpoint waits for the write
+ * (the append's range, or DELAY_CHKPT_START) before the requests are
+ * fsynced.  Never waits: a request the queue refuses makes the next
+ * checkpoint fsync everything instead.
+ */
+static void
+request_sync(Oid dboid, Oid spcoid, int kind, uint64 id)
+{
+	FileTag		tag;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.handler = SYNC_HANDLER_PROLLY_CHUNKS;
+	tag.forknum = (int16) prolly_chunkstore_journal.info.impl_id;
+	tag.rlocator.spcOid = spcoid;
+	tag.rlocator.dbOid = dboid;
+	tag.rlocator.relNumber = kind;
+	tag.segno = id;
+	if (IS_INJECTION_POINT_ATTACHED("prolly-sync-request-refused") ||
+		!RegisterSyncRequest(&tag, SYNC_REQUEST, false))
+		pg_atomic_write_u32(&shared()->sync_all, 1);
+}
+
 /*
  * WAL-log bytes written to a segment at offset, flush the log, and only
  * then write them (to file, or to fd if file is -1): so the segment never
@@ -1022,6 +1060,7 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 	xlrec.segment = segment;
 	xlrec.offset = offset;
 
+	request_sync(dboid, spcoid, SYNC_SEGMENT, segment);
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
@@ -1184,7 +1223,6 @@ segment_header(Oid dboid, Oid spcoid, uint64 id)
 static void refresh_segments(ProllyChunkStore *s);
 static uint64 manifests_count(void);
 
-static JournalShared *shared(void);
 static void scan_segment(ProllyChunkStore *s, Segment *g);
 static uint64 index_range(ProllyChunkStore *s, Segment *g, uint64 offset,
 						  uint64 end, char **rec, Size *reclen);
@@ -1609,6 +1647,7 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	a->at = Max(GetCurrentTimestamp(), js->last_at);
 	js->last_at = a->at;
 
+	request_sync(s->dboid, s->spcoid, SYNC_SEGMENT, g->id);
 	Assert(r->len == 0);
 	START_CRIT_SECTION();
 	SpinLockAcquire(&js->mutex);
@@ -2833,6 +2872,7 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 	xlrec.id = id;
 	xlrec.offset = offset;
 
+	request_sync(s->dboid, s->spcoid, SYNC_TABLE_FILE, id);
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
@@ -3694,6 +3734,7 @@ journal_commit_redo(const char *data, Size len)
 	root_record(&rec, &p.root, p.at, false);
 	path = segment_path(p.dboid, p.spcoid, p.segment);
 	write_at(path, rec.data, rec.len, p.offset);
+	request_sync(p.dboid, p.spcoid, SYNC_SEGMENT, p.segment);
 	pfree(path);
 	pfree(rec.data);
 }
@@ -3731,6 +3772,7 @@ table_files_redo(XLogReaderState *record)
 		}
 		write_at(path, XLogRecGetData(record) + SizeOfChunksFile,
 				 XLogRecGetDataLen(record) - SizeOfChunksFile, xlrec.offset);
+		request_sync(xlrec.dboid, xlrec.spcoid, SYNC_TABLE_FILE, xlrec.id);
 		pfree(path);
 	}
 	else if (info != XLOG_CHUNKS_UNLINK)
@@ -3799,6 +3841,7 @@ journal_redo(XLogReaderState *record)
 			path = segment_path(xlrec.dboid, xlrec.spcoid, xlrec.segment);
 			write_at(path, XLogRecGetData(record) + SizeOfChunksAppend,
 					 XLogRecGetDataLen(record) - SizeOfChunksAppend, xlrec.offset);
+			request_sync(xlrec.dboid, xlrec.spcoid, SYNC_SEGMENT, xlrec.segment);
 			pfree(path);
 			break;
 		case XLOG_CHUNKS_FILE:
@@ -3872,9 +3915,11 @@ sync_journals_under(const char *parent)
 }
 
 /*
- * Make every journal's appends durable.  Appends logged before the redo
- * point were written before it was set (DELAY_CHKPT_START), so this covers
- * them.
+ * Make every journal's appends durable: once the appends reserved before
+ * the redo point are written, the checkpoint fsyncs the files their sync
+ * requests name (what was written since the last one), after this.  A
+ * request the queue refused meanwhile has every store's files fsynced
+ * here instead.
  */
 static void
 journal_checkpoint(void)
@@ -3884,6 +3929,8 @@ journal_checkpoint(void)
 
 	/* the appends reserved before the redo point, written */
 	wait_reserved(NULL);
+	if (pg_atomic_exchange_u32(&shared()->sync_all, 0) == 0)
+		return;
 	sync_journals_under("base");
 
 	tsdir = AllocateDir(PG_TBLSPC_DIR);
@@ -3901,6 +3948,38 @@ journal_checkpoint(void)
 		pfree(sub);
 	}
 	FreeDir(tsdir);
+}
+
+/* fsync the segment or table file a sync request names. */
+static int
+journal_sync_file(const FileTag *ftag, char *path)
+{
+	char	   *dir = GetDatabasePath(ftag->rlocator.dbOid, ftag->rlocator.spcOid);
+	char	   *file;
+	int			fd;
+	int			save_errno;
+
+	if (ftag->rlocator.relNumber == SYNC_TABLE_FILE)
+		file = table_file_path(dir, ftag->segno);
+	else
+		file = segment_path(ftag->rlocator.dbOid, ftag->rlocator.spcOid,
+							ftag->segno);
+	strlcpy(path, file, MAXPGPATH);
+	pfree(file);
+	pfree(dir);
+	INJECTION_POINT("prolly-checkpoint-chunk-file", NULL);
+	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;	/* (gone: retired since) */
+	if (pg_fsync(fd) < 0)
+	{
+		save_errno = errno;
+		CloseTransientFile(fd);
+		errno = save_errno;
+		return -1;
+	}
+	CloseTransientFile(fd);
+	return 0;
 }
 
 static void
@@ -5654,6 +5733,7 @@ journal_shmem_init(void *area)
 	/* every backend reads the manifests once */
 	pg_atomic_init_u64(&js->manifests, 1);
 	pg_atomic_init_u64(&js->keeps_begun, 0);
+	pg_atomic_init_u32(&js->sync_all, 0);
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
 	js->nranges = append_ranges();
@@ -5843,5 +5923,6 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.keep = journal_keep,
 	.gc_kept = journal_gc_kept,
 	.gc_retained = journal_gc_retained,
+	.sync_file = journal_sync_file,
 	.roots = journal_roots,
 };

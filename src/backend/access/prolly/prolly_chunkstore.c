@@ -20,6 +20,7 @@
 #include "access/prolly_hash.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_xlog.h"
+#include "storage/sync.h"
 
 /* the implementation the server's stores use */
 #define CHUNK_STORE_IMPL	"journal"
@@ -106,6 +107,28 @@ prolly_chunkstore_checkpoint(void)
 
 	if (PROLLY_HAS(store, checkpoint))
 		store->checkpoint();
+}
+
+/*
+ * A sync request's file, fsynced by the implementation that made the
+ * request (its impl_id is the tag's forknum).
+ */
+int
+prolly_chunks_syncfiletag(const FileTag *ftag, char *path)
+{
+	const ProllyChunkStoreRoutine *store = store_by_id((uint16) ftag->forknum);
+
+	if (!PROLLY_HAS(store, sync_file))
+		elog(ERROR, "chunk store \"%s\" makes no sync requests",
+			 store->info.name);
+	return store->sync_file(ftag, path);
+}
+
+/* (a database's requests, as a filter request names them) */
+bool
+prolly_chunks_filetagmatches(const FileTag *ftag, const FileTag *candidate)
+{
+	return ftag->rlocator.dbOid == candidate->rlocator.dbOid;
 }
 
 void

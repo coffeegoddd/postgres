@@ -126,24 +126,6 @@ SKIP:
 	like($out, qr/o3/, 'a reader whose files went meanwhile reads the newer ones');
 	$r->quit;
 
-	# A checkpoint syncing a table file a conjoin removes meanwhile carries on.
-	sql(q{SELECT test_chunk_table_file(ARRAY['o4'::bytea])});
-	sql(q{SELECT injection_points_attach('prolly-checkpoint-table-file', 'wait')});
-	my $c = $node->background_psql('postgres');
-	$c->query_until(qr/started/, q{
-		\echo started
-		CHECKPOINT;
-		\echo done
-	});
-	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE wait_event = 'prolly-checkpoint-table-file'}) or die 'the checkpoint did not wait';
-	sql('SELECT test_chunk_conjoin()');
-	sql(q{SELECT injection_points_detach('prolly-checkpoint-table-file')});
-	sql(q{SELECT injection_points_wakeup('prolly-checkpoint-table-file')});
-	$c->query_until(qr/done/, '');
-	$c->quit;
-	is(sql('SELECT 1'), '1', 'a checkpoint racing a conjoin completes');
-
 	# A conjoin that fails gives its files back.
 	my $fds = q{SELECT count(*) FROM pg_ls_dir('/proc/self/fd')};
 	my $s = $node->background_psql('postgres', on_error_stop => 0);

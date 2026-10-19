@@ -21,6 +21,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/prolly_chunkstore.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -122,6 +123,11 @@ static const SyncOps syncsw[] = {
 		.sync_syncfiletag = bmapsyncfiletag,
 		.sync_unlinkfiletag = bmapunlinkfiletag,
 		.sync_filetagmatches = bmapfiletagmatches
+	},
+	/* prolly's chunk store: its journal's segments */
+	[SYNC_HANDLER_PROLLY_CHUNKS] = {
+		.sync_syncfiletag = prolly_chunks_syncfiletag,
+		.sync_filetagmatches = prolly_chunks_filetagmatches
 	}
 };
 
