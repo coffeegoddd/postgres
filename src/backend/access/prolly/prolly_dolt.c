@@ -356,6 +356,19 @@ option_value(char **args, int nargs, int *i, const char *fn)
 	return args[++(*i)];
 }
 
+/*
+ * Is arg the long option name, given with two dashes or one ("--no-ff",
+ * "-no-ff"), as Dolt's argument parser takes either?
+ */
+static bool
+long_option(const char *arg, const char *name)
+{
+	if (arg[0] != '-')
+		return false;
+	arg += arg[1] == '-' ? 2 : 1;
+	return strcmp(arg, name) == 0;
+}
+
 static void
 unsupported(const char *fn, const char *arg)
 {
@@ -1504,7 +1517,8 @@ refuse_violations(const char *what)
  *	  {commit id, fast_forward, conflicts, message}
  *
  * branch; --no-ff; --ff-only; --squash; --no-commit; -m/--message
- * message; --abort.  Rows changed differently on both sides leave the
+ * message; --abort (each long option with one dash or two, as Dolt
+ * takes them).  Rows changed differently on both sides leave the
  * merge in progress, with conflicts (dolt_conflicts) to resolve before
  * dolt_commit makes the merge commit; --no-commit leaves it so without
  * them.  As in Dolt, a transaction can't commit with conflicts unless
@@ -1544,19 +1558,19 @@ dolt_merge(PG_FUNCTION_ARGS)
 			else
 				unexpected("dolt_merge", a);
 		}
-		else if (strcmp(a, "--no-ff") == 0)
+		else if (long_option(a, "no-ff"))
 			flags |= PROLLY_MERGE_NO_FF;
-		else if (strcmp(a, "--ff-only") == 0)
+		else if (long_option(a, "ff-only"))
 			flags |= PROLLY_MERGE_FF_ONLY;
-		else if (strcmp(a, "--squash") == 0)
+		else if (long_option(a, "squash"))
 			flags |= PROLLY_MERGE_SQUASH;
-		else if (strcmp(a, "--no-commit") == 0)
+		else if (long_option(a, "no-commit"))
 			flags |= PROLLY_MERGE_NO_COMMIT;
-		else if (strcmp(a, "--commit") == 0)
+		else if (long_option(a, "commit"))
 			commit = true;		/* (as without it) */
-		else if (strcmp(a, "--abort") == 0)
+		else if (long_option(a, "abort"))
 			abort_merge = true;
-		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
+		else if (strcmp(a, "-m") == 0 || long_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_merge");
 		else
 			unsupported("dolt_merge", a);

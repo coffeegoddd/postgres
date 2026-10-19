@@ -16,6 +16,10 @@ SELECT dolt_checkout('main');
 SELECT dolt_merge('--ff-only', '--no-ff', 'mo_feature');
 SELECT dolt_merge('--ff-only', '--squash', 'mo_feature');
 SELECT dolt_merge('--squash', '--no-ff', 'mo_feature');
+-- (a long option with one dash too, as Dolt's parser takes it)
+SELECT dolt_merge('-ff-only', '-no-ff', 'mo_feature');
+SELECT dolt_merge('-squash', '-no-ff', '-message', 'x', 'mo_feature');
+SELECT dolt_merge('-nope', 'mo_feature');
 
 -- The merge base of two refs is the commit a merge of them starts from.
 SELECT dolt_merge_base('main', 'mo_feature') = dolt_hashof('main') AS base_is_main;

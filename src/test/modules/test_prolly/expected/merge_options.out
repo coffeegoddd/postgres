@@ -42,6 +42,13 @@ SELECT dolt_merge('--ff-only', '--squash', 'mo_feature');
 ERROR:  flags "--ff-only" and "--squash" cannot be used together
 SELECT dolt_merge('--squash', '--no-ff', 'mo_feature');
 ERROR:  flags "--squash" and "--no-ff" cannot be used together
+-- (a long option with one dash too, as Dolt's parser takes it)
+SELECT dolt_merge('-ff-only', '-no-ff', 'mo_feature');
+ERROR:  flags "--ff-only" and "--no-ff" cannot be used together
+SELECT dolt_merge('-squash', '-no-ff', '-message', 'x', 'mo_feature');
+ERROR:  flags "--squash" and "--no-ff" cannot be used together
+SELECT dolt_merge('-nope', 'mo_feature');
+ERROR:  dolt_merge: "-nope" is not supported
 -- The merge base of two refs is the commit a merge of them starts from.
 SELECT dolt_merge_base('main', 'mo_feature') = dolt_hashof('main') AS base_is_main;
  base_is_main 

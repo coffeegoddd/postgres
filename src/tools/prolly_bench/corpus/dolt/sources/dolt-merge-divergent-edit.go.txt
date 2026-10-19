@@ -1,0 +1,31 @@
+{
+		Name: "divergent edit conflict",
+		SetUpScript: []string{
+			"set @@dolt_allow_commit_conflicts = 1",
+			"create table xyz (x int primary key, y int, z int, key y_idx(y), key z_idx(z))",
+			"insert into xyz values (0,0,0), (1,1,1)",
+			"call dolt_commit('-Am', 'make table')",
+
+			"call dolt_checkout('-b', 'feature')",
+			"update xyz set y = 3 where y = 1",
+			"call dolt_commit('-am', 'right delete')",
+
+			"call dolt_checkout('main')",
+			"update xyz set y = 2 where y = 1",
+			"call dolt_commit('-am', 'left update')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM dolt_preview_merge_conflicts_summary('main', 'feature')",
+				Expected: []sql.Row{{"xyz", uint64(1), uint64(0)}},
+			},
+			{
+				Query:    "CALL DOLT_MERGE('feature');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "select our_y, our_diff_type, their_y, their_diff_type from dolt_conflicts_xyz",
+				Expected: []sql.Row{{2, "modified", 3, "modified"}},
+			},
+		},
+	}

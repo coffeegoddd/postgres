@@ -1,0 +1,36 @@
+{
+		Name: "merge conflicts prevent new branch creation",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int primary key, val int)",
+			"call DOLT_ADD('.')",
+			"INSERT INTO test VALUES (0, 0)",
+			"SET autocommit = 0",
+			"CALL DOLT_COMMIT('-a', '-m', 'Step 1', '--date', '2022-08-06T12:00:01');",
+			"CALL DOLT_CHECKOUT('-b', 'feature-branch')",
+			"INSERT INTO test VALUES (1, 1);",
+			"UPDATE test SET val=1000 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'this is a normal commit', '--date', '2022-08-06T12:00:02');",
+			"CALL DOLT_CHECKOUT('main');",
+			"UPDATE test SET val=1001 WHERE pk=0;",
+			"CALL DOLT_COMMIT('-a', '-m', 'update a value', '--date', '2022-08-06T12:00:03');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_MERGE('feature-branch', '-m', 'this is a merge')",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "SELECT is_merging, source, target, unmerged_tables FROM DOLT_MERGE_STATUS;",
+				Expected: []sql.Row{{true, "feature-branch", "refs/heads/main", "test"}},
+			},
+			{
+				Query:    "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{{"test", byte(0), "modified"}, {"test", byte(0), "conflict"}},
+			},
+			{
+				// errors because creating a new branch implicitly commits the current transaction
+				Query:          "CALL DOLT_CHECKOUT('-b', 'other-branch')",
+				ExpectedErrStr: dsess.ErrUnresolvedConflictsCommit.Error(),
+			},
+		},
+	}
