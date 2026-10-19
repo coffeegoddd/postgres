@@ -16,6 +16,7 @@ import fcntl
 import json
 import re
 import socket
+import sys
 import subprocess
 import time
 import traceback
@@ -377,10 +378,13 @@ def interleave(plans, seed):
     return [entry for pair in pairs for entry in pair]
 
 
-def run_many(runners):
+def run_many(runners, report_format="both"):
     if not runners:
         raise ValueError("no engines requested")
     results = [[] for _ in runners]
+    from pbench import report_files
+    invocation = report_files.begin(runners, report_format) if report_format != "none" else None
+    execution_error = None
     try:
         plans = [runner._open(lock=i == 0) for i, runner in enumerate(runners)]
         schedule = interleave(plans, runners[0].cfg["run"]["seed"])
@@ -396,13 +400,38 @@ def run_many(runners):
             results[i].append(result)
             for sink in runner.sinks:
                 sink.cell(result)
+        errors = []
         for runner, cells in zip(runners, results):
             for sink in runner.sinks:
-                sink.close(runner.info, cells)
+                try:
+                    sink.close(runner.info, cells)
+                except (OSError, ValueError, RuntimeError) as e:
+                    errors.append(f"{runner.label}/{sink.name}: {e}")
+        if errors:
+            raise RuntimeError("evidence finalization failed: " + "; ".join(errors))
         return results
+    except BaseException as e:
+        execution_error = e
+        for runner in runners:
+            for sink in runner.sinks:
+                try:
+                    sink.abort()
+                except (OSError, ValueError, RuntimeError) as cleanup_error:
+                    print(f"Sink cleanup failed: {cleanup_error}", file=sys.stderr)
+        raise
     finally:
         for runner in runners:
             for name in ("_host_lock", "_lock"):
                 lock = getattr(runner, name, None)
                 if lock is not None:
                     lock.close()
+        if invocation:
+            try:
+                paths, _ = report_files.invocation(invocation, execution="interrupted" if execution_error else "complete")
+                paths += report_files.catalog(runners[0].out_dir.parent, report_format)
+                for path in paths:
+                    print(f"Report: {path}")
+            except (OSError, ValueError, RuntimeError) as e:
+                print(f"Report generation failed; execution evidence retained: {e}", file=sys.stderr)
+                if execution_error is None:
+                    raise

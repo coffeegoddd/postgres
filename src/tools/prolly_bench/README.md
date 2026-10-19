@@ -444,11 +444,55 @@ Missing tools are `unavailable`, and metrics that don't apply are
 
 ## Results
 
+Every `run` writes HTML and Markdown automatically after measurement and
+evidence finalization. Open `index.html` in a result directory for one
+engine/build, or `reports/<invocation-id>/index.html` under the output root
+for exactly the engines/builds run together. The output root's `index.html`
+and `index.md` list saved runs and invocations, including failed runs.
+All HTML is standalone, works from disk without network access, and links
+to retained evidence with relative paths. Move the result tree together to
+preserve those links.
+
+Reports include a workload overview, coverage and provenance, metric tables
+with medians and spread, compatible comparisons and repetition details.
+Additional numeric metrics appear even when they have no curated heading;
+their units are explicitly unspecified and they receive no performance
+ranking. Invalid or missing evidence remains visible. Engine comparisons
+use heap within the same build; candidate/base comparisons appear in both
+formats. C reports show correctness comparisons when heap is present.
+
+```sh
+# Regenerate from saved evidence; no database server is needed.
+src/tools/prolly_bench/prolly_bench report RESULT_DIR
+src/tools/prolly_bench/prolly_bench report RESULT_DIR --format html
+src/tools/prolly_bench/prolly_bench report HEAP_DIR PROLLY_DIR --output /tmp/storage
+src/tools/prolly_bench/prolly_bench report --manifest ROOT/reports/ID/report.json
+src/tools/prolly_bench/prolly_bench report --catalog ROOT
+src/tools/prolly_bench/prolly_bench table --suite C --format both
+src/tools/prolly_bench/prolly_bench compare HEAP_DIR PROLLY_DIR --format both --output /tmp/comparison
+```
+
+`report`, `table`, and the new formatted `compare` mode accept
+`--format html|markdown|both`. Single-set reports default to `README.md`
+and `index.html`. Explicit output stems produce `.md` and `.html`; multiple
+sets require a stem. Existing `compare` without `--format` still prints
+Markdown or writes it to the exact `--output` filename.
+`run --report-format html|markdown|both|none` chooses automatic formats
+(default `both`). `none` retains execution evidence without derived reports.
+
+Invocation manifests record the original plan, exact source directories and
+source fingerprints. Regeneration diagnoses replaced evidence. Reports are
+derived files outside the execution manifest's hashes; regenerating them
+does not invalidate a run. A renderer failure returns an error while
+preserving all finalized evidence. Orderly interruption leaves an incomplete
+execution manifest and a report showing the missing planned cells.
+
 `specs/results/<date>-<suite>-<label>/`:
 
 | File | Contents |
 |---|---|
 | `README.md` | Command, config, environment, warnings, collector status, summary tables (median and min-max per cell) |
+| `index.html` | Standalone HTML with the same findings and tables as the Markdown report |
 | `config.json` | The resolved configuration |
 | `environment.json` | Machine, kernel, CPU settings, filesystem, device, build, git commits, fio baseline |
 | `run.json` | Versioned plan, completion state, comparison identity and artifact hashes |

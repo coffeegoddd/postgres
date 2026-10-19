@@ -8,7 +8,7 @@
   prolly_bench cbaseline check DIR...           C suite: heap against the checked-in baseline
   prolly_bench creport DIR... --shards N ...    C suite: the pull-request comment
   prolly_bench list                             workloads, collectors, sinks
-  prolly_bench report DIR                       rewrite DIR/README.md
+  prolly_bench report DIR                       regenerate HTML and Markdown reports
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
   prolly_bench table [DIR ...]                  engines side by side, per metric
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
@@ -154,7 +154,7 @@ def _run(args: argparse.Namespace) -> int:
             runners.append(runner)
             out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run
-    all_results = run_many(runners)
+    all_results = run_many(runners, report_format=args.report_format)
     ok = all(bool(results) and not validate_run(runner.out_dir)
              for runner, results in zip(runners, all_results))
     if args.suite == "S":
@@ -223,14 +223,43 @@ def _list(_args) -> int:
 
 
 def _report(args) -> int:
-    from pbench import report
-    report.write_readme(args.dir)
-    print(args.dir / "README.md")
-    from pbench.core.validation import validate_run
-    return int(bool(validate_run(args.dir)))
+    from pbench import presentation, report_files, reports
+    if args.catalog:
+        if args.dirs or args.manifest or args.output:
+            raise ValueError("--catalog cannot be combined with inputs, --manifest or --output")
+        paths = report_files.catalog(args.catalog, args.format)
+        passed = True
+    elif args.manifest:
+        if args.dirs or args.output:
+            raise ValueError("--manifest cannot be combined with inputs or --output")
+        paths, passed = report_files.invocation(args.manifest, formats=args.format)
+    else:
+        if not args.dirs:
+            raise ValueError("give result directories, --manifest or --catalog")
+        sources = [reports.load(d) for d in args.dirs]
+        if len(sources) == 1 and not args.output:
+            paths, passed = report_files.result_set(sources[0], args.format)
+        else:
+            if not args.output:
+                raise ValueError("multiple result sets require --output STEM")
+            document = reports.build(sources, args.output.parent)
+            paths = presentation.write(document, args.output, args.format)
+            passed = document.passed
+    for path in paths:
+        print(path)
+    return int(not passed)
 
 
 def _compare(args) -> int:
+    if args.format:
+        from pbench import presentation, reports
+        if not args.output:
+            raise ValueError("--format requires --output STEM")
+        document = reports.build([reports.load(args.baseline), reports.load(args.dir)],
+                                 args.output.parent, baseline=args.baseline)
+        for path in presentation.write(document, args.output, args.format):
+            print(path)
+        return int(not document.passed)
     from pbench import report
     text = report.compare(args.baseline, args.dir)
     if args.output:
@@ -316,41 +345,32 @@ def _gate(args) -> int:
 
 
 def _table(args) -> int:
-    from pbench import table
+    from pbench import presentation, reports
     if args.dirs:
-        sets = [table.load_set(d) for d in args.dirs]
-        suites = {s.suite for s in sets}
-        if len(suites) != 1:
-            raise SystemExit("give result sets of one suite")
-        suite = suites.pop()
+        sources = [reports.load(d) for d in args.dirs]
     else:
-        suite = args.suite
-        sets = table.discover(args.results, suite)
-    if not sets:
-        raise SystemExit(f"no {suite} result sets under {args.results}")
+        latest = {}
+        for run in sorted(args.results.glob("*/run.json")):
+            source = reports.load(run.parent)
+            if source.run.get("suite") != args.suite:
+                continue
+            label = source.label
+            if label not in latest or source.run.get("started", "") > latest[label].run.get("started", ""):
+                latest[label] = source
+        sources = list(latest.values())
+    if not sources:
+        raise ValueError(f"no {args.suite} result sets under {args.results}")
+    suite = sources[0].run.get("suite", args.suite)
     out = args.output or args.results / f"summary-{suite}"
-    if suite == "C":
-        from pbench import ccompare
-        md = ccompare.to_markdown(sets)
-        out.with_suffix(".md").write_text(md)
-        print(md)
-        print(f"written: {out.with_suffix('.md')}")
-        base = next((s for s in sets if s.table_am == "heap"), None)
-        workloads = sorted({r["key"]["workload"] for s in sets for r in s.results})
-        return int(base is None or len(sets) < 2 or any(ccompare.gate(base, s, workloads)
-                   for s in sets if s is not base))
-    md = table.to_markdown(sets, suite)
-    if any(s.build for s in sets):
-        from pbench import bcompare
-        md += "\n" + bcompare.to_markdown(bcompare.compare(sets))
-    out.with_suffix(".md").write_text(md)
-    out.with_suffix(".html").write_text(table.to_html(sets, suite))
-    print(md)
-    print(f"written: {out.with_suffix('.md')}\n         {out.with_suffix('.html')}")
-    from pbench.core.validation import compatible
-    base = next((s for s in sets if s.is_baseline), None)
-    return int(any(s.problems for s in sets) or bool(base and any(
-        compatible(base.path, s.path) for s in sets if s is not base)))
+    document = reports.build(sources, out.parent)
+    if not args.dirs:
+        document.notes.insert(0, "Selection: latest result set per label; these runs may belong to different invocations.")
+    paths = presentation.write(document, out, args.format)
+    if args.format in ("both", "markdown"):
+        print(presentation.MarkdownRenderer().render(document))
+    for path in paths:
+        print(f"written: {path}")
+    return int(not document.passed)
 
 
 def main(argv=None) -> int:
@@ -388,18 +408,26 @@ def main(argv=None) -> int:
                    help="C suite: run shard I of N of the corpus (see cshard)")
     r.add_argument("--keep-failed", action="store_true",
                    help="keep the cluster of a cell that errors, for debugging")
+    r.add_argument("--report-format", choices=["html", "markdown", "both", "none"], default="both",
+                   help="derived report formats (default both; none keeps only execution evidence)")
     r.set_defaults(fn=_run)
 
     sub.add_parser("list", help="list workloads, collectors and sinks").set_defaults(fn=_list)
 
-    rp = sub.add_parser("report", help="rewrite a result set's README.md")
-    rp.add_argument("dir", type=Path)
+    rp = sub.add_parser("report", help="regenerate HTML and Markdown from saved evidence")
+    rp.add_argument("dirs", type=Path, nargs="*")
+    rp.add_argument("--format", choices=["html", "markdown", "both"], default="both")
+    rp.add_argument("-o", "--output", type=Path, help="output stem; required for multiple inputs")
+    rp.add_argument("--manifest", type=Path, help="an invocation's report.json")
+    rp.add_argument("--catalog", type=Path, help="rebuild a result root's index")
     rp.set_defaults(fn=_report)
 
     c = sub.add_parser("compare", help="S results normalized to a baseline")
     c.add_argument("baseline", type=Path)
     c.add_argument("dir", type=Path)
     c.add_argument("-o", "--output", type=Path)
+    c.add_argument("--format", choices=["html", "markdown", "both"],
+                   help="write selected formats; --output is a stem in this mode")
     c.set_defaults(fn=_compare)
 
     t = sub.add_parser("table", help="engines side by side: a table per metric")
@@ -409,6 +437,7 @@ def main(argv=None) -> int:
     t.add_argument("--results", type=Path, default=REPO / "specs" / "results")
     t.add_argument("-o", "--output", type=Path,
                    help="output path without extension (default RESULTS/summary-SUITE)")
+    t.add_argument("--format", choices=["html", "markdown", "both"], default="both")
     t.set_defaults(fn=_table)
 
     d = sub.add_parser("cdiff", help="C suite: one engine's differences from heap")

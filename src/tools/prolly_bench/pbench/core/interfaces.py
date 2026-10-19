@@ -351,3 +351,6 @@ class Sink(abc.ABC):
 
     @abc.abstractmethod
     def close(self, run: RunInfo, results: list[CellResult]) -> None: ...
+
+    def abort(self) -> None:
+        """Release resources after interruption, leaving evidence incomplete."""
