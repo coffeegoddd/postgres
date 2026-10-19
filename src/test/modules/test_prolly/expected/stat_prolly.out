@@ -48,27 +48,38 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
-SELECT name, value FROM pg_stat_prolly;
-         name         | value 
-----------------------+-------
- nodes_read           |    40
- nodes_written        |    14
- value_nodes_written  |     0
- chunks_appended      |    14
- chunk_bytes_appended | 25801
- bytes_hashed         | 44910
- fold_rows_read       |  1000
- fold_rows_written    |  1000
- fold_pages           |     0
- fold_candidates      |  1000
- fold_full_tables     |     0
- commits              |     1
- head_moves           |     1
- memo_hits            |     0
- memo_misses          |     0
- page_copies_fold     |     0
- page_copies_shared   |     0
-(17 rows)
+-- (the block map's bytes in blocks, whatever the block size)
+SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
+	ELSE value END AS value
+FROM pg_stat_prolly;
+           name            | value 
+---------------------------+-------
+ nodes_read                |    40
+ nodes_written             |    14
+ value_nodes_written       |     0
+ chunks_appended           |    14
+ chunk_bytes_appended      | 25801
+ bytes_hashed              | 44910
+ fold_rows_read            |  1000
+ fold_rows_written         |  1000
+ fold_pages                |     0
+ fold_candidates           |  1000
+ fold_full_tables          |     0
+ commits                   |     1
+ head_moves                |     1
+ memo_hits                 |     0
+ memo_misses               |     0
+ page_copies_fold          |     0
+ page_copies_shared        |     0
+ journal_bytes_written     | 26487
+ table_file_bytes_written  |     0
+ manifest_bytes_written    |     0
+ gc_bytes_copied           |     0
+ conjoin_bytes_copied      |     0
+ bmap_store_bytes_written  |     0
+ bmap_extend_bytes_written |    19
+ bmap_bulk_bytes_written   |     0
+(25 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
@@ -77,6 +88,14 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
  each_node_a_chunk | each_chunk_hashed 
 -------------------+-------------------
  t                 | t
+(1 row)
+
+-- The journal holds each chunk with its record's framing, and the root.
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
+ journal_frames_chunks 
+-----------------------
+ t
 (1 row)
 
 -- One row changed: the fold reads the one row the change log names, and

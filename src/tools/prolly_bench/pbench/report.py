@@ -24,15 +24,32 @@ S_METRICS = [
     "host_busy_cpu_seconds", "host_hash_sample_percent", "io_hit_ratio", "io_evictions",
     "cluster_allocated_bytes_including_wal", "vacuum_seconds", "process_restart_seconds",
     "latency_samples", "hot_query_seconds", "client_process_qps", "skipped_transactions",
+    "wa_server", "wa_wal", "wa_pages", "wa_tree",
 ]
 V_METRICS = [
     "branch_create_ms", "checkout_ms", "change_ms", "commit_ms", "diff_ms",
     "merge_ms", "clone_ms", "fetch_ms", "push_ms", "background_tps",
     "wal_bytes", "device_write_bytes", "host_hash_sample_percent",
+    "wa.server_bytes_per_operation", "wa.tree.file_bytes_per_operation",
 ]
 C_METRICS = [
     "pass_percent", "records", "ok", "not_ok", "not_implemented", "crashed",
     "timeout", "did_not_run", "skipped", "files", "reruns",
+]
+# The write_amp collector's components (specs/20), as bytes per completed
+# unit: (metric, heading).  The server total is WAL + pages + chunk store.
+WA_COMPONENTS = [
+    ("wa.logical_bytes_per_operation", "logical"),
+    ("wa.wal.row_bytes_per_operation", "WAL rows"),
+    ("wa.wal.index_bytes_per_operation", "WAL indexes"),
+    ("wa.wal.fpi_bytes_per_operation", "WAL FPIs"),
+    ("wa.wal.blockmap_bytes_per_operation", "WAL block map"),
+    ("wa.wal.chunk_bytes_per_operation", "WAL chunks"),
+    ("wa.wal.other_bytes_per_operation", "WAL other"),
+    ("wa.pages.write_bytes_per_operation", "pages"),
+    ("wa.tree.file_bytes_per_operation", "chunk store"),
+    ("wa.server_bytes_per_operation", "server total"),
+    ("wa_server", "WA"),
 ]
 # For comparisons: whether a larger value is better.
 HIGHER_IS_BETTER = {"tps", "qps", "rows_per_second", "io_hit_ratio", "background_tps"}
@@ -106,6 +123,35 @@ def summary_tables(results: list[dict], suite: str) -> str:
             out.append(f"\n- {msg}")
         out.append("")
     return "\n".join(out)
+
+
+def wa_breakdown(results: list[dict]) -> list[tuple[tuple, list[Optional[float]]]]:
+    """[(cell key, medians of WA_COMPONENTS)] for the cells write_amp measured."""
+    rows = []
+    for key, rs in _group(results).items():
+        ok = [r for r in rs if r["status"] == "ok" and not cell_problems(r)]
+        if not ok or not any("wa.server_bytes" in r["metrics"] for r in ok):
+            continue
+        rows.append((key, [summarize(r["metrics"].get(m) for r in ok)["median"]
+                           for m, _ in WA_COMPONENTS]))
+    return rows
+
+
+def _wa_table(results: list[dict]) -> str:
+    rows = wa_breakdown(results)
+    if not rows:
+        return ""
+    out = ["## Write amplification\n",
+           "Bytes written per completed unit over the write_amp interval (the window, "
+           "then prolly's fold and a checkpoint), medians over repetitions; WA is the "
+           "server total over the logical bytes (specs/20-write-amplification.md).\n",
+           "| workload | size | variant | clients | " +
+           " | ".join(h for _, h in WA_COMPONENTS) + " |",
+           "|" + "---|" * 4 + "---:|" * len(WA_COMPONENTS)]
+    for (w, size, variant, clients), values in rows:
+        out.append("| " + " | ".join([w, size, variant or "-", str(clients)] +
+                                     [_fmt(v) for v in values]) + " |")
+    return "\n".join(out) + "\n"
 
 
 def _collector_table(results: list[dict]) -> str:
@@ -186,7 +232,7 @@ def write_readme(out_dir: Path) -> None:
         text += [f"- {w}" for w in run["warnings"]]
         text.append("")
     text += ["## Collectors\n", _collector_table(results),
-             "## Results\n", summary_tables(results, run["suite"])]
+             "## Results\n", summary_tables(results, run["suite"]), _wa_table(results)]
     (out_dir / "README.md").write_text("\n".join(text))
 
 
