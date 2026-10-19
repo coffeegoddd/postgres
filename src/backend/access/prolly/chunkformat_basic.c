@@ -118,10 +118,12 @@ basic_encode(uint16 level, int nitems, const ProllyKey *keys,
 	{
 		put_u32_at(out->data + table + 4 * i, (uint32) (out->len - base));
 		put_varint(out, keys[i].len);
-		appendBinaryStringInfo(out, keys[i].data, keys[i].len);
+		if (keys[i].len > 0)
+			appendBinaryStringInfo(out, keys[i].data, keys[i].len);
 		appendStringInfoChar(out, (char) (flags ? flags[i] : 0));
 		put_varint(out, values[i].len);
-		appendBinaryStringInfo(out, values[i].data, values[i].len);
+		if (values[i].len > 0)
+			appendBinaryStringInfo(out, values[i].data, values[i].len);
 	}
 	out->data[out->len] = '\0';
 }

@@ -1,0 +1,143 @@
+# Mails the results of each nightly run (scheduled or dispatched by hand) of
+# the prolly, correctness and performance workflows on master: its outcome,
+# each job's, the failed steps, the artifacts, and links to the run.  A
+# prolly dispatch that unchecked "nightly" ran no nightly job and isn't
+# mailed.
+#
+# Repository secrets it needs (without them, the run says so and mails
+# nothing):
+#   NIGHTLY_EMAIL_TO   the address to mail
+#   SMTP_SERVER        an SMTP server (e.g. smtp.gmail.com)
+#   SMTP_USERNAME      the account to log in as, also the sender
+#   SMTP_PASSWORD      its password (for Gmail, an app password)
+# and optionally:
+#   SMTP_PORT          its port: 465 (the default) is TLS from the start;
+#                      any other port starts in plain text and must be
+#                      upgraded by STARTTLS (as 587 is), or the mail fails
+
+name: nightly email
+
+on:
+  workflow_run:
+    workflows: [prolly, correctness, performance]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  mail:
+    name: mail the nightly results
+    if: >-
+      (github.event.workflow_run.event == 'schedule'
+       || github.event.workflow_run.event == 'workflow_dispatch')
+      && github.event.workflow_run.head_branch == 'master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Mail configured?
+        id: configured
+        env:
+          TO: ${{ secrets.NIGHTLY_EMAIL_TO }}
+          SERVER: ${{ secrets.SMTP_SERVER }}
+          USERNAME: ${{ secrets.SMTP_USERNAME }}
+          PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -n "$TO" ] && [ -n "$SERVER" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::nightly email not sent: set the NIGHTLY_EMAIL_TO, SMTP_SERVER, SMTP_USERNAME and SMTP_PASSWORD secrets"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize the run
+        id: summary
+        if: steps.configured.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          STARTED: ${{ github.event.workflow_run.run_started_at }}
+          UPDATED: ${{ github.event.workflow_run.updated_at }}
+        run: |
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[]' > jobs.json
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' > artifacts.json
+          python3 - <<'PY'
+          import html, json, os
+
+          def objects(path):
+              text = open(path).read()
+              dec, i, out = json.JSONDecoder(), 0, []
+              while i < len(text):
+                  if text[i].isspace():
+                      i += 1
+                      continue
+                  obj, i = dec.raw_decode(text, i)
+                  out.append(obj)
+              return out
+
+          env = os.environ
+          jobs = objects("jobs.json")
+          artifacts = objects("artifacts.json")
+          mark = {"success": "✅", "failure": "❌", "cancelled": "⛔",
+                  "timed_out": "⏱", "skipped": "➖"}
+          conclusion = env["CONCLUSION"]
+          failed = [j for j in jobs if j["conclusion"] not in ("success", "skipped")]
+          # (a prolly dispatch without its nightly jobs isn't a nightly)
+          send = not (env["WORKFLOW"] == "prolly" and any(
+              j["name"] == "nightly address and undefined-behavior checks"
+              and j["conclusion"] == "skipped" for j in jobs))
+
+          how = "manual" if env["EVENT"] == "workflow_dispatch" else "scheduled"
+          subject = (f"{mark.get(conclusion, '❔')} nightly {env['WORKFLOW']} ({how}): "
+                     f"{conclusion} on master {env['SHA'][:10]}")
+          rows = []
+          for j in jobs:
+              steps = [s["name"] for s in j.get("steps") or []
+                       if s.get("conclusion") == "failure"]
+              rows.append(
+                  "<tr><td>{}</td><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td></tr>".format(
+                      mark.get(j["conclusion"], "❔"), j["html_url"], html.escape(j["name"]),
+                      html.escape(j["conclusion"] or j["status"]),
+                      html.escape(", ".join(steps))))
+          arts = "".join(
+              "<li>{} ({:.1f} MB)</li>".format(html.escape(a["name"]), a["size_in_bytes"] / 1e6)
+              for a in artifacts) or "<li>none</li>"
+          body = f"""<p><b>{html.escape(env['WORKFLOW'])}</b> ({html.escape(env['EVENT'])})
+          finished <b>{html.escape(conclusion)}</b> on master
+          <code>{env['SHA'][:10]}</code>: {len(failed)} of {len(jobs)} jobs did not pass.</p>
+          <p>Started {env['STARTED']}, finished {env['UPDATED']}.
+          <a href="{env['URL']}">The run, its job summaries and artifacts</a>.</p>
+          <table border="1" cellpadding="4" cellspacing="0">
+          <tr><th></th><th>Job</th><th>Result</th><th>Failed steps</th></tr>
+          {''.join(rows)}
+          </table>
+          <p>Artifacts (on the run's page):</p><ul>{arts}</ul>
+          """
+          open("body.html", "w").write(body)
+          with open(env["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"subject={subject}\n")
+              out.write(f"send={'true' if send else 'false'}\n")
+          PY
+
+      - name: Mail it
+        if: steps.configured.outputs.ok == 'true' && steps.summary.outputs.send == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT || '465' }}
+          secure: ${{ (secrets.SMTP_PORT || '465') == '465' }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: prolly nightly <${{ secrets.SMTP_USERNAME }}>
+          to: ${{ secrets.NIGHTLY_EMAIL_TO }}
+          subject: ${{ steps.summary.outputs.subject }}
+          html_body: file://body.html
