@@ -370,6 +370,8 @@ def _table(args) -> int:
         print(presentation.MarkdownRenderer().render(document))
     for path in paths:
         print(f"written: {path}")
+    if suite == "C" and (len(sources) < 2 or sum(s.run.get("table_am") == "heap" for s in sources) != 1):
+        return 1  # A correctness comparison requires heap and an engine.
     return int(not document.passed)
 
 

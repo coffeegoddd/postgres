@@ -42,7 +42,7 @@ VACUUM, recovery) with each S number's ratio to B0, and writes
 `specs/results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
 are colored only for benchmark-quality paired repetitions whose 95% bootstrap
 interval clears a 5% practical effect threshold. Smoke ratios are descriptive.
-Hovering a cell shows its spread and validity details.  `compare BASELINE_DIR DIR` gives one result set's ratios
+Each cell includes its spread and validity details. `compare BASELINE_DIR DIR` gives one result set's ratios
 to a baseline in a single wide table.
 
 ## BenchBase TPC workloads
