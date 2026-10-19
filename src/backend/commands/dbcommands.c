@@ -3491,15 +3491,15 @@ dbase_redo(XLogReaderState *record)
 		/* Clean out the xlog relcache too */
 		XLogDropDatabase(xlrec->db_id);
 
-		/* and the lengths block-mapped storage keeps in recovery */
-		bmap_drop_database_recovery(xlrec->db_id);
-
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
 
 		for (i = 0; i < xlrec->ntablespaces; i++)
 		{
 			dst_path = GetDatabasePath(xlrec->db_id, xlrec->tablespace_ids[i]);
+
+			/* the lengths block-mapped storage keeps there in recovery */
+			bmap_drop_database_recovery(xlrec->db_id, xlrec->tablespace_ids[i]);
 
 			/* And remove the physical files */
 			if (!rmtree(dst_path, true))

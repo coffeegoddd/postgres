@@ -1641,7 +1641,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
  * changes and removes entries, which allocates nothing: it removes the
  * relation's once the length it cuts to is no longer past the header's.
  * Unlinking the relation in redo, its XLOG_BMAP_CREATE and its database's
- * drop (bmap_drop_database_recovery()) forget it too.
+ * drop from its tablespace (bmap_drop_database_recovery()) forget it too.
  */
 typedef struct RecoveryLength
 {
@@ -1711,12 +1711,13 @@ forget_recovery_length(RelFileLocator rel)
 }
 
 /*
- * In redo of a database's drop, forget the lengths kept for its relations:
- * their files are removed without unlinking each, and a relation file
- * number may be used again later in the replay.
+ * In redo of a database's drop from tablespace 'spcid' (all of it, or the
+ * old tablespace of a move), forget the lengths kept for its relations
+ * there: their files are removed without unlinking each, and a relation
+ * file number may be used again later in the replay.
  */
 void
-bmap_drop_database_recovery(Oid dbid)
+bmap_drop_database_recovery(Oid dbid, Oid spcid)
 {
 	HASH_SEQ_STATUS status;
 	RecoveryLength *rl;
@@ -1726,7 +1727,7 @@ bmap_drop_database_recovery(Oid dbid)
 	hash_seq_init(&status, recovery_lengths);
 	while ((rl = hash_seq_search(&status)) != NULL)
 	{
-		if (rl->rel.dbOid == dbid)
+		if (rl->rel.dbOid == dbid && rl->rel.spcOid == spcid)
 			(void) hash_search(recovery_lengths, &rl->rel, HASH_REMOVE, NULL);
 	}
 }

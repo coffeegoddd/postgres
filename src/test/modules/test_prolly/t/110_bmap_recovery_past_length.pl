@@ -21,6 +21,7 @@ $node->append_conf(
 debug_block_mapped_heap = on
 autovacuum = off
 shared_buffers = 400kB
+wal_consistency_checking = 'all'
 });
 $node->start;
 
