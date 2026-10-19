@@ -275,12 +275,17 @@ SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
 -- the other's rows aren't checked against an empty table.  A trigger
 -- enabled ALWAYS fires (warns) for the rows emptied no more than for the
 -- rows written.  A column of a type the commit defines otherwise is emptied
--- too, rather than converted to what its NOT NULL refuses.
+-- too, rather than converted to what its NOT NULL refuses; a key of one
+-- (a domain made over another base type), that another table's foreign
+-- key references, loses that key before it converts.
 CREATE SCHEMA sm12 VERSIONED;
 CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.p (id int PRIMARY KEY);
 CREATE TABLE sm12.c (id int PRIMARY KEY, pid int REFERENCES sm12.p);
 CREATE TABLE sm12.d (id int PRIMARY KEY, v sm12.pos NOT NULL);
+CREATE DOMAIN sm12.k AS int CHECK (VALUE > 0);
+CREATE TABLE sm12.kp (k sm12.k PRIMARY KEY);
+CREATE TABLE sm12.kc (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
 	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
 CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
@@ -288,12 +293,18 @@ ALTER TABLE sm12.p ENABLE ALWAYS TRIGGER tr;
 INSERT INTO sm12.p VALUES (1), (2);
 INSERT INTO sm12.c VALUES (1, 1), (2, 2);
 INSERT INTO sm12.d VALUES (1, 5);
+INSERT INTO sm12.kp VALUES (1), (2);
+INSERT INTO sm12.kc VALUES (1, 1), (2, 2);
 SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
 SELECT dolt_branch('sm12_right');
 ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
 UPDATE sm12.d SET v = 20;
 ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
 ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+ALTER TABLE sm12.kp ALTER COLUMN k TYPE int;
+DROP DOMAIN sm12.k;
+CREATE DOMAIN sm12.k AS bigint CHECK (VALUE > 0);
+ALTER TABLE sm12.kp ALTER COLUMN k TYPE sm12.k;
 SELECT (dolt_commit('-Am', 'sm12 main'))[1] AS sm12_main \gset
 SELECT dolt_checkout('sm12_right');
 SELECT format_type(atttypid, atttypmod) FROM pg_attribute
@@ -301,11 +312,19 @@ WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
 SELECT * FROM sm12.c ORDER BY id;
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
   AND contype = 'f';
+SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
+SELECT * FROM sm12.kc ORDER BY id;
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
+  AND contype = 'f';
 SELECT dolt_reset('--hard', :'sm12_main');
 SELECT format_type(atttypid, atttypmod) FROM pg_attribute
 WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
 SELECT * FROM sm12.c ORDER BY id;
 SELECT * FROM sm12.d ORDER BY id;
+SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
+SELECT * FROM sm12.kc ORDER BY id;
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
+  AND contype = 'f';
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
   AND contype = 'f';
 SELECT count(*) AS changed FROM dolt_status;

@@ -5099,6 +5099,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *routines = NIL;
 	List	   *aggregates_made = NIL;
 	List	   *policy_drops = NIL;
+	List	   *fk_drops = NIL;		/* (before the types' columns convert) */
 	List	   *policy_makes = NIL;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
@@ -5222,8 +5223,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	/*
 	 * Foreign keys both sides have, into a table made again or dropped,
-	 * emptied, or whose keys change: they go first, and the ones kept come
-	 * back last, checked against the rows written.
+	 * emptied, or whose keys change: they go first (before the columns of
+	 * types the commit defines otherwise convert, which would check them
+	 * against a table emptied), and the ones kept come back last, checked
+	 * against the rows written.
 	 */
 	keyed = list_concat(list_concat_copy(remade, sm.rekeyed), sm.emptied);
 	foreach(lc, from)
@@ -5251,8 +5254,9 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			{
 				if (strstr(line, psprintf(" REFERENCES %s(", (char *) lfirst(r))) == NULL)
 					continue;
-				sm.before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
-										   f->name, first_field(line)), sm.before);
+				fk_drops = lappend(fk_drops,
+								   psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+											f->name, first_field(line)));
 				if (t)
 					sm.foreign_keys = lappend(sm.foreign_keys,
 											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
@@ -5524,6 +5528,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * Rows to go before their columns change type (with every row written
 	 * afresh), as rows the move writes go (empty_table()).
 	 */
+	run_statements(fk_drops);
 	foreach(lc, sm.emptied)
 		empty_table(lfirst(lc));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));

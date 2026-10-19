@@ -759,12 +759,17 @@ SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
 -- the other's rows aren't checked against an empty table.  A trigger
 -- enabled ALWAYS fires (warns) for the rows emptied no more than for the
 -- rows written.  A column of a type the commit defines otherwise is emptied
--- too, rather than converted to what its NOT NULL refuses.
+-- too, rather than converted to what its NOT NULL refuses; a key of one
+-- (a domain made over another base type), that another table's foreign
+-- key references, loses that key before it converts.
 CREATE SCHEMA sm12 VERSIONED;
 CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.p (id int PRIMARY KEY);
 CREATE TABLE sm12.c (id int PRIMARY KEY, pid int REFERENCES sm12.p);
 CREATE TABLE sm12.d (id int PRIMARY KEY, v sm12.pos NOT NULL);
+CREATE DOMAIN sm12.k AS int CHECK (VALUE > 0);
+CREATE TABLE sm12.kp (k sm12.k PRIMARY KEY);
+CREATE TABLE sm12.kc (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
 	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
 CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
@@ -772,6 +777,8 @@ ALTER TABLE sm12.p ENABLE ALWAYS TRIGGER tr;
 INSERT INTO sm12.p VALUES (1), (2);
 INSERT INTO sm12.c VALUES (1, 1), (2, 2);
 INSERT INTO sm12.d VALUES (1, 5);
+INSERT INTO sm12.kp VALUES (1), (2);
+INSERT INTO sm12.kc VALUES (1, 1), (2, 2);
 SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
  committed 
 -----------
@@ -788,6 +795,10 @@ ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
 UPDATE sm12.d SET v = 20;
 ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
 ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+ALTER TABLE sm12.kp ALTER COLUMN k TYPE int;
+DROP DOMAIN sm12.k;
+CREATE DOMAIN sm12.k AS bigint CHECK (VALUE > 0);
+ALTER TABLE sm12.kp ALTER COLUMN k TYPE sm12.k;
 SELECT (dolt_commit('-Am', 'sm12 main'))[1] AS sm12_main \gset
 SELECT dolt_checkout('sm12_right');
              dolt_checkout             
@@ -816,6 +827,26 @@ SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
  c_pid_fkey
 (1 row)
 
+SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
+ format_type 
+-------------
+ integer
+(1 row)
+
+SELECT * FROM sm12.kc ORDER BY id;
+ id | pid 
+----+-----
+  1 |   1
+  2 |   2
+(2 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
+  AND contype = 'f';
+   conname   
+-------------
+ kc_pid_fkey
+(1 row)
+
 SELECT dolt_reset('--hard', :'sm12_main');
  dolt_reset 
 ------------
@@ -840,6 +871,26 @@ SELECT * FROM sm12.d ORDER BY id;
  id | v  
 ----+----
   1 | 20
+(1 row)
+
+SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
+ format_type 
+-------------
+ bigint
+(1 row)
+
+SELECT * FROM sm12.kc ORDER BY id;
+ id | pid 
+----+-----
+  1 |   1
+  2 |   2
+(2 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
+  AND contype = 'f';
+   conname   
+-------------
+ kc_pid_fkey
 (1 row)
 
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
@@ -868,12 +919,15 @@ SELECT dolt_branch('-D', 'sm12_right');
 (1 row)
 
 DROP SCHEMA sm12 CASCADE;
-NOTICE:  drop cascades to 5 other objects
+NOTICE:  drop cascades to 8 other objects
 DETAIL:  drop cascades to type sm12.pos
 drop cascades to table sm12.p
 drop cascades to table sm12.c
 drop cascades to table sm12.d
+drop cascades to table sm12.kp
+drop cascades to table sm12.kc
 drop cascades to function sm12.f()
+drop cascades to type sm12.k
 SELECT length(dolt_commit('-Am', 'without sm12')::text) AS committed;
  committed 
 -----------
