@@ -171,6 +171,7 @@ tests += {
       't/075_toast_acceptance.pl',
       't/076_remote_answers.pl',
       't/080_versioned_public.pl',
+      't/084_detached_hidden.pl',
       't/101_index_tablespaces.pl',
       't/104_gc_prepared.pl',
       't/107_commit_dates.pl',
