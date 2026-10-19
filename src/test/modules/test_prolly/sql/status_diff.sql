@@ -246,3 +246,25 @@ DROP SCHEMA sdq CASCADE;
 SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;
 DROP SERVER sd_srv;
 DROP FOREIGN DATA WRAPPER sd_fdw;
+
+-- Before the branch's first commit: its changes against the empty root,
+-- as Dolt's are against its initial commit (dolt_log('HEAD') has none).
+SELECT current_database() AS db \gset
+CREATE DATABASE regress_status_unborn;
+\c regress_status_unborn
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'one'), (2, 'two');
+SELECT name, hash, dirty FROM dolt_branches;
+SELECT count(*) AS commits FROM dolt_log();
+SELECT * FROM dolt_status ORDER BY table_name;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT diff_type, from_row, to_row FROM dolt_diff('WORKING', 'head', NULL::app.t) ORDER BY from_row;
+SELECT count(*) FROM dolt_diff('HEAD', 'HEAD', NULL::app.t);
+SELECT * FROM dolt_diff('HEAD~1', 'WORKING', NULL::app.t);	-- (no commit to step back from)
+SELECT * FROM dolt_diff('nope', 'WORKING', NULL::app.t);
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+SELECT * FROM dolt_status;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
+\c :db
+DROP DATABASE regress_status_unborn;

@@ -172,21 +172,37 @@ is_working(const char *ref)
 	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
 }
 
-/* The canonical root of a ref: a commit's, or WORKING folded now. */
+/*
+ * The canonical root of a ref: a commit's, or WORKING folded now.  HEAD
+ * before the branch's first commit is the empty root, as Dolt's initial
+ * commit is (and as dolt_log('HEAD') has no commits).
+ */
 static void
 root_of(const char *ref, ProllyNodeRef *root)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyHash	id;
 	ProllyCommitInfo info;
+	bool		found;
 
 	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
 		return;
 	}
-	if (!PROLLY_CALL(dc.refs, resolve, ref, &id) ||
-		!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+	found = PROLLY_CALL(dc.refs, resolve, ref, &id);
+	if (!found && pg_strcasecmp(ref, "HEAD") == 0)
+	{
+		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+		ProllyTreeEnv env;
+
+		chunk_env(&env);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext),
+					root);
+		return;
+	}
+	if (!found || !PROLLY_CALL(dc.refs, commit_get, &id, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));

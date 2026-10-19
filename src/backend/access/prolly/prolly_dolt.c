@@ -2970,7 +2970,8 @@ with_status(List *names, Oid relid, const char *status)
  * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
  *	  returns setof record
  *
- * The tables changed since the session branch's head commit: rows changed
+ * The tables changed since the session branch's head commit (before its
+ * first, since the empty root: everything is new): rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
  * in progress, with conflicts ("conflict", not staged), or with constraint
  * violations ("constraint violation", not staged); the other objects
@@ -2983,7 +2984,6 @@ dolt_status(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	StatusSink	s = {{status_change}, NIL};
-	ProllyHash	head;
 	List	   *names = NIL;
 	ListCell   *lc;
 
@@ -2992,8 +2992,6 @@ dolt_status(PG_FUNCTION_ARGS)
 	List	   *violated = NIL;
 
 	InitMaterializedSRF(fcinfo, 0);
-	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
-		return (Datum) 0;
 	foreach(lc, PROLLY_CALL(refs(), violations))
 		violated = list_append_unique_oid(violated,
 										  ((ProllyViolation *) lfirst(lc))->relid);
