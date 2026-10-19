@@ -80,6 +80,7 @@ tests += {
       'verify_constraints',
       'domain_violations',
       'redefined_merges',
+      'retyped_merges',
       'matview_merges',
       'type_moves',
       'detached_checkout',
