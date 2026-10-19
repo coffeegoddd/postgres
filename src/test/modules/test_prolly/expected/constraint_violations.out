@@ -225,6 +225,31 @@ SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
         66
 (1 row)
 
+SELECT dolt_branch('no_child');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('no_child');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'no_child'"}
+(1 row)
+
+DROP TABLE cv.child;
+SELECT length(dolt_commit('-am', 'no_child drops cv.child')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
       dolt_merge       
@@ -253,7 +278,35 @@ SELECT count(*) AS still_listed FROM dolt_constraint_violations();
             1
 (1 row)
 
-ROLLBACK;
+-- (and a checkout to a branch without the table doesn't let them through)
+SELECT dolt_checkout('no_child');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'no_child'"}
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with constraint violations
+DETAIL:  Table "child" has a row with a unique index violation on branch "main".
+HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS none_kept FROM dolt_constraint_violations();
+ none_kept 
+-----------
+         0
+(1 row)
+
+SELECT dolt_branch('-D', 'no_child');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Violations kept stay through later merges that find none of their own.
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_merge('feature'))[3:4];
