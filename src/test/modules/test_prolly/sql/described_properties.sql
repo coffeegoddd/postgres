@@ -217,6 +217,63 @@ SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
 SELECT * FROM locality;
 ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
 SELECT * FROM locality;
+
+-- Which inherited columns and constraints are a child's own too is
+-- described (its "local" section), and a move makes them so: a child that
+-- declares an inherited column and check itself keeps them through a
+-- parent's DROP COLUMN, as a table made fresh does; a table made again and
+-- linked has what it only inherits inherited only.
+SELECT dolt_reset('--hard', :'linked');
+CREATE TABLE inh.q2 (a int, b int, CONSTRAINT qa CHECK (a > 0));
+CREATE TABLE inh.p3 (a int, b int);
+CREATE TABLE inh.c3 (y int);
+SELECT (dolt_commit('-Am', 'parents'))[1] AS parents \gset
+CREATE TABLE inh.r (a int, z int, CONSTRAINT qa CHECK (a > 0)) INHERITS (inh.q2);
+INSERT INTO inh.r VALUES (1, 2, 3);
+DROP TABLE inh.c3;
+CREATE TABLE inh.c3 (y int) INHERITS (inh.p3);
+SELECT (dolt_commit('-Am', 'children'))[1] AS children \gset
+CREATE VIEW localities AS
+SELECT c.relname::text AS rel, 'column ' || attname AS what, attislocal AS local, attinhcount AS inherited
+  FROM pg_attribute JOIN pg_class c ON c.oid = attrelid
+  WHERE c.relnamespace = to_regnamespace(current_setting('test.nsp')) AND c.relname IN ('r', 'c3')
+    AND attnum > 0 AND NOT attisdropped
+UNION ALL
+SELECT c.relname::text, 'constraint ' || conname, conislocal, coninhcount
+  FROM pg_constraint JOIN pg_class c ON c.oid = conrelid
+  WHERE c.relnamespace = to_regnamespace(current_setting('test.nsp')) AND c.relname IN ('r', 'c3')
+    AND contype = 'c'
+ORDER BY 1, 2;
+SET test.nsp = 'inh';
+SELECT * INTO TEMP made FROM localities;
+SELECT dolt_reset('--hard', :'parents');
+SELECT dolt_reset('--hard', :'children');
+SELECT test_fold_root() = prolly_root_hash(:'children') AS same_root;
+SELECT * FROM dolt_status();
+SELECT * FROM localities;
+-- (as tables made fresh have them)
+CREATE SCHEMA fresh;
+CREATE TABLE fresh.q2 (a int, b int, CONSTRAINT qa CHECK (a > 0));
+CREATE TABLE fresh.r (a int, z int, CONSTRAINT qa CHECK (a > 0)) INHERITS (fresh.q2);
+CREATE TABLE fresh.p3 (a int, b int);
+CREATE TABLE fresh.c3 (y int) INHERITS (fresh.p3);
+SET test.nsp = 'fresh';
+(SELECT * FROM localities EXCEPT SELECT * FROM made)
+UNION ALL (SELECT * FROM made EXCEPT SELECT * FROM localities);
+DROP SCHEMA fresh CASCADE;
+SET test.nsp = 'inh';
+ALTER TABLE inh.q2 DROP COLUMN a;			-- r keeps its own a
+ALTER TABLE inh.p3 DROP COLUMN b;			-- c3 doesn't keep b
+SELECT * FROM inh.r;
+SELECT * FROM localities;
+SELECT dolt_reset('--hard');
+-- (locality alone is a change)
+ALTER TABLE inh.c3 NO INHERIT inh.p3;
+ALTER TABLE inh.c3 INHERIT inh.p3;
+SELECT * FROM dolt_status();
+SELECT dolt_reset('--hard');
+DROP VIEW localities;
+RESET test.nsp;
 SELECT dolt_reset('--hard', :'linked');
 DROP VIEW locality;
 
