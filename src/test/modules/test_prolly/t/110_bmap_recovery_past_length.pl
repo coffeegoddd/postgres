@@ -96,5 +96,67 @@ is(sql(q{SELECT count(*) FROM g}), '15', 'and its rows');
 sql(q{INSERT INTO g SELECT g, repeat('y', 500) FROM generate_series(1, 30) g});
 is(sql(q{SELECT count(*) FROM g}), '45', 'and extends again');
 
+# A shared map: a block past the length whose entry an extension let go of
+# (another map holds its block) after the truncation, the extension's own
+# change of the header lost in the crash.  Its pages go nowhere in recovery,
+# and records from before the truncation skip it rather than read it back.
+SKIP:
+{
+	skip 'Injection points not supported by this build', 10
+	  if $ENV{enable_injection_points} ne 'yes';
+
+	sql(q{CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points});
+	sql(q{CREATE TABLE s (a int, b text) WITH (fillfactor = 50);
+		INSERT INTO s SELECT g, repeat('x', 500) FROM generate_series(1, 700) g});
+	cmp_ok(nblocks('s'), '>', 60, 'the shared table has many blocks');
+	sql('CHECKPOINT');
+
+	# Images of the blocks past the length to be, records that read them
+	# again (evicted by then), and the blocks emptied before the share, so
+	# that the truncation after it changes none: they stay shared.
+	sql(q{UPDATE s SET b = repeat('y', 500) WHERE ctid >= '(10,0)'});
+	sql(q{DELETE FROM s WHERE ctid >= '(10,0)'});
+	sql(q{VACUUM (TRUNCATE false) s});
+	my $rel = sql(q{SELECT pg_relation_filenode('s')});
+	my $copy = sql(qq{SELECT test_bmap_share($rel)});
+	my $rows = sql(qq{SELECT test_bmap_rows_digest($copy)});
+	sql(q{VACUUM s});
+	is(nblocks('s'), '10', 'the shared table is truncated to 10 blocks');
+	is(evict_header('s'), 't', 'its map\'s header written out');
+
+	# An extension stopped after letting go of the entry it reuses (the
+	# copy holds its block), the map page written out (it isn't locked
+	# meanwhile) but not the header.
+	sql(q{SELECT injection_points_attach('bmap-unshared', 'wait')});
+	my $ext = $node->background_psql('postgres', on_error_stop => 0);
+	$ext->query_until(qr/started/, q{
+		\echo started
+		INSERT INTO s SELECT g, repeat('z', 500) FROM generate_series(1, 100) g;
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0
+		FROM pg_stat_activity WHERE wait_event = 'bmap-unshared'})
+	  or die 'the extension did not stop';
+	is( sql(
+			qq{SELECT coalesce(bool_and((pg_buffercache_evict(bufferid)).buffer_evicted), true)
+			FROM pg_buffercache
+			WHERE relfilenode = $rel AND relforknumber = 4 AND relblocknumber > 0}),
+		't',
+		'the map page written out');
+
+	$node->stop('immediate');
+	eval { $ext->quit };
+	my $log_offset = -s $node->logfile;
+	ok($node->start(fail_ok => 1), 'recovery of the shared table completes');
+	ok( !$node->log_contains('has no page for block', $log_offset),
+		'without reading back a page that went nowhere');
+	is(nblocks('s'), '10', 'the shared table has its length');
+	is(sql(q{SELECT count(*), count(*) FILTER (WHERE b = repeat('x', 500)) FROM s}),
+		'70|70', 'and its rows');
+	is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $rows,
+		'the copy keeps the rows it was made with');
+	sql(q{INSERT INTO s SELECT g, repeat('z', 500) FROM generate_series(1, 100) g});
+	is(sql(q{SELECT count(*) FROM s}), '170', 'and the shared table extends again');
+}
+
 $node->stop;
 done_testing();

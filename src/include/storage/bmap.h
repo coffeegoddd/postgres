@@ -48,6 +48,7 @@ extern void bmappredrop(SMgrRelation reln, bool isRedo);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
+extern void bmap_drop_database_recovery(Oid dbid);
 extern void bmapextend(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, const void *buffer, bool skipFsync);
 extern void bmapzeroextend(SMgrRelation reln, ForkNumber forknum,

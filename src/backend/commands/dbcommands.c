@@ -56,6 +56,7 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "replication/slot.h"
+#include "storage/bmap.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -3489,6 +3490,9 @@ dbase_redo(XLogReaderState *record)
 
 		/* Clean out the xlog relcache too */
 		XLogDropDatabase(xlrec->db_id);
+
+		/* and the lengths block-mapped storage keeps in recovery */
+		bmap_drop_database_recovery(xlrec->db_id);
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
