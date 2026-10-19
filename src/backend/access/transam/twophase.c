@@ -901,6 +901,42 @@ TwoPhaseGetXidByVirtualXID(VirtualTransactionId vxid,
 }
 
 /*
+ * TwoPhaseGetGidByVirtualXID
+ *		The GID of the prepared transaction with this VXID, recovered ones
+ *		too, into gid (GIDSIZE bytes); false if none is prepared with it.
+ */
+bool
+TwoPhaseGetGidByVirtualXID(VirtualTransactionId vxid, char *gid)
+{
+	bool		found = false;
+
+	Assert(VirtualTransactionIdIsValid(vxid));
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+
+	for (int i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
+		PGPROC	   *proc;
+		VirtualTransactionId proc_vxid;
+
+		if (!gxact->valid)
+			continue;
+		proc = GetPGProcByNumber(gxact->pgprocno);
+		GET_VXID_FROM_PGPROC(proc_vxid, *proc);
+		if (VirtualTransactionIdEquals(vxid, proc_vxid))
+		{
+			strlcpy(gid, gxact->gid, GIDSIZE);
+			found = true;
+			break;
+		}
+	}
+
+	LWLockRelease(TwoPhaseStateLock);
+
+	return found;
+}
+
+/*
  * TwoPhaseGetDummyProcNumber
  *		Get the dummy proc number for prepared transaction
  *
