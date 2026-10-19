@@ -155,6 +155,7 @@ typedef struct SavedTransactionCharacteristics
 {
 	int			save_XactIsoLevel;
 	bool		save_XactReadOnly;
+	bool		save_XactReadOnlyFromBranch;
 	bool		save_XactDeferrable;
 } SavedTransactionCharacteristics;
 

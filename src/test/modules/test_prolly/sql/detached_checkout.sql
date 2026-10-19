@@ -82,11 +82,39 @@ BEGIN;
 SET TRANSACTION READ ONLY;
 SELECT dolt_branch('-f', 'from_first', 'main');
 ROLLBACK;
+BEGIN;
+SET LOCAL transaction_read_only = on;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ROLLBACK;
+-- (nor one chained to it, which is read-only as asked too)
+BEGIN READ ONLY;
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ROLLBACK;
+BEGIN READ ONLY;
+ROLLBACK AND CHAIN;
+SELECT dolt_branch('ro_made');
+ROLLBACK;
+-- (one chained to a transaction read-only only for the commit makes one)
+BEGIN;
+COMMIT AND CHAIN;
+SELECT dolt_branch('ro_chained');
+COMMIT;
 SELECT dolt_hashof('from_first') = :'ff' AS not_moved;
 SELECT dolt_branch('ro_made');
 SELECT dolt_hashof('ro_made') = :'c1' AS made_there;
 SELECT (dolt_checkout('main'))[2];
-SELECT dolt_branch('-D', 'ro_made');
+SELECT dolt_branch('-D', 'ro_made', 'ro_chained');
+-- (a transaction chained to one that checked out a commit is read-only
+-- for it, as one begun there is)
+BEGIN;
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+INSERT INTO dc.t VALUES (7, 'seven');
+ROLLBACK;
+SELECT (dolt_checkout('main'))[2];
 -- (a hidden branch isn't checked out by name, nor HEAD as a commit)
 SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
 SELECT dolt_checkout('HEAD');
