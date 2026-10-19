@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "id": "dolt-info-schema-deleted-branch",
+  "description": "Reviewed Dolt port: info_schema when checked out branch was deleted",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltInfoSchemaScripts: info_schema when checked out branch was deleted"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "ref"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (a int primary key, b int);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit-1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-3-connect",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "ref",
+      "op": "exec",
+      "sql": "alter table t add column c int;"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-df', 'b3');",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "select column_name from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1;",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "select column_name from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1;",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "c"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5-connect",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "ref",
+      "op": "query",
+      "sql": "select column_name from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1;",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "c"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b3"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    }
+  ]
+}

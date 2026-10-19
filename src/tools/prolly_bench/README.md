@@ -541,8 +541,9 @@ references are errors.
 
 Capabilities are `sql` and the version-control groups in
 `vcscenario/capabilities.go`: `vc.core` (commit, branch, checkout, hard
-reset, log, status, hashof), `vc.merge`, `vc.conflicts`, `vc.violations`,
-`vc.cherrypick`, `vc.revert` and `vc.diff`. A scenario requires exactly what
+reset, log, status, hashof, connecting to a branch), `vc.merge`,
+`vc.conflicts`, `vc.violations`, `vc.cherrypick`, `vc.revert` and
+`vc.diff`. A scenario requires exactly what
 its steps need, no more.
 
 SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
@@ -551,12 +552,18 @@ capabilities its calls need in its own `requires`, which must match what its
 SQL names, outside string literals, quoted identifiers and comments (a
 `dolt_*` function no capability covers is an error; a table or column of
 the scenario's own named `dolt_...` isn't a call). Typed VC steps
-exist only where the adapter must capture a commit: `commit` (message, then
-optional Dolt flags such as `--allow-empty`), `branch` (name and optional
-start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
+exist only where the adapter must capture a commit or open a connection:
+`commit` (message, then optional Dolt flags such as `--allow-empty`),
+`branch` (name and optional start ref), `checkout` (branch), `reset` (hard-reset ref), and `merge`,
 `cherrypick` and `revert` (Dolt's arguments, flags included: `--no-ff`,
-`--abort`, `--continue`, ...). Their capability is implied. Arguments are in
-`args`; SQL bind parameters are in `params`. Successful commits require a
+`--abort`, `--continue`, ...), and `connect` (Dolt's `USE`: the session's
+connection again, to the case's database or, given a branch, to
+`database/branch`, a name of at most 63 bytes; a connection refused for
+its branch is its SQLSTATE, 42704, and leaves the session as it was, any
+other refusal failing the step; the new connection must be on the branch
+named, or `main`, and the old backend has exited before the step ends).
+Their capability is implied. Arguments are in `args`; SQL bind parameters
+are in `params`. Successful commits require a
 unique `save` name; a merge, pick or revert may name one, and must then
 commit (a revert's is the last of its series): a merge with nothing to merge, or one
 that stops with conflicts, saves nothing and fails the step, its call's

@@ -1,0 +1,529 @@
+{
+  "version": 1,
+  "id": "dolt-checkout-base-name",
+  "description": "Reviewed Dolt port: dolt_checkout and base name resolution",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCheckoutScripts: dolt_checkout and base name resolution"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "ref"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (a int primary key, b int);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit-1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 1);"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values on main"
+      ],
+      "save": "commit-5"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (2, 2);"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values on b2"
+      ],
+      "save": "commit-8"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (3, 3);"
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values on b3"
+      ],
+      "save": "commit-11"
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5-connect",
+      "session": "ref",
+      "op": "connect"
+    },
+    {
+      "id": "assert-5",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b3"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-9-connect",
+      "session": "ref",
+      "op": "connect"
+    },
+    {
+      "id": "assert-9",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-10-connect",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-10",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-14-connect",
+      "session": "ref",
+      "op": "connect"
+    },
+    {
+      "id": "assert-14",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-15-connect",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "assert-15",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-16",
+      "session": "a",
+      "op": "connect"
+    },
+    {
+      "id": "assert-17",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-18",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-19-connect",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-19",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-20",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-21",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "assert-22",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "b3"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-23-connect",
+      "session": "ref",
+      "op": "connect"
+    },
+    {
+      "id": "assert-23",
+      "session": "ref",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-24",
+      "session": "a",
+      "op": "connect"
+    },
+    {
+      "id": "assert-25",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-26",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t;",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

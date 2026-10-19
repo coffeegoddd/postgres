@@ -42,11 +42,11 @@ func manifestAt(t *testing.T, root string) Manifest {
 
 // The reviewed corpus: a port added or deferred updates these.
 const (
-	reviewedPorts      = 123 // ported whole
-	reviewedPartial    = 24  // ported in part
-	reviewedAssertions = 446
-	reviewedOmitted    = 27 // assertions left out, each with its note
-	reviewedDeferred   = 58
+	reviewedPorts      = 129 // ported whole
+	reviewedPartial    = 28  // ported in part
+	reviewedAssertions = 555
+	reviewedOmitted    = 33 // assertions left out, each with its note
+	reviewedDeferred   = 60
 )
 
 func TestReviewedCorpus(t *testing.T) {
@@ -238,6 +238,16 @@ func TestClassification(t *testing.T) {
 	}
 	m := manifestAt(t, fixture)
 	first := classKey(m.Ports[0].Suite, m.Ports[0].Index)
+	var rederived string
+	for _, d := range m.Deferred {
+		if strings.Contains(d.Reason, isolationSpecs) {
+			rederived = classKey(d.Suite, d.Index)
+			break
+		}
+	}
+	if rederived == "" {
+		t.Fatal("no deferral rederived as an isolation spec")
+	}
 	tests := []struct {
 		name, want string
 		mutate     func(*Classification)
@@ -260,6 +270,13 @@ func TestClassification(t *testing.T) {
 			for i := range c.Cases {
 				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == first {
 					c.Cases[i].SHA256 = "0"
+				}
+			}
+		}},
+		{"isolation spec rederivation outside multisession", "not multisession", func(c *Classification) {
+			for i := range c.Cases {
+				if classKey(c.Cases[i].Suite, c.Cases[i].Index) == rederived {
+					c.Cases[i].Area = "branch"
 				}
 			}
 		}},

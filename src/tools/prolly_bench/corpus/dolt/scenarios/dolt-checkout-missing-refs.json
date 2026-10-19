@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "id": "dolt-checkout-missing-refs",
+  "description": "Reviewed Dolt port: Using non-existent refs",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCheckoutScripts: Using non-existent refs"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "ref"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (a int primary key, b int);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 1);"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit-2"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b1"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b1"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "b2"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "tag2"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "h4jks5lomp9u41r6902knn0pfr7lsgth"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "b2"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "tag2"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "ref",
+      "op": "connect",
+      "args": [
+        "h4jks5lomp9u41r6902knn0pfr7lsgth"
+      ],
+      "expect": {
+        "sqlstate": "42704"
+      }
+    }
+  ]
+}

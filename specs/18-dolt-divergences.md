@@ -155,16 +155,21 @@ adapts.
 - **Why:** Postgres's concurrency semantics are what this fork keeps.
 - **Port:** multi-session cases are rederived under Postgres semantics
   (#165): blocking and serialization as isolation specs, sequential
-  interleavings as multi-session scenarios.
+  interleavings as multi-session scenarios. A forced delete
+  (`dolt_branch -D`, `-df`) of a branch another session is on is
+  refused (55006), where Dolt deletes it under that session: that
+  session's catalog is the branch's copies, as Postgres won't drop a
+  database in use. A forced rename (`-mf`) goes ahead, as Dolt's does.
 
-## D9. Reverting several commits (under review)
+## D9. Reverting several commits (no longer a divergence)
 
-- **Dolt:** `dolt_revert` takes several commits.
-- **Prolly:** reverting several commits makes one commit.
-- **Status:** under review: whether Dolt makes one commit or one per
-  reverted commit is to be checked against its source, and prolly
-  changed if it differs. Until then, ports of these cases are F, not
-  divergences.
+- **Dolt:** `dolt_revert` takes several commits and makes one revert
+  commit for each, newest first, stopping at the first that conflicts.
+- **Prolly:** the same, since `bb68288278`; `--abort` and `--continue`
+  work over the series.
+- **Status:** checked against Dolt's source and changed to match; kept
+  so the ID isn't reused. The ports are P (`dolt-revert-one-commit-each`,
+  `dolt-revert-series-stops`, `dolt-revert-abort-series`).
 
 ## D10. Not ported
 
@@ -181,3 +186,27 @@ adapts.
 Every other Dolt version-control feature is in scope; one prolly lacks
 yet (diff system tables, `dolt_history_<t>`, tags, `AS OF`, rebase,
 stash, …) is F, ported with the feature (#163).
+
+## D11. Branch-qualified databases are connections
+
+- **Dolt:** `USE mydb/branch` (or a revision) switches a session's
+  database; `` `mydb/branch`.t `` reads another branch's table in the
+  same query; `mydb` alone resolves to the branch the session last
+  checked out; `information_schema` is the base database's whatever
+  the session uses, with each revision database's tables under its own
+  `table_schema`.
+- **Prolly:** a connection names `dbname/branch` (as Doltgres's do) and
+  starts on that branch; `dbname` alone starts on the database's
+  default branch. A connection to a branch that doesn't exist is
+  refused, SQLSTATE 42704, as `dolt_checkout`'s is. A session's
+  catalogs, `information_schema` included, are its branch's, as in
+  Doltgres.
+- **Why:** Postgres has no `USE` and no cross-database references; a
+  connection is a session, so nothing carries from one to the next.
+- **Port:** `USE` becomes the scenario's `connect` operation, a new
+  connection for that session; a cross-database reference becomes the
+  same query on a second session connected to that branch. Assertions
+  that `mydb` follows the session's last checkout expect the default
+  branch; `information_schema` assertions expect the connection's
+  branch's columns. `DATABASE()` and `SHOW DATABASES` are MySQL's
+  (D10).
