@@ -156,6 +156,15 @@ SELECT dolt_checkout('main');
 SELECT (dolt_merge('--', '-dash'))[4];
 SELECT dolt_reset('--hard', '--', '-dash');
 SELECT dolt_cherry_pick('--', '-dash');
+-- (and to a remote's, pushed, fetched and pulled)
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/dash-' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'dash', :'url');
+SELECT dolt_push('dash', '--', '-dash') IS NOT NULL AS pushed;
+SELECT dolt_fetch('dash', '--', '-dash');
+SELECT name FROM dolt_remote_branches() WHERE name LIKE '%-dash';
+SELECT dolt_pull('dash', '--', '-dash') IS NOT NULL AS pulled;
+SELECT dolt_remote('remove', 'dash');
 SELECT dolt_branch('-D', '--', '-dash');
 -- An option's value is the argument after it, "--" too (as in Dolt and
 -- git), so "--" ends the options only where it isn't one.  "--" isn't a
@@ -171,8 +180,27 @@ BEGIN;
 SELECT length(dolt_commit('--allow-empty', '-m', '--')::text) AS committed;
 SELECT length(dolt_commit('--allow-empty', '-Am', '--', '--author', '--')::text) AS committed;
 SELECT message, committer = '--' AS by_dashes FROM dolt_log('main') LIMIT 2;
-SELECT (dolt_merge('-m', '--', '--', 'main'))[4];
+SELECT dolt_branch('dashed');
+SELECT dolt_checkout('dashed');
+SELECT length(dolt_commit('--allow-empty', '-m', 'on dashed')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('--no-ff', '-m', '--', '--', 'dashed'))[4];
+SELECT message FROM dolt_log('main') LIMIT 1;
 ROLLBACK;
+-- A lone "--" ends the options of the rest too, with nothing after it.
+SELECT dolt_add('--');
+SELECT dolt_verify_constraints('--');
+-- -b's start point is the name given apart from it, before -b or after
+-- (as in Dolt and git); -b is given once.
+SELECT dolt_branch('cko_old', 'HEAD~1');
+SELECT dolt_checkout('cko_old', '-b', 'cko_new');
+SELECT dolt_hashof('cko_new') = dolt_hashof('cko_old') AS at_old,
+	dolt_hashof('cko_new') <> dolt_hashof('main') AS not_main;
+SELECT dolt_checkout('main');
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', '-b', 'cko_y');
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', 'main');
+SELECT name FROM dolt_branches WHERE name IN ('cko_x', 'cko_y');
+SELECT dolt_branch('-D', 'cko_old', 'cko_new');
 SELECT dolt_branch('cased');
 SELECT dolt_branch('CASED');
 SELECT dolt_branch('-f', 'Cased');

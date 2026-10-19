@@ -482,6 +482,45 @@ SELECT dolt_reset('--hard', '--', '-dash');
 SELECT dolt_cherry_pick('--', '-dash');
 ERROR:  dolt_cherry_pick changes nothing on the branch
 HINT:  Pass --allow-empty to commit it anyway.
+-- (and to a remote's, pushed, fetched and pulled)
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/dash-' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'dash', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('dash', '--', '-dash') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_fetch('dash', '--', '-dash');
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_remote_branches() WHERE name LIKE '%-dash';
+        name        
+--------------------
+ remotes/dash/-dash
+(1 row)
+
+SELECT dolt_pull('dash', '--', '-dash') IS NOT NULL AS pulled;
+ pulled 
+--------
+ t
+(1 row)
+
+SELECT dolt_remote('remove', 'dash');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('-D', '--', '-dash');
  dolt_branch 
 -------------
@@ -536,13 +575,98 @@ SELECT message, committer = '--' AS by_dashes FROM dolt_log('main') LIMIT 2;
  --      | f
 (2 rows)
 
-SELECT (dolt_merge('-m', '--', '--', 'main'))[4];
-      dolt_merge       
------------------------
- Everything up-to-date
+SELECT dolt_branch('dashed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dashed');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'dashed'"}
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'on dashed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('--no-ff', '-m', '--', '--', 'dashed'))[4];
+    dolt_merge    
+------------------
+ merge successful
+(1 row)
+
+SELECT message FROM dolt_log('main') LIMIT 1;
+ message 
+---------
+ --
 (1 row)
 
 ROLLBACK;
+-- A lone "--" ends the options of the rest too, with nothing after it.
+SELECT dolt_add('--');
+ dolt_add 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_verify_constraints('--');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+-- -b's start point is the name given apart from it, before -b or after
+-- (as in Dolt and git); -b is given once.
+SELECT dolt_branch('cko_old', 'HEAD~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cko_old', '-b', 'cko_new');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'cko_new'"}
+(1 row)
+
+SELECT dolt_hashof('cko_new') = dolt_hashof('cko_old') AS at_old,
+	dolt_hashof('cko_new') <> dolt_hashof('main') AS not_main;
+ at_old | not_main 
+--------+----------
+ t      | t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', '-b', 'cko_y');
+ERROR:  dolt_checkout: multiple values provided for "-b"
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', 'main');
+ERROR:  dolt_checkout: unexpected argument "main"
+SELECT name FROM dolt_branches WHERE name IN ('cko_x', 'cko_y');
+ name 
+------
+(0 rows)
+
+SELECT dolt_branch('-D', 'cko_old', 'cko_new');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('cased');
  dolt_branch 
 -------------
