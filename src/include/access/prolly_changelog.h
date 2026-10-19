@@ -34,6 +34,11 @@
  *   too).  Either TID may be NULL; both NULL, every row may have changed
  *   (the table was truncated, or rewritten).  It ignores relations that
  *   aren't prolly tables with a log.  Errors are the write's.
+ * - note_made() is note() told of the versions a write made in hand
+ *   (nmade of them, each as heap stored it, its TID in t_self) and of the
+ *   one it replaced, if any (oldtid): an insertion of many rows is noted at
+ *   once, and its entries written together.  Optional: without it, each is
+ *   told to note().
  * - identity() is rel's log's identity now: 0 if rel has none, and another
  *   value whenever the log is made anew (not when a branch's copy of it is
  *   made, which has its entries), so entries a baseline was folded with
@@ -95,13 +100,15 @@ typedef struct ProllyChangeLogRoutine
 	bool		(*is_log) (Relation rel);
 	void		(*reset) (Relation rel);
 	Oid			(*relid) (Oid relid);
+	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
+							  HeapTuple *made, int nmade);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", "reset", \
-	"relid"
+	"relid", "note_made"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK relid
+#define PROLLY_CHANGELOG_LAST_CALLBACK note_made
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

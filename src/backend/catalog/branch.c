@@ -960,6 +960,23 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 		branch_tuple_hook(rel, oldtid, newtid);
 }
 
+/*
+ * As branch_note_tuple, of the versions a write made in hand (an insertion
+ * of many rows, or one) and the one it replaced, if any.
+ */
+void
+branch_note_made(Relation rel, const ItemPointerData *oldtid,
+				 HeapTuple *made, int nmade)
+{
+	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+		prolly_note_made(rel, oldtid, made, nmade);
+	else if (prolly_is_change_log(rel))
+		return;
+	if (branch_tuple_hook && hushes == NIL)
+		for (int i = 0; i < nmade; i++)
+			branch_tuple_hook(rel, i == 0 ? oldtid : NULL, &made[i]->t_self);
+}
+
 void
 branch_forget_written(Oid branch)
 {

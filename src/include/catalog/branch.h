@@ -81,6 +81,9 @@ typedef void (*BranchTupleHook) (Relation rel, const ItemPointerData *oldtid,
 extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
 extern void branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 							  const ItemPointerData *newtid);
+/* ... or of the versions a write made, in hand */
+extern void branch_note_made(Relation rel, const ItemPointerData *oldtid,
+							 HeapTuple *made, int nmade);
 
 /*
  * Whether the transaction wrote a versioned object's catalog row, and the

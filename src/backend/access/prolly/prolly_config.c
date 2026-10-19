@@ -226,6 +226,21 @@ prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 		PROLLY_CALL(log, note, rel, oldtid, newtid);
 }
 
+void
+prolly_note_made(Relation rel, const ItemPointerData *oldtid, HeapTuple *made,
+				 int nmade)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log == NULL)
+		return;
+	if (log->note_made != NULL)
+		log->note_made(rel, oldtid, made, nmade);
+	else
+		for (int i = 0; i < nmade; i++)
+			PROLLY_CALL(log, note, rel, i == 0 ? oldtid : NULL, &made[i]->t_self);
+}
+
 Oid
 prolly_change_log_relid(Oid relid, Oid relam)
 {

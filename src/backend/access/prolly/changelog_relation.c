@@ -225,13 +225,21 @@ key_image(Relation rel, HeapTuple version, const Bitmapset *keyattrs)
 	return image;
 }
 
-/* Insert an entry: image (NULL: read the table in full) and delta. */
+/* A write's entries, inserted together (one WAL record for a page's). */
+typedef struct Entries
+{
+	Relation	log;
+	HeapTuple  *tups;
+	int			n;
+	int			max;
+} Entries;
+
+/* An entry: image (NULL: read the table in full) and delta. */
 static void
-insert_entry(Relation log, HeapTuple image, int32 delta)
+insert_entry(Entries *e, HeapTuple image, int32 delta)
 {
 	Datum		values[Natts_log];
 	bool		isnull[Natts_log] = {0};
-	HeapTuple	tup;
 
 	if (image != NULL)
 	{
@@ -244,19 +252,47 @@ insert_entry(Relation log, HeapTuple image, int32 delta)
 	else
 		isnull[Anum_log_image - 1] = true;
 	values[Anum_log_delta - 1] = Int32GetDatum(delta);
-	tup = heap_form_tuple(RelationGetDescr(log), values, isnull);
-	simple_heap_insert(log, tup);
-	heap_freetuple(tup);
+	if (e->n == e->max)
+	{
+		e->max = Max(8, e->max * 2);
+		e->tups = e->tups ? repalloc_array(e->tups, HeapTuple, e->max) :
+			palloc_array(HeapTuple, e->max);
+	}
+	e->tups[e->n++] = heap_form_tuple(RelationGetDescr(e->log), values, isnull);
+}
+
+static void
+write_entries(Entries *e)
+{
+	TupleTableSlot **slots;
+
+	if (e->n == 0)
+		return;
+	if (e->n == 1)
+	{
+		simple_heap_insert(e->log, e->tups[0]);
+		return;
+	}
+	slots = palloc_array(TupleTableSlot *, e->n);
+	for (int i = 0; i < e->n; i++)
+	{
+		slots[i] = MakeSingleTupleTableSlot(RelationGetDescr(e->log),
+											&TTSOpsHeapTuple);
+		ExecStoreHeapTuple(e->tups[i], slots[i], false);
+	}
+	heap_multi_insert(e->log, slots, e->n, GetCurrentCommandId(true), 0, NULL);
+	for (int i = 0; i < e->n; i++)
+		ExecDropSingleTupleTableSlot(slots[i]);
 }
 
 /* A keyless row's entry: its tuple as stored, unless it can't be kept. */
 static void
-insert_row(Relation log, HeapTuple version, int32 delta)
+insert_row(Entries *e, HeapTuple version, int32 delta)
 {
 	if (HeapTupleHasExternal(version) || version->t_len > MAX_IMAGE_LEN)
-		insert_entry(log, NULL, 0);
+		insert_entry(e, NULL, 0);
 	else
-		insert_entry(log, version, delta);
+		insert_entry(e, version, delta);
 }
 
 static bool
@@ -270,12 +306,50 @@ same_image(HeapTuple a, HeapTuple b)
 
 /* A key's entry: its image, unless it can't be kept (it may: see above). */
 static void
-insert_key(Relation log, HeapTuple image)
+insert_key(Entries *e, HeapTuple image)
 {
 	if (image->t_len > MAX_IMAGE_LEN)
-		insert_entry(log, NULL, 0);
+		insert_entry(e, NULL, 0);
 	else
-		insert_entry(log, image, 0);
+		insert_entry(e, image, 0);
+}
+
+/*
+ * The entries for a write: the version it replaced (old, if any) and those
+ * it made.
+ */
+static void
+note_versions(Relation rel, Entries *e, HeapTuple old, HeapTuple *made,
+			  int nmade)
+{
+	if (old == NULL && nmade == 0)
+		insert_entry(e, NULL, 0);	/* (every row may have changed) */
+	else if (OidIsValid(RelationGetPrimaryKeyIndex(rel, false)))
+	{
+		Bitmapset  *keyattrs = RelationGetIndexAttrBitmap(rel,
+														  INDEX_ATTR_BITMAP_PRIMARY_KEY);
+		HeapTuple	oldkey = old ? key_image(rel, old, keyattrs) : NULL;
+
+		for (int i = 0; i < nmade; i++)
+		{
+			HeapTuple	newkey = key_image(rel, made[i], keyattrs);
+
+			/* (an update that kept its key: the key once) */
+			if (oldkey && !same_image(oldkey, newkey))
+				insert_key(e, oldkey);
+			oldkey = NULL;
+			insert_key(e, newkey);
+		}
+		if (oldkey)
+			insert_key(e, oldkey);
+	}
+	else
+	{
+		if (old)
+			insert_row(e, old, -1);
+		for (int i = 0; i < nmade; i++)
+			insert_row(e, made[i], 1);
+	}
 }
 
 /*
@@ -286,14 +360,18 @@ insert_key(Relation log, HeapTuple image)
  */
 static MemoryContext note_cxt = NULL;
 
+/*
+ * Note a write: the version at oldtid it replaced, and those it made, in
+ * hand (made) or at newtid.
+ */
 static void
-relation_note(Relation rel, const ItemPointerData *oldtid,
-			  const ItemPointerData *newtid)
+note_write(Relation rel, const ItemPointerData *oldtid,
+		   const ItemPointerData *newtid, HeapTuple *made, int nmade)
 {
 	Oid			logid = log_relid(rel);
-	Relation	log;
 	HeapTuple	old = NULL;
-	HeapTuple	new = NULL;
+	HeapTuple	new;
+	Entries		e = {0};
 	MemoryContext caller;
 
 	if (!OidIsValid(logid))
@@ -303,37 +381,36 @@ relation_note(Relation rel, const ItemPointerData *oldtid,
 										 ALLOCSET_SMALL_SIZES);
 	/* (left over by a note an error ended) */
 	MemoryContextReset(note_cxt);
-	log = table_open(logid, RowExclusiveLock);
+	e.log = table_open(logid, RowExclusiveLock);
 	caller = MemoryContextSwitchTo(note_cxt);
 	if (oldtid)
 		old = read_version(rel, oldtid);
 	if (newtid)
+	{
 		new = read_version(rel, newtid);
-
-	if (old == NULL && new == NULL)
-		insert_entry(log, NULL, 0); /* (every row may have changed) */
-	else if (OidIsValid(RelationGetPrimaryKeyIndex(rel, false)))
-	{
-		Bitmapset  *keyattrs = RelationGetIndexAttrBitmap(rel,
-														  INDEX_ATTR_BITMAP_PRIMARY_KEY);
-		HeapTuple	oldkey = old ? key_image(rel, old, keyattrs) : NULL;
-		HeapTuple	newkey = new ? key_image(rel, new, keyattrs) : NULL;
-
-		if (oldkey && !(newkey && same_image(oldkey, newkey)))
-			insert_key(log, oldkey);
-		if (newkey)
-			insert_key(log, newkey);
+		made = &new;
+		nmade = 1;
 	}
-	else
-	{
-		if (old)
-			insert_row(log, old, -1);
-		if (new)
-			insert_row(log, new, 1);
-	}
+	note_versions(rel, &e, old, made, nmade);
+	write_entries(&e);
 	MemoryContextSwitchTo(caller);
 	MemoryContextReset(note_cxt);
-	table_close(log, NoLock);
+	table_close(e.log, NoLock);
+}
+
+static void
+relation_note(Relation rel, const ItemPointerData *oldtid,
+			  const ItemPointerData *newtid)
+{
+	note_write(rel, oldtid, newtid, NULL, 0);
+}
+
+/* (the versions made are heap's: they aren't read again from their pages) */
+static void
+relation_note_made(Relation rel, const ItemPointerData *oldtid,
+				   HeapTuple *made, int nmade)
+{
+	note_write(rel, oldtid, NULL, made, nmade);
 }
 
 /*
@@ -545,7 +622,7 @@ static void
 relation_reset(Relation rel)
 {
 	Oid			logid = log_relid(rel);
-	Relation	log;
+	Entries		e = {0};
 
 	if (!OidIsValid(logid))
 		return;
@@ -554,11 +631,12 @@ relation_reset(Relation rel)
 	 * log's OID is every branch's, and only the branch being made, which no
 	 * other transaction sees, sees this storage)
 	 */
-	log = table_open(logid, RowExclusiveLock);
-	RelationSetNewRelfilenumber(log, log->rd_rel->relpersistence);
+	e.log = table_open(logid, RowExclusiveLock);
+	RelationSetNewRelfilenumber(e.log, e.log->rd_rel->relpersistence);
 	CommandCounterIncrement();
-	insert_entry(log, NULL, 0);
-	table_close(log, NoLock);
+	insert_entry(&e, NULL, 0);
+	write_entries(&e);
+	table_close(e.log, NoLock);
 }
 
 static Oid
@@ -596,4 +674,5 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.is_log = relation_is_log,
 	.reset = relation_reset,
 	.relid = relation_relid,
+	.note_made = relation_note_made,
 };
