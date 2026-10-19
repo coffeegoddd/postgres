@@ -72,7 +72,6 @@
 #include "utils/array.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
-#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
@@ -829,38 +828,25 @@ other_unique_index(Relation rel)
 	return false;
 }
 
-/* Whether rel's rows are keyed by their content, not by a primary key. */
-static bool
-keyed_by_content(Relation rel)
-{
-	const ProllyKeyingRoutine *kr = keying_of(rel);
-	ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
-	bool		keyless = PROLLY_CALL(kr, keyless, k);
-
-	PROLLY_CALL(kr, close, k);
-	return keyless;
-}
-
 /*
  * May a row a merge writes to rel break one of its constraints there: a
  * check, a not-null column outside the primary key, or a unique or
  * exclusion index other than the primary key's?  (The merge decides each
  * row by its primary key, so that one holds, if it keys the rows: a
- * deferrable one, or one the keying can't order, doesn't.)  Asked once a
- * table.
+ * deferrable one, or one the keying can't order, doesn't, and rel's
+ * rows are keyless, keyed by content.)  Worked out as a merge begins
+ * writing a table's rows, for may_break_constraints().
  */
-static bool
-may_break_constraints(Relation rel)
+static void
+note_constraints(Relation rel, bool keyless)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
 
-	if (RelationGetRelid(rel) == breakable_relid)
-		return breakable;
 	breakable_relid = RelationGetRelid(rel);
 	breakable = true;
 	if (desc->constr && desc->constr->num_check > 0)
-		return true;
+		return;
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -868,15 +854,23 @@ may_break_constraints(Relation rel)
 
 		if (att->attnotnull && !att->attisdropped &&
 			!bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, pk))
-			return true;
+			return;
 	}
 	if (other_unique_index(rel))
-		return true;
-	if (OidIsValid(RelationGetPrimaryKeyIndex(rel, true)) &&
-		keyed_by_content(rel))
-		return true;
+		return;
+	if (keyless && OidIsValid(RelationGetPrimaryKeyIndex(rel, true)))
+		return;
 	breakable = false;
-	return false;
+}
+
+/* note_constraints()'s answer for rel, the table a merge is writing. */
+static bool
+may_break_constraints(Relation rel)
+{
+	if (RelationGetRelid(rel) != breakable_relid)
+		elog(ERROR, "constraints of \"%s\" not noted",
+			 RelationGetRelationName(rel));
+	return breakable;
 }
 
 /*
@@ -945,77 +939,14 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 	return s.data;
 }
 
-/* Whether any of an index entry's n key columns is null. */
-static bool
-has_null(const bool *isnull, int n)
-{
-	for (int i = 0; i < n; i++)
-		if (isnull[i])
-			return true;
-	return false;
-}
-
-/*
- * Check now the deferrable unique and exclusion constraints of rel a row
- * just inserted into it may break, as their recheck at the end of the
- * statement or at commit would (unique_key_recheck()): a row breaking one
- * raises the error here, where merge_write() can record it.  (A row is
- * updated in place only where no index but the primary key's could be
- * broken, and a deferrable primary key doesn't key the rows: only
- * inserts are checked.)
- */
-static void
-check_deferrable(Relation rel, TupleTableSlot *row)
-{
-	foreach_oid(indexoid, RelationGetIndexList(rel))
-	{
-		Relation	index = index_open(indexoid, RowExclusiveLock);
-		Form_pg_index form = index->rd_index;
-		IndexInfo  *ii;
-		EState	   *estate;
-		ExprContext *econtext;
-		Datum		values[INDEX_MAX_KEYS];
-		bool		isnull[INDEX_MAX_KEYS];
-
-		if (form->indimmediate || !form->indisready ||
-			!(form->indisunique || form->indisexclusion))
-		{
-			index_close(index, RowExclusiveLock);
-			continue;
-		}
-		ii = BuildIndexInfo(index);
-		estate = CreateExecutorState();
-		econtext = GetPerTupleExprContext(estate);
-		econtext->ecxt_scantuple = row;
-		/* (a partial index has no entry for a row outside it) */
-		if (ii->ii_Predicate == NIL ||
-			ExecQual(ExecPrepareQual(ii->ii_Predicate, estate), econtext))
-		{
-			FormIndexDatum(ii, row, estate, values, isnull);
-			if (ii->ii_ExclusionOps != NULL)
-				check_exclusion_constraint(rel, index, ii, &row->tts_tid,
-										   values, isnull, estate, false);
-			/* (a key with a null is unique, unless nulls aren't distinct) */
-			else if (ii->ii_NullsNotDistinct ||
-					 !has_null(isnull, ii->ii_NumIndexKeyAttrs))
-			{
-				index_insert(index, values, isnull, &row->tts_tid, rel,
-							 UNIQUE_CHECK_EXISTING, false, ii);
-				index_insert_cleanup(index, ii);
-			}
-		}
-		FreeExecutorState(estate);
-		index_close(index, RowExclusiveLock);
-	}
-}
-
 /*
  * Write a row as a merge does: insert it, or update old to it.  While a
  * merge records violations, a row that breaks a unique, check or not-null
  * (or exclusion) constraint isn't written, and is recorded instead: a
  * row the merge made of both sides' columns too, the branch's kept (a
  * table holds no row breaking a constraint, unlike Dolt's).  A deferrable
- * constraint is checked as the row is written, as others are.
+ * constraint is checked as the row is written, as others are (the
+ * applier's immediate()).
  * Returns false if old isn't there.
  */
 static bool
@@ -1033,6 +964,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		PROLLY_CALL(ar, insert, a, row);
 		return true;
 	}
+	PROLLY_CALL(ar, immediate, a);
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
@@ -1040,10 +972,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		if (old)
 			ok = PROLLY_CALL(ar, update, a, old, row, keep);
 		else
-		{
 			PROLLY_CALL(ar, insert, a, row);
-			check_deferrable(rel, row);
-		}
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
@@ -1241,6 +1170,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	ap.in_place = !ap.keyless && updates_in_place(ap.rel);
+	if (recording)
+		note_constraints(ap.rel, ap.keyless);
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
@@ -1681,6 +1612,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	in_place = !keyless && updates_in_place(rel);
+	if (recording)
+		note_constraints(rel, keyless);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	oc = tc;

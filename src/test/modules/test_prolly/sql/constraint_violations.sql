@@ -130,7 +130,8 @@ SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
 -- A deferrable unique or exclusion constraint is checked as the merge
 -- writes each row, as one that isn't deferrable is: a row breaking it is
 -- recorded, not left for the end of the merge or the commit to refuse.
--- So is a deferrable primary key (which doesn't key its table's rows).
+-- So is a deferrable primary key, or one WITHOUT OVERLAPS (neither keys
+-- its table's rows, so the merge doesn't decide rows by it).
 CREATE SCHEMA dv VERSIONED;
 CREATE TABLE dv.later (pk int PRIMARY KEY,
 	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
@@ -138,10 +139,13 @@ CREATE TABLE dv.now (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
 CREATE TABLE dv.pk (pk int PRIMARY KEY DEFERRABLE, x int);
 CREATE TABLE dv.ex (pk int PRIMARY KEY, r int4range,
 	EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.wo (k int4range, during int4range,
+	PRIMARY KEY (k, during WITHOUT OVERLAPS));
 INSERT INTO dv.later VALUES (1, 1);
 INSERT INTO dv.now VALUES (1, 1);
 INSERT INTO dv.pk VALUES (1, 1);
 INSERT INTO dv.ex VALUES (1, '[1,2)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[1,3)');
 SELECT length(dolt_commit('-Am', 'deferrable base')::text) AS committed;
 SELECT dolt_branch('deferring');
 SELECT dolt_checkout('deferring');
@@ -149,12 +153,14 @@ INSERT INTO dv.later VALUES (3, 5), (4, NULL);
 INSERT INTO dv.now VALUES (3, 5);
 INSERT INTO dv.pk VALUES (2, 3);
 INSERT INTO dv.ex VALUES (3, '[5,7)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[5,8)'), ('[2,3)', '[5,8)');
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
 SELECT dolt_checkout('main');
 INSERT INTO dv.later VALUES (2, 5), (5, NULL);
 INSERT INTO dv.now VALUES (2, 5);
 INSERT INTO dv.pk VALUES (2, 2);
 INSERT INTO dv.ex VALUES (2, '[6,8)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[6,9)');
 SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
 BEGIN;
 SELECT (dolt_merge('deferring'))[3:4];
@@ -166,6 +172,7 @@ SELECT * FROM dv.later ORDER BY pk;
 SELECT * FROM dv.now ORDER BY pk;
 SELECT * FROM dv.pk ORDER BY pk, x;
 SELECT * FROM dv.ex ORDER BY pk;
+SELECT * FROM dv.wo ORDER BY k, during;
 SELECT dolt_verify_constraints();
 SELECT length(dolt_commit('-am', 'merged deferring')::text) AS committed;
 COMMIT;
