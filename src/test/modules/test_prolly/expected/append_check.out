@@ -3,7 +3,7 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SELECT test_chunk_put('ac present') AS present \gset
-SELECT encode(sha256('ac missing'), 'hex') AS missing \gset
+SELECT test_content_hash('ac missing') AS missing \gset
 -- A node naming a chunk the store has, or one put in the same
 -- transaction, is stored.
 SELECT test_chunk_put_node(1, ARRAY[:'present']) AS node1 \gset
@@ -99,7 +99,7 @@ SELECT test_chunk_has(:'dangling1');
 -- A subtransaction that aborts takes the chunks it put with it: one
 -- naming a missing chunk fails nothing once it is rolled back.  What the
 -- transaction put before, or in a subtransaction that committed, stays.
-SELECT encode(sha256('ac missing in savepoint'), 'hex') AS missing_sp \gset
+SELECT test_content_hash('ac missing in savepoint') AS missing_sp \gset
 BEGIN;
 SELECT test_chunk_put('ac before savepoint') AS before_sp \gset
 SAVEPOINT a;

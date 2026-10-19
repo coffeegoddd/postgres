@@ -100,6 +100,31 @@ OBJS_COMMON += \
 	sha2.o
 endif
 
+# BLAKE3, imported (README.blake3): its SIMD variants are built with the
+# instructions they use enabled, and chosen at run time.
+BLAKE3_OBJS = \
+	blake3.o \
+	blake3_dispatch.o \
+	blake3_portable.o
+ifneq (,$(filter x86_64 i386 i486 i586 i686,$(host_cpu)))
+BLAKE3_OBJS += \
+	blake3_avx2.o \
+	blake3_avx512.o \
+	blake3_sse2.o \
+	blake3_sse41.o
+endif
+ifeq ($(host_cpu),aarch64)
+BLAKE3_OBJS += blake3_neon.o
+endif
+OBJS_COMMON += $(BLAKE3_OBJS)
+
+blake3_variants = $(1).o $(1)_shlib.o $(1)_srv.o
+$(foreach o,$(BLAKE3_OBJS:.o=),$(call blake3_variants,$(o))): CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
+$(call blake3_variants,blake3_sse2): CFLAGS += -msse2
+$(call blake3_variants,blake3_sse41): CFLAGS += -msse4.1
+$(call blake3_variants,blake3_avx2): CFLAGS += -mavx2
+$(call blake3_variants,blake3_avx512): CFLAGS += -mavx512f -mavx512vl
+
 # A few files are currently only built for frontend, not server.
 # logging.c is excluded from OBJS_FRONTEND_SHLIB (shared library) as
 # a matter of policy, because it is not appropriate for general purpose

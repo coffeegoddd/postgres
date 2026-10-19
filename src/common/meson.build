@@ -75,6 +75,32 @@ ryu_cflags = []
 
 ryu_cflags += cflags_no_decl_after_statement
 
+# BLAKE3, imported (README.blake3), likewise; its SIMD variants are built
+# with the instructions they use enabled, and chosen at run time.
+blake3_sources = files(
+  'blake3.c',
+  'blake3_dispatch.c',
+  'blake3_portable.c',
+)
+blake3_cflags = cflags_no_decl_after_statement
+blake3_simd_sources = {}
+blake3_simd_cflags = {}
+if host_cpu == 'x86' or host_cpu == 'x86_64'
+  foreach variant, flags : {
+      'sse2': ['-msse2'],
+      'sse41': ['-msse4.1'],
+      'avx2': ['-mavx2'],
+      'avx512': ['-mavx512f', '-mavx512vl'],
+    }
+    blake3_simd_sources += {'blake3_' + variant: files('blake3_@0@.c'.format(variant))}
+    blake3_simd_cflags += {'blake3_' + variant:
+      blake3_cflags + (cc.get_id() == 'msvc' ? [] : flags)}
+  endforeach
+elif host_cpu == 'aarch64'
+  blake3_simd_sources += {'blake3_neon': files('blake3_neon.c')}
+  blake3_simd_cflags += {'blake3_neon': blake3_cflags}
+endif
+
 config_info_sources = files('config_info.c',)
 config_info_cflags = [
   '-DVAL_CC="@0@"'.format(var_cc),
@@ -92,11 +118,13 @@ config_info_cflags = [
 common_cflags = {
   'ryu': ryu_cflags,
   'config_info': config_info_cflags,
-}
+  'blake3': blake3_cflags,
+} + blake3_simd_cflags
 common_sources_cflags = {
   'ryu': ryu_sources,
-  'config_info': config_info_sources
-}
+  'config_info': config_info_sources,
+  'blake3': blake3_sources,
+} + blake3_simd_sources
 
 
 # A few files are currently only built for frontend, not server.

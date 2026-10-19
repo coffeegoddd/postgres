@@ -44,6 +44,7 @@
 
 #include "access/heapam.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_config.h"
 #include "access/tableam.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -193,7 +194,7 @@ key_bound(Relation rel)
 										 ALLOCSET_DEFAULT_SIZES);
 	/* (in the chunk format and hash of folded trees, prolly_folded_tree_env()) */
 	made.max = PROLLY_CALL(c.tree, key_max, prolly_chunkformat_lookup("basic"),
-						   prolly_hash_lookup("sha256"));
+						   prolly_content_hash());
 	MemoryContextSwitchTo(old);
 
 	MemoryContextSetParent(made.cxt, CacheMemoryContext);

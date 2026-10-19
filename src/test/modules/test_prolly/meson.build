@@ -42,6 +42,7 @@ tests += {
   'regress': {
     'sql': [
       'test_prolly',
+      'content_hashes',
       'prolly_tables',
       'versioned_schemas',
       'catalog_branch_column',

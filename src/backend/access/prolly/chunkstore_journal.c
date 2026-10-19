@@ -129,6 +129,7 @@
 #include <sys/stat.h>
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_config.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_shmem.h"
 #include "access/prolly_tablefile.h"
@@ -4767,7 +4768,7 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 static void
 gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 {
-	GcCopy		gcc = {gc, marks, keep, 0, prolly_hash_lookup("sha256"), paced};
+	GcCopy		gcc = {gc, marks, keep, 0, prolly_content_hash(), paced};
 	uint32		nchunks;
 	uint64		size;
 

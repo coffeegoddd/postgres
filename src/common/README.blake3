@@ -1,0 +1,24 @@
+BLAKE3
+======
+
+blake3*.c, blake3_impl.h and src/include/common/blake3.h are the official
+BLAKE3 C implementation, version 1.8.2, from
+https://github.com/BLAKE3-team/BLAKE3 (its c/ directory), used under its
+CC0 1.0 Universal dedication (the project offers CC0, Apache 2.0, or
+Apache 2.0 with LLVM exceptions).
+
+They are kept as upstream wrote them, so a newer version can be dropped
+in, but for one change: blake3.c and blake3_impl.h include
+"common/blake3.h" where upstream includes "blake3.h".
+
+The build compiles blake3.c, blake3_dispatch.c and blake3_portable.c
+everywhere; on x86 also blake3_sse2.c, blake3_sse41.c, blake3_avx2.c and
+blake3_avx512.c, each with the instructions it uses enabled (-msse2,
+-msse4.1, -mavx2, -mavx512f -mavx512vl), and on AArch64 blake3_neon.c.
+blake3_dispatch.c asks the CPU which it can run, once, and calls the best;
+a CPU without any runs the portable code.  The upstream assembly files
+(*.S, *.asm) are not used.
+
+To update: copy those files from the new release's c/ directory, make the
+include change again, and check src/test/modules/test_prolly's BLAKE3
+test vectors still pass.

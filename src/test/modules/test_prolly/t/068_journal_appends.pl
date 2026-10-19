@@ -29,7 +29,7 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 sql('CREATE EXTENSION test_prolly');
 sql('CREATE EXTENSION injection_points');
 
-sub hash { return sql(qq{SELECT encode(sha256('$_[0]'), 'hex')}); }
+sub hash { return sql(qq{SELECT test_content_hash('$_[0]')}); }
 
 # A transaction stopped once its last chunks are reserved: its range is
 # the journal's, its bytes not written yet.
@@ -124,7 +124,7 @@ $later->query_until(qr/started/, q{
 	BEGIN;
 	SELECT test_chunk_put('after the checkpoint began');
 	SELECT test_chunk_move_root(} . ($root_now eq '' ? 'NULL' : "'$root_now'") . q{,
-		encode(sha256('after the checkpoint began'), 'hex'));
+		test_content_hash('after the checkpoint began'));
 	COMMIT;
 	\echo done
 });

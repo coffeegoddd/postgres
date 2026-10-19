@@ -34,9 +34,9 @@ my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || 
 my $named = q{SELECT coalesce(string_agg(name || ':' || chunks, ' ' ORDER BY name), '')
 	FROM test_chunk_table_files()};
 my $big = q{SELECT count(*) FROM generate_series(1, 40) g
-	WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 9000), 'UTF8')), 'hex')), 'UTF8')
+	WHERE convert_from(test_chunk_get(test_content_hash(convert_to(repeat(g::text, 9000), 'UTF8'))), 'UTF8')
 		= repeat(g::text, 9000)};
-sub has { return sql("SELECT test_chunk_has(encode(sha256('$_[0]'::bytea), 'hex'))"); }
+sub has { return sql("SELECT test_chunk_has(test_content_hash('$_[0]'::bytea))"); }
 
 my $start = sql('SELECT pg_current_wal_insert_lsn()');
 my @manifests;	# the files named after each manifest, in order
@@ -54,12 +54,12 @@ is($manifests[2], 'prolly_table_0000000000000001:2 prolly_table_0000000000000002
 
 # A session reading the files while another conjoins them.
 my $reader = $node->background_psql('postgres');
-is($reader->query_safe(q{SELECT convert_from(test_chunk_get(encode(sha256('a1'::bytea), 'hex')), 'UTF8')}),
+is($reader->query_safe(q{SELECT convert_from(test_chunk_get(test_content_hash('a1'::bytea)), 'UTF8')}),
 	'a1', 'a session reads a table file');
 sql('SELECT test_chunk_conjoin()');
 push @manifests, sql($named);
 is($manifests[3], 'prolly_table_0000000000000004:43', 'conjoined as one');
-is($reader->query_safe(q{SELECT convert_from(test_chunk_get(encode(sha256('c1'::bytea), 'hex')), 'UTF8')}),
+is($reader->query_safe(q{SELECT convert_from(test_chunk_get(test_content_hash('c1'::bytea)), 'UTF8')}),
 	'c1', 'and reads on from the new one');
 $reader->quit;
 is(sql($big), '40', 'every chunk reads back');
@@ -109,13 +109,13 @@ SKIP:
 	# opens them reads the newer one.  (It reads the manifest again for a
 	# chunk it hasn't the file of.)
 	my $r = $node->background_psql('postgres');
-	$r->query_safe(q{SELECT test_chunk_has(encode(sha256('o1'::bytea), 'hex'))});
+	$r->query_safe(q{SELECT test_chunk_has(test_content_hash('o1'::bytea))});
 	sql(q{SELECT test_chunk_table_file(ARRAY['o3'::bytea])});
 	$r->query_safe(q{SELECT injection_points_set_local();
 		SELECT injection_points_attach('prolly-manifest-read', 'wait')});
 	$r->query_until(qr/started/, q{
 		\echo started
-		SELECT convert_from(test_chunk_get(encode(sha256('o3'::bytea), 'hex')), 'UTF8') AS got;
+		SELECT convert_from(test_chunk_get(test_content_hash('o3'::bytea)), 'UTF8') AS got;
 		\echo done
 	});
 	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
@@ -217,7 +217,7 @@ archive_mode = off
 	  or die "recovery to $lsn did not end";
 	my $got = $pitr->safe_psql('postgres', $named);
 	my $reads = $pitr->safe_psql('postgres',
-		q{SELECT test_chunk_has(encode(sha256('a1'::bytea), 'hex'))});
+		q{SELECT test_chunk_has(test_content_hash('a1'::bytea))});
 	if ($got ne $want || $reads ne ($want eq '' ? 'f' : 't'))
 	{
 		diag("stopped at $lsn: files <$got>, expected <$want>; a1 found: $reads");

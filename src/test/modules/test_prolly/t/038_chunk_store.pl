@@ -37,7 +37,7 @@ is(sql("SELECT test_chunk_has('$h1')"), 'f', 'others don\'t, before it commits')
 $a->query_safe('COMMIT');
 is(sql("SELECT convert_from(test_chunk_get('$h1'), 'UTF8')"), 'one', 'and do after');
 sql(q{BEGIN; SELECT test_chunk_put('aborted'); ROLLBACK});
-is(sql(q{SELECT test_chunk_has(encode(sha256('aborted'), 'hex'))}), 'f',
+is(sql(q{SELECT test_chunk_has(test_content_hash('aborted'))}), 'f',
 	'an aborted transaction\'s chunk is gone');
 is(sql("SELECT test_chunk_put('one')"), $h1, 'putting a chunk again names it the same');
 
@@ -46,7 +46,7 @@ is(sql("SELECT test_chunk_put('one')"), $h1, 'putting a chunk again names it the
 # One putting the same chunk then writes its own copy, which is found once
 # it commits, whatever becomes of the first.
 my $batch = q{convert_to(repeat('x', 1048576), 'UTF8')};
-my $hbig = sql("SELECT encode(sha256($batch), 'hex')");
+my $hbig = sql("SELECT test_content_hash($batch)");
 $a->query_safe("BEGIN; SELECT test_chunk_put($batch)");
 is(sql("SELECT test_chunk_has('$hbig')"), 'f',
 	'others don\'t find a chunk written in a batch, before it commits');
@@ -56,7 +56,7 @@ $a->query_safe('ROLLBACK');
 is(sql("SELECT length(test_chunk_get('$hbig'))"), '1048576',
 	'and still, the first one\'s transaction rolled back');
 $a->query_safe("BEGIN; SELECT test_chunk_put($batch || '\\x01'::bytea)");
-my $hbig1 = sql("SELECT encode(sha256($batch || '\\x01'::bytea), 'hex')");
+my $hbig1 = sql("SELECT test_content_hash($batch || '\\x01'::bytea)");
 is(sql("SELECT test_chunk_has('$hbig1')"), 'f', 'another batch, before its commit');
 $a->query_safe('COMMIT');
 is(sql("SELECT test_chunk_has('$hbig1')"), 't', 'and found after');
@@ -118,8 +118,8 @@ my $big = sql(q{
 my $bigroot = sql('SELECT test_chunk_root()');
 push @moves, $bigroot;
 my $all = q{SELECT count(*) FROM generate_series(1, 120) g
-	WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 20000),
-		'UTF8')), 'hex')), 'UTF8') = repeat(g::text, 20000)};
+	WHERE convert_from(test_chunk_get(test_content_hash(convert_to(repeat(g::text, 20000),
+		'UTF8'))), 'UTF8') = repeat(g::text, 20000)};
 is(sql($all), '120', 'every chunk reads back');
 sql('CHECKPOINT');
 my $after_ckpt = sql(q{SELECT test_chunk_put('after checkpoint')});

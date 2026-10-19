@@ -2,7 +2,7 @@
  *
  * chunkstore_checks.c
  *		Checks of the server's chunk store, from SQL: chunks named by their
- *		SHA-256, as hex text, and the store's root.
+ *		content hash, as hex text, and the store's root.
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -82,13 +82,63 @@ text_hash(text *t, ProllyHash *h)
 }
 
 static void
-sha256(const void *data, Size len, ProllyHash *h)
+hash_with(const ProllyHashRoutine *r, const void *data, Size len,
+		  ProllyHash *h)
 {
-	const ProllyHashRoutine *r = prolly_hash_lookup("sha256");
 	ProllyHashCtx *ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
 
 	PROLLY_CALL(r, update, ctx, data, len);
 	PROLLY_CALL(r, finish, ctx, h);
+}
+
+/* data's name in the store: its hash by the server's content hash */
+static void
+content_hash(const void *data, Size len, ProllyHash *h)
+{
+	hash_with(prolly_content_hash(), data, len, h);
+}
+
+/*
+ * data's content hash, as hex text: by the implementation named (in pieces
+ * of piece bytes, if that is more than 0), or by the server's.
+ */
+PG_FUNCTION_INFO_V1(test_content_hash);
+Datum
+test_content_hash(PG_FUNCTION_ARGS)
+{
+	bytea	   *data;
+	const ProllyHashRoutine *r = prolly_content_hash();
+	int32		piece = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+	const uint8 *p;
+	Size		left;
+	ProllyHashCtx *ctx;
+	ProllyHash	h;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	data = PG_GETARG_BYTEA_PP(0);
+	p = (const uint8 *) VARDATA_ANY(data);
+	left = VARSIZE_ANY_EXHDR(data);
+	if (!PG_ARGISNULL(1))
+	{
+		char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+		r = (const ProllyHashRoutine *)
+			prolly_lookup_impl(PROLLY_IFACE_CONTENT_HASH, name);
+		if (r == NULL)
+			elog(ERROR, "no content hash named \"%s\"", name);
+	}
+	ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
+	while (left > 0)
+	{
+		Size		n = (piece > 0 && left > (Size) piece) ? (Size) piece : left;
+
+		PROLLY_CALL(r, update, ctx, p, n);
+		p += n;
+		left -= n;
+	}
+	PROLLY_CALL(r, finish, ctx, &h);
+	PG_RETURN_TEXT_P(hash_text(&h));
 }
 
 /* Put a chunk; returns its hash. */
@@ -99,7 +149,7 @@ test_chunk_put(PG_FUNCTION_ARGS)
 	bytea	   *data = PG_GETARG_BYTEA_PP(0);
 	ProllyHash	h;
 
-	sha256(VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data), &h);
+	content_hash(VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data), &h);
 	PROLLY_CALL(cs(), put, store(), &h, VARDATA_ANY(data),
 				VARSIZE_ANY_EXHDR(data));
 	PG_RETURN_TEXT_P(hash_text(&h));
@@ -120,7 +170,7 @@ put_at_commit(XactEvent event, void *arg)
 			bytea	   *data = lfirst(lc);
 			ProllyHash	h;
 
-			sha256(VARDATA(data), VARSIZE(data) - VARHDRSZ, &h);
+			content_hash(VARDATA(data), VARSIZE(data) - VARHDRSZ, &h);
 			PROLLY_CALL(cs(), put, store(), &h, VARDATA(data),
 						VARSIZE(data) - VARHDRSZ);
 		}
@@ -238,7 +288,7 @@ array_next(void *arg, ProllyHash *hash, StringInfo data)
 	if (as->i >= as->n)
 		return false;
 	b = DatumGetByteaPP(as->elems[as->i++]);
-	sha256(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), hash);
+	content_hash(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), hash);
 	appendBinaryStringInfo(data, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
 	return true;
 }
@@ -506,7 +556,7 @@ test_fold_items(PG_FUNCTION_ARGS)
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");
-	env.hash = prolly_hash_lookup("sha256");
+	env.hash = prolly_content_hash();
 	env.chunk_store = cs();
 	env.chunks = store();
 	env.compare = memcmp_order;
@@ -1101,7 +1151,7 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 	}
 	initStringInfo(&node);
 	PROLLY_CALL(fmt, encode, (uint16) level, n, keys, values, flags, &node);
-	sha256(node.data, node.len, &h);
+	content_hash(node.data, node.len, &h);
 	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
 	PG_RETURN_TEXT_P(hash_text(&h));
 }

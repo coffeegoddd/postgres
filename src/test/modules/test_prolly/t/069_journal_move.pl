@@ -65,7 +65,7 @@ is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
 is(sql(q{SELECT string_agg(settled::text, ',') FROM test_chunk_table_files()}), 'false',
 	'a table file not settled');
 my $fresh = q{SELECT count(*) FROM generate_series(1, 20) g
-	WHERE test_chunk_has(encode(sha256(convert_to(repeat(g::text, 100000), 'UTF8')), 'hex'))};
+	WHERE test_chunk_has(test_content_hash(convert_to(repeat(g::text, 100000), 'UTF8')))};
 is(sql($fresh), '20', 'a new backend reads the chunks moved');
 is(sql("SELECT test_chunk_has('$dead')"), 't', 'and the garbage: nothing is freed');
 

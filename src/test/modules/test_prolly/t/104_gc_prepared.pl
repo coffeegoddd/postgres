@@ -53,7 +53,7 @@ sub has
 {
 	my ($label, $n) = @_;
 	return sql("SELECT count(*) FROM generate_series(1, $n) g
-		WHERE test_chunk_has(encode(sha256(convert_to(repeat(md5(g::text), 1000) || '$label ' || g, 'UTF8')), 'hex'))");
+		WHERE test_chunk_has(test_content_hash(convert_to(repeat(md5(g::text), 1000) || '$label ' || g, 'UTF8')))");
 }
 
 # The retire: a prepared transaction that never used the store, running

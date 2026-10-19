@@ -153,7 +153,7 @@ refs_init(void)
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");
-	env.hash = prolly_hash_lookup("sha256");
+	env.hash = prolly_content_hash();
 	env.chunk_store = prolly_chunk_store();
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);

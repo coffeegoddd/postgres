@@ -187,6 +187,13 @@ CREATE FUNCTION test_chunk_put_at_commit(data bytea)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- data's content hash, as hex: by the implementation named (fed in pieces
+-- of piece bytes, if given), or by the server's, which names chunks.
+CREATE FUNCTION test_content_hash(data bytea, impl text DEFAULT NULL,
+								  piece int DEFAULT NULL)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

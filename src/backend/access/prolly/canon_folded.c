@@ -278,7 +278,7 @@ prolly_folded_tree_env(ProllyTreeEnv *env)
 	memset(env, 0, sizeof(*env));
 	env->chunk_format = prolly_chunkformat_lookup("basic");
 	env->chunker = prolly_chunker_lookup("bytes");
-	env->hash = prolly_hash_lookup("sha256");
+	env->hash = prolly_content_hash();
 	env->chunk_store = prolly_chunk_store();
 	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
 							  MyDatabaseTableSpace);
@@ -472,7 +472,7 @@ struct BaseTable
 };
 
 static void
-sha256(Canon *cn, const void *data, Size len, ProllyHash *h)
+content_hash(Canon *cn, const void *data, Size len, ProllyHash *h)
 {
 	const ProllyHashRoutine *r = cn->env.hash;
 	ProllyHashCtx *ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
@@ -621,7 +621,7 @@ baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
 							   sizeof(att->attnum));
 		prolly_datum_definition(att->atttypid, &match);
 	}
-	sha256(cn, match.data, match.len, h);
+	content_hash(cn, match.data, match.len, h);
 	pfree(match.data);
 }
 

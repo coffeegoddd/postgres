@@ -58,7 +58,7 @@ sql("SELECT test_chunk_move_root(NULL, '$root')");
 my $dead = sql(q{SELECT test_chunk_put('dead')});
 sql(q{SELECT test_chunk_put(convert_to('dead ' || g, 'UTF8')) FROM generate_series(1, 19) g});
 my $reads = q{SELECT count(*) FROM generate_series(1, 20) g
-	WHERE test_chunk_has(encode(sha256(convert_to('live ' || g, 'UTF8')), 'hex'))};
+	WHERE test_chunk_has(test_content_hash(convert_to('live ' || g, 'UTF8')))};
 
 is(sql('SELECT kept || \' \' || freed FROM test_chunk_gc(false)'), '21 20',
 	'the live chunks kept, the dead freed');
@@ -69,7 +69,7 @@ is(sql($on_disk), sql($named), 'only the files the manifest names are left');
 # A writer running at the swap: what it names that was collected is
 # refused; what it appended before the swap is kept.
 sql("SELECT test_chunk_put('orphan')");
-my $orphan = sql(q{SELECT encode(sha256('orphan'), 'hex')});
+my $orphan = sql(q{SELECT test_content_hash('orphan')});
 my $w = $node->background_psql('gcdb', on_error_stop => 0);
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan')});
 my $g = $node->background_psql('gcdb');
@@ -99,7 +99,7 @@ is(has($early), 't', 'what a writer appended between the seal and the swap is ke
 # The same for a hash a chunk holds otherwise (a commit's parent, a head):
 # found in what the swap dropped.
 sql("SELECT test_chunk_put('orphan 2')");
-my $orphan2 = sql(q{SELECT encode(sha256('orphan 2'), 'hex')});
+my $orphan2 = sql(q{SELECT test_content_hash('orphan 2')});
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan2')});
 $g = $node->background_psql('gcdb');
 $g->query_until(qr/started/, q{
@@ -120,7 +120,7 @@ $g->quit;
 # A root moved to (an older one, say), that a swap since the transaction
 # began dropped, is refused, though the transaction puts nothing.
 sql("SELECT test_chunk_put('orphan root')");
-my $orphan3 = sql(q{SELECT encode(sha256('orphan root'), 'hex')});
+my $orphan3 = sql(q{SELECT test_content_hash('orphan root')});
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan3')});
 $g = $node->background_psql('gcdb');
 $g->query_until(qr/started/, q{

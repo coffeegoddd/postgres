@@ -403,7 +403,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	rv.remote = remote;
 	rv.cs = prolly_chunk_store();
 	rv.store = PROLLY_CALL(rv.cs, open, MyDatabaseId, MyDatabaseTableSpace);
-	rv.hash = prolly_hash_lookup("sha256");
+	rv.hash = prolly_content_hash();
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(Received);
 	ctl.hcxt = CurrentMemoryContext;

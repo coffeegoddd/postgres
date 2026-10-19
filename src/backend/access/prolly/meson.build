@@ -15,6 +15,7 @@ backend_sources += files(
   'chunker_stub.c',
   'chunkstore_journal.c',
   'diffmerge_folded.c',
+  'hash_blake3.c',
   'hash_sha256.c',
   'hash_stub.c',
   'keyenc_ordered.c',

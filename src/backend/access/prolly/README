@@ -28,7 +28,7 @@ design choice can be changed later by writing a new implementation:
 
 	Interface         Header                  Implementations
 	chunker           prolly_chunker.h        bytes, stub
-	content_hash      prolly_hash.h           sha256, stub
+	content_hash      prolly_hash.h           blake3, sha256, stub
 	key_encoder       prolly_keyenc.h         ordered, stub
 	value_encoder     prolly_valenc.h         canonical, stub
 	reclamation       prolly_reclaim.h        copying, stub

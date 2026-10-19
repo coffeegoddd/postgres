@@ -12,6 +12,7 @@ FROM prolly_implementations();
  chunker       | bytes        |       2 |              1
  chunker       | stub         |       0 |              0
  content_hash  | sha256       |       1 |              1
+ content_hash  | blake3       |       2 |              1
  content_hash  | stub         |       0 |              0
  content_hash  | test_fnv     |    9001 |              0
  content_hash  | test_broken  |    9002 |              0
@@ -51,7 +52,7 @@ FROM prolly_implementations();
  writers       | stub         |       0 |              0
  change_log    | relation     |       1 |              1
  change_log    | stub         |       0 |              0
-(42 rows)
+(43 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -71,6 +72,10 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  content_hash  | sha256         | deterministic                  | pass
  content_hash  | sha256         | incremental_equals_one_shot    | pass
  content_hash  | sha256         | complete                       | pass
+ content_hash  | blake3         | identity                       | pass
+ content_hash  | blake3         | deterministic                  | pass
+ content_hash  | blake3         | incremental_equals_one_shot    | pass
+ content_hash  | blake3         | complete                       | pass
  content_hash  | stub           | identity                       | pass
  content_hash  | stub           | deterministic                  | not implemented (missing begin, update, finish)
  content_hash  | stub           | incremental_equals_one_shot    | not implemented (missing begin, update, finish)
@@ -228,7 +233,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (9 of 9 callbacks missing)
-(169 rows)
+(173 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -262,6 +267,10 @@ SELECT * FROM prolly_conformance('content_hash');
  content_hash | sha256         | deterministic               | pass
  content_hash | sha256         | incremental_equals_one_shot | pass
  content_hash | sha256         | complete                    | pass
+ content_hash | blake3         | identity                    | pass
+ content_hash | blake3         | deterministic               | pass
+ content_hash | blake3         | incremental_equals_one_shot | pass
+ content_hash | blake3         | complete                    | pass
  content_hash | stub           | identity                    | pass
  content_hash | stub           | deterministic               | not implemented (missing begin, update, finish)
  content_hash | stub           | incremental_equals_one_shot | not implemented (missing begin, update, finish)
@@ -274,7 +283,7 @@ SELECT * FROM prolly_conformance('content_hash');
  content_hash | test_broken    | deterministic               | pass
  content_hash | test_broken    | incremental_equals_one_shot | fail: hashing in pieces differs from hashing at once
  content_hash | test_broken    | complete                    | pass
-(16 rows)
+(20 rows)
 
 SELECT * FROM prolly_conformance('no_such_interface');
 ERROR:  unknown prolly interface "no_such_interface"

@@ -260,6 +260,17 @@ prolly_is_change_log(Relation rel)
 	return log != NULL && log->is_log != NULL && log->is_log(rel);
 }
 
+/*
+ * The content hash chunks are named by: the profile's, the one hash every
+ * chunk store, tree, transfer and canonical form of this server shares.
+ */
+const ProllyHashRoutine *
+prolly_content_hash(void)
+{
+	return (const ProllyHashRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_CONTENT_HASH);
+}
+
 void
 prolly_database_components(ProllyDatabaseComponents *components)
 {

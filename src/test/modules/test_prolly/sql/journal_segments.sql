@@ -48,7 +48,7 @@ SELECT name, chunks, settled FROM test_chunk_table_files();
 SELECT name, chunks FROM test_chunk_segments();
 \c segments_db
 SELECT convert_from(test_chunk_get(:'three'), 'UTF8') AS three,
-	convert_from(test_chunk_get(encode(sha256('seg tf'), 'hex')), 'UTF8') AS tf,
+	convert_from(test_chunk_get(test_content_hash('seg tf')), 'UTF8') AS tf,
 	test_chunk_root() = :'four' AS root;
 
 -- A database made from this one gets every segment.

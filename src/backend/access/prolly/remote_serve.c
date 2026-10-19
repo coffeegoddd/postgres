@@ -696,7 +696,7 @@ dolt_serve_receive(PG_FUNCTION_ARGS)
 static void
 check_sent(const ProllyHash *hash)
 {
-	const ProllyHashRoutine *hr = prolly_hash_lookup("sha256");
+	const ProllyHashRoutine *hr = prolly_content_hash();
 	StringInfoData data;
 	ProllyHashCtx *ctx;
 	ProllyHash	actual;

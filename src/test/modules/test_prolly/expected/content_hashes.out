@@ -1,0 +1,89 @@
+--
+-- Content hashes.  BLAKE3 against the official test vectors
+-- (test_vectors/test_vectors.json of BLAKE3 1.8.2, each digest's first 20
+-- bytes): every input length there, each input the bytes 0, 1, ..., 250
+-- repeated, so the lengths past 1 KiB take the SIMD paths the CPU has.
+-- Each is hashed whole, and fed in pieces that split its 1 KiB chunks and
+-- 64-byte blocks unevenly.
+--
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE TEMP TABLE blake3_vectors (len int, digest text);
+INSERT INTO blake3_vectors VALUES
+	(0, 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9'),
+	(1, '2d3adedff11b61f14c886e35afa036736dcd87a7'),
+	(2, '7b7015bb92cf0b318037702a6cdd81dee41224f7'),
+	(3, 'e1be4d7a8ab5560aa4199eea339849ba8e293d55'),
+	(4, 'f30f5ab28fe047904037f77b6da4fea1e27241c5'),
+	(5, 'b40b44dfd97e7a84a996a91af8b85188c66c1269'),
+	(6, '06c4e8ffb6872fad96f9aaca5eee1553eb62aed0'),
+	(7, '3f8770f387faad08faa9d8414e9f449ac68e6ff0'),
+	(8, '2351207d04fc16ade43ccab08600939c7c1fa70a'),
+	(63, 'e9bc37a594daad83be9470df7f7b3798297c3d83'),
+	(64, '4eed7141ea4a5cd4b788606bd23f46e212af9cac'),
+	(65, 'de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c9'),
+	(127, 'd81293fda863f008c09e92fc382a81f5a0b4a125'),
+	(128, 'f17e570564b26578c33bb7f44643f539624b05df'),
+	(129, '683aaae9f3c5ba37eaaf072aed0f9e30bac08651'),
+	(1023, '10108970eeda3eb932baac1428c7a2163b0e924c'),
+	(1024, '42214739f095a406f3fc83deb889744ac00df831'),
+	(1025, 'd00278ae47eb27b34faecf67b4fe263f82d54129'),
+	(2048, 'e776b6028c7cd22a4d0ba182a8bf62205d2ef576'),
+	(2049, '5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c4'),
+	(3072, 'b98cb0ff3623be03326b373de6b9095218513e64'),
+	(3073, '7124b49501012f81cc7f11ca069ec9226cecb8a2'),
+	(4096, '015094013f57a5277b59d8475c0501042c0b642e'),
+	(4097, '9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d'),
+	(5120, '9cadc15fed8b5d854562b26a9536d9707cadeda9'),
+	(5121, '628bd2cb2004694adaab7bbd778a25df25c47b9d'),
+	(6144, '3e2e5b74e048f3add6d21faab3f83aa44d3b2278'),
+	(6145, 'f1323a8631446cc50536a9f705ee5cb619424d46'),
+	(7168, '61da957ec2499a95d6b8023e2b0e604ec7f6b50e'),
+	(7169, 'a003fc7a51754a9b3c7fae0367ab3d782dccf288'),
+	(8192, 'aae792484c8efe4f19e2ca7d371d8c467ffb1074'),
+	(8193, 'bab6c09cb8ce8cf459261398d2e7aef35700bf48'),
+	(16384, 'f875d6646de28985646f34ee13be9a576fd515f7'),
+	(31744, '62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32'),
+	(102400, 'bc3e3d41a1146b069abffad3c0d44860cf664390');
+CREATE FUNCTION vector_input(n int) RETURNS bytea LANGUAGE sql AS $$
+	SELECT coalesce(decode(string_agg(lpad(to_hex(i % 251), 2, '0'), '' ORDER BY i),
+						   'hex'), '')
+	FROM generate_series(0, n - 1) i
+$$;
+SELECT len, digest, test_content_hash(vector_input(len), 'blake3') AS got
+FROM blake3_vectors
+WHERE test_content_hash(vector_input(len), 'blake3') IS DISTINCT FROM digest;
+ len | digest | got 
+-----+--------+-----
+(0 rows)
+
+SELECT len, piece
+FROM blake3_vectors, (VALUES (1), (7), (63), (1000), (4097)) p(piece)
+WHERE test_content_hash(vector_input(len), 'blake3', piece) IS DISTINCT FROM digest;
+ len | piece 
+-----+-------
+(0 rows)
+
+SELECT count(*) AS vectors FROM blake3_vectors;
+ vectors 
+---------
+      35
+(1 row)
+
+-- SHA-256 is still there, and agrees with Postgres's.
+SELECT test_content_hash('abc', 'sha256') = encode(sha256('abc'), 'hex') AS sha256_agrees;
+ sha256_agrees 
+---------------
+ t
+(1 row)
+
+-- The hash chunks are named by.
+SELECT length(test_content_hash('')) / 2 AS digest_bytes;
+ digest_bytes 
+--------------
+           32
+(1 row)
+
+SELECT test_content_hash('x', 'no such hash');
+ERROR:  no content hash named "no such hash"

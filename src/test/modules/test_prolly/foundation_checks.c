@@ -22,6 +22,7 @@
 #include "access/nbtree.h"
 #include "access/tupdesc_details.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
 #include "catalog/pg_am_d.h"
@@ -1280,7 +1281,7 @@ memfile_read(void *arg, uint64 offset, char *buf, Size len)
 static void
 tablefile_chunk(int i, StringInfo out, ProllyHash *hash)
 {
-	const ProllyHashRoutine *h = prolly_hash_lookup("sha256");
+	const ProllyHashRoutine *h = prolly_content_hash();
 	ProllyHashCtx *ctx;
 	uint32		x = 2166136261u ^ (uint32) i;
 
