@@ -3164,13 +3164,20 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 Datum
 dolt_diff(PG_FUNCTION_ARGS)
 {
-	char	   *from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *from_ref;
+	char	   *to_ref;
 	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 2);
 	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
 	Relation	rel;
 	RowDiffSink s;
 
+	/* (not strict, for tbl's NULL::t: its refs checked here) */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff's refs can't be null")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	InitMaterializedSRF(fcinfo, 0);
 	rel = open_row_type_table(relid, "dolt_diff", ACL_SELECT);
 	memset(&s, 0, sizeof(s));
