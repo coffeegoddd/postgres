@@ -107,3 +107,30 @@ DROP ROLE regress_rs_push;
 SELECT dolt_branch('-D', 'rs_b');
 DROP SCHEMA rs CASCADE;
 SELECT length(dolt_commit('-Am', 'rs gone')::text) AS committed;
+
+-- what changed since known commits, past a merge: a receiver that has one
+-- parent (and so the fork point beneath it) is sent the merge and the other
+-- side's commit, not the history beneath them
+CREATE SCHEMA rsm VERSIONED;
+CREATE TABLE rsm.t (id int PRIMARY KEY, v text);
+INSERT INTO rsm.t SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+SELECT (dolt_commit('-Am', 'rsm c1'))[1] AS rsm_c1 \gset
+SELECT dolt_branch('rsm_f');
+UPDATE rsm.t SET v = 'm' WHERE id = 1;
+SELECT (dolt_commit('-Am', 'rsm m1'))[1] AS rsm_m1 \gset
+SELECT dolt_checkout('rsm_f') IS NOT NULL AS on_f;
+UPDATE rsm.t SET v = 'f' WHERE id = 20000;
+SELECT (dolt_commit('-Am', 'rsm f1'))[1] AS rsm_f1 \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('rsm_f'))[3:4];
+CREATE FUNCTION pg_temp.since(known text[]) RETURNS bigint LANGUAGE sql
+  AS $$ SELECT count(*) FROM dolt_serve_since(ARRAY[pg_temp.h('main')],
+		 ARRAY(SELECT decode(k, 'hex') FROM unnest(known) k)) $$;
+SELECT pg_temp.since(ARRAY[:'rsm_m1']) * 4 < pg_temp.since('{}') AS far_fewer,
+	   pg_temp.since(ARRAY[:'rsm_m1']) = pg_temp.since(ARRAY[:'rsm_m1', :'rsm_c1']) AS as_with_its_base,
+	   pg_temp.since(ARRAY[:'rsm_f1']) * 4 < pg_temp.since('{}') AS other_side_too,
+	   pg_temp.since(ARRAY[:'rsm_m1', :'rsm_f1']) < pg_temp.since(ARRAY[:'rsm_m1']) AS fewer_with_both,
+	   pg_temp.since(ARRAY[repeat('ab', 32)]) = pg_temp.since('{}') AS unknown_ignored;
+SELECT dolt_branch('-D', 'rsm_f');
+DROP SCHEMA rsm CASCADE;
+SELECT length(dolt_commit('-Am', 'rsm gone')::text) AS committed;

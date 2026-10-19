@@ -32,6 +32,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "storage/buffile.h"
 #include "utils/acl.h"
@@ -411,36 +412,128 @@ send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 }
 
 /*
+ * A commit dolt_serve_since() reached: from the wanted, the known, or both
+ * (what reaches it is painted on it, as git's negotiation does), and
+ * whether it is waiting in the queue.
+ */
+#define SINCE_WANTED	0x01
+#define SINCE_KNOWN		0x02
+
+typedef struct SinceCommit
+{
+	ProllyHash	id;				/* (the key) */
+	uint8		paint;
+	uint8		walked;			/* the paint it was walked with */
+	bool		queued;
+	bool		found;			/* the store has it */
+	TimestampTz committed_at;
+	int			nparents;
+	ProllyHash	parents[PROLLY_MAX_PARENTS];
+} SinceCommit;
+
+typedef struct SinceWalk
+{
+	ProllyDatabaseComponents dc;
+	HTAB	   *commits;
+	binaryheap *queue;			/* by committed_at, the latest first */
+	int			wanted_queued;	/* queued, painted wanted only */
+} SinceWalk;
+
+static int
+since_cmp(Datum a, Datum b, void *arg)
+{
+	SinceCommit *x = (SinceCommit *) DatumGetPointer(a);
+	SinceCommit *y = (SinceCommit *) DatumGetPointer(b);
+
+	if (x->committed_at != y->committed_at)
+		return x->committed_at < y->committed_at ? -1 : 1;
+	return 0;
+}
+
+/* Paint commit id, and queue it if that's new paint on it. */
+static void
+since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
+{
+	ProllyHash	key = {0};
+	SinceCommit *c;
+	bool		found;
+
+	key.len = id->len;
+	memcpy(key.bytes, id->bytes, id->len);
+	c = hash_search(sw->commits, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		ProllyCommitInfo info;
+
+		c->paint = c->walked = 0;
+		c->queued = false;
+		c->found = PROLLY_CALL(sw->dc.refs, commit_get, id, &info);
+		c->committed_at = c->found ? info.committed_at : DT_NOBEGIN;
+		c->nparents = c->found ? info.nparents : 0;
+		for (int p = 0; p < c->nparents; p++)
+			c->parents[p] = info.parents[p];
+	}
+	if ((c->paint | paint) == c->paint)
+		return;
+	if (c->queued && c->paint == SINCE_WANTED)
+		sw->wanted_queued--;
+	c->paint |= paint;
+	if (!c->queued && (c->paint & ~c->walked) != 0)
+	{
+		if (sw->queue->bh_size == sw->queue->bh_space)
+		{
+			binaryheap *bigger = binaryheap_allocate(sw->queue->bh_space * 2,
+													 since_cmp, NULL);
+
+			for (int i = 0; i < sw->queue->bh_size; i++)
+				binaryheap_add_unordered(bigger, sw->queue->bh_nodes[i]);
+			binaryheap_build(bigger);
+			binaryheap_free(sw->queue);
+			sw->queue = bigger;
+		}
+		binaryheap_add(sw->queue, PointerGetDatum(c));
+		c->queued = true;
+	}
+	if (c->queued && c->paint == SINCE_WANTED)
+		sw->wanted_queued++;
+}
+
+/*
  * dolt_serve_since(wanted bytea[], known bytea[], OUT hash bytea, OUT chunk
  * bytea) returns setof record: what a receiver that has the known commits
  * (and all they reach) lacks of the wanted ones, as best it can be told in
- * one go: the commits from the wanted down to the known (by parents), and
- * of each, its own chunks and what its root changed from its first
+ * one go: the commits the wanted reach and the known don't (by parents),
+ * and of each, its own chunks and what its root changed from its first
  * parent's (each tree diffed, equal subtrees skipped).  O(new commits and
  * what they changed), not the history.  The receiver checks all it is
  * sent, and reads what it still lacks as it would without this.
+ *
+ * The commits are told apart as git's negotiation tells them: walked from
+ * the wanted and the known together, the latest first, each painted with
+ * what reaches it and its parents with its paint, until no commit waiting
+ * is reached from the wanted only.  The latest first, a commit is mostly
+ * walked once its descendants have painted it; where commit times are out
+ * of order, one may be sent that the receiver has (never one left out
+ * that it lacks: only the known's ancestors are painted known).
  */
 Datum
 dolt_serve_since(PG_FUNCTION_ARGS)
 {
-	ProllyDatabaseComponents dc;
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	Since		sn;
+	SinceWalk	sw;
 	HASHCTL		ctl;
-	HTAB	   *known;
-	HTAB	   *seen;
 	int			nwanted;
 	int			nknown;
 	ProllyHash *wanted;
 	ProllyHash *known_hashes;
-	List	   *queue = NIL;
 	MemoryContext per_commit;
 
 	check_serving(false);
 	wanted = array_hashes(PG_GETARG_ARRAYTYPE_P(0), &nwanted);
 	known_hashes = array_hashes(PG_GETARG_ARRAYTYPE_P(1), &nknown);
-	prolly_database_components(&dc);
+	prolly_database_components(&sw.dc);
 	prolly_folded_tree_env(&env);
 	InitMaterializedSRF(fcinfo, 0);
 	sn.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -451,78 +544,57 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	ctl.hcxt = CurrentMemoryContext;
 	sn.sent = hash_create("prolly chunks sent since", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	known = hash_create("prolly known commits", 64, &ctl,
-						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	seen = hash_create("prolly commits since", 64, &ctl,
-					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	/*
-	 * What the receiver has: the known heads, and each one's merge base
-	 * with each wanted commit (what it has below its heads that the wanted
-	 * share, a fork point behind its branch's head).
-	 */
-	for (int i = 0; i < nknown; i++)
-	{
-		(void) hash_search(known, &known_hashes[i], HASH_ENTER, NULL);
-		for (int w = 0; w < nwanted; w++)
-		{
-			ProllyHash	base;
-
-			if (PROLLY_CALL(dc.refs, commit_get, &known_hashes[i], &(ProllyCommitInfo) {0}) &&
-				PROLLY_CALL(dc.refs, merge_base, &wanted[w], &known_hashes[i], &base))
-			{
-				ProllyHash	key = {0};
-
-				key.len = base.len;
-				memcpy(key.bytes, base.bytes, base.len);
-				(void) hash_search(known, &key, HASH_ENTER, NULL);
-			}
-		}
-	}
-	for (int i = 0; i < nwanted; i++)
-		queue = lappend(queue, &wanted[i]);
+	ctl.entrysize = sizeof(SinceCommit);
+	sw.commits = hash_create("prolly commits since", 64, &ctl,
+							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	sw.queue = binaryheap_allocate(64, since_cmp, NULL);
+	sw.wanted_queued = 0;
 	per_commit = AllocSetContextCreate(CurrentMemoryContext, "prolly since commit",
 									   ALLOCSET_DEFAULT_SIZES);
 
-	while (queue != NIL)
+	for (int i = 0; i < nknown; i++)
+		since_paint(&sw, &known_hashes[i], SINCE_KNOWN);
+	for (int i = 0; i < nwanted; i++)
+		since_paint(&sw, &wanted[i], SINCE_WANTED);
+
+	while (sw.wanted_queued > 0)
 	{
-		ProllyHash *id = linitial(queue);
+		SinceCommit *c = (SinceCommit *) DatumGetPointer(binaryheap_remove_first(sw.queue));
+		uint8		paint = c->paint;
 		ProllyCommitInfo info;
 		ProllyCommitInfo parent;
 		ProllyNodeRef commit;
-		bool		found;
 		MemoryContext old;
 
-		queue = list_delete_first(queue);
-		if (hash_search(known, id, HASH_FIND, NULL) != NULL)
+		CHECK_FOR_INTERRUPTS();
+		c->queued = false;
+		if (paint == SINCE_WANTED)
+			sw.wanted_queued--;
+		c->walked = paint;
+		for (int p = 0; p < c->nparents; p++)
+			since_paint(&sw, &c->parents[p], paint);
+		/* (one it hasn't: the receiver's walk asks) */
+		if (paint != SINCE_WANTED || !c->found)
 			continue;
-		(void) hash_search(seen, id, HASH_ENTER, &found);
-		if (found || !PROLLY_CALL(dc.refs, commit_get, id, &info))
-			continue;			/* (one it hasn't: the receiver's walk asks) */
-		for (int p = 0; p < info.nparents; p++)
-		{
-			ProllyHash *ph = palloc0(sizeof(ProllyHash));
-
-			ph->len = info.parents[p].len;
-			memcpy(ph->bytes, info.parents[p].bytes, ph->len);
-			queue = lappend(queue, ph);
-		}
 
 		/* (what one commit's walks allocate, gone after it) */
 		old = MemoryContextSwitchTo(per_commit);
-
+		if (!PROLLY_CALL(sw.dc.refs, commit_get, &c->id, &info))
+			elog(ERROR, "commit %s went missing", prolly_hash_hex(&c->id));
 		memset(&commit, 0, sizeof(commit));
-		commit.hash = *id;
+		commit.hash = c->id;
 		(void) PROLLY_CALL(tree, walk, &env, &commit, send_since, &sn);
 		if (info.has_dependencies)
 			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, send_since, &sn);
-		PROLLY_CALL(dc.canonicalizer, walk_changes,
+		PROLLY_CALL(sw.dc.canonicalizer, walk_changes,
 					info.nparents > 0 &&
-					PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &parent) ?
+					PROLLY_CALL(sw.dc.refs, commit_get, &info.parents[0], &parent) ?
 					&parent.root : NULL,
 					&info.root, send_since, &sn);
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(per_commit);
 	}
+	binaryheap_free(sw.queue);
 	return (Datum) 0;
 }
 
