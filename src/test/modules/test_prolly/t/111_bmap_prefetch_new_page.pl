@@ -6,18 +6,15 @@
 # written and the new page not, the page is zeroes on disk, below the map's
 # length, until the record is replayed.  The WAL prefetcher looks blocks up
 # ahead of replay, and a lookup of a block on that page finds no entry: the
-# prefetch is skipped, not a failure of recovery.
+# prefetch is skipped, not a failure of recovery.  Outside recovery, a map
+# page of zeroes under the length is a lost write, and a prefetch through
+# it fails.
 
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-
-# Without read-ahead advice there is no prefetcher to test.
-plan skip_all => 'recovery_prefetch is not supported on this platform'
-  unless check_pg_config('#define HAVE_DECL_POSIX_FADVISE 1')
-  && check_pg_config('#define HAVE_POSIX_FADVISE 1');
 
 # Nothing writes out a dirty buffer but the test's evictions: map page 2
 # stays zeroes on disk until the crash.
@@ -27,7 +24,6 @@ $node->append_conf(
 	'postgresql.conf', q{
 debug_block_mapped_heap = on
 autovacuum = off
-recovery_prefetch = on
 bgwriter_lru_maxpages = 0
 checkpoint_timeout = 1d
 max_wal_size = 10GB
@@ -36,6 +32,17 @@ shared_buffers = 128MB
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+
+# Without read-ahead advice there is no prefetcher to test: the server
+# refuses recovery_prefetch = on (taking effect at the crash's restart)
+# where it has none, as it does without posix_fadvise() (macOS, Windows).
+my ($ret, $stdout, $stderr) = $node->psql('postgres',
+	'ALTER SYSTEM SET recovery_prefetch = on');
+if ($ret != 0)
+{
+	$node->stop;
+	plan skip_all => 'recovery_prefetch is not supported on this platform';
+}
 
 # One row a block (half a block, stored inline), and as many blocks as a
 # map page has entries: (block size - page header - special space) / entry.
@@ -88,6 +95,24 @@ ok(!$node->log_contains('is not an initialized block map page', $log_offset),
 is(sql(q{SELECT count(*) FROM c}), $fanout + 2, 'and recovers every row');
 is(sql(q{SELECT count(*) FROM c WHERE a = 0}), '2',
 	'and the blocks the page maps');
+
+# Outside recovery, map page 2 of zeroes (a lost write) fails a prefetch
+# through it.  pg_prewarm's prefetch mode reaches the map only through
+# bmapprefetch().
+$node->stop;
+open($fh, '+<:raw', $mappath) or die "could not open $mappath: $!";
+seek($fh, 2 * $bs, 0);
+print $fh "\0" x $bs;
+close($fh);
+$node->start;
+sql('CREATE EXTENSION pg_prewarm');
+($ret, $stdout, $stderr) =
+  $node->psql('postgres', q{SELECT pg_prewarm('c', 'prefetch')});
+isnt($ret, 0, 'outside recovery, a prefetch through a zeroed map page fails');
+like(
+	$stderr,
+	qr/block 2 of ".*_bmap" is not an initialized block map page/,
+	'as a map page that isn\'t initialized');
 
 $node->stop;
 done_testing();
