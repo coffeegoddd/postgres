@@ -121,6 +121,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_keying.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -6136,10 +6137,10 @@ restore_locality(List *tables, List *to)
  * table's rows as to has them (see prolly_canon.h).
  */
 static void
-folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
-				   void (*rows) (void *arg),
-				   void (*breaking) (List *added, void *arg), void *arg,
-				   bool rewritten)
+move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
+			void (*rows) (void *arg),
+			void (*breaking) (List *added, void *arg), void *arg,
+			bool rewritten)
 {
 	bool		matviews_made = false;
 	List	   *replaced = NIL; /* ordinary schemas they replace */
@@ -6695,6 +6696,30 @@ unsupported:
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("the branch can't be moved to a commit that defines objects of this kind differently")));
+}
+
+/*
+ * ... every row written, and every primary key's index built over rows,
+ * from trees a commit held: none is refused for its key's length (see
+ * prolly_table.c).
+ */
+static void
+folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
+				   void (*rows) (void *arg),
+				   void (*breaking) (List *added, void *arg), void *arg,
+				   bool rewritten)
+{
+	bool		held = prolly_writing_held_rows(true);
+
+	PG_TRY();
+	{
+		move_schema(from_root, to_root, rows, breaking, arg, rewritten);
+	}
+	PG_FINALLY();
+	{
+		prolly_writing_held_rows(held);
+	}
+	PG_END_TRY();
 }
 
 /*

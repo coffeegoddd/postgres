@@ -253,7 +253,10 @@ prolly_session_init(const char *branch)
 /*
  * The branch a connection asked for, checked out in a transaction of its
  * own now that the backend processes normally.  (An error here, before the
- * main loop, ends the connection: it isn't left on another branch.)
+ * main loop, ends the connection: it isn't left on another branch.)  The
+ * transaction reads nothing else, so it is read committed whatever the
+ * default: a branch's first use moves its copies by a snapshot taken after
+ * they were made, never one taken before.
  */
 void
 prolly_session_ready(void)
@@ -263,6 +266,7 @@ prolly_session_ready(void)
 	if (connect_branch == NULL)
 		return;
 	StartTransactionCommand();
+	XactIsoLevel = XACT_READ_COMMITTED;
 	PushActiveSnapshot(GetTransactionSnapshot());
 	prolly_database_components(&dc);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(dc.refs, checkout, connect_branch));

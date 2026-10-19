@@ -5160,8 +5160,10 @@ mark_foreign_key_validated(Relation pg_constraint, Oid conoid)
  * checks and NOT NULLs it added (unvalidated, ProllyAddedConstraint *)
  * taken away and recorded as violations, as the rows it couldn't write
  * are, so that the constraints validate.  The rows breaking one may be the
- * branch's own as well as those merged: Dolt records them either way.  (No
- * trigger fires for the rows taken away, as none does for those written.)
+ * branch's own as well as those merged: Dolt records them either way,
+ * and takes a NOT NULL's out as well, but keeps a check's in the table
+ * (spec 18, D13).  (No trigger fires for the rows taken away, as none
+ * does for those written.)
  * A foreign key it added is marked validated, its table's rows checked
  * against it as the merge checks every foreign key of the tables it wrote:
  * those breaking it stay, recorded.
@@ -6113,12 +6115,13 @@ without_local(const Local *l, ProllyNodeRef *root)
 /*
  * A fast-forward to theirs with uncommitted changes: the rows and sequence
  * values theirs changed since the head written, the changes left as they
- * are, and theirs made the head.  Refused if the rows written break a
+ * are, and theirs made the head (not for a squash, which leaves the head
+ * where it is, as Dolt's does).  Refused if the rows written break a
  * foreign key, as a merge over uncommitted changes that leaves violations
  * is: the working set may have one the head hasn't.
  */
 static void
-fast_forward_local(const Local *l, const ProllyHash *theirs)
+fast_forward_local(const Local *l, const ProllyHash *theirs, bool squash)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef target;
@@ -6166,7 +6169,8 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 		if (h && !same_sequence(h, t))
 			set_sequence(t);
 	}
-	PROLLY_CALL(dc.refs, set_head, theirs);
+	if (!squash)
+		PROLLY_CALL(dc.refs, set_head, theirs);
 
 	/*
 	 * Then a checkpoint, as after any move: else the pages its rows were
@@ -6281,15 +6285,11 @@ merge_held(const char *branch, const char *message, int flags,
 	check_local(&local, &roots[0], &roots[1], &roots[2], "merge", NULL);
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
-		if (flags & PROLLY_MERGE_SQUASH)
-		{
-			/* their rows, the head left where it is */
-			if (has_local_changes(&local))
-				refuse_local_changes("squash a merge");
-			folded_move_to(&roots[2], NULL);
-		}
-		else if (has_local_changes(&local))
-			fast_forward_local(&local, &theirs);
+		if (has_local_changes(&local))
+			fast_forward_local(&local, &theirs,
+							   (flags & PROLLY_MERGE_SQUASH) != 0);
+		else if (flags & PROLLY_MERGE_SQUASH)
+			folded_move_to(&roots[2], NULL);	/* the head left where it is */
 		else
 			reset_to(&theirs);
 		*commit_id = theirs;

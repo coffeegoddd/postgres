@@ -248,15 +248,25 @@ typedef struct ProllyTreeRoutine
 									StringInfo ref);
 	void		(*value_root) (const ProllyValue *ref, ProllyHash *root,
 							   uint64 *len);
+
+	/*
+	 * The longest key a tree holds in format, its nodes referenced by
+	 * hash's hashes, whatever its size and shape: build_add() and apply()
+	 * take every key up to it, with any value whose references
+	 * (value_refs()) take less than half a node, and may refuse a longer
+	 * one.
+	 */
+	Size		(*key_max) (const ProllyChunkFormatRoutine *format,
+							const ProllyHashRoutine *hash);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
-	"value_present", "value_reference", "value_root"
+	"value_present", "value_reference", "value_root", "key_max"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK value_root
+#define PROLLY_TREE_LAST_CALLBACK key_max
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)
