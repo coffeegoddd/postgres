@@ -47,6 +47,9 @@ step a_active	{ SELECT active_branch(); }
 step a_main		{ SELECT (dolt_checkout('main'))[1] = '0' AS ok; }
 step a_insert	{ INSERT INTO vtb.t (v) VALUES (1) RETURNING id; }
 step a_commit	{ COMMIT; }
+# back on main, whatever branch a permutation left it on: a branch it is
+# on can't be deleted, and the teardown deletes them all
+teardown		{ DO $$ BEGIN PERFORM dolt_checkout('main'); END $$; }
 
 session b
 step b_begin	{ BEGIN; }
@@ -64,6 +67,9 @@ step b_commit	{ COMMIT; }
 # another branch's head moved since the transaction began (BranchIsolation-
 # Tests 1): seen moved
 permutation a_begin a_other_head b_on_other b_change b_dcommit b_main a_other_head a_commit
+# a session left on a branch it made: back on main before the teardown
+# deletes it, and nothing left for the next permutation
+permutation a_mine a_active
 # a branch made since (2): seen made
 permutation a_begin a_branches b_branch a_branches a_commit
 # a branch deleted and another made since (4): seen by name, in a join,

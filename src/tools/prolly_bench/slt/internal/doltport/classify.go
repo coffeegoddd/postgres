@@ -66,10 +66,14 @@ var slug = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
 func classKey(suite string, index int) string { return fmt.Sprintf("%s[%d]", suite, index) }
 
+// Where a deferral rederived under Postgres's concurrency names its spec.
+const isolationSpecs = "src/test/prolly/specs/"
+
 // checkClassification checks the classification against the lock (and the
 // catalog, if given: every case classified once, by its literal's hash),
 // and that ports and deferrals agree with it: a full port is of a P case, a
-// partial one of a P or F case.
+// partial one of a P or F case; a case deferred to an isolation spec is
+// a multi-session one.
 func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[string]doltcatalog.Case, m Manifest, partial map[string]bool) (ClassCoverage, error) {
 	var cov ClassCoverage
 	if c.Version != 1 || c.Revision != lock.Revision {
@@ -132,8 +136,12 @@ func checkClassification(c Classification, lock doltcatalog.Lock, catalog map[st
 	}
 	for _, d := range m.Deferred {
 		key := classKey(d.Suite, d.Index)
-		if k, ok := byKey[key]; !ok || k.SHA256 != d.SourceSHA256 {
+		k, ok := byKey[key]
+		if !ok || k.SHA256 != d.SourceSHA256 {
 			return cov, fmt.Errorf("deferred %s: case unclassified or classified from other source", key)
+		}
+		if strings.Contains(d.Reason, isolationSpecs) && k.Area != "multisession" {
+			return cov, fmt.Errorf("deferred %s: rederived as an isolation spec, but in area %s, not multisession", key, k.Area)
 		}
 		deferred[key] = true
 	}

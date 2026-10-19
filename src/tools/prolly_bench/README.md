@@ -558,8 +558,10 @@ exist only where the adapter must capture a commit or open a connection:
 `cherrypick` and `revert` (Dolt's arguments, flags included: `--no-ff`,
 `--abort`, `--continue`, ...), and `connect` (Dolt's `USE`: the session's
 connection again, to the case's database or, given a branch, to
-`database/branch`; a refused connection is its SQLSTATE and leaves the
-session as it was, and the old backend has exited before the step ends).
+`database/branch`, a name of at most 63 bytes; a connection refused for
+its branch is its SQLSTATE, 42704, and leaves the session as it was, any
+other refusal failing the step; the new connection must be on the branch
+named, or `main`, and the old backend has exited before the step ends).
 Their capability is implied. Arguments are in `args`; SQL bind parameters
 are in `params`. Successful commits require a
 unique `save` name; a merge, pick or revert may name one, and must then

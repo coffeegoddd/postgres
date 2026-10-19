@@ -296,32 +296,31 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 }
 
 // reconnect opens session's connection again, to the case's database or,
-// given a branch, to "database/branch" (Dolt's USE mydb/branch). A refused
-// connection is an outcome, its SQLSTATE, and leaves the session as it
-// was, as a failed USE does. Otherwise the old connection is closed, and
-// its backend gone, before the step ends: its lock on its branch with it.
+// given a branch, to "database/branch" (Dolt's USE mydb/branch). A
+// connection refused for its branch is an outcome, its SQLSTATE, and
+// leaves the session as it was, as a failed USE does; any other refusal is
+// the target's failure. Otherwise the old connection is closed, and its
+// backend gone, before the step ends: its lock on its branch with it. The
+// new connection must be on the branch named, or the default one.
 func (p *Postgres) reconnect(ctx context.Context, session string, args []*string) (Outcome, error) {
 	old := p.sessions[session]
-	db := p.db
-	if len(args) == 1 {
-		db += "/" + *args[0]
+	db, branch, err := connectTarget(p.db, args)
+	if err != nil {
+		return Outcome{}, err
 	}
 	c, err := p.connect(ctx, db)
 	if err != nil {
-		var pgerr *pgconn.PgError
-		if !errors.As(err, &pgerr) || pgerr.Severity != "FATAL" {
-			return Outcome{}, err
+		if code := branchRefusal(err, len(args) == 1); code != "" {
+			return Outcome{Rows: [][]*string{}, SQLState: code, Transaction: string(old.TxStatus())}, nil
 		}
-		return Outcome{Rows: [][]*string{}, SQLState: pgerr.Code, Transaction: string(old.TxStatus())}, nil
+		return Outcome{}, err
 	}
 	pid := fmt.Sprint(old.PID())
 	deadline, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	if err = old.Close(deadline); err != nil {
-		c.Close(deadline)
+	if err = replace(deadline, p.sessions, session, c); err != nil {
 		return Outcome{}, err
 	}
-	p.sessions[session] = c
 	for {
 		o, err := p.must(ctx, p.admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = $1", &pid)
 		if err != nil {
@@ -336,16 +335,59 @@ func (p *Postgres) reconnect(ctx context.Context, session string, args []*string
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if len(args) == 1 {
-		check, err := p.must(ctx, c, "SELECT active_branch()")
-		if err != nil {
-			return Outcome{}, err
-		}
-		if len(check.Rows) != 1 || len(check.Rows[0]) != 1 || check.Rows[0][0] == nil || *check.Rows[0][0] != *args[0] {
-			return Outcome{}, fmt.Errorf("connection did not select requested branch")
-		}
+	check, err := p.must(ctx, c, "SELECT active_branch()")
+	if err != nil {
+		return Outcome{}, err
+	}
+	if len(check.Rows) != 1 || len(check.Rows[0]) != 1 || check.Rows[0][0] == nil || *check.Rows[0][0] != branch {
+		return Outcome{}, fmt.Errorf("connection did not select branch %s", branch)
 	}
 	return Outcome{Rows: [][]*string{}, Tag: "connected to " + db, Transaction: string(c.TxStatus())}, nil
+}
+
+// The longest database name a startup packet keeps (NAMEDATALEN - 1): the
+// server cuts a longer one short, silently, naming another database.
+const maxDatabaseName = 63
+
+// The branch a connection to the database alone starts on.
+const defaultBranch = "main"
+
+// connectTarget is the database a connect step names, the case's db or,
+// given a branch, "db/branch", and the branch the connection must be on.
+func connectTarget(db string, args []*string) (target, branch string, err error) {
+	target, branch = db, defaultBranch
+	if len(args) == 1 {
+		branch = *args[0]
+		target += "/" + branch
+	}
+	if len(target) > maxDatabaseName {
+		return "", "", fmt.Errorf("database name %q is longer than %d bytes", target, maxDatabaseName)
+	}
+	return target, branch, nil
+}
+
+// branchRefusal is the SQLSTATE of a connection refused because the branch
+// it named doesn't exist, or "" for any other failure (too many
+// connections, authentication, the case's database gone): those are the
+// target's, not the case's.
+func branchRefusal(err error, named bool) string {
+	var pgerr *pgconn.PgError
+	if named && errors.As(err, &pgerr) && pgerr.Severity == "FATAL" && pgerr.Code == "42704" {
+		return pgerr.Code
+	}
+	return ""
+}
+
+// replace makes c session's connection in place of the one it has, closing
+// that. If closing it fails the session has neither: the old connection is
+// closed regardless, and c is closed with it.
+func replace[C interface{ Close(context.Context) error }](ctx context.Context, sessions map[string]C, session string, c C) error {
+	if err := sessions[session].Close(ctx); err != nil {
+		delete(sessions, session)
+		return errors.Join(err, c.Close(ctx))
+	}
+	sessions[session] = c
+	return nil
 }
 
 // "$1::text, ..., $n::text": Dolt's arguments, for a variadic text call.
