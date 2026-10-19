@@ -82,6 +82,7 @@
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -127,6 +128,7 @@ static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
+static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
@@ -1371,8 +1373,20 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	base;
 
 	lock_refs();
+
+	/*
+	 * Merged, as in Dolt (and git): into the branch's upstream, read from
+	 * its remote-tracking branch, so only as current as the last fetch; or,
+	 * when it has none there, into the session's branch.  Not asked of the
+	 * session's own branch or main, which the drop refuses whatever they
+	 * contain: refused first, as Dolt (and git) refuses the checked-out
+	 * branch, so the error isn't one -D doesn't get past.
+	 */
 	if (!force && branch_head(name, &head) &&
-		!(branch_head(branch_ops()->current(), &ours) &&
+		strcmp(name, branch_ops()->current()) != 0 &&
+		branch_oid(name) != BRANCH_MAIN_OID &&
+		!((upstream_head(name, &ours) ||
+		   branch_head(branch_ops()->current(), &ours)) &&
 		  copies_merge_base(&head, &ours, &base) && same_hash(&base, &head)))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2446,6 +2460,34 @@ copies_upstream(const char *branch, char **remote, char **remote_branch)
 	pfree(key.data);
 	pfree(v.data);
 	return found;
+}
+
+/*
+ * The commit of branch's upstream's remote-tracking branch; false if it has
+ * no upstream, or the upstream no remote-tracking branch (not yet fetched).
+ */
+static bool
+upstream_head(const char *branch, ProllyHash *commit_id)
+{
+	char	   *remote;
+	char	   *remote_branch;
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	if (!copies_upstream(branch, &remote, &remote_branch))
+		return false;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tracking_key(&key, remote, remote_branch);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+		(void) get_hash(v.data, v.data + v.len, commit_id);
+	pfree(key.data);
+	pfree(v.data);
+	pfree(remote);
+	pfree(remote_branch);
+	return found && commit_id->len > 0;
 }
 
 static bool

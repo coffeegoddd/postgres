@@ -103,6 +103,7 @@ typedef struct BmapFold
 typedef void (*BmapChangeVisit) (const BmapChange *change, void *arg);
 
 extern void bmap_fold_begin(SMgrRelation reln, BmapFold *fold);
+extern bool bmap_folded(SMgrRelation reln);
 extern bool bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
 							  BmapChangeVisit visit, void *arg);
 extern void bmap_fold_prune(SMgrRelation reln, const BmapFold *keep);
