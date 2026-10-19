@@ -180,6 +180,58 @@ INSERT INTO dc.t VALUES (6, 'six');
 ERROR:  cannot execute INSERT in a read-only transaction
 ROLLBACK;
 INSERT INTO dc.t VALUES (6, 'six');
+-- (a transaction on a commit asked to be read-only makes no branch there,
+-- nor moves one)
+SELECT dolt_hashof('from_first') AS ff \gset
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+BEGIN READ ONLY;
+SELECT dolt_branch('ro_made');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN;
+SET TRANSACTION READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+SELECT dolt_hashof('from_first') = :'ff' AS not_moved;
+ not_moved 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('ro_made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('ro_made') = :'c1' AS made_there;
+ made_there 
+------------
+ t
+(1 row)
+
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+SELECT dolt_branch('-D', 'ro_made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- (a hidden branch isn't checked out by name, nor HEAD as a commit)
 SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
 ERROR:  branch names beginning "detached/" are reserved

@@ -68,6 +68,25 @@ SELECT (dolt_checkout('main'))[2];
 INSERT INTO dc.t VALUES (6, 'six');
 ROLLBACK;
 INSERT INTO dc.t VALUES (6, 'six');
+-- (a transaction on a commit asked to be read-only makes no branch there,
+-- nor moves one)
+SELECT dolt_hashof('from_first') AS ff \gset
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+BEGIN READ ONLY;
+SELECT dolt_branch('ro_made');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ROLLBACK;
+BEGIN;
+SET TRANSACTION READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ROLLBACK;
+SELECT dolt_hashof('from_first') = :'ff' AS not_moved;
+SELECT dolt_branch('ro_made');
+SELECT dolt_hashof('ro_made') = :'c1' AS made_there;
+SELECT (dolt_checkout('main'))[2];
+SELECT dolt_branch('-D', 'ro_made');
 -- (a hidden branch isn't checked out by name, nor HEAD as a commit)
 SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
 SELECT dolt_checkout('HEAD');
