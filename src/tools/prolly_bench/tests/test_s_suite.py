@@ -50,6 +50,30 @@ class CounterShapeTest(unittest.TestCase):
                 if wid not in ("S4", "S13"):
                     self.assertGreater(params["transactions"], 0, wid)
 
+    def test_s4_minimal_wal_requires_retention_for_its_checkpoint(self):
+        for setting in ("0", "0MB", "0GB", "1MB", "8192kB"):
+            with self.subTest(wal_keep_size=setting):
+                with self.assertRaisesRegex(config.ConfigError, "S4.*wal_keep_size"):
+                    config.load(HERE / "configs" / "s_counters.toml", {
+                        "run": {"workloads": ["S4"]}, "postgres": {"wal_keep_size": setting}})
+
+    def test_s4_retention_accepts_postgres_wal_size_units(self):
+        for setting in ("16", "16MB", "16384kB", "16777216B", "0.015625GB", "16GB"):
+            with self.subTest(wal_keep_size=setting):
+                config.load(HERE / "configs" / "s_counters.toml", {
+                    "run": {"workloads": ["S4"]}, "postgres": {"wal_keep_size": setting}})
+
+    def test_s4_with_replication_slot_does_not_need_wal_keep_size(self):
+        cfg = config.load(HERE / "configs" / "s_counters.toml", {
+            "run": {"workloads": ["S4"]},
+            "postgres": {"wal_level": "replica", "wal_keep_size": "0"}})
+        self.assertEqual(cfg["postgres"]["wal_level"], "replica")
+
+    def test_minimal_wal_without_s4_can_use_no_retention(self):
+        cfg = config.load(HERE / "configs" / "s_counters.toml", {
+            "run": {"workloads": ["S1"]}, "postgres": {"wal_keep_size": "0"}})
+        self.assertEqual(cfg["postgres"]["wal_level"], "minimal")
+
     def test_s5_left_to_timing(self):
         cfg = config.load(HERE / "configs" / "s_counters.toml", {})
         self.assertNotIn("S5", cfg["run"]["workloads"])

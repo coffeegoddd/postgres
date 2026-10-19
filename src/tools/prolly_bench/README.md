@@ -322,8 +322,13 @@ Reports and run constraints:
   after that checkpoint.
 - **WAL retention.** A replication slot keeps the window's WAL where
   `wal_level` allows one. That WAL can be tens of GB on a long window.
-  The counter runs keep `minimal` and run with no slot. The config refuses
-  `minimal` unless `checkpoint_timeout` exceeds the window.
+  The counter runs keep `minimal` and run with no slot, so `wal_keep_size`
+  retains 16 GB across S4's explicit checkpoint inside the measured window.
+  This retains existing WAL without preallocating 16 GB; each cell starts
+  with a fresh cluster. The config refuses S4 with write amplification at
+  `minimal` without WAL retention, and requires `checkpoint_timeout` to
+  exceed the window. Retention must cover the entire interval; recycled
+  WAL still invalidates the result.
 - **The gate.** In a counter run, `scounters` gates the logical, WAL and
   chunk-store totals. It doesn't gate the page totals: those sum every
   backend type, and how they repeat depends on timing. `s_counters.toml`

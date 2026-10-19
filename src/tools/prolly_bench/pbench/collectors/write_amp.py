@@ -29,10 +29,11 @@ the interval): row records
 hold again), full-page images from any of them, and the rest.  The WAL is
 read before the final checkpoint, which would recycle it; a replication
 slot keeps it from the window's own checkpoints where wal_level allows
-one.  At wal_level = minimal (the counter runs, which have no timed
-checkpoints) there is no slot, and WAL a checkpoint in the window
-recycled fails the read rather than going uncounted.  The WAL's interval
-therefore ends before the final checkpoint's record; the pages' after it.
+one. At wal_level = minimal (the counter runs) there is no slot:
+wal_keep_size must retain WAL across workload checkpoints such as S4's.
+WAL recycled from the interval fails the read rather than going uncounted.
+The WAL's interval therefore ends before the final checkpoint's record;
+the pages' after it.
 
 Logical bytes are the new row versions the SQL wrote:
 (rows inserted + rows updated) x the table's average row size, for every
