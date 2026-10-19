@@ -105,10 +105,9 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
 -- A change only an explicit cast makes (a USING clause), alike on both
--- sides.  Base's values are compared through the explicit cast only where
--- casting back gives them again: '1' reads as 1, so theirs' 5 is the only
--- change; ' 3' doesn't (it comes back '3'), so the cast can't tell whether
--- a side changed row 3, and theirs' 7 against ours' 3 is a conflict.
+-- sides.  Base's values are compared through the explicit cast where it
+-- gives what master compared, their text form read as integers: '1' and
+-- ' 3' read as 1 and 3, so theirs' 5 and 7 are the only changes.
 CREATE TABLE rt.u (id int PRIMARY KEY, v text);
 INSERT INTO rt.u VALUES (1, '1'), (3, ' 3');
 SELECT length(dolt_commit('-Am', 'u base')::text) AS committed;
@@ -319,6 +318,37 @@ ALTER TABLE rt.m ALTER COLUMN n TYPE int;
 SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.m);
 SELECT dolt_conflicts_resolve('--theirs', 'rt.m');
 SELECT * FROM rt.m ORDER BY id;
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+
+-- Retyped alike on both sides within char's own type, or between string
+-- types, the cast is trusted only where it gives what master compared:
+-- base's stored value (the same type), or its text form (another).  A
+-- USING that pads or folds differently can't then hide theirs' edit.
+-- (A plain char(3) to char(10) on both sides is a conflict on a row a
+-- side edited too, as on master: padding changes base's stored value.)
+CREATE TABLE rt.up (id int PRIMARY KEY, code char(3), tags char(2)[], name char(5));
+INSERT INTO rt.up VALUES (1, 'ab', '{ab}', 'ab'), (2, 'cd', '{ef}', 'cd'),
+  (3, 'gh', '{gh}', 'gh');
+SELECT length(dolt_commit('-Am', 'up base')::text) AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.up ALTER COLUMN code TYPE char(10) USING upper(code),
+  ALTER COLUMN tags TYPE char(5)[] USING upper(tags::text)::char(5)[],
+  ALTER COLUMN name TYPE text USING rpad(name, 5);
+INSERT INTO rt.up VALUES (4, 'x', '{x}', 'x');
+SELECT length(dolt_commit('-am', 'main: upper')::text) AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.up ALTER COLUMN code TYPE char(10) USING upper(code),
+  ALTER COLUMN tags TYPE char(5)[] USING upper(tags::text)::char(5)[],
+  ALTER COLUMN name TYPE text USING rpad(name, 5);
+UPDATE rt.up SET code = 'ab' WHERE id = 1;
+UPDATE rt.up SET tags = '{ef}' WHERE id = 2;
+UPDATE rt.up SET name = 'gh' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: upper')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged upper'))[2:4];
+SELECT our_row, their_row FROM dolt_conflicts(NULL::rt.up) ORDER BY 1;
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 

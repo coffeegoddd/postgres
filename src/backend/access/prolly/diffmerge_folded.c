@@ -2173,6 +2173,17 @@ dup_bytes(const char *data, int len)
  * of the key, is unsure: the merge takes either side as having changed
  * it (as_defined_now()'s *unsure).  In a key, or a table without one,
  * nothing can say which side changed it: the merge is refused.
+ *
+ * A column both sides retyped is compared more strictly still: base's cast
+ * is trusted only where it gives what master compared, base's stored
+ * value for the same type (char(3) to char(10): the padding is a
+ * change), its text form read as the new type for another (string types
+ * too).  Both ALTERs may have had a USING (upper(code), rpad(name, 5))
+ * that the cast misses, and a side's edit back to the cast's value would
+ * look like none.  A value of the same type is otherwise kept as stored,
+ * which is what master compared; one of another type is unsure, or
+ * refused where it can't be.  So a plain char(3) to char(10) made on both
+ * sides conflicts on a row a side also edited, as on master.
  */
 typedef enum ReadFor
 {
@@ -2201,6 +2212,8 @@ typedef struct ColumnRead
 	ExprState  *back;			/* conv's value cast back, or NULL: none
 								 * (unchecked, or not kept: see loss) */
 	bool		guarded;		/* conv or back may fail on a value */
+	bool		need_back;		/* not kept without a cast back */
+	bool		match_stored;	/* kept only as the stored value itself */
 	bool		blank_padded;	/* compared back without trailing blanks */
 	bool		by_text;		/* checked against the text form too: */
 	FmgrInfo	out;			/* the old type's output */
@@ -2283,7 +2296,7 @@ is_bit_type(Oid type)
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
-			ReadFor read, bool key, bool keyless, EState *estate,
+			ReadFor read, bool key, bool keyless, bool both, EState *estate,
 			ColumnRead *cr)
 {
 	Form_pg_attribute xa = TupleDescAttr(xd, j);
@@ -2321,6 +2334,35 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 	assign_expr_collations(NULL, e);
 	cr->conv = ExecPrepareExpr((Expr *) e, estate);
 
+	/*
+	 * (compared, retyped by both sides: trusted only as it gives what
+	 * master compared, base's stored value for the same type, its text form
+	 * read as the new type for another; else kept as stored, or unsure)
+	 */
+	if (read == READ_COMPARED && both)
+	{
+		if (same)
+		{
+			cr->loss = LOSS_KEEP_STORED;
+			cr->match_stored = true;
+			cr->guarded = !(is_string_type(att->atttypid) ||
+							is_bit_type(att->atttypid));
+		}
+		else
+		{
+			Oid			outf;
+			bool		varlena;
+
+			cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
+			cr->by_text = true;
+			getTypeOutputInfo(xa->atttypid, &outf, &varlena);
+			fmgr_info(outf, &cr->out);
+			getTypeInputInfo(att->atttypid, &cr->in, &cr->in_param);
+			cr->guarded = true;
+		}
+		return;
+	}
+
 	/* (written; or nothing to lose) */
 	if (read == READ_WRITTEN ||
 		(same && typmod_widens(att->atttypid, xa->atttypmod, att->atttypmod)) ||
@@ -2357,6 +2399,7 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		assign_expr_collations(NULL, back);
 		cr->back = ExecPrepareExpr((Expr *) back, estate);
 	}
+	cr->need_back = true;
 
 	/*
 	 * (an explicit cast between string types, or between bit strings, only
@@ -2421,7 +2464,10 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 
 		*isnull = n;
 		*d = n ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
-		if (cr->back)
+		if (cr->match_stored)
+			kept = !n && datum_image_eq(*d, xs->tts_values[j], att->attbyval,
+										att->attlen);
+		else if (cr->back)
 		{
 			Datum		b = ExecEvalExprSwitchContext(cr->back, econtext, &n);
 
@@ -2431,7 +2477,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 				 datum_image_eq(b, xs->tts_values[j], xatt->attbyval,
 								xatt->attlen));
 		}
-		else if (cr->loss != LOSS_UNCHECKED)
+		else if (cr->need_back)
 			kept = false;		/* (no cast back: nothing says it's kept) */
 		if (kept && cr->by_text && !*isnull)
 		{
@@ -2485,45 +2531,47 @@ name_listed(List *names, const char *name)
 /*
  * The columns of base's a merge's side retyped (another type or typmod,
  * by name), of the table as base, ours and theirs define it (any NULL:
- * none): those whose values a merge reads base's across, which a later
- * retype (mid-resolution) isn't.
+ * none), into *either; those both sides retyped also into *both.  Those
+ * whose values a merge reads base's across, which a later retype
+ * (mid-resolution) isn't.
  */
-static List *
-retyped_columns(const Table *base, const Table *ours, const Table *theirs)
+static void
+retyped_columns(const Table *base, const Table *ours, const Table *theirs,
+				List **either, List **both)
 {
-	List	   *names = NIL;
 	List	   *sides[2];
 	bool		keyed;
 	ListCell   *lc;
 
+	*either = NIL;
+	*both = NIL;
 	if (base == NULL || ours == NULL || theirs == NULL)
-		return NIL;
+		return;
 	sides[0] = version_columns(ours, &keyed);
 	sides[1] = version_columns(theirs, &keyed);
 	foreach(lc, version_columns(base, &keyed))
 	{
 		VersionColumn *c = lfirst(lc);
+		int			n = 0;
 
 		for (int i = 0; i < 2; i++)
 		{
 			ListCell   *sc;
-			bool		differs = false;
 
 			foreach(sc, sides[i])
 			{
 				VersionColumn *s = lfirst(sc);
 
-				if (strcmp(s->name, c->name) == 0)
-					differs = s->type != c->type || s->typmod != c->typmod;
-			}
-			if (differs)
-			{
-				names = lappend(names, c->name);
-				break;
+				if (strcmp(s->name, c->name) == 0 &&
+					(s->type != c->type || s->typmod != c->typmod))
+					n++;
 			}
 		}
+		if (n > 0)
+			*either = lappend(*either, c->name);
+		if (n == 2)
+			*both = lappend(*both, c->name);
 	}
-	return names;
 }
 
 /*
@@ -2537,7 +2585,9 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs)
  *
  * Read for comparing (a merge's base), only the columns named in retyped
  * (those a side retyped: retyped_columns()) are; others are read as
- * shown, as the sides' are.  *unsure (if not NULL) gets the rows (keyed)
+ * shown, as the sides' are.  Those in both_retyped, which both sides
+ * retyped, are trusted through the cast only where it gives what master
+ * compared (see ReadFor).  *unsure (if not NULL) gets the rows (keyed)
  * with a value that's unsure (see ReadFor): a side has changed them,
  * where it has them (merge_table()).  It's left empty otherwise.
  *
@@ -2551,7 +2601,8 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs)
  */
 static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
-			   List *retyped, bool refuse, Table *out, UnsureRows *unsure)
+			   List *retyped, List *both_retyped, bool refuse, Table *out,
+			   UnsureRows *unsure)
 {
 	RowDiff		rd;
 	VersionReader vr;
@@ -2673,7 +2724,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 						!name_listed(retyped, NameStr(att->attname)) ?
 						READ_SHOWN : read,
 						bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk),
-						!vr.keyed, estate, &reads[a]);
+						!vr.keyed, name_listed(both_retyped, NameStr(att->attname)),
+						estate, &reads[a]);
 			converted[a] = true;
 		}
 	}
@@ -3085,8 +3137,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	fp = as_defined_now(rel, from, now, READ_SHOWN, NIL, false, &f, NULL);
-	tp = as_defined_now(rel, to, now, READ_SHOWN, NIL, false, &t, NULL);
+	fp = as_defined_now(rel, from, now, READ_SHOWN, NIL, NIL, false, &f, NULL);
+	tp = as_defined_now(rel, to, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, sink);
 }
@@ -3248,6 +3300,8 @@ merge_rows(void *arg)
 			Table		on;
 			Table		tn;
 			UnsureRows	unsure;
+			List	   *retyped;
+			List	   *both_retyped;
 
 			/*
 			 * (one side's rows alone, defined as merged already: they're
@@ -3268,10 +3322,11 @@ merge_rows(void *arg)
 			rel = table_open(relid, AccessShareLock);
 			refuse_lost_changes(rel, b, o, w);
 			refuse_lost_changes(rel, b, t, w);
-			(void) as_defined_now(rel, b, w, READ_COMPARED,
-								  retyped_columns(b, o, t), true, &bn, &unsure);
-			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, true, &on, NULL);
-			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, true, &tn, NULL);
+			retyped_columns(b, o, t, &retyped, &both_retyped);
+			(void) as_defined_now(rel, b, w, READ_COMPARED, retyped, both_retyped,
+								  true, &bn, &unsure);
+			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, NIL, true, &on, NULL);
+			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, NIL, true, &tn, NULL);
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
 				apply_rows(relid, w, &on);
@@ -5355,6 +5410,8 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	Table	   *bt;
 	Table	   *ot;
 	Table	   *tt;
+	List	   *retyped;
+	List	   *both_retyped;
 
 	/* The merge left the head where it was: ours is the head commit. */
 	if (!PROLLY_CALL(components().refs, resolve, "HEAD", &ours))
@@ -5374,10 +5431,11 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	ot = find_table(tables_at(&ours), name);
 	tt = find_table(tables_at(&ms->theirs), name);
 	rel = table_open(relid, AccessShareLock);
-	bp = as_defined_now(rel, bt, now, READ_COMPARED,
-						retyped_columns(bt, ot, tt), false, &b, &unsure);
-	op = as_defined_now(rel, ot, now, READ_SHOWN, NIL, false, &o, NULL);
-	tp = as_defined_now(rel, tt, now, READ_SHOWN, NIL, false, &t, NULL);
+	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
+	bp = as_defined_now(rel, bt, now, READ_COMPARED, retyped, both_retyped,
+						false, &b, &unsure);
+	op = as_defined_now(rel, ot, now, READ_SHOWN, NIL, NIL, false, &o, NULL);
+	tp = as_defined_now(rel, tt, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
 	table_close(rel, AccessShareLock);
 
 	/*
