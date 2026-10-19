@@ -2626,6 +2626,16 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 }
 
 /*
+ * Whether a fold of the relation has begun: its changes since are listed
+ * from then on.
+ */
+bool
+bmap_folded(SMgrRelation reln)
+{
+	return changes_fold_epoch(reln) > 0;
+}
+
+/*
  * Write 'k' entries into 'buf', a page of a changes list, locked
  * exclusively, as a page of them alone: one record 'info' with main data
  * 'xlrec'.  The buffer is unlocked and released.
