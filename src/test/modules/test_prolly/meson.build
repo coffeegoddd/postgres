@@ -114,6 +114,7 @@ tests += {
       'hash_pointers',
       'toast_by_content',
       'toast_folds',
+      'index_tablespaces',
     ],
   },
   'tap': {
@@ -167,6 +168,7 @@ tests += {
       't/074_toast_rewrites.pl',
       't/075_toast_acceptance.pl',
       't/076_remote_answers.pl',
+      't/101_index_tablespaces.pl',
       't/109_bmap_incremental_backup.pl',
     ],
   },
