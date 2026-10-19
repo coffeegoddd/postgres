@@ -137,6 +137,59 @@ DELETE FROM cv.child WHERE id = 7;
 SELECT dolt_verify_constraints();
 SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
 
+-- A deferrable unique or exclusion constraint is checked as the merge
+-- writes each row, as one that isn't deferrable is: a row breaking it is
+-- recorded, not left for the end of the merge or the commit to refuse.
+-- So is a deferrable primary key, or one WITHOUT OVERLAPS (neither keys
+-- its table's rows, so the merge doesn't decide rows by it).
+CREATE SCHEMA dv VERSIONED;
+CREATE TABLE dv.later (pk int PRIMARY KEY,
+	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.now (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
+CREATE TABLE dv.pk (pk int PRIMARY KEY DEFERRABLE, x int);
+CREATE TABLE dv.ex (pk int PRIMARY KEY, r int4range,
+	EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.wo (k int4range, during int4range,
+	PRIMARY KEY (k, during WITHOUT OVERLAPS));
+INSERT INTO dv.later VALUES (1, 1);
+INSERT INTO dv.now VALUES (1, 1);
+INSERT INTO dv.pk VALUES (1, 1);
+INSERT INTO dv.ex VALUES (1, '[1,2)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[1,3)');
+SELECT length(dolt_commit('-Am', 'deferrable base')::text) AS committed;
+SELECT dolt_branch('deferring');
+SELECT dolt_checkout('deferring');
+INSERT INTO dv.later VALUES (3, 5), (4, NULL);
+INSERT INTO dv.now VALUES (3, 5);
+INSERT INTO dv.pk VALUES (2, 3);
+INSERT INTO dv.ex VALUES (3, '[5,7)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[5,8)'), ('[2,3)', '[5,8)');
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO dv.later VALUES (2, 5), (5, NULL);
+INSERT INTO dv.now VALUES (2, 5);
+INSERT INTO dv.pk VALUES (2, 2);
+INSERT INTO dv.ex VALUES (2, '[6,8)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[6,9)');
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('deferring'))[3:4];
+SELECT table_name, violation_type, violating_row, violation_info
+FROM dolt_constraint_violations() d,
+	LATERAL dolt_constraint_violations(d.table_name::regclass)
+ORDER BY table_name;
+SELECT * FROM dv.later ORDER BY pk;
+SELECT * FROM dv.now ORDER BY pk;
+SELECT * FROM dv.pk ORDER BY pk, x;
+SELECT * FROM dv.ex ORDER BY pk;
+SELECT * FROM dv.wo ORDER BY k, during;
+SELECT dolt_verify_constraints();
+SELECT length(dolt_commit('-am', 'merged deferring')::text) AS committed;
+COMMIT;
+SELECT dolt_branch('-D', 'deferring');
+DROP SCHEMA dv CASCADE;
+SELECT length(dolt_commit('-Am', 'no dv')::text) AS committed;
+
 -- A revert that leaves a child without its parent records it.
 INSERT INTO cv.parent VALUES (10);
 SELECT (dolt_commit('-am', 'parent 10'))[1] AS parent10 \gset
@@ -265,6 +318,57 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'uv_theirs');
 DROP SCHEMA uv CASCADE;
 SELECT length(dolt_commit('-Am', 'uv dropped')::text) AS committed;
+
+-- The rows put back and the pinned row updated are checked against a
+-- deferrable unique constraint as each is written too, so a deferrable
+-- one (d, ad) merges as one that isn't (i, ai).  A row whose new version
+-- takes a value a row of ours holds (d's 2) stays as the branch has it, as
+-- does the row that would take its old value (d's 1); and a pinned row's
+-- update (ad's 3, as uv.a's) neither leaves a buffer pinned nor fails.
+CREATE SCHEMA dw VERSIONED;
+CREATE TABLE dw.d (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
+CREATE TABLE dw.i (pk int PRIMARY KEY, x int UNIQUE);
+CREATE TABLE dw.ad (pk int PRIMARY KEY, b int UNIQUE DEFERRABLE,
+	c int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dw.ai (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO dw.d VALUES (1, 4), (2, 5);
+INSERT INTO dw.i VALUES (1, 4), (2, 5);
+INSERT INTO dw.ad VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+INSERT INTO dw.ai VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+SELECT length(dolt_commit('-Am', 'dw base')::text) AS committed;
+SELECT dolt_branch('dw_theirs');
+INSERT INTO dw.d VALUES (3, 7);
+INSERT INTO dw.i VALUES (3, 7);
+UPDATE dw.ad SET b = 99 WHERE pk = 3;
+UPDATE dw.ai SET b = 99 WHERE pk = 3;
+SELECT length(dolt_commit('-am', 'dw ours')::text) AS committed;
+SELECT dolt_checkout('dw_theirs');
+UPDATE dw.d SET x = 7 WHERE pk = 2;
+UPDATE dw.d SET x = 5 WHERE pk = 1;
+UPDATE dw.i SET x = 7 WHERE pk = 2;
+UPDATE dw.i SET x = 5 WHERE pk = 1;
+UPDATE dw.ad SET b = 99 WHERE pk = 2;
+UPDATE dw.ad SET c = 301 WHERE pk = 3;
+UPDATE dw.ad SET c = 300 WHERE pk = 1;
+UPDATE dw.ai SET b = 99 WHERE pk = 2;
+UPDATE dw.ai SET c = 301 WHERE pk = 3;
+UPDATE dw.ai SET c = 300 WHERE pk = 1;
+SELECT length(dolt_commit('-am', 'dw theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('dw_theirs'))[3:4];
+SELECT * FROM dw.d ORDER BY pk;
+SELECT * FROM dw.i ORDER BY pk;
+SELECT * FROM dw.ad ORDER BY pk;
+SELECT * FROM dw.ai ORDER BY pk;
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row::text
+FROM unnest(ARRAY['dw.d', 'dw.i', 'dw.ad', 'dw.ai']) t,
+	LATERAL dolt_constraint_violations(t)
+ORDER BY 1, 3;
+ROLLBACK;
+SELECT dolt_branch('-D', 'dw_theirs');
+DROP SCHEMA dw CASCADE;
+SELECT length(dolt_commit('-Am', 'dw dropped')::text) AS committed;
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;

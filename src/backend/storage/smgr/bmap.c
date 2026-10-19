@@ -2626,6 +2626,16 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 }
 
 /*
+ * Whether a fold of the relation has begun: its changes since are listed
+ * from then on.
+ */
+bool
+bmap_folded(SMgrRelation reln)
+{
+	return changes_fold_epoch(reln) > 0;
+}
+
+/*
  * Write 'k' entries into 'buf', a page of a changes list, locked
  * exclusively, as a page of them alone: one record 'info' with main data
  * 'xlrec'.  The buffer is unlocked and released.
@@ -5108,9 +5118,24 @@ bmap_redo(XLogReaderState *record)
 					redo_block(record, id);
 				if (zeroed)
 				{
-					/* zeroes in its buffer too, without an LSN, as a new page */
-					Buffer		buf = XLogInitBufferForRedo(record, last);
+					/*
+					 * zeroes in its buffer too, without an LSN, as a new
+					 * page.  A buffer already valid (the old block's page,
+					 * read before) is only locked, not zeroed: zeroed here,
+					 * under a cleanup lock, as a standby's scan may hold a
+					 * pin on it and read its tuples without a content lock.
+					 * A buffer of zeroes stays clean: the block has zeroes.
+					 */
+					Buffer		buf;
 
+					(void) XLogReadBufferForRedoExtended(record, last,
+														 RBM_ZERO_AND_CLEANUP_LOCK,
+														 true, &buf);
+					if (!pg_memory_is_all_zeros(BufferGetPage(buf), BLCKSZ))
+					{
+						memset(BufferGetPage(buf), 0, BLCKSZ);
+						MarkBufferDirty(buf);
+					}
 					UnlockReleaseBuffer(buf);
 				}
 				else
