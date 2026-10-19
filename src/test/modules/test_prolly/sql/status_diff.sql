@@ -263,7 +263,24 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('WORKING', 'head', NULL::app.t
 SELECT count(*) FROM dolt_diff('HEAD', 'HEAD', NULL::app.t);
 SELECT * FROM dolt_diff('HEAD~1', 'WORKING', NULL::app.t);	-- (no commit to step back from)
 SELECT * FROM dolt_diff('nope', 'WORKING', NULL::app.t);
+-- the branch by name, or by its full ref name, as HEAD
+SELECT diff_type, to_row FROM dolt_diff('main', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT diff_type, to_row FROM dolt_diff('refs/heads/main', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT * FROM dolt_diff('main~1', 'WORKING', NULL::app.t);
+SELECT * FROM dolt_diff('refs/heads/nope', 'WORKING', NULL::app.t);
+-- a branch made before the first commit: unborn too, by any of its names
+SELECT dolt_branch('unborn');
+SELECT name, hash FROM dolt_branches ORDER BY name;
+SELECT diff_type, to_row FROM dolt_diff('unborn', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT count(*) FROM dolt_diff('unborn', 'main', NULL::app.t);
+SELECT dolt_checkout('unborn');
+SELECT * FROM dolt_status ORDER BY table_name;
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT diff_type, to_row FROM dolt_diff('main', 'WORKING', NULL::app.t) ORDER BY to_row;
+SELECT dolt_checkout('main');
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+-- unborn stays so after main's first commit: still the empty root
+SELECT diff_type, to_row FROM dolt_diff('unborn', 'main', NULL::app.t) ORDER BY to_row;
 SELECT * FROM dolt_status;
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
 \c :db

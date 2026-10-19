@@ -173,9 +173,32 @@ is_working(const char *ref)
 }
 
 /*
- * The canonical root of a ref: a commit's, or WORKING folded now.  HEAD
- * before the branch's first commit is the empty root, as Dolt's initial
- * commit is (and as dolt_log('HEAD') has no commits).
+ * Does ref, which doesn't resolve, name a branch without a commit yet: HEAD
+ * (the session branch), a branch's name, or refs/heads/ and its name, read
+ * as the refs' resolve reads them?  Not with ancestry steps (HEAD~1): there
+ * is no commit to step back from.
+ */
+static bool
+names_unborn_branch(const ProllyDatabaseComponents *dc, const char *ref)
+{
+	ProllyBranchId branch;
+
+	if (ref[strcspn(ref, "~^")] != '\0')
+		return false;
+	if (pg_strcasecmp(ref, "HEAD") == 0 &&
+		!PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref = branch_ops()->current();
+	else if (strncmp(ref, "refs/heads/", 11) == 0 && ref[11] != '\0' &&
+			 !PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref += 11;
+	return PROLLY_CALL(dc->refs, branch_lookup, ref, &branch);
+}
+
+/*
+ * The canonical root of a ref: a commit's, or WORKING folded now.  A
+ * branch before its first commit (HEAD, or the branch by name) is the
+ * empty root, as Dolt's initial commit is (and as dolt_log('HEAD') has no
+ * commits).
  */
 static void
 root_of(const char *ref, ProllyNodeRef *root)
@@ -191,7 +214,7 @@ root_of(const char *ref, ProllyNodeRef *root)
 		return;
 	}
 	found = PROLLY_CALL(dc.refs, resolve, ref, &id);
-	if (!found && pg_strcasecmp(ref, "HEAD") == 0)
+	if (!found && names_unborn_branch(&dc, ref))
 	{
 		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 		ProllyTreeEnv env;
