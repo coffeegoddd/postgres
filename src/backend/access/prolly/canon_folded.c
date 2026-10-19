@@ -5387,6 +5387,8 @@ typedef struct TypeMoves
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
 	List	   *tables;			/* the tables of those columns */
+	List	   *detached;		/* typed tables detached before their types
+								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -5522,18 +5524,34 @@ same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *n
 	return a && b && strcmp(a, b) == 0;
 }
 
+/* Whether a partitioned table's key uses its column attnum. */
+static bool
+in_partition_key(Oid relid, AttrNumber attnum)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	bool		expr;
+	bool		used = has_partition_attrs(rel,
+										   bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+										   &expr);
+
+	table_close(rel, AccessShareLock);
+	return used;
+}
+
 /*
  * The statements that make the types to defines otherwise than from, under
  * their names, and those that use them, in turn: each renamed aside, made
  * anew, the columns of versioned tables using it (or arrays of it)
  * converted, and the old dropped.  What uses one is found through what
  * depends on it: a composite type or a domain the branch has is moved
- * with it (as to defines it); a check constraint, an index or a default of
- * a versioned table, or a routine, is dropped first and made again after
- * (as to defines it, if alike; the table's or routine's own move does the
- * rest).  Anything else using it (a column of another schema's table, an
- * operator) can't be moved with it: refused.  Views and materialized views
- * using them go and come back with the others (folded_move_schema()).
+ * with it (as to defines it); typed tables are detached for move_table()
+ * to attach again once their columns match; a check constraint, an index
+ * or a default of a versioned table, or a routine, is dropped first and
+ * made again after (as to defines it, if alike; the table's or routine's
+ * own move does the rest).  Anything else using it (a column of another
+ * schema's table, an operator) can't be moved with it: refused.  Views and
+ * materialized views using them go and come back with the others
+ * (folded_move_schema()).
  */
 static TypeMoves
 type_moves(List *from, List *to)
@@ -5626,13 +5644,56 @@ type_moves(List *from, List *to)
 							(void) move_type(&moved, from, to, ct, mt->from->name);
 						handled = true;
 					}
-					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid == 0 && !array)
+					{
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+						MoveItem   *f = find_item(from, 't', rel);
+						TableDef	fd;
+
+						if (f)
+						{
+							parse_table_def(f->def, &fd);
+							if (same_strings(fd.of, mt->from->name))
+							{
+								tm.before = lappend(tm.before, psprintf("ALTER TABLE %s NOT OF", rel));
+								tm.detached = lappend(tm.detached, rel);
+								handled = true;
+							}
+						}
+					}
+					else if (kind == RELKIND_PARTITIONED_TABLE && versioned &&
+							 d->objsubid > 0 && in_partition_key(d->objid, d->objsubid))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+										mt->from->name),
+								 errdetail("%s uses it, in the table's partition key, which can't change type.",
+										   getObjectDescription(&obj, false))));
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid > 0)
 					{
 						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
 						const char *col = quote_identifier(get_attname(d->objid, d->objsubid, false));
 						char	   *conv;
+						bool		inherited = false;
 
-						if (array)
+						/*
+						 * (a partition's inherited column is its parent's:
+						 * converting the parent's converts it)
+						 */
+						if (get_rel_relispartition(d->objid))
+						{
+							HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(d->objid),
+															 Int16GetDatum(d->objsubid));
+
+							if (!HeapTupleIsValid(at))
+								elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+									 d->objsubid, d->objid);
+							inherited = ((Form_pg_attribute) GETSTRUCT(at))->attinhcount > 0;
+							ReleaseSysCache(at);
+						}
+						if (array && !inherited)
 						{
 							/*
 							 * (an array's elements one by one, as a function:
@@ -5655,7 +5716,7 @@ type_moves(List *from, List *to)
 							tm.converts = lappend(tm.converts,
 												  psprintf("DROP FUNCTION %s(%s[])", fn, mt->aside));
 						}
-						else
+						else if (!inherited)
 							tm.converts = lappend(tm.converts,
 												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
 														   rel, col, mt->to->name,
@@ -6326,9 +6387,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	fd;
 		TableDef	td;
 
-		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+		if (f->kind != 't' ||
+			(t && strcmp(t->def, f->def) == 0 && !list_has_string(tm.detached, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
+		/* type_moves() detaches it first; move_table() restores to's link. */
+		if (list_has_string(tm.detached, f->name))
+			fd.of = NULL;
 		if (t)
 			parse_table_def(t->def, &td);
 		if (move_table(&sm, f->name, &fd, t ? &td : NULL))

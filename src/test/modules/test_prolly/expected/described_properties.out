@@ -1515,6 +1515,458 @@ SELECT dolt_branch('-D', 'local_drop');
  {0}
 (1 row)
 
+-- A typed table's composite type can change across a move.  Detach it
+-- before replacing the type, and attach it after its columns match.
+CREATE SCHEMA typed VERSIONED;
+CREATE TYPE typed.ty AS (a int, b text);
+CREATE TABLE typed.tt OF typed.ty (PRIMARY KEY (a));
+INSERT INTO typed.tt VALUES (1, 'one');
+SELECT (dolt_commit('-Am', 'typed base'))[1] AS typed_base \gset
+SELECT dolt_branch('typed_base');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE typed.ty ADD ATTRIBUTE c int CASCADE;
+UPDATE typed.tt SET c = 10;
+SELECT (dolt_commit('-Am', 'typed added'))[1] AS typed_added \gset
+SELECT dolt_reset('--hard', :'typed_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.tt;
+ a |  b  
+---+-----
+ 1 | one
+(1 row)
+
+SELECT dolt_reset('--hard', :'typed_added');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_added') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.tt;
+ a |  b  | c  
+---+-----+----
+ 1 | one | 10
+(1 row)
+
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A merge across the added attribute keeps an independent row edit.
+SELECT dolt_branch('typed_rows', :'typed_base');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('typed_rows');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'typed_rows'"}
+(1 row)
+
+UPDATE typed.tt SET b = 'edited';
+SELECT dolt_commit('-Am', 'typed row edit') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM typed.tt ORDER BY a;
+ a |   b    | c  
+---+--------+----
+ 1 | edited | 10
+(1 row)
+
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'typed_rows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Retyping and reordering attributes, including a table made again.
+ALTER TYPE typed.ty ALTER ATTRIBUTE a TYPE bigint CASCADE;
+ALTER TYPE typed.ty DROP ATTRIBUTE b CASCADE;
+ALTER TYPE typed.ty ADD ATTRIBUTE b text COLLATE "C" CASCADE;
+UPDATE typed.tt SET b = 'reordered';
+SELECT (dolt_commit('-Am', 'typed reordered'))[1] AS typed_reordered \gset
+SELECT dolt_checkout('typed_base');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'typed_base'"}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.tt;
+ a |  b  
+---+-----
+ 1 | one
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_reordered') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.tt;
+ a | c  |     b     
+---+----+-----------
+ 1 | 10 | reordered
+(1 row)
+
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'typed_base');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- An outside table still can't depend on a versioned type: refused as it
+-- is made, so no move meets one.
+CREATE SCHEMA typed_external;
+CREATE TABLE typed_external.tt OF typed.ty;
+ERROR:  an object outside a versioned schema can't depend on type typed.ty, which is versioned
+DETAIL:  Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.
+SELECT test_fold_root() = prolly_root_hash(:'typed_reordered') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT to_regclass('typed_external.tt') IS NULL AS refused;
+ refused 
+---------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+DROP SCHEMA typed_external;
+-- An indirectly replaced composite type: its definition and its typed
+-- table's definition are unchanged when the attribute's domain changes.
+CREATE DOMAIN typed.pos AS int CHECK (VALUE > 0);
+CREATE TYPE typed.indirect AS (a typed.pos);
+CREATE TABLE typed.dt OF typed.indirect;
+INSERT INTO typed.dt VALUES (20);
+SELECT (dolt_commit('-Am', 'typed domain base'))[1] AS typed_domain_base \gset
+ALTER DOMAIN typed.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN typed.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+SELECT (dolt_commit('-Am', 'typed domain changed'))[1] AS typed_domain_changed \gset
+SELECT dolt_reset('--hard', :'typed_domain_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_domain_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'typed_domain_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_domain_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.dt;
+ a  
+----
+ 20
+(1 row)
+
+SELECT reloftype = 'typed.indirect'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.dt'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+INSERT INTO typed.dt VALUES (5);
+ERROR:  value for domain typed.pos violates check constraint "pos_check"
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- The target may leave a table untyped, attach it to a different type,
+-- or drop it while replacing the old type.
+CREATE TYPE typed.other AS (a typed.pos);
+CREATE TABLE typed.untyped OF typed.indirect;
+CREATE TABLE typed.switched OF typed.indirect;
+CREATE TABLE typed.gone OF typed.indirect;
+SELECT (dolt_commit('-Am', 'typed links base'))[1] AS typed_links_base \gset
+ALTER TABLE typed.untyped NOT OF;
+ALTER TABLE typed.switched OF typed.other;
+DROP TABLE typed.gone;
+ALTER TYPE typed.indirect ADD ATTRIBUTE b text CASCADE;
+SELECT (dolt_commit('-Am', 'typed links changed'))[1] AS typed_links_changed \gset
+SELECT dolt_reset('--hard', :'typed_links_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_links_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'typed_links_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_links_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT relname, reloftype::regtype FROM pg_class
+WHERE relnamespace = 'typed'::regnamespace AND relkind = 'r' ORDER BY relname;
+ relname  |   reloftype    
+----------+----------------
+ dt       | typed.indirect
+ switched | typed.other
+ tt       | typed.ty
+ untyped  | -
+(4 rows)
+
+SELECT to_regclass('typed.gone') IS NULL AS gone;
+ gone 
+------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A partitioned typed table detaches too, while its partitions follow
+-- the parent's column changes.
+CREATE TYPE typed.pty AS (a int);
+CREATE TABLE typed.pt OF typed.pty PARTITION BY RANGE (a);
+CREATE TABLE typed.pt1 PARTITION OF typed.pt FOR VALUES FROM (0) TO (10);
+INSERT INTO typed.pt VALUES (1);
+SELECT (dolt_commit('-Am', 'typed partition base'))[1] AS typed_partition_base \gset
+ALTER TYPE typed.pty ADD ATTRIBUTE b text CASCADE;
+UPDATE typed.pt SET b = 'partition';
+SELECT (dolt_commit('-Am', 'typed partition added'))[1] AS typed_partition_added \gset
+SELECT dolt_reset('--hard', :'typed_partition_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_partition_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'typed_partition_added');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_partition_added') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.pt;
+ a |     b     
+---+-----------
+ 1 | partition
+(1 row)
+
+SELECT reloftype = 'typed.pty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.pt'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A partitioned typed table whose type is replaced through a domain: the
+-- parent's column is converted, its partition's follows it.  A domain in
+-- the partition key can't be converted: refused.
+CREATE DOMAIN typed.ppos AS int CHECK (VALUE > 0);
+CREATE TYPE typed.pdy AS (k int, a typed.ppos);
+CREATE TABLE typed.pd OF typed.pdy PARTITION BY RANGE (k);
+CREATE TABLE typed.pd1 PARTITION OF typed.pd FOR VALUES FROM (0) TO (100);
+INSERT INTO typed.pd VALUES (1, 50);
+SELECT (dolt_commit('-Am', 'typed partition domain base'))[1] AS typed_pd_base \gset
+ALTER DOMAIN typed.ppos DROP CONSTRAINT ppos_check;
+ALTER DOMAIN typed.ppos ADD CONSTRAINT ppos_check CHECK (VALUE > 20);
+SELECT (dolt_commit('-Am', 'typed partition domain changed'))[1] AS typed_pd_changed \gset
+SELECT dolt_reset('--hard', :'typed_pd_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_pd_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+INSERT INTO typed.pd VALUES (2, 15);
+SELECT dolt_reset('--hard', :'typed_pd_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'typed_pd_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM typed.pd ORDER BY k;
+ k | a  
+---+----
+ 1 | 50
+(1 row)
+
+SELECT reloftype = 'typed.pdy'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.pd'::regclass;
+ still_typed 
+-------------
+ t
+(1 row)
+
+INSERT INTO typed.pd VALUES (3, 15);
+ERROR:  value for domain typed.ppos violates check constraint "ppos_check"
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE DOMAIN typed.pkey AS int CHECK (VALUE > 0);
+CREATE TYPE typed.pky AS (k typed.pkey);
+CREATE TABLE typed.pk OF typed.pky PARTITION BY RANGE (k);
+CREATE TABLE typed.pk1 PARTITION OF typed.pk FOR VALUES FROM (1) TO (100);
+SELECT (dolt_commit('-Am', 'typed partition key base'))[1] AS typed_pk_base \gset
+ALTER DOMAIN typed.pkey DROP CONSTRAINT pkey_check;
+ALTER DOMAIN typed.pkey ADD CONSTRAINT pkey_check CHECK (VALUE > 20);
+SELECT (dolt_commit('-Am', 'typed partition key changed'))[1] AS typed_pk_changed \gset
+SELECT dolt_reset('--hard', :'typed_pk_base');
+ERROR:  the branch can't be moved to a commit that defines type typed.pkey otherwise
+DETAIL:  column k of table typed.pk uses it, in the table's partition key, which can't change type.
+SELECT test_fold_root() = prolly_root_hash(:'typed_pk_changed') AS unmoved;
+ unmoved 
+---------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
 DROP VIEW described;
 SELECT dolt_reset('--hard', :'base');
  dolt_reset 
