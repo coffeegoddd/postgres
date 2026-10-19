@@ -142,13 +142,126 @@ remote_error(ProllyRemote *r, PGresult *res, const char *what)
 			 errcontext("%s on remote %s", what, r->where)));
 }
 
+/*
+ * What a statement's result is to be: its columns' types, all in one
+ * format, and between min_rows and max_rows rows (any number, if max_rows
+ * is negative), none of them null.  A remote is any server the URL names,
+ * so a result is checked against it before anything reads it: libpq's
+ * value of a row or column a result hasn't is NULL, and of a null is "".
+ */
+typedef struct ResultShape
+{
+	int			min_rows;
+	int			max_rows;
+	int			format;			/* 0 text, 1 binary */
+	int			ncols;
+	Oid			types[2];
+} ResultShape;
+
+static const ResultShape one_text = {1, 1, 0, 1, {TEXTOID}};
+static const ResultShape one_bool = {1, 1, 0, 1, {BOOLOID}};
+static const ResultShape chunk_rows = {0, -1, 1, 2, {BYTEAOID, BYTEAOID}};
+
+/* (a column's type and format, which libpq-be-fe.h doesn't wrap) */
+static inline Oid
+result_ftype(const PGresult *res, int col)
+{
+	return PQftype(res->res, col);
+}
+
+static inline int
+result_fformat(const PGresult *res, int col)
+{
+	return PQfformat(res->res, col);
+}
+
+/*
+ * An ERROR if res's columns aren't shape's; res the caller's to clear, on
+ * an error too, as in the checks below.
+ */
+static void
+result_columns_check(ProllyRemote *r, const PGresult *res,
+					 const ResultShape *shape, const char *what)
+{
+	int			ncols = PQnfields(res);
+
+	if (ncols != shape->ncols)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg_plural("remote %s answered with %d column, not %d",
+							   "remote %s answered with %d columns, not %d",
+							   ncols, r->where, ncols, shape->ncols),
+				 errcontext("%s", what)));
+	for (int c = 0; c < ncols; c++)
+	{
+		if (result_ftype(res, c) != shape->types[c])
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("remote %s answered with type %u in column %d, not %u",
+							r->where, result_ftype(res, c), c + 1, shape->types[c]),
+					 errcontext("%s", what)));
+		if (result_fformat(res, c) != shape->format)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("remote %s answered with format %d in column %d, not %d",
+							r->where, result_fformat(res, c), c + 1, shape->format),
+					 errcontext("%s", what)));
+	}
+}
+
+/* An ERROR if any of res's values is null. */
+static void
+result_nulls_check(ProllyRemote *r, const PGresult *res, const char *what)
+{
+	for (int i = 0; i < PQntuples(res); i++)
+		for (int c = 0; c < PQnfields(res); c++)
+			if (PQgetisnull(res, i, c))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("remote %s answered with a null in row %d, column %d",
+								r->where, i + 1, c + 1),
+						 errcontext("%s", what)));
+}
+
+/* An ERROR if res isn't shape. */
+static void
+result_check(ProllyRemote *r, const PGresult *res, const ResultShape *shape,
+			 const char *what)
+{
+	int			nrows = PQntuples(res);
+
+	result_columns_check(r, res, shape, what);
+	if (nrows < shape->min_rows ||
+		(shape->max_rows >= 0 && nrows > shape->max_rows))
+	{
+		if (shape->min_rows == shape->max_rows)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg_plural("remote %s answered with %d row, not %d",
+								   "remote %s answered with %d rows, not %d",
+								   nrows, r->where, nrows, shape->min_rows),
+					 errcontext("%s", what)));
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg_plural("remote %s answered with %d row, not %d to %d",
+							   "remote %s answered with %d rows, not %d to %d",
+							   nrows, r->where, nrows, shape->min_rows,
+							   shape->max_rows),
+				 errcontext("%s", what)));
+	}
+	result_nulls_check(r, res, what);
+}
+
 static void run_command(ProllyRemote *r, const char *sql, const char *what);
 
-/* Run a statement there; its result, which the caller clears. */
+/*
+ * Run a statement there; its result, which the caller clears, checked to
+ * be shape (a command's, if NULL: nothing in it is read).
+ */
 static PGresult *
 run(ProllyRemote *r, const char *sql, int nparams, const Oid *types,
 	const char *const *values, const int *lengths, const int *formats,
-	int result_format, const char *what)
+	const ResultShape *shape, const char *what)
 {
 	PGresult   *res;
 	ExecStatusType status;
@@ -160,17 +273,30 @@ run(ProllyRemote *r, const char *sql, int nparams, const Oid *types,
 		run_command(r, "BEGIN", "beginning");
 	}
 	res = libpqsrv_exec_params(r->conn, sql, nparams, types, values, lengths,
-							   formats, result_format, we_result);
+							   formats, shape ? shape->format : 0, we_result);
 	status = PQresultStatus(res);
 	if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
 		remote_error(r, res, what);
+	if (shape)
+	{
+		PG_TRY();
+		{
+			result_check(r, res, shape, what);
+		}
+		PG_CATCH();
+		{
+			PQclear(res);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 	return res;
 }
 
 static void
 run_command(ProllyRemote *r, const char *sql, const char *what)
 {
-	PQclear(run(r, sql, 0, NULL, NULL, NULL, NULL, 0, what));
+	PQclear(run(r, sql, 0, NULL, NULL, NULL, NULL, NULL, what));
 }
 
 static ProllyRemote *
@@ -275,7 +401,7 @@ chunks_array(StringInfo out, StringInfoData *const *chunks, int n)
 /* Run a statement whose one parameter is hashes, as a bytea[]. */
 static PGresult *
 run_hashes(ProllyRemote *r, const char *sql, const ProllyHash *hashes, int n,
-		   int result_format, const char *what)
+		   const ResultShape *shape, const char *what)
 {
 	StringInfoData param;
 	const char *values[1];
@@ -288,7 +414,7 @@ run_hashes(ProllyRemote *r, const char *sql, const ProllyHash *hashes, int n,
 	hashes_array(&param, hashes, n);
 	values[0] = param.data;
 	lengths[0] = param.len;
-	res = run(r, sql, 1, types, values, lengths, formats, result_format, what);
+	res = run(r, sql, 1, types, values, lengths, formats, shape, what);
 	pfree(param.data);
 	return res;
 }
@@ -317,7 +443,7 @@ static void
 libpq_format(ProllyRemote *r, StringInfo out)
 {
 	PGresult   *res = run(r, "SELECT pg_catalog.dolt_serve_format()", 0, NULL,
-						  NULL, NULL, NULL, 0, "reading the format");
+						  NULL, NULL, NULL, &one_text, "reading the format");
 
 	appendStringInfoString(out, PQgetvalue(res, 0, 0));
 	PQclear(res);
@@ -326,18 +452,28 @@ libpq_format(ProllyRemote *r, StringInfo out)
 static void
 libpq_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
 {
+	static const ResultShape shape = {0, -1, 1, 2, {TEXTOID, BYTEAOID}};
 	PGresult   *res = run(r, "SELECT branch, commit_id FROM pg_catalog.dolt_serve_heads() "
 						  "ORDER BY branch COLLATE \"C\"",
-						  0, NULL, NULL, NULL, NULL, 1, "reading the heads");
+						  0, NULL, NULL, NULL, NULL, &shape, "reading the heads");
 
 	PG_TRY();
 	{
 		for (int i = 0; i < PQntuples(res); i++)
 		{
-			char	   *branch = pnstrdup(PQgetvalue(res, i, 0),
-										  PQgetlength(res, i, 0));
+			const char *name = PQgetvalue(res, i, 0);
+			int			len = PQgetlength(res, i, 0);
+			char	   *branch;
 			ProllyHash	commit;
 
+			/* (the rest of a name the fetch checks: a NUL would cut it short) */
+			if (memchr(name, '\0', len) != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("remote %s sent a branch name with a NUL in it",
+								r->where),
+						 errcontext("reading the heads")));
+			branch = pnstrdup(name, len);
 			result_hash(r, res, i, 1, &commit);
 			visit(branch, &commit, arg);
 		}
@@ -352,11 +488,12 @@ libpq_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
 static bool
 libpq_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 {
+	static const ResultShape shape = {0, 1, 1, 1, {BYTEAOID}};
 	PGresult   *res;
 	bool		found;
 
 	res = run_hashes(r, "SELECT chunk FROM pg_catalog.dolt_serve_get($1)", hash, 1,
-					 1, "reading a chunk");
+					 &shape, "reading a chunk");
 	found = PQntuples(res) > 0;
 	if (found)
 		appendBinaryStringInfo(out, PQgetvalue(res, 0, 0), PQgetlength(res, 0, 0));
@@ -370,8 +507,8 @@ libpq_has(ProllyRemote *r, const ProllyHash *hash)
 	PGresult   *res;
 	bool		has;
 
-	res = run_hashes(r, "SELECT (pg_catalog.dolt_serve_has($1))[1]", hash, 1, 0,
-					 "asking for a chunk");
+	res = run_hashes(r, "SELECT (pg_catalog.dolt_serve_has($1))[1]", hash, 1,
+					 &one_bool, "asking for a chunk");
 	has = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 	PQclear(res);
 	return has;
@@ -384,7 +521,7 @@ libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 	PGresult   *res;
 
 	res = run_hashes(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)",
-					 hashes, n, 1, "reading chunks");
+					 hashes, n, &chunk_rows, "reading chunks");
 	PG_TRY();
 	{
 		for (int i = 0; i < PQntuples(res); i++)
@@ -405,18 +542,11 @@ libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 static void
 libpq_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
 {
+	ResultShape shape = {n, n, 0, 1, {BOOLOID}};
 	PGresult   *res;
 
 	res = run_hashes(r, "SELECT h FROM unnest(pg_catalog.dolt_serve_has($1)) WITH ORDINALITY AS a(h, i) "
-					 "ORDER BY i", hashes, n, 0, "asking for chunks");
-	if (PQntuples(res) != n)
-	{
-		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_PROTOCOL_VIOLATION),
-				 errmsg("remote %s answered for %d chunks of %d", r->where,
-						PQntuples(res), n)));
-	}
+					 "ORDER BY i", hashes, n, &shape, "asking for chunks");
 	for (int i = 0; i < n; i++)
 		has[i] = strcmp(PQgetvalue(res, i, 0), "t") == 0;
 	PQclear(res);
@@ -438,6 +568,7 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	int			formats[2] = {1, 1};
 	Oid			types[2] = {BYTEAARRAYOID, BYTEAARRAYOID};
 	PGresult   *res;
+	bool		checked = false;
 
 	/*
 	 * (a remote of a build before it has no dolt_serve_since(): it tells
@@ -446,7 +577,7 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	if (r->has_since < 0)
 	{
 		res = run(r, "SELECT pg_catalog.to_regprocedure('pg_catalog.dolt_serve_since(bytea[], bytea[])') IS NOT NULL",
-				  0, NULL, NULL, NULL, NULL, 0, "asking what it serves");
+				  0, NULL, NULL, NULL, NULL, &one_bool, "asking what it serves");
 		r->has_since = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 		PQclear(res);
 	}
@@ -482,6 +613,14 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 
 			PG_TRY();
 			{
+				/*
+				 * (one description for all the rows, checked with the first;
+				 * each row's values, as it comes)
+				 */
+				if (!checked)
+					result_columns_check(r, res, &chunk_rows, "reading what changed");
+				checked = true;
+				result_nulls_check(r, res, "reading what changed");
 				result_hash(r, res, 0, 0, &h);
 				visit(&h, PQgetvalue(res, 0, 1), PQgetlength(res, 0, 1), arg);
 			}
@@ -528,7 +667,7 @@ send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, i
 	values[1] = c.data;
 	lengths[1] = c.len;
 	PQclear(run(r, "SELECT pg_catalog.dolt_serve_receive($1, $2)", 2, types,
-				values, lengths, formats, 0, "sending chunks"));
+				values, lengths, formats, NULL, "sending chunks"));
 	pfree(h.data);
 	pfree(c.data);
 }
@@ -606,7 +745,7 @@ libpq_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
 	values[3] = format;
 	values[4] = force ? "t" : "f";
 	res = run(r, "SELECT pg_catalog.dolt_serve_move_head($1, $2, $3, $4, $5)",
-			  5, types, values, lengths, formats, 0, "moving a branch");
+			  5, types, values, lengths, formats, &one_bool, "moving a branch");
 	moved = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 	PQclear(res);
 	run_command(r, moved ? "COMMIT" : "ROLLBACK", "ending the push");
