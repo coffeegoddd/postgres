@@ -1495,7 +1495,13 @@ step 7's GC to remove; none are read.
   'origin/x')` makes one at its head (head-only, as any new branch).
 - **Upstreams**: a branch may name one (`dolt_push('--set-upstream', …)`,
   `dolt_branch('--set-upstream-to', …)`), for `dolt_pull()` and
-  `dolt_push()` without arguments.
+  `dolt_push()` without arguments, and for `dolt_branch('-d', …)`, which
+  refuses a branch not merged into its upstream's remote-tracking branch
+  (as of the last fetch), or into the session's branch when there is none
+  there, as Dolt's `validateBranchMerged` (and git) does; the session's
+  own branch and `main` are refused first, as in Dolt.  A deleted
+  branch's upstream stays, as Dolt keeps its branch config: a branch made
+  again of its name has it.
 
 ### 7.3 Fetch, pull, push
 
