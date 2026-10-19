@@ -1166,8 +1166,392 @@ SELECT dolt_branch('-D', 'feature');
  {0}
 (1 row)
 
+-- A domain's constraints don't apply to historical values only compared
+-- or shown.  Both sides retype to a checked domain after fixing or deleting
+-- the old values.  Keep those values for comparison and conflict listing.
+CREATE DOMAIN rt.positive AS int CHECK (VALUE > 0);
+CREATE TABLE rt.domain_rows (id int PRIMARY KEY, v int);
+CREATE TABLE rt.domain_keys (id int PRIMARY KEY, v int);
+CREATE TABLE rt.domain_keyless (v int);
+INSERT INTO rt.domain_rows VALUES (1, -1), (2, -2), (3, -3);
+INSERT INTO rt.domain_keys VALUES (-1, 1), (1, 1);
+INSERT INTO rt.domain_keyless VALUES (-1), (1);
+SELECT length(dolt_commit('-Am', 'domain base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DELETE FROM rt.domain_rows WHERE id = 3;
+UPDATE rt.domain_rows SET v = id;
+DELETE FROM rt.domain_keys WHERE id = -1;
+DELETE FROM rt.domain_keyless WHERE v = -1;
+ALTER TABLE rt.domain_rows ALTER COLUMN v TYPE rt.positive;
+ALTER TABLE rt.domain_keys ALTER COLUMN id TYPE rt.positive;
+ALTER TABLE rt.domain_keyless ALTER COLUMN v TYPE rt.positive;
+INSERT INTO rt.domain_keys VALUES (2, 2);
+INSERT INTO rt.domain_keyless VALUES (2);
+SELECT length(dolt_commit('-am', 'main: positive')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.domain_rows) ORDER BY from_row;
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (1,-1)   | (1,1)
+ modified  | (2,-2)   | (2,2)
+ removed   | (3,-3)   | 
+(3 rows)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+DELETE FROM rt.domain_rows WHERE id = 3;
+UPDATE rt.domain_rows SET v = CASE id WHEN 1 THEN 3 ELSE id END;
+DELETE FROM rt.domain_keys WHERE id = -1;
+DELETE FROM rt.domain_keyless WHERE v = -1;
+ALTER TABLE rt.domain_rows ALTER COLUMN v TYPE rt.positive;
+ALTER TABLE rt.domain_keys ALTER COLUMN id TYPE rt.positive;
+ALTER TABLE rt.domain_keyless ALTER COLUMN v TYPE rt.positive;
+INSERT INTO rt.domain_keys VALUES (3, 3);
+INSERT INTO rt.domain_keyless VALUES (3);
+SELECT length(dolt_commit('-am', 'feature: positive')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_rows);
+ base_row | our_row | their_row 
+----------+---------+-----------
+ (1,-1)   | (1,1)   | (1,3)
+(1 row)
+
+SELECT * FROM rt.domain_rows ORDER BY id;
+ id | v 
+----+---
+  1 | 1
+  2 | 2
+(2 rows)
+
+SELECT * FROM rt.domain_keys ORDER BY id;
+ id | v 
+----+---
+  1 | 1
+  2 | 2
+  3 | 3
+(3 rows)
+
+SELECT * FROM rt.domain_keyless ORDER BY v;
+ v 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rt.domain_rows');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM rt.domain_rows ORDER BY id;
+ id | v 
+----+---
+  1 | 3
+  2 | 2
+(2 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Values already stored when a NOT VALID constraint was added remain
+-- comparable too.  The unchanged negative value mustn't hide the independent
+-- edits to other columns, or create a spurious conflict.
+CREATE DOMAIN rt.pending AS int;
+CREATE TABLE rt.domain_pending (id int PRIMARY KEY, v int, a int, b int);
+INSERT INTO rt.domain_pending VALUES (1, -1, 0, 0);
+SELECT length(dolt_commit('-Am', 'pending base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.domain_pending ALTER COLUMN v TYPE rt.pending;
+ALTER DOMAIN rt.pending ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+UPDATE rt.domain_pending SET a = 1;
+SELECT length(dolt_commit('-am', 'main: pending')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.domain_pending ALTER COLUMN v TYPE rt.pending;
+ALTER DOMAIN rt.pending ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+UPDATE rt.domain_pending SET b = 2;
+SELECT length(dolt_commit('-am', 'feature: pending')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM rt.domain_pending;
+ id | v  | a | b 
+----+----+---+---
+  1 | -1 | 1 | 2
+(1 row)
+
+SELECT count(*) AS conflicts FROM dolt_conflicts(NULL::rt.domain_pending);
+ conflicts 
+-----------
+         0
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A retype during conflict resolution mustn't make the existing conflicts
+-- unreadable.  A cast of JSON null to int returns SQL NULL: displaying it
+-- as a NOT NULL domain must not enforce the domain either.
+CREATE DOMAIN rt.required AS int NOT NULL;
+CREATE TABLE rt.domain_mid (id int PRIMARY KEY, v int, n jsonb);
+INSERT INTO rt.domain_mid VALUES (1, -1, 'null');
+SELECT length(dolt_commit('-Am', 'mid base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE rt.domain_mid SET v = 1, n = '1';
+SELECT length(dolt_commit('-am', 'main: mid')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE rt.domain_mid SET v = 2, n = '2';
+SELECT length(dolt_commit('-am', 'feature: mid')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SAVEPOINT before_retype;
+ALTER TABLE rt.domain_mid ALTER COLUMN v TYPE rt.positive;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_mid);
+  base_row   | our_row | their_row 
+-------------+---------+-----------
+ (1,-1,null) | (1,1,1) | (1,2,2)
+(1 row)
+
+ROLLBACK TO before_retype;
+ALTER TABLE rt.domain_mid ALTER COLUMN n TYPE rt.required USING n::int;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_mid);
+ base_row | our_row | their_row 
+----------+---------+-----------
+ (1,-1,)  | (1,1,1) | (1,2,2)
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rt.domain_mid');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM rt.domain_mid;
+ id | v | n 
+----+---+---
+  1 | 2 | 2
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Unwrapping nested domains retains the base type's typmod.  As with a
+-- plain numeric(4,1) column, base's text reads as 1.3; theirs alone changed
+-- it to 1.2, so the merge takes that edit without a conflict.
+CREATE DOMAIN rt.tenths AS numeric(4,1);
+CREATE DOMAIN rt.positive_tenths AS rt.tenths CHECK (VALUE > 0);
+CREATE TABLE rt.domain_numeric (id int PRIMARY KEY, v text);
+INSERT INTO rt.domain_numeric VALUES (1, '1.25');
+SELECT length(dolt_commit('-Am', 'numeric domain base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.domain_numeric ALTER COLUMN v TYPE rt.positive_tenths USING v::numeric;
+INSERT INTO rt.domain_numeric VALUES (2, 2.2);
+SELECT length(dolt_commit('-am', 'main: tenths')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.domain_numeric ALTER COLUMN v TYPE rt.positive_tenths USING v::numeric;
+UPDATE rt.domain_numeric SET v = 1.2;
+INSERT INTO rt.domain_numeric VALUES (3, 3.3);
+SELECT length(dolt_commit('-am', 'feature: tenths')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM rt.domain_numeric ORDER BY id;
+ id |  v  
+----+-----
+  1 | 1.2
+  2 | 2.2
+  3 | 3.3
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- The reverse cast used to check that a value is preserved mustn't
+-- revalidate the source domain either.
+CREATE DOMAIN rt.stored AS varchar(3);
+CREATE TABLE rt.domain_source (id int PRIMARY KEY, v rt.stored);
+INSERT INTO rt.domain_source VALUES (1, 'bad');
+ALTER DOMAIN rt.stored ADD CONSTRAINT not_bad CHECK (VALUE <> 'bad') NOT VALID;
+SELECT length(dolt_commit('-Am', 'source domain base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE rt.domain_source ALTER COLUMN v TYPE varchar(10);
+SELECT length(dolt_commit('-am', 'source domain removed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.domain_source);
+ changed 
+---------
+       0
+(1 row)
+
 DROP SCHEMA rt CASCADE;
-NOTICE:  drop cascades to 18 other objects
+NOTICE:  drop cascades to 31 other objects
 DETAIL:  drop cascades to table rt.c
 drop cascades to table rt.n
 drop cascades to table rt.o
@@ -1186,3 +1570,16 @@ drop cascades to table rt.up
 drop cascades to table rt.ck
 drop cascades to table rt.cl
 drop cascades to table rt.bl
+drop cascades to type rt.positive
+drop cascades to table rt.domain_rows
+drop cascades to table rt.domain_keys
+drop cascades to table rt.domain_keyless
+drop cascades to type rt.pending
+drop cascades to table rt.domain_pending
+drop cascades to type rt.required
+drop cascades to table rt.domain_mid
+drop cascades to type rt.tenths
+drop cascades to type rt.positive_tenths
+drop cascades to table rt.domain_numeric
+drop cascades to type rt.stored
+drop cascades to table rt.domain_source

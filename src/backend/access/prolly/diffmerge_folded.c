@@ -3215,7 +3215,9 @@ dup_bytes(const char *data, int len)
  *
  * Only a written value has to be one the column could hold now, and it's
  * converted as ALTER TABLE ... TYPE without USING converted the side's
- * own rows.  A value shown or compared is made the column's only where
+ * own rows.  Shown or compared values use domains' base types, with their
+ * typmods: a historical value needn't meet a domain's constraints now.
+ * A value shown or compared is made the column's only where
  * nothing is lost: it's cast, and the cast kept only if casting it back
  * gives the value again.  A lossy cast (rounding, cutting to fit) could
  * make two of base's keys one, or make a side's change look like none
@@ -3288,6 +3290,7 @@ typedef struct ColumnRead
 	FmgrInfo	out;			/* the old type's output */
 	Oid			in;				/* the new type's input */
 	Oid			in_param;
+	int32		in_typmod;		/* including a domain's base typmod */
 	CastLoss	loss;
 } ColumnRead;
 
@@ -3361,24 +3364,45 @@ is_bit_type(Oid type)
  * (canon_folded.c's move_table()).  One shown or compared goes through
  * the explicit cast (which cuts a string to fit rather than failing),
  * checked by casting it back unless the cast is a widening, or a relabel
- * of a type stored alike, which loses nothing.
+ * of a type stored alike, which loses nothing.  For these reads, strip
+ * domains from both ends of the cast (including the cast back): their
+ * constraints don't apply to values only shown or compared.
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 			ReadFor read, bool key, bool keyless, bool both, EState *estate,
 			ColumnRead *cr)
 {
-	Form_pg_attribute xa = TupleDescAttr(xd, j);
+	FormData_pg_attribute source = *TupleDescAttr(xd, j);
+	FormData_pg_attribute target = *att;
+	Form_pg_attribute xa = &source;
 	Node	   *var = (Node *) makeVar(1, j + 1, xa->atttypid, xa->atttypmod,
 									   xa->attcollation, 0);
 	Node	   *e = NULL;
 	Node	   *back;
-	bool		same = xa->atttypid == att->atttypid;
-	bool		alike = same ||
+	bool		same;
+	bool		alike;
+
+	if (read != READ_WRITTEN)
+	{
+		source.atttypid = getBaseTypeAndTypmod(source.atttypid,
+											   &source.atttypmod);
+		target.atttypid = getBaseTypeAndTypmod(target.atttypid,
+											   &target.atttypmod);
+		/* The Var must still match the version's tuple descriptor. */
+		if (source.atttypid != TupleDescAttr(xd, j)->atttypid)
+			var = (Node *) makeRelabelType((Expr *) var, source.atttypid,
+										   source.atttypmod, source.attcollation,
+										   COERCE_IMPLICIT_CAST);
+	}
+	att = &target;
+	same = xa->atttypid == att->atttypid;
+	alike = same ||
 		(get_typtype(att->atttypid) != TYPTYPE_DOMAIN &&
 		 IsBinaryCoercible(xa->atttypid, att->atttypid));
 
 	memset(cr, 0, sizeof(ColumnRead));
+	cr->in_typmod = att->atttypmod;
 	if (read == READ_WRITTEN)
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
@@ -3548,7 +3572,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 												  xs->tts_values[j]);
 
 			*d = OidInputFunctionCall(cr->in, text, cr->in_param,
-									  att->atttypmod);
+									  cr->in_typmod);
 			*isnull = false;
 			goto done;
 		}
@@ -3575,7 +3599,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 			char	   *text = OutputFunctionCall((FmgrInfo *) &cr->out,
 												  xs->tts_values[j]);
 			Datum		t = OidInputFunctionCall(cr->in, text, cr->in_param,
-												 att->atttypmod);
+												 cr->in_typmod);
 
 			kept = datum_image_eq(t, *d, att->attbyval, att->attlen);
 		}
