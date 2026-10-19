@@ -52,7 +52,8 @@
  *   transaction ends (another collection meanwhile is refused, as is one
  *   in a transaction that used the store), seals the journal, and numbers
  *   the chunks collected (slots 0 .. *nslots - 1): the sealed segments',
- *   and the table files' (with full all of them, else those not settled),
+ *   and the table files' (as scope says: those not settled, all of them,
+ *   or none),
  *   each file's slots together, as gc_files() visits them; *root is the
  *   root as of the seal.  gc_find() gives a chunk's slot (-1: not collected), gc_read() a
  *   slot's bytes.  gc_new() visits what is new since the seal, or since its
@@ -60,7 +61,8 @@
  *   for the transactions that appended to the sealed segments and were in
  *   progress at the seal, and with window true it holds every append off
  *   until gc_swap().  gc_copy() writes the marked slots (but those of files
- *   kept whole) to new, settled table files, before the window; gc_swap()
+ *   kept whole) to new table files (settled, unless the scope is the
+ *   journal), before the window; gc_swap()
  *   writes those marked since, and replaces the manifest: the new files and
  *   those kept, the segment appends go to, the next GC generation.  What
  *   was collected and not kept is no longer found; gc_retire() removes it
@@ -68,6 +70,19 @@
  *   running at a swap that then appends a chunk naming one no longer found
  *   fails (a serialization failure), as does one adding a table file
  *   (add_table_file()) whose transaction began before the swap.
+ * - keep() is told of a chunk a transaction names from outside the store
+ *   (a hash pointer it writes into a table) without appending it: a
+ *   collection keeps it if it runs then, or begins before the transaction
+ *   ends (or, prepared, is finished).  So gc_begin() makes the first
+ *   gc_new() call wait for the transactions that told keep() of a chunk
+ *   before the collection began, too, and gc_kept() visits the chunks told
+ *   of since it began (false: too many to remember, and the collector must
+ *   keep every chunk collected).  keep() fails (a serialization failure)
+ *   if a swap dropped the chunk before it was told.
+ *   gc_retained() visits the chunks a collection keeps whatever names
+ *   them, the store's own reasons (a logical replication slot may still
+ *   decode a row naming what was appended after its position): roots, as
+ *   gc_new()'s.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -137,6 +152,19 @@ typedef void (*ProllyChunkGcFileVisit) (int file, uint64 first, uint64 nslots,
 										bool settled, uint64 size, void *arg);
 
 /*
+ * What a collection collects: by default the journal's sealed segments and
+ * the table files not settled; full, every file; the journal, its sealed
+ * segments only.  What a collection of the journal writes isn't settled
+ * (it may be told to keep what nothing names: a move).
+ */
+typedef enum ProllyGcScope
+{
+	PROLLY_GC_DEFAULT,
+	PROLLY_GC_FULL,
+	PROLLY_GC_JOURNAL,
+} ProllyGcScope;
+
+/*
  * Visits a table file or segment: its name, its chunk count, its size in
  * bytes, and whether it is settled (a table file closed under what its
  * chunks name).
@@ -165,12 +193,19 @@ typedef struct ProllyChunkStoreRoutine
 							  const ProllyHash *root);
 
 	/*
-	 * Commit.  commit_payload() returns what the commit record carries for
+	 * Commit.  commit_writes() is called first, late in the commit, after
+	 * everything else that may put chunks (and while an error still aborts
+	 * the transaction as any): it readies what the transaction has left to
+	 * write
+	 * and returns whether it has bytes to write once its commit record is
+	 * flushed (so it is flushed at once, whatever synchronous_commit
+	 * says).  commit_payload() returns what the commit record carries for
 	 * the transaction's root move (0 bytes: none); committed() is called
 	 * once the commit record is flushed, inside the commit's critical
-	 * section; commit_redo() replays the payload.
+	 * section, if either; commit_redo() replays the payload.
 	 */
 	Size		(*commit_payload) (char **data);
+	bool		(*commit_writes) (void);
 	void		(*committed) (void);
 	void		(*commit_redo) (const char *data, Size len);
 
@@ -210,7 +245,7 @@ typedef struct ProllyChunkStoreRoutine
 							 ProllyChunkFileVisit visit, void *arg);
 
 	/* Garbage collection: marks are a bit a slot, slot 0 the low bit of 0. */
-	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, bool full,
+	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, ProllyGcScope scope,
 								ProllyHash *root, uint64 *nslots);
 	void		(*gc_files) (ProllyChunkGc *gc, ProllyChunkGcFileVisit visit,
 							 void *arg);
@@ -223,16 +258,30 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*gc_swap) (ProllyChunkGc *gc, const uint8 *marks,
 							const bool *keep, ProllyGcResult *result);
 	void		(*gc_retire) (ProllyChunkGc *gc);
+
+	/* Chunks named from outside the store, kept by a collection. */
+	void		(*keep) (ProllyChunkStore *store, const ProllyHash *hash);
+	bool		(*gc_kept) (ProllyChunkGc *gc, ProllyChunkRefVisit visit,
+							void *arg);
+
+	/*
+	 * The chunks a collection keeps for the store's own reasons, roots
+	 * (with their bytes, as gc_new()'s).
+	 */
+	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
+								void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
-	"committed", "commit_redo", "checkpoint", "redo", "add_table_file", \
+	"commit_writes", "committed", "commit_redo", "checkpoint", "redo", \
+	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
-	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire"
+	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
+	"keep", "gc_kept", "gc_retained"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retire
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retained
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -247,6 +296,7 @@ prolly_chunkstore_lookup(const char *name)
  */
 extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 extern Size prolly_chunkstore_commit_payload(char **data);
+extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);

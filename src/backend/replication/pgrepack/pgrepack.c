@@ -270,9 +270,11 @@ repack_store_change(LogicalDecodingContext *ctx, Relation relation,
 				 * only TOASTed attribute can be seen here.
 				 *
 				 * We get here if the table has external values but only
-				 * in-line values are being updated now.
+				 * in-line values are being updated now, or values named by
+				 * content (which the new table may hold as they are).
 				 */
-				Assert(VARATT_IS_EXTERNAL_ONDISK(varlen));
+				Assert(VARATT_IS_EXTERNAL_ONDISK(varlen) ||
+					   VARATT_IS_EXTERNAL_ONDISK_HASH(varlen));
 			}
 		}
 

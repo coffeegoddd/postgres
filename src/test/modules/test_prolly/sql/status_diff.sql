@@ -185,10 +185,10 @@ CREATE SCHEMA sdt VERSIONED;
 CREATE TABLE sdt.t (id int PRIMARY KEY, big text);
 ALTER TABLE sdt.t ALTER COLUMN big SET STORAGE EXTERNAL;
 INSERT INTO sdt.t VALUES (1, repeat('a', 6000));
-SELECT pg_column_toast_chunk_id(big) IS NOT NULL AS out_of_line FROM sdt.t;
+SELECT test_toast_pointer(big) IS NOT NULL AS out_of_line FROM sdt.t;
 SELECT length(dolt_commit('-Am', 'sdt')::text) AS committed;
 UPDATE sdt.t SET big = repeat('b', 7000);
-SELECT pg_column_toast_chunk_id(big) IS NOT NULL AS out_of_line FROM sdt.t;
+SELECT test_toast_pointer(big) IS NOT NULL AS out_of_line FROM sdt.t;
 SELECT diff_type, length((from_row).big), left((from_row).big, 1),
 	length((to_row).big), left((to_row).big, 1)
   FROM dolt_diff('HEAD', 'WORKING', NULL::sdt.t);

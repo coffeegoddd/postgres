@@ -112,6 +112,13 @@ typedef struct ProllyValueStore
 	const struct ProllyTreeRoutine *tree;
 	const ProllyTreeEnv *env;
 	const struct ProllyValueMemoRoutine *memo;	/* NULL if none */
+
+	/*
+	 * Decoding gives a long value a hash pointer can name as that pointer,
+	 * unread (prolly_toast_pointer()): for rows written back to a table,
+	 * which then hold the tree history has.  Other readers get values.
+	 */
+	bool		pointers;
 } ProllyValueStore;
 
 /* One change for apply(): a put, or a delete if is_delete. */
@@ -232,14 +239,24 @@ typedef struct ProllyTreeRoutine
 	/* Whether the value tree a reference names is in the chunk store. */
 	bool		(*value_present) (const ProllyTreeEnv *env,
 								  const ProllyValue *ref);
+
+	/*
+	 * A value tree's reference from its root and length, appended to ref;
+	 * and the root and length a reference names.
+	 */
+	void		(*value_reference) (const ProllyHash *root, uint64 len,
+									StringInfo ref);
+	void		(*value_root) (const ProllyValue *ref, ProllyHash *root,
+							   uint64 *len);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
-	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", "value_present"
+	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
+	"value_present", "value_reference", "value_root"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK value_present
+#define PROLLY_TREE_LAST_CALLBACK value_root
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

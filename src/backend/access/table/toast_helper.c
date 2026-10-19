@@ -45,6 +45,10 @@ toast_tuple_init(ToastTupleContext *ttc)
 	int			i;
 
 	ttc->ttc_flags = 0;
+	ttc->ttc_destination = toast_relation_destination(ttc->ttc_rel);
+	if (ttc->ttc_destination != NULL ||
+		OidIsValid(ttc->ttc_rel->rd_rel->reltoastrelid))
+		ttc->ttc_flags |= TOAST_CAN_EXTERNALIZE;
 
 	for (i = 0; i < numAttrs; i++)
 	{
@@ -54,6 +58,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
+		ttc->ttc_attr[i].tai_uncompressed = NULL;
 		ttc->ttc_attr[i].tai_compression = att->attcompression;
 
 		if (ttc->ttc_oldvalues != NULL)
@@ -100,6 +105,20 @@ toast_tuple_init(ToastTupleContext *ttc)
 					continue;
 				}
 			}
+
+			/* likewise a value named by content that the update kept */
+			else if (att->attlen == -1 && !ttc->ttc_oldisnull[i] &&
+					 !ttc->ttc_isnull[i] &&
+					 VARATT_IS_EXTERNAL_ONDISK_HASH(old_value) &&
+					 VARATT_IS_EXTERNAL_ONDISK_HASH(new_value) &&
+					 memcmp(old_value, new_value,
+							VARSIZE_EXTERNAL(old_value)) == 0 &&
+					 att->attstorage != TYPSTORAGE_PLAIN &&
+					 att->attstorage != TYPSTORAGE_MAIN)
+			{
+				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
+				continue;
+			}
 		}
 		else
 		{
@@ -131,6 +150,24 @@ toast_tuple_init(ToastTupleContext *ttc)
 				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
 
 			/*
+			 * A value named by content has no owner: whichever row it came
+			 * from, this one may hold it as it is, if its table's values go
+			 * where that pointer's do and the destination would store a
+			 * value of this column as the pointer has it (reference()).
+			 * MAIN storage wants it inline if it fits, PLAIN always.
+			 */
+			else if (VARATT_IS_EXTERNAL_ONDISK_HASH(new_value) &&
+					 att->attstorage != TYPSTORAGE_MAIN &&
+					 ttc->ttc_destination != NULL &&
+					 ttc->ttc_destination == toast_pointer_destination(new_value) &&
+					 ttc->ttc_destination->reference(ttc->ttc_rel, new_value,
+													 att->atttypid))
+			{
+				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
+				continue;
+			}
+
+			/*
 			 * We took care of UPDATE above, so any external value we find
 			 * still in the tuple must be someone else's that we cannot reuse
 			 * (this includes the case of an out-of-line in-memory datum).
@@ -140,7 +177,9 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 */
 			if (VARATT_IS_EXTERNAL(new_value))
 			{
-				ttc->ttc_attr[i].tai_oldexternal = new_value;
+				/* (an OID pointer's value ID, kept by a rewrite) */
+				if (VARATT_IS_EXTERNAL_ONDISK(new_value))
+					ttc->ttc_attr[i].tai_oldexternal = new_value;
 				if (att->attstorage == TYPSTORAGE_PLAIN)
 					new_value = detoast_attr(new_value);
 				else
@@ -199,7 +238,9 @@ toast_tuple_find_biggest_attribute(ToastTupleContext *ttc,
 	 * it can still have some of them compressed.  Fall back to the oid size
 	 * in that case.
 	 */
-	if (RelationGetToastChunkIdType(ttc->ttc_rel) == OID8OID)
+	if (ttc->ttc_destination != NULL)
+		biggest_size = MAXALIGN(TOAST_HASH_POINTER_SIZE);
+	else if (RelationGetToastChunkIdType(ttc->ttc_rel) == OID8OID)
 		biggest_size = MAXALIGN(TOAST_OID8_POINTER_SIZE);
 	else
 		biggest_size = MAXALIGN(TOAST_OID_POINTER_SIZE);
@@ -237,7 +278,10 @@ toast_tuple_find_biggest_attribute(ToastTupleContext *ttc,
 /*
  * Try compression for an attribute.
  *
- * If we find that the attribute is not compressible, mark it so.
+ * If we find that the attribute is not compressible, mark it so.  With a
+ * destination, the uncompressed value is kept until the attribute is
+ * settled: if it is moved out of line after all, the destination stores it
+ * uncompressed, and is given it rather than the compressed one.
  */
 void
 toast_tuple_try_compression(ToastTupleContext *ttc, int attribute)
@@ -251,7 +295,14 @@ toast_tuple_try_compression(ToastTupleContext *ttc, int attribute)
 	if (DatumGetPointer(new_value) != NULL)
 	{
 		/* successful compression */
-		if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
+		if (ttc->ttc_destination != NULL)
+		{
+			Assert(attr->tai_uncompressed == NULL);
+			attr->tai_uncompressed = (varlena *) DatumGetPointer(*value);
+			if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
+				attr->tai_colflags |= TOASTCOL_FREE_UNCOMPRESSED;
+		}
+		else if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
 			pfree(DatumGetPointer(*value));
 		*value = new_value;
 		attr->tai_colflags |= TOASTCOL_NEEDS_FREE;
@@ -265,6 +316,17 @@ toast_tuple_try_compression(ToastTupleContext *ttc, int attribute)
 	}
 }
 
+/* An attribute's uncompressed value let go (freed if the toaster's). */
+static void
+toast_tuple_forget_uncompressed(ToastAttrInfo *attr)
+{
+	if (attr->tai_uncompressed != NULL &&
+		(attr->tai_colflags & TOASTCOL_FREE_UNCOMPRESSED) != 0)
+		pfree(attr->tai_uncompressed);
+	attr->tai_uncompressed = NULL;
+	attr->tai_colflags &= ~TOASTCOL_FREE_UNCOMPRESSED;
+}
+
 /*
  * Move an attribute to external storage.
  */
@@ -276,8 +338,19 @@ toast_tuple_externalize(ToastTupleContext *ttc, int attribute, uint32 options)
 	ToastAttrInfo *attr = &ttc->ttc_attr[attribute];
 
 	attr->tai_colflags |= TOASTCOL_IGNORE;
-	*value = toast_save_datum(ttc->ttc_rel, old_value, attr->tai_oldexternal,
-							  options);
+	if (ttc->ttc_destination != NULL)
+	{
+		Datum		v = attr->tai_uncompressed ?
+			PointerGetDatum(attr->tai_uncompressed) : old_value;
+
+		*value = PointerGetDatum(ttc->ttc_destination->save(ttc->ttc_rel, v,
+															TupleDescAttr(ttc->ttc_rel->rd_att,
+																		  attribute)->atttypid));
+		toast_tuple_forget_uncompressed(attr);
+	}
+	else
+		*value = toast_save_datum(ttc->ttc_rel, old_value,
+								  attr->tai_oldexternal, options);
 	if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
 		pfree(DatumGetPointer(old_value));
 	attr->tai_colflags |= TOASTCOL_NEEDS_FREE;
@@ -306,6 +379,7 @@ toast_tuple_cleanup(ToastTupleContext *ttc)
 
 			if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
 				pfree(DatumGetPointer(ttc->ttc_values[i]));
+			toast_tuple_forget_uncompressed(attr);
 		}
 	}
 

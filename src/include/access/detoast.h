@@ -35,6 +35,9 @@ do { \
 /* Size of an EXTERNAL datum that contains an Oid8 TOAST pointer */
 #define TOAST_OID8_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_external_oid8))
 
+/* Size of a hash pointer, one that names its value by content */
+#define TOAST_HASH_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash))
+
 /* Size of an EXTERNAL datum that contains an indirection pointer */
 #define INDIRECT_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_indirect))
 

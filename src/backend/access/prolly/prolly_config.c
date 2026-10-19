@@ -153,6 +153,7 @@ prolly_keying_use_env(ProllyKeyingRefs *refs, const ProllyKeyingRoutine *routine
 	refs->values.env = env;
 	refs->values.memo = (const ProllyValueMemoRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_VALUE_MEMO);
+	refs->values.pointers = false;
 	PROLLY_CALL(routine, set_values, k, &refs->values);
 	env->value_refs = keying_value_refs;
 	env->value_refs_arg = refs;

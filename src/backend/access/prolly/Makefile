@@ -57,6 +57,7 @@ OBJS = \
 	transfer_stub.o \
 	tablefile_basic.o \
 	tablefile_stub.o \
+	toast_chunkstore.o \
 	tree_cow.o \
 	tree_stub.o \
 	valenc_canonical.o \

@@ -35,6 +35,38 @@ CREATE FUNCTION prolly_canonical_round_trip(anyelement)
 RETURNS anyelement
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The value of the given type whose canonical bytes are these.
+CREATE FUNCTION prolly_canonical_decode(bytea, anyelement)
+RETURNS anyelement
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- A value stored in the chunk store, as the hash pointer that names it;
+-- and a hash pointer's form, raw and stored sizes and root (NULL if the
+-- value isn't one).
+CREATE FUNCTION test_toast_hash_pointer(anyelement)
+RETURNS anyelement
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_toast_pointer(anyelement,
+	OUT form int, OUT rawsize int, OUT stored int, OUT root text)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The value tree nodes this backend read and wrote for values stored by
+-- content.
+CREATE FUNCTION test_toast_counters(reset bool DEFAULT false,
+	OUT nodes_read int8, OUT nodes_written int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A hash pointer's own bytes, as a value to store where a collection looks
+-- for pointers; and the value a pointer's bytes name, read whole.
+CREATE FUNCTION test_toast_pointer_bytes(anyelement)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_toast_pointer_value(bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Check that catalog rows formed with a null branch column don't leak the
 -- rows written in their place.  Inserts into pg_description; roll back.
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)
@@ -148,6 +180,11 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- in hex.
 CREATE FUNCTION test_chunk_put(data bytea)
 RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Put a chunk as the transaction commits, from a callback of its own.
+CREATE FUNCTION test_chunk_put_at_commit(data bytea)
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_chunk_get(hash text)

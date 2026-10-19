@@ -14,6 +14,7 @@
 #ifndef TOAST_HELPER_H
 #define TOAST_HELPER_H
 
+#include "access/toast_destination.h"
 #include "utils/rel.h"
 
 /*
@@ -30,6 +31,8 @@
 typedef struct
 {
 	varlena    *tai_oldexternal;
+	varlena    *tai_uncompressed;	/* a compressed value's, kept for a
+									 * destination (NULL if none) */
 	int32		tai_size;
 	uint8		tai_colflags;
 	char		tai_compression;
@@ -60,6 +63,9 @@ typedef struct
 	 */
 	uint8		ttc_flags;
 	ToastAttrInfo *ttc_attr;
+
+	/* set by toast_tuple_init: where values go out of line (NULL: TOAST) */
+	const ToastDestinationRoutine *ttc_destination;
 } ToastTupleContext;
 
 /*
@@ -74,11 +80,15 @@ typedef struct
  *
  * TOAST_NEEDS_CHANGE indicates that a new tuple needs to built; in other
  * words, the toaster did something.
+ *
+ * TOAST_CAN_EXTERNALIZE indicates that values can be moved out of line:
+ * the table has a TOAST relation or another destination.
  */
 #define TOAST_NEEDS_DELETE_OLD				0x0001
 #define TOAST_NEEDS_FREE					0x0002
 #define TOAST_HAS_NULLS						0x0004
 #define TOAST_NEEDS_CHANGE					0x0008
+#define TOAST_CAN_EXTERNALIZE				0x0010
 
 /*
  * Flags indicating the status of a TOAST operation with respect to a
@@ -95,11 +105,15 @@ typedef struct
  *
  * TOASTCOL_INCOMPRESSIBLE indicates that this column has been found to
  * be incompressible, but could be moved out-of-line.
+ *
+ * TOASTCOL_FREE_UNCOMPRESSED indicates that tai_uncompressed needs to be
+ * freed.
  */
 #define TOASTCOL_NEEDS_DELETE_OLD			TOAST_NEEDS_DELETE_OLD
 #define TOASTCOL_NEEDS_FREE					TOAST_NEEDS_FREE
 #define TOASTCOL_IGNORE						0x0010
 #define TOASTCOL_INCOMPRESSIBLE				0x0020
+#define TOASTCOL_FREE_UNCOMPRESSED			0x0040
 
 extern void toast_tuple_init(ToastTupleContext *ttc);
 extern int	toast_tuple_find_biggest_attribute(ToastTupleContext *ttc,

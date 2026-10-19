@@ -1752,7 +1752,8 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	{
 		uint8		va_tag = VARTAG_EXTERNAL(tp + ctx->offset);
 
-		if (va_tag != VARTAG_ONDISK_OID && va_tag != VARTAG_ONDISK_OID8)
+		if (va_tag != VARTAG_ONDISK_OID && va_tag != VARTAG_ONDISK_OID8 &&
+			va_tag != VARTAG_ONDISK_SHA256)
 		{
 			report_corruption(ctx,
 							  psprintf("toasted attribute has unexpected TOAST tag %u",
@@ -1795,6 +1796,10 @@ check_tuple_attribute(HeapCheckContext *ctx)
 		return true;
 
 	/* It is external, and we're looking at a page on disk */
+
+	/* A value named by content has no TOAST relation to check */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+		return true;
 
 	/* Must copy attr into a decoded pointer for alignment considerations */
 	toast_external_info_get(attr, &toast_ext_data);

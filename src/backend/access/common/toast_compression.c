@@ -258,7 +258,8 @@ toast_get_compression_id(varlena *attr)
 	/*
 	 * If it is stored externally then fetch the compression method id from
 	 * the external toast pointer.  If compressed inline, fetch it from the
-	 * toast compression header.
+	 * toast compression header.  (A value named by content is stored
+	 * uncompressed.)
 	 */
 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{

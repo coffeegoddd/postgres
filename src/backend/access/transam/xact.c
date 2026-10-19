@@ -1342,6 +1342,12 @@ AtSubStart_ResourceOwner(void)
  */
 
 /*
+ * Whether the committing transaction has chunk store bytes to write once
+ * its commit record is flushed (reserved by CommitTransaction).
+ */
+static bool xact_chunk_writes = false;
+
+/*
  *	RecordTransactionCommit
  *
  * Returns latest XID among xact and its children, or InvalidTransactionId
@@ -1367,10 +1373,12 @@ RecordTransactionCommit(void)
 	bool		wrote_xlog;
 	char	   *chunk_root = NULL;
 	Size		chunk_root_len;
+	bool		chunk_writes = xact_chunk_writes;
 
 	/* a chunk store root this transaction moved goes with its commit record */
+	xact_chunk_writes = false;
 	chunk_root_len = prolly_chunkstore_commit_payload(&chunk_root);
-	Assert(chunk_root_len == 0 || markXidCommitted);
+	Assert((chunk_root_len == 0 && !chunk_writes) || markXidCommitted);
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress
@@ -1557,15 +1565,16 @@ RecordTransactionCommit(void)
 	 */
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
-		forceSyncCommit || nrels > 0 || chunk_root_len > 0)
+		forceSyncCommit || nrels > 0 || chunk_root_len > 0 || chunk_writes)
 	{
 		XLogFlush(XactLastRecEnd);
 
 		/*
-		 * A chunk store's root moved: written now that the commit record is
-		 * flushed, still before a checkpoint can be taken (as for CLOG).
+		 * A chunk store's root moved, or its chunks: written now that the
+		 * commit record is flushed, still before a checkpoint can be taken
+		 * (as for CLOG).
 		 */
-		if (chunk_root_len > 0)
+		if (chunk_root_len > 0 || chunk_writes)
 			prolly_chunkstore_committed();
 
 		/*
@@ -2417,6 +2426,13 @@ CommitTransaction(void)
 	 */
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
+
+	/*
+	 * The chunks this transaction has left to write, reserved now that
+	 * nothing more puts any, and while an error still aborts it as any.
+	 */
+	xact_chunk_writes = !is_parallel_worker &&
+		prolly_chunkstore_commit_writes();
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();

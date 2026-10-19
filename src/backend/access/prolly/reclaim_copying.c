@@ -24,6 +24,15 @@
  * by a collected chunk's hash, that chunk is marked.  Bytes that happen to
  * spell one can keep a chunk nothing names; nothing named is ever lost.
  *
+ * Tables are roots too: a versioned table's values out of line are value
+ * trees its rows name by hash pointers (prolly_toast.h), which no ref
+ * reaches.  Every tree a pointer still on a page of the database's page
+ * stores names is marked, dead tuples' too (prolly_toast_roots()), after
+ * the transactions that named a tree before the collection began have
+ * ended; and every tree a transaction names while it runs (the store's
+ * keep set, gc_kept()), before the window and in it.  A keep set too large
+ * to remember keeps every chunk collected.
+ *
  * A default collection stops at settled files (the store doesn't collect
  * them, so marking ends there): it costs what changed since the last.  A
  * full one collects every file, marks through all of them, then keeps
@@ -42,8 +51,10 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 
 /* a settled file with no more garbage than this is kept whole */
@@ -104,6 +115,28 @@ mark_named(Mark *mk, const char *data, Size len)
 		memcpy(h.bytes, data + i + 1, hl);
 		mark_hash(mk, &h);
 	}
+}
+
+/*
+ * A root outside the refs.  (The first may come before any chunk told how
+ * long the store's hashes are: a store with no root yet.)
+ */
+static void
+mark_root(const ProllyHash *hash, void *arg)
+{
+	Mark	   *mk = arg;
+
+	if (mk->hash_len == 0)
+		mk->hash_len = hash->len;
+	mark_hash(mk, hash);
+}
+
+/* Every chunk collected, as a keep set too large to remember asks. */
+static void
+mark_all(Mark *mk)
+{
+	for (uint64 slot = 0; slot < mk->nslots; slot++)
+		mark_slot(mk, slot);
 }
 
 /* Read what was marked, marking what it names, until nothing is left. */
@@ -204,7 +237,9 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
-	mk.gc = PROLLY_CALL(cs, gc_begin, store, full, &root, &mk.nslots);
+	mk.gc = PROLLY_CALL(cs, gc_begin, store,
+						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT,
+						&root, &mk.nslots);
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
 	mk.cap = 1024;
@@ -221,6 +256,17 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	/* what is new since, before the window */
 	PROLLY_CALL(cs, gc_new, mk.gc, false, mark_new, &mk);
+	drain(&mk);
+
+	/* what the store keeps for its own reasons */
+	PROLLY_CALL(cs, gc_retained, mk.gc, mark_new, &mk);
+	drain(&mk);
+
+	/* what tables name, once those who named a tree before have ended */
+	prolly_toast_roots(mark_root, &mk);
+	INJECTION_POINT("prolly-gc-roots-scanned", NULL);
+	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+		mark_all(&mk);
 	drain(&mk);
 
 	/* the settled files kept whole, and what they name */
@@ -246,9 +292,48 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	/* in the window: what came since */
 	PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
+	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+		mark_all(&mk);
+	INJECTION_POINT("prolly-gc-kept", NULL);
 	drain(&mk);
 	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	PROLLY_CALL(cs, gc_retire, mk.gc);
+}
+
+/* (nothing to mark: every chunk is) */
+static void
+mark_none(const ProllyHash *hash, const char *data, Size len, void *arg)
+{
+}
+
+/*
+ * A collection of the journal with every chunk marked: its sealed segments
+ * rewritten as one table file, not settled (it keeps garbage, which the
+ * next default collection collects), nothing dropped; the table files are
+ * left as they are.  Copying is paced as marking is.
+ */
+static void
+copying_move(ProllyGcResult *result)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	ProllyChunkGc *gc;
+	ProllyHash	root;
+	uint64		nslots;
+	uint8	   *marks;
+	int			nfiles = 0;
+	bool	   *keep;
+
+	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, &root, &nslots);
+	marks = MemoryContextAllocHuge(CurrentMemoryContext, nslots / 8 + 1);
+	memset(marks, 0xFF, nslots / 8 + 1);
+	PROLLY_CALL(cs, gc_files, gc, count_file, &nfiles);
+	keep = palloc0(sizeof(bool) * Max(nfiles, 1));
+	PROLLY_CALL(cs, gc_copy, gc, marks, keep);
+	PROLLY_CALL(cs, gc_new, gc, true, mark_none, NULL);
+	PROLLY_CALL(cs, gc_swap, gc, marks, keep, result);
+	PROLLY_CALL(cs, gc_retire, gc);
 }
 
 const ProllyReclaimRoutine prolly_reclaim_copying = {
@@ -261,4 +346,5 @@ const ProllyReclaimRoutine prolly_reclaim_copying = {
 		"to new files, online",
 	},
 	.collect = copying_collect,
+	.move = copying_move,
 };

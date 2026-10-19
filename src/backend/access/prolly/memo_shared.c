@@ -27,12 +27,15 @@
  * name chunks no one else can read until then), and forgotten if it, or
  * the subtransaction that made them, aborts, or if it is prepared (they
  * wait for no COMMIT PREPARED).  A parallel worker's are forgotten when it
- * ends: its leader may yet abort.  At most MEMO_ENTRIES are kept, one per
+ * ends: its leader may yet abort.  At most as many as the shared table
+ * holds, and PENDING_MAX, are kept, one per
  * key.  A hit is also checked against the chunk store, in case anything
  * else removed the tree; an entry of the transaction's that fails it is
  * dropped.
  *
- * The table has MEMO_ENTRIES slots under a spinlock; a key is looked for
+ * The table has prolly_value_memo_entries slots (a server setting: values
+ * stored by content need no memo, only those still in TOAST relations; 0,
+ * none, and nothing is remembered) under a spinlock; a key is looked for
  * in MEMO_PROBE slots from its hash, and a new entry takes the first free
  * or matching one there, else the oldest.  Nothing outlives a restart.
  *
@@ -64,8 +67,8 @@
 #include "utils/rel.h"
 #include "varatt.h"
 
-#define MEMO_ENTRIES	8192
 #define MEMO_PROBE		8
+#define PENDING_MAX		8192	/* a transaction's entries, at most */
 #define MEMO_REF_MAX	(1 + PROLLY_HASH_MAX_LEN + 10)
 #define MEMO_MAX_AGE	(UINT64CONST(1) << 31)
 
@@ -89,8 +92,11 @@ typedef struct MemoEntry
 typedef struct MemoShared
 {
 	slock_t		mutex;
-	MemoEntry	entries[MEMO_ENTRIES];
+	int			nentries;
+	MemoEntry	entries[FLEXIBLE_ARRAY_MEMBER];
 } MemoShared;
+
+int			prolly_value_memo_entries = 8192;
 
 /* An entry of this backend's transaction, not yet everyone's. */
 typedef struct Pending
@@ -129,7 +135,10 @@ shared(void)
 static Size
 shared_shmem_size(void)
 {
-	return sizeof(MemoShared);
+	if (prolly_value_memo_entries == 0)
+		return 0;
+	return add_size(offsetof(MemoShared, entries),
+					mul_size(prolly_value_memo_entries, sizeof(MemoEntry)));
 }
 
 static void
@@ -138,7 +147,8 @@ shared_shmem_init(void *area)
 	MemoShared *m = area;
 
 	SpinLockInit(&m->mutex);
-	memset(m->entries, 0, sizeof(m->entries));
+	m->nentries = prolly_value_memo_entries;
+	memset(m->entries, 0, sizeof(MemoEntry) * m->nentries);
 }
 
 /*
@@ -211,7 +221,7 @@ static int
 first_slot(const MemoKey *key)
 {
 	return (int) (hash_bytes((const unsigned char *) key, sizeof(*key)) %
-				  MEMO_ENTRIES);
+				  prolly_value_memo_entries);
 }
 
 static bool
@@ -230,7 +240,7 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 	int			len = -1;
 	bool		own = false;
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(pointer) ||
+	if (prolly_value_memo_entries == 0 || !VARATT_IS_EXTERNAL_ONDISK(pointer) ||
 		!key_of(pointer, typid, &key, &frozen, false))
 	{
 		counts.misses++;
@@ -259,7 +269,7 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 		SpinLockAcquire(&m->mutex);
 		for (int i = 0; i < MEMO_PROBE; i++)
 		{
-			MemoEntry  *e = &m->entries[(slot + i) % MEMO_ENTRIES];
+			MemoEntry  *e = &m->entries[(slot + i) % m->nentries];
 
 			if (e->filled == 0 || !same_key(&e->key, &key))
 				continue;
@@ -310,7 +320,7 @@ publish(void)
 		SpinLockAcquire(&m->mutex);
 		for (int i = 0; i < MEMO_PROBE; i++)
 		{
-			MemoEntry  *e = &m->entries[(slot + i) % MEMO_ENTRIES];
+			MemoEntry  *e = &m->entries[(slot + i) % m->nentries];
 
 			if (e->filled == 0 || same_key(&e->key, &p->key))
 			{
@@ -394,7 +404,8 @@ shared_remember(const void *pointer, Oid typid, const ProllyValue *ref)
 	bool		frozen;
 	Pending    *p;
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(pointer) || ref->len > MEMO_REF_MAX ||
+	if (prolly_value_memo_entries == 0 ||
+		!VARATT_IS_EXTERNAL_ONDISK(pointer) || ref->len > MEMO_REF_MAX ||
 		!key_of(pointer, typid, &key, &frozen, true) || frozen)
 		return;
 	if (!callbacks_registered)
@@ -414,9 +425,14 @@ shared_remember(const void *pointer, Oid typid, const ProllyValue *ref)
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		pending_newest = InvalidSubTransactionId;
 	}
-	/* (no more than the shared table holds: the rest would be dropped) */
+	/*
+	 * No more than the shared table holds (the rest would be dropped), nor
+	 * than PENDING_MAX: a transaction's memory, and its work to publish
+	 * them as it commits, don't grow with the setting.
+	 */
 	p = hash_search(pending, &key,
-					hash_get_num_entries(pending) < MEMO_ENTRIES ?
+					hash_get_num_entries(pending) <
+					Min(prolly_value_memo_entries, PENDING_MAX) ?
 					HASH_ENTER : HASH_FIND, NULL);
 	if (p == NULL)
 		return;

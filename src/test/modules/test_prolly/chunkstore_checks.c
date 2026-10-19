@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
@@ -102,6 +103,59 @@ test_chunk_put(PG_FUNCTION_ARGS)
 	PROLLY_CALL(cs(), put, store(), &h, VARDATA_ANY(data),
 				VARSIZE_ANY_EXHDR(data));
 	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/* chunks to put as the transaction commits; in TopMemoryContext */
+static List *at_commit = NIL;
+
+static void
+put_at_commit(XactEvent event, void *arg)
+{
+	ListCell   *lc;
+
+	if (event == XACT_EVENT_PRE_COMMIT)
+	{
+		foreach(lc, at_commit)
+		{
+			bytea	   *data = lfirst(lc);
+			ProllyHash	h;
+
+			sha256(VARDATA(data), VARSIZE(data) - VARHDRSZ, &h);
+			PROLLY_CALL(cs(), put, store(), &h, VARDATA(data),
+						VARSIZE(data) - VARHDRSZ);
+		}
+	}
+	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_ABORT)
+	{
+		list_free_deep(at_commit);
+		at_commit = NIL;
+	}
+}
+
+/*
+ * Put a chunk as the transaction commits, from a transaction callback
+ * registered now: one that runs after the chunk store's own if the store
+ * is opened after this (callbacks run newest first).
+ */
+PG_FUNCTION_INFO_V1(test_chunk_put_at_commit);
+Datum
+test_chunk_put_at_commit(PG_FUNCTION_ARGS)
+{
+	static bool registered = false;
+	bytea	   *data = PG_GETARG_BYTEA_P_COPY(0);
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	bytea	   *copy = palloc(VARSIZE(data));
+
+	memcpy(copy, data, VARSIZE(data));
+	at_commit = lappend(at_commit, copy);
+	MemoryContextSwitchTo(old);
+	if (!registered)
+	{
+		RegisterXactCallback(put_at_commit, NULL);
+		registered = true;
+	}
+	(void) GetCurrentTransactionId();
+	PG_RETURN_VOID();
 }
 
 /* A chunk's bytes, or NULL if the store has none by that hash. */

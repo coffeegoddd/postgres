@@ -369,7 +369,7 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 UPDATE mt.t SET k = 3000 WHERE id = 3;
 SELECT length(dolt_commit('-am', 'mt main')::text) AS committed;
 SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
-SELECT length(big), left(big, 1), pg_column_toast_chunk_id(big) IS NOT NULL AS out_of_line
+SELECT length(big), left(big, 1), test_toast_pointer(big) IS NOT NULL AS out_of_line
   FROM mt.t WHERE id = 1;
 SET enable_seqscan = off;
 SELECT id FROM mt.t WHERE k = 1000;

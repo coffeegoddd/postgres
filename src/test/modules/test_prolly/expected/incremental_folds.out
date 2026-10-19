@@ -434,10 +434,12 @@ SELECT length(dolt_commit('-am', 'after multixact')::text) AS committed;
         66
 (1 row)
 
--- A fold that gives up (a deleted row's value out of line may be gone)
--- counts only the full read.
+-- A fold that gives up (a deleted row's value in the TOAST relation may
+-- be gone) counts only the full read.
+SET debug_toast_relation = on;
 INSERT INTO inc.keyless
   SELECT 5000, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
+RESET debug_toast_relation;
 SELECT length(dolt_commit('-am', 'out of line')::text) AS committed;
  committed 
 -----------
@@ -452,6 +454,28 @@ SELECT * FROM pg_temp.fold();
 (1 row)
 
 SELECT length(dolt_commit('-am', 'out of line gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A deleted row's value stored by content stays: the fold doesn't give up.
+INSERT INTO inc.keyless
+  SELECT 5001, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
+SELECT length(dolt_commit('-am', 'by content')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DELETE FROM inc.keyless WHERE a = 5001;
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     2 |          1 |           0 | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'by content gone')::text) AS committed;
  committed 
 -----------
         66

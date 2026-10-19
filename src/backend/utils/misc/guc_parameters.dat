@@ -738,6 +738,13 @@
   ifdef => 'DEBUG_NODE_TESTS_ENABLED',
 },
 
+{ name => 'debug_toast_relation', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Moves values out of line to the TOAST relation even where the table has another TOAST destination, for testing.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_toast_relation',
+  boot_val => 'false',
+},
+
 { name => 'debug_write_read_parse_plan_trees', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all parse and plan trees to be passed through outfuncs.c/readfuncs.c, to facilitate catching errors and omissions in those modules.',
   flags => 'GUC_NOT_IN_SAMPLE',
@@ -2428,6 +2435,15 @@
   variable => 'PrimarySlotName',
   boot_val => '""',
   check_hook => 'check_primary_slot_name',
+},
+
+{ name => 'prolly_value_memo_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
+  short_desc => 'Sets how many values in versioned tables\' TOAST relations a fold remembers the history references of.',
+  long_desc => 'Values stored by content need no memo: a fold takes their references from their pointers. 0 turns the memo off, and reserves no shared memory for it.',
+  variable => 'prolly_value_memo_entries',
+  boot_val => '8192',
+  min => '0',
+  max => '16777216',
 },
 
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',

@@ -22,6 +22,11 @@
  *   kept whole), or every chunk if full; result says what was kept and
  *   freed.  A crash at any point leaves the store as it was or as the
  *   collection made it, never with a live chunk missing.
+ * - move() rewrites the journal's sealed segments into a table file, every
+ *   chunk, garbage and all (not settled: the next default collection still
+ *   collects it), so the journal a backend indexes by reading it stays
+ *   short.  It frees nothing, and leaves the table files as they are.
+ *   Optional.
  *
  * Provisional (v0).
  *
@@ -45,11 +50,14 @@ typedef struct ProllyReclaimRoutine
 	 * the last collection, or (full) all of it.
 	 */
 	void		(*collect) (bool full, ProllyGcResult *result);
+
+	/* Move what was written since the last collection, freeing nothing. */
+	void		(*move) (ProllyGcResult *result);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \
-	"collect"
+	"collect", "move"
 #define PROLLY_RECLAIM_FIRST_CALLBACK collect
-#define PROLLY_RECLAIM_LAST_CALLBACK collect
+#define PROLLY_RECLAIM_LAST_CALLBACK move
 
 #endif							/* PROLLY_RECLAIM_H */

@@ -84,4 +84,7 @@ prolly_memo_lookup(const char *name)
 		prolly_get_impl(PROLLY_IFACE_VALUE_MEMO, name);
 }
 
+/* prolly_value_memo_entries: how many entries a shared memo holds */
+extern PGDLLIMPORT int prolly_value_memo_entries;
+
 #endif							/* PROLLY_MEMO_H */

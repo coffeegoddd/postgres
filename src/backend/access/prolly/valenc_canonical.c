@@ -22,7 +22,14 @@
  * rows holding it share its tree.  A row without long values is the same
  * bytes as before references were.
  *
- * A value TOAST stored out of line is looked up in the value store's memo
+ * A value stored by content (a hash pointer, prolly_toast.h) whose tree
+ * holds its canonical bytes is that tree: its reference is written from
+ * the pointer, and the value isn't read (one short enough to be inline is,
+ * and is stored inline).  Decoding for rows written back to a table (the
+ * value store's pointers) gives a long value whose tree a hash pointer can
+ * name as that pointer, unread (prolly_toast_pointer()): the row holds the
+ * tree history has, and a value no one reads is never fetched.  A value TOAST stored out of line in a TOAST
+ * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
  * the value.  A miss reads it, and remembers the reference made.  Dropped columns are never
@@ -59,6 +66,8 @@
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_toast.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "varatt.h"
 
@@ -256,6 +265,26 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 		if (enc->nulls[j])
 			continue;
 
+		/*
+		 * A value stored by content: its tree is the column's, when it holds
+		 * the canonical bytes and is too long to be inline.  Not read.
+		 */
+		if (att->attlen == -1 && enc->values &&
+			VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(slot->tts_values[i])))
+		{
+			uint64		len;
+
+			initStringInfo(&ref);
+			if (prolly_toast_canonical((varlena *) DatumGetPointer(slot->tts_values[i]),
+									   att->atttypid, enc->values, &ref, &len) &&
+				len > VALUE_INLINE_MAX)
+			{
+				prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+				appendBinaryStringInfo(out, ref.data, ref.len);
+				continue;
+			}
+		}
+
 		/* A value TOAST stored out of line: its reference, if remembered. */
 		if (att->attlen == -1 && enc->values && enc->values->memo &&
 			VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(slot->tts_values[i])))
@@ -452,15 +481,33 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 			else if (enc->codecs[i] != NULL && out_of_line)
 			{
 				ProllyValue ref = {(const uint8 *) p, (uint32) len};
+				ProllyHash	root;
+				uint64		vlen;
+				varlena    *pointer;
 
 				if (enc->values == NULL)
 					no_values();
-				resetStringInfo(&enc->scratch);
-				PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
-							&ref, 0, PG_UINT64_MAX, &enc->scratch);
-				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
-														  enc->scratch.data,
-														  enc->scratch.len);
+
+				/* a tree a hash pointer can name: named, not read */
+				pointer = NULL;
+				if (enc->values->pointers)
+				{
+					PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
+					pointer = prolly_toast_pointer(&root, vlen,
+												   TupleDescAttr(desc, i)->atttypid);
+				}
+				if (pointer != NULL)
+					slot->tts_values[i] = PointerGetDatum(pointer);
+				else
+				{
+					INJECTION_POINT("prolly-value-read", NULL);
+					resetStringInfo(&enc->scratch);
+					PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
+								&ref, 0, PG_UINT64_MAX, &enc->scratch);
+					slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
+															  enc->scratch.data,
+															  enc->scratch.len);
+				}
 				slot->tts_isnull[i] = false;
 			}
 			else if (enc->codecs[i] != NULL)
@@ -551,7 +598,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.info = {
 		.iface = PROLLY_IFACE_VALUE_ENCODER,
 		.impl_id = 2,
-		.format_version = 2,
+		.format_version = 3,		/* 3: jsonb as stored */
 		.name = "canonical",
 		.description = "portable rows of live columns, trailing NULLs omitted, "
 		"no local OIDs, long values out of line",

@@ -15,9 +15,9 @@ FROM prolly_implementations();
  content_hash  | stub         |       0 |              0
  content_hash  | test_fnv     |    9001 |              0
  content_hash  | test_broken  |    9002 |              0
- key_encoder   | ordered      |       1 |              1
+ key_encoder   | ordered      |       1 |              2
  key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              2
+ value_encoder | canonical    |       2 |              3
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
@@ -54,8 +54,8 @@ FROM prolly_implementations();
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
-   interface   | implementation |              test              |                                                                                      result                                                                                      
----------------+----------------+--------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+   interface   | implementation |              test              |                                                                                              result                                                                                               
+---------------+----------------+--------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  chunker       | bytes          | identity                       | pass
  chunker       | bytes          | deterministic                  | pass
  chunker       | bytes          | forced_split_respects_capacity | pass
@@ -105,7 +105,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  reclamation   | stub           | identity                       | pass
  reclamation   | stub           | live_chunks_never_freed        | not implemented (missing collect)
  reclamation   | stub           | keeps_what_writers_reference   | not implemented (missing collect)
- reclamation   | stub           | complete                       | not implemented (1 of 1 callbacks missing)
+ reclamation   | stub           | complete                       | not implemented (2 of 2 callbacks missing)
  refs          | copies         | identity                       | pass
  refs          | copies         | branch_lifecycle               | no checks yet
  refs          | copies         | commit_then_resolve            | no checks yet
@@ -163,9 +163,9 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree          | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
- tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read)
+ tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
  tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
- tree          | stub           | complete                       | not implemented (17 of 17 callbacks missing)
+ tree          | stub           | complete                       | not implemented (19 of 19 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass

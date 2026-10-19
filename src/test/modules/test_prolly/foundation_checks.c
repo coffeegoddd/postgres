@@ -17,11 +17,13 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/tupdesc_details.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_toast.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation_d.h"
@@ -31,6 +33,7 @@
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "nodes/value.h"
@@ -1008,6 +1011,12 @@ valenc_missing_values(const ProllyImplInfo *impl)
 
 PG_FUNCTION_INFO_V1(prolly_canonical_value);
 PG_FUNCTION_INFO_V1(prolly_canonical_round_trip);
+PG_FUNCTION_INFO_V1(prolly_canonical_decode);
+PG_FUNCTION_INFO_V1(test_toast_hash_pointer);
+PG_FUNCTION_INFO_V1(test_toast_pointer);
+PG_FUNCTION_INFO_V1(test_toast_pointer_bytes);
+PG_FUNCTION_INFO_V1(test_toast_pointer_value);
+PG_FUNCTION_INFO_V1(test_toast_counters);
 
 Datum
 prolly_canonical_value(PG_FUNCTION_ARGS)
@@ -1031,6 +1040,102 @@ prolly_canonical_round_trip(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	prolly_datum_encode(codec, PG_GETARG_DATUM(0), &buf);
 	PG_RETURN_DATUM(prolly_datum_decode(codec, buf.data, buf.len));
+}
+
+Datum
+prolly_canonical_decode(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	ProllyDatumCodec *codec;
+	bytea	   *b;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	codec = prolly_datum_codec(type, -1, CurrentMemoryContext);
+	b = PG_GETARG_BYTEA_PP(0);
+	PG_RETURN_DATUM(prolly_datum_decode(codec, VARDATA_ANY(b),
+										VARSIZE_ANY_EXHDR(b)));
+}
+
+Datum
+test_toast_hash_pointer(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+
+	if (get_typlen(type) != -1)
+		elog(ERROR, "only a varlena value can be stored by content");
+	PG_RETURN_POINTER(prolly_toast_store(PG_GETARG_DATUM(0), type));
+}
+
+Datum
+test_toast_counters(PG_FUNCTION_ARGS)
+{
+	ProllyNodeCounters c;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_toast_counters(&c, PG_GETARG_BOOL(0));
+	values[0] = Int64GetDatum(c.nodes_read);
+	values[1] = Int64GetDatum(c.nodes_written);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+Datum
+test_toast_pointer_bytes(PG_FUNCTION_ARGS)
+{
+	varlena    *v = (varlena *) DatumGetPointer(PG_GETARG_DATUM(0));
+
+	if (get_typlen(get_fn_expr_argtype(fcinfo->flinfo, 0)) != -1 ||
+		!VARATT_IS_EXTERNAL_ONDISK_HASH(v))
+		elog(ERROR, "not a hash pointer");
+	PG_RETURN_BYTEA_P(cstring_to_text_with_len((const char *) v,
+											   VARSIZE_EXTERNAL(v)));
+}
+
+Datum
+test_toast_pointer_value(PG_FUNCTION_ARGS)
+{
+	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+	varlena    *p = (varlena *) VARDATA_ANY(b);
+	varlena    *copy;
+
+	if (VARSIZE_ANY_EXHDR(b) != (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)) ||
+		!VARATT_IS_EXTERNAL_ONDISK_HASH(p))
+		elog(ERROR, "not a hash pointer's bytes");
+	copy = palloc((VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)));
+	memcpy(copy, p, (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)));
+	PG_RETURN_BYTEA_P(detoast_attr(copy));
+}
+
+Datum
+test_toast_pointer(PG_FUNCTION_ARGS)
+{
+	varlena    *v = (varlena *) DatumGetPointer(PG_GETARG_DATUM(0));
+	varatt_external_hash p;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	StringInfoData root;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (get_typlen(get_fn_expr_argtype(fcinfo->flinfo, 0)) != -1 ||
+		!VARATT_IS_EXTERNAL_ONDISK_HASH(v))
+		PG_RETURN_NULL();
+	VARATT_EXTERNAL_GET_POINTER(p, v);
+	initStringInfo(&root);
+	for (int i = 0; i < sizeof(p.va_hash); i++)
+		appendStringInfo(&root, "%02x", p.va_hash[i]);
+	values[0] = Int32GetDatum(p.va_extinfo >> VARLENA_EXTSIZE_BITS);
+	values[1] = Int32GetDatum(p.va_rawsize);
+	values[2] = Int32GetDatum(VARATT_EXTINFO_GET_EXTSIZE(p.va_extinfo));
+	values[3] = CStringGetTextDatum(root.data);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /*

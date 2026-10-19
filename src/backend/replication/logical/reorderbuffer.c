@@ -5326,7 +5326,12 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		/* ok, we know we have a toast datum */
 		varlena_pointer = (varlena *) DatumGetPointer(attrs[natt]);
 
-		/* no need to do anything if the tuple isn't external */
+		/*
+		 * No need to do anything if the tuple isn't external.  A value named
+		 * by content (a hash pointer) has no TOAST relation changes to
+		 * reassemble it from: it stays, and is fetched from its destination
+		 * when the output plugin detoasts it.
+		 */
 		if (!VARATT_IS_EXTERNAL_ONDISK(varlena_pointer))
 			continue;
 
