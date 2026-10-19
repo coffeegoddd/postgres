@@ -77,6 +77,7 @@ tests += {
       'dirty_merges',
       'constraint_violations',
       'verify_constraints',
+      'domain_violations',
       'redefined_merges',
       'type_moves',
       'detached_checkout',

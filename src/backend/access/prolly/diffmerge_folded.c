@@ -62,6 +62,7 @@
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/typcache.h"
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -80,11 +81,13 @@
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
 #include "catalog/pg_sequence.h"
+#include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "common/hashfn.h"
 #include "common/int.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -721,15 +724,24 @@ count_of(Changes *c, const StringInfoData *value)
 
 /*
  * While a merge (or pick) runs: the constraint violations it records, and
- * the tables it wrote to, whose foreign keys are checked after; and the
- * last table whose rows a merge wrote, whether a row written may break a
- * constraint there.
+ * the tables it wrote to, whose foreign keys are checked after; the last
+ * table whose rows a merge wrote, whether a row written may break a
+ * constraint there, and its columns whose values a domain's constraint
+ * may reject; and domain_check()'s caches for the domains checked.
  */
 static bool recording = false;
 static List *recorded = NIL;	/* ProllyViolation * */
 static List *written = NIL;		/* OIDs */
 static Oid	breakable_relid = InvalidOid;
 static bool breakable;
+static Bitmapset *breakable_domains = NULL; /* attnums */
+static List *domain_checks = NIL;	/* DomainCheck * */
+
+typedef struct DomainCheck
+{
+	Oid			typid;
+	void	   *extra;
+} DomainCheck;
 
 static void
 note_written(Oid relid)
@@ -757,6 +769,8 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	recorded = NIL;
 	written = NIL;
 	breakable_relid = InvalidOid;
+	breakable_domains = NULL;
+	domain_checks = NIL;
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -829,21 +843,72 @@ other_unique_index(Relation rel)
 }
 
 /*
+ * May a value of type typid break a domain's constraint: is it of a domain
+ * with one (or over such a type), or an array or a composite of such a
+ * type?  (A range's bounds, read through its receive function, are
+ * checked as it is read.)
+ */
+static bool
+domain_constrained(Oid typid)
+{
+	Oid			elem;
+
+	switch (get_typtype(typid))
+	{
+		case TYPTYPE_DOMAIN:
+			return DomainHasConstraints(typid, NULL) ||
+				domain_constrained(getBaseType(typid));
+		case TYPTYPE_COMPOSITE:
+			{
+				TupleDesc	desc = lookup_rowtype_tupdesc(typid, -1);
+				bool		found = false;
+
+				for (int i = 0; i < desc->natts && !found; i++)
+				{
+					Form_pg_attribute att = TupleDescAttr(desc, i);
+
+					found = !att->attisdropped && domain_constrained(att->atttypid);
+				}
+				ReleaseTupleDesc(desc);
+				return found;
+			}
+		default:
+			elem = get_element_type(typid);
+			return OidIsValid(elem) && domain_constrained(elem);
+	}
+}
+
+/*
  * May a row a merge writes to rel break one of its constraints there: a
- * check, a not-null column outside the primary key, or a unique or
- * exclusion index other than the primary key's?  (The merge decides each
- * row by its primary key, so that one holds.)  Asked once a table.
+ * check, a not-null column outside the primary key, a unique or exclusion
+ * index other than the primary key's, or a domain's constraint on a
+ * column's values?  (The merge decides each row by its primary key, so
+ * that one holds.)  Asked once a table.
  */
 static bool
 may_break_constraints(Relation rel)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
+	MemoryContext old;
 
 	if (RelationGetRelid(rel) == breakable_relid)
 		return breakable;
 	breakable_relid = RelationGetRelid(rel);
 	breakable = true;
+	bms_free(breakable_domains);
+	breakable_domains = NULL;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && domain_constrained(att->atttypid))
+			breakable_domains = bms_add_member(breakable_domains, att->attnum);
+	}
+	MemoryContextSwitchTo(old);
+	if (breakable_domains != NULL)
+		return true;
 	if (desc->constr && desc->constr->num_check > 0)
 		return true;
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
@@ -861,11 +926,173 @@ may_break_constraints(Relation rel)
 	return false;
 }
 
+/* domain_check()'s cache for domain typid, kept while the merge runs. */
+static void **
+domain_cache(Oid typid)
+{
+	MemoryContext old;
+	DomainCheck *dc;
+
+	foreach_ptr(DomainCheck, c, domain_checks)
+		if (c->typid == typid)
+			return &c->extra;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	dc = palloc0(sizeof(DomainCheck));
+	dc->typid = typid;
+	domain_checks = lappend(domain_checks, dc);
+	MemoryContextSwitchTo(old);
+	return &dc->extra;
+}
+
+/*
+ * Check value, of type typid, against the constraints of the domains it is
+ * of, as a value input or cast to one is checked: a domain's own, and its
+ * elements' or fields'.  A value breaking one raises the error the domain
+ * does, naming column.
+ */
+static void
+check_domains(Oid typid, Datum value, bool isnull, const char *column)
+{
+	if (!domain_constrained(typid))
+		return;
+	switch (get_typtype(typid))
+	{
+		case TYPTYPE_DOMAIN:
+			{
+				ErrorSaveContext es = {T_ErrorSaveContext};
+
+				es.details_wanted = true;
+				if (!domain_check_safe(value, isnull, typid, domain_cache(typid),
+									   TopTransactionContext, (Node *) &es))
+				{
+					es.error_data->elevel = ERROR;
+					es.error_data->column_name = pstrdup(column);
+					ThrowErrorData(es.error_data);
+				}
+				check_domains(getBaseType(typid), value, isnull, column);
+				break;
+			}
+		case TYPTYPE_COMPOSITE:
+			if (!isnull)
+			{
+				HeapTupleHeader td = DatumGetHeapTupleHeader(value);
+				TupleDesc	desc = lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(td),
+														  HeapTupleHeaderGetTypMod(td));
+				HeapTupleData tuple;
+				Datum	   *values = palloc(desc->natts * sizeof(Datum));
+				bool	   *nulls = palloc(desc->natts * sizeof(bool));
+
+				tuple.t_len = HeapTupleHeaderGetDatumLength(td);
+				ItemPointerSetInvalid(&tuple.t_self);
+				tuple.t_tableOid = InvalidOid;
+				tuple.t_data = td;
+				heap_deform_tuple(&tuple, desc, values, nulls);
+				for (int i = 0; i < desc->natts; i++)
+					if (!TupleDescAttr(desc, i)->attisdropped)
+						check_domains(TupleDescAttr(desc, i)->atttypid,
+									  values[i], nulls[i], column);
+				ReleaseTupleDesc(desc);
+				pfree(values);
+				pfree(nulls);
+				if ((Pointer) td != DatumGetPointer(value))
+					pfree(td);
+			}
+			break;
+		default:
+			if (!isnull)
+			{
+				Oid			elem = get_element_type(typid);
+				ArrayType  *arr = DatumGetArrayTypeP(value);
+				int16		typlen;
+				bool		typbyval;
+				char		typalign;
+				Datum	   *elems;
+				bool	   *nulls;
+				int			n;
+
+				get_typlenbyvalalign(elem, &typlen, &typbyval, &typalign);
+				deconstruct_array(arr, elem, typlen, typbyval, typalign, &elems,
+								  &nulls, &n);
+				for (int i = 0; i < n; i++)
+					check_domains(elem, elems[i], nulls[i], column);
+				pfree(elems);
+				pfree(nulls);
+				if ((Pointer) arr != DatumGetPointer(value))
+					pfree(arr);
+			}
+			break;
+	}
+}
+
+/*
+ * Check row, to be written to rel, against the constraints of its
+ * columns' domains (check_domains()): the replication applier the merge
+ * writes with doesn't.  (A value keep marks is the row's stored one,
+ * unread.)
+ */
+static void
+check_row_domains(Relation rel, TupleTableSlot *row, const bool *keep)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			attnum = -1;
+
+	slot_getallattrs(row);
+	while ((attnum = bms_next_member(breakable_domains, attnum)) >= 0)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+
+		if (keep && keep[attnum - 1])
+			continue;
+		check_domains(att->atttypid, row->tts_values[attnum - 1],
+					  row->tts_isnull[attnum - 1], NameStr(att->attname));
+	}
+}
+
+/*
+ * The expression of the check constraint name, of the domain ed names or
+ * a domain that one is over, deparsed ("" if not found).
+ */
+static char *
+domain_check_expr(const ErrorData *ed, const char *name)
+{
+	Oid			nsp = ed->schema_name ? get_namespace_oid(ed->schema_name, true) : InvalidOid;
+	Oid			typid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+										CStringGetDatum(ed->datatype_name),
+										ObjectIdGetDatum(nsp));
+
+	while (OidIsValid(typid) && get_typtype(typid) == TYPTYPE_DOMAIN)
+	{
+		Oid			con = get_domain_constraint_oid(typid, name, true);
+		HeapTuple	tup;
+
+		if (OidIsValid(con) &&
+			(tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(con))) != NULL)
+		{
+			bool		isnull;
+			Datum		bin = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conbin,
+											  &isnull);
+			char	   *expr = "";
+
+			if (!isnull)
+				expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+															   ObjectIdGetDatum(InvalidOid)));
+			ReleaseSysCache(tup);
+			return expr;
+		}
+		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (!HeapTupleIsValid(tup))
+			break;
+		typid = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+		ReleaseSysCache(tup);
+	}
+	return "";
+}
+
 /*
  * What a row a merge couldn't write breaks (ed, the error writing it
  * raised), as Dolt describes it: a unique index by its name and columns, a
  * check constraint by its name and expression, a not-null constraint by
- * its column.
+ * its column (a domain's, by the column of the domain's value).
  */
 static char *
 constraint_info(Relation rel, const char *type, const ErrorData *ed)
@@ -877,6 +1104,9 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 	if (strcmp(type, "not null") == 0)
 		appendStringInfo(&s, "{\"Columns\": [%s]}",
 						 quote_json(ed->column_name ? ed->column_name : ""));
+	else if (strcmp(type, "check constraint") == 0 && ed->datatype_name)
+		appendStringInfo(&s, "{\"Name\": %s, \"Expression\": %s}",
+						 quote_json(name), quote_json(domain_check_expr(ed, name)));
 	else if (strcmp(type, "check constraint") == 0)
 	{
 		Oid			con = get_relation_constraint_oid(RelationGetRelid(rel), name, true);
@@ -930,10 +1160,11 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 /*
  * Write a row as a merge does: insert it, or update old to it.  While a
  * merge records violations, a row that breaks a unique, check or not-null
- * (or exclusion) constraint isn't written, and is recorded instead: a
- * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).
- * Returns false if old isn't there.
+ * (or exclusion) constraint, or a column's domain's check or not-null
+ * constraint, isn't written, and is recorded instead: a row the merge made
+ * of both sides' columns too, the branch's kept (a table holds no row
+ * breaking a constraint, unlike Dolt's).  Returns false if old isn't
+ * there.
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
@@ -954,6 +1185,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
 	{
+		check_row_domains(rel, row, keep);
 		if (old)
 			ok = PROLLY_CALL(ar, update, a, old, row, keep);
 		else
