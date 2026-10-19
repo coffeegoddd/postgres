@@ -55,8 +55,8 @@ SELECT name, value FROM pg_stat_prolly;
  nodes_written        |    14
  value_nodes_written  |     0
  chunks_appended      |    14
- chunk_bytes_appended | 25809
- bytes_hashed         | 44893
+ chunk_bytes_appended | 25813
+ bytes_hashed         | 44897
  fold_rows_read       |  1000
  fold_rows_written    |  1000
  fold_pages           |     6
