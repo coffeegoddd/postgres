@@ -236,9 +236,10 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 -- Another type, made alike on both sides: boolean to text, numeric to
--- integer.  Base's row comes as the cast makes it ('true', not 't', so
--- only theirs changed it).  1.5, which the cast rounds, isn't refused: as
--- both sides have 2, they agree.
+-- integer.  Neither base value is trusted through the cast: true casts to
+-- 'true' but its text form is 't' (which a USING may have meant), and 1.5
+-- rounds.  Both are unsure, not refused: as both sides have 2, they
+-- agree; theirs' 'yes' against ours' 'true' is a conflict, as on master.
 CREATE TABLE rt.o (id int PRIMARY KEY, b boolean, n numeric);
 INSERT INTO rt.o VALUES (1, true, 1.5);
 SELECT length(dolt_commit('-Am', 'o base')::text) AS committed;
@@ -281,19 +282,27 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
-SELECT (dolt_merge('feature', '-m', 'merged retyped'))[3:4];
-       dolt_merge       
-------------------------
- {0,"merge successful"}
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged retyped'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
 (1 row)
 
 SELECT * FROM rt.o ORDER BY id;
  id |   b   | n 
 ----+-------+---
-  1 | yes   | 2
+  1 | true  | 2
   2 | false | 3
 (2 rows)
 
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.o);
+  base_row  |  our_row   | their_row 
+------------+------------+-----------
+ (1,true,2) | (1,true,2) | (1,yes,2)
+(1 row)
+
+ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -729,8 +738,244 @@ SELECT dolt_branch('-D', 'feature');
  {0}
 (1 row)
 
+-- (finding 3 without a key: a keyless row can't be taken as changed on
+-- both sides, so a base value not trusted refuses the merge, as master's
+-- text conversion of 0.02 to integer did)
+CREATE TABLE rt.xk (id int, n numeric);
+INSERT INTO rt.xk VALUES (1, 0.02), (2, 0.05);
+SELECT length(dolt_commit('-Am', 'xk base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.xk ALTER COLUMN n TYPE int USING (n * 100)::int;
+INSERT INTO rt.xk VALUES (3, 9);
+SELECT length(dolt_commit('-am', 'main: cents')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.xk ALTER COLUMN n TYPE int USING (n * 100)::int;
+UPDATE rt.xk SET n = 0 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: cents')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged cents'))[3:4];
+ERROR:  rows of table "xk" can't be merged across column "n" changing type from numeric to integer
+DETAIL:  A value of the merge base's doesn't convert to the new type as both its cast and its text form say, so which side changed it can't be told, and the table's rows have no key.
+SELECT * FROM rt.xk ORDER BY id;
+ id | n 
+----+---
+  1 | 2
+  2 | 5
+  3 | 9
+(3 rows)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A USING whose values the cast round-trips by chance: an inverted flag
+-- made an integer.  Base's true casts to 1 and back, but its text form
+-- 't' isn't an integer, so the cast isn't trusted: theirs' 1 against
+-- ours' 0 is a conflict, not taken for no change.
+CREATE TABLE rt.f (id int PRIMARY KEY, disabled boolean);
+INSERT INTO rt.f VALUES (1, true), (2, false);
+SELECT length(dolt_commit('-Am', 'f base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.f ALTER COLUMN disabled TYPE int USING (NOT disabled)::int;
+INSERT INTO rt.f VALUES (3, 1);
+SELECT length(dolt_commit('-am', 'main: enabled')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.f ALTER COLUMN disabled TYPE int USING (NOT disabled)::int;
+UPDATE rt.f SET disabled = 1 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: enabled')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged enabled'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM rt.f ORDER BY id;
+ id | disabled 
+----+----------
+  1 |        0
+  2 |        1
+  3 |        1
+(3 rows)
+
+SELECT our_row, their_row FROM dolt_conflicts(NULL::rt.f);
+ our_row | their_row 
+---------+-----------
+ (1,0)   | (1,1)
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Into char(n), text's trailing blanks are char's padding: 'ab ' is
+-- 'ab   ' as ALTER made it, not a change.
+CREATE TABLE rt.s (id int PRIMARY KEY, v text);
+INSERT INTO rt.s VALUES (1, 'ab ');
+SELECT length(dolt_commit('-Am', 's base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE rt.s ALTER COLUMN v TYPE char(5);
+SELECT length(dolt_commit('-am', 's char')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.s);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+-- A column retyped mid-resolution isn't one the merge compared across:
+-- base's 1.5 isn't unsure there, so no conflict the merge didn't find is
+-- listed, and --theirs leaves ours' change (2.5, now 3) as the merge did.
+CREATE TABLE rt.m (id int PRIMARY KEY, v text, n numeric);
+INSERT INTO rt.m VALUES (1, 'base', 1), (5, 'x', 1.5);
+SELECT length(dolt_commit('-Am', 'm base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE rt.m SET v = 'ours' WHERE id = 1;
+UPDATE rt.m SET n = 2.5 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'main: ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+UPDATE rt.m SET v = 'theirs' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged m'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+ALTER TABLE rt.m ALTER COLUMN n TYPE int;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.m);
+  base_row  |  our_row   |  their_row   
+------------+------------+--------------
+ (1,base,1) | (1,ours,1) | (1,theirs,1)
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rt.m');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM rt.m ORDER BY id;
+ id |   v    | n 
+----+--------+---
+  1 | theirs | 1
+  5 | x      | 3
+(2 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA rt CASCADE;
-NOTICE:  drop cascades to 10 other objects
+NOTICE:  drop cascades to 14 other objects
 DETAIL:  drop cascades to table rt.c
 drop cascades to table rt.n
 drop cascades to table rt.o
@@ -741,3 +986,7 @@ drop cascades to table rt.t
 drop cascades to table rt.d
 drop cascades to table rt.dk
 drop cascades to table rt.r
+drop cascades to table rt.xk
+drop cascades to table rt.f
+drop cascades to table rt.s
+drop cascades to table rt.m

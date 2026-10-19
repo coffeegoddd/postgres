@@ -81,9 +81,10 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
 -- Another type, made alike on both sides: boolean to text, numeric to
--- integer.  Base's row comes as the cast makes it ('true', not 't', so
--- only theirs changed it).  1.5, which the cast rounds, isn't refused: as
--- both sides have 2, they agree.
+-- integer.  Neither base value is trusted through the cast: true casts to
+-- 'true' but its text form is 't' (which a USING may have meant), and 1.5
+-- rounds.  Both are unsure, not refused: as both sides have 2, they
+-- agree; theirs' 'yes' against ours' 'true' is a conflict, as on master.
 CREATE TABLE rt.o (id int PRIMARY KEY, b boolean, n numeric);
 INSERT INTO rt.o VALUES (1, true, 1.5);
 SELECT length(dolt_commit('-Am', 'o base')::text) AS committed;
@@ -96,8 +97,11 @@ ALTER TABLE rt.o ALTER COLUMN b TYPE text, ALTER COLUMN n TYPE int;
 UPDATE rt.o SET b = 'yes' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'feature: retyped')::text) AS committed;
 SELECT dolt_checkout('main');
-SELECT (dolt_merge('feature', '-m', 'merged retyped'))[3:4];
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged retyped'))[2:4];
 SELECT * FROM rt.o ORDER BY id;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.o);
+ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
 -- A change only an explicit cast makes (a USING clause), alike on both
@@ -241,6 +245,80 @@ UPDATE rt.r SET v = 'abc' WHERE id = 2;
 UPDATE rt.r SET v = 'o' WHERE id = 1;
 ALTER TABLE rt.r ALTER COLUMN v TYPE varchar(4);
 SELECT dolt_conflicts_resolve('--theirs', 'rt.r');
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+
+-- (finding 3 without a key: a keyless row can't be taken as changed on
+-- both sides, so a base value not trusted refuses the merge, as master's
+-- text conversion of 0.02 to integer did)
+CREATE TABLE rt.xk (id int, n numeric);
+INSERT INTO rt.xk VALUES (1, 0.02), (2, 0.05);
+SELECT length(dolt_commit('-Am', 'xk base')::text) AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.xk ALTER COLUMN n TYPE int USING (n * 100)::int;
+INSERT INTO rt.xk VALUES (3, 9);
+SELECT length(dolt_commit('-am', 'main: cents')::text) AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.xk ALTER COLUMN n TYPE int USING (n * 100)::int;
+UPDATE rt.xk SET n = 0 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: cents')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('feature', '-m', 'merged cents'))[3:4];
+SELECT * FROM rt.xk ORDER BY id;
+SELECT dolt_branch('-D', 'feature');
+
+-- A USING whose values the cast round-trips by chance: an inverted flag
+-- made an integer.  Base's true casts to 1 and back, but its text form
+-- 't' isn't an integer, so the cast isn't trusted: theirs' 1 against
+-- ours' 0 is a conflict, not taken for no change.
+CREATE TABLE rt.f (id int PRIMARY KEY, disabled boolean);
+INSERT INTO rt.f VALUES (1, true), (2, false);
+SELECT length(dolt_commit('-Am', 'f base')::text) AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.f ALTER COLUMN disabled TYPE int USING (NOT disabled)::int;
+INSERT INTO rt.f VALUES (3, 1);
+SELECT length(dolt_commit('-am', 'main: enabled')::text) AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.f ALTER COLUMN disabled TYPE int USING (NOT disabled)::int;
+UPDATE rt.f SET disabled = 1 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: enabled')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged enabled'))[2:4];
+SELECT * FROM rt.f ORDER BY id;
+SELECT our_row, their_row FROM dolt_conflicts(NULL::rt.f);
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+
+-- Into char(n), text's trailing blanks are char's padding: 'ab ' is
+-- 'ab   ' as ALTER made it, not a change.
+CREATE TABLE rt.s (id int PRIMARY KEY, v text);
+INSERT INTO rt.s VALUES (1, 'ab ');
+SELECT length(dolt_commit('-Am', 's base')::text) AS committed;
+ALTER TABLE rt.s ALTER COLUMN v TYPE char(5);
+SELECT length(dolt_commit('-am', 's char')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.s);
+
+-- A column retyped mid-resolution isn't one the merge compared across:
+-- base's 1.5 isn't unsure there, so no conflict the merge didn't find is
+-- listed, and --theirs leaves ours' change (2.5, now 3) as the merge did.
+CREATE TABLE rt.m (id int PRIMARY KEY, v text, n numeric);
+INSERT INTO rt.m VALUES (1, 'base', 1), (5, 'x', 1.5);
+SELECT length(dolt_commit('-Am', 'm base')::text) AS committed;
+SELECT dolt_branch('feature');
+UPDATE rt.m SET v = 'ours' WHERE id = 1;
+UPDATE rt.m SET n = 2.5 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'main: ours')::text) AS committed;
+SELECT dolt_checkout('feature');
+UPDATE rt.m SET v = 'theirs' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'feature: theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged m'))[2:4];
+ALTER TABLE rt.m ALTER COLUMN n TYPE int;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.m);
+SELECT dolt_conflicts_resolve('--theirs', 'rt.m');
+SELECT * FROM rt.m ORDER BY id;
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 

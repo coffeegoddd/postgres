@@ -2158,9 +2158,21 @@ dup_bytes(const char *data, int len)
  * back, a value of the same type, or of one stored alike (text and
  * varchar), is kept as it was: one a column of the new typmod can't
  * hold, so no side's value equals it, and every side has changed (or
- * deleted) that row.  A compared value of another type, in a column not
+ * deleted) that row.  (Into char(n), a value of another string type is
+ * compared without its trailing blanks, which char(n) pads and casting
+ * back trims, except in a key: 'ab' and 'ab ' would be one key.)
+ *
+ * A compared value of another type is trusted only where, besides coming
+ * back, the cast agrees with the value's text form read as the new type
+ * (as master converted it; between string types, where the cast only
+ * pads or trims, that isn't asked).  A USING other than the cast ((n *
+ * 100)::int, (NOT flag)::int) isn't recorded, so a cast that merely
+ * round-trips could still match a side's edit by chance: true to 1
+ * where ALTER made it 0.  Requiring the text form too keeps such a merge
+ * no less careful than master's.  A value not trusted, in a column not
  * of the key, is unsure: the merge takes either side as having changed
- * it (as_defined_now()'s *unsure).
+ * it (as_defined_now()'s *unsure).  In a key, or a table without one,
+ * nothing can say which side changed it: the merge is refused.
  */
 typedef enum ReadFor
 {
@@ -2179,14 +2191,21 @@ typedef enum CastLoss
 	LOSS_UNCHECKED,
 	LOSS_KEEP_STORED,
 	LOSS_UNSURE,
+	LOSS_REFUSE,
 } CastLoss;
 
 /* How a column of a version's is read into the column it is now. */
 typedef struct ColumnRead
 {
 	ExprState  *conv;			/* the cast, or NULL: none (unsure) */
-	ExprState  *back;			/* conv's value cast back, or NULL: unchecked */
+	ExprState  *back;			/* conv's value cast back, or NULL: none
+								 * (unchecked, or not kept: see loss) */
 	bool		guarded;		/* conv or back may fail on a value */
+	bool		blank_padded;	/* compared back without trailing blanks */
+	bool		by_text;		/* checked against the text form too: */
+	FmgrInfo	out;			/* the old type's output */
+	Oid			in;				/* the new type's input */
+	Oid			in_param;
 	CastLoss	loss;
 } ColumnRead;
 
@@ -2251,8 +2270,9 @@ is_bit_type(Oid type)
 
 /*
  * How column j of xd (a version's) is read as rel's column att, read for
- * what (see ReadFor), into *cr; key: att is one of rel's key, or rel has
- * none (where a value can't be unsure).  A value written goes through the
+ * what (see ReadFor), into *cr; key: att is one of rel's key; keyless:
+ * rel has none (in either, a compared value can't be unsure).  A value
+ * written goes through the
  * column's assignment cast, with its typmod, as ALTER TABLE ... TYPE
  * without USING converts rows; where there's none (a change made with
  * USING), through the explicit cast a move's ALTER converts them with
@@ -2263,7 +2283,8 @@ is_bit_type(Oid type)
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
-			ReadFor read, bool key, EState *estate, ColumnRead *cr)
+			ReadFor read, bool key, bool keyless, EState *estate,
+			ColumnRead *cr)
 {
 	Form_pg_attribute xa = TupleDescAttr(xd, j);
 	Node	   *var = (Node *) makeVar(1, j + 1, xa->atttypid, xa->atttypmod,
@@ -2284,7 +2305,7 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
 								  COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
-	if (e == NULL && read == READ_COMPARED && !key)
+	if (e == NULL && read == READ_COMPARED && !key && !keyless)
 	{
 		/* (no cast at all: every value of base's is unsure) */
 		cr->loss = LOSS_UNSURE;
@@ -2306,11 +2327,27 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		(alike && !same && att->atttypmod < 0))
 		return;
 	if (alike)
+	{
 		cr->loss = LOSS_KEEP_STORED;
-	else if (read == READ_COMPARED && !key)
-		cr->loss = LOSS_UNSURE;
+		cr->blank_padded = att->atttypid == BPCHAROID &&
+			xa->atttypid != BPCHAROID && !key;
+	}
+	else if (read == READ_COMPARED)
+	{
+		cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
+		if (!(is_string_type(xa->atttypid) && is_string_type(att->atttypid)))
+		{
+			Oid			outf;
+			bool		varlena;
+
+			cr->by_text = true;
+			getTypeOutputInfo(xa->atttypid, &outf, &varlena);
+			fmgr_info(outf, &cr->out);
+			getTypeInputInfo(att->atttypid, &cr->in, &cr->in_param);
+		}
+	}
 	else
-		return;					/* (shown, or a key: as the cast has it) */
+		return;					/* (shown: as the cast has it) */
 
 	back = coerce_to_target_type(NULL, copyObject(e), att->atttypid,
 								 xa->atttypid, xa->atttypmod,
@@ -2329,11 +2366,31 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 					(is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
 }
 
+/* Are string values a and b the same, but for trailing blanks? */
+static bool
+same_but_trailing_blanks(Datum a, Datum b)
+{
+	text	   *ta = DatumGetTextPP(a);
+	text	   *tb = DatumGetTextPP(b);
+	const char *pa = VARDATA_ANY(ta);
+	const char *pb = VARDATA_ANY(tb);
+	int			la = VARSIZE_ANY_EXHDR(ta);
+	int			lb = VARSIZE_ANY_EXHDR(tb);
+
+	while (la > 0 && pa[la - 1] == ' ')
+		la--;
+	while (lb > 0 && pb[lb - 1] == ' ')
+		lb--;
+	return la == lb && memcmp(pa, pb, la) == 0;
+}
+
 /*
  * Column cr's value of xs's attribute j (att's type before: xatt), read
  * into *d and *isnull, in the current memory context, through cr->conv
  * (evaluated in econtext).  False where the value doesn't come back from
- * it (cr->back), or the cast fails with a data exception (value too long,
+ * it (cr->back; or there's no cast back where one's needed), or differs
+ * from the value's text form read as the new type (cr->by_text), or the
+ * cast or that read fails with a data exception (value too long,
  * numeric field overflow, invalid input) where it's guarded; *d and
  * *isnull are then the cast's value if it gave one, else null.  Other
  * errors are raised.
@@ -2368,8 +2425,22 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 		{
 			Datum		b = ExecEvalExprSwitchContext(cr->back, econtext, &n);
 
-			kept = !n && datum_image_eq(b, xs->tts_values[j], xatt->attbyval,
-										xatt->attlen);
+			kept = !n &&
+				(cr->blank_padded ?
+				 same_but_trailing_blanks(b, xs->tts_values[j]) :
+				 datum_image_eq(b, xs->tts_values[j], xatt->attbyval,
+								xatt->attlen));
+		}
+		else if (cr->loss != LOSS_UNCHECKED)
+			kept = false;		/* (no cast back: nothing says it's kept) */
+		if (kept && cr->by_text && !*isnull)
+		{
+			char	   *text = OutputFunctionCall((FmgrInfo *) &cr->out,
+												  xs->tts_values[j]);
+			Datum		t = OidInputFunctionCall(cr->in, text, cr->in_param,
+												 att->atttypmod);
+
+			kept = datum_image_eq(t, *d, att->attbyval, att->attlen);
 		}
 		if (cr->guarded)
 		{
@@ -2400,6 +2471,61 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 	return kept;
 }
 
+static bool
+name_listed(List *names, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * The columns of base's a merge's side retyped (another type or typmod,
+ * by name), of the table as base, ours and theirs define it (any NULL:
+ * none): those whose values a merge reads base's across, which a later
+ * retype (mid-resolution) isn't.
+ */
+static List *
+retyped_columns(const Table *base, const Table *ours, const Table *theirs)
+{
+	List	   *names = NIL;
+	List	   *sides[2];
+	bool		keyed;
+	ListCell   *lc;
+
+	if (base == NULL || ours == NULL || theirs == NULL)
+		return NIL;
+	sides[0] = version_columns(ours, &keyed);
+	sides[1] = version_columns(theirs, &keyed);
+	foreach(lc, version_columns(base, &keyed))
+	{
+		VersionColumn *c = lfirst(lc);
+
+		for (int i = 0; i < 2; i++)
+		{
+			ListCell   *sc;
+			bool		differs = false;
+
+			foreach(sc, sides[i])
+			{
+				VersionColumn *s = lfirst(sc);
+
+				if (strcmp(s->name, c->name) == 0)
+					differs = s->type != c->type || s->typmod != c->typmod;
+			}
+			if (differs)
+			{
+				names = lappend(names, c->name);
+				break;
+			}
+		}
+	}
+	return names;
+}
+
 /*
  * A version x of table rel's rows as rel defines them now (now: the
  * version that defines it so), into *out: each row decoded with x's
@@ -2409,10 +2535,11 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
  * if it defines the table so already, or if now is NULL (the working set
  * has no such table); NULL if x is.
  *
- * Read for comparing (a merge's base), *unsure (if not NULL) gets the
- * rows (keyed) with a value whose cast doesn't come back, of a column not
- * of the key that changed type: a side has changed them, where it has
- * them (merge_table()).  It's left empty otherwise.
+ * Read for comparing (a merge's base), only the columns named in retyped
+ * (those a side retyped: retyped_columns()) are; others are read as
+ * shown, as the sides' are.  *unsure (if not NULL) gets the rows (keyed)
+ * with a value that's unsure (see ReadFor): a side has changed them,
+ * where it has them (merge_table()).  It's left empty otherwise.
  *
  * Where refuse (a merge), refused where rel's rows can't faithfully come
  * from x's: when x lacks a column whose values each row was given as it
@@ -2424,7 +2551,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
  */
 static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
-			   bool refuse, Table *out, UnsureRows *unsure)
+			   List *retyped, bool refuse, Table *out, UnsureRows *unsure)
 {
 	RowDiff		rd;
 	VersionReader vr;
@@ -2541,10 +2668,12 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		{
 			if (estate == NULL)
 				estate = CreateExecutorState();
-			column_read(rel, xd, from[a], att, read,
-						!vr.keyed || unsure == NULL ||
+			column_read(rel, xd, from[a], att,
+						read == READ_COMPARED &&
+						!name_listed(retyped, NameStr(att->attname)) ?
+						READ_SHOWN : read,
 						bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk),
-						estate, &reads[a]);
+						!vr.keyed, estate, &reads[a]);
 			converted[a] = true;
 		}
 	}
@@ -2606,7 +2735,17 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 					ms->tts_isnull[a] = false;
 					ms->tts_values[a] = xs->tts_values[from[a]];
 				}
-				else
+				else if (reads[a].loss == LOSS_REFUSE && refuse)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("rows of table \"%s\" can't be merged across column \"%s\" changing type from %s to %s",
+									RelationGetRelationName(rel), NameStr(att->attname),
+									format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
+															 TupleDescAttr(xd, from[a])->atttypmod),
+									format_type_with_typemod(att->atttypid, att->atttypmod)),
+							 errdetail("A value of the merge base's doesn't convert to the new type as both its cast and its text form say, so which side changed it can't be told, and the table's %s.",
+									   vr.keyed ? "key holds it" : "rows have no key")));
+				else if (reads[a].loss == LOSS_UNSURE && unsure)
 					unsure_cols = bms_add_member(unsure_cols, a);
 			}
 			else if (!converted[a])
@@ -2946,8 +3085,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	fp = as_defined_now(rel, from, now, READ_SHOWN, false, &f, NULL);
-	tp = as_defined_now(rel, to, now, READ_SHOWN, false, &t, NULL);
+	fp = as_defined_now(rel, from, now, READ_SHOWN, NIL, false, &f, NULL);
+	tp = as_defined_now(rel, to, now, READ_SHOWN, NIL, false, &t, NULL);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, sink);
 }
@@ -3129,9 +3268,10 @@ merge_rows(void *arg)
 			rel = table_open(relid, AccessShareLock);
 			refuse_lost_changes(rel, b, o, w);
 			refuse_lost_changes(rel, b, t, w);
-			(void) as_defined_now(rel, b, w, READ_COMPARED, true, &bn, &unsure);
-			(void) as_defined_now(rel, o, w, READ_WRITTEN, true, &on, NULL);
-			(void) as_defined_now(rel, t, w, READ_WRITTEN, true, &tn, NULL);
+			(void) as_defined_now(rel, b, w, READ_COMPARED,
+								  retyped_columns(b, o, t), true, &bn, &unsure);
+			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, true, &on, NULL);
+			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, true, &tn, NULL);
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
 				apply_rows(relid, w, &on);
@@ -5212,6 +5352,9 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	Table		nt;
 	Relation	rel;
 	UnsureRows	unsure;
+	Table	   *bt;
+	Table	   *ot;
+	Table	   *tt;
 
 	/* The merge left the head where it was: ours is the head commit. */
 	if (!PROLLY_CALL(components().refs, resolve, "HEAD", &ours))
@@ -5220,19 +5363,21 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 				 errmsg("a merge is in progress on a branch with no commit")));
 	/*
 	 * (each as the table is defined now, if one defines it otherwise: base
-	 * compared as the merge compared it, so its conflicts are the ones the
-	 * merge found; ours and theirs as a diff shows them, the table perhaps
-	 * changed since, with theirs' rows checked as they're taken.  Nothing
-	 * refused, as a merge would: rows are listed whatever happened to the
-	 * table since.)
+	 * compared as the merge compared it in the columns the merge retyped,
+	 * so its conflicts are the ones the merge found, and in a column
+	 * retyped since as the sides' are, so it finds none there; ours and
+	 * theirs as a diff shows them, the table perhaps changed since, with
+	 * theirs' rows checked as they're taken.  Nothing refused, as a merge
+	 * would: rows are listed whatever happened to the table since.)
 	 */
+	bt = find_table(tables_at(&ms->base), name);
+	ot = find_table(tables_at(&ours), name);
+	tt = find_table(tables_at(&ms->theirs), name);
 	rel = table_open(relid, AccessShareLock);
-	bp = as_defined_now(rel, find_table(tables_at(&ms->base), name), now,
-						READ_COMPARED, false, &b, &unsure);
-	op = as_defined_now(rel, find_table(tables_at(&ours), name), now,
-						READ_SHOWN, false, &o, NULL);
-	tp = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now,
-						READ_SHOWN, false, &t, NULL);
+	bp = as_defined_now(rel, bt, now, READ_COMPARED,
+						retyped_columns(bt, ot, tt), false, &b, &unsure);
+	op = as_defined_now(rel, ot, now, READ_SHOWN, NIL, false, &o, NULL);
+	tp = as_defined_now(rel, tt, now, READ_SHOWN, NIL, false, &t, NULL);
 	table_close(rel, AccessShareLock);
 
 	/*
