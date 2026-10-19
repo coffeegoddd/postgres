@@ -1825,7 +1825,10 @@ merge_key(StringInfo key, const char *branch)
 	appendStringInfoString(key, branch);
 }
 
-/* The merge in progress on branch, if there is one. */
+/*
+ * The merge in progress on branch, if there is one: its conflicted tables
+ * since dropped left out (as Dolt, dropping a table drops its conflicts).
+ */
 static bool
 merge_state_of(const char *branch, ProllyMergeState *state)
 {
@@ -1843,6 +1846,7 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 	{
 		const char *p = v.data;
 		const char *end = v.data + v.len;
+		uint32		ntables;
 
 		p = get_hash(p, end, &state->theirs);
 		p = get_hash(p, end, &state->base);
@@ -1850,15 +1854,20 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("prolly refs hold an invalid merge state")));
-		state->ntables = get_be32(p);
+		ntables = get_be32(p);
 		p += 4;
-		if (end - p < (int64) state->ntables * 4)
+		if (end - p < (int64) ntables * 4)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("prolly refs hold an invalid merge state")));
-		state->tables = palloc(sizeof(Oid) * Max(state->ntables, 1));
-		for (int i = 0; i < state->ntables; i++, p += 4)
-			state->tables[i] = get_be32(p);
+		state->tables = palloc(sizeof(Oid) * Max(ntables, 1));
+		for (uint32 i = 0; i < ntables; i++, p += 4)
+		{
+			Oid			relid = get_be32(p);
+
+			if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+				state->tables[state->ntables++] = relid;
+		}
 		/* a cherry-pick's message; a revert's series, then its message */
 		state->pick = p < end;
 		if (state->pick && *p == 'r')

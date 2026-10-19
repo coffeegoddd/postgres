@@ -1310,3 +1310,194 @@ SELECT length(dolt_commit('-Am', 'without mt')::text) AS committed;
         66
 (1 row)
 
+-- A table dropped in a merge with conflicts takes its conflicts with it:
+-- the listing, the status and the commit check leave it out.
+CREATE SCHEMA dc VERSIONED;
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+CREATE TABLE dc.b (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+INSERT INTO dc.b VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE dc.a SET v = 'main';
+UPDATE dc.b SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE dc.a SET v = 'side';
+UPDATE dc.b SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT * FROM dolt_conflicts() ORDER BY 1;
+ table_name | num_conflicts 
+------------+---------------
+ dc.a       |             1
+ dc.b       |             1
+(2 rows)
+
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts() ORDER BY 1;
+ table_name | num_conflicts 
+------------+---------------
+ dc.b       |             1
+(1 row)
+
+SELECT table_name, staged, status FROM dolt_status() WHERE table_name LIKE 'dc.%'
+  ORDER BY 1, 2;
+ table_name | staged |  status  
+------------+--------+----------
+ dc.a       | t      | deleted
+ dc.b       | f      | conflict
+(2 rows)
+
+SELECT dolt_conflicts_resolve('--ours', 'dc.b');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+SELECT length(dolt_commit('-Am', 'dc merged without a')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT dolt_status();
+ dolt_status 
+-------------
+(0 rows)
+
+-- (and with the conflicts kept, a commit after the drop goes through)
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc a again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('-D', 'dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE dc.a SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main 2')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE dc.a SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side 2')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ dc.a       |             1
+(1 row)
+
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+SELECT length(dolt_commit('-Am', 'dc merged after drop')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_status();
+ dolt_status 
+-------------
+(0 rows)
+
+SELECT dolt_branch('-D', 'dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dc CASCADE;
+NOTICE:  drop cascades to table dc.b
+SELECT length(dolt_commit('-Am', 'without dc')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
