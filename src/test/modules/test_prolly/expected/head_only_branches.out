@@ -236,7 +236,7 @@ ERROR:  cannot execute dolt_branch() in a read-only transaction
 ROLLBACK;
 BEGIN READ ONLY;
 SELECT dolt_branch('-D', 'ho_mine');
-ERROR:  cannot execute moving a chunk store's root in a read-only transaction
+ERROR:  cannot execute dolt_branch() in a read-only transaction
 ROLLBACK;
 SELECT dolt_branch('ho_later');
  dolt_branch 

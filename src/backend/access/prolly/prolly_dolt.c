@@ -920,7 +920,11 @@ force_branch(const char *name, const char *from)
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
 
-	/* (another branch's rows written, as a create makes its copies) */
+	/*
+	 * (made, as a create is, though the transaction is read-only for the
+	 * branch it started on: the checks too, and another branch's rows
+	 * written, as a create makes its copies)
+	 */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
@@ -1348,6 +1352,13 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch takes one of -d, -c and -m")));
+	/*
+	 * (a rename or delete makes no branch: not in a transaction read-only
+	 * for the branch it started on either, unlike a create, forced or not,
+	 * which a session on a commit makes to change anything)
+	 */
+	if (move || delete)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (move)
 	{
 		if (list_length(names) != 2)

@@ -39,6 +39,15 @@ SELECT dolt_checkout(:'c1') IS NOT NULL AS detached_again;
 SELECT dolt_branch('also_first');
 SELECT dolt_hashof('also_first') = :'c1' AS made_there;
 INSERT INTO dc.t VALUES (4, 'four');
+-- (a forced create, moving one that exists, as a create; a copy too)
+SELECT dolt_branch('-f', 'from_first');
+SELECT dolt_hashof('from_first') = :'c1' AS moved_there;
+SELECT dolt_branch('-c', '-f', 'main', 'also_first');
+SELECT dolt_hashof('also_first') = dolt_hashof('main') AS copied;
+-- (but not a delete or a rename, which make no branch from here)
+SELECT dolt_branch('-d', 'also_first');
+SELECT dolt_branch('-m', 'also_first', 'renamed_first');
+SELECT name FROM dolt_branches WHERE name LIKE '%first' ORDER BY name;
 
 -- A branch checked out ends it, and the hidden branch, which no session
 -- is on any more, is deleted.

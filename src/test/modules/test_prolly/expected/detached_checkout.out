@@ -97,6 +97,43 @@ SELECT dolt_hashof('also_first') = :'c1' AS made_there;
 
 INSERT INTO dc.t VALUES (4, 'four');
 ERROR:  cannot execute INSERT in a read-only transaction
+-- (a forced create, moving one that exists, as a create; a copy too)
+SELECT dolt_branch('-f', 'from_first');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('from_first') = :'c1' AS moved_there;
+ moved_there 
+-------------
+ t
+(1 row)
+
+SELECT dolt_branch('-c', '-f', 'main', 'also_first');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('also_first') = dolt_hashof('main') AS copied;
+ copied 
+--------
+ t
+(1 row)
+
+-- (but not a delete or a rename, which make no branch from here)
+SELECT dolt_branch('-d', 'also_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+SELECT dolt_branch('-m', 'also_first', 'renamed_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+SELECT name FROM dolt_branches WHERE name LIKE '%first' ORDER BY name;
+    name    
+------------
+ also_first
+ from_first
+(2 rows)
+
 -- A branch checked out ends it, and the hidden branch, which no session
 -- is on any more, is deleted.
 SELECT count(*) AS hidden FROM pg_branch WHERE brname LIKE 'detached/%';
