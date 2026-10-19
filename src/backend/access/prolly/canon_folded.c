@@ -111,6 +111,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parser.h"
 #include "access/htup_details.h"
+#include "access/prolly_applier.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/relation.h"
@@ -192,16 +193,18 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "5", a row's long values each out of
- * line in a value tree of its own; "4" had only long rows out of line;
- * "3" keyed value trees' chunks by offset, and was the first with its
- * definitions' fields escaped (append_field()); "2" was keyless rows keyed
- * by their first bytes and their hash, and a root without the item keyed
- * them by the hash alone.  A root in another has its tables' rows
- * unreadable here, and is neither moved to nor merged: its definitions'
- * text isn't this format's.
+ * The format a folded root is in: "6", definitions' expressions (checks,
+ * defaults, generated expressions, policies) as they print read back
+ * (reprinted()); "5" had them as printed, and was the first with a row's
+ * long values each out of line in a value tree of its own; "4" had only
+ * long rows out of line; "3" keyed value trees' chunks by offset, and was
+ * the first with its definitions' fields escaped (append_field()); "2" was
+ * keyless rows keyed by their first bytes and their hash, and a root
+ * without the item keyed them by the hash alone.  A root in another has
+ * its tables' rows unreadable here, and is neither moved to nor merged:
+ * its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"5"
+#define FOLDED_FORMAT	"6"
 
 typedef struct Canon
 {
@@ -749,7 +752,9 @@ printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
 /*
  * A check constraint's definition as pg_get_constraintdef prints it, with
  * its expression as it prints read back (see reprinted); other constraints'
- * as printed.
+ * as printed.  It prints as CHECK (expression) and then words (NO INHERIT,
+ * NOT VALID and the like) without parentheses, so the expression ends at
+ * its last; a definition printed otherwise is taken as printed.
  */
 static char *
 constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain)
@@ -757,22 +762,17 @@ constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain)
 	Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
 	char	   *def = TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
 															  ObjectIdGetDatum(con->oid)));
-	Datum		bin;
-	char	   *src;
-	char	   *head;
+	const char *head = "CHECK (";
+	char	   *end;
 
-	if (con->contype != CONSTRAINT_CHECK)
+	if (con->contype != CONSTRAINT_CHECK || strncmp(def, head, strlen(head)) != 0 ||
+		(end = strrchr(def, ')')) == NULL || end < def + strlen(head))
 		return def;
-	bin = SysCacheGetAttrNotNull(CONSTROID, tup, Anum_pg_constraint_conbin);
-	src = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
-												   ObjectIdGetDatum(rel ? RelationGetRelid(rel) : InvalidOid)));
-	head = psprintf("CHECK (%s)", src);
-	if (strncmp(def, head, strlen(head)) != 0)
-		elog(ERROR, "check constraint \"%s\" prints as \"%s\"", NameStr(con->conname), def);
 	return psprintf("CHECK (%s)%s",
-					reprinted(src, rel, NULL, domain,
+					reprinted(pnstrdup(def + strlen(head), end - def - strlen(head)),
+							  rel, NULL, domain,
 							  domain ? EXPR_KIND_DOMAIN_CHECK : EXPR_KIND_CHECK_CONSTRAINT),
-					def + strlen(head));
+					end + 1);
 }
 
 /* A table's policies section's lines for its row security being on. */
@@ -3658,19 +3658,24 @@ column_attr(const char *line, const char *prefix)
 	return NULL;
 }
 
+/* A column line's type, as written there (its second field). */
+static char *
+column_type(const char *line)
+{
+	const char *tab = strchr(line, '\t');
+
+	if (tab == NULL || tab[1] == '\0' || tab[1] == '\t')
+		elog(ERROR, "unexpected column line \"%s\"", line);
+	return unescape_field(pnstrdup(tab + 1, strcspn(tab + 1, "\t")));
+}
+
 /* The column line (type and collation fields) as ALTER COLUMN TYPE writes it. */
 static char *
 column_type_sql(const char *line)
 {
-	char	   *copy = pstrdup(line);
-	char	   *type;
+	char	   *type = column_type(line);
 	char	   *collate = column_attr(line, "collate ");
 
-	(void) strtok(copy, "\t");
-	type = strtok(NULL, "\t");
-	if (type == NULL)
-		elog(ERROR, "unexpected column line \"%s\"", line);
-	type = unescape_field(type);
 	return collate ? psprintf("%s COLLATE %s", type, collate) : type;
 }
 
@@ -4589,6 +4594,7 @@ typedef struct TypeMoves
 	List	   *creates;		/* the types made (these and new ones), in any
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
+	List	   *tables;			/* the tables of those columns */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -4863,6 +4869,8 @@ type_moves(List *from, List *to)
 														   rel, col, mt->to->name,
 														   converted_value(col, mt->from->def, mt->to->def,
 																		   mt->to->name)));
+						if (!list_has_string(tm.tables, rel))
+							tm.tables = lappend(tm.tables, rel);
 						handled = true;
 					}
 					else if (kind == RELKIND_INDEX && versioned)
@@ -5013,6 +5021,56 @@ type_moves(List *from, List *to)
 }
 
 /*
+ * The table name (qualified) emptied, each partition of it with storage, by
+ * the applier the move writes rows with: no trigger fires (one enabled
+ * ALWAYS neither), no rule applies and no foreign key is checked, and a
+ * table row-level security applies to is refused, as its rows written
+ * would be.  A row read is removed as it is: the scan's snapshot keeps
+ * seeing those removed.
+ */
+static void
+empty_table(const char *name)
+{
+	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										 RowExclusiveLock, false);
+	ListCell   *lc;
+
+	CommandCounterIncrement();
+	foreach(lc, find_all_inheritors(relid, RowExclusiveLock, NULL))
+	{
+		Relation	rel = table_open(lfirst_oid(lc), NoLock);
+		ProllyApplier *a;
+		TableScanDesc scan;
+		TupleTableSlot *slot;
+		Snapshot	snap;
+
+		if (rel->rd_rel->relkind != RELKIND_RELATION)
+		{
+			table_close(rel, NoLock);
+			continue;
+		}
+		a = PROLLY_CALL(ar, begin, rel);
+		slot = table_slot_create(rel, NULL);
+		snap = RegisterSnapshot(GetLatestSnapshot());
+		scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			slot_getallattrs(slot);
+			if (!PROLLY_CALL(ar, remove, a, slot))
+				elog(ERROR, "could not find a row of \"%s\" to remove",
+					 RelationGetRelationName(rel));
+		}
+		table_endscan(scan);
+		UnregisterSnapshot(snap);
+		ExecDropSingleTupleTableSlot(slot);
+		PROLLY_CALL(ar, end, a);
+		table_close(rel, NoLock);
+	}
+	CommandCounterIncrement();
+}
+
+/*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
  * rows(arg), which writes them, then what they must satisfy (the checks,
@@ -5152,10 +5210,22 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 
 	/*
-	 * Foreign keys both sides have, into a table made again or dropped, or
-	 * whose keys change: they go first, and the ones kept come back last.
+	 * Tables whose columns change type in turn (type_moves()) are emptied
+	 * too, as move_table() empties those it changes: converted, their rows
+	 * may break what the new type's column must satisfy (a NOT NULL, a
+	 * unique index).
 	 */
-	keyed = list_concat_copy(remade, sm.rekeyed);
+	if (rewritten)
+		foreach(lc, tm.tables)
+			if (!list_has_string(sm.emptied, lfirst(lc)))
+				sm.emptied = lappend(sm.emptied, lfirst(lc));
+
+	/*
+	 * Foreign keys both sides have, into a table made again or dropped,
+	 * emptied, or whose keys change: they go first, and the ones kept come
+	 * back last, checked against the rows written.
+	 */
+	keyed = list_concat(list_concat_copy(remade, sm.rekeyed), sm.emptied);
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -5452,19 +5522,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	/*
 	 * Rows to go before their columns change type (with every row written
-	 * afresh), as rows the move writes go: firing no user triggers and
-	 * checking no foreign keys.
+	 * afresh), as rows the move writes go (empty_table()).
 	 */
-	if (sm.emptied != NIL)
-	{
-		int			nest = NewGUCNestLevel();
-
-		(void) set_config_option("session_replication_role", "replica", PGC_SUSET,
-								 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-		foreach(lc, sm.emptied)
-			run_statements(list_make1(psprintf("DELETE FROM %s", (char *) lfirst(lc))));
-		AtEOXact_GUC(true, nest);
-	}
+	foreach(lc, sm.emptied)
+		empty_table(lfirst(lc));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
 
 	/*
@@ -5843,17 +5904,6 @@ string_change_merges(const char *from, const char *to)
 	int32		to_len = string_type_length(to);
 
 	return from_len >= 0 && to_len >= 0 && to_len >= from_len;
-}
-
-/* A column line's type, as written there. */
-static char *
-column_type(const char *line)
-{
-	const char *tab = strchr(line, '\t');
-
-	if (tab == NULL)
-		elog(ERROR, "unexpected column line \"%s\"", line);
-	return unescape_field(pnstrdup(tab + 1, strcspn(tab + 1, "\t")));
 }
 
 /*

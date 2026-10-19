@@ -222,6 +222,11 @@ SELECT dolt_checkout('sm10_right');
 SELECT test_fold_root() = prolly_root_hash(:'sm10_base') AS same_root;
 SELECT count(*) AS changed FROM dolt_status;
 SELECT dolt_checkout('main');
+-- a commit of the format before (its expressions described as printed,
+-- which a fold now doesn't match) isn't moved to
+SELECT test_commit_of(test_root_with_format(prolly_root_hash(:'sm10_base'), '5'),
+	'format 5') AS sm10_old \gset
+SELECT dolt_reset('--hard', :'sm10_old');
 SELECT dolt_branch('-D', 'sm10_right');
 DROP SCHEMA sm10 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm10')::text) AS committed;
@@ -264,6 +269,80 @@ SELECT * FROM sm11.p ORDER BY pk;
 SELECT dolt_branch('-D', 'sm11_right');
 DROP SCHEMA sm11 CASCADE;
 SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
+
+-- A table emptied for its key's change of type, that another's foreign key
+-- references: the key goes before the rows do and comes back after, so
+-- the other's rows aren't checked against an empty table.  A trigger
+-- enabled ALWAYS fires (warns) for the rows emptied no more than for the
+-- rows written.  A column of a type the commit defines otherwise is emptied
+-- too, rather than converted to what its NOT NULL refuses.
+CREATE SCHEMA sm12 VERSIONED;
+CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
+CREATE TABLE sm12.p (id int PRIMARY KEY);
+CREATE TABLE sm12.c (id int PRIMARY KEY, pid int REFERENCES sm12.p);
+CREATE TABLE sm12.d (id int PRIMARY KEY, v sm12.pos NOT NULL);
+CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
+	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
+CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
+ALTER TABLE sm12.p ENABLE ALWAYS TRIGGER tr;
+INSERT INTO sm12.p VALUES (1), (2);
+INSERT INTO sm12.c VALUES (1, 1), (2, 2);
+INSERT INTO sm12.d VALUES (1, 5);
+SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
+SELECT dolt_branch('sm12_right');
+ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
+UPDATE sm12.d SET v = 20;
+ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+SELECT (dolt_commit('-Am', 'sm12 main'))[1] AS sm12_main \gset
+SELECT dolt_checkout('sm12_right');
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
+SELECT * FROM sm12.c ORDER BY id;
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
+  AND contype = 'f';
+SELECT dolt_reset('--hard', :'sm12_main');
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
+SELECT * FROM sm12.c ORDER BY id;
+SELECT * FROM sm12.d ORDER BY id;
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
+  AND contype = 'f';
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sm12_right');
+DROP SCHEMA sm12 CASCADE;
+SELECT length(dolt_commit('-Am', 'without sm12')::text) AS committed;
+
+-- Emptying a table row-level security is forced on applies its rows as
+-- the move writes them: refused, as writing them is, not left to a
+-- conversion that can't be made.
+CREATE ROLE regress_sm13;
+CREATE SCHEMA sm13 VERSIONED;
+GRANT ALL ON SCHEMA sm13 TO regress_sm13;
+SET ROLE regress_sm13;
+CREATE TABLE sm13.t (pk int PRIMARY KEY, c text);
+ALTER TABLE sm13.t ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON sm13.t USING (true);
+INSERT INTO sm13.t VALUES (1, 'one');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'sm13 base')::text) AS committed;
+SELECT dolt_branch('sm13_right');
+SET ROLE regress_sm13;
+UPDATE sm13.t SET c = '1';
+ALTER TABLE sm13.t ALTER COLUMN c TYPE int USING c::int;
+RESET ROLE;
+SELECT (dolt_commit('-Am', 'sm13 main'))[1] AS sm13_main \gset
+SELECT dolt_checkout('sm13_right');
+SET ROLE regress_sm13;
+SELECT dolt_reset('--hard', :'sm13_main');
+RESET ROLE;
+SELECT * FROM sm13.t;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sm13_right');
+DROP SCHEMA sm13 CASCADE;
+DROP ROLE regress_sm13;
+SELECT length(dolt_commit('-Am', 'without sm13')::text) AS committed;
 
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;

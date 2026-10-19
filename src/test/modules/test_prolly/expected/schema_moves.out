@@ -613,6 +613,13 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- a commit of the format before (its expressions described as printed,
+-- which a fold now doesn't match) isn't moved to
+SELECT test_commit_of(test_root_with_format(prolly_root_hash(:'sm10_base'), '5'),
+	'format 5') AS sm10_old \gset
+SELECT dolt_reset('--hard', :'sm10_old');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
 SELECT dolt_branch('-D', 'sm10_right');
  dolt_branch 
 -------------
@@ -742,6 +749,198 @@ drop cascades to table sm11.p
 drop cascades to table sm11.c
 drop cascades to function sm11.f()
 SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- A table emptied for its key's change of type, that another's foreign key
+-- references: the key goes before the rows do and comes back after, so
+-- the other's rows aren't checked against an empty table.  A trigger
+-- enabled ALWAYS fires (warns) for the rows emptied no more than for the
+-- rows written.  A column of a type the commit defines otherwise is emptied
+-- too, rather than converted to what its NOT NULL refuses.
+CREATE SCHEMA sm12 VERSIONED;
+CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
+CREATE TABLE sm12.p (id int PRIMARY KEY);
+CREATE TABLE sm12.c (id int PRIMARY KEY, pid int REFERENCES sm12.p);
+CREATE TABLE sm12.d (id int PRIMARY KEY, v sm12.pos NOT NULL);
+CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
+	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
+CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
+ALTER TABLE sm12.p ENABLE ALWAYS TRIGGER tr;
+INSERT INTO sm12.p VALUES (1), (2);
+INSERT INTO sm12.c VALUES (1, 1), (2, 2);
+INSERT INTO sm12.d VALUES (1, 5);
+SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sm12_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
+UPDATE sm12.d SET v = 20;
+ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+SELECT (dolt_commit('-Am', 'sm12 main'))[1] AS sm12_main \gset
+SELECT dolt_checkout('sm12_right');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'sm12_right'"}
+(1 row)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
+ format_type 
+-------------
+ integer
+(1 row)
+
+SELECT * FROM sm12.c ORDER BY id;
+ id | pid 
+----+-----
+  1 |   1
+  2 |   2
+(2 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
+  AND contype = 'f';
+  conname   
+------------
+ c_pid_fkey
+(1 row)
+
+SELECT dolt_reset('--hard', :'sm12_main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
+ format_type 
+-------------
+ bigint
+(1 row)
+
+SELECT * FROM sm12.c ORDER BY id;
+ id | pid 
+----+-----
+  1 |   1
+  2 |   2
+(2 rows)
+
+SELECT * FROM sm12.d ORDER BY id;
+ id | v  
+----+----
+  1 | 20
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
+  AND contype = 'f';
+  conname   
+------------
+ c_pid_fkey
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'sm12_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sm12 CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to type sm12.pos
+drop cascades to table sm12.p
+drop cascades to table sm12.c
+drop cascades to table sm12.d
+drop cascades to function sm12.f()
+SELECT length(dolt_commit('-Am', 'without sm12')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Emptying a table row-level security is forced on applies its rows as
+-- the move writes them: refused, as writing them is, not left to a
+-- conversion that can't be made.
+CREATE ROLE regress_sm13;
+CREATE SCHEMA sm13 VERSIONED;
+GRANT ALL ON SCHEMA sm13 TO regress_sm13;
+SET ROLE regress_sm13;
+CREATE TABLE sm13.t (pk int PRIMARY KEY, c text);
+ALTER TABLE sm13.t ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON sm13.t USING (true);
+INSERT INTO sm13.t VALUES (1, 'one');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'sm13 base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('sm13_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET ROLE regress_sm13;
+UPDATE sm13.t SET c = '1';
+ALTER TABLE sm13.t ALTER COLUMN c TYPE int USING c::int;
+RESET ROLE;
+SELECT (dolt_commit('-Am', 'sm13 main'))[1] AS sm13_main \gset
+SELECT dolt_checkout('sm13_right');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'sm13_right'"}
+(1 row)
+
+SET ROLE regress_sm13;
+SELECT dolt_reset('--hard', :'sm13_main');
+ERROR:  user "regress_sm13" cannot apply rows to relation with row-level security enabled: "t"
+RESET ROLE;
+SELECT * FROM sm13.t;
+ pk |  c  
+----+-----
+  1 | one
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'sm13_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sm13 CASCADE;
+NOTICE:  drop cascades to table sm13.t
+DROP ROLE regress_sm13;
+SELECT length(dolt_commit('-Am', 'without sm13')::text) AS committed;
  committed 
 -----------
         66

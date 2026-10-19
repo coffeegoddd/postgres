@@ -700,6 +700,33 @@ test_root_without_format(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_root_with_format(root, format): a folded root with its "!:format"
+ * item set to format: what a build of that format committed.
+ */
+PG_FUNCTION_INFO_V1(test_root_with_format);
+Datum
+test_root_with_format(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	char	   *format = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ProllyTreeEnv env;
+	ProllyNodeRef root;
+	ProllyNodeRef out;
+	ProllyEdit	e;
+
+	prolly_folded_tree_env(&env);
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	memset(&e, 0, sizeof(e));
+	e.key.data = (const uint8 *) "!:format";
+	e.key.len = 8;
+	e.value.data = (const uint8 *) format;
+	e.value.len = strlen(format);
+	PROLLY_CALL(tree, apply, &env, &root, &e, 1, &out);
+	PG_RETURN_TEXT_P(hash_text(&out.hash));
+}
+
+/*
  * test_root_without_sequence_values(root): a folded root whose sequences
  * have no values recorded, as before the fold recorded them (and as a fold
  * that couldn't read one leaves it).
