@@ -197,20 +197,21 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "7", indexes described without their
- * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
- * default one, and was the first with definitions' expressions (checks,
- * defaults, generated expressions, policies) as they print read back
- * (reprinted()); "5" had them as printed, and was the first with a row's
- * long values each out of line in a value tree of its own; "4" had only
- * long rows out of line; "3" keyed value trees' chunks by offset, and was
- * the first with its definitions' fields escaped (append_field()); "2" was
- * keyless rows keyed by their first bytes and their hash, and a root
- * without the item keyed them by the hash alone.  A root in another has
- * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions' text isn't this format's.
+ * The format a folded root is in: "8", every float NaN in rows and keys the
+ * one canonical NaN (prolly_datum.c); "7" had a NaN's own bits, and was the
+ * first with indexes described without their tablespaces; "6" had an index's
+ * TABLESPACE clause when it wasn't in the default one, and was the first
+ * with definitions' expressions (checks, defaults, generated expressions,
+ * policies) as they print read back (reprinted()); "5" had them as printed,
+ * and was the first with a row's long values each out of line in a value
+ * tree of its own; "4" had only long rows out of line; "3" keyed value
+ * trees' chunks by offset, and was the first with its definitions' fields
+ * escaped (append_field()); "2" was keyless rows keyed by their first bytes
+ * and their hash, and a root without the item keyed them by the hash
+ * alone.  A root in another has its tables' rows unreadable here, and is
+ * neither moved to nor merged: its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"7"
+#define FOLDED_FORMAT	"8"
 
 typedef struct Canon
 {
