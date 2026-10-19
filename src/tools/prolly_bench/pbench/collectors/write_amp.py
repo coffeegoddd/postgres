@@ -65,7 +65,7 @@ from pbench.core.validation import atomic_json
 
 # Ratios below this many logical bytes aren't reported: the denominator is
 # noise (a read-only workload's catalog writes, a V operation's commit).
-MIN_LOGICAL_BYTES = 1 << 20
+MIN_LOGICAL_BYTES = 64 << 10
 
 # Relation I/O by every backend type: the checkpointer and background
 # writer write the pages the window dirtied.

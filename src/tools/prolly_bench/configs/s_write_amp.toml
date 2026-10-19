@@ -1,0 +1,108 @@
+# Write amplification (specs/19-write-amplification.md): the standard
+# procedure's sizes, workloads and settings, with the write_amp collector,
+# which checkpoints before the window and, after it, has prolly fold its
+# working set (prolly_checkpoint()) and checkpoints again, so the bytes
+# the window's work deferred are counted.  The recovery collector is left
+# out: after that checkpoint it would have nothing to replay.  Fewer
+# client counts than the standard sweep; five repetitions, so it may run
+# at benchmark quality.
+#
+#   prolly_bench run S --am heap,prolly --config configs/s_write_amp.toml
+#   prolly_bench table
+
+[run]
+repetitions = 5
+clients = [1, 16, 64]
+warmup_seconds = 60
+measure_seconds = 600          # with checkpoint_timeout = 2min: ~5 checkpoints,
+                               # so full-page images are in their steady state
+sizes = ["fits_shared_buffers"]
+fio_baseline = true
+fio_seconds = 30
+latency_sampling_rate = 0.1
+collectors = ["environment", "wal", "diskstats", "pg_stat_io", "cpu", "space",
+              "engine_counters", "write_amp", "vacuum"]
+required_collectors = ["write_amp"]
+
+[postgres]
+shared_buffers = "16GB"
+max_wal_size = "32GB"
+checkpoint_timeout = "2min"
+synchronous_commit = "on"
+fsync = "on"
+full_page_writes = "on"
+max_connections = 300
+huge_pages = "try"
+# a replication slot keeps the window's WAL for write_amp to split
+wal_level = "replica"
+max_replication_slots = 2
+
+# Fits in shared_buffers (16 GB).
+[sizes.fits_shared_buffers]
+pgbench_scale = 100            # ~1.5 GB
+s4_rows = 10000000
+s7_rows = 2000000
+tpcc_warehouses = 20
+tpch_scale = 1.0
+v_rows = 1000000
+sysbench_tables = 10
+sysbench_table_size = 1000000  # ~2.4 GB
+
+# Several times RAM (92 GB on the development machine).  Needs ~300 GB free
+# on the device under test; not in the default sizes.
+[sizes.exceeds_ram]
+pgbench_scale = 20000          # ~300 GB
+s4_rows = 1000000000
+s7_rows = 400000000
+tpcc_warehouses = 3000
+tpch_scale = 100.0
+v_rows = 100000000
+sysbench_tables = 10
+sysbench_table_size = 120000000  # ~290 GB
+
+[workloads.S3]
+ranges = [100, 10000]
+
+[workloads.S5]
+hot_rows = 10
+
+[workloads.S8]
+percents = [1, 10]
+clients = [1, 4, 16]           # each transaction updates 1-10% of the table
+
+[workloads.S9]
+isolation = "TRANSACTION_SERIALIZABLE"
+
+[workloads.S10]
+tests = ["oltp_read_write", "oltp_read_only", "oltp_write_only",
+         "oltp_point_select", "oltp_update_index", "oltp_update_non_index",
+         "oltp_insert", "select_random_ranges", "bulk_insert"]
+
+[workloads.S13]
+# Both use one client: BenchBase Q15 creates a shared view.
+modes = ["serial", "throughput"]
+
+[workloads.V1]
+iterations = 20
+
+[workloads.V2]
+changes = [1, 100, 10000, 1000000]
+iterations = 10
+
+[workloads.V3]
+changes = [100, 10000]
+locality = ["clustered", "scattered"]
+conflict_percent = [0]
+
+[workloads.V4]
+
+[workloads.V6]
+branches = [20]
+changes = [10000]
+background = ["none"]
+
+[tools]
+# An unpacked BenchBase Postgres build (build_benchbase.sh).
+benchbase = "build-bench/benchbase/benchbase-postgres"
+benchbase_source = "~/cursor_src/benchbase"
+benchbase_build_commit_file = "build-bench/benchbase/BUILD_COMMIT"

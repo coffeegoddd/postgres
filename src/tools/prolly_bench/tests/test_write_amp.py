@@ -474,5 +474,54 @@ class RunnerOrderTest(unittest.TestCase):
                                  "workload.verify", "post", "peer destroyed"])
 
 
+class WriteAmpReportTest(unittest.TestCase):
+    def _set(self, root, label, am, metrics):
+        from tests.evidence_helpers import seal
+        d = root / label
+        d.mkdir()
+        (d / "run.json").write_text(json.dumps(
+            {"suite": "S", "label": label, "table_am": am, "started": "2026-10-19T00:00:00"}))
+        with open(d / "results.jsonl", "w") as f:
+            f.write(json.dumps({
+                "key": {"suite": "S", "workload": "S1", "size": "tiny", "variant": "",
+                        "clients": 4, "rep": 1},
+                "status": "ok", "metrics": {"tps": 100.0, **metrics}}) + "\n")
+        seal(d)
+        return d
+
+    def test_tables_and_breakdown(self):
+        from pbench import report, table
+        heap = {"wa.logical_bytes_per_operation": 236.0, "wa.server_bytes": 1.0,
+                "wa.server_bytes_per_operation": 10_800.0, "wa_server": 45.8,
+                "wa_wal": 23.3, "wa_pages": 22.5, "wa.wal.fpi_bytes_per_operation": 5000.0}
+        prolly = {**heap, "wa.server_bytes_per_operation": 20_900.0, "wa_server": 88.8,
+                  "wa_wal": 44.8, "wa_tree": 20.9,
+                  "wa.tree.file_bytes_per_operation": 4_900.0}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sets = [table.load_set(self._set(root, "B0", "heap", heap)),
+                    table.load_set(self._set(root, "prolly", "prolly", prolly))]
+            md = table.to_markdown(sets, "S")
+            self.assertIn("## Write amplification, server total", md)
+            self.assertIn("| 45.80 | 88.80 (1.94x) |", md)
+            # heap has no chunk store: n/a, not missing
+            self.assertIn("| n/a | 20.90 |", md)
+            self.assertIn("## Write amplification by component", md)
+            self.assertIn("| S1 | - | tiny | 4 | prolly | 236 |", md)
+            self.assertIn("4,900", md)
+            page = table.to_html(sets, "S")
+            self.assertIn("id='wa-components'", page)
+            readme = report._wa_table(report.load_results(root / "prolly"))
+            self.assertIn("| S1 | tiny | - | 4 | 236 |", readme)
+
+    def test_ratio_under_the_floor_is_na(self):
+        from pbench import table
+        rs = [{"status": "ok", "metrics": {"wa_server": None, "tps": 1.0}}]
+        cell = table._cell(rs, "wa_server", None)
+        self.assertEqual((cell.text, cell.detail), ("n/a", "under 64 KiB of logical writes"))
+        cell = table._cell([{"status": "ok", "metrics": {"tps": 1.0}}], "wa_tree", None)
+        self.assertEqual((cell.text, cell.detail), ("n/a", "not measured for this engine"))
+
+
 if __name__ == "__main__":
     unittest.main()

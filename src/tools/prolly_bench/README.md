@@ -238,7 +238,8 @@ purpose.  S and V refuse those settings.
 (`pgbench -t`, sysbench `--events`, the TPC-H serial pass) with one client,
 fixed seeds, autovacuum and timed checkpoints off, so two runs of one build
 count the same: WAL bytes, records and full-page images, `pg_stat_io` for
-client backends, relation and chunk-store bytes, `pg_stat_prolly`, and
+client backends, relation and chunk-store bytes, `pg_stat_prolly`, write
+amplification's totals (`write_amp`), and
 instructions where the machine has hardware counters (`instructions`, by
 `perf stat`).  Counters are read once the measured clients have exited
 (`settled_counters`), so each has flushed its statistics.
@@ -253,6 +254,48 @@ S7's counters vary a little: GiST breaks ties between pages at random.
 Without hardware counters, `configs/s_cachegrind.toml` counts instructions
 with the server under Cachegrind (the `cachegrind` cluster and collector),
 on a reduced workload.
+
+## Write amplification
+
+`configs/s_write_amp.toml` runs the standard procedure's workloads with the
+`write_amp` collector (specs/19-write-amplification.md): for heap and
+prolly alike, the bytes the server wrote per byte of row data the
+workload wrote.
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_write_amp.toml
+src/tools/prolly_bench/prolly_bench table
+```
+
+Logical bytes are (rows inserted + rows updated) x the table's average row
+size, from `pg_stat_get_tuples_*()` for the workload's tables. Prolly's
+tables run heap's code, so the same counts cover both engines; deletes
+count as rows, not bytes. The collector's interval is wider than the
+window. Before the window it checkpoints, so the warm-up's dirty pages
+aren't the window's. After the window it waits for the clients to exit,
+then (prolly, S suite) runs `prolly_checkpoint()`, since a plain SQL
+`COMMIT` writes no chunks and their bytes would otherwise go uncounted
+(`write_amp_materialize`). It then reads the WAL and checkpoints again,
+so the window's dirty pages are written. It reports, per unit and as
+ratios to the logical bytes:
+
+| Ratio | Bytes |
+|---|---|
+| `wa_wal` | WAL, by LSN difference, split by resource manager with pg_walinspect: rows, indexes, full-page images, prolly's `BlockMap` and `ProllyChunks` records, the rest |
+| `wa_pages` | relation pages written and extended by every backend type (`pg_stat_io`), the checkpointer's included |
+| `wa_tree` | prolly only: the chunk store's journal, table files and manifests (`pg_stat_prolly`), with the copies collection and conjoining made |
+| `wa_server` | all three: everything the server handed the kernel |
+
+Every chunk is written twice, once in WAL (`ProllyChunks`) and once in
+the journal. The block map's own page-store writes
+(`wa.pages.bmap_store_bytes`) are reported but not added, since shared
+buffers count the same extends. Ratios are omitted under 64 KiB of logical
+bytes. `table` shows the ratios and a table of every component per
+engine, and each result set's `README.md` shows that table too.
+`write_amp` and `recovery` can't share a run, because after the second
+checkpoint recovery has nothing to replay. A replication slot keeps the
+window's WAL where `wal_level` allows one. The counter runs keep
+`minimal` and take no timed checkpoints, so they run it without one.
 
 ## Comparing builds
 
@@ -396,7 +439,7 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Workload` | S1-S10 and S13, V1-V4 and V6, C1-C4 | `pbench/workloads/` |
-| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
+| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |
 
@@ -404,7 +447,9 @@ A workload creates its data in `prepare`, may warm up in `warmup`, and does
 the measured work inside the window it is given in `measure`, returning an
 `Outcome` (metrics, and a transaction count for per-transaction metrics).  A
 collector snapshots in `start`/`stop`, computes in `results`, and may act on
-the cluster in `post`.
+the cluster in `post`; `before_window` and `after_window` bracket every
+collector's `start` and `stop`, for one whose interval is wider than the
+window (`write_amp`).
 
 ## Tests
 
