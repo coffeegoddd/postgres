@@ -186,6 +186,64 @@ SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
 SELECT * FROM dolt_status();
 SELECT dolt_branch('-D', 'identity_conflict');
 
+-- An identity by an index one side set while the other dropped the index
+-- is a schema conflict, not a failed move.
+CREATE TABLE settings.ri (id int NOT NULL);
+CREATE UNIQUE INDEX ri_key ON settings.ri (id);
+SELECT dolt_commit('-Am', 'identity base') IS NOT NULL AS committed;
+SELECT dolt_branch('identity_index');
+DROP INDEX settings.ri_key;
+SELECT dolt_commit('-Am', 'index dropped') IS NOT NULL AS committed;
+SELECT dolt_checkout('identity_index');
+ALTER TABLE settings.ri REPLICA IDENTITY USING INDEX ri_key;
+SELECT dolt_commit('-Am', 'identity by index') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_merge('identity_index');
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+SELECT * FROM dolt_status();
+SELECT dolt_checkout('identity_index');
+SELECT dolt_merge('main');
+SELECT test_fold_root() = prolly_root_hash('identity_index') AS same_root;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'identity_index');
+
+-- A TOAST table left over from a dropped column isn't made again with its
+-- table: its options aren't described, so the table comes back the same.
+CREATE TABLE settings.leftover (id int, value text);
+ALTER TABLE settings.leftover SET (toast.autovacuum_enabled = false);
+ALTER TABLE settings.leftover DROP COLUMN value;
+SELECT (dolt_commit('-Am', 'leftover TOAST table'))[1] AS leftover \gset
+DROP TABLE settings.leftover;
+SELECT dolt_commit('-Am', 'leftover dropped') IS NOT NULL AS committed;
+SELECT dolt_reset('--hard', :'leftover');
+SELECT test_fold_root() = prolly_root_hash(:'leftover') AS same_root;
+SELECT * FROM dolt_status();
+
+-- A materialized view's options and column settings are versioned too.
+CREATE MATERIALIZED VIEW settings.mv WITH (fillfactor = 70, toast.autovacuum_enabled = false)
+  AS SELECT id, value FROM settings.opts;
+SELECT (dolt_commit('-Am', 'matview'))[1] AS mv_base \gset
+ALTER MATERIALIZED VIEW settings.mv SET (autovacuum_enabled = false);
+ALTER MATERIALIZED VIEW settings.mv RESET (fillfactor);
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET COMPRESSION pglz;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN id SET STATISTICS 77;
+SELECT * FROM dolt_status();
+SELECT (dolt_commit('-Am', 'matview settings'))[1] AS mv_changed \gset
+SELECT dolt_reset('--hard', :'mv_base');
+SELECT test_fold_root() = prolly_root_hash(:'mv_base') AS same_root;
+SELECT * FROM dolt_status();
+SELECT dolt_reset('--hard', :'mv_changed');
+SELECT test_fold_root() = prolly_root_hash(:'mv_changed') AS same_root;
+SELECT * FROM dolt_status();
+SELECT (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(c.reloptions) o) AS options,
+       (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(t.reloptions) o) AS toast_options
+  FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+  WHERE c.oid = 'settings.mv'::regclass;
+SELECT attname, attstorage, attcompression, attstattarget FROM pg_attribute
+  WHERE attrelid = 'settings.mv'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT * FROM settings.mv;
+
 -- A clone creates the definitions from scratch in another database.
 SELECT current_database() AS db \gset
 \getenv abs_builddir PG_ABS_BUILDDIR
@@ -200,6 +258,7 @@ SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
 SELECT * FROM dolt_status();
 SELECT * FROM settings.opts;
 SELECT * FROM settings.parent;
+SELECT * FROM settings.mv;
 \c :db
 DROP DATABASE regress_settings_clone;
 SELECT dolt_remote('remove', 'settings_remote');

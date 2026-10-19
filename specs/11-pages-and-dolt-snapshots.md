@@ -651,9 +651,14 @@ fails without its fix), and Postgres's suites keep passing after each one.
   compression and statistics have no extra fields. Replica identity is
   versioned by mode and, for USING INDEX, the index's name; an index mode
   whose index was dropped is described as NOTHING, its effective behavior.
+  TOAST options are described only when the table needs a TOAST table
+  (one left over from dropped columns isn't made again with the table, so
+  its options couldn't be either). Materialized views' options and column
+  settings are versioned the same way, as lines of their description.
   Replay applies column settings without recursing into children and sets
   replica identity after creating its index. Options merge by name, column
-  settings with their column, and replica identity as one setting. Prolly
+  settings with their column, and replica identity as one setting; an identity by an index the merge
+  doesn't keep is a schema conflict. Prolly
   tables cannot be unlogged, so persistence adds no field. Format 9 omitted
   these settings; format 10 is a clean break, with the same refusal of
   older roots as previous format changes.

@@ -15,8 +15,9 @@
  *						   each ("default": the database's)
  *	"f:" function(args)	-> its definition
  *	"m:" materialized view -> its data tree (hash length, hash), then
- *						   whether it is unpopulated and its indexes, a
- *						   line each, then its query
+ *						   whether it is unpopulated, its indexes, its
+ *						   explicit options and its columns' nondefault
+ *						   settings, a line each, then its query
  *	"n:" schema			-> nothing: a versioned schema, there whether or not
  *						   anything is in it
  *	"s:" sequence		-> its definition, then a line of its own, its
@@ -218,7 +219,8 @@ typedef struct BaseTable BaseTable;
 
 /*
  * The format a folded root is in: "10", table and TOAST options, replica
- * identity and column storage, compression and statistics targets described;
+ * identity and column storage, compression and statistics targets described
+ * (a materialized view's options and column settings too);
  * "9" left those out, and was the first with what changes how a definition
  * behaves described when it isn't the default (inheritance, and which
  * inherited columns and constraints are a child's own too; typed tables,
@@ -1051,6 +1053,53 @@ column_storage(char storage)
 	return NULL;
 }
 
+/*
+ * A column's settings that aren't its type's or the server's defaults, as
+ * fields: storage, compression method, statistics target.
+ */
+static void
+append_column_settings(StringInfo out, Relation rel, Form_pg_attribute att)
+{
+	HeapTuple	atup;
+	bool		isnull;
+	Datum		target;
+
+	if (att->attstorage != get_typstorage(att->atttypid))
+		appendStringInfo(out, "\tstorage %s", column_storage(att->attstorage));
+	if (CompressionMethodIsValid(att->attcompression))
+		appendStringInfo(out, "\tcompression %s", GetCompressionMethodName(att->attcompression));
+	/* (the statistics target is nullable, outside Form_pg_attribute) */
+	atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(RelationGetRelid(rel)),
+						   Int16GetDatum(att->attnum));
+	if (!HeapTupleIsValid(atup))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 att->attnum, RelationGetRelid(rel));
+	target = SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attstattarget, &isnull);
+	if (!isnull)
+		appendStringInfo(out, "\tstatistics %d", DatumGetInt16(target));
+	ReleaseSysCache(atup);
+}
+
+/* A replica identity by an index: this, then the index's name. */
+#define IDENTITY_BY_INDEX "USING INDEX "
+
+/*
+ * A table's (or materialized view's) explicit options, sorted, its TOAST
+ * table's prefixed "toast.".  Its TOAST table's only if it needs one: one
+ * left over from columns since dropped isn't made again with the table, so
+ * its options wouldn't be either.
+ */
+static List *
+described_options(Relation rel)
+{
+	List	   *options = table_options(NIL, RelationGetRelid(rel), "");
+
+	if (OidIsValid(rel->rd_rel->reltoastrelid) && table_relation_needs_toast_table(rel))
+		options = table_options(options, rel->rd_rel->reltoastrelid, "toast.");
+	list_sort(options, cstring_cmp);
+	return options;
+}
+
 static void
 describe_table(Canon *cn, Relation rel, StringInfo out)
 {
@@ -1102,25 +1151,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfo(out, "\tidentity %c", att->attidentity);
 		if (att->attgenerated)
 			appendStringInfo(out, "\tstored %c", att->attgenerated);
-		if (att->attstorage != get_typstorage(att->atttypid))
-			appendStringInfo(out, "\tstorage %s", column_storage(att->attstorage));
-		if (CompressionMethodIsValid(att->attcompression))
-			appendStringInfo(out, "\tcompression %s", GetCompressionMethodName(att->attcompression));
-		/* The statistics target is nullable, outside Form_pg_attribute. */
-		{
-			HeapTuple	atup = SearchSysCache2(ATTNUM,
-											   ObjectIdGetDatum(RelationGetRelid(rel)), Int16GetDatum(att->attnum));
-			bool		isnull;
-			Datum		target;
-
-			if (!HeapTupleIsValid(atup))
-				elog(ERROR, "cache lookup failed for attribute %d of relation %u",
-					 att->attnum, RelationGetRelid(rel));
-			target = SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attstattarget, &isnull);
-			if (!isnull)
-				appendStringInfo(out, "\tstatistics %d", DatumGetInt16(target));
-			ReleaseSysCache(atup);
-		}
+		append_column_settings(out, rel, att);
 		appendStringInfoChar(out, '\n');
 	}
 
@@ -1306,11 +1337,8 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 	/* Local placement is not versioned; explicit tuning options are. */
 	{
-		List	   *options = table_options(NIL, RelationGetRelid(rel), "");
+		List	   *options = described_options(rel);
 
-		if (OidIsValid(rel->rd_rel->reltoastrelid))
-			options = table_options(options, rel->rd_rel->reltoastrelid, "toast.");
-		list_sort(options, cstring_cmp);
 		if (options != NIL)
 			appendStringInfoString(out, "options\n");
 		foreach(lc, options)
@@ -1325,7 +1353,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfoString(out, "FULL");
 		else if (OidIsValid(index))
 		{
-			appendStringInfoString(out, "USING INDEX ");
+			appendStringInfoString(out, IDENTITY_BY_INDEX);
 			append_field(out, quote_identifier(get_rel_name(index)));
 		}
 		else
@@ -1370,17 +1398,25 @@ append_view_options(StringInfo out, Oid view)
 /* A materialized view's line before its query for its being unpopulated. */
 #define MATVIEW_UNPOPULATED "with no data"
 
+/* A materialized view's lines for its options and its columns' settings. */
+#define MATVIEW_OPTION "option\t"
+#define MATVIEW_COLUMN "column\t"
+
 /*
  * What a materialized view has besides its query, a line each before it:
  * whether it is unpopulated (made WITH NO DATA, not refreshed since), then
- * its indexes by name, as a table's are.  (Neither begins with a space or
- * a parenthesis, as the query does.)
+ * its indexes by name, as a table's are, then its explicit options (as a
+ * table's) and the columns with settings that aren't their defaults (each
+ * as a table's column line, its name and those).  (None begins with a
+ * space or a parenthesis, as the query does.)
  */
 static void
 append_matview_state(StringInfo out, Form_pg_class form)
 {
 	Relation	rel = relation_open(form->oid, AccessShareLock);
 	List	   *indexes = list_copy(RelationGetIndexList(rel));
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData settings;
 	ListCell   *lc;
 
 	if (!form->relispopulated)
@@ -1391,6 +1427,24 @@ append_matview_state(StringInfo out, Form_pg_class form)
 		append_field(out, pg_get_indexdef_string_notblspc(lfirst_oid(lc)));
 		appendStringInfoChar(out, '\n');
 	}
+	foreach(lc, described_options(rel))
+		appendStringInfo(out, MATVIEW_OPTION "%s\n", (char *) lfirst(lc));
+	initStringInfo(&settings);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+		resetStringInfo(&settings);
+		append_column_settings(&settings, rel, att);
+		if (settings.len == 0)
+			continue;
+		appendStringInfoString(out, MATVIEW_COLUMN);
+		append_field(out, quote_identifier(NameStr(att->attname)));
+		appendStringInfo(out, "%s\n", settings.data);
+	}
+	pfree(settings.data);
 	relation_close(rel, AccessShareLock);
 }
 
@@ -5269,7 +5323,11 @@ make_matview_sql(const char *name, const char *def)
 	const char *query = def;
 	bool		populated = true;
 	List	   *indexes = NIL;
+	List	   *settings = NIL;
+	StringInfoData with;
 	size_t		len;
+
+	initStringInfo(&with);
 
 	while (*query && *query != ' ' && *query != '(')
 	{
@@ -5281,6 +5339,28 @@ make_matview_sql(const char *name, const char *def)
 		line = pnstrdup(query, nl - query);
 		if (strcmp(line, MATVIEW_UNPOPULATED) == 0)
 			populated = false;
+		else if (strncmp(line, MATVIEW_OPTION, strlen(MATVIEW_OPTION)) == 0)
+		{
+			const char *option = line + strlen(MATVIEW_OPTION);
+
+			appendStringInfo(&with, "%s%s = %s", with.len > 0 ? ", " : "",
+							 first_field(option), constraint_def(option));
+		}
+		else if (strncmp(line, MATVIEW_COLUMN, strlen(MATVIEW_COLUMN)) == 0)
+		{
+			const char *column = line + strlen(MATVIEW_COLUMN);
+			static const char *const fields[] = {"storage ", "compression ", "statistics "};
+
+			for (int i = 0; i < lengthof(fields); i++)
+			{
+				char	   *value = column_attr(column, fields[i]);
+
+				if (value)
+					settings = lappend(settings,
+									   psprintf("ALTER MATERIALIZED VIEW %s ALTER COLUMN %s SET %s%s",
+												name, first_field(column), fields[i], value));
+			}
+		}
 		else
 			indexes = lappend(indexes, unescape_field(line));
 		query = nl + 1;
@@ -5289,9 +5369,10 @@ make_matview_sql(const char *name, const char *def)
 	len = strlen(query);
 	if (len > 0 && query[len - 1] == ';')
 		len--;
-	return lcons(psprintf("CREATE MATERIALIZED VIEW %s AS %.*s WITH %sDATA", name,
+	return lcons(psprintf("CREATE MATERIALIZED VIEW %s%s%s%s AS %.*s WITH %sDATA", name,
+						  with.len > 0 ? " WITH (" : "", with.data, with.len > 0 ? ")" : "",
 						  (int) len, query, populated ? "" : "NO "),
-				 indexes);
+				 list_concat(settings, indexes));
 }
 
 static void
@@ -7110,6 +7191,7 @@ static char *
 merge_table_defs(const char *base, const char *ours, const char *theirs)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
+	List	   *indexes = NIL;
 	StringInfoData out;
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
@@ -7168,6 +7250,19 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 		else
 			qsort(merged, n, sizeof(TableLine), table_line_sort_cmp);
 		if (s == 1 && !constraints_compatible(merged, n))
+			return NULL;
+		if (s == 2)
+			for (int i = 0; i < n; i++)
+				indexes = lappend(indexes, merged[i].key);
+
+		/*
+		 * (a replica identity by an index one side set, the other dropped:
+		 * neither side's)
+		 */
+		if (s == 13 && n == 1 &&
+			strncmp(merged[0].line, IDENTITY_BY_INDEX, strlen(IDENTITY_BY_INDEX)) == 0 &&
+			!list_has_string(indexes,
+							 unquoted(unescape_field(merged[0].line + strlen(IDENTITY_BY_INDEX)))))
 			return NULL;
 		if (n == 0 && s >= ALWAYS_WRITTEN_SECTIONS)
 			continue;

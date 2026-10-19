@@ -611,6 +611,192 @@ SELECT dolt_branch('-D', 'identity_conflict');
  {0}
 (1 row)
 
+-- An identity by an index one side set while the other dropped the index
+-- is a schema conflict, not a failed move.
+CREATE TABLE settings.ri (id int NOT NULL);
+CREATE UNIQUE INDEX ri_key ON settings.ri (id);
+SELECT dolt_commit('-Am', 'identity base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('identity_index');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP INDEX settings.ri_key;
+SELECT dolt_commit('-Am', 'index dropped') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('identity_index');
+               dolt_checkout               
+-------------------------------------------
+ {0,"Switched to branch 'identity_index'"}
+(1 row)
+
+ALTER TABLE settings.ri REPLICA IDENTITY USING INDEX ri_key;
+SELECT dolt_commit('-Am', 'identity by index') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('identity_index');
+ERROR:  schema conflict: settings.ri was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_checkout('identity_index');
+               dolt_checkout               
+-------------------------------------------
+ {0,"Switched to branch 'identity_index'"}
+(1 row)
+
+SELECT dolt_merge('main');
+ERROR:  schema conflict: settings.ri was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('identity_index') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'identity_index');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A TOAST table left over from a dropped column isn't made again with its
+-- table: its options aren't described, so the table comes back the same.
+CREATE TABLE settings.leftover (id int, value text);
+ALTER TABLE settings.leftover SET (toast.autovacuum_enabled = false);
+ALTER TABLE settings.leftover DROP COLUMN value;
+SELECT (dolt_commit('-Am', 'leftover TOAST table'))[1] AS leftover \gset
+DROP TABLE settings.leftover;
+SELECT dolt_commit('-Am', 'leftover dropped') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'leftover');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'leftover') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A materialized view's options and column settings are versioned too.
+CREATE MATERIALIZED VIEW settings.mv WITH (fillfactor = 70, toast.autovacuum_enabled = false)
+  AS SELECT id, value FROM settings.opts;
+SELECT (dolt_commit('-Am', 'matview'))[1] AS mv_base \gset
+ALTER MATERIALIZED VIEW settings.mv SET (autovacuum_enabled = false);
+ALTER MATERIALIZED VIEW settings.mv RESET (fillfactor);
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET COMPRESSION pglz;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN id SET STATISTICS 77;
+SELECT * FROM dolt_status();
+ table_name  | staged |  status  
+-------------+--------+----------
+ settings.mv | t      | modified
+(1 row)
+
+SELECT (dolt_commit('-Am', 'matview settings'))[1] AS mv_changed \gset
+SELECT dolt_reset('--hard', :'mv_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'mv_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', :'mv_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'mv_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(c.reloptions) o) AS options,
+       (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(t.reloptions) o) AS toast_options
+  FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+  WHERE c.oid = 'settings.mv'::regclass;
+         options          |      toast_options       
+--------------------------+--------------------------
+ autovacuum_enabled=false | autovacuum_enabled=false
+(1 row)
+
+SELECT attname, attstorage, attcompression, attstattarget FROM pg_attribute
+  WHERE attrelid = 'settings.mv'::regclass AND attnum > 0 ORDER BY attnum;
+ attname | attstorage | attcompression | attstattarget 
+---------+------------+----------------+---------------
+ id      | p          |                |            77
+ value   | e          | p              |              
+(2 rows)
+
+SELECT * FROM settings.mv;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
 -- A clone creates the definitions from scratch in another database.
 SELECT current_database() AS db \gset
 \getenv abs_builddir PG_ABS_BUILDDIR
@@ -659,6 +845,12 @@ SELECT * FROM settings.parent;
   1 | child
 (1 row)
 
+SELECT * FROM settings.mv;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
 \c :db
 DROP DATABASE regress_settings_clone;
 SELECT dolt_remote('remove', 'settings_remote');
@@ -685,7 +877,7 @@ SELECT dolt_branch('-D', 'settings_conflict');
 (1 row)
 
 DROP SCHEMA settings CASCADE;
-NOTICE:  drop cascades to 10 other objects
+NOTICE:  drop cascades to 13 other objects
 DETAIL:  drop cascades to table settings.compression
 drop cascades to table settings.opts
 drop cascades to table settings.stats
@@ -696,5 +888,8 @@ drop cascades to table settings.inhchild
 drop cascades to table settings.parent
 drop cascades to table settings.words
 drop cascades to type settings.word
+drop cascades to table settings.ri
+drop cascades to table settings.leftover
+drop cascades to materialized view settings.mv
 \c :settings_home
 DROP DATABASE regress_table_settings;
