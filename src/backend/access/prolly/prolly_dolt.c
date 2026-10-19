@@ -4284,6 +4284,34 @@ may_maintain(void)
 }
 
 /*
+ * Collect the current database's chunk store (full: all of it), as the
+ * database's owner or a member of pg_maintain may, as VACUUM asks.
+ */
+static void
+collect(bool full, const char *what, ProllyGcResult *gc)
+{
+	ProllyDatabaseComponents dc;
+
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to collect garbage in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+	PreventCommandIfReadOnly(what);
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, gc);
+	ereport(DEBUG1,
+			(errmsg_internal("%s: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+							 what,
+							 (unsigned long long) gc->chunks_kept,
+							 (unsigned long long) gc->chunks_freed,
+							 (unsigned long long) gc->bytes_freed,
+							 (unsigned long long) gc->window_usec)));
+}
+
+/*
  * dolt_gc(VARIADIC args text[]) returns text[]: {status}
  *
  * --full: the database's chunk store collected (prolly_reclaim.h): what
@@ -4302,7 +4330,6 @@ dolt_gc(PG_FUNCTION_ARGS)
 	bool		shallow = false;
 	bool		options = true;	/* until "--" */
 	const char *result[1] = {"0"};
-	ProllyDatabaseComponents dc;
 	ProllyGcResult gc;
 
 	for (int i = 0; i < nargs; i++)
@@ -4322,22 +4349,7 @@ dolt_gc(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_gc can't --full and --shallow at once")));
-	if (!may_maintain())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to collect garbage in database \"%s\"",
-						get_database_name(MyDatabaseId)),
-				 errdetail("Only the database's owner or members of the \"%s\" role may.",
-						   "pg_maintain")));
-	PreventCommandIfReadOnly("dolt_gc()");
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, full, &gc);
-	ereport(DEBUG1,
-			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
-							 (unsigned long long) gc.chunks_kept,
-							 (unsigned long long) gc.chunks_freed,
-							 (unsigned long long) gc.bytes_freed,
-							 (unsigned long long) gc.window_usec)));
+	collect(full, "dolt_gc()", &gc);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -4345,6 +4357,105 @@ Datum
 dolt_gc_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_gc(fcinfo);
+}
+
+/*
+ * prolly_gc(full bool, OUT chunks_kept int8, OUT chunks_freed int8,
+ *			 OUT bytes_freed int8, OUT window_usec int8) returns record
+ *
+ * A collection, as dolt_gc() makes, and what it did: the chunks it kept
+ * and freed, the bytes freed, and how long appends were held off.
+ * (dolt_gc() answers {0}, as Dolt's does.)
+ */
+Datum
+prolly_gc(PG_FUNCTION_ARGS)
+{
+	bool		full = PG_GETARG_BOOL(0);
+	ProllyGcResult gc;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	collect(full, "prolly_gc()", &gc);
+	values[0] = Int64GetDatum((int64) gc.chunks_kept);
+	values[1] = Int64GetDatum((int64) gc.chunks_freed);
+	values[2] = Int64GetDatum((int64) gc.bytes_freed);
+	values[3] = Int64GetDatum((int64) gc.window_usec);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/* prolly_store_sizes()'s sums */
+typedef struct StoreSizes
+{
+	int64		segments;
+	int64		segment_bytes;
+	int64		files;
+	int64		file_bytes;
+	int64		settled;
+	int64		settled_bytes;
+} StoreSizes;
+
+static void
+size_segment(const char *name, int nchunks, uint64 size, bool settled,
+			 void *arg)
+{
+	StoreSizes *ss = arg;
+
+	ss->segments++;
+	ss->segment_bytes += size;
+}
+
+static void
+size_file(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	StoreSizes *ss = arg;
+
+	ss->files++;
+	ss->file_bytes += size;
+	if (settled)
+	{
+		ss->settled++;
+		ss->settled_bytes += size;
+	}
+}
+
+/*
+ * prolly_store_sizes(OUT journal_segments int8, OUT journal_bytes int8,
+ *					  OUT table_files int8, OUT table_file_bytes int8,
+ *					  OUT settled_files int8, OUT settled_bytes int8)
+ *	 returns record
+ *
+ * The current database's chunk store as it stands, as Dolt's StoreSizes:
+ * its journal (Dolt's journal), its table files, and of those the settled
+ * ones (closed under what they name: Dolt's oldgen; the rest its newgen).
+ * Only sizes are read.
+ */
+Datum
+prolly_store_sizes(PG_FUNCTION_ARGS)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	StoreSizes	ss = {0};
+	TupleDesc	desc;
+	Datum		values[6];
+	bool		nulls[6] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(cs, segments, store, false, size_segment, &ss);
+	PROLLY_CALL(cs, table_files, store, size_file, &ss);
+	values[0] = Int64GetDatum(ss.segments);
+	values[1] = Int64GetDatum(ss.segment_bytes);
+	values[2] = Int64GetDatum(ss.files);
+	values[3] = Int64GetDatum(ss.file_bytes);
+	values[4] = Int64GetDatum(ss.settled);
+	values[5] = Int64GetDatum(ss.settled_bytes);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /*

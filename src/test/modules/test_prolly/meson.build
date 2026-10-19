@@ -107,6 +107,7 @@ tests += {
       'undescribed_objects',
       'statistics_casts',
       'stat_prolly',
+      'store_sizes',
       'append_check',
       'journal_segments',
       'journal_compression',

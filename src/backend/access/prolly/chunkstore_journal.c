@@ -1819,6 +1819,8 @@ static uint64
 index_range(ProllyChunkStore *s, Segment *g, uint64 offset, uint64 end,
 			char **rec, Size *reclen)
 {
+	uint64		start = offset;
+
 	while (offset + RECORD_OVERHEAD <= end)
 	{
 		uint32		len;
@@ -1868,6 +1870,11 @@ index_range(ProllyChunkStore *s, Segment *g, uint64 offset, uint64 end,
 			MemoryContextSwitchTo(old);
 		}
 		offset += len;
+	}
+	if (offset > start)
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_SCANS, 1);
+		pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_SCANNED, offset - start);
 	}
 	return offset;
 }
@@ -4050,6 +4057,7 @@ journal_conjoin(ProllyChunkStore *s)
 		}
 	}
 	PG_END_TRY();
+	pgstat_count_prolly(PGSTAT_PROLLY_CONJOINS, 1);
 	hash_destroy(cs.seen);
 	pfree(keep);
 	pfree(dir);
@@ -5409,21 +5417,29 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 										&gc->nreaders);
 	load_tables(s, true);
 
-	if (result)
 	{
-		memset(result, 0, sizeof(*result));
+		ProllyGcResult r = {0};
+
 		for (uint64 slot = 0; slot < gc->nslots; slot++)
 		{
 			if (keep[slot_file(gc, slot) - gc->files])
 				continue;
 			if (marked(marks, slot))
-				result->chunks_kept++;
+				r.chunks_kept++;
 			else
-				result->chunks_freed++;
+				r.chunks_freed++;
 		}
-		result->bytes_freed = freed_bytes > written_bytes ?
+		r.bytes_freed = freed_bytes > written_bytes ?
 			freed_bytes - written_bytes : 0;
-		result->window_usec = window_usec;
+		r.window_usec = window_usec;
+		/* (a move is a collection of the journal that keeps everything) */
+		pgstat_count_prolly(gc->settle ? PGSTAT_PROLLY_GC_COLLECTIONS :
+							PGSTAT_PROLLY_GC_MOVES, 1);
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_KEPT, r.chunks_kept);
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_FREED, r.chunks_freed);
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_FREED, r.bytes_freed);
+		if (result)
+			*result = r;
 	}
 	keep_end(&gc->keep);
 	INJECTION_POINT("prolly-gc-swapped", NULL);

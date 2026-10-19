@@ -64,6 +64,11 @@ sql(q{SELECT count(test_chunk_put(test_noise(g::text, 100000)))
 reload_settings('autovacuum = on');
 ok($node->poll_query_until('mv', "SELECT ($files) > 0"),
 	'past the threshold, the journal moves to a table file');
+ok($node->poll_query_until('mv', q{SELECT value > 0 FROM pg_stat_prolly
+	WHERE name = 'gc_moves'}),
+	'the move is counted, as a move and not a collection');
+is(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'gc_collections'}), '0',
+	'no collection was made');
 is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
 	'leaving one segment, empty');
 is(sql(q{SELECT string_agg(settled::text, ',') FROM test_chunk_table_files()}), 'false',
