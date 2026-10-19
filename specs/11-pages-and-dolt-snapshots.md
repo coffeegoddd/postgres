@@ -2019,7 +2019,8 @@ A GC runs in one database at a time, by `dolt_gc()` or the trigger
 4. **Retire.** The sealed segment and the replaced table files are
    unlinked once every transaction that was running at the swap has
    ended (the GC waits for their virtual transaction ids, as `CREATE
-   INDEX CONCURRENTLY` does), so no backend reads a file it opened
+   INDEX CONCURRENTLY` does, but not for a prepared transaction, which
+   reads nothing more), so no backend reads a file it opened
    before (a VFD may be closed and reopened at any time, so an unlinked
    file isn't readable to the end of a transaction as an open one would
    be). `GC_RETIRE` (WAL) names them.
@@ -2293,7 +2294,16 @@ Not as designed, or not yet:
   anything new is read, rather than their chunks kept as roots (copied to
   a settled file, an uncommitted chunk would be everyone's before what it
   names is). A long transaction that appended a batch before the seal
-  holds the collection there.
+  holds the collection there. A prepared one, which may stay for days,
+  isn't waited for (here, for a transaction that named a tree before the
+  collection began, or at the retire): its chunks in the sealed segments
+  are roots instead (what they name was appended before them, so it is
+  copied with them; it can't have moved the root, so no PAD of its
+  becomes a ROOT), and its pointers are on pages already. A transaction
+  prepared while it is waited for is waited for until then: the wait is
+  for its backend's virtual transaction id
+  (`VirtualXactLockUnprepared()`, beside `VirtualXactLock()` in
+  `lock.c`), not for its xid, which the prepared transaction keeps.
 - **The manifest's lock is let go at the swap**, and a lock of the
   collection's own held to the end of its transaction (past the retire):
   a transfer waiting for the manifest would otherwise deadlock with the
