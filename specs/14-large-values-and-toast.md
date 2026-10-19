@@ -694,7 +694,9 @@ to decode.
 - **The roots.** The page store's allocated blocks, each read once (until
   two reads agree), their items dead or alive, not their free space;
   `keep()` notes a transaction that names a tree (a collection begun
-  later waits for it, prepared too) and adds the tree to a running
+  later waits for it to end or be prepared, as its pointers are on pages
+  then; a collection waits for no prepared transaction, keeping what one
+  appended to the journal as roots) and adds the tree to a running
   collection's keep set (`gc_kept()`, before the window and in it; too
   many to remember, or no set free, keeps every chunk). It does so under
   the journal's lock, which the window holds from its last `gc_kept()` to

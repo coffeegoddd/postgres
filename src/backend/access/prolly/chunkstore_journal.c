@@ -322,10 +322,7 @@ typedef struct KeepSet
 	ProllyHash	hashes[KEEP_MAX];
 } KeepSet;
 
-/*
- * a transaction that told keep() of a chunk: its backend's, or once
- * prepared a prepared transactions' slot's (xid invalid: none)
- */
+/* a transaction that told keep() of a chunk (xid invalid: none) */
 typedef struct KeepTouch
 {
 	Oid			dboid;
@@ -349,19 +346,13 @@ typedef struct JournalShared
 	KeepSet		keeps[KEEP_COLLECTIONS];
 	pg_atomic_uint64 keeps_begun;	/* keep sets begun */
 
-	/*
-	 * a process's own, by proc number: ranges, then (touches()) touches;
-	 * then (prepared()) the prepared transactions' touches
-	 */
-	int			nprepared;
+	/* a process's own, by proc number: ranges, then (touches()) touches */
 	int			nranges;
 	AppendRange ranges[FLEXIBLE_ARRAY_MEMBER];
 } JournalShared;
 
 #define TOUCHES_OFFSET(nranges) \
 	MAXALIGN(offsetof(JournalShared, ranges) + (nranges) * sizeof(AppendRange))
-#define PREPARED_OFFSET(nranges) \
-	MAXALIGN(TOUCHES_OFFSET(nranges) + (nranges) * sizeof(KeepTouch))
 
 static JournalShared *journal_shared = NULL;
 
@@ -962,12 +953,6 @@ touches(JournalShared *js)
 	return (KeepTouch *) ((char *) js + TOUCHES_OFFSET(js->nranges));
 }
 
-static KeepTouch *
-prepared(JournalShared *js)
-{
-	return (KeepTouch *) ((char *) js + PREPARED_OFFSET(js->nranges));
-}
-
 /*
  * A chunk this transaction names from outside the store: its transaction
  * noted, for a collection that begins before it ends to wait for, and the
@@ -1044,58 +1029,9 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 }
 
 /*
- * The transaction is about to be prepared: its touch moves to a prepared
- * transactions' slot, there until a collection finds it ended (a prepared
- * transaction outlives its backend's).
+ * The transaction has ended, or been prepared (its pointers are on pages):
+ * a collection need wait for it no more.
  */
-static void
-keep_touch_prepare(void)
-{
-	JournalShared *js;
-	KeepTouch  *t;
-	KeepTouch  *ps;
-	TransactionId *xids;
-	bool		moved = false;
-
-	if (journal_shared == NULL)
-		return;
-	js = journal_shared;
-	t = &touches(js)[MyProcNumber];
-	if (!TransactionIdIsValid(t->xid))
-		return;
-	ps = prepared(js);
-	xids = palloc(sizeof(TransactionId) * Max(js->nprepared, 1));
-	for (int pass = 0; pass < 2 && !moved; pass++)
-	{
-		SpinLockAcquire(&js->mutex);
-		for (int i = 0; i < js->nprepared && !moved; i++)
-		{
-			if (!TransactionIdIsValid(ps[i].xid))
-			{
-				ps[i] = *t;
-				t->xid = InvalidTransactionId;
-				moved = true;
-			}
-			xids[i] = ps[i].xid;
-		}
-		SpinLockRelease(&js->mutex);
-		/* (those of transactions ended since free their slots) */
-		for (int i = 0; i < js->nprepared && !moved; i++)
-		{
-			if (TransactionIdIsInProgress(xids[i]))
-				continue;
-			SpinLockAcquire(&js->mutex);
-			if (ps[i].xid == xids[i])
-				ps[i].xid = InvalidTransactionId;
-			SpinLockRelease(&js->mutex);
-		}
-	}
-	pfree(xids);
-	if (!moved)
-		elog(ERROR, "no slot for a prepared transaction's values stored by content");
-}
-
-/* The transaction has ended: a collection need wait for it no more. */
 static void
 keep_touch_end(void)
 {
@@ -1116,17 +1052,15 @@ keep_touch_end(void)
 
 /*
  * A collection begins keeping what keep() is told of, and will wait for
- * the transactions told of one before (prepared ones too): its keep set,
- * or -1 if none is free (it then keeps every chunk).
+ * the transactions told of one before: its keep set, or -1 if none is free
+ * (it then keeps every chunk).
  */
 static int
 keep_begin(ProllyChunkStore *s, List **xids)
 {
 	JournalShared *js = shared();
 	KeepTouch  *ts = touches(js);
-	KeepTouch  *ps = prepared(js);
-	TransactionId *found = palloc(sizeof(TransactionId) *
-								  (js->nranges + js->nprepared));
+	TransactionId *found = palloc(sizeof(TransactionId) * js->nranges);
 	int			nfound = 0;
 	int			slot = -1;
 
@@ -1143,9 +1077,9 @@ keep_begin(ProllyChunkStore *s, List **xids)
 		js->keeps[slot].n = 0;
 		pg_atomic_fetch_add_u64(&js->keeps_begun, 1);
 	}
-	for (int i = 0; i < js->nranges + js->nprepared; i++)
+	for (int i = 0; i < js->nranges; i++)
 	{
-		KeepTouch  *t = i < js->nranges ? &ts[i] : &ps[i - js->nranges];
+		KeepTouch  *t = &ts[i];
 
 		if (TransactionIdIsValid(t->xid) && t->dboid == s->dboid &&
 			t->spcoid == s->spcoid)
@@ -2016,7 +1950,6 @@ journal_xact_callback(XactEvent event, void *arg)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot prepare a transaction that moved the chunk store's root")));
 			flush_pending(s);
-			keep_touch_prepare();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -3999,7 +3932,8 @@ slot_file(ProllyChunkGc *gc, uint64 slot)
 /*
  * Wait for every transaction now running in this database, but ours, to
  * end, as CREATE INDEX CONCURRENTLY does: none can read a file named
- * before.
+ * before.  One prepared meanwhile, or before, isn't waited for: it reads
+ * nothing more, and may stay for days.
  */
 static void
 wait_for_readers(VirtualTransactionId *vxids, int n)
@@ -4007,7 +3941,81 @@ wait_for_readers(VirtualTransactionId *vxids, int n)
 	for (int i = 0; i < n; i++)
 	{
 		CHECK_FOR_INTERRUPTS();
-		(void) VirtualXactLock(vxids[i], true);
+		VirtualXactLockUnprepared(vxids[i]);
+	}
+}
+
+/* The prepared transaction vxid is the id of (invalid: it is none's). */
+static TransactionId
+prepared_xid(VirtualTransactionId vxid)
+{
+	bool		more = false;
+
+	if (VirtualTransactionIdIsRecoveredPreparedXact(vxid))
+		return vxid.localTransactionId;
+	if (max_prepared_xacts == 0)
+		return InvalidTransactionId;
+	return TwoPhaseGetXidByVirtualXID(vxid, &more);
+}
+
+/*
+ * Wait for transaction xid (a top-level one of this database) to end, or
+ * to be prepared: true if it was.  Its backend's virtual transaction is
+ * waited for, not the xid, which a prepared transaction holds until it is
+ * finished, maybe days later.
+ */
+static bool
+wait_unprepared(TransactionId xid)
+{
+	for (;;)
+	{
+		VirtualTransactionId *vxids;
+		TransactionId *pxids;
+		int			n;
+		int			running = -1;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!TransactionIdIsInProgress(xid))
+			return false;
+		vxids = GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
+									  &n);
+		pxids = palloc(sizeof(TransactionId) * Max(n, 1));
+		for (int i = 0; i < n; i++)
+		{
+			pxids[i] = prepared_xid(vxids[i]);
+			if (pxids[i] == xid)
+			{
+				pfree(pxids);
+				pfree(vxids);
+				return true;
+			}
+		}
+
+		/*
+		 * The backend running it, if one is now (not under a prepared
+		 * transaction's id: a backend's own is the same as the one it
+		 * prepared until its next transaction begins).
+		 */
+		for (int i = 0; i < n && running < 0; i++)
+		{
+			TransactionId pxid;
+			TransactionId xmin;
+			int			nsubxid;
+			bool		overflowed;
+
+			if (TransactionIdIsValid(pxids[i]))
+				continue;
+			ProcNumberGetTransactionIds(vxids[i].procNumber, &pxid, &xmin,
+										&nsubxid, &overflowed);
+			if (pxid == xid)
+				running = i;
+		}
+		if (running >= 0)
+			VirtualXactLockUnprepared(vxids[running]);
+		else
+			pg_usleep(1000L);	/* ending, or being prepared */
+		pfree(pxids);
+		pfree(vxids);
 	}
 }
 
@@ -4560,11 +4568,63 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 }
 
 /*
+ * Visit the chunks the transactions prepared appended to the sealed
+ * segments collected: roots, as they may be named when they are finished.
+ */
+static void
+gc_prepared(ProllyChunkGc *gc, List *prepared, ProllyChunkGcVisit visit,
+			void *arg)
+{
+	for (int i = 0; i < gc->nfiles; i++)
+	{
+		GcFile	   *f = &gc->files[i];
+		uint64		offset = JOURNAL_HEADER_SIZE;
+		char	   *rec = NULL;
+		Size		reclen = 0;
+		uint32		len;
+
+		if (!f->segment || f->file < 0)
+			continue;
+		while (offset + RECORD_OVERHEAD <= f->size)
+		{
+			ProllyHash	h;
+			Size		after;
+			TransactionId xid;
+
+			CHECK_FOR_INTERRUPTS();
+			if (FileRead(f->file, (char *) &len, sizeof(len), offset,
+						 WAIT_EVENT_DATA_FILE_READ) != sizeof(len) ||
+				len < RECORD_OVERHEAD || offset + len > f->size)
+				break;
+			if (len > reclen)
+			{
+				reclen = Max(len, 8192);
+				rec = rec ? repalloc(rec, reclen) : palloc(reclen);
+			}
+			if (FileRead(f->file, rec, len, offset,
+						 WAIT_EVENT_DATA_FILE_READ) != len ||
+				!record_valid(rec, len))
+				break;
+			if ((uint8) rec[sizeof(uint32)] == KIND_XCHUNK &&
+				record_hash_xid(rec, len, &h, &after, &xid) &&
+				list_member_xid(prepared, xid))
+				visit(&h, NULL, 0, arg);
+			offset += len;
+		}
+		if (rec)
+			pfree(rec);
+	}
+}
+
+/*
  * The root, and the chunks appended since the seal (or the last call).
  * The first call waits for the transactions that appended to the sealed
  * segments and were in progress at the seal: then their PADs are ROOTs or
- * left, and their chunks committed or not, for good.  With window, appends
- * are held off from here until the swap.
+ * left, and their chunks committed or not, for good.  One prepared isn't
+ * waited for (a PAD of its stays one: it can't have moved the root), its
+ * chunks roots.  Nor is one that told keep() of a chunk, once prepared: its
+ * pointers are on pages.  With window, appends are held off from here
+ * until the swap.
  */
 static void
 journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
@@ -4581,9 +4641,17 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 
 	if (!gc->waited)
 	{
+		List	   *prepared = NIL;
+
 		foreach(lc, gc->xids)
-			XactLockTableWait(lfirst_xid(lc), NULL, NULL, XLTW_None);
+		{
+			if (wait_unprepared(lfirst_xid(lc)))
+				prepared = lappend_xid(prepared, lfirst_xid(lc));
+		}
 		gc->waited = true;
+		if (prepared != NIL)
+			gc_prepared(gc, prepared, visit, arg);
+		list_free(prepared);
 	}
 	if (window && !gc->window)
 	{
@@ -5086,8 +5154,8 @@ append_ranges(void)
 static Size
 journal_shmem_size(void)
 {
-	return add_size(PREPARED_OFFSET(append_ranges()),
-					mul_size(max_prepared_xacts, sizeof(KeepTouch)));
+	return add_size(TOUCHES_OFFSET(append_ranges()),
+					mul_size(append_ranges(), sizeof(KeepTouch)));
 }
 
 static void
@@ -5102,7 +5170,6 @@ journal_shmem_init(void *area)
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
 	js->nranges = append_ranges();
-	js->nprepared = max_prepared_xacts;
 }
 
 /*
