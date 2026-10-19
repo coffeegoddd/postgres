@@ -3298,6 +3298,7 @@
   variable => 'XactReadOnly',
   boot_val => 'false',
   check_hook => 'check_transaction_read_only',
+  assign_hook => 'assign_transaction_read_only',
 },
 
 { name => 'transaction_timeout', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',

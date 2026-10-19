@@ -180,6 +180,164 @@ INSERT INTO dc.t VALUES (6, 'six');
 ERROR:  cannot execute INSERT in a read-only transaction
 ROLLBACK;
 INSERT INTO dc.t VALUES (6, 'six');
+-- (a transaction on a commit asked to be read-only makes no branch there,
+-- nor moves one)
+SELECT dolt_hashof('from_first') AS ff \gset
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+BEGIN READ ONLY;
+SELECT dolt_branch('ro_made');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN;
+SET TRANSACTION READ ONLY;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN;
+SET LOCAL transaction_read_only = on;
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+-- (nor one chained to it, which is read-only as asked too)
+BEGIN READ ONLY;
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ on
+(1 row)
+
+SELECT dolt_branch('-f', 'from_first', 'main');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+ROLLBACK AND CHAIN;
+SELECT dolt_branch('ro_made');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+-- (one chained to a transaction read-only only for the commit makes one)
+BEGIN;
+COMMIT AND CHAIN;
+SELECT dolt_branch('ro_chained');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+COMMIT;
+SELECT dolt_hashof('from_first') = :'ff' AS not_moved;
+ not_moved 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('ro_made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('ro_made') = :'c1' AS made_there;
+ made_there 
+------------
+ t
+(1 row)
+
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+SELECT dolt_branch('-D', 'ro_made', 'ro_chained');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (a transaction chained to one that checked out a commit is read-only
+-- for it, as one begun there is: it makes a branch there, and one chained
+-- to it after a checkout of a branch writes)
+BEGIN;
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ on
+(1 row)
+
+INSERT INTO dc.t VALUES (7, 'seven');
+ERROR:  cannot execute INSERT in a read-only transaction
+ROLLBACK;
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+BEGIN;
+SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+COMMIT AND CHAIN;
+SELECT dolt_branch('ro_chained_made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+COMMIT AND CHAIN;
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
+COMMIT AND CHAIN;
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+INSERT INTO dc.t VALUES (7, 'seven');
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT dolt_hashof('ro_chained_made') = :'c1' AS made_there;
+ made_there 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'ro_chained_made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- (a hidden branch isn't checked out by name, nor HEAD as a commit)
 SELECT dolt_checkout('detached/' || substr(:'c1', 1, 40));
 ERROR:  branch names beginning "detached/" are reserved

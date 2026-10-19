@@ -385,6 +385,118 @@ SELECT dolt_branch('-D', 'wm_f');
  {0}
 (1 row)
 
+-- A forced move of a dirty branch (dolt_branch -f) is its owner's, and
+-- takes the claim with the changes it drops.
+SET dolt.writer = 'dave';
+SELECT dolt_checkout('-b', 'wm_g');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_g'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (11, 'dave on g');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET dolt.writer = 'erin';
+SELECT dolt_branch('-f', 'wm_g', 'main');
+ERROR:  branch "wm_g" has uncommitted changes by writer "dave"
+HINT:  Write on a new branch with dolt_checkout('-b', ...), ask writer "dave" to commit, or take the changes over with dolt_branch('--take', 'wm_g').
+SET dolt.writer = 'dave';
+SELECT dolt_branch('-f', 'wm_g', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'wm_g';
+ name | dirty | owner 
+------+-------+-------
+ wm_g | f     | 
+(1 row)
+
+SET dolt.writer = 'erin';
+SELECT dolt_checkout('wm_g');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_g'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (11, 'erin on g');
+SELECT name, owner FROM dolt_branches() WHERE name = 'wm_g';
+ name | owner 
+------+-------
+ wm_g | erin
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_g');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- And from a session on a commit, read-only for it: the move, and the
+-- claim given up with it.
+SET dolt.writer = 'dave';
+SELECT dolt_checkout('-b', 'wm_h');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'wm_h'"}
+(1 row)
+
+INSERT INTO wm.t VALUES (12, 'dave on h');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_hashof('main') AS wm_head \gset
+SELECT dolt_checkout(:'wm_head') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT dolt_branch('-f', 'wm_h', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'wm_h';
+ name | dirty | owner 
+------+-------+-------
+ wm_h | f     | 
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'wm_h');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Branch-only: main is protected, written only by integrations, which
 -- commit as they change it.
 SELECT dolt_writer_mode('branch-only');

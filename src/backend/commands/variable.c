@@ -583,6 +583,18 @@ check_transaction_read_only(bool *newval, void **extra, GucSource source)
 }
 
 /*
+ * A transaction asked to be read-only is so for that reason too, not only
+ * for the branch it started on: what lifts the branch's read-only for its
+ * own writes (a branch made, or moved, from a commit) leaves it be.
+ */
+void
+assign_transaction_read_only(bool newval, void *extra)
+{
+	if (newval && IsTransactionState() && !InitializingParallelWorker)
+		XactReadOnlyFromBranch = false;
+}
+
+/*
  * SET TRANSACTION ISOLATION LEVEL
  *
  * We allow idempotent changes at any time, but otherwise this can only be

@@ -3254,14 +3254,23 @@ SaveTransactionCharacteristics(SavedTransactionCharacteristics *s)
 {
 	s->save_XactIsoLevel = XactIsoLevel;
 	s->save_XactReadOnly = XactReadOnly;
+	s->save_XactReadOnlyFromBranch = XactReadOnlyFromBranch;
 	s->save_XactDeferrable = XactDeferrable;
 }
 
 void
 RestoreTransactionCharacteristics(const SavedTransactionCharacteristics *s)
 {
+	/*
+	 * Read-only as asked, if the transaction continued was; and for the
+	 * branch the new one starts on, as StartTransaction() found it, whether
+	 * or not that is the branch the continued one started on.
+	 */
+	bool		asked = s->save_XactReadOnly && !s->save_XactReadOnlyFromBranch;
+
 	XactIsoLevel = s->save_XactIsoLevel;
-	XactReadOnly = s->save_XactReadOnly;
+	XactReadOnly = asked || MyBranchReadOnly;
+	XactReadOnlyFromBranch = XactReadOnlyFromBranch && !asked;
 	XactDeferrable = s->save_XactDeferrable;
 }
 

@@ -282,7 +282,8 @@ typedef struct ProllyRefsRoutine
 	 * nothing changed if the branch isn't at expected.  A branch that
 	 * doesn't exist is made, with only its head; one with copies is moved
 	 * there, its rows written, refused if it has uncommitted changes
-	 * unless force (which drops them).  With the transaction.
+	 * unless force (which drops them, and the claim of the writer whose
+	 * they were).  With the transaction.
 	 */
 	bool		(*branch_move) (const char *name, const ProllyHash *expected,
 								const ProllyHash *head, bool force);
