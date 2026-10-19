@@ -118,6 +118,7 @@ tests += {
       'toast_folds',
       'redefined_rows',
       'index_tablespaces',
+      'diff_memory',
     ],
   },
   'tap': {
