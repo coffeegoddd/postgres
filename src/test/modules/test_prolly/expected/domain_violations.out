@@ -533,7 +533,8 @@ CREATE DOMAIN dv.relem AS int;
 CREATE TYPE dv.rpair AS (a dv.relem);
 CREATE DOMAIN dv.rgrand AS int;
 CREATE TABLE dv.r (pk int PRIMARY KEY, v dv.rint);
-CREATE TABLE dv.ru (pk int PRIMARY KEY, v dv.rint UNIQUE);
+CREATE TABLE dv.ru (pk int, v dv.rint UNIQUE, tag text DEFAULT 'row',
+                   PRIMARY KEY (tag, pk) INCLUDE (v));
 CREATE TABLE dv.rn (pk int PRIMARY KEY, v dv.rlabel);
 CREATE TABLE dv.ra (pk int PRIMARY KEY, v dv.relem[]);
 CREATE TABLE dv.rc (pk int PRIMARY KEY, v dv.rpair);
@@ -601,10 +602,46 @@ SELECT (dolt_merge('resolve_domains'))[3] AS conflicts;
  1
 (1 row)
 
+-- Structured diagnostics and the detail identify the refused row, including
+-- when resolving every table.  A composite key uses index column order and
+-- omits INCLUDE columns; CHECK and NOT NULL keep their original SQLSTATE.
+CREATE FUNCTION pg_temp.resolve_error(tab text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	s text;
+	t text;
+	c text;
+	d text;
+BEGIN
+	PERFORM dolt_conflicts_resolve('--theirs', tab);
+	RETURN 'no error';
+EXCEPTION WHEN check_violation OR not_null_violation THEN
+	GET STACKED DIAGNOSTICS s = SCHEMA_NAME, t = TABLE_NAME,
+		c = COLUMN_NAME, d = PG_EXCEPTION_DETAIL;
+	RETURN format('%s: %I.%I.%I: %s', SQLSTATE, s, t, c, d);
+END $$;
+SELECT pg_temp.resolve_error('.');
+                              resolve_error                              
+-------------------------------------------------------------------------
+ 23514: dv.r.v: Key (pk)=(2) in table dv.r violates a domain constraint.
+(1 row)
+
+SELECT pg_temp.resolve_error('dv.ru');
+                                    resolve_error                                    
+-------------------------------------------------------------------------------------
+ 23514: dv.ru.v: Key (tag, pk)=(row, 1) in table dv.ru violates a domain constraint.
+(1 row)
+
+SELECT pg_temp.resolve_error('dv.rn');
+                               resolve_error                               
+---------------------------------------------------------------------------
+ 23502: dv.rn.v: Key (pk)=(1) in table dv.rn violates a domain constraint.
+(1 row)
+
 -- The first row would fit, but the second must not be written.  Neither
 -- row changes, and the table still has its conflicts after the error.
 SELECT dolt_conflicts_resolve('--theirs', 'dv.r');
 ERROR:  value for domain dv.rint violates check constraint "positive"
+DETAIL:  Key (pk)=(2) in table dv.r violates a domain constraint.
 SELECT * FROM dv.r ORDER BY pk;
  pk | v 
 ----+---
@@ -622,6 +659,7 @@ SELECT count(*) AS conflicts_left FROM dolt_conflicts(NULL::dv.r);
 DELETE FROM dv.r WHERE pk = 2;
 SELECT dolt_conflicts_resolve('--theirs', 'dv.r');
 ERROR:  value for domain dv.rint violates check constraint "positive"
+DETAIL:  Key (pk)=(2) in table dv.r violates a domain constraint.
 SELECT * FROM dv.r ORDER BY pk;
  pk | v 
 ----+---
@@ -637,10 +675,11 @@ SELECT dolt_conflicts_resolve('--ours', 'dv.r');
 -- A second unique index makes resolution remove and reinsert the row.
 SELECT dolt_conflicts_resolve('--theirs', 'dv.ru');
 ERROR:  value for domain dv.rint violates check constraint "positive"
+DETAIL:  Key (tag, pk)=(row, 1) in table dv.ru violates a domain constraint.
 SELECT * FROM dv.ru;
- pk | v 
-----+---
-  1 | 1
+ pk | v | tag 
+----+---+-----
+  1 | 1 | row
 (1 row)
 
 SELECT dolt_conflicts_resolve('--ours', 'dv.ru');
@@ -651,6 +690,7 @@ SELECT dolt_conflicts_resolve('--ours', 'dv.ru');
 
 SELECT dolt_conflicts_resolve('--theirs', 'dv.rn');
 ERROR:  domain dv.rlabel does not allow null values
+DETAIL:  Key (pk)=(1) in table dv.rn violates a domain constraint.
 SELECT * FROM dv.rn;
  pk |  v   
 ----+------
@@ -665,6 +705,7 @@ SELECT dolt_conflicts_resolve('--ours', 'dv.rn');
 
 SELECT dolt_conflicts_resolve('--theirs', 'dv.ra');
 ERROR:  value for domain dv.relem violates check constraint "positive"
+DETAIL:  Key (pk)=(1) in table dv.ra violates a domain constraint.
 SELECT * FROM dv.ra;
  pk |  v  
 ----+-----
@@ -679,6 +720,7 @@ SELECT dolt_conflicts_resolve('--ours', 'dv.ra');
 
 SELECT dolt_conflicts_resolve('--theirs', 'dv.rc');
 ERROR:  value for domain dv.relem violates check constraint "positive"
+DETAIL:  Key (pk)=(1) in table dv.rc violates a domain constraint.
 SELECT * FROM dv.rc;
  pk |  v  
 ----+-----
@@ -700,6 +742,7 @@ UPDATE dv.rg SET v = 1;
 SAVEPOINT before_resolution;
 SELECT dolt_conflicts_resolve('--theirs', 'dv.rg');
 ERROR:  value for domain dv.rgrand violates check constraint "positive"
+DETAIL:  Key (pk)=(1) in table dv.rg violates a domain constraint.
 ROLLBACK TO before_resolution;
 SELECT * FROM dv.rg;
  pk | v | w  

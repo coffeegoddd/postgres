@@ -190,7 +190,8 @@ CREATE DOMAIN dv.relem AS int;
 CREATE TYPE dv.rpair AS (a dv.relem);
 CREATE DOMAIN dv.rgrand AS int;
 CREATE TABLE dv.r (pk int PRIMARY KEY, v dv.rint);
-CREATE TABLE dv.ru (pk int PRIMARY KEY, v dv.rint UNIQUE);
+CREATE TABLE dv.ru (pk int, v dv.rint UNIQUE, tag text DEFAULT 'row',
+                   PRIMARY KEY (tag, pk) INCLUDE (v));
 CREATE TABLE dv.rn (pk int PRIMARY KEY, v dv.rlabel);
 CREATE TABLE dv.ra (pk int PRIMARY KEY, v dv.relem[]);
 CREATE TABLE dv.rc (pk int PRIMARY KEY, v dv.rpair);
@@ -223,6 +224,27 @@ ALTER DOMAIN dv.rgrand ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
 SELECT length(dolt_commit('-am', 'ours: conflicting rows and constraints')::text) AS committed;
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_merge('resolve_domains'))[3] AS conflicts;
+
+-- Structured diagnostics and the detail identify the refused row, including
+-- when resolving every table.  A composite key uses index column order and
+-- omits INCLUDE columns; CHECK and NOT NULL keep their original SQLSTATE.
+CREATE FUNCTION pg_temp.resolve_error(tab text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	s text;
+	t text;
+	c text;
+	d text;
+BEGIN
+	PERFORM dolt_conflicts_resolve('--theirs', tab);
+	RETURN 'no error';
+EXCEPTION WHEN check_violation OR not_null_violation THEN
+	GET STACKED DIAGNOSTICS s = SCHEMA_NAME, t = TABLE_NAME,
+		c = COLUMN_NAME, d = PG_EXCEPTION_DETAIL;
+	RETURN format('%s: %I.%I.%I: %s', SQLSTATE, s, t, c, d);
+END $$;
+SELECT pg_temp.resolve_error('.');
+SELECT pg_temp.resolve_error('dv.ru');
+SELECT pg_temp.resolve_error('dv.rn');
 
 -- The first row would fit, but the second must not be written.  Neither
 -- row changes, and the table still has its conflicts after the error.

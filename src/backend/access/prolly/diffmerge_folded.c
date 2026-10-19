@@ -847,11 +847,12 @@ count_of(Changes *c, const StringInfoData *value)
 }
 
 /*
- * While a merge (or pick) runs: the constraint violations it records, and
- * the tables it wrote to, whose foreign keys are checked after; and the
- * last table whose rows a merge wrote, whether a row written may break a
- * constraint there, and its columns whose values a domain's constraint
- * may reject, with how each is checked (DomainPlan).
+ * Constraint state for merges (including picks) and conflict resolution:
+ * the violations a merge records, the tables it wrote to whose foreign
+ * keys are checked after, and the last table whose rows a merge or
+ * resolution checked, whether a row written may break a constraint there,
+ * and its columns whose values a domain's constraint may reject, with how
+ * each is checked (DomainPlan).
  */
 static bool recording = false;
 static List *recorded = NIL;	/* ProllyViolation * */
@@ -864,7 +865,13 @@ static struct Removed *removed = NULL;	/* removed_begin() */
 
 static bool checks_domains(Relation rel);
 
-/* Start a merge or resolution without state from an earlier transaction. */
+/*
+ * Start a merge or resolution without state from an earlier transaction.
+ * Every entry point must call this before consulting the cached state or
+ * calling note_constraints(): its pointers may outlive their transaction
+ * or subtransaction, on success or error.  Forget them without freeing or
+ * dereferencing them; their owning memory context reclaims the allocations.
+ */
 static void
 reset_constraints(void)
 {
@@ -1433,6 +1440,35 @@ row_domain_refusal(Relation rel, TupleTableSlot *row, const bool *keep,
 		}
 	}
 	return NULL;
+}
+
+/* Identify the table and primary key of a row refused during resolution. */
+static void
+describe_resolution_refusal(ErrorData *ed, Relation rel, TupleTableSlot *row)
+{
+	Relation	index;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	char	   *key;
+	char	   *detail;
+	char	   *name;
+
+	index = index_open(RelationGetPrimaryKeyIndex(rel, true), AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
+		values[i] = slot_getattr(row, index->rd_index->indkey.values[i],
+								 &isnull[i]);
+	key = BuildIndexValueDescription(index, values, isnull);
+	index_close(index, AccessShareLock);
+
+	ed->table_name = pstrdup(RelationGetRelationName(rel));
+	ed->schema_name = get_namespace_name(RelationGetNamespace(rel));
+	name = quote_qualified_identifier(ed->schema_name, ed->table_name);
+	if (key)
+		detail = psprintf("Key %s in table %s violates a domain constraint.",
+						  key, name);
+	else
+		detail = psprintf("A row in table %s violates a domain constraint.", name);
+	ed->detail = ed->detail ? psprintf("%s\n%s", ed->detail, detail) : detail;
 }
 
 /*
@@ -3025,7 +3061,10 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 				}
 				ed = row_domain_refusal(rel, s2, NULL, was, NULL);
 				if (ed)
+				{
+					describe_resolution_refusal(ed, rel, s2);
 					ThrowErrorData(ed);
+				}
 			}
 		}
 		removed_begin(rel, keyless);
