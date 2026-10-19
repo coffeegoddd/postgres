@@ -1766,6 +1766,7 @@ typedef struct Applying
 	bool		in_place;		/* changed keyed rows updated in place */
 	bool		put_back;		/* a refused row's old version put back */
 	bool		stuck;			/* a put-back refused: the rest not written */
+	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	bool		inserting;
 } Applying;
 
@@ -1791,6 +1792,27 @@ static bool
 puts_back(Relation rel, bool keyless)
 {
 	return recording && !keyless && !updates_in_place(rel);
+}
+
+/*
+ * A keyless update is an unrelated removal and insertion: if a merge
+ * removed rows of a keyless table and refused one it would write (a
+ * constraint breaks), the rows it removed can't be told from those it
+ * replaced, so neither the branch's rows nor theirs can be kept as the
+ * merge would have them.  Refused: the branch stays as it was.  With no
+ * removals, the rows refused are recorded alone, as for a keyed table.
+ */
+static void
+refuse_keyless_violations(Relation rel, int nrecorded, bool removed_rows)
+{
+	if (!removed_rows || list_length(recorded) == nrecorded)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("the rows of keyless table %s can't be merged: a row the merge writes breaks a constraint",
+					table_name(RelationGetRelid(rel))),
+			 errdetail("Without a key, the rows the merge replaces can't be kept beside the rows it refuses."),
+			 errhint("Change the rows on one branch so they satisfy the table's constraints, then merge again.")));
 }
 
 /*
@@ -1897,6 +1919,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	}
 	if (!ap->inserting && nb > 0)
 	{
+		ap->removed_rows = true;
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
 		removed_note(ap->rel, ap->slot);
@@ -1951,7 +1974,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
  * up), each written as the trees' diff finds it, nothing held.  While
  * violations are recorded, a keyed row refused is put back (puts_back()),
  * in a subtransaction: if a put-back is refused too, it is rolled back,
- * and the rows written held instead.
+ * and the rows written held instead.  A keyless table's rows are refused
+ * if it removes rows and a violation is recorded
+ * (refuse_keyless_violations()).
  */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
@@ -2003,6 +2028,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
+	if (recording && ap.keyless)
+		refuse_keyless_violations(ap.rel, nrecorded, ap.removed_rows);
 	if (ap.put_back)
 	{
 		/* (stuck: none of it written, nor its violations recorded) */
@@ -2422,6 +2449,7 @@ typedef struct KeyWriter
 	bool	   *unread;			/* (decode_update()'s) */
 	bool		put_back;		/* puts_back() */
 	bool		keyless;
+	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	bool		moving;			/* row_missing()'s */
 } KeyWriter;
 
@@ -2608,6 +2636,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 		w->violation = NULL;
 		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
 			continue;
+		kw->removed_rows = true;
 		(void) decode(kw->c, w->old, kw->s1);
 		removed_note(kw->rel, kw->s1);
 		for (int64 i = 0; i < w->nold; i++)
@@ -2734,6 +2763,8 @@ write_keys(KeyWriter *kw, List *writes)
 
 		written = write_keys_once(kw, writes);
 		Assert(written);
+		if (recording && kw->keyless)
+			refuse_keyless_violations(kw->rel, nrecorded, kw->removed_rows);
 		return;
 	}
 	for (;;)

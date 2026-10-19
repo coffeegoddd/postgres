@@ -1,0 +1,368 @@
+-- A keyless UPDATE is a removal and an unrelated insertion.  If a merge
+-- removes rows of a keyless table and refuses a row it writes, it can't
+-- keep the branch's rows and theirs as merged: there is no row identity
+-- with which to pair them.  The merge is refused, the branch unchanged,
+-- rather than losing one side's rows.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA kv VERSIONED;
+CREATE TABLE kv.u (x int UNIQUE, y int);
+CREATE TABLE kv.s (x int, y int);
+CREATE TABLE kv.c (x int, y int);
+CREATE TABLE kv.d (x int, y int);
+CREATE TABLE kv.ok (x int UNIQUE, y int);
+CREATE TABLE kv.sibling (pk int PRIMARY KEY);
+INSERT INTO kv.u VALUES (1, 1), (2, 2);
+INSERT INTO kv.s VALUES (1, 1), (2, 2);
+INSERT INTO kv.c VALUES (2, 2), (2, 2);
+INSERT INTO kv.d VALUES (2, 2), (2, 2);
+INSERT INTO kv.ok VALUES (1, 1), (2, 2);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('theirs_u');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('theirs_s');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('theirs_c');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('theirs_d');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('theirs_ok');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- u and d use merge_table; s and c use the streaming apply_rows path.
+INSERT INTO kv.u VALUES (5, 9);
+CREATE UNIQUE INDEX s_x ON kv.s (x);
+ALTER TABLE kv.c ADD CONSTRAINT small CHECK (x < 5);
+ALTER TABLE kv.d ADD CONSTRAINT small CHECK (x < 5);
+INSERT INTO kv.d VALUES (3, 3);
+INSERT INTO kv.ok VALUES (9, 9);
+SELECT (dolt_commit('-am', 'ours'))[1] AS ours \gset
+-- Each side's change to one table, with an acceptable insert beside the
+-- refused row and changes to other tables: none of it may be lost.
+SELECT dolt_checkout('theirs_u');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'theirs_u'"}
+(1 row)
+
+UPDATE kv.u SET x = 5 WHERE x = 2;
+INSERT INTO kv.u VALUES (7, 7);
+INSERT INTO kv.sibling VALUES (1);
+SELECT length(dolt_commit('-am', 'theirs u')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('theirs_s');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'theirs_s'"}
+(1 row)
+
+UPDATE kv.s SET x = 1 WHERE x = 2;
+INSERT INTO kv.s VALUES (7, 7);
+INSERT INTO kv.sibling VALUES (1);
+SELECT length(dolt_commit('-am', 'theirs s')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('theirs_c');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'theirs_c'"}
+(1 row)
+
+UPDATE kv.c SET x = 5;
+INSERT INTO kv.c VALUES (4, 4);
+INSERT INTO kv.sibling VALUES (1);
+SELECT length(dolt_commit('-am', 'theirs c')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('theirs_d');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'theirs_d'"}
+(1 row)
+
+UPDATE kv.d SET x = 5;
+INSERT INTO kv.d VALUES (4, 4);
+INSERT INTO kv.sibling VALUES (1);
+SELECT length(dolt_commit('-am', 'theirs d')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('theirs_u');
+ERROR:  the rows of keyless table kv.u can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+SELECT dolt_merge('theirs_s');
+ERROR:  the rows of keyless table kv.s can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+SELECT dolt_merge('theirs_c');
+ERROR:  the rows of keyless table kv.c can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+SELECT dolt_merge('theirs_d');
+ERROR:  the rows of keyless table kv.d can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+-- (inside a transaction too, and retried after a savepoint)
+BEGIN;
+SAVEPOINT before_merge;
+SELECT dolt_merge('theirs_u');
+ERROR:  the rows of keyless table kv.u can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+ROLLBACK TO before_merge;
+SELECT dolt_merge('theirs_c');
+ERROR:  the rows of keyless table kv.c can't be merged: a row the merge writes breaks a constraint
+DETAIL:  Without a key, the rows the merge replaces can't be kept beside the rows it refuses.
+HINT:  Change the rows on one branch so they satisfy the table's constraints, then merge again.
+ROLLBACK;
+-- Each refused merge left the branch as it was: rows, violations, root.
+SELECT test_fold_root() = prolly_root_hash(:'ours') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT count(*) AS no_violations FROM dolt_constraint_violations();
+ no_violations 
+---------------
+             0
+(1 row)
+
+SELECT * FROM kv.u ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 1
+ 2 | 2
+ 5 | 9
+(3 rows)
+
+SELECT * FROM kv.s ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 1
+ 2 | 2
+(2 rows)
+
+SELECT * FROM kv.c ORDER BY x, y;
+ x | y 
+---+---
+ 2 | 2
+ 2 | 2
+(2 rows)
+
+SELECT * FROM kv.d ORDER BY x, y;
+ x | y 
+---+---
+ 2 | 2
+ 2 | 2
+ 3 | 3
+(3 rows)
+
+SELECT * FROM kv.sibling;
+ pk 
+----
+(0 rows)
+
+-- With no removals, a refused row is recorded alone and the rest merged,
+-- as for a keyed table; a keyless table whose removals break nothing
+-- merges as usual.
+SELECT dolt_checkout('theirs_ok');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'theirs_ok'"}
+(1 row)
+
+UPDATE kv.ok SET y = y + 1;
+INSERT INTO kv.u VALUES (5, 5), (6, 6);
+INSERT INTO kv.sibling VALUES (1);
+SELECT length(dolt_commit('-am', 'theirs ok')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('theirs_ok'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT * FROM kv.u ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 1
+ 2 | 2
+ 5 | 9
+ 6 | 6
+(4 rows)
+
+SELECT * FROM kv.ok ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 2
+ 2 | 3
+ 9 | 9
+(3 rows)
+
+SELECT * FROM kv.sibling;
+ pk 
+----
+  1
+(1 row)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('kv.u');
+ violation_type |  violating_row   
+----------------+------------------
+ unique index   | {"x": 5, "y": 5}
+(1 row)
+
+SET LOCAL dolt.allow_commit_conflicts = on;
+SELECT length(dolt_commit('-am', 'merged with a violation')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+-- The merged rows survive folding and moving away and back.
+SELECT dolt_branch('saved_merge');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', 'saved_merge');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('saved_merge') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM kv.u ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 1
+ 2 | 2
+ 5 | 9
+ 6 | 6
+(4 rows)
+
+SELECT * FROM kv.ok ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 2
+ 2 | 3
+ 9 | 9
+(3 rows)
+
+SELECT dolt_branch('-D', 'theirs_u');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'theirs_s');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'theirs_c');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'theirs_d');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'theirs_ok');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'saved_merge');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA kv CASCADE;
+NOTICE:  drop cascades to 6 other objects
+DETAIL:  drop cascades to table kv.u
+drop cascades to table kv.s
+drop cascades to table kv.c
+drop cascades to table kv.d
+drop cascades to table kv.ok
+drop cascades to table kv.sibling
