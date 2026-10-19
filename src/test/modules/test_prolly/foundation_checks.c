@@ -28,6 +28,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_opclass_d.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
@@ -168,6 +169,7 @@ typedef struct KeyColSpec
 	Oid			type;
 	Oid			collation;
 	int16		options;		/* INDOPTION_* */
+	Oid			opclass;		/* InvalidOid: the default for type */
 } KeyColSpec;
 
 typedef struct KeyRow
@@ -194,7 +196,8 @@ key_case_init(KeyCase *kc)
 	for (int i = 0; i < kc->ncols; i++)
 	{
 		KeyColSpec *spec = &kc->cols[i];
-		Oid			opclass = GetDefaultOpClass(spec->type, BTREE_AM_OID);
+		Oid			opclass = OidIsValid(spec->opclass) ? spec->opclass :
+			GetDefaultOpClass(spec->type, BTREE_AM_OID);
 		Oid			opfamily = get_opclass_family(opclass);
 
 		kc->types[i] = spec->type;
@@ -267,6 +270,9 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 	"1", "1.0", "1.5", "2", "1e20", "NaN", "Infinity", "-Infinity"};
 	static const char *const arrays[] = {"{}", "{1}", "{1,2}", "{2}", "{1,NULL}",
 	"{NULL}", "{{1,2},{3,4}}", "[0:1]={1,2}", "{-5,7}"};
+	static const char *const cidrs[] = {"0.0.0.0/0", "10.0.0.0/8",
+	"10.0.0.0/16", "10.1.0.0/16", "10.0.0.1/32", "192.168.0.0/16",
+	"192.168.1.0/24", "::/0", "2001:db8::/32", "2001:db8::1/128"};
 	int			n = 0;
 
 	switch (type)
@@ -291,6 +297,7 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 			values[n++] = BoolGetDatum(true);
 			break;
 		case TEXTOID:
+		case VARCHAROID:
 			for (int i = 0; i < lengthof(texts); i++)
 				values[n++] = CStringGetTextDatum(texts[i]);
 			break;
@@ -301,6 +308,11 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 		case INT4ARRAYOID:
 			for (int i = 0; i < lengthof(arrays); i++)
 				values[n++] = typed_value(INT4ARRAYOID, arrays[i]);
+			break;
+		case CIDROID:
+			/* (its opfamily registers a comparison for inet alone) */
+			for (int i = 0; i < lengthof(cidrs); i++)
+				values[n++] = typed_value(CIDROID, cidrs[i]);
 			break;
 		default:
 			elog(ERROR, "no test values for type %u", type);
@@ -439,10 +451,16 @@ keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 		{1, {{BOOLOID}}},
 		{1, {{TEXTOID, C_COLLATION_OID}}},
 		{1, {{TEXTOID, non_c_collation()}}},
+		{1, {{VARCHAROID, C_COLLATION_OID}}},
+		{1, {{VARCHAROID, non_c_collation()}}},
+		{1, {{VARCHAROID, C_COLLATION_OID, 0, VARCHAR_BTREE_PATTERN_OPS_OID}}},
 		{1, {{NUMERICOID}}},
 		{2, {{INT4OID}, {TEXTOID, C_COLLATION_OID}}},
 		{2, {{TEXTOID, non_c_collation()}, {INT8OID}}},
 		{2, {{NUMERICOID}, {BOOLOID}}},
+		{2, {{INT4OID}, {VARCHAROID, C_COLLATION_OID}}},
+		{1, {{CIDROID}}},
+		{2, {{CIDROID}, {INT4OID}}},
 		{1, {{INT4ARRAYOID}}},
 		{2, {{INT4ARRAYOID}, {TEXTOID, C_COLLATION_OID}}},
 	};
@@ -466,6 +484,10 @@ keyenc_desc_and_nulls(const ProllyImplInfo *impl)
 			{1, {{INT4OID, InvalidOid, opts[o]}}},
 			{1, {{TEXTOID, C_COLLATION_OID, opts[o]}}},
 			{1, {{TEXTOID, non_c_collation(), opts[o]}}},
+			{1, {{VARCHAROID, C_COLLATION_OID, opts[o]}}},
+			{1, {{VARCHAROID, non_c_collation(), opts[o]}}},
+			{1, {{VARCHAROID, C_COLLATION_OID, opts[o], VARCHAR_BTREE_PATTERN_OPS_OID}}},
+			{1, {{CIDROID, InvalidOid, opts[o]}}},
 			{1, {{NUMERICOID, InvalidOid, opts[o]}}},
 			{2, {{INT8OID, InvalidOid, opts[o]}, {TEXTOID, C_COLLATION_OID, 0}}},
 			{2, {{BOOLOID, InvalidOid, 0}, {INT2OID, InvalidOid, opts[o]}}},

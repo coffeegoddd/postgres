@@ -663,6 +663,18 @@ fails without its fix), and Postgres's suites keep passing after each one.
   these settings; format 10 is a clean break, with the same refusal of
   older roots as previous format changes.
 
+- Format 11 of the folded root orders a primary key whose opfamily registers its
+  comparison for a type the key's type is binary-coercible to by that
+  comparison, as PostgreSQL's opclass input types do: `varchar` (and
+  domains over it) through `text`, `cidr` through `inet`. Previously those
+  keys fell back to content-keyed rows with a copy count, so a merge
+  across `char` to `varchar`, or `inet` to `cidr`, read the wrong row
+  format (#389). The ordered key encoder is format 4, which also invalidates fold
+  baselines. Older roots are refused for row reads, moves and merges;
+  commit a branch to write its current rows in the new format. A merge
+  whose base was committed in an older format stays refused, as with
+  every earlier format change.
+
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
   reset to a commit, fast-forward, branch at a commit, materializing a

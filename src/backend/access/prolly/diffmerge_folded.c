@@ -363,6 +363,13 @@ row_change(ProllyDiffKind kind, const ProllyKey *key,
 static void
 require_readable(const Table *t)
 {
+	if (t && t->unreadable &&
+		strcmp(t->unreadable, PROLLY_UNREADABLE_OLDER_FORMAT) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the rows of table %s in this version can't be read here", t->name),
+				 errdetail("The %s.", t->unreadable),
+				 errhint("Commit the branch to write it in the current one.")));
 	if (t && t->unreadable)
 		ereport(ERROR,
 				(errcode(ERRCODE_COLLATION_MISMATCH),

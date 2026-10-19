@@ -840,4 +840,91 @@ SELECT * FROM dolt_status();
 SELECT quote_literal(k), v FROM rt.amb_pick ORDER BY 1;
 SELECT dolt_branch('-D', 'feature');
 
+-- A varchar primary key uses the text opfamily's comparison function.
+-- It must stay keyed when char keys become varchar, including composite
+-- keys and domains over varchar; the old rows have no keyless count prefix.
+CREATE DOMAIN rt.vkey AS varchar(10);
+CREATE TABLE rt.vk (k char(5) PRIMARY KEY, v int);
+CREATE TABLE rt.vkc (k char(5), id int, v int, PRIMARY KEY (id, k));
+CREATE TABLE rt.vkd (k char(5) PRIMARY KEY, v int);
+INSERT INTO rt.vk VALUES ('ab', 1), ('cd', 2);
+INSERT INTO rt.vkc VALUES ('ab', 1, 1), ('cd', 1, 2);
+INSERT INTO rt.vkd VALUES ('ab', 1), ('cd', 2);
+SELECT (dolt_commit('-Am', 'varchar key base'))[1] AS vk_base \gset
+SELECT dolt_branch('feature');
+ALTER TABLE rt.vk ALTER COLUMN k TYPE varchar(10);
+ALTER TABLE rt.vkc ALTER COLUMN k TYPE varchar(10);
+ALTER TABLE rt.vkd ALTER COLUMN k TYPE rt.vkey;
+INSERT INTO rt.vk VALUES ('zz', 9);
+INSERT INTO rt.vkc VALUES ('zz', 1, 9);
+INSERT INTO rt.vkd VALUES ('zz', 9);
+SELECT length(dolt_commit('-am', 'main: varchar keys')::text) AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.vk ALTER COLUMN k TYPE varchar(10);
+ALTER TABLE rt.vkc ALTER COLUMN k TYPE varchar(10);
+ALTER TABLE rt.vkd ALTER COLUMN k TYPE rt.vkey;
+INSERT INTO rt.vk VALUES ('yy', 8);
+INSERT INTO rt.vkc VALUES ('yy', 1, 8);
+INSERT INTO rt.vkd VALUES ('yy', 8);
+SELECT length(dolt_commit('-am', 'feature: varchar keys')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'vk_base', 'HEAD', NULL::rt.vk)
+ORDER BY to_row;
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged varchar keys'))[2:4];
+SELECT k, v FROM rt.vk ORDER BY k;
+SELECT k, id, v FROM rt.vkc ORDER BY id, k;
+SELECT k, v FROM rt.vkd ORDER BY k;
+SELECT test_fold_root() AS vk_merged \gset
+SELECT * FROM dolt_status;
+ROLLBACK;
+SELECT dolt_checkout('feature');
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged varchar keys reverse'))[2:4];
+SELECT test_fold_root() = :'vk_merged' AS same_merge;
+SELECT k, v FROM rt.vk ORDER BY k;
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- So does a cidr key, whose opfamily registers its comparison for inet
+-- alone: retyped from inet on both sides, it stays keyed.
+CREATE TABLE rt.ik (k inet PRIMARY KEY, v int);
+INSERT INTO rt.ik VALUES ('10.0.0.0/8', 1), ('192.168.0.0/16', 2);
+SELECT dolt_commit('-Am', 'inet key base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('172.16.0.0/12', 9);
+SELECT dolt_commit('-am', 'main: cidr key') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('10.1.0.0/16', 8);
+SELECT dolt_commit('-am', 'feature: cidr key') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged cidr keys'))[2:4];
+SELECT k, v FROM rt.ik ORDER BY k;
+SELECT test_fold_root() AS ik_merged \gset
+SELECT * FROM dolt_status;
+ROLLBACK;
+SELECT dolt_checkout('feature');
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged cidr keys reverse'))[2:4];
+SELECT test_fold_root() = :'ik_merged' AS same_merge;
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
+-- Older roots can contain varchar primary keys stored as keyless rows.
+-- Refuse them before reading or moving their incompatible trees.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '9'),
+  'old varchar key format') AS vk_old \gset
+SELECT count(*) FROM dolt_diff(:'vk_old', :'vk_base', NULL::rt.vk);
+SELECT dolt_reset('--hard', :'vk_old');
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '10'),
+  'table settings format') AS vk_old10 \gset
+SELECT dolt_reset('--hard', :'vk_old10');
+SELECT * FROM dolt_status;
+SELECT k, v FROM rt.vk ORDER BY k;
+
 DROP SCHEMA rt CASCADE;

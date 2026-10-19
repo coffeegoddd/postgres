@@ -46,11 +46,14 @@
 #include "access/nbtree.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "catalog/pg_amproc.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
+#include "parser/parse_coerce.h"
 #include "port/pg_bswap.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
@@ -103,9 +106,42 @@ typedef struct Segment
  * sort with memcmp.  Returns false if the column can't be encoded.
  */
 /*
+ * The opfamily's comparison function for a type binary-coercible to the
+ * one it registers it for, as an opclass's input type may be (varchar's
+ * opclasses take text; cidr's, inet), or InvalidOid: none, or more than
+ * one.
+ */
+static Oid
+coercible_comparison_proc(Oid opfamily, Oid base)
+{
+	CatCList   *procs = SearchSysCacheList1(AMPROCNUM,
+											ObjectIdGetDatum(opfamily));
+	Oid			proc = InvalidOid;
+
+	for (int i = 0; i < procs->n_members; i++)
+	{
+		Form_pg_amproc p = (Form_pg_amproc) GETSTRUCT(&procs->members[i]->tuple);
+
+		if (p->amprocnum != BTORDER_PROC ||
+			p->amproclefttype != p->amprocrighttype ||
+			!IsBinaryCoercible(base, p->amproclefttype))
+			continue;
+		if (OidIsValid(proc))
+		{
+			proc = InvalidOid;
+			break;
+		}
+		proc = p->amproc;
+	}
+	ReleaseSysCacheList(procs);
+	return proc;
+}
+
+/*
  * The opfamily's comparison function for type.  Families for arrays, enums,
  * ranges, multiranges and composites register theirs for the polymorphic
- * type, not for each concrete one.
+ * type, not for each concrete one; others may for a type it is
+ * binary-coercible to.
  */
 static Oid
 comparison_proc(Oid opfamily, Oid base)
@@ -142,7 +178,8 @@ comparison_proc(Oid opfamily, Oid base)
 				break;
 		}
 	return OidIsValid(poly) ?
-		get_opfamily_proc(opfamily, poly, poly, BTORDER_PROC) : InvalidOid;
+		get_opfamily_proc(opfamily, poly, poly, BTORDER_PROC) :
+		coercible_comparison_proc(opfamily, base);
 }
 
 static bool
@@ -516,7 +553,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.info = {
 		.iface = PROLLY_IFACE_KEY_ENCODER,
 		.impl_id = 1,
-		.format_version = 3,		/* 2: jsonb as stored; 3: NaNs canonical */
+		.format_version = 4,		/* 3: NaNs canonical; 4: varchar keys */
 		.name = "ordered",
 		.description = "memcmp-ordered integers, bools and C-collation text; "
 		"other types by canonical bytes and their comparison function",
