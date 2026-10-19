@@ -1567,6 +1567,17 @@ same_bytes(const StringInfoData *a, const StringInfoData *b)
 	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
 }
 
+/*
+ * When write_keys() writes a keyed row anew, as its put-back was refused
+ * in a pass before (never, once, twice).
+ */
+typedef enum KeyRank
+{
+	KEY_IN_ORDER,				/* in key order */
+	KEY_FIRST,					/* before those in key order */
+	KEY_PINNED					/* old left in place, then updated to row */
+} KeyRank;
+
 /* What a merge writes for one key: copies of a row removed, then added. */
 typedef struct KeyWrite
 {
@@ -1575,7 +1586,10 @@ typedef struct KeyWrite
 	const StringInfoData *row;	/* the row inserted, nrow times */
 	int64		nrow;
 	bool		in_place;		/* or old updated to row */
-	bool		pinned;			/* old left in place, then updated to row */
+	KeyRank		rank;
+	/* (in a pass:) */
+	bool		refused;		/* row refused, old in its place */
+	ProllyViolation *violation; /* as recorded */
 } KeyWrite;
 
 /* How write_keys() writes a table's KeyWrites. */
@@ -1678,14 +1692,19 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 	return true;
 }
 
-/* Update w's old row to its new one, in place (refused: left as it was). */
-static void
-update_key(KeyWriter *kw, KeyWrite *w)
+/*
+ * Update w's old row to its new one, in place.  Returns false if that is
+ * refused, the row left as it was: recorded as a violation if record.
+ */
+static bool
+update_key(KeyWriter *kw, KeyWrite *w, bool record)
 {
 	ProllyValue before;
 	ProllyValue after;
 	ProllyValue v;
 	uint64		count;
+	ErrorData  *ed;
+	bool		found;
 
 	v.data = (const uint8 *) w->old->data;
 	v.len = w->old->len;
@@ -1695,8 +1714,46 @@ update_key(KeyWriter *kw, KeyWrite *w)
 	PROLLY_CALL(kw->c->rd.kr, parse_value, kw->c->rd.k, &v, &after, &count);
 	decode_update(kw->c, kw->rel, kw->pk, &before, &after, kw->s1, kw->s2,
 				  kw->kept);
-	if (!merge_write(kw->ar, kw->a, kw->rel, kw->s1, kw->s2, kw->kept, NULL))
+	if (record)
+	{
+		bool		refused;
+
+		if (!merge_write(kw->ar, kw->a, kw->rel, kw->s1, kw->s2, kw->kept,
+						 &refused))
+			row_missing(kw->rel, kw->moving);
+		return !refused;
+	}
+	ed = try_write(kw->rel, kw->ar, kw->a, kw->s1, kw->s2, kw->kept, &found);
+	if (ed)
+	{
+		FreeErrorData(ed);
+		return false;
+	}
+	if (!found)
 		row_missing(kw->rel, kw->moving);
+	return true;
+}
+
+/*
+ * Write a keyed row refused again, its old version (if any) in place:
+ * returns false if it is refused again (nothing recorded).
+ */
+static bool
+retry_key(KeyWriter *kw, KeyWrite *w)
+{
+	ErrorData  *ed;
+
+	Assert(w->nrow == 1);
+	if (w->nold == 1)
+		return update_key(kw, w, false);
+	(void) decode(kw->c, w->row, kw->s2);
+	ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s2, NULL, NULL);
+	if (ed)
+	{
+		FreeErrorData(ed);
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -1704,65 +1761,82 @@ update_key(KeyWriter *kw, KeyWrite *w)
  * row may take a unique value another gives up (theirs swapping two, say).
  * A keyed row refused, recorded as a violation instead, is put back as
  * the branch has it (kw->put_back).  If that is refused too (another row
- * written has taken its unique value), the row is pinned, and false
- * returned: the writes are to be rolled back and made again.  A pinned
- * row is left in place throughout, and updated to its new version last
- * (if that is refused, it stays as it was).
+ * written has taken its unique value), false is returned: the writes are
+ * to be rolled back and made again, the row ranked up.  The first time,
+ * it is written before the rows in key order, ahead of the row that took
+ * its value; the second, it is pinned: left in place throughout, and
+ * updated to its new version last (if that is refused, it stays as it
+ * was).  A pinned row's old values are held throughout, so once it is
+ * updated, the rows refused are tried again (retry_key()) while one is
+ * written, and a violation is left recorded for those still refused
+ * only.
  */
 static bool
 write_keys_once(KeyWriter *kw, List *writes)
 {
 	bool		written = true;
+	bool		pinned = false;
+	bool		progress;
 	ListCell   *lc;
 
 	foreach(lc, writes)
 	{
 		KeyWrite   *w = lfirst(lc);
 
-		if (w->nold == 0 || w->in_place || w->pinned)
+		w->refused = false;
+		w->violation = NULL;
+		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
 			continue;
 		(void) decode(kw->c, w->old, kw->s1);
 		for (int64 i = 0; i < w->nold; i++)
 			if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
 				row_missing(kw->rel, kw->moving);
 	}
-	foreach(lc, writes)
+	for (int first = 1; first >= 0; first--)
 	{
-		KeyWrite   *w = lfirst(lc);
-		bool		refused = false;
-
-		if (w->nrow == 0 || w->pinned)
-			continue;
-		if (w->in_place)
+		foreach(lc, writes)
 		{
-			/* (a violation recorded instead leaves the row as it was) */
-			update_key(kw, w);
-			continue;
-		}
-		(void) decode(kw->c, w->row, kw->s2);
-		for (int64 i = 0; i < w->nrow; i++)
-		{
-			bool		r;
+			KeyWrite   *w = lfirst(lc);
 
-			(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL, &r);
-			refused |= r;
-		}
-
-		/*
-		 * A keyed row theirs changed, whose new version is recorded as a
-		 * violation instead of written: the row stays as it was.
-		 */
-		if (kw->put_back && w->nold == 1 && refused)
-		{
-			ErrorData  *ed;
-
-			(void) decode(kw->c, w->old, kw->s1);
-			ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL, NULL);
-			if (ed)
+			if (w->nrow == 0 || w->rank == KEY_PINNED ||
+				(w->rank == KEY_FIRST) != (first == 1))
+				continue;
+			if (w->in_place)
 			{
-				FreeErrorData(ed);
-				w->pinned = true;
-				written = false;
+				/* (a violation recorded instead leaves the row as it was) */
+				(void) update_key(kw, w, true);
+				continue;
+			}
+			(void) decode(kw->c, w->row, kw->s2);
+			for (int64 i = 0; i < w->nrow; i++)
+			{
+				bool		r;
+
+				(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL,
+								   &r);
+				if (r)
+				{
+					w->refused = true;
+					w->violation = llast(recorded);
+				}
+			}
+
+			/*
+			 * A keyed row theirs changed, whose new version is recorded as
+			 * a violation instead of written: the row stays as it was.
+			 */
+			if (kw->put_back && w->nold == 1 && w->refused)
+			{
+				ErrorData  *ed;
+
+				(void) decode(kw->c, w->old, kw->s1);
+				ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL, NULL);
+				if (ed)
+				{
+					FreeErrorData(ed);
+					w->rank = w->rank == KEY_FIRST ? KEY_PINNED : KEY_FIRST;
+					written = false;
+				}
 			}
 		}
 	}
@@ -1772,18 +1846,41 @@ write_keys_once(KeyWriter *kw, List *writes)
 	{
 		KeyWrite   *w = lfirst(lc);
 
-		if (w->pinned)
-			update_key(kw, w);
+		if (w->rank != KEY_PINNED)
+			continue;
+		pinned = true;
+		if (!update_key(kw, w, true))
+		{
+			w->refused = true;
+			w->violation = llast(recorded);
+		}
 	}
+	do
+	{
+		progress = false;
+		foreach(lc, pinned ? writes : NIL)
+		{
+			KeyWrite   *w = lfirst(lc);
+
+			if (!w->refused || !retry_key(kw, w))
+				continue;
+			recorded = list_delete_ptr(recorded, w->violation);
+			w->refused = false;
+			progress = true;
+		}
+	} while (progress);
 	return true;
 }
 
 /*
  * Write writes as write_keys_once() does; where a row is put back
  * (kw->put_back), in a subtransaction, rolled back with the violations it
- * recorded and made again while a put-back is refused.  Each time pins
- * one more row at least, so it ends, after one more time than there are
- * rows pinned.
+ * recorded and made again while a put-back is refused.  Each time ranks
+ * one row up at least, and a row is ranked up twice at most, so it ends.
+ * (Without a row pinned, a row refused in the last pass is refused in
+ * the table written: no value is given up once rows are written anew.
+ * With one, a row refused is tried again each time another is written,
+ * so it ends too.)
  */
 static void
 write_keys(KeyWriter *kw, List *writes)
