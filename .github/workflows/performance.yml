@@ -18,10 +18,9 @@
 # request): the gate passes without building, as for specs/ alone.  The
 # nightly and a run by hand are unaffected.
 #
-# It leaves the
-# pull-request comment (<!-- s-suite -->) as the s-suite-comment artifact
-# for the workflow_run commenter to post, so code from a pull request never
-# runs with a token that can write.
+# It leaves the pull-request comment (<!-- s-suite -->) as the
+# s-suite-comment artifact for the workflow_run commenter to post, so code
+# from a pull request never runs with a token that can write.
 #
 # Every push to any branch builds and caches its head, so a pull request's
 # base (a stack layer's base is the layer below's head) is usually cached.
