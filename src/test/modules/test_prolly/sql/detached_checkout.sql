@@ -14,6 +14,7 @@ SELECT (dolt_commit('-Am', 'first'))[1] AS c1 \gset
 UPDATE dc.t SET v = 'uno' WHERE id = 1;
 INSERT INTO dc.t VALUES (2, 'two');
 SELECT length(dolt_commit('-am', 'second')::text) AS committed;
+SELECT dolt_remote('add', 'dc_remote', 'file:///tmp/dc_remote');
 
 SELECT (dolt_checkout(:'c1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, read-only)' AS detached;
 SELECT * FROM dc.t ORDER BY id;
@@ -28,6 +29,13 @@ UPDATE dc.t SET v = 'x';
 RESET default_transaction_read_only;
 SELECT dolt_commit('--allow-empty', '-m', 'no');
 CREATE TABLE dc.u (a int);
+
+-- Public commands report their own read-only errors; getters still work.
+SELECT dolt_writer_mode();
+SELECT dolt_writer_mode('owned');
+SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+SELECT dolt_remote('remove', 'dc_remote');
+SELECT dolt_reset('--hard', 'main');
 
 -- A branch made there is writable.
 SELECT (dolt_checkout('-b', 'from_first'))[2];
@@ -97,6 +105,24 @@ ROLLBACK;
 BEGIN READ ONLY;
 SELECT dolt_branch('--unprotect', 'from_first');
 ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_writer_mode();
+SELECT dolt_writer_mode('owned');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_remote('rm', 'dc_remote');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_reset('--hard');
+ROLLBACK;
+-- Failed commands leave the database settings and working changes intact.
+SELECT dolt_writer_mode();
+SELECT name FROM dolt_remotes WHERE name LIKE 'dc_%' ORDER BY name;
+SELECT * FROM dc.t ORDER BY id;
+SELECT dolt_remote('remove', 'dc_remote');
 -- (a transaction on a commit asked to be read-only makes no branch there,
 -- nor moves one)
 SELECT dolt_hashof('from_first') AS ff \gset

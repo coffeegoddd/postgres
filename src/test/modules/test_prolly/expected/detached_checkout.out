@@ -17,6 +17,12 @@ SELECT length(dolt_commit('-am', 'second')::text) AS committed;
         66
 (1 row)
 
+SELECT dolt_remote('add', 'dc_remote', 'file:///tmp/dc_remote');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
 SELECT (dolt_checkout(:'c1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, read-only)' AS detached;
  detached 
 ----------
@@ -55,6 +61,21 @@ SELECT dolt_commit('--allow-empty', '-m', 'no');
 ERROR:  cannot execute moving a chunk store's root in a read-only transaction
 CREATE TABLE dc.u (a int);
 ERROR:  cannot execute CREATE TABLE in a read-only transaction
+-- Public commands report their own read-only errors; getters still work.
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+SELECT dolt_writer_mode('owned');
+ERROR:  cannot execute dolt_writer_mode() in a read-only transaction
+SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+ERROR:  cannot execute dolt_remote() in a read-only transaction
+SELECT dolt_remote('remove', 'dc_remote');
+ERROR:  cannot execute dolt_remote() in a read-only transaction
+SELECT dolt_reset('--hard', 'main');
+ERROR:  cannot execute dolt_reset() in a read-only transaction
 -- A branch made there is writable.
 SELECT (dolt_checkout('-b', 'from_first'))[2];
           dolt_checkout          
@@ -252,6 +273,56 @@ BEGIN READ ONLY;
 SELECT dolt_branch('--unprotect', 'from_first');
 ERROR:  cannot execute dolt_branch() in a read-only transaction
 ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+SELECT dolt_writer_mode('owned');
+ERROR:  cannot execute dolt_writer_mode() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+ERROR:  cannot execute dolt_remote() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_remote('rm', 'dc_remote');
+ERROR:  cannot execute dolt_remote() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_reset('--hard');
+ERROR:  cannot execute dolt_reset() in a read-only transaction
+ROLLBACK;
+-- Failed commands leave the database settings and working changes intact.
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+SELECT name FROM dolt_remotes WHERE name LIKE 'dc_%' ORDER BY name;
+   name    
+-----------
+ dc_remote
+(1 row)
+
+SELECT * FROM dc.t ORDER BY id;
+ id |  v   
+----+------
+  1 | uno
+  2 | two
+  5 | five
+  6 | six
+(4 rows)
+
+SELECT dolt_remote('remove', 'dc_remote');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
 -- (a transaction on a commit asked to be read-only makes no branch there,
 -- nor moves one)
 SELECT dolt_hashof('from_first') AS ff \gset
