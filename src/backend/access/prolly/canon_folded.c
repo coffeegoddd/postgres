@@ -140,6 +140,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
@@ -160,6 +161,7 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "commands/tablespace.h"
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
@@ -176,6 +178,7 @@
 #include "utils/hsearch.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/regproc.h"
@@ -194,7 +197,9 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "6", definitions' expressions (checks,
+ * The format a folded root is in: "7", indexes described without their
+ * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
+ * default one, and was the first with definitions' expressions (checks,
  * defaults, generated expressions, policies) as they print read back
  * (reprinted()); "5" had them as printed, and was the first with a row's
  * long values each out of line in a value tree of its own; "4" had only
@@ -205,7 +210,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"6"
+#define FOLDED_FORMAT	"7"
 
 typedef struct Canon
 {
@@ -1010,7 +1015,11 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	foreach(lc, cons)
 		appendStringInfoString(out, lfirst(lc));
 
-	/* Indexes, by name. */
+	/*
+	 * Indexes, by name, without their tablespaces: tablespaces are the
+	 * cluster's, so a table's isn't described either (and a move keeps an
+	 * index it makes again where it was: index_places()).
+	 */
 	appendStringInfoString(out, "indexes\n");
 	indexes = list_copy(RelationGetIndexList(rel));
 	list_sort(indexes, oid_name_cmp);
@@ -1021,7 +1030,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		/* (a partition's made for its partitioned table's: the table's) */
 		if (get_rel_relispartition(idx))
 			continue;
-		append_field(out, pg_get_indexdef_string(idx));
+		append_field(out, pg_get_indexdef_string_notblspc(idx));
 		appendStringInfoChar(out, '\n');
 	}
 
@@ -5085,6 +5094,114 @@ type_moves(List *from, List *to)
 }
 
 /*
+ * Where the branch's indexes are stored, when not in the default
+ * tablespace.  Placement is the cluster's, not the commit's: the canonical
+ * form describes an index without its tablespace (describe_table()), so an
+ * index a move drops and makes again (its definition changed, its table
+ * made again, a column under it changing type) goes back where it was,
+ * rather than to default_tablespace.  An index the branch didn't have is
+ * made where CREATE INDEX makes it.  The rule is by name, so a partition's
+ * index made again for its redefined partitioned index (named afresh) is
+ * left in the default tablespace.  Placement is kept at best: a user
+ * without CREATE on the tablespace leaves an index made again where it was
+ * made, with a warning, rather than failing the move.
+ */
+typedef struct IndexPlace
+{
+	char	   *schema;
+	char	   *index;
+	Oid			tablespace;
+} IndexPlace;
+
+static List *
+index_places(List *items)
+{
+	List	   *places = NIL;
+	ListCell   *lc;
+
+	foreach(lc, items)
+	{
+		MoveItem   *f = lfirst(lc);
+		char	   *schema;
+		char	   *table;
+		Oid			nsp;
+		Oid			relid;
+		Relation	rel;
+		List	   *indexes;
+		ListCell   *ic;
+
+		if (f->kind != 't')
+			continue;
+		/* (by the catalogs: what the move reads needs no privilege on it) */
+		DeconstructQualifiedName(stringToQualifiedNameList(f->name, NULL),
+								 &schema, &table);
+		nsp = schema ? get_namespace_oid(schema, true) : InvalidOid;
+		relid = OidIsValid(nsp) ? get_relname_relid(table, nsp) : InvalidOid;
+		if (!OidIsValid(relid))
+			continue;
+		rel = relation_open(relid, AccessShareLock);
+		indexes = RelationGetIndexList(rel);
+		relation_close(rel, NoLock);
+		foreach(ic, indexes)
+		{
+			Oid			idx = lfirst_oid(ic);
+			Oid			spc = get_rel_tablespace(idx);
+			IndexPlace *p;
+
+			if (!OidIsValid(spc))
+				continue;
+			p = palloc(sizeof(IndexPlace));
+			p->schema = get_namespace_name(get_rel_namespace(idx));
+			p->index = get_rel_name(idx);
+			p->tablespace = spc;
+			places = lappend(places, p);
+		}
+	}
+	return places;
+}
+
+/* The indexes index_places() found, made again elsewhere, moved back. */
+static void
+restore_index_places(List *places)
+{
+	ListCell   *lc;
+
+	CommandCounterIncrement();
+	foreach(lc, places)
+	{
+		IndexPlace *p = lfirst(lc);
+		Oid			nsp = get_namespace_oid(p->schema, true);
+		Oid			idx = OidIsValid(nsp) ? get_relname_relid(p->index, nsp) : InvalidOid;
+		char	   *spc;
+		char		kind;
+
+		if (!OidIsValid(idx))
+			continue;			/* the move dropped it */
+		kind = get_rel_relkind(idx);
+		if ((kind != RELKIND_INDEX && kind != RELKIND_PARTITIONED_INDEX) ||
+			get_rel_tablespace(idx) == p->tablespace)
+			continue;			/* not made again, or another object */
+		spc = get_tablespace_name(p->tablespace);
+		if (spc == NULL)
+			continue;
+		if (p->tablespace != MyDatabaseTableSpace &&
+			object_aclcheck(TableSpaceRelationId, p->tablespace, GetUserId(),
+							ACL_CREATE) != ACLCHECK_OK)
+		{
+			ereport(WARNING,
+					(errmsg("index \"%s.%s\" made again in the default tablespace, not in \"%s\"",
+							p->schema, p->index, spc),
+					 errdetail("Permission to create in tablespace \"%s\" is needed to move it back.",
+							   spc)));
+			continue;
+		}
+		run_statements(list_make1(psprintf("ALTER INDEX %s SET TABLESPACE %s",
+										   quote_qualified_identifier(p->schema, p->index),
+										   quote_identifier(spc))));
+	}
+}
+
+/*
  * The table name (qualified) emptied, each partition of it with storage, by
  * the applier the move writes rows with: no trigger fires (one enabled
  * ALWAYS neither), no rule applies and no foreign key is checked, and a
@@ -5170,6 +5287,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *collation_drops = NIL;
 	List	   *collation_makes = NIL;
 	List	   *schema_drops = NIL;
+	List	   *places;			/* the branch's indexes' tablespaces */
 	TypeMoves	tm;
 	bool		matviews_change;
 	ListCell   *lc;
@@ -5583,6 +5701,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
+	places = index_places(from);
 	run_statements(policy_drops);
 
 	/*
@@ -5634,6 +5753,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		run_statements(sm.fk_validations);
 	make_views(views);
 	run_statements(policy_makes);
+	restore_index_places(places);
 	if (matviews_made)
 	{
 		MemoryContext spi;
