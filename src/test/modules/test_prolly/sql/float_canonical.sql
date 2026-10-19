@@ -1,9 +1,11 @@
 -- A float NaN has one canonical bit pattern, the positive quiet NaN,
--- whatever bits the value holds: 'NaN' and 'inf' - 'inf' (on most
--- platforms the negative quiet NaN) are the same value to every operator,
--- so they are the same bytes, and the same rows give the same trees.  So
--- in floats' send formats wherever they're encoded: plain values, arrays,
--- composites, ranges and multiranges over floats, and geometric types.
+-- whatever bits the value holds: 'NaN' and -'NaN' (the negative quiet NaN:
+-- negation flips the sign bit alone, on every IEEE platform, where what
+-- 'inf' - 'inf' gives depends on the platform) are the same value to every
+-- operator, so they are the same bytes, and the same rows give the same
+-- trees.  So in floats' send formats wherever they're encoded: plain values,
+-- arrays, composites, ranges and multiranges over floats, and geometric
+-- types.
 -- Signed zeros stay apart: -0 prints as "-0", and is read back so.
 
 SET client_min_messages = warning;
@@ -16,12 +18,12 @@ SELECT encode(float8send(f), 'hex') <> encode(float8send('NaN'), 'hex') AS f8_bi
 	   encode(prolly_canonical_value(f), 'hex') AS f8_canon,
 	   encode(prolly_canonical_value('NaN'::float8), 'hex') AS f8_nan_canon,
 	   prolly_canonical_round_trip(f)::text AS f8_round_trip
-FROM (SELECT 'inf'::float8 - 'inf'::float8 AS f) s;
+FROM (SELECT -'NaN'::float8 AS f) s;
 SELECT encode(float4send(f), 'hex') <> encode(float4send('NaN'), 'hex') AS f4_bits_differ,
 	   encode(prolly_canonical_value(f), 'hex') AS f4_canon,
 	   encode(prolly_canonical_value('NaN'::float4), 'hex') AS f4_nan_canon,
 	   prolly_canonical_round_trip(f)::text AS f4_round_trip
-FROM (SELECT 'inf'::float4 - 'inf'::float4 AS f) s;
+FROM (SELECT -'NaN'::float4 AS f) s;
 
 -- Every other float is its send format, signed zeros and infinities kept.
 SELECT f, prolly_canonical_value(f) = float8send(f) AS f8_as_sent,
@@ -36,8 +38,11 @@ CREATE TYPE fspan AS RANGE (subtype = float8);
 CREATE TYPE f4span AS RANGE (subtype = float4);
 CREATE DOMAIN dfloat AS float8;
 CREATE TYPE dspan AS RANGE (subtype = dfloat);
-\set nan8 '(\'inf\'::float8 - \'inf\'::float8)'
-\set nan4 '(\'inf\'::float4 - \'inf\'::float4)'
+\set nan8 '(-\'NaN\'::float8)'
+\set nan4 '(-\'NaN\'::float4)'
+-- (the NaNs below are of other bits than 'NaN', or they'd test nothing)
+SELECT encode(float8send(:nan8), 'hex') AS nan8_bits,
+	   encode(float4send(:nan4), 'hex') AS nan4_bits;
 SELECT prolly_canonical_value(ARRAY[:nan8, 1]) =
 	   prolly_canonical_value(ARRAY['NaN'::float8, 1]) AS array_same,
 	   prolly_canonical_value(ROW(:nan8, :nan4)::fnan) =
@@ -66,6 +71,10 @@ SELECT prolly_canonical_value(point(:nan8, 1)) =
 	   prolly_canonical_value(path(polygon(box(point('NaN', 1), point(2, 3))))) AS path_same,
 	   prolly_canonical_value(polygon(box(point(:nan8, 1), point(2, 3)))) =
 	   prolly_canonical_value(polygon(box(point('NaN', 1), point(2, 3)))) AS polygon_same;
+-- Ranges with no NaN, or only 'NaN', are as sent.
+SELECT prolly_canonical_value(fspan_multirange(fspan(0, 1), fspan(2, 'NaN'))) =
+	   multirange_send(fspan_multirange(fspan(0, 1), fspan(2, 'NaN'))) AS multirange_as_sent,
+	   prolly_canonical_value(fspan(1, 2)) = range_send(fspan(1, 2)) AS range_as_sent;
 -- ... and they read back as they were.
 SELECT prolly_canonical_round_trip(fspan_multirange(fspan(0, 1), fspan(2, :nan8))) AS multirange,
 	   prolly_canonical_round_trip(polygon(box(point(:nan8, 1), point(2, 3)))) AS polygon,
@@ -90,7 +99,7 @@ SELECT dolt_checkout('fl_other');
 UPDATE fl.t SET f = :nan8, f4 = :nan4, p = point(:nan8, 0), s = fspan(0, :nan8);
 UPDATE fl.k SET f = :nan8;
 UPDATE fl.kl SET f = :nan8;
-SELECT length(dolt_commit('-Am', 'inf - inf')::text) AS committed;
+SELECT length(dolt_commit('-Am', '-NaN')::text) AS committed;
 SELECT prolly_root_hash('main') = prolly_root_hash('fl_other') AS same_root;
 SELECT (dolt_merge('main'))[2:4];
 SELECT * FROM dolt_status;

@@ -83,6 +83,7 @@ struct ProllyDatumCodec
 	SendFloats	floats;
 	int			floats_from;	/* FLOATS_GEOMETRIC: the first float8's offset */
 	Oid			floats_type;	/* FLOATS_*RANGE: float4 or float8 */
+	TypeCacheEntry *floats_range;	/* FLOATS_*RANGE: the range type's */
 	int16		floats_len;		/* FLOATS_GEOMETRIC: typlen */
 
 	/* CODEC_ARRAY */
@@ -269,6 +270,17 @@ canonical_float(Oid type, Datum value, bool *changed)
 	}
 }
 
+/* Whether a range bound is a NaN of other bits than the canonical NaN's */
+static bool
+bound_noncanonical(Oid type, const RangeBound *b)
+{
+	bool		changed = false;
+
+	if (!b->infinite)
+		(void) canonical_float(type, b->val, &changed);
+	return changed;
+}
+
 /* r, or a copy with its bounds' NaNs made canonical */
 static RangeType *
 canonical_range(TypeCacheEntry *typcache, RangeType *r, Oid type)
@@ -339,10 +351,9 @@ send_floats(ProllyDatumCodec *c, Datum value)
 			}
 		case FLOATS_RANGE:
 			{
-				TypeCacheEntry *typcache = lookup_type_cache(c->type,
-															 TYPECACHE_RANGE_INFO);
 				RangeType  *r = DatumGetRangeTypeP(value);
-				RangeType  *canon = canonical_range(typcache, r, c->floats_type);
+				RangeType  *canon = canonical_range(c->floats_range, r,
+													c->floats_type);
 
 				if (canon != r)
 					return RangeTypePGetDatum(canon);
@@ -350,13 +361,28 @@ send_floats(ProllyDatumCodec *c, Datum value)
 			}
 		case FLOATS_MULTIRANGE:
 			{
-				TypeCacheEntry *rngtyp = lookup_type_cache(c->type,
-														   TYPECACHE_MULTIRANGE_INFO)->rngtype;
+				TypeCacheEntry *rngtyp = c->floats_range;
 				MultirangeType *mr = DatumGetMultirangeTypeP(value);
 				int32		n;
 				RangeType **ranges;
 				bool		changed = false;
 
+				/*
+				 * Its bounds read in place first: a NaN of other bits is
+				 * rare, and only then are its ranges copied out and rebuilt.
+				 */
+				for (uint32 i = 0; i < mr->rangeCount && !changed; i++)
+				{
+					RangeBound	lower;
+					RangeBound	upper;
+
+					multirange_get_bounds(rngtyp, mr, i, &lower, &upper);
+					changed = bound_noncanonical(c->floats_type, &lower) ||
+						bound_noncanonical(c->floats_type, &upper);
+				}
+				if (!changed)
+					break;
+				changed = false;
 				multirange_deserialize(rngtyp, mr, &n, &ranges);
 				for (int i = 0; i < n; i++)
 				{
@@ -531,7 +557,11 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		fmgr_info_cxt(recv, &c->recv, mcxt);
 	}
 
-	/* the floats it holds */
+	/*
+	 * the floats it holds: for the geometric types, floats_from is where the
+	 * float8s the type's send function sends begin in the value (it sends
+	 * them all from there on, and before them no floats: a count, a flag)
+	 */
 	switch (base)
 	{
 		case POINTOID:
@@ -548,7 +578,7 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 			break;
 		case POLYGONOID:
 			c->floats = FLOATS_GEOMETRIC;
-			c->floats_from = offsetof(POLYGON, boundbox);
+			c->floats_from = offsetof(POLYGON, p);	/* not boundbox: unsent */
 			break;
 		default:
 			{
@@ -565,7 +595,12 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 					sub = getBaseType(get_range_subtype(get_multirange_range(base)));
 				}
 				if (sub == FLOAT4OID || sub == FLOAT8OID)
+				{
 					c->floats_type = sub;
+					c->floats_range = c->floats == FLOATS_RANGE ?
+						lookup_type_cache(base, TYPECACHE_RANGE_INFO) :
+						lookup_type_cache(base, TYPECACHE_MULTIRANGE_INFO)->rngtype;
+				}
 				else
 					c->floats = FLOATS_NONE;
 			}
