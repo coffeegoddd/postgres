@@ -46,6 +46,26 @@ SELECT dolt_hashof('HEAD') = :'before_merge' AS nothing_merged;
 SELECT r[2:4] FROM dolt_revert('--author', 'Ada <ada@example.com>', 'HEAD') r;
 SELECT committer, email, message FROM dolt_log('main') LIMIT 1;
 
+-- An abort makes no commit: dolt_merge's -m and dolt_revert's --author
+-- are ignored with --abort (as Dolt ignores -m), even empty.
+CREATE TABLE cm.c (id int PRIMARY KEY, v text);
+INSERT INTO cm.c VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cm.c')::text) AS committed;
+SELECT dolt_checkout('cm_f');
+SELECT dolt_merge('main') IS NOT NULL AS merged;
+UPDATE cm.c SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE cm.c SET v = 'ours';
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS before_abort \gset
+BEGIN;
+SELECT (dolt_merge('cm_f'))[2:4] AS conflicted;
+SELECT (dolt_merge('--abort', '-m', ''))[2:4] AS aborted;
+COMMIT;
+SELECT dolt_hashof('HEAD') = :'before_abort' AS back, v FROM cm.c;
+SELECT dolt_revert('--abort', '--author', '');	-- (no revert to abort)
+
 -- (a transaction's commit message isn't empty either)
 SET dolt.transaction_commit_message = '';
 

@@ -1651,7 +1651,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_merge", a);
 	}
-	given_message("dolt_merge", message);
+	/* (an abort makes no commit: its -m is ignored, as Dolt's is) */
 	if (abort_merge)
 	{
 		ProllyMergeState ms;
@@ -1669,6 +1669,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[3] = "merge aborted";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
+	given_message("dolt_merge", message);
 	if (branch == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -2488,7 +2489,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_revert", args[i]);
 	}
-	given_author("dolt_revert", author);
+	/* (an abort makes no commit: its --author is ignored) */
+	if (!abort_revert)
+		given_author("dolt_revert", author);
 	if (abort_revert && continue_revert)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

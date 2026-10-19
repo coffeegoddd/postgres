@@ -128,6 +128,71 @@ SELECT committer, email, message FROM dolt_log('main') LIMIT 1;
  Ada       | ada@example.com | Revert "by bob"
 (1 row)
 
+-- An abort makes no commit: dolt_merge's -m and dolt_revert's --author
+-- are ignored with --abort (as Dolt ignores -m), even empty.
+CREATE TABLE cm.c (id int PRIMARY KEY, v text);
+INSERT INTO cm.c VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'cm.c')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('cm_f');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cm_f'"}
+(1 row)
+
+SELECT dolt_merge('main') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+UPDATE cm.c SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cm.c SET v = 'ours';
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before_abort \gset
+BEGIN;
+SELECT (dolt_merge('cm_f'))[2:4] AS conflicted;
+       conflicted        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT (dolt_merge('--abort', '-m', ''))[2:4] AS aborted;
+        aborted        
+-----------------------
+ {0,0,"merge aborted"}
+(1 row)
+
+COMMIT;
+SELECT dolt_hashof('HEAD') = :'before_abort' AS back, v FROM cm.c;
+ back |  v   
+------+------
+ t    | ours
+(1 row)
+
+SELECT dolt_revert('--abort', '--author', '');	-- (no revert to abort)
+ERROR:  there is no revert in progress
 -- (a transaction's commit message isn't empty either)
 SET dolt.transaction_commit_message = '';
 ERROR:  invalid value for parameter "dolt.transaction_commit_message": ""
@@ -139,7 +204,9 @@ SELECT dolt_branch('-D', 'cm_f');
 (1 row)
 
 DROP SCHEMA cm CASCADE;
-NOTICE:  drop cascades to table cm.t
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table cm.t
+drop cascades to table cm.c
 SELECT length(dolt_commit('-Am', 'cm gone')::text) AS committed;
  committed 
 -----------
