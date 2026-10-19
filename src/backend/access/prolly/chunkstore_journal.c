@@ -816,7 +816,6 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 	uint64		size;
 	uint64		offset = g->scanned;
 	ListCell   *lc;
-	List	   *still_pads = NIL;
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
@@ -824,6 +823,12 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 		return;
 	size = FileSize(g->file);
 
+	/*
+	 * Each PAD seen: forgotten once it reads as a whole ROOT (taken if later
+	 * than the root); kept, to look at again, while it doesn't (still a PAD,
+	 * or a ROOT not all written yet).  (Deleted from the list in place: the
+	 * list stays the segment's, in its memory.)
+	 */
 	foreach(lc, g->pads)
 	{
 		uint64		pad = *(uint64 *) lfirst(lc);
@@ -841,21 +846,20 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 			if (len <= sizeof(buf))
 			{
 				read_exact(g, buf, len, pad);
-				if (record_valid(buf, len) && record_hash(buf, len, &h, &after) &&
-					root_later(s, g->id, pad))
+				if (record_valid(buf, len) && record_hash(buf, len, &h, &after))
 				{
-					s->root = h;
-					s->root_segment = g->id;
-					s->root_offset = pad;
+					if (root_later(s, g->id, pad))
+					{
+						s->root = h;
+						s->root_segment = g->id;
+						s->root_offset = pad;
+					}
+					pfree(lfirst(lc));
+					g->pads = foreach_delete_current(g->pads, lc);
 				}
 			}
-			pfree(lfirst(lc));
 		}
-		else
-			still_pads = lappend(still_pads, lfirst(lc));
 	}
-	list_free(g->pads);
-	g->pads = still_pads;
 
 	while (offset + RECORD_OVERHEAD <= size)
 	{

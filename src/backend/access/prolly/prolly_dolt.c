@@ -66,6 +66,7 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -2485,23 +2486,17 @@ active_branch(PG_FUNCTION_ARGS)
 
 typedef struct LogEntry
 {
+	ProllyHash	key;			/* hash key: info.id as prolly_hash_key() makes it */
 	ProllyCommitInfo info;
-	int64		order;			/* 1 + the most of its parents' */
+	int64		order;			/* 1 + the most of its parents'; -1 while found */
 } LogEntry;
 
 static LogEntry *
-log_find(List *entries, const ProllyHash *id)
+log_find(HTAB *entries, const ProllyHash *id)
 {
-	ListCell   *lc;
+	ProllyHash	k = prolly_hash_key(id);
 
-	foreach(lc, entries)
-	{
-		LogEntry   *e = lfirst(lc);
-
-		if (same_hash(&e->info.id, id))
-			return e;
-	}
-	return NULL;
+	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
 static int
@@ -2517,25 +2512,55 @@ log_cmp(const ListCell *a, const ListCell *b)
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
-/* The order of e: its parents' first (they are all in entries). */
-static int64
-log_order(List *entries, LogEntry *e)
+/*
+ * The order of e, its parents' first (they are all in entries): without
+ * recursion, as history may be as deep as it is long, on stack (empty, and
+ * left so).  A commit found again while its own parents are being ordered
+ * is in a cycle, which history can't hold.
+ */
+static void
+log_order(HTAB *entries, LogEntry *e, List **stack)
 {
-	if (e->order == 0)
+	*stack = lappend(*stack, e);
+	while (*stack != NIL)
 	{
+		LogEntry   *top = llast(*stack);
 		int64		most = 0;
+		bool		ready = true;
 
-		check_stack_depth();
-		for (int i = 0; i < e->info.nparents; i++)
+		if (top->order > 0)
 		{
-			LogEntry   *p = log_find(entries, &e->info.parents[i]);
-
-			if (p)
-				most = Max(most, log_order(entries, p));
+			*stack = list_delete_last(*stack);
+			continue;
 		}
-		e->order = most + 1;
+		top->order = -1;
+		for (int i = 0; i < top->info.nparents; i++)
+		{
+			LogEntry   *p = log_find(entries, &top->info.parents[i]);
+
+			if (p == NULL)
+				continue;
+			if (p->order < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly commit %s is its own ancestor",
+								hash_hex(&p->info.id))));
+			if (p->order == 0)
+			{
+				*stack = lappend(*stack, p);
+				ready = false;
+			}
+			else
+				most = Max(most, p->order);
+		}
+		/* (else it waits, found, for the parents pushed above it) */
+		if (ready)
+		{
+			top->order = most + 1;
+			*stack = list_delete_last(*stack);
+		}
+		CHECK_FOR_INTERRUPTS();
 	}
-	return e->order;
 }
 
 /*
@@ -2551,9 +2576,13 @@ dolt_log(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ProllyHash	start;
+	HTAB	   *seen;
+	HASHCTL		ctl = {0};
 	List	   *entries = NIL;
-	List	   *todo = NIL;
+	List	   *stack = NIL;
 	ListCell   *lc;
+	ProllyHash	key;
+	bool		found;
 
 	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
@@ -2564,27 +2593,43 @@ dolt_log(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	}
-	todo = lappend(todo, copy_hash(&start));
-	while (todo != NIL)
-	{
-		ProllyHash *id = linitial(todo);
-		LogEntry   *e;
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(LogEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("dolt_log commits", 256, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-		todo = list_delete_first(todo);
+	/*
+	 * Every commit from start, each entered once, as it is found: entries is
+	 * the queue too, walked by an index as it grows.
+	 */
+	key = prolly_hash_key(&start);
+	entries = lappend(entries, hash_search(seen, &key, HASH_ENTER, &found));
+	for (int n = 0; n < list_length(entries); n++)
+	{
+		LogEntry   *e = list_nth(entries, n);
+		ProllyHash	id = e->key;
+
 		CHECK_FOR_INTERRUPTS();
-		if (log_find(entries, id))
-			continue;
-		e = palloc0(sizeof(LogEntry));
-		if (!PROLLY_CALL(refs(), commit_get, id, &e->info))
+		memset(&e->info, 0, sizeof(e->info));
+		e->order = 0;
+		if (!PROLLY_CALL(refs(), commit_get, &id, &e->info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit %s is missing", hash_hex(id))));
-		entries = lappend(entries, e);
+					 errmsg("prolly commit %s is missing", hash_hex(&id))));
 		for (int i = 0; i < e->info.nparents; i++)
-			todo = lappend(todo, copy_hash(&e->info.parents[i]));
+		{
+			LogEntry   *p;
+
+			key = prolly_hash_key(&e->info.parents[i]);
+			p = hash_search(seen, &key, HASH_ENTER, &found);
+			if (!found)
+				entries = lappend(entries, p);
+		}
 	}
 	foreach(lc, entries)
-		(void) log_order(entries, lfirst(lc));
+		log_order(seen, lfirst(lc), &stack);
+	list_free(stack);
 	list_sort(entries, log_cmp);
 	foreach(lc, entries)
 	{
