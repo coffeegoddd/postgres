@@ -172,7 +172,12 @@ RESET ROLE;
 -- row refused only for the values it holds isn't (a's 1, c's 1), and two
 -- rows swapping a value can still both be written (b's 1 and 3).  A row
 -- whose put-back is refused again is left in place, then updated (p: no
--- row of theirs fits, as each takes a value the other keeps).
+-- row of theirs fits, as each takes a value the other keeps).  A known
+-- limit (x): rows refused are tried again one at a time, so two that
+-- swap a value (3 and 4 take each other's b) stay refused, though they
+-- would fit together: no row of theirs is written, and four violations
+-- are recorded where two would do.  Each is a real one, and the table
+-- holds no row breaking a constraint.
 CREATE SCHEMA uv VERSIONED;
 CREATE TABLE uv.u (pk int PRIMARY KEY, x int);
 INSERT INTO uv.u VALUES (1, 1), (2, 2);
@@ -190,6 +195,8 @@ CREATE TABLE uv.c (pk int PRIMARY KEY, b int, c int);
 INSERT INTO uv.c VALUES (1, 10, 100), (2, 20, 200), (3, 99, 300);
 CREATE TABLE uv.p (pk int PRIMARY KEY, b int, c int);
 INSERT INTO uv.p VALUES (1, 4, 1), (2, 3, 2), (3, 2, 4);
+CREATE TABLE uv.x (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.x VALUES (1, 2, 3), (2, 4, 0), (3, 3, 1), (4, 0, 2);
 SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
 SELECT dolt_branch('uv_theirs');
 CREATE UNIQUE INDEX u_x ON uv.u (x);
@@ -202,6 +209,8 @@ CREATE UNIQUE INDEX c_b ON uv.c (b);
 CREATE UNIQUE INDEX c_c ON uv.c (c);
 CREATE UNIQUE INDEX p_b ON uv.p (b);
 CREATE UNIQUE INDEX p_c ON uv.p (c);
+CREATE UNIQUE INDEX x_b ON uv.x (b);
+CREATE UNIQUE INDEX x_c ON uv.x (c);
 SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
 SELECT dolt_checkout('uv_theirs');
 UPDATE uv.u SET x = 1 WHERE pk = 2;
@@ -223,6 +232,7 @@ UPDATE uv.c SET c = 301 WHERE pk = 3;
 UPDATE uv.c SET c = 300 WHERE pk = 1;
 UPDATE uv.p SET c = 2 WHERE pk = 1;
 UPDATE uv.p SET b = 4 WHERE pk = 2;
+UPDATE uv.x SET b = (ARRAY[4, 3, 0, 3])[pk];
 SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
 SELECT dolt_checkout('main');
 BEGIN;
@@ -235,9 +245,10 @@ SELECT * FROM uv.a ORDER BY pk;
 SELECT * FROM uv.b ORDER BY pk;
 SELECT * FROM uv.c ORDER BY pk;
 SELECT * FROM uv.p ORDER BY pk;
+SELECT * FROM uv.x ORDER BY pk;
 SELECT split_part(t, '.', 2) AS t, violation_type, violating_row::text
 FROM unnest(ARRAY['uv.u', 'uv.w', 'uv.r', 'uv.s', 'uv.a', 'uv.b', 'uv.c',
-				  'uv.p']) t,
+				  'uv.p', 'uv.x']) t,
 	LATERAL dolt_constraint_violations(t)
 ORDER BY 1, 3;
 ROLLBACK;

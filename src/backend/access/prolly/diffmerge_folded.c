@@ -1855,6 +1855,13 @@ write_keys_once(KeyWriter *kw, List *writes)
 			w->violation = llast(recorded);
 		}
 	}
+
+	/*
+	 * (only a row refused for a unique value another row holds may fit
+	 * now; a check or not-null constraint refuses it still.  Rows refused
+	 * one for the other's value, as two swapping one, aren't tried
+	 * together: both stay refused, though they would fit.)
+	 */
 	do
 	{
 		progress = false;
@@ -1862,7 +1869,8 @@ write_keys_once(KeyWriter *kw, List *writes)
 		{
 			KeyWrite   *w = lfirst(lc);
 
-			if (!w->refused || !retry_key(kw, w))
+			if (!w->refused || strcmp(w->violation->type, "unique index") != 0 ||
+				!retry_key(kw, w))
 				continue;
 			recorded = list_delete_ptr(recorded, w->violation);
 			w->refused = false;
