@@ -1,0 +1,872 @@
+-- What changes how a definition behaves is part of its description, so
+-- part of the hash: a table's inheritance and type (typed tables), when
+-- its triggers and rules fire, a domain's default and collation, a
+-- composite type's attributes' collations, a view's options and a
+-- materialized view's indexes and whether it is populated.  Each is a
+-- change (dolt_status() has it), and a move to a commit makes it (the
+-- branch folds to the commit's root again).
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.p (a int CHECK (a > 0), note text NOT NULL DEFAULT '');
+CREATE TABLE app.c (a int CONSTRAINT p_a_check CHECK (a > 0), note text NOT NULL DEFAULT '',
+                    extra int);
+CREATE TYPE app.ty AS (a int, b text);
+CREATE TABLE app.tt (a int, b text);
+CREATE DOMAIN app.d AS int;
+CREATE DOMAIN app.dc AS text;
+CREATE TYPE app.co AS (a text);
+CREATE VIEW app.v AS SELECT a FROM app.p;
+CREATE VIEW app.w AS SELECT a FROM app.p WHERE a < 10;
+CREATE MATERIALIZED VIEW app.m AS SELECT a FROM app.p;
+CREATE MATERIALIZED VIEW app.m2 AS SELECT a FROM app.p WHERE false WITH NO DATA;
+CREATE FUNCTION app.mark() RETURNS trigger LANGUAGE plpgsql AS
+$$BEGIN NEW.extra := -1; RETURN NEW; END$$;
+CREATE TRIGGER tr BEFORE INSERT ON app.c FOR EACH ROW EXECUTE FUNCTION app.mark();
+CREATE TRIGGER tr2 BEFORE UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION app.mark();
+CREATE RULE r AS ON DELETE TO app.tt DO INSTEAD NOTHING;
+INSERT INTO app.p VALUES (1, 'p');
+INSERT INTO app.c VALUES (2, 'c', 0);
+INSERT INTO app.tt VALUES (1, 'one');
+SELECT (dolt_commit('-Am', 'base'))[1] AS base \gset
+-- Each one changed.
+ALTER TABLE app.c INHERIT app.p;
+ALTER TABLE app.tt OF app.ty;
+ALTER DOMAIN app.d SET DEFAULT 5;
+DROP DOMAIN app.dc;
+CREATE DOMAIN app.dc AS text COLLATE "C";
+ALTER TYPE app.co ALTER ATTRIBUTE a TYPE text COLLATE "C";
+ALTER VIEW app.v SET (security_invoker = on);
+ALTER VIEW app.w SET (check_option = local);
+CREATE UNIQUE INDEX m_a ON app.m (a);
+REFRESH MATERIALIZED VIEW app.m2;		-- populated, still empty
+ALTER TABLE app.c DISABLE TRIGGER tr;
+ALTER TABLE app.c ENABLE REPLICA TRIGGER tr2;
+ALTER TABLE app.tt DISABLE RULE r;
+SELECT * FROM dolt_status() ORDER BY table_name;
+ table_name | staged |  status  
+------------+--------+----------
+ app.c      | t      | modified
+ app.co     | t      | modified
+ app.d      | t      | modified
+ app.dc     | t      | modified
+ app.m      | t      | modified
+ app.m2     | t      | modified
+ app.tt     | t      | modified
+ app.v      | t      | modified
+ app.w      | t      | modified
+(9 rows)
+
+SELECT (dolt_commit('-Am', 'changed'))[1] AS changed \gset
+-- How each one is, as the branch has it.
+CREATE VIEW described AS
+SELECT 'inherits' AS what, string_agg(inhrelid::regclass || ' ' || inhparent::regclass, ', '
+                                      ORDER BY inhrelid::regclass::text, inhseqno) AS how
+  FROM pg_inherits
+UNION ALL SELECT 'typed', string_agg(oid::regclass || ' ' || reloftype::regtype, ', ')
+  FROM pg_class WHERE relnamespace = to_regnamespace('app') AND reloftype <> 0
+UNION ALL SELECT 'firing', string_agg(tgname || ' ' || tgenabled::text, ', ' ORDER BY tgname)
+  FROM pg_trigger WHERE tgrelid = to_regclass('app.c') AND NOT tgisinternal
+UNION ALL SELECT 'rule', string_agg(rulename || ' ' || ev_enabled::text, ', ')
+  FROM pg_rewrite WHERE ev_class = to_regclass('app.tt')
+UNION ALL SELECT 'domains', string_agg(typname || ' ' || coalesce(typdefault, '-') || ' ' ||
+                                       coalesce(typcollation::regcollation::text, '-'), ', ' ORDER BY typname)
+  FROM pg_type WHERE typnamespace = to_regnamespace('app') AND typtype = 'd'
+UNION ALL SELECT 'composite', string_agg(attname || ' ' || attcollation::regcollation, ', ')
+  FROM pg_attribute WHERE attrelid = to_regclass('app.co')
+UNION ALL SELECT 'views', string_agg(relname || ' ' || coalesce(reloptions::text, '-'), ', ' ORDER BY relname)
+  FROM pg_class WHERE relnamespace = to_regnamespace('app') AND relkind = 'v'
+UNION ALL SELECT 'matviews', string_agg(relname || ' ' || relispopulated || ' ' ||
+                                        coalesce((SELECT string_agg(indexrelid::regclass::text, ' ')
+                                                  FROM pg_index WHERE indrelid = c.oid), '-'), ', '
+                                        ORDER BY relname)
+  FROM pg_class c WHERE relnamespace = to_regnamespace('app') AND relkind = 'm';
+-- Back to the commit before: each one is as it was.
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM described;
+   what    |          how          
+-----------+-----------------------
+ inherits  | 
+ typed     | 
+ firing    | tr O, tr2 O
+ rule      | r O
+ domains   | d - -, dc - "default"
+ composite | a "default"
+ views     | v -, w -
+ matviews  | m true -, m2 false -
+(8 rows)
+
+SELECT count(*) FROM app.p;					-- not the child's rows
+ count 
+-------
+     1
+(1 row)
+
+-- And to the commit after: each one is made again.
+SELECT dolt_reset('--hard', :'changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM described;
+   what    |                        how                        
+-----------+---------------------------------------------------
+ inherits  | app.c app.p
+ typed     | app.tt app.ty
+ firing    | tr D, tr2 R
+ rule      | r D
+ domains   | d 5 -, dc - "C"
+ composite | a "C"
+ views     | v {security_invoker=true}, w {check_option=local}
+ matviews  | m true app.m_a, m2 true -
+(8 rows)
+
+SELECT * FROM app.p ORDER BY a;				-- the child's rows too
+ a | note 
+---+------
+ 1 | p
+ 2 | c
+(2 rows)
+
+INSERT INTO app.c VALUES (3, 'c3', 0);		-- the disabled trigger doesn't fire
+SELECT extra FROM app.c WHERE a = 3;
+ extra 
+-------
+     0
+(1 row)
+
+DELETE FROM app.tt;							-- nor the disabled rule
+SELECT count(*) FROM app.tt;
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO app.w VALUES (20);				-- the view's check option
+ERROR:  new row violates check option for view "w"
+DETAIL:  Failing row contains (20, ).
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- The tables inherited from change (columns added to a parent reach its
+-- children), and a type: the links go before, and come back after.
+CREATE TYPE app.mood AS ENUM ('a', 'b');
+ALTER TABLE app.c ADD COLUMN mood app.mood;
+SELECT (dolt_commit('-Am', 'mood'))[1] AS mood \gset
+ALTER TABLE app.p ADD COLUMN added int DEFAULT 3;
+ALTER TYPE app.mood RENAME VALUE 'b' TO 'bee';
+CREATE TABLE app.p2 (z int);
+ALTER TABLE app.c ADD COLUMN z int;
+ALTER TABLE app.c INHERIT app.p2;
+INSERT INTO app.c (a, note, extra, z, mood) VALUES (5, 'five', 1, 9, 'bee');
+SELECT (dolt_commit('-Am', 'grown'))[1] AS grown \gset
+SELECT dolt_reset('--hard', :'mood');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'mood') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT what, how FROM described WHERE what = 'inherits';
+   what   |     how     
+----------+-------------
+ inherits | app.c app.p
+(1 row)
+
+SELECT dolt_reset('--hard', :'grown');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'grown') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT what, how FROM described WHERE what = 'inherits';
+   what   |            how            
+----------+---------------------------
+ inherits | app.c app.p, app.c app.p2
+(1 row)
+
+SELECT * FROM app.p ORDER BY a;
+ a | note | added 
+---+------+-------
+ 1 | p    |     3
+ 2 | c    |     3
+ 5 | five |     3
+(3 rows)
+
+SELECT * FROM app.p2 ORDER BY z;
+ z 
+---
+ 9
+  
+(2 rows)
+
+-- Merged: one side's table inherits from one table fewer, the other's
+-- trigger fires again.
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE app.c NO INHERIT app.p2;
+SELECT dolt_commit('-Am', 'unlinked') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE app.c ENABLE TRIGGER tr;
+SELECT dolt_commit('-Am', 'enabled') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_merge('feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM described WHERE what IN ('inherits', 'firing');
+   what   |     how     
+----------+-------------
+ inherits | app.c app.p
+ firing   | tr O, tr2 R
+(2 rows)
+
+-- A commit of an older format, which described none of these, isn't moved
+-- to (nor merged): a fold of this format wouldn't match its descriptions.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '8'),
+	'format 8') AS old8 \gset
+SELECT dolt_reset('--hard', :'old8');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS old7 \gset
+SELECT dolt_reset('--hard', :'old7');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+-- A move that changes neither a child's nor its parent's columns or
+-- constraints, nor a type they use, leaves their link alone: the child's
+-- inherited columns stay inherited, and the parent's DDL still reaches
+-- them.
+CREATE SCHEMA inh VERSIONED;
+CREATE TABLE inh.p (a int, b int);
+CREATE TABLE inh.c () INHERITS (inh.p);
+CREATE TYPE inh.mood AS ENUM ('x', 'y');
+CREATE TABLE inh.other (m inh.mood);
+SELECT (dolt_commit('-Am', 'linked'))[1] AS linked \gset
+ALTER TYPE inh.mood RENAME VALUE 'y' TO 'why';
+CREATE INDEX p_a ON inh.p (a);
+SELECT dolt_commit('-Am', 'unrelated') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'inh.c'::regclass AND attnum > 0 ORDER BY attnum;
+ attname | attislocal | attinhcount 
+---------+------------+-------------
+ a       | f          |           1
+ b       | f          |           1
+(2 rows)
+
+ALTER TABLE inh.p DROP COLUMN b;
+SELECT attname FROM pg_attribute
+  WHERE attrelid = 'inh.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+ attname 
+---------
+ a
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A child's own column changes with its link in place; a move that does
+-- change what they share (a parent's column's type, a CHECK the parent
+-- gains) links it again, its inherited columns and constraints inherited
+-- only, as they were.
+CREATE VIEW locality AS
+SELECT 'column ' || attname AS what, attislocal AS local, attinhcount AS inherited
+  FROM pg_attribute WHERE attrelid = to_regclass('inh.c') AND attnum > 0 AND NOT attisdropped
+UNION ALL
+SELECT 'constraint ' || conname, conislocal, coninhcount
+  FROM pg_constraint WHERE conrelid = to_regclass('inh.c') AND contype = 'c'
+ORDER BY 1;
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE inh.c ADD COLUMN x int;
+SELECT (dolt_commit('-Am', 'own column'))[1] AS own \gset
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+ column b | f     |         1
+(2 rows)
+
+SELECT dolt_reset('--hard', :'own');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+ column b | f     |         1
+ column x | t     |         0
+(3 rows)
+
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE inh.p ALTER COLUMN a TYPE bigint;
+ALTER TABLE inh.p ADD CONSTRAINT p_b CHECK (b > 0);
+SELECT (dolt_commit('-Am', 'parent changed'))[1] AS parent_changed \gset
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'linked') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+ column b | f     |         1
+(2 rows)
+
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM locality;
+      what      | local | inherited 
+----------------+-------+-----------
+ column a       | f     |         1
+ column b       | f     |         1
+ constraint p_b | f     |         1
+(3 rows)
+
+ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+(1 row)
+
+-- A child the move makes again (its own columns in another order) is
+-- linked again; one the move makes is linked, none of what it inherits its
+-- own, as CREATE TABLE ... () INHERITS makes it.
+SELECT dolt_reset('--hard', :'own');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE inh.c DROP COLUMN x;
+ALTER TABLE inh.c ADD COLUMN y int;
+ALTER TABLE inh.c ADD COLUMN x int;
+INSERT INTO inh.c (a, b, y, x) VALUES (1, 2, 3, 4);
+SELECT (dolt_commit('-Am', 'reordered'))[1] AS reordered \gset
+SELECT dolt_reset('--hard', :'own');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'reordered');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT inhrelid::regclass, inhparent::regclass FROM pg_inherits WHERE inhrelid = to_regclass('inh.c');
+ inhrelid | inhparent 
+----------+-----------
+ inh.c    | inh.p
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'reordered') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM inh.p;
+ a | b 
+---+---
+ 1 | 2
+(1 row)
+
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+ column b | f     |         1
+ column x | t     |         0
+ column y | t     |         0
+(4 rows)
+
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP TABLE inh.c;
+SELECT (dolt_commit('-Am', 'no child'))[1] AS no_child \gset
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM locality;
+      what      | local | inherited 
+----------------+-------+-----------
+ column a       | f     |         1
+ column b       | f     |         1
+ constraint p_b | f     |         1
+(3 rows)
+
+ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+(1 row)
+
+-- Which inherited columns and constraints are a child's own too is
+-- described (its "local" section), and a move makes them so: a child that
+-- declares an inherited column and check itself keeps them through a
+-- parent's DROP COLUMN, as a table made fresh does; a table made again and
+-- linked has what it only inherits inherited only.
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE inh.q2 (a int, b int, CONSTRAINT qa CHECK (a > 0));
+CREATE TABLE inh.p3 (a int, b int);
+CREATE TABLE inh.c3 (y int);
+SELECT (dolt_commit('-Am', 'parents'))[1] AS parents \gset
+CREATE TABLE inh.r (a int, z int, CONSTRAINT qa CHECK (a > 0)) INHERITS (inh.q2);
+NOTICE:  merging column "a" with inherited definition
+NOTICE:  merging constraint "qa" with inherited definition
+INSERT INTO inh.r VALUES (1, 2, 3);
+DROP TABLE inh.c3;
+CREATE TABLE inh.c3 (y int) INHERITS (inh.p3);
+SELECT (dolt_commit('-Am', 'children'))[1] AS children \gset
+CREATE VIEW localities AS
+SELECT c.relname::text AS rel, 'column ' || attname AS what, attislocal AS local, attinhcount AS inherited
+  FROM pg_attribute JOIN pg_class c ON c.oid = attrelid
+  WHERE c.relnamespace = to_regnamespace(current_setting('test.nsp')) AND c.relname IN ('r', 'c3')
+    AND attnum > 0 AND NOT attisdropped
+UNION ALL
+SELECT c.relname::text, 'constraint ' || conname, conislocal, coninhcount
+  FROM pg_constraint JOIN pg_class c ON c.oid = conrelid
+  WHERE c.relnamespace = to_regnamespace(current_setting('test.nsp')) AND c.relname IN ('r', 'c3')
+    AND contype = 'c'
+ORDER BY 1, 2;
+SET test.nsp = 'inh';
+SELECT * INTO TEMP made FROM localities;
+SELECT dolt_reset('--hard', :'parents');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'children');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'children') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM localities;
+ rel |     what      | local | inherited 
+-----+---------------+-------+-----------
+ c3  | column a      | f     |         1
+ c3  | column b      | f     |         1
+ c3  | column y      | t     |         0
+ r   | column a      | t     |         1
+ r   | column b      | f     |         1
+ r   | column z      | t     |         0
+ r   | constraint qa | t     |         1
+(7 rows)
+
+-- (as tables made fresh have them)
+CREATE SCHEMA fresh;
+CREATE TABLE fresh.q2 (a int, b int, CONSTRAINT qa CHECK (a > 0));
+CREATE TABLE fresh.r (a int, z int, CONSTRAINT qa CHECK (a > 0)) INHERITS (fresh.q2);
+NOTICE:  merging column "a" with inherited definition
+NOTICE:  merging constraint "qa" with inherited definition
+CREATE TABLE fresh.p3 (a int, b int);
+CREATE TABLE fresh.c3 (y int) INHERITS (fresh.p3);
+SET test.nsp = 'fresh';
+(SELECT * FROM localities EXCEPT SELECT * FROM made)
+UNION ALL (SELECT * FROM made EXCEPT SELECT * FROM localities);
+ rel | what | local | inherited 
+-----+------+-------+-----------
+(0 rows)
+
+DROP SCHEMA fresh CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table fresh.q2
+drop cascades to table fresh.r
+drop cascades to table fresh.p3
+drop cascades to table fresh.c3
+SET test.nsp = 'inh';
+ALTER TABLE inh.q2 DROP COLUMN a;			-- r keeps its own a
+ALTER TABLE inh.p3 DROP COLUMN b;			-- c3 doesn't keep b
+SELECT * FROM inh.r;
+ a | b | z 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+SELECT * FROM localities;
+ rel |     what      | local | inherited 
+-----+---------------+-------+-----------
+ c3  | column a      | f     |         1
+ c3  | column y      | t     |         0
+ r   | column a      | t     |         0
+ r   | column b      | f     |         1
+ r   | column z      | t     |         0
+ r   | constraint qa | t     |         1
+(6 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (locality alone is a change)
+ALTER TABLE inh.c3 NO INHERIT inh.p3;
+ALTER TABLE inh.c3 INHERIT inh.p3;
+SELECT * FROM dolt_status();
+ table_name | staged |  status  
+------------+--------+----------
+ inh.c3     | t      | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP VIEW localities;
+RESET test.nsp;
+SELECT dolt_reset('--hard', :'linked');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP VIEW locality;
+-- Merged inheritance or a table's type against the other side's columns:
+-- a schema conflict where the merged definitions can't be made.
+CREATE TABLE inh.q (a int);
+CREATE TABLE inh.d (a int);
+CREATE TYPE inh.ty AS (a int, b text);
+CREATE TABLE inh.tt (a int, b text);
+SELECT (dolt_commit('-Am', 'unlinked'))[1] AS unlinked \gset
+SELECT dolt_branch('parent_grows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('table_grows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('both_grow');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE inh.d INHERIT inh.q;
+ALTER TABLE inh.tt OF inh.ty;
+SELECT (dolt_commit('-Am', 'linked'))[1] AS relinked \gset
+SELECT dolt_checkout('parent_grows');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'parent_grows'"}
+(1 row)
+
+ALTER TABLE inh.q ADD COLUMN z int;
+SELECT dolt_commit('-Am', 'z') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('table_grows');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'table_grows'"}
+(1 row)
+
+ALTER TABLE inh.tt ADD COLUMN x int;
+SELECT dolt_commit('-Am', 'x') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('both_grow');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'both_grow'"}
+(1 row)
+
+ALTER TABLE inh.q ADD COLUMN z int;
+ALTER TABLE inh.d ADD COLUMN z int;
+SELECT dolt_commit('-Am', 'z both') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('parent_grows');
+ERROR:  schema conflict: inh.d inherits from inh.q, whose columns the merge doesn't give it
+DETAIL:  One side changed the inheritance, and the other the columns of either table; a table inheriting from another must have each of its columns, of the same type.
+SELECT dolt_merge('table_grows');
+ERROR:  schema conflict: inh.tt is of type inh.ty, whose attributes the merge doesn't give it as its columns
+DETAIL:  One side made the table typed, and the other changed its columns or the type's attributes; a typed table's columns are exactly its type's.
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT test_fold_root() = prolly_root_hash(:'relinked') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- (a child given the parent's new column too merges)
+SELECT (dolt_merge('both_grow'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'inh.d'::regclass AND attnum > 0 ORDER BY attnum;
+ attname | attislocal | attinhcount 
+---------+------------+-------------
+ a       | t          |           1
+ z       | f          |           1
+(2 rows)
+
+SELECT dolt_branch('-D', 'parent_grows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'table_grows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'both_grow');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP VIEW described;
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 12 other objects
+DETAIL:  drop cascades to table app.p
+drop cascades to table app.c
+drop cascades to type app.ty
+drop cascades to table app.tt
+drop cascades to function app.mark()
+drop cascades to type app.co
+drop cascades to type app.d
+drop cascades to type app.dc
+drop cascades to materialized view app.m
+drop cascades to materialized view app.m2
+drop cascades to view app.v
+drop cascades to view app.w
