@@ -171,6 +171,7 @@ tests += {
       't/101_index_tablespaces.pl',
       't/107_commit_dates.pl',
       't/109_bmap_incremental_backup.pl',
+      't/112_bmap_remap_zero_replay.pl',
     ],
   },
 }
