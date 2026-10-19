@@ -956,7 +956,10 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 	foreach(lc, cons)
 		appendStringInfoString(out, lfirst(lc));
 
-	/* Indexes, by name. */
+	/*
+	 * Indexes, by name, without their tablespaces: tablespaces are the
+	 * cluster's, so a table's isn't described either.
+	 */
 	appendStringInfoString(out, "indexes\n");
 	indexes = list_copy(RelationGetIndexList(rel));
 	list_sort(indexes, oid_name_cmp);
@@ -967,7 +970,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		/* (a partition's made for its partitioned table's: the table's) */
 		if (get_rel_relispartition(idx))
 			continue;
-		append_field(out, pg_get_indexdef_string(idx));
+		append_field(out, pg_get_indexdef_string_notblspc(idx));
 		appendStringInfoChar(out, '\n');
 	}
 

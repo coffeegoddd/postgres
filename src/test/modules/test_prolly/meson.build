@@ -112,6 +112,7 @@ tests += {
       'hash_pointers',
       'toast_by_content',
       'toast_folds',
+      'index_tablespaces',
     ],
   },
   'tap': {

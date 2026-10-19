@@ -1233,6 +1233,20 @@ pg_get_indexdef_string(Oid indexrelid)
 								  0, false);
 }
 
+/*
+ * As pg_get_indexdef_string(), but without the tablespace clause: for a
+ * definition that doesn't depend on the cluster it's read in (a prolly
+ * commit's canonical form, where a table's tablespace isn't either).
+ */
+char *
+pg_get_indexdef_string_notblspc(Oid indexrelid)
+{
+	return pg_get_indexdef_worker(indexrelid, 0, NULL,
+								  false, false,
+								  false, true,
+								  0, false);
+}
+
 /* Internal version that just reports the key-column definitions */
 char *
 pg_get_indexdef_columns(Oid indexrelid, bool pretty)
