@@ -58,8 +58,8 @@ FROM pg_stat_prolly;
  nodes_written             |    14
  value_nodes_written       |     0
  chunks_appended           |    14
- chunk_bytes_appended      | 25847
- bytes_hashed              | 44989
+ chunk_bytes_appended      | 25835
+ bytes_hashed              | 44977
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -71,7 +71,7 @@ FROM pg_stat_prolly;
  memo_misses               |     0
  page_copies_fold          |     0
  page_copies_shared        |     0
- journal_bytes_written     | 26533
+ journal_bytes_written     | 26521
  table_file_bytes_written  |     0
  manifest_bytes_written    |     0
  gc_bytes_copied           |     0
