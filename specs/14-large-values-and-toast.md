@@ -618,6 +618,20 @@ measured.
 4. The journal is bounded: past a size, autovacuum seals it and moves its
    chunks into a table file, collecting nothing.
 
+**Decided (user, 2026-10-18, round 3):**
+
+5. Gate 3 passes at 1.5x: saving a value by content may cost up to one
+   and a half times what heap TOAST's does, per value, at each size and
+   writer count measured.
+6. Logical slots on a standby, which the primary's collections can't see,
+   are closed with the WAL scan of #300: the standby feeds its slots'
+   oldest position back to the primary, as hot standby feedback carries
+   its xmin, and a collection keeps what either may still decode. Until
+   then it is an open gap, as #300's other two cases are.
+7. The roots' scan of every page-store block each collection (decision 3)
+   stays as built; scanning only the blocks changed since the last
+   collection is a follow-up, #340.
+
 **The layers**, one stack, each with its tests. Layers 7 to 10 merge
 together: from the save hook on, values are saved by content, and only
 layer 10 lets logical decoding read them and keeps what a slot still has
