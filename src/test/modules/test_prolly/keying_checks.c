@@ -466,3 +466,30 @@ valenc_decodes_earlier_layouts(const ProllyImplInfo *impl)
 {
 	rolled_back(valenc_decodes_earlier_layouts_body, impl);
 }
+
+/*
+ * Run sql with its rows written as the row applier writes them, from a
+ * tree a commit held: not refused for their keys' length.  (A commit with
+ * a key longer than the bound, as one made before it was can hold.)
+ */
+PG_FUNCTION_INFO_V1(test_write_held_rows);
+Datum
+test_write_held_rows(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		held = prolly_writing_held_rows(true);
+
+	PG_TRY();
+	{
+		SPI_connect();
+		if (SPI_execute(sql, false, 0) < 0)
+			elog(ERROR, "could not run: %s", sql);
+		SPI_finish();
+	}
+	PG_FINALLY();
+	{
+		prolly_writing_held_rows(held);
+	}
+	PG_END_TRY();
+	PG_RETURN_VOID();
+}

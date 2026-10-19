@@ -1659,7 +1659,7 @@ heapam_index_build_range_scan(Relation heapRelation,
 					   isnull);
 
 		if (checking_keys && tupleIsAlive)
-			prolly_check_row_key(heapRelation, heapTuple);
+			prolly_check_row_key(heapRelation, NULL, heapTuple);
 
 		/*
 		 * You'd think we should go ahead and build the index tuple here, but

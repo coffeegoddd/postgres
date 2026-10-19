@@ -377,3 +377,8 @@ CREATE FUNCTION test_memo_counters(reset bool DEFAULT false, OUT hits int8,
 	OUT misses int8)
 RETURNS record
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Run a statement with the rows it writes taken as written from a commit:
+-- not refused for their keys' length, as the row applier's aren't.
+CREATE FUNCTION test_write_held_rows(sql text) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -29,6 +29,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_keying.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
@@ -585,13 +586,28 @@ matview_delete(ProllyApplier *a)
 							  a->estate->es_snapshot);
 }
 
+/*
+ * The rows written are from a tree a commit held, so their keys fit one:
+ * they aren't refused for their keys' length (prolly_table.c), whose bound
+ * a tree written before it may exceed a little.
+ */
 static void
 replication_insert(ProllyApplier *a, TupleTableSlot *row)
 {
-	if (a->matview)
-		matview_insert(a, row);
-	else
-		ExecSimpleRelationInsert(a->rri, a->estate, row);
+	bool		held = prolly_writing_held_rows(true);
+
+	PG_TRY();
+	{
+		if (a->matview)
+			matview_insert(a, row);
+		else
+			ExecSimpleRelationInsert(a->rri, a->estate, row);
+	}
+	PG_FINALLY();
+	{
+		prolly_writing_held_rows(held);
+	}
+	PG_END_TRY();
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);
@@ -646,6 +662,7 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 				   const bool *keep)
 {
 	bool		keeping = false;
+	bool		held;
 
 	for (int i = 0; keep && i < RelationGetDescr(a->rel)->natts; i++)
 		keeping |= keep[i];
@@ -661,6 +678,8 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 		ExecClearTuple(a->found);
 		return false;
 	}
+	/* (its key the row found's, which a tree held: see replication_insert) */
+	held = prolly_writing_held_rows(true);
 	PG_TRY();
 	{
 		if (keeping)
@@ -675,10 +694,12 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 	}
 	PG_CATCH();
 	{
+		prolly_writing_held_rows(held);
 		let_go(a);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	prolly_writing_held_rows(held);
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);

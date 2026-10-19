@@ -1602,7 +1602,7 @@ tree_large_keys(const ProllyImplInfo *impl)
 	initStringInfo(&kbuf);
 	initStringInfo(&vbuf);
 	key_lens[0] = 10000;
-	key_lens[1] = PROLLY_CALL(tr, key_max, env.chunk_format);
+	key_lens[1] = PROLLY_CALL(tr, key_max, env.chunk_format, env.hash);
 	if (key_lens[1] < 10000 || key_lens[1] > 40000)
 		elog(ERROR, "key_max() is %d bytes", key_lens[1]);
 

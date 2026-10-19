@@ -250,12 +250,14 @@ typedef struct ProllyTreeRoutine
 							   uint64 *len);
 
 	/*
-	 * The longest key a tree holds in format, whatever its size and shape:
-	 * build_add() and apply() take every key up to it, with any value
-	 * whose references (value_refs()) take less than half a node, and may
-	 * refuse a longer one.
+	 * The longest key a tree holds in format, its nodes referenced by
+	 * hash's hashes, whatever its size and shape: build_add() and apply()
+	 * take every key up to it, with any value whose references
+	 * (value_refs()) take less than half a node, and may refuse a longer
+	 * one.
 	 */
-	Size		(*key_max) (const ProllyChunkFormatRoutine *format);
+	Size		(*key_max) (const ProllyChunkFormatRoutine *format,
+							const ProllyHashRoutine *hash);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \

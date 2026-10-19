@@ -2357,17 +2357,25 @@ cow_references(const ProllyChunkFormatRoutine *format, const void *data,
 
 /*
  * The longest key levelbuf_add() takes at every level: an internal item of
- * it, with the longest child reference (the longest hash, the largest
+ * it, with the longest child reference (a hash of hash's, the largest
  * count), takes at most half a node.  A leaf item of it fits in a node
  * with a value of up to half a node, and a leaf value is the references it
  * holds, then at most VALUE_INLINE_MAX bytes or a value tree's reference.
  */
 static Size
-cow_key_max(const ProllyChunkFormatRoutine *format)
+cow_key_max(const ProllyChunkFormatRoutine *format,
+			const ProllyHashRoutine *hash)
 {
 	Size		half = node_capacity(format) / 2;
 	ProllyKey	key = {NULL, 0};
-	ProllyValue child = {NULL, 1 + PROLLY_HASH_MAX_LEN + 10};
+	ProllyHash	h;
+	ProllyValue child;
+
+	/* (a hash's length is the same for every hash a routine makes) */
+	PROLLY_CALL(hash, finish, PROLLY_CALL(hash, begin, CurrentMemoryContext),
+				&h);
+	child.data = NULL;
+	child.len = 1 + h.len + 10;
 
 	/* (the space an item takes grows with its key, by a byte or more) */
 	key.len = half;

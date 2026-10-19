@@ -2001,14 +2001,16 @@ note_branch_write(Relation relation)
 }
 
 /*
- * ... and each row it writes, refused if its key is longer than a commit
- * holds: never a row that would make the branch's commits fail.
+ * ... and each row it writes (in place of otid, if valid), refused if its
+ * key is longer than a commit holds: never a row that would make the
+ * branch's commits fail.
  */
 static inline void
-check_branch_key(Relation relation, HeapTuple tup)
+check_branch_key(Relation relation, const ItemPointerData *otid,
+				 HeapTuple tup)
 {
 	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
-		prolly_check_row_key(relation, tup);
+		prolly_check_row_key(relation, otid, tup);
 }
 
 /* ... and once made, the tuple versions it made (new) or replaced (old). */
@@ -2051,7 +2053,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		vmbuffer_modified = false;
 
 	note_branch_write(relation);
-	check_branch_key(relation, tup);
+	check_branch_key(relation, NULL, tup);
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -2382,7 +2384,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		HeapTuple	tuple;
 
 		tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
-		check_branch_key(relation, tuple);
+		check_branch_key(relation, NULL, tuple);
 		slots[i]->tts_tableOid = RelationGetRelid(relation);
 		tuple->t_tableOid = slots[i]->tts_tableOid;
 		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
@@ -3366,7 +3368,7 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 				infomask2_new_tuple;
 
 	note_branch_write(relation);
-	check_branch_key(relation, newtup);
+	check_branch_key(relation, otid, newtup);
 
 	Assert(ItemPointerIsValid(otid));
 

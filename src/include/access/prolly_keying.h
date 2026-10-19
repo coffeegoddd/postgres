@@ -149,11 +149,20 @@ extern void prolly_keying_use_env_rows(ProllyKeyingRefs *refs,
 
 /*
  * Refuse a row of prolly table rel whose key is longer than a data tree
- * holds (prolly_table.c): as heap writes it, or builds the table's primary
+ * holds (prolly_table.c): as heap writes it (an update of row version
+ * otid, keeping its key, is never refused), or builds the table's primary
  * key's index over it; and check every row of rel once a primary key is
  * made of an index built before.
  */
-extern void prolly_check_row_key(Relation rel, HeapTuple tuple);
+extern void prolly_check_row_key(Relation rel, const ItemPointerData *otid,
+								 HeapTuple tuple);
 extern void prolly_check_table_keys(Relation rel);
+
+/*
+ * Set whether the rows written now are from a tree a commit held (the row
+ * applier's), returning what it was: those aren't checked, their keys
+ * having fit a tree already.  Restored however the writes end.
+ */
+extern bool prolly_writing_held_rows(bool on);
 
 #endif							/* PROLLY_KEYING_H */
