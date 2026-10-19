@@ -1296,6 +1296,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (a rename, delete, take or protection makes no branch: not in a
+	 * transaction read-only for the branch it started on either, unlike a
+	 * create, forced or not, which a session on a commit makes to change
+	 * anything)
+	 */
+	if (move || delete || take || protection != PROLLY_PROTECT_DEFAULT)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (protection != PROLLY_PROTECT_DEFAULT)
 	{
 		ListCell   *lc;
@@ -1352,13 +1361,6 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch takes one of -d, -c and -m")));
-	/*
-	 * (a rename or delete makes no branch: not in a transaction read-only
-	 * for the branch it started on either, unlike a create, forced or not,
-	 * which a session on a commit makes to change anything)
-	 */
-	if (move || delete)
-		PreventCommandIfReadOnly("dolt_branch()");
 	if (move)
 	{
 		if (list_length(names) != 2)

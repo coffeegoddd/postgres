@@ -122,10 +122,17 @@ SELECT dolt_hashof('also_first') = dolt_hashof('main') AS copied;
  t
 (1 row)
 
--- (but not a delete or a rename, which make no branch from here)
+-- (but not a delete, a rename, a take or a protection, which make no
+-- branch from here)
 SELECT dolt_branch('-d', 'also_first');
 ERROR:  cannot execute dolt_branch() in a read-only transaction
 SELECT dolt_branch('-m', 'also_first', 'renamed_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+SELECT dolt_branch('--take', 'also_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+SELECT dolt_branch('--protect', 'also_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+SELECT dolt_branch('--unprotect', 'also_first');
 ERROR:  cannot execute dolt_branch() in a read-only transaction
 SELECT name FROM dolt_branches WHERE name LIKE '%first' ORDER BY name;
     name    
@@ -217,6 +224,20 @@ INSERT INTO dc.t VALUES (6, 'six');
 ERROR:  cannot execute INSERT in a read-only transaction
 ROLLBACK;
 INSERT INTO dc.t VALUES (6, 'six');
+-- (nor, on a branch, does a transaction asked to be read-only take a
+-- branch or protect one)
+BEGIN READ ONLY;
+SELECT dolt_branch('--take', 'from_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('--protect', 'from_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('--unprotect', 'from_first');
+ERROR:  cannot execute dolt_branch() in a read-only transaction
+ROLLBACK;
 -- (a transaction on a commit asked to be read-only makes no branch there,
 -- nor moves one)
 SELECT dolt_hashof('from_first') AS ff \gset

@@ -44,9 +44,13 @@ SELECT dolt_branch('-f', 'from_first');
 SELECT dolt_hashof('from_first') = :'c1' AS moved_there;
 SELECT dolt_branch('-c', '-f', 'main', 'also_first');
 SELECT dolt_hashof('also_first') = dolt_hashof('main') AS copied;
--- (but not a delete or a rename, which make no branch from here)
+-- (but not a delete, a rename, a take or a protection, which make no
+-- branch from here)
 SELECT dolt_branch('-d', 'also_first');
 SELECT dolt_branch('-m', 'also_first', 'renamed_first');
+SELECT dolt_branch('--take', 'also_first');
+SELECT dolt_branch('--protect', 'also_first');
+SELECT dolt_branch('--unprotect', 'also_first');
 SELECT name FROM dolt_branches WHERE name LIKE '%first' ORDER BY name;
 
 -- A branch checked out ends it, and the hidden branch, which no session
@@ -77,6 +81,17 @@ SELECT (dolt_checkout('main'))[2];
 INSERT INTO dc.t VALUES (6, 'six');
 ROLLBACK;
 INSERT INTO dc.t VALUES (6, 'six');
+-- (nor, on a branch, does a transaction asked to be read-only take a
+-- branch or protect one)
+BEGIN READ ONLY;
+SELECT dolt_branch('--take', 'from_first');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('--protect', 'from_first');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT dolt_branch('--unprotect', 'from_first');
+ROLLBACK;
 -- (a transaction on a commit asked to be read-only makes no branch there,
 -- nor moves one)
 SELECT dolt_hashof('from_first') AS ff \gset
