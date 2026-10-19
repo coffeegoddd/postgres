@@ -228,3 +228,26 @@ stash, …) is F, ported with the feature (#163).
 - **Port:** expected rows and violations follow prolly's: the violation
   lists the row not written, and the table has one row fewer than
   Dolt's (a count of its rows, as `DELETE`'s, is one lower).
+
+## D13. Rows breaking a check or NOT NULL a merge adds
+
+- **Dolt:** when one side adds a check constraint or a NOT NULL, the
+  merge checks the rows it merges against it (each row added or changed
+  on either side); a row breaking it stays in the table, and is recorded
+  as a violation.
+- **Prolly:** the merge checks every row of the merged table against
+  it, and a row breaking it, the branch's own included, is taken out of
+  the table and recorded as a violation; `violating_row` holds the whole
+  row, to put back once fixed. The constraint is validated. (A foreign
+  key the merge adds keeps its breaking rows, as Dolt's does, recorded.)
+- **Why:** a validated check or NOT NULL is Postgres's promise about
+  every row, which the planner uses to prove quals (constraint
+  exclusion, `IS NULL` on a NOT NULL column), so a table can't hold a
+  row breaking one; validated foreign keys are only estimates to it.
+  Left `NOT VALID`, the merged table's definition would be neither
+  side's, and a commit of it would record a constraint theirs didn't
+  have.
+- **Port:** the breaking row is absent from the table and present in
+  `dolt_constraint_violations` (a count of the table's rows is one lower
+  for each); an assertion reading it after resolving reads it back from
+  `violating_row`, or inserts it fixed.

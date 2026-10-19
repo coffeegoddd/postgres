@@ -706,3 +706,131 @@ SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;
         66
 (1 row)
 
+-- A squashed fast-forward over changes to another table keeps them too,
+-- as Dolt's does: theirs' rows and sequence values written, the head left
+-- where it is, nothing committed.
+CREATE SCHEMA dms VERSIONED;
+CREATE TABLE dms.t (id int PRIMARY KEY, v text);
+CREATE TABLE dms.u (id int PRIMARY KEY, v text);
+CREATE SEQUENCE dms.s;
+INSERT INTO dms.t VALUES (1, 'base');
+INSERT INTO dms.u VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dms base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dms_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dms_feature');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'dms_feature'"}
+(1 row)
+
+UPDATE dms.t SET v = 'feature' WHERE id = 1;
+SELECT nextval('dms.s');
+ nextval 
+---------
+       1
+(1 row)
+
+SELECT length(dolt_commit('-am', 'feature changes t')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO dms.u VALUES (2, 'mine');
+SELECT dolt_hashof('HEAD') AS dms_head \gset
+SELECT (dolt_merge('--squash', 'dms_feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'dms_head' AS head_kept;
+ head_kept 
+-----------
+ t
+(1 row)
+
+SELECT id, v FROM dms.t;
+ id |    v    
+----+---------
+  1 | feature
+(1 row)
+
+SELECT id, v FROM dms.u ORDER BY id;
+ id |  v   
+----+------
+  1 | base
+  2 | mine
+(2 rows)
+
+SELECT last_value FROM dms.s;
+ last_value 
+------------
+          1
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dms.s      | modified
+ dms.t      | modified
+ dms.u      | modified
+(3 rows)
+
+-- over changes to a table the merge changes, it is refused
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE dms.t SET v = 'mine' WHERE id = 1;
+SELECT (dolt_merge('--squash', 'dms_feature'))[2:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "dms.t" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT id, v FROM dms.t;
+ id |  v   
+----+------
+  1 | mine
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dms_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dms CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table dms.t
+drop cascades to table dms.u
+drop cascades to sequence dms.s
+SELECT length(dolt_commit('-Am', 'dms gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

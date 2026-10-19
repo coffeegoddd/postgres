@@ -200,3 +200,37 @@ SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'dmf_feature');
 DROP SCHEMA dmf CASCADE;
 SELECT length(dolt_commit('-Am', 'dmf gone')::text) AS committed;
+
+-- A squashed fast-forward over changes to another table keeps them too,
+-- as Dolt's does: theirs' rows and sequence values written, the head left
+-- where it is, nothing committed.
+CREATE SCHEMA dms VERSIONED;
+CREATE TABLE dms.t (id int PRIMARY KEY, v text);
+CREATE TABLE dms.u (id int PRIMARY KEY, v text);
+CREATE SEQUENCE dms.s;
+INSERT INTO dms.t VALUES (1, 'base');
+INSERT INTO dms.u VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dms base')::text) AS committed;
+SELECT dolt_branch('dms_feature');
+SELECT dolt_checkout('dms_feature');
+UPDATE dms.t SET v = 'feature' WHERE id = 1;
+SELECT nextval('dms.s');
+SELECT length(dolt_commit('-am', 'feature changes t')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO dms.u VALUES (2, 'mine');
+SELECT dolt_hashof('HEAD') AS dms_head \gset
+SELECT (dolt_merge('--squash', 'dms_feature'))[2:4];
+SELECT dolt_hashof('HEAD') = :'dms_head' AS head_kept;
+SELECT id, v FROM dms.t;
+SELECT id, v FROM dms.u ORDER BY id;
+SELECT last_value FROM dms.s;
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+-- over changes to a table the merge changes, it is refused
+SELECT dolt_reset('--hard');
+UPDATE dms.t SET v = 'mine' WHERE id = 1;
+SELECT (dolt_merge('--squash', 'dms_feature'))[2:4];
+SELECT id, v FROM dms.t;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dms_feature');
+DROP SCHEMA dms CASCADE;
+SELECT length(dolt_commit('-Am', 'dms gone')::text) AS committed;
