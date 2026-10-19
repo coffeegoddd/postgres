@@ -31,6 +31,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -3005,6 +3006,186 @@ Datum
 dolt_writer_mode_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_writer_mode(fcinfo);
+}
+
+/* The roots dolt_reflog() reads at most, the newest: as many as Dolt's. */
+#define REFLOG_ROOTS	5000
+
+typedef struct ReflogRoot
+{
+	ProllyHash	root;
+	TimestampTz at;
+} ReflogRoot;
+
+typedef struct ReflogRoots
+{
+	ReflogRoot *roots;			/* a ring of the newest REFLOG_ROOTS */
+	int			n;				/* roots seen */
+} ReflogRoots;
+
+static void
+reflog_root(const ProllyHash *root, TimestampTz at, void *arg)
+{
+	ReflogRoots *rr = arg;
+	ReflogRoot *r = &rr->roots[rr->n++ % REFLOG_ROOTS];
+
+	r->root = *root;
+	r->at = at;
+}
+
+/* A ref's last commit, as the roots are read oldest first. */
+typedef struct ReflogRef
+{
+	char	   *ref;
+	ProllyHash	commit;
+} ReflogRef;
+
+typedef struct ReflogScan
+{
+	TimestampTz at;				/* the root's */
+	char	   *target;			/* the ref asked for, or NULL: all */
+	List	   *last;			/* ReflogRef *, a ref's last commit */
+	List	   *rows;			/* ReflogRow *, oldest first */
+} ReflogScan;
+
+typedef struct ReflogRow
+{
+	Datum		values[4];
+	bool		nulls[4];
+} ReflogRow;
+
+static void
+reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
+{
+	ReflogScan *rs = arg;
+	ReflogRef  *last = NULL;
+	ListCell   *lc;
+	ProllyCommitInfo info;
+	ReflogRow  *row;
+
+	/*
+	 * As Dolt does: a branch's name alone stands for the first ref it ends,
+	 * case aside; then only the ref matching it, case aside, is listed.
+	 */
+	if (rs->target != NULL)
+	{
+		size_t		rl = strlen(ref);
+		size_t		tl = strlen(rs->target);
+
+		if (rl > tl && ref[rl - tl - 1] == '/' &&
+			pg_strcasecmp(ref + rl - tl, rs->target) == 0)
+			rs->target = pstrdup(ref);
+		if (pg_strcasecmp(ref, rs->target) != 0)
+			return;
+	}
+	foreach(lc, rs->last)
+	{
+		if (strcmp(((ReflogRef *) lfirst(lc))->ref, ref) == 0)
+		{
+			last = lfirst(lc);
+			break;
+		}
+	}
+	if (last != NULL && same_hash(&last->commit, commit))
+		return;
+	if (last == NULL)
+	{
+		last = palloc(sizeof(ReflogRef));
+		last->ref = pstrdup(ref);
+		rs->last = lappend(rs->last, last);
+	}
+	last->commit = *commit;
+
+	row = palloc0(sizeof(ReflogRow));
+	row->values[0] = CStringGetTextDatum(ref);
+	/* (a time the store didn't record is unknown) */
+	row->values[1] = TimestampTzGetDatum(rs->at);
+	row->nulls[1] = rs->at == 0;
+	row->values[2] = CStringGetTextDatum(hash_hex(commit));
+	memset(&info, 0, sizeof(info));
+	if (PROLLY_CALL(refs(), commit_get, commit, &info))
+		row->values[3] = CStringGetTextDatum(info.message);
+	else
+		row->nulls[3] = true;
+	rs->rows = lappend(rs->rows, row);
+}
+
+/*
+ * dolt_reflog(VARIADIC args text[], OUT ref text,
+ *			   OUT ref_timestamp timestamptz, OUT commit_hash text,
+ *			   OUT commit_message text) returns setof record
+ *
+ * Each change of a ref (a branch's head, a remote-tracking branch's
+ * commit) the chunk store still records, newest first: as Dolt's reflog,
+ * read from the roots the store was moved to, each with its time; a
+ * garbage collection forgets the moves before it.  An argument names one
+ * ref ("main", or "refs/heads/main"); "--all" lists every ref, which they
+ * all are here already.
+ */
+Datum
+dolt_reflog(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		all = false;
+	ReflogRoots rr = {0};
+	ReflogScan	rs = {0};
+	int			first;
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (strcmp(args[i], "--all") == 0)
+		{
+			if (all)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("multiple values provided for \"--all\"")));
+			all = true;
+		}
+		else if (rs.target != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_reflog takes at most one ref"),
+					 errdetail("It was given \"%s\" and \"%s\".",
+							   rs.target, args[i])));
+		else
+			rs.target = args[i];
+	}
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_HAS(cs, roots))
+		return (Datum) 0;
+	rr.roots = palloc(sizeof(ReflogRoot) * REFLOG_ROOTS);
+	PROLLY_CALL(cs, roots, PROLLY_CALL(cs, open, MyDatabaseId,
+									   MyDatabaseTableSpace),
+				reflog_root, &rr);
+	first = Max(rr.n - REFLOG_ROOTS, 0);
+	for (int i = first; i < rr.n; i++)
+	{
+		ReflogRoot *r = &rr.roots[i % REFLOG_ROOTS];
+
+		CHECK_FOR_INTERRUPTS();
+		rs.at = r->at;
+		(void) PROLLY_CALL(refs(), root_refs, &r->root, reflog_ref, &rs);
+	}
+
+	/* newest first */
+	for (int i = list_length(rs.rows) - 1; i >= 0; i--)
+	{
+		ReflogRow  *row = list_nth(rs.rows, i);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, row->values,
+							 row->nulls);
+	}
+	return (Datum) 0;
+}
+
+Datum
+dolt_reflog_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_reflog(fcinfo);
 }
 
 /* dolt_status's rows ("name\tstatus") by name, which may hold a tab. */

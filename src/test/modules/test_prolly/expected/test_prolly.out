@@ -34,7 +34,7 @@ FROM prolly_implementations();
  table_keying  | stub         |       0 |              0
  canonicalizer | folded       |       2 |              3
  canonicalizer | stub         |       0 |              0
- chunk_store   | journal      |       1 |              3
+ chunk_store   | journal      |       1 |              4
  chunk_format  | basic        |       1 |              1
  row_applier   | replication  |       1 |              1
  row_applier   | stub         |       0 |              0
@@ -123,7 +123,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (35 of 35 callbacks missing)
+ refs          | stub           | complete                       | not implemented (36 of 36 callbacks missing)
  transfer      | chunks         | identity                       | pass
  transfer      | chunks         | receive_then_send              | no checks yet
  transfer      | chunks         | complete                       | pass

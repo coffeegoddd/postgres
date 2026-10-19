@@ -1,0 +1,230 @@
+-- dolt_reflog: each change of a ref the chunk store still records, newest
+-- first, read from the roots it was moved to and the time of each move.
+-- Dolt's reflog scripts (DoltReflogTestScripts, but for tags, which prolly
+-- hasn't), in a database of their own; commit ids masked.  A database here
+-- starts with no commits (Dolt's with "Initialize data repository").
+\c postgres
+CREATE DATABASE reflog_db;
+\c reflog_db
+CREATE SCHEMA rl VERSIONED;
+SET search_path = rl;
+CREATE FUNCTION pg_temp.reflog(VARIADIC args text[] DEFAULT '{}')
+RETURNS TABLE (ref text, commit_message text) LANGUAGE sql AS $$
+	SELECT ref, commit_message FROM dolt_reflog(VARIADIC args)
+$$;
+-- Errors.
+SELECT * FROM dolt_reflog('foo', 'bar');
+ERROR:  dolt_reflog takes at most one ref
+DETAIL:  It was given "foo" and "bar".
+SELECT * FROM dolt_reflog('--all', '--all');
+ERROR:  multiple values provided for "--all"
+SELECT * FROM dolt_reflog(NULL::text);
+ERROR:  arguments must not be null
+-- Nothing yet.
+SELECT count(*) FROM dolt_reflog();
+ count 
+-------
+     0
+(1 row)
+
+CREATE TABLE t1 (pk int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'creating table t1')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO t1 VALUES (1);
+SELECT length(dolt_commit('-Am', 'inserting row 1')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'branch1') IS NOT NULL AS checked_out;
+ checked_out 
+-------------
+ t
+(1 row)
+
+INSERT INTO t1 VALUES (2);
+SELECT length(dolt_commit('-Am', 'inserting row 2')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO t1 VALUES (3);
+SELECT length(dolt_commit('-Am', 'inserting row 3')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- Every ref's changes, newest first; a change of something else (a
+-- working set's checkpoint) isn't one.
+SELECT * FROM pg_temp.reflog();
+        ref         |  commit_message   
+--------------------+-------------------
+ refs/heads/branch1 | inserting row 3
+ refs/heads/branch1 | inserting row 2
+ refs/heads/branch1 | inserting row 1
+ refs/heads/main    | inserting row 1
+ refs/heads/main    | creating table t1
+(5 rows)
+
+SELECT * FROM pg_temp.reflog('--all');
+        ref         |  commit_message   
+--------------------+-------------------
+ refs/heads/branch1 | inserting row 3
+ refs/heads/branch1 | inserting row 2
+ refs/heads/branch1 | inserting row 1
+ refs/heads/main    | inserting row 1
+ refs/heads/main    | creating table t1
+(5 rows)
+
+-- Each entry's commit is the commit its ref was at then, and the times
+-- run back.
+SELECT bool_and(r.commit_hash = l.commit_hash) AS commits_match
+FROM (SELECT commit_hash, row_number() OVER () AS n
+	  FROM dolt_reflog('main')) r
+JOIN (SELECT commit_hash, row_number() OVER (ORDER BY commit_order DESC) AS n
+	  FROM dolt_log('main')) l USING (n);
+ commits_match 
+---------------
+ t
+(1 row)
+
+SELECT bool_and(ref_timestamp IS NOT NULL) AS timed,
+	bool_and(ref_timestamp <= now()) AS not_later,
+	bool_and(prev IS NULL OR ref_timestamp <= prev) AS newest_first
+FROM (SELECT ref_timestamp, lag(ref_timestamp) OVER () AS prev
+	  FROM dolt_reflog()) r;
+ timed | not_later | newest_first 
+-------+-----------+--------------
+ t     | t         | t
+(1 row)
+
+-- One ref, by its full name or its name alone, case aside.
+SELECT * FROM pg_temp.reflog('doesNotExist');
+ ref | commit_message 
+-----+----------------
+(0 rows)
+
+SELECT * FROM pg_temp.reflog('refs/heads/main');
+       ref       |  commit_message   
+-----------------+-------------------
+ refs/heads/main | inserting row 1
+ refs/heads/main | creating table t1
+(2 rows)
+
+SELECT * FROM pg_temp.reflog('reFS/Heads/MaIn');
+       ref       |  commit_message   
+-----------------+-------------------
+ refs/heads/main | inserting row 1
+ refs/heads/main | creating table t1
+(2 rows)
+
+SELECT * FROM pg_temp.reflog('main');
+       ref       |  commit_message   
+-----------------+-------------------
+ refs/heads/main | inserting row 1
+ refs/heads/main | creating table t1
+(2 rows)
+
+SELECT * FROM pg_temp.reflog('MaIN');
+       ref       |  commit_message   
+-----------------+-------------------
+ refs/heads/main | inserting row 1
+ refs/heads/main | creating table t1
+(2 rows)
+
+SELECT * FROM pg_temp.reflog('refs/heads/branch1');
+        ref         | commit_message  
+--------------------+-----------------
+ refs/heads/branch1 | inserting row 3
+ refs/heads/branch1 | inserting row 2
+ refs/heads/branch1 | inserting row 1
+(3 rows)
+
+SELECT * FROM pg_temp.reflog('branch1', '--all');
+        ref         | commit_message  
+--------------------+-----------------
+ refs/heads/branch1 | inserting row 3
+ refs/heads/branch1 | inserting row 2
+ refs/heads/branch1 | inserting row 1
+(3 rows)
+
+-- A branch deleted is still in the reflog.
+SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
+ checked_out 
+-------------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'branch1') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.reflog('branch1');
+        ref         | commit_message  
+--------------------+-----------------
+ refs/heads/branch1 | inserting row 3
+ refs/heads/branch1 | inserting row 2
+ refs/heads/branch1 | inserting row 1
+(3 rows)
+
+-- A head moved back is a change too.
+SELECT dolt_reset('--hard', 'HEAD~1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.reflog('main');
+       ref       |  commit_message   
+-----------------+-------------------
+ refs/heads/main | creating table t1
+ refs/heads/main | inserting row 1
+ refs/heads/main | creating table t1
+(3 rows)
+
+-- A garbage collection forgets the moves before it.
+SELECT dolt_gc() IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+\c reflog_db
+SELECT count(*) FROM dolt_reflog();
+ count 
+-------
+     0
+(1 row)
+
+SELECT dolt_checkout('-b', 'after_gc') IS NOT NULL AS checked_out;
+ checked_out 
+-------------
+ t
+(1 row)
+
+INSERT INTO rl.t1 VALUES (4);
+SELECT length(dolt_commit('-Am', 'after the collection')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT ref, commit_message FROM dolt_reflog();
+         ref         |    commit_message    
+---------------------+----------------------
+ refs/heads/after_gc | after the collection
+ refs/heads/main     | creating table t1
+ refs/heads/after_gc | creating table t1
+(3 rows)
+
+\c postgres
+DROP DATABASE reflog_db;

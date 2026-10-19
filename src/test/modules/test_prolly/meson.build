@@ -129,6 +129,7 @@ tests += {
       'enum_history',
       'index_tablespaces',
       'diff_memory',
+      'reflog',
     ],
   },
   'tap': {

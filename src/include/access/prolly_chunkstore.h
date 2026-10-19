@@ -95,6 +95,9 @@
  *   transaction ends: so walks that know what chunks hold can read another
  *   store's (a transfer's) as if it were this one's.  Its hint, if given
  *   (with or without a source), hears what prefetch() is told.
+ * - roots() visits the roots the store was moved to that it still
+ *   records, oldest first, with the time of each move: what a reflog is
+ *   read from.  A collection may forget them.
  * - prefetch() is told the chunks a walk is about to read (a node's
  *   children), so that a read-through source can fetch them at once
  *   (optional): whether a hint heard them, and with none (n 0), whether
@@ -112,6 +115,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "access/xlogreader.h"
+#include "datatype/timestamp.h"
 #include "lib/stringinfo.h"
 
 typedef struct ProllyChunkStore ProllyChunkStore;
@@ -127,6 +131,12 @@ typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
  * false if it has none by that hash.
  */
 typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo out);
+
+/*
+ * Visits a root the store was moved to, and when (0 if not known).
+ */
+typedef void (*ProllyChunkRootVisit) (const ProllyHash *root, TimestampTz at,
+									  void *arg);
 
 /* Hears the chunks a walk is about to read (prefetch()'s). */
 typedef void (*ProllyChunkHint) (void *arg, const ProllyHash *hashes, int n);
@@ -275,6 +285,14 @@ typedef struct ProllyChunkStoreRoutine
 	 */
 	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
 								void *arg);
+
+	/*
+	 * The roots the store was moved to, oldest first, each with when (the
+	 * reflog): those whose moves it still records, which a garbage
+	 * collection may forget (optional).
+	 */
+	void		(*roots) (ProllyChunkStore *store, ProllyChunkRootVisit visit,
+						  void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -284,9 +302,9 @@ typedef struct ProllyChunkStoreRoutine
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept", "gc_retained"
+	"keep", "gc_kept", "gc_retained", "roots"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retained
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK roots
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

@@ -2465,6 +2465,58 @@ visit_prefix(const char *prefix, int prefixlen,
 	PROLLY_CALL(tree, cursor_close, c);
 }
 
+/*
+ * The refs a root of the store named, whenever it was the store's root:
+ * branches' heads and remote-tracking branches' commits.
+ */
+static bool
+copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
+{
+	ProllyNodeRef r;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	StringInfoData ref;
+
+	refs_init();
+	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, root))
+		return false;
+	ref_of(root, &r);
+	initStringInfo(&ref);
+	c = PROLLY_CALL(tree, cursor_open, &env, &r, CurrentMemoryContext);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		const char *name = (const char *) k.data + 1;
+		int			namelen = k.len - 1;
+		ProllyHash	commit;
+
+		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_TRACKING))
+			continue;
+		resetStringInfo(&ref);
+		if (k.data[0] == TAG_BRANCH)
+		{
+			appendStringInfoString(&ref, "refs/heads/");
+			appendBinaryStringInfo(&ref, name, namelen);
+		}
+		else
+		{
+			int			rlen = strnlen(name, namelen);
+
+			appendStringInfoString(&ref, "refs/remotes/");
+			appendBinaryStringInfo(&ref, name, rlen);
+			appendStringInfoChar(&ref, '/');
+			if (rlen < namelen)
+				appendBinaryStringInfo(&ref, name + rlen + 1, namelen - rlen - 1);
+		}
+		(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
+						&commit);
+		visit(ref.data, &commit, arg);
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(ref.data);
+	return true;
+}
+
 static void
 tracking_key(StringInfo key, const char *remote, const char *branch)
 {
@@ -3130,4 +3182,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.open = refs_init,
 	.commit_rows = copies_commit_rows,
 	.branch_rename = copies_branch_rename,
+	.root_refs = copies_root_refs,
 };

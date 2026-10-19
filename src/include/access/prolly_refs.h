@@ -105,6 +105,10 @@ typedef void (*ProllyRemoteVisit) (const char *name, const char *url,
 								   void *arg);
 
 /* Visits a remote-tracking branch: the remote, its branch, the commit. */
+/* Visits a ref a root named: its full name and its commit. */
+typedef void (*ProllyRootRefVisit) (const char *ref, const ProllyHash *commit,
+									void *arg);
+
 typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
 									 const ProllyHash *commit, void *arg);
 
@@ -325,6 +329,16 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*branch_rename) (const char *name, const char *newname,
 								  bool force);
+
+	/*
+	 * The refs a root of the chunk store named (one it was at, which may be
+	 * long past): each branch's head and remote-tracking branch's commit, by
+	 * full name ("refs/heads/main", "refs/remotes/origin/main"), in no
+	 * particular order.  False, visiting nothing, if the store no longer
+	 * has that root's chunks.
+	 */
+	bool		(*root_refs) (const ProllyHash *root, ProllyRootRefVisit visit,
+							  void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -344,9 +358,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
-	"branch_rename"
+	"branch_rename", "root_refs"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branch_rename
+#define PROLLY_REFS_LAST_CALLBACK root_refs
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

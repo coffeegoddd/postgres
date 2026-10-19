@@ -18,7 +18,8 @@
  *				without reads the others and refuses those)
  *		XCHUNK	uint32 xid, then as CHUNK: a chunk of the transaction
  *				xid, which others don't see while it is in progress
- *		ROOT	uint8 hash length, the hash: the store's root from here on
+ *		ROOT	uint8 hash length, the hash, then when the root was moved
+ *				to it (int64, a TimestampTz): the store's root from here on
  *		PAD		room for a ROOT record, which its transaction's commit
  *				writes over it (a PAD left means the transaction aborted);
  *				its payload starts with its transaction's xid
@@ -169,6 +170,7 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 #define JOURNAL_FILE		"prolly_journal"	/* segment 0's */
@@ -179,7 +181,7 @@
 #define MANIFEST_VERSION	4
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
-#define JOURNAL_VERSION		3
+#define JOURNAL_VERSION		4
 #define JOURNAL_HEADER_SIZE	32	/* magic, version, the store's format */
 
 /* the store's format, as a segment's header and the manifest hold it */
@@ -198,6 +200,10 @@
 
 /* len, kind ... crc */
 #define RECORD_OVERHEAD		(sizeof(uint32) + 1 + sizeof(uint32))
+
+/* a ROOT record's (and its PAD's) length, at most */
+#define ROOT_RECORD_MAX		(RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN + \
+							 sizeof(TimestampTz))
 
 /* a backend appends its chunks in batches of about this much */
 #define APPEND_BATCH		(1024 * 1024)
@@ -386,6 +392,7 @@ typedef struct CommitPayload
 	uint64		segment;		/* the PAD's */
 	uint64		offset;			/* of the PAD the ROOT record goes over */
 	ProllyHash	root;
+	TimestampTz at;				/* when: the ROOT record's time */
 } CommitPayload;
 
 /* an index entry: where a chunk's record is */
@@ -475,8 +482,9 @@ struct ProllyChunkStore
 	bool		at_commit;
 	Append		commit_append;
 	/* the ROOT record, made before the commit's critical section */
-	char		root_rec[RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN];
+	char		root_rec[ROOT_RECORD_MAX];
 	uint32		root_rec_len;
+	TimestampTz root_at;		/* the time root_rec records */
 };
 
 /*
@@ -517,6 +525,8 @@ static void check_dropped(ProllyChunkStore *s, const ProllyHash *root);
 static void gc_abort(ProllyChunkGc *gc);
 static void gc_abort_sub(ProllyChunkGc *gc, int level);
 static XLogRecPtr logical_horizon(Oid dboid);
+static uint32 gc_record(Segment *g, uint64 offset, uint64 size, char **rec,
+						Size *reclen);
 
 /* ----------------------------------------------------------------
  * Records
@@ -570,12 +580,14 @@ hash_payload(const ProllyHash *hash, uint8 *buf, Size *len)
  * transaction in its payload's first bytes (the rest zero).
  */
 static void
-root_record(StringInfo buf, const ProllyHash *root, bool pad)
+root_record(StringInfo buf, const ProllyHash *root, TimestampTz at, bool pad)
 {
-	uint8		payload[1 + PROLLY_HASH_MAX_LEN];
+	uint8		payload[1 + PROLLY_HASH_MAX_LEN + sizeof(TimestampTz)];
 	Size		len;
 
 	hash_payload(root, payload, &len);
+	memcpy(payload + len, &at, sizeof(at));
+	len += sizeof(at);
 	if (pad)
 	{
 		TransactionId xid = GetTopTransactionIdIfAny();
@@ -640,6 +652,21 @@ record_hash(const char *rec, uint32 len, ProllyHash *hash, Size *after)
 	TransactionId xid;
 
 	return record_hash_xid(rec, len, hash, after, &xid);
+}
+
+/*
+ * When a ROOT record's move was made, its payload's hash ending at after (0
+ * if the record doesn't say).
+ */
+static TimestampTz
+record_root_time(const char *rec, uint32 len, Size after)
+{
+	TimestampTz at;
+
+	if (after + sizeof(at) + sizeof(uint32) > len)
+		return 0;
+	memcpy(&at, rec + after, sizeof(at));
+	return at;
 }
 
 /*
@@ -1693,7 +1720,7 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 		if (kind == KIND_ROOT)
 		{
 			uint32		len;
-			char		buf[RECORD_OVERHEAD + 1 + PROLLY_HASH_MAX_LEN];
+			char		buf[ROOT_RECORD_MAX];
 			ProllyHash	h;
 			Size		after;
 
@@ -2121,7 +2148,7 @@ reserve_pending(ProllyChunkStore *s, Append *a, int *pad_at)
 			if (*pad_at < 0)
 			{
 				*pad_at = s->pending.len;
-				root_record(&s->pending, &s->new_root, true);
+				root_record(&s->pending, &s->new_root, 0, true);
 			}
 		}
 		if (append_reserve(s, s->pending.data, s->pending.len, &generation, a))
@@ -2155,7 +2182,8 @@ root_padded(ProllyChunkStore *s, Segment *g, uint64 offset)
 	s->pad_offset = offset;
 	INJECTION_POINT("prolly-root-padded", NULL);
 	initStringInfo(&rec);
-	root_record(&rec, &s->new_root, false);
+	s->root_at = GetCurrentTimestamp();
+	root_record(&rec, &s->new_root, s->root_at, false);
 	Assert(rec.len <= sizeof(s->root_rec));
 	memcpy(s->root_rec, rec.data, rec.len);
 	s->root_rec_len = rec.len;
@@ -3564,6 +3592,7 @@ journal_commit_payload(char **data)
 	p->segment = s->pad_segment->id;
 	p->offset = s->pad_offset;
 	p->root = s->new_root;
+	p->at = s->root_at;
 	*data = (char *) p;
 	return sizeof(CommitPayload);
 }
@@ -3642,7 +3671,7 @@ journal_commit_redo(const char *data, Size len)
 		elog(PANIC, "chunk journal commit payload of %zu bytes", len);
 	memcpy(&p, data, sizeof(p));
 	initStringInfo(&rec);
-	root_record(&rec, &p.root, false);
+	root_record(&rec, &p.root, p.at, false);
 	path = segment_path(p.dboid, p.spcoid, p.segment);
 	write_at(path, rec.data, rec.len, p.offset);
 	pfree(path);
@@ -4138,6 +4167,64 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
 	}
 	pfree(counts);
 	pfree(last);
+}
+
+/*
+ * The roots the store was moved to, oldest first: the ROOT records of the
+ * segments named, in their order, up to where this backend has read them
+ * (skipping the ranges whose appends were in flight then).  A collection
+ * retires the segments it collected, and their ROOT records with them.
+ */
+static void
+journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
+{
+	ListCell   *lc;
+	char	   *rec = NULL;
+	Size		reclen = 0;
+
+	scan_journal(s);
+	foreach(lc, s->segments)
+	{
+		Segment    *g = lfirst(lc);
+		uint64		offset = JOURNAL_HEADER_SIZE;
+		uint32		len;
+
+		if (!open_segment(g))
+			continue;
+		while (offset < g->scanned)
+		{
+			ListCell   *hc;
+			bool		skipped = false;
+
+			CHECK_FOR_INTERRUPTS();
+			foreach(hc, g->holes)
+			{
+				Hole	   *hole = lfirst(hc);
+
+				if (hole->offset == offset)
+				{
+					offset += hole->len;
+					skipped = true;
+					break;
+				}
+			}
+			if (skipped)
+				continue;
+			if ((len = gc_record(g, offset, g->scanned, &rec, &reclen)) == 0)
+				break;
+			if ((uint8) rec[sizeof(uint32)] == KIND_ROOT)
+			{
+				ProllyHash	h;
+				Size		after;
+
+				if (record_hash(rec, len, &h, &after))
+					visit(&h, record_root_time(rec, len, after), arg);
+			}
+			offset += len;
+		}
+	}
+	if (rec)
+		pfree(rec);
 }
 
 /* ----------------------------------------------------------------
@@ -5687,4 +5774,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.keep = journal_keep,
 	.gc_kept = journal_gc_kept,
 	.gc_retained = journal_gc_retained,
+	.roots = journal_roots,
 };
