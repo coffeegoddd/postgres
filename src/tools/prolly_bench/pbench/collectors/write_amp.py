@@ -12,6 +12,18 @@ pages are written, and then takes its final readings. Deferred writes
 caused by the window's work therefore fall inside the interval, whichever
 engine defers them.
 
+WAL is split by resource manager (pg_walinspect's pg_get_wal_stats over
+the interval): row records
+(Heap, Heap2), index records, prolly's block map (BlockMap) and chunks
+(ProllyChunks, which hold every chunk byte the chunk store's files then
+hold again), full-page images from any of them, and the rest.  The WAL is
+read before the final checkpoint, which would recycle it; a replication
+slot keeps it from the window's own checkpoints where wal_level allows
+one.  At wal_level = minimal (the counter runs, which have no timed
+checkpoints) there is no slot, and WAL a checkpoint in the window
+recycled fails the read rather than going uncounted.  The WAL's interval
+therefore ends before the final checkpoint's record; the pages' after it.
+
 Logical bytes are the new row versions the SQL wrote:
 (rows inserted + rows updated) x the table's average row size, for every
 workload table, from the same statistics for every engine. Deleted rows
@@ -37,8 +49,9 @@ from typing import Optional
 
 from pbench.collectors._snapshot import wait_for_clients
 from pbench.core import registry
-from pbench.core.interfaces import Collector, Context, Outcome
+from pbench.core.interfaces import Collector, Context, Outcome, Unavailable
 from pbench.core.stats import counter_delta, per
+from pbench.core.validation import atomic_json
 
 # Ratios below this many logical bytes aren't reported: the denominator is
 # noise (a read-only workload's catalog writes, a V operation's commit).
@@ -49,6 +62,16 @@ MIN_LOGICAL_BYTES = 1 << 20
 _IO_SQL = ("SELECT coalesce(sum(write_bytes), 0) + coalesce(sum(extend_bytes), 0), "
            "coalesce(sum(writes), 0), coalesce(sum(extends), 0) "
            "FROM pg_stat_io WHERE object = 'relation'")
+SLOT = "pbench_write_amp"
+
+# WAL record bytes (without full-page images, which are counted apart)
+# by what wrote them; resource managers not named here are "other".
+RMGR_GROUPS = {"Heap": "row", "Heap2": "row",
+               "Btree": "index", "Hash": "index", "Gin": "index", "Gist": "index",
+               "SPGist": "index", "BRIN": "index",
+               "BlockMap": "blockmap", "ProllyChunks": "chunk"}
+WAL_GROUPS = ("row", "index", "blockmap", "chunk", "other")
+
 _PROLLY_SQL = "SELECT string_agg(name || '=' || value, E'\\n') FROM pg_stat_prolly"
 
 
@@ -143,6 +166,36 @@ def _sum(deltas: list[dict[str, float]]) -> dict[str, float]:
     return out
 
 
+def wal_split(rows: list[tuple[str, float, float, float]]) -> dict[str, float]:
+    """wa.wal.* from pg_get_wal_stats rows (rmgr, records, record bytes, FPI bytes)."""
+    out = {f"wa.wal.{g}_bytes": 0.0 for g in WAL_GROUPS}
+    out["wa.wal.fpi_bytes"] = out["wa.wal.records"] = 0.0
+    for rmgr, count, record_bytes, fpi_bytes in rows:
+        out[f"wa.wal.{RMGR_GROUPS.get(rmgr, 'other')}_bytes"] += record_bytes
+        out["wa.wal.fpi_bytes"] += fpi_bytes
+        out["wa.wal.records"] += count
+    return out
+
+
+def _wal_stats(ctx: Context, start: str, end: str) -> list[tuple[str, float, float, float]]:
+    # pg_get_wal_stats quietly stops at the flushed position: the records
+    # since the last checkpoint may not be flushed yet.  A switch flushes
+    # them; its own record is after end.
+    if float(ctx.cluster.scalar(
+            f"SELECT pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '{end}')")) < 0:
+        ctx.cluster.sql("SELECT pg_switch_wal()")
+    out = ctx.cluster.scalar(
+        "SELECT string_agg(concat_ws('|', \"resource_manager/record_type\", count, "
+        f"record_size, fpi_size), E'\\n') "
+        f"FROM pg_get_wal_stats('{start}', '{end}', false) WHERE count > 0")
+    rows = []
+    for line in out.splitlines():
+        if line:
+            rmgr, *nums = line.split("|")
+            rows.append((rmgr, *(float(v) for v in nums)))
+    return rows
+
+
 def _ratio(numerator: Optional[float], logical: float, outcome: Outcome) -> Optional[float]:
     if numerator is None or outcome.read_only or logical < MIN_LOGICAL_BYTES:
         return None
@@ -153,8 +206,14 @@ def _ratio(numerator: Optional[float], logical: float, outcome: Outcome) -> Opti
 class WriteAmpCollector(Collector):
     name = "write_amp"
 
+    def check(self, ctx):
+        r = ctx.cluster.sql("CREATE EXTENSION IF NOT EXISTS pg_walinspect", check=False)
+        if not r.ok:
+            raise Unavailable(f"pg_walinspect: {r.stderr.strip()}")
+
     def before_window(self, ctx):
         self.peers = [_on(ctx, p) for p in getattr(ctx, "peers", [])]
+        self.slot = ctx.cluster.scalar("SHOW wal_level") != "minimal"
         for c in [ctx] + self.peers:
             wait_for_autovacuum(c)
             # Fold what came before (the load, the warm-up) first, so the
@@ -162,6 +221,9 @@ class WriteAmpCollector(Collector):
             # nothing folds the working set between the load and the window.
             if materialize_mode(ctx) == "prolly_checkpoint":
                 c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+            if self.slot:
+                # Before the checkpoint: the slot holds WAL from the redo point on.
+                c.cluster.sql(f"SELECT pg_create_physical_replication_slot('{SLOT}', true)")
             checkpoint(c)
 
     def _snap(self, ctx, tuples: bool = True) -> dict:
@@ -187,7 +249,17 @@ class WriteAmpCollector(Collector):
             self.unmaterialized = self._snap(ctx)
             for c in [ctx] + self.peers:
                 c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
-        for c in [ctx] + self.peers:
+        instances = [ctx] + self.peers
+        # each instance's WAL, read before its final checkpoint
+        self.wal_ends = [c.cluster.scalar("SELECT pg_current_wal_insert_lsn()")
+                         for c in instances]
+        self.wal_end = self.wal_ends[0]
+        self.rmgrs = [row for c, x, end in zip(instances, [self.before] + self.peers_before,
+                                               self.wal_ends)
+                      for row in _wal_stats(c, x["lsn"], end)]
+        for c in instances:
+            if self.slot:
+                c.cluster.sql(f"SELECT pg_drop_replication_slot('{SLOT}')")
             checkpoint(c)
             wait_for_autovacuum(c)
         self.after = self._snap(ctx)
@@ -201,8 +273,8 @@ class WriteAmpCollector(Collector):
     def results(self, ctx, outcome):
         b, a = self.before, self.after
         n = outcome.transactions
-        wal = sum(float(c.cluster.scalar(f"SELECT pg_wal_lsn_diff('{y['lsn']}', '{x['lsn']}')"))
-                  for c, x, y in self._pairs(ctx))
+        wal = sum(float(c.cluster.scalar(f"SELECT pg_wal_lsn_diff('{end}', '{x['lsn']}')"))
+                  for (c, x, _), end in zip(self._pairs(ctx), self.wal_ends))
         io = _sum([counter_delta(x["io"], y["io"]) for _, x, y in self._pairs(ctx)])
 
         rows_written = rows_deleted = logical = 0.0
@@ -216,6 +288,12 @@ class WriteAmpCollector(Collector):
             if written:
                 logical += written * _avg_row_bytes(ctx, t)
 
+        atomic_json(ctx.raw_dir / "write-amp-wal.json", {
+            "start_lsn": b["lsn"], "end_lsn": self.wal_end, "slot": self.slot,
+            "rmgrs": [dict(zip(("resource_manager", "records", "record_bytes", "fpi_bytes"), r))
+                      for r in self.rmgrs]})
+        split = wal_split(self.rmgrs)
+
         m: dict[str, Optional[float]] = {
             "wa.logical_bytes": logical,
             "wa.logical_rows_written": rows_written,
@@ -223,6 +301,10 @@ class WriteAmpCollector(Collector):
             # (the origin, and the workload's other instances)
             "wa.instances": float(1 + len(self.peers)),
             "wa.wal.total_bytes": wal,
+            **split,
+            # Page headers and alignment: in the LSN difference, in no record.
+            "wa.wal.unattributed_bytes": wal - sum(
+                v for k, v in split.items() if k != "wa.wal.records"),
             "wa.pages.write_bytes": io["bytes"],
             "wa.pages.writes": io["writes"],
             "wa.pages.extends": io["extends"],
@@ -235,7 +317,7 @@ class WriteAmpCollector(Collector):
                 late = counter_delta(self.unmaterialized["prolly"], a["prolly"])
                 m["wa.tree.materialize_chunk_payload_bytes"] = late.get("chunk_bytes_appended")
                 m["wa.wal.materialize_bytes"] = float(ctx.cluster.scalar(
-                    f"SELECT pg_wal_lsn_diff('{a['lsn']}', '{self.unmaterialized['lsn']}')"))
+                    f"SELECT pg_wal_lsn_diff('{self.wal_end}', '{self.unmaterialized['lsn']}')"))
         m["wa.server_bytes"] = server
         for name in [k for k, v in m.items() if k.endswith("_bytes") and k != "wa.logical_bytes"]:
             m[f"{name}_per_operation"] = per(m[name], n) if m[name] is not None else None

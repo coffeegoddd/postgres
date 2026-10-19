@@ -171,6 +171,11 @@ def validate(cfg: dict, suite: str) -> None:
                           "holds a session open for its whole window: leave S6 out")
     if run["write_amp_materialize"] not in ("auto", "prolly_checkpoint", "none"):
         raise ConfigError("write_amp_materialize must be auto, prolly_checkpoint or none")
+    pg = cfg.get("postgres", {})
+    if ("write_amp" in run["collectors"] and pg.get("wal_level", "replica") != "minimal"
+            and str(pg.get("max_replication_slots", "10")) == "0"):
+        raise ConfigError("write_amp holds a replication slot over its interval, so the WAL "
+                          "it splits isn't recycled: give it max_replication_slots >= 1")
     if "write_amp" in run["collectors"] and "recovery" in run["collectors"]:
         raise ConfigError("write_amp checkpoints after the window, which leaves the recovery "
                           "collector nothing to replay: run them in separate configs")

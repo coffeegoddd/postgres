@@ -1,6 +1,9 @@
 """The write_amp collector, against a scripted server."""
+import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from pbench.collectors import write_amp
@@ -21,6 +24,10 @@ class FakeServer:
         self.prolly = {"chunk_bytes_appended": 0, "nodes_written": 0}
         self.checkpoints = 0
         self.autovacuum = []        # workers running, read one per query
+        self.flushed = None             # flush LSN, if behind the insert LSN
+        self.rmgrs = []                 # pg_get_wal_stats rows
+        self.slots = set()
+        self.wal_level = "replica"
         self.log = []
         self.on_checkpoint = lambda: None
         self.on_prolly_checkpoint = lambda: None
@@ -32,11 +39,26 @@ class FakeServer:
             self.on_checkpoint()
         elif "prolly_checkpoint()" in sql:
             self.on_prolly_checkpoint()
+        elif "pg_switch_wal" in sql:
+            self.flushed = None
+        elif "pg_create_physical_replication_slot" in sql:
+            self.slots.add(re.search(r"'(\w+)'", sql).group(1))
+        elif "pg_drop_replication_slot" in sql:
+            self.slots.remove(re.search(r"'(\w+)'", sql).group(1))
         return SimpleNamespace(stdout="", ok=True)
 
     def scalar(self, sql, dbname="postgres"):
+        if sql == "SHOW wal_level":
+            return self.wal_level
         if "pg_current_wal_insert_lsn" in sql:
             return f"0/{self.lsn:X}"
+        m = re.search(r"pg_wal_lsn_diff\(pg_current_wal_flush_lsn\(\), '0/([0-9A-F]+)'\)", sql)
+        if m:
+            flushed = self.lsn if self.flushed is None else self.flushed
+            return str(flushed - int(m.group(1), 16))
+        if "pg_get_wal_stats" in sql:
+            assert self.flushed is None, "read WAL past the flushed position"
+            return "\n".join("|".join(str(v) for v in r) for r in self.rmgrs)
         m = re.search(r"pg_wal_lsn_diff\('0/([0-9A-F]+)', '0/([0-9A-F]+)'\)", sql)
         if m:
             return str(int(m.group(1), 16) - int(m.group(2), 16))
@@ -51,6 +73,8 @@ class FakeServer:
         if "pg_stat_get_tuples_inserted" in sql:
             t = re.search(r"to_regclass\('(\w+)'\)", sql).group(1)
             return "|".join(str(v) for v in self.tuples[t])
+        if "CREATE EXTENSION" in sql:
+            return ""
         if "IS NOT NULL" in sql:
             return "t"
         if "avg(pg_column_size" in sql:
@@ -62,7 +86,9 @@ class FakeServer:
 
 
 def context(server, am="heap", suite="S", **params):
+    raw = tempfile.mkdtemp()
     return SimpleNamespace(cluster=server, table_am=am, tables=["t"], dbname="bench",
+                           raw_dir=Path(raw),
                            key=CellKey(suite, "S1", "tiny", "", 1, 1),
                            params={"settled_counters": False, **params})
 
@@ -79,9 +105,12 @@ class WriteAmpTest(unittest.TestCase):
 
     def run_cell(self, server, ctx, work, outcome):
         c = WriteAmpCollector()
+        c.check(ctx)
         self.client_waits.clear()
         self.phase = "before"
         c.before_window(ctx)
+        self.assertEqual(server.slots,
+                         set() if server.wal_level == "minimal" else {"pbench_write_amp"})
         c.start(ctx)
         self.phase = "window"
         work()
@@ -91,7 +120,9 @@ class WriteAmpTest(unittest.TestCase):
         # A workload may hold sessions open as the window opens (S6, the
         # V suite's background S1): only the flush waits for clients.
         self.assertTrue(self.client_waits and set(self.client_waits) == {"after"})
-        return c.results(ctx, outcome)
+        m = c.results(ctx, outcome)
+        self.assertEqual(server.slots, set())
+        return m
 
     def test_heap_counts_the_flush_checkpoint(self):
         s = FakeServer()
@@ -117,6 +148,44 @@ class WriteAmpTest(unittest.TestCase):
         self.assertEqual(m["wa.server_bytes_per_operation"], ((4 << 20) + 8192 * 300) / 1000)
         self.assertNotIn("wa_tree_payload", m)
         self.assertFalse(any("prolly_checkpoint" in q for q in s.log))
+
+    def test_wal_split_by_resource_manager(self):
+        s = FakeServer()
+        ctx = context(s, am="prolly")
+        def work():
+            s.lsn += 10_000
+            s.flushed = s.lsn - 500      # the tail isn't flushed yet
+            s.tuples["t"] = [0, 20_000, 0]
+            s.rmgrs = [("Heap", 40, 3000, 2000), ("Heap2", 2, 100, 0),
+                       ("Btree", 10, 500, 1000), ("BlockMap", 5, 200, 800),
+                       ("ProllyChunks", 3, 1500, 0), ("Transaction", 20, 600, 0),
+                       ("XLOG", 4, 200, 0)]
+        m = self.run_cell(s, ctx, work, Outcome(transactions=10))
+        self.assertEqual(m["wa.wal.row_bytes"], 3100)
+        self.assertEqual(m["wa.wal.index_bytes"], 500)
+        self.assertEqual(m["wa.wal.blockmap_bytes"], 200)
+        self.assertEqual(m["wa.wal.chunk_bytes"], 1500)
+        self.assertEqual(m["wa.wal.other_bytes"], 800)
+        self.assertEqual(m["wa.wal.fpi_bytes"], 3800)
+        self.assertEqual(m["wa.wal.records"], 84)
+        self.assertEqual(m["wa.wal.unattributed_bytes"], 10_000 - 9_900)
+        self.assertEqual(m["wa.wal.fpi_bytes_per_operation"], 380)
+        saved = json.loads((ctx.raw_dir / "write-amp-wal.json").read_text())
+        self.assertEqual(saved["rmgrs"][0], {"resource_manager": "Heap", "records": 40,
+                                             "record_bytes": 3000, "fpi_bytes": 2000})
+
+    def test_wal_read_before_the_final_checkpoint(self):
+        s = FakeServer()
+        s.wal_level = "minimal"
+        def work():
+            s.lsn += 10_000
+            s.tuples["t"] = [0, 20_000, 0]
+            s.rmgrs = [("Heap", 40, 9_900, 0)]
+        # the final checkpoint's record and what follows it aren't the window's
+        s.on_checkpoint = lambda: setattr(s, "lsn", s.lsn + 120)
+        m = self.run_cell(s, context(s), work, Outcome(transactions=10))
+        self.assertEqual(m["wa.wal.total_bytes"], 10_000)
+        self.assertEqual(m["wa.wal.row_bytes"], 9_900)
 
     def test_prolly_materializes_before_the_checkpoint(self):
         s = FakeServer()
@@ -246,6 +315,12 @@ class WriteAmpTest(unittest.TestCase):
         with self.assertRaisesRegex(config.ConfigError, "recovery"):
             config.validate(cfg, "S")
         cfg["run"]["collectors"] = ["wal", "write_amp"]
+        config.validate(cfg, "S")
+        cfg["postgres"] = {"max_replication_slots": "0"}
+        with self.assertRaisesRegex(config.ConfigError, "replication slot"):
+            config.validate(cfg, "S")
+        # (minimal: no slot; the counter runs have no timed checkpoints)
+        cfg["postgres"] = {"wal_level": "minimal", "max_replication_slots": "0"}
         config.validate(cfg, "S")
         cfg["run"]["write_amp_materialize"] = "dolt_commit"
         with self.assertRaisesRegex(config.ConfigError, "write_amp_materialize"):

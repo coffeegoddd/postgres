@@ -39,7 +39,9 @@ def main():
     flags = args.configure[1:] if args.configure[:1] == ["--"] else args.configure
     command = [str(source / "configure"), f"--prefix={install}", *flags]
     with (build / "build.log").open("w") as log:
-        for cmd in (command, ["make", f"-j{args.jobs}"], ["make", "install"]):
+        # pg_walinspect: the write_amp collector splits WAL by resource manager.
+        for cmd in (command, ["make", f"-j{args.jobs}"], ["make", "install"],
+                    ["make", "-C", "contrib/pg_walinspect", "install"]):
             subprocess.run(cmd, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
     if before != sources(build, source):
         raise RuntimeError("source changed during build; refusing to attest this install")
