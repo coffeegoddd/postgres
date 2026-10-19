@@ -173,6 +173,7 @@ tests += {
       't/080_versioned_public.pl',
       't/084_detached_hidden.pl',
       't/101_index_tablespaces.pl',
+      't/103_gc_root_commit.pl',
       't/104_gc_prepared.pl',
       't/106_branch_delete_prepared.pl',
       't/107_commit_dates.pl',
