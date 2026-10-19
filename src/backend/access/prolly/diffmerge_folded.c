@@ -58,6 +58,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
@@ -125,6 +126,7 @@ static bool same_description(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
+static List *matviews_in_root(const ProllyNodeRef *root);
 static List *foreign_key_violations(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
 						   List **found);
@@ -1984,6 +1986,26 @@ lookup_sequence(HTAB *h, const char *name)
 }
 
 /*
+ * Write every materialized view's rows that differ from target's, from's
+ * as the branch has them: those both have.
+ */
+static void
+apply_matview_rows(const ProllyNodeRef *from, const ProllyNodeRef *target)
+{
+	List	   *fs = matviews_in_root(from);
+	ListCell   *lc;
+
+	foreach(lc, matviews_in_root(target))
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *f = find_table(fs, t->name);
+
+		if (f != NULL && !same_hash(&f->data.hash, &t->data.hash))
+			apply_rows(table_named(t->name), f, t);
+	}
+}
+
+/*
  * Write every table's rows that differ from target's, the branch's as
  * working has them.
  */
@@ -2012,17 +2034,7 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 	 * Materialized views' rows too, as the commit holds them: those there
 	 * are (one being made again is written once it is).
 	 */
-	from.tables = to.tables = NIL;
-	PROLLY_CALL(dc.canonicalizer, materialized_views, working, add_table, &from);
-	PROLLY_CALL(dc.canonicalizer, materialized_views, target, add_table, &to);
-	foreach(lc, to.tables)
-	{
-		Table	   *t = lfirst(lc);
-		Table	   *f = find_table(from.tables, t->name);
-
-		if (f != NULL && !same_hash(&f->data.hash, &t->data.hash))
-			apply_rows(table_named(t->name), f, t);
-	}
+	apply_matview_rows(working, target);
 
 	/* and every sequence's value */
 	{
@@ -3463,6 +3475,8 @@ typedef struct MergeRows
 	int			conflicts;
 	List	   *now;			/* the tables as the branch has them, if
 								 * known (NIL: folded when needed) */
+	const ProllyNodeRef *roots; /* base, ours, theirs */
+	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
 } MergeRows;
 
 
@@ -3512,6 +3526,211 @@ row_conflicts(MergeRows *mr, Oid relid, int n)
 		mr->conflicts += n;
 		*mr->conflicted = lappend_oid(*mr->conflicted, relid);
 	}
+}
+
+static List *
+matviews_in_root(const ProllyNodeRef *root)
+{
+	Tables		ts = {NIL};
+
+	PROLLY_CALL(components().canonicalizer, materialized_views, root,
+				add_table, &ts);
+	return ts.tables;
+}
+
+/*
+ * What view's query reads, transitively: the relations (through views'
+ * rules), functions (through BEGIN ATOMIC bodies) and operators (through
+ * their functions) it depends on, as (class, object); then "where", over
+ * that, says whether to count it.
+ */
+static bool
+view_reaches(Oid view, const char *where, Oid arg)
+{
+	Datum		args[2] = {ObjectIdGetDatum(view), ObjectIdGetDatum(arg)};
+	Oid			types[2] = {OIDOID, OIDOID};
+
+	if (SPI_execute_with_args(psprintf("WITH RECURSIVE r(cls, obj) AS ("
+									   "SELECT 'pg_class'::regclass::oid, $1"
+									   " UNION SELECT e.cls, e.obj FROM r"
+									   " LEFT JOIN pg_rewrite w"
+									   " ON r.cls = 'pg_class'::regclass AND w.ev_class = r.obj"
+									   " LEFT JOIN pg_operator o"
+									   " ON r.cls = 'pg_operator'::regclass AND o.oid = r.obj"
+									   " CROSS JOIN LATERAL ("
+									   "SELECT d.refclassid, d.refobjid FROM pg_depend d"
+									   " WHERE (d.classid = 'pg_rewrite'::regclass AND d.objid = w.oid)"
+									   " OR (r.cls = 'pg_proc'::regclass"
+									   " AND d.classid = 'pg_proc'::regclass AND d.objid = r.obj)"
+									   " UNION ALL SELECT 'pg_proc'::regclass, o.oprcode"
+									   " WHERE o.oid IS NOT NULL) e(cls, obj)"
+									   " WHERE e.cls IN ('pg_class'::regclass, 'pg_proc'::regclass,"
+									   " 'pg_operator'::regclass)"
+									   " AND NOT (e.cls = r.cls AND e.obj = r.obj))"
+									   " SELECT 1 FROM r WHERE %s", where),
+							  2, types, args, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read materialized view dependencies");
+	return SPI_processed > 0;
+}
+
+/* Whether view's query reads rel. */
+static bool
+view_reads(Oid view, Oid rel)
+{
+	return view_reaches(view, "cls = 'pg_class'::regclass AND obj = $2", rel);
+}
+
+/*
+ * Whether view's query calls a function (not a built-in one) whose body
+ * is a string, or C, which records nothing of what it reads.
+ */
+static bool
+view_reads_opaquely(Oid view)
+{
+	return view_reaches(view,
+						psprintf("cls = 'pg_proc'::regclass AND obj >= %u AND EXISTS"
+								 " (SELECT 1 FROM pg_proc p"
+								 " WHERE p.oid = obj AND p.prosqlbody IS NULL)",
+								 FirstNormalObjectId),
+						InvalidOid);
+}
+
+static void
+refresh_matview(Oid view)
+{
+	char	   *name = table_name(view);
+
+	if (SPI_execute(psprintf("REFRESH MATERIALIZED VIEW %s", name),
+					false, 0) != SPI_OK_UTILITY)
+		elog(ERROR, "could not refresh materialized view %s", name);
+}
+
+/*
+ * Each materialized view's rows, the tables' merged: a REFRESH changes
+ * them, as a write does a table's, so they're those of the side that
+ * refreshed it since base (ours if neither); of the side whose query the
+ * merged one is, if only one's is; refreshed again, from the merged rows,
+ * if both refreshed it (or made it) to other rows, as neither side's are
+ * the rows its query reads now.  One the merge makes again (made with the
+ * rows as they are) is given them too.  The refreshes come last, each
+ * after those of the views it reads (through views and functions), so
+ * that it reads their merged rows.
+ */
+static void
+merge_matviews(MergeRows *mr)
+{
+	List	   *base = matviews_in_root(&mr->roots[0]);
+	List	   *ours = matviews_in_root(&mr->roots[1]);
+	List	   *theirs = matviews_in_root(&mr->roots[2]);
+	List	   *now;
+	List	   *refresh = NIL;
+	ListCell   *lc;
+
+	if (mr->now_root)
+		now = matviews_in_root(mr->now_root);
+	else
+	{
+		ProllyNodeRef working;
+
+		(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
+		now = matviews_in_root(&working);
+	}
+	foreach(lc, now)
+	{
+		Table	   *w = lfirst(lc);
+		Table	   *b = find_table(base, w->name);
+		Table	   *o = find_table(ours, w->name);
+		Table	   *t = find_table(theirs, w->name);
+		const Table *want;
+
+		/* (only rows of the query it has now fit it) */
+		if (b && !same_description(b, w))
+			b = NULL;
+		if (o && !same_description(o, w))
+			o = NULL;
+		if (t && !same_description(t, w))
+			t = NULL;
+		if (o == NULL || t == NULL)
+			want = o ? o : t;
+		else if (same_hash(&o->data.hash, &t->data.hash) ||
+				 (b && same_hash(&t->data.hash, &b->data.hash)))
+			want = o;
+		else if (b && same_hash(&o->data.hash, &b->data.hash))
+			want = t;
+		else
+		{
+			refresh = lappend_oid(refresh, table_named(w->name));
+			continue;
+		}
+		if (want && !same_hash(&w->data.hash, &want->data.hash))
+			apply_rows(table_named(w->name), w, want);
+	}
+	if (refresh == NIL)
+		return;
+
+	/*
+	 * (as the session would, its owner's query reading the merged rows)
+	 * Each after the views it reads.  One calling a function that records
+	 * nothing of what it reads (opaque) may read any of them: so after a
+	 * pass over all of them, the opaque ones and those reading them are
+	 * refreshed again, once per opaque one, each pass leaving one more of
+	 * any chain through them right.
+	 */
+	SPI_connect();
+	{
+		List	   *order = NIL;
+		List	   *opaque = NIL;
+		List	   *again = NIL;
+
+		foreach(lc, refresh)
+			if (view_reads_opaquely(lfirst_oid(lc)))
+				opaque = lappend_oid(opaque, lfirst_oid(lc));
+		while (refresh != NIL)
+		{
+			Oid			next = InvalidOid;
+
+			/* one reading none of those still to order (they read no cycle) */
+			foreach(lc, refresh)
+			{
+				Oid			v = lfirst_oid(lc);
+				ListCell   *lc2;
+
+				next = v;
+				foreach(lc2, refresh)
+					if (lfirst_oid(lc2) != v && view_reads(v, lfirst_oid(lc2)))
+					{
+						next = InvalidOid;
+						break;
+					}
+				if (OidIsValid(next))
+					break;
+			}
+			if (!OidIsValid(next))
+				elog(ERROR, "materialized views read each other");
+			order = lappend_oid(order, next);
+			refresh = list_delete_oid(refresh, next);
+		}
+		foreach(lc, order)
+		{
+			Oid			v = lfirst_oid(lc);
+			ListCell   *lc2;
+
+			refresh_matview(v);
+			if (list_member_oid(opaque, v))
+				again = lappend_oid(again, v);
+			else
+				foreach(lc2, opaque)
+					if (view_reads(v, lfirst_oid(lc2)))
+					{
+						again = lappend_oid(again, v);
+						break;
+					}
+		}
+		for (int i = 0; i < list_length(opaque); i++)
+			foreach(lc, again)
+				refresh_matview(lfirst_oid(lc));
+	}
+	SPI_finish();
 }
 
 /*
@@ -3650,6 +3869,7 @@ merge_rows(void *arg)
 		if (!same_hash(&w->data.hash, &want->data.hash))
 			apply_rows(relid, w, want);
 	}
+	merge_matviews(mr);
 }
 
 /*
@@ -3820,7 +4040,7 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0, NIL};
+		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
@@ -3833,7 +4053,8 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 	{
 		/* (the branch has ours' rows, every table defined alike) */
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0, ours_tables};
+		fail_on_conflict, what, name, conflicted, 0, ours_tables, roots,
+		&roots[1]};
 
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		merge_rows(&mr);
@@ -5025,10 +5246,13 @@ list_has_name(List *list, const char *name)
  * the uncommitted rows back as ours has them), or the uncommitted changes
  * are of something other than tables and sequences.  Tables the working
  * set made or redefined, a merge changing no definitions leaves alone.
+ * views (NULL for one merge) is for a series checked before it merges:
+ * ours' materialized views as the merges before this one leave them (NIL:
+ * ours'), set to those this one leaves.
  */
 static void
 check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
-			const ProllyNodeRef *theirs, const char *what)
+			const ProllyNodeRef *theirs, const char *what, List **views)
 {
 	ProllyDatabaseComponents dc = components();
 	Tables		bt = {NIL};
@@ -5103,6 +5327,40 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 							   name, what),
 					 errhint("Commit the changes, or reset the branch, first.")));
 	}
+	/*
+	 * one both sides refreshed: refreshed from the merged rows
+	 * (merge_matviews()), which the uncommitted rows would be among.  Ours'
+	 * views as the merge leaves them, for the next of a series, are those
+	 * merge_matviews() takes (definitions are alike here).
+	 */
+	if (l->tables != NIL)
+	{
+		List	   *bm = matviews_in_root(base);
+		List	   *om = views && *views ? *views : matviews_in_root(ours);
+		List	   *merged = NIL;
+
+		foreach(lc, matviews_in_root(theirs))
+		{
+			Table	   *t = lfirst(lc);
+			Table	   *b = find_table(bm, t->name);
+			Table	   *o = find_table(om, t->name);
+
+			if (same_hash(&o->data.hash, &t->data.hash) ||
+				same_hash(&t->data.hash, &b->data.hash))
+				merged = lappend(merged, o);
+			else if (same_hash(&o->data.hash, &b->data.hash))
+				merged = lappend(merged, t);
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot %s with uncommitted changes where both sides refreshed a materialized view", what),
+						 errdetail("Materialized view \"%s\" would be refreshed from the merged rows, the uncommitted ones among them.",
+								   t->name),
+						 errhint("Commit the changes, or reset the branch, first.")));
+		}
+		if (views)
+			*views = merged;
+	}
 }
 
 /*
@@ -5168,6 +5426,8 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 			relids = lappend_oid(relids, relid);
 		}
 	}
+	/* materialized views theirs refreshed (check_local(): not these) */
+	apply_matview_rows(&l->head, &target);
 	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -5298,7 +5558,7 @@ merge_held(const char *branch, const char *message, int flags,
 	commit_root(&ours, &roots[1]);
 	commit_root(&theirs, &roots[2]);
 	local_changes(&ours, &local);
-	check_local(&local, &roots[0], &roots[1], &roots[2], "merge");
+	check_local(&local, &roots[0], &roots[1], &roots[2], "merge", NULL);
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
 		if (flags & PROLLY_MERGE_SQUASH)
@@ -5495,6 +5755,7 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 	StringInfoData message;
 	ProllyNodeRef before;
 	Local		local;
+	List	   *views = NIL;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -5513,7 +5774,7 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 	{
 		commit_root(&info[i].parents[0], &roots[0]);
 		commit_root(&picked[i], &roots[2]);
-		check_local(&local, &roots[0], &head, &roots[2], what);
+		check_local(&local, &roots[0], &head, &roots[2], what, &views);
 	}
 	root_of("WORKING", &before);
 
@@ -5596,6 +5857,7 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	ProllyNodeRef head;
 	ProllyMergeState ms;
 	Local		local;
+	List	   *views = NIL;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -5614,7 +5876,7 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	{
 		commit_root(&picked[i], &roots[0]);
 		commit_root(&info[i].parents[0], &roots[2]);
-		check_local(&local, &roots[0], &head, &roots[2], what);
+		check_local(&local, &roots[0], &head, &roots[2], what, &views);
 	}
 
 	roots[1] = head;
