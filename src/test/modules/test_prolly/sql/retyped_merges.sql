@@ -442,6 +442,34 @@ ROLLBACK;
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'feature');
 
+-- So does a cidr key, whose opfamily registers its comparison for inet
+-- alone: retyped from inet on both sides, it stays keyed.
+CREATE TABLE rt.ik (k inet PRIMARY KEY, v int);
+INSERT INTO rt.ik VALUES ('10.0.0.0/8', 1), ('192.168.0.0/16', 2);
+SELECT dolt_commit('-Am', 'inet key base') IS NOT NULL AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('172.16.0.0/12', 9);
+SELECT dolt_commit('-am', 'main: cidr key') IS NOT NULL AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('10.1.0.0/16', 8);
+SELECT dolt_commit('-am', 'feature: cidr key') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged cidr keys'))[2:4];
+SELECT k, v FROM rt.ik ORDER BY k;
+SELECT test_fold_root() AS ik_merged \gset
+SELECT * FROM dolt_status;
+ROLLBACK;
+SELECT dolt_checkout('feature');
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged cidr keys reverse'))[2:4];
+SELECT test_fold_root() = :'ik_merged' AS same_merge;
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'feature');
+
 -- Older roots can contain varchar primary keys stored as keyless rows.
 -- Refuse them before reading or moving their incompatible trees.
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '9'),

@@ -213,16 +213,17 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "11", varchar primary keys ordered
- * through their text opfamilies, rather than rows keyed by content;
- * "10" is reserved for table and column settings (#400).  "9" described
+ * The format a folded root is in: "11", primary keys whose opfamily
+ * compares them as a type they're binary-coercible to (varchar as text,
+ * cidr as inet) ordered by that comparison, rather than rows keyed by
+ * content; "10" is reserved for table and column settings (#400).  "9" described
  * what changes how a definition behaves when it isn't the default
  * (inheritance, and which inherited columns and constraints are a child's
  * own too; typed tables, trigger and rule firing, domain collations and
  * defaults, composite attributes' collations, view options, matviews'
- * indexes and being
- * unpopulated); "8" left those out, and was the first with every float NaN
- * in rows and keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
+ * indexes and being unpopulated); "8" left those out, and was the first
+ * with every float NaN in rows and keys the one canonical NaN
+ * (prolly_datum.c); "7" had a NaN's
  * own bits, and was the first with indexes described without their
  * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
  * default one, and was the first with definitions' expressions (checks,
@@ -3251,7 +3252,7 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
 		visit(name, &data, &description,
 			  kind != 't' ? NULL :
-			  !current ? "it was committed in an older format of prolly's history (commit the branch to write it in the current one)" :
+			  !current ? PROLLY_UNREADABLE_OLDER_FORMAT :
 			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
 			  arg);
 		pfree(name);

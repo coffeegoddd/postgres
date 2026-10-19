@@ -96,11 +96,16 @@ CREATE TABLE frozen.varchar_keys (k varchar(10) COLLATE "C" PRIMARY KEY, v int);
 CREATE TABLE frozen.varchar_domain (k frozen.vkey COLLATE "C" PRIMARY KEY, v int);
 INSERT INTO frozen.varchar_keys VALUES ('ab', 1), ('ab ', 2), ('cd', 3), ('', 4);
 INSERT INTO frozen.varchar_domain SELECT * FROM frozen.varchar_keys;
+-- So do cidr keys, through inet's comparison.
+CREATE TABLE frozen.cidr_keys (k cidr PRIMARY KEY, v int);
+INSERT INTO frozen.cidr_keys VALUES ('10.0.0.0/8', 1), ('10.0.0.0/16', 2),
+  ('192.168.1.0/24', 3), ('2001:db8::/32', 4);
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
          name          |                               tree                               | unreadable 
 -----------------------+------------------------------------------------------------------+------------
  frozen.bool_keys      | d04d885b23f1fc97cb3a0b562d78b9e06e3dc27d40f6912859590c77017d37c8 | 
+ frozen.cidr_keys      | 5db807cc33fefb7698aefe5a3834c16af760d6f0d4e8c17e1a4c2858e027dbfb | 
  frozen.composite      | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
  frozen.keyless        | b5ef3d66d0a49c160542af1794d03a1493a4a0256c0181782b3eac7c76ba1d0d | 
  frozen.large          | 0358a81e973ee335bd03364304062146a27611383d5b505807236bb0677739a3 | 
@@ -111,10 +116,10 @@ WHERE name LIKE 'frozen.%' ORDER BY name;
  frozen.special_n      | ab02342d95270ade28aab540f2ba4b0fc9c170fb176617dec9346f8c5aa47020 | 
  frozen.varchar_domain | d09e6d56e4f3718ebc4027babed2c3480297cf607890eee6ebc956e5aa18d836 | 
  frozen.varchar_keys   | d09e6d56e4f3718ebc4027babed2c3480297cf607890eee6ebc956e5aa18d836 | 
-(11 rows)
+(12 rows)
 
 DROP SCHEMA frozen CASCADE;
-NOTICE:  drop cascades to 13 other objects
+NOTICE:  drop cascades to 14 other objects
 DETAIL:  drop cascades to type frozen.pair
 drop cascades to table frozen.scalars
 drop cascades to table frozen.composite
@@ -128,3 +133,4 @@ drop cascades to table frozen.large
 drop cascades to type frozen.vkey
 drop cascades to table frozen.varchar_keys
 drop cascades to table frozen.varchar_domain
+drop cascades to table frozen.cidr_keys

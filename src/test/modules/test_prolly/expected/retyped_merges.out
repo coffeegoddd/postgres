@@ -1308,14 +1308,113 @@ SELECT dolt_branch('-D', 'feature');
  {0}
 (1 row)
 
+-- So does a cidr key, whose opfamily registers its comparison for inet
+-- alone: retyped from inet on both sides, it stays keyed.
+CREATE TABLE rt.ik (k inet PRIMARY KEY, v int);
+INSERT INTO rt.ik VALUES ('10.0.0.0/8', 1), ('192.168.0.0/16', 2);
+SELECT dolt_commit('-Am', 'inet key base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('172.16.0.0/12', 9);
+SELECT dolt_commit('-am', 'main: cidr key') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+ALTER TABLE rt.ik ALTER COLUMN k TYPE cidr;
+INSERT INTO rt.ik VALUES ('10.1.0.0/16', 8);
+SELECT dolt_commit('-am', 'feature: cidr key') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged cidr keys'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT k, v FROM rt.ik ORDER BY k;
+       k        | v 
+----------------+---
+ 10.0.0.0/8     | 1
+ 10.1.0.0/16    | 8
+ 172.16.0.0/12  | 9
+ 192.168.0.0/16 | 2
+(4 rows)
+
+SELECT test_fold_root() AS ik_merged \gset
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+ROLLBACK;
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged cidr keys reverse'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT test_fold_root() = :'ik_merged' AS same_merge;
+ same_merge 
+------------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Older roots can contain varchar primary keys stored as keyless rows.
 -- Refuse them before reading or moving their incompatible trees.
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '9'),
   'old varchar key format') AS vk_old \gset
 SELECT count(*) FROM dolt_diff(:'vk_old', :'vk_base', NULL::rt.vk);
 ERROR:  the rows of table rt.vk in this version can't be read here
-DETAIL:  The it was committed in an older format of prolly's history (commit the branch to write it in the current one).
-HINT:  A version's rows can only be read where the collations ordering their keys are as it recorded.
+DETAIL:  The version was committed in an older format of prolly's history.
+HINT:  Commit the branch to write it in the current one.
 SELECT dolt_reset('--hard', :'vk_old');
 ERROR:  a commit made in an older format of prolly's history can't be moved to
 HINT:  Commit the branch to write it in the current one.
@@ -1338,7 +1437,7 @@ SELECT k, v FROM rt.vk ORDER BY k;
 (3 rows)
 
 DROP SCHEMA rt CASCADE;
-NOTICE:  drop cascades to 22 other objects
+NOTICE:  drop cascades to 23 other objects
 DETAIL:  drop cascades to table rt.c
 drop cascades to table rt.n
 drop cascades to table rt.o
@@ -1361,3 +1460,4 @@ drop cascades to type rt.vkey
 drop cascades to table rt.vk
 drop cascades to table rt.vkc
 drop cascades to table rt.vkd
+drop cascades to table rt.ik

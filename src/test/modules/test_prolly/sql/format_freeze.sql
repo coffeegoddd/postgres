@@ -98,6 +98,10 @@ CREATE TABLE frozen.varchar_keys (k varchar(10) COLLATE "C" PRIMARY KEY, v int);
 CREATE TABLE frozen.varchar_domain (k frozen.vkey COLLATE "C" PRIMARY KEY, v int);
 INSERT INTO frozen.varchar_keys VALUES ('ab', 1), ('ab ', 2), ('cd', 3), ('', 4);
 INSERT INTO frozen.varchar_domain SELECT * FROM frozen.varchar_keys;
+-- So do cidr keys, through inet's comparison.
+CREATE TABLE frozen.cidr_keys (k cidr PRIMARY KEY, v int);
+INSERT INTO frozen.cidr_keys VALUES ('10.0.0.0/8', 1), ('10.0.0.0/16', 2),
+  ('192.168.1.0/24', 3), ('2001:db8::/32', 4);
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
 
