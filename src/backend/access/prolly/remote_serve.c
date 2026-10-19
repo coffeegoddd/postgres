@@ -557,8 +557,9 @@ since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
  * is reached from the wanted only.  A commit is higher than its parents,
  * so each is walked after all it is reached from have painted it: those
  * sent are just the ones the known don't reach, whatever the commits'
- * times (a transaction's start, the same for all it commits, and earlier
- * than its parents' for one begun before they were committed).
+ * dates (each is dated when it is made, after its parents, but the walk
+ * doesn't rely on that: history fetched from elsewhere was dated by other
+ * clocks, and the dates only break ties between commits as high).
  */
 Datum
 dolt_serve_since(PG_FUNCTION_ARGS)

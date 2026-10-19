@@ -94,6 +94,7 @@
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -2236,9 +2237,18 @@ ExecuteTruncateGuts(List *explicit_rels,
 		 * a new relfilenumber in the current (sub)transaction, then we can
 		 * just truncate it in-place, because a rollback would cause the whole
 		 * table or the current physical file to be thrown away anyway.
+		 *
+		 * Not, though, block-mapped storage a fold has begun on (a Dolt
+		 * commit or checkpoint made in the transaction): truncating it in
+		 * place cuts pages whose rows the fold's tree holds without listing
+		 * them as changed, and the next fold, reading only what is listed,
+		 * would not see the rows go.  New storage starts without a list, and is
+		 * folded in full.
 		 */
-		if (rel->rd_createSubid == mySubid ||
-			rel->rd_newRelfilelocatorSubid == mySubid)
+		if ((rel->rd_createSubid == mySubid ||
+			 rel->rd_newRelfilelocatorSubid == mySubid) &&
+			!(RelationGetSmgr(rel)->smgr_which == SMGR_BMAP &&
+			  bmap_folded(RelationGetSmgr(rel))))
 		{
 			/* Immediate, non-rollbackable truncation is OK */
 			heap_truncate_one_rel(rel);

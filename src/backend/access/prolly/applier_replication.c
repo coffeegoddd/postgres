@@ -16,7 +16,10 @@
  * constraints, and only a superuser may set it.  Here the result
  * relation instead keeps only those rechecks among its triggers, so no
  * user trigger fires and no foreign key is checked, and nothing else in
- * the session changes.
+ * the session changes.  After immediate(), the rechecks it keeps are
+ * immediate ones, and each write fires its own in a query level of its
+ * own: an error a recheck raises is the write's, and a subtransaction the
+ * write was made in takes that level with it as it rolls back.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/applier_replication.c
@@ -66,6 +69,7 @@ struct ProllyApplier
 	EPQState	epq;
 	TupleTableSlot *found;
 	bool		matview;		/* rows written as REFRESH writes them */
+	bool		immediate;		/* each write's rechecks fired as it ends */
 	/* without a key or match_index: its rows by the hash of their values */
 	HTAB	   *rows;
 	int			lookups;		/* of a keyless table's rows, so far */
@@ -414,27 +418,32 @@ replication_begin(Relation rel)
 }
 
 /*
- * The next write sees this one.  The row found for it is let go, so no
- * buffer stays pinned between writes (a caller may write each in a
- * subtransaction of its own).
- */
-static void
-advance(ProllyApplier *a)
-{
-	ExecClearTuple(a->found);
-	CommandCounterIncrement();
-	a->estate->es_output_cid = GetCurrentCommandId(true);
-}
-
-/*
- * A write failed: the row found for it is let go before the error reaches
- * the caller, whose subtransaction (if it wrote in one) pinned its buffer
- * and lets the pin go as it rolls back.
+ * The rows a write read are let go: the one found for it, and those its
+ * after-row triggers' events read (the old row an update's event keeps,
+ * or the row a recheck that raised read).  So no buffer stays pinned
+ * between writes: a caller may write each in a subtransaction of its own,
+ * and update in the next a row the last read.  A write that failed lets
+ * them go before the error reaches the caller, whose subtransaction (if
+ * it wrote in one) pinned their buffers and lets the pins go as it rolls
+ * back.
  */
 static void
 let_go(ProllyApplier *a)
 {
 	ExecClearTuple(a->found);
+	if (a->rri->ri_TrigOldSlot)
+		ExecClearTuple(a->rri->ri_TrigOldSlot);
+	if (a->rri->ri_TrigNewSlot)
+		ExecClearTuple(a->rri->ri_TrigNewSlot);
+}
+
+/* The next write sees this one, and its rows are let go (let_go()). */
+static void
+advance(ProllyApplier *a)
+{
+	let_go(a);
+	CommandCounterIncrement();
+	a->estate->es_output_cid = GetCurrentCommandId(true);
 }
 
 /* The hash of a row's values (their images: equal rows' are alike). */
@@ -587,9 +596,41 @@ matview_delete(ProllyApplier *a)
 }
 
 /*
+ * A write's rechecks of deferrable unique and exclusion constraints, once
+ * immediate(): queued in a query level begun for the write, and fired as
+ * it ends (only those of the indexes the write's entries may break, as
+ * the executor queues them).
+ */
+static void
+rechecks_begin(ProllyApplier *a)
+{
+	if (a->immediate)
+		AfterTriggerBeginQuery();
+}
+
+static void
+rechecks_fire(ProllyApplier *a)
+{
+	if (!a->immediate)
+		return;
+	PG_TRY();
+	{
+		AfterTriggerEndQuery(a->estate);
+	}
+	PG_CATCH();
+	{
+		/* (a recheck that raised left its row in the trigger slots) */
+		let_go(a);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
  * The rows written are from a tree a commit held, so their keys fit one:
  * they aren't refused for their keys' length (prolly_table.c), whose bound
- * a tree written before it may exceed a little.
+ * a tree written before it may exceed a little.  (Restored however the
+ * write ends, its rechecks raising too.)
  */
 static void
 replication_insert(ProllyApplier *a, TupleTableSlot *row)
@@ -601,7 +642,11 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 		if (a->matview)
 			matview_insert(a, row);
 		else
+		{
+			rechecks_begin(a);
 			ExecSimpleRelationInsert(a->rri, a->estate, row);
+			rechecks_fire(a);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -690,7 +735,12 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 			matview_insert(a, row);
 		}
 		else
-			ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found, row);
+		{
+			rechecks_begin(a);
+			ExecSimpleRelationUpdate(a->rri, a->estate, &a->epq, a->found,
+									 row);
+			rechecks_fire(a);
+		}
 	}
 	PG_CATCH();
 	{
@@ -731,6 +781,25 @@ replication_remove(ProllyApplier *a, TupleTableSlot *old)
 	return true;
 }
 
+/*
+ * The rechecks kept, made immediate ones (not deferrable, so neither
+ * INITIALLY DEFERRED nor SET CONSTRAINTS defers their events), are fired
+ * as each write ends.  (The trigger descriptions are kept_triggers()'
+ * copies.)
+ */
+static void
+replication_immediate(ProllyApplier *a)
+{
+	TriggerDesc *td = a->rri->ri_TrigDesc;
+
+	for (int i = 0; td && i < td->numtriggers; i++)
+	{
+		td->triggers[i].tgdeferrable = false;
+		td->triggers[i].tginitdeferred = false;
+	}
+	a->immediate = (td != NULL);
+}
+
 static void
 replication_end(ProllyApplier *a)
 {
@@ -756,5 +825,6 @@ const ProllyApplierRoutine prolly_applier_replication = {
 	.insert = replication_insert,
 	.update = replication_update,
 	.remove = replication_remove,
+	.immediate = replication_immediate,
 	.end = replication_end,
 };
