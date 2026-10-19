@@ -210,10 +210,14 @@ def _ratio(numerator: Optional[float], logical: float, outcome: Outcome) -> Opti
 class WriteAmpCollector(Collector):
     name = "write_amp"
 
-    def check(self, ctx):
+    @staticmethod
+    def _walinspect(ctx):
         r = ctx.cluster.sql("CREATE EXTENSION IF NOT EXISTS pg_walinspect", check=False)
         if not r.ok:
             raise Unavailable(f"pg_walinspect: {r.stderr.strip()}")
+
+    def check(self, ctx):
+        self._walinspect(ctx)
 
     def _drop_slot(self, ctx):
         # (if it's there: whatever failed may have come before or after)
@@ -223,6 +227,9 @@ class WriteAmpCollector(Collector):
     def before_window(self, ctx):
         self.peers = [_on(ctx, p) for p in getattr(ctx, "peers", [])]
         self.slot = ctx.cluster.scalar("SHOW wal_level") != "minimal"
+        # (a peer is made in measure(), after check(): its WAL is read too)
+        for c in self.peers:
+            self._walinspect(c)
         try:
             for c in [ctx] + self.peers:
                 wait_for_autovacuum(c)

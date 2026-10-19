@@ -27,6 +27,7 @@ class FakeServer:
         self.flushed = None             # flush LSN, if behind the insert LSN
         self.rmgrs = []                 # pg_get_wal_stats rows
         self.slots = set()
+        self.extensions = set()
         self.wal_level = "replica"
         self.log = []
         self.on_checkpoint = lambda: None
@@ -39,6 +40,8 @@ class FakeServer:
             self.on_checkpoint()
         elif "prolly_checkpoint()" in sql:
             self.on_prolly_checkpoint()
+        elif "CREATE EXTENSION IF NOT EXISTS pg_walinspect" in sql:
+            self.extensions.add("pg_walinspect")
         elif "pg_switch_wal" in sql:
             self.flushed = None
         elif "pg_create_physical_replication_slot" in sql:
@@ -57,6 +60,7 @@ class FakeServer:
             flushed = self.lsn if self.flushed is None else self.flushed
             return str(flushed - int(m.group(1), 16))
         if "pg_get_wal_stats" in sql:
+            assert "pg_walinspect" in self.extensions, "pg_walinspect isn't installed here"
             assert self.flushed is None, "read WAL past the flushed position"
             m = re.search(r"pg_get_wal_stats\('0/([0-9A-F]+)', '0/([0-9A-F]+)'", sql)
             assert m.group(1) != m.group(2), "no record to find in an empty interval"
