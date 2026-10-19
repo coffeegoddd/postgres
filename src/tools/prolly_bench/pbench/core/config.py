@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,17 @@ def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, A
     return cfg
 
 
+_GUC_SECONDS = {"us": 1e-6, "ms": 1e-3, "s": 1, "min": 60, "h": 3600, "d": 86400}
+
+
+def guc_seconds(value) -> float:
+    """A time setting ("5min", "1d", "300") in seconds; bare numbers are seconds."""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([a-z]*)\s*", str(value))
+    if not m or m.group(2) not in _GUC_SECONDS and m.group(2):
+        raise ConfigError(f"unreadable time setting {value!r}")
+    return float(m.group(1)) * _GUC_SECONDS.get(m.group(2) or "s", 1)
+
+
 def validate(cfg: dict, suite: str) -> None:
     run = cfg["run"]
     def number(value, name, minimum=1, maximum=None):
@@ -176,6 +188,18 @@ def validate(cfg: dict, suite: str) -> None:
             and str(pg.get("max_replication_slots", "10")) == "0"):
         raise ConfigError("write_amp holds a replication slot over its interval, so the WAL "
                           "it splits isn't recycled: give it max_replication_slots >= 1")
+    if "write_amp" in run["collectors"] and pg.get("wal_level") == "minimal":
+        # No slot: a checkpoint in the window would recycle the WAL it
+        # reads (the read then fails).  Its first checkpoint restarts the
+        # timer; checkpoints on WAL volume (max_wal_size) remain possible.
+        timeout = guc_seconds(pg.get("checkpoint_timeout", "5min"))
+        longest = max([run["measure_seconds"]] + [
+            p["measure_seconds"] for p in cfg.get("workloads", {}).values()
+            if "measure_seconds" in p])
+        if timeout <= longest:
+            raise ConfigError(f"write_amp at wal_level = minimal keeps no replication slot: "
+                              f"checkpoint_timeout ({timeout:.0f} s) must exceed the measured "
+                              f"window ({longest} s)")
     if "write_amp" in run["collectors"] and "recovery" in run["collectors"]:
         raise ConfigError("write_amp checkpoints after the window, which leaves the recovery "
                           "collector nothing to replay: run them in separate configs")

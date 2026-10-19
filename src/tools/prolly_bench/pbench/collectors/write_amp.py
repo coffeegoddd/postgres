@@ -178,6 +178,10 @@ def wal_split(rows: list[tuple[str, float, float, float]]) -> dict[str, float]:
 
 
 def _wal_stats(ctx: Context, start: str, end: str) -> list[tuple[str, float, float, float]]:
+    # An interval that wrote no WAL (a read-only cell at wal_level =
+    # minimal) has no record to find: pg_get_wal_stats would fail on it.
+    if float(ctx.cluster.scalar(f"SELECT pg_wal_lsn_diff('{end}', '{start}')")) <= 0:
+        return []
     # pg_get_wal_stats quietly stops at the flushed position: the records
     # since the last checkpoint may not be flushed yet.  A switch flushes
     # them; its own record is after end.
@@ -211,20 +215,31 @@ class WriteAmpCollector(Collector):
         if not r.ok:
             raise Unavailable(f"pg_walinspect: {r.stderr.strip()}")
 
+    def _drop_slot(self, ctx):
+        # (if it's there: whatever failed may have come before or after)
+        ctx.cluster.sql(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                        f"WHERE slot_name = '{SLOT}'")
+
     def before_window(self, ctx):
         self.peers = [_on(ctx, p) for p in getattr(ctx, "peers", [])]
         self.slot = ctx.cluster.scalar("SHOW wal_level") != "minimal"
-        for c in [ctx] + self.peers:
-            wait_for_autovacuum(c)
-            # Fold what came before (the load, the warm-up) first, so the
-            # fold after the window writes the window's changes only:
-            # nothing folds the working set between the load and the window.
-            if materialize_mode(ctx) == "prolly_checkpoint":
-                c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+        try:
+            for c in [ctx] + self.peers:
+                wait_for_autovacuum(c)
+                # Fold what came before (the load, the warm-up) first, so the
+                # fold after the window writes the window's changes only:
+                # nothing folds the working set between the load and the window.
+                if materialize_mode(ctx) == "prolly_checkpoint":
+                    c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+                if self.slot:
+                    # Before the checkpoint: the slot holds WAL from the redo point on.
+                    c.cluster.sql(f"SELECT pg_create_physical_replication_slot('{SLOT}', true)")
+                checkpoint(c)
+        except Exception:
             if self.slot:
-                # Before the checkpoint: the slot holds WAL from the redo point on.
-                c.cluster.sql(f"SELECT pg_create_physical_replication_slot('{SLOT}', true)")
-            checkpoint(c)
+                for c in [ctx] + self.peers:
+                    self._drop_slot(c)
+            raise
 
     def _snap(self, ctx, tuples: bool = True) -> dict:
         s = {}
@@ -240,26 +255,29 @@ class WriteAmpCollector(Collector):
         self.peers_before = [self._snap(p, tuples=False) for p in self.peers]
 
     def after_window(self, ctx, outcome):
-        for c in [ctx] + self.peers:
-            wait_for_clients(c)
-            wait_for_autovacuum(c)
-        self.mode = materialize_mode(ctx)
-        self.unmaterialized = None
-        if self.mode == "prolly_checkpoint":
-            self.unmaterialized = self._snap(ctx)
-            for c in [ctx] + self.peers:
-                c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
         instances = [ctx] + self.peers
-        # each instance's WAL, read before its final checkpoint
-        self.wal_ends = [c.cluster.scalar("SELECT pg_current_wal_insert_lsn()")
-                         for c in instances]
-        self.wal_end = self.wal_ends[0]
-        self.rmgrs = [row for c, x, end in zip(instances, [self.before] + self.peers_before,
-                                               self.wal_ends)
-                      for row in _wal_stats(c, x["lsn"], end)]
-        for c in instances:
+        try:
+            for c in instances:
+                wait_for_clients(c)
+                wait_for_autovacuum(c)
+            self.mode = materialize_mode(ctx)
+            self.unmaterialized = None
+            if self.mode == "prolly_checkpoint":
+                self.unmaterialized = self._snap(ctx)
+                for c in instances:
+                    c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+            # each instance's WAL, read before its final checkpoint
+            self.wal_ends = [c.cluster.scalar("SELECT pg_current_wal_insert_lsn()")
+                             for c in instances]
+            self.wal_end = self.wal_ends[0]
+            self.rmgrs = [row for c, x, end in zip(instances, [self.before] + self.peers_before,
+                                                   self.wal_ends)
+                          for row in _wal_stats(c, x["lsn"], end)]
+        finally:
             if self.slot:
-                c.cluster.sql(f"SELECT pg_drop_replication_slot('{SLOT}')")
+                for c in instances:
+                    self._drop_slot(c)
+        for c in instances:
             checkpoint(c)
             wait_for_autovacuum(c)
         self.after = self._snap(ctx)
@@ -305,6 +323,10 @@ class WriteAmpCollector(Collector):
             # Page headers and alignment: in the LSN difference, in no record.
             "wa.wal.unattributed_bytes": wal - sum(
                 v for k, v in split.items() if k != "wa.wal.records"),
+            # about 0.5%; much more is a segment switch's padding
+            # (archive_timeout), not the work
+            "wa.wal.unattributed_fraction": (wal - sum(
+                v for k, v in split.items() if k != "wa.wal.records")) / wal if wal else None,
             "wa.pages.write_bytes": io["bytes"],
             "wa.pages.writes": io["writes"],
             "wa.pages.extends": io["extends"],

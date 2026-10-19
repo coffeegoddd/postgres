@@ -44,7 +44,7 @@ class FakeServer:
         elif "pg_create_physical_replication_slot" in sql:
             self.slots.add(re.search(r"'(\w+)'", sql).group(1))
         elif "pg_drop_replication_slot" in sql:
-            self.slots.remove(re.search(r"'(\w+)'", sql).group(1))
+            self.slots.discard(re.search(r"'(\w+)'", sql).group(1))
         return SimpleNamespace(stdout="", ok=True)
 
     def scalar(self, sql, dbname="postgres"):
@@ -58,6 +58,8 @@ class FakeServer:
             return str(flushed - int(m.group(1), 16))
         if "pg_get_wal_stats" in sql:
             assert self.flushed is None, "read WAL past the flushed position"
+            m = re.search(r"pg_get_wal_stats\('0/([0-9A-F]+)', '0/([0-9A-F]+)'", sql)
+            assert m.group(1) != m.group(2), "no record to find in an empty interval"
             return "\n".join("|".join(str(v) for v in r) for r in self.rmgrs)
         m = re.search(r"pg_wal_lsn_diff\('0/([0-9A-F]+)', '0/([0-9A-F]+)'\)", sql)
         if m:
@@ -186,6 +188,36 @@ class WriteAmpTest(unittest.TestCase):
         m = self.run_cell(s, context(s), work, Outcome(transactions=10))
         self.assertEqual(m["wa.wal.total_bytes"], 10_000)
         self.assertEqual(m["wa.wal.row_bytes"], 9_900)
+
+    def test_interval_without_wal(self):
+        # a read-only cell at wal_level = minimal writes no WAL at all
+        s = FakeServer()
+        s.wal_level = "minimal"
+        m = self.run_cell(s, context(s), lambda: None, Outcome(transactions=10, read_only=True))
+        self.assertEqual(m["wa.wal.total_bytes"], 0)
+        self.assertEqual(m["wa.wal.row_bytes"], 0)
+        self.assertIsNone(m["wa.wal.unattributed_fraction"])
+
+    def test_slot_dropped_when_the_interval_fails(self):
+        s = FakeServer()
+        ctx = context(s, am="prolly")
+        c = WriteAmpCollector()
+        c.check(ctx)
+        c.before_window(ctx)
+        c.start(ctx)
+        def broken():
+            raise RuntimeError("fold failed")
+        s.on_prolly_checkpoint = broken
+        with self.assertRaisesRegex(RuntimeError, "fold failed"):
+            c.after_window(ctx, Outcome(transactions=1))
+        self.assertEqual(s.slots, set())
+        # and when the first checkpoint fails, after the slot is made
+        s = FakeServer()
+        s.on_checkpoint = broken
+        ctx = context(s)
+        with self.assertRaisesRegex(RuntimeError, "fold failed"):
+            WriteAmpCollector().before_window(ctx)
+        self.assertEqual(s.slots, set())
 
     def test_prolly_materializes_before_the_checkpoint(self):
         s = FakeServer()
@@ -320,8 +352,16 @@ class WriteAmpTest(unittest.TestCase):
         with self.assertRaisesRegex(config.ConfigError, "replication slot"):
             config.validate(cfg, "S")
         # (minimal: no slot; the counter runs have no timed checkpoints)
-        cfg["postgres"] = {"wal_level": "minimal", "max_replication_slots": "0"}
+        cfg["postgres"] = {"wal_level": "minimal", "max_replication_slots": "0",
+                           "checkpoint_timeout": "1d"}
         config.validate(cfg, "S")
+        # ... so a timed one in the window would recycle what it reads
+        cfg["run"]["measure_seconds"] = 600
+        cfg["postgres"]["checkpoint_timeout"] = "5min"
+        with self.assertRaisesRegex(config.ConfigError, "checkpoint_timeout"):
+            config.validate(cfg, "S")
+        self.assertEqual(config.guc_seconds("2min"), 120)
+        self.assertEqual(config.guc_seconds("300"), 300)
         cfg["run"]["write_amp_materialize"] = "dolt_commit"
         with self.assertRaisesRegex(config.ConfigError, "write_amp_materialize"):
             config.validate(cfg, "S")

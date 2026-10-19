@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from pbench.core import env as envmod
 from pbench.core.validation import atomic_json, sha256
 
 REPO = Path(__file__).resolve().parents[3]
@@ -47,8 +48,12 @@ def main():
         raise RuntimeError("source changed during build; refusing to attest this install")
     binary_hashes = {name: sha256(install / "bin" / name)
                      for name in ("postgres", "pg_config", "psql", "pgbench", "initdb", "pg_ctl")}
+    library_hashes = envmod.library_hashes(install / "bin")
+    if set(library_hashes) != set(envmod.LIBRARIES):
+        raise RuntimeError(f"missing server libraries: {set(envmod.LIBRARIES) - set(library_hashes)}")
     atomic_json(install / "pbench-build.json", {
         "schema_version": 1, "source_files": before, "binary_hashes": binary_hashes,
+        "library_hashes": library_hashes,
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
         "configure_command": command})
     print(install / "bin")
