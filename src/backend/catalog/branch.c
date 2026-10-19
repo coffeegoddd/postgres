@@ -949,10 +949,13 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 	/*
 	 * The change log is told of every write, the session's own or not;
 	 * not of a TOAST relation's versions, or a change log's (they are its
-	 * table's).
+	 * table's).  A change log's entries are bookkeeping, no change of the
+	 * session's: the hook isn't told of them either.
 	 */
 	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
 		prolly_note_change(rel, oldtid, newtid);
+	else if (prolly_is_change_log(rel))
+		return;
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }
