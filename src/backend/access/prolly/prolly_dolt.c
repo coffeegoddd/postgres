@@ -3174,6 +3174,7 @@ typedef struct Rows
 	TupleTableSlot *slot;
 	ProllyTreeEnv env;			/* where values out of line are read */
 	ProllyKeyingRefs refs;
+	MemoryContext rowcxt;		/* a row's decoding, reset for the next */
 } Rows;
 
 static void
@@ -3186,6 +3187,21 @@ rows_begin(Rows *r, Relation rel)
 	prolly_folded_tree_env(&r->env);
 	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
+									  ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * Where a sink decodes the rows it's handed: what it decoded for the last
+ * row is freed (the tuplestore has its own copies), so a diff of millions
+ * of rows takes the memory of one.
+ */
+static MemoryContext
+rows_next(Rows *r)
+{
+	ExecClearTuple(r->slot);
+	MemoryContextReset(r->rowcxt);
+	return MemoryContextSwitchTo(r->rowcxt);
 }
 
 static void
@@ -3193,9 +3209,13 @@ rows_end(Rows *r)
 {
 	ExecDropSingleTupleTableSlot(r->slot);
 	PROLLY_CALL(r->c.keying, close, r->keying);
+	MemoryContextDelete(r->rowcxt);
 }
 
-/* The row a tree value holds, as a composite datum; and its copies. */
+/*
+ * The row a tree value holds, as a composite datum of its own (the slot
+ * is reused for the next value); and its copies.
+ */
 static Datum
 rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
@@ -3282,6 +3302,7 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	uint64		nafter = 0;
 	Datum		from = (Datum) 0;
 	Datum		to = (Datum) 0;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (before)
 		from = rows_datum(&s->rows, before, &nbefore);
@@ -3296,14 +3317,14 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		else
 			put_diff(s, "removed", from, false, (Datum) 0, true,
 					 nbefore - nafter);
-		return;
 	}
-	if (kind == PROLLY_DIFF_ADDED)
+	else if (kind == PROLLY_DIFF_ADDED)
 		put_diff(s, "added", (Datum) 0, true, to, false, 1);
 	else if (kind == PROLLY_DIFF_REMOVED)
 		put_diff(s, "removed", from, false, (Datum) 0, true, 1);
 	else
 		put_diff(s, "modified", from, false, to, false, 1);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -3587,17 +3608,19 @@ row_conflict(ProllyConflictSink *self, const ProllyKey *key,
 	Datum		values[5];
 	bool		nulls[5] = {base == NULL, ours == NULL, theirs == NULL, false, false};
 	uint64		count;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (base)
-		values[0] = datumCopy(rows_datum(&s->rows, base, &count), false, -1);
+		values[0] = rows_datum(&s->rows, base, &count);
 	if (ours)
-		values[1] = datumCopy(rows_datum(&s->rows, ours, &count), false, -1);
+		values[1] = rows_datum(&s->rows, ours, &count);
 	if (theirs)
 		values[2] = rows_datum(&s->rows, theirs, &count);
 	values[3] = CStringGetTextDatum(change_kind(base, ours));
 	values[4] = CStringGetTextDatum(change_kind(base, theirs));
 	tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
 						 nulls);
+	MemoryContextSwitchTo(old);
 }
 
 /*
