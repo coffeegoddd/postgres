@@ -59,9 +59,15 @@ class FilesSink(Sink):
         names = ["config.json", "environment.json", "results.jsonl"]
         names += [str(p.relative_to(run.out_dir)) for p in sorted((run.out_dir / "raw").rglob("*"))
                   if p.is_file()]
-        self.manifest.update(state="complete", artifacts={n: sha256(run.out_dir / n) for n in names})
-        atomic_json(run.out_dir / "run.json", self.manifest)
+        manifest = dict(self.manifest, state="complete",
+                        artifacts={n: sha256(run.out_dir / n) for n in names})
+        atomic_json(run.out_dir / "run.json", manifest)
+        self.manifest = manifest
 
-    def abort(self) -> None:
+    def abort(self, *, state: str = "interrupted", message: str = "") -> None:
         if hasattr(self, "results"):
             self.results.close()
+        if hasattr(self, "manifest") and self.manifest["state"] == "running":
+            manifest = dict(self.manifest, state=state, error=message)
+            atomic_json(self.run.out_dir / "run.json", manifest)
+            self.manifest = manifest

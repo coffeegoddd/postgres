@@ -156,6 +156,7 @@ class Runner:
                            capture_output=True)
         # One run at a time per work directory: concurrent runs would share
         # cluster directories, and would disturb each other's measurements.
+        self._host_locked = False
         if lock:
             self._lock = open(self.work_dir / ".lock", "w")
             self._host_lock = open(Path(tempfile.gettempdir()) / f"prolly-bench-{os.getuid()}.lock", "w")
@@ -164,6 +165,7 @@ class Runner:
                 fcntl.flock(self._host_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SystemExit("another prolly_bench run is active on this host for this user")
+            self._host_locked = True
         self.out_dir.mkdir(parents=True)
         raw_root = self.out_dir / "raw"
         raw_root.mkdir()
@@ -378,17 +380,34 @@ def interleave(plans, seed):
     return [entry for pair in pairs for entry in pair]
 
 
+class RunResults(list):
+    """Cell results remain available even when derived reports fail."""
+
+    def __init__(self, count):
+        super().__init__([] for _ in range(count))
+        self.report_errors: list[str] = []
+
+
 def run_many(runners, report_format="both"):
     if not runners:
         raise ValueError("no engines requested")
-    results = [[] for _ in runners]
+    results = RunResults(len(runners))
     from pbench import report_files
     invocation = None
     execution_error = None
+
+    def report_error(error):
+        message = f"{type(error).__name__}: {error}"
+        results.report_errors.append(message)
+        print(f"Report generation failed; execution evidence retained: {message}", file=sys.stderr)
+
     try:
         plans = [runner._open(lock=i == 0) for i, runner in enumerate(runners)]
         if report_format != "none":
-            invocation = report_files.begin(runners, report_format)
+            try:
+                invocation = report_files.begin(runners, report_format)
+            except Exception as error:
+                report_error(error)
         schedule = interleave(plans, runners[0].cfg["run"]["seed"])
         evidence = [{"engine": runners[i].table_am, "build": runners[i].build,
                      "key": dataclasses.asdict(key)}
@@ -407,7 +426,7 @@ def run_many(runners, report_format="both"):
             for sink in runner.sinks:
                 try:
                     sink.close(runner.info, cells)
-                except (OSError, ValueError, RuntimeError) as e:
+                except Exception as e:
                     errors.append(f"{runner.label}/{sink.name}: {e}")
         if errors:
             raise RuntimeError("evidence finalization failed: " + "; ".join(errors))
@@ -417,26 +436,38 @@ def run_many(runners, report_format="both"):
         for runner in runners:
             for sink in runner.sinks:
                 try:
-                    sink.abort()
-                except (OSError, ValueError, RuntimeError) as cleanup_error:
+                    sink.abort(state="interrupted" if isinstance(e, KeyboardInterrupt) else "failed",
+                               message=f"{type(e).__name__}: {e}")
+                except Exception as cleanup_error:
                     print(f"Sink cleanup failed: {cleanup_error}", file=sys.stderr)
         raise
     finally:
         try:
-            if report_format != "none":
-                if invocation is None:
-                    invocation = report_files.begin(runners, report_format)
-                paths, _ = report_files.invocation(invocation, execution="interrupted" if execution_error else "complete")
-                paths += report_files.catalog(runners[0].out_dir.parent, report_format)
+            # A rejected invocation has no right to write into the active run's
+            # report tree. Keep the lock through both independent report steps.
+            if report_format != "none" and getattr(runners[0], "_host_locked", False):
+                paths = []
+                try:
+                    if invocation is None:
+                        invocation = report_files.begin(runners, report_format)
+                    state = ("interrupted" if isinstance(execution_error, KeyboardInterrupt)
+                             else "failed" if execution_error else "complete")
+                    paths, _ = report_files.invocation(
+                        invocation, execution=state,
+                        execution_error=f"{type(execution_error).__name__}: {execution_error}"
+                                        if execution_error else None)
+                except Exception as error:
+                    report_error(error)
+                try:
+                    paths += report_files.catalog(runners[0].out_dir.parent, report_format)
+                except Exception as error:
+                    report_error(error)
                 for path in paths:
                     print(f"Report: {path}")
-        except (OSError, ValueError, RuntimeError) as e:
-            print(f"Report generation failed; execution evidence retained: {e}", file=sys.stderr)
-            if execution_error is None:
-                raise
         finally:
             for runner in runners:
                 for name in ("_host_lock", "_lock"):
                     lock = getattr(runner, name, None)
                     if lock is not None:
                         lock.close()
+                runner._host_locked = False

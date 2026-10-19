@@ -451,7 +451,10 @@ for exactly the engines/builds run together. The output root's `index.html`
 and `index.md` list saved runs and invocations, including failed runs.
 All HTML is standalone, works from disk without network access, and links
 to retained evidence with relative paths. Move the result tree together to
-preserve those links.
+preserve those links. The root catalog uses cached counts and evidence status
+from each result directory's `report-status.json`; it does not revalidate
+historical raw artifacts. Changed source files invalidate the cache. Run
+`report RESULT_DIR` to recheck all evidence and refresh that cached summary.
 
 Reports include a workload overview, coverage and provenance, metric tables
 with medians and spread, compatible comparisons and repetition details.
@@ -485,9 +488,14 @@ Markdown or writes it to the exact `--output` filename.
 Invocation manifests record the original plan, exact source directories and
 source fingerprints. Regeneration diagnoses replaced evidence. Reports are
 derived files outside the execution manifest's hashes; regenerating them
-does not invalidate a run. A renderer failure returns an error while
-preserving all finalized evidence. Orderly interruption leaves an incomplete
-execution manifest and a report showing the missing planned cells.
+does not invalidate a run. Renderer failures preserve finalized evidence,
+still run benchmark validation and comparison gates, and attempt the catalog
+update independently; the CLI then returns nonzero. Invocation manifests record
+execution and rendering failures separately, including their reasons. Orderly
+interruption marks execution `interrupted`; other execution errors mark it
+`failed`. Completed result sets retain `complete` even if another set fails.
+Reports show the original plan and missing cells. A lock-rejected process does
+not write reports or the catalog.
 
 `specs/results/<date>-<suite>-<label>/`:
 
@@ -495,6 +503,7 @@ execution manifest and a report showing the missing planned cells.
 |---|---|
 | `README.md` | Command, config, environment, warnings, collector status, summary tables (median and min-max per cell) |
 | `index.html` | Standalone HTML with the same findings and tables as the Markdown report |
+| `report-status.json` | Derived counts, evidence findings and source fingerprints for the root catalog |
 | `config.json` | The resolved configuration |
 | `environment.json` | Machine, kernel, CPU settings, filesystem, device, build, git commits, fio baseline |
 | `run.json` | Versioned plan, completion state, comparison identity and artifact hashes |

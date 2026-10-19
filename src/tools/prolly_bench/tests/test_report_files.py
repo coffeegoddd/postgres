@@ -26,6 +26,7 @@ class FakeRunner:
             yield CellKey('S', 'S1', 'memory', '', 1, rep), {}
 
     def _open(self, lock):
+        self._host_locked = lock
         (self.out_dir / "raw").mkdir(parents=True)
         self.info = RunInfo(suite='S', label=self.label, table_am=self.table_am, started='2026-10-19',
                             command='test benchmark', config=self.cfg, environment={}, warnings=[],
@@ -86,8 +87,8 @@ class ReportFilesTest(unittest.TestCase):
     def test_render_failure_happens_after_every_evidence_set_is_finalized(self):
         runners = [FakeRunner(self.root), FakeRunner(self.root, 'prolly', 'prolly')]
         with patch.object(report_files, 'result_set', side_effect=RuntimeError('renderer failed')) as render:
-            with self.assertRaises(RuntimeError):
-                run_many(runners)
+            results = run_many(runners)
+            self.assertTrue(results.report_errors)
         self.assertEqual(render.call_count, 2)
         for runner in runners:
             self.assertEqual(validate_run(runner.out_dir), [])
@@ -104,7 +105,7 @@ class ReportFilesTest(unittest.TestCase):
         data = json.loads(manifest.read_text())
         self.assertEqual(data['execution'], 'interrupted')
         self.assertFalse(data['passed'])
-        self.assertEqual(json.loads((runner.out_dir / 'run.json').read_text())['state'], 'running')
+        self.assertEqual(json.loads((runner.out_dir / 'run.json').read_text())['state'], 'interrupted')
         text = (manifest.parent / 'README.md').read_text()
         self.assertIn('0/2 planned', text)
         self.assertIn('missing', text)

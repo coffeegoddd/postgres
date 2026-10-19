@@ -180,7 +180,7 @@ def _run(args: argparse.Namespace) -> int:
         ok = ok and base is not None and all(not ccompare.gate(base, s,
             cfg["run"]["workloads"] or WORKLOADS)
             for s in sets if s is not base)
-    return 0 if ok else 1
+    return 0 if ok and not all_results.report_errors else 1
 
 
 def _resolve_tools(cfg: dict) -> None:
@@ -222,44 +222,52 @@ def _list(_args) -> int:
     return 0
 
 
-def _report(args) -> int:
+def _show_report(paths, passed, *, show_markdown=False) -> int:
+    if show_markdown:
+        for path in paths:
+            if path.suffix == ".md":
+                print(path.read_text())
+    for path in paths:
+        print(f"written: {path}")
+    return int(not passed)
+
+
+def _render_report(dirs, output, formats, *, baseline=None, notes=(), show_markdown=False) -> int:
     from pbench import presentation, report_files, reports
+    sources = [reports.load(d) for d in dirs]
+    if output is None:
+        if len(sources) != 1:
+            raise ValueError("multiple result sets require --output STEM")
+        paths, passed = report_files.result_set(sources[0], formats)
+    else:
+        document = reports.build(sources, output.parent, baseline=baseline)
+        document.notes[0:0] = notes
+        paths = presentation.write(document, output, formats)
+        passed = document.passed
+    return _show_report(paths, passed, show_markdown=show_markdown)
+
+
+def _report(args) -> int:
+    from pbench import report_files
     if args.catalog:
         if args.dirs or args.manifest or args.output:
             raise ValueError("--catalog cannot be combined with inputs, --manifest or --output")
-        paths = report_files.catalog(args.catalog, args.format)
-        passed = True
-    elif args.manifest:
+        return _show_report(report_files.catalog(args.catalog, args.format), True)
+    if args.manifest:
         if args.dirs or args.output:
             raise ValueError("--manifest cannot be combined with inputs or --output")
-        paths, passed = report_files.invocation(args.manifest, formats=args.format)
-    else:
-        if not args.dirs:
-            raise ValueError("give result directories, --manifest or --catalog")
-        sources = [reports.load(d) for d in args.dirs]
-        if len(sources) == 1 and not args.output:
-            paths, passed = report_files.result_set(sources[0], args.format)
-        else:
-            if not args.output:
-                raise ValueError("multiple result sets require --output STEM")
-            document = reports.build(sources, args.output.parent)
-            paths = presentation.write(document, args.output, args.format)
-            passed = document.passed
-    for path in paths:
-        print(path)
-    return int(not passed)
+        return _show_report(*report_files.invocation(args.manifest, formats=args.format))
+    if not args.dirs:
+        raise ValueError("give result directories, --manifest or --catalog")
+    return _render_report(args.dirs, args.output, args.format)
 
 
 def _compare(args) -> int:
     if args.format:
-        from pbench import presentation, reports
         if not args.output:
             raise ValueError("--format requires --output STEM")
-        document = reports.build([reports.load(args.baseline), reports.load(args.dir)],
-                                 args.output.parent, baseline=args.baseline)
-        for path in presentation.write(document, args.output, args.format):
-            print(path)
-        return int(not document.passed)
+        return _render_report([args.baseline, args.dir], args.output, args.format,
+                              baseline=args.baseline)
     from pbench import report
     text = report.compare(args.baseline, args.dir)
     if args.output:
@@ -345,34 +353,15 @@ def _gate(args) -> int:
 
 
 def _table(args) -> int:
-    from pbench import presentation, reports
-    if args.dirs:
-        sources = [reports.load(d) for d in args.dirs]
-    else:
-        latest = {}
-        for run in sorted(args.results.glob("*/run.json")):
-            source = reports.load(run.parent)
-            if source.run.get("suite") != args.suite:
-                continue
-            label = source.label
-            if label not in latest or source.run.get("started", "") > latest[label].run.get("started", ""):
-                latest[label] = source
-        sources = list(latest.values())
-    if not sources:
+    from pbench import discovery
+    dirs = args.dirs or discovery.latest(args.results, args.suite)
+    if not dirs:
         raise ValueError(f"no {args.suite} result sets under {args.results}")
-    suite = sources[0].run.get("suite", args.suite)
+    suite = discovery.header(dirs[0]).get("suite", args.suite)
     out = args.output or args.results / f"summary-{suite}"
-    document = reports.build(sources, out.parent)
-    if not args.dirs:
-        document.notes.insert(0, "Selection: latest result set per label; these runs may belong to different invocations.")
-    paths = presentation.write(document, out, args.format)
-    if args.format in ("both", "markdown"):
-        print(presentation.MarkdownRenderer().render(document))
-    for path in paths:
-        print(f"written: {path}")
-    if suite == "C" and (len(sources) < 2 or sum(s.run.get("table_am") == "heap" for s in sources) != 1):
-        return 1  # A correctness comparison requires heap and an engine.
-    return int(not document.passed)
+    notes = [] if args.dirs else [
+        "Selection: latest result set per label; these runs may belong to different invocations."]
+    return _render_report(dirs, out, args.format, notes=notes, show_markdown=True)
 
 
 def main(argv=None) -> int:
