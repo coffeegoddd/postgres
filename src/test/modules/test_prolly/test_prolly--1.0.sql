@@ -304,6 +304,12 @@ CREATE FUNCTION test_root_without_format(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A folded root with its "!:format" item set, as a build of that format
+-- made it.
+CREATE FUNCTION test_root_with_format(root text, format text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A folded root whose sequences have no values recorded.
 CREATE FUNCTION test_root_without_sequence_values(root text)
 RETURNS text

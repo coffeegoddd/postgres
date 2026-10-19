@@ -80,7 +80,7 @@ ORDER BY (coalesce(to_row, from_row)).id;
  modified  | (1,v1,1,7) | (1,feature,1,7)
 (1 row)
 
--- Ours retypes and drops a column; theirs changes rows.
+-- Ours drops a column; theirs changes rows.
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -106,9 +106,9 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
-ALTER TABLE rm.t ALTER COLUMN n TYPE bigint, DROP COLUMN w;
+ALTER TABLE rm.t DROP COLUMN w;
 UPDATE rm.t SET n = 400 WHERE id = 4;
-SELECT length(dolt_commit('-am', 'main: n bigint, no w')::text) AS committed;
+SELECT length(dolt_commit('-am', 'main: no w')::text) AS committed;
  committed 
 -----------
         66
@@ -120,6 +120,55 @@ SELECT (dolt_merge('feature', '-m', 'merged again'))[3:4];
  {0,"merge successful"}
 (1 row)
 
+SELECT * FROM rm.t ORDER BY id;
+ id |       v       |  n  
+----+---------------+-----
+  1 | feature       |   1
+  2 | main          |   2
+  3 | feature again |   3
+  4 | v4            | 400
+  5 | v5            |   5
+  6 | six           |   6
+(6 rows)
+
+-- Ours retypes a column theirs's rows changed under: a schema conflict, as
+-- in Dolt (only a string type made no shorter merges across the other
+-- side's changes), and the merge doesn't happen.
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE rm.t SET n = 30 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'feature: n of a row')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER TABLE rm.t ALTER COLUMN n TYPE bigint;
+SELECT length(dolt_commit('-am', 'main: n bigint')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'not merged'))[3:4];
+ERROR:  schema conflict: column n of rm.t changed type from integer to bigint on one side, and the other side changed the table
+DETAIL:  A change of type merges with the other side's changes only as a string type made no shorter.
 SELECT * FROM rm.t ORDER BY id;
  id |       v       |  n  
 ----+---------------+-----

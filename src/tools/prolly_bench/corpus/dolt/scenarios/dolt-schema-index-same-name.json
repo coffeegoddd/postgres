@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "id": "dolt-schema-index-same-name",
+  "description": "Reviewed Dolt port: index conflicts: both sides add an index with the same name, same columns, but different type",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+    "case": "SchemaChangeTestsSchemaConflicts: index conflicts: both sides add an index with the same name, same columns, but different type"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "variants": [
+    {
+      "name": "forward",
+      "vars": {
+        "right_side": "right",
+        "left_side": "main"
+      }
+    },
+    {
+      "name": "flipped",
+      "vars": {
+        "right_side": "main",
+        "left_side": "right"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "anc-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "anc-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, col1 int, col2 varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "h-ancestor",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        "ancestor commit"
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "h-branch",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT dolt_branch('right')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      },
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "h-right-side",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "var": "right_side"
+        }
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "right-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX idx1 ON t (substr(col2, 1, 2))",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "right-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 10, '100')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "h-right-commit",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        "right commit"
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "h-left-side",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "var": "left_side"
+        }
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "left-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX idx1 ON t (col2)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "left-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 20, '200')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "h-left-commit",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        "left commit"
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "h-main",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT (dolt_checkout($1))[1]",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        "main"
+      ],
+      "requires": [
+        "vc.core"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "SELECT dolt_merge('right')",
+      "expect": {
+        "sqlstate": "40001"
+      },
+      "requires": [
+        "vc.merge"
+      ]
+    }
+  ]
+}

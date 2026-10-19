@@ -57,7 +57,9 @@
  *   (ProllyAddedConstraint *): it takes the rows that break a check or
  *   NOT NULL away, which the move then validates, and checks a foreign
  *   key itself (marking it validated), which the move validates only
- *   without breaking().
+ *   without breaking().  rewritten says rows() writes every table's rows
+ *   as to has them, so those the branch has needn't be kept: a table whose
+ *   columns change type loses its rows first rather than converting them.
  *
  * Provisional (v0).
  *
@@ -157,7 +159,7 @@ typedef struct ProllyCanonRoutine
 	void		(*move_schema) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 								void (*rows) (void *arg),
 								void (*breaking) (List *added, void *arg),
-								void *arg);
+								void *arg, bool rewritten);
 	void		(*sequences) (const ProllyNodeRef *root,
 							  ProllyCanonSequenceVisit visit, void *arg);
 	void		(*fold_dependencies) (ProllyNodeRef *tree);

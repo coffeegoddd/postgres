@@ -102,9 +102,16 @@
 
 #include "access/genam.h"
 #include "nodes/makefuncs.h"
+#include "nodes/miscnodes.h"
 #include "catalog/pg_attribute.h"
 #include "parser/parse_type.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
+#include "parser/parse_expr.h"
+#include "parser/parse_relation.h"
+#include "parser/parser.h"
 #include "access/htup_details.h"
+#include "access/prolly_applier.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/relation.h"
@@ -116,6 +123,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -185,16 +193,18 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "5", a row's long values each out of
- * line in a value tree of its own; "4" had only long rows out of line;
- * "3" keyed value trees' chunks by offset, and was the first with its
- * definitions' fields escaped (append_field()); "2" was keyless rows keyed
- * by their first bytes and their hash, and a root without the item keyed
- * them by the hash alone.  A root in another has its tables' rows
- * unreadable here, and is neither moved to nor merged: its definitions'
- * text isn't this format's.
+ * The format a folded root is in: "6", definitions' expressions (checks,
+ * defaults, generated expressions, policies) as they print read back
+ * (reprinted()); "5" had them as printed, and was the first with a row's
+ * long values each out of line in a value tree of its own; "4" had only
+ * long rows out of line; "3" keyed value trees' chunks by offset, and was
+ * the first with its definitions' fields escaped (append_field()); "2" was
+ * keyless rows keyed by their first bytes and their hash, and a root
+ * without the item keyed them by the hash alone.  A root in another has
+ * its tables' rows unreadable here, and is neither moved to nor merged:
+ * its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"5"
+#define FOLDED_FORMAT	"6"
 
 typedef struct Canon
 {
@@ -657,6 +667,114 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 	}
 }
 
+/* VALUE in a domain's check, as Postgres reads it (typecmds.c's). */
+static Node *
+domain_value_ref(ParseState *pstate, ColumnRef *cref)
+{
+	CoerceToDomainValue *v;
+
+	if (list_length(cref->fields) != 1 ||
+		strcmp(strVal(linitial(cref->fields)), "value") != 0)
+		return NULL;
+	v = copyObject((CoerceToDomainValue *) pstate->p_ref_hook_state);
+	v->location = cref->location;
+	return (Node *) v;
+}
+
+/*
+ * An expression's text as it prints once read back.  Postgres doesn't always
+ * read its printed text back as the expression it printed (an IN list over a
+ * varchar prints its array with a cast, which reads back as a cast of each
+ * element), and a move makes an object again from its text, so a definition
+ * described by the printed text alone isn't the same after a move.  The text
+ * read back prints the same again.
+ *
+ * src is an expression printed, read as Postgres reads its kind: a check
+ * or policy of rel (kind its expression kind), a default or generated
+ * expression of att, or a check of domain (with rel NULL).
+ */
+static char *
+reprinted(const char *src, Relation rel, Form_pg_attribute att,
+		  Form_pg_type domain, ParseExprKind kind)
+{
+	List	   *raw = raw_parser(psprintf("SELECT %s", src), RAW_PARSE_DEFAULT);
+	SelectStmt *sel = (SelectStmt *) linitial_node(RawStmt, raw)->stmt;
+	ResTarget  *rt = linitial_node(ResTarget, sel->targetList);
+	ParseState *pstate = make_parsestate(NULL);
+	Node	   *expr;
+
+	if (rel)
+	{
+		ParseNamespaceItem *nsitem;
+
+		nsitem = addRangeTableEntryForRelation(pstate, rel, AccessShareLock,
+											   NULL, false, true);
+		addNSItemToQuery(pstate, nsitem, true, true, true);
+	}
+	if (att)
+		expr = cookDefault(pstate, rt->val, att->atttypid, att->atttypmod,
+						   NameStr(att->attname), att->attgenerated);
+	else
+	{
+		if (domain)
+		{
+			CoerceToDomainValue *v = makeNode(CoerceToDomainValue);
+
+			v->typeId = domain->typbasetype;
+			v->typeMod = domain->typtypmod;
+			v->collation = get_typcollation(domain->typbasetype);
+			v->location = -1;
+			pstate->p_pre_columnref_hook = domain_value_ref;
+			pstate->p_ref_hook_state = v;
+		}
+		expr = transformExpr(pstate, rt->val, kind);
+		expr = coerce_to_boolean(pstate, expr,
+								 kind == EXPR_KIND_POLICY ? "POLICY" : "CHECK");
+		assign_expr_collations(pstate, expr);
+	}
+	free_parsestate(pstate);
+	return TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
+												   CStringGetTextDatum(nodeToString(expr)),
+												   ObjectIdGetDatum(rel ? RelationGetRelid(rel) : InvalidOid)));
+}
+
+/* bin (an expression's node tree as text) printed, as it prints read back. */
+static char *
+printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
+			 Form_pg_type domain, ParseExprKind kind)
+{
+	char	   *src = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+															   ObjectIdGetDatum(rel ? RelationGetRelid(rel) : InvalidOid)));
+
+	return reprinted(src, rel, att, domain, kind);
+}
+
+/*
+ * A check constraint's definition as pg_get_constraintdef prints it, with
+ * its expression as it prints read back (see reprinted); other constraints'
+ * as printed.  It prints as CHECK (expression) and then words (NO INHERIT,
+ * NOT VALID and the like) without parentheses, so the expression ends at
+ * its last; a definition printed otherwise is taken as printed.
+ */
+static char *
+constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain)
+{
+	Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+	char	   *def = TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
+															  ObjectIdGetDatum(con->oid)));
+	const char *head = "CHECK (";
+	char	   *end;
+
+	if (con->contype != CONSTRAINT_CHECK || strncmp(def, head, strlen(head)) != 0 ||
+		(end = strrchr(def, ')')) == NULL || end < def + strlen(head))
+		return def;
+	return psprintf("CHECK (%s)%s",
+					reprinted(pnstrdup(def + strlen(head), end - def - strlen(head)),
+							  rel, NULL, domain,
+							  domain ? EXPR_KIND_DOMAIN_CHECK : EXPR_KIND_CHECK_CONSTRAINT),
+					end + 1);
+}
+
 /* A table's policies section's lines for its row security being on. */
 #define ROW_SECURITY		"row level security"
 #define FORCED_ROW_SECURITY "forced row level security"
@@ -715,13 +833,11 @@ append_policies(StringInfo out, Relation rel)
 		d = heap_getattr(tup, Anum_pg_policy_polqual, RelationGetDescr(prel), &isnull);
 		if (!isnull)
 			appendStringInfo(&def, " USING (%s)",
-							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
-																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+							 printed_expr(d, rel, NULL, NULL, EXPR_KIND_POLICY));
 		d = heap_getattr(tup, Anum_pg_policy_polwithcheck, RelationGetDescr(prel), &isnull);
 		if (!isnull)
 			appendStringInfo(&def, " WITH CHECK (%s)",
-							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, d,
-																	 ObjectIdGetDatum(RelationGetRelid(rel)))));
+							 printed_expr(d, rel, NULL, NULL, EXPR_KIND_POLICY));
 		defs = lappend(defs, def.data);
 	}
 	systable_endscan(scan);
@@ -795,13 +911,10 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 
 				if (def->adnum == att->attnum)
 				{
-					Datum		txt = DirectFunctionCall2(pg_get_expr,
-														  CStringGetTextDatum(def->adbin),
-														  ObjectIdGetDatum(RelationGetRelid(rel)));
-
 					appendStringInfoString(out, att->attgenerated ?
 										   "\tgenerated " : "\tdefault ");
-					append_field(out, TextDatumGetCString(txt));
+					append_field(out, printed_expr(CStringGetTextDatum(def->adbin),
+												   rel, att, NULL, EXPR_KIND_NONE));
 				}
 			}
 		}
@@ -833,8 +946,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		line = makeStringInfo();
 		append_field(line, quote_identifier(NameStr(con->conname)));
 		appendStringInfoChar(line, '\t');
-		append_field(line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
-																   ObjectIdGetDatum(con->oid))));
+		append_field(line, constraint_text(tup, rel, NULL));
 		appendStringInfoChar(line, '\n');
 		cons = lappend(cons, line->data);
 	}
@@ -1173,8 +1285,7 @@ describe_type(Canon *cn, Form_pg_type typ)
 				initStringInfo(&line);
 				append_field(&line, quote_identifier(NameStr(con->conname)));
 				appendStringInfoChar(&line, '\t');
-				append_field(&line, TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
-																			ObjectIdGetDatum(con->oid))));
+				append_field(&line, constraint_text(tup, NULL, typ));
 				appendStringInfoChar(&line, '\n');
 				cons = lappend(cons, line.data);
 			}
@@ -3165,6 +3276,13 @@ typedef struct SchemaMove
 	List	   *foreign_keys;	/* after, last */
 	List	   *fk_validations; /* validating the foreign keys */
 	List	   *rekeyed;		/* tables whose keys change in place */
+	List	   *emptied;		/* tables whose rows go first */
+	List	   *fk_drops;		/* foreign keys going: first of all, before
+								 * the columns of types the commit defines
+								 * otherwise convert (which would check them
+								 * against a table emptied) */
+	bool		rewritten;		/* the rows written are all to's: those
+								 * the tables have needn't convert */
 } SchemaMove;
 
 static char *
@@ -3544,19 +3662,24 @@ column_attr(const char *line, const char *prefix)
 	return NULL;
 }
 
+/* A column line's type, as written there (its second field). */
+static char *
+column_type(const char *line)
+{
+	const char *tab = strchr(line, '\t');
+
+	if (tab == NULL || tab[1] == '\0' || tab[1] == '\t')
+		elog(ERROR, "unexpected column line \"%s\"", line);
+	return unescape_field(pnstrdup(tab + 1, strcspn(tab + 1, "\t")));
+}
+
 /* The column line (type and collation fields) as ALTER COLUMN TYPE writes it. */
 static char *
 column_type_sql(const char *line)
 {
-	char	   *copy = pstrdup(line);
-	char	   *type;
+	char	   *type = column_type(line);
 	char	   *collate = column_attr(line, "collate ");
 
-	(void) strtok(copy, "\t");
-	type = strtok(NULL, "\t");
-	if (type == NULL)
-		elog(ERROR, "unexpected column line \"%s\"", line);
-	type = unescape_field(type);
 	return collate ? psprintf("%s COLLATE %s", type, collate) : type;
 }
 
@@ -3621,7 +3744,10 @@ partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
  * (NULL: dropped): what must go before the rows are written, and what the
  * rows must satisfy, after.  Columns are added and dropped, and changed in
  * type or default, when that gives to's columns in to's order; else the
- * table is made again (its rows written afresh).
+ * table is made again (its rows written afresh).  A column's type changes
+ * with the rows converted, unless sm->rewritten: then the rows go first
+ * (they may not cast, or cast to values its keys or NOT NULLs refuse),
+ * all to's written afresh.
  */
 static bool
 move_table(SchemaMove *sm, const char *name, const TableDef *from,
@@ -3643,15 +3769,21 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		 */
 		if (from->partition_of)
 		{
+			/* (its own foreign keys first, as a table's) */
+			foreach(lc, from->constraints)
+				if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
+					sm->fk_drops = lappend(sm->fk_drops,
+										   psprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s",
+													name, first_field(lfirst(lc))));
 			sm->before = lcons(psprintf("DROP TABLE IF EXISTS %s", name), sm->before);
 			return true;
 		}
 		/* (its foreign keys first, as other tables' may point at it) */
 		foreach(lc, from->constraints)
 			if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
-				sm->before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
-											name, first_field(lfirst(lc))),
-								   sm->before);
+				sm->fk_drops = lappend(sm->fk_drops,
+									   psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+												name, first_field(lfirst(lc))));
 		/* (sequences its columns own stay: to has them, or drops them) */
 		sm->before = lappend(sm->before,
 							 psprintf("DO $move$ DECLARE s regclass; BEGIN "
@@ -3814,6 +3946,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			old = list_nth(from->columns, i);
 			if (strcmp(column_type_sql(old), column_type_sql(line)) != 0)
 			{
+				if (sm->rewritten && !list_has_string(sm->emptied, name))
+					sm->emptied = lappend(sm->emptied, pstrdup(name));
 				/* the old default goes first: it may not cast */
 				if (column_attr(old, "default "))
 					sm->changes = lappend(sm->changes,
@@ -3864,7 +3998,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sm->rekeyed = lappend(sm->rekeyed, pstrdup(name));
 		/* (foreign keys first: they may need others' keys) */
 		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
-			sm->before = lcons(sql, sm->before);
+			sm->fk_drops = lappend(sm->fk_drops, sql);
 		else
 			sm->before = lappend(sm->before, sql);
 	}
@@ -4470,6 +4604,7 @@ typedef struct TypeMoves
 	List	   *creates;		/* the types made (these and new ones), in any
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
+	List	   *tables;			/* the tables of those columns */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -4744,6 +4879,8 @@ type_moves(List *from, List *to)
 														   rel, col, mt->to->name,
 														   converted_value(col, mt->from->def, mt->to->def,
 																		   mt->to->name)));
+						if (!list_has_string(tm.tables, rel))
+							tm.tables = lappend(tm.tables, rel);
 						handled = true;
 					}
 					else if (kind == RELKIND_INDEX && versioned)
@@ -4894,23 +5031,75 @@ type_moves(List *from, List *to)
 }
 
 /*
+ * The table name (qualified) emptied, each partition of it with storage, by
+ * the applier the move writes rows with: no trigger fires (one enabled
+ * ALWAYS neither), no rule applies and no foreign key is checked, and a
+ * table row-level security applies to is refused, as its rows written
+ * would be.  A row read is removed as it is: the scan's snapshot keeps
+ * seeing those removed.
+ */
+static void
+empty_table(const char *name)
+{
+	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										 RowExclusiveLock, false);
+	ListCell   *lc;
+
+	CommandCounterIncrement();
+	foreach(lc, find_all_inheritors(relid, RowExclusiveLock, NULL))
+	{
+		Relation	rel = table_open(lfirst_oid(lc), NoLock);
+		ProllyApplier *a;
+		TableScanDesc scan;
+		TupleTableSlot *slot;
+		Snapshot	snap;
+
+		if (rel->rd_rel->relkind != RELKIND_RELATION)
+		{
+			table_close(rel, NoLock);
+			continue;
+		}
+		a = PROLLY_CALL(ar, begin, rel);
+		slot = table_slot_create(rel, NULL);
+		snap = RegisterSnapshot(GetLatestSnapshot());
+		scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			slot_getallattrs(slot);
+			if (!PROLLY_CALL(ar, remove, a, slot))
+				elog(ERROR, "could not find a row of \"%s\" to remove",
+					 RelationGetRelationName(rel));
+		}
+		table_endscan(scan);
+		UnregisterSnapshot(snap);
+		ExecDropSingleTupleTableSlot(slot);
+		PROLLY_CALL(ar, end, a);
+		table_close(rel, NoLock);
+	}
+	CommandCounterIncrement();
+}
+
+/*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
  * rows(arg), which writes them, then what they must satisfy (the checks,
  * NOT NULLs and foreign keys they may break unvalidated, breaking(them,
  * arg), their validation); and, if materialized views were made again,
- * rows(arg) once more, for theirs.
+ * rows(arg) once more, for theirs.  rewritten: rows(arg) writes every
+ * table's rows as to has them (see prolly_canon.h).
  */
 static void
 folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				   void (*rows) (void *arg),
-				   void (*breaking) (List *added, void *arg), void *arg)
+				   void (*breaking) (List *added, void *arg), void *arg,
+				   bool rewritten)
 {
 	bool		matviews_made = false;
 	Canon		cn;
 	List	   *from;
 	List	   *to;
-	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL};
+	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, rewritten};
 	List	   *views = NIL;
 	List	   *view_drops = NIL;
 	List	   *matview_drops = NIL;
@@ -5031,10 +5220,22 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 
 	/*
-	 * Foreign keys both sides have, into a table made again or dropped, or
-	 * whose keys change: they go first, and the ones kept come back last.
+	 * Tables whose columns change type in turn (type_moves()) are emptied
+	 * too, as move_table() empties those it changes: converted, their rows
+	 * may break what the new type's column must satisfy (a NOT NULL, a
+	 * unique index).
 	 */
-	keyed = list_concat_copy(remade, sm.rekeyed);
+	if (rewritten)
+		foreach(lc, tm.tables)
+			if (!list_has_string(sm.emptied, lfirst(lc)))
+				sm.emptied = lappend(sm.emptied, lfirst(lc));
+
+	/*
+	 * Foreign keys both sides have, into a table made again or dropped,
+	 * emptied, or whose keys change: they go first (sm.fk_drops), and the
+	 * ones kept come back last, checked against the rows written.
+	 */
+	keyed = list_concat(list_concat_copy(remade, sm.rekeyed), sm.emptied);
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -5060,8 +5261,9 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			{
 				if (strstr(line, psprintf(" REFERENCES %s(", (char *) lfirst(r))) == NULL)
 					continue;
-				sm.before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
-										   f->name, first_field(line)), sm.before);
+				sm.fk_drops = lappend(sm.fk_drops,
+									  psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+											   f->name, first_field(line)));
 				if (t)
 					sm.foreign_keys = lappend(sm.foreign_keys,
 											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
@@ -5328,6 +5530,14 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
 	run_statements(policy_drops);
+
+	/*
+	 * Rows to go before their columns change type (with every row written
+	 * afresh), as rows the move writes go (empty_table()).
+	 */
+	run_statements(sm.fk_drops);
+	foreach(lc, sm.emptied)
+		empty_table(lfirst(lc));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
 
 	/*
@@ -5673,6 +5883,98 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 	return out.data;
 }
 
+/*
+ * The longest value of a string type that a change to another merges
+ * across (string_change_merges()), -1 for a type that isn't one: varchar,
+ * char and text, of any length.
+ */
+static int32
+string_type_length(const char *type)
+{
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	Oid			typid;
+	int32		typmod;
+
+	if (!parseTypeString(type, &typid, &typmod, (Node *) &escontext))
+		return -1;
+	if (typid != VARCHAROID && typid != BPCHAROID && typid != TEXTOID)
+		return -1;
+	return typmod < 0 ? PG_INT32_MAX : typmod - VARHDRSZ;
+}
+
+/*
+ * Whether a column changed from type from to type to on one side merges
+ * with the other side's changes, as Dolt's does: only between string types
+ * (varchar, char, text), and only if the longest value doesn't shrink.
+ * Other changes Dolt can't make to the other side's rows, and calls a
+ * schema conflict.
+ */
+static bool
+string_change_merges(const char *from, const char *to)
+{
+	int32		from_len = string_type_length(from);
+	int32		to_len = string_type_length(to);
+
+	return from_len >= 0 && to_len >= 0 && to_len >= from_len;
+}
+
+/*
+ * A table both sides changed (its rows or its definition), whose
+ * definition one side changed, fails to merge as a schema conflict where
+ * that side changed a column's type in a way Dolt doesn't merge
+ * (string_change_merges()).  A column both changed differently is a
+ * conflict already (merge_table_defs()).
+ */
+static void
+check_type_changes(const char *name, const char *base, const char *ours,
+				   const char *theirs)
+{
+	List	   *sec[3][NUM_TABLE_SECTIONS];
+	TableLine  *tl[3];
+	int			len[3];
+
+	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
+		!split_table_def(theirs, sec[2]))
+		return;
+	for (int side = 0; side < 3; side++)
+	{
+		tl[side] = table_lines(0, sec[side][0]);
+		len[side] = list_length(sec[side][0]);
+	}
+	for (int i = 0; i < len[0]; i++)
+	{
+		const char *col = tl[0][i].key;
+		char	   *type[3];
+		bool		found = true;
+
+		type[0] = column_type(tl[0][i].line);
+		for (int side = 1; side < 3 && found; side++)
+		{
+			TableLine	want = {.key = unconstify(char *, col)};
+			TableLine  *l = bsearch(&want, tl[side], len[side], sizeof(TableLine),
+									table_line_key_cmp);
+
+			found = l != NULL;
+			if (found)
+				type[side] = column_type(l->line);
+		}
+		if (!found)
+			continue;
+		for (int side = 1; side < 3; side++)
+		{
+			char	   *other = type[3 - side];
+
+			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
+				!string_change_merges(type[0], type[side]))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: column %s of %s changed type from %s to %s on one side, and the other side changed the table",
+								col, name, type[0], type[side]),
+						 errdetail("A change of type merges with the other side's changes only as a string type made no shorter.")));
+		}
+	}
+}
+
 
 /*
  * The definitions of base, ours and theirs merged: each object as the side
@@ -5736,6 +6038,13 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		}
 #define SAME(a, b) (has[a] == has[b] && (!has[a] || \
 					(def[a].len == def[b].len && memcmp(def[a].data, def[b].data, def[a].len) == 0)))
+#define CHANGED(a) (v[a].len != v[0].len || memcmp(v[a].data, v[0].data, v[0].len) != 0)
+		if (least->data[0] == 't' && has[0] && has[1] && has[2] &&
+			CHANGED(1) && CHANGED(2) && !(SAME(0, 1) && SAME(0, 2)) && !SAME(1, 2))
+			check_type_changes(from_utf8(least->data + 2, least->len - 2),
+							   pnstrdup((const char *) def[0].data, def[0].len),
+							   pnstrdup((const char *) def[1].data, def[1].len),
+							   pnstrdup((const char *) def[2].data, def[2].len));
 		if (SAME(0, 2))
 			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
 		else if (SAME(0, 1) || SAME(1, 2))
@@ -5765,6 +6074,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 							from_utf8(least->data + 2, least->len - 2)),
 					 errdetail("Both branches made, dropped or redefined it since their common ancestor.")));
 #undef SAME
+#undef CHANGED
 		if (take)
 			PROLLY_CALL(cn.tree, build_add, b, least, take);
 		if (least->data[0] == 'n' && has[0] && !take)

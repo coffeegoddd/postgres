@@ -133,8 +133,8 @@ SELECT length(dolt_commit('-Am', 'main makes both')::text) AS committed;
 SELECT (dolt_merge('mr_side'))[2:4];
 SELECT * FROM mr.both ORDER BY k;
 
--- The other side's rows, taken into a table one side redefined, must fit
--- it as it is defined now: ours narrows a column, theirs adds a row too
+-- A column one side narrows, where the other side changed the table too, is
+-- a schema conflict, as in Dolt: ours narrows it, theirs adds a row too
 -- long for it.
 SELECT dolt_branch('-D', 'mr_side');
 SELECT dolt_branch('mr_side');
@@ -491,4 +491,40 @@ SELECT length(dolt_commit('-Am', 'slk left')::text) AS committed;
 SELECT dolt_merge('slk_right');
 SELECT dolt_branch('-D', 'slk_right');
 DROP SCHEMA slk CASCADE;
+-- A column one side changed type merges with the other side's changes to
+-- the table only as Dolt merges it: a string type (varchar, char, text)
+-- made no shorter.  Others are schema conflicts; a table the other side
+-- didn't change takes the change whatever it is.
+CREATE SCHEMA stc VERSIONED;
+CREATE TABLE stc.t (pk int PRIMARY KEY, s varchar(5), c char(3), i int);
+CREATE TABLE stc.u (pk int PRIMARY KEY, i int);
+INSERT INTO stc.t VALUES (1, 'a', 'b', 1);
+INSERT INTO stc.u VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'stc base')::text) AS committed;
+SELECT dolt_branch('stc_right');
+SELECT dolt_checkout('stc_right');
+ALTER TABLE stc.t ALTER COLUMN s TYPE text, ALTER COLUMN c TYPE varchar(3);
+ALTER TABLE stc.u ALTER COLUMN i TYPE varchar(10);
+INSERT INTO stc.t VALUES (2, 'longer', 'cc', 2);
+SELECT length(dolt_commit('-Am', 'stc right')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO stc.t VALUES (3, 'x', 'y', 3);
+SELECT length(dolt_commit('-Am', 'stc left')::text) AS committed;
+SELECT (dolt_merge('stc_right'))[2:4];
+SELECT * FROM stc.t ORDER BY pk;
+SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid IN ('stc.t'::regclass, 'stc.u'::regclass) AND attnum > 1
+ORDER BY attrelid::regclass::text, attnum;
+SELECT dolt_branch('-D', 'stc_right');
+SELECT dolt_branch('stc_right');
+SELECT dolt_checkout('stc_right');
+ALTER TABLE stc.t ALTER COLUMN i TYPE bigint;
+SELECT length(dolt_commit('-Am', 'stc right: bigint')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE stc.t SET i = 30 WHERE pk = 3;
+SELECT length(dolt_commit('-Am', 'stc left: a row')::text) AS committed;
+SELECT dolt_merge('stc_right');
+SELECT dolt_merge('stc_right', '--squash');
+SELECT dolt_branch('-D', 'stc_right');
+DROP SCHEMA stc CASCADE;
 DROP SCHEMA app CASCADE;

@@ -16375,6 +16375,661 @@
         "Each client is a session: client a is session a, client b session b.",
         "USE dolt/main becomes the session's connection to the case's database's branch main (connect). (D11)"
       ]
+    },
+    {
+      "id": "dolt-schema-check-altered",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsConstraints",
+      "index": 3,
+      "name": "altering a check constraint on one side",
+      "source_sha256": "bdaf95d22b38508e330422f58cd0a0f29adce06883563a6c1e0dcb32bb045877",
+      "scenario_sha256": "0c8127e07e39fcb52e1723034c25eb47f5ad454e145b5df329f53798fda454f6",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "keep, with the string literals single-quoted."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "anc-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "right-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "right-2",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "keep, with the string literals single-quoted."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "keep, with the string literals single-quoted. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message). doltCommit checked as a commit id. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-index-same-name",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsSchemaConflicts",
+      "index": 3,
+      "name": "index conflicts: both sides add an index with the same name, same columns, but different type",
+      "source_sha256": "09c3374057198709c2c1087dd8f8f84712083f12ad336b7b67fecc801c04a60a",
+      "scenario_sha256": "a6ad0997fc8ce1e6efd29d508cd14e014af593b6ee42fbbedf96f37066635df0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "MySQL's prefix index col2(2) as an index on the expression substr(col2, 1, 2): Postgres has no prefix indexes, and the case is about one index name with two definitions. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "right-1",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "keep, with the string literals single-quoted."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "left-0"
+          ],
+          "note": "MySQL's ALTER TABLE ... ADD INDEX as CREATE INDEX. (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "left-1",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "keep, with the string literals single-quoted. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax (indexes as CREATE INDEX, the prefix index as an expression index). (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-modify-drop-column",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsSchemaConflicts",
+      "index": 4,
+      "name": "modifying a column on one side of a merge, and deleting it on the other",
+      "source_sha256": "e71a824e079f618713b19efa45c11d8d9a1796de1f6496a5b2ba5659e6deb3ff",
+      "scenario_sha256": "c1ff7dfcf3531a943107763b01fd25126366deff62b9315601fc87f7f611cb40",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-type-change-both",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsSchemaConflicts",
+      "index": 5,
+      "name": "type changes to a column on both sides of a merge",
+      "source_sha256": "a1866bb24374e8a9ff045f9d1a57e44c9945ce6baa70017579e0bf02bd23f33f",
+      "scenario_sha256": "1eda53dc3d276f9bc8c9791492feae82211c5351cb491edb4e490ad282e68c6c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE; MySQL's float, single precision, is real. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-type-change-one-side",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsSchemaConflicts",
+      "index": 6,
+      "name": "changing the type of a column",
+      "source_sha256": "1630635691fee1f75c87aeda6be2b763db10d0cb803abb8ab391b510faa26a2b",
+      "scenario_sha256": "ba3060b05b7c3c37c94ca0fa96942def9dfc5a6aaf0cf3c912432230e45ad072",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "anc-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "right-1",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-type-change-indexed",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsSchemaConflicts",
+      "index": 7,
+      "name": "changing the type of a column with an index",
+      "source_sha256": "02ae88bbc8cbd935809e90072879a65df02ae74e7779e9fd8a3447aba623a9a4",
+      "scenario_sha256": "c1b53040cd6e7a85cbad54b6340d21099da932d8f5d6ba60af64a8d2bf2574f4",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1a",
+            "anc-1b"
+          ],
+          "note": "MySQL's inline INDEX col1_idx (col1) as CREATE INDEX. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "anc-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "right-1",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-varchar-narrowing",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsTypeChanges",
+      "index": 12,
+      "name": "varchar narrowing",
+      "source_sha256": "1aec957e69fa2a382784cc4a2d7283a7198753ea206620598163219f55bfcfe7",
+      "scenario_sha256": "4babc30a93dd6e1e0242f8e27b45c4145c755bf05064f79f3ee8003f8b7fe165",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "anc-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "anc-3"
+          ],
+          "note": "MySQL's prefix index as an index on the column (Postgres has no prefix indexes). (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "right-1",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax (indexes as CREATE INDEX). (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
+    },
+    {
+      "id": "dolt-schema-text-to-varchar-narrowing",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
+      "suite": "SchemaChangeTestsTypeChanges",
+      "index": 13,
+      "name": "TEXT to VARCHAR narrowing",
+      "source_sha256": "d1cd6415fe6b4a0bbef976eaab20b2115ac41cd57fdfe0884a82bbda9f1c2289",
+      "scenario_sha256": "694c29488c5bef4774a436b5de1ed3e60e4ad5d323c2aa6ffe9873fec3b61aa0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "anc-0"
+          ],
+          "note": "set autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so the harness's commits, checkouts and the merge are query steps. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "anc-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax; same columns, keys and constraints. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "anc-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "anc-3"
+          ],
+          "note": "MySQL's prefix index as an index on the column (Postgres has no prefix indexes). (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "h-ancestor",
+            "h-branch",
+            "h-right-side",
+            "right-0"
+          ],
+          "note": "MySQL's MODIFY COLUMN as ALTER COLUMN ... TYPE. (D10) Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "right-1",
+            "h-right-commit",
+            "h-left-side"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "left-0",
+            "h-left-commit",
+            "h-main"
+          ],
+          "note": "Preserved SQL and ordering. Dolt's harness steps around the scripts: the ancestor commit, branch right and checkouts, and each side's commit."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_preview_merge_conflicts_summary is a feature prolly lacks (F preview-merge-conflicts): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax (indexes as CREATE INDEX). (D3, D10)",
+        "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
+      ]
     }
   ],
   "deferred": [
@@ -16441,14 +17096,6 @@
       "name": "renaming a column",
       "source_sha256": "294cd2f7298ccdf2c3d70a36804042042fc3b8fd706491fb5f6c8ee9b4264c61",
       "reason": "Prolly's rule, decided by the user (2026-10-14): a rename merges as a drop and an add (Dolt tracks columns by tag), so rows the other side inserted can't be merged across the renamed column (0A000). Dolt keeps their values under the new name. Stable column tags are the decided later option."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
-      "suite": "SchemaChangeTestsConstraints",
-      "index": 3,
-      "name": "altering a check constraint on one side",
-      "source_sha256": "bdaf95d22b38508e330422f58cd0a0f29adce06883563a6c1e0dcb32bb045877",
-      "reason": "Blocked by a prolly bug found porting it: branch right, first used after main changed the check, is moved to the ancestor commit by re-making check1 from its printed definition, and Postgres parses that into a different expression (ARRAY[...]::text[] versus casts of each element), so the branch's definition no longer equals the ancestor's and the merge sees a schema conflict on both sides. The canonical form of a check isn't stable across a move; to fix in the canonicalizer."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",

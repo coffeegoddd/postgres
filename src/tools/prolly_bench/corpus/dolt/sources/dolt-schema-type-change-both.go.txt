@@ -1,0 +1,27 @@
+{
+		Name: "type changes to a column on both sides of a merge",
+		AncSetUpScript: []string{
+			"set @@autocommit=0;",
+			"create table t(i int primary key, j int);",
+		},
+		RightSetUpScript: []string{
+			"alter table t modify column j varchar(100);",
+		},
+		LeftSetUpScript: []string{
+			"alter table t modify column j float;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_preview_merge_conflicts_summary('main', 'right');",
+				Expected: []sql.Row{{"t", nil, uint64(1)}},
+			},
+			{
+				Query:    "call dolt_merge('right');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:    "select table_name from dolt_schema_conflicts",
+				Expected: []sql.Row{{"t"}},
+			},
+		},
+	}

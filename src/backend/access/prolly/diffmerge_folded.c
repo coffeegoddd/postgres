@@ -1377,7 +1377,7 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 		rows_from(&working, target);	/* (folded already) */
 	else
 		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
-					NULL, (void *) target);
+					NULL, (void *) target, true);
 }
 
 /*
@@ -2747,7 +2747,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 	PG_TRY();
 	{
 		PROLLY_CALL(components().canonicalizer, move_schema, ours, merged,
-					merge_rows, take_breaking_rows, mr);
+					merge_rows, take_breaking_rows, mr, false);
 	}
 	PG_CATCH();
 	{
