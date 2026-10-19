@@ -979,7 +979,11 @@ force_branch(const char *name, const char *from)
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
 
-	/* (another branch's rows written, as a create makes its copies) */
+	/*
+	 * (made, as a create is, though the transaction is read-only for the
+	 * branch it started on: the checks too, and another branch's rows
+	 * written, as a create makes its copies)
+	 */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
@@ -1351,6 +1355,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (a rename, delete, take or protection makes no branch: not in a
+	 * transaction read-only for the branch it started on either, unlike a
+	 * create, forced or not, which a session on a commit makes to change
+	 * anything)
+	 */
+	if (move || delete || take || protection != PROLLY_PROTECT_DEFAULT)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (protection != PROLLY_PROTECT_DEFAULT)
 	{
 		ListCell   *lc;
@@ -2655,7 +2668,7 @@ typedef struct LogEntry
 {
 	ProllyHash	key;			/* hash key: info.id as prolly_hash_key() makes it */
 	ProllyCommitInfo info;
-	int64		order;			/* 1 + the most of its parents'; -1 while found */
+	int64		order;			/* its height: 1 + the most of its parents' */
 } LogEntry;
 
 static LogEntry *
@@ -2666,68 +2679,36 @@ log_find(HTAB *entries, const ProllyHash *id)
 	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
+/*
+ * Highest order first, then newest, as Dolt's log goes by height and then
+ * date: a commit is always above its parents.
+ */
 static int
 log_cmp(const ListCell *a, const ListCell *b)
 {
 	LogEntry   *x = lfirst(a);
 	LogEntry   *y = lfirst(b);
 
-	if (x->info.committed_at != y->info.committed_at)
-		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	if (x->order != y->order)
 		return x->order > y->order ? -1 : 1;
+	if (x->info.committed_at != y->info.committed_at)
+		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
 /*
- * The order of e, its parents' first (they are all in entries): without
- * recursion, as history may be as deep as it is long, on stack (empty, and
- * left so).  A commit found again while its own parents are being ordered
- * is in a cycle, which history can't hold.
+ * A commit of the log, for prolly_history_height(): read already, so none
+ * is read twice.
  */
-static void
-log_order(HTAB *entries, LogEntry *e, List **stack)
+static bool
+log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 {
-	*stack = lappend(*stack, e);
-	while (*stack != NIL)
-	{
-		LogEntry   *top = llast(*stack);
-		int64		most = 0;
-		bool		ready = true;
+	LogEntry   *e = log_find(arg, id);
 
-		if (top->order > 0)
-		{
-			*stack = list_delete_last(*stack);
-			continue;
-		}
-		top->order = -1;
-		for (int i = 0; i < top->info.nparents; i++)
-		{
-			LogEntry   *p = log_find(entries, &top->info.parents[i]);
-
-			if (p == NULL)
-				continue;
-			if (p->order < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("prolly commit %s is its own ancestor",
-								hash_hex(&p->info.id))));
-			if (p->order == 0)
-			{
-				*stack = lappend(*stack, p);
-				ready = false;
-			}
-			else
-				most = Max(most, p->order);
-		}
-		/* (else it waits, found, for the parents pushed above it) */
-		if (ready)
-		{
-			top->order = most + 1;
-			*stack = list_delete_last(*stack);
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
+	if (e == NULL)
+		return false;
+	*info = e->info;
+	return true;
 }
 
 /*
@@ -2735,7 +2716,8 @@ log_order(HTAB *entries, LogEntry *e, List **stack)
  *			OUT email text, OUT date timestamptz, OUT message text,
  *			OUT commit_order int8) returns setof record
  *
- * Every commit ref reaches, newest first.
+ * Every commit ref reaches, highest commit order (height) first, then
+ * newest.
  */
 Datum
 dolt_log(PG_FUNCTION_ARGS)
@@ -2745,8 +2727,8 @@ dolt_log(PG_FUNCTION_ARGS)
 	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
+	HTAB	   *heights;
 	List	   *entries = NIL;
-	List	   *stack = NIL;
 	ListCell   *lc;
 	ProllyHash	key;
 	bool		found;
@@ -2794,9 +2776,14 @@ dolt_log(PG_FUNCTION_ARGS)
 				entries = lappend(entries, p);
 		}
 	}
+	heights = prolly_history_heights();
 	foreach(lc, entries)
-		log_order(seen, lfirst(lc), &stack);
-	list_free(stack);
+	{
+		LogEntry   *e = lfirst(lc);
+
+		e->order = prolly_history_height(&e->info.id, heights, log_lookup, seen);
+	}
+	hash_destroy(heights);
 	list_sort(entries, log_cmp);
 	foreach(lc, entries)
 	{

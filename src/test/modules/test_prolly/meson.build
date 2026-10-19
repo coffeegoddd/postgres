@@ -110,6 +110,7 @@ tests += {
       'doltgres_objects',
       'doltgres_fks_auth',
       'jsonb_canonical',
+      'float_canonical',
       'hash_pointers',
       'toast_by_content',
       'toast_folds',
@@ -168,8 +169,10 @@ tests += {
       't/075_toast_acceptance.pl',
       't/076_remote_answers.pl',
       't/101_index_tablespaces.pl',
+      't/107_commit_dates.pl',
       't/109_bmap_incremental_backup.pl',
       't/111_bmap_prefetch_new_page.pl',
+      't/112_bmap_remap_zero_replay.pl',
     ],
   },
 }

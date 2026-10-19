@@ -82,6 +82,7 @@
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -127,6 +128,7 @@ static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
+static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
@@ -670,6 +672,7 @@ move_settled(void *arg)
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+static bool commit_time(const ProllyHash *id, TimestampTz *at);
 
 /* The session's branch folded, as a commit's fold would be: its baseline. */
 static void
@@ -822,19 +825,33 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 /*
  * Write a commit's tree; its id is the root's hash.  What its versioned
  * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.
+ * transaction sees them.  It is dated now, as Dolt's are, not at the
+ * transaction's start, so a parent another session committed since then is
+ * older than it; and never at or before a parent's date (the clock may have
+ * stepped back, or a parent come from a remote whose clock runs ahead), so
+ * along history the dates only rise.  (A parent dated outside timestamp's
+ * range, or at its last microsecond, which only a foreign or corrupt commit
+ * could be, leaves the date as it is.)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, TimestampTz at,
-			 ProllyHash *id)
+			 const char *author, const char *message, ProllyHash *id)
 {
+	TimestampTz at = GetCurrentTimestamp();
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
 	ProllyNodeRef deps;
 	ProllyDatabaseComponents dc;
 
+	for (int i = 0; i < nparents; i++)
+	{
+		TimestampTz parent_at;
+
+		if (commit_time(&parents[i], &parent_at) && at <= parent_at &&
+			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
+			at = parent_at + 1;
+	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
@@ -872,6 +889,20 @@ read_item(const ProllyNodeRef *commit, const char *key, StringInfo out)
 	ProllyKey	k = {(const uint8 *) key, strlen(key)};
 
 	return PROLLY_CALL(tree, get, &env, commit, &k, out);
+}
+
+/* A commit's "time" item, as write_commit puts it; false if it isn't one. */
+static bool
+get_time(const StringInfoData *v, TimestampTz *at)
+{
+	uint64		t = 0;
+
+	if (v->len != 8)
+		return false;
+	for (int i = 0; i < 8; i++)
+		t = (t << 8) | (uint8) v->data[i];
+	*at = (TimestampTz) t;
+	return true;
 }
 
 static bool
@@ -916,16 +947,28 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		info->has_dependencies = true;
 	}
 	resetStringInfo(&v);
-	if (read_item(&ref, "time", &v) && v.len == 8)
-	{
-		uint64		t = 0;
-
-		for (int i = 0; i < 8; i++)
-			t = (t << 8) | (uint8) v.data[i];
-		info->committed_at = (TimestampTz) t;
-	}
+	if (read_item(&ref, "time", &v))
+		(void) get_time(&v, &info->committed_at);
 	pfree(v.data);
 	return true;
+}
+
+/* Just the date of commit id, which is read only for it. */
+static bool
+commit_time(const ProllyHash *id, TimestampTz *at)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+		return false;
+	ref_of(id, &ref);
+	initStringInfo(&v);
+	found = read_item(&ref, "time", &v) && get_time(&v, at);
+	pfree(v.data);
+	return found;
 }
 
 /* A commit id in hex; false if refname isn't one. */
@@ -1234,7 +1277,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		return false;
 	}
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -1371,8 +1414,20 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	base;
 
 	lock_refs();
+
+	/*
+	 * Merged, as in Dolt (and git): into the branch's upstream, read from
+	 * its remote-tracking branch, so only as current as the last fetch; or,
+	 * when it has none there, into the session's branch.  Not asked of the
+	 * session's own branch or main, which the drop refuses whatever they
+	 * contain: refused first, as Dolt (and git) refuses the checked-out
+	 * branch, so the error isn't one -D doesn't get past.
+	 */
 	if (!force && branch_head(name, &head) &&
-		!(branch_head(branch_ops()->current(), &ours) &&
+		strcmp(name, branch_ops()->current()) != 0 &&
+		branch_oid(name) != BRANCH_MAIN_OID &&
+		!((upstream_head(name, &ours) ||
+		   branch_head(branch_ops()->current(), &ours)) &&
 		  copies_merge_base(&head, &ours, &base) && same_hash(&base, &head)))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1675,7 +1730,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
 	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 GetCurrentTransactionStartTimestamp(), commit_id);
+				 commit_id);
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	return 1;
@@ -1707,7 +1762,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -2446,6 +2501,34 @@ copies_upstream(const char *branch, char **remote, char **remote_branch)
 	pfree(key.data);
 	pfree(v.data);
 	return found;
+}
+
+/*
+ * The commit of branch's upstream's remote-tracking branch; false if it has
+ * no upstream, or the upstream no remote-tracking branch (not yet fetched).
+ */
+static bool
+upstream_head(const char *branch, ProllyHash *commit_id)
+{
+	char	   *remote;
+	char	   *remote_branch;
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	if (!copies_upstream(branch, &remote, &remote_branch))
+		return false;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tracking_key(&key, remote, remote_branch);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+		(void) get_hash(v.data, v.data + v.len, commit_id);
+	pfree(key.data);
+	pfree(v.data);
+	pfree(remote);
+	pfree(remote_branch);
+	return found && commit_id->len > 0;
 }
 
 static bool
