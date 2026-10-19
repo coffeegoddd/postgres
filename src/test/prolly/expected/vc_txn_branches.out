@@ -49,6 +49,14 @@ vtb_mine
 (1 row)
 
 
+starting permutation: b_on_other
+step b_on_other: SELECT (dolt_checkout('vtb_other'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+
 starting permutation: a_begin a_branches b_branch a_branches a_commit
 step a_begin: BEGIN;
 step a_branches: SELECT count(*) AS vtb_branches FROM dolt_branches WHERE starts_with(name, 'vtb_');

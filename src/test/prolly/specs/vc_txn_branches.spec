@@ -63,13 +63,16 @@ step b_branches	{ SELECT name FROM dolt_branches WHERE starts_with(name, 'vtb_')
 step b_delete_mine { SELECT dolt_branch('-D', 'vtb_mine'); }
 step b_insert	{ INSERT INTO vtb.t (v) VALUES (2) RETURNING id; }
 step b_commit	{ COMMIT; }
+# back on main, as a is
+teardown		{ DO $$ BEGIN PERFORM dolt_checkout('main'); END $$; }
 
 # another branch's head moved since the transaction began (BranchIsolation-
 # Tests 1): seen moved
 permutation a_begin a_other_head b_on_other b_change b_dcommit b_main a_other_head a_commit
-# a session left on a branch it made: back on main before the teardown
-# deletes it, and nothing left for the next permutation
+# a session left on a branch, one it made or another: back on main before
+# the teardown deletes it, and nothing left for the next permutation
 permutation a_mine a_active
+permutation b_on_other
 # a branch made since (2): seen made
 permutation a_begin a_branches b_branch a_branches a_commit
 # a branch deleted and another made since (4): seen by name, in a join,
