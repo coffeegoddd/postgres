@@ -119,6 +119,7 @@ typedef struct Tables
 
 static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 						const char *what, const char *name, List **conflicted);
+static void apply_rows_held(Oid relid, const Table *from, const Table *to);
 static bool same_description(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
@@ -931,28 +932,42 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 }
 
 /*
- * Write a row as a merge does: insert it, or update old to it.  While a
- * merge records violations, a row that breaks a unique, check or not-null
- * (or exclusion) constraint isn't written, and is recorded instead: a
- * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).
- * Returns false if old isn't there.
+ * The kind of violation a merge records for an error a row's write
+ * raised: a unique, check or not-null (or exclusion) constraint broken.
+ * NULL: the error is no refusal, and is raised.
  */
-static bool
-merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
-			TupleTableSlot *old, TupleTableSlot *row, const bool *keep)
+static const char *
+refusal_type(int sqlerrcode)
+{
+	switch (sqlerrcode)
+	{
+		case ERRCODE_UNIQUE_VIOLATION:
+		case ERRCODE_EXCLUSION_VIOLATION:
+			return "unique index";
+		case ERRCODE_CHECK_VIOLATION:
+			return "check constraint";
+		case ERRCODE_NOT_NULL_VIOLATION:
+			return "not null";
+		default:
+			return NULL;
+	}
+}
+
+/*
+ * Insert row into rel, or update old to it, in a subtransaction: a row
+ * whose error refusal_type() names is rolled back, and the error returned
+ * (NULL: written).  *found (if not NULL) gets whether old was there.
+ */
+static ErrorData *
+try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
+		  TupleTableSlot *old, TupleTableSlot *row, const bool *keep,
+		  bool *found)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *volatile refused = NULL;
 	volatile bool ok = true;
 
-	if (!recording || !may_break_constraints(rel))
-	{
-		if (old)
-			return PROLLY_CALL(ar, update, a, old, row, keep);
-		PROLLY_CALL(ar, insert, a, row);
-		return true;
-	}
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
@@ -968,40 +983,64 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	PG_CATCH();
 	{
 		ErrorData  *ed;
-		const char *type;
-		char	   *info;
-		MemoryContext rec;
 
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
-		switch (ed->sqlerrcode)
-		{
-			case ERRCODE_UNIQUE_VIOLATION:
-			case ERRCODE_EXCLUSION_VIOLATION:
-				type = "unique index";
-				break;
-			case ERRCODE_CHECK_VIOLATION:
-				type = "check constraint";
-				break;
-			case ERRCODE_NOT_NULL_VIOLATION:
-				type = "not null";
-				break;
-			default:
-				PG_RE_THROW();
-		}
+		if (refusal_type(ed->sqlerrcode) == NULL)
+			PG_RE_THROW();
 		FlushErrorState();
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
-		info = constraint_info(rel, type, ed);
-		rec = MemoryContextSwitchTo(TopTransactionContext);
-		recorded = lappend(recorded,
-						   violation(RelationGetRelid(rel), type, row_json(row),
-									 pstrdup(info)));
-		MemoryContextSwitchTo(rec);
-		FreeErrorData(ed);
+		refused = ed;
 	}
 	PG_END_TRY();
+	if (found)
+		*found = ok;
+	return refused;
+}
+
+/*
+ * Write a row as a merge does: insert it, or update old to it.  While a
+ * merge records violations, a row that breaks a unique, check or not-null
+ * (or exclusion) constraint isn't written, and is recorded instead: a
+ * row the merge made of both sides' columns too, the branch's kept (a
+ * table holds no row breaking a constraint, unlike Dolt's).  *refused (if
+ * not NULL) gets whether it was.  Returns false if old isn't there.
+ */
+static bool
+merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
+			TupleTableSlot *old, TupleTableSlot *row, const bool *keep,
+			bool *refused)
+{
+	ErrorData  *ed;
+	const char *type;
+	char	   *info;
+	MemoryContext rec;
+	bool		ok;
+
+	if (refused)
+		*refused = false;
+	if (!recording || !may_break_constraints(rel))
+	{
+		if (old)
+			return PROLLY_CALL(ar, update, a, old, row, keep);
+		PROLLY_CALL(ar, insert, a, row);
+		return true;
+	}
+	ed = try_write(rel, ar, a, old, row, keep, &ok);
+	if (ed == NULL)
+		return ok;
+	type = refusal_type(ed->sqlerrcode);
+	info = constraint_info(rel, type, ed);
+	rec = MemoryContextSwitchTo(TopTransactionContext);
+	recorded = lappend(recorded,
+					   violation(RelationGetRelid(rel), type, row_json(row),
+								 pstrdup(info)));
+	MemoryContextSwitchTo(rec);
+	FreeErrorData(ed);
+	if (refused)
+		*refused = true;
 	return ok;
 }
 
@@ -1018,6 +1057,8 @@ typedef struct Applying
 	Bitmapset  *pk;				/* the primary key's columns */
 	bool		keyless;
 	bool		in_place;		/* changed keyed rows updated in place */
+	bool		put_back;		/* a refused row's old version put back */
+	bool		stuck;			/* a put-back refused: the rest not written */
 	bool		inserting;
 } Applying;
 
@@ -1031,6 +1072,38 @@ static bool
 updates_in_place(Relation rel)
 {
 	return !other_unique_index(rel);
+}
+
+/*
+ * Does a merge put a keyed row of rel back as the branch has it when the
+ * version it writes is refused?  While violations are recorded, where a
+ * changed keyed row is removed and inserted again, not updated in place:
+ * the row is to stay, but was removed.
+ */
+static bool
+puts_back(Relation rel, bool keyless)
+{
+	return recording && !keyless && !updates_in_place(rel);
+}
+
+/*
+ * A row the merge removes or updates isn't there: another wrote it since
+ * (moving: as the branch was brought to one side's rows).
+ */
+static void
+row_missing(Relation rel, bool moving)
+{
+	if (moving)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("a row of \"%s\" changed while the branch was moved",
+						RelationGetRelationName(rel)),
+				 errhint("Try again.")));
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("a row of \"%s\" changed while it was merged",
+					RelationGetRelationName(rel)),
+			 errhint("Try again.")));
 }
 
 /*
@@ -1085,6 +1158,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	uint64		nb = copies_of(&ap->c, before, &brow);
 	uint64		na = copies_of(&ap->c, after, &arow);
 
+	if (ap->stuck)
+		return;
+
 	/* a keyed row that changed, updated in place, while inserting */
 	if (ap->in_place && nb == 1 && na == 1)
 	{
@@ -1092,12 +1168,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 			return;
 		decode_update(&ap->c, ap->rel, ap->pk, &brow, &arow, ap->old,
 					  ap->slot, ap->kept);
-		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept))
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("a row of \"%s\" changed while the branch was moved",
-							RelationGetRelationName(ap->rel)),
-					 errhint("Try again.")));
+		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept,
+						 NULL))
+			row_missing(ap->rel, true);
 		return;
 	}
 
@@ -1118,33 +1191,58 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
 		for (uint64 i = 0; i < nb; i++)
 			if (!PROLLY_CALL(ap->ar, remove, ap->a, ap->slot))
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("a row of \"%s\" changed while the branch was moved",
-								RelationGetRelationName(ap->rel)),
-						 errhint("Try again.")));
+				row_missing(ap->rel, true);
 	}
 	else if (ap->inserting && na > 0)
 	{
+		bool		refused = false;
+
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
 		for (uint64 i = 0; i < na; i++)
-			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL);
+			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL,
+							   &refused);
+
+		/*
+		 * A keyed row whose new version is refused, recorded as a violation
+		 * instead: the row stays as the branch has it.  If that is refused
+		 * too (another row written has taken its unique value), the rows
+		 * are written held instead (apply_rows_held()).
+		 */
+		if (ap->put_back && refused && nb == 1)
+		{
+			ErrorData  *ed;
+
+			ExecClearTuple(ap->old);
+			PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->old);
+			ed = try_write(ap->rel, ap->ar, ap->a, NULL, ap->old, NULL, NULL);
+			if (ed)
+			{
+				FreeErrorData(ed);
+				ap->stuck = true;
+			}
+		}
 	}
 }
 
 /*
  * Write the rows of relation relid that differ between from and to: the
  * removals, then the inserts (a row taking a unique value another gives
- * up), each written as the trees' diff finds it, nothing held.
+ * up), each written as the trees' diff finds it, nothing held.  While
+ * violations are recorded, a keyed row refused is put back (puts_back()),
+ * in a subtransaction: if a put-back is refused too, it is rolled back,
+ * and the rows written held instead.
  */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
 	Applying	ap;
+	int			nrecorded = list_length(recorded);
 
 	require_readable(from);
 	require_readable(to);
@@ -1158,6 +1256,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	ap.in_place = !ap.keyless && updates_in_place(ap.rel);
+	ap.put_back = puts_back(ap.rel, ap.keyless);
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
@@ -1170,10 +1269,28 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.kept = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
+	if (ap.put_back)
+	{
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+	}
 	for (int pass = 0; pass < 2; pass++)
 	{
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
+	}
+	if (ap.put_back)
+	{
+		/* (stuck: none of it written, nor its violations recorded) */
+		if (ap.stuck)
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			recorded = list_truncate(recorded, nrecorded);
+		}
+		else
+			ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
 	}
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
@@ -1182,6 +1299,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	bms_free(ap.pk);
 	PROLLY_CALL(ap.c.rd.kr, close, ap.c.rd.k);
 	table_close(ap.rel, NoLock);
+	if (ap.stuck)
+		apply_rows_held(relid, from, to);
 }
 
 /* A sequence's value, as a canonical root has it. */
@@ -1461,6 +1580,17 @@ same_bytes(const StringInfoData *a, const StringInfoData *b)
 	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
 }
 
+/*
+ * When write_keys() writes a keyed row anew, as its put-back was refused
+ * in a pass before (never, once, twice).
+ */
+typedef enum KeyRank
+{
+	KEY_IN_ORDER,				/* in key order */
+	KEY_FIRST,					/* before those in key order */
+	KEY_PINNED					/* old left in place, then updated to row */
+} KeyRank;
+
 /* What a merge writes for one key: copies of a row removed, then added. */
 typedef struct KeyWrite
 {
@@ -1469,7 +1599,26 @@ typedef struct KeyWrite
 	const StringInfoData *row;	/* the row inserted, nrow times */
 	int64		nrow;
 	bool		in_place;		/* or old updated to row */
+	KeyRank		rank;
+	/* (in a pass:) */
+	bool		refused;		/* row refused, old in its place */
+	ProllyViolation *violation; /* as recorded */
 } KeyWrite;
+
+/* How write_keys() writes a table's KeyWrites. */
+typedef struct KeyWriter
+{
+	Changes    *c;				/* (the table's keying) */
+	Relation	rel;
+	const ProllyApplierRoutine *ar;
+	ProllyApplier *a;
+	TupleTableSlot *s1;
+	TupleTableSlot *s2;
+	const Bitmapset *pk;		/* the primary key's columns */
+	bool	   *kept;			/* (decode_update()'s) */
+	bool		put_back;		/* puts_back() */
+	bool		moving;			/* row_missing()'s */
+} KeyWriter;
 
 /* Three versions of a row decoded, for merging it column by column. */
 typedef struct CellMerge
@@ -1554,6 +1703,304 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
 	*merged = value;
 	return true;
+}
+
+/*
+ * Update w's old row to its new one, in place.  Returns false if that is
+ * refused, the row left as it was: recorded as a violation if record.
+ */
+static bool
+update_key(KeyWriter *kw, KeyWrite *w, bool record)
+{
+	ProllyValue before;
+	ProllyValue after;
+	ProllyValue v;
+	uint64		count;
+	ErrorData  *ed;
+	bool		found;
+
+	v.data = (const uint8 *) w->old->data;
+	v.len = w->old->len;
+	PROLLY_CALL(kw->c->rd.kr, parse_value, kw->c->rd.k, &v, &before, &count);
+	v.data = (const uint8 *) w->row->data;
+	v.len = w->row->len;
+	PROLLY_CALL(kw->c->rd.kr, parse_value, kw->c->rd.k, &v, &after, &count);
+	decode_update(kw->c, kw->rel, kw->pk, &before, &after, kw->s1, kw->s2,
+				  kw->kept);
+	if (record)
+	{
+		bool		refused;
+
+		if (!merge_write(kw->ar, kw->a, kw->rel, kw->s1, kw->s2, kw->kept,
+						 &refused))
+			row_missing(kw->rel, kw->moving);
+		return !refused;
+	}
+	ed = try_write(kw->rel, kw->ar, kw->a, kw->s1, kw->s2, kw->kept, &found);
+	if (ed)
+	{
+		FreeErrorData(ed);
+		return false;
+	}
+	if (!found)
+		row_missing(kw->rel, kw->moving);
+	return true;
+}
+
+/*
+ * Write a keyed row refused again, its old version (if any) in place:
+ * returns false if it is refused again (nothing recorded).
+ */
+static bool
+retry_key(KeyWriter *kw, KeyWrite *w)
+{
+	ErrorData  *ed;
+
+	Assert(w->nrow == 1);
+	if (w->nold == 1)
+		return update_key(kw, w, false);
+	(void) decode(kw->c, w->row, kw->s2);
+	ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s2, NULL, NULL);
+	if (ed)
+	{
+		FreeErrorData(ed);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Write writes (KeyWrite *): the rows going first, then those coming, so a
+ * row may take a unique value another gives up (theirs swapping two, say).
+ * A keyed row refused, recorded as a violation instead, is put back as
+ * the branch has it (kw->put_back).  If that is refused too (another row
+ * written has taken its unique value), false is returned: the writes are
+ * to be rolled back and made again, the row ranked up.  The first time,
+ * it is written before the rows in key order, ahead of the row that took
+ * its value; the second, it is pinned: left in place throughout, and
+ * updated to its new version last (if that is refused, it stays as it
+ * was).  A pinned row's old values are held throughout, so once it is
+ * updated, the rows refused are tried again (retry_key()) while one is
+ * written, and a violation is left recorded for those still refused
+ * only.
+ */
+static bool
+write_keys_once(KeyWriter *kw, List *writes)
+{
+	bool		written = true;
+	bool		pinned = false;
+	bool		progress;
+	ListCell   *lc;
+
+	foreach(lc, writes)
+	{
+		KeyWrite   *w = lfirst(lc);
+
+		w->refused = false;
+		w->violation = NULL;
+		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
+			continue;
+		(void) decode(kw->c, w->old, kw->s1);
+		for (int64 i = 0; i < w->nold; i++)
+			if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
+				row_missing(kw->rel, kw->moving);
+	}
+	for (int first = 1; first >= 0; first--)
+	{
+		foreach(lc, writes)
+		{
+			KeyWrite   *w = lfirst(lc);
+
+			if (w->nrow == 0 || w->rank == KEY_PINNED ||
+				(w->rank == KEY_FIRST) != (first == 1))
+				continue;
+			if (w->in_place)
+			{
+				/* (a violation recorded instead leaves the row as it was) */
+				(void) update_key(kw, w, true);
+				continue;
+			}
+			(void) decode(kw->c, w->row, kw->s2);
+			for (int64 i = 0; i < w->nrow; i++)
+			{
+				bool		r;
+
+				(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL,
+								   &r);
+				if (r)
+				{
+					w->refused = true;
+					w->violation = llast(recorded);
+				}
+			}
+
+			/*
+			 * A keyed row theirs changed, whose new version is recorded as
+			 * a violation instead of written: the row stays as it was.
+			 */
+			if (kw->put_back && w->nold == 1 && w->refused)
+			{
+				ErrorData  *ed;
+
+				(void) decode(kw->c, w->old, kw->s1);
+				ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL, NULL);
+				if (ed)
+				{
+					FreeErrorData(ed);
+					w->rank = w->rank == KEY_FIRST ? KEY_PINNED : KEY_FIRST;
+					written = false;
+				}
+			}
+		}
+	}
+	if (!written)
+		return false;
+	foreach(lc, writes)
+	{
+		KeyWrite   *w = lfirst(lc);
+
+		if (w->rank != KEY_PINNED)
+			continue;
+		pinned = true;
+		if (!update_key(kw, w, true))
+		{
+			w->refused = true;
+			w->violation = llast(recorded);
+		}
+	}
+
+	/*
+	 * (only a row refused for a unique value another row holds may fit
+	 * now; a check or not-null constraint refuses it still.  Rows refused
+	 * one for the other's value, as two swapping one, aren't tried
+	 * together: both stay refused, though they would fit.)
+	 */
+	do
+	{
+		progress = false;
+		foreach(lc, pinned ? writes : NIL)
+		{
+			KeyWrite   *w = lfirst(lc);
+
+			if (!w->refused || strcmp(w->violation->type, "unique index") != 0 ||
+				!retry_key(kw, w))
+				continue;
+			recorded = list_delete_ptr(recorded, w->violation);
+			w->refused = false;
+			progress = true;
+		}
+	} while (progress);
+	return true;
+}
+
+/*
+ * Write writes as write_keys_once() does; where a row is put back
+ * (kw->put_back), in a subtransaction, rolled back with the violations it
+ * recorded and made again while a put-back is refused.  Each time ranks
+ * one row up at least, and a row is ranked up twice at most, so it ends.
+ * (Without a row pinned, a row refused in the last pass is refused in
+ * the table written: no value is given up once rows are written anew.
+ * With one, a row refused is tried again each time another is written,
+ * so it ends too.)
+ */
+static void
+write_keys(KeyWriter *kw, List *writes)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int			nrecorded = list_length(recorded);
+
+	if (!kw->put_back)
+	{
+		bool		written PG_USED_FOR_ASSERTS_ONLY;
+
+		written = write_keys_once(kw, writes);
+		Assert(written);
+		return;
+	}
+	for (;;)
+	{
+		bool		written;
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		written = write_keys_once(kw, writes);
+		if (written)
+			ReleaseCurrentSubTransaction();
+		else
+			RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (written)
+			return;
+		recorded = list_truncate(recorded, nrecorded);
+	}
+}
+
+/*
+ * apply_rows()'s writes, held as merge_table()'s are and written as
+ * write_keys() does: for a keyed table where a row refused was refused
+ * its put-back too.
+ */
+static void
+apply_rows_held(Oid relid, const Table *from, const Table *to)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
+	Changes		c;
+	KeyWriter	kw;
+	List	   *writes = NIL;
+	ListCell   *lc;
+
+	memset(&c, 0, sizeof(c));
+	memset(&kw, 0, sizeof(kw));
+	kw.rel = table_open(relid, RowExclusiveLock);
+	c.rd.kr = keying_of(kw.rel);
+	c.rd.k = PROLLY_CALL(c.rd.kr, open, kw.rel, CurrentMemoryContext);
+	Assert(!PROLLY_CALL(c.rd.kr, keyless, c.rd.k));
+	chunk_env(&env);
+	env.compare = changes_compare;
+	env.compare_arg = &c;
+	prolly_keying_use_env(&krefs, c.rd.kr, c.rd.k, tree, &env);
+	krefs.values.pointers = true;
+	PROLLY_CALL(tree, diff, &env, &from->data, &to->data, collect_change, &c);
+	foreach(lc, c.list)
+	{
+		Change	   *ch = lfirst(lc);
+		KeyWrite   *w = palloc0(sizeof(KeyWrite));
+
+		if (ch->before.len > 0)
+		{
+			w->old = &ch->before;
+			w->nold = 1;
+		}
+		if (ch->after.len > 0)
+		{
+			w->row = &ch->after;
+			w->nrow = 1;
+		}
+		writes = lappend(writes, w);
+	}
+
+	kw.c = &c;
+	kw.ar = prolly_applier_lookup("replication");
+	kw.s1 = table_slot_create(kw.rel, NULL);
+	kw.s2 = table_slot_create(kw.rel, NULL);
+	kw.pk = RelationGetIndexAttrBitmap(kw.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	kw.kept = palloc0_array(bool, RelationGetDescr(kw.rel)->natts);
+	kw.put_back = puts_back(kw.rel, false);
+	kw.moving = true;
+	Assert(kw.put_back);
+	kw.a = PROLLY_CALL(kw.ar, begin, kw.rel);
+	write_keys(&kw, writes);
+	PROLLY_CALL(kw.ar, end, kw.a);
+	ExecDropSingleTupleTableSlot(kw.s1);
+	ExecDropSingleTupleTableSlot(kw.s2);
+	pfree(kw.kept);
+	bms_free((Bitmapset *) kw.pk);
+	PROLLY_CALL(c.rd.kr, close, c.rd.k);
+	table_close(kw.rel, NoLock);
 }
 
 /*
@@ -1777,60 +2224,21 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		writes = lappend(writes, w);
 	}
 
-	/*
-	 * The rows written: those going first, then those coming, so a row may
-	 * take a unique value another gives up (theirs swapping two, say).
-	 */
-	foreach(lt, writes)
+	if (writes != NIL)
 	{
-		KeyWrite   *w = lfirst(lt);
+		KeyWriter	kw = {0};
 
-		if (w->nold == 0 || w->in_place)
-			continue;
-		(void) decode(&tc, w->old, s1);
-		for (int64 i = 0; i < w->nold; i++)
-			if (!PROLLY_CALL(ar, remove, a, s1))
-				goto missing;
-	}
-	foreach(lt, writes)
-	{
-		KeyWrite   *w = lfirst(lt);
-		int			nrecorded = list_length(recorded);
+		kw.c = &tc;
+		kw.rel = rel;
+		kw.ar = ar;
+		kw.a = a;
+		kw.s1 = s1;
+		kw.s2 = s2;
+		kw.pk = pk;
+		kw.kept = kept;
+		kw.put_back = puts_back(rel, keyless);
 
-		if (w->nrow == 0)
-			continue;
-		if (w->in_place)
-		{
-			ProllyValue before;
-			ProllyValue after;
-			ProllyValue v;
-			uint64		count;
-
-			/* (a violation recorded instead leaves the row as it was) */
-			v.data = (const uint8 *) w->old->data;
-			v.len = w->old->len;
-			PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &v, &before, &count);
-			v.data = (const uint8 *) w->row->data;
-			v.len = w->row->len;
-			PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &v, &after, &count);
-			decode_update(&tc, rel, pk, &before, &after, s1, s2, kept);
-			if (!merge_write(ar, a, rel, s1, s2, kept))
-				goto missing;
-			continue;
-		}
-		(void) decode(&tc, w->row, s2);
-		for (int64 i = 0; i < w->nrow; i++)
-			(void) merge_write(ar, a, rel, NULL, s2, NULL);
-
-		/*
-		 * A keyed row theirs changed, whose new version is recorded as a
-		 * violation instead of written: the row stays as it was.
-		 */
-		if (!keyless && w->nold == 1 && list_length(recorded) > nrecorded)
-		{
-			(void) decode(&tc, w->old, s1);
-			(void) merge_write(ar, a, rel, NULL, s1, NULL);
-		}
+		write_keys(&kw, writes);
 	}
 	if (a)
 		PROLLY_CALL(ar, end, a);
@@ -1848,14 +2256,6 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
 	table_close(rel, NoLock);
 	return conflicts;
-
-missing:
-	ereport(ERROR,
-			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-			 errmsg("a row of \"%s\" changed while it was merged",
-					RelationGetRelationName(rel)),
-			 errhint("Try again.")));
-	return 0;					/* keep compiler quiet */
 }
 
 /* ------------------------------------------------------------------------
