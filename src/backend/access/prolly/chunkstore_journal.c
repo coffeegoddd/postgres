@@ -4881,6 +4881,8 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m", path)));
+	/* (not WAL-logged: the store's metadata, as a manifest is) */
+	pgstat_count_prolly(PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN, 1 + (uint64) n * gc->hash_len);
 	pfree(hashes);
 	pfree(path);
 }

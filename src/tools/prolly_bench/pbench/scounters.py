@@ -30,7 +30,8 @@ _BYTES = {"wal_bytes", "wal_fpi_bytes", "relation_bytes", "chunk_store_bytes",
           "engine.chunk_bytes_appended", "engine.bytes_hashed",
           "engine.journal_bytes_written", "engine.table_file_bytes_written",
           "engine.manifest_bytes_written", "engine.gc_bytes_copied",
-          "engine.conjoin_bytes_copied", "engine.bmap_store_bytes_written"}
+          "engine.conjoin_bytes_copied", "engine.bmap_store_bytes_written",
+          "engine.bmap_extend_bytes_written", "engine.bmap_bulk_bytes_written"}
 
 
 def is_counter(metric: str) -> bool:

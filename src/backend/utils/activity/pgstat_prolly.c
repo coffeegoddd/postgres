@@ -61,6 +61,8 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_GC_BYTES_COPIED] = "gc_bytes_copied",
 	[PGSTAT_PROLLY_CONJOIN_BYTES_COPIED] = "conjoin_bytes_copied",
 	[PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN] = "bmap_store_bytes_written",
+	[PGSTAT_PROLLY_BMAP_EXTEND_BYTES_WRITTEN] = "bmap_extend_bytes_written",
+	[PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN] = "bmap_bulk_bytes_written",
 };
 
 /*

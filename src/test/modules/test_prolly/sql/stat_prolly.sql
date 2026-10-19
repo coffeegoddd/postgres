@@ -21,7 +21,10 @@ SELECT name, value FROM pg_stat_prolly WHERE value <> 0;
 INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-m', '1000 rows')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
-SELECT name, value FROM pg_stat_prolly;
+-- (the block map's bytes in blocks, whatever the block size)
+SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
+	ELSE value END AS value
+FROM pg_stat_prolly;
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') >=

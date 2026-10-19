@@ -24,7 +24,8 @@ class FakeServer:
         self.prolly = {"chunk_bytes_appended": 0, "nodes_written": 0,
                        "journal_bytes_written": 0, "table_file_bytes_written": 0,
                        "manifest_bytes_written": 0, "gc_bytes_copied": 0,
-                       "conjoin_bytes_copied": 0, "bmap_store_bytes_written": 0}
+                       "conjoin_bytes_copied": 0, "bmap_store_bytes_written": 0,
+                       "bmap_extend_bytes_written": 0, "bmap_bulk_bytes_written": 0}
         self.checkpoints = 0
         self.autovacuum = []        # workers running, read one per query
         self.flushed = None             # flush LSN, if behind the insert LSN
@@ -247,8 +248,10 @@ class WriteAmpTest(unittest.TestCase):
         def work():
             s.lsn += 1_000_000
             s.tuples["t"] = [0, 20_000, 0]
-            s.prolly["bmap_store_bytes_written"] += 8192
-            # autovacuum collecting in the window: a table file of copies
+            s.prolly["bmap_store_bytes_written"] += 8192        # a remap: added
+            s.prolly["bmap_extend_bytes_written"] += 16384      # pg_stat_io's too
+            s.prolly["bmap_bulk_bytes_written"] += 32768        # heap's go uncounted
+            # autovacuum collected in the window (and exited, so it counted)
             s.prolly["table_file_bytes_written"] += 500_000
             s.prolly["gc_bytes_copied"] += 500_000
             s.prolly["manifest_bytes_written"] += 300
@@ -264,7 +267,11 @@ class WriteAmpTest(unittest.TestCase):
         self.assertEqual(m["wa.tree.file_bytes"], 2_590_300)
         self.assertEqual(m["wa.tree.gc_copied_bytes"], 500_000)
         self.assertEqual(m["wa.pages.bmap_store_bytes"], 8192)
-        self.assertEqual(m["wa.server_bytes"], 3_000_100 + 1000 + 2_590_300)
+        self.assertEqual(m["wa.pages.bmap_extend_bytes"], 16384)
+        self.assertEqual(m["wa.pages.bmap_bulk_bytes"], 32768)
+        self.assertEqual(m["wa.pages.io_bytes"], 1000)
+        self.assertEqual(m["wa.pages.write_bytes"], 1000 + 8192)
+        self.assertEqual(m["wa.server_bytes"], 3_000_100 + 1000 + 8192 + 2_590_300)
         self.assertAlmostEqual(m["wa_tree_payload"], 1.0)
         self.assertAlmostEqual(m["wa_tree"], 2_590_300 / 2_000_000)
 

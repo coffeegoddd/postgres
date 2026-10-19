@@ -619,17 +619,27 @@ typedef enum PgStat_ProllyCounter
 											 * segments: records with their
 											 * framing, headers, roots */
 	PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN, /* bytes written to table files */
-	PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN,	/* bytes of manifests written */
+	PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN,	/* bytes of manifests and
+											 * collections' dropped-chunk
+											 * lists written */
 	PGSTAT_PROLLY_GC_BYTES_COPIED,	/* of the table-file bytes, those
 									 * collection (and moving the journal)
 									 * copied */
 	PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, /* and those conjoining copied */
 	PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, /* page-store bytes the block
-											 * map wrote itself, not through
-											 * shared buffers */
+											 * map wrote itself for a
+											 * copy-on-write remap: no other
+											 * counter has them */
+	PGSTAT_PROLLY_BMAP_EXTEND_BYTES_WRITTEN,	/* and to extend for shared
+												 * buffers, which pg_stat_io
+												 * counts as extends */
+	PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN,	/* and for bulk writes and
+											 * copies (smgrextend,
+											 * smgrpreextend), which nothing
+											 * else counts, for md either */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

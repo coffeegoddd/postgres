@@ -15,7 +15,12 @@ engine defers them.
 Prolly's chunk store writes its journal, table files and manifests
 itself, outside shared buffers, so pg_stat_io doesn't see them;
 pg_stat_prolly counts them (journal_bytes_written, ...), and the copies
-collection and conjoining make of chunks already stored.
+collection and conjoining make of chunks already stored.  The block map
+writes some of its page store itself too: a copy-on-write remap's blocks
+are pages written (bmap_store_bytes_written, added to pg_stat_io's);
+its extends for shared buffers pg_stat_io counts already, and its bulk
+writes' (index builds, copies) heap's relations count nowhere either, so
+those two are reported, not added.
 
 WAL is split by resource manager (pg_walinspect's pg_get_wal_stats over
 the interval): row records
@@ -347,7 +352,7 @@ class WriteAmpCollector(Collector):
             "wa.pages.writes": io["writes"],
             "wa.pages.extends": io["extends"],
         }
-        server: Optional[float] = wal + io["bytes"]
+        pages = io["bytes"]
         tree_files = None
         if _is_prolly(ctx):
             chunks = _sum([counter_delta(x["prolly"], y["prolly"]) for _, x, y in self._pairs(ctx)])
@@ -360,11 +365,21 @@ class WriteAmpCollector(Collector):
                 # Breakdowns of the table-file bytes, not more of them.
                 m["wa.tree.gc_copied_bytes"] = chunks.get("gc_bytes_copied")
                 m["wa.tree.conjoin_copied_bytes"] = chunks.get("conjoin_bytes_copied")
-                # The block map's own page-store writes: zeroing and
-                # extending, which shared buffers also count as extends,
-                # so it isn't added to the total.
-                m["wa.pages.bmap_store_bytes"] = chunks.get("bmap_store_bytes_written")
+                # The block map's own page-store writes.  A copy-on-write
+                # remap's no other counter has: they are pages written.  Its
+                # extends for shared buffers pg_stat_io counts already, and
+                # its bulk writes' heap's md relations count nowhere either:
+                # both are reported, not added.
+                store = chunks.get("bmap_store_bytes_written")
+                m["wa.pages.bmap_store_bytes"] = store
+                m["wa.pages.bmap_extend_bytes"] = chunks.get("bmap_extend_bytes_written")
+                m["wa.pages.bmap_bulk_bytes"] = chunks.get("bmap_bulk_bytes_written")
+                m["wa.pages.io_bytes"] = io["bytes"]
+                pages += store or 0.0
             m["wa.tree.file_bytes"] = tree_files
+        m["wa.pages.write_bytes"] = pages
+        server: Optional[float] = wal + pages
+        if _is_prolly(ctx):
             server = server + tree_files if tree_files is not None else None
             if self.unmaterialized is not None:
                 late = counter_delta(self.unmaterialized["prolly"], a["prolly"])
@@ -379,7 +394,7 @@ class WriteAmpCollector(Collector):
         m["wa.logical_bytes_per_operation"] = per(logical, n)
 
         m["wa_wal"] = _ratio(wal, logical, outcome)
-        m["wa_pages"] = _ratio(io["bytes"], logical, outcome)
+        m["wa_pages"] = _ratio(pages, logical, outcome)
         m["wa_server"] = _ratio(server, logical, outcome)
         if _is_prolly(ctx):
             m["wa_tree_payload"] = _ratio(m["wa.tree.chunk_payload_bytes"], logical, outcome)
