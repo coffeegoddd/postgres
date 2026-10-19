@@ -173,21 +173,60 @@ is_working(const char *ref)
 	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
 }
 
-/* The canonical root of a ref: a commit's, or WORKING folded now. */
+/*
+ * Does ref, which doesn't resolve, name a branch without a commit yet: HEAD
+ * (the session branch), a branch's name, or refs/heads/ and its name, read
+ * as the refs' resolve reads them?  Not with ancestry steps (HEAD~1): there
+ * is no commit to step back from.
+ */
+static bool
+names_unborn_branch(const ProllyDatabaseComponents *dc, const char *ref)
+{
+	ProllyBranchId branch;
+
+	if (ref[strcspn(ref, "~^")] != '\0')
+		return false;
+	if (pg_strcasecmp(ref, "HEAD") == 0 &&
+		!PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref = branch_ops()->current();
+	else if (strncmp(ref, "refs/heads/", 11) == 0 && ref[11] != '\0' &&
+			 !PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref += 11;
+	return PROLLY_CALL(dc->refs, branch_lookup, ref, &branch);
+}
+
+/*
+ * The canonical root of a ref: a commit's, or WORKING folded now.  A
+ * branch before its first commit (HEAD, or the branch by name) is the
+ * empty root, as Dolt's initial commit is (and as dolt_log('HEAD') has no
+ * commits).
+ */
 static void
 root_of(const char *ref, ProllyNodeRef *root)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyHash	id;
 	ProllyCommitInfo info;
+	bool		found;
 
 	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
 		return;
 	}
-	if (!PROLLY_CALL(dc.refs, resolve, ref, &id) ||
-		!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+	found = PROLLY_CALL(dc.refs, resolve, ref, &id);
+	if (!found && names_unborn_branch(&dc, ref))
+	{
+		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+		ProllyTreeEnv env;
+
+		chunk_env(&env);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext),
+					root);
+		return;
+	}
+	if (!found || !PROLLY_CALL(dc.refs, commit_get, &id, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
