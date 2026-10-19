@@ -122,6 +122,7 @@ tests += {
       'toast_by_content',
       'toast_folds',
       'redefined_rows',
+      'enum_history',
       'index_tablespaces',
       'diff_memory',
     ],

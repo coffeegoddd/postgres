@@ -1,0 +1,461 @@
+-- Historical enum labels are read through their saved type definitions.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA eh VERSIONED;
+CREATE TYPE eh.mood AS ENUM ('sad', 'ok', 'happy');
+CREATE DOMAIN eh.dmood AS eh.mood;
+CREATE TYPE eh.pair AS (m eh.mood, n int);
+CREATE TABLE eh.t (id int PRIMARY KEY, m eh.mood, a eh.mood[], p eh.pair, d eh.dmood);
+CREATE TABLE eh.k (m eh.mood PRIMARY KEY, v int);
+CREATE TABLE eh.l (m eh.mood);
+CREATE TABLE eh.big (id int PRIMARY KEY, a eh.mood[]);
+INSERT INTO eh.t VALUES (1, 'sad', '{sad,ok}', '(sad,1)', 'sad'),
+  (2, 'ok', '{ok}', '(ok,2)', 'ok');
+INSERT INTO eh.k VALUES ('sad', 1), ('ok', 2);
+INSERT INTO eh.l VALUES ('sad'), ('sad'), ('ok');
+INSERT INTO eh.big SELECT 1, array_agg('sad'::eh.mood) FROM generate_series(1, 2000);
+SELECT (dolt_commit('-Am', 'enum base'))[1] AS base \gset
+SELECT dolt_branch('old_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.mood RENAME VALUE 'sad' TO 'blue';
+SELECT length(dolt_commit('-Am', 'rename')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- Typed diffs use the current row type, including its current enum labels.
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'base', 'HEAD', NULL::eh.t);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'base', 'HEAD', NULL::eh.k);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'base', 'HEAD', NULL::eh.l);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+SELECT count(*) AS big_changes FROM dolt_diff(:'base', 'HEAD', NULL::eh.big);
+ big_changes 
+-------------
+           0
+(1 row)
+
+SELECT dolt_checkout('old_writer');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'old_writer'"}
+(1 row)
+
+INSERT INTO eh.t VALUES (3, 'sad', '{sad,happy}', '(sad,3)', 'sad');
+INSERT INTO eh.k VALUES ('happy', 3);
+INSERT INTO eh.l VALUES ('sad');
+SELECT length(dolt_commit('-am', 'old writer')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'base', 'old_writer', NULL::eh.t);
+ diff_type | from_row |                 to_row                  
+-----------+----------+-----------------------------------------
+ added     |          | (3,blue,"{blue,happy}","(blue,3)",blue)
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('old_writer', '-m', 'merged enum'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.t ORDER BY id;
+ id |  m   |      a       |    p     |  d   
+----+------+--------------+----------+------
+  1 | blue | {blue,ok}    | (blue,1) | blue
+  2 | ok   | {ok}         | (ok,2)   | ok
+  3 | blue | {blue,happy} | (blue,3) | blue
+(3 rows)
+
+SELECT * FROM eh.k ORDER BY m;
+   m   | v 
+-------+---
+ blue  | 1
+ ok    | 2
+ happy | 3
+(3 rows)
+
+SELECT m, count(*) FROM eh.l GROUP BY m ORDER BY m;
+  m   | count 
+------+-------
+ blue |     3
+ ok   |     1
+(2 rows)
+
+SELECT test_fold_root() AS merged \gset
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+ROLLBACK;
+SELECT dolt_checkout('old_writer');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'old_writer'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged enum reverse'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT test_fold_root() = :'merged' AS same_merge;
+ same_merge 
+------------
+ t
+(1 row)
+
+SELECT * FROM eh.t ORDER BY id;
+ id |  m   |      a       |    p     |  d   
+----+------+--------------+----------+------
+  1 | blue | {blue,ok}    | (blue,1) | blue
+  2 | ok   | {ok}         | (ok,2)   | ok
+  3 | blue | {blue,happy} | (blue,3) | blue
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- Conflicts are also decoded and resolved through the saved definitions.
+UPDATE eh.t SET m = 'ok' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'ours edit')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('old_writer');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'old_writer'"}
+(1 row)
+
+UPDATE eh.t SET m = 'happy' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'theirs edit')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('old_writer', '-m', 'enum conflict'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT (base_row).m, (our_row).m, (their_row).m FROM dolt_conflicts(NULL::eh.t);
+  m   | m  |   m   
+------+----+-------
+ blue | ok | happy
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'eh.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT id, m FROM eh.t ORDER BY id;
+ id |   m   
+----+-------
+  1 | happy
+  2 | ok
+  3 | blue
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'old_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Additions preserve old labels by name, even when inserted before them.
+CREATE TYPE eh.added AS ENUM ('a', 'b');
+CREATE TABLE eh.adds (id int PRIMARY KEY, e eh.added);
+INSERT INTO eh.adds VALUES (1, 'a');
+SELECT (dolt_commit('-Am', 'before addition'))[1] AS add_base \gset
+ALTER TYPE eh.added ADD VALUE 'x' BEFORE 'a';
+SELECT length(dolt_commit('-Am', 'addition')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_diff(:'add_base', 'HEAD', NULL::eh.adds);
+ changed 
+---------
+       0
+(1 row)
+
+-- Escaping and UTF-8 apply to the saved labels, including nested arrays.
+CREATE TYPE eh."odd type" AS ENUM (E'a\tb', E'c\\d', 'é');
+CREATE TABLE eh.odd (id int PRIMARY KEY, e eh."odd type"[]);
+INSERT INTO eh.odd VALUES (1, ARRAY[E'a\tb', E'c\\d', 'é']::eh."odd type"[]);
+SELECT (dolt_commit('-Am', 'odd labels'))[1] AS odd_base \gset
+ALTER TYPE eh."odd type" RENAME VALUE E'a\tb' TO E'q\n''u';
+SELECT length(dolt_commit('-Am', 'renamed odd label')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_diff(:'odd_base', 'HEAD', NULL::eh.odd);
+ changed 
+---------
+       0
+(1 row)
+
+-- A rename mixed with additions is ambiguous, even if the old label is
+-- absent from the rows.  Refuse before applying any of the other side.
+CREATE TYPE eh.amb AS ENUM ('a', 'b');
+CREATE TABLE eh.ambiguous (id int PRIMARY KEY, e eh.amb);
+INSERT INTO eh.ambiguous VALUES (1, 'b');
+SELECT (dolt_commit('-Am', 'ambiguous base'))[1] AS amb_base \gset
+SELECT dolt_branch('amb_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.amb RENAME VALUE 'a' TO 'x';
+ALTER TYPE eh.amb ADD VALUE 'y';
+SELECT length(dolt_commit('-Am', 'rename and add')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) FROM dolt_diff(:'amb_base', 'HEAD', NULL::eh.ambiguous);
+ERROR:  schema conflict: cannot map historical labels of enum eh.amb
+DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
+HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+SELECT dolt_checkout('amb_writer');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'amb_writer'"}
+(1 row)
+
+INSERT INTO eh.ambiguous VALUES (2, 'b');
+SELECT length(dolt_commit('-am', 'ambiguous writer')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT test_fold_root() AS before_refusal \gset
+SELECT dolt_merge('amb_writer');
+ERROR:  schema conflict: cannot map historical labels of enum eh.amb
+DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
+HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+SELECT test_fold_root() = :'before_refusal' AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM eh.ambiguous ORDER BY id;
+ id | e 
+----+---
+  1 | b
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'amb_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Reused names cannot be mistaken for unchanged enum members.
+CREATE TYPE eh.reused AS ENUM ('a', 'b');
+CREATE TABLE eh.reuse (id int PRIMARY KEY, e eh.reused);
+INSERT INTO eh.reuse VALUES (1, 'b');
+SELECT (dolt_commit('-Am', 'reuse base'))[1] AS reuse_base \gset
+ALTER TYPE eh.reused RENAME VALUE 'a' TO 'tmp';
+ALTER TYPE eh.reused RENAME VALUE 'b' TO 'a';
+ALTER TYPE eh.reused RENAME VALUE 'tmp' TO 'b';
+SELECT length(dolt_commit('-Am', 'swapped names')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) FROM dolt_diff(:'reuse_base', 'HEAD', NULL::eh.reuse);
+ERROR:  schema conflict: cannot map historical labels of enum eh.reused
+DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
+HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+-- Renaming an enum does not supply a historical layout for an enclosing
+-- composite that also changed.  Refuse that combination explicitly.
+CREATE TYPE eh.ce AS ENUM ('a', 'b');
+CREATE TYPE eh.container AS (e eh.ce, n int);
+CREATE TABLE eh.contained (id int PRIMARY KEY, c eh.container);
+INSERT INTO eh.contained VALUES (1, '(a,1)');
+SELECT (dolt_commit('-Am', 'container base'))[1] AS container_base \gset
+ALTER TYPE eh.ce RENAME VALUE 'a' TO 'x';
+ALTER TYPE eh.container DROP ATTRIBUTE n CASCADE;
+SELECT length(dolt_commit('-Am', 'container changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) FROM dolt_diff(:'container_base', 'HEAD', NULL::eh.contained);
+ERROR:  schema conflict: cannot map historical enum labels through redefined type eh.container
+HINT:  Merge row changes before changing the enclosing type.
+-- Likewise, ranges use their own binary receiver, not the nested codecs.
+CREATE TYPE eh.range_enum AS ENUM ('a', 'b');
+CREATE TYPE eh.enum_range AS RANGE (subtype = eh.range_enum);
+CREATE TABLE eh.ranged (id int PRIMARY KEY, r eh.enum_range);
+INSERT INTO eh.ranged VALUES (1, '[a,b]');
+SELECT (dolt_commit('-Am', 'range base'))[1] AS range_base \gset
+ALTER TYPE eh.range_enum RENAME VALUE 'a' TO 'x';
+SELECT length(dolt_commit('-Am', 'range enum changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) FROM dolt_diff(:'range_base', 'HEAD', NULL::eh.ranged);
+ERROR:  schema conflict: cannot map historical enum labels inside eh.enum_range
+HINT:  Merge row changes before changing the range's enum labels.
+-- The lost-column check must not compare old enum keys with today's
+-- decoder before the historical rows have been converted.
+CREATE TYPE eh.drop_enum AS ENUM ('a', 'b');
+CREATE TABLE eh.dropped (e eh.drop_enum PRIMARY KEY, v int);
+INSERT INTO eh.dropped VALUES ('a', 1);
+SELECT length(dolt_commit('-Am', 'drop base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('drop_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.drop_enum RENAME VALUE 'a' TO 'x';
+SELECT length(dolt_commit('-Am', 'drop rename')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('drop_writer');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'drop_writer'"}
+(1 row)
+
+ALTER TABLE eh.dropped DROP COLUMN v;
+SELECT length(dolt_commit('-Am', 'drop column')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT test_fold_root() AS before_drop \gset
+SELECT dolt_merge('drop_writer');
+ERROR:  schema conflict: cannot merge dropped columns with changed enum labels
+HINT:  Merge row changes before dropping columns or changing enum labels.
+SELECT test_fold_root() = :'before_drop' AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM eh.dropped;
+ e | v 
+---+---
+ x | 1
+(1 row)
+
+SELECT dolt_branch('-D', 'drop_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA eh CASCADE;
+NOTICE:  drop cascades to 23 other objects
+DETAIL:  drop cascades to type eh.mood
+drop cascades to type eh.dmood
+drop cascades to type eh.pair
+drop cascades to table eh.t
+drop cascades to table eh.k
+drop cascades to table eh.l
+drop cascades to table eh.big
+drop cascades to type eh.added
+drop cascades to table eh.adds
+drop cascades to type eh."odd type"
+drop cascades to table eh.odd
+drop cascades to type eh.amb
+drop cascades to table eh.ambiguous
+drop cascades to type eh.reused
+drop cascades to table eh.reuse
+drop cascades to type eh.ce
+drop cascades to type eh.container
+drop cascades to table eh.contained
+drop cascades to type eh.range_enum
+drop cascades to type eh.enum_range
+drop cascades to table eh.ranged
+drop cascades to type eh.drop_enum
+drop cascades to table eh.dropped

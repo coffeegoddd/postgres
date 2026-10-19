@@ -3256,6 +3256,63 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+static char *from_utf8(const uint8 *data, int len);
+
+/* Saved type definitions accompany historical rows; labels are not OIDs. */
+static List *
+folded_type_definitions(const ProllyNodeRef *root)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur;
+	ProllyKey	from = {(const uint8 *) "y:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *types = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	if (!root_in_format(&cn, root))
+		return NIL;
+	cur = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, cur, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, cur, &k, &v))
+	{
+		ProllyTypeDefinition *e;
+		StringInfoData sql;
+		char	   *line;
+		bool		first = true;
+		RawStmt    *raw;
+
+		if (k.len < 2 || memcmp(k.data, "y:", 2) != 0)
+			break;
+		e = palloc0(sizeof(ProllyTypeDefinition));
+		e->name = from_utf8(k.data + 2, k.len - 2);
+		e->definition = from_utf8(v.data, v.len);
+		types = lappend(types, e);
+		if (v.len < 5 || memcmp(v.data, "enum\n", 5) != 0)
+			continue;
+		line = from_utf8(v.data + 5, v.len - 5);
+		initStringInfo(&sql);
+		appendStringInfoString(&sql, "CREATE TYPE historical_enum AS ENUM (");
+		while (*line)
+		{
+			char	   *next = strchr(line, '\n');
+
+			if (next == NULL)
+				elog(ERROR, "invalid canonical enum definition");
+			*next++ = '\0';
+			appendStringInfo(&sql, "%s%s", first ? "" : ", ", unescape_field(line));
+			first = false;
+			line = next;
+		}
+		appendStringInfoChar(&sql, ')');
+		raw = linitial_node(RawStmt, raw_parser(sql.data, RAW_PARSE_DEFAULT));
+		e->labels = castNode(CreateEnumStmt, raw->stmt)->vals;
+	}
+	PROLLY_CALL(cn.tree, cursor_close, cur);
+	return types;
+}
+
 /* The tables of a folded root: its "t:" items. */
 static void
 folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
@@ -3273,8 +3330,6 @@ folded_materialized_views(const ProllyNodeRef *root,
 }
 
 /* An item's value without the data tree a table's or view's starts with. */
-static char *from_utf8(const uint8 *data, int len);
-
 /* (and without a sequence's value) */
 static void
 definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
@@ -7582,6 +7637,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
 	.table_columns = folded_table_columns,
+	.type_definitions = folded_type_definitions,
 	.in_format = folded_in_format,
 	.format = folded_format,
 };
