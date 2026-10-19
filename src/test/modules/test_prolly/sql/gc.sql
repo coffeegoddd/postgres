@@ -82,7 +82,20 @@ SELECT length(dolt_commit('-m', 'on side')::text) AS committed;
 SELECT dolt_hashof('side') AS side_head \gset
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'side', 'kept');
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'gc_bytes_copied') AS gc_before,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') AS tf_before,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'manifest_bytes_written') AS mf_before \gset
 SELECT kept > 0 AS kept, freed > 0 AS freed FROM test_chunk_gc(false);
+-- What it kept it copied, into table files; its manifest and list of
+-- dropped chunks are the store's metadata.
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'gc_bytes_copied') > :gc_before AS copied,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') - :tf_before >=
+	(SELECT value FROM pg_stat_prolly WHERE name = 'gc_bytes_copied') - :gc_before
+		AS copies_in_table_files,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'manifest_bytes_written') > :mf_before
+		AS metadata_written;
 SELECT test_chunk_has(:'side_head') AS side_head,
 	test_chunk_has(:'kept_head') AS kept_head;
 SELECT count(*) AS main_commits FROM dolt_log('main');

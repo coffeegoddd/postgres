@@ -145,7 +145,7 @@ SET dolt.transaction_commit = on;
 SELECT test_fold_counters(true) IS NOT NULL AS reset;
 INSERT INTO tc.t VALUES (21, 'mine');
 UPDATE tc.t SET v = 'mine, updated' WHERE id = 21;
-SELECT pages, full_tables FROM test_fold_counters();
+SELECT pages, candidates, full_tables FROM test_fold_counters();
 BEGIN;
 INSERT INTO tc.t VALUES (22, 'kept');
 SAVEPOINT s;
@@ -156,7 +156,7 @@ UPDATE tc.t SET v = 'kept, released' WHERE id = 22;
 RELEASE r;
 DELETE FROM tc.t WHERE id = 1;
 COMMIT;
-SELECT pages, full_tables FROM test_fold_counters();
+SELECT pages, candidates, full_tables FROM test_fold_counters();
 SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
 -- (the head has the mode's rows; the working set, the other writer's too)
 SET dolt.transaction_commit = off;
@@ -170,7 +170,7 @@ SELECT test_fold_counters(true) IS NOT NULL AS reset;
 INSERT INTO tc.bag VALUES ('a'), ('a'), ('b');
 DELETE FROM tc.bag WHERE ctid = (SELECT min(ctid) FROM tc.bag WHERE v = 'a');
 UPDATE tc.bag SET v = 'c' WHERE v = 'b';
-SELECT pages, full_tables FROM test_fold_counters();
+SELECT pages, candidates, full_tables FROM test_fold_counters();
 SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
 SELECT v, count(*) FROM tc.bag GROUP BY v ORDER BY v;
 

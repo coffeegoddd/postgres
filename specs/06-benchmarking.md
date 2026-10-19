@@ -102,7 +102,8 @@ each other.
 | Throughput (TPS) | pgbench / BenchBase |
 | Latency p50 / p99 / p99.9 | pgbench `--log`, BenchBase |
 | WAL bytes per transaction | `pg_stat_wal`, or `pg_current_wal_lsn()` difference / transactions |
-| Device bytes written per transaction (write amplification) | `/proc/diskstats` before/after; optionally the device's own counters |
+| Write amplification: bytes written per logical byte, as WAL, data pages and (prolly) chunk store | The `write_amp` collector (`20-write-amplification.md`) |
+| Device bytes written per transaction | `/proc/diskstats` before/after (the whole device); optionally the device's own counters |
 | Space amplification | On-disk size / logical data size; allocation waste for D3/D4 by block size |
 | Cache hit rate, buffer evictions | `pg_stat_io` |
 | CPU per transaction, hashing share | `perf` profiles |

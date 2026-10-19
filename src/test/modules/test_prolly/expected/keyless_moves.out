@@ -119,10 +119,10 @@ SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
  t
 (1 row)
 
-SELECT pages AS pages_read, full_tables FROM test_fold_counters(true);
- pages_read | full_tables 
-------------+-------------
-          0 |           0
+SELECT pages AS pages_read, candidates, full_tables FROM test_fold_counters(true);
+ pages_read | candidates | full_tables 
+------------+------------+-------------
+          0 |          0 |           0
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;

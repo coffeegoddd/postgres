@@ -15,7 +15,8 @@ from pbench import scalibrate, scounters
 from test_s_suite import build_set
 
 
-def counter_run(root: Path, name: str, counters: dict, am="prolly") -> Path:
+def counter_run(root: Path, name: str, counters: dict, am="prolly",
+                collector_status=None) -> Path:
     """A counter run: a directory with one result set of one S1 cell."""
     d = root / name / f"x-S-{am}"
     d.mkdir(parents=True)
@@ -24,7 +25,8 @@ def counter_run(root: Path, name: str, counters: dict, am="prolly") -> Path:
     (d / "results.jsonl").write_text(json.dumps({
         "key": {"suite": "S", "workload": "S1", "size": "counters", "variant": "",
                 "clients": 1, "rep": 1},
-        "status": "ok", "metrics": counters, "denominator": 2000}) + "\n")
+        "status": "ok", "metrics": counters, "denominator": 2000,
+        "collector_status": collector_status or {}}) + "\n")
     seal(d)
     return root / name
 

@@ -4,6 +4,10 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (Folded by the change finder "pages": what it reads, and the map epochs
+-- its folds raise, show when a checkpoint is taken.  "log"'s checkpoints
+-- are change_log's.)
+SET debug_prolly_change_finder = pages;
 CREATE FUNCTION pg_temp.fold(OUT pages int8, OUT full_tables int8,
 	OUT same_as_full bool) AS $$
 DECLARE

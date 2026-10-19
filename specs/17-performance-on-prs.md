@@ -195,6 +195,7 @@ the gate's floors apply to the totals over the fixed work, below):
 | WAL bytes, records, full-page images | `pg_stat_wal`, LSN difference | Logging more |
 | Buffer hits, reads, writes, extends | `pg_stat_io`, client backends only | Touching more pages, plan changes |
 | Relation, index and chunk-store bytes | `space.py` | Space amplification |
+| Write amplification's logical, WAL and chunk-store totals (not its page total, which sums every backend type) | `write_amp.py` (`20-write-amplification.md`) | Writing more per byte of data |
 | Instructions retired (user and kernel) | `perf stat -e instructions` over the measured part | CPU cost of any change |
 | Engine counters: nodes read and written, chunks appended, bytes hashed, fold rows, value-tree chunks, commits, head moves, memo hits and misses, the change finder's counts | `pg_stat_prolly` (to build) | Prolly's own work |
 | Rows, answers | the invariants, TPC-H digests | That both did the same work |

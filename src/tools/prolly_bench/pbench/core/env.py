@@ -97,6 +97,7 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     env["postgres"]["binary_hashes"] = {
         name: sha256(bin_dir / name) for name in ("postgres", "pg_config", "psql", "pgbench", "initdb", "pg_ctl")
         if (bin_dir / name).is_file()}
+    env["postgres"]["library_hashes"] = library_hashes(bin_dir)
     env["postgres"]["build_provenance"] = build_provenance(bin_dir)
     src = repo / "src/tools/prolly_bench"
     env["harness_hash"] = fingerprint({str(p.relative_to(src)): sha256(p)
@@ -114,6 +115,20 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     if tools.get("slt_runner") and Path(tools["slt_runner"]).is_file():
         env["client_hashes"]["slt_runner"] = sha256(Path(tools["slt_runner"]))
     return env
+
+
+# Server libraries the harness loads (write_amp's pg_walinspect).
+LIBRARIES = ("pg_walinspect.so",)
+
+
+def library_hashes(bin_dir: Path) -> dict[str, str]:
+    try:
+        pkglibdir = Path(subprocess.check_output([str(bin_dir / "pg_config"), "--pkglibdir"],
+                                                 text=True).strip())
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {name: sha256(pkglibdir / name) for name in LIBRARIES
+            if (pkglibdir / name).is_file()}
 
 
 def build_provenance(bin_dir: Path) -> Any:
@@ -158,6 +173,9 @@ def warnings(env: dict[str, Any], suite: str = "S") -> list[str]:
     provenance = env["postgres"].get("build_provenance")
     if not provenance or provenance.get("binary_hashes") != env["postgres"].get("binary_hashes"):
         w.append("server binary has no matching build provenance; use build_postgres.sh")
+    elif "library_hashes" in provenance and \
+            provenance["library_hashes"] != env["postgres"].get("library_hashes"):
+        w.append("server libraries (pg_walinspect) differ from the build's provenance")
     if env["cpu_governors"] != ["performance"]:
         w.append(f"CPU governor is {env['cpu_governors']}, not performance "
                  "(run system/system_prepare.sh)")
