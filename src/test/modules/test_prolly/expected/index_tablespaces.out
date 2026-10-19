@@ -1,7 +1,8 @@
 -- Tablespaces are local to a cluster: neither a table's nor its indexes'
 -- reach the canonical form, so the same tables hash the same wherever their
--- storage is, and a clone into a cluster without the tablespace (or a move
--- that makes an index again) needs none.
+-- storage is.  A move that makes an index again keeps it where the branch
+-- had it; one the branch didn't have is made in the default tablespace.
+-- (A clone into a cluster without the tablespace: t/101_index_tablespaces.pl.)
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -27,7 +28,10 @@ SELECT * FROM dolt_status;
 ------------+--------+--------
 (0 rows)
 
--- and back, the table with them: still nothing
+-- and back, and the table too (which moves none of its indexes): still
+-- nothing
+ALTER INDEX tsp.t_pkey SET TABLESPACE regress_prolly_ts;
+ALTER INDEX tsp.t_a_key SET TABLESPACE regress_prolly_ts;
 ALTER INDEX tsp.t_b SET TABLESPACE regress_prolly_ts;
 ALTER TABLE tsp.t SET TABLESPACE regress_prolly_ts;
 SELECT * FROM dolt_status;
@@ -35,13 +39,74 @@ SELECT * FROM dolt_status;
 ------------+--------+--------
 (0 rows)
 
--- a move makes the indexes from definitions without a tablespace
+-- a move that makes the indexes again (their definitions changed, a
+-- constraint's among them) keeps them where they were
 SELECT dolt_branch('tsp_side');
  dolt_branch 
 -------------
  {0}
 (1 row)
 
+SELECT dolt_checkout('tsp_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'tsp_side'"}
+(1 row)
+
+ALTER INDEX tsp.t_pkey SET TABLESPACE pg_default;
+ALTER INDEX tsp.t_a_key SET TABLESPACE pg_default;
+ALTER INDEX tsp.t_b SET TABLESPACE pg_default;
+ALTER TABLE tsp.t DROP CONSTRAINT t_a_key, ADD CONSTRAINT t_a_key UNIQUE (a, b);
+DROP INDEX tsp.t_b;
+CREATE INDEX t_b ON tsp.t (b, a);
+SELECT length(dolt_commit('-Am', 'redefined')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'tsp_side');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT indexname, tablespace, indexdef FROM pg_indexes WHERE schemaname = 'tsp'
+  ORDER BY indexname COLLATE "C";
+ indexname |    tablespace     |                        indexdef                         
+-----------+-------------------+---------------------------------------------------------
+ t_a_key   | regress_prolly_ts | CREATE UNIQUE INDEX t_a_key ON tsp.t USING btree (a, b)
+ t_b       | regress_prolly_ts | CREATE INDEX t_b ON tsp.t USING btree (b, a)
+ t_pkey    | regress_prolly_ts | CREATE UNIQUE INDEX t_pkey ON tsp.t USING btree (id)
+(3 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT indexname, tablespace FROM pg_indexes WHERE schemaname = 'tsp'
+  ORDER BY indexname COLLATE "C";
+ indexname |    tablespace     
+-----------+-------------------
+ t_a_key   | regress_prolly_ts
+ t_b       | regress_prolly_ts
+ t_pkey    | regress_prolly_ts
+(3 rows)
+
+-- an index the branch didn't have is made in the default tablespace
 SELECT dolt_checkout('tsp_side');
             dolt_checkout            
 -------------------------------------
@@ -67,7 +132,7 @@ SELECT dolt_reset('--hard', 'tsp_side');
  {0}
 (1 row)
 
-SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_reset('--hard', 'HEAD~2');
  dolt_reset 
 ------------
  {0}
@@ -75,11 +140,11 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 
 SELECT indexname, tablespace FROM pg_indexes WHERE schemaname = 'tsp'
   ORDER BY indexname COLLATE "C";
- indexname | tablespace 
------------+------------
- t_a_key   | 
+ indexname |    tablespace     
+-----------+-------------------
+ t_a_key   | regress_prolly_ts
  t_b       | 
- t_pkey    | 
+ t_pkey    | regress_prolly_ts
 (3 rows)
 
 SELECT * FROM dolt_status;
@@ -87,6 +152,13 @@ SELECT * FROM dolt_status;
 ------------+--------+--------
 (0 rows)
 
+-- a commit of format 6, whose index lines had the TABLESPACE clause, isn't
+-- moved to (a fold of this format no longer matches it; nor is it merged)
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '6'),
+	'format 6') AS tsp_old \gset
+SELECT dolt_reset('--hard', :'tsp_old');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
 SELECT dolt_branch('-D', 'tsp_side');
  dolt_branch 
 -------------

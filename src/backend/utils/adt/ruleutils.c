@@ -1174,7 +1174,8 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
  *
  * Note that the SQL-function versions of this omit any info about the
  * index tablespace; this is intentional because pg_dump wants it that way.
- * However pg_get_indexdef_string() includes the index tablespace.
+ * However pg_get_indexdef_string() includes the index tablespace, and
+ * pg_get_indexdef_string_notblspc() is the same internal version without it.
  * ----------
  */
 Datum
