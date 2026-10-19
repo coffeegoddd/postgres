@@ -763,7 +763,9 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
  * transaction's start, so a parent another session committed since then is
  * older than it; and never at or before a parent's date (the clock may have
  * stepped back, or a parent come from a remote whose clock runs ahead), so
- * along history the dates only rise.
+ * along history the dates only rise.  (A parent dated outside timestamp's
+ * range, or at its last microsecond, which only a foreign or corrupt commit
+ * could be, leaves the date as it is.)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
@@ -780,7 +782,8 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	{
 		TimestampTz parent_at;
 
-		if (commit_time(&parents[i], &parent_at) && at <= parent_at)
+		if (commit_time(&parents[i], &parent_at) && at <= parent_at &&
+			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
 			at = parent_at + 1;
 	}
 	prolly_database_components(&dc);
