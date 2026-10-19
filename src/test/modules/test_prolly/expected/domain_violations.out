@@ -268,6 +268,159 @@ SELECT * FROM dv.u ORDER BY pk;
 (4 rows)
 
 ROLLBACK;
+-- Only the values a write changes are checked: a stored value a NOT VALID
+-- constraint allows stays (as an UPDATE of another column leaves it), with
+-- theirs' change to another column written, the row updated in place or
+-- (a second unique index) removed and inserted again.  A value theirs
+-- changes is checked (in dv.n: in dv.nu, its refusal would remove the row,
+-- with no put-back of the branch's version on that path yet).
+CREATE DOMAIN dv.nv AS int;
+CREATE TABLE dv.n (pk int PRIMARY KEY, v dv.nv, w int);
+CREATE TABLE dv.nu (pk int PRIMARY KEY, v dv.nv, w int, u int UNIQUE);
+INSERT INTO dv.n VALUES (1, -1, 10), (2, -2, 20);
+INSERT INTO dv.nu VALUES (1, -1, 10, 1), (2, -2, 20, 2);
+SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('other4');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER DOMAIN dv.nv ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
+SELECT length(dolt_commit('-am', 'ours: nv constrained, not valid')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('other4');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'other4'"}
+(1 row)
+
+UPDATE dv.n SET w = 11 WHERE pk = 1;
+UPDATE dv.nu SET w = 11 WHERE pk = 1;
+UPDATE dv.n SET v = -3 WHERE pk = 2;		-- a change breaking it
+SELECT length(dolt_commit('-am', 'theirs: w, v')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('other4'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_type, violation_info
+FROM dolt_constraint_violations('dv.n')
+UNION ALL
+SELECT violating_row->>'pk' AS pk, violation_type, violation_info
+FROM dolt_constraint_violations('dv.nu')
+ORDER BY pk;
+ pk |  violation_type  |                violation_info                
+----+------------------+----------------------------------------------
+ 2  | check constraint | {"Name": "pos", "Expression": "(VALUE > 0)"}
+(1 row)
+
+SELECT * FROM dv.n ORDER BY pk;
+ pk | v  | w  
+----+----+----
+  1 | -1 | 11
+  2 | -2 | 20
+(2 rows)
+
+SELECT * FROM dv.nu ORDER BY pk;
+ pk | v  | w  | u 
+----+----+----+---
+  1 | -1 | 11 | 1
+  2 | -2 | 20 | 2
+(2 rows)
+
+ROLLBACK;
+-- A domain over another, each with a constraint of the same name: the one
+-- broken is described, the base's.
+CREATE DOMAIN dv.lower AS int;
+CREATE DOMAIN dv.upper AS dv.lower;
+CREATE TABLE dv.s (pk int PRIMARY KEY, v dv.upper);
+INSERT INTO dv.s VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 's')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('other5');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER DOMAIN dv.lower ADD CONSTRAINT c CHECK (VALUE > 0);
+ALTER DOMAIN dv.upper ADD CONSTRAINT c CHECK (VALUE < 100);
+SELECT length(dolt_commit('-am', 'ours: lower and upper constrained')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('other5');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'other5'"}
+(1 row)
+
+INSERT INTO dv.s VALUES (2, -5), (3, 500), (4, 50);
+SELECT length(dolt_commit('-am', 'theirs: s rows')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('other5'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_type, violation_info
+FROM dolt_constraint_violations('dv.s')
+ORDER BY pk;
+ pk |  violation_type  |                     violation_info                      
+----+------------------+---------------------------------------------------------
+ 2  | check constraint | {"Name": "c", "Expression": "(VALUE > 0)"}
+ 3  | check constraint | {"Name": "c", "Expression": "((VALUE)::integer < 100)"}
+(2 rows)
+
+SELECT pk FROM dv.s ORDER BY pk;
+ pk 
+----
+  1
+  4
+(2 rows)
+
+ROLLBACK;
 -- Rows that meet the domains merge as ever.
 SELECT dolt_branch('fine');
  dolt_branch 
@@ -350,6 +503,18 @@ SELECT dolt_branch('-D', 'other3');
  {0}
 (1 row)
 
+SELECT dolt_branch('-D', 'other4');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'other5');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('-D', 'fine');
  dolt_branch 
 -------------
@@ -357,7 +522,7 @@ SELECT dolt_branch('-D', 'fine');
 (1 row)
 
 DROP SCHEMA dv CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 15 other objects
 DETAIL:  drop cascades to type dv.posint
 drop cascades to type dv.small
 drop cascades to type dv.label
@@ -367,3 +532,9 @@ drop cascades to type dv.pair
 drop cascades to table dv.c
 drop cascades to type dv.ours
 drop cascades to table dv.u
+drop cascades to type dv.nv
+drop cascades to table dv.n
+drop cascades to table dv.nu
+drop cascades to type dv.lower
+drop cascades to type dv.upper
+drop cascades to table dv.s
