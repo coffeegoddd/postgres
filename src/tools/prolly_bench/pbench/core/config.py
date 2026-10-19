@@ -44,6 +44,11 @@ RUN_DEFAULTS: dict[str, Any] = {
     # may turn synchronous_commit off (fsync stays on), so a machine's
     # flush time doesn't bury the change compared.
     "comparison_only": False,
+    # What the write_amp collector's flush has prolly do after the window,
+    # so its deferred tree writes are counted: "prolly_checkpoint" folds the
+    # working set into trees, "none" doesn't (the V suite's workloads
+    # commit), and "auto" is the first for S, the second for V.
+    "write_amp_materialize": "auto",
 }
 
 # Settings every S and V run requires: results are only comparable when
@@ -164,6 +169,11 @@ def validate(cfg: dict, suite: str) -> None:
     if run["settled_counters"] and suite == "S" and (not run["workloads"] or "S6" in run["workloads"]):
         raise ConfigError("settled_counters waits until no other client is connected, and S6 "
                           "holds a session open for its whole window: leave S6 out")
+    if run["write_amp_materialize"] not in ("auto", "prolly_checkpoint", "none"):
+        raise ConfigError("write_amp_materialize must be auto, prolly_checkpoint or none")
+    if "write_amp" in run["collectors"] and "recovery" in run["collectors"]:
+        raise ConfigError("write_amp checkpoints after the window, which leaves the recovery "
+                          "collector nothing to replay: run them in separate configs")
     if not set(run["required_collectors"]) <= set(run["collectors"]):
         raise ConfigError("required_collectors must be enabled")
     for label, sizes in cfg["sizes"].items():
