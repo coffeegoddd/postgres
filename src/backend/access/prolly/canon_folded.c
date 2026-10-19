@@ -159,6 +159,9 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_init_privs.h"
+#include "catalog/pg_seclabel.h"
+#include "commands/seclabel.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -4245,6 +4248,9 @@ typedef struct Replaced
 	Oid			owner;
 	Acl		   *acl;			/* NULL: the default */
 	char	   *comment;		/* NULL: none */
+	List	   *labels;			/* its security labels: provider, label, ... */
+	char		privtype;		/* its pg_init_privs row's, or 0: none */
+	Acl		   *initprivs;		/* likewise */
 } Replaced;
 
 /* A branch other than the session's whose folded root lacks schema name. */
@@ -4337,8 +4343,21 @@ make_schema(Canon *cn, const char *name, List **replaced)
 				 errhint("Drop it, or rename it, and try again.")));
 	{
 		ProllyDatabaseComponents dc;
+		ProllyHash	head = {0};
 
+		/*
+		 * (a branch with commits already: those from before may use this
+		 * one, and moving back to them would find none)
+		 */
 		prolly_database_components(&dc);
+		if (PROLLY_CALL(dc.refs, resolve, lacking.session, &head) &&
+			head.len > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_SCHEMA),
+					 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+					 errdetail("The commit's schema \"%s\" is versioned, and branch \"%s\" has commits already: only a branch's first history (a clone, or a push into a new database) replaces an ordinary schema.",
+							   plain, lacking.session),
+					 errhint("Drop it, or rename it, and try again.")));
 		PROLLY_CALL(dc.refs, branches, note_lacking, &lacking);
 	}
 	if (lacking.branch != NULL)
@@ -4360,6 +4379,55 @@ make_schema(Canon *cn, const char *name, List **replaced)
 	r->acl = isnull ? NULL : DatumGetAclPCopy(acl);
 	ReleaseSysCache(tup);
 	r->comment = GetComment(nsp, NamespaceRelationId, 0);
+	r->labels = NIL;
+	r->privtype = 0;
+	r->initprivs = NULL;
+	{
+		Relation	rel;
+		ScanKeyData skey[3];
+		HeapTuple	row;
+
+		rel = table_open(SecLabelRelationId, AccessShareLock);
+		ScanKeyInit(&skey[0], Anum_pg_seclabel_objoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(nsp));
+		ScanKeyInit(&skey[1], Anum_pg_seclabel_classoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+		ScanKeyInit(&skey[2], Anum_pg_seclabel_objsubid, BTEqualStrategyNumber,
+					F_INT4EQ, Int32GetDatum(0));
+		scan = systable_beginscan(rel, SecLabelObjectIndexId, true, NULL, 3, skey);
+		while ((row = systable_getnext(scan)) != NULL)
+		{
+			Datum		provider;
+			Datum		label;
+
+			provider = heap_getattr(row, Anum_pg_seclabel_provider,
+									RelationGetDescr(rel), &isnull);
+			label = heap_getattr(row, Anum_pg_seclabel_label,
+								 RelationGetDescr(rel), &isnull);
+			r->labels = lappend(lappend(r->labels, TextDatumGetCString(provider)),
+								TextDatumGetCString(label));
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+
+		rel = table_open(InitPrivsRelationId, AccessShareLock);
+		ScanKeyInit(&skey[0], Anum_pg_init_privs_objoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(nsp));
+		ScanKeyInit(&skey[1], Anum_pg_init_privs_classoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+		ScanKeyInit(&skey[2], Anum_pg_init_privs_objsubid, BTEqualStrategyNumber,
+					F_INT4EQ, Int32GetDatum(0));
+		scan = systable_beginscan(rel, InitPrivsObjIndexId, true, NULL, 3, skey);
+		if ((row = systable_getnext(scan)) != NULL)
+		{
+			r->privtype = ((Form_pg_init_privs) GETSTRUCT(row))->privtype;
+			acl = heap_getattr(row, Anum_pg_init_privs_initprivs,
+							   RelationGetDescr(rel), &isnull);
+			r->initprivs = DatumGetAclPCopy(acl);
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
 	*replaced = lappend(*replaced, r);
 	/* (no CASCADE: nothing is in it) */
 	return list_make2(psprintf("DROP SCHEMA %s", name), create);
@@ -4415,6 +4483,36 @@ carry_over(List *replaced)
 							  0, NULL, nmembers, members);
 		if (r->comment != NULL)
 			CreateComments(nsp, NamespaceRelationId, 0, r->comment);
+		for (int i = 0; i < list_length(r->labels); i += 2)
+		{
+			ObjectAddress obj;
+
+			ObjectAddressSet(obj, NamespaceRelationId, nsp);
+			SetSecurityLabel(&obj, list_nth(r->labels, i),
+							 list_nth(r->labels, i + 1));
+		}
+		if (r->privtype != 0)
+		{
+			Relation	ip = table_open(InitPrivsRelationId, RowExclusiveLock);
+			Datum		ivalues[Natts_pg_init_privs] = {0};
+			bool		inulls[Natts_pg_init_privs] = {0};
+			HeapTuple	row;
+
+			ivalues[Anum_pg_init_privs_objoid - 1] = ObjectIdGetDatum(nsp);
+			ivalues[Anum_pg_init_privs_classoid - 1] =
+				ObjectIdGetDatum(NamespaceRelationId);
+			ivalues[Anum_pg_init_privs_objsubid - 1] = Int32GetDatum(0);
+			ivalues[Anum_pg_init_privs_privtype - 1] = CharGetDatum(r->privtype);
+			ivalues[Anum_pg_init_privs_initprivs - 1] =
+				PointerGetDatum(r->initprivs);
+			row = heap_form_tuple(RelationGetDescr(ip), ivalues, inulls);
+			CatalogTupleInsert(ip, row);
+			heap_freetuple(row);
+			table_close(ip, RowExclusiveLock);
+			nmembers = aclmembers(r->initprivs, &members);
+			updateInitAclDependencies(NamespaceRelationId, nsp, 0,
+									  0, NULL, nmembers, members);
+		}
 		InvokeObjectPostAlterHook(NamespaceRelationId, nsp, 0);
 	}
 	CommandCounterIncrement();

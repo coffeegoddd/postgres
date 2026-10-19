@@ -151,6 +151,8 @@ SELECT nspversioned FROM pg_namespace WHERE nspname = 'public';
 SELECT nspowner::regrole AS owner, nspacl,
        obj_description(oid, 'pg_namespace') AS comment
 FROM pg_namespace WHERE nspname = 'public';
+SELECT privtype, initprivs FROM pg_init_privs
+WHERE objoid = 'public'::regnamespace AND classoid = 'pg_namespace'::regclass;
 SELECT count(*) AS uncommitted FROM dolt_status;
 -- (another branch, its versioned public the same)
 SELECT dolt_checkout('side') IS NOT NULL AS on_side;
@@ -181,7 +183,11 @@ CREATE DATABASE regress_clone_g OWNER regress_clone_dbo;
 \c regress_clone_g
 GRANT USAGE, CREATE ON SCHEMA public TO regress_clone_app;
 COMMENT ON SCHEMA public IS 'granted';
+LOAD 'dummy_seclabel';
+SECURITY LABEL ON SCHEMA public IS 'classified';
 SELECT dolt_clone(:'url_pub');
+SELECT provider, label FROM pg_seclabels
+WHERE objoid = 'public'::regnamespace AND classoid = 'pg_namespace'::regclass;
 SELECT nspversioned, nspowner::regrole AS owner, nspacl,
        obj_description(oid, 'pg_namespace') AS comment
 FROM pg_namespace WHERE nspname = 'public';
@@ -211,8 +217,8 @@ SELECT dolt_clone(:'url_pub');
 DROP DATABASE regress_clone_d;
 
 -- a later move, here a hard reset of main to a history with a versioned
--- public while dev's has none: the ordinary public is dev's too, refused,
--- and dev keeps it
+-- public: main's own commits use the ordinary public (and dev's history
+-- has none), refused, main and dev keeping it
 CREATE DATABASE regress_clone_m;
 \c regress_clone_m
 GRANT USAGE ON SCHEMA public TO regress_clone_app;
@@ -225,6 +231,11 @@ SELECT length(dolt_commit('-Am', 'app gone')::text) AS committed;
 SELECT dolt_remote('add', 'origin', :'url_pub');
 SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
 SELECT dolt_reset('--hard', 'origin/main');
+-- (refused for main's commits even where every other branch has one)
+SELECT dolt_branch('-D', 'dev');
+SELECT dolt_branch('b2', 'origin/main');
+SELECT dolt_reset('--hard', 'origin/main');
+SELECT dolt_branch('dev', 'HEAD~1');
 SELECT nspversioned, nspacl FROM pg_namespace WHERE nspname = 'public';
 SELECT dolt_checkout('dev') IS NOT NULL AS on_dev;
 CREATE TABLE x (id int);
@@ -232,5 +243,29 @@ SELECT nspversioned FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oi
 WHERE c.relname = 'x';
 \c :db
 DROP DATABASE regress_clone_m;
+
+-- a clone of a history one of whose branches has no versioned public: that
+-- branch uses the ordinary one, refused, naming it
+\set url_mix :run '/mix'
+CREATE DATABASE regress_clone_x;
+\c regress_clone_x
+SET default_table_access_method = prolly;
+CREATE SCHEMA s VERSIONED;
+CREATE TABLE s.a (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'bare')::text) AS committed;
+SELECT dolt_branch('bare');
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+SELECT length(dolt_commit('-Am', 'pub')::text) AS committed;
+SELECT dolt_remote('add', 'origin', :'url_mix');
+SELECT dolt_push('origin', 'main') AS pushed;
+SELECT dolt_push('origin', 'bare') AS pushed;
+CREATE DATABASE regress_clone_y;
+\c regress_clone_y
+SELECT dolt_clone(:'url_mix');
+SELECT nspversioned FROM pg_namespace WHERE nspname = 'public';
+\c :db
+DROP DATABASE regress_clone_y;
+DROP DATABASE regress_clone_x;
 DROP ROLE regress_clone_app;
 DROP ROLE regress_clone_dbo;

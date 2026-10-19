@@ -76,4 +76,20 @@ is(o('used', q{SELECT nspversioned::text || count(c.oid) FROM pg_namespace n
 	LEFT JOIN pg_class c ON c.relnamespace = n.oid
 	WHERE nspname = 'public' GROUP BY nspversioned}), 'false1', 'its public as it was');
 
+# a later move there, the pushed branch checked out where main has
+# commits of its own using the ordinary public: refused, public kept
+o('postgres', 'CREATE DATABASE hist');
+o('hist', q{SELECT dolt_commit('--allow-empty', '-m', 'own')});
+$u = url('hist');
+l('postgres', qq{
+	SELECT dolt_remote('add', 'hist', '$u');
+	SELECT dolt_branch('feature');
+	SELECT dolt_push('hist', 'feature');
+});
+($ret, $out, $err) = $origin->psql('hist', q{SELECT dolt_checkout('feature')});
+like($err, qr/branch "feature" has commits already/,
+	'a later move: refused');
+is(o('hist', q{SELECT nspversioned FROM pg_namespace WHERE nspname = 'public'}), 'f',
+	'its public as it was');
+
 done_testing();
