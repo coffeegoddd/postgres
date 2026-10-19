@@ -72,6 +72,7 @@
 #include "utils/array.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
@@ -828,11 +829,25 @@ other_unique_index(Relation rel)
 	return false;
 }
 
+/* Whether rel's rows are keyed by their content, not by a primary key. */
+static bool
+keyed_by_content(Relation rel)
+{
+	const ProllyKeyingRoutine *kr = keying_of(rel);
+	ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
+	bool		keyless = PROLLY_CALL(kr, keyless, k);
+
+	PROLLY_CALL(kr, close, k);
+	return keyless;
+}
+
 /*
  * May a row a merge writes to rel break one of its constraints there: a
  * check, a not-null column outside the primary key, or a unique or
  * exclusion index other than the primary key's?  (The merge decides each
- * row by its primary key, so that one holds.)  Asked once a table.
+ * row by its primary key, so that one holds, if it keys the rows: a
+ * deferrable one, or one the keying can't order, doesn't.)  Asked once a
+ * table.
  */
 static bool
 may_break_constraints(Relation rel)
@@ -856,6 +871,9 @@ may_break_constraints(Relation rel)
 			return true;
 	}
 	if (other_unique_index(rel))
+		return true;
+	if (OidIsValid(RelationGetPrimaryKeyIndex(rel, true)) &&
+		keyed_by_content(rel))
 		return true;
 	breakable = false;
 	return false;
@@ -927,12 +945,77 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 	return s.data;
 }
 
+/* Whether any of an index entry's n key columns is null. */
+static bool
+has_null(const bool *isnull, int n)
+{
+	for (int i = 0; i < n; i++)
+		if (isnull[i])
+			return true;
+	return false;
+}
+
+/*
+ * Check now the deferrable unique and exclusion constraints of rel a row
+ * just inserted into it may break, as their recheck at the end of the
+ * statement or at commit would (unique_key_recheck()): a row breaking one
+ * raises the error here, where merge_write() can record it.  (A row is
+ * updated in place only where no index but the primary key's could be
+ * broken, and a deferrable primary key doesn't key the rows: only
+ * inserts are checked.)
+ */
+static void
+check_deferrable(Relation rel, TupleTableSlot *row)
+{
+	foreach_oid(indexoid, RelationGetIndexList(rel))
+	{
+		Relation	index = index_open(indexoid, RowExclusiveLock);
+		Form_pg_index form = index->rd_index;
+		IndexInfo  *ii;
+		EState	   *estate;
+		ExprContext *econtext;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+
+		if (form->indimmediate || !form->indisready ||
+			!(form->indisunique || form->indisexclusion))
+		{
+			index_close(index, RowExclusiveLock);
+			continue;
+		}
+		ii = BuildIndexInfo(index);
+		estate = CreateExecutorState();
+		econtext = GetPerTupleExprContext(estate);
+		econtext->ecxt_scantuple = row;
+		/* (a partial index has no entry for a row outside it) */
+		if (ii->ii_Predicate == NIL ||
+			ExecQual(ExecPrepareQual(ii->ii_Predicate, estate), econtext))
+		{
+			FormIndexDatum(ii, row, estate, values, isnull);
+			if (ii->ii_ExclusionOps != NULL)
+				check_exclusion_constraint(rel, index, ii, &row->tts_tid,
+										   values, isnull, estate, false);
+			/* (a key with a null is unique, unless nulls aren't distinct) */
+			else if (ii->ii_NullsNotDistinct ||
+					 !has_null(isnull, ii->ii_NumIndexKeyAttrs))
+			{
+				index_insert(index, values, isnull, &row->tts_tid, rel,
+							 UNIQUE_CHECK_EXISTING, false, ii);
+				index_insert_cleanup(index, ii);
+			}
+		}
+		FreeExecutorState(estate);
+		index_close(index, RowExclusiveLock);
+	}
+}
+
 /*
  * Write a row as a merge does: insert it, or update old to it.  While a
  * merge records violations, a row that breaks a unique, check or not-null
  * (or exclusion) constraint isn't written, and is recorded instead: a
  * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).
+ * table holds no row breaking a constraint, unlike Dolt's).  A deferrable
+ * constraint is checked as the row is written, as others are.
  * Returns false if old isn't there.
  */
 static bool
@@ -957,7 +1040,10 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		if (old)
 			ok = PROLLY_CALL(ar, update, a, old, row, keep);
 		else
+		{
 			PROLLY_CALL(ar, insert, a, row);
+			check_deferrable(rel, row);
+		}
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;

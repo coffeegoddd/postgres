@@ -127,6 +127,52 @@ DELETE FROM cv.child WHERE id = 7;
 SELECT dolt_verify_constraints();
 SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
 
+-- A deferrable unique or exclusion constraint is checked as the merge
+-- writes each row, as one that isn't deferrable is: a row breaking it is
+-- recorded, not left for the end of the merge or the commit to refuse.
+-- So is a deferrable primary key (which doesn't key its table's rows).
+CREATE SCHEMA dv VERSIONED;
+CREATE TABLE dv.later (pk int PRIMARY KEY,
+	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.now (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
+CREATE TABLE dv.pk (pk int PRIMARY KEY DEFERRABLE, x int);
+CREATE TABLE dv.ex (pk int PRIMARY KEY, r int4range,
+	EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+INSERT INTO dv.later VALUES (1, 1);
+INSERT INTO dv.now VALUES (1, 1);
+INSERT INTO dv.pk VALUES (1, 1);
+INSERT INTO dv.ex VALUES (1, '[1,2)');
+SELECT length(dolt_commit('-Am', 'deferrable base')::text) AS committed;
+SELECT dolt_branch('deferring');
+SELECT dolt_checkout('deferring');
+INSERT INTO dv.later VALUES (3, 5), (4, NULL);
+INSERT INTO dv.now VALUES (3, 5);
+INSERT INTO dv.pk VALUES (2, 3);
+INSERT INTO dv.ex VALUES (3, '[5,7)');
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO dv.later VALUES (2, 5), (5, NULL);
+INSERT INTO dv.now VALUES (2, 5);
+INSERT INTO dv.pk VALUES (2, 2);
+INSERT INTO dv.ex VALUES (2, '[6,8)');
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('deferring'))[3:4];
+SELECT table_name, violation_type, violating_row, violation_info
+FROM dolt_constraint_violations() d,
+	LATERAL dolt_constraint_violations(d.table_name::regclass)
+ORDER BY table_name;
+SELECT * FROM dv.later ORDER BY pk;
+SELECT * FROM dv.now ORDER BY pk;
+SELECT * FROM dv.pk ORDER BY pk, x;
+SELECT * FROM dv.ex ORDER BY pk;
+SELECT dolt_verify_constraints();
+SELECT length(dolt_commit('-am', 'merged deferring')::text) AS committed;
+COMMIT;
+SELECT dolt_branch('-D', 'deferring');
+DROP SCHEMA dv CASCADE;
+SELECT length(dolt_commit('-Am', 'no dv')::text) AS committed;
+
 -- A revert that leaves a child without its parent records it.
 INSERT INTO cv.parent VALUES (10);
 SELECT (dolt_commit('-am', 'parent 10'))[1] AS parent10 \gset
