@@ -3296,17 +3296,17 @@ take_breaking_rows(List *added, void *arg)
 
 /*
  * The rows of the session branch's tables changed since its head, by
- * table, each as its key: a JSON object of its columns in a unique index
- * (the primary key's among them), each value as its type's output gives
- * it, which json_to_recordset() reads back to match the table's rows by
+ * table, each as its key: a JSON object of the columns rows are matched
+ * by (its primary key's, and those a foreign key references), each value
+ * as its type's output gives it, which json_to_recordset() reads back to match the table's rows by
  * key.  Those added or changed as they are now, and those removed or
  * changed as they were.  (A keyless row's copies added are a row now, its
  * copies removed one that was.)  Only key columns are read, so a row
  * matches whatever its other columns hold or how they print.  A table is
  * checked whole where rows can't be matched so: one made or redefined
  * since (its constraints may be new), one with violations recorded (each
- * is found again or not, whatever its row is now), and one with no unique
- * index.
+ * is found again or not, whatever its row is now), and one with neither
+ * a primary key nor columns a foreign key references.
  */
 typedef struct ChangedTable
 {
@@ -3330,7 +3330,7 @@ typedef struct ChangedRows
 	bool		keyless;
 	ProllyTreeEnv env;			/* (its values out of line read through) */
 	ProllyKeyingRefs krefs;
-	Bitmapset  *keycols;		/* its columns in a unique index */
+	Bitmapset  *keycols;		/* its columns matched by (match_columns()) */
 	bool	   *kept;			/* (decoding: the columns left unread) */
 	TupleTableSlot *slot;
 } ChangedRows;
@@ -3416,6 +3416,53 @@ changed_key(ChangedRows *cr, const ProllyValue *value, uint64 *count)
 	return buf.data;
 }
 
+/*
+ * The columns of rel (a partition, of ancestors) its changed rows are
+ * matched by: its primary key's, which its own rows' checks match, and
+ * those a foreign key references, which its referencing rows' match (as
+ * RelationGetIndexAttrBitmap() numbers them).  Only these are read, so a
+ * unique column out of line no check matches by stays unread.
+ */
+static Bitmapset *
+match_columns(Relation rel, List *ancestors)
+{
+	Oid			relid = RelationGetRelid(rel);
+	Oid			conoid;
+	Bitmapset  *out = bms_copy(get_primary_key_attnos(relid, false, &conoid));
+	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
+										  NULL, 0, NULL);
+	HeapTuple	tup;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		d;
+		ArrayType  *fk;
+		int16	   *keys;
+
+		if (con->contype != CONSTRAINT_FOREIGN ||
+			(con->confrelid != relid && !list_member_oid(ancestors, con->confrelid)))
+			continue;
+		d = heap_getattr(tup, Anum_pg_constraint_confkey,
+						 RelationGetDescr(pg_constraint), &isnull);
+		fk = DatumGetArrayTypeP(d);
+		keys = (int16 *) ARR_DATA_PTR(fk);
+		/* (by name: a partition's columns may be numbered otherwise) */
+		for (int i = 0; i < ARR_DIMS(fk)[0]; i++)
+		{
+			AttrNumber	attno = get_attnum(relid, get_attname(con->confrelid, keys[i], false));
+
+			if (attno != InvalidAttrNumber)
+				out = bms_add_member(out, attno - FirstLowInvalidHeapAttributeNumber);
+		}
+	}
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+	return out;
+}
+
 /* Whether table ct is one to check, or one a foreign key joins it to. */
 static bool
 changed_relevant(const ChangedRows *cr, const ChangedTable *ct)
@@ -3460,7 +3507,7 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		if (cr->cur->whole || !changed_relevant(cr, cr->cur))
 			return;
 		cr->rel = table_open(relid, AccessShareLock);
-		cr->keycols = RelationGetIndexAttrBitmap(cr->rel, INDEX_ATTR_BITMAP_KEY);
+		cr->keycols = match_columns(cr->rel, cr->cur->ancestors);
 		if (bms_is_empty(cr->keycols))
 		{
 			/* (no key to match its rows by) */
