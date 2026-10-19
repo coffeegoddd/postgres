@@ -198,7 +198,10 @@ stash, …) is F, ported with the feature (#163).
 - **Prolly:** a connection names `dbname/branch` (as Doltgres's do) and
   starts on that branch; `dbname` alone starts on the database's
   default branch. A connection to a branch that doesn't exist is
-  refused, SQLSTATE 42704, as `dolt_checkout`'s is. A session's
+  refused, SQLSTATE 42704, as `dolt_checkout`'s is; one naming
+  `detached/...`, a commit's hidden branch (spec 11), whether or not it
+  exists, is refused with 42939, as `dolt_checkout` refuses that
+  name. A session's
   catalogs, `information_schema` included, are its branch's, as in
   Doltgres.
 - **Why:** Postgres has no `USE` and no cross-database references; a
