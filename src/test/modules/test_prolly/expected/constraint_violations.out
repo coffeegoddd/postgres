@@ -225,6 +225,31 @@ SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
         66
 (1 row)
 
+SELECT dolt_branch('no_child');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('no_child');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'no_child'"}
+(1 row)
+
+DROP TABLE cv.child;
+SELECT length(dolt_commit('-am', 'no_child drops cv.child')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
       dolt_merge       
@@ -253,7 +278,35 @@ SELECT count(*) AS still_listed FROM dolt_constraint_violations();
             1
 (1 row)
 
-ROLLBACK;
+-- (and a checkout to a branch without the table doesn't let them through)
+SELECT dolt_checkout('no_child');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'no_child'"}
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with constraint violations
+DETAIL:  Table "child" has a row with a unique index violation on branch "main".
+HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS none_kept FROM dolt_constraint_violations();
+ none_kept 
+-----------
+         0
+(1 row)
+
+SELECT dolt_branch('-D', 'no_child');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- Violations kept stay through later merges that find none of their own.
 SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_merge('feature'))[3:4];
@@ -402,6 +455,161 @@ SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
         66
 (1 row)
 
+-- A deferrable unique or exclusion constraint is checked as the merge
+-- writes each row, as one that isn't deferrable is: a row breaking it is
+-- recorded, not left for the end of the merge or the commit to refuse.
+-- So is a deferrable primary key, or one WITHOUT OVERLAPS (neither keys
+-- its table's rows, so the merge doesn't decide rows by it).
+CREATE SCHEMA dv VERSIONED;
+CREATE TABLE dv.later (pk int PRIMARY KEY,
+	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.now (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
+CREATE TABLE dv.pk (pk int PRIMARY KEY DEFERRABLE, x int);
+CREATE TABLE dv.ex (pk int PRIMARY KEY, r int4range,
+	EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dv.wo (k int4range, during int4range,
+	PRIMARY KEY (k, during WITHOUT OVERLAPS));
+INSERT INTO dv.later VALUES (1, 1);
+INSERT INTO dv.now VALUES (1, 1);
+INSERT INTO dv.pk VALUES (1, 1);
+INSERT INTO dv.ex VALUES (1, '[1,2)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[1,3)');
+SELECT length(dolt_commit('-Am', 'deferrable base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('deferring');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('deferring');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'deferring'"}
+(1 row)
+
+INSERT INTO dv.later VALUES (3, 5), (4, NULL);
+INSERT INTO dv.now VALUES (3, 5);
+INSERT INTO dv.pk VALUES (2, 3);
+INSERT INTO dv.ex VALUES (3, '[5,7)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[5,8)'), ('[2,3)', '[5,8)');
+SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO dv.later VALUES (2, 5), (5, NULL);
+INSERT INTO dv.now VALUES (2, 5);
+INSERT INTO dv.pk VALUES (2, 2);
+INSERT INTO dv.ex VALUES (2, '[6,8)');
+INSERT INTO dv.wo VALUES ('[1,2)', '[6,9)');
+SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('deferring'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT table_name, violation_type, violating_row, violation_info
+FROM dolt_constraint_violations() d,
+	LATERAL dolt_constraint_violations(d.table_name::regclass)
+ORDER BY table_name;
+ table_name | violation_type |           violating_row           |                 violation_info                  
+------------+----------------+-----------------------------------+-------------------------------------------------
+ dv.ex      | unique index   | {"r": "[5,7)", "pk": 3}           | {"Name": "ex_r_excl", "Columns": ["r"]}
+ dv.later   | unique index   | {"x": 5, "pk": 3}                 | {"Name": "later_x_key", "Columns": ["x"]}
+ dv.now     | unique index   | {"x": 5, "pk": 3}                 | {"Name": "now_x_key", "Columns": ["x"]}
+ dv.pk      | unique index   | {"x": 3, "pk": 2}                 | {"Name": "pk_pkey", "Columns": ["pk"]}
+ dv.wo      | unique index   | {"k": "[1,2)", "during": "[5,8)"} | {"Name": "wo_pkey", "Columns": ["k", "during"]}
+(5 rows)
+
+SELECT * FROM dv.later ORDER BY pk;
+ pk | x 
+----+---
+  1 | 1
+  2 | 5
+  4 |  
+  5 |  
+(4 rows)
+
+SELECT * FROM dv.now ORDER BY pk;
+ pk | x 
+----+---
+  1 | 1
+  2 | 5
+(2 rows)
+
+SELECT * FROM dv.pk ORDER BY pk, x;
+ pk | x 
+----+---
+  1 | 1
+  2 | 2
+(2 rows)
+
+SELECT * FROM dv.ex ORDER BY pk;
+ pk |   r   
+----+-------
+  1 | [1,2)
+  2 | [6,8)
+(2 rows)
+
+SELECT * FROM dv.wo ORDER BY k, during;
+   k   | during 
+-------+--------
+ [1,2) | [1,3)
+ [1,2) | [6,9)
+ [2,3) | [5,8)
+(3 rows)
+
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('-am', 'merged deferring')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+COMMIT;
+SELECT dolt_branch('-D', 'deferring');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dv CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table dv.later
+drop cascades to table dv.now
+drop cascades to table dv.pk
+drop cascades to table dv.ex
+drop cascades to table dv.wo
+SELECT length(dolt_commit('-Am', 'no dv')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 -- A revert that leaves a child without its parent records it.
 INSERT INTO cv.parent VALUES (10);
 SELECT (dolt_commit('-am', 'parent 10'))[1] AS parent10 \gset
@@ -487,6 +695,372 @@ SELECT count(*) AS none FROM dolt_constraint_violations();
 (1 row)
 
 RESET ROLE;
+-- A keyed row whose new version breaks a unique index stays as the branch
+-- has it, whether the merge applies theirs' changes alone (u: ours changed
+-- its definition only) or merges both sides' (w); and so does one whose
+-- new version would take the value a row kept so still holds (w's 1).
+-- A row whose put-back was refused keeps the branch's version while the
+-- others are written, then takes its new one if it fits: r's 2 and s's 2
+-- (s: theirs' changes alone, as u) do once 1 is refused, so only 1's
+-- violation is recorded.  Such a row is written first the next time, so a
+-- row refused only for the values it holds isn't (a's 1, c's 1), and two
+-- rows swapping a value can still both be written (b's 1 and 3).  A row
+-- whose put-back is refused again is left in place, then updated (p: no
+-- row of theirs fits, as each takes a value the other keeps).  A known
+-- limit (x): rows refused are tried again one at a time, so two that
+-- swap a value (3 and 4 take each other's b) stay refused, though they
+-- would fit together: no row of theirs is written, and four violations
+-- are recorded where two would do.  Each is a real one, and the table
+-- holds no row breaking a constraint.
+CREATE SCHEMA uv VERSIONED;
+CREATE TABLE uv.u (pk int PRIMARY KEY, x int);
+INSERT INTO uv.u VALUES (1, 1), (2, 2);
+CREATE TABLE uv.w (pk int PRIMARY KEY, x int UNIQUE);
+INSERT INTO uv.w VALUES (1, 1), (2, 2);
+CREATE TABLE uv.r (pk int PRIMARY KEY, b int UNIQUE, c int);
+INSERT INTO uv.r VALUES (1, 100, 0), (2, 200, 0);
+CREATE TABLE uv.s (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.s VALUES (1, 100, 0), (2, 999, 0);
+CREATE TABLE uv.a (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO uv.a VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+CREATE TABLE uv.b (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO uv.b VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+CREATE TABLE uv.c (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.c VALUES (1, 10, 100), (2, 20, 200), (3, 99, 300);
+CREATE TABLE uv.p (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.p VALUES (1, 4, 1), (2, 3, 2), (3, 2, 4);
+CREATE TABLE uv.x (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.x VALUES (1, 2, 3), (2, 4, 0), (3, 3, 1), (4, 0, 2);
+SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('uv_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE UNIQUE INDEX u_x ON uv.u (x);
+INSERT INTO uv.w VALUES (3, 5);
+UPDATE uv.r SET b = 999 WHERE pk = 2;
+CREATE UNIQUE INDEX s_b ON uv.s (b);
+UPDATE uv.a SET b = 99 WHERE pk = 3;
+UPDATE uv.b SET c = 999 WHERE pk = 3;
+CREATE UNIQUE INDEX c_b ON uv.c (b);
+CREATE UNIQUE INDEX c_c ON uv.c (c);
+CREATE UNIQUE INDEX p_b ON uv.p (b);
+CREATE UNIQUE INDEX p_c ON uv.p (c);
+CREATE UNIQUE INDEX x_b ON uv.x (b);
+CREATE UNIQUE INDEX x_c ON uv.x (c);
+SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('uv_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'uv_theirs'"}
+(1 row)
+
+UPDATE uv.u SET x = 1 WHERE pk = 2;
+UPDATE uv.w SET x = 5 WHERE pk = 2;
+UPDATE uv.w SET x = 2 WHERE pk = 1;
+UPDATE uv.r SET b = 999 WHERE pk = 1;
+UPDATE uv.r SET c = 1 WHERE pk = 2;
+UPDATE uv.s SET b = 999 WHERE pk = 1;
+UPDATE uv.s SET c = 1 WHERE pk = 2;
+UPDATE uv.a SET b = 99 WHERE pk = 2;
+UPDATE uv.a SET c = 301 WHERE pk = 3;
+UPDATE uv.a SET c = 300 WHERE pk = 1;
+UPDATE uv.b SET c = 999 WHERE pk = 2;
+UPDATE uv.b SET b = 0 WHERE pk = 1;
+UPDATE uv.b SET b = 10 WHERE pk = 3;
+UPDATE uv.b SET b = 30 WHERE pk = 1;
+UPDATE uv.c SET b = 99 WHERE pk = 2;
+UPDATE uv.c SET c = 301 WHERE pk = 3;
+UPDATE uv.c SET c = 300 WHERE pk = 1;
+UPDATE uv.p SET c = 2 WHERE pk = 1;
+UPDATE uv.p SET b = 4 WHERE pk = 2;
+UPDATE uv.x SET b = (ARRAY[4, 3, 0, 3])[pk];
+SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('uv_theirs'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT * FROM uv.u ORDER BY pk;
+ pk | x 
+----+---
+  1 | 1
+  2 | 2
+(2 rows)
+
+SELECT * FROM uv.w ORDER BY pk;
+ pk | x 
+----+---
+  1 | 1
+  2 | 2
+  3 | 5
+(3 rows)
+
+SELECT * FROM uv.r ORDER BY pk;
+ pk |  b  | c 
+----+-----+---
+  1 | 100 | 0
+  2 | 999 | 1
+(2 rows)
+
+SELECT * FROM uv.s ORDER BY pk;
+ pk |  b  | c 
+----+-----+---
+  1 | 100 | 0
+  2 | 999 | 1
+(2 rows)
+
+SELECT * FROM uv.a ORDER BY pk;
+ pk | b  |  c  
+----+----+-----
+  1 | 10 | 300
+  2 | 20 | 200
+  3 | 99 | 301
+(3 rows)
+
+SELECT * FROM uv.b ORDER BY pk;
+ pk | b  |  c  
+----+----+-----
+  1 | 30 | 100
+  2 | 20 | 200
+  3 | 10 | 999
+(3 rows)
+
+SELECT * FROM uv.c ORDER BY pk;
+ pk | b  |  c  
+----+----+-----
+  1 | 10 | 300
+  2 | 20 | 200
+  3 | 99 | 301
+(3 rows)
+
+SELECT * FROM uv.p ORDER BY pk;
+ pk | b | c 
+----+---+---
+  1 | 4 | 1
+  2 | 3 | 2
+  3 | 2 | 4
+(3 rows)
+
+SELECT * FROM uv.x ORDER BY pk;
+ pk | b | c 
+----+---+---
+  1 | 2 | 3
+  2 | 4 | 0
+  3 | 3 | 1
+  4 | 0 | 2
+(4 rows)
+
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row::text
+FROM unnest(ARRAY['uv.u', 'uv.w', 'uv.r', 'uv.s', 'uv.a', 'uv.b', 'uv.c',
+				  'uv.p', 'uv.x']) t,
+	LATERAL dolt_constraint_violations(t)
+ORDER BY 1, 3;
+ t | violation_type |        violating_row         
+---+----------------+------------------------------
+ a | unique index   | {"b": 99, "c": 200, "pk": 2}
+ b | unique index   | {"b": 20, "c": 999, "pk": 2}
+ c | unique index   | {"b": 99, "c": 200, "pk": 2}
+ p | unique index   | {"b": 4, "c": 2, "pk": 1}
+ p | unique index   | {"b": 4, "c": 2, "pk": 2}
+ r | unique index   | {"b": 999, "c": 0, "pk": 1}
+ s | unique index   | {"b": 999, "c": 0, "pk": 1}
+ u | unique index   | {"x": 1, "pk": 2}
+ w | unique index   | {"x": 2, "pk": 1}
+ w | unique index   | {"x": 5, "pk": 2}
+ x | unique index   | {"b": 0, "c": 1, "pk": 3}
+ x | unique index   | {"b": 3, "c": 0, "pk": 2}
+ x | unique index   | {"b": 3, "c": 2, "pk": 4}
+ x | unique index   | {"b": 4, "c": 3, "pk": 1}
+(14 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'uv_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA uv CASCADE;
+NOTICE:  drop cascades to 9 other objects
+DETAIL:  drop cascades to table uv.u
+drop cascades to table uv.w
+drop cascades to table uv.r
+drop cascades to table uv.s
+drop cascades to table uv.a
+drop cascades to table uv.b
+drop cascades to table uv.c
+drop cascades to table uv.p
+drop cascades to table uv.x
+SELECT length(dolt_commit('-Am', 'uv dropped')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- The rows put back and the pinned row updated are checked against a
+-- deferrable unique constraint as each is written too, so a deferrable
+-- one (d, ad) merges as one that isn't (i, ai).  A row whose new version
+-- takes a value a row of ours holds (d's 2) stays as the branch has it, as
+-- does the row that would take its old value (d's 1); and a pinned row's
+-- update (ad's 3, as uv.a's) neither leaves a buffer pinned nor fails.
+CREATE SCHEMA dw VERSIONED;
+CREATE TABLE dw.d (pk int PRIMARY KEY, x int UNIQUE DEFERRABLE);
+CREATE TABLE dw.i (pk int PRIMARY KEY, x int UNIQUE);
+CREATE TABLE dw.ad (pk int PRIMARY KEY, b int UNIQUE DEFERRABLE,
+	c int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE dw.ai (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO dw.d VALUES (1, 4), (2, 5);
+INSERT INTO dw.i VALUES (1, 4), (2, 5);
+INSERT INTO dw.ad VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+INSERT INTO dw.ai VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+SELECT length(dolt_commit('-Am', 'dw base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dw_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO dw.d VALUES (3, 7);
+INSERT INTO dw.i VALUES (3, 7);
+UPDATE dw.ad SET b = 99 WHERE pk = 3;
+UPDATE dw.ai SET b = 99 WHERE pk = 3;
+SELECT length(dolt_commit('-am', 'dw ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('dw_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'dw_theirs'"}
+(1 row)
+
+UPDATE dw.d SET x = 7 WHERE pk = 2;
+UPDATE dw.d SET x = 5 WHERE pk = 1;
+UPDATE dw.i SET x = 7 WHERE pk = 2;
+UPDATE dw.i SET x = 5 WHERE pk = 1;
+UPDATE dw.ad SET b = 99 WHERE pk = 2;
+UPDATE dw.ad SET c = 301 WHERE pk = 3;
+UPDATE dw.ad SET c = 300 WHERE pk = 1;
+UPDATE dw.ai SET b = 99 WHERE pk = 2;
+UPDATE dw.ai SET c = 301 WHERE pk = 3;
+UPDATE dw.ai SET c = 300 WHERE pk = 1;
+SELECT length(dolt_commit('-am', 'dw theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dw_theirs'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT * FROM dw.d ORDER BY pk;
+ pk | x 
+----+---
+  1 | 4
+  2 | 5
+  3 | 7
+(3 rows)
+
+SELECT * FROM dw.i ORDER BY pk;
+ pk | x 
+----+---
+  1 | 4
+  2 | 5
+  3 | 7
+(3 rows)
+
+SELECT * FROM dw.ad ORDER BY pk;
+ pk | b  |  c  
+----+----+-----
+  1 | 10 | 300
+  2 | 20 | 200
+  3 | 99 | 301
+(3 rows)
+
+SELECT * FROM dw.ai ORDER BY pk;
+ pk | b  |  c  
+----+----+-----
+  1 | 10 | 300
+  2 | 20 | 200
+  3 | 99 | 301
+(3 rows)
+
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row::text
+FROM unnest(ARRAY['dw.d', 'dw.i', 'dw.ad', 'dw.ai']) t,
+	LATERAL dolt_constraint_violations(t)
+ORDER BY 1, 3;
+ t  | violation_type |        violating_row         
+----+----------------+------------------------------
+ ad | unique index   | {"b": 99, "c": 200, "pk": 2}
+ ai | unique index   | {"b": 99, "c": 200, "pk": 2}
+ d  | unique index   | {"x": 5, "pk": 1}
+ d  | unique index   | {"x": 7, "pk": 2}
+ i  | unique index   | {"x": 5, "pk": 1}
+ i  | unique index   | {"x": 7, "pk": 2}
+(6 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'dw_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dw CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table dw.d
+drop cascades to table dw.i
+drop cascades to table dw.ad
+drop cascades to table dw.ai
+SELECT length(dolt_commit('-Am', 'dw dropped')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

@@ -148,6 +148,40 @@ check_commit_message(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * An author has a name, and an email when it has <...>, as Dolt's commits
+ * need both (one without <...> is a name alone, as the session user is).
+ * Its parts are as split_author finds them.
+ */
+static bool
+author_ok(const char *author)
+{
+	const char *lt = strrchr(author, '<');
+	const char *gt = lt ? strchr(lt, '>') : NULL;
+
+	if (lt && gt)
+	{
+		const char *end = lt;
+
+		while (end > author && end[-1] == ' ')
+			end--;
+		return end > author && gt > lt + 1;
+	}
+	return author[0] != '\0';
+}
+
+/* (empty, dolt.author is the session user's name) */
+static bool
+check_author(char **newval, void **extra, GucSource source)
+{
+	if (**newval != '\0' && !author_ok(*newval))
+	{
+		GUC_check_errdetail("An author is \"Name <email>\", or a name alone.");
+		return false;
+	}
+	return true;
+}
+
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
 
@@ -171,7 +205,7 @@ prolly_session_init(const char *branch)
 								   "",
 								   PGC_USERSET,
 								   0,
-								   NULL, NULL, NULL);
+								   check_author, NULL, NULL);
 		prolly_autovacuum_init();
 		DefineCustomBoolVariable("dolt.transaction_commit",
 								 "Makes a Dolt commit of every transaction that changes a branch, as it commits.",
@@ -719,6 +753,28 @@ split_author(const char *author, char **name, char **email)
 	}
 }
 
+/* An --author given to fn, refused unless it is an author. */
+static void
+given_author(const char *fn, const char *author)
+{
+	if (author != NULL && !author_ok(author))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s: \"%s\" is not an author", fn, author),
+				 errhint("An author is \"Name <email>\", or a name alone.")));
+}
+
+/* A -m given to fn, refused when empty: a commit needs a message. */
+static void
+given_message(const char *fn, const char *message)
+{
+	if (message != NULL && message[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s needs a message", fn),
+				 errdetail("A commit's message can't be empty.")));
+}
+
 /* NULL for one dropped (as a table whose violations are kept may be) */
 static char *
 qualified_name(Oid relid)
@@ -740,12 +796,13 @@ qualified_name(Oid relid)
 /*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
- * -m/--message message (required), --author "Name <email>", -a/-A/--all
- * (every change is always committed), --allow-empty (else a commit whose
- * root equals its parent's is refused), --skip-empty (nothing to commit:
- * no commit, and NULL), -f/--force (constraint violations don't stop the
- * commit, as in Dolt; the transaction still can't commit with them unless
- * dolt.allow_commit_conflicts is on).
+ * -m/--message message (required, not empty), --author "Name <email>" (or
+ * a name alone), -a/-A/--all (every change is always committed),
+ * --allow-empty (else a commit whose root equals its parent's is refused),
+ * --skip-empty (nothing to commit: no commit, and NULL), -f/--force
+ * (constraint violations don't stop the commit, as in Dolt; the
+ * transaction still can't commit with them unless dolt.allow_commit_conflicts
+ * is on).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -806,6 +863,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit needs a message"),
 				 errhint("Pass -m and a message.")));
+	given_message("dolt_commit", message);
+	given_author("dolt_commit", author);
 	if (allow_empty && skip_empty)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -920,7 +979,11 @@ force_branch(const char *name, const char *from)
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
 
-	/* (another branch's rows written, as a create makes its copies) */
+	/*
+	 * (made, as a create is, though the transaction is read-only for the
+	 * branch it started on: the checks too, and another branch's rows
+	 * written, as a create makes its copies)
+	 */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
@@ -1292,6 +1355,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (a rename, delete, take or protection makes no branch: not in a
+	 * transaction read-only for the branch it started on either, unlike a
+	 * create, forced or not, which a session on a commit makes to change
+	 * anything)
+	 */
+	if (move || delete || take || protection != PROLLY_PROTECT_DEFAULT)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (protection != PROLLY_PROTECT_DEFAULT)
 	{
 		ListCell   *lc;
@@ -1592,6 +1664,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_merge", a);
 	}
+	/* (an abort makes no commit: its -m is ignored, as Dolt's is) */
 	if (abort_merge)
 	{
 		ProllyMergeState ms;
@@ -1609,6 +1682,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[3] = "merge aborted";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
+	given_message("dolt_merge", message);
 	if (branch == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -2081,6 +2155,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_integrate needs a message"),
 				 errhint("Pass -m and a message.")));
+	given_message("dolt_integrate", message);
 	mine = pstrdup(branch_ops()->current());
 	if (target == NULL)
 	{
@@ -2253,8 +2328,8 @@ tables_left(int *conflicted, int *violated)
  * [--allow-empty] commit: its changes, committed again on the current
  * branch, with its author.  Rows changed differently on both sides leave
  * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
- * (or [--allow-empty] --continue, with the picked commit's message) makes
- * its commit, with one parent; --abort ends it.  The counts are of tables,
+ * (or [--allow-empty] --continue, with the picked commit's message and
+ * author) makes its commit, with one parent; --abort ends it.  The counts are of tables,
  * as Dolt's.
  */
 Datum
@@ -2299,6 +2374,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	if (abort_pick || continue_pick)
 	{
 		ProllyMergeState ms;
+		ProllyCommitInfo picked;
 
 		if (ref != NULL)
 			unexpected("dolt_cherry_pick", ref);
@@ -2313,10 +2389,29 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 			result[0] = "";
 			PG_RETURN_DATUM(text_array(4, result));
 		}
-		/* a pick resolved to nothing: as a pick of nothing is */
+		/*
+		 * By the picked commit's author, as a pick that doesn't stop is
+		 * (Dolt's ContinueCherryPick): the merge's theirs is that commit.
+		 * A pick resolved to nothing: as a pick of nothing is.
+		 */
+		if (!PROLLY_CALL(refs(), commit_get, &ms.theirs, &picked))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the cherry-pick's commit %s is missing",
+							hash_hex(&ms.theirs))));
 		note_integration();
-		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, ms.message,
-													 allow_empty, &id));
+		author_override = picked.author;
+		PG_TRY();
+		{
+			BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit,
+														 ms.message,
+														 allow_empty, &id));
+		}
+		PG_FINALLY();
+		{
+			author_override = NULL;
+		}
+		PG_END_TRY();
 		if (!committed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2427,6 +2522,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_revert", args[i]);
 	}
+	/* (an abort makes no commit: its --author is ignored) */
+	if (!abort_revert)
+		given_author("dolt_revert", author);
 	if (abort_revert && continue_revert)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -2570,7 +2668,7 @@ typedef struct LogEntry
 {
 	ProllyHash	key;			/* hash key: info.id as prolly_hash_key() makes it */
 	ProllyCommitInfo info;
-	int64		order;			/* 1 + the most of its parents'; -1 while found */
+	int64		order;			/* its height: 1 + the most of its parents' */
 } LogEntry;
 
 static LogEntry *
@@ -2581,68 +2679,36 @@ log_find(HTAB *entries, const ProllyHash *id)
 	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
+/*
+ * Highest order first, then newest, as Dolt's log goes by height and then
+ * date: a commit is always above its parents.
+ */
 static int
 log_cmp(const ListCell *a, const ListCell *b)
 {
 	LogEntry   *x = lfirst(a);
 	LogEntry   *y = lfirst(b);
 
-	if (x->info.committed_at != y->info.committed_at)
-		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	if (x->order != y->order)
 		return x->order > y->order ? -1 : 1;
+	if (x->info.committed_at != y->info.committed_at)
+		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
 /*
- * The order of e, its parents' first (they are all in entries): without
- * recursion, as history may be as deep as it is long, on stack (empty, and
- * left so).  A commit found again while its own parents are being ordered
- * is in a cycle, which history can't hold.
+ * A commit of the log, for prolly_history_height(): read already, so none
+ * is read twice.
  */
-static void
-log_order(HTAB *entries, LogEntry *e, List **stack)
+static bool
+log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 {
-	*stack = lappend(*stack, e);
-	while (*stack != NIL)
-	{
-		LogEntry   *top = llast(*stack);
-		int64		most = 0;
-		bool		ready = true;
+	LogEntry   *e = log_find(arg, id);
 
-		if (top->order > 0)
-		{
-			*stack = list_delete_last(*stack);
-			continue;
-		}
-		top->order = -1;
-		for (int i = 0; i < top->info.nparents; i++)
-		{
-			LogEntry   *p = log_find(entries, &top->info.parents[i]);
-
-			if (p == NULL)
-				continue;
-			if (p->order < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("prolly commit %s is its own ancestor",
-								hash_hex(&p->info.id))));
-			if (p->order == 0)
-			{
-				*stack = lappend(*stack, p);
-				ready = false;
-			}
-			else
-				most = Max(most, p->order);
-		}
-		/* (else it waits, found, for the parents pushed above it) */
-		if (ready)
-		{
-			top->order = most + 1;
-			*stack = list_delete_last(*stack);
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
+	if (e == NULL)
+		return false;
+	*info = e->info;
+	return true;
 }
 
 /*
@@ -2650,7 +2716,8 @@ log_order(HTAB *entries, LogEntry *e, List **stack)
  *			OUT email text, OUT date timestamptz, OUT message text,
  *			OUT commit_order int8) returns setof record
  *
- * Every commit ref reaches, newest first.
+ * Every commit ref reaches, highest commit order (height) first, then
+ * newest.
  */
 Datum
 dolt_log(PG_FUNCTION_ARGS)
@@ -2660,8 +2727,8 @@ dolt_log(PG_FUNCTION_ARGS)
 	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
+	HTAB	   *heights;
 	List	   *entries = NIL;
-	List	   *stack = NIL;
 	ListCell   *lc;
 	ProllyHash	key;
 	bool		found;
@@ -2709,9 +2776,14 @@ dolt_log(PG_FUNCTION_ARGS)
 				entries = lappend(entries, p);
 		}
 	}
+	heights = prolly_history_heights();
 	foreach(lc, entries)
-		log_order(seen, lfirst(lc), &stack);
-	list_free(stack);
+	{
+		LogEntry   *e = lfirst(lc);
+
+		e->order = prolly_history_height(&e->info.id, heights, log_lookup, seen);
+	}
+	hash_destroy(heights);
 	list_sort(entries, log_cmp);
 	foreach(lc, entries)
 	{
@@ -2970,7 +3042,8 @@ with_status(List *names, Oid relid, const char *status)
  * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
  *	  returns setof record
  *
- * The tables changed since the session branch's head commit: rows changed
+ * The tables changed since the session branch's head commit (before its
+ * first, since the empty root: everything is new): rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
  * in progress, with conflicts ("conflict", not staged), or with constraint
  * violations ("constraint violation", not staged); the other objects
@@ -2983,7 +3056,6 @@ dolt_status(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	StatusSink	s = {{status_change}, NIL};
-	ProllyHash	head;
 	List	   *names = NIL;
 	ListCell   *lc;
 
@@ -2992,8 +3064,6 @@ dolt_status(PG_FUNCTION_ARGS)
 	List	   *violated = NIL;
 
 	InitMaterializedSRF(fcinfo, 0);
-	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
-		return (Datum) 0;
 	foreach(lc, PROLLY_CALL(refs(), violations))
 		violated = list_append_unique_oid(violated,
 										  ((ProllyViolation *) lfirst(lc))->relid);
@@ -4190,8 +4260,12 @@ dolt_pull(PG_FUNCTION_ARGS)
 			merge_args = lappend(merge_args, a);
 		else if (is_option(a, "m") || is_option(a, "message"))
 		{
+			char	   *message = option_value(args, nargs, &i, "dolt_pull");
+
+			/* (before the fetch, as dolt_merge would refuse it after) */
+			given_message("dolt_pull", message);
 			merge_args = lappend(merge_args, a);
-			merge_args = lappend(merge_args, option_value(args, nargs, &i, "dolt_pull"));
+			merge_args = lappend(merge_args, message);
 		}
 		else if (a[0] == '-')
 			unsupported("dolt_pull", a);

@@ -82,6 +82,7 @@
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -117,11 +118,17 @@ static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
+static void merge_tables_left(const char *branch, ProllyMergeState *state,
+							  char **name);
+static List *violations_left(const char *branch, List *violations,
+							 char **name);
+static Oid	branch_oid(const char *name);
 static void merge_key(StringInfo key, const char *branch);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
+static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
@@ -175,9 +182,66 @@ note_merge_changed(const char *branch)
 	}
 }
 
+typedef struct TablesExist
+{
+	int			n;
+	const Oid  *relids;
+	bool	   *exists;			/* out: whether each is a table there */
+	char	  **name;			/* out, if not NULL: the first one's name */
+} TablesExist;
+
+static void
+tables_exist_here(void *arg)
+{
+	TablesExist *te = arg;
+
+	if (te->name)
+		*te->name = NULL;
+	for (int i = 0; i < te->n; i++)
+	{
+		te->exists[i] = SearchSysCacheExists1(RELOID,
+											  ObjectIdGetDatum(te->relids[i]));
+		if (te->exists[i] && te->name && *te->name == NULL)
+			*te->name = get_rel_name(te->relids[i]);
+	}
+}
+
+/*
+ * Which of relids are tables on branch, as its own catalog has them: a
+ * merge state, or violations, of a branch other than the session's names
+ * tables of that branch, which the session's branch may not have (or may
+ * have dropped, where that one still has them).  A branch with only a head
+ * has no catalog of its own yet, and so nothing dropped from it.
+ */
+static void
+tables_exist_on(const char *branch, int n, const Oid *relids, bool *exists,
+				char **name)
+{
+	TablesExist te = {n, relids, exists, name};
+
+	if (n == 0)
+	{
+		if (name)
+			*name = NULL;
+		return;
+	}
+	if (strcmp(branch, branch_ops()->current()) == 0)
+		tables_exist_here(&te);
+	else if (OidIsValid(branch_oid(branch)))
+		branch_ops()->run_on(branch, tables_exist_here, &te);
+	else
+	{
+		for (int i = 0; i < n; i++)
+			exists[i] = true;
+		if (name)
+			*name = get_rel_name(relids[0]);
+	}
+}
+
 /*
  * Unresolved conflicts, or constraint violations, of a merge the
- * transaction made aren't committed.
+ * transaction made aren't committed: on each branch it made one on, as
+ * that branch has its tables (a checkout since doesn't hide them).
  */
 static void
 check_merge_conflicts(const char *what)
@@ -188,27 +252,29 @@ check_merge_conflicts(const char *what)
 		return;
 	foreach(lc, merge_changed)
 	{
+		const char *branch = lfirst(lc);
 		ProllyMergeState ms;
-
 		List	   *v;
+		char	   *name = NULL;
 
-		if (merge_state_of(lfirst(lc), &ms) && ms.ntables > 0)
+		if (merge_state_of(branch, &ms))
+			merge_tables_left(branch, &ms, &name);
+		if (ms.ntables > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
 					 errdetail("Table \"%s\" has conflicts on branch \"%s\".",
-							   get_rel_name(ms.tables[0]),
-							   (char *) lfirst(lc)),
+							   name, branch),
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
-		v = violations_of(lfirst(lc));
+		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
 					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
-							   get_rel_name(((ProllyViolation *) linitial(v))->relid),
+							   name,
 							   ((ProllyViolation *) linitial(v))->type,
-							   (char *) lfirst(lc)),
+							   branch),
 					 errhint("Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.")));
 	}
 }
@@ -606,6 +672,7 @@ move_settled(void *arg)
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+static bool commit_time(const ProllyHash *id, TimestampTz *at);
 
 /* The session's branch folded, as a commit's fold would be: its baseline. */
 static void
@@ -758,19 +825,33 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 /*
  * Write a commit's tree; its id is the root's hash.  What its versioned
  * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.
+ * transaction sees them.  It is dated now, as Dolt's are, not at the
+ * transaction's start, so a parent another session committed since then is
+ * older than it; and never at or before a parent's date (the clock may have
+ * stepped back, or a parent come from a remote whose clock runs ahead), so
+ * along history the dates only rise.  (A parent dated outside timestamp's
+ * range, or at its last microsecond, which only a foreign or corrupt commit
+ * could be, leaves the date as it is.)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, TimestampTz at,
-			 ProllyHash *id)
+			 const char *author, const char *message, ProllyHash *id)
 {
+	TimestampTz at = GetCurrentTimestamp();
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
 	ProllyNodeRef deps;
 	ProllyDatabaseComponents dc;
 
+	for (int i = 0; i < nparents; i++)
+	{
+		TimestampTz parent_at;
+
+		if (commit_time(&parents[i], &parent_at) && at <= parent_at &&
+			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
+			at = parent_at + 1;
+	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
@@ -808,6 +889,20 @@ read_item(const ProllyNodeRef *commit, const char *key, StringInfo out)
 	ProllyKey	k = {(const uint8 *) key, strlen(key)};
 
 	return PROLLY_CALL(tree, get, &env, commit, &k, out);
+}
+
+/* A commit's "time" item, as write_commit puts it; false if it isn't one. */
+static bool
+get_time(const StringInfoData *v, TimestampTz *at)
+{
+	uint64		t = 0;
+
+	if (v->len != 8)
+		return false;
+	for (int i = 0; i < 8; i++)
+		t = (t << 8) | (uint8) v->data[i];
+	*at = (TimestampTz) t;
+	return true;
 }
 
 static bool
@@ -852,16 +947,28 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		info->has_dependencies = true;
 	}
 	resetStringInfo(&v);
-	if (read_item(&ref, "time", &v) && v.len == 8)
-	{
-		uint64		t = 0;
-
-		for (int i = 0; i < 8; i++)
-			t = (t << 8) | (uint8) v.data[i];
-		info->committed_at = (TimestampTz) t;
-	}
+	if (read_item(&ref, "time", &v))
+		(void) get_time(&v, &info->committed_at);
 	pfree(v.data);
 	return true;
+}
+
+/* Just the date of commit id, which is read only for it. */
+static bool
+commit_time(const ProllyHash *id, TimestampTz *at)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+		return false;
+	ref_of(id, &ref);
+	initStringInfo(&v);
+	found = read_item(&ref, "time", &v) && get_time(&v, at);
+	pfree(v.data);
+	return found;
 }
 
 /* A commit id in hex; false if refname isn't one. */
@@ -1170,7 +1277,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		return false;
 	}
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -1307,8 +1414,20 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	base;
 
 	lock_refs();
+
+	/*
+	 * Merged, as in Dolt (and git): into the branch's upstream, read from
+	 * its remote-tracking branch, so only as current as the last fetch; or,
+	 * when it has none there, into the session's branch.  Not asked of the
+	 * session's own branch or main, which the drop refuses whatever they
+	 * contain: refused first, as Dolt (and git) refuses the checked-out
+	 * branch, so the error isn't one -D doesn't get past.
+	 */
 	if (!force && branch_head(name, &head) &&
-		!(branch_head(branch_ops()->current(), &ours) &&
+		strcmp(name, branch_ops()->current()) != 0 &&
+		branch_oid(name) != BRANCH_MAIN_OID &&
+		!((upstream_head(name, &ours) ||
+		   branch_head(branch_ops()->current(), &ours)) &&
 		  copies_merge_base(&head, &ours, &base) && same_hash(&base, &head)))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1611,7 +1730,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
 	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 GetCurrentTransactionStartTimestamp(), commit_id);
+				 commit_id);
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	return 1;
@@ -1643,7 +1762,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -1825,7 +1944,11 @@ merge_key(StringInfo key, const char *branch)
 	appendStringInfoString(key, branch);
 }
 
-/* The merge in progress on branch, if there is one. */
+/*
+ * The merge in progress on branch, if there is one, as the refs hold it:
+ * its conflicted tables, as merge_tables_left() has them, may include some
+ * since dropped.
+ */
 static bool
 merge_state_of(const char *branch, ProllyMergeState *state)
 {
@@ -1884,10 +2007,34 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 	return found;
 }
 
+/*
+ * Leave out of a branch's merge state the conflicted tables the branch has
+ * since dropped (as Dolt, dropping a table drops its conflicts); name: the
+ * first one left's name, if wanted.
+ */
+static void
+merge_tables_left(const char *branch, ProllyMergeState *state, char **name)
+{
+	bool	   *exists = palloc(sizeof(bool) * Max(state->ntables, 1));
+	int			n = 0;
+
+	tables_exist_on(branch, state->ntables, state->tables, exists, name);
+	for (int i = 0; i < state->ntables; i++)
+		if (exists[i])
+			state->tables[n++] = state->tables[i];
+	state->ntables = n;
+	pfree(exists);
+}
+
 static bool
 copies_merge_state(ProllyMergeState *state)
 {
-	return merge_state_of(branch_ops()->current(), state);
+	char	   *branch = branch_ops()->current();
+
+	if (!merge_state_of(branch, state))
+		return false;
+	merge_tables_left(branch, state, NULL);
+	return true;
 }
 
 /* (NULL: none) */
@@ -1976,8 +2123,8 @@ corrupt:
 }
 
 /*
- * The constraint violations a merge left on branch: those of tables since
- * dropped left out (a dropped table has no rows to fix).
+ * The constraint violations a merge left on branch, as the refs hold them:
+ * violations_left() leaves out those of tables since dropped.
  */
 static List *
 violations_of(const char *branch)
@@ -2008,8 +2155,7 @@ violations_of(const char *branch)
 			pv->type = get_text(&p, end);
 			pv->row = get_text(&p, end);
 			pv->info = get_text(&p, end);
-			if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(pv->relid)))
-				list = lappend(list, pv);
+			list = lappend(list, pv);
 		}
 	}
 	pfree(key.data);
@@ -2017,10 +2163,37 @@ violations_of(const char *branch)
 	return list;
 }
 
+/*
+ * Of a branch's constraint violations, those of tables it still has (a
+ * dropped table has no rows to fix); name: the first one's table's name,
+ * if wanted.
+ */
+static List *
+violations_left(const char *branch, List *violations, char **name)
+{
+	int			n = list_length(violations);
+	Oid		   *relids = palloc(sizeof(Oid) * Max(n, 1));
+	bool	   *exists = palloc(sizeof(bool) * Max(n, 1));
+	List	   *left = NIL;
+	ListCell   *lc;
+
+	foreach(lc, violations)
+		relids[foreach_current_index(lc)] = ((ProllyViolation *) lfirst(lc))->relid;
+	tables_exist_on(branch, n, relids, exists, name);
+	foreach(lc, violations)
+		if (exists[foreach_current_index(lc)])
+			left = lappend(left, lfirst(lc));
+	pfree(relids);
+	pfree(exists);
+	return left;
+}
+
 static List *
 copies_violations(void)
 {
-	return violations_of(branch_ops()->current());
+	char	   *branch = branch_ops()->current();
+
+	return violations_left(branch, violations_of(branch), NULL);
 }
 
 static void
@@ -2328,6 +2501,34 @@ copies_upstream(const char *branch, char **remote, char **remote_branch)
 	pfree(key.data);
 	pfree(v.data);
 	return found;
+}
+
+/*
+ * The commit of branch's upstream's remote-tracking branch; false if it has
+ * no upstream, or the upstream no remote-tracking branch (not yet fetched).
+ */
+static bool
+upstream_head(const char *branch, ProllyHash *commit_id)
+{
+	char	   *remote;
+	char	   *remote_branch;
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	if (!copies_upstream(branch, &remote, &remote_branch))
+		return false;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tracking_key(&key, remote, remote_branch);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+		(void) get_hash(v.data, v.data + v.len, commit_id);
+	pfree(key.data);
+	pfree(v.data);
+	pfree(remote);
+	pfree(remote_branch);
+	return found && commit_id->len > 0;
 }
 
 static bool
