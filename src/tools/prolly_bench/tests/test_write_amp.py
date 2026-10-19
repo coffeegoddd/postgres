@@ -90,7 +90,7 @@ class WriteAmpTest(unittest.TestCase):
         c.after_window(ctx, outcome)
         # A workload may hold sessions open as the window opens (S6, the
         # V suite's background S1): only the flush waits for clients.
-        self.assertEqual(self.client_waits, ["after"])
+        self.assertTrue(self.client_waits and set(self.client_waits) == {"after"})
         return c.results(ctx, outcome)
 
     def test_heap_counts_the_flush_checkpoint(self):
@@ -170,6 +170,29 @@ class WriteAmpTest(unittest.TestCase):
             s.tuples["t"] = [1_000_000, 0, 0]
         m = self.run_cell(s, context(s), bulk, Outcome(transactions=10, read_only=True))
         self.assertIsNone(m["wa_server"])
+
+    def test_peer_instances_are_counted(self):
+        # V4: the clone, fetch and push write to a second instance
+        origin, peer = FakeServer(), FakeServer()
+        ctx = context(origin, am="prolly", suite="V")
+        ctx.peers = [peer]
+        peer.on_checkpoint = lambda: peer.io.__setitem__(0, peer.io[0] + 8192 * peer.checkpoints)
+        def work():
+            origin.lsn += 100_000
+            origin.tuples["t"] = [0, 10_000, 0]
+            origin.prolly["chunk_bytes_appended"] += 30_000
+            peer.lsn += 300_000
+            peer.prolly["chunk_bytes_appended"] += 80_000
+            peer.tuples["t"] = [999, 0, 0]      # the clone's rows: not logical bytes
+        m = self.run_cell(origin, ctx, work, Outcome(transactions=3, unit="operation"))
+        self.assertEqual(peer.checkpoints, 2)
+        self.assertEqual(self.client_waits, ["after", "after"])
+        self.assertEqual(m["wa.instances"], 2)
+        self.assertEqual(m["wa.wal.total_bytes"], 400_000)
+        self.assertEqual(m["wa.pages.write_bytes"], 8192 * 2)
+        self.assertEqual(m["wa.tree.chunk_payload_bytes"], 110_000)
+        self.assertEqual(m["wa.logical_bytes"], 1_000_000)      # the origin's rows only
+        self.assertEqual(m["wa.server_bytes_per_operation"], (400_000 + 8192 * 2) / 3)
 
     def test_waits_for_autovacuum_at_each_end(self):
         s = FakeServer()
@@ -259,11 +282,14 @@ class RunnerOrderTest(unittest.TestCase):
             id, suite, title = "S1", "S", "probe"
             def prepare(self, ctx): pass
             def measure(self, ctx, window):
+                ctx.peers.append(peer)          # (V4's clone)
                 with window:
                     order.append("work")
                 return Outcome(transactions=1)
             def verify(self, ctx): order.append("workload.verify")
 
+        peer = mock.MagicMock()
+        peer.destroy.side_effect = lambda: order.append("peer destroyed")
         cluster = mock.MagicMock()
         cluster.log_since.return_value = ""
         cluster.scalar.return_value = "[]"
@@ -290,7 +316,7 @@ class RunnerOrderTest(unittest.TestCase):
         self.assertEqual(result.status.value, "ok", result.message)
         self.assertEqual(order, ["correctness.before", "before_window", "start", "work", "stop",
                                  "after_window", "results", "correctness.after",
-                                 "workload.verify", "post"])
+                                 "workload.verify", "post", "peer destroyed"])
 
 
 if __name__ == "__main__":

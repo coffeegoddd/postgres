@@ -17,6 +17,11 @@ Logical bytes are the new row versions the SQL wrote:
 workload table, from the same statistics for every engine. Deleted rows
 add no bytes and are reported as a count.
 
+A workload's other instances (ctx.peers: V4's clone, which the clone,
+fetch and push write to) are checkpointed, waited for and read like the
+origin, and their WAL, pages and chunk-store bytes added in; logical
+bytes are the origin's.
+
 Autovacuum workers flush their statistics only when they exit
 (autovacuum.c never reports them sooner), so the collector waits for none
 to be running at each end of the interval.  Otherwise a worker's pages
@@ -26,6 +31,7 @@ the interval its exit fell in.
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Optional
 
@@ -122,6 +128,21 @@ def _prolly(ctx: Context) -> dict[str, float]:
     return {k: float(v) for k, v in (r.split("=", 1) for r in rows.splitlines() if r)}
 
 
+def _on(ctx: Context, cluster) -> Context:
+    """ctx, reading another instance (a peer) instead of the origin."""
+    c = copy.copy(ctx)
+    c.cluster = cluster
+    return c
+
+
+def _sum(deltas: list[dict[str, float]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for d in deltas:
+        for k, v in d.items():
+            out[k] = out.get(k, 0.0) + v
+    return out
+
+
 def _ratio(numerator: Optional[float], logical: float, outcome: Outcome) -> Optional[float]:
     if numerator is None or outcome.read_only or logical < MIN_LOGICAL_BYTES:
         return None
@@ -133,43 +154,56 @@ class WriteAmpCollector(Collector):
     name = "write_amp"
 
     def before_window(self, ctx):
-        wait_for_autovacuum(ctx)
-        # Fold what came before (the load, the warm-up) first, so the fold
-        # after the window writes the window's changes only: nothing folds
-        # the working set between the load and the window.
-        if materialize_mode(ctx) == "prolly_checkpoint":
-            ctx.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
-        checkpoint(ctx)
+        self.peers = [_on(ctx, p) for p in getattr(ctx, "peers", [])]
+        for c in [ctx] + self.peers:
+            wait_for_autovacuum(c)
+            # Fold what came before (the load, the warm-up) first, so the
+            # fold after the window writes the window's changes only:
+            # nothing folds the working set between the load and the window.
+            if materialize_mode(ctx) == "prolly_checkpoint":
+                c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+            checkpoint(c)
 
-    def _snap(self, ctx) -> dict:
+    def _snap(self, ctx, tuples: bool = True) -> dict:
         s = {}
         s["lsn"] = ctx.cluster.scalar("SELECT pg_current_wal_insert_lsn()")
         page_bytes, writes, extends = ctx.cluster.scalar(_IO_SQL).split("|")
         s["io"] = {"bytes": float(page_bytes), "writes": float(writes), "extends": float(extends)}
-        s["tuples"] = _tuples(ctx)
+        s["tuples"] = _tuples(ctx) if tuples else {}
         s["prolly"] = _prolly(ctx) if _is_prolly(ctx) else {}
         return s
 
     def start(self, ctx):
         self.before = self._snap(ctx)
+        self.peers_before = [self._snap(p, tuples=False) for p in self.peers]
 
     def after_window(self, ctx, outcome):
-        wait_for_clients(ctx)
-        wait_for_autovacuum(ctx)
+        for c in [ctx] + self.peers:
+            wait_for_clients(c)
+            wait_for_autovacuum(c)
         self.mode = materialize_mode(ctx)
         self.unmaterialized = None
         if self.mode == "prolly_checkpoint":
             self.unmaterialized = self._snap(ctx)
-            ctx.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
-        checkpoint(ctx)
-        wait_for_autovacuum(ctx)
+            for c in [ctx] + self.peers:
+                c.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
+        for c in [ctx] + self.peers:
+            checkpoint(c)
+            wait_for_autovacuum(c)
         self.after = self._snap(ctx)
+        self.peers_after = [self._snap(p, tuples=False) for p in self.peers]
+
+    def _pairs(self, ctx):
+        """(instance's ctx, before, after) for the origin and each peer."""
+        return [(ctx, self.before, self.after)] + list(
+            zip(self.peers, self.peers_before, self.peers_after))
 
     def results(self, ctx, outcome):
         b, a = self.before, self.after
         n = outcome.transactions
-        wal = float(ctx.cluster.scalar(f"SELECT pg_wal_lsn_diff('{a['lsn']}', '{b['lsn']}')"))
-        io = counter_delta(b["io"], a["io"])
+        wal = sum(float(c.cluster.scalar(f"SELECT pg_wal_lsn_diff('{y['lsn']}', '{x['lsn']}')"))
+                  for c, x, y in self._pairs(ctx))
+        io = _sum([counter_delta(x["io"], y["io"]) for _, x, y in self._pairs(ctx)])
 
         rows_written = rows_deleted = logical = 0.0
         for t, (ins, upd, dele) in a["tuples"].items():
@@ -186,6 +220,8 @@ class WriteAmpCollector(Collector):
             "wa.logical_bytes": logical,
             "wa.logical_rows_written": rows_written,
             "wa.logical_rows_deleted": rows_deleted,
+            # (the origin, and the workload's other instances)
+            "wa.instances": float(1 + len(self.peers)),
             "wa.wal.total_bytes": wal,
             "wa.pages.write_bytes": io["bytes"],
             "wa.pages.writes": io["writes"],
@@ -193,7 +229,7 @@ class WriteAmpCollector(Collector):
         }
         server = wal + io["bytes"]
         if _is_prolly(ctx):
-            chunks = counter_delta(b["prolly"], a["prolly"])
+            chunks = _sum([counter_delta(x["prolly"], y["prolly"]) for _, x, y in self._pairs(ctx)])
             m["wa.tree.chunk_payload_bytes"] = chunks.get("chunk_bytes_appended")
             if self.unmaterialized is not None:
                 late = counter_delta(self.unmaterialized["prolly"], a["prolly"])

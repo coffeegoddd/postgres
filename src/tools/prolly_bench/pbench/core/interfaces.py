@@ -172,6 +172,10 @@ class Context:
     # Filled in by the cluster factory, for workloads needing a second
     # instance (V4).
     make_cluster: Optional[Callable[[str], Cluster]] = None
+    # Other instances the measured work writes to (V4's clone), added by
+    # the workload before it opens the window.  The runner destroys them
+    # after the collectors, which see their writes too (write_amp).
+    peers: list[Cluster] = field(default_factory=list)
 
     def session_options(self) -> dict[str, str]:
         """GUCs every client session of this run uses."""

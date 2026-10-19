@@ -329,6 +329,11 @@ class Runner:
             except OSError:
                 pass
             shutil.rmtree(scratch, ignore_errors=True)
+            for peer in ctx.peers:
+                try:
+                    peer.destroy()
+                except Exception as e:
+                    result.validation_errors.append(f"peer cluster cleanup failed: {e}")
             try:
                 if (failed or result.validation_errors or result.status != Status.OK) and self.keep_failed:
                     cluster.stop("immediate")
