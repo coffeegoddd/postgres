@@ -46,6 +46,9 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('main', 'f', NULL::app.t);
 
 -- Bad refs and tables.
 SELECT * FROM dolt_diff('nope', 'HEAD', NULL::app.t);
+-- (a null ref is refused, as Dolt refuses one: not read as text)
+SELECT * FROM dolt_diff(NULL, 'WORKING', NULL::app.t);
+SELECT * FROM dolt_diff('HEAD', NULL, NULL::app.t);
 CREATE TABLE plain (x int);
 SELECT * FROM dolt_diff('HEAD~1', 'HEAD', NULL::plain);
 DROP TABLE plain;
