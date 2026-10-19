@@ -48,10 +48,11 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
--- (the block map's bytes in blocks, whatever the block size)
+-- (the block map's bytes in blocks, whatever the block size; the journal's
+-- bytes depend on whether the server compresses its chunks, below)
 SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
 	ELSE value END AS value
-FROM pg_stat_prolly;
+FROM pg_stat_prolly WHERE name <> 'journal_bytes_written';
            name            | value 
 ---------------------------+-------
  nodes_read                |    40
@@ -71,7 +72,6 @@ FROM pg_stat_prolly;
  memo_misses               |     0
  page_copies_fold          |     0
  page_copies_shared        |     0
- journal_bytes_written     | 25957
  table_file_bytes_written  |     0
  manifest_bytes_written    |     0
  gc_bytes_copied           |     0
@@ -79,7 +79,7 @@ FROM pg_stat_prolly;
  bmap_store_bytes_written  |     0
  bmap_extend_bytes_written |    19
  bmap_bulk_bytes_written   |     0
-(25 rows)
+(24 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
@@ -90,11 +90,14 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
  t                 | t
 (1 row)
 
--- The journal holds each chunk with its record's framing, and the root.
-SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
-	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
- journal_frames_chunks 
------------------------
+-- The journal holds each chunk with its record's framing, and the root:
+-- compressed, fewer bytes than the chunks, where the server has LZ4.
+SELECT ((SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') <
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended')) =
+	(SELECT 'lz4' = ANY(enumvals) FROM pg_settings
+	 WHERE name = 'default_toast_compression') AS journal_compressed_with_lz4;
+ journal_compressed_with_lz4 
+-----------------------------
  t
 (1 row)
 

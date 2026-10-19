@@ -34,11 +34,12 @@ SELECT test_chunk_has(:'dangling0');
 -- The error's code: retryable.
 SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
 
--- A batch is checked as it is appended (a megabyte of chunks), before the
--- transaction commits.
+-- A batch is checked as it is appended (a megabyte of chunks, which LZ4
+-- can't make smaller), before the transaction commits.
 BEGIN;
 SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
-SELECT test_chunk_put(convert_to(repeat('ac batch', 150000), 'UTF8')) IS NOT NULL AS batch;
+SELECT test_chunk_put(decode(string_agg(md5('ac batch ' || g), '' ORDER BY g), 'hex'))
+	IS NOT NULL AS batch FROM generate_series(1, 75000) g;
 ROLLBACK;
 SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
 
@@ -71,7 +72,8 @@ SELECT test_chunk_has(:'before_sp') AS before_sp, test_chunk_has(:'released') AS
 -- stays, the rest goes.
 BEGIN;
 SAVEPOINT a;
-SELECT test_chunk_put(convert_to(repeat('ac sp batch', 120000), 'UTF8')) AS sp_batch \gset
+SELECT test_chunk_put(decode(string_agg(md5('ac sp batch ' || g), '' ORDER BY g), 'hex'))
+	AS sp_batch FROM generate_series(1, 75000) g \gset
 SELECT test_chunk_put_node(1, ARRAY[:'missing_sp']) AS rolled_back2 \gset
 ROLLBACK TO SAVEPOINT a;
 COMMIT;

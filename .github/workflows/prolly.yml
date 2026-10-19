@@ -120,11 +120,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench
+            bison flex libicu-dev liblz4-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench
 
       - name: Build
         run: |
-          ./configure --prefix="$PWD/build-rel/inst" --enable-injection-points --with-openssl
+          ./configure --prefix="$PWD/build-rel/inst" --enable-injection-points --with-openssl --with-lz4
           make -s -j4 COPT=-Werror
           make -s -j4 -C contrib COPT=-Werror
           make -s -j4 -C src/test/modules COPT=-Werror
@@ -175,11 +175,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bison flex libicu-dev libipc-run-perl libreadline-dev libssl-dev zlib1g-dev
+            bison flex libicu-dev libipc-run-perl liblz4-dev libreadline-dev libssl-dev zlib1g-dev
 
       - name: Build
         run: |
-          ./configure --enable-cassert --enable-debug --enable-tap-tests --enable-injection-points --with-openssl
+          ./configure --enable-cassert --enable-debug --enable-tap-tests --enable-injection-points --with-openssl --with-lz4
           make -s -j4
           make -s -j4 -C contrib
 

@@ -109,6 +109,7 @@ tests += {
       'stat_prolly',
       'append_check',
       'journal_segments',
+      'journal_compression',
       'gc',
       'gc_full',
       'page_sweep',

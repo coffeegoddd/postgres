@@ -200,6 +200,15 @@ CREATE FUNCTION test_blake3_variants()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- len bytes no compressor makes smaller, the same for the same seed.
+CREATE FUNCTION test_noise(seed text, len int)
+RETURNS bytea
+LANGUAGE sql IMMUTABLE STRICT
+AS $$
+	SELECT substr(decode(string_agg(md5(seed || ' ' || i), '' ORDER BY i), 'hex'), 1, len)
+	FROM generate_series(0, len / 16) i
+$$;
+
 CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

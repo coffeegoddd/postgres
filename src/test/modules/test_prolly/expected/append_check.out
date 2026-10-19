@@ -59,8 +59,8 @@ SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
  40001
 (1 row)
 
--- A batch is checked as it is appended (a megabyte of chunks), before the
--- transaction commits.
+-- A batch is checked as it is appended (a megabyte of chunks, which LZ4
+-- can't make smaller), before the transaction commits.
 BEGIN;
 SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
  put 
@@ -68,7 +68,8 @@ SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
  t
 (1 row)
 
-SELECT test_chunk_put(convert_to(repeat('ac batch', 150000), 'UTF8')) IS NOT NULL AS batch;
+SELECT test_chunk_put(decode(string_agg(md5('ac batch ' || g), '' ORDER BY g), 'hex'))
+	IS NOT NULL AS batch FROM generate_series(1, 75000) g;
 ERROR:  could not store chunk 6e5d1a2636396dfcb20471f55566d791909d5b03: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 ROLLBACK;
 SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
@@ -125,7 +126,8 @@ SELECT test_chunk_has(:'before_sp') AS before_sp, test_chunk_has(:'released') AS
 -- stays, the rest goes.
 BEGIN;
 SAVEPOINT a;
-SELECT test_chunk_put(convert_to(repeat('ac sp batch', 120000), 'UTF8')) AS sp_batch \gset
+SELECT test_chunk_put(decode(string_agg(md5('ac sp batch ' || g), '' ORDER BY g), 'hex'))
+	AS sp_batch FROM generate_series(1, 75000) g \gset
 SELECT test_chunk_put_node(1, ARRAY[:'missing_sp']) AS rolled_back2 \gset
 ROLLBACK TO SAVEPOINT a;
 COMMIT;

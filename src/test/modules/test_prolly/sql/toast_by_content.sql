@@ -8,6 +8,8 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (the default method differs with whether the server has LZ4)
+SET default_toast_compression = pglz;
 
 CREATE SCHEMA tc VERSIONED;
 CREATE TABLE tc.docs (id int PRIMARY KEY, n int, t text, b bytea, j jsonb);

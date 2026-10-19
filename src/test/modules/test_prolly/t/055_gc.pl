@@ -83,7 +83,7 @@ $g->query_until(qr/started/, q{
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'prolly-gc-sealed'}) or die 'the collection did not stop';
 my $early = $w->query_safe(qq{SELECT test_chunk_put('written before the swap')});
-$w->query_safe(qq{SELECT test_chunk_put(convert_to(repeat('w', 1048576), 'UTF8'))});
+$w->query_safe(qq{SELECT test_chunk_put(test_noise('w', 1048576))});
 sql(q{SELECT injection_points_wakeup('prolly-gc-sealed')});
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';

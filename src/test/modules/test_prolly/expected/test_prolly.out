@@ -34,7 +34,7 @@ FROM prolly_implementations();
  table_keying  | stub         |       0 |              0
  canonicalizer | folded       |       2 |              3
  canonicalizer | stub         |       0 |              0
- chunk_store   | journal      |       1 |              2
+ chunk_store   | journal      |       1 |              3
  chunk_format  | basic        |       1 |              1
  row_applier   | replication  |       1 |              1
  row_applier   | stub         |       0 |              0

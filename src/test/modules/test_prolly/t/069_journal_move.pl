@@ -55,9 +55,13 @@ my $dead = sql(q{SELECT test_chunk_put('garbage, never named')});
 sleep(3);
 is(sql($files), '0', 'below the threshold, no table file');
 
-# Past it, its chunks move, the garbage too.
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 100000), 'UTF8')))
+# Past it, its chunks move, the garbage too.  (Written with autovacuum
+# off: the transaction appends its batches as it goes, and a move between
+# them would leave the rest in the new segment.)
+reload_settings('autovacuum = off');
+sql(q{SELECT count(test_chunk_put(test_noise(g::text, 100000)))
 	FROM generate_series(1, 20) g});
+reload_settings('autovacuum = on');
 ok($node->poll_query_until('mv', "SELECT ($files) > 0"),
 	'past the threshold, the journal moves to a table file');
 is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
@@ -65,7 +69,7 @@ is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
 is(sql(q{SELECT string_agg(settled::text, ',') FROM test_chunk_table_files()}), 'false',
 	'a table file not settled');
 my $fresh = q{SELECT count(*) FROM generate_series(1, 20) g
-	WHERE test_chunk_has(test_content_hash(convert_to(repeat(g::text, 100000), 'UTF8')))};
+	WHERE test_chunk_has(test_content_hash(test_noise(g::text, 100000)))};
 is(sql($fresh), '20', 'a new backend reads the chunks moved');
 is(sql("SELECT test_chunk_has('$dead')"), 't', 'and the garbage: nothing is freed');
 
@@ -77,10 +81,10 @@ is($standby->safe_psql('mv', $fresh), '20', 'a standby reads them too');
 # is.
 my $first = sql(q{SELECT name FROM test_chunk_table_files()});
 reload_settings('autovacuum = off');
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 50000) || 's', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 's', 50000)))
 	FROM generate_series(1, 20) g});
 sql('SELECT test_chunk_seal()');
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 50000) || 't', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 't', 50000)))
 	FROM generate_series(1, 20) g});
 is(sql(q{SELECT count(*) FROM test_chunk_segments() WHERE chunks > 0}), '2',
 	'two segments with chunks');
@@ -93,7 +97,7 @@ is(sql(qq{SELECT count(*) FROM test_chunk_table_files() WHERE name = '$first'}),
 # With the threshold -1, it doesn't move.
 reload_settings('prolly.journal_move_threshold = -1');
 my $before = sql($files);
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 100000) || 'b', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 'b', 100000)))
 	FROM generate_series(1, 20) g});
 sleep(3);
 is(sql($files), $before, 'with the threshold -1, the journal stays');

@@ -41,7 +41,7 @@ SELECT test_chunk_has(:'big_head') AS big_head;
 -- A full one frees it: the file is mostly garbage, so rewritten.
 SELECT name AS big_file FROM test_chunk_table_files()
 ORDER BY chunks DESC, name LIMIT 1 \gset
-SELECT kept > 0 AS kept, freed > 10 AS freed, bytes_freed > 100000 AS bytes_freed
+SELECT kept > 0 AS kept, freed > 10 AS freed, bytes_freed > 10000 AS bytes_freed
 FROM test_chunk_gc(true);
 SELECT test_chunk_has(:'big_head') AS big_head;
 SELECT count(*) FILTER (WHERE name = :'big_file') AS big_file_left,

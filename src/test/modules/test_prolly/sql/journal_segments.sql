@@ -34,7 +34,8 @@ SELECT name, chunks FROM test_chunk_segments();
 
 -- A transaction's batches, and its root move, across a seal.
 BEGIN;
-SELECT test_chunk_put(convert_to(repeat('seg batch', 120000), 'UTF8')) AS big \gset
+SELECT test_chunk_put(decode(string_agg(md5('seg batch ' || g), '' ORDER BY g), 'hex'))
+	AS big FROM generate_series(1, 75000) g \gset
 SELECT test_chunk_seal();
 SELECT test_chunk_put('seg four') AS four \gset
 SELECT test_chunk_move_root(:'two', :'four');
