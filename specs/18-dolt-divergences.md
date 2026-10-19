@@ -210,3 +210,21 @@ stash, …) is F, ported with the feature (#163).
   branch; `information_schema` assertions expect the connection's
   branch's columns. `DATABASE()` and `SHOW DATABASES` are MySQL's
   (D10).
+
+## D12. Rows breaking a unique constraint
+
+- **Dolt:** a merge writes every row it merges, one that breaks a unique
+  index too, and records each row involved as a violation (the merged
+  row and those it collides with), once for each unique index it breaks.
+- **Prolly:** the merge doesn't write a row that would break a unique
+  constraint: the branch keeps its own version of that key (none, for a
+  new one), and the row not written is recorded alone, once, for the
+  first unique constraint it breaks. Check and not-null constraints are
+  the same: their breaking rows are recorded, not written.
+- **Why:** a Postgres unique index refuses the second row (as a
+  validated check or not-null constraint refuses a row breaking it); a
+  table can't hold both, so there is no state in which Dolt's rows
+  exist.
+- **Port:** expected rows and violations follow prolly's: the violation
+  lists the row not written, and the table has one row fewer than
+  Dolt's (a count of its rows, as `DELETE`'s, is one lower).

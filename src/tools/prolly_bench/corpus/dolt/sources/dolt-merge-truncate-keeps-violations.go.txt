@@ -1,0 +1,22 @@
+{
+		Name:        "`Truncate table` should keep artifacts - violations",
+		SetUpScript: createViolationsSetupScript,
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select pk, col1 from dolt_constraint_violations_t;",
+				Expected: []sql.Row{{1, 1}, {2, 1}},
+			},
+			{
+				Query:    "truncate t;",
+				Expected: []sql.Row{{types.NewOkResult(4)}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select pk, col1 from dolt_constraint_violations_t;",
+				Expected: []sql.Row{{1, 1}, {2, 1}},
+			},
+		},
+	}

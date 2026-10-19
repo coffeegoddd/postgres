@@ -149,8 +149,23 @@ type Case struct {
 	Source         string `json:"source"` // exact literal bytes; no SQL translation
 }
 type Catalog struct {
-	Lock  Lock   `json:"lock"`
-	Cases []Case `json:"cases"`
+	Lock   Lock    `json:"lock"`
+	Cases  []Case  `json:"cases"`
+	Setups []Setup `json:"setups,omitempty"`
+}
+
+// Setup is a shared setup script: a top-level []string literal that cases
+// name as their SetUpScript (an unresolved field of theirs). Its exact
+// literal bytes are kept, as a case's are; the file's hash in the lock pins
+// them.
+type Setup struct {
+	Path           string `json:"path"`
+	Name           string `json:"name"`
+	Line           int    `json:"line"`
+	SHA256         string `json:"sha256"`
+	Statements     int    `json:"statements"`
+	SQLExpressions int    `json:"sql_expressions_requiring_review"`
+	Source         string `json:"source"` // exact literal bytes
 }
 
 func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
@@ -269,6 +284,60 @@ func Scan(path string, source []byte) ([]Case, error) {
 	return out, nil
 }
 
+// SharedSetupNames are the shared setups cases name: the identifiers their
+// unresolved SetUpScript fields are. (An expression, an append() say, is
+// left unresolved: no setup stands for it.)
+func SharedSetupNames(cases []Case) map[string]bool {
+	names := map[string]bool{}
+	for _, c := range cases {
+		for _, u := range c.Unresolved {
+			if u.Field == "SetUpScript" && token.IsIdentifier(u.Expression) {
+				names[u.Expression] = true
+			}
+		}
+	}
+	return names
+}
+
+// ScanSetups inventories the top-level []string literals of source that
+// names lists, as Scan does cases: their exact bytes, never evaluated.
+func ScanSetups(path string, source []byte, names map[string]bool) ([]Setup, error) {
+	fs := token.NewFileSet()
+	f, err := parser.ParseFile(fs, path, source, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []Setup
+	for _, decl := range f.Decls {
+		g, ok := decl.(*ast.GenDecl)
+		if !ok || g.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range g.Specs {
+			v := spec.(*ast.ValueSpec)
+			for i, val := range v.Values {
+				if !names[v.Names[i].Name] {
+					continue
+				}
+				lit, ok := val.(*ast.CompositeLit)
+				if !ok || expression(fs, lit.Type) != "[]string" {
+					return nil, fmt.Errorf("%s: shared setup %s is not a []string literal", path, v.Names[i].Name)
+				}
+				start, end := fs.Position(lit.Pos()), fs.Position(lit.End())
+				raw := source[start.Offset:end.Offset]
+				s := Setup{Path: path, Name: v.Names[i].Name, Line: start.Line, SHA256: Hash(raw), Statements: len(lit.Elts), Source: string(raw)}
+				for _, e := range lit.Elts {
+					if x, ok := e.(*ast.BasicLit); !ok || x.Kind != token.STRING {
+						s.SQLExpressions++
+					}
+				}
+				out = append(out, s)
+			}
+		}
+	}
+	return out, nil
+}
+
 // Read uses Git objects at an exact commit, ignoring dirty working-tree files.
 func Read(repo, revision string) (Catalog, error) {
 	c := Catalog{Lock: Lock{Version: 1, Repository: Repository, Revision: revision, Scope: Scope}}
@@ -280,6 +349,7 @@ func Read(repo, revision string) (Catalog, error) {
 	if err != nil {
 		return c, err
 	}
+	sources := map[string][]byte{}
 	for _, path := range strings.Split(strings.TrimSpace(string(paths)), "\n") {
 		relative := strings.TrimPrefix(path, Directory)
 		if strings.Contains(relative, "/") || !strings.HasSuffix(path, ".go") {
@@ -289,6 +359,7 @@ func Read(repo, revision string) (Catalog, error) {
 		if err != nil {
 			return c, err
 		}
+		sources[path] = source
 		cases, err := Scan(path, source)
 		if err != nil {
 			return c, err
@@ -306,6 +377,15 @@ func Read(repo, revision string) (Catalog, error) {
 	}
 	if len(c.Cases) == 0 {
 		return c, fmt.Errorf("no cases found in pinned source")
+	}
+	// (one package: a shared setup is declared once, in any of its files)
+	names := SharedSetupNames(c.Cases)
+	for _, file := range c.Lock.Files {
+		setups, err := ScanSetups(file.Path, sources[file.Path], names)
+		if err != nil {
+			return c, err
+		}
+		c.Setups = append(c.Setups, setups...)
 	}
 	c.Lock.GoTests, err = PinFiles(Repository, repo, revision, GoTestFiles)
 	return c, err

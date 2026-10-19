@@ -1541,12 +1541,16 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
  * they changed alike isn't.  A keyless table's row
  * changed alike on both sides (by the same number of copies) is changed
  * once; otherwise it has the copies its base had, those either side
- * added, less the most either removed; it never conflicts.  Returns how
- * many keys conflict.
+ * added, less the most either removed; it never conflicts.  current, if
+ * not NULL, is the table as the branch has it now (listing or resolving a
+ * merge in progress): a conflict's row on the branch is its row there,
+ * none if it was deleted since, not ours'.  Returns how many keys
+ * conflict.
  */
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
-			const Table *theirs, WalkMode mode, ProllyConflictSink *sink)
+			const Table *theirs, WalkMode mode, ProllyConflictSink *sink,
+			const Table *current)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
@@ -1572,6 +1576,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	require_readable(base);
 	require_readable(ours);
 	require_readable(theirs);
+	require_readable(current);
 	if (recording && mode == WALK_MERGE)
 		note_written(relid);
 	memset(&tc, 0, sizeof(tc));
@@ -1691,6 +1696,15 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 						tv;
 
 			conflicts++;
+			if (current)
+			{
+				StringInfo	cur = makeStringInfo();
+
+				if (!PROLLY_CALL(tree, get, &env, &current->data, &tk, cur))
+					resetStringInfo(cur);
+				now = cur;
+				have = (int64) count_of(&tc, now);
+			}
 			if (mode == WALK_LIST)
 				sink->conflict(sink, &tk, value_or_null(&t->before, &bv),
 							   value_or_null(now, &ov),
@@ -2572,7 +2586,7 @@ merge_rows(void *arg)
 				if (!same_hash(&w->data.hash, &o->data.hash))
 					apply_rows(relid, w, o);
 				row_conflicts(mr, relid,
-							  merge_table(relid, b, o, t, WALK_MERGE, NULL));
+							  merge_table(relid, b, o, t, WALK_MERGE, NULL, NULL));
 				continue;
 			}
 		}
@@ -2619,7 +2633,7 @@ merge_rows(void *arg)
 				apply_rows(relid, &on, &tn);
 			else
 				row_conflicts(mr, relid,
-							  merge_table(relid, &bn, &on, &tn, WALK_MERGE, NULL));
+							  merge_table(relid, &bn, &on, &tn, WALK_MERGE, NULL, NULL));
 			continue;
 		}
 		else
@@ -4036,7 +4050,10 @@ conflicted_table(Oid relid, ProllyMergeState *state)
 	return -1;
 }
 
-/* Walk relid's changes in the merge in progress, as mode says. */
+/*
+ * Walk relid's changes in the merge in progress, as mode says, against
+ * the branch's rows as they are now.
+ */
 static void
 walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 			   ProllyConflictSink *sink)
@@ -4083,7 +4100,7 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 		no_rows(bp, &nt);
 		tp = &nt;
 	}
-	(void) merge_table(relid, bp, op, tp, mode, sink);
+	(void) merge_table(relid, bp, op, tp, mode, sink, now);
 }
 
 static void

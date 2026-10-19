@@ -50,3 +50,37 @@ var T = []queries.ScriptTest{{Name:"a", SetUpScript:nil, Assertions:shared}}`))
 		t.Fatalf("%+v", cases)
 	}
 }
+
+func TestSharedSetups(t *testing.T) {
+	src := []byte(`package fixture
+var shared = []string{
+	"create table t (x int)",
+	"insert into t values (1)",
+}
+var computed = []string{"select 1", fmt.Sprint(2)}
+var unused = []string{"select 3"}
+var T = []queries.ScriptTest{{Name:"a", SetUpScript:shared}, {Name:"b", SetUpScript:computed}, {Name:"c", SetUpScript:append(shared, "x")}}
+`)
+	cases, err := Scan("fixture.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := SharedSetupNames(cases)
+	if len(names) != 2 || !names["shared"] || !names["computed"] {
+		t.Fatalf("%v", names)
+	}
+	setups, err := ScanSetups("fixture.go", src, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(setups) != 2 || setups[0].Name != "shared" || setups[0].Statements != 2 || setups[0].SQLExpressions != 0 ||
+		setups[1].Name != "computed" || setups[1].SQLExpressions != 1 {
+		t.Fatalf("%+v", setups)
+	}
+	if setups[0].SHA256 != Hash([]byte(setups[0].Source)) || !strings.HasPrefix(setups[0].Source, "[]string{") || !strings.Contains(string(src), setups[0].Source) {
+		t.Fatal("setup bytes were changed")
+	}
+	if _, err := ScanSetups("fixture.go", []byte("package fixture\nvar shared = makeSetup()\n"), names); err == nil {
+		t.Fatal("accepted a computed shared setup")
+	}
+}

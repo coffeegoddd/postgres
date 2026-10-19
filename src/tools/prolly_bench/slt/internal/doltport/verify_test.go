@@ -42,11 +42,11 @@ func manifestAt(t *testing.T, root string) Manifest {
 
 // The reviewed corpus: a port added or deferred updates these.
 const (
-	reviewedPorts      = 130 // ported whole
-	reviewedPartial    = 35  // ported in part
-	reviewedAssertions = 564
-	reviewedOmitted    = 47 // assertions left out, each with its note
-	reviewedDeferred   = 59
+	reviewedPorts      = 140 // ported whole
+	reviewedPartial    = 37  // ported in part
+	reviewedAssertions = 633
+	reviewedOmitted    = 52 // assertions left out, each with its note
+	reviewedDeferred   = 60
 )
 
 func TestReviewedCorpus(t *testing.T) {
@@ -97,6 +97,100 @@ func TestManifestDrift(t *testing.T) {
 		})
 	}
 }
+
+// A case naming a shared setup maps its statements; the setup's excerpt is
+// pinned like a case's, and must be the setup the case names.
+func TestSharedSetups(t *testing.T) {
+	shared := func(m *Manifest) *Port {
+		for i := range m.Ports {
+			if m.Ports[i].SharedSetup != "" {
+				return &m.Ports[i]
+			}
+		}
+		t.Fatal("no port uses a shared setup")
+		return nil
+	}
+	tests := []struct {
+		name, want string
+		mutate     func(*Manifest)
+	}{
+		{"setup not named", "unresolved source excerpt", func(m *Manifest) { shared(m).SharedSetup = "" }},
+		{"unknown setup", "isn't the case's SetUpScript", func(m *Manifest) { shared(m).SharedSetup = "nope" }},
+		{"another setup", "isn't the case's SetUpScript", func(m *Manifest) {
+			p := shared(m)
+			for _, st := range m.Setups {
+				if st.ID != p.SharedSetup {
+					p.SharedSetup = st.ID
+					return
+				}
+			}
+		}},
+		{"setup statement unmapped", "mapping has", func(m *Manifest) { p := shared(m); p.Setup = p.Setup[1:] }},
+		{"duplicate setup", "duplicate", func(m *Manifest) { m.Setups = append(m.Setups, m.Setups[0]) }},
+		{"unpinned path", "unpinned path", func(m *Manifest) { m.Setups[0].Path = "elsewhere.go" }},
+		{"setup excerpt hash", "hash mismatch", func(m *Manifest) { m.Setups[0].SourceSHA256 = "0" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := copyFixture(t)
+			m := manifestAt(t, root)
+			tt.mutate(&m)
+			put(t, filepath.Join(root, "ports.json"), m)
+			if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %s, got %v", tt.want, err)
+			}
+		})
+	}
+	t.Run("unused setup", func(t *testing.T) {
+		root := copyFixture(t)
+		m := manifestAt(t, root)
+		b, err := os.ReadFile(filepath.Join(root, "sources", m.Setups[0].ID+".go.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(filepath.Join(root, "sources", "extra.go.txt"), b, 0644); err != nil {
+			t.Fatal(err)
+		}
+		m.Setups = append(m.Setups, SharedSetup{ID: "extra", Path: m.Setups[0].Path, Name: "extra", SourceSHA256: m.Setups[0].SourceSHA256})
+		put(t, filepath.Join(root, "ports.json"), m)
+		if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), "no port uses") {
+			t.Fatalf("accepted an unused setup: %v", err)
+		}
+	})
+	t.Run("changed setup bytes", func(t *testing.T) {
+		root := copyFixture(t)
+		m := manifestAt(t, root)
+		p := filepath.Join(root, "sources", m.Setups[0].ID+".go.txt")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(p, append(b, ' '), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+			t.Fatalf("accepted changed bytes: %v", err)
+		}
+	})
+	t.Run("catalog drift", func(t *testing.T) {
+		root := copyFixture(t)
+		m := manifestAt(t, root)
+		var lock doltcatalog.Lock
+		if err := readJSON(filepath.Join(root, "source-lock.json"), &lock); err != nil {
+			t.Fatal(err)
+		}
+		// a catalog whose setup of that name has other bytes: drift
+		c := doltcatalog.Catalog{Lock: lock, Setups: []doltcatalog.Setup{{Path: m.Setups[0].Path, Name: m.Setups[0].Name, SHA256: "0"}}}
+		catalog := map[string]doltcatalog.Setup{c.Setups[0].Path + "/" + c.Setups[0].Name: c.Setups[0]}
+		if _, err := sharedSetups(root, m, lock, catalog); err == nil || !strings.Contains(err.Error(), "drift") {
+			t.Fatalf("accepted a drifted setup: %v", err)
+		}
+		if _, err := sharedSetups(root, m, lock, map[string]doltcatalog.Setup{}); err == nil || !strings.Contains(err.Error(), "drift") {
+			t.Fatalf("accepted a setup the catalog lacks: %v", err)
+		}
+	})
+}
+
 func TestExplicitOmissionIsPartial(t *testing.T) {
 	root := copyFixture(t)
 	m := manifestAt(t, root)

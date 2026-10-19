@@ -1,0 +1,28 @@
+{
+		Name:        "`Truncate table` should keep artifacts - conflicts",
+		SetUpScript: createConflictsSetupScript,
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select base_pk, base_col1, our_pk, our_col1, their_pk, their_col1 from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{nil, nil, 1, -100, 1, 100},
+					{nil, nil, 2, -200, 2, 200},
+				},
+			},
+			{
+				Query:    "truncate t;",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query: "select base_pk, base_col1, our_pk, our_col1, their_pk, their_col1 from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{nil, nil, nil, nil, 1, 100},
+					{nil, nil, nil, nil, 2, 200},
+				},
+			},
+		},
+	}

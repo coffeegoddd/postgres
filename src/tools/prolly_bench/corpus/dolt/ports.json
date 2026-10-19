@@ -1,5 +1,19 @@
 {
   "version": 1,
+  "setups": [
+    {
+      "id": "dolt-setup-create-conflicts",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "name": "createConflictsSetupScript",
+      "source_sha256": "1bedc222c13dd31f544caea8f3ba187fe81d1e301ef94a37757c1dbadd97e3de"
+    },
+    {
+      "id": "dolt-setup-create-violations",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "name": "createViolationsSetupScript",
+      "source_sha256": "4308e0ba57790d50af9038a7eee5bd94b2d37738784fd6fa3cfc02092e7f6402"
+    }
+  ],
   "ports": [
     {
       "id": "dolt-checkout-working-set",
@@ -2745,14 +2759,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 3,
@@ -2768,7 +2782,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -2872,14 +2886,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 3,
@@ -2895,7 +2909,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -2999,14 +3013,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 3,
@@ -3022,7 +3036,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -5293,14 +5307,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -5308,7 +5322,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -5551,7 +5565,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -5559,7 +5573,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -6229,35 +6243,35 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed). from_root_ish (the commit a violation came from) has no counterpart in prolly's rows; the other columns are checked."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12). from_root_ish (the commit a violation came from) has no counterpart in prolly's rows; the other columns are checked."
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 5,
           "steps": [
             "assert-5"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -6265,7 +6279,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -6479,14 +6493,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -6494,7 +6508,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -6598,14 +6612,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -6613,7 +6627,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -6724,14 +6738,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -6739,7 +6753,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -6946,7 +6960,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -6954,7 +6968,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -7051,7 +7065,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -7059,7 +7073,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -7156,21 +7170,21 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved expected rows; unordered queries compare bags with duplicates. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
         "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
       ]
     },
     {
@@ -8387,7 +8401,7 @@
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
       "suite": "SchemaChangeTestsConstraints",
       "index": 5,
-      "name": "foreign keys \u2013 drop tables with FK reference between them",
+      "name": "foreign keys – drop tables with FK reference between them",
       "source_sha256": "5ff512db629ea6bdee32ca88830f48137587c9c94880eb3f4f11d76bc9b5df2f",
       "scenario_sha256": "ad8cabee38b97ba8b8242d2c88ed5f18a7430bb39ccc87891d3830e952a3ae72",
       "setup": [
@@ -9350,7 +9364,7 @@
             "assert-2-forward",
             "assert-2-flipped"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 3,
@@ -9358,7 +9372,7 @@
             "assert-3-forward",
             "assert-3-flipped"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed). Which row is written depends on the direction: the merged side's row is the one not written."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12). Which row is written depends on the direction: the merged side's row is the one not written."
         },
         {
           "index": 4,
@@ -9366,7 +9380,7 @@
             "assert-4-forward",
             "assert-4-flipped"
           ],
-          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -10286,14 +10300,14 @@
           "steps": [
             "assert-1-flipped"
           ],
-          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2-flipped"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics, to be listed)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
         }
       ],
       "adaptations": [
@@ -17030,6 +17044,1524 @@
         "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax (indexes as CREATE INDEX). (D3, D10)",
         "Run in both directions, as Dolt runs merge tests: forward applies the right script on branch right and the left on main; flipped applies the right script on main and the left on right; the merge is of right into main either way."
       ]
+    },
+    {
+      "id": "dolt-merge-delete-keeps-conflicts",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 60,
+      "name": "`Delete from table` should keep artifacts - conflicts",
+      "source_sha256": "42a2814a75b13f9cfd8ffa9e5cce61d425d73e9306d0c15bf810cdd0823dea5e",
+      "scenario_sha256": "1b37966a12e47034139efd67574749765243da7f2fc4842946b19fb0f7214383",
+      "shared_setup": "dolt-setup-create-conflicts",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch-other",
+            "checkout-other"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "other-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "other-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "other-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "main-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "main-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "allow"
+          ],
+          "note": "The Dolt session variable as prolly's dolt.allow_commit_conflicts setting. (D5)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "merge"
+          ],
+          "note": "Native merge; it stops with conflicts, kept outside a transaction block by dolt.allow_commit_conflicts; errors fail the case. (D5)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Checked by its tag (an OK result's count)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3) Our row is the branch's row now: none once the rows are deleted, as Dolt reads it from the working set."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_allow_commit_conflicts becomes dolt.allow_commit_conflicts. (D5)",
+        "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-merge-truncate-keeps-conflicts",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 61,
+      "name": "`Truncate table` should keep artifacts - conflicts",
+      "source_sha256": "f061c86b91da52d19ba3f534d65b49493111337d29971d2c791b1135fadf64e7",
+      "scenario_sha256": "178adaa5fce5a5e3bb5a098afbdf1a53e5f839b767a9de820060c34de8409c39",
+      "shared_setup": "dolt-setup-create-conflicts",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch-other",
+            "checkout-other"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "other-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "other-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "other-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "main-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "main-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "allow"
+          ],
+          "note": "The Dolt session variable as prolly's dolt.allow_commit_conflicts setting. (D5)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "merge"
+          ],
+          "note": "Native merge; it stops with conflicts, kept outside a transaction block by dolt.allow_commit_conflicts; errors fail the case. (D5)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Checked by its tag: Postgres's TRUNCATE reports no row count (Dolt's OK result counts 2); the rows' going is checked next. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3) Our row is the branch's row now: none once the rows are deleted, as Dolt reads it from the working set."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_allow_commit_conflicts becomes dolt.allow_commit_conflicts. (D5)",
+        "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t), whose rows are (base_row, our_row, their_row, ...) of t's row type: the columns are read from them. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-merge-delete-keeps-violations",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 62,
+      "name": "`Delete from table` should keep artifacts - violations",
+      "source_sha256": "f85edce565e9ed4c86d0464bd86062c2a7e88b534183709aef5be98e162efb51",
+      "scenario_sha256": "0595e5ada0268b36aa39ce463f79cb7bba2147ab9dbae2964565af1dcd609247",
+      "shared_setup": "dolt-setup-create-violations",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch-other",
+            "checkout-other"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "other-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "other-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "allow"
+          ],
+          "note": "dolt_force_transaction_commit as prolly's dolt.allow_commit_conflicts setting. (D5)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "merge"
+          ],
+          "note": "Native merge; it stops with a unique violation, kept outside a transaction block by dolt.allow_commit_conflicts; errors fail the case. (D5)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Checked by its tag: 3 rows where Dolt's OK result counts 4, as the merge didn't write the row breaking the unique constraint. (D12)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
+        "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
+        "Postgres can't hold rows that break a unique constraint: the merge records the row it doesn't write, alone, where Dolt writes it and records both rows. (D12)"
+      ]
+    },
+    {
+      "id": "dolt-merge-truncate-keeps-violations",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 63,
+      "name": "`Truncate table` should keep artifacts - violations",
+      "source_sha256": "36f003f49b8cfd6a56e9286bbeb2e43a47ba29f54c3d613db2aa0f82e3191c11",
+      "scenario_sha256": "28134fbb9bf9c025528605bfc68a39ae3f91ea4d598bfaee0583e7ff7fc0cc87",
+      "shared_setup": "dolt-setup-create-violations",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch-other",
+            "checkout-other"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "other-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "other-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "allow"
+          ],
+          "note": "dolt_force_transaction_commit as prolly's dolt.allow_commit_conflicts setting. (D5)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "merge"
+          ],
+          "note": "Native merge; it stops with a unique violation, kept outside a transaction block by dolt.allow_commit_conflicts; errors fail the case. (D5)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Checked by its tag: Postgres's TRUNCATE reports no row count (Dolt's OK result counts 4); the rows' going is checked next. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
+        "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
+        "Postgres can't hold rows that break a unique constraint: the merge records the row it doesn't write, alone, where Dolt writes it and records both rows. (D12)"
+      ]
+    },
+    {
+      "id": "dolt-identity-branches",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 0,
+      "name": "insert on different branches",
+      "source_sha256": "f7dff6287b67e84ffd54565bcd11291de8186d29d7795e0b33b6f057d3f2ca81",
+      "scenario_sha256": "5266a38e3bbd28ef941b80e8948e6ab576c4b5d4688e3f1bf96e819882b1a8aa",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are 3 and 4."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are (3, 3), (4, 4)."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are 5 and 6."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are (5, 5), (6, 6)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-drop-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 1,
+      "name": "drop table",
+      "source_sha256": "cf9359ee3323f59180a3bac59b7f2375fa909c35f9f4eb1846145e88b6202f5f",
+      "scenario_sha256": "27e5d0827a88a36173584d7017472dd7d403e2ad78ae15d76ae59a3d01889f7d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "checkout-branch1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "branch1-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "branch1-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "checkout-branch2"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "branch2-insert"
+          ],
+          "note": "Preserved SQL and ordering. Left uncommitted on branch2, as upstream: each branch has its own working set."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "checkout-branch1-again"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Checked by its tag (an OK result)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. main's sequence is at 2; Dolt's counter at 6 gives 7 and 8."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's last two are (7, 7), (8, 8)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Checked by its tag (an OK result)."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. branch2's sequence is at 2 (its keys were 1 and 2); Dolt's counter gives 7 and 8."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are (5, 5) to (8, 8)."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Checked by its tag (an OK result)."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10) Upstream SkipResultsCheck replaced by its tag."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) A table made again has a new sequence, as in Dolt."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-delete-all",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 2,
+      "name": "delete all rows in table",
+      "source_sha256": "4db12f2a827f30f1657d725bd54f15ecde0a33531107d35c71e8539e82b99b4c",
+      "scenario_sha256": "8c6d4085a6387e5153d7df0139b8ed1b72645ea12efe328862ef7f6c72f25a2a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Checked by its tag (an OK result's count)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's ALTER TABLE ... AUTO_INCREMENT = 1 as the identity's RESTART WITH 1; checked by its tag (upstream SkipResultsCheck). (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-below-max",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 3,
+      "name": "set auto-increment below current max value",
+      "source_sha256": "1be75f3753b610ec867b5abf9b6bd348d1dc9e9c847980ac5d803ec5926ec4c8",
+      "scenario_sha256": "fb6613510b887cfde33d6c8f8ad1c98603593eee7a8f248d1692f4e9cac6bba0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "Omitted: MySQL ignores an AUTO_INCREMENT set below the table's largest key; an identity's RESTART WITH 2 would hand out 2 again, a duplicate key. Not version control. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) (The setting upstream ignores is left out, above.)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Checked by its tag (an OK result's count); the key is given, as upstream's InsertID 100 says."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "Omitted: MySQL ignores an AUTO_INCREMENT set below the table's largest key (100). (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [],
+          "note": "Omitted: MySQL's counter jumps past a key given explicitly (to 101); a Postgres identity's sequence doesn't, and gives 7. Not version control. (D10)"
+        },
+        {
+          "index": 6,
+          "steps": [],
+          "note": "Omitted: follows the counter MySQL moved. (D10)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-truncate",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 8,
+      "name": "truncate table",
+      "source_sha256": "8338fd0c46089fcb0e2ebebcea7177873451c0a0ba4e700c06e9931d4067788f",
+      "scenario_sha256": "9fa2987e5dc2acbd81b5d57738b698660eeb10534b70d3037ca29527d25a7357",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "checkout-branch1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "branch1-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "branch1-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "checkout-branch2"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "branch2-insert"
+          ],
+          "note": "Preserved SQL and ordering. Left uncommitted on branch2, as upstream: each branch has its own working set."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "checkout-branch1-again"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's TRUNCATE resets AUTO_INCREMENT: Postgres's TRUNCATE ... RESTART IDENTITY does. Checked by its tag: it reports no row count (Dolt's OK result counts 2); the rows' going is checked by the keys after. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. main's sequence is at 2; Dolt's counter at 6 gives 7 and 8."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's last two are (7, 7), (8, 8)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "MySQL's TRUNCATE resets AUTO_INCREMENT: Postgres's TRUNCATE ... RESTART IDENTITY does. Checked by its tag: it reports no row count (Dolt's OK result counts 4); the rows' going is checked by the keys after. (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. branch2's sequence is at 2 (its keys were 1 and 2); Dolt's counter gives 7 and 8."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are (5, 5) to (8, 8)."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "MySQL's TRUNCATE resets AUTO_INCREMENT: Postgres's TRUNCATE ... RESTART IDENTITY does. Checked by its tag: it reports no row count (Dolt's OK result counts 4); the rows' going is checked by the keys after. (D10)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Restarted, as in Dolt."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-drop-key",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 9,
+      "name": "drop auto_increment primary key",
+      "source_sha256": "d4fb8778c673e4801bd4c62738ab70ef1aafa80ea4a2fd8024b911c89f104d38",
+      "scenario_sha256": "52db1424409f1433aea1e44b44aa85c7c41bc45e508e9f431d7a59416e3fc94e",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create",
+            "create-index"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10) MySQL's KEY (a) as an index on a."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "empty-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "branch2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "main-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-branch1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "branch1-insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "branch1-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "checkout-branch2"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "branch2-insert"
+          ],
+          "note": "Preserved SQL and ordering. Left uncommitted on branch2, as upstream: each branch has its own working set."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "checkout-main-again"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's DROP PRIMARY KEY as dropping the primary key constraint; checked by its tag. The identity column and its sequence stay, as MySQL's AUTO_INCREMENT does (on its KEY (a)). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. main's sequence is at 2; Dolt's counter at 6 gives 7 and 8."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's last two are (7, 7), (8, 8)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. Upstream SkipResultsCheck replaced by native operation success."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. branch2's sequence is at 2; Dolt's counter (8, from main) gives 9 and 10."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are (5, 5), (6, 6), (9, 9), (10, 10)."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "MySQL's DROP PRIMARY KEY as dropping the primary key constraint; checked by its tag. The identity column and its sequence stay, as MySQL's AUTO_INCREMENT does (on its KEY (a)). (D10)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence. Dolt's are 11 and 12."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved upstream expected rows and their order. Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so each branch generates keys from its own sequence; Dolt's auto-increment counter is kept across branches (the largest key any branch has used). Expected keys follow the branch's sequence."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-identity-reset-dropped",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 10,
+      "name": "hard reset dropped table restores auto increment",
+      "source_sha256": "b76efcc784c12d8034be1c0f07376003e02f3a9fce98d69be2d75b4916c7fe1f",
+      "scenario_sha256": "0a1f8ce89485aff36f924cad368192d6cc356c7414c3b077b2dd9e7832635946",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "init-commit"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "drop"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "reset"
+          ],
+          "note": "Native hard reset to HEAD; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) The reset restores the table and its sequence, as the commit has them."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
+    },
+    {
+      "id": "dolt-merge-identity-ff",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "MergeScripts",
+      "index": 43,
+      "name": "dolt_merge() works with no auto increment overlap",
+      "source_sha256": "815bc454e952f4b0ae89e205eb4ba56545962c34ae2a3e0454b3ee53a2fa55c6",
+      "scenario_sha256": "a83568ede9d2cca0d6e2422e20e483db6c5e7c3885513ab72927d1983f2d1b6b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's AUTO_INCREMENT as an identity column, BY DEFAULT so a value may be given. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "add"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "insert-main"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "cm1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch-test",
+            "checkout-test"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "insert-test"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "cm2"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "Omitted: needs dolt_preview_merge_conflicts_summary (feature preview-merge-conflicts), which prolly lacks."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message): a fast-forward. The hash isn't Dolt's (it's checked by the rows after). (D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "MySQL's OkResult InsertID (the first key generated) is checked as every key the INSERT generates, by RETURNING. (D10) The fast-forward gives main the merged branch's sequence, as Dolt's counter continues."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream expected rows and their order."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "MySQL's AUTO_INCREMENT is an identity column (GENERATED BY DEFAULT AS IDENTITY); the keys an INSERT generates are checked with RETURNING, where Dolt checks the first (InsertID). (D10)",
+        "A versioned schema's sequences, an identity's among them, are per branch and in each commit: each branch generates keys from its own, and a merge gives each the larger of the two values. Dolt keeps one auto-increment counter across branches. Keys that differ for that reason follow prolly's. (D6)"
+      ]
     }
   ],
   "deferred": [
@@ -17504,6 +19036,14 @@
       "name": "dolt_branches name index uses transaction snapshot",
       "source_sha256": "6803751bac9c59d0e4c6165df190081babd2aab92bfa5e7fe856bd74682eb104",
       "reason": "Rederived under Postgres semantics, as the classification says (Dolt's transaction sees dolt_branches as it began; prolly's READ COMMITTED as each statement begins), not ported literally; its index hints are MySQL's (D10): src/test/prolly/specs/vc_txn_branches.spec, a branch deleted and another made since: seen by name, in a join, deleted and made."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltAutoIncrementTests",
+      "index": 12,
+      "name": "hard reset dropped table with branch restores auto increment",
+      "source_sha256": "90efb05eca8330d15b2d933e51e33366ca458d4348eae6410d8fb3ac22cbbc4e",
+      "reason": "Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so the hard reset restores main's sequence as its commit has it and the next generated key is 3, not Dolt's 101: Dolt's auto-increment counter is kept across branches and continues past branch1's explicit 100. (A Postgres identity's sequence doesn't advance past a key given explicitly either.) The case is about that counter: ported, it would be DoltAutoIncrementTests 10 again."
     }
   ]
 }
