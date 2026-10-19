@@ -3328,6 +3328,7 @@ typedef struct ColumnRead
 	bool		by_text;		/* checked against the text form too, */
 	bool		text_only;		/* or read as the text form: */
 	bool		compare_cast;	/* compare that text reading with the cast */
+	bool		cast_guarded;	/* that cast may fail on a value */
 	bool		cast_key;		/* use the cast for an ambiguous key */
 	FmgrInfo	out;			/* the old type's output */
 	Oid			in;				/* the new type's input */
@@ -3470,6 +3471,10 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 			cr->guarded = !(is_string_type(xa->atttypid) &&
 							is_string_type(att->atttypid) &&
 							att->atttypmod < 0);
+			/* (as below: the explicit cast only cuts, pads or trims) */
+			cr->cast_guarded =
+				!((is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+				  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
 		}
 		return;
 	}
@@ -3562,11 +3567,13 @@ same_but_trailing_blanks(Datum a, Datum b)
  * unsure; a key sets *alternative, or takes the cast for READ_ALTERNATIVE.
  * False where the value doesn't come back from
  * it (cr->back; or there's no cast back where one's needed), or differs
- * from the value's text form read as the new type (cr->by_text), or the
- * cast or that read fails with a data exception (value too long,
+ * from the value's text form read as the new type (cr->by_text), or, read
+ * as its text form, disagrees with its cast where that makes it unsure, or
+ * the cast or that read fails with a data exception (value too long,
  * numeric field overflow, invalid input) where it's guarded; *d and
- * *isnull are then the cast's value if it gave one, else null.  Other
- * errors are raised.
+ * *isnull are then the value read if there was one (the cast's, or the
+ * text reading's where cr->text_only), else null.  Other errors are
+ * raised.
  */
 static bool
 read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
@@ -3609,7 +3616,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 				bool		unused;
 
 				cast.text_only = false;
-				cast.guarded = true;
+				cast.guarded = cr->cast_guarded;
 				if (read_value(&cast, econtext, xs, j, att, xatt, &cv, &cn, &unused) &&
 					(cn || !datum_image_eq(cv, *d, att->attbyval, att->attlen)))
 				{
@@ -3753,8 +3760,9 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  * (those a side retyped: retyped_columns()) are; others are read as
  * shown, as the sides' are.  Those in both_retyped, which both sides
  * retyped, compare the text and cast readings (see ReadFor).  *unsure
- * (if not NULL) gets the rows (keyed) with a value that's unsure (see ReadFor): a side has changed them,
- * where it has them (merge_table()).  Its alternative flag requests a
+ * (if not NULL) gets the rows (keyed) with a value that's unsure (see
+ * ReadFor): a side has changed them, where it has them (merge_table()).
+ * Its alternative flag requests a
  * second reading for ambiguous keys or keyless rows.  READ_ALTERNATIVE
  * uses that cast reading, leaving non-key columns' uncertainty unchanged.
  *
@@ -4708,11 +4716,18 @@ merge_rows(void *arg)
 			{
 				Table		alternative;
 				UnsureRows	alternative_unsure;
+				MemoryContext check = AllocSetContextCreate(CurrentMemoryContext,
+															"merge readings check",
+															ALLOCSET_DEFAULT_SIZES);
+				MemoryContext old = MemoryContextSwitchTo(check);
 
+				/* (all of it freed after: only an ERROR comes out of it) */
 				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, retyped, both_retyped,
 									  true, &alternative, &alternative_unsure);
 				check_merge_readings(relid, &bn, &alternative, &on, &tn,
 									 &unsure, &alternative_unsure);
+				MemoryContextSwitchTo(old);
+				MemoryContextDelete(check);
 			}
 			table_close(rel, AccessShareLock);
 			if (!same_hash(&w->data.hash, &on.data.hash))
