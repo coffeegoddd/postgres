@@ -110,6 +110,7 @@ tests += {
       'doltgres_objects',
       'doltgres_fks_auth',
       'jsonb_canonical',
+      'float_canonical',
       'hash_pointers',
       'toast_by_content',
       'toast_folds',
