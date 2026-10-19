@@ -28,12 +28,15 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS each_chunk_hashed;
 
 -- One row changed: the fold reads its page's rows and writes the one.
+-- Its page is full, so the new version goes to another: both pages are
+-- copied, to keep them as the last fold saw them.
 SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 SELECT name, value FROM pg_stat_prolly
-WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves');
+WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves',
+			   'page_copies_fold', 'page_copies_shared');
 
 -- The same commit again, in a database just like it: the same counts.
 SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly \gset
@@ -56,6 +59,19 @@ SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_pro
 -- Per database: the other's work isn't counted here.
 \c stat_prolly
 SELECT sum(value) = 0 AS nothing_since_reset FROM pg_stat_prolly;
+
+-- A branch shares the table's pages: its first change to one copies it
+-- (here both heap pages, and the primary key's leaf).
+SELECT dolt_branch('other');
+SELECT dolt_checkout('other');
+UPDATE sp.t SET v = 'y' WHERE id = 1;
+SELECT pg_stat_force_next_flush();
+SELECT name, value FROM pg_stat_prolly
+WHERE name IN ('page_copies_fold', 'page_copies_shared');
+SELECT dolt_checkout('main');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+
 -- An unknown target is still refused, and names this one.
 SELECT pg_stat_reset_shared('prollyx');
 

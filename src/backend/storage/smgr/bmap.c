@@ -106,6 +106,7 @@
 #include "common/int.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bmap_xlog.h"
 #include "storage/bufmgr.h"
@@ -3711,6 +3712,10 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		END_CRIT_SECTION();
 		if (listed)
 			changes_append_finish(&ca, lsn);
+
+		/* (copied for another map's sake, or else only to keep the fold's) */
+		pgstat_count_prolly(count > 0 ? PGSTAT_PROLLY_PAGE_COPIES_SHARED :
+							PGSTAT_PROLLY_PAGE_COPIES_FOLD, 1);
 
 		alloc_release(&alloc);
 		if (rdelta)
