@@ -640,6 +640,29 @@ fails without its fix), and Postgres's suites keep passing after each one.
   text was re-escaped. `dolt_status` splits its rows at the last tab and
   sorts them by name, a table's name holding a tab included.
 
+- **Table settings (#400, folded format 10):** explicitly set table and
+  TOAST reloptions are versioned, sorted by option name, including explicit
+  values equal to built-in defaults. Resetting an option removes it so the
+  server's policy applies again. These tuning choices (fillfactor,
+  autovacuum, parallel workers, and other accepted reloptions) travel with
+  the schema; tablespaces and physical placement remain local. Column
+  storage differing from its type's default, explicit compression methods,
+  and explicit statistics targets are versioned too; default storage,
+  compression and statistics have no extra fields. Replica identity is
+  versioned by mode and, for USING INDEX, the index's name; an index mode
+  whose index was dropped is described as NOTHING, its effective behavior.
+  TOAST options are described only when the table needs a TOAST table
+  (one left over from dropped columns isn't made again with the table, so
+  its options couldn't be either). Materialized views' options and column
+  settings are versioned the same way, as lines of their description.
+  Replay applies column settings without recursing into children and sets
+  replica identity after creating its index. Options merge by name, column
+  settings with their column, and replica identity as one setting; an identity by an index the merge
+  doesn't keep is a schema conflict. Prolly
+  tables cannot be unlogged, so persistence adds no field. Format 9 omitted
+  these settings; format 10 is a clean break, with the same refusal of
+  older roots as previous format changes.
+
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
   reset to a commit, fast-forward, branch at a commit, materializing a
@@ -664,6 +687,18 @@ fails without its fix), and Postgres's suites keep passing after each one.
     text) made no shorter; any other change of type, int to bigint
     included, is a schema conflict.  A table the other side didn't change
     takes the change whatever it is.)
+  - Both sides retyping a column to the same different type can leave an
+    ambiguous base (#391): its text form read as the new type and its SQL
+    cast need not agree, and history does not record USING expressions.
+    A non-key value with two successful but different readings is treated
+    as changed on both sides, conflicting if the sides differ. For keys
+    and keyless rows, compare the outcomes under both readings before
+    applying rows. Keep a text-reading conflict for resolution; otherwise
+    refuse if the rows, copy counts, or conflict status differ. Matching
+    outcomes still merge. This prevents an edit to the old text form or a
+    deletion from silently disappearing without rejecting insert-only
+    merges whose outcomes agree. Failed text readings retain the existing
+    uncertainty/refusal rules; ordinary diffs still show historical values.
   - Checking out a commit (not a branch) gives a detached, read-only
     session; changing anything takes a branch made from it.
   - A merge gives each sequence the larger of its two values.

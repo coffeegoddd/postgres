@@ -867,6 +867,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit can't --allow-empty and --skip-empty at once")));
+	PreventCommandIfReadOnly("dolt_commit()");
 	author_override = author;
 	commit_forced = force;
 	PG_TRY();
@@ -2294,6 +2295,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 				 errmsg("dolt_reset only does hard resets"),
 				 errdetail("Prolly branches have no staging area to reset."),
 				 errhint("Pass --hard.")));
+	PreventCommandIfReadOnly("dolt_reset()");
 	/*
 	 * What the target needs that the head doesn't, checked (a reset to the
 	 * head moves nothing new in, as an abort's doesn't).
@@ -2993,6 +2995,7 @@ dolt_writer_mode(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("unknown writer mode \"%s\"", mode),
 					 errhint("The writer modes are \"shared\", \"owned\", \"branch-only\" and \"branch-auto\".")));
+		PreventCommandIfReadOnly("dolt_writer_mode()");
 		PROLLY_CALL(writers(), set_mode, (ProllyWriterMode) m);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(names[PROLLY_CALL(writers(), mode)]));
@@ -3832,6 +3835,7 @@ dolt_remote(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_remote add needs a name and a URL")));
+		PreventCommandIfReadOnly("dolt_remote()");
 		add_remote(args[1], args[2]);
 	}
 	else if (nargs >= 1 && (strcmp(args[0], "remove") == 0 ||
@@ -3841,6 +3845,7 @@ dolt_remote(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_remote remove needs a name")));
+		PreventCommandIfReadOnly("dolt_remote()");
 		(void) need_remote(args[1]);
 		PROLLY_CALL(remote_refs(), remote_set, args[1], NULL);
 	}
