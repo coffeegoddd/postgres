@@ -273,6 +273,11 @@ func validatePass(p Pass, requires, used map[string]bool) error {
 				if n < 1 {
 					return fmt.Errorf("%s: commit takes a message and optional flags", st.ID)
 				}
+			case "connect":
+				// none: the case's database; one: a branch of it
+				if n > 1 {
+					return fmt.Errorf("%s: connect takes at most a branch", st.ID)
+				}
 			case "checkout", "reset":
 				if n != 1 {
 					return fmt.Errorf("%s: %s takes one argument", st.ID, st.Op)

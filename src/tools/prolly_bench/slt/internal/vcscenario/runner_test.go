@@ -186,6 +186,25 @@ func TestStepCapabilities(t *testing.T) {
 	}
 }
 
+// connect: to the database (no argument) or a branch of it (one), a refusal
+// expected as its SQLSTATE; never a save.
+func TestConnect(t *testing.T) {
+	const connect = `{"version":1,"id":"c","description":"connect","requires":["sql","vc.core"],"sessions":["a"],"steps":[{"id":"b","op":"connect","session":"a","args":["b2"]},{"id":"n","op":"connect","session":"a","args":["nope"],"expect":{"sqlstate":"42704"}},{"id":"d","op":"connect","session":"a"}]}`
+	if _, err := Parse([]byte(connect)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"two arguments", `"args":["b2"]`, `"args":["b2","b3"]`},
+		{"null branch", `"args":["b2"]`, `"args":[null]`},
+		{"save", `"args":["b2"]`, `"args":["b2"],"save":"x"`},
+		{"tag", `"op":"connect","session":"a"}`, `"op":"connect","session":"a","requires":["vc.core"]}`},
+	} {
+		if _, err := Parse([]byte(strings.Replace(connect, tc.from, tc.to, 1))); err == nil {
+			t.Fatalf("%s: accepted", tc.name)
+		}
+	}
+}
+
 func TestSQLRequires(t *testing.T) {
 	for sql, want := range map[string]string{
 		"SELECT 1": "",

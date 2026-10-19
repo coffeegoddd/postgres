@@ -237,6 +237,9 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 	if c.TxStatus() != 'I' {
 		return Outcome{}, fmt.Errorf("VC operations require SQL-committed writes; session is in transaction state %c", c.TxStatus())
 	}
+	if s.Op == "connect" {
+		return p.reconnect(ctx, s.Session, args)
+	}
 	var sql string
 	switch s.Op {
 	case "commit":
@@ -290,6 +293,59 @@ func (p *Postgres) Execute(ctx context.Context, s Step, params, args []*string) 
 		}
 	}
 	return o, nil
+}
+
+// reconnect opens session's connection again, to the case's database or,
+// given a branch, to "database/branch" (Dolt's USE mydb/branch). A refused
+// connection is an outcome, its SQLSTATE, and leaves the session as it
+// was, as a failed USE does. Otherwise the old connection is closed, and
+// its backend gone, before the step ends: its lock on its branch with it.
+func (p *Postgres) reconnect(ctx context.Context, session string, args []*string) (Outcome, error) {
+	old := p.sessions[session]
+	db := p.db
+	if len(args) == 1 {
+		db += "/" + *args[0]
+	}
+	c, err := p.connect(ctx, db)
+	if err != nil {
+		var pgerr *pgconn.PgError
+		if !errors.As(err, &pgerr) || pgerr.Severity != "FATAL" {
+			return Outcome{}, err
+		}
+		return Outcome{Rows: [][]*string{}, SQLState: pgerr.Code, Transaction: string(old.TxStatus())}, nil
+	}
+	pid := fmt.Sprint(old.PID())
+	deadline, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	if err = old.Close(deadline); err != nil {
+		c.Close(deadline)
+		return Outcome{}, err
+	}
+	p.sessions[session] = c
+	for {
+		o, err := p.must(ctx, p.admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = $1", &pid)
+		if err != nil {
+			return Outcome{}, err
+		}
+		if len(o.Rows) == 1 && len(o.Rows[0]) == 1 && o.Rows[0][0] != nil && *o.Rows[0][0] == "0" {
+			break
+		}
+		select {
+		case <-deadline.Done():
+			return Outcome{}, fmt.Errorf("session %s's old backend didn't exit", session)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if len(args) == 1 {
+		check, err := p.must(ctx, c, "SELECT active_branch()")
+		if err != nil {
+			return Outcome{}, err
+		}
+		if len(check.Rows) != 1 || len(check.Rows[0]) != 1 || check.Rows[0][0] == nil || *check.Rows[0][0] != *args[0] {
+			return Outcome{}, fmt.Errorf("connection did not select requested branch")
+		}
+	}
+	return Outcome{Rows: [][]*string{}, Tag: "connected to " + db, Transaction: string(c.TxStatus())}, nil
 }
 
 // "$1::text, ..., $n::text": Dolt's arguments, for a variadic text call.

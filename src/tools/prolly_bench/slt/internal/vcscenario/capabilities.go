@@ -13,7 +13,7 @@ import (
 // a step's SQL shows what it needs.
 var Capabilities = map[string]string{
 	"sql":           "plain SQL",
-	"vc.core":       "commit, branch, checkout, hard reset, log, status, hashof",
+	"vc.core":       "commit, branch, checkout, hard reset, log, status, hashof; connecting to a branch",
 	"vc.merge":      "dolt_merge: fast-forward, --no-ff, --abort",
 	"vc.conflicts":  "reading and resolving merge conflicts; dolt.allow_commit_conflicts",
 	"vc.violations": "constraint violations left by merges; dolt_verify_constraints",
@@ -50,8 +50,9 @@ var callCapability = map[string]string{
 	"dolt_merge_base":             "vc.mergebase",
 }
 
-// A typed operation: the capability it needs, the dolt_* function it calls,
-// and whether it may save the commit it makes.
+// A typed operation: the capability it needs, the dolt_* function it calls
+// (connect calls none: it opens the session's connection again), and
+// whether it may save the commit it makes.
 type opSpec struct {
 	capability string
 	function   string
@@ -62,6 +63,7 @@ var ops = map[string]opSpec{
 	"commit":     {"vc.core", "dolt_commit", true},
 	"branch":     {"vc.core", "dolt_branch", false},
 	"checkout":   {"vc.core", "dolt_checkout", false},
+	"connect":    {"vc.core", "", false},
 	"reset":      {"vc.core", "dolt_reset", false},
 	"merge":      {"vc.merge", "dolt_merge", true},
 	"cherrypick": {"vc.cherrypick", "dolt_cherry_pick", true},

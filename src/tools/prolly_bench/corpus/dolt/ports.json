@@ -14835,6 +14835,1546 @@
       "adaptations": [
         "A temporary table is Postgres's, in the session's pg_temp schema, which no branch versions; pg_temp comes first in the search path, so a temporary table hides a table of its name."
       ]
+    },
+    {
+      "id": "dolt-checkout-use",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 4,
+      "name": "dolt_checkout mixed with USE statements",
+      "source_sha256": "41b81c429cd79927ebc81a26240933341cee17e2f049becdc88919be206887a8",
+      "scenario_sha256": "7bd55f2e1f9c6b56b6314a9cdbb259b91a8a045865f1825a699aa37cbf87d3e0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE mydb/b2 becomes session a's connection to the case's database's branch b2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "USE mydb/b3 becomes session a's connection to the case's database's branch b3 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "USE mydb becomes session a's connection to the case's database (connect), on its default branch. (D11)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "USE mydb/b3 becomes session a's connection to the case's database's branch b3 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "USE mydb becomes session a's connection to the case's database (connect), on its default branch. (D11)"
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "Divergence: Dolt resolves mydb to the branch the session last checked out (b2); a connection is a new session, on the database's default branch, so prolly's is main. (D11)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "Divergence: Dolt resolves mydb to the branch the session last checked out (b2); a connection is a new session, on the database's default branch, so prolly's is main. (D11) Its rows are main's."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)"
+      ]
+    },
+    {
+      "id": "dolt-checkout-base-name",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 5,
+      "name": "dolt_checkout and base name resolution",
+      "source_sha256": "99770c4e82631133e5a5f0294c89ea73396101e6a22e97f018f540a9e38be90e",
+      "scenario_sha256": "0649b380716c6eea563e853654ed47d60a7e06ce7243e7337e62c9577b6f15e3",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE mydb/b2 becomes session a's connection to the case's database's branch b2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5-connect",
+            "assert-5"
+          ],
+          "note": "The cross-database reference mydb.t becomes the same query on session ref, connected to the case's database: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "USE mydb/b3 becomes session a's connection to the case's database's branch b3 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9-connect",
+            "assert-9"
+          ],
+          "note": "The cross-database reference mydb.t becomes the same query on session ref, connected to the case's database: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10-connect",
+            "assert-10"
+          ],
+          "note": "The cross-database reference `mydb/b2`.t becomes the same query on session ref, connected to b2: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-14-connect",
+            "assert-14"
+          ],
+          "note": "The cross-database reference mydb.t becomes the same query on session ref, connected to the case's database: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-15-connect",
+            "assert-15"
+          ],
+          "note": "The cross-database reference `mydb/b3`.t becomes the same query on session ref, connected to b3: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "USE mydb becomes session a's connection to the case's database (connect), on its default branch. (D11)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-19-connect",
+            "assert-19"
+          ],
+          "note": "The cross-database reference `mydb/main`.t becomes the same query on session ref, connected to main: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "USE mydb/b3 becomes session a's connection to the case's database's branch b3 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-22"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "assert-23-connect",
+            "assert-23"
+          ],
+          "note": "The cross-database reference `mydb`.t becomes the same query on session ref, connected to the case's database: Postgres has no cross-database references, and a branch is read by connecting to it. (D11) Divergence: Dolt resolves mydb to the branch session a last checked out (b2); session ref's connection to the database is on its default branch, main. (D11)"
+        },
+        {
+          "index": 24,
+          "steps": [
+            "assert-24"
+          ],
+          "note": "USE mydb becomes session a's connection to the case's database (connect), on its default branch. (D11)"
+        },
+        {
+          "index": 25,
+          "steps": [
+            "assert-25"
+          ],
+          "note": "Divergence: Dolt resolves mydb to the branch the session last checked out (b2); a connection is a new session, on the database's default branch, so prolly's is main. (D11)"
+        },
+        {
+          "index": 26,
+          "steps": [
+            "assert-26"
+          ],
+          "note": "Divergence: Dolt resolves mydb to the branch the session last checked out (b2); a connection is a new session, on the database's default branch, so prolly's is main. (D11) Its rows are main's."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)"
+      ]
+    },
+    {
+      "id": "dolt-checkout-base-name-commit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 6,
+      "name": "dolt_checkout and base name resolution for commit",
+      "source_sha256": "91a619ec19e6762ae8ddb905214a79e979516fd7499dff0ef42f44e4a9f73d3c",
+      "scenario_sha256": "dd6f63542ce46301194d78599da7fa5065c22c02232fbe9bc954a4fd29fc71f2",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt's OkResult (1 row affected) checked as the command tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows and their order."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6-connect",
+            "assert-6"
+          ],
+          "note": "The cross-database reference `mydb/main`.t becomes the same query on session ref, connected to main: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7-connect",
+            "assert-7"
+          ],
+          "note": "The cross-database reference `mydb/b2`.t becomes the same query on session ref, connected to b2: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)"
+      ]
+    },
+    {
+      "id": "dolt-checkout-deleted-branch",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 7,
+      "name": "branch last checked out is deleted",
+      "source_sha256": "0e75a0b644cb0c5c4a20fb3ff4ecca1322d2819792d59714bc578d5014658a1a",
+      "scenario_sha256": "b335eddc6a1d05acffcf6c12c2f5bc1ad9ee9504775f0c7630123056b76129a1",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11) The connection on b2 ends with its session, and the adapter waits for its backend to exit, so b2 is no session's."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt's OkResult (1 row affected) checked as the command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows and their order."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3-connect",
+            "assert-3"
+          ],
+          "note": "The cross-database reference `mydb/main`.t becomes the same query on session ref, connected to main: Postgres has no cross-database references, and a branch is read by connecting to it. (D11)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "The cross-database reference `mydb/b2`.t becomes the same query on session ref, connected to b2: Postgres has no cross-database references, and a branch is read by connecting to it. (D11) Dolt's 'database not found: mydb/b2': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)",
+        "CALL becomes SELECT; dolt_branch returns {status}, as Dolt's (0). (D3)"
+      ]
+    },
+    {
+      "id": "dolt-checkout-missing-refs",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 8,
+      "name": "Using non-existent refs",
+      "source_sha256": "0182f2c72c458005da7777ae7a69109b76819d27b030f7f9a068a47546953abf",
+      "scenario_sha256": "06a6317077f85b629c9b765173da2031eef8c38781b277bb27ec92c2d6be4ea7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "Tags are a feature prolly lacks (F tags): not ported, so the case is partial; the tag's own assertion is left out with it."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "USE mydb/b1 becomes session a's connection to the case's database's branch b1 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt's 'database not found: mydb/b2': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Needs tag1, a tag (F tags): left out with it."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Dolt's 'database not found: mydb/tag2': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11) No tag or branch has the name."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt's 'database not found: mydb/h4jks5lomp9u41r6902knn0pfr7lsgth': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11) Dolt's literal names no commit there either (prolly's ids are hex, D7)."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "The cross-database reference `mydb/b2`.t becomes the same query on session ref, connected to b2: Postgres has no cross-database references, and a branch is read by connecting to it. (D11) Dolt's 'database not found: mydb/b2': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "The cross-database reference `mydb/tag2`.t becomes the same query on session ref, connected to tag2: Postgres has no cross-database references, and a branch is read by connecting to it. (D11) Dolt's 'database not found: mydb/tag2': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "The cross-database reference `mydb/h4jks5lomp9u41r6902knn0pfr7lsgth`.t becomes the same query on session ref, connected to h4jks5lomp9u41r6902knn0pfr7lsgth: Postgres has no cross-database references, and a branch is read by connecting to it. (D11) Dolt's 'database not found: mydb/h4jks5lomp9u41r6902knn0pfr7lsgth': the connection is refused, as the branch doesn't exist (SQLSTATE 42704, as dolt_checkout's), and the session stays as it was. (D4, D11)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)"
+      ]
+    },
+    {
+      "id": "dolt-info-schema-use",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltInfoSchemaScripts",
+      "index": 1,
+      "name": "info_schema does not change with USE",
+      "source_sha256": "9834a9fb1eb852bc8f897057429ad36029d2d28803d6a8a221788cb48baa6fbb",
+      "scenario_sha256": "6f4aac1291ceabb9554fcba72594e8ff61b58b56f6523fd40b1b025957842f40",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4-connect",
+            "setup-4"
+          ],
+          "note": "ALTER TABLE `mydb/b2`.t becomes the ALTER on session ref, connected to b2: Postgres has no cross-database references. (D11)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5-connect",
+            "setup-5"
+          ],
+          "note": "ALTER TABLE `mydb/b3`.t becomes the ALTER on session ref, connected to b3: Postgres has no cross-database references. (D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. Preserved expected rows and their order."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE mydb/b2 becomes session a's connection to the case's database's branch b2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. Divergence: Dolt's information_schema is the base database's on any branch; a connection's catalogs are its branch's, so prolly lists b2's columns, as Doltgres's information_schema follows the checked-out branch (TestInfoSchemaRevisionDb). (D2, D11)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5-connect",
+            "assert-5"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. table_schema 'mydb/b2' becomes the query on session ref, connected to b2. (D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "USE mydb/b3 becomes session a's connection to the case's database's branch b3 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. Divergence: Dolt's information_schema is the base database's on any branch; a connection's catalogs are its branch's, so prolly lists b3's columns, as Doltgres's information_schema follows the checked-out branch (TestInfoSchemaRevisionDb). (D2, D11)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9-connect",
+            "assert-9"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. table_schema 'mydb/b3' becomes the query on session ref, connected to b3. (D11)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)"
+      ]
+    },
+    {
+      "id": "dolt-info-schema-deleted-branch",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltInfoSchemaScripts",
+      "index": 2,
+      "name": "info_schema when checked out branch was deleted",
+      "source_sha256": "6efecb2e2669b5be01a7ba5498deb052b112c7d31748c8b534ea96805096e540",
+      "scenario_sha256": "287c920495a44a3a1c61c09b6ce29e58cb63ac44112fdca3d73b02b0b38403df",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3-connect",
+            "setup-3"
+          ],
+          "note": "ALTER TABLE `mydb/b2`.t becomes the ALTER on session ref, connected to b2: Postgres has no cross-database references. (D11)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "USE mydb/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11) The connection on b3 ends with its session, and the adapter waits for its backend to exit, so b3 is no session's."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. Preserved expected rows and their order."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE mydb/b2 becomes session a's connection to the case's database's branch b2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. Divergence: Dolt's information_schema is the base database's on any branch; a connection's catalogs are its branch's, so prolly lists b2's columns, as Doltgres's information_schema follows the checked-out branch (TestInfoSchemaRevisionDb). (D2, D11)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5-connect",
+            "assert-5"
+          ],
+          "note": "information_schema's table_schema is the Postgres schema, public, where MySQL's is the database. table_schema 'mydb/b2' becomes the query on session ref, connected to b2. (D11)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "table_schema 'mydb/b3' becomes session ref's connection to b3, refused: the branch is gone, so there are no columns to count (Dolt's 0). (D4, D11)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "USE mydb/<branch> becomes a connection to the case's database's branch (connect), USE mydb one to the database; a connection is a new session. (D11)",
+        "A cross-database reference (mydb.t, `mydb/<branch>`.t) becomes the same query on a second session, ref, connected to that database or branch. (D11)",
+        "CALL becomes SELECT; dolt_branch returns {status}, as Dolt's (0). (D3)"
+      ]
+    },
+    {
+      "id": "dolt-branch-qualified-delete",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "suite": "DoltBranchMultiSessionScriptTests",
+      "index": 2,
+      "name": "Test branch deletion when clients are using a branch-qualified database",
+      "source_sha256": "53ffd6a3392aac68582a8d0e032bcae684f3fb440d3f68899526d33ca39f70aa",
+      "scenario_sha256": "5cf9352f453c8ed4b7523b9bff2b5ea5eca44ae6292286258dbfaae91e94d0a7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "USE dolt/branch1 becomes session a's connection to the case's database's branch branch1 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "DATABASE() is MySQL's (D10); Postgres's current_database() is the database's name without the branch, the case's random one, so active_branch() alone is checked."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE dolt/branch2 becomes session b's connection to the case's database's branch branch2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "DATABASE() is MySQL's (D10); Postgres's current_database() is the database's name without the branch, the case's random one, so active_branch() alone is checked."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "SHOW DATABASES is MySQL's (D10), and Postgres lists databases, not a session's branch-qualified ones: left out."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'unsafe to delete or rename branches in use in other sessions': session b's connection holds its branch, SQLSTATE 55006. (D4, D8)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE. Divergence: forced, Dolt deletes the branch under the other session; prolly still refuses (SQLSTATE 55006), since that session's catalog is the branch's copies, as Postgres refuses to drop a database in use without terminating its sessions. (D4, D8)"
+        },
+        {
+          "index": 7,
+          "steps": [],
+          "note": "SHOW DATABASES is MySQL's (D10), and Postgres lists databases, not a session's branch-qualified ones: left out."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "DATABASE() is MySQL's (D10); Postgres's current_database() is the database's name without the branch, the case's random one, so active_branch() alone is checked."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_branch returns {status}, as Dolt's (0). (D3)",
+        "Each client is a session: client a is session a, client b session b.",
+        "USE dolt/<branch> becomes the session's connection to the case's database's branch (connect). (D11)"
+      ]
+    },
+    {
+      "id": "dolt-branch-qualified-rename",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "suite": "DoltBranchMultiSessionScriptTests",
+      "index": 3,
+      "name": "Test branch renaming when clients are using a branch-qualified database",
+      "source_sha256": "feed2d2bd0ea0fc9ab8e4f08afab5616aa41bc74c7727cb411a96619129972a2",
+      "scenario_sha256": "d7703b2ac83fd2f8d8be5b642936dbbe11322a9eecf22f7ce9a449023f3e21d5",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "USE dolt/branch1 becomes session a's connection to the case's database's branch branch1 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "DATABASE() is MySQL's (D10); Postgres's current_database() is the database's name without the branch, the case's random one, so active_branch() alone is checked."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "USE dolt/branch2 becomes session b's connection to the case's database's branch branch2 (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "DATABASE() is MySQL's (D10); Postgres's current_database() is the database's name without the branch, the case's random one, so active_branch() alone is checked."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "SHOW DATABASES is MySQL's (D10), and Postgres lists databases, not a session's branch-qualified ones: left out."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'unsafe to delete or rename branches in use in other sessions': session b's connection holds its branch, SQLSTATE 55006. (D4, D8)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3) Forced, the rename goes ahead under session b, as Dolt's does."
+        },
+        {
+          "index": 7,
+          "steps": [],
+          "note": "SHOW DATABASES is MySQL's (D10), and Postgres lists databases, not a session's branch-qualified ones: left out."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_branch returns {status}, as Dolt's (0). (D3)",
+        "Each client is a session: client a is session a, client b session b.",
+        "USE dolt/<branch> becomes the session's connection to the case's database's branch (connect). (D11)"
+      ]
+    },
+    {
+      "id": "dolt-branch-force-delete-active",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "suite": "DoltBranchMultiSessionScriptTests",
+      "index": 4,
+      "name": "Test multi-session behavior for force deleting active branch with autocommit on",
+      "source_sha256": "4f35d2768ed4d22d2280c48d18de01751679510eb5d357e8803526f44cb3327d",
+      "scenario_sha256": "a55895aca74ce40137f09e0ab8bb9e10b89b090bbde5b78fa7e217cb26f5a49b",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "Autocommit is the client's in Postgres: a statement outside a transaction block commits by itself, so there is nothing to set. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_checkout returns {status, message}, as Dolt. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows and their order."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE. -D is -d forced. Divergence: forced, Dolt deletes the branch under the other session; prolly still refuses (SQLSTATE 55006), since that session's catalog is the branch's copies, as Postgres refuses to drop a database in use without terminating its sessions. (D4, D8)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Divergence: follows from the refused delete (D8): branch1 is still there, so Dolt's {main} is {branch1, main}."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Divergence: follows from the refused delete (D8): branch1 is still there and session a still on it: Dolt's 'database not found: dolt/branch1' is the branch list."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Divergence: follows from the refused delete (D8): branch1 is still there: Dolt's 'database not found: dolt/branch1' is the checkout's success. dolt_checkout returns {status, message}. (D3)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "USE dolt/main becomes session a's connection to the case's database's branch main (connect); SkipResultsCheck becomes the connection's success, and the adapter verifies the active branch. (D11)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_checkout returns {status, message} and dolt_branch {status}, as Dolt's. (D3)",
+        "Each client is a session: client a is session a, client b session b.",
+        "USE dolt/main becomes the session's connection to the case's database's branch main (connect). (D11)"
+      ]
     }
   ],
   "deferred": [
@@ -15301,6 +16841,22 @@
       "name": "two auto increment values in two transactions",
       "source_sha256": "48613cdd8ad8ecbf25c7de55ac96ee6d7fb308b5eb06e767580a6c4a062a8f77",
       "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_branches.spec, two transactions' sequence values: different, neither waiting."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+      "suite": "DoltBranchMultiSessionScriptTests",
+      "index": 5,
+      "name": "Test multi-session behavior for force deleting active branch with autocommit off",
+      "source_sha256": "f2d2cec72f603c4737e45671d94a7ce90deedb685d5115433eebe9a05de29242",
+      "reason": "Rederived under Postgres semantics (D5, D8), not ported literally: with autocommit off, the branch dolt_checkout('-b') makes is in session a's transaction, unseen by b until it commits, and b's forced delete waits for that commit, a blocking schedule the sequential scenarios can't hold. src/test/prolly/specs/vc_txn_branches.spec, a branch made, and checked out, in a transaction: unseen until committed, its forced delete waiting, then refused (the forced-delete divergence, D8)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "BranchIsolationTests",
+      "index": 4,
+      "name": "dolt_branches name index uses transaction snapshot",
+      "source_sha256": "6803751bac9c59d0e4c6165df190081babd2aab92bfa5e7fe856bd74682eb104",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's transaction sees dolt_branches as it began; prolly's READ COMMITTED as each statement begins), not ported literally; its index hints are MySQL's (D10): src/test/prolly/specs/vc_txn_branches.spec, a branch deleted and another made since: seen by name, in a join, deleted and made."
     }
   ]
 }

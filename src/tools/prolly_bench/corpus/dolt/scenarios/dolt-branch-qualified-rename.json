@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "id": "dolt-branch-qualified-rename",
+  "description": "Reviewed Dolt port: Test branch renaming when clients are using a branch-qualified database",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_server_tests.go",
+    "case": "DoltBranchMultiSessionScriptTests: Test branch renaming when clients are using a branch-qualified database"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "connect",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "branch1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "b",
+      "op": "connect",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch();",
+      "expect": {
+        "rows": [
+          [
+            "branch2"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-m', 'branch2', 'newName');",
+      "expect": {
+        "sqlstate": "55006"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('-mf', 'branch2', 'newName');",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_branch('branch3');",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}
