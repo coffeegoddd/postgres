@@ -1373,6 +1373,18 @@ dolt_branch(PG_FUNCTION_ARGS)
 				 errmsg("dolt_branch needs a branch")));
 
 	/*
+	 * (nor is a commit's hidden branch renamed: renamed, it would be an
+	 * ordinary, writable branch where the sessions detached at the commit
+	 * are; said before a detached session's read-only transaction is, as
+	 * the more specific)
+	 */
+	if (move && detached_branch(linitial(names)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a commit's hidden branch can't be renamed"),
+				 errhint("Make a branch at the commit with dolt_branch().")));
+
+	/*
 	 * (a rename, delete, take or protection makes no branch: not in a
 	 * transaction read-only for the branch it started on either, unlike a
 	 * create, forced or not, which a session on a commit makes to change
@@ -1452,16 +1464,6 @@ dolt_branch(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a writer's branch can't be renamed")));
-
-		/*
-		 * (nor a commit's hidden branch: renamed, it would be an ordinary,
-		 * writable branch where the sessions detached at the commit are)
-		 */
-		if (detached_branch(linitial(names)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("a commit's hidden branch can't be renamed"),
-					 errhint("Make a branch at the commit with dolt_branch().")));
 		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
 		/* (the branch a forced rename replaces) */
 		replaces_protected = force &&
