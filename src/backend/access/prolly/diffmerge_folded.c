@@ -124,7 +124,6 @@ static List *foreign_key_violations(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
 						   List **found);
 static bool changed_rows_of(List *changed, Oid relid, List **now, List **was);
-static char *rows_text_array(List *rows);
 static char *rows_json_array(List *rows);
 static void take_breaking_rows(List *added, void *arg);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
@@ -2884,7 +2883,7 @@ rel_owner(Oid relid)
  * MATCH FULL, some of it set, has no referenced row.  With changed (the
  * rows changed since the head, changed_since_head()'s; NIL: every row),
  * only the rows changed, and those referencing a row the referenced table
- * removed or changed, unless either table was redefined since.
+ * removed or changed, unless either table is checked whole.
  */
 static List *
 foreign_key_violations(List *relids, List *changed)
@@ -2926,11 +2925,11 @@ foreign_key_violations(List *relids, List *changed)
 			continue;
 		if (changed != NIL)
 		{
-			bool		redefined;
+			bool		whole;
 
-			redefined = changed_rows_of(changed, con->conrelid, &child_now, NULL);
-			redefined |= changed_rows_of(changed, con->confrelid, NULL, &parent_was);
-			if (redefined)
+			whole = changed_rows_of(changed, con->conrelid, &child_now, NULL);
+			whole |= changed_rows_of(changed, con->confrelid, NULL, &parent_was);
+			if (whole)
 				child_now = parent_was = NIL;
 			else if (child_now == NIL && parent_was == NIL)
 				continue;
@@ -2988,8 +2987,8 @@ foreign_key_violations(List *relids, List *changed)
 		{
 			appendStringInfoString(&q, " AND (false");
 			if (child_now != NIL)
-				appendStringInfo(&q, " OR row_to_json(c.*)::text = ANY (%s::text[])",
-								 rows_text_array(child_now));
+				appendStringInfo(&q, " OR to_jsonb(c.*) IN (SELECT jsonb_array_elements(%s::jsonb))",
+								 rows_json_array(child_now));
 			if (parent_was != NIL)
 				appendStringInfo(&q, " OR (%s) IN (SELECT %s FROM json_populate_recordset(NULL::%s, %s::json) w)",
 								 cols.data, pcols.data, parent,
@@ -3094,8 +3093,8 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing,
 		appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
 	}
 	if (only != NIL)
-		cond = psprintf("%s AND row_to_json(c.*)::text = ANY (%s::text[])",
-						cond, rows_text_array(only));
+		cond = psprintf("%s AND to_jsonb(c.*) IN (SELECT jsonb_array_elements(%s::jsonb))",
+						cond, rows_json_array(only));
 	if (removing)
 		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c.*)::text",
 						 only_unless_partitioned(con->conrelid), table, cond);
@@ -3110,7 +3109,7 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing,
  * a check or not-null constraint not validated yet: a table holds none
  * that break one validated, Postgres checks every row written against it.
  * With changed (as foreign_key_violations() takes it), only the rows
- * added or changed since the head, unless the table was redefined since.
+ * added or changed since the head, unless the table is checked whole.
  */
 static List *
 unvalidated_violations(List *relids, List *changed)
@@ -3141,9 +3140,13 @@ unvalidated_violations(List *relids, List *changed)
 			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
 			(relids != NIL && !list_member_oid(relids, con->conrelid)))
 			continue;
-		if (changed != NIL &&
-			!changed_rows_of(changed, con->conrelid, &now, NULL) && now == NIL)
-			continue;
+		if (changed != NIL)
+		{
+			if (changed_rows_of(changed, con->conrelid, &now, NULL))
+				now = NIL;		/* (whole) */
+			else if (now == NIL)
+				continue;
+		}
 		qi = breaking_query(pg_constraint, tup, false, now, &check);
 		if (check)
 			checks = lappend(checks, qi);
@@ -3257,21 +3260,28 @@ take_breaking_rows(List *added, void *arg)
  * table, as row_to_json() gives them: those added or changed as they are
  * now, and those removed or changed as they were.  (A keyless row's
  * copies added are a row now, its copies removed one that was.)  A table
- * made or redefined since is checked whole, as its constraints may be new.
+ * made or redefined since is checked whole, as its constraints may be new;
+ * so is one whose rows changed would make too big a query (more than
+ * CHANGED_ROWS_MAX bytes of them), where the whole check is cheaper too.
  */
 typedef struct ChangedTable
 {
 	Oid			relid;
 	List	   *ancestors;		/* its partitioned tables', if a partition */
-	bool		redefined;
+	bool		whole;			/* every row is to be checked */
+	Size		bytes;			/* of now's and was' rows */
 	List	   *now;			/* char * */
 	List	   *was;			/* char * */
 } ChangedTable;
+
+#define CHANGED_ROWS_MAX (16 * 1024 * 1024)
 
 typedef struct ChangedRows
 {
 	ProllyDiffSink sink;		/* must be first */
 	List	   *tables;			/* ChangedTable * */
+	List	   *relevant;		/* the tables to check, and those their
+								 * foreign keys join (NIL: every one) */
 	ChangedTable *cur;			/* the table being read, as: */
 	Relation	rel;
 	const ProllyKeyingRoutine *kr;
@@ -3305,6 +3315,38 @@ changed_json(ChangedRows *cr, const ProllyValue *value, uint64 *count)
 	return row_json(cr->slot);
 }
 
+/* Whether table ct is one to check, or one a foreign key joins it to. */
+static bool
+changed_relevant(const ChangedRows *cr, const ChangedTable *ct)
+{
+	ListCell   *lc;
+
+	if (cr->relevant == NIL || list_member_oid(cr->relevant, ct->relid))
+		return true;
+	foreach(lc, ct->ancestors)
+		if (list_member_oid(cr->relevant, lfirst_oid(lc)))
+			return true;
+	return false;
+}
+
+/* Row (JSON) added to ct's rows *rows; too many, and ct is checked whole. */
+static void
+changed_add(ChangedTable *ct, List **rows, char *row)
+{
+	if (ct->whole)
+		return;
+	ct->bytes += strlen(row);
+	if (ct->bytes > CHANGED_ROWS_MAX)
+	{
+		ct->whole = true;
+		list_free_deep(ct->now);
+		list_free_deep(ct->was);
+		ct->now = ct->was = NIL;
+		return;
+	}
+	*rows = lappend(*rows, row);
+}
+
 static void
 changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 			const ProllyKey *key, const ProllyValue *before,
@@ -3321,6 +3363,9 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	{
 		changed_close(cr);
 		cr->cur = changed_table(&cr->tables, relid);
+		/* (a table checked whole, or not at all: its rows aren't read) */
+		if (cr->cur->whole || !changed_relevant(cr, cr->cur))
+			return;
 		cr->rel = table_open(relid, AccessShareLock);
 		cr->kr = keying_of(cr->rel);
 		cr->k = PROLLY_CALL(cr->kr, open, cr->rel, CurrentMemoryContext);
@@ -3328,6 +3373,8 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		cr->slot = MakeSingleTupleTableSlot(RelationGetDescr(cr->rel),
 											&TTSOpsVirtual);
 	}
+	if (cr->rel == NULL || cr->cur->whole)
+		return;
 	if (before)
 		was = changed_json(cr, before, &nbefore);
 	if (after)
@@ -3335,19 +3382,56 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (cr->keyless)
 	{
 		if (nafter > nbefore)
-			cr->cur->now = lappend(cr->cur->now, now);
+			changed_add(cr->cur, &cr->cur->now, now);
 		else
-			cr->cur->was = lappend(cr->cur->was, was);
+			changed_add(cr->cur, &cr->cur->was, was);
 		return;
 	}
 	if (now)
-		cr->cur->now = lappend(cr->cur->now, now);
+		changed_add(cr->cur, &cr->cur->now, now);
 	if (was)
-		cr->cur->was = lappend(cr->cur->was, was);
+		changed_add(cr->cur, &cr->cur->was, was);
 }
 
+/*
+ * The tables of relids, and those their foreign keys join them to: theirs
+ * and those referencing them (NIL, relids NIL: every one).
+ */
 static List *
-changed_since_head(void)
+joined_tables(List *relids)
+{
+	Relation	pg_constraint;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *out = list_copy(relids);
+
+	if (relids == NIL)
+		return NIL;
+	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_constraint, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		if (con->contype != CONSTRAINT_FOREIGN)
+			continue;
+		if (list_member_oid(relids, con->conrelid))
+			out = list_append_unique_oid(out, con->confrelid);
+		if (list_member_oid(relids, con->confrelid))
+			out = list_append_unique_oid(out, con->conrelid);
+	}
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+	return out;
+}
+
+/*
+ * What changed since the head (for the tables of relids, NIL: every
+ * one), as ChangedTables; the rows recorded as violating a constraint
+ * count as changed, so a check replacing them checks them again.
+ */
+static List *
+changed_since_head(List *relids)
 {
 	ChangedRows cr;
 	List	   *head = tables_of("HEAD", InvalidOid);
@@ -3355,8 +3439,8 @@ changed_since_head(void)
 
 	memset(&cr, 0, sizeof(cr));
 	cr.sink.change = changed_row;
-	folded_diff("HEAD", "WORKING", InvalidOid, &cr.sink);
-	changed_close(&cr);
+	cr.relevant = joined_tables(relids);
+	/* (those made or redefined first: their rows aren't read) */
 	foreach(lc, tables_of("WORKING", InvalidOid))
 	{
 		Table	   *t = lfirst(lc);
@@ -3364,7 +3448,20 @@ changed_since_head(void)
 		Oid			relid = table_named(t->name);
 
 		if (OidIsValid(relid) && (h == NULL || !same_description(h, t)))
-			changed_table(&cr.tables, relid)->redefined = true;
+			changed_table(&cr.tables, relid)->whole = true;
+	}
+	folded_diff("HEAD", "WORKING", InvalidOid, &cr.sink);
+	changed_close(&cr);
+	foreach(lc, PROLLY_CALL(components().refs, violations))
+	{
+		ProllyViolation *pv = lfirst(lc);
+		ChangedTable *ct;
+
+		if (!OidIsValid(pv->relid) || !SearchSysCacheExists1(RELOID, ObjectIdGetDatum(pv->relid)))
+			continue;
+		ct = changed_table(&cr.tables, pv->relid);
+		if (changed_relevant(&cr, ct))
+			changed_add(ct, &ct->now, pstrdup(pv->row));
 	}
 	return cr.tables;
 }
@@ -3390,13 +3487,12 @@ changed_table(List **tables, Oid relid)
 /*
  * Table relid's rows in changed (its partitions' too, if it's
  * partitioned), appended to *now and *was (where not NULL).  Returns
- * whether it (or a partition of it) was redefined: every row is to be
- * checked.
+ * whether it (or a partition of it) is checked whole: every row.
  */
 static bool
 changed_rows_of(List *changed, Oid relid, List **now, List **was)
 {
-	bool		redefined = false;
+	bool		whole = false;
 	ListCell   *lc;
 
 	foreach(lc, changed)
@@ -3405,31 +3501,20 @@ changed_rows_of(List *changed, Oid relid, List **now, List **was)
 
 		if (ct->relid != relid && !list_member_oid(ct->ancestors, relid))
 			continue;
-		redefined |= ct->redefined;
+		whole |= ct->whole;
 		if (now)
 			*now = list_concat(*now, ct->now);
 		if (was)
 			*was = list_concat(*was, ct->was);
 	}
-	return redefined;
+	return whole;
 }
 
-/* Rows (char *) as a quoted text[] literal. */
-static char *
-rows_text_array(List *rows)
-{
-	Datum	   *d = palloc_array(Datum, list_length(rows));
-	ArrayType  *a;
-	ListCell   *lc;
-
-	foreach(lc, rows)
-		d[foreach_current_index(lc)] = CStringGetTextDatum(lfirst(lc));
-	a = construct_array_builtin(d, list_length(rows), TEXTOID);
-	return quote_literal_cstr(OidOutputFunctionCall(F_ARRAY_OUT,
-													PointerGetDatum(a)));
-}
-
-/* Rows (char *, JSON objects) as a quoted JSON array literal. */
+/*
+ * Rows (char *, JSON objects) as a quoted JSON array literal.  (Compared
+ * as jsonb, a row matches whatever its columns' order: a partition's
+ * row read through its partitioned table, say.)
+ */
 static char *
 rows_json_array(List *rows)
 {
@@ -3451,10 +3536,11 @@ rows_json_array(List *rows)
  * and those breaking a check or not-null constraint not validated yet.
  * Unless all, only rows changed since the head commit are checked (and,
  * for a foreign key, those referencing a row removed or changed), as Dolt
- * checks what the working set changed; a table made or redefined since,
- * whole.  (The rows merges couldn't write
- * aren't in the tables: their violations aren't found again, what to do
- * with them is the user's.)
+ * checks what the working set changed, and the rows of the violations
+ * recorded, which the caller replaces with what's found; a table made or
+ * redefined since, whole.  (The rows merges couldn't write aren't in the
+ * tables: their violations aren't found again, what to do with them is
+ * the user's.)
  */
 static List *
 verify_constraints(List *relids, bool all)
@@ -3465,7 +3551,7 @@ verify_constraints(List *relids, bool all)
 	/* (a branch with no commit yet: every row is a change) */
 	if (!all && PROLLY_CALL(components().refs, resolve, "HEAD", &head))
 	{
-		changed = changed_since_head();
+		changed = changed_since_head(relids);
 		if (changed == NIL)
 			return NIL;
 	}

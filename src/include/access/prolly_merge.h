@@ -54,8 +54,9 @@
  *   one) against their foreign keys, and against their check and not-null
  *   constraints not validated yet (Postgres keeps the others), and returns
  *   the violations found.  With all, every row is checked; without, only
- *   the rows changed since the head commit, and, for a foreign key, those
- *   referencing a row the referenced table removed or changed since.
+ *   the rows changed since the head commit and those of the violations
+ *   recorded, and, for a foreign key, those referencing a row the
+ *   referenced table removed or changed since.
  * - cherry_pick() commits refs' changes (each from its parent) again on
  *   the current branch, merging each three-way with the branch as the
  *   ones before left it, every ref resolved first, and returns the one

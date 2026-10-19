@@ -117,6 +117,56 @@ RESET dolt.allow_commit_conflicts;
 
 DROP SCHEMA vd CASCADE;
 
+-- Violations recorded are checked again without --all, changed or not:
+-- one still holding is kept (and the status says so), one fixed goes.
+CREATE SCHEMA vr VERSIONED;
+SET dolt.allow_commit_conflicts = on;
+CREATE TABLE vr.parent (id int PRIMARY KEY);
+CREATE TABLE vr.child (id int PRIMARY KEY, p int REFERENCES vr.parent);
+INSERT INTO vr.parent VALUES (1);
+SET session_replication_role = replica;
+INSERT INTO vr.child VALUES (1, 1), (2, 2), (3, 3);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('vr.child');
+SELECT length(dolt_commit('-Am', 'vr')::text) AS committed;
+SELECT * FROM dolt_constraint_violations();
+-- (nothing changed since the head)
+SELECT dolt_verify_constraints();
+SELECT * FROM dolt_constraint_violations();
+-- (one recorded fixed, the other unchanged)
+UPDATE vr.child SET p = 1 WHERE id = 3;
+INSERT INTO vr.parent VALUES (5);
+SELECT dolt_verify_constraints('vr.child');
+SELECT violating_row FROM dolt_constraint_violations('vr.child');
+SELECT dolt_reset('--hard');
+-- A table redefined since is checked whole, whatever else of it changed.
+CREATE TABLE vr.k (id int PRIMARY KEY, a int, b int);
+INSERT INTO vr.k VALUES (1, 1, 2), (2, 5, 4), (3, 8, 7);
+SELECT length(dolt_commit('-Am', 'vr.k')::text) AS committed;
+ALTER TABLE vr.k ADD CONSTRAINT k_chk CHECK (a < b) NOT VALID;
+UPDATE vr.k SET b = 3 WHERE id = 1;
+SELECT dolt_verify_constraints('-o', 'vr.k');
+SELECT dolt_verify_constraints('vr.k');
+SELECT violating_row FROM dolt_constraint_violations('vr.k')
+ORDER BY violating_row->>'id';
+SELECT dolt_reset('--hard');
+-- (so is a partitioned table one of whose partitions was, though another
+-- partition's rows changed too)
+CREATE TABLE vr.pk (id int PRIMARY KEY, a int, b int) PARTITION BY RANGE (id);
+CREATE TABLE vr.pk1 PARTITION OF vr.pk FOR VALUES FROM (0) TO (10);
+CREATE TABLE vr.pk2 PARTITION OF vr.pk FOR VALUES FROM (10) TO (20);
+INSERT INTO vr.pk VALUES (1, 1, 2), (2, 5, 4), (11, 8, 7);
+ALTER TABLE vr.pk ADD CONSTRAINT pk_chk CHECK (a < b) NOT VALID;
+SELECT length(dolt_commit('-Am', 'vr.pk')::text) AS committed;
+ALTER TABLE vr.pk2 ADD CONSTRAINT pk2_chk CHECK (id > 0);
+UPDATE vr.pk SET b = 3 WHERE id = 1;
+SELECT dolt_verify_constraints('vr.pk');
+SELECT violating_row FROM dolt_constraint_violations('vr.pk')
+ORDER BY (violating_row->>'id')::int;
+SELECT dolt_reset('--hard');
+RESET dolt.allow_commit_conflicts;
+DROP SCHEMA vr CASCADE;
+
 -- On a branch with no commit yet, every row is a change.
 CREATE DATABASE vc_fresh TEMPLATE template0;
 \c vc_fresh

@@ -288,6 +288,147 @@ NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table vd.parent
 drop cascades to table vd.child
 drop cascades to table vd.k
+-- Violations recorded are checked again without --all, changed or not:
+-- one still holding is kept (and the status says so), one fixed goes.
+CREATE SCHEMA vr VERSIONED;
+SET dolt.allow_commit_conflicts = on;
+CREATE TABLE vr.parent (id int PRIMARY KEY);
+CREATE TABLE vr.child (id int PRIMARY KEY, p int REFERENCES vr.parent);
+INSERT INTO vr.parent VALUES (1);
+SET session_replication_role = replica;
+INSERT INTO vr.child VALUES (1, 1), (2, 2), (3, 3);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('vr.child');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'vr')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ vr.child   |              2
+(1 row)
+
+-- (nothing changed since the head)
+SELECT dolt_verify_constraints();
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT * FROM dolt_constraint_violations();
+ table_name | num_violations 
+------------+----------------
+ vr.child   |              2
+(1 row)
+
+-- (one recorded fixed, the other unchanged)
+UPDATE vr.child SET p = 1 WHERE id = 3;
+INSERT INTO vr.parent VALUES (5);
+SELECT dolt_verify_constraints('vr.child');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT violating_row FROM dolt_constraint_violations('vr.child');
+   violating_row   
+-------------------
+ {"p": 2, "id": 2}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A table redefined since is checked whole, whatever else of it changed.
+CREATE TABLE vr.k (id int PRIMARY KEY, a int, b int);
+INSERT INTO vr.k VALUES (1, 1, 2), (2, 5, 4), (3, 8, 7);
+SELECT length(dolt_commit('-Am', 'vr.k')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE vr.k ADD CONSTRAINT k_chk CHECK (a < b) NOT VALID;
+UPDATE vr.k SET b = 3 WHERE id = 1;
+SELECT dolt_verify_constraints('-o', 'vr.k');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_verify_constraints('vr.k');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT violating_row FROM dolt_constraint_violations('vr.k')
+ORDER BY violating_row->>'id';
+       violating_row       
+---------------------------
+ {"a": 5, "b": 4, "id": 2}
+ {"a": 8, "b": 7, "id": 3}
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- (so is a partitioned table one of whose partitions was, though another
+-- partition's rows changed too)
+CREATE TABLE vr.pk (id int PRIMARY KEY, a int, b int) PARTITION BY RANGE (id);
+CREATE TABLE vr.pk1 PARTITION OF vr.pk FOR VALUES FROM (0) TO (10);
+CREATE TABLE vr.pk2 PARTITION OF vr.pk FOR VALUES FROM (10) TO (20);
+INSERT INTO vr.pk VALUES (1, 1, 2), (2, 5, 4), (11, 8, 7);
+ALTER TABLE vr.pk ADD CONSTRAINT pk_chk CHECK (a < b) NOT VALID;
+SELECT length(dolt_commit('-Am', 'vr.pk')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE vr.pk2 ADD CONSTRAINT pk2_chk CHECK (id > 0);
+UPDATE vr.pk SET b = 3 WHERE id = 1;
+SELECT dolt_verify_constraints('vr.pk');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT violating_row FROM dolt_constraint_violations('vr.pk')
+ORDER BY (violating_row->>'id')::int;
+       violating_row        
+----------------------------
+ {"a": 5, "b": 4, "id": 2}
+ {"a": 8, "b": 7, "id": 11}
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+DROP SCHEMA vr CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table vr.parent
+drop cascades to table vr.child
+drop cascades to table vr.k
+drop cascades to table vr.pk
 -- On a branch with no commit yet, every row is a change.
 CREATE DATABASE vc_fresh TEMPLATE template0;
 \c vc_fresh
