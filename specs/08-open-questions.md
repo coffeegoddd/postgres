@@ -53,6 +53,7 @@ the record of what was decided for it. D1 is removed by #177, #178 and
 | Write amplification (`20-write-amplification.md`) | Decided by the user 2026-10-19, as recommended: per cell, for heap and prolly, over an interval that flushes deferred page and tree writes; WAL by resource manager; prolly's chunk-store and block-map bytes from `pg_stat_prolly`. **Open:** deleted rows' logical bytes, an exact row-byte counter, and counting bulk writes in `pg_stat_io` (part 4) |
 | Default writer (#148) | **Open:** whether `dolt.writer` defaults to the session or the role; revisited with data from the `owned` mode's use (`11-pages-and-dolt-snapshots.md` 6.2) |
 | Change finder "log" (2026-10-19) | Decided by the user: folds find changes from a change log per table, an entry per changed tuple version written with it, instead of from old page versions (`19-change-log.md`); built, "log" the default |
+| The chunk store against Dolt's (2026-10-19) | Decided by the user, as recommended (`22-chunk-store-parity.md` part 4): BLAKE3 at 20 bytes (the user's choice; 32 was recommended) in one clean break of format with the journal's chunks compressed, Dolt's index layout, root timestamps and the manifest recording the format (the freeze at spec 11's step 4 doesn't bind a prototype); then observability, the read path, GC and remotes, before step 8; archives after it. |
 
 ## Questions
 
