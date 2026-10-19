@@ -157,6 +157,21 @@ SELECT (dolt_merge('--', '-dash'))[4];
 SELECT dolt_reset('--hard', '--', '-dash');
 SELECT dolt_cherry_pick('--', '-dash');
 SELECT dolt_branch('-D', '--', '-dash');
+-- "--" is never an option's value: what needs one is refused, and no
+-- branch named "--" is made.
+SELECT dolt_checkout('-b', '--', 'main');
+SELECT dolt_checkout('-b', '--');
+SELECT name FROM dolt_branches WHERE name = '--';
+SELECT active_branch();
+SELECT dolt_commit('-m', '--');
+SELECT dolt_commit('-Am', '--', '--allow-empty');
+SELECT dolt_commit('--author', '--', '-m', 'x');
+SELECT dolt_merge('-m', '--', 'main');
+SELECT dolt_integrate('-m', '--', 'main');
+SELECT dolt_revert('--author', '--', 'HEAD');
+SELECT dolt_pull('-m', '--', 'origin');
+SELECT dolt_clone('-b', '--', 'file:///nowhere');
+SELECT dolt_clone('--remote', '--', 'file:///nowhere');
 SELECT dolt_branch('cased');
 SELECT dolt_branch('CASED');
 SELECT dolt_branch('-f', 'Cased');

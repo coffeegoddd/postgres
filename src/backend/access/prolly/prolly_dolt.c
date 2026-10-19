@@ -345,11 +345,15 @@ options_end(char **args, int nargs)
 	return nargs;
 }
 
-/* The argument after option args[*i]. */
+/*
+ * The argument after option args[*i]. "--" is never one: it ends the
+ * options (options_end), so "-b", "--" is a -b with no branch, not a
+ * branch named "--".
+ */
 static char *
 option_value(char **args, int nargs, int *i, const char *fn)
 {
-	if (*i + 1 >= nargs)
+	if (*i + 1 >= nargs || strcmp(args[*i + 1], "--") == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%s: option \"%s\" needs a value", fn, args[*i])));

@@ -488,6 +488,41 @@ SELECT dolt_branch('-D', '--', '-dash');
  {0}
 (1 row)
 
+-- "--" is never an option's value: what needs one is refused, and no
+-- branch named "--" is made.
+SELECT dolt_checkout('-b', '--', 'main');
+ERROR:  dolt_checkout: option "-b" needs a value
+SELECT dolt_checkout('-b', '--');
+ERROR:  dolt_checkout: option "-b" needs a value
+SELECT name FROM dolt_branches WHERE name = '--';
+ name 
+------
+(0 rows)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT dolt_commit('-m', '--');
+ERROR:  dolt_commit: option "-m" needs a value
+SELECT dolt_commit('-Am', '--', '--allow-empty');
+ERROR:  dolt_commit: option "-Am" needs a value
+SELECT dolt_commit('--author', '--', '-m', 'x');
+ERROR:  dolt_commit: option "--author" needs a value
+SELECT dolt_merge('-m', '--', 'main');
+ERROR:  dolt_merge: option "-m" needs a value
+SELECT dolt_integrate('-m', '--', 'main');
+ERROR:  dolt_integrate: option "-m" needs a value
+SELECT dolt_revert('--author', '--', 'HEAD');
+ERROR:  dolt_revert: option "--author" needs a value
+SELECT dolt_pull('-m', '--', 'origin');
+ERROR:  dolt_pull: option "-m" needs a value
+SELECT dolt_clone('-b', '--', 'file:///nowhere');
+ERROR:  dolt_clone: option "-b" needs a value
+SELECT dolt_clone('--remote', '--', 'file:///nowhere');
+ERROR:  dolt_clone: option "--remote" needs a value
 SELECT dolt_branch('cased');
  dolt_branch 
 -------------
