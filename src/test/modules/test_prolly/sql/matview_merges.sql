@@ -226,7 +226,68 @@ SELECT (SELECT c FROM mm.d) AS d, (SELECT c FROM mm.c) AS c,
 	(SELECT sum(pk) FROM mm.t) AS t_sum;
 SELECT count(*) AS clean FROM dolt_status;
 
+-- and through an operator, its function reading the other view (a string
+-- body: refreshed again after the pass over them all).
+CREATE SCHEMA mmc;
+CREATE MATERIALIZED VIEW mm.ob AS SELECT coalesce(sum(pk), 0)::int AS c FROM mm.t;
+CREATE FUNCTION mmc.times_ob(int, int) RETURNS int LANGUAGE plpgsql STABLE
+	AS $$BEGIN RETURN $1 * (SELECT c FROM mm.ob); END$$;
+CREATE OPERATOR mmc.*** (LEFTARG = int, RIGHTARG = int, FUNCTION = mmc.times_ob);
+CREATE MATERIALIZED VIEW mm.oa AS SELECT 10 OPERATOR(mmc.***) 0 AS c;
+SELECT length(dolt_commit('-Am', 'a view reading a view through an operator')::text) AS committed;
+SELECT dolt_checkout('-b', 'mm_op');
+INSERT INTO mm.t VALUES (10000);
+REFRESH MATERIALIZED VIEW mm.ob;
+REFRESH MATERIALIZED VIEW mm.oa;
+SELECT length(dolt_commit('-am', 'theirs: t, both refreshed')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO mm.t VALUES (20000);
+REFRESH MATERIALIZED VIEW mm.ob;
+REFRESH MATERIALIZED VIEW mm.oa;
+SELECT length(dolt_commit('-am', 'ours: t, both refreshed')::text) AS committed;
+SELECT (dolt_merge('mm_op', '-m', 'both refreshed both'))[3:4];
+SELECT (SELECT c FROM mm.ob) AS ob, (SELECT c FROM mm.oa) AS oa,
+	(SELECT sum(pk) FROM mm.t) AS t_sum;
+SELECT count(*) AS clean FROM dolt_status;
+
+-- Only the opaque views (and those reading them) are refreshed again:
+-- three plain views and one opaque one, both sides refreshing all four,
+-- refresh five times, not sixteen.
+CREATE SEQUENCE mmc.s;
+CREATE FUNCTION mmc.tick() RETURNS int LANGUAGE sql VOLATILE
+	BEGIN ATOMIC SELECT (nextval('mmc.s') * 0)::int; END;
+CREATE FUNCTION mmc.tsum() RETURNS int LANGUAGE sql STABLE
+	AS 'SELECT coalesce(sum(pk), 0)::int FROM mm.t';
+CREATE MATERIALIZED VIEW mm.k1 AS SELECT coalesce(sum(pk), 0) + mmc.tick() AS c FROM mm.t;
+CREATE MATERIALIZED VIEW mm.k2 AS SELECT coalesce(sum(pk), 0) + mmc.tick() AS c FROM mm.t;
+CREATE MATERIALIZED VIEW mm.k3 AS SELECT coalesce(sum(pk), 0) + mmc.tick() AS c FROM mm.t;
+CREATE MATERIALIZED VIEW mm.k4 AS SELECT mmc.tsum() + mmc.tick() AS c;
+SELECT length(dolt_commit('-Am', 'views counting their refreshes')::text) AS committed;
+SELECT dolt_checkout('-b', 'mm_cnt');
+INSERT INTO mm.t VALUES (100000);
+REFRESH MATERIALIZED VIEW mm.k1;
+REFRESH MATERIALIZED VIEW mm.k2;
+REFRESH MATERIALIZED VIEW mm.k3;
+REFRESH MATERIALIZED VIEW mm.k4;
+SELECT length(dolt_commit('-am', 'theirs: t, all refreshed')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO mm.t VALUES (200000);
+REFRESH MATERIALIZED VIEW mm.k1;
+REFRESH MATERIALIZED VIEW mm.k2;
+REFRESH MATERIALIZED VIEW mm.k3;
+REFRESH MATERIALIZED VIEW mm.k4;
+SELECT length(dolt_commit('-am', 'ours: t, all refreshed')::text) AS committed;
+SELECT nextval('mmc.s') AS before \gset
+SELECT (dolt_merge('mm_cnt', '-m', 'both refreshed all'))[3:4];
+SELECT nextval('mmc.s') - :before - 1 AS refreshes;
+SELECT (SELECT c FROM mm.k1) AS k1, (SELECT c FROM mm.k4) AS k4,
+	(SELECT sum(pk) FROM mm.t) AS t_sum;
+SELECT count(*) AS clean FROM dolt_status;
+
 SELECT dolt_branch('-D', 'mm_other');
 SELECT dolt_branch('-D', 'mm_fn');
+SELECT dolt_branch('-D', 'mm_op');
+SELECT dolt_branch('-D', 'mm_cnt');
 DROP SCHEMA mm CASCADE;
+DROP SCHEMA mmc CASCADE;
 SELECT length(dolt_commit('-Am', 'mm gone')::text) AS committed;

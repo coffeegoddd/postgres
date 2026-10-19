@@ -58,6 +58,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
@@ -2557,8 +2558,9 @@ matviews_in_root(const ProllyNodeRef *root)
 
 /*
  * What view's query reads, transitively: the relations (through views'
- * rules) and functions (through BEGIN ATOMIC bodies) it depends on, as
- * (class, object); then "where", over that, says whether to count it.
+ * rules), functions (through BEGIN ATOMIC bodies) and operators (through
+ * their functions) it depends on, as (class, object); then "where", over
+ * that, says whether to count it.
  */
 static bool
 view_reaches(Oid view, const char *where, Oid arg)
@@ -2568,15 +2570,21 @@ view_reaches(Oid view, const char *where, Oid arg)
 
 	if (SPI_execute_with_args(psprintf("WITH RECURSIVE r(cls, obj) AS ("
 									   "SELECT 'pg_class'::regclass::oid, $1"
-									   " UNION SELECT d.refclassid, d.refobjid FROM r"
+									   " UNION SELECT e.cls, e.obj FROM r"
 									   " LEFT JOIN pg_rewrite w"
 									   " ON r.cls = 'pg_class'::regclass AND w.ev_class = r.obj"
-									   " JOIN pg_depend d"
-									   " ON (d.classid = 'pg_rewrite'::regclass AND d.objid = w.oid)"
+									   " LEFT JOIN pg_operator o"
+									   " ON r.cls = 'pg_operator'::regclass AND o.oid = r.obj"
+									   " CROSS JOIN LATERAL ("
+									   "SELECT d.refclassid, d.refobjid FROM pg_depend d"
+									   " WHERE (d.classid = 'pg_rewrite'::regclass AND d.objid = w.oid)"
 									   " OR (r.cls = 'pg_proc'::regclass"
 									   " AND d.classid = 'pg_proc'::regclass AND d.objid = r.obj)"
-									   " WHERE d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass)"
-									   " AND NOT (d.refclassid = r.cls AND d.refobjid = r.obj))"
+									   " UNION ALL SELECT 'pg_proc'::regclass, o.oprcode"
+									   " WHERE o.oid IS NOT NULL) e(cls, obj)"
+									   " WHERE e.cls IN ('pg_class'::regclass, 'pg_proc'::regclass,"
+									   " 'pg_operator'::regclass)"
+									   " AND NOT (e.cls = r.cls AND e.obj = r.obj))"
 									   " SELECT 1 FROM r WHERE %s", where),
 							  2, types, args, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read materialized view dependencies");
@@ -2591,17 +2599,28 @@ view_reads(Oid view, Oid rel)
 }
 
 /*
- * Whether view's query calls a function whose body is a string (or C),
- * which records nothing of what it reads.
+ * Whether view's query calls a function (not a built-in one) whose body
+ * is a string, or C, which records nothing of what it reads.
  */
 static bool
 view_reads_opaquely(Oid view)
 {
 	return view_reaches(view,
-						"cls = 'pg_proc'::regclass AND EXISTS"
-						" (SELECT 1 FROM pg_proc p"
-						" WHERE p.oid = obj AND p.prosqlbody IS NULL)",
+						psprintf("cls = 'pg_proc'::regclass AND obj >= %u AND EXISTS"
+								 " (SELECT 1 FROM pg_proc p"
+								 " WHERE p.oid = obj AND p.prosqlbody IS NULL)",
+								 FirstNormalObjectId),
 						InvalidOid);
+}
+
+static void
+refresh_matview(Oid view)
+{
+	char	   *name = table_name(view);
+
+	if (SPI_execute(psprintf("REFRESH MATERIALIZED VIEW %s", name),
+					false, 0) != SPI_OK_UTILITY)
+		elog(ERROR, "could not refresh materialized view %s", name);
 }
 
 /*
@@ -2670,18 +2689,20 @@ merge_matviews(MergeRows *mr)
 	/*
 	 * (as the session would, its owner's query reading the merged rows)
 	 * Each after the views it reads.  One calling a function that records
-	 * nothing of what it reads may read any of them: then the whole order
-	 * is refreshed as many times as there are views, each pass leaving one
-	 * more of any chain of them right.
+	 * nothing of what it reads (opaque) may read any of them: so after a
+	 * pass over all of them, the opaque ones and those reading them are
+	 * refreshed again, once per opaque one, each pass leaving one more of
+	 * any chain through them right.
 	 */
 	SPI_connect();
 	{
 		List	   *order = NIL;
-		int			passes = 1;
+		List	   *opaque = NIL;
+		List	   *again = NIL;
 
 		foreach(lc, refresh)
 			if (view_reads_opaquely(lfirst_oid(lc)))
-				passes = list_length(refresh);
+				opaque = lappend_oid(opaque, lfirst_oid(lc));
 		while (refresh != NIL)
 		{
 			Oid			next = InvalidOid;
@@ -2707,15 +2728,25 @@ merge_matviews(MergeRows *mr)
 			order = lappend_oid(order, next);
 			refresh = list_delete_oid(refresh, next);
 		}
-		for (int i = 0; i < passes; i++)
-			foreach(lc, order)
-			{
-				char	   *name = table_name(lfirst_oid(lc));
+		foreach(lc, order)
+		{
+			Oid			v = lfirst_oid(lc);
+			ListCell   *lc2;
 
-				if (SPI_execute(psprintf("REFRESH MATERIALIZED VIEW %s", name),
-								false, 0) != SPI_OK_UTILITY)
-					elog(ERROR, "could not refresh materialized view %s", name);
-			}
+			refresh_matview(v);
+			if (list_member_oid(opaque, v))
+				again = lappend_oid(again, v);
+			else
+				foreach(lc2, opaque)
+					if (view_reads(v, lfirst_oid(lc2)))
+					{
+						again = lappend_oid(again, v);
+						break;
+					}
+		}
+		for (int i = 0; i < list_length(opaque); i++)
+			foreach(lc, again)
+				refresh_matview(lfirst_oid(lc));
 	}
 	SPI_finish();
 }
