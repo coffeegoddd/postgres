@@ -1330,6 +1330,10 @@ log_newpage_buffer(Buffer buffer, bool page_std)
  * AccessExclusiveLock on it, so no other backend can be accessing it at the
  * same time. If that's not the case, you must ensure that this does not
  * cause a deadlock through some other means.
+ *
+ * Logging a page changes none of its rows, so the pages are locked for a
+ * neutral change: a storage manager need not copy a page it shares, as of
+ * a fold, just to log it.
  */
 void
 log_newpage_range(Relation rel, ForkNumber forknum,
@@ -1367,7 +1371,7 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 			Buffer		buf = ReadBufferExtended(rel, forknum, blkno,
 												 RBM_NORMAL, NULL);
 
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			LockBufferForNeutralChange(buf);
 
 			/*
 			 * Completely empty pages are not WAL-logged. Writing a WAL record
