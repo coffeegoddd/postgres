@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "id": "dolt-reflog-errors",
+  "description": "Reviewed Dolt port: dolt_reflog: error cases",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltReflogTestScripts: dolt_reflog: error cases"
+  },
+  "requires": [
+    "sql",
+    "vc.reflog"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.reflog"
+      ],
+      "sql": "SELECT * FROM dolt_reflog('foo', 'bar')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.reflog"
+      ],
+      "sql": "SELECT * FROM dolt_reflog(NULL)",
+      "expect": {
+        "sqlstate": "22004"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.reflog"
+      ],
+      "sql": "SELECT * FROM dolt_reflog(-100)",
+      "expect": {
+        "sqlstate": "42883"
+      }
+    }
+  ]
+}

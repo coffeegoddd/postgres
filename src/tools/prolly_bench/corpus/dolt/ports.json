@@ -22189,6 +22189,169 @@
         "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t). (D3)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
       ]
+    },
+    {
+      "id": "dolt-reflog-errors",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 0,
+      "name": "dolt_reflog: error cases",
+      "source_sha256": "1a44dcc1600e5b10f2db9e2a07f57c4042efbade873307dda18527cf3e736291",
+      "scenario_sha256": "c5041c644dd526e87f818716bcc568c87d28008399f57ed2cf9a19847196fb3c",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text: more than one ref is an invalid argument. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE: a null argument is refused as a null value not allowed. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE: dolt_reflog takes text, so an integer argument names no function. (D4)"
+        }
+      ],
+      "adaptations": [
+        "Dolt's argument errors are SQLSTATEs: 22023 (too many refs), 22004 (a null argument), 42883 (an argument not text: no such function). (D4)"
+      ]
+    },
+    {
+      "id": "dolt-reflog-gc-empty",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 3,
+      "name": "dolt_reflog: garbage collection with no newgen data",
+      "source_sha256": "4973024f3a32a5f72c98d7b49bac02648143e45faddbfbaa2a65a6ce0f8daaca",
+      "scenario_sha256": "e9d9fe9e77cf337977743e47d8dabaa8b4d887955f5749cde95fc0c9790404ca",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; doltCommit is the commit the case makes first, as a prolly database starts with none (Dolt's has 'Initialize data repository'). (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "A new session, as Dolt's NewSession: the collection forgot every root move before it."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "Dolt's doltCommit placeholder is the commit captured as it is made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-reflog-gc-newgen",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 4,
+      "name": "dolt_reflog: garbage collection with newgen data",
+      "source_sha256": "141919be2c921a9d79c4e3b62ef5b8e70cceb49ff7dec5468f6c3fb7e072d21c",
+      "scenario_sha256": "6d0f314db243b597feb80254d0a6c67330b4150284e4e7b2f4498073202b1151",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "dolt_tag is a feature prolly lacks (F tags): not ported, so the case is partial. No assertion reads the tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the commit captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "A new session, as Dolt's NewSession: the collection forgot every root move before it."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "The tag the setup makes isn't: prolly has no tags (F tags), and nothing reads it.",
+        "Dolt's doltCommit placeholders are the commits captured as they are made. (D7)"
+      ]
     }
   ],
   "deferred": [

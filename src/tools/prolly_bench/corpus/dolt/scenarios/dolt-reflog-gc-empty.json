@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "id": "dolt-reflog-gc-empty",
+  "description": "Reviewed Dolt port: dolt_reflog: garbage collection with no newgen data",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltReflogTestScripts: dolt_reflog: garbage collection with no newgen data"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.gc",
+    "vc.reflog"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.reflog"
+      ],
+      "sql": "SELECT ref, commit_hash, commit_message FROM dolt_reflog('main')",
+      "expect": {
+        "rows": [
+          [
+            "refs/heads/main",
+            {
+              "ref": "init"
+            },
+            "Initialize data repository"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.gc"
+      ],
+      "sql": "SELECT dolt_gc()",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.reflog"
+      ],
+      "sql": "SELECT ref, commit_hash, commit_message FROM dolt_reflog('main')",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    }
+  ]
+}
