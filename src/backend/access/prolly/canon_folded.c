@@ -539,7 +539,13 @@ empty_root(Canon *cn, ProllyNodeRef *root)
  * column dropped and one of the same name and type added describe the
  * table alike, but its rows read as NULL.  And the definitions of the
  * columns' types (prolly_datum_definition()): an enum's label renamed, a
- * composite's attribute dropped, encode the same rows otherwise.
+ * composite's attribute dropped, encode the same rows otherwise.  And
+ * the key encoder, value encoder and keying, by implementation and format
+ * version: one whose format changed encodes the same rows otherwise too.
+ *
+ * (An enum's label added changes its definition but no existing row's
+ * bytes; telling it from a rename would take the old labels, so the next
+ * fold reads each table using it in full, once.)
  */
 static void
 baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
@@ -547,10 +553,24 @@ baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	StringInfoData match;
+	ProllyComponents c;
+	const ProllyImplInfo *encoders[3];
 
 	initStringInfo(&match);
 	appendBinaryStringInfo(&match, description->data, description->len);
 	appendStringInfoChar(&match, '\0');
+	prolly_components_for_relation(rel, &c);
+	encoders[0] = &c.key_encoder->info;
+	encoders[1] = &c.value_encoder->info;
+	encoders[2] = &c.keying->info;
+	for (int i = 0; i < lengthof(encoders); i++)
+	{
+		appendBinaryStringInfo(&match, (const char *) &encoders[i]->impl_id,
+							   sizeof(encoders[i]->impl_id));
+		appendBinaryStringInfo(&match,
+							   (const char *) &encoders[i]->format_version,
+							   sizeof(encoders[i]->format_version));
+	}
 	for (int i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
