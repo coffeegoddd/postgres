@@ -1174,7 +1174,8 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
  *
  * Note that the SQL-function versions of this omit any info about the
  * index tablespace; this is intentional because pg_dump wants it that way.
- * However pg_get_indexdef_string() includes the index tablespace.
+ * However pg_get_indexdef_string() includes the index tablespace, and
+ * pg_get_indexdef_string_notblspc() is the same internal version without it.
  * ----------
  */
 Datum
@@ -1230,6 +1231,20 @@ pg_get_indexdef_string(Oid indexrelid)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  false, false,
 								  true, true,
+								  0, false);
+}
+
+/*
+ * As pg_get_indexdef_string(), but without the tablespace clause: for a
+ * definition that doesn't depend on the cluster it's read in (a prolly
+ * commit's canonical form, where a table's tablespace isn't either).
+ */
+char *
+pg_get_indexdef_string_notblspc(Oid indexrelid)
+{
+	return pg_get_indexdef_worker(indexrelid, 0, NULL,
+								  false, false,
+								  false, true,
 								  0, false);
 }
 

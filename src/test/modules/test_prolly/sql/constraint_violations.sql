@@ -76,6 +76,11 @@ SELECT length(dolt_commit('-am', 'feature recodes 1')::text) AS committed;
 SELECT dolt_checkout('main');
 INSERT INTO cv.child VALUES (7, 1, 'z');
 SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
+SELECT dolt_branch('no_child');
+SELECT dolt_checkout('no_child');
+DROP TABLE cv.child;
+SELECT length(dolt_commit('-am', 'no_child drops cv.child')::text) AS committed;
+SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
@@ -85,7 +90,12 @@ DROP TABLE cv.child;
 SELECT * FROM dolt_constraint_violations();
 ROLLBACK TO s;
 SELECT count(*) AS still_listed FROM dolt_constraint_violations();
-ROLLBACK;
+-- (and a checkout to a branch without the table doesn't let them through)
+SELECT dolt_checkout('no_child');
+COMMIT;
+SELECT dolt_checkout('main');
+SELECT count(*) AS none_kept FROM dolt_constraint_violations();
+SELECT dolt_branch('-D', 'no_child');
 
 -- Violations kept stay through later merges that find none of their own.
 SET dolt.allow_commit_conflicts = on;
@@ -160,6 +170,101 @@ SELECT count(*) AS hidden FROM cv.parent;
 SELECT dolt_verify_constraints('cv.child');
 SELECT count(*) AS none FROM dolt_constraint_violations();
 RESET ROLE;
+
+-- A keyed row whose new version breaks a unique index stays as the branch
+-- has it, whether the merge applies theirs' changes alone (u: ours changed
+-- its definition only) or merges both sides' (w); and so does one whose
+-- new version would take the value a row kept so still holds (w's 1).
+-- A row whose put-back was refused keeps the branch's version while the
+-- others are written, then takes its new one if it fits: r's 2 and s's 2
+-- (s: theirs' changes alone, as u) do once 1 is refused, so only 1's
+-- violation is recorded.  Such a row is written first the next time, so a
+-- row refused only for the values it holds isn't (a's 1, c's 1), and two
+-- rows swapping a value can still both be written (b's 1 and 3).  A row
+-- whose put-back is refused again is left in place, then updated (p: no
+-- row of theirs fits, as each takes a value the other keeps).  A known
+-- limit (x): rows refused are tried again one at a time, so two that
+-- swap a value (3 and 4 take each other's b) stay refused, though they
+-- would fit together: no row of theirs is written, and four violations
+-- are recorded where two would do.  Each is a real one, and the table
+-- holds no row breaking a constraint.
+CREATE SCHEMA uv VERSIONED;
+CREATE TABLE uv.u (pk int PRIMARY KEY, x int);
+INSERT INTO uv.u VALUES (1, 1), (2, 2);
+CREATE TABLE uv.w (pk int PRIMARY KEY, x int UNIQUE);
+INSERT INTO uv.w VALUES (1, 1), (2, 2);
+CREATE TABLE uv.r (pk int PRIMARY KEY, b int UNIQUE, c int);
+INSERT INTO uv.r VALUES (1, 100, 0), (2, 200, 0);
+CREATE TABLE uv.s (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.s VALUES (1, 100, 0), (2, 999, 0);
+CREATE TABLE uv.a (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO uv.a VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+CREATE TABLE uv.b (pk int PRIMARY KEY, b int UNIQUE, c int UNIQUE);
+INSERT INTO uv.b VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+CREATE TABLE uv.c (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.c VALUES (1, 10, 100), (2, 20, 200), (3, 99, 300);
+CREATE TABLE uv.p (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.p VALUES (1, 4, 1), (2, 3, 2), (3, 2, 4);
+CREATE TABLE uv.x (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.x VALUES (1, 2, 3), (2, 4, 0), (3, 3, 1), (4, 0, 2);
+SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
+SELECT dolt_branch('uv_theirs');
+CREATE UNIQUE INDEX u_x ON uv.u (x);
+INSERT INTO uv.w VALUES (3, 5);
+UPDATE uv.r SET b = 999 WHERE pk = 2;
+CREATE UNIQUE INDEX s_b ON uv.s (b);
+UPDATE uv.a SET b = 99 WHERE pk = 3;
+UPDATE uv.b SET c = 999 WHERE pk = 3;
+CREATE UNIQUE INDEX c_b ON uv.c (b);
+CREATE UNIQUE INDEX c_c ON uv.c (c);
+CREATE UNIQUE INDEX p_b ON uv.p (b);
+CREATE UNIQUE INDEX p_c ON uv.p (c);
+CREATE UNIQUE INDEX x_b ON uv.x (b);
+CREATE UNIQUE INDEX x_c ON uv.x (c);
+SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
+SELECT dolt_checkout('uv_theirs');
+UPDATE uv.u SET x = 1 WHERE pk = 2;
+UPDATE uv.w SET x = 5 WHERE pk = 2;
+UPDATE uv.w SET x = 2 WHERE pk = 1;
+UPDATE uv.r SET b = 999 WHERE pk = 1;
+UPDATE uv.r SET c = 1 WHERE pk = 2;
+UPDATE uv.s SET b = 999 WHERE pk = 1;
+UPDATE uv.s SET c = 1 WHERE pk = 2;
+UPDATE uv.a SET b = 99 WHERE pk = 2;
+UPDATE uv.a SET c = 301 WHERE pk = 3;
+UPDATE uv.a SET c = 300 WHERE pk = 1;
+UPDATE uv.b SET c = 999 WHERE pk = 2;
+UPDATE uv.b SET b = 0 WHERE pk = 1;
+UPDATE uv.b SET b = 10 WHERE pk = 3;
+UPDATE uv.b SET b = 30 WHERE pk = 1;
+UPDATE uv.c SET b = 99 WHERE pk = 2;
+UPDATE uv.c SET c = 301 WHERE pk = 3;
+UPDATE uv.c SET c = 300 WHERE pk = 1;
+UPDATE uv.p SET c = 2 WHERE pk = 1;
+UPDATE uv.p SET b = 4 WHERE pk = 2;
+UPDATE uv.x SET b = (ARRAY[4, 3, 0, 3])[pk];
+SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uv_theirs'))[3:4];
+SELECT * FROM uv.u ORDER BY pk;
+SELECT * FROM uv.w ORDER BY pk;
+SELECT * FROM uv.r ORDER BY pk;
+SELECT * FROM uv.s ORDER BY pk;
+SELECT * FROM uv.a ORDER BY pk;
+SELECT * FROM uv.b ORDER BY pk;
+SELECT * FROM uv.c ORDER BY pk;
+SELECT * FROM uv.p ORDER BY pk;
+SELECT * FROM uv.x ORDER BY pk;
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row::text
+FROM unnest(ARRAY['uv.u', 'uv.w', 'uv.r', 'uv.s', 'uv.a', 'uv.b', 'uv.c',
+				  'uv.p', 'uv.x']) t,
+	LATERAL dolt_constraint_violations(t)
+ORDER BY 1, 3;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uv_theirs');
+DROP SCHEMA uv CASCADE;
+SELECT length(dolt_commit('-Am', 'uv dropped')::text) AS committed;
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
