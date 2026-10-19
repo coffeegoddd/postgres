@@ -40,7 +40,10 @@ my $want = sql($sum);
 my $rel = sql(q{SELECT pg_relation_filenode('cow.t')});
 
 # A prune stopped by a crash after its list let go of the old pages,
-# before it freed them: the sweep frees them.
+# before it freed them: the sweep frees them.  The crash keeps only the
+# WAL written out before it, and the prune doesn't write its records out
+# (the WAL writer, the background writer or a backend evicting the list's
+# page might, or not yet): they are flushed before the crash.
 my ($lineage, $e1) = split /\|/, sql(qq{SELECT lineage, epoch FROM test_bmap_fold_begin($rel)});
 sql(q{UPDATE cow.t SET b = b + 1 WHERE a % 100 = 0});
 my $e2 = sql(qq{SELECT epoch FROM test_bmap_fold_begin($rel)});
@@ -57,6 +60,10 @@ $p->query_until(qr/started/, qq{
 });
 $node->poll_query_until('sw', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'bmap-pruned'}) or die 'the prune did not stop';
+my $pruned = sql('SELECT pg_current_wal_insert_lsn()');
+sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
+is(sql(qq{SELECT pg_current_wal_flush_lsn() >= '$pruned'}), 't',
+	'the prune\'s records are flushed');
 $node->stop('immediate');
 eval { $p->quit; };
 $node->start;
