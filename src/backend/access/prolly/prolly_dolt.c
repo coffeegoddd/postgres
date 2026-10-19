@@ -148,6 +148,40 @@ check_commit_message(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * An author has a name, and an email when it has <...>, as Dolt's commits
+ * need both (one without <...> is a name alone, as the session user is).
+ * Its parts are as split_author finds them.
+ */
+static bool
+author_ok(const char *author)
+{
+	const char *lt = strrchr(author, '<');
+	const char *gt = lt ? strchr(lt, '>') : NULL;
+
+	if (lt && gt)
+	{
+		const char *end = lt;
+
+		while (end > author && end[-1] == ' ')
+			end--;
+		return end > author && gt > lt + 1;
+	}
+	return author[0] != '\0';
+}
+
+/* (empty, dolt.author is the session user's name) */
+static bool
+check_author(char **newval, void **extra, GucSource source)
+{
+	if (**newval != '\0' && !author_ok(*newval))
+	{
+		GUC_check_errdetail("An author is \"Name <email>\", or a name alone.");
+		return false;
+	}
+	return true;
+}
+
 /* dolt_commit's --author, while its commit runs. */
 static const char *author_override = NULL;
 
@@ -171,7 +205,7 @@ prolly_session_init(const char *branch)
 								   "",
 								   PGC_USERSET,
 								   0,
-								   NULL, NULL, NULL);
+								   check_author, NULL, NULL);
 		prolly_autovacuum_init();
 		DefineCustomBoolVariable("dolt.transaction_commit",
 								 "Makes a Dolt commit of every transaction that changes a branch, as it commits.",
@@ -719,6 +753,28 @@ split_author(const char *author, char **name, char **email)
 	}
 }
 
+/* An --author given to fn, refused unless it is an author. */
+static void
+given_author(const char *fn, const char *author)
+{
+	if (author != NULL && !author_ok(author))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s: \"%s\" is not an author", fn, author),
+				 errhint("An author is \"Name <email>\", or a name alone.")));
+}
+
+/* A -m given to fn, refused when empty: a commit needs a message. */
+static void
+given_message(const char *fn, const char *message)
+{
+	if (message != NULL && message[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s needs a message", fn),
+				 errdetail("A commit's message can't be empty.")));
+}
+
 /* NULL for one dropped (as a table whose violations are kept may be) */
 static char *
 qualified_name(Oid relid)
@@ -740,12 +796,13 @@ qualified_name(Oid relid)
 /*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
- * -m/--message message (required), --author "Name <email>", -a/-A/--all
- * (every change is always committed), --allow-empty (else a commit whose
- * root equals its parent's is refused), --skip-empty (nothing to commit:
- * no commit, and NULL), -f/--force (constraint violations don't stop the
- * commit, as in Dolt; the transaction still can't commit with them unless
- * dolt.allow_commit_conflicts is on).
+ * -m/--message message (required, not empty), --author "Name <email>" (or
+ * a name alone), -a/-A/--all (every change is always committed),
+ * --allow-empty (else a commit whose root equals its parent's is refused),
+ * --skip-empty (nothing to commit: no commit, and NULL), -f/--force
+ * (constraint violations don't stop the commit, as in Dolt; the
+ * transaction still can't commit with them unless dolt.allow_commit_conflicts
+ * is on).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -806,6 +863,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit needs a message"),
 				 errhint("Pass -m and a message.")));
+	given_message("dolt_commit", message);
+	given_author("dolt_commit", author);
 	if (allow_empty && skip_empty)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -936,7 +995,11 @@ force_branch(const char *name, const char *from)
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
 
-	/* (another branch's rows written, as a create makes its copies) */
+	/*
+	 * (made, as a create is, though the transaction is read-only for the
+	 * branch it started on: the checks too, and another branch's rows
+	 * written, as a create makes its copies)
+	 */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
@@ -1308,6 +1371,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (a rename, delete, take or protection makes no branch: not in a
+	 * transaction read-only for the branch it started on either, unlike a
+	 * create, forced or not, which a session on a commit makes to change
+	 * anything)
+	 */
+	if (move || delete || take || protection != PROLLY_PROTECT_DEFAULT)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (protection != PROLLY_PROTECT_DEFAULT)
 	{
 		ListCell   *lc;
@@ -1618,6 +1690,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_merge", a);
 	}
+	/* (an abort makes no commit: its -m is ignored, as Dolt's is) */
 	if (abort_merge)
 	{
 		ProllyMergeState ms;
@@ -1635,6 +1708,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		result[3] = "merge aborted";
 		PG_RETURN_DATUM(text_array(4, result));
 	}
+	given_message("dolt_merge", message);
 	if (branch == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -2107,6 +2181,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_integrate needs a message"),
 				 errhint("Pass -m and a message.")));
+	given_message("dolt_integrate", message);
 	mine = pstrdup(branch_ops()->current());
 	if (target == NULL)
 	{
@@ -2279,8 +2354,8 @@ tables_left(int *conflicted, int *violated)
  * [--allow-empty] commit: its changes, committed again on the current
  * branch, with its author.  Rows changed differently on both sides leave
  * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
- * (or [--allow-empty] --continue, with the picked commit's message) makes
- * its commit, with one parent; --abort ends it.  The counts are of tables,
+ * (or [--allow-empty] --continue, with the picked commit's message and
+ * author) makes its commit, with one parent; --abort ends it.  The counts are of tables,
  * as Dolt's.
  */
 Datum
@@ -2325,6 +2400,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	if (abort_pick || continue_pick)
 	{
 		ProllyMergeState ms;
+		ProllyCommitInfo picked;
 
 		if (ref != NULL)
 			unexpected("dolt_cherry_pick", ref);
@@ -2339,10 +2415,29 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 			result[0] = "";
 			PG_RETURN_DATUM(text_array(4, result));
 		}
-		/* a pick resolved to nothing: as a pick of nothing is */
+		/*
+		 * By the picked commit's author, as a pick that doesn't stop is
+		 * (Dolt's ContinueCherryPick): the merge's theirs is that commit.
+		 * A pick resolved to nothing: as a pick of nothing is.
+		 */
+		if (!PROLLY_CALL(refs(), commit_get, &ms.theirs, &picked))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the cherry-pick's commit %s is missing",
+							hash_hex(&ms.theirs))));
 		note_integration();
-		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, ms.message,
-													 allow_empty, &id));
+		author_override = picked.author;
+		PG_TRY();
+		{
+			BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit,
+														 ms.message,
+														 allow_empty, &id));
+		}
+		PG_FINALLY();
+		{
+			author_override = NULL;
+		}
+		PG_END_TRY();
 		if (!committed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2453,6 +2548,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_revert", args[i]);
 	}
+	/* (an abort makes no commit: its --author is ignored) */
+	if (!abort_revert)
+		given_author("dolt_revert", author);
 	if (abort_revert && continue_revert)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3247,13 +3345,20 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 Datum
 dolt_diff(PG_FUNCTION_ARGS)
 {
-	char	   *from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *from_ref;
+	char	   *to_ref;
 	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 2);
 	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
 	Relation	rel;
 	RowDiffSink s;
 
+	/* (not strict, for tbl's NULL::t: its refs checked here) */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff's refs can't be null")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	InitMaterializedSRF(fcinfo, 0);
 	rel = open_row_type_table(relid, "dolt_diff", ACL_SELECT);
 	memset(&s, 0, sizeof(s));
@@ -4215,8 +4320,12 @@ dolt_pull(PG_FUNCTION_ARGS)
 			merge_args = lappend(merge_args, a);
 		else if (is_option(a, "m") || is_option(a, "message"))
 		{
+			char	   *message = option_value(args, nargs, &i, "dolt_pull");
+
+			/* (before the fetch, as dolt_merge would refuse it after) */
+			given_message("dolt_pull", message);
 			merge_args = lappend(merge_args, a);
-			merge_args = lappend(merge_args, option_value(args, nargs, &i, "dolt_pull"));
+			merge_args = lappend(merge_args, message);
 		}
 		else if (a[0] == '-')
 			unsupported("dolt_pull", a);

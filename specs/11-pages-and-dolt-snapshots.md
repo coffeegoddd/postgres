@@ -1047,6 +1047,15 @@ opportunistic pruning skips shared pages.
 ### Known limits after step 1
 
 - `pg_rewind` and `pg_upgrade` don't understand block-mapped storage yet.
+- Incremental backups send the page store in full (#334), so on a
+  block-mapped cluster an incremental backup is about as large as a full
+  one: WAL names a relation's logical blocks, never the page store's
+  physical ones, so WAL summaries have no entry for it, and an incremental
+  copy would send none of its changes. Its allocator, reference counts
+  and the map and changes forks are summarized and sent incrementally.
+  `pg_combinebackup` refuses a page store sent incrementally. Summarizing
+  the physical blocks (from the maps, at backup time) would make the
+  store incremental too.
 - Freed blocks are reused, but the page store never shrinks.
 - Online checksum enabling skips map forks, which `smgrexists` hides.
 - Each I/O looks up the map (a copied map page or two); a buffer header
@@ -1485,7 +1494,13 @@ step 7's GC to remove; none are read.
   'origin/x')` makes one at its head (head-only, as any new branch).
 - **Upstreams**: a branch may name one (`dolt_push('--set-upstream', …)`,
   `dolt_branch('--set-upstream-to', …)`), for `dolt_pull()` and
-  `dolt_push()` without arguments.
+  `dolt_push()` without arguments, and for `dolt_branch('-d', …)`, which
+  refuses a branch not merged into its upstream's remote-tracking branch
+  (as of the last fetch), or into the session's branch when there is none
+  there, as Dolt's `validateBranchMerged` (and git) does; the session's
+  own branch and `main` are refused first, as in Dolt.  A deleted
+  branch's upstream stays, as Dolt keeps its branch config: a branch made
+  again of its name has it.
 
 ### 7.3 Fetch, pull, push
 
