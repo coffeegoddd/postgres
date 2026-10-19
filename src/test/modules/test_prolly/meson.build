@@ -177,6 +177,7 @@ tests += {
       't/107_commit_dates.pl',
       't/109_bmap_incremental_backup.pl',
       't/110_bmap_recovery_past_length.pl',
+      't/111_bmap_prefetch_new_page.pl',
       't/112_bmap_remap_zero_replay.pl',
     ],
   },
