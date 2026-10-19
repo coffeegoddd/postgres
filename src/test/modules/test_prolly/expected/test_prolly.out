@@ -15,9 +15,9 @@ FROM prolly_implementations();
  content_hash  | stub         |       0 |              0
  content_hash  | test_fnv     |    9001 |              0
  content_hash  | test_broken  |    9002 |              0
- key_encoder   | ordered      |       1 |              2
+ key_encoder   | ordered      |       1 |              3
  key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              3
+ value_encoder | canonical    |       2 |              4
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
@@ -39,7 +39,7 @@ FROM prolly_implementations();
  row_applier   | stub         |       0 |              0
  table_file    | basic        |       1 |              1
  table_file    | stub         |       0 |              0
- change_finder | pages        |       1 |              7
+ change_finder | pages        |       1 |              8
  change_finder | stub         |       0 |              0
  remote        | file         |       1 |              1
  remote        | postgresql   |       2 |              1
