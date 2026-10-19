@@ -273,12 +273,19 @@ ROLLBACK;
 -- theirs' change to another column written, the row updated in place or
 -- (a second unique index) removed and inserted again.  A value theirs
 -- changes is checked (in dv.n: in dv.nu, its refusal would remove the row,
--- with no put-back of the branch's version on that path yet).
+-- with no put-back of the branch's version on that path yet).  In a keyless
+-- table, a changed row is removed and another inserted: a value a row
+-- removed held isn't checked, theirs' rows written as ours' are kept
+-- (dv.k) or ours changed rows too (dv.k2).
 CREATE DOMAIN dv.nv AS int;
 CREATE TABLE dv.n (pk int PRIMARY KEY, v dv.nv, w int);
 CREATE TABLE dv.nu (pk int PRIMARY KEY, v dv.nv, w int, u int UNIQUE);
 INSERT INTO dv.n VALUES (1, -1, 10), (2, -2, 20);
 INSERT INTO dv.nu VALUES (1, -1, 10, 1), (2, -2, 20, 2);
+CREATE TABLE dv.k (v dv.nv, w int);
+CREATE TABLE dv.k2 (v dv.nv, w int);
+INSERT INTO dv.k VALUES (-1, 10), (5, 50);
+INSERT INTO dv.k2 VALUES (-1, 10), (5, 50);
 SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
  committed 
 -----------
@@ -292,6 +299,7 @@ SELECT dolt_branch('other4');
 (1 row)
 
 ALTER DOMAIN dv.nv ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
+INSERT INTO dv.k2 VALUES (7, 70);
 SELECT length(dolt_commit('-am', 'ours: nv constrained, not valid')::text) AS committed;
  committed 
 -----------
@@ -306,6 +314,8 @@ SELECT dolt_checkout('other4');
 
 UPDATE dv.n SET w = 11 WHERE pk = 1;
 UPDATE dv.nu SET w = 11 WHERE pk = 1;
+UPDATE dv.k SET w = 11 WHERE v = -1;
+UPDATE dv.k2 SET w = 11 WHERE v = -1;
 UPDATE dv.n SET v = -3 WHERE pk = 2;		-- a change breaking it
 SELECT length(dolt_commit('-am', 'theirs: w, v')::text) AS committed;
  committed 
@@ -350,6 +360,33 @@ SELECT * FROM dv.nu ORDER BY pk;
   1 | -1 | 11 | 1
   2 | -2 | 20 | 2
 (2 rows)
+
+SELECT count(*) AS none FROM dolt_constraint_violations('dv.k');
+ none 
+------
+    0
+(1 row)
+
+SELECT count(*) AS none FROM dolt_constraint_violations('dv.k2');
+ none 
+------
+    0
+(1 row)
+
+SELECT * FROM dv.k ORDER BY v, w;
+ v  | w  
+----+----
+ -1 | 11
+  5 | 50
+(2 rows)
+
+SELECT * FROM dv.k2 ORDER BY v, w;
+ v  | w  
+----+----
+ -1 | 11
+  5 | 50
+  7 | 70
+(3 rows)
 
 ROLLBACK;
 -- A domain over another, each with a constraint of the same name: the one
@@ -522,7 +559,7 @@ SELECT dolt_branch('-D', 'fine');
 (1 row)
 
 DROP SCHEMA dv CASCADE;
-NOTICE:  drop cascades to 15 other objects
+NOTICE:  drop cascades to 17 other objects
 DETAIL:  drop cascades to type dv.posint
 drop cascades to type dv.small
 drop cascades to type dv.label
@@ -535,6 +572,8 @@ drop cascades to table dv.u
 drop cascades to type dv.nv
 drop cascades to table dv.n
 drop cascades to table dv.nu
+drop cascades to table dv.k
+drop cascades to table dv.k2
 drop cascades to type dv.lower
 drop cascades to type dv.upper
 drop cascades to table dv.s

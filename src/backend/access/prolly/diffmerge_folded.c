@@ -736,6 +736,9 @@ static Oid	breakable_relid = InvalidOid;
 static bool breakable;
 static Bitmapset *breakable_domains = NULL; /* attnums */
 static struct DomainPlan **domain_plans = NULL; /* by attnum - 1 */
+static struct Removed *removed = NULL;	/* removed_begin() */
+
+static bool checks_domains(Relation rel);
 
 static void
 note_written(Oid relid)
@@ -765,6 +768,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	breakable_relid = InvalidOid;
 	breakable_domains = NULL;
 	domain_plans = NULL;
+	removed = NULL;
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -1099,6 +1103,145 @@ domain_refusal(DomainPlan *p, Datum value, bool isnull)
 }
 
 /*
+ * A keyless table's rows a merge removes, while it writes the table's rows
+ * (removed_begin() to removed_end()): their values of its domain-checked
+ * columns, as images (datumIsEqual()), each column's in a set.  A keyless
+ * row that changed is removed and another inserted, with no tie between
+ * them, so a value inserted that a row removed held counts as unchanged
+ * (row_domain_refusal()), whichever row held it.
+ */
+typedef struct Removed
+{
+	MemoryContext cxt;
+	HTAB	   *values;			/* RemovedValue, by RemovedKey */
+	Bitmapset  *nulls;			/* attnums of a null removed */
+} Removed;
+
+typedef struct RemovedKey
+{
+	int			attnum;
+	uint32		hash;			/* of the value's image */
+} RemovedKey;
+
+typedef struct RemovedValue
+{
+	RemovedKey	key;
+	List	   *images;			/* Datum *, those with that hash */
+} RemovedValue;
+
+/* The hash of value's image, of column att. */
+static uint32
+image_hash(Form_pg_attribute att, Datum value)
+{
+	if (att->attbyval)
+		return DatumGetUInt32(hash_any((const unsigned char *) &value,
+									   sizeof(Datum)));
+	return DatumGetUInt32(hash_any((const unsigned char *) DatumGetPointer(value),
+								   datumGetSize(value, false, att->attlen)));
+}
+
+/* Start noting the rows a merge removes from rel, if keyless and checked. */
+static void
+removed_begin(Relation rel, bool keyless)
+{
+	HASHCTL		ctl;
+
+	removed = NULL;
+	if (!keyless || !checks_domains(rel))
+		return;
+	removed = palloc0(sizeof(Removed));
+	removed->cxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "merge removed values",
+										 ALLOCSET_DEFAULT_SIZES);
+	ctl.keysize = sizeof(RemovedKey);
+	ctl.entrysize = sizeof(RemovedValue);
+	ctl.hcxt = removed->cxt;
+	removed->values = hash_create("merge removed values", 64, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/* Note row, removed from rel, while removed_begin() has started. */
+static void
+removed_note(Relation rel, TupleTableSlot *row)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	MemoryContext old;
+	int			attnum = -1;
+
+	if (removed == NULL)
+		return;
+	slot_getallattrs(row);
+	old = MemoryContextSwitchTo(removed->cxt);
+	while ((attnum = bms_next_member(breakable_domains, attnum)) >= 0)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+		Datum		value = row->tts_values[attnum - 1];
+		RemovedKey	key;
+		RemovedValue *rv;
+		bool		found;
+		Datum	   *image;
+
+		if (row->tts_isnull[attnum - 1])
+		{
+			removed->nulls = bms_add_member(removed->nulls, attnum);
+			continue;
+		}
+		memset(&key, 0, sizeof(key));
+		key.attnum = attnum;
+		key.hash = image_hash(att, value);
+		rv = hash_search(removed->values, &key, HASH_ENTER, &found);
+		if (!found)
+			rv->images = NIL;
+		else
+		{
+			bool		dup = false;
+
+			foreach_ptr(Datum, d, rv->images)
+				if ((dup = datumIsEqual(*d, value, att->attbyval, att->attlen)))
+					break;
+			if (dup)
+				continue;
+		}
+		image = palloc(sizeof(Datum));
+		*image = datumCopy(value, att->attbyval, att->attlen);
+		rv->images = lappend(rv->images, image);
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/* Did a row removed (removed_note()) hold value in column att? */
+static bool
+removed_held(Form_pg_attribute att, Datum value, bool isnull)
+{
+	RemovedKey	key;
+	RemovedValue *rv;
+
+	if (isnull)
+		return bms_is_member(att->attnum, removed->nulls);
+	memset(&key, 0, sizeof(key));
+	key.attnum = att->attnum;
+	key.hash = image_hash(att, value);
+	rv = hash_search(removed->values, &key, HASH_FIND, NULL);
+	if (rv == NULL)
+		return false;
+	foreach_ptr(Datum, d, rv->images)
+		if (datumIsEqual(*d, value, att->attbyval, att->attlen))
+			return true;
+	return false;
+}
+
+/* Stop noting the rows removed (removed_begin()). */
+static void
+removed_end(void)
+{
+	if (removed == NULL)
+		return;
+	MemoryContextDelete(removed->cxt);
+	pfree(removed);
+	removed = NULL;
+}
+
+/*
  * Check row, to be written to rel, against the constraints of its
  * columns' domains (domain_refusal()): the replication applier the merge
  * writes with doesn't.  Only the values that differ from was, the
@@ -1106,7 +1249,8 @@ domain_refusal(DomainPlan *p, Datum value, bool isnull)
  * isn't checked again by an update leaving it (a NOT VALID constraint may
  * not hold for it).  So neither is a value keep marks, the row's stored
  * one, unread; nor one of was's unread ones that the row's has too
- * (was_unread marks them, NULL: none).  For a value breaking one: the
+ * (was_unread marks them, NULL: none); nor, in a keyless table, a value a
+ * row the merge removed held (removed_held()).  For a value breaking one: the
  * error (domain_refusal()'s), naming its column; NULL
  * if none.
  */
@@ -1133,6 +1277,8 @@ row_domain_refusal(Relation rel, TupleTableSlot *row, const bool *keep,
 			(row->tts_isnull[i] ||
 			 datumIsEqual(was->tts_values[i], row->tts_values[i],
 						  att->attbyval, att->attlen)))
+			continue;
+		if (removed && removed_held(att, row->tts_values[i], row->tts_isnull[i]))
 			continue;
 		ed = domain_refusal(domain_plans[i], row->tts_values[i],
 							row->tts_isnull[i]);
@@ -1472,6 +1618,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	{
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
+		removed_note(ap->rel, ap->slot);
 		for (uint64 i = 0; i < nb; i++)
 			if (!PROLLY_CALL(ap->ar, remove, ap->a, ap->slot))
 				ereport(ERROR,
@@ -1537,11 +1684,13 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.unread = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
+	removed_begin(ap.rel, ap.keyless);
 	for (int pass = 0; pass < 2; pass++)
 	{
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
+	removed_end();
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
 	ExecDropSingleTupleTableSlot(ap.old);
@@ -2141,6 +2290,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	 * The rows written: those going first, then those coming, so a row may
 	 * take a unique value another gives up (theirs swapping two, say).
 	 */
+	removed_begin(rel, keyless);
 	foreach(lt, writes)
 	{
 		KeyWrite   *w = lfirst(lt);
@@ -2148,6 +2298,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		if (w->nold == 0 || w->in_place)
 			continue;
 		(void) decode(&tc, w->old, s1);
+		removed_note(rel, s1);
 		for (int64 i = 0; i < w->nold; i++)
 			if (!PROLLY_CALL(ar, remove, a, s1))
 				goto missing;
@@ -2201,6 +2352,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			(void) merge_write(ar, a, rel, NULL, s1, NULL, s1, NULL);
 		}
 	}
+	removed_end();
 	if (a)
 		PROLLY_CALL(ar, end, a);
 	ExecDropSingleTupleTableSlot(s1);

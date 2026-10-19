@@ -102,19 +102,29 @@ ROLLBACK;
 -- theirs' change to another column written, the row updated in place or
 -- (a second unique index) removed and inserted again.  A value theirs
 -- changes is checked (in dv.n: in dv.nu, its refusal would remove the row,
--- with no put-back of the branch's version on that path yet).
+-- with no put-back of the branch's version on that path yet).  In a keyless
+-- table, a changed row is removed and another inserted: a value a row
+-- removed held isn't checked, theirs' rows written as ours' are kept
+-- (dv.k) or ours changed rows too (dv.k2).
 CREATE DOMAIN dv.nv AS int;
 CREATE TABLE dv.n (pk int PRIMARY KEY, v dv.nv, w int);
 CREATE TABLE dv.nu (pk int PRIMARY KEY, v dv.nv, w int, u int UNIQUE);
 INSERT INTO dv.n VALUES (1, -1, 10), (2, -2, 20);
 INSERT INTO dv.nu VALUES (1, -1, 10, 1), (2, -2, 20, 2);
+CREATE TABLE dv.k (v dv.nv, w int);
+CREATE TABLE dv.k2 (v dv.nv, w int);
+INSERT INTO dv.k VALUES (-1, 10), (5, 50);
+INSERT INTO dv.k2 VALUES (-1, 10), (5, 50);
 SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
 SELECT dolt_branch('other4');
 ALTER DOMAIN dv.nv ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
+INSERT INTO dv.k2 VALUES (7, 70);
 SELECT length(dolt_commit('-am', 'ours: nv constrained, not valid')::text) AS committed;
 SELECT dolt_checkout('other4');
 UPDATE dv.n SET w = 11 WHERE pk = 1;
 UPDATE dv.nu SET w = 11 WHERE pk = 1;
+UPDATE dv.k SET w = 11 WHERE v = -1;
+UPDATE dv.k2 SET w = 11 WHERE v = -1;
 UPDATE dv.n SET v = -3 WHERE pk = 2;		-- a change breaking it
 SELECT length(dolt_commit('-am', 'theirs: w, v')::text) AS committed;
 SELECT dolt_checkout('main');
@@ -128,6 +138,10 @@ FROM dolt_constraint_violations('dv.nu')
 ORDER BY pk;
 SELECT * FROM dv.n ORDER BY pk;
 SELECT * FROM dv.nu ORDER BY pk;
+SELECT count(*) AS none FROM dolt_constraint_violations('dv.k');
+SELECT count(*) AS none FROM dolt_constraint_violations('dv.k2');
+SELECT * FROM dv.k ORDER BY v, w;
+SELECT * FROM dv.k2 ORDER BY v, w;
 ROLLBACK;
 
 -- A domain over another, each with a constraint of the same name: the one
