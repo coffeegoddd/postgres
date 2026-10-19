@@ -176,21 +176,60 @@ is_working(const char *ref)
 	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
 }
 
-/* The canonical root of a ref: a commit's, or WORKING folded now. */
+/*
+ * Does ref, which doesn't resolve, name a branch without a commit yet: HEAD
+ * (the session branch), a branch's name, or refs/heads/ and its name, read
+ * as the refs' resolve reads them?  Not with ancestry steps (HEAD~1): there
+ * is no commit to step back from.
+ */
+static bool
+names_unborn_branch(const ProllyDatabaseComponents *dc, const char *ref)
+{
+	ProllyBranchId branch;
+
+	if (ref[strcspn(ref, "~^")] != '\0')
+		return false;
+	if (pg_strcasecmp(ref, "HEAD") == 0 &&
+		!PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref = branch_ops()->current();
+	else if (strncmp(ref, "refs/heads/", 11) == 0 && ref[11] != '\0' &&
+			 !PROLLY_CALL(dc->refs, branch_lookup, ref, &branch))
+		ref += 11;
+	return PROLLY_CALL(dc->refs, branch_lookup, ref, &branch);
+}
+
+/*
+ * The canonical root of a ref: a commit's, or WORKING folded now.  A
+ * branch before its first commit (HEAD, or the branch by name) is the
+ * empty root, as Dolt's initial commit is (and as dolt_log('HEAD') has no
+ * commits).
+ */
 static void
 root_of(const char *ref, ProllyNodeRef *root)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyHash	id;
 	ProllyCommitInfo info;
+	bool		found;
 
 	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
 		return;
 	}
-	if (!PROLLY_CALL(dc.refs, resolve, ref, &id) ||
-		!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+	found = PROLLY_CALL(dc.refs, resolve, ref, &id);
+	if (!found && names_unborn_branch(&dc, ref))
+	{
+		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+		ProllyTreeEnv env;
+
+		chunk_env(&env);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext),
+					root);
+		return;
+	}
+	if (!found || !PROLLY_CALL(dc.refs, commit_get, &id, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
@@ -961,17 +1000,19 @@ plan_domains(Oid typid)
  * check, a not-null column outside the primary key, a unique or exclusion
  * index other than the primary key's, or a domain's constraint on a
  * column's values?  (The merge decides each row by its primary key, so
- * that one holds.)  Asked once a table.
+ * that one holds, if it keys the rows: a deferrable one, or one the keying
+ * can't order, doesn't, and rel's rows are keyless, keyed by content.)
+ * Worked out as a merge begins writing a table's rows, for
+ * may_break_constraints(), with the plans for checking its columns'
+ * domains (DomainPlan).
  */
-static bool
-may_break_constraints(Relation rel)
+static void
+note_constraints(Relation rel, bool keyless)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
 	MemoryContext old;
 
-	if (RelationGetRelid(rel) == breakable_relid)
-		return breakable;
 	breakable_relid = RelationGetRelid(rel);
 	breakable = true;
 	bms_free(breakable_domains);
@@ -988,9 +1029,9 @@ may_break_constraints(Relation rel)
 	}
 	MemoryContextSwitchTo(old);
 	if (breakable_domains != NULL)
-		return true;
+		return;
 	if (desc->constr && desc->constr->num_check > 0)
-		return true;
+		return;
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -998,12 +1039,23 @@ may_break_constraints(Relation rel)
 
 		if (att->attnotnull && !att->attisdropped &&
 			!bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, pk))
-			return true;
+			return;
 	}
 	if (other_unique_index(rel))
-		return true;
+		return;
+	if (keyless && OidIsValid(RelationGetPrimaryKeyIndex(rel, true)))
+		return;
 	breakable = false;
-	return false;
+}
+
+/* note_constraints()'s answer for rel, the table a merge is writing. */
+static bool
+may_break_constraints(Relation rel)
+{
+	if (RelationGetRelid(rel) != breakable_relid)
+		elog(ERROR, "constraints of \"%s\" not noted",
+			 RelationGetRelationName(rel));
+	return breakable;
 }
 
 /*
@@ -1421,9 +1473,13 @@ checks_domains(Relation rel)
  * Insert row into rel, or update old to it, in a subtransaction: a row
  * whose error refusal_type() names is rolled back, and the error returned
  * (NULL: written).  *found (if not NULL) gets whether old was there.
- * Its values are checked against their domains first, but for those of
- * was, the branch's version of the row (row_domain_refusal()): a row put
- * back as the branch has it is was itself.
+ * The applier's deferrable rechecks are made immediate first, so a row
+ * breaking a deferrable unique or exclusion constraint is refused here
+ * too: each row a merge recording violations writes, puts back, or
+ * updates pinned (update_key(), retry_key()) comes through here.  Then
+ * its values are checked against their domains, but for those of was,
+ * the branch's version of the row (row_domain_refusal()): a row put back
+ * as the branch has it is was itself.
  */
 static ErrorData *
 try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
@@ -1437,6 +1493,8 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
 
 	if (found)
 		*found = true;
+
+	PROLLY_CALL(ar, immediate, a);
 
 	/* (a domain's check, its error not raised, has nothing to roll back) */
 	if (row != was && checks_domains(rel) &&
@@ -1481,8 +1539,9 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
  * row the merge made of both sides' columns too, the branch's kept (a
  * table holds no row breaking a constraint, unlike Dolt's), or a column's
  * domain's check or not-null constraint (try_write(), was and was_unread
- * its).  *refused (if not NULL) gets whether it was.  Returns false if old
- * isn't there.
+ * its).  A deferrable constraint is checked as the row is written, as
+ * others are (the applier's immediate(), in try_write()).  *refused (if
+ * not NULL) gets whether it was.  Returns false if old isn't there.
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
@@ -1746,6 +1805,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	ap.in_place = !ap.keyless && updates_in_place(ap.rel);
+	if (recording)
+		note_constraints(ap.rel, ap.keyless);
 	ap.put_back = puts_back(ap.rel, ap.keyless);
 	chunk_env(&env);
 	env.compare = changes_compare;
@@ -2556,6 +2617,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	in_place = !keyless && updates_in_place(rel);
+	if (recording)
+		note_constraints(rel, keyless);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	unread = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
