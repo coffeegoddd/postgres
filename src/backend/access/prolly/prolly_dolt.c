@@ -3347,8 +3347,10 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
  * table holds no row breaking one validated).  Their recorded violations
  * are replaced by what is found now, unless --output-only: rows a merge
  * didn't write for breaking a unique, check or not-null constraint are
- * dropped, what to do with them is the user's.  Every row is checked, so
- * --all changes nothing.  Status 1 if any are found, else 0.
+ * dropped, what to do with them is the user's.  Only the rows changed
+ * since the head commit are checked (and those referencing rows removed
+ * or changed), unless --all: every row.  Status 1 if any are found, else
+ * 0.
  */
 Datum
 dolt_verify_constraints(PG_FUNCTION_ARGS)
@@ -3361,11 +3363,15 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	ListCell   *lc;
 	const char *result[1];
 	bool		output_only = false;
+	bool		all = false;
 
 	for (int i = 0; i < nargs; i++)
 	{
 		if (strcmp(args[i], "--all") == 0)
+		{
+			all = true;
 			continue;
+		}
 		if (strcmp(args[i], "--output-only") == 0)
 		{
 			output_only = true;
@@ -3376,6 +3382,7 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 			strspn(args[i] + 1, "ao") == strlen(args[i] + 1))
 		{
 			output_only |= strchr(args[i], 'o') != NULL;
+			all |= strchr(args[i], 'a') != NULL;
 			continue;
 		}
 		if (args[i][0] == '-')
@@ -3391,7 +3398,7 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 		if (relids != NIL && !list_member_oid(relids, pv->relid))
 			kept = lappend(kept, pv);
 	}
-	BRANCH_WRITES_HUSHED(found = PROLLY_CALL(diff_merge(), verify, relids));
+	BRANCH_WRITES_HUSHED(found = PROLLY_CALL(diff_merge(), verify, relids, all));
 	if (relids != NIL)
 	{
 		List	   *own = NIL;

@@ -1,0 +1,20 @@
+{
+		// See https://github.com/dolthub/dolt/issues/10903
+		Name: "UPDATE on table with BINARY primary key, explicit secondary index, and foreign key",
+		SetUpScript: []string{
+			"CREATE TABLE a (a_id INT NOT NULL PRIMARY KEY);",
+			"CREATE TABLE b (b_id BINARY(1) NOT NULL PRIMARY KEY, a_id INT NOT NULL, val INT NOT NULL, KEY a_id (a_id), CONSTRAINT FOREIGN KEY (a_id) REFERENCES a (a_id));",
+			"INSERT INTO a (a_id) VALUES (1);",
+			"INSERT INTO b (b_id, a_id, val) VALUES (0x3c, 1, 0), (0x52, 1, 1);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "UPDATE b SET val = 2;",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, Info: plan.UpdateInfo{Matched: 2, Updated: 2}}}},
+			},
+			{
+				Query:    "SELECT val FROM b ORDER BY b_id;",
+				Expected: []sql.Row{{int32(2)}, {int32(2)}},
+			},
+		},
+	}

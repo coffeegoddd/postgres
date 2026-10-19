@@ -59,5 +59,74 @@ SELECT dolt_verify_constraints('vc.parted', 'vc.parted_1');
 SELECT * FROM dolt_constraint_violations();
 SELECT violating_row FROM dolt_constraint_violations('vc.parted');
 ROLLBACK;
-
 DROP SCHEMA vc CASCADE;
+
+-- Without --all, as in Dolt, only what changed since the head commit is
+-- checked: rows added or updated, and rows referencing a parent row
+-- removed or updated; a table made or redefined since, whole.  --all
+-- checks every row.
+CREATE SCHEMA vd VERSIONED;
+CREATE TABLE vd.parent (pk int PRIMARY KEY, v int UNIQUE);
+CREATE TABLE vd.child (pk int PRIMARY KEY, v int REFERENCES vd.parent (v));
+CREATE TABLE vd.k (a int, b int);
+INSERT INTO vd.parent VALUES (1, 1), (2, 2), (3, 3);
+SET session_replication_role = replica;
+INSERT INTO vd.child VALUES (1, 1), (2, 2), (3, 3), (9, 9);
+RESET session_replication_role;
+INSERT INTO vd.k VALUES (1, 2), (5, 4), (8, 7);
+ALTER TABLE vd.k ADD CONSTRAINT k_chk CHECK (a < b) NOT VALID;
+-- (made since the head: whole)
+SELECT dolt_verify_constraints('-o');
+SELECT length(dolt_commit('-Am', 'vd')::text) AS committed;
+SELECT dolt_verify_constraints('-o');
+SELECT dolt_verify_constraints('-ao');
+
+SET dolt.allow_commit_conflicts = on;
+-- a child added, a parent deleted, one's key changed, one's other column
+SET session_replication_role = replica;
+INSERT INTO vd.child VALUES (8, 8);
+DELETE FROM vd.parent WHERE pk = 1;
+UPDATE vd.parent SET v = 20 WHERE pk = 2;
+UPDATE vd.parent SET pk = 30 WHERE pk = 3;
+RESET session_replication_role;
+-- (vd.k's rows breaking its check are as committed: not checked again;
+-- Postgres checks a row written against it, validated or not)
+BEGIN;
+SELECT dolt_verify_constraints();
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
+SELECT violation_type, violating_row FROM dolt_constraint_violations('vd.child')
+ORDER BY violating_row->>'pk';
+SELECT violating_row FROM dolt_constraint_violations('vd.k')
+ORDER BY violating_row->>'a';
+ROLLBACK;
+BEGIN;
+SELECT dolt_verify_constraints('--all', 'vd.child', 'vd.k');
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
+ROLLBACK;
+-- (a row of the transaction's own is a change too)
+BEGIN;
+SET LOCAL session_replication_role = replica;
+INSERT INTO vd.child VALUES (7, 7);
+SELECT dolt_verify_constraints('-o', 'vd.child');
+ROLLBACK;
+-- nothing changed, nothing found
+SELECT dolt_reset('--hard');
+SELECT dolt_verify_constraints('-o');
+SELECT dolt_verify_constraints('-ao');
+RESET dolt.allow_commit_conflicts;
+
+DROP SCHEMA vd CASCADE;
+
+-- On a branch with no commit yet, every row is a change.
+CREATE DATABASE vc_fresh TEMPLATE template0;
+\c vc_fresh
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.parent (id int PRIMARY KEY);
+CREATE TABLE app.child (id int PRIMARY KEY, p int REFERENCES app.parent);
+SET session_replication_role = replica;
+INSERT INTO app.child VALUES (1, 1);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('-o');
+SELECT dolt_verify_constraints('-o', 'app.child');
+\c contrib_regression
+DROP DATABASE vc_fresh;

@@ -53,7 +53,9 @@
  * - verify() checks the session branch's tables of relids (NIL: every
  *   one) against their foreign keys, and against their check and not-null
  *   constraints not validated yet (Postgres keeps the others), and returns
- *   the violations found.
+ *   the violations found.  With all, every row is checked; without, only
+ *   the rows changed since the head commit, and, for a foreign key, those
+ *   referencing a row the referenced table removed or changed since.
  * - cherry_pick() commits refs' changes (each from its parent) again on
  *   the current branch, merging each three-way with the branch as the
  *   ones before left it, every ref resolved first, and returns the one
@@ -132,7 +134,7 @@ typedef struct ProllyMergeRoutine
 	void		(*move_to) (const ProllyNodeRef *root, const ProllyNodeRef *working);
 	int			(*cherry_pick) (const char *const *refs, int nrefs,
 								bool allow_empty, ProllyHash *commit_id);
-	List	   *(*verify) (List *relids);
+	List	   *(*verify) (List *relids, bool all);
 	int			(*revert) (const char *const *refs, int nrefs,
 						   const ProllyHash *series_head,
 						   ProllyHash *commit_id);

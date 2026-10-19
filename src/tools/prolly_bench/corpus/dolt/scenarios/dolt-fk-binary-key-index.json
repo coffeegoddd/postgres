@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "dolt-fk-binary-key-index",
+  "description": "Reviewed Dolt port: UPDATE on table with BINARY primary key, explicit secondary index, and foreign key",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_foreign_keys.go",
+    "case": "DoltForeignKeyTests: UPDATE on table with BINARY primary key, explicit secondary index, and foreign key"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "a",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE a (a_id int NOT NULL PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "b",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE b (b_id bytea NOT NULL PRIMARY KEY, a_id int NOT NULL, val int NOT NULL, FOREIGN KEY (a_id) REFERENCES a (a_id))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "b-index",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX a_id ON b (a_id)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "a-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO a (a_id) VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "b-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO b (b_id, a_id, val) VALUES ('\\x3c', 1, 0), ('\\x52', 1, 1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE b SET val = 2",
+      "expect": {
+        "tag": "UPDATE 2"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT val FROM b ORDER BY b_id",
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ],
+          [
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

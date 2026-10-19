@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "id": "dolt-fk-binary-composite-key",
+  "description": "Reviewed Dolt port: UPDATE on table with composite BINARY primary key and foreign key",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_foreign_keys.go",
+    "case": "DoltForeignKeyTests: UPDATE on table with composite BINARY primary key and foreign key"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (id int NOT NULL PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (id1 bytea NOT NULL, id2 bytea NOT NULL, parent_id int, val int, PRIMARY KEY (id1, id2), CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "parent-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-row",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES ('\\x0000000000000001', '\\x0000000000000002', 1, 10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE child SET val = 20 WHERE id1 = '\\x0000000000000001' AND id2 = '\\x0000000000000002'",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT val FROM child WHERE id1 = '\\x0000000000000001' AND id2 = '\\x0000000000000002'",
+      "expect": {
+        "rows": [
+          [
+            "20"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

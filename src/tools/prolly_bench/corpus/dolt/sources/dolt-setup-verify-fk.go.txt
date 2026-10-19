@@ -1,0 +1,48 @@
+[]string{
+	"CREATE TABLE parent3 (pk BIGINT PRIMARY KEY, v1 BIGINT, INDEX (v1));",
+	"CREATE TABLE child3 (pk BIGINT PRIMARY KEY, v1 BIGINT, CONSTRAINT fk_name1 FOREIGN KEY (v1) REFERENCES parent3 (v1));",
+	"CREATE TABLE parent4 (pk BIGINT PRIMARY KEY, v1 BIGINT, INDEX (v1));",
+	"CREATE TABLE child4 (pk BIGINT PRIMARY KEY, v1 BIGINT, CONSTRAINT fk_name2 FOREIGN KEY (v1) REFERENCES parent4 (v1));",
+	"CALL DOLT_ADD('.')",
+	"INSERT INTO parent3 VALUES (1, 1);",
+	"INSERT INTO parent4 VALUES (2, 2);",
+	"SET foreign_key_checks=0;",
+	"INSERT INTO child3 VALUES (1, 1), (2, 2);",
+	"INSERT INTO child4 VALUES (1, 1), (2, 2);",
+	"SET foreign_key_checks=1;",
+	"CALL DOLT_COMMIT('-afm', 'has fk violations');",
+	`
+	CREATE TABLE parent1 (
+  		pk BIGINT PRIMARY KEY,
+  		v1 BIGINT,
+  		INDEX (v1)
+	);`,
+	`
+	CREATE TABLE parent2 (
+	  pk BIGINT PRIMARY KEY,
+	  v1 BIGINT,
+	  INDEX (v1)
+	);`,
+	`
+	CREATE TABLE child1 (
+	  pk BIGINT PRIMARY KEY,
+	  parent1_v1 BIGINT,
+	  parent2_v1 BIGINT,
+	  CONSTRAINT child1_parent1 FOREIGN KEY (parent1_v1) REFERENCES parent1 (v1),
+	  CONSTRAINT child1_parent2 FOREIGN KEY (parent2_v1) REFERENCES parent2 (v1)
+	);`,
+	`
+	CREATE TABLE child2 (
+	  pk BIGINT PRIMARY KEY,
+	  parent2_v1 BIGINT,
+	  CONSTRAINT child2_parent2 FOREIGN KEY (parent2_v1) REFERENCES parent2 (v1)
+	);`,
+	"INSERT INTO parent1 VALUES (1,1), (2,2), (3,3);",
+	"INSERT INTO parent2 VALUES (1,1), (2,2), (3,3);",
+	"INSERT INTO child1 VALUES (1,1,1), (2,2,2);",
+	"INSERT INTO child2 VALUES (2,2), (3,3);",
+	"SET foreign_key_checks=0;",
+	"INSERT INTO child3 VALUES (3, 3);",
+	"INSERT INTO child4 VALUES (3, 3);",
+	"SET foreign_key_checks=1;",
+}

@@ -1,0 +1,20 @@
+{
+		// See https://github.com/dolthub/dolt/issues/10903
+		Name: "UPDATE on table where the FK column is BINARY",
+		SetUpScript: []string{
+			"CREATE TABLE parent (id BINARY(16) NOT NULL PRIMARY KEY);",
+			"CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id BINARY(16), val INT, CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id));",
+			"INSERT INTO parent VALUES (0x00000000000000000000000000000001);",
+			"INSERT INTO child VALUES (1, 0x00000000000000000000000000000001, 10);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "UPDATE child SET val = 20 WHERE id = 1;",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}}},
+			},
+			{
+				Query:    "SELECT val FROM child WHERE id = 1;",
+				Expected: []sql.Row{{int32(20)}},
+			},
+		},
+	}

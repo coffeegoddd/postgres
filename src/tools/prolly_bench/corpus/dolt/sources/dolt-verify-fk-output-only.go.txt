@@ -1,0 +1,14 @@
+{
+		Name:        "verify-constraints: FK violations: --output-only",
+		SetUpScript: verifyConstraintsFkViolationsSetupScript,
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_VERIFY_CONSTRAINTS('--output-only', 'child3', 'child4');",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT * from dolt_constraint_violations;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

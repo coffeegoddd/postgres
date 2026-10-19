@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "id": "dolt-verify-fk-compound-key-violation",
+  "description": "Reviewed Dolt port: verify-constraints: FK violations: bad compound primary key reuse as index - error",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_verify_constraints.go",
+    "case": "DoltVerifyConstraintsTestScripts: verify-constraints: FK violations: bad compound primary key reuse as index - error"
+  },
+  "requires": [
+    "sql",
+    "vc.conflicts",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "parent",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (col1 int NOT NULL, col2 real NOT NULL, PRIMARY KEY (col1, col2))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "child",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (col1 int NOT NULL, col2 real NOT NULL, col3 int NOT NULL, col4 real NOT NULL, col5 int NOT NULL, col6 real NOT NULL, PRIMARY KEY (col1, col2, col3, col4, col5, col6), FOREIGN KEY (col1, col2) REFERENCES parent (col1, col2))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "checks-off",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "parent-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (1, 2.5)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "child-rows",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 2.5, 3, 4.5, 5, 6.5), (7, 8.5, 9, 10.5, 11, 12.5)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "checks-on",
+      "session": "a",
+      "op": "exec",
+      "sql": "RESET session_replication_role",
+      "expect": {
+        "tag": "RESET"
+      }
+    },
+    {
+      "id": "allow",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT dolt_verify_constraints('--all')",
+      "expect": {
+        "rows": [
+          [
+            "{1}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT * FROM dolt_constraint_violations()",
+      "expect": {
+        "rows": [
+          [
+            "public.child",
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

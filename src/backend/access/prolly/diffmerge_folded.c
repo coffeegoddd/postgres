@@ -78,6 +78,7 @@
 #include "access/xact.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_sequence.h"
 #include "commands/sequence.h"
 #include "common/int.h"
@@ -119,9 +120,12 @@ static bool same_description(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
-static List *foreign_key_violations(List *relids);
+static List *foreign_key_violations(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
 						   List **found);
+static bool changed_rows_of(List *changed, Oid relid, List **now, List **was);
+static char *rows_text_array(List *rows);
+static char *rows_json_array(List *rows);
 static void take_breaking_rows(List *added, void *arg);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
 						  const Table *now, ProllyDiffSink *sink);
@@ -752,7 +756,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
 								conflicted);
 		recording = false;
-		found = list_concat(recorded, foreign_key_violations(written));
+		found = list_concat(recorded, foreign_key_violations(written, NIL));
 	}
 	PG_FINALLY();
 	{
@@ -2877,10 +2881,13 @@ rel_owner(Oid relid)
  * The rows of the session branch's tables of relids (NIL: every one) that
  * break a foreign key, theirs or one referencing them, as violations: a
  * row whose key, all of it set (MATCH SIMPLE: any of it null passes), or,
- * MATCH FULL, some of it set, has no referenced row.
+ * MATCH FULL, some of it set, has no referenced row.  With changed (the
+ * rows changed since the head, changed_since_head()'s; NIL: every row),
+ * only the rows changed, and those referencing a row the referenced table
+ * removed or changed, unless either table was redefined since.
  */
 static List *
-foreign_key_violations(List *relids)
+foreign_key_violations(List *relids, List *changed)
 {
 	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
 	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
@@ -2903,9 +2910,13 @@ foreign_key_violations(List *relids)
 		StringInfoData set;
 		StringInfoData any;
 		StringInfoData eq;
+		StringInfoData cols;
+		StringInfoData pcols;
 		StringInfoData info;
 		char	   *child;
 		char	   *parent;
+		List	   *child_now = NIL;
+		List	   *parent_was = NIL;
 
 		/* (a partition's clone of its parent's is checked as the parent's) */
 		if (con->contype != CONSTRAINT_FOREIGN || OidIsValid(con->conparentid) ||
@@ -2913,6 +2924,17 @@ foreign_key_violations(List *relids)
 			(relids != NIL && !list_member_oid(relids, con->conrelid) &&
 			 !list_member_oid(relids, con->confrelid)))
 			continue;
+		if (changed != NIL)
+		{
+			bool		redefined;
+
+			redefined = changed_rows_of(changed, con->conrelid, &child_now, NULL);
+			redefined |= changed_rows_of(changed, con->confrelid, NULL, &parent_was);
+			if (redefined)
+				child_now = parent_was = NIL;
+			else if (child_now == NIL && parent_was == NIL)
+				continue;
+		}
 		d = heap_getattr(tup, Anum_pg_constraint_conkey,
 						 RelationGetDescr(pg_constraint), &isnull);
 		ck = DatumGetArrayTypeP(d);
@@ -2927,6 +2949,8 @@ foreign_key_violations(List *relids)
 		initStringInfo(&set);
 		initStringInfo(&any);
 		initStringInfo(&eq);
+		initStringInfo(&cols);
+		initStringInfo(&pcols);
 		initStringInfo(&info);
 		appendStringInfo(&info, "{\"ForeignKey\": %s, \"Table\": %s, \"ReferencedTable\": %s, \"Columns\": [",
 						 quote_json(NameStr(con->conname)), quote_json(child),
@@ -2939,6 +2963,8 @@ foreign_key_violations(List *relids)
 			appendStringInfo(&set, "%sc.%s IS NOT NULL", i ? " AND " : "", c);
 			appendStringInfo(&any, "%sc.%s IS NOT NULL", i ? " OR " : "", c);
 			appendStringInfo(&eq, "%sp.%s = c.%s", i ? " AND " : "", p, c);
+			appendStringInfo(&cols, "%sc.%s", i ? ", " : "", c);
+			appendStringInfo(&pcols, "%sw.%s", i ? ", " : "", p);
 			appendStringInfo(&info, "%s%s", i ? ", " : "",
 							 quote_json(get_attname(con->conrelid, cks[i], false)));
 		}
@@ -2958,6 +2984,18 @@ foreign_key_violations(List *relids)
 			appendStringInfo(&q, "(%s)", any.data);
 		else
 			appendStringInfo(&q, "(%s)", set.data);
+		if (child_now != NIL || parent_was != NIL)
+		{
+			appendStringInfoString(&q, " AND (false");
+			if (child_now != NIL)
+				appendStringInfo(&q, " OR row_to_json(c.*)::text = ANY (%s::text[])",
+								 rows_text_array(child_now));
+			if (parent_was != NIL)
+				appendStringInfo(&q, " OR (%s) IN (SELECT %s FROM json_populate_recordset(NULL::%s, %s::json) w)",
+								 cols.data, pcols.data, parent,
+								 rows_json_array(parent_was));
+			appendStringInfoChar(&q, ')');
+		}
 		queries = lappend(queries, list_make3(q.data, info.data,
 											  (void *) (uintptr_t) con->conrelid));
 	}
@@ -3020,10 +3058,11 @@ violating_rows(List *queries, const char *type, bool removing, List **found)
 /*
  * The query (sql, info, relid) finding the rows of con's table that break
  * it, a check or not-null constraint, as JSON (removing: deleting them);
- * *check: whether it's a check.
+ * *check: whether it's a check.  With only (rows, as JSON), only those.
  */
 static List *
-breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check)
+breaking_query(Relation pg_constraint, HeapTuple tup, bool removing,
+			   List *only, bool *check)
 {
 	Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
 	char	   *table = table_name(con->conrelid);
@@ -3054,6 +3093,9 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check
 		cond = psprintf("c.%s IS NULL", quote_identifier(name));
 		appendStringInfo(&info, "{\"Columns\": [%s]}", quote_json(name));
 	}
+	if (only != NIL)
+		cond = psprintf("%s AND row_to_json(c.*)::text = ANY (%s::text[])",
+						cond, rows_text_array(only));
 	if (removing)
 		appendStringInfo(&q, "DELETE FROM %s%s c WHERE %s RETURNING row_to_json(c.*)::text",
 						 only_unless_partitioned(con->conrelid), table, cond);
@@ -3067,9 +3109,11 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing, bool *check
  * The rows of the tables of relids (NIL: every versioned one) that break
  * a check or not-null constraint not validated yet: a table holds none
  * that break one validated, Postgres checks every row written against it.
+ * With changed (as foreign_key_violations() takes it), only the rows
+ * added or changed since the head, unless the table was redefined since.
  */
 static List *
-unvalidated_violations(List *relids)
+unvalidated_violations(List *relids, List *changed)
 {
 	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
 	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
@@ -3083,6 +3127,7 @@ unvalidated_violations(List *relids)
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
 		List	   *qi;
+		List	   *now = NIL;
 		bool		check;
 
 		/*
@@ -3096,7 +3141,10 @@ unvalidated_violations(List *relids)
 			!namespace_is_versioned(get_rel_namespace(con->conrelid)) ||
 			(relids != NIL && !list_member_oid(relids, con->conrelid)))
 			continue;
-		qi = breaking_query(pg_constraint, tup, false, &check);
+		if (changed != NIL &&
+			!changed_rows_of(changed, con->conrelid, &now, NULL) && now == NIL)
+			continue;
+		qi = breaking_query(pg_constraint, tup, false, now, &check);
 		if (check)
 			checks = lappend(checks, qi);
 		else
@@ -3184,7 +3232,7 @@ take_breaking_rows(List *added, void *arg)
 		tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(conoid));
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "cache lookup failed for constraint %u", conoid);
-		qi = breaking_query(pg_constraint, tup, true, &check);
+		qi = breaking_query(pg_constraint, tup, true, NIL, &check);
 		heap_freetuple(tup);
 		if (check)
 			checks = lappend(checks, qi);
@@ -3205,17 +3253,224 @@ take_breaking_rows(List *added, void *arg)
 }
 
 /*
+ * The rows of the session branch's tables changed since its head, by
+ * table, as row_to_json() gives them: those added or changed as they are
+ * now, and those removed or changed as they were.  (A keyless row's
+ * copies added are a row now, its copies removed one that was.)  A table
+ * made or redefined since is checked whole, as its constraints may be new.
+ */
+typedef struct ChangedTable
+{
+	Oid			relid;
+	List	   *ancestors;		/* its partitioned tables', if a partition */
+	bool		redefined;
+	List	   *now;			/* char * */
+	List	   *was;			/* char * */
+} ChangedTable;
+
+typedef struct ChangedRows
+{
+	ProllyDiffSink sink;		/* must be first */
+	List	   *tables;			/* ChangedTable * */
+	ChangedTable *cur;			/* the table being read, as: */
+	Relation	rel;
+	const ProllyKeyingRoutine *kr;
+	ProllyKeying *k;
+	bool		keyless;
+	TupleTableSlot *slot;
+} ChangedRows;
+
+static ChangedTable *changed_table(List **tables, Oid relid);
+
+static void
+changed_close(ChangedRows *cr)
+{
+	if (cr->rel == NULL)
+		return;
+	ExecDropSingleTupleTableSlot(cr->slot);
+	PROLLY_CALL(cr->kr, close, cr->k);
+	table_close(cr->rel, AccessShareLock);
+	cr->rel = NULL;
+}
+
+/* A tree value's row as JSON; *count gets how many copies it stands for. */
+static char *
+changed_json(ChangedRows *cr, const ProllyValue *value, uint64 *count)
+{
+	ProllyValue row;
+
+	PROLLY_CALL(cr->kr, parse_value, cr->k, value, &row, count);
+	ExecClearTuple(cr->slot);
+	PROLLY_CALL(cr->kr, decode_row, cr->k, &row, cr->slot);
+	return row_json(cr->slot);
+}
+
+static void
+changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+			const ProllyKey *key, const ProllyValue *before,
+			const ProllyValue *after)
+{
+	ChangedRows *cr = (ChangedRows *) self;
+	uint64		nbefore = 0;
+	uint64		nafter = 0;
+	char	   *was = NULL;
+	char	   *now = NULL;
+
+	/* (a table's rows come together) */
+	if (cr->cur == NULL || cr->cur->relid != relid)
+	{
+		changed_close(cr);
+		cr->cur = changed_table(&cr->tables, relid);
+		cr->rel = table_open(relid, AccessShareLock);
+		cr->kr = keying_of(cr->rel);
+		cr->k = PROLLY_CALL(cr->kr, open, cr->rel, CurrentMemoryContext);
+		cr->keyless = PROLLY_CALL(cr->kr, keyless, cr->k);
+		cr->slot = MakeSingleTupleTableSlot(RelationGetDescr(cr->rel),
+											&TTSOpsVirtual);
+	}
+	if (before)
+		was = changed_json(cr, before, &nbefore);
+	if (after)
+		now = changed_json(cr, after, &nafter);
+	if (cr->keyless)
+	{
+		if (nafter > nbefore)
+			cr->cur->now = lappend(cr->cur->now, now);
+		else
+			cr->cur->was = lappend(cr->cur->was, was);
+		return;
+	}
+	if (now)
+		cr->cur->now = lappend(cr->cur->now, now);
+	if (was)
+		cr->cur->was = lappend(cr->cur->was, was);
+}
+
+static List *
+changed_since_head(void)
+{
+	ChangedRows cr;
+	List	   *head = tables_of("HEAD", InvalidOid);
+	ListCell   *lc;
+
+	memset(&cr, 0, sizeof(cr));
+	cr.sink.change = changed_row;
+	folded_diff("HEAD", "WORKING", InvalidOid, &cr.sink);
+	changed_close(&cr);
+	foreach(lc, tables_of("WORKING", InvalidOid))
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *h = find_table(head, t->name);
+		Oid			relid = table_named(t->name);
+
+		if (OidIsValid(relid) && (h == NULL || !same_description(h, t)))
+			changed_table(&cr.tables, relid)->redefined = true;
+	}
+	return cr.tables;
+}
+
+/* Table relid's entry in *tables, made if it has none. */
+static ChangedTable *
+changed_table(List **tables, Oid relid)
+{
+	ChangedTable *ct;
+	ListCell   *lc;
+
+	foreach(lc, *tables)
+		if (((ChangedTable *) lfirst(lc))->relid == relid)
+			return lfirst(lc);
+	ct = palloc0(sizeof(ChangedTable));
+	ct->relid = relid;
+	if (get_rel_relispartition(relid))
+		ct->ancestors = get_partition_ancestors(relid);
+	*tables = lappend(*tables, ct);
+	return ct;
+}
+
+/*
+ * Table relid's rows in changed (its partitions' too, if it's
+ * partitioned), appended to *now and *was (where not NULL).  Returns
+ * whether it (or a partition of it) was redefined: every row is to be
+ * checked.
+ */
+static bool
+changed_rows_of(List *changed, Oid relid, List **now, List **was)
+{
+	bool		redefined = false;
+	ListCell   *lc;
+
+	foreach(lc, changed)
+	{
+		ChangedTable *ct = lfirst(lc);
+
+		if (ct->relid != relid && !list_member_oid(ct->ancestors, relid))
+			continue;
+		redefined |= ct->redefined;
+		if (now)
+			*now = list_concat(*now, ct->now);
+		if (was)
+			*was = list_concat(*was, ct->was);
+	}
+	return redefined;
+}
+
+/* Rows (char *) as a quoted text[] literal. */
+static char *
+rows_text_array(List *rows)
+{
+	Datum	   *d = palloc_array(Datum, list_length(rows));
+	ArrayType  *a;
+	ListCell   *lc;
+
+	foreach(lc, rows)
+		d[foreach_current_index(lc)] = CStringGetTextDatum(lfirst(lc));
+	a = construct_array_builtin(d, list_length(rows), TEXTOID);
+	return quote_literal_cstr(OidOutputFunctionCall(F_ARRAY_OUT,
+													PointerGetDatum(a)));
+}
+
+/* Rows (char *, JSON objects) as a quoted JSON array literal. */
+static char *
+rows_json_array(List *rows)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '[');
+	foreach(lc, rows)
+		appendStringInfo(&buf, "%s%s", foreach_current_index(lc) ? ", " : "",
+						 (char *) lfirst(lc));
+	appendStringInfoChar(&buf, ']');
+	return quote_literal_cstr(buf.data);
+}
+
+/*
  * dolt_verify_constraints' check of the session branch's tables of relids
  * (NIL: every one): the rows breaking a foreign key, as a merge finds them,
  * and those breaking a check or not-null constraint not validated yet.
- * (The rows merges couldn't write aren't in the tables: their violations
- * aren't found again, what to do with them is the user's.)
+ * Unless all, only rows changed since the head commit are checked (and,
+ * for a foreign key, those referencing a row removed or changed), as Dolt
+ * checks what the working set changed; a table made or redefined since,
+ * whole.  (The rows merges couldn't write
+ * aren't in the tables: their violations aren't found again, what to do
+ * with them is the user's.)
  */
 static List *
-verify_constraints(List *relids)
+verify_constraints(List *relids, bool all)
 {
-	return list_concat(foreign_key_violations(relids),
-					   unvalidated_violations(relids));
+	List	   *changed = NIL;
+	ProllyHash	head;
+
+	/* (a branch with no commit yet: every row is a change) */
+	if (!all && PROLLY_CALL(components().refs, resolve, "HEAD", &head))
+	{
+		changed = changed_since_head();
+		if (changed == NIL)
+			return NIL;
+	}
+	return list_concat(foreign_key_violations(relids, changed),
+					   unvalidated_violations(relids, changed));
 }
 
 /*
@@ -3548,7 +3803,7 @@ fast_forward_local(const Local *l, const ProllyHash *theirs)
 			relids = lappend_oid(relids, relid);
 		}
 	}
-	if (relids != NIL && (broken = foreign_key_violations(relids)) != NIL)
+	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot merge with uncommitted changes when the merge conflicts"),
