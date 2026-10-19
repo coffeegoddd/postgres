@@ -5108,9 +5108,15 @@ bmap_redo(XLogReaderState *record)
 					redo_block(record, id);
 				if (zeroed)
 				{
-					/* zeroes in its buffer too, without an LSN, as a new page */
+					/*
+					 * zeroes in its buffer too, without an LSN, as a new
+					 * page.  A buffer already valid (the old block's page,
+					 * read before) is only locked, not zeroed: zeroed here.
+					 */
 					Buffer		buf = XLogInitBufferForRedo(record, last);
 
+					memset(BufferGetPage(buf), 0, BLCKSZ);
+					MarkBufferDirty(buf);
 					UnlockReleaseBuffer(buf);
 				}
 				else
