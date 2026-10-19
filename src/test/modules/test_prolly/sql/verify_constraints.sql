@@ -214,11 +214,38 @@ INSERT INTO vr.bc VALUES (0, 9);
 RESET session_replication_role;
 SELECT length(dolt_commit('-Am', 'vr.bc')::text) AS committed;
 SET session_replication_role = replica;
-INSERT INTO vr.bc SELECT g, CASE WHEN g = 2400 THEN 9 ELSE 1 END
+INSERT INTO vr.bc SELECT g, CASE WHEN g IN (1, 1000, 1001, 2000, 2001, 2400) THEN 9 ELSE 1 END
 FROM generate_series(1, 2500) g;
 RESET session_replication_role;
 SELECT dolt_verify_constraints('vr.bc');
-SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.bc');
+SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.bc')
+ORDER BY (violating_row->>'id')::int;
+SELECT dolt_reset('--hard');
+-- A changed table with no unique index is checked whole; a changed row
+-- with a value out of line, in its key or not, is read for its key; a
+-- float key matches whatever extra_float_digits says.
+CREATE TABLE vr.nk (a int, p int REFERENCES vr.tp);
+CREATE TABLE vr.lc (id int PRIMARY KEY, p int REFERENCES vr.tp, big text);
+CREATE TABLE vr.lk (k text PRIMARY KEY, p int REFERENCES vr.tp);
+CREATE TABLE vr.fk (k float8 PRIMARY KEY, p int REFERENCES vr.tp);
+SELECT length(dolt_commit('-Am', 'vr.nk, vr.lc, vr.lk, vr.fk')::text) AS committed;
+SET session_replication_role = replica;
+INSERT INTO vr.nk VALUES (1, 9);
+INSERT INTO vr.lc SELECT 1, 9, string_agg(md5(g::text), '') FROM generate_series(1, 70) g;
+INSERT INTO vr.lc SELECT 2, 1, string_agg(md5(g::text), '') FROM generate_series(1, 160) g;
+INSERT INTO vr.lk SELECT string_agg(md5(g::text), '') || 'k', 9 FROM generate_series(1, 80) g;
+INSERT INTO vr.lk VALUES ('short', 1);
+INSERT INTO vr.fk VALUES (0.1, 9), (1.0 / 3, 9), (2, 1);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('-o', 'vr.lc');
+SELECT dolt_verify_constraints('-o', 'vr.lk');
+SET extra_float_digits = 0;
+SELECT dolt_verify_constraints('vr.fk');
+SELECT violating_row->>'p' AS p FROM dolt_constraint_violations('vr.fk');
+RESET extra_float_digits;
+SELECT dolt_verify_constraints('-o', 'vr.nk');
+SELECT dolt_verify_constraints('vr.lc', 'vr.lk', 'vr.nk');
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
 SELECT dolt_reset('--hard');
 RESET dolt.allow_commit_conflicts;
 DROP SCHEMA vr CASCADE;

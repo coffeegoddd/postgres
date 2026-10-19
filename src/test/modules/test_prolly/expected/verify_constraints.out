@@ -544,7 +544,7 @@ SELECT length(dolt_commit('-Am', 'vr.bc')::text) AS committed;
 (1 row)
 
 SET session_replication_role = replica;
-INSERT INTO vr.bc SELECT g, CASE WHEN g = 2400 THEN 9 ELSE 1 END
+INSERT INTO vr.bc SELECT g, CASE WHEN g IN (1, 1000, 1001, 2000, 2001, 2400) THEN 9 ELSE 1 END
 FROM generate_series(1, 2500) g;
 RESET session_replication_role;
 SELECT dolt_verify_constraints('vr.bc');
@@ -553,11 +553,92 @@ SELECT dolt_verify_constraints('vr.bc');
  {1}
 (1 row)
 
-SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.bc');
+SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.bc')
+ORDER BY (violating_row->>'id')::int;
   id  
 ------
+ 1
+ 1000
+ 1001
+ 2000
+ 2001
  2400
+(6 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
 (1 row)
+
+-- A changed table with no unique index is checked whole; a changed row
+-- with a value out of line, in its key or not, is read for its key; a
+-- float key matches whatever extra_float_digits says.
+CREATE TABLE vr.nk (a int, p int REFERENCES vr.tp);
+CREATE TABLE vr.lc (id int PRIMARY KEY, p int REFERENCES vr.tp, big text);
+CREATE TABLE vr.lk (k text PRIMARY KEY, p int REFERENCES vr.tp);
+CREATE TABLE vr.fk (k float8 PRIMARY KEY, p int REFERENCES vr.tp);
+SELECT length(dolt_commit('-Am', 'vr.nk, vr.lc, vr.lk, vr.fk')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SET session_replication_role = replica;
+INSERT INTO vr.nk VALUES (1, 9);
+INSERT INTO vr.lc SELECT 1, 9, string_agg(md5(g::text), '') FROM generate_series(1, 70) g;
+INSERT INTO vr.lc SELECT 2, 1, string_agg(md5(g::text), '') FROM generate_series(1, 160) g;
+INSERT INTO vr.lk SELECT string_agg(md5(g::text), '') || 'k', 9 FROM generate_series(1, 80) g;
+INSERT INTO vr.lk VALUES ('short', 1);
+INSERT INTO vr.fk VALUES (0.1, 9), (1.0 / 3, 9), (2, 1);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('-o', 'vr.lc');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_verify_constraints('-o', 'vr.lk');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SET extra_float_digits = 0;
+SELECT dolt_verify_constraints('vr.fk');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT violating_row->>'p' AS p FROM dolt_constraint_violations('vr.fk');
+ p 
+---
+ 9
+ 9
+(2 rows)
+
+RESET extra_float_digits;
+SELECT dolt_verify_constraints('-o', 'vr.nk');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT dolt_verify_constraints('vr.lc', 'vr.lk', 'vr.nk');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
+ table_name | num_violations 
+------------+----------------
+ vr.fk      |              2
+ vr.lc      |              1
+ vr.lk      |              1
+ vr.nk      |              1
+(4 rows)
 
 SELECT dolt_reset('--hard');
  dolt_reset 
@@ -567,7 +648,7 @@ SELECT dolt_reset('--hard');
 
 RESET dolt.allow_commit_conflicts;
 DROP SCHEMA vr CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 13 other objects
 DETAIL:  drop cascades to table vr.parent
 drop cascades to table vr.child
 drop cascades to table vr.k
@@ -577,6 +658,10 @@ drop cascades to table vr.tc
 drop cascades to table vr.jc
 drop cascades to table vr.gc
 drop cascades to table vr.bc
+drop cascades to table vr.nk
+drop cascades to table vr.lc
+drop cascades to table vr.lk
+drop cascades to table vr.fk
 -- On a branch with no commit yet, every row is a change.
 CREATE DATABASE vc_fresh TEMPLATE template0;
 \c vc_fresh

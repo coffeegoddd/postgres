@@ -3328,7 +3328,10 @@ typedef struct ChangedRows
 	const ProllyKeyingRoutine *kr;
 	ProllyKeying *k;
 	bool		keyless;
+	ProllyTreeEnv env;			/* (its values out of line read through) */
+	ProllyKeyingRefs krefs;
 	Bitmapset  *keycols;		/* its columns in a unique index */
+	bool	   *kept;			/* (decoding: the columns left unread) */
 	TupleTableSlot *slot;
 } ChangedRows;
 
@@ -3343,11 +3346,16 @@ changed_close(ChangedRows *cr)
 {
 	if (cr->rel == NULL)
 		return;
-	ExecDropSingleTupleTableSlot(cr->slot);
-	PROLLY_CALL(cr->kr, close, cr->k);
+	/* (each only if opened: a table with no key is closed before them) */
+	if (cr->slot != NULL)
+		ExecDropSingleTupleTableSlot(cr->slot);
+	if (cr->k != NULL)
+		PROLLY_CALL(cr->kr, close, cr->k);
 	table_close(cr->rel, AccessShareLock);
 	bms_free(cr->keycols);
 	cr->keycols = NULL;
+	cr->slot = NULL;
+	cr->k = NULL;
 	cr->rel = NULL;
 }
 
@@ -3365,8 +3373,22 @@ changed_key(ChangedRows *cr, const ProllyValue *value, uint64 *count)
 	bool		first = true;
 
 	PROLLY_CALL(cr->kr, parse_value, cr->k, value, &row, count);
+	/*
+	 * (its columns out of line left unread, as kept against itself, unless
+	 * a key column is one of them: then read whole)
+	 */
 	ExecClearTuple(cr->slot);
-	PROLLY_CALL(cr->kr, decode_row, cr->k, &row, cr->slot);
+	PROLLY_CALL(cr->kr, decode_row_kept, cr->k, &row, &row, cr->slot, cr->kept);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		if (cr->kept[i] &&
+			bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber, cr->keycols))
+		{
+			ExecClearTuple(cr->slot);
+			PROLLY_CALL(cr->kr, decode_row, cr->k, &row, cr->slot);
+			break;
+		}
+	}
 	slot_getallattrs(cr->slot);
 	initStringInfo(&buf);
 	appendStringInfoChar(&buf, '{');
@@ -3449,6 +3471,10 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		cr->kr = keying_of(cr->rel);
 		cr->k = PROLLY_CALL(cr->kr, open, cr->rel, CurrentMemoryContext);
 		cr->keyless = PROLLY_CALL(cr->kr, keyless, cr->k);
+		chunk_env(&cr->env);
+		prolly_keying_use_env(&cr->krefs, cr->kr, cr->k,
+							  prolly_tree_lookup("cow"), &cr->env);
+		cr->kept = palloc0_array(bool, RelationGetDescr(cr->rel)->natts);
 		cr->slot = MakeSingleTupleTableSlot(RelationGetDescr(cr->rel),
 											&TTSOpsVirtual);
 	}
@@ -3760,17 +3786,26 @@ static List *
 verify_constraints(List *relids, bool all)
 {
 	List	   *changed = NIL;
+	List	   *found = NIL;
 	ProllyHash	head;
+	bool		partial;
+	int			save_nestlevel = NewGUCNestLevel();
 
+	/*
+	 * (keys print as their values, read back exactly, whatever the session
+	 * says: a float's every digit)
+	 */
+	(void) set_config_option("extra_float_digits", "3", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	/* (a branch with no commit yet: every row is a change) */
-	if (!all && PROLLY_CALL(components().refs, resolve, "HEAD", &head))
-	{
+	partial = !all && PROLLY_CALL(components().refs, resolve, "HEAD", &head);
+	if (partial)
 		changed = changed_since_head(relids);
-		if (changed == NIL)
-			return NIL;
-	}
-	return list_concat(foreign_key_violations(relids, changed),
-					   unvalidated_violations(relids, changed));
+	if (!partial || changed != NIL)
+		found = list_concat(foreign_key_violations(relids, changed),
+							unvalidated_violations(relids, changed));
+	AtEOXact_GUC(true, save_nestlevel);
+	return found;
 }
 
 /*
