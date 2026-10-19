@@ -159,7 +159,7 @@ jobs:
         with:
           name: c-shard-${{ matrix.shard }}
           path: engine-results/c-shard-${{ matrix.shard }}
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: ignore
 
   # (not on cancellation: a newer push cancelled this run, and its own gate
@@ -279,7 +279,9 @@ jobs:
         if: always()
         with:
           name: c-suite-comment
-          path: comment
+          path: |
+            comment/comment.md
+            comment/summary.json
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v5
@@ -290,7 +292,6 @@ jobs:
             comment/report.html
             comment/report.md
             comment/summary.json
-            shards
           retention-days: 30
           if-no-files-found: ignore
 

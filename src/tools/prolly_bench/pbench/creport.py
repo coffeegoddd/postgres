@@ -265,11 +265,16 @@ def build(dirs: list[Path], shards: int, base_baseline: Path, *,
     details = {
         "Timing by shard": [{"shard": shard, "workload": workload, "engine": am, "seconds": seconds}
                             for am, e in rows.items() for (shard, workload), seconds in sorted(e.seconds.items())],
-        "Stale exceptions": [{"engine": am, **entry} for am, e in rows.items() for entry in e.stale],
-        "Failure examples": [{"engine": am, "class": cls, **entry,
+        "Stale exceptions": [{**entry, "engine": am} for am, e in rows.items() for entry in e.stale],
+        "Failure examples": [{**entry, "engine_result": entry.get("engine"), "engine": am, "class": cls,
                               "query": ccompare.query_text(corpus, entry["file"], entry["line"]) if corpus else "unavailable"}
                              for am, e in rows.items() for cls, entries in e.examples.items() for entry in entries],
     }
+    if check:
+        details["Failure examples"] += [
+            {**entry, "engine": "heap", "class": "heap regression",
+             "query": ccompare.query_text(corpus, entry["file"], entry["line"]) if corpus else "unavailable"}
+            for entry in (check.new + check.changed)[:PER_CLASS]]
     return Report(text, passed, problems, summary, details)
 
 

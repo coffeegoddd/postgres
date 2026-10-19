@@ -259,22 +259,18 @@ def run(args) -> int:
     timing = _load(args.timing)
     if args.timing and timing is None:
         failed_jobs.append(f"timing results missing: {args.timing}")
-    text, passed = render(merge_counters(parts), timing, head=args.head,
+    counters = merge_counters(parts)
+    text, passed = render(counters, timing, head=args.head,
                           base=args.base, runner=args.runner, run_url=args.run_url or "",
                           failed_jobs=failed_jobs, reproduce=args.reproduce or "",
                           nightly=getattr(args, "nightly", False))
     args.out.write_text(text)
-    from pbench import finding_reports, presentation
-    from pbench.presentation import Section, link
-    output = getattr(args, "report_output", None) or args.out.with_name(args.out.stem + "-full")
-    document = finding_reports.storage(merge_counters(parts), timing, passed=passed,
+    print(text)
+    from pbench import finding_reports
+    finding_reports.write(lambda: finding_reports.storage(counters, timing, passed=passed,
         metadata={"base": args.base, "head": args.head, "runner": args.runner,
                   "run_url": args.run_url or "", "reproduce": args.reproduce or "",
-                  "nightly": getattr(args, "nightly", False)}, failed_jobs=failed_jobs)
-    evidence = Section("Source artifacts", ["Evidence", "Location"])
-    for path in [*args.counters, *([args.timing] if args.timing else []), *getattr(args, "results", [])]:
-        evidence.rows.append([path.name, link(path, output.parent, str(path))])
-    document.sections.append(evidence)
-    presentation.write(document, output)
-    print(text)
+                  "nightly": getattr(args, "nightly", False)}, failed_jobs=failed_jobs),
+        args.out, getattr(args, "report_output", None),
+        [*args.counters, *([args.timing] if args.timing else []), *getattr(args, "results", [])])
     return 0 if passed else 1

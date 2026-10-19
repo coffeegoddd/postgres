@@ -6,8 +6,47 @@ comments keep their separate bounded renderers and stable markers.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
+from typing import Callable, Iterable
 
-from pbench.presentation import Document, Section, Value
+from pbench import presentation
+from pbench.presentation import Document, Section, Value, link
+
+
+def write(build: Callable[[], Document], out: Path | None,
+          report_output: Path | None = None, sources: Iterable[Path] = ()) -> list[Path]:
+    """Write derived artifacts without changing the analyzer's gate verdict.
+
+    Build lazily inside the boundary so adapter failures are isolated too.
+    Callers save and print their primary comment/JSON outputs first.
+    """
+    output = report_output or (out.with_name(out.stem + "-full") if out else None)
+    if output is None:
+        return []
+    try:
+        document = build()
+        evidence = Section("Source artifacts", ["Evidence", "Report", "Location"])
+        for path in sources:
+            report = path / "index.html"
+            evidence.rows.append([path.name,
+                link(report, output.parent, "HTML report") if report.is_file() else "unavailable",
+                link(path, output.parent, str(path))])
+        if evidence.rows:
+            evidence.notes.append("CI saves source evidence in its original artifacts. Restore the source "
+                                  "directories alongside the report before following relative links; "
+                                  "see the benchmark README for the download layout.")
+            document.sections.append(evidence)
+        return presentation.write(document, output)
+    except Exception as error:
+        print(f"Full report generation failed; gate verdict unchanged: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        return []
+
+
+def _extra(row: dict, displayed: set[str]) -> str:
+    extra = {k: v for k, v in row.items() if k not in displayed}
+    return _text(extra) if extra else "—"
 
 
 def _text(value) -> str:
@@ -16,7 +55,7 @@ def _text(value) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
     if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, int):
         return f"{value:,}"
     if isinstance(value, float):
@@ -52,7 +91,7 @@ def storage(counters: dict | None, timing: dict | None, *, passed: bool,
     if failed_jobs:
         _records(document, "Failed or missing jobs", failed_jobs)
     section = Section("Counter findings", ["Workload", "Engine", "Counter", "Completed unit", "Base", "Candidate",
-                                           "Change", "Total change", "Result", "Reason"])
+                                           "Change", "Total change", "Result", "Reason", "Additional evidence"])
     for finding in (counters or {}).get("findings", []):
         f = finding
         status = f.get("result", "unknown")
@@ -62,25 +101,29 @@ def storage(counters: dict | None, timing: dict | None, *, passed: bool,
                              sreport._per(f, "base") if "base" in f else "—",
                              sreport._per(f, "candidate") if "candidate" in f else "—",
                              sreport._change(f) if "base" in f and "candidate" in f else "—",
-                             sreport._total(f) if "base" in f and "candidate" in f else "—",
-                             Value(status, tone=tone), f.get("reason") or f.get("detail", "")])
+                             sreport._total(f) if all(k in f for k in ("base", "candidate", "counter")) else "—",
+                             Value(status, tone=tone), f.get("reason") or f.get("detail", ""),
+                             _extra(f, {"workload", "engine", "counter", "unit", "base", "candidate",
+                                        "result", "reason"} | ({"detail"} if not f.get("reason") else set()))])
     section.notes.append("Base and candidate values are per completed unit when a unit denominator is supplied. "
                          "Total change covers the whole fixed-work run.")
     document.sections.append(section)
     if counters is None and not metadata.get("nightly"):
         document.notes.append("No counter findings were available.")
     section = Section("Timing findings", ["Workload", "Variant", "Size", "Clients", "Engine", "Metric", "Candidate/base ratio",
-                                          "95% interval", "Result", "Attempts", "Problems"])
+                                          "95% interval", "Result", "Attempts", "Problems", "Additional evidence"])
     for c in (timing or {}).get("cells", []):
         section.rows.append([c.get("workload", "?"), c.get("variant", "-"), c.get("size", "?"),
                              str(c.get("clients", "?")), c.get("engine", "?"), c.get("metric", "?"),
                              _text(c.get("ratio")), f"{_text(c.get('low'))} – {_text(c.get('high'))}",
-                             c.get("result", "unknown"), _text(c.get("attempts", [])), _text(c.get("problems", []))])
+                             c.get("result", "unknown"), _text(c.get("attempts", [])), _text(c.get("problems", [])),
+                             _extra(c, {"workload", "variant", "size", "clients", "engine", "metric",
+                                        "ratio", "low", "high", "result", "attempts", "problems"})])
     section.notes.append("Median paired ratios and existing retry/confirmation decisions. "
                          + ("Timing is report-only; it is not gated." if (timing or {}).get("report_only") else "Timing gate policy is recorded below."))
     document.sections.append(section)
-    _records(document, "Counter evidence", counters or {}, folded=True)
-    _records(document, "Timing evidence", timing or {}, folded=True)
+    _records(document, "Counter evidence", {k: v for k, v in (counters or {}).items() if k != "findings"}, folded=True)
+    _records(document, "Timing evidence", {k: v for k, v in (timing or {}).items() if k != "cells"}, folded=True)
     return document
 
 
@@ -95,20 +138,22 @@ def correctness(summary: dict, metadata: dict, details: dict | None = None) -> D
     _records(document, "Notes", summary.get("notes", []))
     engines = summary.get("engines", {})
     classes = sorted({k for row in engines.values() for k in row.get("counts", {})})
-    section = Section("Engine summary", ["Engine", "Records run", "Pass rate", "Failing", "Incomplete", "vs base",
-                                         *classes, "Gate"])
+    section = Section("Engine summary", ["Engine", "Records run", "Passed", "Pass rate", "Failing", "Incomplete", "vs base",
+                                         *classes, "Gate", "Additional evidence"])
     for engine, row in engines.items():
         rate = f"{100 * row['ok'] / row['ran']:.3f}%" if row.get("ran") else "—"
-        section.rows.append([engine, _text(row.get("ran")), rate, _text(row.get("failing")),
+        section.rows.append([engine, _text(row.get("ran")), _text(row.get("ok")), rate, _text(row.get("failing")),
                              _text(row.get("incomplete")), _text(row.get("vs_base")),
                              *[_text(row.get("counts", {}).get(k, 0)) for k in classes],
-                             Value("PASS" if row.get("gate") else "FAIL", tone="good" if row.get("gate") else "bad")])
+                             Value("PASS" if row.get("gate") else "FAIL", tone="good" if row.get("gate") else "bad"),
+                             _extra(row, {"ran", "ok", "failing", "incomplete", "vs_base", "counts", "gate"})])
     document.sections.append(section)
     if details:
         _records(document, "Details", details)
         document.notes.append("Failure examples are sampled by the existing correctness analyzer; "
                               "complete per-record differences remain in the linked source artifacts.")
-    _records(document, "Correctness evidence", summary, folded=True)
+    _records(document, "Correctness evidence", {k: v for k, v in summary.items()
+             if k not in {"engines", "problems", "notes", "pass", "corpus", "coverage", "shards"}}, folded=True)
     return document
 
 

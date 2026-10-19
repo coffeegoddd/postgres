@@ -288,7 +288,7 @@ jobs:
         with:
           name: s-counters-${{ strategy.job-index }}
           path: counters
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: ignore
 
   timing-hosted:
@@ -342,7 +342,7 @@ jobs:
         with:
           name: s-timing
           path: timing
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: ignore
 
   gate:
@@ -416,7 +416,7 @@ jobs:
         if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
         with:
           name: s-suite-comment
-          path: comment
+          path: comment/comment.md
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v5
@@ -426,8 +426,6 @@ jobs:
           path: |
             comment/report.html
             comment/report.md
-            counters
-            timing
           retention-days: 30
           if-no-files-found: ignore
 
@@ -637,25 +635,23 @@ jobs:
           # clean: results, valid, nothing confirmed; regressed: something
           # confirmed; none: no valid results (the watchdog's case)
           verdict=none
+          mkdir -p nightly
+          timing=()
+          [ ! -f nightly/sgate.json ] || timing=(--timing nightly/sgate.json)
+          status=0
+          "$BENCH/prolly_bench" sreport --nightly "${timing[@]}" \
+            --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+            --run-url "$RUN_URL" --out nightly/comment.md --report-output nightly/report \
+            --results nightly > /dev/null || status=$?
           if [ -f nightly/sgate.json ]; then
-            status=0
-            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
-              --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
-              --run-url "$RUN_URL" --out nightly/comment.md --report-output nightly/report \
-              --results nightly > /dev/null || status=$?
             confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
             if [ "$confirmed" != 0 ]; then
               verdict=regressed
             elif [ "$status" = 0 ]; then
               verdict=clean
             fi
-            cat nightly/comment.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            mkdir -p nightly
-            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
-              --head "$CANDIDATE" --base "$BASE" --run-url "$RUN_URL" \
-              --out nightly/comment.md --report-output nightly/report --results nightly > /dev/null || true
           fi
+          cat nightly/comment.md >> "$GITHUB_STEP_SUMMARY"
           echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
 
       - name: Summary on perf-history

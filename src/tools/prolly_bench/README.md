@@ -502,12 +502,33 @@ artifacts alongside their existing comments/reports (the output stem
 defaults to `<out-stem>-full`; override it with `--report-output STEM`).
 Full reports use the same gate findings and have no comment character limit.
 C failure examples retain the analyzer's sampling limit; complete differences
-remain in linked evidence. CI uploads `s-suite-report`, `c-suite-report`, and
-`s-calibration-report` bundles containing reports plus their source evidence.
+remain in linked evidence. Full-report failures print a diagnostic and preserve
+the analyzer's exit status, bounded comment, JSON summary and stdout output.
+
+CI uploads `s-suite-report`, `c-suite-report`, and `s-calibration-report`
+with HTML and Markdown. Source evidence stays in the original artifacts,
+with the same retention period as its report: 30 days for PR runs, 90 days
+for calibration. To use relative evidence links, download artifacts from
+the same workflow run into this layout:
+
+| Report artifact → directory | Source artifact → directory |
+|---|---|
+| `s-suite-report` → `comment/` | Each `s-counters-N` → `counters/s-counters-N/`; `s-timing` → `timing/` |
+| `c-suite-report` → `comment/` | Each `c-shard-N` → `shards/c-shard-N/` |
+| `s-calibration-report` → `calibration/` | Each `s-calibration-N` → `runs/` (merge their contents) |
+
 Open `comment/report.html` for PR runs or `calibration/report.html` for
-calibration after unpacking. Nightly artifacts contain `report.html` at their
-root. Existing sticky comment markers, size limits and gate policies are
-unchanged.
+calibration. For example, download a C report and its source shards with:
+
+```sh
+gh run download RUN_ID --name c-suite-report --dir comment
+# Repeat for each c-shard-N artifact from this run:
+gh run download RUN_ID --name c-shard-N --dir shards/c-shard-N
+```
+
+The `s-nightly` artifact retains its complete tree, with `report.html` at
+its root. Existing sticky comment markers, size limits and gate policies
+are unchanged.
 
 `specs/results/<date>-<suite>-<label>/`:
 

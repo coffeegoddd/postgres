@@ -307,18 +307,11 @@ def run(args) -> int:
     md = to_markdown(counters, timing, suggested, left_out)
     if args.out:
         args.out.write_text(md)
-    from pbench import finding_reports, presentation
-    from pbench.presentation import Section, link
-    output = getattr(args, "report_output", None) or (args.out.with_name(args.out.stem + "-full") if args.out else None)
-    if output:
-        data = {"counters": counters, "timing": timing, "suggested": suggested, "left_out": left_out}
-        document = finding_reports.calibration(data)
-        document.sections.append(Section("Source artifacts", ["Run", "Location"],
-            [[p.name, link(p, output.parent, str(p))] for p in [*args.counters, *args.timing]]))
-        presentation.write(document, output)
+    data = {"counters": counters, "timing": timing, "suggested": suggested, "left_out": left_out}
     if args.json:
-        args.json.write_text(json.dumps({"counters": counters, "timing": timing,
-                                         "suggested": suggested, "left_out": left_out},
-                                        indent=2) + "\n")
+        args.json.write_text(json.dumps(data, indent=2) + "\n")
     print(md)
+    from pbench import finding_reports
+    finding_reports.write(lambda: finding_reports.calibration(data),
+                          args.out, getattr(args, "report_output", None), [*args.counters, *args.timing])
     return 0 if counters or timing else 1

@@ -145,7 +145,7 @@ jobs:
         with:
           name: s-calibration-${{ matrix.run }}
           path: aa
-          retention-days: 30
+          retention-days: 90
 
   summary:
     name: calibration summary
@@ -190,7 +190,10 @@ jobs:
         if: always()
         with:
           name: s-calibration-summary
-          path: calibration
+          path: |
+            calibration/calibration.md
+            calibration/calibration.json
+            calibration/probe.txt
           retention-days: 90
 
       - uses: actions/upload-artifact@v5
@@ -198,7 +201,7 @@ jobs:
         with:
           name: s-calibration-report
           path: |
-            calibration
-            runs
+            calibration/report.html
+            calibration/report.md
           retention-days: 90
           if-no-files-found: ignore

@@ -34,7 +34,7 @@ class FindingReportsTest(unittest.TestCase):
         self.assertNotIn('counter999', out.read_text())
         for suffix in ('.md', '.html'):
             text = stem.with_suffix(suffix).read_text()
-            self.assertIn('counter999', text)
+            self.assertEqual(text.count('counter999'), 1)
             self.assertIn('Counter findings', text)
             self.assertIn('PASS', text)
             self.assertNotIn('<script>', text)

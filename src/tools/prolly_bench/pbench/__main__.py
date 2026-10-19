@@ -309,21 +309,16 @@ def _creport(args) -> int:
                            run_url=args.run_url, wall_clock=args.wall_clock,
                            failed_jobs=args.failed_job, engines=args.engines)
     args.out.write_text(report.text)
-    from pbench import finding_reports, presentation
-    from pbench.presentation import Section, link
-    output = args.report_output or args.out.with_name(args.out.stem + "-full")
-    document = finding_reports.correctness(report.summary,
-        {"base": args.base, "head": args.head, "base_ref": args.base_ref,
-         "run_url": args.run_url, "wall_clock": args.wall_clock}, report.details)
-    document.sections.append(Section("Source artifacts", ["Result set", "Report", "Evidence"],
-        [[p.name, link(p / "index.html", output.parent, "HTML report") if (p / "index.html").exists() else "unavailable",
-          link(p, output.parent, "run evidence")] for p in args.dirs]))
-    presentation.write(document, output)
     if args.json:
         args.json.write_text(json.dumps(report.summary, indent=1) + "\n")
     for problem in report.problems:
         print(problem, file=sys.stderr)
     print(f"C suite: {'PASS' if report.passed else 'FAIL'}; written: {args.out}")
+    from pbench import finding_reports
+    finding_reports.write(lambda: finding_reports.correctness(report.summary,
+        {"base": args.base, "head": args.head, "base_ref": args.base_ref,
+         "run_url": args.run_url, "wall_clock": args.wall_clock}, report.details),
+        args.out, getattr(args, "report_output", None), args.dirs)
     return int(not report.passed)
 
 
