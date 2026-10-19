@@ -74,6 +74,26 @@ class CountersGateTest(unittest.TestCase):
         self.assertEqual(self.results(f), {("io_extends", "unstable_candidate")})
         self.assertTrue(f[0].fails)
 
+    def test_a_collector_lost_in_the_candidate_fails(self):
+        # pg_walinspect missing from the candidate's install: write_amp
+        # unavailable, its counters gone; skipped as "one build has" they'd pass
+        wa = {**BASE, "wa.logical_bytes": 470696.0, "wa.wal.total_bytes": 17146024.0,
+              "wa.tree.file_bytes": 0.0}
+        lost = {"write_amp": ["unavailable", "pg_walinspect missing"]}
+        runs = [counter_run(self.root, "b", wa), counter_run(self.root, "b2", wa),
+                counter_run(self.root, "c", BASE, collector_status=lost),
+                counter_run(self.root, "c2", BASE, collector_status=lost)]
+        f = sgate.gate_counters(*runs, [], self.t)
+        self.assertEqual({(x.counter, x.result) for x in f}, {("collector write_amp", "invariant")})
+        self.assertTrue(all(x.fails for x in f))
+        self.assertIn("unavailable in the candidate: pg_walinspect missing", f[0].detail)
+
+    def test_a_collector_unavailable_in_both_builds_is_not_a_loss(self):
+        lost = {"write_amp": ["unavailable", "pg_walinspect missing"]}
+        runs = [counter_run(self.root, n, BASE, collector_status=lost)
+                for n in ("b", "b2", "c", "c2")]
+        self.assertEqual(sgate.gate_counters(*runs, [], self.t), [])
+
     def test_jitter_is_listed_not_failed(self):
         # (a page more in one of the candidate's runs, as hosted runners do)
         f = self.gate(BASE, BASE, cand2={**BASE, "io_extends": 41.0})

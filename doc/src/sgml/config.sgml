@@ -12941,6 +12941,27 @@ dynamic_library_path = '/usr/local/lib/postgresql:$libdir'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-debug-prolly-change-finder" xreflabel="debug_prolly_change_finder">
+      <term><varname>debug_prolly_change_finder</varname> (<type>string</type>)
+      <indexterm>
+       <primary><varname>debug_prolly_change_finder</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Names the change finder that folds of <literal>prolly</literal>
+        tables use (to find the rows changed since a table's last fold)
+        instead of the default, <literal>log</literal>, which reads each
+        table's change log.  <literal>pages</literal> reads the pages
+        changed since instead.  Either folds a table in full once from a
+        baseline the other made.  The default, an empty string, means
+        <literal>log</literal>.  It is meant for testing and measurement.
+        Only superusers and users with the appropriate <literal>SET</literal>
+        privilege can change this setting.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-debug-raw-expression-coverage-test" xreflabel="debug_raw_expression_coverage_test">
       <term><varname>debug_raw_expression_coverage_test</varname> (<type>boolean</type>)
       <indexterm>

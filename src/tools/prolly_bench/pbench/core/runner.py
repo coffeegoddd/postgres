@@ -71,6 +71,8 @@ class CollectorWindow(Window):
     def __enter__(self):
         self.entered = True
         self.collectors = [c for c in self.collectors
+                           if guard(c.name, lambda c=c: c.before_window(self.ctx), self.status)]
+        self.collectors = [c for c in self.collectors
                            if self._guard(c, lambda c=c: c.start(self.ctx))]
         self.t0 = time.monotonic()
         return self
@@ -204,6 +206,7 @@ class Runner:
                                       run["latency_sampling_rate"], "seed": run["seed"] + rep,
                                       "quality": run["quality"],
                                       "settled_counters": run["settled_counters"],
+                                      "write_amp_materialize": run["write_amp_materialize"],
                                       **params, **vparams}
                             yield key, {"workload": w, "params": merged}
 
@@ -290,6 +293,9 @@ class Runner:
             if outcome.unit != "transaction":
                 result.notes.append(f"per-operation metrics are per {outcome.unit}")
 
+            window.collectors = [c for c in window.collectors
+                                 if guard(c.name, lambda c=c: c.after_window(ctx, outcome),
+                                          result.collector_status)]
             for c in window.collectors:
                 guard(c.name, lambda c=c: result.metrics.update(c.results(ctx, outcome)),
                       result.collector_status)
@@ -323,6 +329,11 @@ class Runner:
             except OSError:
                 pass
             shutil.rmtree(scratch, ignore_errors=True)
+            for peer in ctx.peers:
+                try:
+                    peer.destroy()
+                except Exception as e:
+                    result.validation_errors.append(f"peer cluster cleanup failed: {e}")
             try:
                 if (failed or result.validation_errors or result.status != Status.OK) and self.keep_failed:
                     cluster.stop("immediate")

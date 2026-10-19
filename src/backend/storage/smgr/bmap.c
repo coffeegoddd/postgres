@@ -106,6 +106,7 @@
 #include "common/int.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bmap_xlog.h"
 #include "storage/bufmgr.h"
@@ -1235,11 +1236,15 @@ lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
  * Make the page store hold the blocks below 'new_hw', zeroing the blocks
  * from 'old_hw', and zero the reused blocks.  Done before the record that
  * maps them, and again by its redo unless 'skip_existing': then blocks the
- * page store already has are left as they are.
+ * page store already has are left as they are.  The bytes count in
+ * 'counter': the block map's own page-store writes, shared buffers' extends
+ * (which pg_stat_io counts as extends too) or bulk writes' (which nothing
+ * else counts) by what the blocks are for.
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
-			  const BlockNumber *reused, uint32 nreused, bool skip_existing)
+			  const BlockNumber *reused, uint32 nreused, bool skip_existing,
+			  PgStat_ProllyCounter counter)
 {
 	SMgrRelation ssrel = store_smgr(rel);
 	BlockNumber store_cur = mdnblocks(ssrel, MAIN_FORKNUM);
@@ -1252,6 +1257,7 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing && reused[i] < store_cur)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
+		pgstat_count_prolly(counter, BLCKSZ);
 	}
 	for (blk = old_hw; blk < new_hw && blk < store_cur; blk++)
 	{
@@ -1260,9 +1266,14 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, blk, &page, 1, false);
+		pgstat_count_prolly(counter, BLCKSZ);
 	}
 	if (blk < new_hw)
+	{
 		mdzeroextend(ssrel, MAIN_FORKNUM, blk, new_hw - blk, false);
+		pgstat_count_prolly(counter,
+							(uint64) (new_hw - blk) * BLCKSZ);
+	}
 }
 
 typedef struct BitsChange
@@ -1489,7 +1500,8 @@ alloc_release(Allocation *a)
  */
 static void
 extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
-			 BlockNumber to, const void *content, bool skipFsync)
+			 BlockNumber to, const void *content, bool skipFsync,
+			 PgStat_ProllyCounter counter)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	uint32		n = to - from;
@@ -1596,13 +1608,14 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		map_lock(mapbuf, false);
 
 	/* the page store before the record */
-	prepare_store(rel, old_hw, new_hw, reused, nreused, false);
+	prepare_store(rel, old_hw, new_hw, reused, nreused, false, counter);
 	if (content)
 	{
 		const void *page = content;
 
 		mdwritev(store_smgr(rel), MAIN_FORKNUM, phys[n - 1], &page, 1,
 				 skipFsync);
+		pgstat_count_prolly(counter, BLCKSZ);
 	}
 
 	/* deltas */
@@ -1798,11 +1811,12 @@ extend_in_recovery(SMgrRelation reln, BlockNumber to, const void *content,
 }
 
 /*
- * Extend 'reln' to 'to' blocks, writing 'content' to block to - 1 if given.
+ * Extend 'reln' to 'to' blocks, writing 'content' to block to - 1 if given;
+ * the page-store bytes count in 'counter' (prepare_store).
  */
 static void
 extend_to(SMgrRelation reln, BlockNumber to, const void *content,
-		  bool skipFsync)
+		  bool skipFsync, PgStat_ProllyCounter counter)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		headerbuf;
@@ -1832,6 +1846,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 
 				mdwritev(store_smgr(rel), MAIN_FORKNUM, phys, &page, 1,
 						 skipFsync);
+				pgstat_count_prolly(counter, BLCKSZ);
 			}
 			break;
 		}
@@ -1847,7 +1862,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 			INJECTION_POINT("bmap-unshared", NULL);
 		}
 		extend_piece(reln, headerbuf, nblocks, end,
-					 end == to ? content : NULL, skipFsync);
+					 end == to ? content : NULL, skipFsync, counter);
 	}
 	UnlockReleaseBuffer(headerbuf);
 }
@@ -3629,7 +3644,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 * is zeroed in the new block instead, here and in redo.
 		 */
 		prepare_store(rel, alloc.old_hw, alloc.new_hw,
-					  &new_block, zeroed && reused ? 1 : 0, false);
+					  &new_block, zeroed && reused ? 1 : 0, false,
+					  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 
 		/* a listed block keeps the reference, which the list holds */
 		if (count == BMAP_REFS_STUCK && !listed)
@@ -3711,6 +3727,10 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		END_CRIT_SECTION();
 		if (listed)
 			changes_append_finish(&ca, lsn);
+
+		/* (copied for another map's sake, or else only to keep the fold's) */
+		pgstat_count_prolly(count > 0 ? PGSTAT_PROLLY_PAGE_COPIES_SHARED :
+							PGSTAT_PROLLY_PAGE_COPIES_FOLD, 1);
 
 		alloc_release(&alloc);
 		if (rdelta)
@@ -4703,7 +4723,9 @@ bmapextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		mdextend(reln, forknum, blocknum, buffer, skipFsync);
 		return;
 	}
-	extend_to(reln, blocknum + 1, buffer, skipFsync);
+	/* (bulk writes and copies: no shared buffer, nothing else counts it) */
+	extend_to(reln, blocknum + 1, buffer, skipFsync,
+			  PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN);
 }
 
 void
@@ -4715,7 +4737,9 @@ bmapzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		mdzeroextend(reln, forknum, blocknum, nblocks, skipFsync);
 		return;
 	}
-	extend_to(reln, blocknum + nblocks, NULL, skipFsync);
+	/* (shared buffers extending: pg_stat_io counts these as extends) */
+	extend_to(reln, blocknum + nblocks, NULL, skipFsync,
+			  PGSTAT_PROLLY_BMAP_EXTEND_BYTES_WRITTEN);
 }
 
 /*
@@ -4729,7 +4753,8 @@ bmappreextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	if (forknum != MAIN_FORKNUM)
 		return;
-	extend_to(reln, blocknum + nblocks, NULL, true);
+	extend_to(reln, blocknum + nblocks, NULL, true,
+			  PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN);
 }
 
 bool
@@ -5288,7 +5313,8 @@ bmap_redo(XLogReaderState *record)
 
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  reused, xlrec->nreused,
-							  (xlrec->flags & BMAP_EXTEND_SKIP_ZERO) != 0);
+							  (xlrec->flags & BMAP_EXTEND_SKIP_ZERO) != 0,
+							  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
 				forget_cached_size(xlrec->locator);
@@ -5348,7 +5374,7 @@ bmap_redo(XLogReaderState *record)
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  &xlrec->new_block,
 							  zeroed && xlrec->new_block < xlrec->old_hw ? 1 : 0,
-							  !zeroed);
+							  !zeroed, PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 				for (uint8 id = 0; id < last; id++)
 					redo_block(record, id);
 				if (zeroed)

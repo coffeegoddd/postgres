@@ -730,6 +730,15 @@
   boot_val => 'false',
 },
 
+{ name => 'debug_prolly_change_finder', type => 'string', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Names the change finder prolly folds use instead of the profile\'s, for testing and measurement.',
+  long_desc => 'An empty string means the profile\'s.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_change_finder',
+  boot_val => '""',
+  check_hook => 'check_debug_prolly_change_finder',
+},
+
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',

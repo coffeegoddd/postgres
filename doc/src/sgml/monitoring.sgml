@@ -5677,9 +5677,40 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>fold_full_tables</literal> (pages read, rows looked up, and
        tables folded from every row, finding changed rows),
        <literal>commits</literal> (commits written),
-       <literal>head_moves</literal> (branch heads set), and
+       <literal>head_moves</literal> (branch heads set),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>
-       (lookups of the value memo)
+       (lookups of the value memo),
+       <literal>page_copies_fold</literal> and
+       <literal>page_copies_shared</literal> (pages of block-mapped
+       relations copied before a change: only to keep them as the last
+       fold saw them, or because another map, such as a branch's copy,
+       shares them),
+       <literal>journal_bytes_written</literal>,
+       <literal>table_file_bytes_written</literal> and
+       <literal>manifest_bytes_written</literal> (bytes written to the chunk
+       store's journal segments, with each record's framing, to its table
+       files, with their index, and of its manifests and collections' lists
+       of dropped chunks; each chunk is also written to WAL),
+       <literal>gc_bytes_copied</literal> and
+       <literal>conjoin_bytes_copied</literal> (of the table-file bytes, those
+       of the files that collection, moving the journal, and conjoining
+       table files wrote from the store's existing chunks, counted once a
+       file is complete), and <literal>bmap_store_bytes_written</literal>,
+       <literal>bmap_extend_bytes_written</literal> and
+       <literal>bmap_bulk_bytes_written</literal> (bytes the block map wrote
+       to its page store itself, outside shared buffers: for copy-on-write
+       remaps, which no other statistic counts; extending for shared buffers,
+       which <structname>pg_stat_io</structname> counts as extends too; and
+       extending for bulk writes and copies, which nothing else counts, for
+       other relations either.  Extending by
+       <function>posix_fallocate</function> counts the bytes allocated, as
+       <structname>pg_stat_io</structname> does).  Bytes are counted when
+       written, not when synced.  A process counts in the database it is
+       connected to: a <command>CREATE DATABASE</command> copying a chunk
+       store counts in the database it runs in, and what processes connected
+       to no database (the checkpointer, the startup process's redo) write
+       isn't counted.  An autovacuum worker's counts reach the view when it
+       exits
       </para></entry>
      </row>
 

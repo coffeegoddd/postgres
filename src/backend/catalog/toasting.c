@@ -16,6 +16,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/prolly_config.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -60,6 +61,8 @@ void
 AlterTableCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode)
 {
 	CheckAndCreateToastTable(relOid, reloptions, lockmode, true, InvalidOid);
+	/* (and a prolly table's change log, if it has none) */
+	prolly_make_change_log(relOid, lockmode);
 }
 
 void
@@ -74,6 +77,7 @@ NewRelationCreateToastTable(Oid relOid, Datum reloptions)
 {
 	CheckAndCreateToastTable(relOid, reloptions, AccessExclusiveLock, false,
 							 InvalidOid);
+	prolly_make_change_log(relOid, AccessExclusiveLock);
 }
 
 static void

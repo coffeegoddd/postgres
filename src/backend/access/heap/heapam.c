@@ -2013,13 +2013,25 @@ check_branch_key(Relation relation, const ItemPointerData *otid,
 		prolly_check_row_key(relation, otid, tup);
 }
 
-/* ... and once made, the tuple versions it made (new) or replaced (old). */
+/*
+ * ... and once made, the tuple versions it made (new) or replaced (old), or
+ * a speculative insertion took back (old).
+ */
 static inline void
 note_branch_tuple(Relation relation, const ItemPointerData *old,
 				  const ItemPointerData *new)
 {
 	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
 		branch_note_tuple(relation, old, new);
+}
+
+/* ... or, with them in hand, the versions it made (and the one it replaced) */
+static inline void
+note_branch_made(Relation relation, const ItemPointerData *old,
+				 HeapTuple *made, int nmade)
+{
+	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		branch_note_made(relation, old, made, nmade);
 }
 
 /*
@@ -2248,7 +2260,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	/* Note: speculative insertions are counted too, even if aborted later */
 	pgstat_count_heap_insert(relation, 1);
-	note_branch_tuple(relation, NULL, &heaptup->t_self);
+	note_branch_made(relation, NULL, &heaptup, 1);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -2729,10 +2741,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* copy t_self fields back to the caller's slots */
 	for (i = 0; i < ntuples; i++)
-	{
 		slots[i]->tts_tid = heaptuples[i]->t_self;
-		note_branch_tuple(relation, NULL, &heaptuples[i]->t_self);
-	}
+	note_branch_made(relation, NULL, heaptuples, ntuples);
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -4398,7 +4408,7 @@ l2:
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
-	note_branch_tuple(relation, otid, &heaptup->t_self);
+	note_branch_made(relation, otid, &heaptup, 1);
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
@@ -6586,6 +6596,9 @@ heap_abort_speculative(Relation relation, const ItemPointerData *tid)
 	END_CRIT_SECTION();
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/* (taken back: as the insertion was told, while its values are there) */
+	note_branch_tuple(relation, tid, NULL);
 
 	if (HeapTupleHasExternal(&tp))
 	{

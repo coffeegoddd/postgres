@@ -15,8 +15,11 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	canon_folded.o \
 	canon_stub.o \
+	changes_log.o \
 	changes_pages.o \
 	changes_stub.o \
+	changelog_relation.o \
+	changelog_stub.o \
 	chunker_bytes.o \
 	applier_replication.o \
 	applier_stub.o \

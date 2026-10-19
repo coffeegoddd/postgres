@@ -315,6 +315,183 @@ SELECT dolt_branch('-D', 'parent_grows');
 SELECT dolt_branch('-D', 'table_grows');
 SELECT dolt_branch('-D', 'both_grow');
 
+-- Making an inherited column or CHECK local on one side conflicts with
+-- the other side dropping it from its parent.  Neither merge direction
+-- may silently discard the child's own column/data or constraint.
+CREATE SCHEMA lm VERSIONED;
+CREATE TABLE lm.p ("a field" int, b int CONSTRAINT positive CHECK (b > 0));
+CREATE TABLE lm.c () INHERITS (lm.p);
+CREATE TABLE lm.existing ("a field" int) INHERITS (lm.p);
+CREATE TABLE lm.q ("check me" int, CONSTRAINT "check me" CHECK ("check me" > 0));
+CREATE TABLE lm.d () INHERITS (lm.q);
+INSERT INTO lm.c VALUES (11, 22);
+INSERT INTO lm.existing VALUES (33, 44);
+INSERT INTO lm.d VALUES (7);
+SELECT (dolt_commit('-Am', 'locality merge base'))[1] AS locality_base \gset
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.c NO INHERIT lm.p;
+ALTER TABLE lm.c INHERIT lm.p;
+SELECT (dolt_commit('-Am', 'child columns made local'))[1] AS local_columns \gset
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.p DROP COLUMN "a field";
+SELECT (dolt_commit('-Am', 'parent column dropped'))[1] AS dropped_column \gset
+SELECT dolt_checkout('main');
+SELECT dolt_merge('local_drop');
+SELECT * FROM lm.c;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT test_fold_root() = prolly_root_hash(:'local_columns') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_reset('--hard', :'local_columns');
+SELECT dolt_checkout('local_drop');
+SELECT dolt_merge('main');
+SELECT * FROM lm.c;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT test_fold_root() = prolly_root_hash(:'dropped_column') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard', :'locality_base');
+SELECT dolt_branch('-D', 'local_drop');
+
+-- The constraint has the same name as its column: a surviving column
+-- doesn't stand in for a dropped CHECK when checking the local markers.
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.d NO INHERIT lm.q;
+ALTER TABLE lm.d INHERIT lm.q;
+SELECT (dolt_commit('-Am', 'child constraint made local'))[1] AS local_check \gset
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.q DROP CONSTRAINT "check me";
+SELECT (dolt_commit('-Am', 'parent constraint dropped'))[1] AS dropped_check \gset
+SELECT dolt_checkout('main');
+SELECT dolt_merge('local_drop');
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
+BEGIN;
+INSERT INTO lm.d VALUES (-1);
+ROLLBACK;
+SELECT * FROM lm.d;
+SELECT test_fold_root() = prolly_root_hash(:'local_check') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_reset('--hard', :'local_check');
+SELECT dolt_checkout('local_drop');
+SELECT dolt_merge('main');
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
+SELECT test_fold_root() = prolly_root_hash(:'dropped_check') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard', :'locality_base');
+SELECT dolt_branch('-D', 'local_drop');
+
+-- NO INHERIT makes the child's columns and constraints local without a
+-- local marker: they no longer have a parent.  Detaching on one side must
+-- conflict with dropping an inherited part on the other, in both directions.
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.c NO INHERIT lm.p;
+SELECT (dolt_commit('-Am', 'child detached with its columns'))[1] AS detached_column \gset
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.p DROP COLUMN "a field";
+SELECT (dolt_commit('-Am', 'parent column dropped'))[1] AS dropped_column \gset
+SELECT dolt_checkout('main');
+SELECT dolt_merge('local_drop');
+SELECT * FROM lm.c;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT inhparent::regclass FROM pg_inherits WHERE inhrelid = 'lm.c'::regclass;
+SELECT test_fold_root() = prolly_root_hash(:'detached_column') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_reset('--hard', :'detached_column');
+SELECT dolt_checkout('local_drop');
+SELECT dolt_merge('main');
+SELECT * FROM lm.c;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT inhparent::regclass FROM pg_inherits WHERE inhrelid = 'lm.c'::regclass;
+SELECT test_fold_root() = prolly_root_hash(:'dropped_column') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard', :'locality_base');
+SELECT dolt_branch('-D', 'local_drop');
+
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.d NO INHERIT lm.q;
+SELECT (dolt_commit('-Am', 'child detached with its check'))[1] AS detached_check \gset
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.q DROP CONSTRAINT "check me";
+SELECT (dolt_commit('-Am', 'parent constraint dropped'))[1] AS dropped_check \gset
+SELECT dolt_checkout('main');
+SELECT dolt_merge('local_drop');
+SELECT * FROM lm.d;
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
+SELECT inhparent::regclass FROM pg_inherits WHERE inhrelid = 'lm.d'::regclass;
+BEGIN;
+INSERT INTO lm.d VALUES (-1);
+ROLLBACK;
+SELECT test_fold_root() = prolly_root_hash(:'detached_check') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_reset('--hard', :'detached_check');
+SELECT dolt_checkout('local_drop');
+SELECT dolt_merge('main');
+SELECT * FROM lm.d;
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
+SELECT inhparent::regclass FROM pg_inherits WHERE inhrelid = 'lm.d'::regclass;
+SELECT test_fold_root() = prolly_root_hash(:'dropped_check') AS unchanged;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT dolt_checkout('main');
+SELECT dolt_reset('--hard', :'locality_base');
+SELECT dolt_branch('-D', 'local_drop');
+
+-- Detaching does not block a drop both sides agree on: the detached child
+-- explicitly drops the same column and CHECK as the parent's other branch.
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.c NO INHERIT lm.p;
+ALTER TABLE lm.c DROP COLUMN "a field";
+ALTER TABLE lm.c DROP CONSTRAINT positive;
+SELECT dolt_commit('-Am', 'detached child drops both parts') IS NOT NULL AS committed;
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.p DROP COLUMN "a field";
+ALTER TABLE lm.p DROP CONSTRAINT positive;
+SELECT dolt_commit('-Am', 'parent drops both parts') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('local_drop'))[2:4];
+SELECT * FROM lm.c;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT conname FROM pg_constraint WHERE conrelid = 'lm.c'::regclass;
+SELECT inhparent::regclass FROM pg_inherits WHERE inhrelid = 'lm.c'::regclass;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+SELECT dolt_reset('--hard', :'locality_base');
+SELECT dolt_branch('-D', 'local_drop');
+
+-- A different inherited part made local is compatible with the drop.
+-- A column already local in base also survives its parent's drop, while
+-- an inherited-only column is dropped normally.  Both sides change the
+-- already-local child's definition, so it is merged part by part.
+SELECT dolt_branch('local_drop');
+ALTER TABLE lm.c ADD CONSTRAINT positive CHECK (b > 0);
+ALTER TABLE lm.existing ADD CONSTRAINT small_b CHECK (b < 100);
+SELECT dolt_commit('-Am', 'unrelated check made local') IS NOT NULL AS committed;
+SELECT dolt_checkout('local_drop');
+ALTER TABLE lm.p DROP COLUMN "a field";
+SELECT dolt_commit('-Am', 'parent column dropped') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('local_drop'))[2:4];
+SELECT * FROM lm.c;
+SELECT * FROM lm.existing;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'lm.existing'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.existing'::regclass ORDER BY conname;
+SELECT conname, conislocal, coninhcount FROM pg_constraint
+  WHERE conrelid = 'lm.c'::regclass ORDER BY conname;
+SELECT count(*) AS changes FROM dolt_status();
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+SELECT dolt_branch('-D', 'local_drop');
+
 -- A typed table's composite type can change across a move.  Detach it
 -- before replacing the type, and attach it after its columns match.
 CREATE SCHEMA typed VERSIONED;

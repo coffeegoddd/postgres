@@ -14,6 +14,9 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('keyless_unsettled');
 $node->init;
 $node->append_conf('postgresql.conf', 'autovacuum = off');
+# (the change finder "pages" carries what was in flight; "log" leaves it in
+# the change log, 121_log_unsettled.pl)
+$node->append_conf('postgresql.conf', 'debug_prolly_change_finder = pages');
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }

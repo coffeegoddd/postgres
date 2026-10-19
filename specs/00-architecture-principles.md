@@ -70,7 +70,8 @@ provisional.
 | **Table keying** | How a folded table's rows become tree items: key, value layout, content hash | Primary key, else the row's leading bytes and hash with a count (**pk_or_prefix**, #149; replaced **pk_or_content**) |
 | **Chunk store** | A database's chunks and root: appends, root moves, WAL, checkpoints | Append-only journal, conjoined into table files (**journal**) |
 | **Table file** | The format of a file of chunks with its index | **basic** |
-| **Change finder** | Which rows changed since a fold | From the pages block-mapped storage lists as changed (**pages**) |
+| **Change finder** | Which rows changed since a fold | From the pages block-mapped storage lists as changed (**pages**); from the table's change log (**log**) |
+| **Change log** | A prolly table's row changes, recorded as they are written, for folds to read | A relation of the table's own (**relation**, `19-change-log.md`) |
 | **Row applier** | Writing rows into a branch's tables when a head moves | As logical replication's apply worker writes them (**replication**) |
 | **Refs and commit graph** | Branches, commits, tags, remotes, merge state | In the chunk store's root (**copies**) |
 | **Transfer** | Moving commits between stores: what to send, checking what is received | The chunks a commit reaches that the other side lacks (**chunks**) |

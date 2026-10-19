@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from pbench.collectors.write_amp import MIN_LOGICAL_BYTES
 from pbench.core import registry
 from pbench.core.stats import summarize, paired_ratio_interval
-from pbench.report import HIGHER_IS_BETTER, load_results
+from pbench.report import HIGHER_IS_BETTER, WA_COMPONENTS, load_results
 from pbench.core.validation import cell_problems, compatible, validate_run
 
 # (metric, heading, unit) per suite, in display order.  "throughput" is
@@ -32,6 +33,13 @@ S_TABLES = [
     ("latency_p999_ms", "Latency p99.9", "ms"),
     ("wal_bytes_per_operation", "WAL per completed unit", "bytes"),
     ("device_write_bytes_per_operation", "Whole-device writes per completed unit", "bytes"),
+    ("wa.logical_bytes_per_operation", "Logical bytes written per completed unit",
+     "bytes of new row versions"),
+    ("wa_server", "Write amplification, server total",
+     "WAL + pages + chunk store bytes per logical byte"),
+    ("wa_wal", "Write amplification: WAL", "bytes per logical byte"),
+    ("wa_pages", "Write amplification: data pages", "bytes per logical byte"),
+    ("wa_tree", "Write amplification: prolly chunk store", "bytes per logical byte"),
     ("host_busy_cpu_seconds", "Host busy CPU", "seconds"),
     ("latency_samples", "Latency observations", "samples"),
     ("failed_transactions", "Failed transactions", "count"),
@@ -54,10 +62,18 @@ V_TABLES = [
     ("fetch_ms", "Fetch", "ms"),
     ("push_ms", "Push", "ms"),
     ("background_tps", "Background S1 throughput", "tps"),
+    ("wa.server_bytes_per_operation", "Server bytes written per operation",
+     "WAL + pages + chunk store bytes"),
+    ("wa.tree.file_bytes_per_operation", "Chunk-store bytes written per operation", "bytes"),
 ]
 _HIGHER = HIGHER_IS_BETTER | {"throughput"}
 # Metrics that measure write volume; not applicable to read-only cells.
-_WRITE_METRICS = {"wal_bytes_per_operation", "device_write_bytes_per_operation"}
+_WRITE_METRICS = {"wal_bytes_per_operation", "device_write_bytes_per_operation",
+                  "wa.logical_bytes_per_operation", "wa_server", "wa_wal", "wa_pages",
+                  "wa_tree"}
+# Write amplification's ratios, absent where they don't apply (wa_tree on
+# heap) and None under the collector's floor of logical bytes.
+_WA_RATIOS = {"wa_server", "wa_wal", "wa_pages", "wa_tree"}
 _STATUS_TEXT = {"not_implemented": "not impl.", "unavailable": "unavail.",
                 "error": "error", "not_applicable": "n/a"}
 
@@ -141,6 +157,9 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
     if metric in _WRITE_METRICS and all(r.get("read_only") for r in ok):
         return Cell(_STATUS_TEXT["not_applicable"], ok=False,
                     detail="read-only workload")
+    if metric in _WA_RATIOS and all(_metric(r, metric) is None for r in ok):
+        return Cell(_STATUS_TEXT["not_applicable"], ok=False,
+                    detail="; ".join(sorted({_wa_reason(r, metric) for r in ok})))
     s = summarize(_metric(r, metric) for r in ok)
     if s["n"] != len(rs):
         return Cell(f"missing {len(rs) - s['n']}/{len(rs)}", ok=False)
@@ -170,6 +189,21 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
                     else:
                         cell.detail += "; inconclusive at 5% practical effect threshold"
     return cell
+
+
+def _wa_reason(r: dict, metric: str) -> str:
+    """Why a cell has no write-amplification ratio."""
+    status = r.get("collector_status", {}).get("write_amp")
+    if status:
+        return f"write_amp {status[0]}: {status[1]}"
+    m = r["metrics"]
+    if "wa.logical_bytes" not in m:
+        return "write_amp didn't run"
+    if metric not in m:
+        return "not measured for this engine"
+    if (m.get("wa.logical_bytes") or 0) < MIN_LOGICAL_BYTES:
+        return f"under {MIN_LOGICAL_BYTES // 1024} KiB of logical writes"
+    return "the build counts no chunk-store file bytes"
 
 
 def _fmt(x: float) -> str:
@@ -274,7 +308,35 @@ def to_markdown(sets: list[ResultSet], suite: str) -> str:
             prev = w
             out.append("| " + " | ".join(lead + [str(clients)] + texts) + " |")
         out.append("")
+    rows = wa_rows(sets)
+    if rows:
+        out.append("## Write amplification by component (bytes per completed unit)\n")
+        out.append("| workload | variant | size | clients | engine | " +
+                   " | ".join(h for _, h in WA_COMPONENTS) + " |")
+        out.append("|" + "---|" * 5 + "---:|" * len(WA_COMPONENTS))
+        for (w, variant, size, clients), label, values in rows:
+            out.append("| " + " | ".join([w, variant or "-", size, str(clients), label] +
+                                         [_fmt(v) if v is not None else "-" for v in values])
+                       + " |")
+        out.append("")
     return "\n".join(out)
+
+
+def wa_rows(sets: list[ResultSet]):
+    """[(row key, label, medians of WA_COMPONENTS)]: a row per engine per
+    cell the write_amp collector measured, the engines of a cell together."""
+    sets = _order(sets)
+    out = []
+    for key in _row_keys(sets):
+        for s in sets:
+            rs = [r for r in s.results if r["status"] == "ok" and not cell_problems(r)
+                  and (r["key"]["workload"], r["key"]["variant"], r["key"]["size"],
+                       r["key"]["clients"]) == key]
+            if s.problems or not any("wa.server_bytes" in r["metrics"] for r in rs):
+                continue
+            out.append((key, s.label, [summarize(r["metrics"].get(m) for r in rs)["median"]
+                                       for m, _ in WA_COMPONENTS]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +428,25 @@ def to_html(sets: list[ResultSet], suite: str) -> str:
                 parts.append(f"<td class='{' '.join(cls)}' title='{esc(c.detail)}'>"
                              f"{esc(c.text)}{ratio}</td>")
             parts.append("</tr>")
+        parts.append("</tbody></table></div>")
+    rows = wa_rows(sets)
+    if rows:
+        parts.append("<h2 id='wa-components'>Write amplification by component "
+                     "<span class='unit'>(bytes per completed unit)</span></h2>"
+                     "<div class='wrap'><table><thead><tr><th>workload</th><th>variant</th>"
+                     "<th>size</th><th class='num'>clients</th><th>engine</th>" +
+                     "".join(f"<th class='num'>{esc(h)}</th>" for _, h in WA_COMPONENTS) +
+                     "</tr></thead><tbody>")
+        prev = None
+        for (w, variant, size, clients), label, values in rows:
+            first = (w, variant, size, clients) != prev
+            prev = (w, variant, size, clients)
+            parts.append(f"<tr class='{'first' if first else ''}'>"
+                         f"<td class='wl'>{esc(_workload_title(w)) if first else ''}</td>"
+                         f"<td>{esc(variant or '-')}</td><td>{esc(size)}</td>"
+                         f"<td class='num'>{clients}</td><td>{esc(label)}</td>" +
+                         "".join(f"<td class='num'>{_fmt(v) if v is not None else '-'}</td>"
+                                 for v in values) + "</tr>")
         parts.append("</tbody></table></div>")
     parts.append("</main></body></html>")
     return "".join(parts)
