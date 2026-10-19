@@ -165,6 +165,7 @@ tests += {
       't/074_toast_rewrites.pl',
       't/075_toast_acceptance.pl',
       't/076_remote_answers.pl',
+      't/110_bmap_recovery_past_length.pl',
     ],
   },
 }
