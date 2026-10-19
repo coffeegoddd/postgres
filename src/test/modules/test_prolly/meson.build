@@ -55,6 +55,7 @@ tests += {
       'branch_writes',
       'writer_modes',
       'transaction_commits',
+      'commit_messages',
       'status_diff',
       'collations',
       'applier',
@@ -166,6 +167,7 @@ tests += {
       't/074_toast_rewrites.pl',
       't/075_toast_acceptance.pl',
       't/076_remote_answers.pl',
+      't/109_bmap_incremental_backup.pl',
     ],
   },
 }
