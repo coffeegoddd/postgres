@@ -40,7 +40,7 @@ FROM prolly_implementations();
  table_file    | basic        |       1 |              1
  table_file    | stub         |       0 |              0
  change_finder | pages        |       1 |              8
- change_finder | log          |       2 |              1
+ change_finder | log          |       2 |              2
  change_finder | stub         |       0 |              0
  remote        | file         |       1 |              1
  remote        | postgresql   |       2 |              1

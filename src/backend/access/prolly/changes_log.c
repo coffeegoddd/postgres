@@ -20,15 +20,31 @@
  * isn't one this finder made with the table's log as it is now (none,
  * another finder's, or a log made since: the table had none then), when
  * the snapshot doesn't see the baseline's fold as committed (it may not see
- * what that fold saw), when an entry says to (a row the log couldn't hold,
- * or the table truncated or rewritten), when a keyless table has a key's
- * entry or a row's count would go below none (the keying changed
- * meanwhile), and during recovery.  A branch's copy of a table has its
+ * what that fold saw), when the baseline's fold was such a fold itself
+ * (unsettled: see below), when the table's catalog row was changed by a
+ * transaction the snapshot doesn't see (a truncation or rewrite the
+ * snapshot doesn't see the entry of, though it reads the new storage), when
+ * an entry says to (a row the log couldn't hold, or the table truncated or
+ * rewritten), when a keyless table has a key's entry, a row's count would
+ * go below none (the keying changed meanwhile) or a key column of an
+ * entry is null (it was written under another key), when the entries name
+ * more rows than the table has, and during recovery.  A branch's copy of a
+ * table has its
  * source's baseline and a copy of its log, so it folds from them.  Its
  * pages are never kept as of a fold: only sharing between branches copies
  * them.
  *
- * A baseline's state: a tag and version, the log's identity, and the
+ * A fold by a snapshot that doesn't see its baseline's fold reads the
+ * table in full, but by an old snapshot: rows written meanwhile whose
+ * entries another fold consumed are neither in what it reads nor left in
+ * the log.  Its baseline is marked unsettled, so the next fold reads the
+ * table in full again, by its own snapshot.
+ *
+ * The entries a fold reads are kept once per row (a key's, or a keyless
+ * row's with its count summed), so the memory a fold takes is of the rows
+ * changed, not of the writes.
+ *
+ * A baseline's state: a tag and version, flags, the log's identity, and the
  * fold's snapshot's xmax, the fold's own transaction (if it had written)
  * and the transactions it saw running (a count, then each).
  *
@@ -59,13 +75,21 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 /* (a first byte no "pages" state has: neither reads the other's) */
 #define STATE_TAG			'L'
-#define STATE_VERSION		1
+#define STATE_VERSION		2		/* 2: flags */
+
+#define STATE_UNSETTLED		0x01	/* folded by a snapshot older than its
+									 * baseline's fold: fold in full next */
+
+/* Entries kept before they are first made one per row. */
+#define COMPACT_AT			65536
 
 typedef struct State
 {
+	uint8		flags;
 	uint64		log;			/* the log's identity then */
 	TransactionId xmax;			/* the fold's snapshot's */
 	uint32		nxip;			/* the transactions it saw running, sorted */
@@ -106,8 +130,11 @@ typedef struct Finder
 	Datum	   *values;
 	bool	   *isnull;
 	Copy	   *c;
-	int			n;
-	int			max;
+	int64		n;
+	int64		max;
+	MemoryContext ccxt;			/* the copies' keys and rows */
+	bool		compact;		/* entries: kept once per row */
+	int64		limit;			/* more rows than this: fold in full */
 	bool		give_up;
 	StringInfoData key;			/* reused for each encoding */
 	StringInfoData row;
@@ -151,6 +178,7 @@ put_state(StringInfo out, const State *st)
 {
 	appendStringInfoChar(out, STATE_TAG);
 	appendStringInfoChar(out, (char) STATE_VERSION);
+	appendStringInfoChar(out, (char) st->flags);
 	put_u64(out, st->log);
 	put_u32(out, st->xmax);
 	put_u32(out, st->own);
@@ -159,7 +187,7 @@ put_state(StringInfo out, const State *st)
 		put_u32(out, st->xip[i]);
 }
 
-#define STATE_FIXED_LEN	(2 + 8 + 4 + 4 + 4)
+#define STATE_FIXED_LEN	(3 + 8 + 4 + 4 + 4)
 
 static bool
 parse_state(const ProllyValue *state, State *st)
@@ -170,10 +198,11 @@ parse_state(const ProllyValue *state, State *st)
 	if (state->len < STATE_FIXED_LEN || p[0] != STATE_TAG ||
 		p[1] != STATE_VERSION)
 		return false;
-	st->log = get_u64(p + 2);
-	st->xmax = get_u32(p + 10);
-	st->own = get_u32(p + 14);
-	st->nxip = get_u32(p + 18);
+	st->flags = p[2];
+	st->log = get_u64(p + 3);
+	st->xmax = get_u32(p + 11);
+	st->own = get_u32(p + 15);
+	st->nxip = get_u32(p + 19);
 	if ((uint64) state->len != STATE_FIXED_LEN + (uint64) st->nxip * 4)
 		return false;
 	p += STATE_FIXED_LEN;
@@ -215,6 +244,29 @@ sees_fold(Snapshot snap, const State *st)
 	return true;
 }
 
+/*
+ * Was the table's catalog row changed by a transaction the snapshot doesn't
+ * see?  A truncation or rewrite is: the snapshot reads the table's new
+ * storage, but not the entry saying its rows were replaced.
+ */
+static bool
+storage_unseen(Relation rel, Snapshot snap)
+{
+	HeapTuple	tup = SearchSysCache1(RELOID,
+									  ObjectIdGetDatum(RelationGetRelid(rel)));
+	TransactionId xmin;
+	bool		unseen;
+
+	if (!HeapTupleIsValid(tup))
+		return true;
+	xmin = HeapTupleHeaderGetXmin(tup->t_data);
+	unseen = TransactionIdIsNormal(xmin) &&
+		!TransactionIdIsCurrentTransactionId(xmin) &&
+		XidInMVCCSnapshot(xmin, snap);
+	ReleaseSysCache(tup);
+	return unseen;
+}
+
 /* ----------------------------------------------------------------
  * Rows
  * ----------------------------------------------------------------
@@ -246,6 +298,13 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->env.compare_arg = f;
 	prolly_keying_use_env(&f->krefs, f->kr, f->k, f->tree, &f->env);
 	f->desc = RelationGetDescr(rel);
+	f->ccxt = AllocSetContextCreate(CurrentMemoryContext, "log fold copies",
+									ALLOCSET_DEFAULT_SIZES);
+	/* (more rows changed than the table holds: reading it all is less) */
+	f->limit = rel->rd_rel->reltuples >= 0 ?
+		Max((int64) rel->rd_rel->reltuples, COMPACT_AT) :
+		Max((int64) RelationGetNumberOfBlocks(rel) * MaxHeapTuplesPerPage,
+			COMPACT_AT);
 	f->values = palloc_array(Datum, f->desc->natts);
 	f->isnull = palloc_array(bool, f->desc->natts);
 	f->keyslot = MakeSingleTupleTableSlot(f->desc, &TTSOpsVirtual);
@@ -288,6 +347,50 @@ finder_close(Finder *f)
 	PROLLY_CALL(f->kr, close, f->k);
 }
 
+static int	copy_cmp(const void *a, const void *b, void *arg);
+static bool same_bytes(const char *a, uint32 alen, const uint8 *b, uint32 blen);
+
+/*
+ * The entries kept once per row: sorted, a row's copies made one (a key's
+ * first, or a keyless row's with its count summed; one summed to none is
+ * no change).
+ */
+static void
+compact_copies(Finder *f)
+{
+	int64		u = 0;
+
+	if (f->n > 1)
+		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
+	for (int64 i = 0; i < f->n; i++)
+	{
+		Copy	   *c = &f->c[i];
+
+		if (u > 0 && same_bytes(f->c[u - 1].key, f->c[u - 1].keylen,
+								(const uint8 *) c->key, c->keylen))
+		{
+			f->c[u - 1].delta += c->delta;
+			pfree(c->key);
+			pfree(c->row);
+			continue;
+		}
+		if (u > 0 && f->keyless && f->c[u - 1].delta == 0)
+		{
+			pfree(f->c[u - 1].key);
+			pfree(f->c[u - 1].row);
+			u--;
+		}
+		f->c[u++] = *c;
+	}
+	if (u > 0 && f->keyless && f->c[u - 1].delta == 0)
+	{
+		pfree(f->c[u - 1].key);
+		pfree(f->c[u - 1].row);
+		u--;
+	}
+	f->n = u;
+}
+
 static void
 add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 		 int64 delta)
@@ -296,16 +399,29 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 
 	if (f->n == f->max)
 	{
-		f->max = Max(64, f->max * 2);
-		f->c = f->c ? repalloc_array(f->c, Copy, f->max) :
-			palloc_array(Copy, f->max);
+		if (f->compact && f->n >= COMPACT_AT)
+		{
+			compact_copies(f);
+			if (f->n > f->limit)
+			{
+				f->give_up = true;
+				return;
+			}
+		}
+		/* (grown only if compacting left it more than half full) */
+		if (f->n * 2 > f->max || f->max == 0)
+		{
+			f->max = Max(64, f->max * 2);
+			f->c = f->c ? repalloc_huge(f->c, f->max * sizeof(Copy)) :
+				MemoryContextAllocHuge(f->ccxt, f->max * sizeof(Copy));
+		}
 	}
 	c = &f->c[f->n++];
 	c->keylen = key->len;
-	c->key = palloc(Max(key->len, 1));
+	c->key = MemoryContextAlloc(f->ccxt, Max(key->len, 1));
 	memcpy(c->key, key->data, key->len);
 	c->rowlen = rowlen;
-	c->row = palloc(Max(rowlen, 1));
+	c->row = MemoryContextAlloc(f->ccxt, Max(rowlen, 1));
 	memcpy(c->row, row, rowlen);
 	c->delta = delta;
 }
@@ -355,6 +471,12 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		{
 			int			a = f->keyattrs[i] - 1;
 
+			/* (a key column null: the entry is of another key's columns) */
+			if (f->isnull[a])
+			{
+				f->give_up = true;
+				return false;
+			}
 			f->keyslot->tts_values[a] = f->values[a];
 			f->keyslot->tts_isnull[a] = f->isnull[a];
 		}
@@ -365,7 +487,7 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0);
 	}
 	CHECK_FOR_INTERRUPTS();
-	return true;
+	return !f->give_up;
 }
 
 static bool
@@ -436,7 +558,7 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	/* (each key once, as the keying tells keys apart) */
 	if (f->n > 1)
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
-	for (int i = 0; i < f->n; i++)
+	for (int64 i = 0; i < f->n; i++)
 	{
 		ProllyKey	prev = {u > 0 ? (const uint8 *) f->c[u - 1].key : NULL,
 		u > 0 ? f->c[u - 1].keylen : 0};
@@ -449,13 +571,14 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	f->work.candidates += f->n;
 	f->work.rows_read += f->n;
 
-	edits = palloc_array(ProllyEdit, Max(f->n, 1));
+	edits = MemoryContextAllocHuge(CurrentMemoryContext,
+								   Max(f->n, 1) * sizeof(ProllyEdit));
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
 					  CurrentMemoryContext);
 	scan = index_beginscan(f->rel, f->pk, false, f->snap, NULL, f->nkeys, 0,
 						   SO_NONE);
 	initStringInfo(&value);
-	for (int i = 0; i < f->n; i++)
+	for (int64 i = 0; i < f->n; i++)
 	{
 		Copy	   *c = &f->c[i];
 		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
@@ -527,10 +650,11 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 
 	if (f->n > 1)
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
-	edits = palloc_array(ProllyEdit, Max(f->n, 1));
+	edits = MemoryContextAllocHuge(CurrentMemoryContext,
+								   Max(f->n, 1) * sizeof(ProllyEdit));
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, data_in,
 					  CurrentMemoryContext);
-	for (int i = 0; ok && i < f->n;)
+	for (int64 i = 0; ok && i < f->n;)
 	{
 		Copy	   *c = &f->c[i];
 		Copy	   *made = NULL;
@@ -628,10 +752,13 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 	return ok;
 }
 
+/* A row read: its key and encoding, each allocated to its length. */
 typedef struct FoldRow
 {
-	StringInfoData key;
-	StringInfoData row;
+	char	   *key;
+	uint32		keylen;
+	char	   *row;
+	uint32		rowlen;
 } FoldRow;
 
 static int
@@ -639,14 +766,14 @@ fold_row_cmp(const void *a, const void *b, void *arg)
 {
 	const FoldRow *ra = *(FoldRow *const *) a;
 	const FoldRow *rb = *(FoldRow *const *) b;
-	ProllyKey	ka = {(const uint8 *) ra->key.data, ra->key.len};
-	ProllyKey	kb = {(const uint8 *) rb->key.data, rb->key.len};
+	ProllyKey	ka = {(const uint8 *) ra->key, ra->keylen};
+	ProllyKey	kb = {(const uint8 *) rb->key, rb->keylen};
 	int			r = keying_compare(&ka, &kb, arg);
 
 	/* equal keys of a keyless table: the same row; order by bytes anyway */
 	if (r == 0)
-		r = memcmp(ra->key.data, rb->key.data, Min(ra->key.len, rb->key.len));
-	return r != 0 ? r : (ra->key.len > rb->key.len) - (ra->key.len < rb->key.len);
+		r = memcmp(ra->key, rb->key, Min(ra->keylen, rb->keylen));
+	return r != 0 ? r : (ra->keylen > rb->keylen) - (ra->keylen < rb->keylen);
 }
 
 /*
@@ -659,8 +786,8 @@ fold_all(Finder *f, ProllyNodeRef *data)
 {
 	TableScanDesc scan;
 	FoldRow   **rows = NULL;
-	int			nrows = 0;
-	int			maxrows = 0;
+	int64		nrows = 0;
+	int64		maxrows = 0;
 	ProllyTreeBuilder *b;
 
 	f->work.full++;
@@ -670,14 +797,21 @@ fold_all(Finder *f, ProllyNodeRef *data)
 		FoldRow    *r = palloc(sizeof(FoldRow));
 		ProllyHash	content;
 
-		initStringInfo(&r->key);
-		initStringInfo(&r->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &r->key, &r->row, &content);
+		resetStringInfo(&f->key);
+		resetStringInfo(&f->row);
+		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
+		r->keylen = f->key.len;
+		r->key = palloc(Max(r->keylen, 1));
+		memcpy(r->key, f->key.data, r->keylen);
+		r->rowlen = f->row.len;
+		r->row = palloc(Max(r->rowlen, 1));
+		memcpy(r->row, f->row.data, r->rowlen);
 		if (nrows == maxrows)
 		{
 			maxrows = Max(64, maxrows * 2);
-			rows = rows ? repalloc_array(rows, FoldRow *, maxrows) :
-				palloc_array(FoldRow *, maxrows);
+			rows = rows ? repalloc_huge(rows, maxrows * sizeof(FoldRow *)) :
+				MemoryContextAllocHuge(CurrentMemoryContext,
+									   maxrows * sizeof(FoldRow *));
 		}
 		rows[nrows++] = r;
 		CHECK_FOR_INTERRUPTS();
@@ -689,16 +823,16 @@ fold_all(Finder *f, ProllyNodeRef *data)
 		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, f);
 
 	b = PROLLY_CALL(f->tree, build_begin, &f->env, CurrentMemoryContext);
-	for (int i = 0; i < nrows;)
+	for (int64 i = 0; i < nrows;)
 	{
-		int			j = i + 1;
-		ProllyKey	k = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
-		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
+		int64		j = i + 1;
+		ProllyKey	k = {(const uint8 *) rows[i]->key, rows[i]->keylen};
+		ProllyValue row = {(const uint8 *) rows[i]->row, rows[i]->rowlen};
 		StringInfoData value;
 		ProllyValue v;
 
-		while (j < nrows && rows[j]->key.len == rows[i]->key.len &&
-			   memcmp(rows[j]->key.data, rows[i]->key.data, k.len) == 0)
+		while (j < nrows && rows[j]->keylen == rows[i]->keylen &&
+			   memcmp(rows[j]->key, rows[i]->key, k.len) == 0)
 			j++;
 		if (!f->keyless && j > i + 1)
 			ereport(ERROR,
@@ -726,10 +860,12 @@ static bool
 fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 			 const ProllyChangeLogRoutine *log, ProllyNodeRef *data)
 {
-	if (f->give_up || !sees_fold(f->snap, st) ||
+	f->compact = true;
+	if (f->give_up ||
 		!PROLLY_CALL(log, read, f->rel, f->snap, entry_visit, f) ||
 		f->give_up)
 		return false;
+	compact_copies(f);
 	if (!f->keyless)
 	{
 		fold_keys(f, baseline, data);
@@ -829,6 +965,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	ProllyComponents c;
 	uint64		identity = 0;
 	bool		have;
+	bool		stale;
 	MemoryContext cxt;
 	MemoryContext old;
 
@@ -840,12 +977,19 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	prolly_components_for_relation(rel, &c);
 	if (c.change_log)
 		identity = PROLLY_CALL(c.change_log, identity, rel);
-	have = identity != 0 && !RecoveryInProgress() && baseline != NULL &&
+	have = identity != 0 && baseline != NULL &&
 		parse_state(&baseline->state, &st) && st.log == identity;
+	/* (a snapshot older than the baseline's fold: see the file's header) */
+	stale = have && !sees_fold(f.snap, &st);
+	have = have && !stale && !RecoveryInProgress() &&
+		!(st.flags & STATE_UNSETTLED) && !storage_unseen(rel, f.snap);
 	if (!have || !fold_changed(&f, baseline, &st, c.change_log, data))
 	{
 		/* (what the fold from the baseline read is thrown away) */
 		memset(&f.work, 0, sizeof(f.work));
+		MemoryContextReset(f.ccxt);
+		f.c = NULL;
+		f.n = f.max = 0;
 		fold_all(&f, data);
 	}
 	counters.pages += f.work.pages;
@@ -861,11 +1005,13 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	{
 		State		ns = {0};
 
+		ns.flags = stale ? STATE_UNSETTLED : 0;
 		ns.log = identity;
 		ns.xmax = f.snap->xmax;
 		ns.nxip = f.snap->xcnt;
 		ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-		memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
+		if (ns.nxip > 0)
+			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
 		qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
 		ns.own = GetTopTransactionIdIfAny();
 		MemoryContextSwitchTo(old);
