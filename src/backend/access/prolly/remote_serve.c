@@ -743,6 +743,15 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("only dolt_serve_move_head's head can be null")));
 	branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	/*
+	 * (a commit's hidden branch, not served: moved, the sessions detached
+	 * on it would see another commit's rows while at theirs)
+	 */
+	if (strncmp(branch, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
 	if (VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_PP(1)) > 0)
 		bytea_hash(PG_GETARG_BYTEA_PP(1), &expected);
 	prolly_database_components(&dc);
