@@ -194,6 +194,39 @@ SELECT (SELECT c FROM mm.b) AS b, (SELECT c FROM mm.a) AS a,
 	(SELECT sum(pk) FROM mm.t) AS t_sum;
 SELECT count(*) AS clean FROM dolt_status;
 
+-- and reading it through a function: one with a BEGIN ATOMIC body
+-- records what it reads; one with a string body doesn't, so the views are
+-- refreshed until any order of them is right.
+CREATE MATERIALIZED VIEW mm.d AS SELECT coalesce(sum(pk), 0)::int AS c FROM mm.t;
+CREATE FUNCTION mm.dsum() RETURNS int LANGUAGE sql STABLE
+	BEGIN ATOMIC SELECT c FROM mm.d; END;
+CREATE MATERIALIZED VIEW mm.c AS SELECT mm.dsum() * 10 AS c;
+CREATE MATERIALIZED VIEW mm.f AS SELECT coalesce(sum(pk), 0)::int AS c FROM mm.t;
+CREATE FUNCTION mm.fsum() RETURNS int LANGUAGE sql STABLE
+	AS 'SELECT c FROM mm.f';
+CREATE MATERIALIZED VIEW mm.e AS SELECT mm.fsum() * 10 AS c;
+SELECT length(dolt_commit('-Am', 'views reading views through functions')::text) AS committed;
+SELECT dolt_checkout('-b', 'mm_fn');
+INSERT INTO mm.t VALUES (1000);
+REFRESH MATERIALIZED VIEW mm.d;
+REFRESH MATERIALIZED VIEW mm.c;
+REFRESH MATERIALIZED VIEW mm.f;
+REFRESH MATERIALIZED VIEW mm.e;
+SELECT length(dolt_commit('-am', 'theirs: t, all refreshed')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO mm.t VALUES (2000);
+REFRESH MATERIALIZED VIEW mm.d;
+REFRESH MATERIALIZED VIEW mm.c;
+REFRESH MATERIALIZED VIEW mm.f;
+REFRESH MATERIALIZED VIEW mm.e;
+SELECT length(dolt_commit('-am', 'ours: t, all refreshed')::text) AS committed;
+SELECT (dolt_merge('mm_fn', '-m', 'both refreshed all'))[3:4];
+SELECT (SELECT c FROM mm.d) AS d, (SELECT c FROM mm.c) AS c,
+	(SELECT c FROM mm.f) AS f, (SELECT c FROM mm.e) AS e,
+	(SELECT sum(pk) FROM mm.t) AS t_sum;
+SELECT count(*) AS clean FROM dolt_status;
+
 SELECT dolt_branch('-D', 'mm_other');
+SELECT dolt_branch('-D', 'mm_fn');
 DROP SCHEMA mm CASCADE;
 SELECT length(dolt_commit('-Am', 'mm gone')::text) AS committed;
