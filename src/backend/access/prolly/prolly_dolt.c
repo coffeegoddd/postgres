@@ -51,6 +51,7 @@
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "parser/analyze.h"
 #include "storage/lmgr.h"
@@ -3621,23 +3622,71 @@ typedef struct Heads
 {
 	List	   *branches;		/* char * */
 	List	   *commits;		/* ProllyHash * */
+	const char *remote;			/* the remote's name, for messages */
 } Heads;
 
+/* name, a remote's branch's, for a message: bytes not printable ASCII as \xNN */
+static char *
+escaped_branch_name(const char *name)
+{
+	StringInfoData out;
+
+	initStringInfo(&out);
+	for (const char *p = name; *p; p++)
+	{
+		unsigned char c = (unsigned char) *p;
+
+		if (c < 0x20 || c >= 0x7f)
+			appendStringInfo(&out, "\\x%02x", c);
+		else
+			appendStringInfoChar(&out, c);
+	}
+	return out.data;
+}
+
+/*
+ * A remote's head, kept to track.  A branch here is named by stricter rules
+ * than one made under older ones may meet ("odd..name", "head", one not ASCII
+ * are tracked, and a clone doesn't make a branch of them); but no rules
+ * named one "", "HEAD" or with a control character, so a remote sending
+ * one is in error.  One not valid in this database's encoding isn't kept
+ * as text here: that head alone isn't fetched.
+ */
 static void
 collect_head(const char *branch, const ProllyHash *commit, void *arg)
 {
 	Heads	   *h = arg;
+	bool		control = false;
 
+	for (const char *p = branch; *p; p++)
+	{
+		if ((unsigned char) *p < 0x20 || (unsigned char) *p == 0x7f)
+			control = true;
+	}
+	if (branch[0] == '\0' || strcmp(branch, "HEAD") == 0 || control)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("remote \"%s\" sent the branch name \"%s\", which no branch can have",
+						h->remote, escaped_branch_name(branch))));
+	if (!pg_verifymbstr(branch, strlen(branch), true))
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("remote \"%s\"'s branch \"%s\" isn't fetched",
+						h->remote, escaped_branch_name(branch)),
+				 errdetail("Its name isn't valid in this database's encoding.")));
+		return;
+	}
 	h->branches = lappend(h->branches, pstrdup(branch));
 	h->commits = lappend(h->commits, copy_hash(commit));
 }
 
 /* A remote's head of branch: false if it hasn't the branch. */
 static bool
-remote_head(const ProllyRemoteRoutine *rr, ProllyRemote *r, const char *branch,
-			ProllyHash *head)
+remote_head(const ProllyRemoteRoutine *rr, ProllyRemote *r, const char *remote,
+			const char *branch, ProllyHash *head)
 {
-	Heads		h = {NIL, NIL};
+	Heads		h = {NIL, NIL, remote};
 	ListCell   *b;
 	ListCell   *c;
 
@@ -3696,8 +3745,8 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got)
 	char	   *url = need_remote(name);
 	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
 	ProllyRemote *r;
-	Heads		all = {NIL, NIL};
-	Heads		want = {NIL, NIL};
+	Heads		all = {NIL, NIL, name};
+	Heads		want = {NIL, NIL, name};
 	ListCell   *b;
 	ListCell   *c;
 
@@ -3986,7 +4035,7 @@ dolt_push(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		check_remote_format(rr, r, remote);
-		had = remote_head(rr, r, remote_branch, &theirs);
+		had = remote_head(rr, r, remote, remote_branch, &theirs);
 		if (had && same_hash(&theirs, &local))
 			result[1] = "Everything up-to-date";
 		else
