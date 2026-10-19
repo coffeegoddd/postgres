@@ -112,6 +112,7 @@ tests += {
       'doltgres_vc',
       'doltgres_objects',
       'doltgres_fks_auth',
+      'described_properties',
       'jsonb_canonical',
       'float_canonical',
       'hash_pointers',

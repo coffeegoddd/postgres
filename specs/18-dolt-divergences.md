@@ -231,3 +231,19 @@ stash, …) is F, ported with the feature (#163).
 - **Port:** expected rows and violations follow prolly's: the violation
   lists the row not written, and the table has one row fewer than
   Dolt's (a count of its rows, as `DELETE`'s, is one lower).
+
+## D14. No branch is named "--"
+
+- **Dolt:** a branch name is refused when it is empty, `HEAD`, `-`,
+  a commit id, or has an empty `/` component; `--` is accepted, so
+  `dolt_checkout('-b', '--', 'main')` (its argument parser takes `--`
+  as `-b`'s value) makes and checks out a branch named `--`.
+- **Prolly:** `--` is refused as a branch's name, as git's
+  `check-ref-format` refuses it (git refuses any name beginning with
+  `-`; names like `-dash` are still accepted here, as in Dolt). An
+  option's value is taken as Dolt takes it, `--` included, so
+  `dolt_commit('-m', '--')` commits with the message `--`.
+- **Why:** the user's expectation in #314: `--` ends the options, and a
+  branch named `--` could be named only after another `--`.
+- **Port:** a case that makes a branch named `--` expects the
+  `invalid branch name` error (SQLSTATE 42602) instead.

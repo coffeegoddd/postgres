@@ -355,7 +355,8 @@ delete_here(void *arg)
  * checks them)?  "~" and "^" would be read as ancestry steps, ":" as a
  * refspec, and so on: a branch so named couldn't be named again.  As in
  * Dolt, a name is ASCII, and may begin with "-" (given after "--") but
- * isn't "-" alone (git's previous branch); "HEAD", in any case, the
+ * isn't "-" alone (git's previous branch), nor, as in git, "--" (the end
+ * of the options, spec 18, D14); "HEAD", in any case, the
  * session branch's head, isn't a branch's name.  (Nor is a commit's id:
  * the refs, which know commits, refuse that.)
  */
@@ -364,7 +365,8 @@ branch_name_ok(const char *name)
 {
 	size_t		len = strlen(name);
 
-	if (len == 0 || len >= NAMEDATALEN || strcmp(name, "-") == 0)
+	if (len == 0 || len >= NAMEDATALEN || strcmp(name, "-") == 0 ||
+		strcmp(name, "--") == 0)
 		return false;
 
 	if (pg_strcasecmp(name, "HEAD") == 0 || strcmp(name, "@") == 0 ||
@@ -403,7 +405,7 @@ copies_check_create(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid branch name \"%s\"", name),
-				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not \"-\" alone or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
+				 errdetail("A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \\; no \"..\", \"@{\" or \"//\"; not \"HEAD\" (in any case) or \"@\"; not \"-\" or \"--\" alone, or beginning with \"/\", nor ending with \"/\" or \".\"; and no \"/\"-separated part beginning with \".\" or ending with \".lock\".")));
 	PreventCommandIfReadOnly("dolt_branch()");
 	/* (one made on the session's behalf is the database's mechanism, not the role's) */
 	if (BranchCreateOnBehalf)
