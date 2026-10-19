@@ -315,6 +315,127 @@ SELECT dolt_branch('-D', 'parent_grows');
 SELECT dolt_branch('-D', 'table_grows');
 SELECT dolt_branch('-D', 'both_grow');
 
+-- A typed table's composite type can change across a move.  Detach it
+-- before replacing the type, and attach it after its columns match.
+CREATE SCHEMA typed VERSIONED;
+CREATE TYPE typed.ty AS (a int, b text);
+CREATE TABLE typed.tt OF typed.ty (PRIMARY KEY (a));
+INSERT INTO typed.tt VALUES (1, 'one');
+SELECT (dolt_commit('-Am', 'typed base'))[1] AS typed_base \gset
+SELECT dolt_branch('typed_base');
+ALTER TYPE typed.ty ADD ATTRIBUTE c int CASCADE;
+UPDATE typed.tt SET c = 10;
+SELECT (dolt_commit('-Am', 'typed added'))[1] AS typed_added \gset
+SELECT dolt_reset('--hard', :'typed_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_base') AS same_root;
+SELECT * FROM typed.tt;
+SELECT dolt_reset('--hard', :'typed_added');
+SELECT test_fold_root() = prolly_root_hash(:'typed_added') AS same_root;
+SELECT * FROM typed.tt;
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+SELECT * FROM dolt_status();
+
+-- A merge across the added attribute keeps an independent row edit.
+SELECT dolt_branch('typed_rows', :'typed_base');
+SELECT dolt_checkout('typed_rows');
+UPDATE typed.tt SET b = 'edited';
+SELECT dolt_commit('-Am', 'typed row edit') IS NOT NULL AS committed;
+SELECT (dolt_merge('main'))[2:4];
+SELECT * FROM typed.tt ORDER BY a;
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+SELECT * FROM dolt_status();
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'typed_rows');
+
+-- Retyping and reordering attributes, including a table made again.
+ALTER TYPE typed.ty ALTER ATTRIBUTE a TYPE bigint CASCADE;
+ALTER TYPE typed.ty DROP ATTRIBUTE b CASCADE;
+ALTER TYPE typed.ty ADD ATTRIBUTE b text COLLATE "C" CASCADE;
+UPDATE typed.tt SET b = 'reordered';
+SELECT (dolt_commit('-Am', 'typed reordered'))[1] AS typed_reordered \gset
+SELECT dolt_checkout('typed_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_base') AS same_root;
+SELECT * FROM typed.tt;
+SELECT dolt_checkout('main');
+SELECT test_fold_root() = prolly_root_hash(:'typed_reordered') AS same_root;
+SELECT * FROM typed.tt;
+SELECT reloftype = 'typed.ty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.tt'::regclass;
+SELECT * FROM dolt_status();
+
+SELECT dolt_branch('-D', 'typed_base');
+
+-- An outside table is still refused before it can depend on a versioned type.
+CREATE SCHEMA typed_external;
+CREATE TABLE typed_external.tt OF typed.ty;
+SELECT test_fold_root() = prolly_root_hash(:'typed_reordered') AS same_root;
+SELECT to_regclass('typed_external.tt') IS NULL AS refused;
+SELECT * FROM dolt_status();
+DROP SCHEMA typed_external;
+
+-- An indirectly replaced composite type: its definition and its typed
+-- table's definition are unchanged when the attribute's domain changes.
+CREATE DOMAIN typed.pos AS int CHECK (VALUE > 0);
+CREATE TYPE typed.indirect AS (a typed.pos);
+CREATE TABLE typed.dt OF typed.indirect;
+INSERT INTO typed.dt VALUES (20);
+SELECT (dolt_commit('-Am', 'typed domain base'))[1] AS typed_domain_base \gset
+ALTER DOMAIN typed.pos DROP CONSTRAINT pos_check;
+ALTER DOMAIN typed.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+SELECT (dolt_commit('-Am', 'typed domain changed'))[1] AS typed_domain_changed \gset
+SELECT dolt_reset('--hard', :'typed_domain_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_domain_base') AS same_root;
+SELECT dolt_reset('--hard', :'typed_domain_changed');
+SELECT test_fold_root() = prolly_root_hash(:'typed_domain_changed') AS same_root;
+SELECT * FROM typed.dt;
+SELECT reloftype = 'typed.indirect'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.dt'::regclass;
+INSERT INTO typed.dt VALUES (5);
+SELECT * FROM dolt_status();
+
+-- The target may leave a table untyped, attach it to a different type,
+-- or drop it while replacing the old type.
+CREATE TYPE typed.other AS (a typed.pos);
+CREATE TABLE typed.untyped OF typed.indirect;
+CREATE TABLE typed.switched OF typed.indirect;
+CREATE TABLE typed.gone OF typed.indirect;
+SELECT (dolt_commit('-Am', 'typed links base'))[1] AS typed_links_base \gset
+ALTER TABLE typed.untyped NOT OF;
+ALTER TABLE typed.switched OF typed.other;
+DROP TABLE typed.gone;
+ALTER TYPE typed.indirect ADD ATTRIBUTE b text CASCADE;
+SELECT (dolt_commit('-Am', 'typed links changed'))[1] AS typed_links_changed \gset
+SELECT dolt_reset('--hard', :'typed_links_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_links_base') AS same_root;
+SELECT dolt_reset('--hard', :'typed_links_changed');
+SELECT test_fold_root() = prolly_root_hash(:'typed_links_changed') AS same_root;
+SELECT relname, reloftype::regtype FROM pg_class
+WHERE relnamespace = 'typed'::regnamespace AND relkind = 'r' ORDER BY relname;
+SELECT to_regclass('typed.gone') IS NULL AS gone;
+SELECT * FROM dolt_status();
+
+-- A partitioned typed table detaches too, while its partitions follow
+-- the parent's column changes.
+CREATE TYPE typed.pty AS (a int);
+CREATE TABLE typed.pt OF typed.pty PARTITION BY RANGE (a);
+CREATE TABLE typed.pt1 PARTITION OF typed.pt FOR VALUES FROM (0) TO (10);
+INSERT INTO typed.pt VALUES (1);
+SELECT (dolt_commit('-Am', 'typed partition base'))[1] AS typed_partition_base \gset
+ALTER TYPE typed.pty ADD ATTRIBUTE b text CASCADE;
+UPDATE typed.pt SET b = 'partition';
+SELECT (dolt_commit('-Am', 'typed partition added'))[1] AS typed_partition_added \gset
+SELECT dolt_reset('--hard', :'typed_partition_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_partition_base') AS same_root;
+SELECT dolt_reset('--hard', :'typed_partition_added');
+SELECT test_fold_root() = prolly_root_hash(:'typed_partition_added') AS same_root;
+SELECT * FROM typed.pt;
+SELECT reloftype = 'typed.pty'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.pt'::regclass;
+SELECT * FROM dolt_status();
+
 DROP VIEW described;
 SELECT dolt_reset('--hard', :'base');
 DROP SCHEMA app CASCADE;

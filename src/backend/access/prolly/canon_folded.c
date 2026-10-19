@@ -5323,6 +5323,8 @@ typedef struct TypeMoves
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
 	List	   *tables;			/* the tables of those columns */
+	List	   *detached;		/* typed tables detached before their types
+								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -5464,12 +5466,14 @@ same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *n
  * anew, the columns of versioned tables using it (or arrays of it)
  * converted, and the old dropped.  What uses one is found through what
  * depends on it: a composite type or a domain the branch has is moved
- * with it (as to defines it); a check constraint, an index or a default of
- * a versioned table, or a routine, is dropped first and made again after
- * (as to defines it, if alike; the table's or routine's own move does the
- * rest).  Anything else using it (a column of another schema's table, an
- * operator) can't be moved with it: refused.  Views and materialized views
- * using them go and come back with the others (folded_move_schema()).
+ * with it (as to defines it); typed tables are detached for move_table()
+ * to attach again once their columns match; a check constraint, an index
+ * or a default of a versioned table, or a routine, is dropped first and
+ * made again after (as to defines it, if alike; the table's or routine's
+ * own move does the rest).  Anything else using it (a column of another
+ * schema's table, an operator) can't be moved with it: refused.  Views and
+ * materialized views using them go and come back with the others
+ * (folded_move_schema()).
  */
 static TypeMoves
 type_moves(List *from, List *to)
@@ -5561,6 +5565,24 @@ type_moves(List *from, List *to)
 						if (moved_type(moved, ct) == NULL)
 							(void) move_type(&moved, from, to, ct, mt->from->name);
 						handled = true;
+					}
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid == 0 && !array)
+					{
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+						MoveItem   *f = find_item(from, 't', rel);
+						TableDef	fd;
+
+						if (f)
+						{
+							parse_table_def(f->def, &fd);
+							if (same_strings(fd.of, mt->from->name))
+							{
+								tm.before = lappend(tm.before, psprintf("ALTER TABLE %s NOT OF", rel));
+								tm.detached = lappend(tm.detached, rel);
+								handled = true;
+							}
+						}
 					}
 					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
 					{
@@ -6262,9 +6284,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	fd;
 		TableDef	td;
 
-		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+		if (f->kind != 't' ||
+			(t && strcmp(t->def, f->def) == 0 && !list_has_string(tm.detached, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
+		/* type_moves() detaches it first; move_table() restores to's link. */
+		if (list_has_string(tm.detached, f->name))
+			fd.of = NULL;
 		if (t)
 			parse_table_def(t->def, &td);
 		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
