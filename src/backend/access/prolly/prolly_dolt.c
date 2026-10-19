@@ -367,19 +367,10 @@ text_array(int n, const char *const *vals)
 }
 
 /*
- * Where the options end: the index of the first "--" (what follows it is
- * a branch or ref, even one beginning with "-"), or nargs.
+ * The argument after option args[*i], whatever it is, "--" too (as Dolt's
+ * argument parser and git's take it): an option's value is never read as
+ * the "--" that ends the options.
  */
-static int
-options_end(char **args, int nargs)
-{
-	for (int i = 0; i < nargs; i++)
-		if (strcmp(args[i], "--") == 0)
-			return i;
-	return nargs;
-}
-
-/* The argument after option args[*i]. */
 static char *
 option_value(char **args, int nargs, int *i, const char *fn)
 {
@@ -814,6 +805,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		allow_empty = false;
 	bool		skip_empty = false;
 	bool		force = false;
+	bool		options = true;	/* until "--" */
 	ProllyHash	id = {0};
 	bool		committed = false;
 	ProllyMergeState ms;
@@ -823,7 +815,11 @@ dolt_commit(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "m") || is_option(a, "message"))
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* (and nothing after it) */
+		else if (!options || a[0] != '-')
+			unexpected("dolt_commit", a);
+		else if (is_option(a, "m") || is_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_commit");
 		else if (is_option(a, "author"))
 			author = option_value(args, nargs, &i, "dolt_commit");
@@ -853,10 +849,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 					unsupported("dolt_commit", a);
 			}
 		}
-		else if (a[0] == '-')
-			unsupported("dolt_commit", a);
 		else
-			unexpected("dolt_commit", a);
+			unsupported("dolt_commit", a);
 	}
 	if (message == NULL)
 		ereport(ERROR,
@@ -923,6 +917,22 @@ reserved_branch_name(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_WRITER_PREFIX)));
+}
+
+/*
+ * A connection doesn't name a hidden branch, as dolt_checkout() doesn't:
+ * on it, it would be writable, and its writes would move the branch off
+ * the commit that the sessions detached there are at.  (A writer's branch
+ * is connected to as any other.)
+ */
+void
+prolly_check_connect_branch(const char *branch)
+{
+	if (detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Check out the commit with dolt_checkout(), read-only.")));
 }
 
 /* Does what's checked out name a commit by its hash (a prefix of it)? */
@@ -1181,9 +1191,10 @@ dolt_checkout(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	char	   *branch = NULL;
 	char	   *start = NULL;
+	char	   *named = NULL;	/* the one name given apart from -b's */
 	bool		create = false;
 	const char *result[2];
 
@@ -1191,25 +1202,32 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
-			if (branch == NULL)
-				branch = a;
-			else if (create && start == NULL)
-				start = a;
+			if (named == NULL)
+				named = a;
 			else
 				unexpected("dolt_checkout", a);
 		}
 		else if (is_option(a, "b"))
 		{
+			if (create)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("dolt_checkout: multiple values provided for \"%s\"", a)));
 			create = true;
 			branch = option_value(args, nargs, &i, "dolt_checkout");
 		}
 		else
 			unsupported("dolt_checkout", a);
 	}
+	/* (-b's start point, before or after it, as in Dolt and git) */
+	if (create)
+		start = named;
+	else
+		branch = named;
 	if (branch == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1355,6 +1373,18 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (nor is a commit's hidden branch renamed: renamed, it would be an
+	 * ordinary, writable branch where the sessions detached at the commit
+	 * are; said before a detached session's read-only transaction is, as
+	 * the more specific)
+	 */
+	if (move && detached_branch(linitial(names)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a commit's hidden branch can't be renamed"),
+				 errhint("Make a branch at the commit with dolt_branch().")));
 
 	/*
 	 * (a rename, delete, take or protection makes no branch: not in a
@@ -1620,7 +1650,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	char	   *branch = NULL;
 	char	   *message = NULL;
 	int			flags = 0;
@@ -1638,9 +1668,9 @@ dolt_merge(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
 			if (branch == NULL)
 				branch = a;
@@ -2126,6 +2156,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	char	   *target = NULL;
 	char	   *message = NULL;
+	bool		options = true;	/* until "--" */
 	char	   *mine;
 	ProllyHash	before = {0};
 	ProllyHash	id = {0};
@@ -2141,10 +2172,15 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "m") || is_option(a, "message"))
-			message = option_value(args, nargs, &i, "dolt_integrate");
-		else if (a[0] == '-')
-			unsupported("dolt_integrate", a);
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (options && a[0] == '-')
+		{
+			if (is_option(a, "m") || is_option(a, "message"))
+				message = option_value(args, nargs, &i, "dolt_integrate");
+			else
+				unsupported("dolt_integrate", a);
+		}
 		else if (target == NULL)
 			target = a;
 		else
@@ -2225,7 +2261,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	bool		hard = false;
 	char	   *ref = NULL;
 	const char *result[1] = {"0"};
@@ -2234,9 +2270,9 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
 			if (ref == NULL)
 				ref = a;
@@ -2337,7 +2373,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	const char *ref = NULL;
 	bool		allow_empty = false;
 	ProllyHash	id;
@@ -2349,9 +2385,9 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (i == dashes)
-			continue;
-		if (i > dashes || args[i][0] != '-')
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || args[i][0] != '-')
 		{
 			if (ref == NULL)
 				ref = args[i];
@@ -2502,16 +2538,16 @@ dolt_revert(PG_FUNCTION_ARGS)
 	const char *result[4] = {"", "0", "0", "0"};
 	const char **refs_given = palloc(sizeof(char *) * Max(nargs, 1));
 	int			nrefs = 0;
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	bool		abort_revert = false;
 	bool		continue_revert = false;
 	char	   *author = NULL;
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (i == dashes)
-			continue;
-		if (i > dashes || args[i][0] != '-')
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || args[i][0] != '-')
 			refs_given[nrefs++] = args[i];
 		else if (is_option(args[i], "abort"))
 			abort_revert = true;
@@ -2600,12 +2636,16 @@ dolt_add(PG_FUNCTION_ARGS)
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
 	const char *result[1] = {"0"};
+	bool		options = true;	/* until "--" */
 
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];
 
-		if (a[0] == '-' && !is_option(a, "A") && !is_option(a, "all"))
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* tables after it, even ones like flags */
+		else if (options && a[0] == '-' &&
+				 !is_option(a, "A") && !is_option(a, "all"))
 			unsupported("dolt_add", a);
 	}
 	PG_RETURN_DATUM(text_array(1, result));
@@ -3146,6 +3186,7 @@ typedef struct Rows
 	TupleTableSlot *slot;
 	ProllyTreeEnv env;			/* where values out of line are read */
 	ProllyKeyingRefs refs;
+	MemoryContext rowcxt;		/* a row's decoding, reset for the next */
 } Rows;
 
 static void
@@ -3158,6 +3199,21 @@ rows_begin(Rows *r, Relation rel)
 	prolly_folded_tree_env(&r->env);
 	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
+									  ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * Where a sink decodes the rows it's handed: what it decoded for the last
+ * row is freed (the tuplestore has its own copies), so a diff of millions
+ * of rows takes the memory of one.
+ */
+static MemoryContext
+rows_next(Rows *r)
+{
+	ExecClearTuple(r->slot);
+	MemoryContextReset(r->rowcxt);
+	return MemoryContextSwitchTo(r->rowcxt);
 }
 
 static void
@@ -3165,9 +3221,13 @@ rows_end(Rows *r)
 {
 	ExecDropSingleTupleTableSlot(r->slot);
 	PROLLY_CALL(r->c.keying, close, r->keying);
+	MemoryContextDelete(r->rowcxt);
 }
 
-/* The row a tree value holds, as a composite datum; and its copies. */
+/*
+ * The row a tree value holds, as a composite datum of its own (the slot
+ * is reused for the next value); and its copies.
+ */
 static Datum
 rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
@@ -3254,6 +3314,7 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	uint64		nafter = 0;
 	Datum		from = (Datum) 0;
 	Datum		to = (Datum) 0;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (before)
 		from = rows_datum(&s->rows, before, &nbefore);
@@ -3268,14 +3329,14 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		else
 			put_diff(s, "removed", from, false, (Datum) 0, true,
 					 nbefore - nafter);
-		return;
 	}
-	if (kind == PROLLY_DIFF_ADDED)
+	else if (kind == PROLLY_DIFF_ADDED)
 		put_diff(s, "added", (Datum) 0, true, to, false, 1);
 	else if (kind == PROLLY_DIFF_REMOVED)
 		put_diff(s, "removed", from, false, (Datum) 0, true, 1);
 	else
 		put_diff(s, "modified", from, false, to, false, 1);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -3472,29 +3533,32 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	const char *result[1];
 	bool		output_only = false;
 	bool		all = false;
+	bool		options = true;	/* until "--" */
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (is_option(args[i], "all"))
+		if (options && strcmp(args[i], "--") == 0)
 		{
-			all = true;
+			options = false;	/* tables after it, even ones like flags */
 			continue;
 		}
-		if (is_option(args[i], "output-only"))
+		if (options && args[i][0] == '-')
 		{
-			output_only = true;
+			if (is_option(args[i], "all"))
+				all = true;
+			else if (is_option(args[i], "output-only"))
+				output_only = true;
+			/* short flags, together or apart: -a, -o, -ao */
+			else if (short_flags(args[i]) != NULL &&
+					 strspn(short_flags(args[i]), "ao") == strlen(short_flags(args[i])))
+			{
+				output_only |= strchr(short_flags(args[i]), 'o') != NULL;
+				all |= strchr(short_flags(args[i]), 'a') != NULL;
+			}
+			else
+				unsupported("dolt_verify_constraints", args[i]);
 			continue;
 		}
-		/* short flags, together or apart: -a, -o, -ao */
-		if (short_flags(args[i]) != NULL &&
-			strspn(short_flags(args[i]), "ao") == strlen(short_flags(args[i])))
-		{
-			output_only |= strchr(short_flags(args[i]), 'o') != NULL;
-			all |= strchr(short_flags(args[i]), 'a') != NULL;
-			continue;
-		}
-		if (args[i][0] == '-')
-			unsupported("dolt_verify_constraints", args[i]);
 		relids = lappend_oid(relids,
 							 RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(args[i], NULL)),
 											  AccessShareLock, false));
@@ -3559,17 +3623,19 @@ row_conflict(ProllyConflictSink *self, const ProllyKey *key,
 	Datum		values[5];
 	bool		nulls[5] = {base == NULL, ours == NULL, theirs == NULL, false, false};
 	uint64		count;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (base)
-		values[0] = datumCopy(rows_datum(&s->rows, base, &count), false, -1);
+		values[0] = rows_datum(&s->rows, base, &count);
 	if (ours)
-		values[1] = datumCopy(rows_datum(&s->rows, ours, &count), false, -1);
+		values[1] = rows_datum(&s->rows, ours, &count);
 	if (theirs)
 		values[2] = rows_datum(&s->rows, theirs, &count);
 	values[3] = CStringGetTextDatum(change_kind(base, ours));
 	values[4] = CStringGetTextDatum(change_kind(base, theirs));
 	tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
 						 nulls);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -3615,6 +3681,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
 	int			side = 0;		/* 1 ours, 2 theirs */
+	bool		options = true;	/* until "--" */
 	List	   *tables = NIL;
 	ListCell   *lc;
 	ProllyMergeState ms;
@@ -3624,12 +3691,17 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "ours"))
-			side = 1;
-		else if (is_option(a, "theirs"))
-			side = 2;
-		else if (a[0] == '-')
-			unsupported("dolt_conflicts_resolve", a);
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* tables after it, even ones like flags */
+		else if (options && a[0] == '-')
+		{
+			if (is_option(a, "ours"))
+				side = 1;
+			else if (is_option(a, "theirs"))
+				side = 2;
+			else
+				unsupported("dolt_conflicts_resolve", a);
+		}
 		else if (strcmp(a, ".") == 0)
 		{
 			if (PROLLY_CALL(refs(), merge_state, &ms))
@@ -3742,6 +3814,14 @@ dolt_remote(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	const char *result[1] = {"0"};
 
+	/* (no options: a "--" only lets a name begin with "-") */
+	for (int i = 0; i < nargs; i++)
+		if (strcmp(args[i], "--") == 0)
+		{
+			memmove(&args[i], &args[i + 1], sizeof(char *) * (nargs - i));
+			nargs--;
+			break;
+		}
 	if (nargs >= 1 && strcmp(args[0], "add") == 0)
 	{
 		if (nargs != 3)
@@ -3982,11 +4062,14 @@ dolt_fetch(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	char	   *remote = NULL;
 	List	   *branches = NIL;
+	bool		options = true;	/* until "--" */
 	const char *result[1] = {"0"};
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (args[i][0] == '-')
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (options && args[i][0] == '-')
 			unsupported("dolt_fetch", args[i]);
 		else if (remote == NULL)
 			remote = args[i];
@@ -4025,13 +4108,18 @@ dolt_gc(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	bool		full = false;
 	bool		shallow = false;
+	bool		options = true;	/* until "--" */
 	const char *result[1] = {"0"};
 	ProllyDatabaseComponents dc;
 	ProllyGcResult gc;
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (is_option(args[i], "full"))
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* (and nothing after it) */
+		else if (!options)
+			unexpected("dolt_gc", args[i]);
+		else if (is_option(args[i], "full"))
 			full = true;
 		else if (is_option(args[i], "shallow"))
 			shallow = true;
@@ -4138,6 +4226,7 @@ dolt_push(PG_FUNCTION_ARGS)
 	char	   *remote_branch = NULL;
 	bool		force = false;
 	bool		set_upstream = false;
+	bool		options = true;	/* until "--" */
 	char	   *url;
 	const ProllyRemoteRoutine *rr;
 	ProllyRemote *r;
@@ -4150,12 +4239,24 @@ dolt_push(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "f") || is_option(a, "force"))
-			force = true;
-		else if (is_option(a, "u") || is_option(a, "set-upstream"))
-			set_upstream = true;
-		else if (a[0] == '-')
-			unsupported("dolt_push", a);
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (options && a[0] == '-')
+		{
+			if (is_option(a, "f") || is_option(a, "force"))
+				force = true;
+			else if (is_option(a, "u") || is_option(a, "set-upstream"))
+				set_upstream = true;
+			/* short flags together: -fu */
+			else if (short_flags(a) != NULL &&
+					 strspn(short_flags(a), "fu") == strlen(short_flags(a)))
+			{
+				force |= strchr(short_flags(a), 'f') != NULL;
+				set_upstream |= strchr(short_flags(a), 'u') != NULL;
+			}
+			else
+				unsupported("dolt_push", a);
+		}
 		else if (remote == NULL)
 			remote = a;
 		else if (branch == NULL)
@@ -4169,6 +4270,12 @@ dolt_push(PG_FUNCTION_ARGS)
 		branch = pstrdup(branch_ops()->current());
 	if (remote_branch == NULL)
 		remote_branch = branch;
+	/* (a commit's hidden branch, a session's, isn't a remote's: as it serves) */
+	if (detached_branch(remote_branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Push a branch made at the commit with dolt_branch().")));
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -4248,6 +4355,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 	char	   *remote = NULL;
 	char	   *branch = NULL;
 	List	   *merge_args = NIL;
+	bool		options = true;	/* until "--" */
 	Datum	   *d;
 	int			n = 0;
 	ListCell   *lc;
@@ -4256,19 +4364,24 @@ dolt_pull(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "no-ff"))
-			merge_args = lappend(merge_args, a);
-		else if (is_option(a, "m") || is_option(a, "message"))
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (options && a[0] == '-')
 		{
-			char	   *message = option_value(args, nargs, &i, "dolt_pull");
+			if (is_option(a, "no-ff"))
+				merge_args = lappend(merge_args, a);
+			else if (is_option(a, "m") || is_option(a, "message"))
+			{
+				char	   *message = option_value(args, nargs, &i, "dolt_pull");
 
-			/* (before the fetch, as dolt_merge would refuse it after) */
-			given_message("dolt_pull", message);
-			merge_args = lappend(merge_args, a);
-			merge_args = lappend(merge_args, message);
+				/* (before the fetch, as dolt_merge would refuse it after) */
+				given_message("dolt_pull", message);
+				merge_args = lappend(merge_args, a);
+				merge_args = lappend(merge_args, message);
+			}
+			else
+				unsupported("dolt_pull", a);
 		}
-		else if (a[0] == '-')
-			unsupported("dolt_pull", a);
 		else if (remote == NULL)
 			remote = a;
 		else if (branch == NULL)
@@ -4282,6 +4395,8 @@ dolt_pull(PG_FUNCTION_ARGS)
 		branch = pstrdup(branch_ops()->current());
 	fetch_remote(remote, list_make1(branch), NULL, NULL);
 
+	/* (after "--": a remote's name may begin with "-") */
+	merge_args = lappend(merge_args, "--");
 	merge_args = lappend(merge_args, psprintf("%s/%s", remote, branch));
 	d = palloc(sizeof(Datum) * list_length(merge_args));
 	foreach(lc, merge_args)
@@ -4427,6 +4542,19 @@ check_clone_target(const char *current)
 }
 
 /*
+ * Is a remote's branch made a branch here by a clone?  Not one whose name
+ * this database's rules refuse, made under older ones, nor one named as a
+ * commit's hidden branch (which a served database doesn't list, but a file
+ * remote may hold): made here, it would be where sessions detached at the
+ * commit it names go, though at another commit.
+ */
+static bool
+cloned_as_branch(const char *name)
+{
+	return branch_ops()->name_ok(name) && !detached_branch(name);
+}
+
+/*
  * dolt_clone(VARIADIC args text[]) returns text[]: {status}
  *
  * url, [--remote name] (origin), [--branch branch]: in an empty database
@@ -4450,6 +4578,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 	char	   *url = NULL;
 	char	   *remote = "origin";
 	char	   *branch = NULL;
+	bool		options = true;	/* until "--" */
 	const char *current = branch_ops()->current();
 	Heads		h = {NIL, NIL};
 	ListCell   *lc;
@@ -4459,12 +4588,17 @@ dolt_clone(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (is_option(a, "remote"))
-			remote = option_value(args, nargs, &i, "dolt_clone");
-		else if (is_option(a, "b") || is_option(a, "branch"))
-			branch = option_value(args, nargs, &i, "dolt_clone");
-		else if (a[0] == '-')
-			unsupported("dolt_clone", a);
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* a URL after it */
+		else if (options && a[0] == '-')
+		{
+			if (is_option(a, "remote"))
+				remote = option_value(args, nargs, &i, "dolt_clone");
+			else if (is_option(a, "b") || is_option(a, "branch"))
+				branch = option_value(args, nargs, &i, "dolt_clone");
+			else
+				unsupported("dolt_clone", a);
+		}
 		else if (url == NULL)
 			url = a;
 		else
@@ -4479,6 +4613,10 @@ dolt_clone(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("dolt_clone needs the session on a branch")));
+	if (branch != NULL && detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
 	check_clone_target(current);
 
 	/* the remote added as dolt_remote() adds one, and fetched */
@@ -4499,7 +4637,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 		}
 		foreach(lc, h.branches)
 		{
-			if (branch == NULL && branch_ops()->name_ok(lfirst(lc)))
+			if (branch == NULL && cloned_as_branch(lfirst(lc)))
 				branch = lfirst(lc);
 		}
 		if (branch == NULL)
@@ -4543,14 +4681,16 @@ dolt_clone(PG_FUNCTION_ARGS)
 		char	   *tracking = psprintf("%s/%s", remote, b);
 
 		/*
-		 * (a remote branch whose name this database's rules refuse, made
-		 * under older ones: tracked, not made here)
+		 * (a remote branch whose name this database refuses: tracked, not
+		 * made here)
 		 */
-		if (!branch_ops()->name_ok(b))
+		if (!cloned_as_branch(b))
 		{
 			ereport(WARNING,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("remote branch \"%s\" isn't cloned as a branch", b),
+					 detached_branch(b) ?
+					 errdetail("Names beginning \"%s\" are reserved.", PROLLY_DETACHED_PREFIX) :
 					 errdetail("Its name isn't a branch's by this database's rules."),
 					 errhint("Its commits are fetched: dolt_branch(name, '%s') makes a branch of it under another name.",
 							 tracking)));

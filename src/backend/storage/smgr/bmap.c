@@ -98,6 +98,7 @@
 #include "access/bufmask.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
@@ -116,6 +117,7 @@
 #include "storage/proc.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
+#include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -994,23 +996,34 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 }
 
 /*
+ * Verify map page 'blk' of 'rel'.  A page of zeroes (an extension's whose
+ * record a crash lost) passes if 'new_ok' (returning false), else fails.
+ */
+static bool
+check_node(char *page, uint16 type, RelFileLocator rel,
+		   BlockNumber blk, bool new_ok)
+{
+	if (new_ok && PageIsNew(page))
+		return false;
+	check_page(page, type, rel, BMAP_FORKNUM, blk);
+	return true;
+}
+
+/*
  * Copy map page 'blk' of 'rel', pinned in 'buf', into 'dst' under a share
- * lock.  A page of zeroes (an extension's whose record a crash lost) is
- * copied as such if 'new_ok' (returning false), else fails verification.
+ * lock, verified as in check_node().
  */
 static bool
 copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
 		  uint16 type, bool new_ok)
 {
-	bool		isnew;
+	bool		found;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	isnew = new_ok && PageIsNew(BufferGetPage(buf));
-	if (!isnew)
-		check_page(BufferGetPage(buf), type, rel, BMAP_FORKNUM, blk);
+	found = check_node(BufferGetPage(buf), type, rel, blk, new_ok);
 	memcpy(dst, BufferGetPage(buf), BLCKSZ);
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	return !isnew;
+	return found;
 }
 
 /*
@@ -1025,13 +1038,16 @@ copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
  * a write can need: an entry's block changes only while its logical block
  * can't be written, so a write after the change finds the page cached or
  * written out.  A torn read fails verification and is read again.
+ *
+ * The page is verified as in check_node(); see read_node_ext().
  */
-static void
-read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
-		  uint16 type)
+static bool
+read_node_ext(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
+			  uint16 type, bool new_ok)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		buf;
+	bool		found;
 
 	if (for_write)
 	{
@@ -1053,8 +1069,7 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 							 errmsg("invalid page in block %u of \"%s\"",
 									blk, relpathperm(rel, BMAP_FORKNUM).str)));
 			}
-			check_page(dst, type, rel, BMAP_FORKNUM, blk);
-			return;
+			return check_node(dst, type, rel, blk, new_ok);
 		}
 		buf = r.recent_buffer;
 
@@ -1069,24 +1084,46 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 	else
 		buf = map_read(rel, blk);
 
-	(void) copy_node(rel, buf, blk, dst, type, false);
+	found = copy_node(rel, buf, blk, dst, type, new_ok);
 	ReleaseBuffer(buf);
+	return found;
 }
 
+/* read_node_ext() of a page that must be initialized */
+static void
+read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
+		  uint16 type)
+{
+	(void) read_node_ext(reln, blk, for_write, dst, type, false);
+}
+
+/*
+ * The relation's length in its map's header, and in *lsn (if given) the
+ * header's LSN.  See read_node() for 'for_write'.
+ */
 static BlockNumber
-header_nblocks(SMgrRelation reln)
+header_nblocks(SMgrRelation reln, bool for_write, XLogRecPtr *lsn)
 {
 	PGIOAlignedBlock copy;
 
-	read_node(reln, 0, false, copy.data, BMAP_PAGE_HEADER);
+	read_node(reln, 0, for_write, copy.data, BMAP_PAGE_HEADER);
+	if (lsn)
+		*lsn = PageGetLSN(copy.data);
 	return PageGetBmapHeader(copy.data)->nblocks;
 }
 
 /*
  * The physical block of logical block 'blkno', and in *run how many logical
  * blocks from it (at most 'maxrun') are physically consecutive.  If the
- * block has no entry, returns InvalidBlockNumber when 'missing_ok', else
- * fails.  See read_node() for 'for_write'.
+ * block has no entry, returns InvalidBlockNumber when 'missing_ok', with
+ * *run how many blocks from it have none on its map page, else fails.  See
+ * read_node() for 'for_write'.
+ *
+ * In recovery, a lookup that may miss finds no entries on a map page of
+ * zeroes: the map's header on disk may cover a page an extension added
+ * whose buffer wasn't written out before a crash, until the extension's
+ * record is replayed (see bmapprefetch()).  Outside recovery such a page
+ * under the length is a write that was lost, and fails verification.
  */
 static BlockNumber
 lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
@@ -1098,17 +1135,30 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	BlockNumber phys;
 	BlockNumber n;
 
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
+		!read_node_ext(reln, MAP_PAGE(blkno), for_write, copy.data,
+					   BMAP_PAGE_NODE, missing_ok && InRecovery))
+	{
 		phys = InvalidBlockNumber;
+		n = Min(maxrun, BMAP_FANOUT - slot);
+	}
 	else
 	{
-		read_node(reln, MAP_PAGE(blkno), for_write, copy.data, BMAP_PAGE_NODE);
 		phys = entries[slot].block;
+		n = 1;
+		while (!BlockNumberIsValid(phys) && n < maxrun &&
+			   slot + n < BMAP_FANOUT &&
+			   !BlockNumberIsValid(entries[slot + n].block))
+			n++;
 	}
 	if (!BlockNumberIsValid(phys))
 	{
 		if (missing_ok)
+		{
+			if (run)
+				*run = n;
 			return InvalidBlockNumber;
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("block map of \"%s\" has no page for block %u",
@@ -1615,6 +1665,139 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 }
 
 /*
+ * Lengths in recovery.  The map's header recovery reads may be newer than
+ * the record being replayed (written before a crash, or copied by a base
+ * backup), and so shorter, if a truncation came between: a record from
+ * before the truncation may restore or initialize a page past the length
+ * the header has.  md.c's file, truncated before the crash, is extended
+ * then, and the truncation's replay cuts it again.  So is a map's length,
+ * though not in the header, whose record the truncation's would then find
+ * already replayed: the startup process keeps it until the truncation's
+ * replay (bmaptruncate()).  Redo never allocates; the blocks keep the
+ * entries the truncation left them, or none, one let go of since
+ * (unshare_stale()): records before the truncation are skipped for such a
+ * block (bmapreplacedafter()), and pages made for it go nowhere
+ * (bmapwritev()).
+ *
+ * The truncation's replay runs in a critical section, so it only finds,
+ * changes and removes entries, which allocates nothing: it removes the
+ * relation's once the length it cuts to is no longer past the header's.
+ * Unlinking the relation in redo, its XLOG_BMAP_CREATE and its database's
+ * drop from its tablespace (bmap_drop_database_recovery()) forget it too.
+ */
+typedef struct RecoveryLength
+{
+	RelFileLocator rel;
+	BlockNumber nblocks;		/* the length kept */
+	BlockNumber header;			/* the header's length then */
+} RecoveryLength;
+
+static HTAB *recovery_lengths = NULL;
+
+/* the length recovery keeps for 'rel' past its header's, or 0 */
+static BlockNumber
+recovery_length(RelFileLocator rel)
+{
+	RecoveryLength *rl;
+
+	if (recovery_lengths == NULL)
+		return 0;
+	rl = hash_search(recovery_lengths, &rel, HASH_FIND, NULL);
+	return rl ? rl->nblocks : 0;
+}
+
+/* keep 'rel' at least 'nblocks' long, past its header's length 'header' */
+static void
+keep_recovery_length(RelFileLocator rel, BlockNumber nblocks,
+					 BlockNumber header)
+{
+	RecoveryLength *rl;
+	bool		found;
+
+	if (recovery_lengths == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(RecoveryLength);
+		recovery_lengths = hash_create("block map lengths in recovery", 16,
+									   &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	rl = hash_search(recovery_lengths, &rel, HASH_ENTER, &found);
+	rl->nblocks = Max(found ? rl->nblocks : 0, nblocks);
+	rl->header = header;
+}
+
+/* a truncation's replay cuts the length kept (in a critical section) */
+static void
+cut_recovery_length(RelFileLocator rel, BlockNumber nblocks)
+{
+	RecoveryLength *rl;
+
+	if (recovery_lengths == NULL)
+		return;
+	rl = hash_search(recovery_lengths, &rel, HASH_FIND, NULL);
+	if (rl == NULL)
+		return;
+	if (nblocks <= rl->header)
+		(void) hash_search(recovery_lengths, &rel, HASH_REMOVE, NULL);
+	else if (nblocks < rl->nblocks)
+		rl->nblocks = nblocks;
+}
+
+static void
+forget_recovery_length(RelFileLocator rel)
+{
+	if (recovery_lengths != NULL)
+		(void) hash_search(recovery_lengths, &rel, HASH_REMOVE, NULL);
+}
+
+/*
+ * In redo of a database's drop from tablespace 'spcid' (all of it, or the
+ * old tablespace of a move), forget the lengths kept for its relations
+ * there: their files are removed without unlinking each, and a relation
+ * file number may be used again later in the replay.
+ */
+void
+bmap_drop_database_recovery(Oid dbid, Oid spcid)
+{
+	HASH_SEQ_STATUS status;
+	RecoveryLength *rl;
+
+	if (recovery_lengths == NULL)
+		return;
+	hash_seq_init(&status, recovery_lengths);
+	while ((rl = hash_seq_search(&status)) != NULL)
+	{
+		if (rl->rel.dbOid == dbid && rl->rel.spcOid == spcid)
+			(void) hash_search(recovery_lengths, &rl->rel, HASH_REMOVE, NULL);
+	}
+}
+
+/*
+ * In recovery, extend 'reln' to 'to' blocks past its header's length (see
+ * above), writing 'content' to block to - 1 if given.  A header no newer
+ * than the record being replayed has every block the record can have.
+ */
+static void
+extend_in_recovery(SMgrRelation reln, BlockNumber to, const void *content,
+				   bool skipFsync)
+{
+	XLogRecPtr	lsn;
+	BlockNumber nblocks = header_nblocks(reln, false, &lsn);
+
+	if (nblocks < to)
+	{
+		if (lsn <= GetCurrentReplayRecPtr(NULL))
+			elog(ERROR, "block-mapped relation %s extended during recovery without its allocation",
+				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+		keep_recovery_length(reln->smgr_rlocator.locator, to, nblocks);
+	}
+	if (content)
+		bmapwritev(reln, MAIN_FORKNUM, to - 1, &content, 1, skipFsync);
+}
+
+/*
  * Extend 'reln' to 'to' blocks, writing 'content' to block to - 1 if given.
  */
 static void
@@ -1625,8 +1808,10 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 	Buffer		headerbuf;
 
 	if (InRecovery)
-		elog(ERROR, "block-mapped relation %s extended during recovery without its allocation",
-			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+	{
+		extend_in_recovery(reln, to, content, skipFsync);
+		return;
+	}
 
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
@@ -1655,9 +1840,12 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 		end = Min(end, (nblocks / BMAP_FANOUT + 1) * BMAP_FANOUT);
 		/* a map never shared has no entry born before its epoch */
 		if (PageGetBmapHeader(BufferGetPage(headerbuf))->epoch > 0)
+		{
 			unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
 						  PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch,
 						  nblocks, end);
+			INJECTION_POINT("bmap-unshared", NULL);
+		}
 		extend_piece(reln, headerbuf, nblocks, end,
 					 end == to ? content : NULL, skipFsync);
 	}
@@ -2192,7 +2380,20 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	BmapEntry	entry;
 
-	return lookup_entry(reln, blocknum, &entry) && entry.since > lsn;
+	if (lookup_entry(reln, blocknum, &entry))
+		return entry.since > lsn;
+
+	/*
+	 * A block recovery keeps past its header's length whose entry was let
+	 * go of after the truncation the header has (extend_in_recovery()): its
+	 * pages go nowhere (bmapwritev()), so one read back would find no
+	 * block.  The truncation's replay drops it, as a block given other
+	 * storage is skipped until the change (this record is from before
+	 * both).
+	 */
+	return InRecovery &&
+		blocknum < recovery_length(reln->smgr_rlocator.locator) &&
+		blocknum >= header_nblocks(reln, false, NULL);
 }
 
 /* ----------------------------------------------------------------
@@ -4430,6 +4631,7 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		DropRelationBuffers(smgropen(rlocator.locator, INVALID_PROC_NUMBER),
 							forks, 2, firsts);
 		mdunlink(rlocator, BMAP_FORKNUM, true);
+		forget_recovery_length(rlocator.locator);
 		return;
 	}
 
@@ -4547,16 +4749,14 @@ bmapprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		/*
 		 * A block without an entry has nothing to prefetch.  In recovery the
 		 * map's header on disk may be newer than the map page that will have
-		 * the entry, so a block below the length may have none yet; a
-		 * prefetch is only a hint.
+		 * the entry, so a block below the length may have none yet, and its
+		 * map page may still be zeroes (one the same extension added, whose
+		 * buffer wasn't written out before a crash); a prefetch is only a
+		 * hint.  The blocks after it without one on its map page are
+		 * skipped with it.
 		 */
-		if (!BlockNumberIsValid(phys))
-		{
-			blocknum++;
-			nblocks--;
-			continue;
-		}
-		if (!mdprefetch(ssrel, MAIN_FORKNUM, phys, run))
+		if (BlockNumberIsValid(phys) &&
+			!mdprefetch(ssrel, MAIN_FORKNUM, phys, run))
 			return false;
 		blocknum += run;
 		nblocks -= run;
@@ -4684,9 +4884,29 @@ bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		BlockNumber run;
 		BlockNumber phys = lookup_ext(reln, blocknum, recovery ? 1 : nblocks,
-									  &run, false, true);
+									  &run, recovery, true);
 
-		if (!recovery || !page_predates_entry(reln, blocknum, buffers[0]))
+		if (!BlockNumberIsValid(phys))
+		{
+			XLogRecPtr	lsn;
+
+			/*
+			 * In recovery, a page past the header's length that is older
+			 * than the header was cut off by a truncation the header has,
+			 * whose replay drops it: its entry may have been let go of
+			 * since (see extend_in_recovery()), and it goes nowhere.  Any
+			 * process may be writing it out, not only the startup process
+			 * that kept the length.  Anywhere else, the lookup fails as
+			 * without 'missing_ok'.
+			 */
+			if (blocknum < header_nblocks(reln, true, &lsn) ||
+				PageGetLSN((const PageData *) buffers[0]) >= lsn)
+				(void) lookup_ext(reln, blocknum, 1, NULL, false, true);
+			elog(DEBUG1, "block %u of %s, past its map's length and without an entry, not written",
+				 blocknum, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+			run = 1;
+		}
+		else if (!recovery || !page_predates_entry(reln, blocknum, buffers[0]))
 			mdwritev(ssrel, MAIN_FORKNUM, phys, buffers, run, skipFsync);
 		blocknum += run;
 		buffers += run;
@@ -4727,9 +4947,15 @@ bmapwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 BlockNumber
 bmapnblocks(SMgrRelation reln, ForkNumber forknum)
 {
+	BlockNumber nblocks;
+
 	if (forknum != MAIN_FORKNUM)
 		return mdnblocks(reln, forknum);
-	return header_nblocks(reln);
+	nblocks = header_nblocks(reln, false, NULL);
+	/* (a length past the header's, see extend_in_recovery()) */
+	if (InRecovery)
+		nblocks = Max(nblocks, recovery_length(reln->smgr_rlocator.locator));
+	return nblocks;
 }
 
 /*
@@ -4811,9 +5037,16 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 		return;
 	}
 
-	/* in recovery, the primary's own truncation record follows this one */
+	/*
+	 * In recovery, the primary's own truncation record follows this one; a
+	 * length kept past the header's is cut here, the header's record maybe
+	 * already replayed.
+	 */
 	if (InRecovery)
+	{
+		cut_recovery_length(reln->smgr_rlocator.locator, nblocks);
 		return;
+	}
 
 	headerbuf = reln->bmap_pretrunc;
 	if (!BufferIsValid(headerbuf))
@@ -5040,6 +5273,7 @@ bmap_redo(XLogReaderState *record)
 
 				/* making the header creates the map fork */
 				redo_block(record, 0);
+				forget_recovery_length(xlrec->locator);
 
 				/* an earlier open of this relation may have chosen md.c */
 				reln = smgropen(xlrec->locator, INVALID_PROC_NUMBER);

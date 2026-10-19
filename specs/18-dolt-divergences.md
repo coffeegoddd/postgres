@@ -198,7 +198,10 @@ stash, …) is F, ported with the feature (#163).
 - **Prolly:** a connection names `dbname/branch` (as Doltgres's do) and
   starts on that branch; `dbname` alone starts on the database's
   default branch. A connection to a branch that doesn't exist is
-  refused, SQLSTATE 42704, as `dolt_checkout`'s is. A session's
+  refused, SQLSTATE 42704, as `dolt_checkout`'s is; one naming
+  `detached/...`, a commit's hidden branch (spec 11), whether or not it
+  exists, is refused with 42939, as `dolt_checkout` refuses that
+  name. A session's
   catalogs, `information_schema` included, are its branch's, as in
   Doltgres.
 - **Why:** Postgres has no `USE` and no cross-database references; a
@@ -257,3 +260,19 @@ stash, …) is F, ported with the feature (#163).
   is one lower for each); an assertion reading it after resolving reads
   it back from `violating_row`, or inserts it fixed. A NOT NULL case
   ports as is.
+
+## D14. No branch is named "--"
+
+- **Dolt:** a branch name is refused when it is empty, `HEAD`, `-`,
+  a commit id, or has an empty `/` component; `--` is accepted, so
+  `dolt_checkout('-b', '--', 'main')` (its argument parser takes `--`
+  as `-b`'s value) makes and checks out a branch named `--`.
+- **Prolly:** `--` is refused as a branch's name, as git's
+  `check-ref-format` refuses it (git refuses any name beginning with
+  `-`; names like `-dash` are still accepted here, as in Dolt). An
+  option's value is taken as Dolt takes it, `--` included, so
+  `dolt_commit('-m', '--')` commits with the message `--`.
+- **Why:** the user's expectation in #314: `--` ends the options, and a
+  branch named `--` could be named only after another `--`.
+- **Port:** a case that makes a branch named `--` expects the
+  `invalid branch name` error (SQLSTATE 42602) instead.

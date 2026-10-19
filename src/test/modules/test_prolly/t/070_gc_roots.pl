@@ -6,9 +6,9 @@
 # collection did (waited for); and those named while it runs (its keep
 # set).  A tree nothing names is freed.  A transaction that names a tree
 # in a collection's window waits for its swap, and fails if the tree went;
-# a prepared one that named one is waited for; a sweep waits for the scan
-# of the page store; a collection that fails as it begins lets its keep
-# set go.
+# a prepared one that named one isn't waited for; a sweep waits for the
+# scan of the page store; a collection that fails as it begins lets its
+# keep set go.
 
 use strict;
 use warnings FATAL => 'all';
@@ -96,7 +96,7 @@ $c->query_until(qr/collecting/, q{
 	\echo collected
 });
 $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-	WHERE wait_event_type = 'Lock' AND wait_event = 'transactionid'
+	WHERE wait_event_type = 'Lock' AND wait_event = 'virtualxid'
 	AND query LIKE '%test_chunk_gc%'})
   or die 'the collection did not wait';
 pass('a collection waits for a transaction that named a tree');
@@ -157,30 +157,18 @@ ok($namer->{stderr} =~ /concurrent collection of the chunk store/
 	'a tree named in the window fails or is kept, never lost');
 $namer->quit;
 
-# A prepared transaction that named a tree is waited for.  (The tree is
-# there already, so naming it appends nothing; and a collection first, so
-# none is left retiring, whose readers a collection would wait for.)
-gc();
+# A prepared transaction that named a tree isn't waited for: its
+# pointers are on pages.  (The tree is there already, so naming it
+# appends nothing.)
 my $prep = $node->background_psql('postgres');
 $prep->query_safe('SELECT (test_toast_pointer(' . pointer('prepared') . ')).root');
 $prep->query_safe('BEGIN');
 $prep->query_safe('SELECT (test_toast_pointer(' . pointer('prepared') . ')).root');
 $prep->query_safe(q{PREPARE TRANSACTION 'named'});
 $prep->quit;
-my $pc = $node->background_psql('postgres');
-$pc->query_until(qr/collecting/, q{
-	\echo collecting
-	SELECT test_chunk_gc(false) IS NOT NULL;
-	\echo collected
-});
-$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-	WHERE wait_event_type = 'Lock' AND wait_event = 'transactionid'
-	AND query LIKE '%test_chunk_gc%'})
-  or die 'the collection did not wait for the prepared transaction';
-pass('a collection waits for a prepared transaction that named a tree');
+is(sql(q{SET statement_timeout = '60s'; SELECT test_chunk_gc(false) IS NOT NULL}),
+	't', 'a collection does not wait for a prepared transaction that named a tree');
 sql(q{COMMIT PREPARED 'named'});
-$pc->query_until(qr/collected/, '');
-$pc->quit;
 
 # A sweep waits for a collection's scan of the page store.
 my $sc = $node->background_psql('postgres');

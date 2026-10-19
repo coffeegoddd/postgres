@@ -63,6 +63,7 @@
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/typcache.h"
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -87,6 +88,7 @@
 #include "common/int.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -766,13 +768,19 @@ count_of(Changes *c, const StringInfoData *value)
  * While a merge (or pick) runs: the constraint violations it records, and
  * the tables it wrote to, whose foreign keys are checked after; and the
  * last table whose rows a merge wrote, whether a row written may break a
- * constraint there.
+ * constraint there, and its columns whose values a domain's constraint
+ * may reject, with how each is checked (DomainPlan).
  */
 static bool recording = false;
 static List *recorded = NIL;	/* ProllyViolation * */
 static List *written = NIL;		/* OIDs */
 static Oid	breakable_relid = InvalidOid;
 static bool breakable;
+static Bitmapset *breakable_domains = NULL; /* attnums */
+static struct DomainPlan **domain_plans = NULL; /* by attnum - 1 */
+static struct Removed *removed = NULL;	/* removed_begin() */
+
+static bool checks_domains(Relation rel);
 
 static void
 note_written(Oid relid)
@@ -800,6 +808,9 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	recorded = NIL;
 	written = NIL;
 	breakable_relid = InvalidOid;
+	breakable_domains = NULL;
+	domain_plans = NULL;
+	removed = NULL;
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -872,22 +883,155 @@ other_unique_index(Relation rel)
 }
 
 /*
+ * How a value of a type is checked against the domains' constraints it
+ * may break (plan_domains()): a domain's, its base type's after; an
+ * array's elements'; a composite's fields'.
+ */
+typedef struct DomainPlan
+{
+	char		kind;			/* TYPTYPE_DOMAIN, TYPTYPE_COMPOSITE, or 'a' */
+	/* a domain: it and the domains it is over, outer first */
+	int			nlevels;
+	Oid		   *levels;
+	void	  **extras;			/* domain_check_safe()'s, each level's */
+	struct DomainPlan *inner;	/* a domain's base type's; an element's */
+	/* an array's elements */
+	Oid			elem;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	/* a composite's fields */
+	TupleDesc	desc;
+	struct DomainPlan **fields;
+} DomainPlan;
+
+/*
+ * The plan for checking a value of type typid against the domains'
+ * constraints it may break, in the current memory context: NULL if it can
+ * break none (it isn't of a domain with one, or over such a type, nor an
+ * array or a composite of such a type).  (A range's bounds, read through
+ * its receive function, are checked as it is read.)
+ */
+static DomainPlan *
+plan_domains(Oid typid)
+{
+	DomainPlan *p;
+	Oid			elem;
+
+	switch (get_typtype(typid))
+	{
+		case TYPTYPE_DOMAIN:
+			{
+				List	   *levels = NIL;
+				Oid			base = typid;
+				DomainPlan *inner;
+				int			i = 0;
+
+				/* (DomainHasConstraints() counts its base domains' too) */
+				while (get_typtype(base) == TYPTYPE_DOMAIN)
+				{
+					HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base));
+
+					if (!HeapTupleIsValid(tup))
+						elog(ERROR, "cache lookup failed for type %u", base);
+					levels = lappend_oid(levels, base);
+					base = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+					ReleaseSysCache(tup);
+				}
+				inner = plan_domains(base);
+				if (!DomainHasConstraints(typid, NULL))
+				{
+					list_free(levels);
+					return inner;
+				}
+				p = palloc0(sizeof(DomainPlan));
+				p->kind = TYPTYPE_DOMAIN;
+				p->inner = inner;
+				p->nlevels = list_length(levels);
+				p->levels = palloc_array(Oid, p->nlevels);
+				p->extras = palloc0_array(void *, p->nlevels);
+				foreach_oid(level, levels)
+					p->levels[i++] = level;
+				list_free(levels);
+				return p;
+			}
+		case TYPTYPE_COMPOSITE:
+			{
+				TupleDesc	desc = lookup_rowtype_tupdesc(typid, -1);
+				bool		found = false;
+
+				p = palloc0(sizeof(DomainPlan));
+				p->kind = TYPTYPE_COMPOSITE;
+				p->fields = palloc0_array(DomainPlan *, desc->natts);
+				for (int i = 0; i < desc->natts; i++)
+				{
+					Form_pg_attribute att = TupleDescAttr(desc, i);
+
+					if (!att->attisdropped &&
+						(p->fields[i] = plan_domains(att->atttypid)) != NULL)
+						found = true;
+				}
+				if (found)
+					p->desc = CreateTupleDescCopy(desc);
+				ReleaseTupleDesc(desc);
+				if (found)
+					return p;
+				pfree(p->fields);
+				pfree(p);
+				return NULL;
+			}
+		default:
+			elem = get_element_type(typid);
+			if (!OidIsValid(elem))
+				return NULL;
+			p = palloc0(sizeof(DomainPlan));
+			p->kind = 'a';
+			p->inner = plan_domains(elem);
+			if (p->inner == NULL)
+			{
+				pfree(p);
+				return NULL;
+			}
+			p->elem = elem;
+			get_typlenbyvalalign(elem, &p->elmlen, &p->elmbyval, &p->elmalign);
+			return p;
+	}
+}
+/*
  * May a row a merge writes to rel break one of its constraints there: a
- * check, a not-null column outside the primary key, or a unique or
- * exclusion index other than the primary key's?  (The merge decides each
- * row by its primary key, so that one holds, if it keys the rows: a
- * deferrable one, or one the keying can't order, doesn't, and rel's
- * rows are keyless, keyed by content.)  Worked out as a merge begins
- * writing a table's rows, for may_break_constraints().
+ * check, a not-null column outside the primary key, a unique or exclusion
+ * index other than the primary key's, or a domain's constraint on a
+ * column's values?  (The merge decides each row by its primary key, so
+ * that one holds, if it keys the rows: a deferrable one, or one the keying
+ * can't order, doesn't, and rel's rows are keyless, keyed by content.)
+ * Worked out as a merge begins writing a table's rows, for
+ * may_break_constraints(), with the plans for checking its columns'
+ * domains (DomainPlan).
  */
 static void
 note_constraints(Relation rel, bool keyless)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
+	MemoryContext old;
 
 	breakable_relid = RelationGetRelid(rel);
 	breakable = true;
+	bms_free(breakable_domains);
+	breakable_domains = NULL;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	domain_plans = palloc0_array(DomainPlan *, desc->natts);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped &&
+			(domain_plans[i] = plan_domains(att->atttypid)) != NULL)
+			breakable_domains = bms_add_member(breakable_domains, att->attnum);
+	}
+	MemoryContextSwitchTo(old);
+	if (breakable_domains != NULL)
+		return;
 	if (desc->constr && desc->constr->num_check > 0)
 		return;
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
@@ -917,10 +1061,324 @@ may_break_constraints(Relation rel)
 }
 
 /*
+ * Check value against the constraints of the domains it is of, as plan p
+ * has them, as a value input or cast to one is checked: a domain's own,
+ * and its elements' or fields'.  For a value breaking one: the error the
+ * domain raises, not thrown, naming as its data type the domain whose
+ * constraint is broken (a constraint's name may be a base domain's too).
+ * NULL: it breaks none.
+ */
+static ErrorData *
+domain_refusal(DomainPlan *p, Datum value, bool isnull)
+{
+	ErrorData  *ed = NULL;
+
+	switch (p->kind)
+	{
+		case TYPTYPE_DOMAIN:
+			{
+				ErrorSaveContext es = {T_ErrorSaveContext};
+
+				es.details_wanted = true;
+				if (domain_check_safe(value, isnull, p->levels[0], &p->extras[0],
+									  TopTransactionContext, (Node *) &es))
+				{
+					if (p->inner)
+						ed = domain_refusal(p->inner, value, isnull);
+					break;
+				}
+				ed = es.error_data;
+				if (ed->sqlerrcode != ERRCODE_CHECK_VIOLATION)
+					break;
+
+				/*
+				 * The domain whose check fails: of those it is over, the
+				 * first failing from the innermost, each checked with those
+				 * it is over (and those passing), so failing by its own.
+				 */
+				for (int i = p->nlevels - 1; i > 0; i--)
+				{
+					ErrorSaveContext les = {T_ErrorSaveContext};
+
+					les.details_wanted = true;
+					if (!domain_check_safe(value, isnull, p->levels[i],
+										   &p->extras[i], TopTransactionContext,
+										   (Node *) &les))
+					{
+						FreeErrorData(ed);
+						ed = les.error_data;
+						break;
+					}
+				}
+				break;
+			}
+		case TYPTYPE_COMPOSITE:
+			if (!isnull)
+			{
+				HeapTupleHeader td = DatumGetHeapTupleHeader(value);
+				HeapTupleData tuple;
+				int			natts = p->desc->natts;
+				Datum	   *values = palloc(natts * sizeof(Datum));
+				bool	   *nulls = palloc(natts * sizeof(bool));
+
+				tuple.t_len = HeapTupleHeaderGetDatumLength(td);
+				ItemPointerSetInvalid(&tuple.t_self);
+				tuple.t_tableOid = InvalidOid;
+				tuple.t_data = td;
+				heap_deform_tuple(&tuple, p->desc, values, nulls);
+				for (int i = 0; i < natts && ed == NULL; i++)
+					if (p->fields[i])
+						ed = domain_refusal(p->fields[i], values[i], nulls[i]);
+				pfree(values);
+				pfree(nulls);
+				if ((Pointer) td != DatumGetPointer(value))
+					pfree(td);
+			}
+			break;
+		default:
+			if (!isnull)
+			{
+				ArrayType  *arr = DatumGetArrayTypeP(value);
+				Datum	   *elems;
+				bool	   *nulls;
+				int			n;
+
+				deconstruct_array(arr, p->elem, p->elmlen, p->elmbyval,
+								  p->elmalign, &elems, &nulls, &n);
+				for (int i = 0; i < n && ed == NULL; i++)
+					ed = domain_refusal(p->inner, elems[i], nulls[i]);
+				pfree(elems);
+				pfree(nulls);
+				if ((Pointer) arr != DatumGetPointer(value))
+					pfree(arr);
+			}
+			break;
+	}
+	return ed;
+}
+
+/*
+ * A keyless table's rows a merge removes, while it writes the table's rows
+ * (removed_begin() to removed_end()): their values of its domain-checked
+ * columns, as images (datumIsEqual()), each column's in a set.  A keyless
+ * row that changed is removed and another inserted, with no tie between
+ * them, so a value inserted that a row removed held counts as unchanged
+ * (row_domain_refusal()), whichever row held it.
+ */
+typedef struct Removed
+{
+	MemoryContext cxt;
+	HTAB	   *values;			/* RemovedValue, by RemovedKey */
+	Bitmapset  *nulls;			/* attnums of a null removed */
+} Removed;
+
+typedef struct RemovedKey
+{
+	int			attnum;
+	uint32		hash;			/* of the value's image */
+} RemovedKey;
+
+typedef struct RemovedValue
+{
+	RemovedKey	key;
+	List	   *images;			/* Datum *, those with that hash */
+} RemovedValue;
+
+/* The hash of value's image, of column att. */
+static uint32
+image_hash(Form_pg_attribute att, Datum value)
+{
+	if (att->attbyval)
+		return DatumGetUInt32(hash_any((const unsigned char *) &value,
+									   sizeof(Datum)));
+	return DatumGetUInt32(hash_any((const unsigned char *) DatumGetPointer(value),
+								   datumGetSize(value, false, att->attlen)));
+}
+
+/* Start noting the rows a merge removes from rel, if keyless and checked. */
+static void
+removed_begin(Relation rel, bool keyless)
+{
+	HASHCTL		ctl;
+
+	removed = NULL;
+	if (!keyless || !checks_domains(rel))
+		return;
+	removed = palloc0(sizeof(Removed));
+	removed->cxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "merge removed values",
+										 ALLOCSET_DEFAULT_SIZES);
+	ctl.keysize = sizeof(RemovedKey);
+	ctl.entrysize = sizeof(RemovedValue);
+	ctl.hcxt = removed->cxt;
+	removed->values = hash_create("merge removed values", 64, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/* Note row, removed from rel, while removed_begin() has started. */
+static void
+removed_note(Relation rel, TupleTableSlot *row)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	MemoryContext old;
+	int			attnum = -1;
+
+	if (removed == NULL)
+		return;
+	slot_getallattrs(row);
+	old = MemoryContextSwitchTo(removed->cxt);
+	while ((attnum = bms_next_member(breakable_domains, attnum)) >= 0)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+		Datum		value = row->tts_values[attnum - 1];
+		RemovedKey	key;
+		RemovedValue *rv;
+		bool		found;
+		Datum	   *image;
+
+		if (row->tts_isnull[attnum - 1])
+		{
+			removed->nulls = bms_add_member(removed->nulls, attnum);
+			continue;
+		}
+		memset(&key, 0, sizeof(key));
+		key.attnum = attnum;
+		key.hash = image_hash(att, value);
+		rv = hash_search(removed->values, &key, HASH_ENTER, &found);
+		if (!found)
+			rv->images = NIL;
+		else
+		{
+			bool		dup = false;
+
+			foreach_ptr(Datum, d, rv->images)
+				if ((dup = datumIsEqual(*d, value, att->attbyval, att->attlen)))
+					break;
+			if (dup)
+				continue;
+		}
+		image = palloc(sizeof(Datum));
+		*image = datumCopy(value, att->attbyval, att->attlen);
+		rv->images = lappend(rv->images, image);
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/* Did a row removed (removed_note()) hold value in column att? */
+static bool
+removed_held(Form_pg_attribute att, Datum value, bool isnull)
+{
+	RemovedKey	key;
+	RemovedValue *rv;
+
+	if (isnull)
+		return bms_is_member(att->attnum, removed->nulls);
+	memset(&key, 0, sizeof(key));
+	key.attnum = att->attnum;
+	key.hash = image_hash(att, value);
+	rv = hash_search(removed->values, &key, HASH_FIND, NULL);
+	if (rv == NULL)
+		return false;
+	foreach_ptr(Datum, d, rv->images)
+		if (datumIsEqual(*d, value, att->attbyval, att->attlen))
+			return true;
+	return false;
+}
+
+/* Stop noting the rows removed (removed_begin()). */
+static void
+removed_end(void)
+{
+	if (removed == NULL)
+		return;
+	MemoryContextDelete(removed->cxt);
+	pfree(removed);
+	removed = NULL;
+}
+
+/*
+ * Check row, to be written to rel, against the constraints of its
+ * columns' domains (domain_refusal()): the replication applier the merge
+ * writes with doesn't.  Only the values that differ from was, the
+ * branch's version of the row (NULL: none), are: a value Postgres stored
+ * isn't checked again by an update leaving it (a NOT VALID constraint may
+ * not hold for it).  So neither is a value keep marks, the row's stored
+ * one, unread; nor one of was's unread ones that the row's has too
+ * (was_unread marks them, NULL: none); nor, in a keyless table, a value a
+ * row the merge removed held (removed_held()).  For a value breaking one: the
+ * error (domain_refusal()'s), naming its column; NULL
+ * if none.
+ */
+static ErrorData *
+row_domain_refusal(Relation rel, TupleTableSlot *row, const bool *keep,
+				   TupleTableSlot *was, const bool *was_unread)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			attnum = -1;
+
+	slot_getallattrs(row);
+	if (was)
+		slot_getallattrs(was);
+	while ((attnum = bms_next_member(breakable_domains, attnum)) >= 0)
+	{
+		int			i = attnum - 1;
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		ErrorData  *ed;
+
+		if (keep && keep[i])
+			continue;
+		if (was && !(was_unread && was_unread[i]) &&
+			was->tts_isnull[i] == row->tts_isnull[i] &&
+			(row->tts_isnull[i] ||
+			 datumIsEqual(was->tts_values[i], row->tts_values[i],
+						  att->attbyval, att->attlen)))
+			continue;
+		if (removed && removed_held(att, row->tts_values[i], row->tts_isnull[i]))
+			continue;
+		ed = domain_refusal(domain_plans[i], row->tts_values[i],
+							row->tts_isnull[i]);
+		if (ed)
+		{
+			ed->column_name = pstrdup(NameStr(att->attname));
+			return ed;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The expression of check constraint con, a table's or a domain's,
+ * deparsed ("" if not found).
+ */
+static char *
+check_expr(Oid con)
+{
+	HeapTuple	tup;
+	char	   *expr = "";
+
+	if (!OidIsValid(con) ||
+		!HeapTupleIsValid(tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(con))))
+		return expr;
+	{
+		Oid			relid = ((Form_pg_constraint) GETSTRUCT(tup))->conrelid;
+		bool		isnull;
+		Datum		bin = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conbin,
+										  &isnull);
+
+		if (!isnull)
+			expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
+														   ObjectIdGetDatum(relid)));
+	}
+	ReleaseSysCache(tup);
+	return expr;
+}
+
+/*
  * What a row a merge couldn't write breaks (ed, the error writing it
  * raised), as Dolt describes it: a unique index by its name and columns, a
- * check constraint by its name and expression, a not-null constraint by
- * its column.
+ * check constraint by its name and expression (a domain's, of the domain
+ * ed names), a not-null constraint by its column (a domain's, by the
+ * column of the domain's value).
  */
 static char *
 constraint_info(Relation rel, const char *type, const ErrorData *ed)
@@ -934,24 +1392,23 @@ constraint_info(Relation rel, const char *type, const ErrorData *ed)
 						 quote_json(ed->column_name ? ed->column_name : ""));
 	else if (strcmp(type, "check constraint") == 0)
 	{
-		Oid			con = get_relation_constraint_oid(RelationGetRelid(rel), name, true);
-		char	   *expr = "";
-		HeapTuple	tup;
+		Oid			con;
 
-		if (OidIsValid(con) &&
-			(tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(con))) != NULL)
+		if (ed->datatype_name)
 		{
-			bool		isnull;
-			Datum		bin = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conbin,
-											  &isnull);
+			Oid			nsp = ed->schema_name ?
+				get_namespace_oid(ed->schema_name, true) : InvalidOid;
+			Oid			domain = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+												 CStringGetDatum(ed->datatype_name),
+												 ObjectIdGetDatum(nsp));
 
-			if (!isnull)
-				expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr, bin,
-															   ObjectIdGetDatum(RelationGetRelid(rel))));
-			ReleaseSysCache(tup);
+			con = OidIsValid(domain) ?
+				get_domain_constraint_oid(domain, name, true) : InvalidOid;
 		}
+		else
+			con = get_relation_constraint_oid(RelationGetRelid(rel), name, true);
 		appendStringInfo(&s, "{\"Name\": %s, \"Expression\": %s}",
-						 quote_json(name), quote_json(expr));
+						 quote_json(name), quote_json(check_expr(con)));
 	}
 	else
 	{
@@ -1005,25 +1462,46 @@ refusal_type(int sqlerrcode)
 }
 
 /*
+ * Does a merge check the rows it writes to rel against its columns'
+ * domains (row_domain_refusal())?
+ */
+static bool
+checks_domains(Relation rel)
+{
+	return recording && may_break_constraints(rel) && breakable_domains != NULL;
+}
+
+/*
  * Insert row into rel, or update old to it, in a subtransaction: a row
  * whose error refusal_type() names is rolled back, and the error returned
  * (NULL: written).  *found (if not NULL) gets whether old was there.
  * The applier's deferrable rechecks are made immediate first, so a row
  * breaking a deferrable unique or exclusion constraint is refused here
  * too: each row a merge recording violations writes, puts back, or
- * updates pinned (update_key(), retry_key()) comes through here.
+ * updates pinned (update_key(), retry_key()) comes through here.  Then
+ * its values are checked against their domains, but for those of was,
+ * the branch's version of the row (row_domain_refusal()): a row put back
+ * as the branch has it is was itself.
  */
 static ErrorData *
 try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
 		  TupleTableSlot *old, TupleTableSlot *row, const bool *keep,
-		  bool *found)
+		  TupleTableSlot *was, const bool *was_unread, bool *found)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	ErrorData  *volatile refused = NULL;
 	volatile bool ok = true;
 
+	if (found)
+		*found = true;
+
 	PROLLY_CALL(ar, immediate, a);
+
+	/* (a domain's check, its error not raised, has nothing to roll back) */
+	if (row != was && checks_domains(rel) &&
+		(refused = row_domain_refusal(rel, row, keep, was, was_unread)) != NULL)
+		return refused;
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
@@ -1061,15 +1539,16 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
  * merge records violations, a row that breaks a unique, check or not-null
  * (or exclusion) constraint isn't written, and is recorded instead: a
  * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).  A deferrable
- * constraint is checked as the row is written, as others are (the
- * applier's immediate(), in try_write()).  *refused (if not NULL) gets
- * whether it was.  Returns false if old isn't there.
+ * table holds no row breaking a constraint, unlike Dolt's), or a column's
+ * domain's check or not-null constraint (try_write(), was and was_unread
+ * its).  A deferrable constraint is checked as the row is written, as
+ * others are (the applier's immediate(), in try_write()).  *refused (if
+ * not NULL) gets whether it was.  Returns false if old isn't there.
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 			TupleTableSlot *old, TupleTableSlot *row, const bool *keep,
-			bool *refused)
+			TupleTableSlot *was, const bool *was_unread, bool *refused)
 {
 	ErrorData  *ed;
 	const char *type;
@@ -1086,7 +1565,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		PROLLY_CALL(ar, insert, a, row);
 		return true;
 	}
-	ed = try_write(rel, ar, a, old, row, keep, &ok);
+	ed = try_write(rel, ar, a, old, row, keep, was, was_unread, &ok);
 	if (ed == NULL)
 		return ok;
 	type = refusal_type(ed->sqlerrcode);
@@ -1112,6 +1591,7 @@ typedef struct Applying
 	TupleTableSlot *slot;
 	TupleTableSlot *old;		/* a row updated, as it was */
 	bool	   *kept;			/* its columns kept as stored */
+	bool	   *unread;			/* old's columns left unread */
 	Bitmapset  *pk;				/* the primary key's columns */
 	bool		keyless;
 	bool		in_place;		/* changed keyed rows updated in place */
@@ -1169,24 +1649,27 @@ row_missing(Relation rel, bool moving)
  * line left unread, but its primary key (pk, its columns as
  * RelationGetIndexAttrBitmap() gives them) whole: the row is found by it;
  * and row, with the columns out of line that old has too marked in kept.
+ * old's columns left unread are marked in unread.
  */
 static void
 decode_update(Changes *c, Relation rel, const Bitmapset *pk,
 			  const ProllyValue *before, const ProllyValue *after,
-			  TupleTableSlot *old, TupleTableSlot *row, bool *kept)
+			  TupleTableSlot *old, TupleTableSlot *row, bool *kept,
+			  bool *unread)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 
 	/* (decoded as kept against itself: every column out of line unread) */
 	ExecClearTuple(old);
-	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, before, before, old, kept);
+	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, before, before, old, unread);
 	for (int i = 0; i < desc->natts; i++)
 	{
-		if (kept[i] &&
+		if (unread[i] &&
 			bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber, pk))
 		{
 			ExecClearTuple(old);
 			PROLLY_CALL(c->rd.kr, decode_row, c->rd.k, before, old);
+			memset(unread, 0, desc->natts * sizeof(bool));
 			break;
 		}
 	}
@@ -1225,9 +1708,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		if (!ap->inserting)
 			return;
 		decode_update(&ap->c, ap->rel, ap->pk, &brow, &arow, ap->old,
-					  ap->slot, ap->kept);
+					  ap->slot, ap->kept, ap->unread);
 		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept,
-						 NULL))
+						 ap->old, ap->unread, NULL))
 			row_missing(ap->rel, true);
 		return;
 	}
@@ -1247,6 +1730,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	{
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
+		removed_note(ap->rel, ap->slot);
 		for (uint64 i = 0; i < nb; i++)
 			if (!PROLLY_CALL(ap->ar, remove, ap->a, ap->slot))
 				row_missing(ap->rel, true);
@@ -1254,12 +1738,20 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	else if (ap->inserting && na > 0)
 	{
 		bool		refused = false;
+		TupleTableSlot *was = NULL;
 
+		/* a keyed row that changed: as the branch has it, for its domains */
+		if (!ap->keyless && nb == 1 && checks_domains(ap->rel))
+		{
+			ExecClearTuple(ap->old);
+			PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->old);
+			was = ap->old;
+		}
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
 		for (uint64 i = 0; i < na; i++)
 			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL,
-							   &refused);
+							   was, NULL, &refused);
 
 		/*
 		 * A keyed row whose new version is refused, recorded as a violation
@@ -1273,7 +1765,8 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 
 			ExecClearTuple(ap->old);
 			PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->old);
-			ed = try_write(ap->rel, ap->ar, ap->a, NULL, ap->old, NULL, NULL);
+			ed = try_write(ap->rel, ap->ar, ap->a, NULL, ap->old, NULL,
+						   ap->old, NULL, NULL);
 			if (ed)
 			{
 				FreeErrorData(ed);
@@ -1327,8 +1820,10 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.slot = table_slot_create(ap.rel, NULL);
 	ap.old = table_slot_create(ap.rel, NULL);
 	ap.kept = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
+	ap.unread = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
+	removed_begin(ap.rel, ap.keyless);
 	if (ap.put_back)
 	{
 		BeginInternalSubTransaction(NULL);
@@ -1352,10 +1847,12 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
 	}
+	removed_end();
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
 	ExecDropSingleTupleTableSlot(ap.old);
 	pfree(ap.kept);
+	pfree(ap.unread);
 	bms_free(ap.pk);
 	PROLLY_CALL(ap.c.rd.kr, close, ap.c.rd.k);
 	table_close(ap.rel, NoLock);
@@ -1676,7 +2173,9 @@ typedef struct KeyWriter
 	TupleTableSlot *s2;
 	const Bitmapset *pk;		/* the primary key's columns */
 	bool	   *kept;			/* (decode_update()'s) */
+	bool	   *unread;			/* (decode_update()'s) */
 	bool		put_back;		/* puts_back() */
+	bool		keyless;
 	bool		moving;			/* row_missing()'s */
 } KeyWriter;
 
@@ -1786,17 +2285,18 @@ update_key(KeyWriter *kw, KeyWrite *w, bool record)
 	v.len = w->row->len;
 	PROLLY_CALL(kw->c->rd.kr, parse_value, kw->c->rd.k, &v, &after, &count);
 	decode_update(kw->c, kw->rel, kw->pk, &before, &after, kw->s1, kw->s2,
-				  kw->kept);
+				  kw->kept, kw->unread);
 	if (record)
 	{
 		bool		refused;
 
 		if (!merge_write(kw->ar, kw->a, kw->rel, kw->s1, kw->s2, kw->kept,
-						 &refused))
+						 kw->s1, kw->unread, &refused))
 			row_missing(kw->rel, kw->moving);
 		return !refused;
 	}
-	ed = try_write(kw->rel, kw->ar, kw->a, kw->s1, kw->s2, kw->kept, &found);
+	ed = try_write(kw->rel, kw->ar, kw->a, kw->s1, kw->s2, kw->kept, kw->s1,
+				   kw->unread, &found);
 	if (ed)
 	{
 		FreeErrorData(ed);
@@ -1820,7 +2320,8 @@ retry_key(KeyWriter *kw, KeyWrite *w)
 	if (w->nold == 1)
 		return update_key(kw, w, false);
 	(void) decode(kw->c, w->row, kw->s2);
-	ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s2, NULL, NULL);
+	ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s2, NULL, NULL, NULL,
+				   NULL);
 	if (ed)
 	{
 		FreeErrorData(ed);
@@ -1861,6 +2362,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
 			continue;
 		(void) decode(kw->c, w->old, kw->s1);
+		removed_note(kw->rel, kw->s1);
 		for (int64 i = 0; i < w->nold; i++)
 			if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
 				row_missing(kw->rel, kw->moving);
@@ -1870,6 +2372,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 		foreach(lc, writes)
 		{
 			KeyWrite   *w = lfirst(lc);
+			TupleTableSlot *was;
 
 			if (w->nrow == 0 || w->rank == KEY_PINNED ||
 				(w->rank == KEY_FIRST) != (first == 1))
@@ -1880,13 +2383,20 @@ write_keys_once(KeyWriter *kw, List *writes)
 				(void) update_key(kw, w, true);
 				continue;
 			}
+			/* a keyed row that changed: as the branch has it, for its domains */
+			was = NULL;
+			if (!kw->keyless && w->nold == 1 && checks_domains(kw->rel))
+			{
+				(void) decode(kw->c, w->old, kw->s1);
+				was = kw->s1;
+			}
 			(void) decode(kw->c, w->row, kw->s2);
 			for (int64 i = 0; i < w->nrow; i++)
 			{
 				bool		r;
 
 				(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL,
-								   &r);
+								   was, NULL, &r);
 				if (r)
 				{
 					w->refused = true;
@@ -1903,7 +2413,8 @@ write_keys_once(KeyWriter *kw, List *writes)
 				ErrorData  *ed;
 
 				(void) decode(kw->c, w->old, kw->s1);
-				ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL, NULL);
+				ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL,
+							   kw->s1, NULL, NULL);
 				if (ed)
 				{
 					FreeErrorData(ed);
@@ -2049,6 +2560,7 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	kw.s2 = table_slot_create(kw.rel, NULL);
 	kw.pk = RelationGetIndexAttrBitmap(kw.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	kw.kept = palloc0_array(bool, RelationGetDescr(kw.rel)->natts);
+	kw.unread = palloc0_array(bool, RelationGetDescr(kw.rel)->natts);
 	kw.put_back = puts_back(kw.rel, false);
 	kw.moving = true;
 	Assert(kw.put_back);
@@ -2058,6 +2570,7 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	ExecDropSingleTupleTableSlot(kw.s1);
 	ExecDropSingleTupleTableSlot(kw.s2);
 	pfree(kw.kept);
+	pfree(kw.unread);
 	bms_free((Bitmapset *) kw.pk);
 	PROLLY_CALL(c.rd.kr, close, c.rd.k);
 	table_close(kw.rel, NoLock);
@@ -2099,6 +2612,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	bool		keyless;
 	bool		in_place;
 	bool	   *kept;
+	bool	   *unread;
 	Bitmapset  *pk;
 	List	   *writes = NIL;
 	CellMerge	cm = {0};
@@ -2118,6 +2632,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	if (recording)
 		note_constraints(rel, keyless);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+	unread = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	oc = tc;
 	chunk_env(&env);
@@ -2298,9 +2813,13 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		kw.s2 = s2;
 		kw.pk = pk;
 		kw.kept = kept;
+		kw.unread = unread;
+		kw.keyless = keyless;
 		kw.put_back = puts_back(rel, keyless);
 
+		removed_begin(rel, keyless);
 		write_keys(&kw, writes);
+		removed_end();
 	}
 	if (a)
 		PROLLY_CALL(ar, end, a);
@@ -2314,6 +2833,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		ExecDropSingleTupleTableSlot(cm.merged);
 	}
 	pfree(kept);
+	pfree(unread);
 	bms_free(pk);
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
 	table_close(rel, NoLock);

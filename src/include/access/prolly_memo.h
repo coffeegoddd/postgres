@@ -19,9 +19,11 @@
  *
  * Contract:
  * - lookup() gives the reference remember() was given for the value a
- *   pointer names now, in a column of type typid, or nothing; never a
- *   reference to other content, nor one whose value tree values' store
- *   doesn't have.
+ *   pointer names now, in a column of type typid as typdef defines it, or
+ *   nothing; never a reference to other content, nor one whose value tree
+ *   values' store doesn't have.  (typdef is a hash of the type's
+ *   prolly_datum_definition(): a type's definition changed, say an enum
+ *   label renamed, its values encode otherwise.)
  * - remember() notes a reference the current transaction made.  The
  *   transaction sees it at once; others only once it commits, after the
  *   chunks it wrote are everyone's.  An abort (of the transaction, or of
@@ -62,11 +64,13 @@ typedef struct ProllyValueMemoRoutine
 
 	/*
 	 * The reference the value pointer (an on-disk TOAST pointer) names was
-	 * remembered by, in a column of type typid: appended to ref.
+	 * remembered by, in a column of type typid defined as typdef: appended
+	 * to ref.
 	 */
 	bool		(*lookup) (const struct ProllyValueStore *values,
-						   const void *pointer, Oid typid, StringInfo ref);
-	void		(*remember) (const void *pointer, Oid typid,
+						   const void *pointer, Oid typid, uint64 typdef,
+						   StringInfo ref);
+	void		(*remember) (const void *pointer, Oid typid, uint64 typdef,
 							 const ProllyValue *ref);
 
 	void		(*counters) (ProllyMemoCounters *out, bool reset);

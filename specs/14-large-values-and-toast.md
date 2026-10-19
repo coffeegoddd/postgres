@@ -212,7 +212,10 @@ canonical encoder looks a column's on-disk TOAST pointer up before
 reading it and remembers the reference it made on a miss. Implementation
 "shared" (`memo_shared.c`): 8192 entries in shared memory under a
 spinlock, eight probed per key, the oldest replaced; the key also holds
-the database and the column's type (whose encoding made the reference).
+the database and the column's type (whose encoding made the reference),
+and a hash of that type's definition (`prolly_datum_definition()`: an
+enum's labels, a composite's attributes, those of the types they hold),
+which `ALTER TYPE` can change without touching the value (#323).
 Entries are kept in the backend, one per key and at most as many as the
 shared table holds, until `XACT_EVENT_COMMIT`, and forgotten on an abort,
 on the abort of the subtransaction that made them (or of one it was
@@ -660,8 +663,11 @@ to decode.
   concurrent appends and commits share), a transaction's last chunks and
   its PAD once its commit record is flushed (reserved by the store's new
   `commit_writes()` at the end of the commit's pre-commit steps, which
-  also makes such a commit flush at once). The ranges reserved and not
-  written are listed in shared memory: a reader skips one (met at its
+  also makes such a commit flush at once), with the ROOT record written
+  in the PAD's place, not over it after: a collection's window, which
+  waits for the ranges in flight, finds the ROOT, never a PAD that
+  becomes one once the window has marked (#328). The ranges reserved
+  and not written are listed in shared memory: a reader skips one (met at its
   start or inside it) and reads it once written, a checkpoint and a
   collection wait for those in flight as they begin, an abort writes its
   own. A crash can leave a range the WAL never
@@ -691,7 +697,9 @@ to decode.
 - **The roots.** The page store's allocated blocks, each read once (until
   two reads agree), their items dead or alive, not their free space;
   `keep()` notes a transaction that names a tree (a collection begun
-  later waits for it, prepared too) and adds the tree to a running
+  later waits for it to end or be prepared, as its pointers are on pages
+  then; a collection waits for no prepared transaction, keeping what one
+  appended to the journal as roots) and adds the tree to a running
   collection's keep set (`gc_kept()`, before the window and in it; too
   many to remember, or no set free, keeps every chunk). It does so under
   the journal's lock, which the window holds from its last `gc_kept()` to

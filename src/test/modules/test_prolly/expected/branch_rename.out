@@ -138,7 +138,7 @@ ERROR:  branch "main" already exists
 HINT:  Replace it with -f.
 SELECT dolt_branch('-m', 'br_mine', 'HEAD');
 ERROR:  invalid branch name "HEAD"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('-m', 'br_mine', 'detached/x');
 ERROR:  branch names beginning "detached/" are reserved
 SELECT dolt_branch('-m', 'main', 'trunk');
