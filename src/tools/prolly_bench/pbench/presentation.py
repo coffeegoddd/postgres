@@ -8,7 +8,9 @@ from __future__ import annotations
 import html
 import os
 import re
+import stat
 import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -162,19 +164,20 @@ def write(document: Document, stem: Path, formats: str = "both", *,
     """Render everything before replacing any output; never modify evidence."""
     names = ["markdown", "html"] if formats == "both" else [formats]
     outputs = [(markdown_path if name == "markdown" and markdown_path else
-                stem.with_suffix(".md" if name == "markdown" else ".html"),
+                stem.with_name(stem.name + (".md" if name == "markdown" else ".html")),
                 RENDERERS[name].render(document)) for name in names]
     temporary = []
-    try:
+    with ExitStack() as cleanup:
         for path, text in outputs:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                             prefix=f".{path.name}.", delete=False) as f:
-                temporary.append((Path(f.name), path))
-                f.write(text)
+            # A private directory protects partial output while ordinary file
+            # creation respects umask. Preserve an existing report's mode.
+            directory = cleanup.enter_context(tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.name}."))
+            tmp = Path(directory) / path.name
+            tmp.write_text(text, encoding="utf-8")
+            if path.exists():
+                tmp.chmod(stat.S_IMODE(path.stat().st_mode))
+            temporary.append((tmp, path))
         for tmp, path in temporary:
             tmp.replace(path)
-    finally:
-        for tmp, _ in temporary:
-            tmp.unlink(missing_ok=True)
     return [p for p, _ in outputs]

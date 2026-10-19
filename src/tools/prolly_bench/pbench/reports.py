@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,6 +112,8 @@ def load(path: Path) -> Source:
         if name in run and (not isinstance(run[name], list) or any(not isinstance(v, expected) for v in run[name])):
             problems.append(f"invalid run field: {name}")
             run[name] = []
+    for key in run.get("planned_cells", []):
+        problems.extend(f"planned cell: {error}" for error in _key_errors(key, run.get("suite")))
     results = []
     try:
         for n, line in enumerate((path / "results.jsonl").read_text().splitlines(), 1):
@@ -123,6 +127,18 @@ def load(path: Path) -> Source:
                     raise ValueError("expected measurement object and raw path string")
                 if any(not isinstance(v, (str, int, float, type(None))) for v in r["key"].values()):
                     raise ValueError("invalid cell key")
+                problems.extend(f"results.jsonl line {n}: {error}" for error in _key_errors(r["key"], run.get("suite")))
+                statuses = r.get("collector_status", {})
+                if not isinstance(statuses, dict):
+                    statuses = {"collector_status": statuses}
+                safe_statuses = {}
+                for name, value in statuses.items():
+                    if not isinstance(value, (list, tuple)) or len(value) != 2 or not all(isinstance(v, str) for v in value):
+                        reason = f"invalid collector_status {name}: {value!r}"
+                        problems.append(f"results.jsonl line {n}: {reason}")
+                        value = ("invalid", reason)
+                    safe_statuses[name] = value
+                r["collector_status"] = safe_statuses
                 results.append(r)
             except (ValueError, TypeError) as e:
                 problems.append(f"results.jsonl line {n}: {e}")
@@ -131,9 +147,26 @@ def load(path: Path) -> Source:
     return Source(path, run, config, env, results, list(dict.fromkeys(problems)))
 
 
+def _key_errors(key: dict, suite: str | None) -> list[str]:
+    errors = []
+    if not isinstance(key.get("workload"), str) or not re.fullmatch(r"[SVC][1-9][0-9]*", key["workload"]):
+        errors.append("missing or invalid workload in cell key")
+    for name, kind in (("size", str), ("variant", str), ("clients", int), ("rep", int)):
+        # Older C evidence names only the workload. Build comparisons need the
+        # complete S/V key; never fill in missing repetition IDs for inference.
+        if (suite in ("S", "V") or name in key) and type(key.get(name)) is not kind:
+            errors.append(f"missing or invalid {name} in cell key")
+    return errors
+
+
 def _key(k: dict) -> tuple:
-    return (k.get("workload", "?"), k.get("size", "-"),
-            k.get("variant", "") or "-", k.get("clients", 0))
+    return (str(k.get("workload") or "?"), str(k.get("size") or "-"),
+            str(k.get("variant") or "-"), str(k.get("clients", 0)))
+
+
+def _natural(value) -> tuple:
+    return tuple((1, int(p)) if p.isdigit() else (0, p)
+                 for p in re.split(r"([0-9]+)", str(value)))
 
 
 def _groups(source: Source) -> dict[tuple, list[dict]]:
@@ -214,11 +247,21 @@ def _build_comparisons(sources: list[Source], document: Document) -> None:
         return
     for candidate in sorted({s.run.get("build", "") for s in sources} - {base, ""}):
         selected = [s for s in sources if s.run.get("build") in (base, candidate)]
-        rows = bcompare.compare([s.result_set() for s in selected])
         section = Section(f"Candidate over base: {candidate}/{base}", ["Workload", "Variant", "Size", "Clients", "Engine"] +
                       [h for _, h, _ in bcompare.METRICS] + ["prolly/heap base → candidate", "Result"],
                       notes=["Median of paired ratios with 95% bootstrap intervals; candidate over base. "
                              "Verdicts use the existing 5% practical effect threshold."])
+        problems = [f"{s.label}: {p}" for s in selected for p in s.problems]
+        try:
+            rows = bcompare.compare([s.result_set() for s in selected]) if not problems else []
+        except (KeyError, ValueError, TypeError) as e:
+            problems.append(f"invalid build comparison inputs: {e}")
+            rows = []
+        if problems:
+            section.notes.extend(f"Comparison withheld: {p}" for p in problems)
+            document.passed = False
+            document.sections.append(section)
+            continue
         benchmark = all(r.get("measurement", {}).get("quality") == "benchmark" for s in selected for r in s.results)
         for r in rows:
             if not benchmark:
@@ -240,17 +283,21 @@ def _correctness(sources: list[Source], document: Document) -> None:
                       notes=["Pass rates against corpus answers and agreement with heap are different measures."])
     if len(bases) != 1 or len(sources) < 2:
         section.notes.append("Comparison unavailable: supply exactly one heap result and at least one engine; no correctness verdict established.")
+        document.passed = False
     else:
         base = bases[0]
         for s in sources:
             if s is base:
                 continue
             workloads = sorted({_key(k)[0] for k in s.run.get("planned_cells", [])} |
-                               {r["key"]["workload"] for r in s.results})
+                               {_key(r["key"])[0] for r in s.results}, key=_natural)
             try:
-                problems = ccompare.gate(base.result_set(), s.result_set(), workloads)
-                comparisons = ccompare.compare(base.result_set(), s.result_set()) if not (base.problems or s.problems) else {}
-            except (OSError, ValueError, RuntimeError, KeyError) as e:
+                problems = [*base.problems, *s.problems]
+                if problems:
+                    comparisons = {}
+                else:
+                    problems, comparisons = ccompare.assess(base.result_set(), s.result_set(), workloads)
+            except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as e:
                 problems, comparisons = [f"correctness comparison unavailable: {e}"], {}
             document.passed &= not bool(problems)
             section.notes += [f"{s.label}: {p}" for p in problems]
@@ -272,6 +319,11 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     if len(suites) > 1:
         raise ValueError("give result sets of one suite")
     suite = next(iter(suites), "?")
+    if baseline is not None:
+        if suite != "S":
+            raise ValueError("an explicit baseline is supported only for the S suite")
+        if sum(s.path.resolve() == baseline.resolve() for s in sources) != 1:
+            raise ValueError("the explicit baseline must name exactly one loaded result set")
     sources = sorted(sources, key=lambda s: (s.run.get("table_am") != "heap", s.label))
     document = Document(f"{suite} suite benchmark results", [
         "Medians and min–max over repetitions. Missing and invalid evidence is never ranked. "
@@ -279,11 +331,25 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
         "Execution evidence and correctness gates are reported separately. "
         "Retained files are linked relative to this report."], passed=not any(s.problems for s in sources))
     groups = {s.label: _groups(s) for s in sources}
-    keys = sorted({k for g in groups.values() for k in g}, key=lambda k: tuple(str(v) for v in k))
+    keys = sorted({k for g in groups.values() for k in g}, key=lambda k: tuple(_natural(v) for v in k))
     found = {k for s in sources for r in s.results for k in r["metrics"]}
     if suite == "S":
         found.add("throughput")
     definitions = metrics(suite, found)
+    # Infer applicability per workload variant, across engines/client counts.
+    # A metric absent in one repetition is still missing evidence; a metric
+    # produced only by a different workload must not create false missing rows.
+    producers = {m.key: set() for m in definitions}
+    for source in sources:
+        for result in source.results:
+            key = _key(result["key"])
+            for metric in definitions:
+                if metric.key in result["metrics"] or metric.key == "throughput" and any(
+                        k in result["metrics"] for k in ("tps", "rows_per_second")):
+                    producers[metric.key].add((key[0], key[2]))
+
+    def applicable(metric: Metric, key: tuple) -> bool:
+        return not producers[metric.key] or (key[0], key[2]) in producers[metric.key]
     overview_keys = ({"throughput", "latency_p99_ms", "wal_bytes_per_operation", "wa_server",
                       "cluster_allocated_bytes_including_wal"} if suite == "S" else
                      {k for k in found if k.endswith("_ms")} | {"background_tps"} if suite == "V" else
@@ -291,7 +357,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     overview_metrics = [m for m in definitions if m.key in overview_keys]
     overview = Section("Workload overview", ["Workload", "Size", "Variant", "Clients", "Engine/build", "Repetitions"] +
                        [f"{m.title} ({m.unit})" for m in overview_metrics])
-    overview.notes = [table._workload_title(w) for w in sorted({k[0] for k in keys})]
+    overview.notes = [table._workload_title(w) for w in sorted({k[0] for k in keys}, key=_natural)]
     for key in keys:
         for s in sources:
             rows = groups[s.label].get(key, [])
@@ -299,7 +365,8 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
                 continue
             overview.rows.append([*[str(v) for v in key], s.label,
                                   f"{len(rows)}/{_planned(s, key)} planned"] +
-                                 [_metric_value(s, key, rows, m) for m in overview_metrics])
+                                 [_metric_value(s, key, rows, m) if applicable(m, key) else
+                                  Value("n/a", "Metric not produced by this workload variant") for m in overview_metrics])
     document.sections.append(overview)
     for s in sources:
         document.sections.append(_coverage(s, output_dir))
@@ -344,6 +411,8 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
                           notes=[f"Metric: {metric.key}. Direction: {metric.direction}. "
                                  "Ratios use the compatible reference within this build unless explicitly nominated."])
         for key in keys:
+            if not applicable(metric, key):
+                continue
             units = sorted({r.get("unit", "unknown") for s in sources for r in groups[s.label].get(key, [])})
             cells = []
             for s in sources:

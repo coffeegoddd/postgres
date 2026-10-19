@@ -258,12 +258,22 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
     Order-only findings require review here; the reporting comparator doesn't
     distinguish a required ORDER BY from an unspecified result order.
     """
+    return assess(base, eng, workloads)[0]
+
+
+def assess(base: ResultSet, eng: ResultSet, workloads: list[str]) -> tuple[list[str], dict]:
+    """Gate findings and the comparisons they came from, computed once.
+
+    Input validation failures return no comparisons and never launch the
+    external comparator. Reports can retain counts even when those counts
+    fail the gate, without attempting a second comparison after a failure.
+    """
     problems = compatible(base.path, eng.path)
     if base.suite != "C" or eng.suite != "C" or base.table_am != "heap":
-        return ["the gate needs C results with heap as the baseline"]
+        return ["the gate needs C results with heap as the baseline"], {}
     required = set(workloads)
     if not required:
-        return ["no required workloads"]
+        return ["no required workloads"], {}
     for name, rs in (("heap", base), (eng.table_am, eng)):
         cells = [r["key"]["workload"] for r in rs.results]
         if set(cells) != required or len(cells) != len(required):
@@ -279,11 +289,11 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
                 if corpus != baseline_corpus:
                     problems.append(f"{name}/{w}: different corpus contents")
     if problems:
-        return problems
+        return problems, {}
     try:
         comparisons = compare(base, eng)
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-        return [f"comparison failed: {e}"]
+        return [f"comparison failed: {e}"], {}
     if set(comparisons) != required:
         problems.append("missing workload comparisons")
     for w, result in comparisons.items():
@@ -296,7 +306,7 @@ def gate(base: ResultSet, eng: ResultSet, workloads: list[str]) -> list[str]:
                 problems.append(f"{w}: {count} {kind}")
         if result["stale_exceptions"]:
             problems.append(f"{w}: stale exceptions")
-    return problems
+    return problems, comparisons
 
 
 def diffs(base: ResultSet, eng: ResultSet) -> Iterator[dict[str, Any]]:
