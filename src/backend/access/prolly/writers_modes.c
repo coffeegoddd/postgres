@@ -99,6 +99,48 @@ static ProllyWriterMode mode_read;
 static LocalTransactionId protections_lxid = InvalidLocalTransactionId;
 static char *protections = NULL;
 
+/*
+ * what mode() and protected() answer, as last set or undone: and the
+ * subtransaction that last set them, whose abort undoes the set
+ */
+static uint64 modes_gen = 0;
+static LocalTransactionId set_lxid = InvalidLocalTransactionId;
+static SubTransactionId set_subid = InvalidSubTransactionId;
+
+static void
+modes_changed(void)
+{
+	modes_gen++;
+	set_lxid = MyProc->vxid.lxid;
+	set_subid = GetCurrentSubTransactionId();
+}
+
+static uint64
+modes_generation(void)
+{
+	return modes_gen;
+}
+
+/*
+ * (a subtransaction aborted that set the mode or protections, which the
+ * refs undo with it: read them again.  Its parent may have set them too.)
+ */
+static void
+modes_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					   SubTransactionId parentSubid, void *arg)
+{
+	if (set_lxid != MyProc->vxid.lxid || set_subid != mySubid)
+		return;
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		mode_lxid = InvalidLocalTransactionId;
+		protections_lxid = InvalidLocalTransactionId;
+		modes_gen++;
+		set_subid = parentSubid;
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		set_subid = parentSubid;
+}
 
 static bool
 check_writer(char **newval, void **extra, GucSource source)
@@ -155,6 +197,7 @@ prolly_writers_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+	RegisterSubXactCallback(modes_subxact_callback, NULL);
 }
 
 char *
@@ -214,6 +257,7 @@ modes_set_mode(ProllyWriterMode mode)
 				mode == PROLLY_WRITERS_SHARED ? NULL : mode_names[mode]);
 	mode_lxid = MyProc->vxid.lxid;
 	mode_read = mode;
+	modes_changed();
 }
 
 /* as the mode has it: main, in the branch modes */
@@ -397,6 +441,7 @@ modes_set_protected(const char *name, ProllyBranchProtection protection)
 	protections = MemoryContextStrdup(TopMemoryContext, v.data);
 	protections_lxid = MyProc->vxid.lxid;
 	pfree(v.data);
+	modes_changed();
 }
 
 /* branch's pg_branch row, with its owner (NULL if none) and owner's role */
@@ -674,4 +719,5 @@ const ProllyWritersRoutine prolly_writers_modes = {
 	.set_protected = modes_set_protected,
 	.writer_branch = modes_writer_branch,
 	.set_writer_branch = modes_set_writer_branch,
+	.generation = modes_generation,
 };

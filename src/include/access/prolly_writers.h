@@ -41,6 +41,9 @@
  * - writer_branch() says whether name is a writer branch, and whose (its
  *   writer, the branch it was forked from, and the role that made it);
  *   set_writer_branch() records one (writer NULL: forgets it).
+ * - generation() changes whenever what mode() or protected() answers may
+ *   have changed in the session: a set, or the abort of a subtransaction
+ *   that set one; a caller keeping their answers compares it.
  *
  * Provisional (v0).
  *
@@ -98,13 +101,16 @@ typedef struct ProllyWritersRoutine
 								  Oid *role);
 	void		(*set_writer_branch) (const char *name, const char *writer,
 									  const char *base);
+
+	/* changes as the mode's or a protection's answer may */
+	uint64		(*generation) (void);
 } ProllyWritersRoutine;
 
 #define PROLLY_WRITERS_CALLBACK_NAMES \
 	"note_write", "settled", "take", "mode", "set_mode", "protected", \
-	"set_protected", "writer_branch", "set_writer_branch"
+	"set_protected", "writer_branch", "set_writer_branch", "generation"
 #define PROLLY_WRITERS_FIRST_CALLBACK note_write
-#define PROLLY_WRITERS_LAST_CALLBACK set_writer_branch
+#define PROLLY_WRITERS_LAST_CALLBACK generation
 
 /* writer branches' names: PROLLY_WRITER_PREFIX writer "/" base */
 #define PROLLY_WRITER_PREFIX "writer/"

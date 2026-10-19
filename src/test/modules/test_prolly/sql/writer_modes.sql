@@ -335,6 +335,145 @@ RESET ROLE;
 SELECT dolt_writer_mode('nobody');
 SELECT dolt_writer_mode('shared');
 RESET dolt.writer;
+
+-- A mode or protection set in a subtransaction that aborts is undone with
+-- it, for the rest of the transaction too; one released is kept.
+SELECT active_branch();
+CREATE TABLE wm.sp (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'wm.sp')::text) AS committed;
+SELECT dolt_branch('wm_sp');
+SELECT dolt_writer_mode('branch-only');
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('shared');
+ROLLBACK TO s;
+SELECT dolt_writer_mode();
+INSERT INTO wm.sp VALUES (1);
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_branch('--unprotect', 'main');
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (1);
+ROLLBACK;
+SELECT dolt_writer_mode('shared');
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('branch-only');
+ROLLBACK TO s;
+SELECT dolt_writer_mode();
+INSERT INTO wm.sp VALUES (1);
+SAVEPOINT s;
+SELECT dolt_branch('--protect', 'wm_sp');
+ROLLBACK TO s;
+SELECT name, protected FROM dolt_branches() WHERE name = 'wm_sp';
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('branch-only');
+RELEASE s;
+SELECT dolt_writer_mode();
+INSERT INTO wm.sp VALUES (2);
+ROLLBACK;
+-- In branch-auto, a write after main's unprotect is undone moves to the
+-- writer branch, as main is protected again.
+SELECT dolt_writer_mode('branch-auto');
+SET dolt.writer = 'sp';
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_branch('--unprotect', 'main');
+INSERT INTO wm.sp VALUES (3);
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (4);
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+SELECT count(*) AS on_main FROM wm.sp;
+-- A set released into an outer savepoint is undone with that one.
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_branch('--unprotect', 'main');
+INSERT INTO wm.sp VALUES (9);
+RELEASE b;
+ROLLBACK TO a;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.sp VALUES (10);
+SELECT active_branch();
+ROLLBACK;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+SELECT dolt_writer_mode('shared');
+RELEASE b;
+ROLLBACK TO a;
+SELECT dolt_writer_mode();
+ROLLBACK;
+-- A set in the transaction stays when a later one in a savepoint is undone.
+BEGIN;
+SELECT dolt_branch('--unprotect', 'main');
+SAVEPOINT s;
+SELECT dolt_branch('--protect', 'main');
+ROLLBACK TO s;
+SELECT name, protected FROM dolt_branches() WHERE name = 'main';
+INSERT INTO wm.sp VALUES (11);
+SELECT active_branch();
+ROLLBACK;
+-- A transaction found to stay on its branch looks again once the branch is
+-- protected, however it is: a write after it moves to the writer branch.
+SELECT dolt_checkout('wm_sp');
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_branch('--protect', 'wm_sp');
+INSERT INTO wm.sp VALUES (5);
+SELECT active_branch();
+ROLLBACK;
+SELECT dolt_checkout('wm_sp');
+SELECT dolt_branch('wm_sp_prot');
+SELECT dolt_branch('--protect', 'wm_sp_prot');
+-- (a branch with changes, renamed onto a protected name, isn't protected
+-- by it, as it wouldn't be protected itself)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
+ROLLBACK;
+-- (and unforced, onto a name that exists, it is no rename)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', 'wm_sp', 'wm_sp_prot');
+ROLLBACK;
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
+SELECT name, protected FROM dolt_branches() WHERE name LIKE 'wm_sp%';
+INSERT INTO wm.sp VALUES (6);
+SELECT active_branch();
+ROLLBACK;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'wm_sp_prot');
+-- And once the mode is branch-auto.
+SELECT dolt_writer_mode('owned');
+BEGIN;
+UPDATE wm.sp SET id = id WHERE false;
+SELECT dolt_writer_mode('branch-auto');
+INSERT INTO wm.sp VALUES (7);
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+-- A subtransaction that set nothing, aborted, leaves what was set.
+BEGIN;
+SELECT dolt_branch('--unprotect', 'main');
+SAVEPOINT s;
+SELECT 1 / 0;
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (8);
+SELECT active_branch();
+ROLLBACK;
+SELECT dolt_writer_mode('shared');
+RESET dolt.writer;
+SELECT dolt_branch('-D', 'wm_sp');
+DROP TABLE wm.sp;
+SELECT length(dolt_commit('-Am', 'no wm.sp')::text) AS committed;
 REVOKE ALL ON wm.t FROM wm_other, wm_carol;
 REVOKE USAGE ON SCHEMA wm FROM wm_other, wm_carol;
 DROP ROLE wm_other;
