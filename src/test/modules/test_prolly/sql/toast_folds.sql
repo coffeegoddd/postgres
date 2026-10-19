@@ -2,7 +2,7 @@
 -- stored: by content, or in a TOAST relation compressed or not; moved
 -- out of line, or inline.  (A value stored by content whose
 -- tree holds the column's canonical bytes is that tree: the fold writes
--- its reference without reading the value; 062_toast_folds.pl.)
+-- its reference without reading the value; 071_toast_folds.pl.)
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
