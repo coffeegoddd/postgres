@@ -213,11 +213,14 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "9", what changes how a definition
- * behaves described when it isn't the default (inheritance, and which
- * inherited columns and constraints are a child's own too; typed tables,
- * trigger and rule firing, domain collations and defaults, composite
- * attributes' collations, view options, matviews' indexes and being
+ * The format a folded root is in: "11", varchar primary keys ordered
+ * through their text opfamilies, rather than rows keyed by content;
+ * "10" is reserved for table and column settings (#400).  "9" described
+ * what changes how a definition behaves when it isn't the default
+ * (inheritance, and which inherited columns and constraints are a child's
+ * own too; typed tables, trigger and rule firing, domain collations and
+ * defaults, composite attributes' collations, view options, matviews'
+ * indexes and being
  * unpopulated); "8" left those out, and was the first with every float NaN
  * in rows and keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
  * own bits, and was the first with indexes described without their
@@ -231,9 +234,9 @@ typedef struct BaseTable BaseTable;
  * keyless rows keyed by their first bytes and their hash, and a root
  * without the item keyed them by the hash alone.  A root in another has
  * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions' text isn't this format's.
+ * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"9"
+#define FOLDED_FORMAT	"11"
 
 typedef struct Canon
 {

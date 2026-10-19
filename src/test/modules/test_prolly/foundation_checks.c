@@ -28,6 +28,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_opclass_d.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
@@ -168,6 +169,7 @@ typedef struct KeyColSpec
 	Oid			type;
 	Oid			collation;
 	int16		options;		/* INDOPTION_* */
+	Oid			opclass;		/* InvalidOid: the default for type */
 } KeyColSpec;
 
 typedef struct KeyRow
@@ -194,7 +196,8 @@ key_case_init(KeyCase *kc)
 	for (int i = 0; i < kc->ncols; i++)
 	{
 		KeyColSpec *spec = &kc->cols[i];
-		Oid			opclass = GetDefaultOpClass(spec->type, BTREE_AM_OID);
+		Oid			opclass = OidIsValid(spec->opclass) ? spec->opclass :
+			GetDefaultOpClass(spec->type, BTREE_AM_OID);
 		Oid			opfamily = get_opclass_family(opclass);
 
 		kc->types[i] = spec->type;
@@ -291,6 +294,7 @@ column_values(Oid type, bool with_nulls, Datum *values, bool *isnull)
 			values[n++] = BoolGetDatum(true);
 			break;
 		case TEXTOID:
+		case VARCHAROID:
 			for (int i = 0; i < lengthof(texts); i++)
 				values[n++] = CStringGetTextDatum(texts[i]);
 			break;
@@ -439,10 +443,14 @@ keyenc_order_matches_opclass(const ProllyImplInfo *impl)
 		{1, {{BOOLOID}}},
 		{1, {{TEXTOID, C_COLLATION_OID}}},
 		{1, {{TEXTOID, non_c_collation()}}},
+		{1, {{VARCHAROID, C_COLLATION_OID}}},
+		{1, {{VARCHAROID, non_c_collation()}}},
+		{1, {{VARCHAROID, C_COLLATION_OID, 0, VARCHAR_BTREE_PATTERN_OPS_OID}}},
 		{1, {{NUMERICOID}}},
 		{2, {{INT4OID}, {TEXTOID, C_COLLATION_OID}}},
 		{2, {{TEXTOID, non_c_collation()}, {INT8OID}}},
 		{2, {{NUMERICOID}, {BOOLOID}}},
+		{2, {{INT4OID}, {VARCHAROID, C_COLLATION_OID}}},
 		{1, {{INT4ARRAYOID}}},
 		{2, {{INT4ARRAYOID}, {TEXTOID, C_COLLATION_OID}}},
 	};
@@ -466,6 +474,9 @@ keyenc_desc_and_nulls(const ProllyImplInfo *impl)
 			{1, {{INT4OID, InvalidOid, opts[o]}}},
 			{1, {{TEXTOID, C_COLLATION_OID, opts[o]}}},
 			{1, {{TEXTOID, non_c_collation(), opts[o]}}},
+			{1, {{VARCHAROID, C_COLLATION_OID, opts[o]}}},
+			{1, {{VARCHAROID, non_c_collation(), opts[o]}}},
+			{1, {{VARCHAROID, C_COLLATION_OID, opts[o], VARCHAR_BTREE_PATTERN_OPS_OID}}},
 			{1, {{NUMERICOID, InvalidOid, opts[o]}}},
 			{2, {{INT8OID, InvalidOid, opts[o]}, {TEXTOID, C_COLLATION_OID, 0}}},
 			{2, {{BOOLOID, InvalidOid, 0}, {INT2OID, InvalidOid, opts[o]}}},

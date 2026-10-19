@@ -640,6 +640,15 @@ fails without its fix), and Postgres's suites keep passing after each one.
   text was re-escaped. `dolt_status` splits its rows at the last tab and
   sorts them by name, a table's name holding a tab included.
 
+- Format 11 of the folded root (10 is reserved for table and column
+  settings, #400) uses the text opfamily's comparison for
+  `varchar` primary keys (including domains over `varchar`), as PostgreSQL
+  does. Previously those keys fell back to content-keyed rows with a copy
+  count, so a merge across `char` to `varchar` read the wrong row format
+  (#389). The ordered key encoder is format 4, which also invalidates fold
+  baselines. Older roots are refused for row reads, moves and merges;
+  commit a branch to write its current rows in the new format.
+
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
   reset to a commit, fast-forward, branch at a commit, materializing a

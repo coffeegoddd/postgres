@@ -91,6 +91,13 @@ SELECT 10 + g, string_agg(md5(g::text || '-' || i), '' ORDER BY i),
 	decode(string_agg(md5(g::text || '+' || i), '' ORDER BY i), 'hex')
 FROM generate_series(1, 3) g, generate_series(1, 50) i GROUP BY g;
 
+-- Varchar keys, including domains, use the text opfamily.  Pin their
+-- trees so a fallback to keyless storage cannot silently change them.
+CREATE DOMAIN frozen.vkey AS varchar(10);
+CREATE TABLE frozen.varchar_keys (k varchar(10) COLLATE "C" PRIMARY KEY, v int);
+CREATE TABLE frozen.varchar_domain (k frozen.vkey COLLATE "C" PRIMARY KEY, v int);
+INSERT INTO frozen.varchar_keys VALUES ('ab', 1), ('ab ', 2), ('cd', 3), ('', 4);
+INSERT INTO frozen.varchar_domain SELECT * FROM frozen.varchar_keys;
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
 

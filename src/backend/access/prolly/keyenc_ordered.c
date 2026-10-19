@@ -123,6 +123,9 @@ comparison_proc(Oid opfamily, Oid base)
 
 	if (OidIsValid(proc))
 		return proc;
+	/* varchar's standard opclasses use text's binary-compatible input. */
+	if (base == VARCHAROID)
+		return get_opfamily_proc(opfamily, TEXTOID, TEXTOID, BTORDER_PROC);
 	if (OidIsValid(get_element_type(base)))
 		poly = ANYARRAYOID;
 	else
@@ -516,7 +519,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.info = {
 		.iface = PROLLY_IFACE_KEY_ENCODER,
 		.impl_id = 1,
-		.format_version = 3,		/* 2: jsonb as stored; 3: NaNs canonical */
+		.format_version = 4,		/* 3: NaNs canonical; 4: varchar keys */
 		.name = "ordered",
 		.description = "memcmp-ordered integers, bools and C-collation text; "
 		"other types by canonical bytes and their comparison function",
