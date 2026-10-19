@@ -366,43 +366,43 @@ SELECT message, committer = current_user AS session_user,
 -- or options would read otherwise is refused.
 SELECT dolt_branch('bad~name');
 ERROR:  invalid branch name "bad~name"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad^name');
 ERROR:  invalid branch name "bad^name"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('bad:name');
 ERROR:  invalid branch name "bad:name"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('two words');
 ERROR:  invalid branch name "two words"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a..b');
 ERROR:  invalid branch name "a..b"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('HEAD');
 ERROR:  invalid branch name "HEAD"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('@');
 ERROR:  invalid branch name "@"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends.lock');
 ERROR:  invalid branch name "ends.lock"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('part.lock/b');
 ERROR:  invalid branch name "part.lock/b"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('.hidden');
 ERROR:  invalid branch name ".hidden"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feat/.x');
 ERROR:  invalid branch name "feat/.x"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('a//b');
 ERROR:  invalid branch name "a//b"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('ends/');
 ERROR:  invalid branch name "ends/"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_branch('feature/ok-name_1.2');
  dolt_branch 
 -------------
@@ -426,7 +426,7 @@ SELECT dolt_branch('-d', 'feature/ok-name_1.2');
 -- only by case names that branch, made, copied or renamed to.
 SELECT dolt_branch('head');
 ERROR:  invalid branch name "head"
-DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" alone or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_hashof('head') = dolt_hashof('HEAD') AS head_any_case,
 	dolt_hashof('Head~0') = dolt_hashof('HEAD') AS with_steps;
  head_any_case | with_steps 
@@ -482,7 +482,220 @@ SELECT dolt_reset('--hard', '--', '-dash');
 SELECT dolt_cherry_pick('--', '-dash');
 ERROR:  dolt_cherry_pick changes nothing on the branch
 HINT:  Pass --allow-empty to commit it anyway.
+-- (and to a remote's, pushed, fetched and pulled)
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/dash-' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'dash', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('dash', '--', '-dash') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_fetch('dash', '--', '-dash');
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT name FROM dolt_remote_branches() WHERE name LIKE '%-dash';
+        name        
+--------------------
+ remotes/dash/-dash
+(1 row)
+
+SELECT dolt_pull('dash', '--', '-dash') IS NOT NULL AS pulled;
+ pulled 
+--------
+ t
+(1 row)
+
+SELECT dolt_remote('remove', 'dash');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+-- (a remote named like a flag, after "--": pulled from by name, and as
+-- the session branch's upstream, set by -fu, short flags together)
+SELECT dolt_remote('add', '--', '-r', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('-fu', '--', '-r', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT (dolt_pull('--', '-r', 'main'))[4];
+       dolt_pull       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT (dolt_pull())[4];
+       dolt_pull       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT dolt_remote('remove', '--', '-r');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_gc('--', '--full');
+ERROR:  dolt_gc: unexpected argument "--full"
 SELECT dolt_branch('-D', '--', '-dash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- An option's value is the argument after it, "--" too (as in Dolt and
+-- git), so "--" ends the options only where it isn't one.  "--" isn't a
+-- branch's name (as in git), however it's given: no branch "--" is made.
+SELECT dolt_checkout('-b', '--', 'main');
+ERROR:  invalid branch name "--"
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_checkout('-b', '--');
+ERROR:  invalid branch name "--"
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_branch('--', '--');
+ERROR:  invalid branch name "--"
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_branch('-c', '--', 'main', '--');
+ERROR:  invalid branch name "--"
+DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
+SELECT dolt_checkout('--', '--');
+ERROR:  branch "--" does not exist
+SELECT name FROM dolt_branches WHERE name = '--';
+ name 
+------
+(0 rows)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+BEGIN;
+SELECT length(dolt_commit('--allow-empty', '-m', '--')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-Am', '--', '--author', '--')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT message, committer = '--' AS by_dashes FROM dolt_log('main') LIMIT 2;
+ message | by_dashes 
+---------+-----------
+ --      | t
+ --      | f
+(2 rows)
+
+SELECT dolt_branch('dashed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dashed');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'dashed'"}
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'on dashed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('--no-ff', '-m', '--', '--', 'dashed'))[4];
+    dolt_merge    
+------------------
+ merge successful
+(1 row)
+
+SELECT message FROM dolt_log('main') LIMIT 1;
+ message 
+---------
+ --
+(1 row)
+
+ROLLBACK;
+-- A lone "--" ends the options of the rest too, with nothing after it.
+SELECT dolt_add('--');
+ dolt_add 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_verify_constraints('--');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+-- -b's start point is the name given apart from it, before -b or after
+-- (as in Dolt and git); -b is given once.
+SELECT dolt_branch('cko_old', 'HEAD~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cko_old', '-b', 'cko_new');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'cko_new'"}
+(1 row)
+
+SELECT dolt_hashof('cko_new') = dolt_hashof('cko_old') AS at_old,
+	dolt_hashof('cko_new') <> dolt_hashof('main') AS not_main;
+ at_old | not_main 
+--------+----------
+ t      | t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', '-b', 'cko_y');
+ERROR:  dolt_checkout: multiple values provided for "-b"
+SELECT dolt_checkout('-b', 'cko_x', 'cko_old', 'main');
+ERROR:  dolt_checkout: unexpected argument "main"
+SELECT name FROM dolt_branches WHERE name IN ('cko_x', 'cko_y');
+ name 
+------
+(0 rows)
+
+SELECT dolt_branch('-D', 'cko_old', 'cko_new');
  dolt_branch 
 -------------
  {0}
