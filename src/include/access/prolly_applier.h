@@ -28,6 +28,12 @@
  *   logical replication's apply does.  A materialized view's rows are
  *   written with index maintenance, as its refresh writes them.  Nothing
  *   else in the session changes.
+ * - immediate() has the rows written after it checked against the
+ *   deferrable unique and exclusion constraints as an immediate one checks
+ *   them: insert() or update() of a row breaking one raises the error,
+ *   whether the constraint is INITIALLY DEFERRED or SET CONSTRAINTS defers
+ *   it.  (A caller that records the rows refused, writing each in a
+ *   subtransaction, calls it.)  Calling it again changes nothing.
  * - Each write is visible to the next, and holds nothing (no buffer pin)
  *   once it returns, so writes may be made in subtransactions.
  *
@@ -55,11 +61,12 @@ typedef struct ProllyApplierRoutine
 	bool		(*update) (ProllyApplier *a, TupleTableSlot *old,
 						   TupleTableSlot *row, const bool *keep);
 	bool		(*remove) (ProllyApplier *a, TupleTableSlot *old);
+	void		(*immediate) (ProllyApplier *a);
 	void		(*end) (ProllyApplier *a);
 } ProllyApplierRoutine;
 
 #define PROLLY_APPLIER_CALLBACK_NAMES \
-	"begin", "insert", "update", "remove", "end"
+	"begin", "insert", "update", "remove", "immediate", "end"
 #define PROLLY_APPLIER_FIRST_CALLBACK begin
 #define PROLLY_APPLIER_LAST_CALLBACK end
 

@@ -688,6 +688,13 @@ fails without its fix), and Postgres's suites keep passing after each one.
     Dolt, it is also refused whenever definitions change, whether
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
+  - A materialized view's rows merge as a REFRESH made them: those of
+    the side that refreshed it since the merge base (ours if neither), or
+    of the side whose query the merged one is; if both refreshed it to
+    other rows, neither's are what its query reads after the merge, and
+    it is refreshed from the merged rows (refused over uncommitted rows,
+    which it would read). A fast-forward over uncommitted changes brings
+    theirs' rows too (#320).
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the
@@ -2034,7 +2041,8 @@ A GC runs in one database at a time, by `dolt_gc()` or the trigger
 4. **Retire.** The sealed segment and the replaced table files are
    unlinked once every transaction that was running at the swap has
    ended (the GC waits for their virtual transaction ids, as `CREATE
-   INDEX CONCURRENTLY` does), so no backend reads a file it opened
+   INDEX CONCURRENTLY` does, but not for a prepared transaction, which
+   reads nothing more), so no backend reads a file it opened
    before (a VFD may be closed and reopened at any time, so an unlinked
    file isn't readable to the end of a transaction as an open one would
    be). `GC_RETIRE` (WAL) names them.
@@ -2308,7 +2316,16 @@ Not as designed, or not yet:
   anything new is read, rather than their chunks kept as roots (copied to
   a settled file, an uncommitted chunk would be everyone's before what it
   names is). A long transaction that appended a batch before the seal
-  holds the collection there.
+  holds the collection there. A prepared one, which may stay for days,
+  isn't waited for (here, for a transaction that named a tree before the
+  collection began, or at the retire): its chunks in the sealed segments
+  are roots instead (what they name was appended before them, so it is
+  copied with them; it can't have moved the root, so no PAD of its
+  becomes a ROOT), and its pointers are on pages already. A transaction
+  prepared while it is waited for is waited for until then: the wait is
+  for its backend's virtual transaction id
+  (`VirtualXactLockUnprepared()`, beside `VirtualXactLock()` in
+  `lock.c`), not for its xid, which the prepared transaction keeps.
 - **The manifest's lock is let go at the swap**, and a lock of the
   collection's own held to the end of its transaction (past the retire):
   a transfer waiting for the manifest would otherwise deadlock with the
