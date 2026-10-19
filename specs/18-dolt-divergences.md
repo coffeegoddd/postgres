@@ -225,15 +225,15 @@ stash, …) is F, ported with the feature (#163).
   first unique constraint it breaks. Check and not-null constraints are
   the same: their breaking rows are recorded, not written.
   For a keyless table, a removal cannot be paired with a rejected insert.
-  If a pass that removes rows encounters a unique, exclusion, check, not-null,
-  or domain violation, all row changes in that pass are rolled back,
-  including acceptable inserts, and a warning explains that its rows were
-  kept. The rejected rows remain listed as violations; other tables merge
-  normally. Passes that only insert rows still keep acceptable inserts.
-  Resolve the affected table's incoming changes manually before
-  verifying constraints and committing. This does not change foreign-key
-  checks performed after writing, or the handling of constraints added by
-  the schema merge (D13).
+  If a merge that removes rows of a keyless table refuses a row it writes
+  (a unique, exclusion, check, not-null or domain violation), the merge is
+  refused with an error and the branch is left as it was: keeping either
+  side's rows would silently lose the other's. Change the rows on one
+  branch so they satisfy the table's constraints, then merge again. A
+  merge that only inserts rows into a keyless table records the refused
+  rows alone and keeps the rest, as for a keyed table. This does not change
+  foreign-key checks performed after writing, or the handling of
+  constraints added by the schema merge (D13).
 - **Why:** a Postgres unique index refuses the second row (as a
   validated check or not-null constraint refuses a row breaking it); a
   table can't hold both, so there is no state in which Dolt's rows

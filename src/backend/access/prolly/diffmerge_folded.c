@@ -1679,7 +1679,7 @@ typedef struct Applying
 	bool		in_place;		/* changed keyed rows updated in place */
 	bool		put_back;		/* a refused row's old version put back */
 	bool		stuck;			/* a put-back refused: the rest not written */
-	bool		removed_rows;	/* keyless removals need protection on refusal */
+	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	bool		inserting;
 } Applying;
 
@@ -1708,27 +1708,24 @@ puts_back(Relation rel, bool keyless)
 }
 
 /*
- * A keyless update is an unrelated removal and insertion.  If an insert
- * is refused, there is no way to identify which removed row to put back.
- * Roll back the table's whole row-write pass, retaining its violations
- * (allocated in TopTransactionContext), for explicit resolution instead.
- * With no removals there is nothing to restore, so valid inserts stay.
- * The caller restores its memory context and resource owner afterward.
+ * A keyless update is an unrelated removal and insertion: if a merge
+ * removed rows of a keyless table and refused one it would write (a
+ * constraint breaks), the rows it removed can't be told from those it
+ * replaced, so neither the branch's rows nor theirs can be kept as the
+ * merge would have them.  Refused: the branch stays as it was.  With no
+ * removals, the rows refused are recorded alone, as for a keyed table.
  */
 static void
-finish_keyless_write(Relation rel, int nrecorded, bool removed_rows)
+refuse_keyless_violations(Relation rel, int nrecorded, bool removed_rows)
 {
 	if (!removed_rows || list_length(recorded) == nrecorded)
-		ReleaseCurrentSubTransaction();
-	else
-	{
-		RollbackAndReleaseCurrentSubTransaction();
-		/* Schema moves suppress notices while invoking the row writer. */
-		ereport(WARNING,
-				(errmsg("rows of keyless table \"%s\" were kept because the merge found constraint violations",
-						RelationGetRelationName(rel)),
-				 errdetail("None of this table's row changes were applied.")));
-	}
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("the rows of keyless table %s can't be merged: a row the merge writes breaks a constraint",
+					table_name(RelationGetRelid(rel))),
+			 errdetail("Without a key, the rows the merge replaces can't be kept beside the rows it refuses."),
+			 errhint("Change the rows on one branch so they satisfy the table's constraints, then merge again.")));
 }
 
 /*
@@ -1890,9 +1887,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
  * up), each written as the trees' diff finds it, nothing held.  While
  * violations are recorded, a keyed row refused is put back (puts_back()),
  * in a subtransaction: if a put-back is refused too, it is rolled back,
- * and the rows written held instead.  A keyless table's row changes are
- * atomic if it removes rows while recording violations
- * (finish_keyless_write()).
+ * and the rows written held instead.  A keyless table's rows are refused
+ * if it removes rows and a violation is recorded
+ * (refuse_keyless_violations()).
  */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
@@ -1904,7 +1901,6 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ProllyKeyingRefs krefs;
 	Applying	ap;
 	int			nrecorded = list_length(recorded);
-	bool		atomic_keyless;
 
 	require_readable(from);
 	require_readable(to);
@@ -1921,7 +1917,6 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	if (recording)
 		note_constraints(ap.rel, ap.keyless);
 	ap.put_back = puts_back(ap.rel, ap.keyless);
-	atomic_keyless = recording && ap.keyless && may_break_constraints(ap.rel);
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
@@ -1936,7 +1931,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	removed_begin(ap.rel, ap.keyless);
-	if (ap.put_back || atomic_keyless)
+	if (ap.put_back)
 	{
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
@@ -1946,12 +1941,12 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
-	if (ap.put_back || atomic_keyless)
+	if (recording && ap.keyless)
+		refuse_keyless_violations(ap.rel, nrecorded, ap.removed_rows);
+	if (ap.put_back)
 	{
 		/* (stuck: none of it written, nor its violations recorded) */
-		if (atomic_keyless)
-			finish_keyless_write(ap.rel, nrecorded, ap.removed_rows);
-		else if (ap.stuck)
+		if (ap.stuck)
 		{
 			RollbackAndReleaseCurrentSubTransaction();
 			recorded = list_truncate(recorded, nrecorded);
@@ -2359,7 +2354,7 @@ typedef struct KeyWriter
 	bool	   *unread;			/* (decode_update()'s) */
 	bool		put_back;		/* puts_back() */
 	bool		keyless;
-	bool		removed_rows;	/* finish_keyless_write()'s */
+	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	bool		moving;			/* row_missing()'s */
 } KeyWriter;
 
@@ -2667,25 +2662,14 @@ write_keys(KeyWriter *kw, List *writes)
 	ResourceOwner owner = CurrentResourceOwner;
 	int			nrecorded = list_length(recorded);
 
-	if (recording && kw->keyless && may_break_constraints(kw->rel))
-	{
-		bool		written PG_USED_FOR_ASSERTS_ONLY;
-
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(cxt);
-		written = write_keys_once(kw, writes);
-		Assert(written);
-		finish_keyless_write(kw->rel, nrecorded, kw->removed_rows);
-		MemoryContextSwitchTo(cxt);
-		CurrentResourceOwner = owner;
-		return;
-	}
 	if (!kw->put_back)
 	{
 		bool		written PG_USED_FOR_ASSERTS_ONLY;
 
 		written = write_keys_once(kw, writes);
 		Assert(written);
+		if (recording && kw->keyless)
+			refuse_keyless_violations(kw->rel, nrecorded, kw->removed_rows);
 		return;
 	}
 	for (;;)
