@@ -966,6 +966,10 @@ refusal_type(int sqlerrcode)
  * Insert row into rel, or update old to it, in a subtransaction: a row
  * whose error refusal_type() names is rolled back, and the error returned
  * (NULL: written).  *found (if not NULL) gets whether old was there.
+ * The applier's deferrable rechecks are made immediate first, so a row
+ * breaking a deferrable unique or exclusion constraint is refused here
+ * too: each row a merge recording violations writes, puts back, or
+ * updates pinned (update_key(), retry_key()) comes through here.
  */
 static ErrorData *
 try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
@@ -1015,8 +1019,10 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
  * merge records violations, a row that breaks a unique, check or not-null
  * (or exclusion) constraint isn't written, and is recorded instead: a
  * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).  *refused (if
- * not NULL) gets whether it was.  Returns false if old isn't there.
+ * table holds no row breaking a constraint, unlike Dolt's).  A deferrable
+ * constraint is checked as the row is written, as others are (the
+ * applier's immediate(), in try_write()).  *refused (if not NULL) gets
+ * whether it was.  Returns false if old isn't there.
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
