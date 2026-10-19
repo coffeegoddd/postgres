@@ -1297,10 +1297,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/*
 	 * Prolly's session state, and the branch the connection asked for: a
 	 * row of pg_branch if there is one by that name, else a branch with
-	 * only a head, checked out once the backend is ready.
+	 * only a head, checked out once the backend is ready.  (Not a branch
+	 * no connection names.)
 	 */
 	if (!bootstrap)
 	{
+		if (connect_branch != NULL)
+			prolly_check_connect_branch(connect_branch);
 		if (connect_branch != NULL &&
 			branch_session_init(connect_branch))
 			connect_branch = NULL;
