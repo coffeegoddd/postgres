@@ -122,6 +122,14 @@ static LocalTransactionId settled_lxid = InvalidLocalTransactionId;
 static SubTransactionId settled_subid = InvalidSubTransactionId;
 static bool settle_undone = false;
 
+/*
+ * a transaction found not to move from a branch: needn't look again there
+ * (unless the mode or a protection changes, or a subtransaction that may
+ * have changed them aborts)
+ */
+static LocalTransactionId stays_lxid = InvalidLocalTransactionId;
+static Oid	stays_branch = InvalidOid;
+
 static void transaction_commit_at_end(bool prepare);
 static void note_own_change(Relation rel, const ItemPointerData *oldtid,
 							const ItemPointerData *newtid);
@@ -1265,6 +1273,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 						 errmsg("branch \"%s\" does not exist", (char *) lfirst(lc))));
 			PROLLY_CALL(writers(), set_protected, (char *) lfirst(lc), protection);
 		}
+		stays_lxid = InvalidLocalTransactionId;
 		PG_RETURN_DATUM(text_array(1, result));
 	}
 	if (take)
@@ -1617,10 +1626,6 @@ static ProcessUtility_hook_type prev_process_utility = NULL;
 /* how deep in statements the session is: 0 at the top, a client's own */
 static int	statement_depth = 0;
 
-/* a transaction found not to move from a branch: needn't look again there */
-static LocalTransactionId stays_lxid = InvalidLocalTransactionId;
-static Oid	stays_branch = InvalidOid;
-
 /* a transaction that moved, which can't be prepared, and the subtransaction */
 static LocalTransactionId moved_lxid = InvalidLocalTransactionId;
 static SubTransactionId moved_subid = InvalidSubTransactionId;
@@ -1943,6 +1948,8 @@ static void
 writer_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						SubTransactionId parentSubid, void *arg)
 {
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		stays_lxid = InvalidLocalTransactionId;
 	if (settled_lxid == MyProc->vxid.lxid && settled_subid == mySubid)
 	{
 		if (event == SUBXACT_EVENT_ABORT_SUB)
@@ -2821,6 +2828,7 @@ dolt_writer_mode(PG_FUNCTION_ARGS)
 					 errmsg("unknown writer mode \"%s\"", mode),
 					 errhint("The writer modes are \"shared\", \"owned\", \"branch-only\" and \"branch-auto\".")));
 		PROLLY_CALL(writers(), set_mode, (ProllyWriterMode) m);
+		stays_lxid = InvalidLocalTransactionId;
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(names[PROLLY_CALL(writers(), mode)]));
 }

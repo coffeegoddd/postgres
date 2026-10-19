@@ -1048,6 +1048,186 @@ SELECT dolt_writer_mode('shared');
 (1 row)
 
 RESET dolt.writer;
+-- A mode or protection set in a subtransaction that aborts is undone with
+-- it, for the rest of the transaction too; one released is kept.
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+CREATE TABLE wm.sp (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'wm.sp')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('wm_sp');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_writer_mode('branch-only');
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+ROLLBACK TO s;
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+INSERT INTO wm.sp VALUES (1);
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (1);
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+ROLLBACK;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('branch-only');
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+ROLLBACK TO s;
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+INSERT INTO wm.sp VALUES (1);
+SAVEPOINT s;
+SELECT dolt_branch('--protect', 'wm_sp');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ROLLBACK TO s;
+SELECT name, protected FROM dolt_branches() WHERE name = 'wm_sp';
+ name  | protected 
+-------+-----------
+ wm_sp | f
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_writer_mode('branch-only');
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+RELEASE s;
+SELECT dolt_writer_mode();
+ dolt_writer_mode 
+------------------
+ branch-only
+(1 row)
+
+INSERT INTO wm.sp VALUES (2);
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+ROLLBACK;
+-- In branch-auto, a write after main's unprotect is undone moves to the
+-- writer branch, as main is protected again.
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'sp';
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO wm.sp VALUES (3);
+ROLLBACK TO s;
+INSERT INTO wm.sp VALUES (4);
+NOTICE:  writing on branch "writer/sp/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+ active_branch  
+----------------
+ writer/sp/main
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+SELECT count(*) AS on_main FROM wm.sp;
+ on_main 
+---------
+       0
+(1 row)
+
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+RESET dolt.writer;
+SELECT dolt_branch('-D', 'wm_sp');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TABLE wm.sp;
+SELECT length(dolt_commit('-Am', 'no wm.sp')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 REVOKE ALL ON wm.t FROM wm_other, wm_carol;
 REVOKE USAGE ON SCHEMA wm FROM wm_other, wm_carol;
 DROP ROLE wm_other;

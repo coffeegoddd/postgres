@@ -99,6 +99,21 @@ static ProllyWriterMode mode_read;
 static LocalTransactionId protections_lxid = InvalidLocalTransactionId;
 static char *protections = NULL;
 
+/*
+ * (a subtransaction aborted may have set the mode or protections, which the
+ * refs undo with it: read them again)
+ */
+static void
+modes_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					   SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		mode_lxid = InvalidLocalTransactionId;
+		protections_lxid = InvalidLocalTransactionId;
+	}
+}
+
 
 static bool
 check_writer(char **newval, void **extra, GucSource source)
@@ -155,6 +170,7 @@ prolly_writers_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+	RegisterSubXactCallback(modes_subxact_callback, NULL);
 }
 
 char *
