@@ -82,6 +82,7 @@ control; this project's premise is that we should not have to.
 | [16-correctness-on-prs.md](16-correctness-on-prs.md) | **Decided (2026-10-18), not built:** C suite results on every pull request and a gate that blocks regressions: how Dolt, Doltgres and doltlite do it, a heap baseline checked both ways, the full corpus in shards, a sticky comment, branch protection with the C suite gate required, a tracking issue for `master` (#234) |
 | [17-performance-on-prs.md](17-performance-on-prs.md) | **Decided (2026-10-18), not built:** the S suite on every pull request: how Dolt, Doltgres and doltlite benchmark and gate PRs, and two layers here: deterministic work counters on hosted runners (the gate, required after calibration) and paired, retry-confirmed timing against the PR's base, reported (gated only once a dedicated host exists); one sticky comment (#240) |
 | [18-dolt-divergences.md](18-dolt-divergences.md) | **Decided (2026-10-18):** the intended differences from Dolt, each with a stable ID (D1, D2, …) that Dolt test ports cite: no staging area, versioned schemas only, return shapes, SQLSTATEs, transactions, merges, hashes, concurrency, what isn't ported (#156) |
+| [19-change-log.md](19-change-log.md) | **Decided (2026-10-19), built:** change finder "log": a change log per table, an entry per changed tuple version written with it, read by folds instead of old page versions; no baseline page copies, folds by the rows changed |
 
 ## Related local repositories
 

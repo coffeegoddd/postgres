@@ -5677,9 +5677,14 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>fold_full_tables</literal> (pages read, rows looked up, and
        tables folded from every row, finding changed rows),
        <literal>commits</literal> (commits written),
-       <literal>head_moves</literal> (branch heads set), and
+       <literal>head_moves</literal> (branch heads set),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>
-       (lookups of the value memo)
+       (lookups of the value memo), and
+       <literal>page_copies_fold</literal> and
+       <literal>page_copies_shared</literal> (pages of block-mapped
+       relations copied before a change: only to keep them as the last
+       fold saw them, or because another map, such as a branch's copy,
+       shares them)
       </para></entry>
      </row>
 

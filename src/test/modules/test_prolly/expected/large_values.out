@@ -223,7 +223,10 @@ SELECT dolt_reset('--hard', :'k2');
 -- transaction remembers is forgotten if it rolls back.  (Values in a TOAST
 -- relation, as before values were stored by content; the setting puts
 -- them there.)
+-- (Folded by the change finder "pages", whose candidates are every row
+-- on a changed page: the rows not changed are folded again, and hit.)
 SET debug_toast_relation = on;
+SET debug_prolly_change_finder = pages;
 CREATE TABLE lv.memo (id int PRIMARY KEY, n int, body text);
 ALTER TABLE lv.memo ALTER COLUMN body SET STORAGE EXTERNAL;
 INSERT INTO lv.memo
@@ -388,6 +391,7 @@ FROM test_memo_counters(true);
  t          | t
 (1 row)
 
+RESET debug_prolly_change_finder;
 -- A reset or merge that changes a keyed row updates it in place, and a
 -- long value whose reference is the same on both sides keeps the row's
 -- TOAST pointer: it isn't read, compressed or stored again.  A table with

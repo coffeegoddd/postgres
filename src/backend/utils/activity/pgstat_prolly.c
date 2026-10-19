@@ -5,9 +5,9 @@
  *
  * This file contains the implementation of the prolly engine's work
  * counters: tree nodes read and written, chunks appended, bytes hashed,
- * rows folded, commits, head moves, value memo lookups.  It is kept
- * separate from pgstat.c to enforce the line between the statistics access
- * / storage implementation and the details about individual types of
+ * rows folded, commits, head moves, value memo lookups, pages copied.  It
+ * is kept separate from pgstat.c to enforce the line between the statistics
+ * access / storage implementation and the details about individual types of
  * statistics.
  *
  * This statistics kind uses a database's OID as the key of its one entry,
@@ -52,6 +52,8 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_HEAD_MOVES] = "head_moves",
 	[PGSTAT_PROLLY_MEMO_HITS] = "memo_hits",
 	[PGSTAT_PROLLY_MEMO_MISSES] = "memo_misses",
+	[PGSTAT_PROLLY_PAGE_COPIES_FOLD] = "page_copies_fold",
+	[PGSTAT_PROLLY_PAGE_COPIES_SHARED] = "page_copies_shared",
 };
 
 /*

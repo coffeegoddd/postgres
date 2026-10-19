@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBE
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBF
 
 typedef struct PgStat_ArchiverStats
 {
@@ -612,9 +612,12 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */
 	PGSTAT_PROLLY_MEMO_MISSES,	/* and those that didn't */
+	PGSTAT_PROLLY_PAGE_COPIES_FOLD, /* pages copied only to keep a fold's */
+	PGSTAT_PROLLY_PAGE_COPIES_SHARED,	/* pages copied because another map
+										 * shares them */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MEMO_MISSES + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_PAGE_COPIES_SHARED + 1)
 
 typedef struct PgStat_ProllyStats
 {
