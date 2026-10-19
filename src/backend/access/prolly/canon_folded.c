@@ -3769,6 +3769,12 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		 */
 		if (from->partition_of)
 		{
+			/* (its own foreign keys first, as a table's) */
+			foreach(lc, from->constraints)
+				if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
+					sm->fk_drops = lappend(sm->fk_drops,
+										   psprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s",
+													name, first_field(lfirst(lc))));
 			sm->before = lcons(psprintf("DROP TABLE IF EXISTS %s", name), sm->before);
 			return true;
 		}

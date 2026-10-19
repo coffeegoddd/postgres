@@ -278,8 +278,8 @@ SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
 -- too, rather than converted to what its NOT NULL refuses; a key of one
 -- (a domain made over another base type), that another table's foreign
 -- key references, loses that key before it converts: so do those of a
--- table the move drops (kd) or makes again (kr), and one whose definition
--- changes (kf).
+-- table the move drops (kd, and a partition, kq2, its own) or makes again
+-- (kr), and one whose definition changes (kf).
 CREATE SCHEMA sm12 VERSIONED;
 CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.p (id int PRIMARY KEY);
@@ -290,6 +290,8 @@ CREATE TABLE sm12.kp (k sm12.k PRIMARY KEY);
 CREATE TABLE sm12.kc (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE TABLE sm12.kr (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE TABLE sm12.kf (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
+CREATE TABLE sm12.kq (id int, pid int) PARTITION BY RANGE (id);
+CREATE TABLE sm12.kq1 PARTITION OF sm12.kq FOR VALUES FROM (0) TO (10);
 CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
 	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
 CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
@@ -301,6 +303,7 @@ INSERT INTO sm12.kp VALUES (1), (2);
 INSERT INTO sm12.kc VALUES (1, 1), (2, 2);
 INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
 INSERT INTO sm12.kf VALUES (1, 1), (2, 2);
+INSERT INTO sm12.kq VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
 SELECT dolt_branch('sm12_right');
 ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
@@ -309,6 +312,9 @@ ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
 ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
 CREATE TABLE sm12.kd (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 INSERT INTO sm12.kd VALUES (1, 1), (2, 2);
+CREATE TABLE sm12.kq2 PARTITION OF sm12.kq FOR VALUES FROM (10) TO (20);
+ALTER TABLE sm12.kq2 ADD CONSTRAINT kq2_fk FOREIGN KEY (pid) REFERENCES sm12.kp;
+INSERT INTO sm12.kq VALUES (11, 2);
 DROP TABLE sm12.kr;
 CREATE TABLE sm12.kr (pid int REFERENCES sm12.kp, id int PRIMARY KEY);
 INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
@@ -330,7 +336,8 @@ SELECT * FROM sm12.kc ORDER BY id;
 SELECT conrelid::regclass, pg_get_constraintdef(oid) FROM pg_constraint
 WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
 SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
-	(SELECT count(*) FROM sm12.kf) AS kf;
+	(SELECT count(*) FROM sm12.kf) AS kf, to_regclass('sm12.kq2') AS kq2,
+	(SELECT count(*) FROM sm12.kq) AS kq;
 SELECT dolt_reset('--hard', :'sm12_main');
 SELECT format_type(atttypid, atttypmod) FROM pg_attribute
 WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
@@ -341,7 +348,8 @@ SELECT * FROM sm12.kc ORDER BY id;
 SELECT conrelid::regclass, pg_get_constraintdef(oid) FROM pg_constraint
 WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
 SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
-	(SELECT count(*) FROM sm12.kf) AS kf;
+	(SELECT count(*) FROM sm12.kf) AS kf, to_regclass('sm12.kq2') AS kq2,
+	(SELECT count(*) FROM sm12.kq) AS kq;
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
   AND contype = 'f';
 SELECT count(*) AS changed FROM dolt_status;

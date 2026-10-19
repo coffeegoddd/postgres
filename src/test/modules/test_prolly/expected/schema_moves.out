@@ -762,8 +762,8 @@ SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
 -- too, rather than converted to what its NOT NULL refuses; a key of one
 -- (a domain made over another base type), that another table's foreign
 -- key references, loses that key before it converts: so do those of a
--- table the move drops (kd) or makes again (kr), and one whose definition
--- changes (kf).
+-- table the move drops (kd, and a partition, kq2, its own) or makes again
+-- (kr), and one whose definition changes (kf).
 CREATE SCHEMA sm12 VERSIONED;
 CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.p (id int PRIMARY KEY);
@@ -774,6 +774,8 @@ CREATE TABLE sm12.kp (k sm12.k PRIMARY KEY);
 CREATE TABLE sm12.kc (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE TABLE sm12.kr (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE TABLE sm12.kf (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
+CREATE TABLE sm12.kq (id int, pid int) PARTITION BY RANGE (id);
+CREATE TABLE sm12.kq1 PARTITION OF sm12.kq FOR VALUES FROM (0) TO (10);
 CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
 	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
 CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
@@ -785,6 +787,7 @@ INSERT INTO sm12.kp VALUES (1), (2);
 INSERT INTO sm12.kc VALUES (1, 1), (2, 2);
 INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
 INSERT INTO sm12.kf VALUES (1, 1), (2, 2);
+INSERT INTO sm12.kq VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
  committed 
 -----------
@@ -803,6 +806,9 @@ ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
 ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
 CREATE TABLE sm12.kd (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 INSERT INTO sm12.kd VALUES (1, 1), (2, 2);
+CREATE TABLE sm12.kq2 PARTITION OF sm12.kq FOR VALUES FROM (10) TO (20);
+ALTER TABLE sm12.kq2 ADD CONSTRAINT kq2_fk FOREIGN KEY (pid) REFERENCES sm12.kp;
+INSERT INTO sm12.kq VALUES (11, 2);
 DROP TABLE sm12.kr;
 CREATE TABLE sm12.kr (pid int REFERENCES sm12.kp, id int PRIMARY KEY);
 INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
@@ -863,10 +869,11 @@ WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
 (3 rows)
 
 SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
-	(SELECT count(*) FROM sm12.kf) AS kf;
- kd | kr | kf 
-----+----+----
-    |  2 |  2
+	(SELECT count(*) FROM sm12.kf) AS kf, to_regclass('sm12.kq2') AS kq2,
+	(SELECT count(*) FROM sm12.kq) AS kq;
+ kd | kr | kf | kq2 | kq 
+----+----+----+-----+----
+    |  2 |  2 |     |  1
 (1 row)
 
 SELECT dolt_reset('--hard', :'sm12_main');
@@ -915,14 +922,16 @@ WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
  sm12.kc  | FOREIGN KEY (pid) REFERENCES sm12.kp(k)
  sm12.kd  | FOREIGN KEY (pid) REFERENCES sm12.kp(k)
  sm12.kf  | FOREIGN KEY (pid) REFERENCES sm12.kp(k) ON DELETE CASCADE
+ sm12.kq2 | FOREIGN KEY (pid) REFERENCES sm12.kp(k)
  sm12.kr  | FOREIGN KEY (pid) REFERENCES sm12.kp(k)
-(4 rows)
+(5 rows)
 
 SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
-	(SELECT count(*) FROM sm12.kf) AS kf;
-   kd    | kr | kf 
----------+----+----
- sm12.kd |  2 |  2
+	(SELECT count(*) FROM sm12.kf) AS kf, to_regclass('sm12.kq2') AS kq2,
+	(SELECT count(*) FROM sm12.kq) AS kq;
+   kd    | kr | kf |   kq2    | kq 
+---------+----+----+----------+----
+ sm12.kd |  2 |  2 | sm12.kq2 |  2
 (1 row)
 
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
@@ -951,7 +960,7 @@ SELECT dolt_branch('-D', 'sm12_right');
 (1 row)
 
 DROP SCHEMA sm12 CASCADE;
-NOTICE:  drop cascades to 11 other objects
+NOTICE:  drop cascades to 12 other objects
 DETAIL:  drop cascades to type sm12.pos
 drop cascades to table sm12.p
 drop cascades to table sm12.c
@@ -959,6 +968,7 @@ drop cascades to table sm12.d
 drop cascades to table sm12.kp
 drop cascades to table sm12.kc
 drop cascades to table sm12.kf
+drop cascades to table sm12.kq
 drop cascades to function sm12.f()
 drop cascades to table sm12.kd
 drop cascades to table sm12.kr
