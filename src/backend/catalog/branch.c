@@ -686,8 +686,9 @@ branch_xact_locktag(LOCKTAG *tag, Oid branch)
 }
 
 /*
- * Lock a branch to delete it, until the transaction ends, against the
- * prepared transactions that were on it: an error, naming one, if any is.
+ * Lock a branch to delete or move it, until the transaction ends, against
+ * the prepared transactions that were on it: an error, naming one, if any
+ * is.
  */
 void
 lock_branch_unprepared(Oid branch, const char *name)

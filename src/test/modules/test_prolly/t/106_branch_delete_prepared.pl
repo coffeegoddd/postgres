@@ -3,7 +3,7 @@
 # A branch isn't deleted under a prepared transaction that was on it: the
 # transaction's rows there would outlive the branch, on no branch at all.
 # The deletion is refused, naming the transaction, until it is committed or
-# rolled back, across a restart too.
+# rolled back, across a restart too; so is a forced move of the branch.
 
 use strict;
 use warnings FATAL => 'all';
@@ -112,6 +112,63 @@ is(sql(q{SELECT count(*) FROM ghost5}, 'postgres/pb5'), '0',
 	'it committed to the branch');
 is(delete_error('pb5'), 'deleted', 'which is then deleted');
 is(live_class_rows('ghost5'), '0', 'with its rows');
+
+# Moving a branch overwrites its rows as deletion drops them: a forced move
+# over a prepared transaction's row would wait for it, maybe for days, and
+# one over a table it made would leave the table as an uncommitted change
+# after it.  Refused the same way, by dolt_branch -f and by a push.
+sql(q{
+	CREATE TABLE u (id int PRIMARY KEY, v text);
+	INSERT INTO u VALUES (1, 'main');
+	SELECT dolt_commit('-Am', 'u');
+	SELECT dolt_branch('m2');
+	SELECT dolt_branch('m3');
+});
+sql(q{UPDATE u SET v = 'm2' WHERE id = 1; SELECT dolt_commit('-am', 'm2')},
+	'postgres/m2');
+sql(q{BEGIN; UPDATE u SET v = 'pb' WHERE id = 1; PREPARE TRANSACTION 'pf'},
+	'postgres/m2');
+
+sub forced_move
+{
+	my ($branch, $start) = @_;
+	my ($ret, $out, $err) = $node->psql('postgres',
+		"SET statement_timeout = '60s'; SELECT dolt_branch('-f', '$branch', '$start')");
+	return $ret == 0 ? 'moved' : $err;
+}
+like(forced_move('m2', 'main'),
+	qr/branch "m2" has a prepared transaction on it.*\n.*DETAIL:  Prepared transaction "pf" was on it\./,
+	'a forced move over a prepared transaction\'s row is refused, not waited on');
+sql(q{ROLLBACK PREPARED 'pf'});
+is(forced_move('m2', 'main'), 'moved', 'rolled back, the branch is moved');
+is(sql(q{SELECT v FROM u}, 'postgres/m2'), 'main', 'to the start point');
+
+my $fmt = sql(q{SELECT dolt_serve_format()});
+sub serve_move
+{
+	my ($branch, $to) = @_;
+	my $at = sql(qq{SELECT dolt_hashof('$branch')});
+	my $head = sql(qq{SELECT dolt_hashof('$to')});
+	my ($ret, $out, $err) = $node->psql('postgres', qq{
+		SET statement_timeout = '60s';
+		SELECT dolt_serve_move_head('$branch', decode('$at', 'hex'),
+			decode('$head', 'hex'), '$fmt', true)});
+	return $ret == 0 ? $out : $err;
+}
+sql(q{UPDATE u SET v = 'm3' WHERE id = 1; SELECT dolt_commit('-am', 'm3')},
+	'postgres/m3');
+sql(q{BEGIN; CREATE TABLE ghost3 (id int); PREPARE TRANSACTION 'ps'},
+	'postgres/m3');
+like(serve_move('m3', 'main'),
+	qr/branch "m3" has a prepared transaction on it.*\n.*DETAIL:  Prepared transaction "ps" was on it\./,
+	'a push moving the branch is refused too');
+sql(q{COMMIT PREPARED 'ps'});
+is(sql(q{SELECT count(*) FROM ghost3}, 'postgres/m3'), '0',
+	'the transaction committed to the branch');
+is(serve_move('m3', 'main'), 't', 'which a forced push then moves');
+is(sql(q{SELECT v FROM u}, 'postgres/m3'), 'main', 'to the head pushed');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname = 'ghost3'}, 'postgres/m3'),
+	'0', 'its uncommitted table dropped');
 
 $node->stop;
 done_testing();
