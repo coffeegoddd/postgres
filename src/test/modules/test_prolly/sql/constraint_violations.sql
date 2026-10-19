@@ -161,6 +161,40 @@ SELECT dolt_verify_constraints('cv.child');
 SELECT count(*) AS none FROM dolt_constraint_violations();
 RESET ROLE;
 
+-- A keyed row whose new version breaks a unique index stays as the branch
+-- has it, whether the merge applies theirs' changes alone (u: ours changed
+-- its definition only) or merges both sides' (w); and so does one whose
+-- new version would take the value a row kept so still holds (w's 1).
+CREATE SCHEMA uv VERSIONED;
+CREATE TABLE uv.u (pk int PRIMARY KEY, x int);
+INSERT INTO uv.u VALUES (1, 1), (2, 2);
+CREATE TABLE uv.w (pk int PRIMARY KEY, x int UNIQUE);
+INSERT INTO uv.w VALUES (1, 1), (2, 2);
+SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
+SELECT dolt_branch('uv_theirs');
+CREATE UNIQUE INDEX u_x ON uv.u (x);
+INSERT INTO uv.w VALUES (3, 5);
+SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
+SELECT dolt_checkout('uv_theirs');
+UPDATE uv.u SET x = 1 WHERE pk = 2;
+UPDATE uv.w SET x = 5 WHERE pk = 2;
+UPDATE uv.w SET x = 2 WHERE pk = 1;
+SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uv_theirs'))[3:4];
+SELECT * FROM uv.u ORDER BY pk;
+SELECT * FROM uv.w ORDER BY pk;
+SELECT 'u' AS t, violation_type, violating_row::text
+FROM dolt_constraint_violations('uv.u')
+UNION ALL
+SELECT 'w', violation_type, violating_row::text
+FROM dolt_constraint_violations('uv.w') ORDER BY 1, 3;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uv_theirs');
+DROP SCHEMA uv CASCADE;
+SELECT length(dolt_commit('-Am', 'uv dropped')::text) AS committed;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
 DROP ROLE regress_cv_owner;
