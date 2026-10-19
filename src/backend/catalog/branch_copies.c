@@ -15,11 +15,12 @@
  * for writers to finish), so no change is in flight in a page the copy
  * shares, and the copy holds every row they committed, whether the making
  * transaction's snapshot sees it or not (what moves the copy reads it by
- * one that does).  The locks are let go once the copy is made, not held
- * to the end of the transaction: the copy shares no page a later change
- * could be in (one changes its own), and whatever the making transaction
- * does next with the new branch (moving it to a commit, say) needn't hold
- * up the source's writers.
+ * one that does, or, where the snapshot can't move, empties the copies
+ * that hold what it doesn't see).  The locks are let go once the copy is
+ * made, not held to the end of the transaction: the copy shares no page a
+ * later change could be in (one changes its own), and whatever the making
+ * transaction does next with the new branch (moving it to a commit, say)
+ * needn't hold up the source's writers.
  *
  * Deleting a branch deletes its rows and drops its relations' storage when
  * the transaction commits; pages another branch still shares stay.  It
