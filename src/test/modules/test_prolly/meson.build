@@ -171,6 +171,7 @@ tests += {
       't/076_remote_answers.pl',
       't/080_versioned_public.pl',
       't/101_index_tablespaces.pl',
+      't/104_gc_prepared.pl',
       't/107_commit_dates.pl',
       't/109_bmap_incremental_backup.pl',
       't/110_bmap_recovery_past_length.pl',
