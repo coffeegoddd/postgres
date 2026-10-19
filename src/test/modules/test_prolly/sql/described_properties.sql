@@ -160,6 +160,41 @@ SELECT attname FROM pg_attribute
   WHERE attrelid = 'inh.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
 SELECT dolt_reset('--hard');
 
+-- A child's own column changes with its link in place; a move that does
+-- change what they share (a parent's column's type, a CHECK the parent
+-- gains) links it again, its inherited columns and constraints inherited
+-- only, as they were.
+CREATE VIEW locality AS
+SELECT 'column ' || attname AS what, attislocal AS local, attinhcount AS inherited
+  FROM pg_attribute WHERE attrelid = to_regclass('inh.c') AND attnum > 0 AND NOT attisdropped
+UNION ALL
+SELECT 'constraint ' || conname, conislocal, coninhcount
+  FROM pg_constraint WHERE conrelid = to_regclass('inh.c') AND contype = 'c'
+ORDER BY 1;
+SELECT dolt_reset('--hard', :'linked');
+ALTER TABLE inh.c ADD COLUMN x int;
+SELECT (dolt_commit('-Am', 'own column'))[1] AS own \gset
+SELECT dolt_reset('--hard', :'linked');
+SELECT * FROM dolt_status();
+SELECT * FROM locality;
+SELECT dolt_reset('--hard', :'own');
+SELECT * FROM locality;
+SELECT dolt_reset('--hard', :'linked');
+ALTER TABLE inh.p ALTER COLUMN a TYPE bigint;
+ALTER TABLE inh.p ADD CONSTRAINT p_b CHECK (b > 0);
+SELECT (dolt_commit('-Am', 'parent changed'))[1] AS parent_changed \gset
+SELECT dolt_reset('--hard', :'linked');
+SELECT test_fold_root() = prolly_root_hash(:'linked') AS same_root;
+SELECT * FROM locality;
+SELECT dolt_reset('--hard', :'parent_changed');
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+SELECT * FROM dolt_status();
+SELECT * FROM locality;
+ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
+SELECT * FROM locality;
+SELECT dolt_reset('--hard', :'linked');
+DROP VIEW locality;
+
 -- Merged inheritance or a table's type against the other side's columns:
 -- a schema conflict where the merged definitions can't be made.
 CREATE TABLE inh.q (a int);

@@ -183,6 +183,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/acl.h"
@@ -5515,14 +5516,30 @@ same_str(const char *a, const char *b)
 	return (a == NULL) == (b == NULL) && (a == NULL || strcmp(a, b) == 0);
 }
 
+/* Of lines, those whose first field is one of names (all, if names is NIL). */
+static List *
+lines_named(List *lines, List *names, bool all)
+{
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	foreach(lc, lines)
+		if (all || list_has_string(names, first_field(lfirst(lc))))
+			out = lappend(out, lfirst(lc));
+	return out;
+}
+
 /*
  * Whether a move leaves what a table shares with the tables it inherits
- * from, or they with it, as it is: its columns, constraints, parents, type
- * and partitioning, the same in from and to (table name, in both), and no
- * column of it changing type in turn (types_moved: type_moves()'s tables).
+ * from, or they with it, as it is: its parents, type and partitioning, the
+ * same in from and to (table name, in both), its columns and constraints
+ * too (only those named shared_cols and shared_cons, unless all: what it
+ * shares as a child), and no column of it changing type in turn
+ * (types_moved: type_moves()'s tables).
  */
 static bool
-inheritance_unmoved(List *from, List *to, const char *name, List *types_moved)
+inheritance_unmoved(List *from, List *to, const char *name, List *types_moved,
+					List *shared_cols, List *shared_cons, bool all)
 {
 	MoveItem   *f = find_item(from, 't', name);
 	MoveItem   *t = find_item(to, 't', name);
@@ -5535,8 +5552,10 @@ inheritance_unmoved(List *from, List *to, const char *name, List *types_moved)
 		return true;
 	parse_table_def(f->def, &fd);
 	parse_table_def(t->def, &td);
-	return same_lines(fd.columns, td.columns) &&
-		same_lines(fd.constraints, td.constraints) &&
+	return same_lines(lines_named(fd.columns, shared_cols, all),
+					  lines_named(td.columns, shared_cols, all)) &&
+		same_lines(lines_named(fd.constraints, shared_cons, all),
+				   lines_named(td.constraints, shared_cons, all)) &&
 		same_lines(fd.inherits, td.inherits) &&
 		same_str(fd.of, td.of) &&
 		same_str(fd.partition_by, td.partition_by) &&
@@ -5545,22 +5564,24 @@ inheritance_unmoved(List *from, List *to, const char *name, List *types_moved)
 
 /*
  * Whether table name's inheritance (td's, as from or to defines it) stays
- * as it is through a move: neither it nor the tables it inherits from
- * change what they share (inheritance_unmoved()).  What changes it is done
- * to each table alone, unlinked: an ALTER of a parent's column would
- * recurse to its children, and an inherited column can't be altered alone.
- * Only these are unlinked and linked again: a link made again leaves the
- * child's columns and constraints its own (attislocal, conislocal), which
- * isn't described, so a later change of the parent wouldn't reach them.
+ * as it is through a move: neither the tables it inherits from change what
+ * they share (their columns and constraints, all of them), nor it what it
+ * shares with them (its columns and constraints of their names; its own
+ * may change with the links in place) (inheritance_unmoved()).  What
+ * changes it is done to each table alone, unlinked: an ALTER of a parent's
+ * column would recurse to its children, and an inherited column can't be
+ * altered alone.  (A link made again leaves the child's columns and
+ * constraints its own, attislocal and conislocal; inheritance_locality()
+ * puts back what was inherited only.)
  */
 static bool
 inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 				 List *types_moved)
 {
+	List	   *cols = NIL;
+	List	   *cons = NIL;
 	ListCell   *lc;
 
-	if (!inheritance_unmoved(from, to, name, types_moved))
-		return false;
 	foreach(lc, td->inherits)
 	{
 		MoveItem   *pf = find_item(from, 't', lfirst(lc));
@@ -5569,10 +5590,155 @@ inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 		/* (one of another schema's isn't the move's) */
 		if (pf == NULL && pt == NULL)
 			continue;
-		if (!inheritance_unmoved(from, to, lfirst(lc), types_moved))
+		if (!inheritance_unmoved(from, to, lfirst(lc), types_moved, NIL, NIL, true))
 			return false;
+		/* (unmoved: both alike) */
+		{
+			TableDef	pd;
+			ListCell   *c;
+
+			parse_table_def(pf->def, &pd);
+			foreach(c, pd.columns)
+				cols = lappend(cols, first_field(lfirst(c)));
+			foreach(c, pd.constraints)
+				cons = lappend(cons, first_field(lfirst(c)));
+		}
 	}
-	return true;
+	return inheritance_unmoved(from, to, name, types_moved, cols, cons, false);
+}
+
+/* A child's columns and constraints its own, as it was before a move. */
+typedef struct Locality
+{
+	char	   *table;			/* qualified */
+	List	   *columns;		/* the names of those local (attislocal) */
+	List	   *constraints;	/* likewise (conislocal) */
+} Locality;
+
+/*
+ * Which of table name's columns and constraints are its own, as the branch
+ * has it now (before the move unlinks it): NULL if there is no such table.
+ */
+static Locality *
+inheritance_locality(const char *name)
+{
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										 NoLock, true);
+	Locality   *l;
+	Relation	rel;
+	TupleDesc	desc;
+	Relation	pg_constraint;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (!OidIsValid(relid))
+		return NULL;
+	l = palloc0_object(Locality);
+	l->table = pstrdup(name);
+	rel = relation_open(relid, AccessShareLock);
+	desc = RelationGetDescr(rel);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->attislocal)
+			l->columns = lappend(l->columns, pstrdup(NameStr(att->attname)));
+	}
+	relation_close(rel, AccessShareLock);
+	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId,
+							  true, NULL, 1, &key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		if (con->conislocal)
+			l->constraints = lappend(l->constraints, pstrdup(NameStr(con->conname)));
+	}
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+	return l;
+}
+
+/*
+ * Each child's columns and constraints, linked again, inherited only
+ * (attislocal, conislocal false) as before the move unlinked it: those
+ * still inherited (attinhcount, coninhcount) that weren't its own then
+ * (ALTER TABLE INHERIT makes the child's existing ones its own, so a later
+ * change of the parent wouldn't reach them).  One the move made is
+ * inherited only, as a parent's ADD COLUMN would make it.
+ */
+static void
+restore_locality(List *localities)
+{
+	Relation	pg_attribute = NULL;
+	Relation	pg_constraint = NULL;
+	ListCell   *lc;
+
+	foreach(lc, localities)
+	{
+		Locality   *l = lfirst(lc);
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(l->table, NULL)),
+											 NoLock, true);
+		ScanKeyData key;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		if (!OidIsValid(relid))
+			continue;
+		if (pg_attribute == NULL)
+		{
+			pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
+			pg_constraint = table_open(ConstraintRelationId, RowExclusiveLock);
+		}
+		ScanKeyInit(&key, Anum_pg_attribute_attrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(relid));
+		scan = systable_beginscan(pg_attribute, AttributeRelidNumIndexId, true,
+								  NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(tup);
+			HeapTuple	copy;
+
+			if (att->attnum <= 0 || att->attisdropped || !att->attislocal ||
+				att->attinhcount == 0 ||
+				list_has_string(l->columns, NameStr(att->attname)))
+				continue;
+			copy = heap_copytuple(tup);
+			((Form_pg_attribute) GETSTRUCT(copy))->attislocal = false;
+			CatalogTupleUpdate(pg_attribute, &copy->t_self, copy);
+			heap_freetuple(copy);
+		}
+		systable_endscan(scan);
+		ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(relid));
+		scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId,
+								  true, NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+			HeapTuple	copy;
+
+			if (!con->conislocal || con->coninhcount == 0 ||
+				list_has_string(l->constraints, NameStr(con->conname)))
+				continue;
+			copy = heap_copytuple(tup);
+			((Form_pg_constraint) GETSTRUCT(copy))->conislocal = false;
+			CatalogTupleUpdate(pg_constraint, &copy->t_self, copy);
+			heap_freetuple(copy);
+		}
+		systable_endscan(scan);
+		CacheInvalidateRelcacheByRelid(relid);
+	}
+	if (pg_attribute != NULL)
+	{
+		table_close(pg_constraint, RowExclusiveLock);
+		table_close(pg_attribute, RowExclusiveLock);
+	}
+	CommandCounterIncrement();
 }
 
 /*
@@ -5613,6 +5779,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *schema_drops = NIL;
 	List	   *unlinks = NIL;		/* inheritance, broken first */
 	List	   *links = NIL;		/* and made last */
+	List	   *localities = NIL;	/* (the unlinked's own columns) */
 	List	   *places;			/* the branch's indexes' tablespaces */
 	TypeMoves	tm;
 	bool		matviews_change;
@@ -5788,6 +5955,12 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(f->def, &fd);
 		if (fd.inherits == NIL || inheritance_kept(from, to, f->name, &fd, tm.tables))
 			continue;
+		{
+			Locality   *l = inheritance_locality(f->name);
+
+			if (l)
+				localities = lappend(localities, l);
+		}
 		foreach(c, fd.inherits)
 			unlinks = lappend(unlinks, psprintf("ALTER TABLE %s NO INHERIT %s",
 												f->name, (char *) lfirst(c)));
@@ -6118,6 +6291,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	if (breaking == NULL)
 		run_statements(sm.fk_validations);
 	run_statements(links);
+	restore_locality(localities);
 	make_views(views);
 	run_statements(policy_makes);
 	restore_index_places(places);
