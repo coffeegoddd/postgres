@@ -872,20 +872,21 @@ other_unique_index(Relation rel)
  * May a row a merge writes to rel break one of its constraints there: a
  * check, a not-null column outside the primary key, or a unique or
  * exclusion index other than the primary key's?  (The merge decides each
- * row by its primary key, so that one holds.)  Asked once a table.
+ * row by its primary key, so that one holds, if it keys the rows: a
+ * deferrable one, or one the keying can't order, doesn't, and rel's
+ * rows are keyless, keyed by content.)  Worked out as a merge begins
+ * writing a table's rows, for may_break_constraints().
  */
-static bool
-may_break_constraints(Relation rel)
+static void
+note_constraints(Relation rel, bool keyless)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *pk;
 
-	if (RelationGetRelid(rel) == breakable_relid)
-		return breakable;
 	breakable_relid = RelationGetRelid(rel);
 	breakable = true;
 	if (desc->constr && desc->constr->num_check > 0)
-		return true;
+		return;
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -893,12 +894,23 @@ may_break_constraints(Relation rel)
 
 		if (att->attnotnull && !att->attisdropped &&
 			!bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, pk))
-			return true;
+			return;
 	}
 	if (other_unique_index(rel))
-		return true;
+		return;
+	if (keyless && OidIsValid(RelationGetPrimaryKeyIndex(rel, true)))
+		return;
 	breakable = false;
-	return false;
+}
+
+/* note_constraints()'s answer for rel, the table a merge is writing. */
+static bool
+may_break_constraints(Relation rel)
+{
+	if (RelationGetRelid(rel) != breakable_relid)
+		elog(ERROR, "constraints of \"%s\" not noted",
+			 RelationGetRelationName(rel));
+	return breakable;
 }
 
 /*
@@ -993,6 +1005,10 @@ refusal_type(int sqlerrcode)
  * Insert row into rel, or update old to it, in a subtransaction: a row
  * whose error refusal_type() names is rolled back, and the error returned
  * (NULL: written).  *found (if not NULL) gets whether old was there.
+ * The applier's deferrable rechecks are made immediate first, so a row
+ * breaking a deferrable unique or exclusion constraint is refused here
+ * too: each row a merge recording violations writes, puts back, or
+ * updates pinned (update_key(), retry_key()) comes through here.
  */
 static ErrorData *
 try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
@@ -1004,6 +1020,7 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
 	ErrorData  *volatile refused = NULL;
 	volatile bool ok = true;
 
+	PROLLY_CALL(ar, immediate, a);
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
@@ -1041,8 +1058,10 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
  * merge records violations, a row that breaks a unique, check or not-null
  * (or exclusion) constraint isn't written, and is recorded instead: a
  * row the merge made of both sides' columns too, the branch's kept (a
- * table holds no row breaking a constraint, unlike Dolt's).  *refused (if
- * not NULL) gets whether it was.  Returns false if old isn't there.
+ * table holds no row breaking a constraint, unlike Dolt's).  A deferrable
+ * constraint is checked as the row is written, as others are (the
+ * applier's immediate(), in try_write()).  *refused (if not NULL) gets
+ * whether it was.  Returns false if old isn't there.
  */
 static bool
 merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
@@ -1292,6 +1311,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 							CurrentMemoryContext);
 	ap.keyless = PROLLY_CALL(ap.c.rd.kr, keyless, ap.c.rd.k);
 	ap.in_place = !ap.keyless && updates_in_place(ap.rel);
+	if (recording)
+		note_constraints(ap.rel, ap.keyless);
 	ap.put_back = puts_back(ap.rel, ap.keyless);
 	chunk_env(&env);
 	env.compare = changes_compare;
@@ -2081,6 +2102,8 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
 	in_place = !keyless && updates_in_place(rel);
+	if (recording)
+		note_constraints(rel, keyless);
 	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	oc = tc;
