@@ -62,11 +62,14 @@
  * are serialized, and they reach the file in commit order: as the commit
  * begins a PAD is appended for the new ROOT record; the commit record
  * carries its segment and offset and the root; once the commit record is
- * flushed,
- * still within the commit's critical section, the ROOT record is written
- * over the PAD (redo of the commit record writes it too), in a segment
- * sealed meanwhile as in any.  The root is the last ROOT record of the
- * segments named, in their order; if they have none, the manifest's.
+ * flushed, still within the commit's critical section, the append is
+ * written with the ROOT record in the PAD's place (redo writes the PAD,
+ * then the commit record's ROOT over it), in a segment sealed meanwhile
+ * as in any.  So the range is in flight until it holds the ROOT, and a
+ * collection's window, which waits for the appends in flight, never sees
+ * the PAD of a transaction whose ROOT comes after it.  The root is the
+ * last ROOT record of the segments named, in their order; if they have
+ * none, the manifest's.
  *
  * Table files.  Chunks added together (received from another store, or
  * rewritten by conjoin()) go to an immutable table file of their own,
@@ -1844,7 +1847,7 @@ flush_pending(ProllyChunkStore *s)
 
 /*
  * The root a move goes to has its PAD at offset of segment g: keep the
- * ROOT record that goes over it once the commit record is flushed.
+ * ROOT record that takes its place as the append is written (committed()).
  */
 static void
 root_padded(ProllyChunkStore *s, Segment *g, uint64 offset)
@@ -3267,17 +3270,38 @@ journal_commit_writes(void)
 	if (s == NULL)
 		return false;
 	reserve_at_commit(s);
+	if (s->moving)
+		INJECTION_POINT_LOAD("prolly-root-committing");
 	return s->at_commit;
 }
 
-/* In the commit's critical section: no allocation. */
+/*
+ * In the commit's critical section: no allocation.  A root moved goes in
+ * its PAD's place in the bytes written (the WAL has the PAD, the commit
+ * record the ROOT, both flushed), not over the PAD after them: while the
+ * range is in flight a collection's window waits for it, and once it is
+ * written the window may have read it and marked from what it found.
+ */
 static void
 journal_committed(void)
 {
 	ProllyChunkStore *s = session_store;
+	bool		in_append = false;
 
 	if (s == NULL)
 		return;
+	if (s->moving)
+	{
+		uint64		at = s->pad_offset - s->commit_append.offset;
+
+		in_append = s->at_commit && s->pad_segment == s->commit_append.g &&
+			s->pad_offset >= s->commit_append.offset &&
+			at + s->root_rec_len <= s->commit_append.len;
+		Assert(in_append);
+		INJECTION_POINT_CACHED("prolly-root-committing", NULL);
+		if (in_append)
+			memcpy(s->pending.data + at, s->root_rec, s->root_rec_len);
+	}
 	if (s->at_commit)
 	{
 		append_write(&s->commit_append, s->pending.data);
@@ -3285,7 +3309,9 @@ journal_committed(void)
 	}
 	if (!s->moving)
 		return;
-	if (FileWrite(s->pad_segment->file, s->root_rec, s->root_rec_len,
+	/* (a PAD not in this append, never expected: the ROOT over it) */
+	if (!in_append &&
+		FileWrite(s->pad_segment->file, s->root_rec, s->root_rec_len,
 				  s->pad_offset, WAIT_EVENT_DATA_FILE_WRITE) != s->root_rec_len)
 		ereport(PANIC,
 				(errcode_for_file_access(),

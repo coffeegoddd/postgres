@@ -663,8 +663,11 @@ to decode.
   concurrent appends and commits share), a transaction's last chunks and
   its PAD once its commit record is flushed (reserved by the store's new
   `commit_writes()` at the end of the commit's pre-commit steps, which
-  also makes such a commit flush at once). The ranges reserved and not
-  written are listed in shared memory: a reader skips one (met at its
+  also makes such a commit flush at once), with the ROOT record written
+  in the PAD's place, not over it after: a collection's window, which
+  waits for the ranges in flight, finds the ROOT, never a PAD that
+  becomes one once the window has marked (#328). The ranges reserved
+  and not written are listed in shared memory: a reader skips one (met at its
   start or inside it) and reads it once written, a checkpoint and a
   collection wait for those in flight as they begin, an abort writes its
   own. A crash can leave a range the WAL never
