@@ -3419,6 +3419,84 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
+static char *from_utf8(const uint8 *data, int len);
+
+/*
+ * A literal's value, as quote_literal_cstr() wrote it: quotes doubled, and
+ * backslashes too if it begins E.
+ */
+static char *
+literal_value(const char *literal)
+{
+	bool		e = literal[0] == 'E';
+	const char *p = literal + (e ? 1 : 0);
+	StringInfoData out;
+
+	if (*p++ != '\'')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	initStringInfo(&out);
+	for (; *p; p++)
+	{
+		if (*p == '\'' && p[1] == '\'')
+			p++;
+		else if (*p == '\'')
+			break;
+		else if (e && *p == '\\' && p[1] == '\\')
+			p++;
+		appendStringInfoChar(&out, *p);
+	}
+	if (*p != '\'' || p[1] != '\0')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	return out.data;
+}
+
+/* Saved type definitions accompany historical rows; labels are not OIDs. */
+static List *
+folded_type_definitions(const ProllyNodeRef *root)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur;
+	ProllyKey	from = {(const uint8 *) "y:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *types = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	if (!root_in_format(&cn, root))
+		return NIL;
+	cur = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, cur, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, cur, &k, &v))
+	{
+		ProllyTypeDefinition *e;
+		char	   *line;
+
+		if (k.len < 2 || memcmp(k.data, "y:", 2) != 0)
+			break;
+		e = palloc0(sizeof(ProllyTypeDefinition));
+		e->name = from_utf8(k.data + 2, k.len - 2);
+		e->definition = from_utf8(v.data, v.len);
+		types = lappend(types, e);
+		if (v.len < 5 || memcmp(v.data, "enum\n", 5) != 0)
+			continue;
+		line = e->definition + 5;
+		while (*line)
+		{
+			char	   *next = strchr(line, '\n');
+			char	   *field;
+
+			if (next == NULL)
+				elog(ERROR, "invalid canonical enum definition");
+			field = unescape_field(pnstrdup(line, next - line));
+			e->labels = lappend(e->labels, makeString(literal_value(field)));
+			line = next + 1;
+		}
+	}
+	PROLLY_CALL(cn.tree, cursor_close, cur);
+	return types;
+}
+
 /* The tables of a folded root: its "t:" items. */
 static void
 folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
@@ -3436,8 +3514,6 @@ folded_materialized_views(const ProllyNodeRef *root,
 }
 
 /* An item's value without the data tree a table's or view's starts with. */
-static char *from_utf8(const uint8 *data, int len);
-
 /* (and without a sequence's value) */
 static void
 definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
@@ -8001,6 +8077,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
 	.table_columns = folded_table_columns,
+	.type_definitions = folded_type_definitions,
 	.in_format = folded_in_format,
 	.format = folded_format,
 };

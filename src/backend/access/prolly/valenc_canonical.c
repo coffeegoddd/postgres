@@ -99,6 +99,17 @@ struct ProllyValueEncoder
 	StringInfoData scratch;		/* a value read from out of line */
 };
 
+bool
+prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings)
+{
+	bool		changed = false;
+
+	for (int i = 0; i < enc->desc->natts; i++)
+		if (enc->codecs[i])
+			changed |= prolly_datum_map_enums(enc->codecs[i], mappings);
+	return changed;
+}
+
 static void
 no_values(void)
 {

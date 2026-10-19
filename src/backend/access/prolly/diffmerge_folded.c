@@ -56,6 +56,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_datum.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -104,6 +105,18 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/*
+ * A root's named types, shared by its tables, with the enums renamed
+ * between it and the root last compared with (by serial: lists come and go).
+ */
+typedef struct TypeDefs
+{
+	List	   *types;			/* ProllyTypeDefinition *, from the root */
+	uint64		serial;
+	uint64		renamed_from;	/* the other's serial, or 0 */
+	List	   *renamed;		/* names of the enums renamed between them */
+} TypeDefs;
+
 /* A table as one version has it. */
 typedef struct Table
 {
@@ -113,18 +126,21 @@ typedef struct Table
 	ProllyNodeRef data;
 	char	   *text;			/* the definition, as described */
 	int			textlen;
+	TypeDefs   *types;			/* its root's named types */
 	char	   *unreadable;		/* why its rows can't be read here, or NULL */
 } Table;
 
 typedef struct Tables
 {
 	List	   *tables;			/* Table *, in name order */
+	TypeDefs   *types;			/* the root's named types, for its tables */
 } Tables;
 
 static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 						const char *what, const char *name, List **conflicted);
 static void apply_rows_held(Oid relid, const Table *from, const Table *to);
 static bool same_description(const Table *a, const Table *b);
+static bool same_table_enums(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(List *found);
@@ -253,11 +269,30 @@ add_table(const char *name, const ProllyNodeRef *data,
 	t->unreadable = unreadable ?
 		pstrdup(pg_any_to_server(unreadable, strlen(unreadable), PG_UTF8)) : NULL;
 	t->data = *data;
+	t->types = ts->types;
 	t->text = palloc(description->len + 1);
 	memcpy(t->text, description->data, description->len);
 	t->text[description->len] = '\0';
 	t->textlen = description->len;
 	ts->tables = lappend(ts->tables, t);
+}
+
+static TypeDefs *
+type_defs(const ProllyNodeRef *root)
+{
+	static uint64 serial = 0;
+	TypeDefs   *td = palloc0(sizeof(TypeDefs));
+
+	td->types = PROLLY_CALL(components().canonicalizer, type_definitions, root);
+	td->serial = ++serial;
+	return td;
+}
+
+static void
+read_tables(const ProllyNodeRef *root, Tables *ts)
+{
+	ts->types = type_defs(root);
+	PROLLY_CALL(components().canonicalizer, tables, root, add_table, ts);
 }
 
 /*
@@ -285,7 +320,7 @@ tables_of_reading(const char *ref, Oid relid, List **left_out,
 		root_of(ref, &root);
 	if (root_out)
 		*root_out = root;
-	PROLLY_CALL(components().canonicalizer, tables, &root, add_table, &ts);
+	read_tables(&root, &ts);
 	if (OidIsValid(relid))
 	{
 		Table	   *t = find_table(ts.tables, table_name(relid));
@@ -311,7 +346,8 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 static bool
 same_description(const Table *a, const Table *b)
 {
-	return a->textlen == b->textlen && memcmp(a->text, b->text, a->textlen) == 0;
+	return a->textlen == b->textlen && memcmp(a->text, b->text, a->textlen) == 0 &&
+		same_table_enums(a, b);
 }
 
 static Table *
@@ -2145,13 +2181,12 @@ apply_matview_rows(const ProllyNodeRef *from, const ProllyNodeRef *target)
 static void
 rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 {
-	ProllyDatabaseComponents dc = components();
 	Tables		from = {NIL};
 	Tables		to = {NIL};
 	ListCell   *lc;
 
-	PROLLY_CALL(dc.canonicalizer, tables, working, add_table, &from);
-	PROLLY_CALL(dc.canonicalizer, tables, target, add_table, &to);
+	read_tables(working, &from);
+	read_tables(target, &to);
 	foreach(lc, to.tables)
 	{
 		Table	   *t = lfirst(lc);
@@ -3241,6 +3276,221 @@ version_columns(const Table *x, bool *keyed)
 	return cols;
 }
 
+static ProllyTypeDefinition *
+find_type_definition(List *types, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, types)
+	{
+		ProllyTypeDefinition *e = lfirst(lc);
+
+		if (strcmp(e->name, name) == 0)
+			return e;
+	}
+	return NULL;
+}
+
+/* Only a table that uses a changed enum needs its rows converted. */
+static bool
+type_uses_enums(Oid type, List *names, List *seen)
+{
+	Oid			base = getBaseType(type);
+	Oid			elem;
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (list_member_oid(seen, base))
+		return false;
+	seen = lappend_oid(list_copy(seen), base);
+	if (get_typtype(base) == TYPTYPE_ENUM)
+	{
+		char	   *name = format_type_be_qualified(base);
+
+		foreach(lc, names)
+			if (strcmp(lfirst(lc), name) == 0)
+				return true;
+	}
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+		return type_uses_enums(elem, names, seen);
+	if (get_typtype(base) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(base, -1);
+		bool		found = false;
+
+		for (int i = 0; i < desc->natts && !found; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				found = type_uses_enums(TupleDescAttr(desc, i)->atttypid, names, seen);
+		ReleaseTupleDesc(desc);
+		return found;
+	}
+	if (type_is_range(base))
+		return type_uses_enums(get_range_subtype(base), names, seen);
+	if (type_is_multirange(base))
+		return type_uses_enums(get_multirange_range(base), names, seen);
+	return false;
+}
+
+/* Whether labels are among others, in the same order. */
+static bool
+labels_among(List *labels, List *others)
+{
+	ListCell   *o = list_head(others);
+	ListCell   *lc;
+
+	foreach(lc, labels)
+	{
+		while (o != NULL && strcmp(strVal(lfirst(lc)), strVal(lfirst(o))) != 0)
+			o = lnext(others, o);
+		if (o == NULL)
+			return false;
+		o = lnext(others, o);
+	}
+	return true;
+}
+
+/*
+ * Whether an enum's labels were renamed between two definitions: neither
+ * has all the other's, in order.  (Labels added alone read the same: an old
+ * value's label is still the new type's, in the same order to the others.)
+ */
+static bool
+enum_renamed(const ProllyTypeDefinition *a, const ProllyTypeDefinition *b)
+{
+	return strcmp(a->definition, b->definition) != 0 &&
+		!labels_among(a->labels, b->labels) && !labels_among(b->labels, a->labels);
+}
+
+/* The enums renamed between two roots' types, by name; worked out once. */
+static List *
+renamed_enums(TypeDefs *a, TypeDefs *b)
+{
+	ListCell   *lc;
+
+	if (a->renamed_from == b->serial)
+		return a->renamed;
+	a->renamed = NIL;
+	foreach(lc, a->types)
+	{
+		ProllyTypeDefinition *e = lfirst(lc);
+		ProllyTypeDefinition *other;
+
+		if (strncmp(e->definition, "enum\n", 5) != 0)
+			continue;
+		other = find_type_definition(b->types, e->name);
+		if (other != NULL && enum_renamed(e, other))
+			a->renamed = lappend(a->renamed, e->name);
+	}
+	a->renamed_from = b->serial;
+	return a->renamed;
+}
+
+/*
+ * Whether a table's rows read the same by both roots' types: none of its
+ * columns uses an enum renamed between them.
+ */
+static bool
+same_table_enums(const Table *a, const Table *b)
+{
+	List	   *changed;
+	ListCell   *lc;
+	ProllyValue d = {(const uint8 *) a->text, a->textlen};
+	bool		keyed;
+
+	if (a->types == b->types)
+		return true;
+	changed = renamed_enums(a->types, b->types);
+	if (changed == NIL)
+		return true;
+	foreach(lc, PROLLY_CALL(components().canonicalizer, table_columns, &d, &keyed))
+	{
+		ProllyTableColumn *col = lfirst(lc);
+		Oid			type = LookupTypeNameOid(NULL, typeStringToTypeName(col->type, NULL), true);
+
+		if (!OidIsValid(type) || type_uses_enums(type, changed, NIL))
+			return false;
+	}
+	return true;
+}
+
+static List *
+enum_mappings(const Table *from, const Table *to)
+{
+	List	   *maps = NIL;
+	ListCell   *lc;
+
+	foreach(lc, from->types->types)
+	{
+		ProllyTypeDefinition *e = lfirst(lc);
+		ProllyTypeDefinition *other;
+		ProllyEnumMapping *m;
+		Oid			type;
+
+		if (strncmp(e->definition, "enum\n", 5) != 0)
+			continue;
+		other = find_type_definition(to->types->types, e->name);
+		if (other == NULL || !enum_renamed(e, other))
+			continue;
+		type = LookupTypeNameOid(NULL, typeStringToTypeName(e->name, NULL), true);
+		if (!OidIsValid(type) || get_typtype(type) != TYPTYPE_ENUM)
+			continue;
+		m = palloc(sizeof(ProllyEnumMapping));
+		m->type = type;
+		m->before = e->labels;
+		m->after = other->labels;
+		maps = lappend(maps, m);
+	}
+	return maps;
+}
+
+/* Mapping enum labels does not describe changes to their containers. */
+static void
+check_enum_layout(Oid type, const Table *from, const Table *to, List *seen)
+{
+	char	   *name;
+	ProllyTypeDefinition *before;
+	ProllyTypeDefinition *after;
+	Oid			elem;
+
+	check_stack_depth();
+	if (list_member_oid(seen, type))
+		return;
+	seen = lappend_oid(list_copy(seen), type);
+	if (get_typtype(type) == TYPTYPE_ENUM)
+		return;
+	name = format_type_be_qualified(type);
+	before = find_type_definition(from->types->types, name);
+	after = find_type_definition(to->types->types, name);
+	if (before && after && strcmp(before->definition, after->definition) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema conflict: cannot map historical enum labels through redefined type %s", name),
+				 errhint("Merge row changes before changing the enclosing type.")));
+	if (get_typtype(type) == TYPTYPE_DOMAIN)
+	{
+		check_enum_layout(getBaseType(type), from, to, seen);
+		return;
+	}
+	elem = get_element_type(type);
+	if (OidIsValid(elem))
+		check_enum_layout(elem, from, to, seen);
+	else if (get_typtype(type) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
+
+		for (int i = 0; i < desc->natts; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				check_enum_layout(TupleDescAttr(desc, i)->atttypid, from, to, seen);
+		ReleaseTupleDesc(desc);
+	}
+	else if (type_is_range(type) || type_is_multirange(type))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema conflict: cannot map historical enum labels inside %s", name),
+				 errhint("Merge row changes before changing the range's enum labels.")));
+}
+
 /*
  * A version's rows decoded: its columns, as its description has them, and
  * whether it has a primary key.
@@ -3900,6 +4150,9 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	List	   *gen_exprs = NIL;
 	bool		keyed_now;
 	bool		keys_kept;
+	bool		enums_changed;
+	List	   *maps;
+	List	   *enum_names = NIL;
 	Bitmapset  *pk;
 	MemoryContext rowcxt;
 	MemoryContext outer;
@@ -3922,6 +4175,23 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	env.compare_arg = &rd;
 	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
 	version_reader(x, &krefs, &vr);
+	maps = enum_mappings(x, now);
+	if (maps != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, maps)
+			enum_names = lappend(enum_names,
+								 format_type_be_qualified(((ProllyEnumMapping *) lfirst(lc))->type));
+		for (int a = 0; a < vr.slot->tts_tupleDescriptor->natts; a++)
+		{
+			Oid			type = TupleDescAttr(vr.slot->tts_tupleDescriptor, a)->atttypid;
+
+			if (type_uses_enums(type, enum_names, NIL))
+				check_enum_layout(type, x, now, NIL);
+		}
+	}
+	enums_changed = prolly_canonical_map_enums(vr.enc, maps);
 	now_cols = version_columns(now, &keyed_now);
 
 	/*
@@ -4007,7 +4277,9 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	keys_kept = vr.keyed;
 	for (int a = 0; a < md->natts && keys_kept; a++)
 		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
-			keys_kept = from[a] >= 0 && !converted[a];
+			keys_kept = from[a] >= 0 && !converted[a] &&
+				(!enums_changed ||
+				 !type_uses_enums(TupleDescAttr(xd, from[a])->atttypid, enum_names, NIL));
 
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
@@ -4192,6 +4464,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	MemoryContextDelete(rowcxt);
 	out->text = now->text;
 	out->textlen = now->textlen;
+	out->types = now->types;
 	PROLLY_CALL(ve, end, vr.enc);
 	ExecDropSingleTupleTableSlot(xs);
 	ExecDropSingleTupleTableSlot(ms);
@@ -4338,6 +4611,11 @@ refuse_lost_changes(Relation rel, const Table *base, const Table *side,
 	}
 	if (gone == NIL || keyed_base != keyed_now || keyed_side != keyed_now)
 		return;
+	if (!same_table_enums(base, now) || !same_table_enums(side, now))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema conflict: cannot merge dropped columns with changed enum labels"),
+				 errhint("Merge row changes before dropping columns or changing enum labels.")));
 	require_readable(base);
 	require_readable(side);
 
@@ -4486,6 +4764,7 @@ matviews_in_root(const ProllyNodeRef *root)
 {
 	Tables		ts = {NIL};
 
+	ts.types = type_defs(root);
 	PROLLY_CALL(components().canonicalizer, materialized_views, root,
 				add_table, &ts);
 	return ts.tables;
@@ -4708,7 +4987,7 @@ merge_rows(void *arg)
 		Tables		ts = {NIL};
 
 		(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
-		PROLLY_CALL(components().canonicalizer, tables, &working, add_table, &ts);
+		read_tables(&working, &ts);
 		now = ts.tables;
 	}
 	foreach(lc, mr->ours)
@@ -4886,7 +5165,7 @@ tables_in_root(const ProllyNodeRef *root)
 {
 	Tables		ts = {NIL};
 
-	PROLLY_CALL(components().canonicalizer, tables, root, add_table, &ts);
+	read_tables(root, &ts);
 	return ts.tables;
 }
 
@@ -6250,8 +6529,8 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot %s with uncommitted changes where definitions change", what),
 				 errhint("Commit the changes, or reset the branch, first.")));
-	PROLLY_CALL(dc.canonicalizer, tables, base, add_table, &bt);
-	PROLLY_CALL(dc.canonicalizer, tables, theirs, add_table, &tt);
+	read_tables(base, &bt);
+	read_tables(theirs, &tt);
 	/* (base and theirs define the same objects) */
 	foreach(lc, tt.tables)
 	{
@@ -6392,8 +6671,8 @@ fast_forward_local(const Local *l, const ProllyHash *theirs, bool squash)
 	ListCell   *lc;
 
 	commit_root(theirs, &target);
-	PROLLY_CALL(dc.canonicalizer, tables, &l->head, add_table, &ht);
-	PROLLY_CALL(dc.canonicalizer, tables, &target, add_table, &tt);
+	read_tables(&l->head, &ht);
+	read_tables(&target, &tt);
 	foreach(lc, tt.tables)
 	{
 		Table	   *t = lfirst(lc);

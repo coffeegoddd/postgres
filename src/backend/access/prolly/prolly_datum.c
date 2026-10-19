@@ -97,7 +97,96 @@ struct ProllyDatumCodec
 
 	/* CODEC_ANYARRAY: element codecs built so far */
 	List	   *anyarray_elems;	/* of ElemInfo * */
+
+	/* Historical decoding; the mappings outlive this codec. */
+	ProllyEnumMapping *enum_mapping;
+	List	   *enum_targets;
+	List	   *enum_mappings;	/* also for lazily built anyarray codecs */
 };
+
+/*
+ * Snapshots do not record individual ALTER TYPE commands.  Accept pure
+ * renames in place, or additions retaining every old label in order.  A
+ * shifted surviving label in a rename can mean that a name was reused.
+ */
+static List *
+enum_targets(ProllyEnumMapping *m)
+{
+	bool		same_count = list_length(m->before) == list_length(m->after);
+	int			last = -1;
+
+	for (int i = 0; i < list_length(m->before); i++)
+	{
+		int			at = -1;
+
+		for (int j = 0; j < list_length(m->after); j++)
+			if (strcmp(strVal(list_nth(m->before, i)), strVal(list_nth(m->after, j))) == 0)
+				at = j;
+		if ((same_count && at >= 0 && at != i) ||
+			(!same_count && (at < 0 || at <= last)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("schema conflict: cannot map historical labels of enum %s",
+							format_type_be(m->type)),
+					 errdetail("Only renames in place or additions preserving all old labels can be read across enum definitions."),
+					 errhint("Merge row changes before combining enum renames and additions or reusing labels.")));
+		last = at;
+	}
+	return same_count ? m->after : m->before;
+}
+
+/* Attach mappings only to decoders for the enums they describe. */
+bool
+prolly_datum_map_enums(ProllyDatumCodec *c, List *mappings)
+{
+	bool		changed = false;
+	ListCell   *lc;
+
+	c->enum_mappings = mappings;
+	c->enum_mapping = NULL;
+	c->enum_targets = NIL;
+	foreach(lc, mappings)
+	{
+		ProllyEnumMapping *m = lfirst(lc);
+
+		if (c->type == m->type)
+		{
+			c->enum_mapping = m;
+			c->enum_targets = enum_targets(m);
+			changed = true;
+		}
+	}
+	if (c->kind == CODEC_ARRAY)
+		changed |= prolly_datum_map_enums(c->elem.codec, mappings);
+	else if (c->kind == CODEC_COMPOSITE)
+	{
+		for (int i = 0; i < c->tupdesc->natts; i++)
+			if (c->attcodecs[i])
+				changed |= prolly_datum_map_enums(c->attcodecs[i], mappings);
+	}
+	else if (c->kind == CODEC_ANYARRAY)
+	{
+		changed = mappings != NIL;
+		foreach(lc, c->anyarray_elems)
+			(void) prolly_datum_map_enums(((ElemInfo *) lfirst(lc))->codec, mappings);
+	}
+	return changed;
+}
+
+/* Decode only labels that actually belonged to the saved definition. */
+static const char *
+historical_enum_label(ProllyDatumCodec *c, const char *label)
+{
+	List	   *before = c->enum_mapping->before;
+
+	for (int i = 0; i < list_length(before); i++)
+		if (strcmp(strVal(list_nth(before, i)), label) == 0)
+			return strVal(list_nth(c->enum_targets, i));
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("enum label \"%s\" is absent from its saved definition", label)));
+	return NULL;
+}
 
 /* ------------------------------------------------------------------------
  * Varints
@@ -892,6 +981,7 @@ anyarray_elem(ProllyDatumCodec *c, Oid elemtype)
 	}
 	ei = MemoryContextAlloc(c->mcxt, sizeof(ElemInfo));
 	elem_info_init(ei, elemtype, -1, c->mcxt);
+	(void) prolly_datum_map_enums(ei->codec, c->enum_mappings);
 	old = MemoryContextSwitchTo(c->mcxt);
 	c->anyarray_elems = lappend(c->anyarray_elems, ei);
 	MemoryContextSwitchTo(old);
@@ -1305,6 +1395,19 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 		case CODEC_JSONB:
 			return decode_jsonb(c, data, len);
 		case CODEC_SEND:
+			if (c->enum_mapping)
+			{
+				char	   *label = pnstrdup(data, len);
+				const char *mapped;
+				char	   *utf8;
+
+				if (strlen(label) != len)
+					bad_value("enum label contains a zero byte");
+				label = pg_any_to_server(label, len, PG_UTF8);
+				mapped = historical_enum_label(c, label);
+				utf8 = pg_server_to_any(mapped, strlen(mapped), PG_UTF8);
+				return recv_utf8(c, utf8, strlen(utf8));
+			}
 			return recv_utf8(c, data, len);
 		default:
 			elog(ERROR, "unrecognized prolly datum codec kind %d", c->kind);
