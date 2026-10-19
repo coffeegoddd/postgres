@@ -66,25 +66,47 @@ $restored->init_from_backup($primary, 'incr', combine_with_prior => ['full']);
 $restored->start;
 is($restored->safe_psql('postgres', $digest), $expected,
 	'the combined backup has every change since the full backup');
-is($restored->safe_psql('postgres',
-		q{SELECT count(*) FROM h WHERE a BETWEEN 49990 AND 50010}),
-	'21', 'the index finds the rows');
+
+# The index, from the incremental backup's files, finds the rows in the
+# page store as the combined backup has it.  No statistics after the
+# restore: force the index scan rather than trust the planner to choose it.
+my $by_index = q{
+	SET enable_seqscan = off;
+	SET enable_bitmapscan = off;
+	SET enable_indexonlyscan = off;
+	EXPLAIN (COSTS OFF)
+	SELECT string_agg(a || b, ',' ORDER BY a) FROM h
+	WHERE a BETWEEN 49990 AND 50010;
+	SELECT string_agg(a || b, ',' ORDER BY a) FROM h
+	WHERE a BETWEEN 49990 AND 50010};
+my $indexed = $restored->safe_psql('postgres', $by_index);
+like($indexed, qr/Index Scan using h_pkey on h/, 'the scan is by the index');
+is((split /\n/, $indexed)[-1], (split /\n/, sql($by_index))[-1],
+	'the index finds the rows');
 $restored->stop;
 
 # An incremental backup that sent the page store incrementally, as a server
-# without the fix did, is refused.
+# without the fix did, is refused, whichever segment (or fork, which the
+# store has none of) the incremental file is of.  The check comes before
+# reconstruction reads the file, so any incremental file's contents do.
 my $forged = "$backup_path/forged";
 PostgreSQL::Test::RecursiveCopy::copypath("$backup_path/incr", $forged);
-rename("$forged/base/$dboid/9421", "$forged/base/$dboid/INCREMENTAL.9421")
-  or die "could not rename page store: $!"
-  unless -e "$forged/base/$dboid/INCREMENTAL.9421";
-command_fails_like(
-	[
-		'pg_combinebackup', "$backup_path/full", $forged,
-		'--output' => PostgreSQL::Test::Utils::tempdir . '/forged_out',
-	],
-	qr/incremental copy of a block-mapped page store/,
-	'pg_combinebackup refuses a page store sent incrementally');
+my $forged_db = "$forged/base/$dboid";
+unlink("$forged_db/9421") or die "could not remove page store: $!";
+my $sample = (glob("$forged_db/INCREMENTAL.*"))[0];
+foreach my $name ('9421', '9421.1', '9421_vm')
+{
+	PostgreSQL::Test::Utils::append_to_file("$forged_db/INCREMENTAL.$name",
+		PostgreSQL::Test::Utils::slurp_file($sample));
+	command_fails_like(
+		[
+			'pg_combinebackup', "$backup_path/full", $forged,
+			'--output' => PostgreSQL::Test::Utils::tempdir . '/forged_out',
+		],
+		qr/"[^"]*INCREMENTAL\.\Q$name\E" is an incremental copy of a block-mapped page store(?s:.*)hint: Take a new full backup/,
+		"pg_combinebackup refuses INCREMENTAL.$name");
+	unlink("$forged_db/INCREMENTAL.$name") or die "could not remove: $!";
+}
 
 $primary->stop;
 

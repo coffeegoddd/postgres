@@ -708,6 +708,13 @@ GetFileBackupMethod(IncrementalBackupInfo *ib, const char *path,
 	 * the prior backup.  Back it up in full every time.  (Its allocator,
 	 * reference counts and the relations' map and changes forks are buffers
 	 * WAL-logged under their own file numbers, so they are summarized.)
+	 *
+	 * This makes every incremental backup carry each database's whole page
+	 * store, unchanged or not: on a block-mapped cluster an incremental
+	 * backup is about as large as a full one.  Summarizing the store's
+	 * physical blocks would make it incremental, and pg_combinebackup, which
+	 * refuses an incremental store, would have to learn to tell such a
+	 * server's backups from those of one before this rule.
 	 */
 	if (relfilenumber == BMAP_STORE_RELNUMBER)
 		return BACK_UP_FILE_FULLY;
