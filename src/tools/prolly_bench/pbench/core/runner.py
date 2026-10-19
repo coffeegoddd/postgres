@@ -383,10 +383,12 @@ def run_many(runners, report_format="both"):
         raise ValueError("no engines requested")
     results = [[] for _ in runners]
     from pbench import report_files
-    invocation = report_files.begin(runners, report_format) if report_format != "none" else None
+    invocation = None
     execution_error = None
     try:
         plans = [runner._open(lock=i == 0) for i, runner in enumerate(runners)]
+        if report_format != "none":
+            invocation = report_files.begin(runners, report_format)
         schedule = interleave(plans, runners[0].cfg["run"]["seed"])
         evidence = [{"engine": runners[i].table_am, "build": runners[i].build,
                      "key": dataclasses.asdict(key)}
@@ -420,18 +422,21 @@ def run_many(runners, report_format="both"):
                     print(f"Sink cleanup failed: {cleanup_error}", file=sys.stderr)
         raise
     finally:
-        for runner in runners:
-            for name in ("_host_lock", "_lock"):
-                lock = getattr(runner, name, None)
-                if lock is not None:
-                    lock.close()
-        if invocation:
-            try:
+        try:
+            if report_format != "none":
+                if invocation is None:
+                    invocation = report_files.begin(runners, report_format)
                 paths, _ = report_files.invocation(invocation, execution="interrupted" if execution_error else "complete")
                 paths += report_files.catalog(runners[0].out_dir.parent, report_format)
                 for path in paths:
                     print(f"Report: {path}")
-            except (OSError, ValueError, RuntimeError) as e:
-                print(f"Report generation failed; execution evidence retained: {e}", file=sys.stderr)
-                if execution_error is None:
-                    raise
+        except (OSError, ValueError, RuntimeError) as e:
+            print(f"Report generation failed; execution evidence retained: {e}", file=sys.stderr)
+            if execution_error is None:
+                raise
+        finally:
+            for runner in runners:
+                for name in ("_host_lock", "_lock"):
+                    lock = getattr(runner, name, None)
+                    if lock is not None:
+                        lock.close()

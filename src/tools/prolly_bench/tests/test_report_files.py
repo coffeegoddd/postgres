@@ -67,6 +67,22 @@ class ReportFilesTest(unittest.TestCase):
         self.assertEqual(main(['report', '--manifest', str(manifest)]), 0)
         self.assertEqual((manifest.parent / 'index.html').read_bytes(), before)
 
+    def test_report_files_do_not_change_pre_run_environment_and_locks_cover_rendering(self):
+        runner = FakeRunner(self.root)
+        open_run = runner._open
+        def recording_environment(lock):
+            self.assertFalse((self.root / 'reports').exists())
+            return open_run(lock)
+        runner._host_lock = io.StringIO()
+        render = report_files.invocation
+        def rendering(*args, **kwargs):
+            self.assertFalse(runner._host_lock.closed)
+            return render(*args, **kwargs)
+        with patch.object(runner, '_open', side_effect=recording_environment), \
+                patch.object(report_files, 'invocation', side_effect=rendering):
+            run_many([runner])
+        self.assertTrue(runner._host_lock.closed)
+
     def test_render_failure_happens_after_every_evidence_set_is_finalized(self):
         runners = [FakeRunner(self.root), FakeRunner(self.root, 'prolly', 'prolly')]
         with patch.object(report_files, 'result_set', side_effect=RuntimeError('renderer failed')) as render:
