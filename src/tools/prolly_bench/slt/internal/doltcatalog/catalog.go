@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -152,7 +153,16 @@ type Catalog struct {
 	Lock   Lock    `json:"lock"`
 	Cases  []Case  `json:"cases"`
 	Setups []Setup `json:"setups,omitempty"`
+	// The shared setups cases name that no setup stands for: computed
+	// rather than a literal, or not declared at top level in scope.
+	UnresolvedSetups []Flag `json:"unresolved_setups,omitempty"`
 }
+
+// The reasons a case-named shared setup is unresolved.
+const (
+	SetupComputed   = "computed, not a []string literal"
+	SetupUndeclared = "not a top-level var of the scanned files"
+)
 
 // Setup is a shared setup script: a top-level []string literal that cases
 // name as their SetUpScript (an unresolved field of theirs). Its exact
@@ -184,6 +194,109 @@ func Scan(path string, source []byte) ([]Case, error) {
 		return nil, err
 	}
 	var out []Case
+	err = topLevelVars(f, func(name string, val ast.Expr) error {
+		lit, ok := val.(*ast.CompositeLit)
+		if !ok {
+			return nil
+		}
+		a, ok := lit.Type.(*ast.ArrayType)
+		if !ok {
+			return nil
+		}
+		kind := expression(fs, a.Elt)
+		if kind != "queries.ScriptTest" && kind != "queries.TransactionTest" && kind != "MergeScriptTest" {
+			return nil
+		}
+		for index, el := range lit.Elts {
+			row, ok := el.(*ast.CompositeLit)
+			if !ok {
+				return fmt.Errorf("%s/%s[%d]: nonliteral case requires catalog support", path, name, index)
+			}
+			start, end := fs.Position(row.Pos()), fs.Position(row.End())
+			raw := source[start.Offset:end.Offset]
+			c := Case{Path: path, Suite: name, Index: index, Kind: kind, Line: start.Line, SHA256: Hash(raw), Source: string(raw)}
+			for _, field := range row.Elts {
+				kv, ok := field.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				switch key.Name {
+				case "Name":
+					x, ok := kv.Value.(*ast.BasicLit)
+					if !ok || x.Kind != token.STRING {
+						return fmt.Errorf("%s:%d: computed case name", path, c.Line)
+					}
+					var err error
+					c.Name, err = strconv.Unquote(x.Value)
+					if err != nil {
+						return err
+					}
+				case "Assertions", "SetUpScript", "AncSetUpScript", "LeftSetUpScript", "RightSetUpScript":
+					if x, ok := kv.Value.(*ast.Ident); ok && x.Name == "nil" {
+						continue
+					}
+					x, ok := kv.Value.(*ast.CompositeLit)
+					if !ok {
+						c.Unresolved = append(c.Unresolved, Flag{key.Name, expression(fs, kv.Value)})
+						continue
+					}
+					if key.Name == "Assertions" {
+						c.Assertions = len(x.Elts)
+					} else {
+						c.Setup += len(x.Elts)
+					}
+				}
+			}
+			ast.Inspect(row, func(n ast.Node) bool {
+				kv, ok := n.(*ast.KeyValueExpr)
+				if !ok {
+					return true
+				}
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if strings.HasPrefix(key.Name, "Skip") {
+					c.Flags = append(c.Flags, Flag{key.Name, expression(fs, kv.Value)})
+				}
+				count := func(e ast.Expr) {
+					if !literalSQL(e) {
+						c.SQLExpressions++
+					}
+				}
+				switch key.Name {
+				case "Query":
+					count(kv.Value)
+				case "SetUpScript", "AncSetUpScript", "LeftSetUpScript", "RightSetUpScript":
+					if x, ok := kv.Value.(*ast.CompositeLit); ok {
+						for _, e := range x.Elts {
+							count(e)
+						}
+					}
+				}
+				return true
+			})
+			out = append(out, c)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// literalSQL is whether a statement is literal SQL, a string literal: the
+// one rule cases' and shared setups' statements are both counted by.
+func literalSQL(e ast.Expr) bool {
+	x, ok := e.(*ast.BasicLit)
+	return ok && x.Kind == token.STRING
+}
+
+// topLevelVars calls fn with each name and value of f's top-level var
+// declarations, stopping at its first error.
+func topLevelVars(f *ast.File, fn func(name string, val ast.Expr) error) error {
 	for _, decl := range f.Decls {
 		g, ok := decl.(*ast.GenDecl)
 		if !ok || g.Tok != token.VAR {
@@ -192,96 +305,13 @@ func Scan(path string, source []byte) ([]Case, error) {
 		for _, spec := range g.Specs {
 			v := spec.(*ast.ValueSpec)
 			for i, val := range v.Values {
-				lit, ok := val.(*ast.CompositeLit)
-				if !ok {
-					continue
-				}
-				a, ok := lit.Type.(*ast.ArrayType)
-				if !ok {
-					continue
-				}
-				kind := expression(fs, a.Elt)
-				if kind != "queries.ScriptTest" && kind != "queries.TransactionTest" && kind != "MergeScriptTest" {
-					continue
-				}
-				for index, el := range lit.Elts {
-					row, ok := el.(*ast.CompositeLit)
-					if !ok {
-						return nil, fmt.Errorf("%s/%s[%d]: nonliteral case requires catalog support", path, v.Names[i].Name, index)
-					}
-					start, end := fs.Position(row.Pos()), fs.Position(row.End())
-					raw := source[start.Offset:end.Offset]
-					c := Case{Path: path, Suite: v.Names[i].Name, Index: index, Kind: kind, Line: start.Line, SHA256: Hash(raw), Source: string(raw)}
-					for _, field := range row.Elts {
-						kv, ok := field.(*ast.KeyValueExpr)
-						if !ok {
-							continue
-						}
-						key, ok := kv.Key.(*ast.Ident)
-						if !ok {
-							continue
-						}
-						switch key.Name {
-						case "Name":
-							x, ok := kv.Value.(*ast.BasicLit)
-							if !ok || x.Kind != token.STRING {
-								return nil, fmt.Errorf("%s:%d: computed case name", path, c.Line)
-							}
-							c.Name, err = strconv.Unquote(x.Value)
-							if err != nil {
-								return nil, err
-							}
-						case "Assertions", "SetUpScript", "AncSetUpScript", "LeftSetUpScript", "RightSetUpScript":
-							if x, ok := kv.Value.(*ast.Ident); ok && x.Name == "nil" {
-								continue
-							}
-							x, ok := kv.Value.(*ast.CompositeLit)
-							if !ok {
-								c.Unresolved = append(c.Unresolved, Flag{key.Name, expression(fs, kv.Value)})
-								continue
-							}
-							if key.Name == "Assertions" {
-								c.Assertions = len(x.Elts)
-							} else {
-								c.Setup += len(x.Elts)
-							}
-						}
-					}
-					ast.Inspect(row, func(n ast.Node) bool {
-						kv, ok := n.(*ast.KeyValueExpr)
-						if !ok {
-							return true
-						}
-						key, ok := kv.Key.(*ast.Ident)
-						if !ok {
-							return true
-						}
-						if strings.HasPrefix(key.Name, "Skip") {
-							c.Flags = append(c.Flags, Flag{key.Name, expression(fs, kv.Value)})
-						}
-						count := func(e ast.Expr) {
-							if x, ok := e.(*ast.BasicLit); !ok || x.Kind != token.STRING {
-								c.SQLExpressions++
-							}
-						}
-						switch key.Name {
-						case "Query":
-							count(kv.Value)
-						case "SetUpScript", "AncSetUpScript", "LeftSetUpScript", "RightSetUpScript":
-							if x, ok := kv.Value.(*ast.CompositeLit); ok {
-								for _, e := range x.Elts {
-									count(e)
-								}
-							}
-						}
-						return true
-					})
-					out = append(out, c)
+				if err := fn(v.Names[i].Name, val); err != nil {
+					return err
 				}
 			}
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // SharedSetupNames are the shared setups cases name: the identifiers their
@@ -300,42 +330,47 @@ func SharedSetupNames(cases []Case) map[string]bool {
 }
 
 // ScanSetups inventories the top-level []string literals of source that
-// names lists, as Scan does cases: their exact bytes, never evaluated.
-func ScanSetups(path string, source []byte, names map[string]bool) ([]Setup, error) {
+// names lists, as Scan does cases: their exact bytes, never evaluated. A
+// named var computed instead is returned among computed, never guessed at.
+func ScanSetups(path string, source []byte, names map[string]bool) (setups []Setup, computed []string, err error) {
 	fs := token.NewFileSet()
 	f, err := parser.ParseFile(fs, path, source, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var out []Setup
-	for _, decl := range f.Decls {
-		g, ok := decl.(*ast.GenDecl)
-		if !ok || g.Tok != token.VAR {
-			continue
+	err = topLevelVars(f, func(name string, val ast.Expr) error {
+		if !names[name] {
+			return nil
 		}
-		for _, spec := range g.Specs {
-			v := spec.(*ast.ValueSpec)
-			for i, val := range v.Values {
-				if !names[v.Names[i].Name] {
-					continue
-				}
-				lit, ok := val.(*ast.CompositeLit)
-				if !ok || expression(fs, lit.Type) != "[]string" {
-					return nil, fmt.Errorf("%s: shared setup %s is not a []string literal", path, v.Names[i].Name)
-				}
-				start, end := fs.Position(lit.Pos()), fs.Position(lit.End())
-				raw := source[start.Offset:end.Offset]
-				s := Setup{Path: path, Name: v.Names[i].Name, Line: start.Line, SHA256: Hash(raw), Statements: len(lit.Elts), Source: string(raw)}
-				for _, e := range lit.Elts {
-					if x, ok := e.(*ast.BasicLit); !ok || x.Kind != token.STRING {
-						s.SQLExpressions++
-					}
-				}
-				out = append(out, s)
+		lit, ok := val.(*ast.CompositeLit)
+		if !ok || expression(fs, lit.Type) != "[]string" {
+			computed = append(computed, name)
+			return nil
+		}
+		start, end := fs.Position(lit.Pos()), fs.Position(lit.End())
+		raw := source[start.Offset:end.Offset]
+		s := Setup{Path: path, Name: name, Line: start.Line, SHA256: Hash(raw), Statements: len(lit.Elts), Source: string(raw)}
+		for _, e := range lit.Elts {
+			if !literalSQL(e) {
+				s.SQLExpressions++
 			}
 		}
+		setups = append(setups, s)
+		return nil
+	})
+	return setups, computed, err
+}
+
+// Undeclared flags, in name order, each of names that found lacks.
+func Undeclared(names, found map[string]bool) []Flag {
+	var out []Flag
+	for name := range names {
+		if !found[name] {
+			out = append(out, Flag{name, SetupUndeclared})
+		}
 	}
-	return out, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Field < out[j].Field })
+	return out
 }
 
 // Read uses Git objects at an exact commit, ignoring dirty working-tree files.
@@ -379,14 +414,25 @@ func Read(repo, revision string) (Catalog, error) {
 		return c, fmt.Errorf("no cases found in pinned source")
 	}
 	// (one package: a shared setup is declared once, in any of its files)
+	// A named setup no literal stands for is recorded unresolved, not an
+	// error: only the cases naming it can't be ported by it.
 	names := SharedSetupNames(c.Cases)
+	found := map[string]bool{}
 	for _, file := range c.Lock.Files {
-		setups, err := ScanSetups(file.Path, sources[file.Path], names)
+		setups, computed, err := ScanSetups(file.Path, sources[file.Path], names)
 		if err != nil {
 			return c, err
 		}
+		for _, s := range setups {
+			found[s.Name] = true
+		}
+		for _, name := range computed {
+			found[name] = true
+			c.UnresolvedSetups = append(c.UnresolvedSetups, Flag{name, SetupComputed})
+		}
 		c.Setups = append(c.Setups, setups...)
 	}
+	c.UnresolvedSetups = append(c.UnresolvedSetups, Undeclared(names, found)...)
 	c.Lock.GoTests, err = PinFiles(Repository, repo, revision, GoTestFiles)
 	return c, err
 }

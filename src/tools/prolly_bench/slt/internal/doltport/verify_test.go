@@ -153,7 +153,7 @@ func TestSharedSetups(t *testing.T) {
 		}
 		m.Setups = append(m.Setups, SharedSetup{ID: "extra", Path: m.Setups[0].Path, Name: "extra", SourceSHA256: m.Setups[0].SourceSHA256})
 		put(t, filepath.Join(root, "ports.json"), m)
-		if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), "no port uses") {
+		if _, err := Verify(root, "", ""); err == nil || !strings.Contains(err.Error(), "no port uses: extra") {
 			t.Fatalf("accepted an unused setup: %v", err)
 		}
 	})
@@ -182,11 +182,16 @@ func TestSharedSetups(t *testing.T) {
 		// a catalog whose setup of that name has other bytes: drift
 		c := doltcatalog.Catalog{Lock: lock, Setups: []doltcatalog.Setup{{Path: m.Setups[0].Path, Name: m.Setups[0].Name, SHA256: "0"}}}
 		catalog := map[string]doltcatalog.Setup{c.Setups[0].Path + "/" + c.Setups[0].Name: c.Setups[0]}
-		if _, err := sharedSetups(root, m, lock, catalog); err == nil || !strings.Contains(err.Error(), "drift") {
+		if _, err := sharedSetups(root, m, lock, catalog, nil); err == nil || !strings.Contains(err.Error(), "drift") {
 			t.Fatalf("accepted a drifted setup: %v", err)
 		}
-		if _, err := sharedSetups(root, m, lock, map[string]doltcatalog.Setup{}); err == nil || !strings.Contains(err.Error(), "drift") {
+		if _, err := sharedSetups(root, m, lock, map[string]doltcatalog.Setup{}, nil); err == nil || !strings.Contains(err.Error(), "drift") {
 			t.Fatalf("accepted a setup the catalog lacks: %v", err)
+		}
+		// one the catalog records unresolved says why
+		gaps := map[string]string{m.Setups[0].Name: doltcatalog.SetupComputed}
+		if _, err := sharedSetups(root, m, lock, map[string]doltcatalog.Setup{}, gaps); err == nil || !strings.Contains(err.Error(), doltcatalog.SetupComputed) {
+			t.Fatalf("unresolved setup's reason: %v", err)
 		}
 	})
 }

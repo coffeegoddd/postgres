@@ -143,6 +143,7 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 	report.SourceCases, report.SourceAssertions, report.UnresolvedFields = lock.Counts.Cases, lock.Counts.Assertions, lock.Counts.UnresolvedFields
 	sourceCases := map[string]doltcatalog.Case{}
 	var catalogSetups map[string]doltcatalog.Setup
+	var unresolvedSetups map[string]string
 	partial := map[string]bool{}
 	if catalogPath != "" {
 		var catalog doltcatalog.Catalog
@@ -167,8 +168,12 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		for _, st := range catalog.Setups {
 			catalogSetups[st.Path+"/"+st.Name] = st
 		}
+		unresolvedSetups = map[string]string{}
+		for _, u := range catalog.UnresolvedSetups {
+			unresolvedSetups[u.Field] = u.Expression
+		}
 	}
-	setups, err := sharedSetups(root, manifest, lock, catalogSetups)
+	setups, err := sharedSetups(root, manifest, lock, catalogSetups, unresolvedSetups)
 	if err != nil {
 		return report, err
 	}
@@ -271,7 +276,13 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 		scenarios[s.ID], hashes[s.ID], credits[s.ID] = s, p.ScenarioSHA256, assertions
 	}
 	if len(used) != len(setups) {
-		return report, fmt.Errorf("a shared setup no port uses")
+		var unused []string
+		for _, st := range manifest.Setups {
+			if !used[st.ID] {
+				unused = append(unused, st.ID)
+			}
+		}
+		return report, fmt.Errorf("shared setups no port uses: %s", strings.Join(unused, ", "))
 	}
 	files, err := filepath.Glob(filepath.Join(root, "scenarios", "*.json"))
 	if err != nil {
@@ -319,8 +330,12 @@ func Verify(root, catalogPath, resultsPath string) (Report, error) {
 // sharedSetups checks the manifest's shared setups, by ID: each retained
 // excerpt's bytes are a []string literal of its hash, in a file the lock
 // pins, every statement literal SQL; with the catalog, the pinned source's
-// literal of that name has the same hash.
-func sharedSetups(root string, m Manifest, lock doltcatalog.Lock, catalog map[string]doltcatalog.Setup) (map[string]doltcatalog.Setup, error) {
+// literal of that name has the same hash. Only the catalog ties the name to
+// the bytes: an excerpt holds the literal alone, so without --catalog one
+// setup's bytes under another's name (hash and all) pass. CI always
+// verifies with --catalog. unresolved holds the catalog's reasons, by name,
+// for named setups no literal stands for.
+func sharedSetups(root string, m Manifest, lock doltcatalog.Lock, catalog map[string]doltcatalog.Setup, unresolved map[string]string) (map[string]doltcatalog.Setup, error) {
 	pinned := map[string]bool{}
 	for _, f := range lock.Files {
 		pinned[f.Path] = true
@@ -346,15 +361,18 @@ func sharedSetups(root string, m Manifest, lock doltcatalog.Lock, catalog map[st
 		if doltcatalog.Hash(raw) != st.SourceSHA256 {
 			return nil, fmt.Errorf("%s: source excerpt hash mismatch", st.ID)
 		}
-		found, err := doltcatalog.ScanSetups(st.Path, []byte("package excerpt\nvar "+st.Name+" = "+string(raw)+"\n"), map[string]bool{st.Name: true})
+		found, computed, err := doltcatalog.ScanSetups(st.Path, []byte("package excerpt\nvar "+st.Name+" = "+string(raw)+"\n"), map[string]bool{st.Name: true})
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", st.ID, err)
 		}
-		if len(found) != 1 || found[0].Source != string(raw) || found[0].SQLExpressions != 0 {
+		if len(computed) != 0 || len(found) != 1 || found[0].Source != string(raw) || found[0].SQLExpressions != 0 {
 			return nil, fmt.Errorf("%s: invalid or computed shared setup excerpt", st.ID)
 		}
 		if catalog != nil {
 			c, ok := catalog[st.Path+"/"+st.Name]
+			if reason, gap := unresolved[st.Name]; !ok && gap {
+				return nil, fmt.Errorf("source identity drift: shared setup %s: the pinned %s is %s", st.ID, st.Name, reason)
+			}
 			if !ok || c.SHA256 != st.SourceSHA256 {
 				return nil, fmt.Errorf("source identity drift: shared setup %s", st.ID)
 			}

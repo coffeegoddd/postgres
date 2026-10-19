@@ -1572,6 +1572,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	Bitmapset  *pk;
 	List	   *writes = NIL;
 	CellMerge	cm = {0};
+	StringInfoData listed = {0};	/* (the branch's row now, listing) */
 
 	require_readable(base);
 	require_readable(ours);
@@ -1698,8 +1699,18 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 			conflicts++;
 			if (current)
 			{
-				StringInfo	cur = makeStringInfo();
+				StringInfo	cur;
 
+				/* (a listed row is copied out at once; a write keeps its own) */
+				if (mode == WALK_LIST)
+				{
+					if (listed.data == NULL)
+						initStringInfo(&listed);
+					resetStringInfo(&listed);
+					cur = &listed;
+				}
+				else
+					cur = makeStringInfo();
 				if (!PROLLY_CALL(tree, get, &env, &current->data, &tk, cur))
 					resetStringInfo(cur);
 				now = cur;
@@ -4073,6 +4084,15 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	Table		nt;
 	Relation	rel;
 
+	/*
+	 * (a versioned table is always in the working set, and one can't leave
+	 * its versioned schema: never ours' rows standing in for the branch's)
+	 */
+	if (now == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("table %s has merge conflicts but is not in the working set",
+						name)));
 	/* The merge left the head where it was: ours is the head commit. */
 	if (!PROLLY_CALL(components().refs, resolve, "HEAD", &ours))
 		ereport(ERROR,

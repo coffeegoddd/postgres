@@ -69,9 +69,9 @@ var T = []queries.ScriptTest{{Name:"a", SetUpScript:shared}, {Name:"b", SetUpScr
 	if len(names) != 2 || !names["shared"] || !names["computed"] {
 		t.Fatalf("%v", names)
 	}
-	setups, err := ScanSetups("fixture.go", src, names)
-	if err != nil {
-		t.Fatal(err)
+	setups, computed, err := ScanSetups("fixture.go", src, names)
+	if err != nil || len(computed) != 0 {
+		t.Fatal(err, computed)
 	}
 	if len(setups) != 2 || setups[0].Name != "shared" || setups[0].Statements != 2 || setups[0].SQLExpressions != 0 ||
 		setups[1].Name != "computed" || setups[1].SQLExpressions != 1 {
@@ -80,7 +80,14 @@ var T = []queries.ScriptTest{{Name:"a", SetUpScript:shared}, {Name:"b", SetUpScr
 	if setups[0].SHA256 != Hash([]byte(setups[0].Source)) || !strings.HasPrefix(setups[0].Source, "[]string{") || !strings.Contains(string(src), setups[0].Source) {
 		t.Fatal("setup bytes were changed")
 	}
-	if _, err := ScanSetups("fixture.go", []byte("package fixture\nvar shared = makeSetup()\n"), names); err == nil {
-		t.Fatal("accepted a computed shared setup")
+	// A computed setup is reported, not an error, and not a setup: the
+	// catalog records it unresolved, as it does a name no file declares.
+	setups, computed, err = ScanSetups("fixture.go", []byte("package fixture\nvar shared = makeSetup()\n"), names)
+	if err != nil || len(setups) != 0 || len(computed) != 1 || computed[0] != "shared" {
+		t.Fatalf("computed shared setup: %v %+v %v", err, setups, computed)
+	}
+	gaps := Undeclared(map[string]bool{"shared": true, "local": true, "a": true}, map[string]bool{"shared": true})
+	if len(gaps) != 2 || gaps[0] != (Flag{"a", SetupUndeclared}) || gaps[1] != (Flag{"local", SetupUndeclared}) {
+		t.Fatalf("undeclared: %+v", gaps)
 	}
 }

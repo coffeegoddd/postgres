@@ -91,7 +91,11 @@ its excerpt is a literal of the recorded hash with no computed statements,
 and, with `--catalog`, that the pinned file's literal of that name has the
 same hash. A script no port uses is an error. Setups built by expressions
 (`append(createConflictsSetupScript, ...)`) stay unresolved; their cases
-aren't ported this way.
+aren't ported this way. A named script that is computed, or that no scanned
+file declares at top level, is listed in the catalog's `unresolved_setups`
+with the reason, and a port naming it fails with that reason. Without
+`--catalog`, nothing ties a retained excerpt's bytes to the name recorded
+for it; the catalog is what checks that, so CI always verifies with it.
 
 Ports adapt MySQL `CALL` and staging flags to prolly's commit-all
 operations (there is no staging area: `dolt_add` stages nothing), call
