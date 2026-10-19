@@ -2013,7 +2013,10 @@ check_branch_key(Relation relation, const ItemPointerData *otid,
 		prolly_check_row_key(relation, otid, tup);
 }
 
-/* ... and once made, the tuple versions it made (new) or replaced (old). */
+/*
+ * ... and once made, the tuple versions it made (new) or replaced (old), or
+ * a speculative insertion took back (old).
+ */
 static inline void
 note_branch_tuple(Relation relation, const ItemPointerData *old,
 				  const ItemPointerData *new)
@@ -6586,6 +6589,9 @@ heap_abort_speculative(Relation relation, const ItemPointerData *tid)
 	END_CRIT_SECTION();
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/* (taken back: as the insertion was told, while its values are there) */
+	note_branch_tuple(relation, tid, NULL);
 
 	if (HeapTupleHasExternal(&tp))
 	{

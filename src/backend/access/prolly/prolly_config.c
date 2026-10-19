@@ -17,8 +17,11 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "access/table.h"
+#include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
+#include "utils/guc_hooks.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -33,6 +36,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",
 	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_VALUE_MEMO] = "shared",
+	[PROLLY_IFACE_CHANGE_FINDER] = "pages",
 };
 
 /*
@@ -82,6 +86,8 @@ prolly_check_unlogged(Relation rel)
 				 errhint("Use ALTER TABLE ... SET ACCESS METHOD heap first.")));
 }
 
+static const ProllyChangeLogRoutine *change_log(void);
+
 void
 prolly_components_for_relation(Relation rel, ProllyComponents *components)
 {
@@ -111,6 +117,83 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 		profile_impl(history_profile, PROLLY_IFACE_TREE);
 	components->keying = (const ProllyKeyingRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_TABLE_KEYING);
+	components->change_finder = prolly_change_finder();
+	components->change_log = change_log();
+}
+
+/* (empty: the profile's) */
+char	   *debug_prolly_change_finder = NULL;
+
+bool
+check_debug_prolly_change_finder(char **newval, void **extra, GucSource source)
+{
+	if (**newval != '\0' &&
+		prolly_lookup_impl(PROLLY_IFACE_CHANGE_FINDER, *newval) == NULL)
+	{
+		GUC_check_errdetail("There is no change finder named \"%s\".", *newval);
+		return false;
+	}
+	return true;
+}
+
+const ProllyChangeFinderRoutine *
+prolly_change_finder(void)
+{
+	if (debug_prolly_change_finder != NULL && *debug_prolly_change_finder != '\0')
+		return prolly_changes_lookup(debug_prolly_change_finder);
+	return (const ProllyChangeFinderRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_CHANGE_FINDER);
+}
+
+/* The profile's change log, looked up once: told of every write. */
+static const ProllyChangeLogRoutine *
+change_log(void)
+{
+	static const ProllyChangeLogRoutine *routine = NULL;
+	static bool looked_up = false;
+
+	if (!looked_up)
+	{
+		routine = (const ProllyChangeLogRoutine *)
+			profile_impl(history_profile, PROLLY_IFACE_CHANGE_LOG);
+		looked_up = true;
+	}
+	return routine;
+}
+
+void
+prolly_make_change_log(Oid relid, LOCKMODE lockmode)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+	Relation	rel;
+
+	if (log == NULL || get_rel_relam(relid) != PROLLY_TABLE_AM_OID)
+		return;
+	rel = table_open(relid, lockmode);
+	if (PROLLY_CALL(log, identity, rel) == 0)
+	{
+		PROLLY_CALL(log, create, rel);
+		CommandCounterIncrement();
+	}
+	table_close(rel, NoLock);
+}
+
+void
+prolly_note_change(Relation rel, const ItemPointerData *oldtid,
+				   const ItemPointerData *newtid)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log != NULL)
+		PROLLY_CALL(log, note, rel, oldtid, newtid);
+}
+
+bool
+prolly_is_change_log(Relation rel)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	return log != NULL && PROLLY_CALL(log, is_log, rel);
 }
 
 void

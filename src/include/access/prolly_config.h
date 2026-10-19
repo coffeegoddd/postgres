@@ -16,6 +16,7 @@
 
 #include "access/prolly_applier.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_changelog.h"
 #include "access/prolly_changes.h"
 #include "access/prolly_chunker.h"
 #include "access/prolly_chunkformat.h"
@@ -33,6 +34,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_valenc.h"
 #include "access/prolly_writers.h"
+#include "storage/lockdefs.h"
 
 /* The components a prolly table's rows' history is folded with. */
 typedef struct ProllyComponents
@@ -43,6 +45,8 @@ typedef struct ProllyComponents
 	const ProllyValueEncoderRoutine *value_encoder;
 	const ProllyTreeRoutine *tree;
 	const ProllyKeyingRoutine *keying;
+	const ProllyChangeFinderRoutine *change_finder;
+	const ProllyChangeLogRoutine *change_log;	/* NULL: none is kept */
 } ProllyComponents;
 
 /* Database-wide components: version control. */
@@ -73,5 +77,22 @@ extern Oid	prolly_table_am_for_persistence(Oid amoid, char relpersistence,
 
 /* Error if a prolly table is to become unlogged. */
 extern void prolly_check_unlogged(Relation rel);
+
+/*
+ * The change finder folds use: the profile's, unless the developer setting
+ * names another (any may fold any table: each folds in full from a
+ * baseline another made).
+ */
+extern PGDLLIMPORT char *debug_prolly_change_finder;
+extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
+
+/*
+ * The change log, if the profile keeps one: a prolly table's made as the
+ * table is made (or, for one that has none, as it is altered), and told
+ * each tuple version a write to one made or replaced.
+ */
+extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
+extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,
+							   const ItemPointerData *newtid);
 
 #endif							/* PROLLY_CONFIG_H */

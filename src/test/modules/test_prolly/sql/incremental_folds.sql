@@ -271,5 +271,15 @@ SELECT * FROM pg_temp.fold();
 SELECT dolt_checkout('main');
 SELECT * FROM pg_temp.fold();
 
+-- Which change finder folds is configuration: a name that isn't one is
+-- refused, and one that can't fold says so.
+SET debug_prolly_change_finder = 'nonesuch';
+SET debug_prolly_change_finder = 'stub';
+\set VERBOSITY terse
+SELECT * FROM pg_temp.fold();
+\set VERBOSITY default
+RESET debug_prolly_change_finder;
+SELECT * FROM pg_temp.fold();
+
 DROP SCHEMA inc CASCADE;
 SELECT dolt_branch('-D', 'other');

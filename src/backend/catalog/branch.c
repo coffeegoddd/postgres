@@ -24,6 +24,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -945,6 +946,11 @@ void
 branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 				  const ItemPointerData *newtid)
 {
+	/* (a TOAST relation's versions, or a change log's, are its table's) */
+	if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+		return;
+	/* (the change log is told of every write, the session's own or not) */
+	prolly_note_change(rel, oldtid, newtid);
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }

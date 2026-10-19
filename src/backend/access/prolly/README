@@ -43,6 +43,7 @@ design choice can be changed later by writing a new implementation:
 	row_applier       prolly_applier.h        replication, stub
 	table_file        prolly_tablefile.h      basic, stub
 	change_finder     prolly_changes.h        pages, stub
+	change_log        prolly_changelog.h      stub
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
 	writers           prolly_writers.h        modes, stub

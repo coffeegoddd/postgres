@@ -2863,7 +2863,7 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	cn.reading = reading;
 	cn.only = only;
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
+	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
 	if (baseline)
 		load_baseline(&cn, baseline);
@@ -2959,7 +2959,7 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
+	cn.finder = prolly_change_finder();
 	/* (a baseline the visitor declines: it has seen the trees it names) */
 	if (!PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg))
 		return;
@@ -7438,7 +7438,7 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
+	cn.finder = prolly_change_finder();
 	if (!root_in_format(&cn, head))
 		return false;
 	initStringInfo(&v);

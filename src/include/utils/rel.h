@@ -743,15 +743,24 @@ RelationCloseSmgr(Relation relation)
  * We don't log information for unlogged tables (since they don't WAL log
  * anyway), for foreign tables (since they don't WAL log, either),
  * and for system tables (their content is hard to make sense of, and
- * it would complicate decoding slightly for little gain). Note that we *do*
- * log information for user defined catalog tables since they presumably are
- * interesting to the user...
+ * it would complicate decoding slightly for little gain), nor for a prolly
+ * table's change log (its rows are bookkeeping, not anyone's data). Note that
+ * we *do* log information for user defined catalog tables since they
+ * presumably are interesting to the user...
  */
 #define RelationIsLogicallyLogged(relation) \
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
-	 !IsCatalogRelation(relation))
+	 !IsCatalogRelation(relation) && \
+	 !((relation)->rd_rel->relkind == RELKIND_TOASTVALUE && \
+	   prolly_is_change_log(relation)))
+
+/*
+ * Is the relation a prolly table's change log (access/prolly_config.h)?
+ * Its rows are no table's: a TOAST-kind relation, not a TOAST table.
+ */
+extern bool prolly_is_change_log(Relation rel);
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

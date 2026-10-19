@@ -468,7 +468,7 @@ test_fold_counters(PG_FUNCTION_ARGS)
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	PROLLY_CALL(prolly_changes_lookup("pages"), counters, &c, PG_GETARG_BOOL(0));
+	PROLLY_CALL(prolly_change_finder(), counters, &c, PG_GETARG_BOOL(0));
 	values[0] = Int64GetDatum((int64) c.pages);
 	values[1] = Int64GetDatum((int64) c.candidates);
 	values[2] = Int64GetDatum((int64) c.full);
