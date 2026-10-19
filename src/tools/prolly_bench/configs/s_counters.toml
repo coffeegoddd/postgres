@@ -34,7 +34,8 @@ fio_baseline = false
 seed = 1
 settled_counters = true
 collectors = ["wal", "pg_stat_io", "space", "engine_counters", "instructions", "write_amp"]
-required_collectors = ["wal", "pg_stat_io", "space"]
+# (write_amp too: its totals are gated, so a run that lost it isn't a pass)
+required_collectors = ["wal", "pg_stat_io", "space", "write_amp"]
 
 [postgres]
 shared_buffers = "512MB"

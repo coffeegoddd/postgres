@@ -307,6 +307,10 @@ Notes on the totals:
 - **What isn't counted:** SLRU writes, and WAL's partial-page rewrites.
 - **Small intervals.** Ratios are omitted under 64 KiB of logical bytes,
   and `table` says why for each n/a.
+- **Other instances.** A workload's other instances (`ctx.peers`: V4's
+  clone, which the clone, fetch and push write to) are measured like the
+  origin, and their bytes are added in. `wa.instances` says how many
+  instances were counted. Logical bytes are the origin's.
 
 Reports and run constraints:
 
@@ -322,7 +326,9 @@ Reports and run constraints:
   `minimal` unless `checkpoint_timeout` exceeds the window.
 - **The gate.** In a counter run, `scounters` gates the logical, WAL and
   chunk-store totals. It doesn't gate the page totals: those sum every
-  backend type, and how they repeat depends on timing.
+  backend type, and how they repeat depends on timing. `s_counters.toml`
+  requires `write_amp`, and the gate fails when any collector that ran in
+  the base didn't run in the candidate.
 
 ## Comparing builds
 
