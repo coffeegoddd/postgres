@@ -3,7 +3,7 @@ data the workload wrote (specs/20-write-amplification.md).
 
 The collector has its own interval, wider than the window. Before the
 window it checkpoints, so the warm-up's dirty pages aren't charged to the
-window. It doesn't wait for clients there: a workload may connect before
+window, and has prolly fold first, so the load's trees aren't either. It doesn't wait for clients there: a workload may connect before
 the window opens (S6's snapshot holder, the V suite's background S1).
 After the window it waits for the measured clients to exit, and
 then has prolly fold the working set into trees (prolly_checkpoint(); plain
@@ -134,6 +134,11 @@ class WriteAmpCollector(Collector):
 
     def before_window(self, ctx):
         wait_for_autovacuum(ctx)
+        # Fold what came before (the load, the warm-up) first, so the fold
+        # after the window writes the window's changes only: nothing folds
+        # the working set between the load and the window.
+        if materialize_mode(ctx) == "prolly_checkpoint":
+            ctx.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
         checkpoint(ctx)
 
     def _snap(self, ctx) -> dict:

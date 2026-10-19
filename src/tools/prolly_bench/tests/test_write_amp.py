@@ -126,6 +126,11 @@ class WriteAmpTest(unittest.TestCase):
 
         def fold():
             order.append("fold")
+            if order.count("fold") == 1:
+                # before the window: the load's trees, not the window's
+                s.prolly["chunk_bytes_appended"] += 50_000_000
+                s.lsn += 50_000_000
+                return
             s.prolly["chunk_bytes_appended"] += 2_000_000
             s.lsn += 2_000_100
         s.on_prolly_checkpoint = fold
@@ -134,7 +139,7 @@ class WriteAmpTest(unittest.TestCase):
             s.lsn += 1_000_000
             s.tuples["t"] = [0, 20_000, 0]
         m = self.run_cell(s, ctx, work, Outcome(transactions=100))
-        self.assertEqual(order, ["checkpoint", "fold", "checkpoint"])
+        self.assertEqual(order, ["fold", "checkpoint", "fold", "checkpoint"])
         self.assertEqual(m["wa.tree.chunk_payload_bytes"], 2_000_000)
         self.assertEqual(m["wa.tree.materialize_chunk_payload_bytes"], 2_000_000)
         self.assertEqual(m["wa.wal.materialize_bytes"], 2_000_100)
