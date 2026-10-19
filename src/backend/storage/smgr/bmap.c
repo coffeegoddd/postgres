@@ -1025,13 +1025,17 @@ copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
  * a write can need: an entry's block changes only while its logical block
  * can't be written, so a write after the change finds the page cached or
  * written out.  A torn read fails verification and is read again.
+ *
+ * A page of zeroes is copied as such if 'new_ok' (returning false), else
+ * fails verification, as in copy_node().
  */
-static void
+static bool
 read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
-		  uint16 type)
+		  uint16 type, bool new_ok)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		buf;
+	bool		found;
 
 	if (for_write)
 	{
@@ -1053,8 +1057,10 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 							 errmsg("invalid page in block %u of \"%s\"",
 									blk, relpathperm(rel, BMAP_FORKNUM).str)));
 			}
+			if (new_ok && PageIsNew(dst))
+				return false;
 			check_page(dst, type, rel, BMAP_FORKNUM, blk);
-			return;
+			return true;
 		}
 		buf = r.recent_buffer;
 
@@ -1069,8 +1075,9 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 	else
 		buf = map_read(rel, blk);
 
-	(void) copy_node(rel, buf, blk, dst, type, false);
+	found = copy_node(rel, buf, blk, dst, type, new_ok);
 	ReleaseBuffer(buf);
+	return found;
 }
 
 static BlockNumber
@@ -1078,7 +1085,7 @@ header_nblocks(SMgrRelation reln)
 {
 	PGIOAlignedBlock copy;
 
-	read_node(reln, 0, false, copy.data, BMAP_PAGE_HEADER);
+	(void) read_node(reln, 0, false, copy.data, BMAP_PAGE_HEADER, false);
 	return PageGetBmapHeader(copy.data)->nblocks;
 }
 
@@ -1086,7 +1093,8 @@ header_nblocks(SMgrRelation reln)
  * The physical block of logical block 'blkno', and in *run how many logical
  * blocks from it (at most 'maxrun') are physically consecutive.  If the
  * block has no entry, returns InvalidBlockNumber when 'missing_ok', else
- * fails.  See read_node() for 'for_write'.
+ * fails.  When 'missing_ok', a map page of zeroes has no entries, as in
+ * lookup_entry(); see bmapprefetch().  See read_node() for 'for_write'.
  */
 static BlockNumber
 lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
@@ -1098,13 +1106,12 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	BlockNumber phys;
 	BlockNumber n;
 
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
+		!read_node(reln, MAP_PAGE(blkno), for_write, copy.data,
+				   BMAP_PAGE_NODE, missing_ok))
 		phys = InvalidBlockNumber;
 	else
-	{
-		read_node(reln, MAP_PAGE(blkno), for_write, copy.data, BMAP_PAGE_NODE);
 		phys = entries[slot].block;
-	}
 	if (!BlockNumberIsValid(phys))
 	{
 		if (missing_ok)
@@ -3031,7 +3038,7 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 	uint32		i = 0;
 	bool		first = true;
 
-	read_node(src, mapblk, false, copy.data, BMAP_PAGE_NODE);
+	(void) read_node(src, mapblk, false, copy.data, BMAP_PAGE_NODE, false);
 	for (uint32 slot = 0; slot < BMAP_FANOUT; slot++)
 	{
 		BlockNumber blk = (mapblk - 1) * BMAP_FANOUT + slot;
@@ -4537,8 +4544,10 @@ bmapprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		/*
 		 * A block without an entry has nothing to prefetch.  In recovery the
 		 * map's header on disk may be newer than the map page that will have
-		 * the entry, so a block below the length may have none yet; a
-		 * prefetch is only a hint.
+		 * the entry, so a block below the length may have none yet, and its
+		 * map page may still be zeroes (one the same extension added, whose
+		 * buffer wasn't written out before a crash); a prefetch is only a
+		 * hint.
 		 */
 		if (!BlockNumberIsValid(phys))
 		{
@@ -4652,7 +4661,8 @@ page_predates_entry(SMgrRelation reln, BlockNumber blkno, const void *page)
 	PGIOAlignedBlock copy;
 	BmapEntry  *entry = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
 
-	read_node(reln, MAP_PAGE(blkno), true, copy.data, BMAP_PAGE_NODE);
+	(void) read_node(reln, MAP_PAGE(blkno), true, copy.data, BMAP_PAGE_NODE,
+					 false);
 	return PageGetLSN((const PageData *) page) < entry->since;
 }
 
