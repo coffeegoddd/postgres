@@ -33,6 +33,14 @@ BEGIN;
 INSERT INTO mo.u VALUES (1);
 SELECT length(dolt_commit('-allow-empty', '--m', 'one dash, two')::text) AS committed;
 SELECT dolt_reset('-hard', 'HEAD~1');
+-- (short flags that go together, one with two dashes)
+SELECT length(dolt_commit('--A', '--allow-empty', '-m', 'two-dash flag')::text) AS committed;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_branch('mo_short');
+SELECT dolt_branch('--m', 'mo_short', 'mo_short2');
+SELECT dolt_branch('--D', 'mo_short2');
+SELECT count(*) AS left FROM dolt_branches WHERE name LIKE 'mo_short%';
+SELECT dolt_verify_constraints('--a', '--o');
 SELECT count(*) AS reset FROM mo.u;
 ROLLBACK;
 

@@ -371,6 +371,21 @@ is_option(const char *arg, const char *name)
 	return strcmp(arg, name) == 0;
 }
 
+/*
+ * The short flags arg holds: one or several after one dash ("-am"), or
+ * one after two ("--a", as Dolt's parser takes any name so); NULL if it
+ * isn't such.
+ */
+static const char *
+short_flags(const char *arg)
+{
+	if (arg[0] != '-' || arg[1] == '\0')
+		return NULL;
+	if (arg[1] != '-')
+		return arg + 1;
+	return arg[2] != '\0' && arg[2] != '-' && arg[3] == '\0' ? arg + 2 : NULL;
+}
+
 static void
 unsupported(const char *fn, const char *arg)
 {
@@ -763,10 +778,10 @@ dolt_commit(PG_FUNCTION_ARGS)
 			skip_empty = true;
 		else if (is_option(a, "force"))
 			force = true;
-		else if (a[0] == '-' && a[1] != '-' && a[1] != '\0')
+		else if (short_flags(a) != NULL)
 		{
 			/* Short options together, as -Am message. */
-			for (const char *c = a + 1; *c; c++)
+			for (const char *c = short_flags(a); *c; c++)
 			{
 				if (*c == 'a' || *c == 'A')
 					continue;
@@ -1249,12 +1264,12 @@ dolt_branch(PG_FUNCTION_ARGS)
 			protection = PROLLY_PROTECT_OFF;
 		else if (is_option(a, "move"))
 			move = true;
-		else if (a[1] == '-' || a[1] == '\0')
+		else if (short_flags(a) == NULL)
 			unsupported("dolt_branch", a);
 		else
 		{
 			/* short flags, one or several together ("-mf") */
-			for (const char *f = a + 1; *f; f++)
+			for (const char *f = short_flags(a); *f; f++)
 			{
 				if (*f == 'd')
 					delete = true;
@@ -3394,11 +3409,11 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 			continue;
 		}
 		/* short flags, together or apart: -a, -o, -ao */
-		if (args[i][0] == '-' && args[i][1] != '-' && args[i][1] != '\0' &&
-			strspn(args[i] + 1, "ao") == strlen(args[i] + 1))
+		if (short_flags(args[i]) != NULL &&
+			strspn(short_flags(args[i]), "ao") == strlen(short_flags(args[i])))
 		{
-			output_only |= strchr(args[i], 'o') != NULL;
-			all |= strchr(args[i], 'a') != NULL;
+			output_only |= strchr(short_flags(args[i]), 'o') != NULL;
+			all |= strchr(short_flags(args[i]), 'a') != NULL;
 			continue;
 		}
 		if (args[i][0] == '-')
