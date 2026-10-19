@@ -3052,13 +3052,14 @@ bmap_read_old(SMgrRelation reln, BlockNumber blkno, BlockNumber old_block,
 
 	mdreadv(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM, old_block,
 			pages, 1);
-	memcpy(page, copy.data, BLCKSZ);
-	if (!PageIsVerified((Page) page, blkno, PIV_LOG_WARNING, NULL))
+	/* (verified in the aligned copy: 'page' needn't be aligned) */
+	if (!PageIsVerified((Page) copy.data, blkno, PIV_LOG_WARNING, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid page in block %u of the page store of \"%s\", kept for block %u",
 						old_block, relpathperm(reln->smgr_rlocator.locator, MAIN_FORKNUM).str,
 						blkno)));
+	memcpy(page, copy.data, BLCKSZ);
 }
 
 /*

@@ -1908,7 +1908,8 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 			ns.xmax = f.snap->xmax;
 			ns.nxip = f.snap->xcnt;
 			ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
+			if (ns.nxip > 0)
+				memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
 			qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
 			ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
 			ns.own = GetTopTransactionIdIfAny();

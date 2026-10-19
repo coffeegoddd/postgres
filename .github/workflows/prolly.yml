@@ -36,9 +36,10 @@ jobs:
       - uses: ./.github/actions/specs-only
         id: classify
 
+  # The nightly jobs and settings run on a manual dispatch too.
   sanitizers:
     name: nightly address and undefined-behavior checks
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -67,6 +68,7 @@ jobs:
           name: sanitizer-evidence
           path: |
             **/tmp_check/log/**
+            src/test/modules/test_prolly/log/**
             **/regression.diffs
 
   controlled-performance:
@@ -198,7 +200,7 @@ jobs:
         run: make -n -C src/test/prolly check PROLLY_AM=prolly > /dev/null
 
       - name: Upstream suites on block-mapped storage (nightly)
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: make -C src/test/prolly check-upstream-bmap
 
       - uses: actions/setup-go@v5
@@ -310,7 +312,7 @@ jobs:
 
       - name: Seeded differential histories
         env:
-          NIGHTLY: ${{ github.event_name == 'schedule' }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           seeds=5
           steps=36
@@ -331,7 +333,7 @@ jobs:
 
       - name: Seeded version-control histories
         env:
-          NIGHTLY: ${{ github.event_name == 'schedule' }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           seeds=8
           steps=80
