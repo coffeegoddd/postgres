@@ -3693,6 +3693,14 @@ dolt_remote(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	const char *result[1] = {"0"};
 
+	/* (no options: a "--" only lets a name begin with "-") */
+	for (int i = 0; i < nargs; i++)
+		if (strcmp(args[i], "--") == 0)
+		{
+			memmove(&args[i], &args[i + 1], sizeof(char *) * (nargs - i));
+			nargs--;
+			break;
+		}
 	if (nargs >= 1 && strcmp(args[0], "add") == 0)
 	{
 		if (nargs != 3)
@@ -3979,13 +3987,18 @@ dolt_gc(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	bool		full = false;
 	bool		shallow = false;
+	bool		options = true;	/* until "--" */
 	const char *result[1] = {"0"};
 	ProllyDatabaseComponents dc;
 	ProllyGcResult gc;
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (is_option(args[i], "full"))
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* (and nothing after it) */
+		else if (!options)
+			unexpected("dolt_gc", args[i]);
+		else if (is_option(args[i], "full"))
 			full = true;
 		else if (is_option(args[i], "shallow"))
 			shallow = true;
@@ -4113,6 +4126,13 @@ dolt_push(PG_FUNCTION_ARGS)
 				force = true;
 			else if (is_option(a, "u") || is_option(a, "set-upstream"))
 				set_upstream = true;
+			/* short flags together: -fu */
+			else if (short_flags(a) != NULL &&
+					 strspn(short_flags(a), "fu") == strlen(short_flags(a)))
+			{
+				force |= strchr(short_flags(a), 'f') != NULL;
+				set_upstream |= strchr(short_flags(a), 'u') != NULL;
+			}
 			else
 				unsupported("dolt_push", a);
 		}
@@ -4244,6 +4264,8 @@ dolt_pull(PG_FUNCTION_ARGS)
 		branch = pstrdup(branch_ops()->current());
 	fetch_remote(remote, list_make1(branch), NULL, NULL);
 
+	/* (after "--": a remote's name may begin with "-") */
+	merge_args = lappend(merge_args, "--");
 	merge_args = lappend(merge_args, psprintf("%s/%s", remote, branch));
 	d = palloc(sizeof(Datum) * list_length(merge_args));
 	foreach(lc, merge_args)

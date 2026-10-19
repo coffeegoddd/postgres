@@ -165,6 +165,14 @@ SELECT dolt_fetch('dash', '--', '-dash');
 SELECT name FROM dolt_remote_branches() WHERE name LIKE '%-dash';
 SELECT dolt_pull('dash', '--', '-dash') IS NOT NULL AS pulled;
 SELECT dolt_remote('remove', 'dash');
+-- (a remote named like a flag, after "--": pulled from by name, and as
+-- the session branch's upstream, set by -fu, short flags together)
+SELECT dolt_remote('add', '--', '-r', :'url');
+SELECT dolt_push('-fu', '--', '-r', 'main') IS NOT NULL AS pushed;
+SELECT (dolt_pull('--', '-r', 'main'))[4];
+SELECT (dolt_pull())[4];
+SELECT dolt_remote('remove', '--', '-r');
+SELECT dolt_gc('--', '--full');
 SELECT dolt_branch('-D', '--', '-dash');
 -- An option's value is the argument after it, "--" too (as in Dolt and
 -- git), so "--" ends the options only where it isn't one.  "--" isn't a

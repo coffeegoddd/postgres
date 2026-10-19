@@ -521,6 +521,40 @@ SELECT dolt_remote('remove', 'dash');
  {0}
 (1 row)
 
+-- (a remote named like a flag, after "--": pulled from by name, and as
+-- the session branch's upstream, set by -fu, short flags together)
+SELECT dolt_remote('add', '--', '-r', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('-fu', '--', '-r', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT (dolt_pull('--', '-r', 'main'))[4];
+       dolt_pull       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT (dolt_pull())[4];
+       dolt_pull       
+-----------------------
+ Everything up-to-date
+(1 row)
+
+SELECT dolt_remote('remove', '--', '-r');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_gc('--', '--full');
+ERROR:  dolt_gc: unexpected argument "--full"
 SELECT dolt_branch('-D', '--', '-dash');
  dolt_branch 
 -------------
