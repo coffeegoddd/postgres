@@ -515,6 +515,179 @@ SELECT length(dolt_commit('-am', 'rewritten')::text) AS committed;
         66
 (1 row)
 
+-- TRUNCATE where the table's storage was made in the transaction, after a
+-- commit in it folded the table: the storage is made anew, as a TRUNCATE
+-- elsewhere makes it, not cut in place, which the next fold wouldn't see
+-- (it reads only the pages listed).  The commit keeps the rows, for a
+-- branch made from it and a hard reset.
+BEGIN;
+CREATE TABLE inc.made (id int PRIMARY KEY, v text);
+INSERT INTO inc.made SELECT g, 'x' || g FROM generate_series(1, 5000) g;
+SELECT length(dolt_commit('-Am', 'made')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_relation_filenode('inc.made') AS made \gset
+TRUNCATE inc.made;
+SELECT pg_relation_filenode('inc.made') <> :made AS made_anew;
+ made_anew 
+-----------
+ t
+(1 row)
+
+COMMIT;
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     0 |          0 |           1 | t
+(1 row)
+
+SELECT table_name, status FROM dolt_status;
+ table_name |  status  
+------------+----------
+ inc.made   | modified
+(1 row)
+
+SELECT dolt_checkout('made');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'made'"}
+(1 row)
+
+SELECT count(*) FROM inc.made;
+ count 
+-------
+  5000
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) FROM inc.made;
+ count 
+-------
+  5000
+(1 row)
+
+-- storage made anew in the transaction, and rows inserted after the
+-- TRUNCATE: the working set has just those
+BEGIN;
+TRUNCATE inc.made;
+INSERT INTO inc.made SELECT g, 'y' || g FROM generate_series(1, 5000) g;
+SELECT length(dolt_commit('-am', 'made again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('made_again');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+TRUNCATE inc.made;
+INSERT INTO inc.made SELECT g, 'z' || g FROM generate_series(1, 10) g;
+COMMIT;
+SELECT * FROM pg_temp.fold();
+ pages | candidates | full_tables | same_as_full 
+-------+------------+-------------+--------------
+     0 |          0 |           1 | t
+(1 row)
+
+SELECT count(*), min(v), max(v) FROM inc.made;
+ count | min | max 
+-------+-----+-----
+    10 | z1  | z9
+(1 row)
+
+SELECT diff_type, count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::inc.made)
+  GROUP BY 1 ORDER BY 1;
+ diff_type | count 
+-----------+-------
+ modified  |    10
+ removed   |  4990
+(2 rows)
+
+SELECT dolt_checkout('made_again');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'made_again'"}
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE v LIKE 'y%') AS made_again FROM inc.made;
+ count | made_again 
+-------+------------
+  5000 |       5000
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE v LIKE 'y%') AS made_again FROM inc.made;
+ count | made_again 
+-------+------------
+  5000 |       5000
+(1 row)
+
+-- storage made in the transaction and not folded is still cut in place
+BEGIN;
+CREATE TABLE inc.unfolded (id int);
+INSERT INTO inc.unfolded SELECT generate_series(1, 1000);
+SELECT pg_relation_filenode('inc.unfolded') AS unfolded \gset
+TRUNCATE inc.unfolded;
+SELECT pg_relation_filenode('inc.unfolded') = :unfolded AS in_place;
+ in_place 
+----------
+ t
+(1 row)
+
+COMMIT;
+SELECT dolt_branch('-D', 'made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'made_again');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TABLE inc.made, inc.unfolded;
+SELECT length(dolt_commit('-Am', 'made gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 -- A branch starts from its source's baseline.
 SELECT dolt_branch('other');
  dolt_branch 
