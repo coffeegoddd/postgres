@@ -3349,8 +3349,8 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
  * didn't write for breaking a unique, check or not-null constraint are
  * dropped, what to do with them is the user's.  Only the rows changed
  * since the head commit are checked (and those referencing rows removed
- * or changed), and those of the violations recorded, so one still holding
- * is kept, unless --all: every row.  Status 1 if any are found, else 0.
+ * or changed), and every row of a table with violations recorded, so one
+ * still holding is kept, unless --all: every row.  Status 1 if any are found, else 0.
  */
 Datum
 dolt_verify_constraints(PG_FUNCTION_ARGS)

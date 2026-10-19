@@ -164,6 +164,62 @@ SELECT dolt_verify_constraints('vr.pk');
 SELECT violating_row FROM dolt_constraint_violations('vr.pk')
 ORDER BY (violating_row->>'id')::int;
 SELECT dolt_reset('--hard');
+-- Rows are matched by their keys, never by how the whole row prints: a
+-- violation recorded is found again after its row changed otherwise, or
+-- under another TimeZone; a json value no jsonb takes, or a virtual
+-- generated column, doesn't stop a changed row matching.
+CREATE TABLE vr.tp (id int PRIMARY KEY);
+CREATE TABLE vr.tc (id int PRIMARY KEY, p int REFERENCES vr.tp, note text,
+                    at timestamptz);
+SET TimeZone = 'UTC';
+SET session_replication_role = replica;
+INSERT INTO vr.tc VALUES (1, 1, NULL, '2026-01-01 12:00+00'),
+                         (2, 2, NULL, '2026-01-01 12:00+00');
+RESET session_replication_role;
+SELECT dolt_verify_constraints('vr.tc');
+UPDATE vr.tc SET note = 'still an orphan' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'vr.tc')::text) AS committed;
+SET TimeZone = 'America/New_York';
+SELECT dolt_verify_constraints();
+SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.tc')
+ORDER BY 1;
+RESET TimeZone;
+SELECT dolt_reset('--hard');
+DELETE FROM vr.tc;
+SELECT dolt_verify_constraints('vr.tc');
+SELECT length(dolt_commit('-Am', 'vr.tc empty')::text) AS committed;
+CREATE TABLE vr.jc (id int PRIMARY KEY, p int REFERENCES vr.tp, doc json, s json);
+CREATE TABLE vr.gc (id int PRIMARY KEY, p int REFERENCES vr.tp,
+                    g int GENERATED ALWAYS AS (id * 2) VIRTUAL);
+INSERT INTO vr.tp VALUES (1), (2);
+INSERT INTO vr.jc VALUES (1, 1, '{"a": "\u0000"}', '"\u0000"');
+INSERT INTO vr.gc VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'vr.jc, vr.gc')::text) AS committed;
+UPDATE vr.jc SET p = 2 WHERE id = 1;
+SET session_replication_role = replica;
+INSERT INTO vr.jc VALUES (2, 9, '"\u0000"', NULL);
+INSERT INTO vr.gc VALUES (2, 9);
+RESET session_replication_role;
+SELECT dolt_verify_constraints('-o');
+SELECT dolt_verify_constraints('vr.jc', 'vr.gc');
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
+SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.gc');
+SELECT dolt_reset('--hard');
+-- However many rows changed, the same are found: a batch of keys at a
+-- time, not the whole table once there are many (an orphan committed
+-- before isn't found again).
+CREATE TABLE vr.bc (id int PRIMARY KEY, p int REFERENCES vr.tp);
+SET session_replication_role = replica;
+INSERT INTO vr.bc VALUES (0, 9);
+RESET session_replication_role;
+SELECT length(dolt_commit('-Am', 'vr.bc')::text) AS committed;
+SET session_replication_role = replica;
+INSERT INTO vr.bc SELECT g, CASE WHEN g = 2400 THEN 9 ELSE 1 END
+FROM generate_series(1, 2500) g;
+RESET session_replication_role;
+SELECT dolt_verify_constraints('vr.bc');
+SELECT violating_row->>'id' AS id FROM dolt_constraint_violations('vr.bc');
+SELECT dolt_reset('--hard');
 RESET dolt.allow_commit_conflicts;
 DROP SCHEMA vr CASCADE;
 
