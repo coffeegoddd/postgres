@@ -22,7 +22,7 @@ REGRESS = test_prolly prolly_tables versioned_schemas catalog_branch_column bran
 TAP_TESTS = 1
 EXTRA_INSTALL = contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect \
 	contrib/pg_walinspect contrib/test_decoding \
-	src/test/modules/injection_points
+	src/test/modules/injection_points src/test/modules/dummy_seclabel
 
 export enable_injection_points
 export with_ssl
