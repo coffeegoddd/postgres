@@ -97,8 +97,9 @@ FROM dolt_constraint_violations('dv.u');
 SELECT * FROM dv.u ORDER BY pk;
 ROLLBACK;
 
--- The same incoming check, unvalidated: preserve its state and report
--- the receiver's violating row through the merge's normal checks.
+-- The same incoming check, unvalidated: its state is kept, and so is
+-- ours' stored value it rejects, which the merge didn't write: no
+-- violation, as ALTER DOMAIN ... NOT VALID would leave it.
 SELECT dolt_checkout('other3');
 ALTER DOMAIN dv.ours DROP CONSTRAINT pos;
 ALTER DOMAIN dv.ours ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;

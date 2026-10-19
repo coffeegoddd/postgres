@@ -144,5 +144,27 @@ SELECT dolt_reset('--hard', 'not_valid');
 SELECT test_fold_root() = prolly_root_hash('not_valid') AS same_root;
 SELECT * FROM tm3.t;
 SELECT count(*) AS no_leftovers FROM pg_type WHERE typname LIKE 'prolly_moving_%';
+-- A stored value an unvalidated check rejects, then the domain changed
+-- otherwise: a reset across both keeps the value, the column moving to
+-- the changed domain before its unvalidated checks are added.
+ALTER DOMAIN tm3."nv domain" DROP CONSTRAINT "positive check";
+INSERT INTO tm3.t VALUES (3, -4);
+ALTER DOMAIN tm3."nv domain" ADD CONSTRAINT "positive check" CHECK (VALUE > 0) NOT VALID;
+SELECT (dolt_commit('-am', 'stored value an unvalidated check rejects'))[1] AS nv_stored \gset
+ALTER DOMAIN tm3."nv domain" SET DEFAULT 4;
+SELECT (dolt_commit('-am', 'domain default'))[1] AS nv_default \gset
+SELECT dolt_reset('--hard', :'nv_stored');
+SELECT test_fold_root() = prolly_root_hash(:'nv_stored') AS same_root;
+SELECT * FROM tm3.t ORDER BY pk;
+SELECT dolt_reset('--hard', :'nv_default');
+SELECT test_fold_root() = prolly_root_hash(:'nv_default') AS same_root;
+SELECT * FROM tm3.t ORDER BY pk;
+SELECT dolt_reset('--hard', 'not_valid');
+SELECT dolt_reset('--hard', :'nv_default');
+SELECT test_fold_root() = prolly_root_hash(:'nv_default') AS same_root;
+SELECT * FROM tm3.t ORDER BY pk;
+SELECT c.conname, c.convalidated FROM pg_constraint c
+WHERE c.contypid = 'tm3."nv domain"'::regtype ORDER BY c.conname;
+SELECT * FROM dolt_status();
 SELECT dolt_branch('-D', 'not_valid');
 DROP SCHEMA tm3 CASCADE;

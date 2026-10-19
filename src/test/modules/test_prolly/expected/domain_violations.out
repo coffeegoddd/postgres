@@ -268,8 +268,9 @@ SELECT * FROM dv.u ORDER BY pk;
 (4 rows)
 
 ROLLBACK;
--- The same incoming check, unvalidated: preserve its state and report
--- the receiver's violating row through the merge's normal checks.
+-- The same incoming check, unvalidated: its state is kept, and so is
+-- ours' stored value it rejects, which the merge didn't write: no
+-- violation, as ALTER DOMAIN ... NOT VALID would leave it.
 SELECT dolt_checkout('other3');
            dolt_checkout           
 -----------------------------------
@@ -292,9 +293,9 @@ SELECT dolt_checkout('main');
 
 BEGIN;
 SELECT (dolt_merge('other3'))[3:4];
-      dolt_merge       
------------------------
- {1,"conflicts found"}
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
 (1 row)
 
 SELECT conname, convalidated FROM pg_constraint
@@ -306,18 +307,17 @@ WHERE contypid = 'dv.ours'::regtype;
 
 SELECT violation_type, violating_row, violation_info
 FROM dolt_constraint_violations('dv.u');
-  violation_type  |   violating_row    |                violation_info                
-------------------+--------------------+----------------------------------------------
- check constraint | {"v": -2, "pk": 2} | {"Name": "pos", "Expression": "(VALUE > 0)"}
-(1 row)
+ violation_type | violating_row | violation_info 
+----------------+---------------+----------------
+(0 rows)
 
 SELECT * FROM dv.u ORDER BY pk;
- pk | v 
-----+---
-  1 | 1
-  2 |  
-  3 | 3
-  4 | 4
+ pk | v  
+----+----
+  1 |  1
+  2 | -2
+  3 |  3
+  4 |  4
 (4 rows)
 
 ROLLBACK;
