@@ -1679,6 +1679,7 @@ typedef struct Applying
 	bool		in_place;		/* changed keyed rows updated in place */
 	bool		put_back;		/* a refused row's old version put back */
 	bool		stuck;			/* a put-back refused: the rest not written */
+	bool		removed_rows;	/* keyless removals need protection on refusal */
 	bool		inserting;
 } Applying;
 
@@ -1704,6 +1705,30 @@ static bool
 puts_back(Relation rel, bool keyless)
 {
 	return recording && !keyless && !updates_in_place(rel);
+}
+
+/*
+ * A keyless update is an unrelated removal and insertion.  If an insert
+ * is refused, there is no way to identify which removed row to put back.
+ * Roll back the table's whole row-write pass, retaining its violations
+ * (allocated in TopTransactionContext), for explicit resolution instead.
+ * With no removals there is nothing to restore, so valid inserts stay.
+ * The caller restores its memory context and resource owner afterward.
+ */
+static void
+finish_keyless_write(Relation rel, int nrecorded, bool removed_rows)
+{
+	if (!removed_rows || list_length(recorded) == nrecorded)
+		ReleaseCurrentSubTransaction();
+	else
+	{
+		RollbackAndReleaseCurrentSubTransaction();
+		/* Schema moves suppress notices while invoking the row writer. */
+		ereport(WARNING,
+				(errmsg("rows of keyless table \"%s\" were kept because the merge found constraint violations",
+						RelationGetRelationName(rel)),
+				 errdetail("None of this table's row changes were applied.")));
+	}
 }
 
 /*
@@ -1810,6 +1835,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	}
 	if (!ap->inserting && nb > 0)
 	{
+		ap->removed_rows = true;
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &brow, ap->slot);
 		removed_note(ap->rel, ap->slot);
@@ -1864,7 +1890,9 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
  * up), each written as the trees' diff finds it, nothing held.  While
  * violations are recorded, a keyed row refused is put back (puts_back()),
  * in a subtransaction: if a put-back is refused too, it is rolled back,
- * and the rows written held instead.
+ * and the rows written held instead.  A keyless table's row changes are
+ * atomic if it removes rows while recording violations
+ * (finish_keyless_write()).
  */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
@@ -1876,6 +1904,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ProllyKeyingRefs krefs;
 	Applying	ap;
 	int			nrecorded = list_length(recorded);
+	bool		atomic_keyless;
 
 	require_readable(from);
 	require_readable(to);
@@ -1892,6 +1921,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	if (recording)
 		note_constraints(ap.rel, ap.keyless);
 	ap.put_back = puts_back(ap.rel, ap.keyless);
+	atomic_keyless = recording && ap.keyless && may_break_constraints(ap.rel);
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &ap.c;
@@ -1906,7 +1936,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	removed_begin(ap.rel, ap.keyless);
-	if (ap.put_back)
+	if (ap.put_back || atomic_keyless)
 	{
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
@@ -1916,10 +1946,12 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
-	if (ap.put_back)
+	if (ap.put_back || atomic_keyless)
 	{
 		/* (stuck: none of it written, nor its violations recorded) */
-		if (ap.stuck)
+		if (atomic_keyless)
+			finish_keyless_write(ap.rel, nrecorded, ap.removed_rows);
+		else if (ap.stuck)
 		{
 			RollbackAndReleaseCurrentSubTransaction();
 			recorded = list_truncate(recorded, nrecorded);
@@ -2327,6 +2359,7 @@ typedef struct KeyWriter
 	bool	   *unread;			/* (decode_update()'s) */
 	bool		put_back;		/* puts_back() */
 	bool		keyless;
+	bool		removed_rows;	/* finish_keyless_write()'s */
 	bool		moving;			/* row_missing()'s */
 } KeyWriter;
 
@@ -2513,6 +2546,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 		w->violation = NULL;
 		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
 			continue;
+		kw->removed_rows = true;
 		(void) decode(kw->c, w->old, kw->s1);
 		removed_note(kw->rel, kw->s1);
 		for (int64 i = 0; i < w->nold; i++)
@@ -2633,6 +2667,19 @@ write_keys(KeyWriter *kw, List *writes)
 	ResourceOwner owner = CurrentResourceOwner;
 	int			nrecorded = list_length(recorded);
 
+	if (recording && kw->keyless && may_break_constraints(kw->rel))
+	{
+		bool		written PG_USED_FOR_ASSERTS_ONLY;
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		written = write_keys_once(kw, writes);
+		Assert(written);
+		finish_keyless_write(kw->rel, nrecorded, kw->removed_rows);
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		return;
+	}
 	if (!kw->put_back)
 	{
 		bool		written PG_USED_FOR_ASSERTS_ONLY;

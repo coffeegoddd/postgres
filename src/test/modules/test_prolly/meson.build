@@ -79,6 +79,7 @@ tests += {
       'format_freeze',
       'dirty_merges',
       'constraint_violations',
+      'keyless_violations',
       'verify_constraints',
       'domain_violations',
       'redefined_merges',
