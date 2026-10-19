@@ -129,6 +129,20 @@ SELECT length(dolt_commit('-am', 'by ada', '--author', 'Ada <ada@example.com>'):
 SELECT dolt_checkout('main');
 SELECT (dolt_cherry_pick('cp_author'))[2:4];
 SELECT committer, email, message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+-- So does one stopped on conflicts and finished by --continue, as in
+-- Dolt's ContinueCherryPick.
+SELECT dolt_checkout('cp_author');
+UPDATE app.t SET v = 'bob' WHERE id = 10;
+SELECT (dolt_commit('-am', 'by bob', '--author', 'Bob <bob@example.com>'))[1] AS bob \gset
+SELECT dolt_checkout('main');
+UPDATE app.t SET v = 'not bob' WHERE id = 10;
+SELECT length(dolt_commit('-am', 'not by bob')::text) AS committed;
+BEGIN;
+SELECT (dolt_cherry_pick(:'bob'))[2:4];
+SELECT dolt_conflicts_resolve('--theirs', 'app.t');
+SELECT length((dolt_cherry_pick('--continue'))[1]) AS picked;
+COMMIT;
+SELECT committer, email, message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 
 -- Refusals name what was refused; a branch's first commit has no
 -- changes from a parent to undo.

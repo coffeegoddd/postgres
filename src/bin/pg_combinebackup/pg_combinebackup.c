@@ -39,6 +39,7 @@
 #include "lib/stringinfo.h"
 #include "load_manifest.h"
 #include "reconstruct.h"
+#include "storage/bmap_files.h"
 #include "write_manifest.h"
 
 /* Incremental file naming convention. */
@@ -1043,6 +1044,32 @@ process_directory_recursively(Oid tsoid,
 			strncmp(de->d_name, INCREMENTAL_PREFIX,
 					INCREMENTAL_PREFIX_LENGTH) == 0)
 		{
+			RelFileNumber relnumber;
+			ForkNumber	forknum;
+			unsigned	segno;
+
+			/*
+			 * The server never sends a block-mapped page store incrementally,
+			 * in any fork or segment: WAL names the logical blocks of
+			 * block-mapped relations, never the page store's physical blocks
+			 * holding them, so WAL summaries can't say which of its blocks
+			 * changed (see GetFileBackupMethod()).  That is part of the format:
+			 * an incremental copy of the store can only be from a server built
+			 * before the rule, and has none of the store's changes since the
+			 * prior backup.  Refuse it, rather than restore the store as an
+			 * older backup had it.  A server that learns to summarize the
+			 * store's blocks must change this check with it.
+			 */
+			if (parse_filename_for_nontemp_relation(de->d_name + INCREMENTAL_PREFIX_LENGTH,
+													&relnumber, &forknum, &segno) &&
+				relnumber == BMAP_STORE_RELNUMBER)
+			{
+				pg_log_error("file \"%s\" is an incremental copy of a block-mapped page store, which cannot be reconstructed",
+							 ifullpath);
+				pg_log_error_hint("Take a new full backup, and base later incremental backups on it.");
+				exit(1);
+			}
+
 			/* Output path should not include "INCREMENTAL." prefix. */
 			snprintf(ofullpath, MAXPGPATH, "%s/%s", ofulldir,
 					 de->d_name + INCREMENTAL_PREFIX_LENGTH);

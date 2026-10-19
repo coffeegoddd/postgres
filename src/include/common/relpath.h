@@ -78,6 +78,10 @@ extern PGDLLIMPORT const char *const forkNames[];
 
 extern ForkNumber forkname_to_number(const char *forkName);
 extern int	forkname_chars(const char *str, ForkNumber *fork);
+extern bool parse_filename_for_nontemp_relation(const char *name,
+												RelFileNumber *relnumber,
+												ForkNumber *fork,
+												unsigned *segno);
 
 
 /*
