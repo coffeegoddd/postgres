@@ -467,6 +467,26 @@ SELECT count(*) AS conflicts FROM dolt_conflicts(NULL::rt.domain_pending);
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
+-- Only one side retypes, after fixing a bad base value; the other changes
+-- another column.  The schema merger refuses this before comparing rows:
+-- only widening string changes merge with the other side's row edits.
+CREATE TABLE rt.domain_one_side (id int PRIMARY KEY, v int, w int);
+INSERT INTO rt.domain_one_side VALUES (1, -1, 0);
+SELECT length(dolt_commit('-Am', 'one-sided domain base')::text) AS committed;
+SELECT dolt_branch('feature');
+UPDATE rt.domain_one_side SET v = 1;
+ALTER TABLE rt.domain_one_side ALTER COLUMN v TYPE rt.positive;
+SELECT length(dolt_commit('-am', 'main: one-sided domain')::text) AS committed;
+SELECT dolt_checkout('feature');
+UPDATE rt.domain_one_side SET w = 2;
+SELECT length(dolt_commit('-am', 'feature: another column')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature'))[2:4];
+ROLLBACK;
+SELECT * FROM rt.domain_one_side;
+SELECT dolt_branch('-D', 'feature');
+
 -- A retype during conflict resolution mustn't make the existing conflicts
 -- unreadable.  A cast of JSON null to int returns SQL NULL: displaying it
 -- as a NOT NULL domain must not enforce the domain either.
@@ -478,7 +498,7 @@ SELECT dolt_branch('feature');
 UPDATE rt.domain_mid SET v = 1, n = '1';
 SELECT length(dolt_commit('-am', 'main: mid')::text) AS committed;
 SELECT dolt_checkout('feature');
-UPDATE rt.domain_mid SET v = 2, n = '2';
+UPDATE rt.domain_mid SET v = -2, n = '2';
 SELECT length(dolt_commit('-am', 'feature: mid')::text) AS committed;
 SELECT dolt_checkout('main');
 BEGIN;
@@ -486,11 +506,48 @@ SELECT (dolt_merge('feature'))[2:4];
 SAVEPOINT before_retype;
 ALTER TABLE rt.domain_mid ALTER COLUMN v TYPE rt.positive;
 SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_mid);
+SAVEPOINT before_resolution;
+SELECT dolt_conflicts_resolve('--theirs', 'rt.domain_mid');
+ROLLBACK TO before_resolution;
+SELECT * FROM rt.domain_mid;
+SELECT count(*) AS conflicts_left FROM dolt_conflicts(NULL::rt.domain_mid);
 ROLLBACK TO before_retype;
 ALTER TABLE rt.domain_mid ALTER COLUMN n TYPE rt.required USING n::int;
 SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_mid);
 SELECT dolt_conflicts_resolve('--theirs', 'rt.domain_mid');
 SELECT * FROM rt.domain_mid;
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+
+-- Arrays still coerce their domain elements.  A bad historical element is
+-- an unsure comparison, not a CHECK or NOT NULL error aborting the merge.
+-- Different fixes conflict; matching fixes agree.  Resolution takes only
+-- valid values, and a savepoint retry rebuilds the guarded reads.
+CREATE TABLE rt.domain_arrays (id int PRIMARY KEY, v int[], n int[]);
+INSERT INTO rt.domain_arrays VALUES (1, '{-1}', '{NULL}'), (2, '{-2}', '{NULL}');
+SELECT length(dolt_commit('-Am', 'array domain base')::text) AS committed;
+SELECT dolt_branch('feature');
+UPDATE rt.domain_arrays SET v = ARRAY[id], n = ARRAY[id];
+ALTER TABLE rt.domain_arrays ALTER COLUMN v TYPE rt.positive[],
+                            ALTER COLUMN n TYPE rt.required[];
+SELECT length(dolt_commit('-am', 'main: array domains')::text) AS committed;
+SELECT dolt_checkout('feature');
+UPDATE rt.domain_arrays SET v = '{2}', n = '{2}';
+ALTER TABLE rt.domain_arrays ALTER COLUMN v TYPE rt.positive[],
+                            ALTER COLUMN n TYPE rt.required[];
+SELECT length(dolt_commit('-am', 'feature: array domains')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SAVEPOINT before_merge;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.domain_arrays);
+SELECT * FROM rt.domain_arrays ORDER BY id;
+SELECT dolt_conflicts_resolve('--theirs', 'rt.domain_arrays');
+SELECT * FROM rt.domain_arrays ORDER BY id;
+SELECT count(*) AS conflicts_left FROM dolt_conflicts(NULL::rt.domain_arrays);
+ROLLBACK TO before_merge;
+SELECT (dolt_merge('feature'))[2:4];
+SELECT count(*) AS conflicts FROM dolt_conflicts(NULL::rt.domain_arrays);
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 

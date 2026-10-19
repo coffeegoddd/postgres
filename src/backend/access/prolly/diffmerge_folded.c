@@ -3538,9 +3538,10 @@ same_but_trailing_blanks(Datum a, Datum b)
  * it (cr->back; or there's no cast back where one's needed), or differs
  * from the value's text form read as the new type (cr->by_text), or the
  * cast or that read fails with a data exception (value too long,
- * numeric field overflow, invalid input) where it's guarded; *d and
- * *isnull are then the cast's value if it gave one, else null.  Other
- * errors are raised.
+ * numeric field overflow, invalid input) or an integrity constraint
+ * violation (a domain nested in an array, composite or range) where it's
+ * guarded (written reads never are); *d and *isnull are then the cast's
+ * value if it gave one, else null.  Other errors are raised.
  */
 static bool
 read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
@@ -3619,7 +3620,8 @@ done:
 			PG_RE_THROW();
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION &&
+			ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION)
 			PG_RE_THROW();
 		FlushErrorState();
 		FreeErrorData(ed);
