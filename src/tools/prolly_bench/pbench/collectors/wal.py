@@ -3,6 +3,7 @@ full-page images (from pg_stat_wal)."""
 
 from __future__ import annotations
 
+from pbench.collectors._snapshot import snapshot
 from pbench.core import registry
 from pbench.core.interfaces import Collector
 from pbench.core.stats import per, counter_delta
@@ -16,7 +17,7 @@ class WalCollector(Collector):
             "FROM pg_stat_wal")
 
     def _snap(self, ctx):
-        lsn, records, fpi, fpi_bytes = ctx.cluster.scalar(self._SQL).split("|")
+        lsn, records, fpi, fpi_bytes = snapshot(ctx, self._SQL).split("|")
         return lsn, int(records), int(fpi), int(fpi_bytes)
 
     def start(self, ctx):

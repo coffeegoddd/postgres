@@ -56,6 +56,7 @@
 #include "access/xact.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/spin.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
@@ -233,6 +234,7 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 		!key_of(pointer, typid, &key, &frozen, false))
 	{
 		counts.misses++;
+		pgstat_count_prolly(PGSTAT_PROLLY_MEMO_MISSES, 1);
 		return false;
 	}
 
@@ -280,12 +282,14 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 		{
 			appendBinaryStringInfo(ref, (const char *) buf, len);
 			counts.hits++;
+			pgstat_count_prolly(PGSTAT_PROLLY_MEMO_HITS, 1);
 			return true;
 		}
 		if (own)
 			(void) hash_search(pending, &key, HASH_REMOVE, NULL);
 	}
 	counts.misses++;
+	pgstat_count_prolly(PGSTAT_PROLLY_MEMO_MISSES, 1);
 	return false;
 }
 

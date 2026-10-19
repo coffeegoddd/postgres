@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBD
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBE
 
 typedef struct PgStat_ArchiverStats
 {
@@ -586,6 +586,43 @@ typedef struct PgStat_WalStats
 } PgStat_WalStats;
 
 /* -------
+ * PgStat_ProllyStats	The prolly storage engine's work, per database
+ *
+ * Counters, not timings: what the engine did, so two runs of the same work
+ * count the same.  Work counts when it is done, whether or not its
+ * transaction commits (chunks a rollback discards were still appended).
+ * pg_stat_prolly shows each as a (name, value) row, named by
+ * pgstat_prolly_counter_name().
+ * -------
+ */
+typedef enum PgStat_ProllyCounter
+{
+	PGSTAT_PROLLY_NODES_READ,	/* tree nodes read from the chunk store */
+	PGSTAT_PROLLY_NODES_WRITTEN,	/* new tree nodes written */
+	PGSTAT_PROLLY_VALUE_NODES_WRITTEN,	/* of those, value trees' */
+	PGSTAT_PROLLY_CHUNKS_APPENDED,	/* new chunks put in the chunk store */
+	PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, /* and their bytes */
+	PGSTAT_PROLLY_BYTES_HASHED, /* bytes given to the content hash */
+	PGSTAT_PROLLY_FOLD_ROWS_READ,	/* rows a fold read */
+	PGSTAT_PROLLY_FOLD_ROWS_WRITTEN,	/* rows a fold put in or took out */
+	PGSTAT_PROLLY_FOLD_PAGES,	/* pages the change finder read */
+	PGSTAT_PROLLY_FOLD_CANDIDATES,	/* rows the change finder looked up */
+	PGSTAT_PROLLY_FOLD_FULL,	/* tables folded from every row */
+	PGSTAT_PROLLY_COMMITS,		/* commits written */
+	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
+	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */
+	PGSTAT_PROLLY_MEMO_MISSES,	/* and those that didn't */
+} PgStat_ProllyCounter;
+
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MEMO_MISSES + 1)
+
+typedef struct PgStat_ProllyStats
+{
+	PgStat_Counter counts[PGSTAT_PROLLY_NUM_COUNTERS];
+	TimestampTz stat_reset_timestamp;
+} PgStat_ProllyStats;
+
+/* -------
  * PgStat_Backend		Backend statistics
  * -------
  */
@@ -724,6 +761,26 @@ extern void pgstat_count_lock_fastpath_exceeded(uint8 locktag_type);
 extern void pgstat_count_lock_waits(uint8 locktag_type,
 									PgStat_Counter usecs);
 extern PgStat_Lock *pgstat_fetch_stat_lock(void);
+
+/*
+ * Functions in pgstat_prolly.c
+ */
+
+struct ProllyNodeCounters;
+
+extern PGDLLIMPORT PgStat_Counter PendingProllyStats[PGSTAT_PROLLY_NUM_COUNTERS];
+
+/* Count n more of the engine's work c (flushed after the transaction). */
+static inline void
+pgstat_count_prolly(PgStat_ProllyCounter c, uint64 n)
+{
+	PendingProllyStats[c] += n;
+}
+
+extern struct ProllyNodeCounters *pgstat_prolly_tree_counters(void);
+extern const char *pgstat_prolly_counter_name(PgStat_ProllyCounter c);
+extern void AtEOXact_PgStat_Prolly(void);
+extern PgStat_ProllyStats *pgstat_fetch_stat_prolly(Oid dboid);
 
 /*
  * Functions in pgstat_database.c

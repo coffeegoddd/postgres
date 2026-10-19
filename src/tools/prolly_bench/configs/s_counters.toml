@@ -1,0 +1,85 @@
+# The S suite's counter shape: a fixed amount of work, so two runs of one
+# build count the same, exactly, and a pull request is compared with its
+# base by what each workload does, not by how long it takes.
+#
+# One client; pgbench -t, sysbench --events and the TPC-H serial pass as the
+# work; fixed seeds; autovacuum off; no timed checkpoints, and a CHECKPOINT
+# just before the measured part (no warm-up comes between); sizes that fit
+# shared_buffers.  Counters are read once the measured clients have gone
+# (settled_counters), pg_stat_io's for client backends only.  wal_level is
+# minimal so that no standby snapshots are logged on a timer.
+#
+# S7's GiST index varies by a few pages between runs: GiST breaks ties
+# between equally good pages at random (gistchoose()), from a seed no
+# setting fixes.  The gate reports a counter unstable in the base, and
+# doesn't gate on it.
+#
+# S5 (hot-row contention) isn't here: at one client it exercises none of
+# the lock code it is for.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["counters"]
+workloads = ["S1", "S2", "S3", "S4", "S7", "S8", "S10", "S13"]
+fio_baseline = false
+seed = 1
+settled_counters = true
+collectors = ["wal", "pg_stat_io", "space", "engine_counters", "instructions"]
+required_collectors = ["wal", "pg_stat_io", "space"]
+
+[postgres]
+shared_buffers = "512MB"
+autovacuum = "off"
+checkpoint_timeout = "1d"
+max_wal_size = "16GB"
+wal_level = "minimal"
+max_wal_senders = 0
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 32
+# ANALYZE samples 300 rows per unit of target: at 1000, every row of these
+# sizes, so its statistics (and the plans made from them) don't vary.
+default_statistics_target = 1000
+
+[sizes.counters]
+pgbench_scale = 2
+s4_rows = 50000
+s7_rows = 20000
+tpcc_warehouses = 1
+tpch_scale = 0.01
+v_rows = 1000
+sysbench_tables = 2
+sysbench_table_size = 10000
+
+[workloads.S1]
+transactions = 2000
+
+[workloads.S2]
+transactions = 5000
+
+[workloads.S3]
+ranges = [100]
+transactions = 500
+
+[workloads.S7]
+transactions = 2000
+
+[workloads.S8]
+percents = [1]
+transactions = 20
+
+[workloads.S10]
+tests = ["oltp_read_write", "oltp_point_select", "oltp_update_index"]
+transactions = 1000
+
+[workloads.S13]
+# Serial: Q1-Q22 once each (cold, then measured), a fixed amount of work.
+modes = ["serial"]
+
+[tools]
+benchbase = "build-bench/benchbase/benchbase-postgres"

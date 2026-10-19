@@ -69,6 +69,7 @@
 #include "common/int.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -1243,6 +1244,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 		if (!ok || delta == 0)
 			continue;
 		f->work.candidates++;
+		f->work.rows_read++;
 		PROLLY_CALL(f->tree, cursor_seek, cur, &ck, ForwardScanDirection);
 		if (PROLLY_CALL(f->tree, cursor_next, cur, &k, &v) &&
 			keying_compare(&k, &ck, f) == 0)
@@ -1283,6 +1285,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(f->tree, cursor_close, cur);
+	f->work.rows_written += nedits;
 	if (ok && nedits > 0)
 		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
 	else if (ok)
@@ -1389,6 +1392,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	/* each candidate's old and new rows; the pairs that differ are edits */
 	f->ncands = unique_candidates(f, f->cands, f->ncands);
 	f->work.candidates += f->ncands;
+	f->work.rows_read += f->ncands;
 	edits = palloc_array(ProllyEdit, Max(f->ncands, 1));
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
 					  CurrentMemoryContext);
@@ -1458,6 +1462,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	}
 	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
+	f->work.rows_written += nedits;
 	if (nedits > 0)
 		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
 	else
@@ -1521,6 +1526,7 @@ fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 		CHECK_FOR_INTERRUPTS();
 	}
 	table_endscan(scan);
+	f->work.rows_read += nrows;
 
 	if (nrows > 1)
 		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, f);
@@ -1549,6 +1555,7 @@ fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 		v.len = value.len;
 		PROLLY_CALL(f->tree, build_add, b, &k, &v);
 		pfree(value.data);
+		f->work.rows_written++;
 		i = j;
 	}
 	PROLLY_CALL(f->tree, build_finish, b, data);
@@ -1875,6 +1882,13 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 		counters.pages += f.work.pages;
 		counters.candidates += f.work.candidates;
 		counters.full += f.work.full;
+		counters.rows_read += f.work.rows_read;
+		counters.rows_written += f.work.rows_written;
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_PAGES, f.work.pages);
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f.work.candidates);
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f.work.rows_read);
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f.work.rows_written);
 		if (next)
 		{
 			State		ns = {0};

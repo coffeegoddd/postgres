@@ -1,9 +1,12 @@
 """Buffer-manager I/O during the window, from pg_stat_io: hits, reads,
-writes, extends, evictions and fsyncs on relations, summed over backend
-types and contexts."""
+writes, extends, evictions and fsyncs on relations, summed over contexts
+and backend types (with settled_counters, client backends only: the
+checkpointer's and background writer's I/O is decided by timing, not by
+the work)."""
 
 from __future__ import annotations
 
+from pbench.collectors._snapshot import settled, snapshot
 from pbench.core import registry
 from pbench.core.interfaces import Collector
 from pbench.core.stats import counter_delta
@@ -18,16 +21,19 @@ class PgStatIoCollector(Collector):
 
     def _snap(self, ctx):
         sums = ", ".join(f"coalesce(sum({c}), 0)" for c in _COLS)
-        vals = ctx.cluster.scalar(
-            f"SELECT {sums} FROM pg_stat_io WHERE object = 'relation'").split("|")
+        where = "object = 'relation'"
+        if settled(ctx):
+            where += " AND backend_type = 'client backend'"
+        vals = snapshot(ctx, f"SELECT {sums} FROM pg_stat_io WHERE {where}").split("|")
         return dict(zip(_COLS, (float(v) for v in vals)))
 
     def start(self, ctx):
         self.before = self._snap(ctx)
 
     def stop(self, ctx):
-        # Cumulative statistics may lag backend work. Never sleep here:
-        # doing so extends every collector stopped after this one.
+        # Cumulative statistics may lag backend work. Never sleep here
+        # (settling waits for the measured clients only): doing so extends
+        # every collector stopped after this one.
         self.after = self._snap(ctx)
 
     def results(self, ctx, outcome):
@@ -35,6 +41,7 @@ class PgStatIoCollector(Collector):
         lookups = d["hits"] + d["reads"]
         return {
             "io_hit_ratio": d["hits"] / lookups if lookups else None,
+            "io_hits": d["hits"],
             "io_reads": d["reads"],
             "io_writes": d["writes"],
             "io_extends": d["extends"],

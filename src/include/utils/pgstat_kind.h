@@ -41,8 +41,11 @@
 #define PGSTAT_KIND_SLRU	13
 #define PGSTAT_KIND_WAL	14
 
+/* the prolly storage engine's work, per database (variable-numbered) */
+#define PGSTAT_KIND_PROLLY	15
+
 #define PGSTAT_KIND_BUILTIN_MIN PGSTAT_KIND_DATABASE
-#define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_WAL
+#define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_PROLLY
 #define PGSTAT_KIND_BUILTIN_SIZE (PGSTAT_KIND_BUILTIN_MAX + 1)
 
 /* Custom stats kinds */

@@ -97,8 +97,7 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     env["postgres"]["binary_hashes"] = {
         name: sha256(bin_dir / name) for name in ("postgres", "pg_config", "psql", "pgbench", "initdb", "pg_ctl")
         if (bin_dir / name).is_file()}
-    provenance = bin_dir.parent / "pbench-build.json"
-    env["postgres"]["build_provenance"] = json.loads(provenance.read_text()) if provenance.exists() else None
+    env["postgres"]["build_provenance"] = build_provenance(bin_dir)
     src = repo / "src/tools/prolly_bench"
     env["harness_hash"] = fingerprint({str(p.relative_to(src)): sha256(p)
         for p in sorted(src.rglob("*")) if p.is_file() and p.suffix in (".py", ".go", ".sql", ".sh", ".java")})
@@ -115,6 +114,13 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     if tools.get("slt_runner") and Path(tools["slt_runner"]).is_file():
         env["client_hashes"]["slt_runner"] = sha256(Path(tools["slt_runner"]))
     return env
+
+
+def build_provenance(bin_dir: Path) -> Any:
+    """What build_postgres.sh recorded about the build bin_dir is of (its
+    commit, source and binary hashes), or None for a build without."""
+    provenance = bin_dir.parent / "pbench-build.json"
+    return json.loads(provenance.read_text()) if provenance.exists() else None
 
 
 def slt_source_hash(repo: Path) -> str:

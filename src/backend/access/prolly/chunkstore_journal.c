@@ -126,6 +126,7 @@
 #include "access/xloginsert.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "port/atomics.h"
 #include "portability/instr_time.h"
 #include "port/pg_crc32c.h"
@@ -2405,6 +2406,8 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	e->len = s->pending.len - at;
 	e->xid = xid;
 	e->other = NULL;
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNKS_APPENDED, 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, len);
 
 	if (s->pending.len >= APPEND_BATCH)
 		flush_pending(s);

@@ -92,6 +92,7 @@ typedef struct ProllyNodeCounters
 {
 	uint64		nodes_read;
 	uint64		nodes_written;		/* new nodes, not ones already stored */
+	uint64		value_nodes_written;	/* of those, value trees' */
 } ProllyNodeCounters;
 
 /*

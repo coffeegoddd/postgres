@@ -12,6 +12,10 @@
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
   prolly_bench table [DIR ...]                  engines side by side, per metric
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
+  prolly_bench scounters RUN RUN2               S counter runs of one build: unstable counters
+  prolly_bench scalibrate --counters ... --timing ...   S gate: the noise of A/A runs
+  prolly_bench sgate counters|timing RUN ...    S gate: a pull request against its base
+  prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
 """
 
 from __future__ import annotations
@@ -30,6 +34,52 @@ HERE = Path(__file__).resolve().parents[1]
 
 def _csv(conv):
     return lambda s: [conv(x) for x in s.split(",") if x]
+
+
+def pg_bins(text: str) -> list[tuple[str, Path]]:
+    """--pg-bin: one directory ([("", DIR)]), or builds to compare, the base
+    first: base=DIR,candidate=DIR."""
+    if "=" not in text:
+        return [("", Path(text))]
+    builds = []
+    for part in text.split(","):
+        name, sep, path = part.partition("=")
+        if not sep or not name or not path or not name.replace("_", "").isalnum():
+            raise SystemExit(f"--pg-bin: expected NAME=DIR, got {part!r}")
+        builds.append((name, Path(path)))
+    if len(builds) < 2 or len({n for n, _ in builds}) != len(builds):
+        raise SystemExit("--pg-bin: give two or more builds, each named once")
+    return builds
+
+
+def build_commits(text: str | None, builds: list[tuple[str, Path]]) -> dict[str, str]:
+    """--build-commit base=SHA,candidate=SHA: the commit (or a prefix of 7
+    or more of its hex digits) each build's provenance must name."""
+    if not text:
+        return {}
+    out = {}
+    for part in text.split(","):
+        name, sep, sha = part.partition("=")
+        if not sep or len(sha) < 7 or any(c not in "0123456789abcdef" for c in sha.lower()):
+            raise SystemExit(f"--build-commit: expected NAME=SHA (7 or more hex digits), got {part!r}")
+        out[name] = sha.lower()
+    unknown = set(out) - {name for name, _ in builds}
+    if unknown:
+        raise SystemExit(f"--build-commit names no build given to --pg-bin: {sorted(unknown)}")
+    return out
+
+
+def check_build_commits(builds: list[tuple[str, Path]], commits: dict[str, str]) -> None:
+    """Refuse, before anything runs, a build whose provenance names another
+    commit than --build-commit gives it."""
+    from pbench.core.env import build_provenance
+    for name, bin_dir in builds:
+        if name not in commits:
+            continue
+        commit = (build_provenance(bin_dir.resolve()) or {}).get("commit") or ""
+        if not commit.startswith(commits[name]):
+            raise SystemExit(f"the {name} build at {bin_dir} is of "
+                             f"{commit or 'no recorded commit'}, not {commits[name]}")
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -69,40 +119,58 @@ def _run(args: argparse.Namespace) -> int:
         from pbench import cshard
         print(cshard.to_text([cshard.apply(cfg, _corpus(cfg), cfg["run"]["shard"])]))
 
-    # Each engine retains its result set; matched cells run as randomized pairs.
+    # Each engine (and build) retains its result set; matched cells run as
+    # randomized groups.
     ams = sorted(dict.fromkeys(args.am), key=lambda am: am != "heap")
-    if args.label and len(ams) > 1:
-        raise SystemExit("--label names one result set; give one --am with it")
+    builds = pg_bins(args.pg_bin)
+    commits = build_commits(args.build_commit, builds)
+    if args.label and len(ams) * len(builds) > 1:
+        raise SystemExit("--label names one result set; give one --am and one --pg-bin with it")
+    if len(builds) > 1 and args.suite != "S":
+        raise SystemExit("builds are compared in the S suite only")
+    if cfg["run"]["comparison_only"] and len(builds) < 2:
+        raise SystemExit("a comparison_only configuration compares builds: give "
+                         "--pg-bin base=DIR,candidate=DIR")
+    check_build_commits(builds, commits)
     ok = True
     out_dirs = []
     runners = []
-    for am in ams:
-        label = args.label
-        if not label:
-            label = "B0" if am == "heap" else am
-            if cfg["postgres"].get("full_page_writes") == "off" and \
-                    args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
-                label += "-fpw-off"
-        runner = Runner(suite=args.suite, cfg=cfg, table_am=am, label=label,
-                        repo=REPO, bin_dir=args.pg_bin.resolve(),
-                        work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
-                        command="prolly_bench " + shlex.join(sys.argv[1:]),
-                        keep_failed=args.keep_failed)
-        runners.append(runner)
-        out_dirs.append(runner.out_dir)
+    for build, bin_dir in builds:
+        for am in ams:
+            label = args.label
+            if not label:
+                label = "B0" if am == "heap" else am
+                if cfg["postgres"].get("full_page_writes") == "off" and \
+                        args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
+                    label += "-fpw-off"
+                if build:
+                    label = f"{build}-{label}"
+            runner = Runner(suite=args.suite, cfg=cfg, table_am=am, label=label,
+                            repo=REPO, bin_dir=bin_dir.resolve(),
+                            work_dir=args.work_dir.resolve(), out_root=args.out.resolve(),
+                            command="prolly_bench " + shlex.join(sys.argv[1:]),
+                            keep_failed=args.keep_failed, build=build,
+                            builds=tuple(name for name, _ in builds if name))
+            runners.append(runner)
+            out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run
     all_results = run_many(runners)
     ok = all(bool(results) and not validate_run(runner.out_dir)
              for runner, results in zip(runners, all_results))
-    if args.suite == "S" and "heap" in ams:
+    if args.suite == "S":
         from pbench.core.validation import compatible
-        baseline = runners[ams.index("heap")].out_dir
-        for runner in runners:
-            if runner.table_am != "heap":
-                problems = compatible(baseline, runner.out_dir)
-                for problem in problems:
-                    print(problem, file=sys.stderr)
-                ok = ok and not problems
+        by = {(r.build, r.table_am): r.out_dir for r in runners}
+        pairs = [(by[(b, "heap")], by[(b, am)], "engine")
+                 for b, _ in builds for am in ams if am != "heap" and (b, "heap") in by]
+        if len(builds) > 1:
+            first = builds[0][0]
+            pairs += [(by[(first, am)], by[(b, am)], "build")
+                      for b, _ in builds[1:] for am in ams]
+        for base, other, vary in pairs:
+            problems = compatible(base, other, vary)
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            ok = ok and not problems
     if args.suite == "C" and len(out_dirs) > 1:
         from pbench import ccompare, table
         print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
@@ -272,6 +340,9 @@ def _table(args) -> int:
         return int(base is None or len(sets) < 2 or any(ccompare.gate(base, s, workloads)
                    for s in sets if s is not base))
     md = table.to_markdown(sets, suite)
+    if any(s.build for s in sets):
+        from pbench import bcompare
+        md += "\n" + bcompare.to_markdown(bcompare.compare(sets))
     out.with_suffix(".md").write_text(md)
     out.with_suffix(".html").write_text(table.to_html(sets, suite))
     print(md)
@@ -304,7 +375,11 @@ def main(argv=None) -> int:
     r.add_argument("--measure", type=int, help="measured seconds")
     r.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                    help="Postgres setting override (repeatable)")
-    r.add_argument("--pg-bin", type=Path, default=REPO / "build-rel" / "inst" / "bin")
+    r.add_argument("--pg-bin", default=str(REPO / "build-rel" / "inst" / "bin"),
+                   help="the server's bin directory, or builds to compare, base first: "
+                        "base=DIR,candidate=DIR (S suite)")
+    r.add_argument("--build-commit", metavar="NAME=SHA,...",
+                   help="the commit each build's provenance must name")
     r.add_argument("--work-dir", type=Path, default=REPO / "build-bench" / "work",
                    help="where clusters live: on the device under test")
     r.add_argument("--out", type=Path, default=REPO / "specs" / "results")
@@ -392,6 +467,63 @@ def main(argv=None) -> int:
     evidence.add_argument("dirs", nargs="+", type=Path)
     evidence.add_argument("--baseline", type=Path)
     evidence.set_defaults(fn=_gate)
+
+    from pbench import scounters
+    sc = sub.add_parser("scounters", help="S counter runs: counters two runs of one build disagree on")
+    sc.add_argument("one", type=Path)
+    sc.add_argument("two", type=Path)
+    sc.add_argument("--instructions-tolerance", type=float, default=0.01,
+                    help="relative difference instruction counts may have (default 0.01)")
+    sc.set_defaults(fn=scounters.run)
+
+    from pbench import scalibrate
+    cal = sub.add_parser("scalibrate", help="S suite gate: noise of A/A counter and timing runs")
+    cal.add_argument("--counters", type=Path, nargs="*", default=[],
+                     help="counter runs of one build (configs/s_counters.toml)")
+    cal.add_argument("--timing", type=Path, nargs="*", default=[],
+                     help="timing runs of one build against itself (configs/s_pr.toml)")
+    cal.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
+    cal.add_argument("--out", type=Path, help="Markdown report")
+    cal.add_argument("--json", type=Path)
+    cal.set_defaults(fn=scalibrate.run)
+
+    from pbench import sgate
+    sg = sub.add_parser("sgate", help="S suite gate: a pull request's counters and timing against its base's")
+    sg.add_argument("layer", choices=["counters", "timing"])
+    sg.add_argument("runs", type=Path, nargs="+",
+                    help="counters: BASE BASE2 CANDIDATE CANDIDATE2; timing: RUN [RETRY ...]")
+    sg.add_argument("--accept", type=Path, help="perf_accept.toml, as the pull request has it")
+    sg.add_argument("--accept-base", type=Path,
+                    help="perf_accept.toml as the base has it: only entries the pull request adds count")
+    sg.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
+    sg.add_argument("--report-only", action="store_true", help="timing: report, never fail")
+    sg.add_argument("--json", type=Path, help="the findings, for sreport")
+    sg.set_defaults(fn=sgate.run)
+
+    from pbench import sreport
+    sr = sub.add_parser("sreport", help="S suite gate: the pull-request comment")
+    sr.add_argument("--counters", type=Path, action="append", default=[],
+                    help="sgate counters --json output (repeatable: one per group of workloads)")
+    sr.add_argument("--timing", type=Path, help="sgate timing --json output")
+    sr.add_argument("--head", required=True)
+    sr.add_argument("--base", required=True)
+    sr.add_argument("--runner", default="ubuntu-24.04")
+    sr.add_argument("--run-url")
+    sr.add_argument("--failed-job", action="append", default=[], metavar="NAME: RESULT")
+    sr.add_argument("--reproduce", help="a command that reproduces the run")
+    sr.add_argument("--out", type=Path, required=True)
+    sr.add_argument("--nightly", action="store_true",
+                    help="a night against the night before: timing only")
+    sr.set_defaults(fn=sreport.run)
+
+    from pbench import shistory
+    sh = sub.add_parser("shistory", help="S suite nightly: a night's summary for perf-history")
+    sh.add_argument("run", type=Path, help="the nightly's timing run")
+    sh.add_argument("--timing", type=Path, help="sgate timing --json output")
+    sh.add_argument("--instructions", type=Path, help="a cachegrind run (s_cachegrind.toml)")
+    sh.add_argument("--date", required=True)
+    sh.add_argument("--out", type=Path, required=True)
+    sh.set_defaults(fn=shistory.run)
 
     from pbench import complexity
     growth = sub.add_parser("complexity", help="gate node-work growth at fixed workload variant across dataset sizes")

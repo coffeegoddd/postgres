@@ -42,6 +42,7 @@ AtEOXact_PgStat(bool isCommit, bool parallel)
 	PgStat_SubXactStatus *xact_state;
 
 	AtEOXact_PgStat_Database(isCommit, parallel);
+	AtEOXact_PgStat_Prolly();
 
 	/* handle transactional stats information */
 	xact_state = pgStatXactStack;
@@ -225,6 +226,9 @@ PostPrepare_PgStat(void)
 		PostPrepare_PgStat_Relations(xact_state);
 	}
 	pgStatXactStack = NULL;
+
+	/* (the prolly engine's work counts whether its transaction commits) */
+	AtEOXact_PgStat_Prolly();
 
 	/* Make sure any stats snapshot is thrown away */
 	pgstat_clear_snapshot();

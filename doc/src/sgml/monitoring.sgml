@@ -539,6 +539,15 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
      </row>
 
      <row>
+      <entry><structname>pg_stat_prolly</structname><indexterm><primary>pg_stat_prolly</primary></indexterm></entry>
+      <entry>One row per counter of the prolly storage engine's work in the
+       current database. See
+       <link linkend="monitoring-pg-stat-prolly-view">
+       <structname>pg_stat_prolly</structname></link> for details.
+      </entry>
+     </row>
+
+     <row>
       <entry><structname>pg_stat_replication_slots</structname><indexterm><primary>pg_stat_replication_slots</primary></indexterm></entry>
       <entry>One row per replication slot, showing statistics about the
        replication slot's usage. See
@@ -5616,6 +5625,78 @@ description | Waiting for a newly initialized WAL file to reach durable storage
 
  </sect2>
 
+ <sect2 id="monitoring-pg-stat-prolly-view">
+  <title><structname>pg_stat_prolly</structname></title>
+
+  <indexterm>
+   <primary>pg_stat_prolly</primary>
+  </indexterm>
+
+  <para>
+   The <structname>pg_stat_prolly</structname> view will contain one row for
+   each counter of the work the prolly storage engine did in the current
+   database: what it read, wrote and hashed, not how long that took, so the
+   same work counts the same.  Work counts when it is done, whether or not
+   its transaction commits: chunks a rollback discards were still appended,
+   and a head set to the commit it already named was still set.  Each
+   backend counts in its own memory and flushes its counts when its
+   transaction ends, as for the other cumulative statistics.
+  </para>
+
+  <table id="pg-stat-prolly-view" xreflabel="pg_stat_prolly">
+   <title><structname>pg_stat_prolly</structname> View</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>name</structfield> <type>text</type>
+      </para>
+      <para>
+       The counter: <literal>nodes_read</literal> and
+       <literal>nodes_written</literal> (tree nodes read from and newly
+       written to the chunk store), <literal>value_nodes_written</literal>
+       (of those written, the nodes of value trees, which hold large values
+       out of line), <literal>chunks_appended</literal> and
+       <literal>chunk_bytes_appended</literal> (new chunks put in the chunk
+       store, and their bytes), <literal>bytes_hashed</literal> (bytes given
+       to the content hash), <literal>fold_rows_read</literal> and
+       <literal>fold_rows_written</literal> (rows folds read, and put in or
+       took out of a tree), <literal>fold_pages</literal>,
+       <literal>fold_candidates</literal> and
+       <literal>fold_full_tables</literal> (pages read, rows looked up, and
+       tables folded from every row, finding changed rows),
+       <literal>commits</literal> (commits written),
+       <literal>head_moves</literal> (branch heads set), and
+       <literal>memo_hits</literal> and <literal>memo_misses</literal>
+       (lookups of the value memo)
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>value</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Its count since the statistics were last reset
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+ </sect2>
+
  <sect2 id="monitoring-pg-stat-slru-view">
   <title><structname>pg_stat_slru</structname></title>
 
@@ -6024,6 +6105,12 @@ description | Waiting for a newly initialized WAL file to reach durable storage
          <para>
           <literal>lock</literal>: Reset all the counters shown in the
           <structname>pg_stat_lock</structname> view.
+         </para>
+        </listitem>
+        <listitem>
+         <para>
+          <literal>prolly</literal>: Reset all the counters shown in the
+          <structname>pg_stat_prolly</structname> view, in every database.
          </para>
         </listitem>
         <listitem>

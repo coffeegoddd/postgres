@@ -548,6 +548,12 @@ typedef struct PgStatShared_Backend
 	PgStat_Backend stats;
 } PgStatShared_Backend;
 
+typedef struct PgStatShared_Prolly
+{
+	PgStatShared_Common header;
+	PgStat_ProllyStats stats;
+} PgStatShared_Prolly;
+
 /*
  * Central shared memory entry for the cumulative stats system.
  *
@@ -795,6 +801,14 @@ extern bool pgstat_lock_flush_cb(bool nowait);
 extern void pgstat_lock_init_shmem_cb(void *stats);
 extern void pgstat_lock_reset_all_cb(TimestampTz ts);
 extern void pgstat_lock_snapshot_cb(void);
+
+/*
+ * Functions in pgstat_prolly.c
+ */
+
+extern bool pgstat_prolly_flush_cb(bool nowait);
+extern void pgstat_prolly_reset_timestamp_cb(PgStatShared_Common *header,
+											 TimestampTz ts);
 
 /*
  * Functions in pgstat_relation.c

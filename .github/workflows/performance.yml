@@ -1,0 +1,743 @@
+# The S suite on every pull request: the pull request (the candidate, its
+# merge commit) against its base (that merge commit's first parent), on
+# GitHub-hosted runners, in two layers:
+#
+# - counters: what each workload does over a fixed amount of work
+#   (configs/s_counters.toml), the base and the candidate each run twice;
+#   `sgate counters` fails on a regression no perf_accept.toml entry the
+#   pull request adds accepts;
+# - timing: the builds' paired, interleaved timing (configs/s_pr.toml),
+#   retried where a cell regresses; reported, not gated, on shared VMs.
+#
+# "S suite gate" always reports, so it can be a required check (it isn't
+# until the gate is calibrated: configs/s_gate.toml); it passes without
+# building for a pull request that changes only specs/.  It leaves the
+# pull-request comment (<!-- s-suite -->) as the s-suite-comment artifact
+# for the workflow_run commenter to post, so code from a pull request never
+# runs with a token that can write.
+#
+# Every push to any branch builds and caches its head, so a pull request's
+# base (a stack layer's base is the layer below's head) is usually cached.
+#
+# Nightly (and by hand), the nightly job compares tonight's master with the
+# previous night's; see it below.
+
+name: performance
+
+on:
+  pull_request:
+  # (a branch's pushes build and cache its head: a pull request onto it
+  # finds its base cached; a pull request's own run builds its merge)
+  push:
+    tags-ignore: ['**']
+    # (the nightly's history, no source)
+    branches-ignore: [perf-history]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run; pushes each get their
+# own group (by commit), so none cancels another.
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BENCH: src/tools/prolly_bench
+  BENCHBASE_COMMIT: a3a748326f4d1e615fd12db4a6ae59a60190a6ee
+
+jobs:
+  classify:
+    name: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      base: ${{ steps.classify.outputs.base }}
+      candidate: ${{ steps.classify.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Anything outside specs/?
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          code=true
+          candidate=$(git rev-parse HEAD)
+          base=
+          if [ "$EVENT" = pull_request ]; then
+            # (HEAD is the merge into the base: its first parent is the base)
+            base=$(git rev-parse HEAD^1)
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            printf '%s\n' "$changed"
+            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
+              code=false
+            fi
+          fi
+          { echo "code=$code"; echo "base=$base"; echo "candidate=$candidate"; } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BASE: ${{ needs.classify.outputs.base }}
+      CANDIDATE: ${{ needs.classify.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync
+
+      # Builds are cached by commit and runner image (the toolchain), each
+      # at one path outside the checkout, so a push's build of a commit is
+      # the one a pull request onto it finds as its base, and no build
+      # lies in the tree the next one hashes as source.  The head is built
+      # first, from the checkout; the base with the head's build script,
+      # from the base's source beside it (which may predate the script).
+      - name: Runner image
+        id: image
+        run: echo "image=$ImageOS-$ImageVersion" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Cached head build
+        id: head-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.CANDIDATE }}-${{ steps.image.outputs.image }}
+
+      - name: Build the head
+        if: steps.head-cache.outputs.cache-hit != 'true'
+        run: |
+          bash "$BENCH/build_postgres.sh" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/head-build" -- --with-openssl
+          mv "$RUNNER_TEMP/head-build/inst" "$RUNNER_TEMP/s-cache"
+
+      - uses: actions/cache/save@v4
+        if: steps.head-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.CANDIDATE }}-${{ steps.image.outputs.image }}
+
+      - name: Set the head aside
+        run: |
+          mkdir -p "$RUNNER_TEMP/s-builds"
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/candidate"
+
+      - name: Cached base build
+        if: env.BASE != ''
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
+
+      - name: Build the base
+        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
+          bash "$BENCH/build_postgres.sh" --source "$RUNNER_TEMP/base-src" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/base-build" -- --with-openssl
+          mv "$RUNNER_TEMP/base-build/inst" "$RUNNER_TEMP/s-cache"
+
+      - uses: actions/cache/save@v4
+        if: env.BASE != '' && steps.base-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ env.BASE }}-${{ steps.image.outputs.image }}
+
+      - name: Both builds are of their commits
+        if: github.event_name == 'pull_request'
+        run: |
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/base"
+          for b in base candidate; do
+            want=$([ "$b" = base ] && echo "$BASE" || echo "$CANDIDATE")
+            got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' \
+              "$RUNNER_TEMP/s-builds/$b/pbench-build.json")
+            test "$got" = "$want" || { echo "$b build is of $got, not $want" >&2; exit 1; }
+          done
+          { echo "base=$BASE"; echo "candidate=$CANDIDATE"; } > "$RUNNER_TEMP/s-builds/SHAS"
+
+      - name: Cached BenchBase
+        if: github.event_name == 'pull_request'
+        id: benchbase-cache
+        uses: actions/cache@v4
+        with:
+          path: build-bench/benchbase/benchbase-postgres
+          key: benchbase-${{ env.BENCHBASE_COMMIT }}-${{ hashFiles('src/tools/prolly_bench/benchbase/**', 'src/tools/prolly_bench/build_benchbase.sh') }}
+
+      - uses: actions/setup-java@v4
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Fetch pinned BenchBase source
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/benchbase
+          ref: ${{ env.BENCHBASE_COMMIT }}
+          path: benchbase-source
+
+      - name: Build BenchBase
+        if: github.event_name == 'pull_request' && steps.benchbase-cache.outputs.cache-hit != 'true'
+        run: bash "$BENCH/build_benchbase.sh" "$PWD/benchbase-source"
+
+      - name: Pack both builds and BenchBase
+        if: github.event_name == 'pull_request'
+        run: |
+          tar -czf s-builds.tgz -C "$RUNNER_TEMP" s-builds \
+            -C "$GITHUB_WORKSPACE" build-bench/benchbase/benchbase-postgres
+
+      - uses: actions/upload-artifact@v5
+        if: github.event_name == 'pull_request'
+        with:
+          name: s-builds
+          path: s-builds.tgz
+          retention-days: 3
+
+  counters:
+    name: counters (${{ matrix.workloads }})
+    needs: [classify, build]
+    if: github.event_name == 'pull_request' && needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        workloads: ['S1,S2,S3', 'S4,S7,S8', 'S10,S13']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: s-builds
+
+      - name: Unpack, install clients, and allow counting instructions
+        run: |
+          tar -xzf s-builds.tgz
+          cat s-builds/SHAS
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sysbench \
+            "linux-tools-$(uname -r)" linux-tools-common || \
+            sudo apt-get install -y --no-install-recommends sysbench
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Base, candidate, base again, candidate again
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: |
+          for run in base candidate base2 candidate2; do
+            build=${run%2}
+            # (a failed run leaves evidence the gate reports as an invariant)
+            "$BENCH/prolly_bench" run S --am heap,prolly \
+              --config "$BENCH/configs/s_counters.toml" --workloads "$WORKLOADS" \
+              --pg-bin "$PWD/s-builds/$build/bin" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/counters/$run" || true
+          done
+
+      - name: sgate counters
+        env:
+          WORKLOADS: ${{ matrix.workloads }}
+        run: |
+          # Only the entries this pull request adds to perf_accept.toml count.
+          git show "HEAD^1:$BENCH/configs/perf_accept.toml" > "$RUNNER_TEMP/base-accept.toml" 2>/dev/null \
+            || : > "$RUNNER_TEMP/base-accept.toml"
+          name=$(echo "$WORKLOADS" | tr , -)
+          "$BENCH/prolly_bench" sgate counters \
+            counters/base counters/base2 counters/candidate counters/candidate2 \
+            --accept "$BENCH/configs/perf_accept.toml" --accept-base "$RUNNER_TEMP/base-accept.toml" \
+            --thresholds "$BENCH/configs/s_gate.toml" --json "counters/sgate-$name.json" || true
+          test -f "counters/sgate-$name.json"
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-counters-${{ strategy.job-index }}
+          path: counters
+          retention-days: 7
+          if-no-files-found: ignore
+
+  timing-hosted:
+    name: timing (hosted, reported)
+    needs: [classify, build]
+    if: github.event_name == 'pull_request' && needs.classify.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: s-builds
+
+      - name: Unpack and install clients
+        run: |
+          tar -xzf s-builds.tgz
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sysbench
+
+      - name: Paired timing, then the cells that regressed again
+        run: |
+          . s-builds/SHAS
+          bins="base=$PWD/s-builds/base/bin,candidate=$PWD/s-builds/candidate/bin"
+          commits="base=$base,candidate=$candidate"
+          "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_pr.toml" \
+            --pg-bin "$bins" --build-commit "$commits" \
+            --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt1" || true
+          runs=(timing/attempt1)
+          for attempt in 2 3; do
+            # (this attempt's findings, never a former's)
+            rm -f timing/sgate.json
+            "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+              --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
+            [ -f timing/sgate.json ] || break
+            rerun=$(python3 -c 'import json; print(",".join(json.load(open("timing/sgate.json"))["rerun"]))')
+            [ -n "$rerun" ] || break
+            "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_pr.toml" \
+              --workloads "$rerun" --pg-bin "$bins" --build-commit "$commits" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/timing/attempt$attempt" || true
+            runs+=("timing/attempt$attempt")
+          done
+          rm -f timing/sgate.json
+          "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+            --thresholds "$BENCH/configs/s_gate.toml" --json timing/sgate.json || true
+          test -f timing/sgate.json
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-timing
+          path: timing
+          retention-days: 7
+          if-no-files-found: ignore
+
+  gate:
+    name: S suite gate
+    needs: [classify, build, counters, timing-hosted]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Nothing to compare
+        if: needs.classify.result == 'success' && (needs.classify.outputs.code != 'true' || github.event_name != 'pull_request')
+        run: echo "A push, or a pull request that changes only specs/; the S suite doesn't compare anything."
+
+      - name: Classification failed
+        if: needs.classify.result != 'success'
+        run: |
+          echo "classify: ${{ needs.classify.result }}" >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+
+      # (a job that left nothing is reported by Report, as a failed job)
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        with:
+          pattern: s-counters-*
+          path: counters
+
+      - uses: actions/download-artifact@v5
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        with:
+          name: s-timing
+          path: timing
+
+      - name: Report
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        id: report
+        env:
+          BUILD: ${{ needs.build.result }}
+          COUNTERS: ${{ needs.counters.result }}
+          TIMING: ${{ needs.timing-hosted.result }}
+          BASE: ${{ needs.classify.outputs.base }}
+          HEAD_SHA: ${{ needs.classify.outputs.candidate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=()
+          [ "$BUILD" = success ] || failed+=(--failed-job "build: $BUILD")
+          [ "$COUNTERS" = success ] || failed+=(--failed-job "counters: $COUNTERS")
+          # (timing is reported on hosted runners: its failure is noted, not gated)
+          timing=()
+          [ -f timing/sgate.json ] && timing=(--timing timing/sgate.json)
+          counters=()
+          shopt -s nullglob
+          for f in counters/*/sgate-*.json; do counters+=(--counters "$f"); done
+          mkdir -p comment
+          status=0
+          "$BENCH/prolly_bench" sreport "${counters[@]}" "${timing[@]}" \
+            --head "$HEAD_SHA" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+            --run-url "$RUN_URL" "${failed[@]}" \
+            --reproduce "prolly_bench run S --am heap,prolly --config $BENCH/configs/s_counters.toml --pg-bin DIR (base and candidate, twice each); prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2" \
+            --out comment/comment.md || status=$?
+          [ "$TIMING" = success ] || echo "timing: $TIMING (reported only)" >> comment/comment.md
+          cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        with:
+          name: s-suite-comment
+          path: comment
+          if-no-files-found: ignore
+
+      - name: Verdict
+        if: needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        env:
+          STATUS: ${{ steps.report.outputs.status }}
+        run: test "$STATUS" = 0
+
+  # Nightly: tonight's master against the last clean night's (no confirmed
+  # regression; perf-history's CLEAN), at configs/s_nightly.toml's shape
+  # (360 cells, some 4 to 5 hours), on a hosted runner, so its timing is
+  # reported with a shared machine's noise.  Against the last clean night,
+  # not the last night: a regression stays in the comparison until it is
+  # fixed.  Each night's summary goes to the orphan perf-history branch (and
+  # the whole result set to an artifact); a confirmed regression opens or
+  # updates one issue labelled nightly-performance-regression, and a clean
+  # night says it cleared.  Without hardware counters, Cachegrind counts
+  # the server's instructions on a reduced workload, reported.  Master's
+  # only: run by hand on another branch it does nothing.
+  nightly:
+    name: nightly
+    needs: build
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    concurrency:
+      group: performance-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MARKER: '<!-- s-suite-nightly -->'
+      LABEL: nightly-performance-regression
+      WATCHDOG_MARKER: '<!-- s-suite-nightly-watchdog -->'
+      WATCHDOG_LABEL: nightly-performance-watchdog
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # (the job's limit, as timeout-minutes; and what the steps after the
+      # runs need of it)
+      JOB_MINUTES: 355
+      REPORT_MINUTES: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench valgrind \
+            "linux-tools-$(uname -r)" linux-tools-common || \
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev libssl-dev zlib1g-dev rsync sysbench valgrind
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - name: Tonight and the last clean night
+        id: commits
+        run: |
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          candidate=$(git rev-parse HEAD)
+          base=
+          if git fetch --depth 1 origin perf-history:perf-history 2>/dev/null; then
+            base=$(git show perf-history:CLEAN 2>/dev/null || true)
+          fi
+          # (the first night, or a base no longer fetchable: the build against itself)
+          if [ -n "$base" ] && ! git fetch --depth 1 origin "$base" 2>/dev/null; then
+            base=
+          fi
+          [ -n "$base" ] || base=$candidate
+          { echo "base=$base"; echo "candidate=$candidate"; echo "image=$ImageOS-$ImageVersion"; \
+            echo "date=$(date -u +%F)"; } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Nothing new since the last clean night
+        if: steps.commits.outputs.base == steps.commits.outputs.candidate
+        run: echo "master is still at the last clean night's commit; the nightly compares nothing."
+
+      # (cached as performance.yml's build job caches: one path, by commit)
+      - name: Cached tonight's build
+        id: candidate-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ steps.commits.outputs.candidate }}-${{ steps.commits.outputs.image }}
+
+      - name: Build tonight's
+        if: steps.candidate-cache.outputs.cache-hit != 'true'
+        run: |
+          bash "$BENCH/build_postgres.sh" --jobs 4 --build-dir "$RUNNER_TEMP/head" -- --with-openssl
+          mv "$RUNNER_TEMP/head/inst" "$RUNNER_TEMP/s-cache"
+
+      - name: Set tonight's aside
+        run: |
+          mkdir -p "$RUNNER_TEMP/s-builds"
+          mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/candidate"
+
+      - name: Cached last clean night's build
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/s-cache
+          key: s-server-${{ steps.commits.outputs.base }}-${{ steps.commits.outputs.image }}
+
+      - name: Build last clean night's
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.base-cache.outputs.cache-hit != 'true'
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base-src" "$BASE"
+          bash "$BENCH/build_postgres.sh" --source "$RUNNER_TEMP/base-src" --jobs 4 \
+            --build-dir "$RUNNER_TEMP/base" -- --with-openssl
+          mv "$RUNNER_TEMP/base/inst" "$RUNNER_TEMP/s-cache"
+
+      - name: Set last clean night's aside
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        run: mv "$RUNNER_TEMP/s-cache" "$RUNNER_TEMP/s-builds/base"
+
+      - uses: actions/setup-java@v4
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Cached BenchBase
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        id: benchbase-cache
+        uses: actions/cache@v4
+        with:
+          path: build-bench/benchbase/benchbase-postgres
+          key: benchbase-${{ env.BENCHBASE_COMMIT }}-${{ hashFiles('src/tools/prolly_bench/benchbase/**', 'src/tools/prolly_bench/build_benchbase.sh') }}
+
+      - name: Fetch pinned BenchBase source
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.benchbase-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: dolthub/benchbase
+          ref: ${{ env.BENCHBASE_COMMIT }}
+          path: benchbase-source
+
+      - name: Build BenchBase
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate && steps.benchbase-cache.outputs.cache-hit != 'true'
+        run: bash "$BENCH/build_benchbase.sh" "$PWD/benchbase-source"
+
+      - name: The nightly shape, then the cells that regressed again
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          STARTED: ${{ steps.commits.outputs.started }}
+        run: |
+          bins="base=$RUNNER_TEMP/s-builds/base/bin,candidate=$RUNNER_TEMP/s-builds/candidate/bin"
+          commits="base=$BASE,candidate=$CANDIDATE"
+          first=$(date +%s)
+          "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_nightly.toml" \
+            --pg-bin "$bins" --build-commit "$commits" \
+            --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/attempt1" || true
+          first=$(( $(date +%s) - first ))
+          runs=(nightly/attempt1)
+          for attempt in 2 3; do
+            rm -f nightly/sgate.json
+            "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+              --thresholds "$BENCH/configs/s_gate.toml" --json nightly/sgate.json || true
+            [ -f nightly/sgate.json ] || break
+            rerun=$(python3 -c 'import json; print(",".join(json.load(open("nightly/sgate.json"))["rerun"]))')
+            [ -n "$rerun" ] || break
+            # A retry only if the job has time for it (the first pass's
+            # time per workload, times the workloads to rerun), and for what
+            # comes after: one a timeout cut short would cost the night's
+            # report.
+            workloads=$(python3 -c 'import sys, tomllib; print(len(tomllib.load(open(sys.argv[1], "rb"))["run"]["workloads"]))' \
+              "$BENCH/configs/s_nightly.toml")
+            need=$(( first * $(echo "$rerun" | tr , '\n' | wc -l) / workloads / 60 ))
+            left=$(( JOB_MINUTES - REPORT_MINUTES - ($(date +%s) - STARTED) / 60 ))
+            if [ "$need" -ge "$left" ]; then
+              echo "no time to retry $rerun (about $need min, $left left): its cells are reported transient"
+              break
+            fi
+            "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_nightly.toml" \
+              --workloads "$rerun" --pg-bin "$bins" --build-commit "$commits" \
+              --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/attempt$attempt" || true
+            runs+=("nightly/attempt$attempt")
+          done
+          rm -f nightly/sgate.json
+          "$BENCH/prolly_bench" sgate timing "${runs[@]}" --report-only \
+            --thresholds "$BENCH/configs/s_gate.toml" --json nightly/sgate.json || true
+
+      - name: Instructions without hardware counters (Cachegrind, reduced)
+        if: steps.commits.outputs.base != steps.commits.outputs.candidate
+        run: |
+          if python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from pbench.collectors.instructions import probe; sys.exit(0 if probe()[0] else 1)' "$BENCH"; then
+            echo "hardware counters: the nightly's instructions collector counted them"
+            exit 0
+          fi
+          "$BENCH/prolly_bench" run S --am heap,prolly --config "$BENCH/configs/s_cachegrind.toml" \
+            --pg-bin "$RUNNER_TEMP/s-builds/candidate/bin" \
+            --work-dir "$RUNNER_TEMP/work" --out "$PWD/nightly/cachegrind" || true
+
+      - name: Judge the night
+        id: judge
+        if: always() && steps.commits.outputs.base != steps.commits.outputs.candidate
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+        run: |
+          # clean: results, valid, nothing confirmed; regressed: something
+          # confirmed; none: no valid results (the watchdog's case)
+          verdict=none
+          if [ -f nightly/sgate.json ]; then
+            status=0
+            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
+              --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+              --run-url "$RUN_URL" --out "$RUNNER_TEMP/nightly.md" > /dev/null || status=$?
+            confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
+            if [ "$confirmed" != 0 ]; then
+              verdict=regressed
+            elif [ "$status" = 0 ]; then
+              verdict=clean
+            fi
+            cat "$RUNNER_TEMP/nightly.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Summary on perf-history
+        if: always() && steps.judge.outputs.verdict != 'none' && steps.judge.outputs.verdict != ''
+        env:
+          DATE: ${{ steps.commits.outputs.date }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          VERDICT: ${{ steps.judge.outputs.verdict }}
+        run: |
+          instructions=()
+          [ -d nightly/cachegrind ] && instructions=(--instructions nightly/cachegrind)
+          name="nights/$DATE-${CANDIDATE:0:10}.json"
+          "$BENCH/prolly_bench" shistory nightly/attempt1 --timing nightly/sgate.json \
+            "${instructions[@]}" --date "$DATE" --out "$RUNNER_TEMP/summary.json"
+          if git rev-parse --verify -q perf-history > /dev/null; then
+            git worktree add "$RUNNER_TEMP/history" perf-history
+          else
+            git worktree add --orphan -b perf-history "$RUNNER_TEMP/history"
+          fi
+          cd "$RUNNER_TEMP/history"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          mkdir -p nights
+          cp "$RUNNER_TEMP/summary.json" "$name"
+          echo "$CANDIDATE" > LATEST
+          # (the base of the nights to come: the last night nothing regressed)
+          [ "$VERDICT" = clean ] && echo "$CANDIDATE" > CLEAN
+          git add -A nights LATEST $([ -f CLEAN ] && echo CLEAN)
+          git commit -q -m "S suite nightly $DATE at ${CANDIDATE:0:10}: $VERDICT"
+          for try in 1 2 3; do
+            git push origin HEAD:perf-history && exit 0
+            git pull -q --rebase origin perf-history || true
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-nightly
+          path: nightly
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Open, update or clear the regression issue
+        if: always() && (steps.judge.outputs.verdict == 'clean' || steps.judge.outputs.verdict == 'regressed')
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          VERDICT: ${{ steps.judge.outputs.verdict }}
+        run: |
+          issue=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,body \
+            --jq "map(select(.body | startswith(env.MARKER)))[0].number // empty")
+          if [ "$VERDICT" = clean ]; then
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "The S suite nightly at $CANDIDATE, against $BASE, confirms no regression: cleared. $RUN_URL"
+              gh issue close "$issue"
+            fi
+            exit 0
+          fi
+          { echo "$MARKER"; echo "The S suite nightly confirmed a regression at $CANDIDATE against the last clean night, $BASE: $RUN_URL"; \
+            echo; head -c 60000 "$RUNNER_TEMP/nightly.md"; } > body.md
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" --body-file body.md
+            gh issue comment "$issue" --body "Still regressed at $CANDIDATE: $RUN_URL"
+          else
+            gh label create "$LABEL" --color D93F0B \
+              --description "A regression the S suite nightly confirmed" 2>/dev/null || true
+            gh issue create --title "S suite nightly: performance regression" --label "$LABEL" --body-file body.md
+          fi
+
+      - name: A night without valid results fails (the watchdog reports it)
+        if: always() && steps.judge.outputs.verdict == 'none'
+        run: |
+          echo "the nightly produced no valid results" >&2
+          exit 1
+
+      - name: Close the watchdog issue
+        if: success()
+        run: |
+          issue=$(gh issue list --label "$WATCHDOG_LABEL" --state open --limit 100 --json number,body \
+            --jq "map(select(.body | startswith(env.WATCHDOG_MARKER)))[0].number // empty")
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "The S suite nightly finished again at $GITHUB_SHA: $RUN_URL"
+            gh issue close "$issue"
+          fi
+
+  # A nightly that fails, is cancelled or leaves no valid results opens (or
+  # adds to) a watchdog issue; the next night that finishes closes it.
+  nightly-watchdog:
+    name: nightly watchdog
+    needs: [build, nightly]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' && needs.nightly.result != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MARKER: '<!-- s-suite-nightly-watchdog -->'
+      LABEL: nightly-performance-watchdog
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RESULT: 'build: ${{ needs.build.result }}, nightly: ${{ needs.nightly.result }}'
+    steps:
+      - name: Open or update the watchdog issue
+        run: |
+          issue=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,body \
+            --jq "map(select(.body | startswith(env.MARKER)))[0].number // empty")
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "The S suite nightly didn't finish again at $GITHUB_SHA ($RESULT): $RUN_URL"
+          else
+            gh label create "$LABEL" --color FBCA04 \
+              --description "The S suite nightly didn't produce results" 2>/dev/null || true
+            printf '%s\nThe S suite nightly at %s didn'"'"'t produce results (%s): %s\n' \
+              "$MARKER" "$GITHUB_SHA" "$RESULT" "$RUN_URL" > body.md
+            gh issue create --title "S suite nightly didn't finish" --label "$LABEL" --body-file body.md
+          fi

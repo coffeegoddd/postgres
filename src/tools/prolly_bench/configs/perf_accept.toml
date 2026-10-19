@@ -1,0 +1,12 @@
+# Regressions of the S suite's gate a pull request accepts, one entry each:
+#
+#   [[accept]]
+#   workload = "S1"            # S10/oltp_read_write for one variant
+#   engine = "prolly"          # heap or prolly
+#   counter = "wal_bytes"      # a counter, or a timing metric (throughput,
+#                              # latency_p50_ms, latency_p99_ms)
+#   reason = "the fold logs its root (fixes #210)"
+#
+# Only the entries a pull request's own diff adds count: entries already on
+# its base accept nothing.  The file has a code owner, so an entry is
+# reviewed by a maintainer.  Leave old entries here; they are history.

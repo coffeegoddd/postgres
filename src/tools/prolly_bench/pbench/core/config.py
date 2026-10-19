@@ -35,6 +35,15 @@ RUN_DEFAULTS: dict[str, Any] = {
     "required_collectors": [],
     # C suite only: "I/N" runs shard I of N of the corpus (cshard.py).
     "shard": "",
+    # Counters read after the measured clients have gone (so every backend
+    # that did the work has flushed its statistics), pg_stat_io's for client
+    # backends only: for runs whose counters are compared exactly.
+    "settled_counters": False,
+    # A run whose numbers only compare two builds of the server (a pull
+    # request and its base) and are never reported as the procedure's: it
+    # may turn synchronous_commit off (fsync stays on), so a machine's
+    # flush time doesn't bury the change compared.
+    "comparison_only": False,
 }
 
 # Settings every S and V run requires: results are only comparable when
@@ -99,6 +108,8 @@ def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, A
         if suite in DURABILITY_EXEMPT_SUITES:
             break
         actual = cfg["postgres"].get(k, v)
+        if k == "synchronous_commit" and cfg["run"]["comparison_only"] and actual == "off":
+            continue
         if actual != v:
             raise ConfigError(f"{k} = {actual}: the procedure requires {k} = {v} "
                               "(results with it off are not reported)")
@@ -147,6 +158,12 @@ def validate(cfg: dict, suite: str) -> None:
         raise ConfigError("benchmark quality requires at least 5 repetitions and warmup")
     if run["quality"] == "benchmark" and "environment" not in run["collectors"]:
         raise ConfigError("benchmark quality requires runtime environment monitoring")
+    for name in ("settled_counters", "comparison_only"):
+        if type(run[name]) is not bool:
+            raise ConfigError(f"{name} must be true or false")
+    if run["settled_counters"] and suite == "S" and (not run["workloads"] or "S6" in run["workloads"]):
+        raise ConfigError("settled_counters waits until no other client is connected, and S6 "
+                          "holds a session open for its whole window: leave S6 out")
     if not set(run["required_collectors"]) <= set(run["collectors"]):
         raise ConfigError("required_collectors must be enabled")
     for label, sizes in cfg["sizes"].items():
@@ -159,7 +176,7 @@ def validate(cfg: dict, suite: str) -> None:
                 raise ConfigError(f"sizes.{label}.{name} must be an integer")
     common = {"clients", "warmup_seconds", "measure_seconds", "protocol",
               "perf_frequency", "hash_symbols", "latency_sampling_rate", "timeout_seconds",
-              "rate", "latency_limit_ms"}
+              "rate", "latency_limit_ms", "transactions"}
     keys = {"S3": {"ranges"}, "S5": {"hot_rows"}, "S8": {"percents"},
             "S9": {"isolation", "weights"}, "S10": {"tests"}, "S13": {"modes", "weights", "isolation"},
             "V1": {"iterations", "background"}, "V2": {"iterations", "background", "changes"},
@@ -188,11 +205,14 @@ def validate(cfg: dict, suite: str) -> None:
                            100 if name in ("percents", "conflict_percent") else None)
                     if name in ("clients", "ranges", "changes", "branches") and type(v) is not int:
                         raise ConfigError(f"{wid}.{name} must contain integers")
-        for name in ("iterations", "workers", "hot_rows", "timeout_seconds", "measure_seconds", "warmup_seconds"):
+        for name in ("iterations", "workers", "hot_rows", "timeout_seconds", "measure_seconds",
+                     "warmup_seconds", "transactions"):
             if name in params:
                 number(params[name], f"{wid}.{name}", 0 if name == "warmup_seconds" else 1)
                 if type(params[name]) is not int:
                     raise ConfigError(f"{wid}.{name} must be an integer")
+        if "transactions" in params and wid not in {"S1", "S2", "S3", "S5", "S6", "S7", "S8", "S10"}:
+            raise ConfigError("transactions is supported only by pgbench and sysbench workloads")
         for name in ("rate", "latency_limit_ms"):
             if name in params:
                 if wid not in {"S1", "S2", "S3", "S5", "S6", "S7", "S8"}:

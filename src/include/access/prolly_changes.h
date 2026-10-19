@@ -56,6 +56,8 @@ typedef struct ProllyChangeCounters
 	uint64		pages;			/* pages read, of any version */
 	uint64		candidates;		/* rows looked up */
 	uint64		full;			/* tables whose every row was read */
+	uint64		rows_read;		/* rows read: looked up, or every row */
+	uint64		rows_written;	/* rows put in or taken out of the tree */
 } ProllyChangeCounters;
 
 typedef struct ProllyChangeFinderRoutine

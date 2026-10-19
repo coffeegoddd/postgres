@@ -1,0 +1,22 @@
+# The S suite gate's settings (prolly_bench sgate, scalibrate).
+#
+# Calibrated on GitHub's hosted runners (performance-calibration.yml): with
+# these, no simulated gate of A/A counter runs failed (0 of 240 within a
+# runner, 0 of 2,000 across runners), and no A/A timing cell regressed at
+# 5% or 10% in ten runs.  The runners have no hardware instruction
+# counters.  Timing stays reported, not gated, on them.
+
+[gate]
+# A counter regresses when it is more than this much above the base's ...
+relative = 0.05
+# ... and, in total over the run's fixed work, more than its floor above it.
+floor_events = 8.0
+floor_bytes = 8192.0
+# Instructions: no floor beyond the tolerance, which two runs of one build
+# may differ by (unused on hosted runners, which can't count them).
+floor_instructions = 0.0
+instructions_tolerance = 0.01
+# A timing cell regresses when its 95% interval clears this ...
+timing_threshold = 0.05
+# ... in every one of this many attempts.
+attempts = 3

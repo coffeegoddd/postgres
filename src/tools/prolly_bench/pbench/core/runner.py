@@ -101,11 +101,15 @@ def guard(name: str, fn: Callable[[], Any], status: dict[str, tuple[str, str]]) 
 class Runner:
     def __init__(self, *, suite: str, cfg: dict[str, Any], table_am: str, label: str,
                  repo: Path, bin_dir: Path, work_dir: Path, out_root: Path,
-                 command: str, keep_failed: bool = False):
+                 command: str, keep_failed: bool = False, build: str = "",
+                 builds: tuple[str, ...] = ()):
         registry.load_all()
         self.suite, self.cfg, self.table_am, self.label = suite, cfg, table_am, label
         self.repo, self.bin_dir, self.work_dir = repo, bin_dir, work_dir
         self.command, self.keep_failed = command, keep_failed
+        # The build this runner's server is ("" unless builds are compared),
+        # and every build compared, the base first.
+        self.build, self.builds = build, tuple(builds)
         if suite == "V" and table_am not in targets.VERSIONED_HISTORY:
             raise SystemExit("The V suite measures version control, which only "
                              f"{', '.join(sorted(targets.VERSIONED_HISTORY))} has.")
@@ -177,7 +181,8 @@ class Runner:
                        started=dt.datetime.now().isoformat(timespec="seconds"),
                        command=self.command, config=self.cfg, environment=environment,
                        warnings=warnings, out_dir=self.out_dir,
-                       planned_cells=[key for key, _ in cells])
+                       planned_cells=[key for key, _ in cells], build=self.build,
+                       builds=list(self.builds))
         for s in self.sinks:
             s.open(info)
 
@@ -193,10 +198,12 @@ class Runner:
                 for vlabel, vparams in w.variants(params):
                     for c in w.client_counts(clients, vparams):
                         for rep in range(1, int(run["repetitions"]) + 1):
-                            key = CellKey(self.suite, w.id, size, vlabel, c, rep)
+                            key = CellKey(self.suite, w.id, size, vlabel, c, rep,
+                                          build=self.build)
                             merged = {"latency_sampling_rate":
                                       run["latency_sampling_rate"], "seed": run["seed"] + rep,
                                       "quality": run["quality"],
+                                      "settled_counters": run["settled_counters"],
                                       **params, **vparams}
                             yield key, {"workload": w, "params": merged}
 
@@ -224,6 +231,9 @@ class Runner:
             for program, digest in self.info.environment["postgres"]["binary_hashes"].items():
                 if sha256(self.bin_dir / program) != digest:
                     raise RuntimeError(f"{program} changed after the run was planned")
+            if env_mod.build_provenance(self.bin_dir) != \
+                    self.info.environment["postgres"].get("build_provenance"):
+                raise RuntimeError("the build's provenance changed after the run was planned")
             cluster.create(config_mod.server_settings(self.cfg))
             cluster.start()
             cluster.sql(f"CREATE DATABASE {ctx.dbname}")
@@ -342,11 +352,12 @@ def write_json(path: Path, obj: Any) -> None:
 
 
 def interleave(plans, seed):
-    """Pair identical cells across engines, randomizing pair and engine order."""
+    """Group identical cells across engines and builds, randomizing the order
+    of the groups and of the cells in each."""
     groups = {}
     for index, cells in enumerate(plans):
         for key, args in cells:
-            groups.setdefault(str(key.path()), []).append((index, key, args))
+            groups.setdefault(str(key.pair_path()), []).append((index, key, args))
     rng = random.Random(seed)
     pairs = list(groups.values())
     rng.shuffle(pairs)
@@ -362,7 +373,8 @@ def run_many(runners):
     try:
         plans = [runner._open(lock=i == 0) for i, runner in enumerate(runners)]
         schedule = interleave(plans, runners[0].cfg["run"]["seed"])
-        evidence = [{"engine": runners[i].table_am, "key": dataclasses.asdict(key)}
+        evidence = [{"engine": runners[i].table_am, "build": runners[i].build,
+                     "key": dataclasses.asdict(key)}
                     for i, key, _ in schedule]
         for runner in runners:
             write_json(runner.out_dir / "raw/experiment-order.json", evidence)

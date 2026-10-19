@@ -232,6 +232,95 @@ C configs turn off `fsync`, `synchronous_commit`, `full_page_writes` and
 autovacuum: the suite measures correctness and never crashes the server on
 purpose.  S and V refuse those settings.
 
+## Counter runs
+
+`configs/s_counters.toml` runs the S workloads as a fixed amount of work
+(`pgbench -t`, sysbench `--events`, the TPC-H serial pass) with one client,
+fixed seeds, autovacuum and timed checkpoints off, so two runs of one build
+count the same: WAL bytes, records and full-page images, `pg_stat_io` for
+client backends, relation and chunk-store bytes, `pg_stat_prolly`, and
+instructions where the machine has hardware counters (`instructions`, by
+`perf stat`).  Counters are read once the measured clients have exited
+(`settled_counters`), so each has flushed its statistics.
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_counters.toml --out A
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_counters.toml --out B
+src/tools/prolly_bench/prolly_bench scounters A/*-S-prolly B/*-S-prolly   # which counters differ
+```
+
+S7's counters vary a little: GiST breaks ties between pages at random.
+Without hardware counters, `configs/s_cachegrind.toml` counts instructions
+with the server under Cachegrind (the `cachegrind` cluster and collector),
+on a reduced workload.
+
+## Comparing builds
+
+`--pg-bin base=DIR,candidate=DIR` runs two builds of the server, a pull
+request's base and the pull request, as the variable compared: a result set
+per build and engine (`base-B0`, `base-prolly`, `candidate-B0`, ...), the
+cells with the same workload, size, clients and repetition run as a group
+in random order, with the same seed.  Before every cell, each build's
+binaries and provenance are checked against what the run recorded;
+`--build-commit base=SHA,candidate=SHA` also checks the commit each build's
+provenance names.  `table` then gives each candidate cell's ratio to the
+same engine's base cell, with the paired bootstrap interval (5 repetitions
+or more), and prolly's ratio to heap in each build.  A comparison of builds
+is refused unless everything but the build matches (engine, configuration,
+harness, clients, machine).
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_pr.toml \
+    --pg-bin base=build-base/inst/bin,candidate=build-rel/inst/bin --out pr
+src/tools/prolly_bench/prolly_bench table pr/*-S-*
+```
+
+`configs/s_pr.toml` is a pull request's timing shape: S1, S2 and S10's
+read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
+Its numbers only compare builds (`comparison_only`), so it may run with
+`synchronous_commit = off`; they are never reported as the procedure's.
+
+## The pull-request gate
+
+```sh
+# counters: base and candidate counter runs, twice each
+src/tools/prolly_bench/prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2 \
+    --accept configs/perf_accept.toml --accept-base base-perf_accept.toml --json counters.json
+# timing: a run of both builds (s_pr.toml), then retries of the cells that regressed
+src/tools/prolly_bench/prolly_bench sgate timing RUN [RETRY ...] --report-only --json timing.json
+src/tools/prolly_bench/prolly_bench sreport --counters counters.json --timing timing.json \
+    --head SHA --base SHA --out comment.md
+```
+
+A counter regresses when the candidate's is more than 5% above the base's
+and, in total over the fixed work, above its floor (`configs/s_gate.toml`);
+one that differs between the base's own two runs is reported, not gated, and
+one stable in the base but not in the candidate fails.  Fewer is listed as
+an improvement.  A timing cell regresses when its whole 95% interval clears
+the threshold; one that does in every one of 3 attempts is confirmed, else
+transient (hosted runners: reported only).  Missing or failed cells, and
+cells whose work differs, always fail.  An entry the pull request adds to
+`configs/perf_accept.toml` accepts one regression (entries on the base
+accept nothing); the file has a code owner.  `sreport` writes the sticky
+comment, marked `<!-- s-suite -->`.
+
+The nightly (`performance.yml`'s nightly job) runs `configs/s_nightly.toml`,
+360 cells and some 4 to 5 hours, with tonight's master against the last night
+no regression was confirmed on (so a regression stays in the comparison
+until it is fixed), retries the cells that regress while the job has time,
+and keeps a summary of each night
+(`prolly_bench shistory`: medians, ratios with their intervals, commits,
+comparison identities) on the orphan `perf-history` branch.
+
+## Calibrating the gate
+
+`prolly_bench scalibrate --counters RUN ... --timing RUN ...` measures the
+noise of A/A runs (one build against itself): each counter's stability, the
+instruction counts' spread, the timing intervals' widths, and how often the
+gate would fail a pull request that changed nothing; it suggests the gate's
+settings (`configs/s_gate.toml`).  `.github/workflows/performance-calibration.yml`
+runs it on GitHub's hosted runners.
+
 ## Targets
 
 `prolly` tables exist only in versioned schemas, and with `prolly` as the
@@ -307,9 +396,9 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Workload` | S1-S10 and S13, V1-V4 and V6, C1-C4 | `pbench/workloads/` |
-| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, perf, vacuum, recovery | `pbench/collectors/` |
+| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
-| `Cluster` | local | `pbench/clusters/` |
+| `Cluster` | local, cachegrind | `pbench/clusters/` |
 
 A workload creates its data in `prepare`, may warm up in `warmup`, and does
 the measured work inside the window it is given in `measure`, returning an
