@@ -1,14 +1,19 @@
 # Mails the results of each nightly run (scheduled or dispatched by hand) of
 # the prolly, correctness and performance workflows on master: its outcome,
-# each job's, the failed steps, the artifacts, and links to the run.
+# each job's, the failed steps, the artifacts, and links to the run.  A
+# prolly dispatch that unchecked "nightly" ran no nightly job and isn't
+# mailed.
 #
 # Repository secrets it needs (without them, the run says so and mails
 # nothing):
 #   NIGHTLY_EMAIL_TO   the address to mail
 #   SMTP_SERVER        an SMTP server (e.g. smtp.gmail.com)
-#   SMTP_PORT          its port (465 for implicit TLS, 587 for STARTTLS)
 #   SMTP_USERNAME      the account to log in as, also the sender
 #   SMTP_PASSWORD      its password (for Gmail, an app password)
+# and optionally:
+#   SMTP_PORT          its port: 465 (the default) is TLS from the start;
+#                      any other port starts in plain text and must be
+#                      upgraded by STARTTLS (as 587 is), or the mail fails
 
 name: nightly email
 
@@ -42,7 +47,7 @@ jobs:
           if [ -n "$TO" ] && [ -n "$SERVER" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::nightly email not sent: set the NIGHTLY_EMAIL_TO, SMTP_SERVER, SMTP_PORT, SMTP_USERNAME and SMTP_PASSWORD secrets"
+            echo "::warning::nightly email not sent: set the NIGHTLY_EMAIL_TO, SMTP_SERVER, SMTP_USERNAME and SMTP_PASSWORD secrets"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -86,8 +91,13 @@ jobs:
                   "timed_out": "⏱", "skipped": "➖"}
           conclusion = env["CONCLUSION"]
           failed = [j for j in jobs if j["conclusion"] not in ("success", "skipped")]
+          # (a prolly dispatch without its nightly jobs isn't a nightly)
+          send = not (env["WORKFLOW"] == "prolly" and any(
+              j["name"] == "nightly address and undefined-behavior checks"
+              and j["conclusion"] == "skipped" for j in jobs))
 
-          subject = (f"{mark.get(conclusion, '❔')} nightly {env['WORKFLOW']}: "
+          how = "manual" if env["EVENT"] == "workflow_dispatch" else "scheduled"
+          subject = (f"{mark.get(conclusion, '❔')} nightly {env['WORKFLOW']} ({how}): "
                      f"{conclusion} on master {env['SHA'][:10]}")
           rows = []
           for j in jobs:
@@ -115,15 +125,16 @@ jobs:
           open("body.html", "w").write(body)
           with open(env["GITHUB_OUTPUT"], "a") as out:
               out.write(f"subject={subject}\n")
+              out.write(f"send={'true' if send else 'false'}\n")
           PY
 
       - name: Mail it
-        if: steps.configured.outputs.ok == 'true'
-        uses: dawidd6/action-send-mail@v3
+        if: steps.configured.outputs.ok == 'true' && steps.summary.outputs.send == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT || '465' }}
-          secure: ${{ secrets.SMTP_PORT != '587' }}
+          secure: ${{ (secrets.SMTP_PORT || '465') == '465' }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
           from: prolly nightly <${{ secrets.SMTP_USERNAME }}>
