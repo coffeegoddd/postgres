@@ -42,7 +42,7 @@ design choice can be changed later by writing a new implementation:
 	chunk_format      prolly_chunkformat.h    basic
 	row_applier       prolly_applier.h        replication, stub
 	table_file        prolly_tablefile.h      basic, stub
-	change_finder     prolly_changes.h        pages, stub
+	change_finder     prolly_changes.h        pages, log, stub
 	change_log        prolly_changelog.h      relation, stub
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub

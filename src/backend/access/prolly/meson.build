@@ -3,6 +3,7 @@
 backend_sources += files(
   'canon_folded.c',
   'canon_stub.c',
+  'changes_log.c',
   'changes_pages.c',
   'changes_stub.c',
   'changelog_relation.c',

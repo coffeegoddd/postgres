@@ -74,6 +74,7 @@ tests += {
       'table_files',
       'incremental_folds',
       'change_log',
+      'log_folds',
       'checkpoints',
       'format_freeze',
       'dirty_merges',

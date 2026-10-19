@@ -40,6 +40,7 @@ FROM prolly_implementations();
  table_file    | basic        |       1 |              1
  table_file    | stub         |       0 |              0
  change_finder | pages        |       1 |              8
+ change_finder | log          |       2 |              1
  change_finder | stub         |       0 |              0
  remote        | file         |       1 |              1
  remote        | postgresql   |       2 |              1
@@ -50,7 +51,7 @@ FROM prolly_implementations();
  writers       | stub         |       0 |              0
  change_log    | relation     |       1 |              1
  change_log    | stub         |       0 |              0
-(41 rows)
+(42 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -202,6 +203,8 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_file    | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  change_finder | pages          | identity                       | pass
  change_finder | pages          | complete                       | pass
+ change_finder | log            | identity                       | pass
+ change_finder | log            | complete                       | pass
  change_finder | stub           | identity                       | pass
  change_finder | stub           | complete                       | not implemented (4 of 4 callbacks missing)
  remote        | file           | identity                       | pass
@@ -225,7 +228,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (9 of 9 callbacks missing)
-(167 rows)
+(169 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
