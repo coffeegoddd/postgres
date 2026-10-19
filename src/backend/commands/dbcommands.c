@@ -56,6 +56,7 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "replication/slot.h"
+#include "storage/bmap.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -3496,6 +3497,9 @@ dbase_redo(XLogReaderState *record)
 		for (i = 0; i < xlrec->ntablespaces; i++)
 		{
 			dst_path = GetDatabasePath(xlrec->db_id, xlrec->tablespace_ids[i]);
+
+			/* the lengths block-mapped storage keeps there in recovery */
+			bmap_drop_database_recovery(xlrec->db_id, xlrec->tablespace_ids[i]);
 
 			/* And remove the physical files */
 			if (!rmtree(dst_path, true))

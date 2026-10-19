@@ -21,6 +21,12 @@
 extern void prolly_session_init(const char *branch);
 extern void prolly_session_ready(void);
 
+/*
+ * Refuses the branch a connection asked for if no connection may name it:
+ * a hidden branch of sessions checked out at a commit.
+ */
+extern void prolly_check_connect_branch(const char *branch);
+
 /* Who the session's commits are by: dolt.author, else the session user. */
 extern const char *prolly_commit_author(void);
 /* Commits name author until reset (NULL), whatever dolt.author says. */

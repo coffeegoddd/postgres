@@ -73,12 +73,17 @@
  * - keep() is told of a chunk a transaction names from outside the store
  *   (a hash pointer it writes into a table) without appending it: a
  *   collection keeps it if it runs then, or begins before the transaction
- *   ends (or, prepared, is finished).  So gc_begin() makes the first
- *   gc_new() call wait for the transactions that told keep() of a chunk
- *   before the collection began, too, and gc_kept() visits the chunks told
- *   of since it began (false: too many to remember, and the collector must
- *   keep every chunk collected).  keep() fails (a serialization failure)
- *   if a swap dropped the chunk before it was told.
+ *   ends or is prepared (its pointers are on pages then).  So gc_begin()
+ *   makes the first gc_new() call wait for the transactions that told
+ *   keep() of a chunk before the collection began, too, and gc_kept()
+ *   visits the chunks told of since it began (false: too many to
+ *   remember, and the collector must keep every chunk collected).  keep()
+ *   fails (a serialization failure) if a swap dropped the chunk before it
+ *   was told.
+ * - A collection never waits for a prepared transaction, which may stay
+ *   for days: gc_new() keeps as roots the chunks one appended to the
+ *   segments collected, and gc_retire() doesn't wait for one running at
+ *   the swap (it reads nothing more).
  *   gc_retained() visits the chunks a collection keeps whatever names
  *   them, the store's own reasons (a logical replication slot may still
  *   decode a row naming what was appended after its position): roots, as
