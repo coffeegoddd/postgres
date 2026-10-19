@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pbench import bcompare, report, table
+from pbench.core import registry
 from pbench.core.stats import summarize
 from pbench.core.validation import cell_problems, compatible, validate_run
 from pbench.presentation import Document, Section, Value, link
@@ -242,6 +243,7 @@ def _correctness(sources: list[Source], document: Document) -> None:
 
 
 def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = None) -> Document:
+    registry.load_all()
     if not sources:
         raise ValueError("no result sets")
     if len({s.label for s in sources}) != len(sources):
@@ -269,6 +271,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     overview_metrics = [m for m in definitions if m.key in overview_keys]
     overview = Section("Workload overview", ["Workload", "Size", "Variant", "Clients", "Engine/build", "Repetitions"] +
                        [f"{m.title} ({m.unit})" for m in overview_metrics])
+    overview.notes = [table._workload_title(w) for w in sorted({k[0] for k in keys})]
     for key in keys:
         for s in sources:
             rows = groups[s.label].get(key, [])
@@ -300,7 +303,22 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
         elif suite == "S" and len(candidates) > 1:
             document.notes.append(f"{s.label}: comparison withheld: ambiguous heap baseline")
             document.passed = False
+    additional = {}
     for metric in definitions:
+        if metric.unit == "unit unspecified":
+            group = metric.key.split(".", 1)[0] if "." in metric.key else "other collectors"
+            section = additional.setdefault(group, Section(f"Additional metrics: {group}",
+                ["Metric", "Workload", "Size", "Variant", "Clients", "Engine/build", "Completed unit", "Value"],
+                notes=["Units are unspecified for these unregistered metrics. No performance ranking is assigned."], folded=True))
+            for key in keys:
+                for s in sources:
+                    rows = groups[s.label].get(key, [])
+                    if not any(metric.key in r["metrics"] for r in rows):
+                        continue
+                    units = sorted({r.get("unit", "unknown") for r in rows})
+                    section.rows.append([metric.key, *[str(v) for v in key], s.label,
+                                         ", ".join(units), _metric_value(s, key, rows, metric)])
+            continue
         section = Section(f"{metric.title} ({metric.unit})",
                           ["Workload", "Size", "Variant", "Clients", "Completed unit"] + [s.label for s in sources],
                           notes=[f"Metric: {metric.key}. Direction: {metric.direction}. "
@@ -314,6 +332,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
                              groups[reference.label].get(key) if reference else None))
             section.rows.append([*[str(v) for v in key], ", ".join(units) or "not recorded", *cells])
         document.sections.append(section)
+    document.sections.extend(additional.values())
     if any(s.run.get("build") for s in sources):
         _build_comparisons(sources, document)
     for s in sources:
