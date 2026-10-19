@@ -368,7 +368,8 @@ SELECT * FROM dolt_status();
 
 SELECT dolt_branch('-D', 'typed_base');
 
--- An outside table is still refused before it can depend on a versioned type.
+-- An outside table still can't depend on a versioned type: refused as it
+-- is made, so no move meets one.
 CREATE SCHEMA typed_external;
 CREATE TABLE typed_external.tt OF typed.ty;
 SELECT test_fold_root() = prolly_root_hash(:'typed_reordered') AS same_root;
@@ -434,6 +435,40 @@ SELECT test_fold_root() = prolly_root_hash(:'typed_partition_added') AS same_roo
 SELECT * FROM typed.pt;
 SELECT reloftype = 'typed.pty'::regtype AS still_typed
 FROM pg_class WHERE oid = 'typed.pt'::regclass;
+SELECT * FROM dolt_status();
+
+-- A partitioned typed table whose type is replaced through a domain: the
+-- parent's column is converted, its partition's follows it.  A domain in
+-- the partition key can't be converted: refused.
+CREATE DOMAIN typed.ppos AS int CHECK (VALUE > 0);
+CREATE TYPE typed.pdy AS (k int, a typed.ppos);
+CREATE TABLE typed.pd OF typed.pdy PARTITION BY RANGE (k);
+CREATE TABLE typed.pd1 PARTITION OF typed.pd FOR VALUES FROM (0) TO (100);
+INSERT INTO typed.pd VALUES (1, 50);
+SELECT (dolt_commit('-Am', 'typed partition domain base'))[1] AS typed_pd_base \gset
+ALTER DOMAIN typed.ppos DROP CONSTRAINT ppos_check;
+ALTER DOMAIN typed.ppos ADD CONSTRAINT ppos_check CHECK (VALUE > 20);
+SELECT (dolt_commit('-Am', 'typed partition domain changed'))[1] AS typed_pd_changed \gset
+SELECT dolt_reset('--hard', :'typed_pd_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_pd_base') AS same_root;
+INSERT INTO typed.pd VALUES (2, 15);
+SELECT dolt_reset('--hard', :'typed_pd_changed');
+SELECT test_fold_root() = prolly_root_hash(:'typed_pd_changed') AS same_root;
+SELECT * FROM typed.pd ORDER BY k;
+SELECT reloftype = 'typed.pdy'::regtype AS still_typed
+FROM pg_class WHERE oid = 'typed.pd'::regclass;
+INSERT INTO typed.pd VALUES (3, 15);
+SELECT * FROM dolt_status();
+CREATE DOMAIN typed.pkey AS int CHECK (VALUE > 0);
+CREATE TYPE typed.pky AS (k typed.pkey);
+CREATE TABLE typed.pk OF typed.pky PARTITION BY RANGE (k);
+CREATE TABLE typed.pk1 PARTITION OF typed.pk FOR VALUES FROM (1) TO (100);
+SELECT (dolt_commit('-Am', 'typed partition key base'))[1] AS typed_pk_base \gset
+ALTER DOMAIN typed.pkey DROP CONSTRAINT pkey_check;
+ALTER DOMAIN typed.pkey ADD CONSTRAINT pkey_check CHECK (VALUE > 20);
+SELECT (dolt_commit('-Am', 'typed partition key changed'))[1] AS typed_pk_changed \gset
+SELECT dolt_reset('--hard', :'typed_pk_base');
+SELECT test_fold_root() = prolly_root_hash(:'typed_pk_changed') AS unmoved;
 SELECT * FROM dolt_status();
 
 DROP VIEW described;

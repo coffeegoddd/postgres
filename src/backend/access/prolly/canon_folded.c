@@ -5460,6 +5460,20 @@ same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *n
 	return a && b && strcmp(a, b) == 0;
 }
 
+/* Whether a partitioned table's key uses its column attnum. */
+static bool
+in_partition_key(Oid relid, AttrNumber attnum)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	bool		expr;
+	bool		used = has_partition_attrs(rel,
+										   bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+										   &expr);
+
+	table_close(rel, AccessShareLock);
+	return used;
+}
+
 /*
  * The statements that make the types to defines otherwise than from, under
  * their names, and those that use them, in turn: each renamed aside, made
@@ -5584,13 +5598,38 @@ type_moves(List *from, List *to)
 							}
 						}
 					}
-					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
+					else if (kind == RELKIND_PARTITIONED_TABLE && versioned &&
+							 d->objsubid > 0 && in_partition_key(d->objid, d->objsubid))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+										mt->from->name),
+								 errdetail("%s uses it, in the table's partition key, which can't change type.",
+										   getObjectDescription(&obj, false))));
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid > 0)
 					{
 						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
 						const char *col = quote_identifier(get_attname(d->objid, d->objsubid, false));
 						char	   *conv;
+						bool		inherited = false;
 
-						if (array)
+						/*
+						 * (a partition's inherited column is its parent's:
+						 * converting the parent's converts it)
+						 */
+						if (get_rel_relispartition(d->objid))
+						{
+							HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(d->objid),
+															 Int16GetDatum(d->objsubid));
+
+							if (!HeapTupleIsValid(at))
+								elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+									 d->objsubid, d->objid);
+							inherited = ((Form_pg_attribute) GETSTRUCT(at))->attinhcount > 0;
+							ReleaseSysCache(at);
+						}
+						if (array && !inherited)
 						{
 							/*
 							 * (an array's elements one by one, as a function:
@@ -5613,7 +5652,7 @@ type_moves(List *from, List *to)
 							tm.converts = lappend(tm.converts,
 												  psprintf("DROP FUNCTION %s(%s[])", fn, mt->aside));
 						}
-						else
+						else if (!inherited)
 							tm.converts = lappend(tm.converts,
 												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
 														   rel, col, mt->to->name,
