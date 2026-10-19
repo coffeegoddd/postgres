@@ -1202,12 +1202,18 @@ heapam_index_build_range_scan(Relation heapRelation,
 	Assert(OidIsValid(indexRelation->rd_rel->relam));
 
 	/*
-	 * A prolly table's rows are keyed by its primary key, so as the key's
-	 * index is built (over rows written before it, or rewritten) each live
-	 * row's key is checked, as heap checks a row's as it writes it.
+	 * A prolly table's rows are keyed by its primary key, so as a new key's
+	 * index is built over rows written before it, each live row's key is
+	 * checked, as heap checks a row's as it writes it.  An index rebuilt
+	 * (REINDEX, and the rebuild after VACUUM FULL, CLUSTER or a rewrite)
+	 * isn't a new key: its rows' keys are those they had, which may be
+	 * longer than the bound if a commit made before it held them.  A new
+	 * key rebuilt, as a key column's type changed, is checked once rebuilt
+	 * (reindex_index()).  (The reindex state is a parallel worker's too.)
 	 */
 	checking_keys = (heapRelation->rd_rel->relam == PROLLY_TABLE_AM_OID &&
-					 indexRelation->rd_index->indisprimary);
+					 indexRelation->rd_index->indisprimary &&
+					 !ReindexIsProcessingIndex(RelationGetRelid(indexRelation)));
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(heapRelation);

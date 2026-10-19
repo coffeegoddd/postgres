@@ -27,6 +27,7 @@
 #include "access/attmap.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/prolly_keying.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
@@ -4029,6 +4030,22 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 		}
 
 		table_close(pg_index, RowExclusiveLock);
+	}
+
+	/*
+	 * A prolly table's primary key made in this transaction, its build put
+	 * off to now (as a key column's type changed, rewriting the table), is
+	 * a new key: each row is checked for a key longer than a commit holds,
+	 * as a new key's build checks them (heapam_index_build_range_scan()).
+	 * A key rebuilt keeps its rows' keys, and isn't.
+	 */
+	if (heapRelation->rd_rel->relam == PROLLY_TABLE_AM_OID &&
+		iRel->rd_index->indisprimary &&
+		iRel->rd_createSubid != InvalidSubTransactionId)
+	{
+		/* (the rows rewritten, and the key, now valid, seen) */
+		CommandCounterIncrement();
+		prolly_check_table_keys(heapRelation);
 	}
 
 	/* Log what we did */

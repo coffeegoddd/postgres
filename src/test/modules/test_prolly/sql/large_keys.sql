@@ -130,6 +130,29 @@ UPDATE lk.held SET k = k || 'h' WHERE n = 4;
 UPDATE lk.held SET k = left(k, 32000) WHERE n = 5;
 DELETE FROM lk.held WHERE n = 11;
 SELECT n, octet_length(k) FROM lk.held ORDER BY n;
+
+-- Nor for what keeps their keys: REINDEX (concurrently too), VACUUM FULL,
+-- CLUSTER, and rewrites of other columns.  A new key made over them is
+-- refused (ADD PRIMARY KEY, USING INDEX, a key column's new type).
+REINDEX TABLE lk.held;
+REINDEX TABLE CONCURRENTLY lk.held;
+VACUUM FULL lk.held;
+CLUSTER lk.held USING held_pkey;
+ALTER TABLE lk.held ALTER COLUMN n TYPE bigint;
+ALTER TABLE lk.held ADD COLUMN r float8 DEFAULT random();
+SELECT count(*), max(octet_length(k)), count(r) FROM lk.held;
+BEGIN;
+ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
+ALTER TABLE lk.held ADD PRIMARY KEY (k);
+ROLLBACK;
+BEGIN;
+CREATE UNIQUE INDEX held_k ON lk.held (k);
+ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
+ALTER TABLE lk.held ADD CONSTRAINT held_pk PRIMARY KEY USING INDEX held_k;
+ROLLBACK;
+ALTER TABLE lk.held ALTER COLUMN k TYPE text USING k || '';
+ALTER TABLE lk.held ALTER COLUMN k TYPE text COLLATE "C";
+ALTER TABLE lk.held DROP COLUMN r;
 SELECT dolt_commit('-am', 'one held key deleted') IS NOT NULL AS committed;
 SELECT dolt_branch('-D', 'held_old') IS NOT NULL AS deleted;
 

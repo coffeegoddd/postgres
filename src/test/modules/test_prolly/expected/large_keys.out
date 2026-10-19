@@ -311,6 +311,46 @@ SELECT n, octet_length(k) FROM lk.held ORDER BY n;
  23 |        32715
 (6 rows)
 
+-- Nor for what keeps their keys: REINDEX (concurrently too), VACUUM FULL,
+-- CLUSTER, and rewrites of other columns.  A new key made over them is
+-- refused (ADD PRIMARY KEY, USING INDEX, a key column's new type).
+REINDEX TABLE lk.held;
+REINDEX TABLE CONCURRENTLY lk.held;
+VACUUM FULL lk.held;
+CLUSTER lk.held USING held_pkey;
+ALTER TABLE lk.held ALTER COLUMN n TYPE bigint;
+ALTER TABLE lk.held ADD COLUMN r float8 DEFAULT random();
+SELECT count(*), max(octet_length(k)), count(r) FROM lk.held;
+ count |  max  | count 
+-------+-------+-------
+     6 | 32715 |     6
+(1 row)
+
+BEGIN;
+ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
+ALTER TABLE lk.held ADD PRIMARY KEY (k);
+ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+HINT:  Key the table by a shorter value, such as a hash of this one.
+ROLLBACK;
+BEGIN;
+CREATE UNIQUE INDEX held_k ON lk.held (k);
+ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
+ALTER TABLE lk.held ADD CONSTRAINT held_pk PRIMARY KEY USING INDEX held_k;
+NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "held_k" to "held_pk"
+ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+HINT:  Key the table by a shorter value, such as a hash of this one.
+ROLLBACK;
+ALTER TABLE lk.held ALTER COLUMN k TYPE text USING k || '';
+ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+HINT:  Key the table by a shorter value, such as a hash of this one.
+ALTER TABLE lk.held ALTER COLUMN k TYPE text COLLATE "C";
+ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+HINT:  Key the table by a shorter value, such as a hash of this one.
+ALTER TABLE lk.held DROP COLUMN r;
 SELECT dolt_commit('-am', 'one held key deleted') IS NOT NULL AS committed;
  committed 
 -----------
