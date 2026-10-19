@@ -10,10 +10,12 @@
  * changes them (smgrshare()), or, where the storage manager can't share
  * (md.c's sequences), a copy of its files.  No page is read.
  *
- * The copy is a snapshot of the source as the making transaction sees it:
- * its versioned relations are locked against changes meanwhile (ShareLock,
- * which waits for writers to finish), so no change is in flight in a page
- * the copy shares.  The locks are let go once the copy is made, not held
+ * The copy is of the source as its writers left it: its versioned
+ * relations are locked against changes meanwhile (ShareLock, which waits
+ * for writers to finish), so no change is in flight in a page the copy
+ * shares, and the copy holds every row they committed, whether the making
+ * transaction's snapshot sees it or not (what moves the copy reads it by
+ * one that does).  The locks are let go once the copy is made, not held
  * to the end of the transaction: the copy shares no page a later change
  * could be in (one changes its own), and whatever the making transaction
  * does next with the new branch (moving it to a commit, say) needn't hold

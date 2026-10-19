@@ -619,6 +619,42 @@ fold_as_baseline(void *arg)
 }
 
 /*
+ * A branch's first use's move to its head, as a snapshot that sees what
+ * its copies hold: the copy waited for the session branch's writers, so
+ * its pages hold every row they committed, some after the active snapshot
+ * was taken, which a fold by that snapshot wouldn't see and the move
+ * wouldn't undo (nor put back the rows they deleted).  Read committed,
+ * by a newer snapshot; a transaction whose snapshot can't move fails
+ * instead if the copies hold what it doesn't see, to be retried, as its
+ * reads of the branch would see the rows they deleted still.
+ */
+static void
+move_copies(void *arg)
+{
+	if (IsolationUsesXactSnapshot())
+	{
+		ProllyNodeRef seen;
+		ProllyNodeRef copied;
+
+		fold(&seen);
+		PushActiveSnapshot(GetLatestSnapshot());
+		fold(&copied);
+		PopActiveSnapshot();
+		if (!same_hash(&seen.hash, &copied.hash))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize access: branch \"%s\"'s first use copies changes committed since this transaction's snapshot",
+							branch_ops()->current()),
+					 errhint("The transaction might succeed if retried.")));
+		move_settled(arg);
+		return;
+	}
+	PushActiveSnapshot(GetLatestSnapshot());
+	move_settled(arg);
+	PopActiveSnapshot();
+}
+
+/*
  * Make the copies of a branch that has only its head: a copy of the
  * session's branch's (which has the same changes since the same
  * baseline), moved to the head's root.
@@ -676,7 +712,7 @@ materialize(const char *name)
 							&baseline : NULL, NULL);
 
 		/* (moved to the head, unless the copies are there already) */
-		branch_ops()->run_on(name, move_settled, &info.root);
+		branch_ops()->run_on(name, move_copies, &info.root);
 done:
 		;
 	}
