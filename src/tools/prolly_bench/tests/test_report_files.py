@@ -158,10 +158,13 @@ class ReportFilesTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn('Source evidence changed', (manifest.parent / 'README.md').read_text())
 
-    def test_c_table_without_heap_cannot_establish_a_comparison(self):
+    def test_c_reports_without_heap_cannot_establish_a_comparison(self):
         from evidence_helpers import c_result
         path = self.root / 'prolly'
         c_result(path, 'prolly', {'C1': [{'file': 'select1.test', 'line': 1, 'status': 'ok'}]})
-        self.assertEqual(main(['report', str(path)]), 0)
+        self.assertEqual(validate_run(path), [])
+        self.assertEqual(main(['report', str(path)]), 1)
+        self.assertTrue((path / 'index.html').exists())
+        self.assertTrue((path / 'README.md').exists())
         self.assertEqual(main(['table', str(path), '--output', str(self.root / 'comparison')]), 1)
         self.assertIn('Comparison unavailable', (self.root / 'comparison.html').read_text())

@@ -460,6 +460,8 @@ their units are explicitly unspecified and they receive no performance
 ranking. Invalid or missing evidence remains visible. Engine comparisons
 use heap within the same build; candidate/base comparisons appear in both
 formats. C reports show correctness comparisons when heap is present.
+C reports without exactly one heap reference and at least one engine are
+still written, but cannot establish a pass; `report` and `table` return nonzero.
 
 ```sh
 # Regenerate from saved evidence; no database server is needed.
