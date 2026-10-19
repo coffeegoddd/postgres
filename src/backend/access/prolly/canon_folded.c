@@ -6935,12 +6935,14 @@ same_line(const TableLine *a, const TableLine *b)
  * (and trigger, rule, policy, statistics object; and its partitioning) as
  * the side that changed it has it, both alike as they have it.  Columns
  * come in ours' order, then those only theirs added, in theirs'.  NULL if
- * both changed a part differently: a schema conflict.
+ * both changed a part differently, or a merged local marker names a
+ * column or constraint the merge drops: a schema conflict.
  */
 static char *
 merge_table_defs(const char *base, const char *ours, const char *theirs)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
+	List	   *local_parts = NIL; /* local markers for the parts kept */
 	StringInfoData out;
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
@@ -7004,7 +7006,20 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			continue;
 		appendStringInfo(&out, "%s\n", table_sections[s]);
 		for (int i = 0; i < n; i++)
+		{
+			if (s == 0 || s == 1)
+				local_parts = lappend(local_parts,
+									 psprintf("%s %s", s == 0 ? "column" : "constraint",
+											  merged[i].key));
+			/*
+			 * Locality and the part's definition merge separately.  One
+			 * side making an inherited part local mustn't lose it to the
+			 * other side's drop from the parent.
+			 */
+			else if (s == 11 && !list_has_string(local_parts, merged[i].line))
+				return NULL;
 			appendStringInfo(&out, "%s\n", merged[i].line);
+		}
 	}
 	return out.data;
 }
