@@ -23,6 +23,7 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/prolly_keying.h"
 #include "access/rewriteheap.h"
 #include "access/syncscan.h"
 #include "access/tableam.h"
@@ -1193,11 +1194,20 @@ heapam_index_build_range_scan(Relation heapRelation,
 	BlockNumber previous_blkno = InvalidBlockNumber;
 	BlockNumber root_blkno = InvalidBlockNumber;
 	OffsetNumber root_offsets[MaxHeapTuplesPerPage];
+	bool		checking_keys;
 
 	/*
 	 * sanity checks
 	 */
 	Assert(OidIsValid(indexRelation->rd_rel->relam));
+
+	/*
+	 * A prolly table's rows are keyed by its primary key, so as the key's
+	 * index is built (over rows written before it, or rewritten) each live
+	 * row's key is checked, as heap checks a row's as it writes it.
+	 */
+	checking_keys = (heapRelation->rd_rel->relam == PROLLY_TABLE_AM_OID &&
+					 indexRelation->rd_index->indisprimary);
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(heapRelation);
@@ -1647,6 +1657,9 @@ heapam_index_build_range_scan(Relation heapRelation,
 					   estate,
 					   values,
 					   isnull);
+
+		if (checking_keys && tupleIsAlive)
+			prolly_check_row_key(heapRelation, heapTuple);
 
 		/*
 		 * You'd think we should go ahead and build the index tuple here, but

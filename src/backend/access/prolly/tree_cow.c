@@ -308,9 +308,15 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 }
 
 static Size
+node_capacity(const ProllyChunkFormatRoutine *format)
+{
+	return CHUNK_NODE_MAX - PROLLY_CALL(format, header_size);
+}
+
+static Size
 level_capacity(const ProllyTreeEnv *env, uint16 level)
 {
-	return CHUNK_NODE_MAX - PROLLY_CALL(env->chunk_format, header_size);
+	return node_capacity(env->chunk_format);
 }
 
 /* ------------------------------------------------------------------------
@@ -2349,6 +2355,28 @@ cow_references(const ProllyChunkFormatRoutine *format, const void *data,
 	}
 }
 
+/*
+ * The longest key levelbuf_add() takes at every level: an internal item of
+ * it, with the longest child reference (the longest hash, the largest
+ * count), takes at most half a node.  A leaf item of it fits in a node
+ * with a value of up to half a node, and a leaf value is the references it
+ * holds, then at most VALUE_INLINE_MAX bytes or a value tree's reference.
+ */
+static Size
+cow_key_max(const ProllyChunkFormatRoutine *format)
+{
+	Size		half = node_capacity(format) / 2;
+	ProllyKey	key = {NULL, 0};
+	ProllyValue child = {NULL, 1 + PROLLY_HASH_MAX_LEN + 10};
+
+	/* (the space an item takes grows with its key, by a byte or more) */
+	key.len = half;
+	while (key.len > 0 &&
+		   PROLLY_CALL(format, item_space, 1, &key, &child) > half)
+		key.len--;
+	return key.len;
+}
+
 const ProllyTreeRoutine prolly_tree_cow = {
 	.info = {
 		.iface = PROLLY_IFACE_TREE,
@@ -2376,4 +2404,5 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.value_reference = cow_value_reference,
 	.value_root = cow_value_root,
 	.value_present = cow_value_present,
+	.key_max = cow_key_max,
 };

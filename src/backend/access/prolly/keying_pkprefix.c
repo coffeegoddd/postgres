@@ -198,6 +198,22 @@ pkprefix_keyless(ProllyKeying *k)
 	return k->keyless;
 }
 
+/* Append the primary key of slot's row to key. */
+static void
+encode_pk(ProllyKeying *k, TupleTableSlot *slot, StringInfo key)
+{
+	slot_getallattrs(slot);
+	for (int i = 0; i < k->nkeys; i++)
+	{
+		int			att = k->key_attnos[i] - 1;
+
+		k->key_values[i] = slot->tts_values[att];
+		k->key_isnull[i] = slot->tts_isnull[att];
+	}
+	PROLLY_CALL(k->keyenc_routine, encode, k->keyenc, k->key_values,
+				k->key_isnull, key);
+}
+
 static void
 pkprefix_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 					 StringInfo row, ProllyHash *content)
@@ -224,16 +240,16 @@ pkprefix_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 		return;
 	}
 
-	slot_getallattrs(slot);
-	for (int i = 0; i < k->nkeys; i++)
-	{
-		int			att = k->key_attnos[i] - 1;
+	encode_pk(k, slot, key);
+}
 
-		k->key_values[i] = slot->tts_values[att];
-		k->key_isnull[i] = slot->tts_isnull[att];
-	}
-	PROLLY_CALL(k->keyenc_routine, encode, k->keyenc, k->key_values,
-				k->key_isnull, key);
+static bool
+pkprefix_encode_key(ProllyKeying *k, TupleTableSlot *slot, StringInfo key)
+{
+	if (k->keyless)
+		return false;
+	encode_pk(k, slot, key);
+	return true;
 }
 
 static void
@@ -383,4 +399,5 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.set_values = pkprefix_set_values,
 	.row_refs = pkprefix_row_refs,
 	.decode_row_kept = pkprefix_decode_row_kept,
+	.encode_key = pkprefix_encode_key,
 };
