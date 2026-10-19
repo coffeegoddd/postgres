@@ -140,12 +140,23 @@ INSERT INTO t VALUES (1);
 SELECT length(dolt_commit('-Am', 'p 1')::text) AS committed;
 SELECT dolt_remote('add', 'origin', :'url_pub');
 SELECT dolt_push('origin', 'main') AS pushed;
+SELECT dolt_branch('side');
+SELECT dolt_push('origin', 'side') AS pushed;
 CREATE DATABASE regress_clone_q;
 \c regress_clone_q
 SELECT dolt_clone(:'url_pub');
 SELECT id FROM t;
 SELECT nspversioned FROM pg_namespace WHERE nspname = 'public';
+-- (what a commit doesn't hold kept: a new database's public, as it was)
+SELECT nspowner::regrole AS owner, nspacl,
+       obj_description(oid, 'pg_namespace') AS comment
+FROM pg_namespace WHERE nspname = 'public';
 SELECT count(*) AS uncommitted FROM dolt_status;
+-- (another branch, its versioned public the same)
+SELECT dolt_checkout('side') IS NOT NULL AS on_side;
+SELECT id FROM t;
+SELECT nspversioned, nspowner::regrole AS owner, nspacl
+FROM pg_namespace WHERE nspname = 'public';
 \c regress_clone_p
 DROP DATABASE regress_clone_q;
 CREATE DATABASE regress_clone_r;
@@ -161,3 +172,65 @@ SELECT id FROM t;
 \c :db
 DROP DATABASE regress_clone_r;
 DROP DATABASE regress_clone_p;
+
+-- a public given to others, its owner, grants and comment kept on the
+-- versioned one; one made by another role stays that role's
+CREATE ROLE regress_clone_dbo;
+CREATE ROLE regress_clone_app;
+CREATE DATABASE regress_clone_g OWNER regress_clone_dbo;
+\c regress_clone_g
+GRANT USAGE, CREATE ON SCHEMA public TO regress_clone_app;
+COMMENT ON SCHEMA public IS 'granted';
+SELECT dolt_clone(:'url_pub');
+SELECT nspversioned, nspowner::regrole AS owner, nspacl,
+       obj_description(oid, 'pg_namespace') AS comment
+FROM pg_namespace WHERE nspname = 'public';
+SELECT has_schema_privilege('regress_clone_app', 'public', 'USAGE, CREATE') AS app,
+       has_schema_privilege('regress_clone_dbo', 'public', 'CREATE') AS dbo,
+       has_schema_privilege('public', 'public', 'USAGE') AS everyone;
+SELECT count(*) AS grant_dependencies FROM pg_shdepend
+WHERE objid = 'public'::regnamespace AND refobjid = 'regress_clone_app'::regrole;
+SELECT count(*) AS uncommitted FROM dolt_status;
+\c :db
+DROP DATABASE regress_clone_g;
+CREATE DATABASE regress_clone_a;
+\c regress_clone_a
+DROP SCHEMA public;
+CREATE SCHEMA public AUTHORIZATION regress_clone_app;
+SELECT dolt_clone(:'url_pub');
+SELECT nspversioned, nspowner::regrole AS owner, nspacl
+FROM pg_namespace WHERE nspname = 'public';
+-- default privileges for it are something depending on it: refused
+\c :db
+DROP DATABASE regress_clone_a;
+CREATE DATABASE regress_clone_d;
+\c regress_clone_d
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_clone_dbo IN SCHEMA public GRANT SELECT ON TABLES TO regress_clone_app;
+SELECT dolt_clone(:'url_pub');
+\c :db
+DROP DATABASE regress_clone_d;
+
+-- a later move, here a hard reset of main to a history with a versioned
+-- public while dev's has none: the ordinary public is dev's too, refused,
+-- and dev keeps it
+CREATE DATABASE regress_clone_m;
+\c regress_clone_m
+GRANT USAGE ON SCHEMA public TO regress_clone_app;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.a (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'app')::text) AS committed;
+SELECT dolt_branch('dev');
+DROP SCHEMA app CASCADE;
+SELECT length(dolt_commit('-Am', 'app gone')::text) AS committed;
+SELECT dolt_remote('add', 'origin', :'url_pub');
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+SELECT dolt_reset('--hard', 'origin/main');
+SELECT nspversioned, nspacl FROM pg_namespace WHERE nspname = 'public';
+SELECT dolt_checkout('dev') IS NOT NULL AS on_dev;
+CREATE TABLE x (id int);
+SELECT nspversioned FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid
+WHERE c.relname = 'x';
+\c :db
+DROP DATABASE regress_clone_m;
+DROP ROLE regress_clone_app;
+DROP ROLE regress_clone_dbo;

@@ -414,6 +414,18 @@ SELECT dolt_push('origin', 'main') AS pushed;
  {0,"main -> origin/main"}
 (1 row)
 
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'side') AS pushed;
+          pushed           
+---------------------------
+ {0,"side -> origin/side"}
+(1 row)
+
 CREATE DATABASE regress_clone_q;
 \c regress_clone_q
 SELECT dolt_clone(:'url_pub');
@@ -434,10 +446,39 @@ SELECT nspversioned FROM pg_namespace WHERE nspname = 'public';
  t
 (1 row)
 
+-- (what a commit doesn't hold kept: a new database's public, as it was)
+SELECT nspowner::regrole AS owner, nspacl,
+       obj_description(oid, 'pg_namespace') AS comment
+FROM pg_namespace WHERE nspname = 'public';
+       owner       |                            nspacl                             |        comment         
+-------------------+---------------------------------------------------------------+------------------------
+ pg_database_owner | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner} | standard public schema
+(1 row)
+
 SELECT count(*) AS uncommitted FROM dolt_status;
  uncommitted 
 -------------
            0
+(1 row)
+
+-- (another branch, its versioned public the same)
+SELECT dolt_checkout('side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SELECT id FROM t;
+ id 
+----
+  1
+(1 row)
+
+SELECT nspversioned, nspowner::regrole AS owner, nspacl
+FROM pg_namespace WHERE nspname = 'public';
+ nspversioned |       owner       |                            nspacl                             
+--------------+-------------------+---------------------------------------------------------------
+ t            | pg_database_owner | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}
 (1 row)
 
 \c regress_clone_p
@@ -447,7 +488,7 @@ CREATE DATABASE regress_clone_r;
 CREATE TABLE public.mine (id int);
 SELECT dolt_clone(:'url_pub');
 ERROR:  schema "public" already exists and isn't versioned
-DETAIL:  The commit's schema "public" is versioned, and this one has objects in it.
+DETAIL:  The commit's schema "public" is versioned, and table mine depends on this one.
 HINT:  Drop it, or rename it, and try again.
 SELECT count(*) AS remotes FROM dolt_remotes;
  remotes 
@@ -478,3 +519,145 @@ SELECT id FROM t;
 \c :db
 DROP DATABASE regress_clone_r;
 DROP DATABASE regress_clone_p;
+-- a public given to others, its owner, grants and comment kept on the
+-- versioned one; one made by another role stays that role's
+CREATE ROLE regress_clone_dbo;
+CREATE ROLE regress_clone_app;
+CREATE DATABASE regress_clone_g OWNER regress_clone_dbo;
+\c regress_clone_g
+GRANT USAGE, CREATE ON SCHEMA public TO regress_clone_app;
+COMMENT ON SCHEMA public IS 'granted';
+SELECT dolt_clone(:'url_pub');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT nspversioned, nspowner::regrole AS owner, nspacl,
+       obj_description(oid, 'pg_namespace') AS comment
+FROM pg_namespace WHERE nspname = 'public';
+ nspversioned |       owner       |                                                nspacl                                                | comment 
+--------------+-------------------+------------------------------------------------------------------------------------------------------+---------
+ t            | pg_database_owner | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,regress_clone_app=UC/pg_database_owner} | granted
+(1 row)
+
+SELECT has_schema_privilege('regress_clone_app', 'public', 'USAGE, CREATE') AS app,
+       has_schema_privilege('regress_clone_dbo', 'public', 'CREATE') AS dbo,
+       has_schema_privilege('public', 'public', 'USAGE') AS everyone;
+ app | dbo | everyone 
+-----+-----+----------
+ t   | t   | t
+(1 row)
+
+SELECT count(*) AS grant_dependencies FROM pg_shdepend
+WHERE objid = 'public'::regnamespace AND refobjid = 'regress_clone_app'::regrole;
+ grant_dependencies 
+--------------------
+                  1
+(1 row)
+
+SELECT count(*) AS uncommitted FROM dolt_status;
+ uncommitted 
+-------------
+           0
+(1 row)
+
+\c :db
+DROP DATABASE regress_clone_g;
+CREATE DATABASE regress_clone_a;
+\c regress_clone_a
+DROP SCHEMA public;
+CREATE SCHEMA public AUTHORIZATION regress_clone_app;
+SELECT dolt_clone(:'url_pub');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT nspversioned, nspowner::regrole AS owner, nspacl
+FROM pg_namespace WHERE nspname = 'public';
+ nspversioned |       owner       | nspacl 
+--------------+-------------------+--------
+ t            | regress_clone_app | 
+(1 row)
+
+-- default privileges for it are something depending on it: refused
+\c :db
+DROP DATABASE regress_clone_a;
+CREATE DATABASE regress_clone_d;
+\c regress_clone_d
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_clone_dbo IN SCHEMA public GRANT SELECT ON TABLES TO regress_clone_app;
+SELECT dolt_clone(:'url_pub');
+ERROR:  schema "public" already exists and isn't versioned
+DETAIL:  The commit's schema "public" is versioned, and default privileges on new relations belonging to role regress_clone_dbo in schema public depends on this one.
+HINT:  Drop it, or rename it, and try again.
+\c :db
+DROP DATABASE regress_clone_d;
+-- a later move, here a hard reset of main to a history with a versioned
+-- public while dev's has none: the ordinary public is dev's too, refused,
+-- and dev keeps it
+CREATE DATABASE regress_clone_m;
+\c regress_clone_m
+GRANT USAGE ON SCHEMA public TO regress_clone_app;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.a (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'app')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dev');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to table app.a
+SELECT length(dolt_commit('-Am', 'app gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url_pub');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+ fetched 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'origin/main');
+ERROR:  schema "public" already exists and isn't versioned
+DETAIL:  The commit's schema "public" is versioned, and branch "dev" has no versioned one: this one is that branch's too.
+HINT:  Drop it, or rename it, and try again.
+SELECT nspversioned, nspacl FROM pg_namespace WHERE nspname = 'public';
+ nspversioned |                                               nspacl                                                
+--------------+-----------------------------------------------------------------------------------------------------
+ f            | {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,regress_clone_app=U/pg_database_owner}
+(1 row)
+
+SELECT dolt_checkout('dev') IS NOT NULL AS on_dev;
+ on_dev 
+--------
+ t
+(1 row)
+
+CREATE TABLE x (id int);
+SELECT nspversioned FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid
+WHERE c.relname = 'x';
+ nspversioned 
+--------------
+ f
+(1 row)
+
+\c :db
+DROP DATABASE regress_clone_m;
+DROP ROLE regress_clone_app;
+DROP ROLE regress_clone_dbo;

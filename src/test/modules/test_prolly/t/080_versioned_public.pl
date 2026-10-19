@@ -48,6 +48,10 @@ is(o('fresh', q{SELECT dolt_hashof('main')}), l('postgres', q{SELECT dolt_hashof
 is(o('fresh', 'SELECT count(*), max(v) FROM t'), '100|v99', 'with its rows');
 is(o('fresh', q{SELECT nspversioned FROM pg_namespace WHERE nspname = 'public'}), 't',
 	'its public the history\'s');
+is( o('fresh',
+		q{SELECT nspowner::regrole, nspacl FROM pg_namespace WHERE nspname = 'public'}),
+	'pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}',
+	'owned and usable as the one it replaced');
 is(o('fresh', q{SELECT count(*) FROM dolt_status}), '0', 'and nothing uncommitted');
 
 # and pushed to again
