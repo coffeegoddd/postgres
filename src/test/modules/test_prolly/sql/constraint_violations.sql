@@ -165,31 +165,53 @@ RESET ROLE;
 -- has it, whether the merge applies theirs' changes alone (u: ours changed
 -- its definition only) or merges both sides' (w); and so does one whose
 -- new version would take the value a row kept so still holds (w's 1).
+-- A row whose put-back was refused keeps the branch's version while the
+-- others are written, then takes its new one if it fits: r's 2 and s's 2
+-- (s: theirs' changes alone, as u) do once 1 is refused, so only 1's
+-- violation is recorded.
 CREATE SCHEMA uv VERSIONED;
 CREATE TABLE uv.u (pk int PRIMARY KEY, x int);
 INSERT INTO uv.u VALUES (1, 1), (2, 2);
 CREATE TABLE uv.w (pk int PRIMARY KEY, x int UNIQUE);
 INSERT INTO uv.w VALUES (1, 1), (2, 2);
+CREATE TABLE uv.r (pk int PRIMARY KEY, b int UNIQUE, c int);
+INSERT INTO uv.r VALUES (1, 100, 0), (2, 200, 0);
+CREATE TABLE uv.s (pk int PRIMARY KEY, b int, c int);
+INSERT INTO uv.s VALUES (1, 100, 0), (2, 999, 0);
 SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
 SELECT dolt_branch('uv_theirs');
 CREATE UNIQUE INDEX u_x ON uv.u (x);
 INSERT INTO uv.w VALUES (3, 5);
+UPDATE uv.r SET b = 999 WHERE pk = 2;
+CREATE UNIQUE INDEX s_b ON uv.s (b);
 SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
 SELECT dolt_checkout('uv_theirs');
 UPDATE uv.u SET x = 1 WHERE pk = 2;
 UPDATE uv.w SET x = 5 WHERE pk = 2;
 UPDATE uv.w SET x = 2 WHERE pk = 1;
+UPDATE uv.r SET b = 999 WHERE pk = 1;
+UPDATE uv.r SET c = 1 WHERE pk = 2;
+UPDATE uv.s SET b = 999 WHERE pk = 1;
+UPDATE uv.s SET c = 1 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
 SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('uv_theirs'))[3:4];
 SELECT * FROM uv.u ORDER BY pk;
 SELECT * FROM uv.w ORDER BY pk;
+SELECT * FROM uv.r ORDER BY pk;
+SELECT * FROM uv.s ORDER BY pk;
 SELECT 'u' AS t, violation_type, violating_row::text
 FROM dolt_constraint_violations('uv.u')
 UNION ALL
 SELECT 'w', violation_type, violating_row::text
-FROM dolt_constraint_violations('uv.w') ORDER BY 1, 3;
+FROM dolt_constraint_violations('uv.w')
+UNION ALL
+SELECT 'r', violation_type, violating_row::text
+FROM dolt_constraint_violations('uv.r')
+UNION ALL
+SELECT 's', violation_type, violating_row::text
+FROM dolt_constraint_violations('uv.s') ORDER BY 1, 3;
 ROLLBACK;
 SELECT dolt_branch('-D', 'uv_theirs');
 DROP SCHEMA uv CASCADE;
