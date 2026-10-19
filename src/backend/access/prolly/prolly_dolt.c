@@ -866,6 +866,22 @@ reserved_branch_name(const char *name)
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_WRITER_PREFIX)));
 }
 
+/*
+ * A connection doesn't name a hidden branch, as dolt_checkout() doesn't:
+ * on it, it would be writable, and its writes would move the branch off
+ * the commit that the sessions detached there are at.  (A writer's branch
+ * is connected to as any other.)
+ */
+void
+prolly_check_connect_branch(const char *branch)
+{
+	if (detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Check out the commit with dolt_checkout(), read-only.")));
+}
+
 /* Does what's checked out name a commit by its hash (a prefix of it)? */
 static bool
 names_commit(const char *ref)
@@ -1364,6 +1380,16 @@ dolt_branch(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a writer's branch can't be renamed")));
+
+		/*
+		 * (nor a commit's hidden branch: renamed, it would be an ordinary,
+		 * writable branch where the sessions detached at the commit are)
+		 */
+		if (detached_branch(linitial(names)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a commit's hidden branch can't be renamed"),
+					 errhint("Make a branch at the commit with dolt_branch().")));
 		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
 		/* (the branch a forced rename replaces) */
 		replaces_protected = force &&

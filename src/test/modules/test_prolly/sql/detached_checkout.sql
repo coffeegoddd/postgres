@@ -61,6 +61,11 @@ SELECT active_branch();
 INSERT INTO dc.t VALUES (5, 'five');
 SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
 SELECT active_branch() LIKE 'detached/%' AS on_a_hidden_branch;
+-- (nor is its hidden branch renamed, forced or not: it would be a writable
+-- branch where the session is detached)
+SELECT dolt_branch('-m', active_branch(), 'zz');
+SELECT dolt_branch('-mf', active_branch(), 'zz');
+SELECT active_branch() LIKE 'detached/%' AS on_a_hidden_branch;
 SELECT dolt_checkout('-b', 'main');
 INSERT INTO dc.t VALUES (6, 'six');
 BEGIN READ ONLY;

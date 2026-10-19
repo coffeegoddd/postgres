@@ -671,7 +671,9 @@ fails without its fix), and Postgres's suites keep passing after each one.
     the session on it. A checkout that leaves one deletes every hidden
     branch no session is on, but only those the session may delete
     (deleting a branch takes owning the database): one left by a session
-    that may not stays until one that may checks out.
+    that may not stays until one that may checks out. No session moves
+    a hidden branch: `dolt_checkout` and a `dbname/branch` connection
+    refuse its name, and `dolt_branch -m` doesn't rename it.
   - Every new branch has only its head until first used, whether made
     from a branch (`dolt_branch`, `dolt_checkout -b`) or at a commit; only
     one made from a branch with no commits is copied at once. Its first
