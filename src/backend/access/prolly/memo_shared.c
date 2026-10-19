@@ -3,7 +3,7 @@
  * memo_shared.c
  *	  Value memo implementation "shared": a bounded table in shared memory
  *	  keyed by database, TOAST relation, value ID, the xmin of the value's
- *	  first chunk, and the column's type.
+ *	  first chunk, and the column's type and its definition.
  *
  * A value ID isn't a name for content (prolly_memo.h); with its first
  * chunk's xmin it is.  A value inserted before a branch was made has the
@@ -12,7 +12,9 @@
  * transaction writes on one branch).  So a lookup reads the first chunk
  * by the TOAST relation's index (one probe, against reading and hashing
  * the value), and finds the entry by the pointer and that xmin; and by
- * the column's type, whose encoding made the reference.
+ * the column's type, whose encoding made the reference, and the hash of
+ * that type's definition (an enum's labels, a composite's attributes),
+ * which the catalog changes without the value.
  *
  * The xmin is the raw one, which freezing keeps, and which repeats after
  * 2^32 transactions.  Each entry records the transaction ID it was filled
@@ -79,6 +81,7 @@ typedef struct MemoKey
 	uint64		valueid;
 	TransactionId xmin;
 	Oid			typid;
+	uint64		typdef;			/* the type's definition, hashed */
 } MemoKey;
 
 typedef struct MemoEntry
@@ -157,7 +160,8 @@ shared_shmem_init(void *area)
  * the last lookup's key if it was of the same pointer.
  */
 static bool
-key_of(const void *pointer, Oid typid, MemoKey *key, bool *frozen, bool cached)
+key_of(const void *pointer, Oid typid, uint64 typdef, MemoKey *key,
+	   bool *frozen, bool cached)
 {
 	toast_external_data ext;
 	Relation	toastrel;
@@ -171,7 +175,8 @@ key_of(const void *pointer, Oid typid, MemoKey *key, bool *frozen, bool cached)
 	Size		len = VARSIZE_ANY(pointer);
 
 	if (cached && len == last_pointer_len &&
-		memcmp(pointer, last_pointer, len) == 0 && last_key.typid == typid)
+		memcmp(pointer, last_pointer, len) == 0 && last_key.typid == typid &&
+		last_key.typdef == typdef)
 	{
 		*key = last_key;
 		*frozen = last_frozen;
@@ -186,6 +191,7 @@ key_of(const void *pointer, Oid typid, MemoKey *key, bool *frozen, bool cached)
 	key->toastrelid = ext.toastrelid;
 	key->valueid = ext.valueid;
 	key->typid = typid;
+	key->typdef = typdef;
 
 	toastrel = table_open(ext.toastrelid, AccessShareLock);
 	valid = toast_open_indexes(toastrel, AccessShareLock, &toastidxs, &nidx);
@@ -232,7 +238,7 @@ same_key(const MemoKey *a, const MemoKey *b)
 
 static bool
 shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
-			  StringInfo ref)
+			  uint64 typdef, StringInfo ref)
 {
 	MemoKey		key;
 	bool		frozen;
@@ -241,7 +247,7 @@ shared_lookup(const ProllyValueStore *values, const void *pointer, Oid typid,
 	bool		own = false;
 
 	if (prolly_value_memo_entries == 0 || !VARATT_IS_EXTERNAL_ONDISK(pointer) ||
-		!key_of(pointer, typid, &key, &frozen, false))
+		!key_of(pointer, typid, typdef, &key, &frozen, false))
 	{
 		counts.misses++;
 		pgstat_count_prolly(PGSTAT_PROLLY_MEMO_MISSES, 1);
@@ -398,7 +404,8 @@ memo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 }
 
 static void
-shared_remember(const void *pointer, Oid typid, const ProllyValue *ref)
+shared_remember(const void *pointer, Oid typid, uint64 typdef,
+				const ProllyValue *ref)
 {
 	MemoKey		key;
 	bool		frozen;
@@ -406,7 +413,7 @@ shared_remember(const void *pointer, Oid typid, const ProllyValue *ref)
 
 	if (prolly_value_memo_entries == 0 ||
 		!VARATT_IS_EXTERNAL_ONDISK(pointer) || ref->len > MEMO_REF_MAX ||
-		!key_of(pointer, typid, &key, &frozen, true) || frozen)
+		!key_of(pointer, typid, typdef, &key, &frozen, true) || frozen)
 		return;
 	if (!callbacks_registered)
 	{

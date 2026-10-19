@@ -115,6 +115,7 @@ tests += {
       'hash_pointers',
       'toast_by_content',
       'toast_folds',
+      'redefined_rows',
       'index_tablespaces',
     ],
   },
