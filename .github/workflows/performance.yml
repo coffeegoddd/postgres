@@ -11,10 +11,16 @@
 #
 # "S suite gate" always reports, so it can be a required check (it isn't
 # until the gate is calibrated: configs/s_gate.toml); it passes without
-# building for a pull request that changes only specs/.  It leaves the
-# pull-request comment (<!-- s-suite -->) as the s-suite-comment artifact
-# for the workflow_run commenter to post, so code from a pull request never
-# runs with a token that can write.
+# building for a pull request that changes only specs/.
+#
+# Pull requests and pushes run none of this unless the repository variable
+# S_SUITE_PRS is 'true' (it is off while the suite would hold up every pull
+# request): the gate passes without building, as for specs/ alone.  The
+# nightly and a run by hand are unaffected.
+#
+# It leaves the pull-request comment (<!-- s-suite -->) as the
+# s-suite-comment artifact for the workflow_run commenter to post, so code
+# from a pull request never runs with a token that can write.
 #
 # Every push to any branch builds and caches its head, so a pull request's
 # base (a stack layer's base is the layer below's head) is usually cached.
@@ -66,6 +72,7 @@ jobs:
         id: classify
         env:
           EVENT: ${{ github.event_name }}
+          S_SUITE_PRS: ${{ vars.S_SUITE_PRS }}
         run: |
           code=true
           candidate=$(git rev-parse HEAD)
@@ -78,6 +85,12 @@ jobs:
             if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
               code=false
             fi
+          fi
+          # (off for pull requests and pushes unless S_SUITE_PRS: see above)
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } &&
+             [ "$S_SUITE_PRS" != true ]; then
+            echo "S_SUITE_PRS isn't 'true': the S suite doesn't run for a $EVENT."
+            code=false
           fi
           { echo "code=$code"; echo "base=$base"; echo "candidate=$candidate"; } | tee -a "$GITHUB_OUTPUT"
 
@@ -341,7 +354,7 @@ jobs:
     steps:
       - name: Nothing to compare
         if: needs.classify.result == 'success' && (needs.classify.outputs.code != 'true' || github.event_name != 'pull_request')
-        run: echo "A push, or a pull request that changes only specs/; the S suite doesn't compare anything."
+        run: echo "A push, a pull request that changes only specs/, or the S suite off for pull requests (S_SUITE_PRS); it doesn't compare anything."
 
       - name: Classification failed
         if: needs.classify.result != 'success'
