@@ -22,6 +22,12 @@
  *					canonical bytes.  No type OIDs.
  *	anyarray		the element type's qualified name (varint length, UTF-8),
  *					then the array (pg_statistic holds such values).
+ *	float4, float8	the send format (IEEE 754 bits, network byte order),
+ *					except that every NaN is the positive quiet NaN
+ *					(7fc00000, 7ff8000000000000): NaNs are equal whatever
+ *					their bits.  So too the floats inside geometric
+ *					values, and ranges and multiranges of floats, which are
+ *					otherwise their send format as below.
  *	jsonb			a version byte (2), then the document as jsonb stores it
  *					(after its varlena header), its strings in UTF-8: in a
  *					UTF-8 database, the bytes the value holds.  Version 1,
@@ -65,6 +71,16 @@ extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,
  */
 extern Datum prolly_datum_decode(ProllyDatumCodec *codec, const char *data,
 								 int len);
+
+/*
+ * What values of typid encode by besides their type: the definitions their
+ * canonical bytes depend on that the catalog can change without rewriting
+ * the rows holding them (an enum's labels, a composite's attributes, and
+ * those of the types they hold), appended to out.  Local, not canonical
+ * (OIDs and attribute numbers): for telling whether bytes encoded before
+ * are still the ones values encode to.
+ */
+extern void prolly_datum_definition(Oid typid, StringInfo out);
 
 /* Unsigned LEB128, the minimal encoding. */
 extern void prolly_put_varint(StringInfo out, uint64 v);

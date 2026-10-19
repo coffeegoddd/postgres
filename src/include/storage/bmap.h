@@ -48,6 +48,7 @@ extern void bmappredrop(SMgrRelation reln, bool isRedo);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
+extern void bmap_drop_database_recovery(Oid dbid, Oid spcid);
 extern void bmapextend(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, const void *buffer, bool skipFsync);
 extern void bmapzeroextend(SMgrRelation reln, ForkNumber forknum,
@@ -103,6 +104,7 @@ typedef struct BmapFold
 typedef void (*BmapChangeVisit) (const BmapChange *change, void *arg);
 
 extern void bmap_fold_begin(SMgrRelation reln, BmapFold *fold);
+extern bool bmap_folded(SMgrRelation reln);
 extern bool bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
 							  BmapChangeVisit visit, void *arg);
 extern void bmap_fold_prune(SMgrRelation reln, const BmapFold *keep);

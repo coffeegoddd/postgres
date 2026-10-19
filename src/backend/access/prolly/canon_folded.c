@@ -114,13 +114,17 @@
 #include "access/prolly_applier.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
+#include "catalog/branch_ops.h"
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
+#include "catalog/objectaccess.h"
+#include "commands/comment.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/heap.h"
@@ -156,6 +160,9 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_init_privs.h"
+#include "catalog/pg_seclabel.h"
+#include "commands/seclabel.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -196,20 +203,21 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "7", indexes described without their
- * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
- * default one, and was the first with definitions' expressions (checks,
- * defaults, generated expressions, policies) as they print read back
- * (reprinted()); "5" had them as printed, and was the first with a row's
- * long values each out of line in a value tree of its own; "4" had only
- * long rows out of line; "3" keyed value trees' chunks by offset, and was
- * the first with its definitions' fields escaped (append_field()); "2" was
- * keyless rows keyed by their first bytes and their hash, and a root
- * without the item keyed them by the hash alone.  A root in another has
- * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions' text isn't this format's.
+ * The format a folded root is in: "8", every float NaN in rows and keys the
+ * one canonical NaN (prolly_datum.c); "7" had a NaN's own bits, and was the
+ * first with indexes described without their tablespaces; "6" had an index's
+ * TABLESPACE clause when it wasn't in the default one, and was the first
+ * with definitions' expressions (checks, defaults, generated expressions,
+ * policies) as they print read back (reprinted()); "5" had them as printed,
+ * and was the first with a row's long values each out of line in a value
+ * tree of its own; "4" had only long rows out of line; "3" keyed value
+ * trees' chunks by offset, and was the first with its definitions' fields
+ * escaped (append_field()); "2" was keyless rows keyed by their first bytes
+ * and their hash, and a root without the item keyed them by the hash
+ * alone.  A root in another has its tables' rows unreadable here, and is
+ * neither moved to nor merged: its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"7"
+#define FOLDED_FORMAT	"8"
 
 typedef struct Canon
 {
@@ -431,7 +439,7 @@ struct BaseTable
 {
 	StringInfoData key;			/* its item's key */
 	ProllyNodeRef data;
-	ProllyHash	description;	/* of its definition */
+	ProllyHash	description;	/* of its definition (baseline_hash()) */
 	StringInfoData state;		/* the change finder's */
 };
 
@@ -537,11 +545,64 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
+ * What a baseline's tree is kept for: the table's description, and what
+ * its rows' canonical bytes depend on that changes no page (so no change
+ * the finder would see).  The columns rows are read over, by number: a
+ * column dropped and one of the same name and type added describe the
+ * table alike, but its rows read as NULL.  And the definitions of the
+ * columns' types (prolly_datum_definition()): an enum's label renamed, a
+ * composite's attribute dropped, encode the same rows otherwise.  And
+ * the key encoder, value encoder and keying, by implementation and format
+ * version: one whose format changed encodes the same rows otherwise too.
+ *
+ * (An enum's label added changes its definition but no existing row's
+ * bytes; telling it from a rename would take the old labels, so the next
+ * fold reads each table using it in full, once.)
+ */
+static void
+baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
+			  ProllyHash *h)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	StringInfoData match;
+	ProllyComponents c;
+	const ProllyImplInfo *encoders[3];
+
+	initStringInfo(&match);
+	appendBinaryStringInfo(&match, description->data, description->len);
+	appendStringInfoChar(&match, '\0');
+	prolly_components_for_relation(rel, &c);
+	encoders[0] = &c.key_encoder->info;
+	encoders[1] = &c.value_encoder->info;
+	encoders[2] = &c.keying->info;
+	for (int i = 0; i < lengthof(encoders); i++)
+	{
+		appendBinaryStringInfo(&match, (const char *) &encoders[i]->impl_id,
+							   sizeof(encoders[i]->impl_id));
+		appendBinaryStringInfo(&match,
+							   (const char *) &encoders[i]->format_version,
+							   sizeof(encoders[i]->format_version));
+	}
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		appendBinaryStringInfo(&match, (const char *) &att->attnum,
+							   sizeof(att->attnum));
+		prolly_datum_definition(att->atttypid, &match);
+	}
+	sha256(cn, match.data, match.len, h);
+	pfree(match.data);
+}
+
+/*
  * A table's data tree, folded from its rows as the transaction sees them by
  * the change finder: from its baseline if it has one for this definition
- * (described in 'description'); with a next baseline being made, its entry
- * there too.  The same rows give the same tree whatever pages, order or
- * history they come from.
+ * (described in 'description', its rows as baseline_hash() has them); with
+ * a next baseline being made, its entry there too.  The same rows give the
+ * same tree whatever pages, order or history they come from.
  */
 static void
 table_root(Canon *cn, CanonItem *it, Relation rel,
@@ -567,7 +628,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		index_close(pk, AccessShareLock);
 	}
 
-	sha256(cn, description->data, description->len, &dh);
+	baseline_hash(cn, rel, description, &dh);
 	bt = find_base_table(cn, &it->key);
 	if (bt && (bt->description.len != dh.len ||
 			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
@@ -4232,6 +4293,286 @@ collation_in_use(Oid coll)
 	return used;
 }
 
+/*
+ * An ordinary schema a versioned one of its name replaces: what the commit
+ * doesn't hold, carried onto the new one (carry_over()).
+ */
+typedef struct Replaced
+{
+	char	   *name;			/* unquoted */
+	Oid			owner;
+	Acl		   *acl;			/* NULL: the default */
+	char	   *comment;		/* NULL: none */
+	List	   *labels;			/* its security labels: provider, label, ... */
+	char		privtype;		/* its pg_init_privs row's, or 0: none */
+	Acl		   *initprivs;		/* likewise */
+} Replaced;
+
+/* A branch other than the session's whose folded root lacks schema name. */
+typedef struct Lacking
+{
+	Canon	   *cn;
+	const char *name;			/* quoted, as a commit has it */
+	const char *session;		/* the session's branch */
+	char	   *branch;			/* the first found */
+} Lacking;
+
+static void
+note_lacking(const char *branch, const ProllyHash *head, void *arg)
+{
+	Lacking    *l = arg;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef root;
+
+	if (l->branch != NULL || strcmp(branch, l->session) == 0)
+		return;
+	prolly_database_components(&dc);
+	if (head->len == 0 ||
+		!PROLLY_CALL(dc.refs, working_set, branch, &root) ||
+		root.hash.len == 0 ||
+		find_item(move_items(l->cn, &root), 'n', l->name) == NULL)
+		l->branch = pstrdup(branch);
+}
+
+/*
+ * A schema the move makes, name (quoted) as a commit has it: the statements
+ * making it.  An ordinary schema of its name is in the way.  It is every
+ * branch's, so it is replaced only where nothing else has a use for it:
+ * nothing depends on it (as a new database's public), the database has no
+ * versioned schemas yet (its first history, cloned or pushed into it), and
+ * every other branch's root has a versioned one of its name, which that
+ * branch makes in its place in turn.  Its owner, privileges and comment,
+ * which a commit doesn't hold, are noted in *replaced for the new one.
+ * Otherwise the move is refused, naming it and what uses it.
+ */
+static List *
+make_schema(Canon *cn, const char *name, List **replaced)
+{
+	char	   *plain = strVal(linitial(stringToQualifiedNameList(name, NULL)));
+	Oid			nsp = get_namespace_oid(plain, true);
+	char	   *create = psprintf("CREATE SCHEMA %s VERSIONED", name);
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	dep;
+	char	   *user = NULL;	/* what depends on it, the first */
+	Lacking		lacking = {cn, name, branch_ops()->current(), NULL};
+	HeapTuple	tup;
+	Datum		acl;
+	bool		isnull;
+	Replaced   *r;
+
+	if (!OidIsValid(nsp))
+		return list_make1(create);
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(nsp));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	if ((dep = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(dep);
+		ObjectAddress obj;
+
+		ObjectAddressSubSet(obj, d->classid, d->objid, d->objsubid);
+		user = getObjectDescription(&obj, true);
+		if (user == NULL)
+			user = pstrdup("an object");
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	if (user != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+				 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+				 errdetail("The commit's schema \"%s\" is versioned, and %s depends on this one.",
+						   plain, user),
+				 errhint("Drop it, or rename it, and try again.")));
+	if (database_has_versioned_schemas())
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+				 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+				 errdetail("The commit's schema \"%s\" is versioned, and the database has versioned schemas already; this one is every branch's.",
+						   plain),
+				 errhint("Drop it, or rename it, and try again.")));
+	{
+		ProllyDatabaseComponents dc;
+		ProllyHash	head = {0};
+
+		/*
+		 * (a branch with commits already: those from before may use this
+		 * one, and moving back to them would find none)
+		 */
+		prolly_database_components(&dc);
+		if (PROLLY_CALL(dc.refs, resolve, lacking.session, &head) &&
+			head.len > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_SCHEMA),
+					 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+					 errdetail("The commit's schema \"%s\" is versioned, and branch \"%s\" has commits already: only a branch's first history (a clone, or a push into a new database) replaces an ordinary schema.",
+							   plain, lacking.session),
+					 errhint("Drop it, or rename it, and try again.")));
+		PROLLY_CALL(dc.refs, branches, note_lacking, &lacking);
+	}
+	if (lacking.branch != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+				 errmsg("schema \"%s\" already exists and isn't versioned", plain),
+				 errdetail("The commit's schema \"%s\" is versioned, and branch \"%s\" has no versioned one: this one is that branch's too.",
+						   plain, lacking.branch),
+				 errhint("Drop it, or rename it, and try again.")));
+
+	/* what the new one keeps of it */
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nsp));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for schema %u", nsp);
+	r = palloc(sizeof(Replaced));
+	r->name = pstrdup(plain);
+	r->owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+	acl = SysCacheGetAttr(NAMESPACEOID, tup, Anum_pg_namespace_nspacl, &isnull);
+	r->acl = isnull ? NULL : DatumGetAclPCopy(acl);
+	ReleaseSysCache(tup);
+	r->comment = GetComment(nsp, NamespaceRelationId, 0);
+	r->labels = NIL;
+	r->privtype = 0;
+	r->initprivs = NULL;
+	{
+		Relation	rel;
+		ScanKeyData skey[3];
+		HeapTuple	row;
+
+		rel = table_open(SecLabelRelationId, AccessShareLock);
+		ScanKeyInit(&skey[0], Anum_pg_seclabel_objoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(nsp));
+		ScanKeyInit(&skey[1], Anum_pg_seclabel_classoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+		ScanKeyInit(&skey[2], Anum_pg_seclabel_objsubid, BTEqualStrategyNumber,
+					F_INT4EQ, Int32GetDatum(0));
+		scan = systable_beginscan(rel, SecLabelObjectIndexId, true, NULL, 3, skey);
+		while ((row = systable_getnext(scan)) != NULL)
+		{
+			Datum		provider;
+			Datum		label;
+
+			provider = heap_getattr(row, Anum_pg_seclabel_provider,
+									RelationGetDescr(rel), &isnull);
+			label = heap_getattr(row, Anum_pg_seclabel_label,
+								 RelationGetDescr(rel), &isnull);
+			r->labels = lappend(lappend(r->labels, TextDatumGetCString(provider)),
+								TextDatumGetCString(label));
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+
+		rel = table_open(InitPrivsRelationId, AccessShareLock);
+		ScanKeyInit(&skey[0], Anum_pg_init_privs_objoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(nsp));
+		ScanKeyInit(&skey[1], Anum_pg_init_privs_classoid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(NamespaceRelationId));
+		ScanKeyInit(&skey[2], Anum_pg_init_privs_objsubid, BTEqualStrategyNumber,
+					F_INT4EQ, Int32GetDatum(0));
+		scan = systable_beginscan(rel, InitPrivsObjIndexId, true, NULL, 3, skey);
+		if ((row = systable_getnext(scan)) != NULL)
+		{
+			r->privtype = ((Form_pg_init_privs) GETSTRUCT(row))->privtype;
+			acl = heap_getattr(row, Anum_pg_init_privs_initprivs,
+							   RelationGetDescr(rel), &isnull);
+			r->initprivs = DatumGetAclPCopy(acl);
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
+	*replaced = lappend(*replaced, r);
+	/* (no CASCADE: nothing is in it) */
+	return list_make2(psprintf("DROP SCHEMA %s", name), create);
+}
+
+/*
+ * The schemas make_schema() replaced, made now: each given the owner,
+ * privileges and comment of the ordinary one it replaced, which a commit
+ * doesn't hold (a new database's public stays pg_database_owner's, usable
+ * by PUBLIC).
+ */
+static void
+carry_over(List *replaced)
+{
+	ListCell   *lc;
+
+	if (replaced == NIL)
+		return;
+	CommandCounterIncrement();
+	foreach(lc, replaced)
+	{
+		Replaced   *r = lfirst(lc);
+		Oid			nsp = get_namespace_oid(r->name, false);
+		Relation	rel = table_open(NamespaceRelationId, RowExclusiveLock);
+		HeapTuple	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nsp));
+		Datum		values[Natts_pg_namespace] = {0};
+		bool		nulls[Natts_pg_namespace] = {0};
+		bool		replaces[Natts_pg_namespace] = {0};
+		HeapTuple	newtup;
+		Oid		   *members = NULL;
+		int			nmembers;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for schema %u", nsp);
+		values[Anum_pg_namespace_nspowner - 1] = ObjectIdGetDatum(r->owner);
+		replaces[Anum_pg_namespace_nspowner - 1] = true;
+		if (r->acl != NULL)
+			values[Anum_pg_namespace_nspacl - 1] = PointerGetDatum(r->acl);
+		else
+			nulls[Anum_pg_namespace_nspacl - 1] = true;
+		replaces[Anum_pg_namespace_nspacl - 1] = true;
+		newtup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
+								   replaces);
+		CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+		ReleaseSysCache(tup);
+		heap_freetuple(newtup);
+		table_close(rel, RowExclusiveLock);
+
+		/* (made with no privileges given: none to take back) */
+		changeDependencyOnOwner(NamespaceRelationId, nsp, r->owner);
+		nmembers = r->acl ? aclmembers(r->acl, &members) : 0;
+		updateAclDependencies(NamespaceRelationId, nsp, 0, r->owner,
+							  0, NULL, nmembers, members);
+		if (r->comment != NULL)
+			CreateComments(nsp, NamespaceRelationId, 0, r->comment);
+		for (int i = 0; i < list_length(r->labels); i += 2)
+		{
+			ObjectAddress obj;
+
+			ObjectAddressSet(obj, NamespaceRelationId, nsp);
+			SetSecurityLabel(&obj, list_nth(r->labels, i),
+							 list_nth(r->labels, i + 1));
+		}
+		if (r->privtype != 0)
+		{
+			Relation	ip = table_open(InitPrivsRelationId, RowExclusiveLock);
+			Datum		ivalues[Natts_pg_init_privs] = {0};
+			bool		inulls[Natts_pg_init_privs] = {0};
+			HeapTuple	row;
+
+			ivalues[Anum_pg_init_privs_objoid - 1] = ObjectIdGetDatum(nsp);
+			ivalues[Anum_pg_init_privs_classoid - 1] =
+				ObjectIdGetDatum(NamespaceRelationId);
+			ivalues[Anum_pg_init_privs_objsubid - 1] = Int32GetDatum(0);
+			ivalues[Anum_pg_init_privs_privtype - 1] = CharGetDatum(r->privtype);
+			ivalues[Anum_pg_init_privs_initprivs - 1] =
+				PointerGetDatum(r->initprivs);
+			row = heap_form_tuple(RelationGetDescr(ip), ivalues, inulls);
+			CatalogTupleInsert(ip, row);
+			heap_freetuple(row);
+			table_close(ip, RowExclusiveLock);
+			nmembers = aclmembers(r->initprivs, &members);
+			updateInitAclDependencies(NamespaceRelationId, nsp, 0,
+									  0, NULL, nmembers, members);
+		}
+		InvokeObjectPostAlterHook(NamespaceRelationId, nsp, 0);
+	}
+	CommandCounterIncrement();
+}
+
 /* A cast, as described (its method, then its context). */
 static char *
 create_cast_sql(const char *name, const char *def)
@@ -5213,6 +5554,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				   bool rewritten)
 {
 	bool		matviews_made = false;
+	List	   *replaced = NIL; /* ordinary schemas they replace */
 	Canon		cn;
 	List	   *from;
 	List	   *to;
@@ -5429,8 +5771,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'n' && find_item(from, 'n', t->name) == NULL)
-			schemas = lappend(schemas,
-							  psprintf("CREATE SCHEMA %s VERSIONED", t->name));
+			schemas = list_concat(schemas,
+								  make_schema(&cn, t->name, &replaced));
 	}
 	foreach(lc, to)
 	{
@@ -5666,6 +6008,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 */
 	run_statements(tm.before);
 	run_statements(schemas);
+	carry_over(replaced);
 	run_statements(collation_makes);	/* (types and columns may use them) */
 	make_views(tm.creates);
 	run_statements(tm.converts);

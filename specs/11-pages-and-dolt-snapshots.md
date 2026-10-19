@@ -312,6 +312,18 @@ commit or checkpoint all use it.
   unless another branch shares it (then it is copied for that reason
   alone, and not listed). Candidates come from every tuple of an old
   version, so a page changed in place this way loses none.
+- **Changes to rows that change no page read the table again.** A
+  baseline's tree is kept for the table's description and what its rows
+  encode by without being rewritten: the columns' numbers (a column
+  dropped and one of the same name and type added reads as NULL) and the
+  definitions of their types (an enum's label renamed, a composite's
+  attribute dropped), and the key encoder's, value encoder's and keying's
+  implementations and format versions. Any of these changed, the next
+  fold reads the table in full (#322, #323). An enum's label added
+  (`ALTER TYPE ... ADD VALUE`) changes its definition without changing
+  a row, and costs each table using it one full read: telling an
+  addition from a rename would take the old labels, which a baseline
+  doesn't keep.
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and
@@ -671,7 +683,13 @@ fails without its fix), and Postgres's suites keep passing after each one.
     the session on it. A checkout that leaves one deletes every hidden
     branch no session is on, but only those the session may delete
     (deleting a branch takes owning the database): one left by a session
-    that may not stays until one that may checks out.
+    that may not stays until one that may checks out. No session moves
+    a hidden branch: `dolt_checkout` and a `dbname/branch` connection
+    refuse its name, `dolt_branch -m` doesn't rename it, a push neither
+    sends one (`dolt_push`) nor moves or deletes one
+    (`dolt_serve_move_head`, as `dolt_serve_heads` doesn't list them),
+    and `dolt_clone` makes no branch of a remote's branch so named (a
+    file remote may hold one), only tracks it.
   - Every new branch has only its head until first used, whether made
     from a branch (`dolt_branch`, `dolt_checkout -b`) or at a commit; only
     one made from a branch with no commits is copied at once. Its first
@@ -688,6 +706,13 @@ fails without its fix), and Postgres's suites keep passing after each one.
     Dolt, it is also refused whenever definitions change, whether
     uncommitted or on either side of the merge, even without a conflict
     ("cannot merge with uncommitted changes where definitions change").
+  - A materialized view's rows merge as a REFRESH made them: those of
+    the side that refreshed it since the merge base (ours if neither), or
+    of the side whose query the merged one is; if both refreshed it to
+    other rows, neither's are what its query reads after the merge, and
+    it is refreshed from the merged rows (refused over uncommitted rows,
+    which it would read). A fast-forward over uncommitted changes brings
+    theirs' rows too (#320).
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the
@@ -2034,7 +2059,8 @@ A GC runs in one database at a time, by `dolt_gc()` or the trigger
 4. **Retire.** The sealed segment and the replaced table files are
    unlinked once every transaction that was running at the swap has
    ended (the GC waits for their virtual transaction ids, as `CREATE
-   INDEX CONCURRENTLY` does), so no backend reads a file it opened
+   INDEX CONCURRENTLY` does, but not for a prepared transaction, which
+   reads nothing more), so no backend reads a file it opened
    before (a VFD may be closed and reopened at any time, so an unlinked
    file isn't readable to the end of a transaction as an open one would
    be). `GC_RETIRE` (WAL) names them.
@@ -2308,7 +2334,16 @@ Not as designed, or not yet:
   anything new is read, rather than their chunks kept as roots (copied to
   a settled file, an uncommitted chunk would be everyone's before what it
   names is). A long transaction that appended a batch before the seal
-  holds the collection there.
+  holds the collection there. A prepared one, which may stay for days,
+  isn't waited for (here, for a transaction that named a tree before the
+  collection began, or at the retire): its chunks in the sealed segments
+  are roots instead (what they name was appended before them, so it is
+  copied with them; it can't have moved the root, so no PAD of its
+  becomes a ROOT), and its pointers are on pages already. A transaction
+  prepared while it is waited for is waited for until then: the wait is
+  for its backend's virtual transaction id
+  (`VirtualXactLockUnprepared()`, beside `VirtualXactLock()` in
+  `lock.c`), not for its xid, which the prepared transaction keeps.
 - **The manifest's lock is let go at the swap**, and a lock of the
   collection's own held to the end of its transaction (past the retire):
   a transfer waiting for the manifest would otherwise deadlock with the

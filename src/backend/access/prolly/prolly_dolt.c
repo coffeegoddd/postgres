@@ -929,6 +929,22 @@ reserved_branch_name(const char *name)
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_WRITER_PREFIX)));
 }
 
+/*
+ * A connection doesn't name a hidden branch, as dolt_checkout() doesn't:
+ * on it, it would be writable, and its writes would move the branch off
+ * the commit that the sessions detached there are at.  (A writer's branch
+ * is connected to as any other.)
+ */
+void
+prolly_check_connect_branch(const char *branch)
+{
+	if (detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Check out the commit with dolt_checkout(), read-only.")));
+}
+
 /* Does what's checked out name a commit by its hash (a prefix of it)? */
 static bool
 names_commit(const char *ref)
@@ -1359,6 +1375,18 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (nor is a commit's hidden branch renamed: renamed, it would be an
+	 * ordinary, writable branch where the sessions detached at the commit
+	 * are; said before a detached session's read-only transaction is, as
+	 * the more specific)
+	 */
+	if (move && detached_branch(linitial(names)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a commit's hidden branch can't be renamed"),
+				 errhint("Make a branch at the commit with dolt_branch().")));
 
 	/*
 	 * (a rename, delete, take or protection makes no branch: not in a
@@ -2672,7 +2700,7 @@ typedef struct LogEntry
 {
 	ProllyHash	key;			/* hash key: info.id as prolly_hash_key() makes it */
 	ProllyCommitInfo info;
-	int64		order;			/* 1 + the most of its parents'; -1 while found */
+	int64		order;			/* its height: 1 + the most of its parents' */
 } LogEntry;
 
 static LogEntry *
@@ -2683,68 +2711,36 @@ log_find(HTAB *entries, const ProllyHash *id)
 	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
+/*
+ * Highest order first, then newest, as Dolt's log goes by height and then
+ * date: a commit is always above its parents.
+ */
 static int
 log_cmp(const ListCell *a, const ListCell *b)
 {
 	LogEntry   *x = lfirst(a);
 	LogEntry   *y = lfirst(b);
 
-	if (x->info.committed_at != y->info.committed_at)
-		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	if (x->order != y->order)
 		return x->order > y->order ? -1 : 1;
+	if (x->info.committed_at != y->info.committed_at)
+		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
 /*
- * The order of e, its parents' first (they are all in entries): without
- * recursion, as history may be as deep as it is long, on stack (empty, and
- * left so).  A commit found again while its own parents are being ordered
- * is in a cycle, which history can't hold.
+ * A commit of the log, for prolly_history_height(): read already, so none
+ * is read twice.
  */
-static void
-log_order(HTAB *entries, LogEntry *e, List **stack)
+static bool
+log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 {
-	*stack = lappend(*stack, e);
-	while (*stack != NIL)
-	{
-		LogEntry   *top = llast(*stack);
-		int64		most = 0;
-		bool		ready = true;
+	LogEntry   *e = log_find(arg, id);
 
-		if (top->order > 0)
-		{
-			*stack = list_delete_last(*stack);
-			continue;
-		}
-		top->order = -1;
-		for (int i = 0; i < top->info.nparents; i++)
-		{
-			LogEntry   *p = log_find(entries, &top->info.parents[i]);
-
-			if (p == NULL)
-				continue;
-			if (p->order < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("prolly commit %s is its own ancestor",
-								hash_hex(&p->info.id))));
-			if (p->order == 0)
-			{
-				*stack = lappend(*stack, p);
-				ready = false;
-			}
-			else
-				most = Max(most, p->order);
-		}
-		/* (else it waits, found, for the parents pushed above it) */
-		if (ready)
-		{
-			top->order = most + 1;
-			*stack = list_delete_last(*stack);
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
+	if (e == NULL)
+		return false;
+	*info = e->info;
+	return true;
 }
 
 /*
@@ -2752,7 +2748,8 @@ log_order(HTAB *entries, LogEntry *e, List **stack)
  *			OUT email text, OUT date timestamptz, OUT message text,
  *			OUT commit_order int8) returns setof record
  *
- * Every commit ref reaches, newest first.
+ * Every commit ref reaches, highest commit order (height) first, then
+ * newest.
  */
 Datum
 dolt_log(PG_FUNCTION_ARGS)
@@ -2762,8 +2759,8 @@ dolt_log(PG_FUNCTION_ARGS)
 	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
+	HTAB	   *heights;
 	List	   *entries = NIL;
-	List	   *stack = NIL;
 	ListCell   *lc;
 	ProllyHash	key;
 	bool		found;
@@ -2811,9 +2808,14 @@ dolt_log(PG_FUNCTION_ARGS)
 				entries = lappend(entries, p);
 		}
 	}
+	heights = prolly_history_heights();
 	foreach(lc, entries)
-		log_order(seen, lfirst(lc), &stack);
-	list_free(stack);
+	{
+		LogEntry   *e = lfirst(lc);
+
+		e->order = prolly_history_height(&e->info.id, heights, log_lookup, seen);
+	}
+	hash_destroy(heights);
 	list_sort(entries, log_cmp);
 	foreach(lc, entries)
 	{
@@ -3072,7 +3074,8 @@ with_status(List *names, Oid relid, const char *status)
  * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
  *	  returns setof record
  *
- * The tables changed since the session branch's head commit: rows changed
+ * The tables changed since the session branch's head commit (before its
+ * first, since the empty root: everything is new): rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
  * in progress, with conflicts ("conflict", not staged), or with constraint
  * violations ("constraint violation", not staged); the other objects
@@ -3085,7 +3088,6 @@ dolt_status(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	StatusSink	s = {{status_change}, NIL};
-	ProllyHash	head;
 	List	   *names = NIL;
 	ListCell   *lc;
 
@@ -3094,8 +3096,6 @@ dolt_status(PG_FUNCTION_ARGS)
 	List	   *violated = NIL;
 
 	InitMaterializedSRF(fcinfo, 0);
-	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
-		return (Datum) 0;
 	foreach(lc, PROLLY_CALL(refs(), violations))
 		violated = list_append_unique_oid(violated,
 										  ((ProllyViolation *) lfirst(lc))->relid);
@@ -3178,6 +3178,7 @@ typedef struct Rows
 	TupleTableSlot *slot;
 	ProllyTreeEnv env;			/* where values out of line are read */
 	ProllyKeyingRefs refs;
+	MemoryContext rowcxt;		/* a row's decoding, reset for the next */
 } Rows;
 
 static void
@@ -3190,6 +3191,21 @@ rows_begin(Rows *r, Relation rel)
 	prolly_folded_tree_env(&r->env);
 	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
+									  ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * Where a sink decodes the rows it's handed: what it decoded for the last
+ * row is freed (the tuplestore has its own copies), so a diff of millions
+ * of rows takes the memory of one.
+ */
+static MemoryContext
+rows_next(Rows *r)
+{
+	ExecClearTuple(r->slot);
+	MemoryContextReset(r->rowcxt);
+	return MemoryContextSwitchTo(r->rowcxt);
 }
 
 static void
@@ -3197,9 +3213,13 @@ rows_end(Rows *r)
 {
 	ExecDropSingleTupleTableSlot(r->slot);
 	PROLLY_CALL(r->c.keying, close, r->keying);
+	MemoryContextDelete(r->rowcxt);
 }
 
-/* The row a tree value holds, as a composite datum; and its copies. */
+/*
+ * The row a tree value holds, as a composite datum of its own (the slot
+ * is reused for the next value); and its copies.
+ */
 static Datum
 rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
@@ -3286,6 +3306,7 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	uint64		nafter = 0;
 	Datum		from = (Datum) 0;
 	Datum		to = (Datum) 0;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (before)
 		from = rows_datum(&s->rows, before, &nbefore);
@@ -3300,14 +3321,14 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		else
 			put_diff(s, "removed", from, false, (Datum) 0, true,
 					 nbefore - nafter);
-		return;
 	}
-	if (kind == PROLLY_DIFF_ADDED)
+	else if (kind == PROLLY_DIFF_ADDED)
 		put_diff(s, "added", (Datum) 0, true, to, false, 1);
 	else if (kind == PROLLY_DIFF_REMOVED)
 		put_diff(s, "removed", from, false, (Datum) 0, true, 1);
 	else
 		put_diff(s, "modified", from, false, to, false, 1);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -3591,17 +3612,19 @@ row_conflict(ProllyConflictSink *self, const ProllyKey *key,
 	Datum		values[5];
 	bool		nulls[5] = {base == NULL, ours == NULL, theirs == NULL, false, false};
 	uint64		count;
+	MemoryContext old = rows_next(&s->rows);
 
 	if (base)
-		values[0] = datumCopy(rows_datum(&s->rows, base, &count), false, -1);
+		values[0] = rows_datum(&s->rows, base, &count);
 	if (ours)
-		values[1] = datumCopy(rows_datum(&s->rows, ours, &count), false, -1);
+		values[1] = rows_datum(&s->rows, ours, &count);
 	if (theirs)
 		values[2] = rows_datum(&s->rows, theirs, &count);
 	values[3] = CStringGetTextDatum(change_kind(base, ours));
 	values[4] = CStringGetTextDatum(change_kind(base, theirs));
 	tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
 						 nulls);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -4201,6 +4224,12 @@ dolt_push(PG_FUNCTION_ARGS)
 		branch = pstrdup(branch_ops()->current());
 	if (remote_branch == NULL)
 		remote_branch = branch;
+	/* (a commit's hidden branch, a session's, isn't a remote's: as it serves) */
+	if (detached_branch(remote_branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Push a branch made at the commit with dolt_branch().")));
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -4459,6 +4488,19 @@ check_clone_target(const char *current)
 }
 
 /*
+ * Is a remote's branch made a branch here by a clone?  Not one whose name
+ * this database's rules refuse, made under older ones, nor one named as a
+ * commit's hidden branch (which a served database doesn't list, but a file
+ * remote may hold): made here, it would be where sessions detached at the
+ * commit it names go, though at another commit.
+ */
+static bool
+cloned_as_branch(const char *name)
+{
+	return branch_ops()->name_ok(name) && !detached_branch(name);
+}
+
+/*
  * dolt_clone(VARIADIC args text[]) returns text[]: {status}
  *
  * url, [--remote name] (origin), [--branch branch]: in an empty database
@@ -4511,6 +4553,10 @@ dolt_clone(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("dolt_clone needs the session on a branch")));
+	if (branch != NULL && detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
 	check_clone_target(current);
 
 	/* the remote added as dolt_remote() adds one, and fetched */
@@ -4531,7 +4577,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 		}
 		foreach(lc, h.branches)
 		{
-			if (branch == NULL && branch_ops()->name_ok(lfirst(lc)))
+			if (branch == NULL && cloned_as_branch(lfirst(lc)))
 				branch = lfirst(lc);
 		}
 		if (branch == NULL)
@@ -4575,14 +4621,16 @@ dolt_clone(PG_FUNCTION_ARGS)
 		char	   *tracking = psprintf("%s/%s", remote, b);
 
 		/*
-		 * (a remote branch whose name this database's rules refuse, made
-		 * under older ones: tracked, not made here)
+		 * (a remote branch whose name this database refuses: tracked, not
+		 * made here)
 		 */
-		if (!branch_ops()->name_ok(b))
+		if (!cloned_as_branch(b))
 		{
 			ereport(WARNING,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("remote branch \"%s\" isn't cloned as a branch", b),
+					 detached_branch(b) ?
+					 errdetail("Names beginning \"%s\" are reserved.", PROLLY_DETACHED_PREFIX) :
 					 errdetail("Its name isn't a branch's by this database's rules."),
 					 errhint("Its commits are fetched: dolt_branch(name, '%s') makes a branch of it under another name.",
 							 tracking)));

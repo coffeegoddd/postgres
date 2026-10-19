@@ -497,6 +497,7 @@ copies_drop(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out in another session", name)));
+	lock_branch_unprepared(branch, name);
 
 	on_branch(branch, delete_here, NULL);
 

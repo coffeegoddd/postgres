@@ -4732,16 +4732,12 @@ XactLockForVirtualXact(VirtualTransactionId vxid,
 }
 
 /*
- *		VirtualXactLock
+ *		VirtualXactLockGuts
  *
- * If wait = true, wait as long as the given VXID or any XID acquired by the
- * same transaction is still running.  Then, return true.
- *
- * If wait = false, just check whether that VXID or one of those XIDs is still
- * running, and return true or false.
+ * VirtualXactLock(), or with prepared = false, VirtualXactLockUnprepared().
  */
-bool
-VirtualXactLock(VirtualTransactionId vxid, bool wait)
+static bool
+VirtualXactLockGuts(VirtualTransactionId vxid, bool wait, bool prepared)
 {
 	LOCKTAG		tag;
 	PGPROC	   *proc;
@@ -4750,8 +4746,12 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	Assert(VirtualTransactionIdIsValid(vxid));
 
 	if (VirtualTransactionIdIsRecoveredPreparedXact(vxid))
+	{
+		if (!prepared)
+			return true;
 		/* no vxid lock; localTransactionId is a normal, locked XID */
 		return XactLockForVirtualXact(vxid, vxid.localTransactionId, wait);
+	}
 
 	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
 
@@ -4765,7 +4765,8 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	 */
 	proc = ProcNumberGetProc(vxid.procNumber);
 	if (proc == NULL)
-		return XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
+		return !prepared ||
+			XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
 
 	/*
 	 * We must acquire this lock before checking the procNumber and lxid
@@ -4779,7 +4780,8 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	{
 		/* VXID ended */
 		LWLockRelease(&proc->fpInfoLock);
-		return XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
+		return !prepared ||
+			XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
 	}
 
 	/*
@@ -4843,7 +4845,36 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	(void) LockAcquire(&tag, ShareLock, false, false);
 
 	LockRelease(&tag, ShareLock, false);
-	return XactLockForVirtualXact(vxid, xid, wait);
+	return !prepared || XactLockForVirtualXact(vxid, xid, wait);
+}
+
+/*
+ *		VirtualXactLock
+ *
+ * If wait = true, wait as long as the given VXID or any XID acquired by the
+ * same transaction is still running.  Then, return true.
+ *
+ * If wait = false, just check whether that VXID or one of those XIDs is still
+ * running, and return true or false.
+ */
+bool
+VirtualXactLock(VirtualTransactionId vxid, bool wait)
+{
+	return VirtualXactLockGuts(vxid, wait, true);
+}
+
+/*
+ *		VirtualXactLockUnprepared
+ *
+ * Wait as long as the given VXID is still running, but not for a transaction
+ * it prepared: return once its transaction has ended or been prepared.  For a
+ * caller that only needs the VXID's backend to be done with the transaction,
+ * since a prepared transaction may stay for days.
+ */
+void
+VirtualXactLockUnprepared(VirtualTransactionId vxid)
+{
+	(void) VirtualXactLockGuts(vxid, true, false);
 }
 
 /*

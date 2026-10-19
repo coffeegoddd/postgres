@@ -557,8 +557,9 @@ since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
  * is reached from the wanted only.  A commit is higher than its parents,
  * so each is walked after all it is reached from have painted it: those
  * sent are just the ones the known don't reach, whatever the commits'
- * times (a transaction's start, the same for all it commits, and earlier
- * than its parents' for one begun before they were committed).
+ * dates (each is dated when it is made, after its parents, but the walk
+ * doesn't rely on that: history fetched from elsewhere was dated by other
+ * clocks, and the dates only break ties between commits as high).
  */
 Datum
 dolt_serve_since(PG_FUNCTION_ARGS)
@@ -743,6 +744,15 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("only dolt_serve_move_head's head can be null")));
 	branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	/*
+	 * (a commit's hidden branch, not served: moved, the sessions detached
+	 * on it would see another commit's rows while at theirs)
+	 */
+	if (strncmp(branch, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
 	if (VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_PP(1)) > 0)
 		bytea_hash(PG_GETARG_BYTEA_PP(1), &expected);
 	prolly_database_components(&dc);

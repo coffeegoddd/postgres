@@ -32,7 +32,9 @@
  * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
- * the value.  A miss reads it, and remembers the reference made.  Dropped columns are never
+ * the value, if its type is defined as it was then (an enum's label
+ * renamed, its values encode otherwise).  A miss reads it, and remembers
+ * the reference made.  Dropped columns are never
  * stored, so a table that dropped a column encodes rows exactly as one that
  * never had it.  Trailing NULL columns are not stored, so adding a nullable
  * column without a default needs no rewrite.
@@ -67,6 +69,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
+#include "common/hashfn.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "varatt.h"
@@ -90,6 +93,9 @@ struct ProllyValueEncoder
 	int		   *extra_attno;
 
 	const ProllyValueStore *values; /* values out of line; NULL if none */
+	uint64	   *typdefs;		/* per attribute: its type's definition,
+								 * hashed, for the memo; once asked */
+	bool	   *typdef_known;
 	StringInfoData scratch;		/* a value read from out of line */
 };
 
@@ -119,6 +125,8 @@ begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt
 	enc->has_missing = MemoryContextAlloc(mcxt, sizeof(bool) * Max(ncols, 1));
 	enc->nulls = MemoryContextAlloc(mcxt, sizeof(bool) * Max(ncols, 1));
 	enc->extra_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(natts, 1));
+	enc->typdefs = MemoryContextAlloc(mcxt, sizeof(uint64) * Max(natts, 1));
+	enc->typdef_known = MemoryContextAllocZero(mcxt, sizeof(bool) * Max(natts, 1));
 	enc->decode_only = (attnos != NULL);
 	{
 		MemoryContext old = MemoryContextSwitchTo(mcxt);
@@ -171,6 +179,24 @@ begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt
 		enc->decode_only = !current;
 	}
 	return enc;
+}
+
+/* Attribute i's type's definition (prolly_datum_definition()), hashed. */
+static uint64
+column_typdef(ProllyValueEncoder *enc, int i)
+{
+	if (!enc->typdef_known[i])
+	{
+		StringInfoData def;
+
+		initStringInfo(&def);
+		prolly_datum_definition(TupleDescAttr(enc->desc, i)->atttypid, &def);
+		enc->typdefs[i] = hash_bytes_extended((const unsigned char *) def.data,
+											  def.len, 0);
+		enc->typdef_known[i] = true;
+		pfree(def.data);
+	}
+	return enc->typdefs[i];
 }
 
 static ProllyValueEncoder *
@@ -292,7 +318,7 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 			toasted = DatumGetPointer(slot->tts_values[i]);
 			initStringInfo(&ref);
 			if (PROLLY_CALL(enc->values->memo, lookup, enc->values, toasted,
-							att->atttypid, &ref))
+							att->atttypid, column_typdef(enc, i), &ref))
 			{
 				prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 				appendBinaryStringInfo(out, ref.data, ref.len);
@@ -319,7 +345,7 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 				ProllyValue r = {(const uint8 *) ref.data, ref.len};
 
 				PROLLY_CALL(enc->values->memo, remember, toasted,
-							att->atttypid, &r);
+							att->atttypid, column_typdef(enc, i), &r);
 			}
 		}
 		else
@@ -598,7 +624,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.info = {
 		.iface = PROLLY_IFACE_VALUE_ENCODER,
 		.impl_id = 2,
-		.format_version = 3,		/* 3: jsonb as stored */
+		.format_version = 4,		/* 3: jsonb as stored; 4: NaNs canonical */
 		.name = "canonical",
 		.description = "portable rows of live columns, trailing NULLs omitted, "
 		"no local OIDs, long values out of line",

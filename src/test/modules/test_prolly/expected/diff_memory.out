@@ -1,0 +1,136 @@
+-- dolt_diff and dolt_conflicts free what they decoded for a row before
+-- the next: a diff of 20,000 rows holds the memory of one row, not of
+-- 20,000.  (What a row decoded to is in the tuplestore, which spills.)
+--
+-- Scheduled last: its commits grow the database's chunk journal by about
+-- 7 MB, and a journal past prolly.gc_journal_threshold may be collected
+-- under a test that reads it by name.
+CREATE SCHEMA dm VERSIONED;
+CREATE TABLE dm.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'dm empty')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO dm.t SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'dm rows')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- The backend's memory, read while a set-returning function's rows are
+-- read out: what it allocated as it built them is still held then.
+CREATE FUNCTION dm.held() RETURNS bigint VOLATILE LANGUAGE sql
+	AS $$SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts$$;
+SET work_mem = '64kB';
+-- (when every row's decoding was kept, this held 8 to 25 MB; freed, under
+-- half a MB)
+SELECT dm.held() AS before \gset
+SELECT dm.held() - :before < 4000000 AS bounded, diff_type
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.t) LIMIT 1;
+ bounded | diff_type 
+---------+-----------
+ t       | added
+(1 row)
+
+SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.t);
+ count 
+-------
+ 20000
+(1 row)
+
+UPDATE dm.t SET v = repeat('y', 100);
+SELECT dm.held() AS before \gset
+SELECT dm.held() - :before < 4000000 AS bounded, diff_type
+FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t) LIMIT 1;
+ bounded | diff_type 
+---------+-----------
+ t       | modified
+(1 row)
+
+SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t);
+ count 
+-------
+ 20000
+(1 row)
+
+-- Every row in conflict.  (Finding them holds both sides' changes, as
+-- the merge did: what's held past that, for the rows, is what's bounded.)
+SELECT length(dolt_commit('-Am', 'dm ours')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('dm_side', 'HEAD~1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dm_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'dm_side'"}
+(1 row)
+
+UPDATE dm.t SET v = repeat('z', 100);
+SELECT length(dolt_commit('-Am', 'dm theirs')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dm_side'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ dm.t       |         20000
+(1 row)
+
+SELECT dm.held() AS found FROM dolt_conflicts() \gset
+SELECT dm.held() - :found < 4000000 AS bounded, our_diff_type, their_diff_type
+FROM dolt_conflicts(NULL::dm.t) LIMIT 1;
+ bounded | our_diff_type | their_diff_type 
+---------+---------------+-----------------
+ t       | modified      | modified
+(1 row)
+
+SELECT count(*) FROM dolt_conflicts(NULL::dm.t);
+ count 
+-------
+ 20000
+(1 row)
+
+ROLLBACK;
+RESET work_mem;
+SELECT dolt_branch('-D', 'dm_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dm CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table dm.t
+drop cascades to function dm.held()
+SELECT length(dolt_commit('-Am', 'dm gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
