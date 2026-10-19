@@ -3277,6 +3277,10 @@ typedef struct SchemaMove
 	List	   *fk_validations; /* validating the foreign keys */
 	List	   *rekeyed;		/* tables whose keys change in place */
 	List	   *emptied;		/* tables whose rows go first */
+	List	   *fk_drops;		/* foreign keys going: first of all, before
+								 * the columns of types the commit defines
+								 * otherwise convert (which would check them
+								 * against a table emptied) */
 	bool		rewritten;		/* the rows written are all to's: those
 								 * the tables have needn't convert */
 } SchemaMove;
@@ -3771,9 +3775,9 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		/* (its foreign keys first, as other tables' may point at it) */
 		foreach(lc, from->constraints)
 			if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
-				sm->before = lcons(psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
-											name, first_field(lfirst(lc))),
-								   sm->before);
+				sm->fk_drops = lappend(sm->fk_drops,
+									   psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+												name, first_field(lfirst(lc))));
 		/* (sequences its columns own stay: to has them, or drops them) */
 		sm->before = lappend(sm->before,
 							 psprintf("DO $move$ DECLARE s regclass; BEGIN "
@@ -3988,7 +3992,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			sm->rekeyed = lappend(sm->rekeyed, pstrdup(name));
 		/* (foreign keys first: they may need others' keys) */
 		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
-			sm->before = lcons(sql, sm->before);
+			sm->fk_drops = lappend(sm->fk_drops, sql);
 		else
 			sm->before = lappend(sm->before, sql);
 	}
@@ -5089,7 +5093,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	Canon		cn;
 	List	   *from;
 	List	   *to;
-	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, rewritten};
+	SchemaMove	sm = {NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, NIL, rewritten};
 	List	   *views = NIL;
 	List	   *view_drops = NIL;
 	List	   *matview_drops = NIL;
@@ -5099,7 +5103,6 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *routines = NIL;
 	List	   *aggregates_made = NIL;
 	List	   *policy_drops = NIL;
-	List	   *fk_drops = NIL;		/* (before the types' columns convert) */
 	List	   *policy_makes = NIL;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
@@ -5223,10 +5226,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 	/*
 	 * Foreign keys both sides have, into a table made again or dropped,
-	 * emptied, or whose keys change: they go first (before the columns of
-	 * types the commit defines otherwise convert, which would check them
-	 * against a table emptied), and the ones kept come back last, checked
-	 * against the rows written.
+	 * emptied, or whose keys change: they go first (sm.fk_drops), and the
+	 * ones kept come back last, checked against the rows written.
 	 */
 	keyed = list_concat(list_concat_copy(remade, sm.rekeyed), sm.emptied);
 	foreach(lc, from)
@@ -5254,9 +5255,9 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			{
 				if (strstr(line, psprintf(" REFERENCES %s(", (char *) lfirst(r))) == NULL)
 					continue;
-				fk_drops = lappend(fk_drops,
-								   psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
-											f->name, first_field(line)));
+				sm.fk_drops = lappend(sm.fk_drops,
+									  psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
+											   f->name, first_field(line)));
 				if (t)
 					sm.foreign_keys = lappend(sm.foreign_keys,
 											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
@@ -5528,7 +5529,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * Rows to go before their columns change type (with every row written
 	 * afresh), as rows the move writes go (empty_table()).
 	 */
-	run_statements(fk_drops);
+	run_statements(sm.fk_drops);
 	foreach(lc, sm.emptied)
 		empty_table(lfirst(lc));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));

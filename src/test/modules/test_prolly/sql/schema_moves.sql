@@ -277,7 +277,9 @@ SELECT length(dolt_commit('-Am', 'without sm11')::text) AS committed;
 -- rows written.  A column of a type the commit defines otherwise is emptied
 -- too, rather than converted to what its NOT NULL refuses; a key of one
 -- (a domain made over another base type), that another table's foreign
--- key references, loses that key before it converts.
+-- key references, loses that key before it converts: so do those of a
+-- table the move drops (kd) or makes again (kr), and one whose definition
+-- changes (kf).
 CREATE SCHEMA sm12 VERSIONED;
 CREATE DOMAIN sm12.pos AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.p (id int PRIMARY KEY);
@@ -286,6 +288,8 @@ CREATE TABLE sm12.d (id int PRIMARY KEY, v sm12.pos NOT NULL);
 CREATE DOMAIN sm12.k AS int CHECK (VALUE > 0);
 CREATE TABLE sm12.kp (k sm12.k PRIMARY KEY);
 CREATE TABLE sm12.kc (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
+CREATE TABLE sm12.kr (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
+CREATE TABLE sm12.kf (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
 CREATE FUNCTION sm12.f() RETURNS trigger LANGUAGE plpgsql
 	AS $$BEGIN RAISE WARNING 'fired'; RETURN OLD; END$$;
 CREATE TRIGGER tr BEFORE DELETE ON sm12.p FOR EACH ROW EXECUTE FUNCTION sm12.f();
@@ -295,12 +299,21 @@ INSERT INTO sm12.c VALUES (1, 1), (2, 2);
 INSERT INTO sm12.d VALUES (1, 5);
 INSERT INTO sm12.kp VALUES (1), (2);
 INSERT INTO sm12.kc VALUES (1, 1), (2, 2);
+INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
+INSERT INTO sm12.kf VALUES (1, 1), (2, 2);
 SELECT length(dolt_commit('-Am', 'sm12 base')::text) AS committed;
 SELECT dolt_branch('sm12_right');
 ALTER TABLE sm12.p ALTER COLUMN id TYPE bigint;
 UPDATE sm12.d SET v = 20;
 ALTER DOMAIN sm12.pos DROP CONSTRAINT pos_check;
 ALTER DOMAIN sm12.pos ADD CONSTRAINT pos_check CHECK (VALUE > 10);
+CREATE TABLE sm12.kd (id int PRIMARY KEY, pid int REFERENCES sm12.kp);
+INSERT INTO sm12.kd VALUES (1, 1), (2, 2);
+DROP TABLE sm12.kr;
+CREATE TABLE sm12.kr (pid int REFERENCES sm12.kp, id int PRIMARY KEY);
+INSERT INTO sm12.kr VALUES (1, 1), (2, 2);
+ALTER TABLE sm12.kf DROP CONSTRAINT kf_pid_fkey,
+	ADD CONSTRAINT kf_pid_fkey FOREIGN KEY (pid) REFERENCES sm12.kp ON DELETE CASCADE;
 ALTER TABLE sm12.kp ALTER COLUMN k TYPE int;
 DROP DOMAIN sm12.k;
 CREATE DOMAIN sm12.k AS bigint CHECK (VALUE > 0);
@@ -314,8 +327,10 @@ SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
   AND contype = 'f';
 SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
 SELECT * FROM sm12.kc ORDER BY id;
-SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
-  AND contype = 'f';
+SELECT conrelid::regclass, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
+SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
+	(SELECT count(*) FROM sm12.kf) AS kf;
 SELECT dolt_reset('--hard', :'sm12_main');
 SELECT format_type(atttypid, atttypmod) FROM pg_attribute
 WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
@@ -323,8 +338,10 @@ SELECT * FROM sm12.c ORDER BY id;
 SELECT * FROM sm12.d ORDER BY id;
 SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'sm12.k'::regtype;
 SELECT * FROM sm12.kc ORDER BY id;
-SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.kc'::regclass
-  AND contype = 'f';
+SELECT conrelid::regclass, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
+SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
+	(SELECT count(*) FROM sm12.kf) AS kf;
 SELECT conname FROM pg_constraint WHERE conrelid = 'sm12.c'::regclass
   AND contype = 'f';
 SELECT count(*) AS changed FROM dolt_status;
