@@ -640,6 +640,24 @@ fails without its fix), and Postgres's suites keep passing after each one.
   text was re-escaped. `dolt_status` splits its rows at the last tab and
   sorts them by name, a table's name holding a tab included.
 
+- **Table settings (#400, folded format 10):** explicitly set table and
+  TOAST reloptions are versioned, sorted by option name, including explicit
+  values equal to built-in defaults. Resetting an option removes it so the
+  server's policy applies again. These tuning choices (fillfactor,
+  autovacuum, parallel workers, and other accepted reloptions) travel with
+  the schema; tablespaces and physical placement remain local. Column
+  storage differing from its type's default, explicit compression methods,
+  and explicit statistics targets are versioned too; default storage,
+  compression and statistics have no extra fields. Replica identity is
+  versioned by mode and, for USING INDEX, the index's name; an index mode
+  whose index was dropped is described as NOTHING, its effective behavior.
+  Replay applies column settings without recursing into children and sets
+  replica identity after creating its index. Options merge by name, column
+  settings with their column, and replica identity as one setting. Prolly
+  tables cannot be unlogged, so persistence adds no field. Format 9 omitted
+  these settings; format 10 is a clean break, with the same refusal of
+  older roots as previous format changes.
+
 **Step 5. Moving heads.**
 - The row applier (from logical replication's apply worker); checkout and
   reset to a commit, fast-forward, branch at a commit, materializing a

@@ -31,11 +31,13 @@
  *						   a range type's definition
  *
  * A table's schema lists its live columns in order (name, type, nullness,
- * collation if not the type's, default, identity, generation), then its
+ * collation if not the type's, default, identity, generation, nondefault
+ * storage, compression and statistics target), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
  * prints them, a trigger or rule that doesn't fire as made with when it
  * does (then its policies and extended statistics, its partitioning, the
- * tables it inherits from and a typed table's type, if any).  Names are
+ * tables it inherits from and a typed table's type, explicit table and
+ * TOAST options, and nondefault replica identity, if any).  Names are
  * qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
@@ -123,8 +125,10 @@
 #include "access/prolly_datum.h"
 #include "access/prolly_keying.h"
 #include "access/relation.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/toast_compression.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
@@ -213,7 +217,9 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "9", what changes how a definition
+ * The format a folded root is in: "10", table and TOAST options, replica
+ * identity and column storage, compression and statistics targets described;
+ * "9" left those out, and was the first with what changes how a definition
  * behaves described when it isn't the default (inheritance, and which
  * inherited columns and constraints are a child's own too; typed tables,
  * trigger and rule firing, domain collations and defaults, composite
@@ -233,7 +239,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"9"
+#define FOLDED_FORMAT	"10"
 
 typedef struct Canon
 {
@@ -996,6 +1002,55 @@ foreign_key_clone(Form_pg_constraint con)
 	return clone;
 }
 
+/* Explicit options, by name, independent of the order they were set in. */
+static List *
+table_options(List *options, Oid relid, const char *prefix)
+{
+	HeapTuple	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	bool		isnull;
+	Datum		value;
+	ListCell   *lc;
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	value = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		foreach(lc, untransformRelOptions(value))
+		{
+			DefElem    *def = lfirst_node(DefElem, lc);
+			StringInfoData line;
+
+			initStringInfo(&line);
+			append_field(&line, psprintf("%s%s", prefix, quote_identifier(def->defname)));
+			appendStringInfoChar(&line, '\t');
+			append_field(&line, quote_literal_cstr(defGetString(def)));
+			options = lappend(options, line.data);
+		}
+	}
+	ReleaseSysCache(tuple);
+	return options;
+}
+
+static const char *
+column_storage(char storage)
+{
+	switch (storage)
+	{
+		case TYPSTORAGE_PLAIN:
+			return "PLAIN";
+		case TYPSTORAGE_EXTERNAL:
+			return "EXTERNAL";
+		case TYPSTORAGE_EXTENDED:
+			return "EXTENDED";
+		case TYPSTORAGE_MAIN:
+			return "MAIN";
+		default:
+			elog(ERROR, "unexpected column storage %c", storage);
+	}
+	return NULL;
+}
+
 static void
 describe_table(Canon *cn, Relation rel, StringInfo out)
 {
@@ -1047,6 +1102,25 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfo(out, "\tidentity %c", att->attidentity);
 		if (att->attgenerated)
 			appendStringInfo(out, "\tstored %c", att->attgenerated);
+		if (att->attstorage != get_typstorage(att->atttypid))
+			appendStringInfo(out, "\tstorage %s", column_storage(att->attstorage));
+		if (CompressionMethodIsValid(att->attcompression))
+			appendStringInfo(out, "\tcompression %s", GetCompressionMethodName(att->attcompression));
+		/* The statistics target is nullable, outside Form_pg_attribute. */
+		{
+			HeapTuple	atup = SearchSysCache2(ATTNUM,
+											   ObjectIdGetDatum(RelationGetRelid(rel)), Int16GetDatum(att->attnum));
+			bool		isnull;
+			Datum		target;
+
+			if (!HeapTupleIsValid(atup))
+				elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+					 att->attnum, RelationGetRelid(rel));
+			target = SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attstattarget, &isnull);
+			if (!isnull)
+				appendStringInfo(out, "\tstatistics %d", DatumGetInt16(target));
+			ReleaseSysCache(atup);
+		}
 		appendStringInfoChar(out, '\n');
 	}
 
@@ -1228,6 +1302,38 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfoString(out, "local\n");
 		foreach(lc, local)
 			appendStringInfo(out, "%s\n", (char *) lfirst(lc));
+	}
+
+	/* Local placement is not versioned; explicit tuning options are. */
+	{
+		List	   *options = table_options(NIL, RelationGetRelid(rel), "");
+
+		if (OidIsValid(rel->rd_rel->reltoastrelid))
+			options = table_options(options, rel->rd_rel->reltoastrelid, "toast.");
+		list_sort(options, cstring_cmp);
+		if (options != NIL)
+			appendStringInfoString(out, "options\n");
+		foreach(lc, options)
+			appendStringInfo(out, "%s\n", (char *) lfirst(lc));
+	}
+	if (rel->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT)
+	{
+		Oid			index = RelationGetReplicaIndex(rel);
+
+		appendStringInfoString(out, "replica identity\n");
+		if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+			appendStringInfoString(out, "FULL");
+		else if (OidIsValid(index))
+		{
+			appendStringInfoString(out, "USING INDEX ");
+			append_field(out, quote_identifier(get_rel_name(index)));
+		}
+		else
+		{
+			/* A dropped identity index leaves mode i, behaving as NOTHING. */
+			appendStringInfoString(out, "NOTHING");
+		}
+		appendStringInfoChar(out, '\n');
 	}
 }
 
@@ -3553,6 +3659,9 @@ typedef struct TableDef
 	char	   *partition_of;	/* a partition's parent and bound (escaped), or NULL */
 	List	   *inherits;		/* the tables it inherits from, in order */
 	char	   *of;				/* a typed table's type, or NULL */
+	List	   *options;		/* lines: option name, a tab, SQL literal */
+	List	   *replica_identity;	/* one statement suffix, or NIL for
+									 * DEFAULT */
 	List	   *local;			/* local_line()s: what it inherits that is
 								 * its own too */
 } TableDef;
@@ -3667,6 +3776,10 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->inherits;
 		else if (strcmp(line, "local") == 0)
 			section = &td->local;
+		else if (strcmp(line, "options") == 0)
+			section = &td->options;
+		else if (strcmp(line, "replica identity") == 0)
+			section = &td->replica_identity;
 		else if (strcmp(line, "of") == 0)
 		{
 			section = NULL;
@@ -3697,7 +3810,8 @@ parse_table_def(const char *def, TableDef *td)
 			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
 		}
 		else if (section == &td->columns || section == &td->constraints ||
-				 section == &td->statistics || section == &td->local)
+				 section == &td->statistics || section == &td->local ||
+				 section == &td->options)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
 			*section = lappend(*section, unescape_field(line));
@@ -4344,6 +4458,47 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	}
 
 	/*
+	 * Type changes reset storage and compression; a new partition inherits
+	 * them.  Reapply explicit values even when the column line is unchanged:
+	 * type_moves() may have redefined its named type.  Do not recurse into a
+	 * child whose own description may specify something else.
+	 */
+	foreach(lc, to->columns)
+	{
+		const char *line = lfirst(lc);
+		char	   *col = first_field(line);
+		const char *old = NULL;
+		ListCell   *c;
+		static const char *const fields[] = {"storage ", "compression ", "statistics "};
+		static const char *const defaults[] = {"DEFAULT", "default", "-1"};
+
+		foreach(c, from->columns)
+			if (strcmp(first_field(lfirst(c)), col) == 0)
+				old = lfirst(c);
+		for (int i = 0; i < lengthof(fields); i++)
+		{
+			char	   *value = column_attr(line, fields[i]);
+			char	   *before = old ? column_attr(old, fields[i]) : NULL;
+
+			if (value || before || (to->partition_of && !old))
+				sm->changes = lappend(sm->changes,
+									  psprintf("ALTER TABLE ONLY %s ALTER COLUMN %s SET %s%s",
+											   name, col, fields[i], value ? value : defaults[i]));
+		}
+	}
+
+	/* Reset removed options, then set changed ones, including TOAST's. */
+	foreach(lc, from->options)
+		if (!list_has_string(to->options, lfirst(lc)))
+			sm->changes = lappend(sm->changes,
+								  psprintf("ALTER TABLE ONLY %s RESET (%s)", name, first_field(lfirst(lc))));
+	foreach(lc, to->options)
+		if (!list_has_string(from->options, lfirst(lc)))
+			sm->changes = lappend(sm->changes,
+								  psprintf("ALTER TABLE ONLY %s SET (%s = %s)", name,
+										   first_field(lfirst(lc)), constraint_def(lfirst(lc))));
+
+	/*
 	 * A typed table's type: it stops being one before its columns change
 	 * (first: before its type may go), and is one once they have.  (Its
 	 * inheritance: folded_move_schema()'s.)
@@ -4509,6 +4664,16 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
 	}
+
+	/*
+	 * The identity index must exist first.  Reapply even an unchanged
+	 * identity: its index may have been dropped and made again above.
+	 */
+	if (to->replica_identity != NIL || from->replica_identity != NIL)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE ONLY %s REPLICA IDENTITY %s", name,
+									 to->replica_identity ? (char *) linitial(to->replica_identity) : "DEFAULT"));
+
 	foreach(lc, to->triggers)
 		if (!list_has_string(from->triggers, lfirst(lc)))
 			make_firing(&sm->after, name, lfirst(lc), true);
@@ -6262,7 +6427,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	fd;
 		TableDef	td;
 
-		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0 &&
+								 !list_has_string(tm.tables, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
 		if (t)
@@ -6729,7 +6895,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
  */
 static const char *const table_sections[] = {
 	"columns", "constraints", "indexes", "triggers", "rules", "policies",
-	"statistics", "partition by", "partition of", "inherits", "of", "local"
+	"statistics", "partition by", "partition of", "inherits", "of", "local",
+	"options", "replica identity"
 };
 #define NUM_TABLE_SECTIONS lengthof(table_sections)
 #define ALWAYS_WRITTEN_SECTIONS 5
@@ -6787,6 +6954,7 @@ table_line_key(int s, const char *line)
 		case 7:
 		case 8:
 		case 10:
+		case 13:
 			return pstrdup("");	/* (one line, the table's) */
 		default:
 			return pnstrdup(line, strcspn(line, "\t"));	/* its first field */
@@ -6866,6 +7034,7 @@ set_table_line_sort(int s, TableLine *l)
 		case 1:
 		case 6:
 		case 11:
+		case 12:
 			l->sort = unconstify(char *, l->line);
 			break;
 		case 2:
