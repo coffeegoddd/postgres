@@ -10,3 +10,158 @@
 # Only the entries a pull request's own diff adds count: entries already on
 # its base accept nothing.  The file has a code owner, so an entry is
 # reviewed by a maintainer.  Leave old entries here; they are history.
+
+# #412: the change log writes an entry with each tuple version, so every
+# write costs about one more WAL record (and its buffers) until #414's
+# folds stop copying pages; accepted by the user, after a write's
+# entries were batched and the versions made passed in hand.
+
+[[accept]]
+workload = "S1"
+engine = "prolly"
+counter = "io_extends"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S1"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S1"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S1"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S4"
+engine = "prolly"
+counter = "io_extends"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S4"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S4"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S4"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S7"
+engine = "prolly"
+counter = "io_extends"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S7"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S7"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S8/pct1"
+engine = "prolly"
+counter = "io_extends"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S8/pct1"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S8/pct1"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S8/pct1"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_read_write"
+engine = "prolly"
+counter = "io_extends"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_read_write"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_read_write"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_update_index"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_update_index"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_update_index"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S13/serial"
+engine = "prolly"
+counter = "wal_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S13/serial"
+engine = "prolly"
+counter = "wal_fpi_bytes"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S13/serial"
+engine = "prolly"
+counter = "wal_records"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
+
+[[accept]]
+workload = "S10/oltp_read_write"
+engine = "prolly"
+counter = "io_hits"
+reason = "a change log entry per write (#412): the design's cost, accepted by the user"
