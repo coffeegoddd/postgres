@@ -206,6 +206,22 @@ What the collector does at each step:
 - **`results`.** Compute L, the components and the ratios. Write the rmgr
   rows to `raw/.../write-amp-wal.json`.
 
+**Other instances.** V4 clones, fetches and pushes with a second
+instance, and the clone and fetch write there. A workload adds such
+instances to `ctx.peers` before it opens the window, and the runner
+destroys them after the collectors. Each step above runs on every
+instance: the waits, the folds, the slot, the checkpoints, the snapshots
+and the WAL read.
+
+- **What's summed.** The WAL, pages and chunk-store bytes of all instances
+  are added together. `wa.instances` says how many were counted.
+- **Logical bytes** are the origin's: the clone's rows are a copy, not new
+  row versions the workload asked for.
+- **The first version** read only the origin, and destroyed V4's second
+  instance before `after_window` ran. Review measured another 314 kB of
+  WAL and 82 kB of chunk-store files on that instance that weren't
+  counted.
+
 **Checkpoints are awaited.** `CHECKPOINT` returns before the checkpointer
 reports its statistics (`checkpointer.c`). The collector waits for
 `pg_stat_checkpointer.num_requested` to move, and then for the
@@ -354,6 +370,12 @@ It is not built. `diskstats` still reports whole-device writes.
   backend type, and how often the background writer and the checkpointer
   write a page dirtied again is timing. That is why `17-performance-on-prs.md`
   reads `pg_stat_io` for client backends only in counter runs.
+  `s_counters.toml` requires `write_amp`. The gate also fails, as an
+  invariant, on any collector that ran in a cell of both base runs but not
+  in that cell of a candidate run. Otherwise a candidate that lost
+  `write_amp`, say to a missing `pg_walinspect`, would pass: a counter only
+  one build has is skipped. A collector unavailable in every run is no
+  loss.
 
 ### 3.8 Configs
 
@@ -363,7 +385,8 @@ It is not built. `diskstats` still reports whole-device writes.
     engine_counters, write_amp` (`write_amp` required);
   - 5 repetitions at 1, 16 and 64 clients;
   - `wal_level = replica` and `max_replication_slots = 2`.
-- **`configs/s_counters.toml`.** Adds `write_amp`, and keeps `minimal`.
+- **`configs/s_counters.toml`.** Adds `write_amp`, as a required
+  collector, and keeps `minimal`.
 - **`standard.toml`.** Unchanged. Its default collectors include
   `recovery`.
 
