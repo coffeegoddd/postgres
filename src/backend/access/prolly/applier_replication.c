@@ -417,27 +417,32 @@ replication_begin(Relation rel)
 }
 
 /*
- * The next write sees this one.  The row found for it is let go, so no
- * buffer stays pinned between writes (a caller may write each in a
- * subtransaction of its own).
- */
-static void
-advance(ProllyApplier *a)
-{
-	ExecClearTuple(a->found);
-	CommandCounterIncrement();
-	a->estate->es_output_cid = GetCurrentCommandId(true);
-}
-
-/*
- * A write failed: the row found for it is let go before the error reaches
- * the caller, whose subtransaction (if it wrote in one) pinned its buffer
- * and lets the pin go as it rolls back.
+ * The rows a write read are let go: the one found for it, and those its
+ * after-row triggers' events read (the old row an update's event keeps,
+ * or the row a recheck that raised read).  So no buffer stays pinned
+ * between writes: a caller may write each in a subtransaction of its own,
+ * and update in the next a row the last read.  A write that failed lets
+ * them go before the error reaches the caller, whose subtransaction (if
+ * it wrote in one) pinned their buffers and lets the pins go as it rolls
+ * back.
  */
 static void
 let_go(ProllyApplier *a)
 {
 	ExecClearTuple(a->found);
+	if (a->rri->ri_TrigOldSlot)
+		ExecClearTuple(a->rri->ri_TrigOldSlot);
+	if (a->rri->ri_TrigNewSlot)
+		ExecClearTuple(a->rri->ri_TrigNewSlot);
+}
+
+/* The next write sees this one, and its rows are let go (let_go()). */
+static void
+advance(ProllyApplier *a)
+{
+	let_go(a);
+	CommandCounterIncrement();
+	a->estate->es_output_cid = GetCurrentCommandId(true);
 }
 
 /* The hash of a row's values (their images: equal rows' are alike). */
@@ -614,8 +619,7 @@ rechecks_fire(ProllyApplier *a)
 	PG_CATCH();
 	{
 		/* (a recheck that raised left its row in the trigger slots) */
-		ExecClearTuple(a->rri->ri_TrigOldSlot);
-		ExecClearTuple(a->rri->ri_TrigNewSlot);
+		let_go(a);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
