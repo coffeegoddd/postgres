@@ -2581,16 +2581,20 @@ log_find(HTAB *entries, const ProllyHash *id)
 	return hash_search(entries, &k, HASH_FIND, NULL);
 }
 
+/*
+ * Newest first, by order and then by date, as Dolt's log is: a commit is
+ * always above its parents, whatever the clocks said when they were made.
+ */
 static int
 log_cmp(const ListCell *a, const ListCell *b)
 {
 	LogEntry   *x = lfirst(a);
 	LogEntry   *y = lfirst(b);
 
-	if (x->info.committed_at != y->info.committed_at)
-		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	if (x->order != y->order)
 		return x->order > y->order ? -1 : 1;
+	if (x->info.committed_at != y->info.committed_at)
+		return x->info.committed_at > y->info.committed_at ? -1 : 1;
 	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 

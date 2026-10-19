@@ -758,13 +758,15 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 /*
  * Write a commit's tree; its id is the root's hash.  What its versioned
  * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.
+ * transaction sees them.  It is dated now, as Dolt's are, not at the
+ * transaction's start: a parent another session committed since then is
+ * older than it.
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, TimestampTz at,
-			 ProllyHash *id)
+			 const char *author, const char *message, ProllyHash *id)
 {
+	TimestampTz at = GetCurrentTimestamp();
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
@@ -1170,7 +1172,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		return false;
 	}
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
@@ -1611,7 +1613,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
 	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 GetCurrentTransactionStartTimestamp(), commit_id);
+				 commit_id);
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	return 1;
@@ -1643,7 +1645,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	if (pushed)
 		PopActiveSnapshot();
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, GetCurrentTransactionStartTimestamp(), commit_id);
+				 message, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
