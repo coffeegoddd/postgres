@@ -6935,19 +6935,32 @@ same_line(const TableLine *a, const TableLine *b)
  * (and trigger, rule, policy, statistics object; and its partitioning) as
  * the side that changed it has it, both alike as they have it.  Columns
  * come in ours' order, then those only theirs added, in theirs'.  NULL if
- * both changed a part differently, or a merged local marker names a
- * column or constraint the merge drops: a schema conflict.
+ * both changed a part differently, a merged local marker names a column
+ * or constraint the merge drops, or a drop would discard a part the other
+ * side kept while removing an inheritance parent: a schema conflict.
  */
 static char *
 merge_table_defs(const char *base, const char *ours, const char *theirs)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
 	List	   *local_parts = NIL; /* local markers for the parts kept */
+	bool		detached[3] = {false, false, false};
 	StringInfoData out;
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
 		return NULL;
+	for (int side = 1; side < 3; side++)
+	{
+		foreach_ptr(char, parent, sec[0][9])
+		{
+			if (!list_has_string(sec[side][9], parent))
+			{
+				detached[side] = true;
+				break;
+			}
+		}
+	}
 	initStringInfo(&out);
 	for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
 	{
@@ -6987,7 +7000,18 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			else
 				return NULL;
 			if (m == NULL)
+			{
+				/*
+				 * NO INHERIT can make a retained part local without a
+				 * local marker: it no longer has an inheritance count.
+				 * Don't let the other side's drop silently discard it.
+				 * Both sides dropping the part is still agreement.
+				 */
+				if ((s == 0 || s == 1) &&
+					((x[1] && detached[1]) || (x[2] && detached[2])))
+					return NULL;
 				continue;
+			}
 
 			/* (where it comes: as ours has it, then theirs, then base) */
 			merged[n] = *m;
