@@ -140,6 +140,30 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-d', 'up6');
 SELECT dolt_branch('-D', 'up6');
 SELECT dolt_branch('-D', 'ahead6');
+-- (the session's own branch, ahead of its upstream: refused as checked
+-- out, before the merge test, as in Dolt and git, so not with a -D hint
+-- that -D doesn't get past)
+SELECT dolt_checkout('-b', 'cur') IS NOT NULL AS on_cur;
+SELECT dolt_push('-u', 'origin', 'cur') AS pushed;
+INSERT INTO rm.t VALUES (9070, 'cur');
+SELECT length(dolt_commit('-am', 'cur')::text) AS committed;
+SELECT dolt_branch('-d', 'cur');
+SELECT dolt_branch('-D', 'cur');
+-- (main, ahead of its upstream: refused as main, from another branch too)
+SELECT dolt_hashof('main') <> dolt_hashof('origin/main') AS main_ahead;
+SELECT dolt_branch('-d', 'main');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-d', 'main');
+SELECT dolt_branch('-D', 'cur');
+-- (a branch deleted keeps its upstream, as in Dolt, whose delete leaves the
+-- branch's config: one made again of its name has it, and -d checks it
+-- against the old branch's remote-tracking branch; git drops it)
+SELECT dolt_branch('rc', 'HEAD~1');
+SELECT dolt_push('-u', 'origin', 'rc') AS pushed;
+SELECT dolt_branch('-D', 'rc');
+SELECT dolt_branch('rc');
+SELECT dolt_branch('-d', 'rc');
+SELECT dolt_branch('-D', 'rc');
 
 -- a walk from a commit: a chunk that isn't a commit visits nothing, one
 -- the store hasn't is an error (its store isn't whole)

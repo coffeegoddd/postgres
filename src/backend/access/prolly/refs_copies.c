@@ -82,6 +82,7 @@
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -1312,9 +1313,14 @@ copies_branch_delete(const char *name, bool force)
 	/*
 	 * Merged, as in Dolt (and git): into the branch's upstream, read from
 	 * its remote-tracking branch, so only as current as the last fetch; or,
-	 * when it has none there, into the session's branch.
+	 * when it has none there, into the session's branch.  Not asked of the
+	 * session's own branch or main, which the drop refuses whatever they
+	 * contain: refused first, as Dolt (and git) refuses the checked-out
+	 * branch, so the error isn't one -D doesn't get past.
 	 */
 	if (!force && branch_head(name, &head) &&
+		strcmp(name, branch_ops()->current()) != 0 &&
+		branch_oid(name) != BRANCH_MAIN_OID &&
 		!((upstream_head(name, &ours) ||
 		   branch_head(branch_ops()->current(), &ours)) &&
 		  copies_merge_base(&head, &ours, &base) && same_hash(&base, &head)))
