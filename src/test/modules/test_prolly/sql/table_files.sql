@@ -1,7 +1,16 @@
 -- Table files: chunks added together, in a file of their own, found as
 -- the journal's are.
 SELECT count(*) FROM test_chunk_table_files();
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') AS tf_before,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'manifest_bytes_written') AS mf_before \gset
 SELECT test_chunk_table_file(ARRAY['tf one'::bytea, 'tf two'::bytea]);
+-- (the file, and the manifest naming it, written and counted)
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') > :tf_before
+		AS file_written,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'manifest_bytes_written') > :mf_before
+		AS manifest_written;
 SELECT name, chunks FROM test_chunk_table_files();
 SELECT convert_from(test_chunk_get(encode(sha256('tf one'::bytea), 'hex')), 'UTF8');
 SELECT test_chunk_has(encode(sha256('tf two'::bytea), 'hex')) AS two,
@@ -32,7 +41,16 @@ WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000)
 	= repeat(g::text, 5000);
 
 -- Conjoining rewrites them as one, which every session reads.
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'conjoin_bytes_copied') AS cj_before,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') AS tf_before \gset
 SELECT test_chunk_conjoin();
+-- (its file is copies of chunks the store had, and table-file bytes)
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'conjoin_bytes_copied') - :cj_before
+	= (SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written') - :tf_before
+	AND (SELECT value FROM pg_stat_prolly WHERE name = 'conjoin_bytes_copied') > :cj_before
+	AS conjoin_copied;
 SELECT name, chunks FROM test_chunk_table_files();
 SELECT count(*) FROM generate_series(1, 50) g
 WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000), 'UTF8')), 'hex')), 'UTF8')

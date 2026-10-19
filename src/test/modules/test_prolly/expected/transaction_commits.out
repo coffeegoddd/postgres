@@ -306,10 +306,10 @@ SELECT test_fold_counters(true) IS NOT NULL AS reset;
 
 INSERT INTO tc.t VALUES (21, 'mine');
 UPDATE tc.t SET v = 'mine, updated' WHERE id = 21;
-SELECT pages, full_tables FROM test_fold_counters();
- pages | full_tables 
--------+-------------
-     0 |           0
+SELECT pages, candidates, full_tables FROM test_fold_counters();
+ pages | candidates | full_tables 
+-------+------------+-------------
+     0 |          0 |           0
 (1 row)
 
 BEGIN;
@@ -322,10 +322,10 @@ UPDATE tc.t SET v = 'kept, released' WHERE id = 22;
 RELEASE r;
 DELETE FROM tc.t WHERE id = 1;
 COMMIT;
-SELECT pages, full_tables FROM test_fold_counters();
- pages | full_tables 
--------+-------------
-     0 |           0
+SELECT pages, candidates, full_tables FROM test_fold_counters();
+ pages | candidates | full_tables 
+-------+------------+-------------
+     0 |          0 |           0
 (1 row)
 
 SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
@@ -361,10 +361,10 @@ SELECT test_fold_counters(true) IS NOT NULL AS reset;
 INSERT INTO tc.bag VALUES ('a'), ('a'), ('b');
 DELETE FROM tc.bag WHERE ctid = (SELECT min(ctid) FROM tc.bag WHERE v = 'a');
 UPDATE tc.bag SET v = 'c' WHERE v = 'b';
-SELECT pages, full_tables FROM test_fold_counters();
- pages | full_tables 
--------+-------------
-     0 |           0
+SELECT pages, candidates, full_tables FROM test_fold_counters();
+ pages | candidates | full_tables 
+-------+------------+-------------
+     0 |          0 |           0
 (1 row)
 
 SELECT name, dirty FROM dolt_branches() WHERE name = 'main';

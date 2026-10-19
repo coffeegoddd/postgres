@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,11 @@ RUN_DEFAULTS: dict[str, Any] = {
     # may turn synchronous_commit off (fsync stays on), so a machine's
     # flush time doesn't bury the change compared.
     "comparison_only": False,
+    # What the write_amp collector's flush has prolly do after the window,
+    # so its deferred tree writes are counted: "prolly_checkpoint" folds the
+    # working set into trees, "none" doesn't (the V suite's workloads
+    # commit), and "auto" is the first for S, the second for V.
+    "write_amp_materialize": "auto",
 }
 
 # Settings every S and V run requires: results are only comparable when
@@ -117,6 +123,17 @@ def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, A
     return cfg
 
 
+_GUC_SECONDS = {"us": 1e-6, "ms": 1e-3, "s": 1, "min": 60, "h": 3600, "d": 86400}
+
+
+def guc_seconds(value) -> float:
+    """A time setting ("5min", "1d", "300") in seconds; bare numbers are seconds."""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([a-z]*)\s*", str(value))
+    if not m or m.group(2) not in _GUC_SECONDS and m.group(2):
+        raise ConfigError(f"unreadable time setting {value!r}")
+    return float(m.group(1)) * _GUC_SECONDS.get(m.group(2) or "s", 1)
+
+
 def validate(cfg: dict, suite: str) -> None:
     run = cfg["run"]
     def number(value, name, minimum=1, maximum=None):
@@ -164,6 +181,28 @@ def validate(cfg: dict, suite: str) -> None:
     if run["settled_counters"] and suite == "S" and (not run["workloads"] or "S6" in run["workloads"]):
         raise ConfigError("settled_counters waits until no other client is connected, and S6 "
                           "holds a session open for its whole window: leave S6 out")
+    if run["write_amp_materialize"] not in ("auto", "prolly_checkpoint", "none"):
+        raise ConfigError("write_amp_materialize must be auto, prolly_checkpoint or none")
+    pg = cfg.get("postgres", {})
+    if ("write_amp" in run["collectors"] and pg.get("wal_level", "replica") != "minimal"
+            and str(pg.get("max_replication_slots", "10")) == "0"):
+        raise ConfigError("write_amp holds a replication slot over its interval, so the WAL "
+                          "it splits isn't recycled: give it max_replication_slots >= 1")
+    if "write_amp" in run["collectors"] and pg.get("wal_level") == "minimal":
+        # No slot: a checkpoint in the window would recycle the WAL it
+        # reads (the read then fails).  Its first checkpoint restarts the
+        # timer; checkpoints on WAL volume (max_wal_size) remain possible.
+        timeout = guc_seconds(pg.get("checkpoint_timeout", "5min"))
+        longest = max([run["measure_seconds"]] + [
+            p["measure_seconds"] for p in cfg.get("workloads", {}).values()
+            if "measure_seconds" in p])
+        if timeout <= longest:
+            raise ConfigError(f"write_amp at wal_level = minimal keeps no replication slot: "
+                              f"checkpoint_timeout ({timeout:.0f} s) must exceed the measured "
+                              f"window ({longest} s)")
+    if "write_amp" in run["collectors"] and "recovery" in run["collectors"]:
+        raise ConfigError("write_amp checkpoints after the window, which leaves the recovery "
+                          "collector nothing to replay: run them in separate configs")
     if not set(run["required_collectors"]) <= set(run["collectors"]):
         raise ConfigError("required_collectors must be enabled")
     for label, sizes in cfg["sizes"].items():

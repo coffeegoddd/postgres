@@ -172,6 +172,10 @@ class Context:
     # Filled in by the cluster factory, for workloads needing a second
     # instance (V4).
     make_cluster: Optional[Callable[[str], Cluster]] = None
+    # Other instances the measured work writes to (V4's clone), added by
+    # the workload before it opens the window.  The runner destroys them
+    # after the collectors, which see their writes too (write_amp).
+    peers: list[Cluster] = field(default_factory=list)
 
     def session_options(self) -> dict[str, str]:
         """GUCs every client session of this run uses."""
@@ -261,7 +265,9 @@ class Collector(abc.ABC):
     A new instance is made for every cell.  start and stop bracket the
     measured window and should only take snapshots; results then turns the
     snapshots into metrics, once the workload's Outcome (e.g. its
-    transaction count) is known.  post runs after the window, in ascending
+    transaction count) is known.  before_window and after_window bracket
+    every collector's start and stop, for a collector whose interval is
+    wider than the window.  post runs after the window, in ascending
     post_order, for measurements that act on the cluster (VACUUM, crash
     recovery).  Raising Unavailable, NotImplementedByEngine or NotApplicable
     from any hook marks the collector's metrics with that status instead of
@@ -274,9 +280,18 @@ class Collector(abc.ABC):
     def check(self, ctx: Context) -> None:
         """Raise Unavailable or NotApplicable if the collector can't run."""
 
+    def before_window(self, ctx: Context) -> None:
+        """Act on the cluster before any collector's start (write_amp's
+        checkpoint), so no other collector's interval includes it."""
+
     def start(self, ctx: Context) -> None: ...
 
     def stop(self, ctx: Context) -> None: ...
+
+    def after_window(self, ctx: Context, outcome: Outcome) -> None:
+        """Act on the cluster after every collector's stop and before any
+        results or verification (write_amp's flush): the post-run checks
+        read the tables, and reading them can write (hint bits)."""
 
     def results(self, ctx: Context, outcome: Outcome) -> dict[str, Optional[float]]:
         return {}

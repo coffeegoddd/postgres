@@ -671,6 +671,12 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	if (cn->advance)
 	{
 		CanonItem  *next = palloc0(sizeof(CanonItem));
+		ProllyComponents c;
+
+		/* (what the fold saw is in the next baseline: its entries are spent) */
+		prolly_components_for_relation(rel, &c);
+		if (c.change_log)
+			PROLLY_CALL(c.change_log, consume, rel, GetActiveSnapshot());
 
 		initStringInfo(&next->key);
 		appendBinaryStringInfo(&next->key, it->key.data, it->key.len);
@@ -2863,7 +2869,7 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	cn.reading = reading;
 	cn.only = only;
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
+	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
 	if (baseline)
 		load_baseline(&cn, baseline);
@@ -2950,19 +2956,25 @@ folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root,
 		*left_out = list_concat(*left_out, l);
 }
 
-/* A baseline's tree, its tables' data trees and the finder's states. */
+/*
+ * A baseline's tree, its tables' data trees and the finders' states.  Each
+ * state is walked by every change finder, not the one configured now: the
+ * one that wrote it may be another (a fold under another setting, or before
+ * the default changed), and each passes over states it didn't write.
+ */
 static void
 folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 					 void *arg)
 {
 	Canon		cn;
+	List	   *finders;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
 	/* (a baseline the visitor declines: it has seen the trees it names) */
 	if (!PROLLY_CALL(cn.tree, walk, &cn.env, baseline, visit, arg))
 		return;
+	finders = prolly_list_impls(PROLLY_IFACE_CHANGE_FINDER);
 	load_baseline(&cn, baseline);
 	for (int i = 0; i < cn.nbase; i++)
 	{
@@ -2970,8 +2982,13 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 		cn.base[i].state.len};
 
 		PROLLY_CALL(cn.tree, walk, &cn.env, &cn.base[i].data, visit, arg);
-		PROLLY_CALL(cn.finder, walk, &cn.env, &state, visit, arg);
+		foreach_ptr(const ProllyChangeFinderRoutine, finder, finders)
+		{
+			if (finder->walk != NULL)
+				finder->walk(&cn.env, &state, visit, arg);
+		}
 	}
+	list_free(finders);
 }
 
 /*
@@ -3950,9 +3967,13 @@ schema_of(const char *qualified_name)
 	return NULL;
 }
 
-/* A column, as CREATE TABLE and ADD COLUMN write it. */
+/*
+ * A column of table, as CREATE TABLE and ADD COLUMN write it; with what
+ * must run right after that statement appended to *after.
+ */
 static char *
-column_sql(const char *line)
+column_sql(const char *table, const char *line, List *constraints,
+		   List **after)
 {
 	char	   *copy = pstrdup(line);
 	char	   *name = strtok(copy, "\t");
@@ -3993,8 +4014,43 @@ column_sql(const char *line)
 	else if (def)
 		appendStringInfo(&sql, " DEFAULT %s", def);
 	if (identity)
+	{
+		char	   *prefix = psprintf("NOT NULL %s", name);
+		size_t		len = strlen(prefix);
+		ListCell   *lc;
+
+		/*
+		 * Give the identity's implicit NOT NULL its recorded name now.
+		 * Automatic naming may choose another name if, for example, a
+		 * child still has the constraint inherited from a remade parent.
+		 * Postgres refuses NO INHERIT beside IDENTITY in a column
+		 * definition, though ALTER can make a table with both: the
+		 * constraint is made inheritable, then made NO INHERIT right after.
+		 */
+		foreach(lc, constraints)
+		{
+			const char *constraint = lfirst(lc);
+			char	   *definition = constraint_def(constraint);
+
+			if (strncmp(definition, prefix, len) == 0 &&
+				(definition[len] == '\0' || definition[len] == ' '))
+			{
+				const char *rest = definition + len;
+
+				appendStringInfo(&sql, " CONSTRAINT %s NOT NULL",
+								 first_field(constraint));
+				if (strcmp(rest, " NO INHERIT") == 0)
+					*after = lappend(*after,
+									 psprintf("ALTER TABLE %s ALTER CONSTRAINT %s NO INHERIT",
+											  table, first_field(constraint)));
+				else
+					appendStringInfoString(&sql, rest);
+				break;
+			}
+		}
 		appendStringInfo(&sql, " GENERATED %s AS IDENTITY",
 						 identity == 'a' ? "ALWAYS" : "BY DEFAULT");
+	}
 	return sql.data;
 }
 
@@ -4233,6 +4289,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	if (from == NULL || remake)
 	{
 		StringInfoData sql;
+		List	   *after_columns = NIL;
 
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
@@ -4248,12 +4305,14 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			appendStringInfo(&sql, "CREATE TABLE %s (", name);
 			foreach(lc, to->columns)
 				appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
-								 column_sql(lfirst(lc)));
+								 column_sql(name, lfirst(lc), to->constraints,
+											&after_columns));
 			appendStringInfoChar(&sql, ')');
 		}
 		if (to->partition_by)
 			appendStringInfo(&sql, " PARTITION BY %s", to->partition_by);
 		sm->changes = lappend(sm->changes, sql.data);
+		sm->changes = list_concat(sm->changes, after_columns);
 
 		/* sequences its defaults draw from, that no column owns: its own */
 		sm->changes = lappend(sm->changes,
@@ -4309,9 +4368,13 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 			if (i < 0)
 			{
+				List	   *after_column = NIL;
+
 				sm->changes = lappend(sm->changes,
 									  psprintf("ALTER TABLE %s ADD COLUMN %s",
-											   name, column_sql(line)));
+											   name, column_sql(name, line, to->constraints,
+																&after_column)));
+				sm->changes = list_concat(sm->changes, after_column);
 				continue;
 			}
 			old = list_nth(from->columns, i);
@@ -4461,7 +4524,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			}
 
 			/*
-			 * (an identity column, or a key, may have made it already; a
+			 * (an identity column, whose column definition gives its NOT
+			 * NULL this recorded name, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
 			if (not_null || to->partition_of)
@@ -5323,6 +5387,8 @@ typedef struct TypeMoves
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
 	List	   *tables;			/* the tables of those columns */
+	List	   *detached;		/* typed tables detached before their types
+								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -5458,18 +5524,34 @@ same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *n
 	return a && b && strcmp(a, b) == 0;
 }
 
+/* Whether a partitioned table's key uses its column attnum. */
+static bool
+in_partition_key(Oid relid, AttrNumber attnum)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	bool		expr;
+	bool		used = has_partition_attrs(rel,
+										   bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+										   &expr);
+
+	table_close(rel, AccessShareLock);
+	return used;
+}
+
 /*
  * The statements that make the types to defines otherwise than from, under
  * their names, and those that use them, in turn: each renamed aside, made
  * anew, the columns of versioned tables using it (or arrays of it)
  * converted, and the old dropped.  What uses one is found through what
  * depends on it: a composite type or a domain the branch has is moved
- * with it (as to defines it); a check constraint, an index or a default of
- * a versioned table, or a routine, is dropped first and made again after
- * (as to defines it, if alike; the table's or routine's own move does the
- * rest).  Anything else using it (a column of another schema's table, an
- * operator) can't be moved with it: refused.  Views and materialized views
- * using them go and come back with the others (folded_move_schema()).
+ * with it (as to defines it); typed tables are detached for move_table()
+ * to attach again once their columns match; a check constraint, an index
+ * or a default of a versioned table, or a routine, is dropped first and
+ * made again after (as to defines it, if alike; the table's or routine's
+ * own move does the rest).  Anything else using it (a column of another
+ * schema's table, an operator) can't be moved with it: refused.  Views and
+ * materialized views using them go and come back with the others
+ * (folded_move_schema()).
  */
 static TypeMoves
 type_moves(List *from, List *to)
@@ -5562,13 +5644,56 @@ type_moves(List *from, List *to)
 							(void) move_type(&moved, from, to, ct, mt->from->name);
 						handled = true;
 					}
-					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid == 0 && !array)
+					{
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+						MoveItem   *f = find_item(from, 't', rel);
+						TableDef	fd;
+
+						if (f)
+						{
+							parse_table_def(f->def, &fd);
+							if (same_strings(fd.of, mt->from->name))
+							{
+								tm.before = lappend(tm.before, psprintf("ALTER TABLE %s NOT OF", rel));
+								tm.detached = lappend(tm.detached, rel);
+								handled = true;
+							}
+						}
+					}
+					else if (kind == RELKIND_PARTITIONED_TABLE && versioned &&
+							 d->objsubid > 0 && in_partition_key(d->objid, d->objsubid))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+										mt->from->name),
+								 errdetail("%s uses it, in the table's partition key, which can't change type.",
+										   getObjectDescription(&obj, false))));
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid > 0)
 					{
 						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
 						const char *col = quote_identifier(get_attname(d->objid, d->objsubid, false));
 						char	   *conv;
+						bool		inherited = false;
 
-						if (array)
+						/*
+						 * (a partition's inherited column is its parent's:
+						 * converting the parent's converts it)
+						 */
+						if (get_rel_relispartition(d->objid))
+						{
+							HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(d->objid),
+															 Int16GetDatum(d->objsubid));
+
+							if (!HeapTupleIsValid(at))
+								elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+									 d->objsubid, d->objid);
+							inherited = ((Form_pg_attribute) GETSTRUCT(at))->attinhcount > 0;
+							ReleaseSysCache(at);
+						}
+						if (array && !inherited)
 						{
 							/*
 							 * (an array's elements one by one, as a function:
@@ -5591,7 +5716,7 @@ type_moves(List *from, List *to)
 							tm.converts = lappend(tm.converts,
 												  psprintf("DROP FUNCTION %s(%s[])", fn, mt->aside));
 						}
-						else
+						else if (!inherited)
 							tm.converts = lappend(tm.converts,
 												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
 														   rel, col, mt->to->name,
@@ -6262,9 +6387,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	fd;
 		TableDef	td;
 
-		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+		if (f->kind != 't' ||
+			(t && strcmp(t->def, f->def) == 0 && !list_has_string(tm.detached, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
+		/* type_moves() detaches it first; move_table() restores to's link. */
+		if (list_has_string(tm.detached, f->name))
+			fd.of = NULL;
 		if (t)
 			parse_table_def(t->def, &td);
 		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
@@ -6935,17 +7064,32 @@ same_line(const TableLine *a, const TableLine *b)
  * (and trigger, rule, policy, statistics object; and its partitioning) as
  * the side that changed it has it, both alike as they have it.  Columns
  * come in ours' order, then those only theirs added, in theirs'.  NULL if
- * both changed a part differently: a schema conflict.
+ * both changed a part differently, a merged local marker names a column
+ * or constraint the merge drops, or a drop would discard a part the other
+ * side kept while removing an inheritance parent: a schema conflict.
  */
 static char *
 merge_table_defs(const char *base, const char *ours, const char *theirs)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
+	List	   *local_parts = NIL; /* local markers for the parts kept */
+	bool		detached[3] = {false, false, false};
 	StringInfoData out;
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
 		return NULL;
+	for (int side = 1; side < 3; side++)
+	{
+		foreach_ptr(char, parent, sec[0][9])
+		{
+			if (!list_has_string(sec[side][9], parent))
+			{
+				detached[side] = true;
+				break;
+			}
+		}
+	}
 	initStringInfo(&out);
 	for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
 	{
@@ -6985,7 +7129,18 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			else
 				return NULL;
 			if (m == NULL)
+			{
+				/*
+				 * NO INHERIT can make a retained part local without a
+				 * local marker: it no longer has an inheritance count.
+				 * Don't let the other side's drop silently discard it.
+				 * Both sides dropping the part is still agreement.
+				 */
+				if ((s == 0 || s == 1) &&
+					((x[1] && detached[1]) || (x[2] && detached[2])))
+					return NULL;
 				continue;
+			}
 
 			/* (where it comes: as ours has it, then theirs, then base) */
 			merged[n] = *m;
@@ -7004,7 +7159,20 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			continue;
 		appendStringInfo(&out, "%s\n", table_sections[s]);
 		for (int i = 0; i < n; i++)
+		{
+			if (s == 0 || s == 1)
+				local_parts = lappend(local_parts,
+									 psprintf("%s %s", s == 0 ? "column" : "constraint",
+											  merged[i].key));
+			/*
+			 * Locality and the part's definition merge separately.  One
+			 * side making an inherited part local mustn't lose it to the
+			 * other side's drop from the parent.
+			 */
+			else if (s == 11 && !list_has_string(local_parts, merged[i].line))
+				return NULL;
 			appendStringInfo(&out, "%s\n", merged[i].line);
+		}
 	}
 	return out.data;
 }
@@ -7438,7 +7606,7 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	cn.finder = prolly_changes_lookup("pages");
+	cn.finder = prolly_change_finder();
 	if (!root_in_format(&cn, head))
 		return false;
 	initStringInfo(&v);

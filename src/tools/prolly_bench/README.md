@@ -238,7 +238,8 @@ purpose.  S and V refuse those settings.
 (`pgbench -t`, sysbench `--events`, the TPC-H serial pass) with one client,
 fixed seeds, autovacuum and timed checkpoints off, so two runs of one build
 count the same: WAL bytes, records and full-page images, `pg_stat_io` for
-client backends, relation and chunk-store bytes, `pg_stat_prolly`, and
+client backends, relation and chunk-store bytes, `pg_stat_prolly`, write
+amplification's totals (`write_amp`), and
 instructions where the machine has hardware counters (`instructions`, by
 `perf stat`).  Counters are read once the measured clients have exited
 (`settled_counters`), so each has flushed its statistics.
@@ -253,6 +254,81 @@ S7's counters vary a little: GiST breaks ties between pages at random.
 Without hardware counters, `configs/s_cachegrind.toml` counts instructions
 with the server under Cachegrind (the `cachegrind` cluster and collector),
 on a reduced workload.
+
+## Write amplification
+
+`configs/s_write_amp.toml` runs the standard procedure's workloads with the
+`write_amp` collector (specs/20-write-amplification.md): for heap and
+prolly alike, the bytes the server wrote per byte of row data the
+workload wrote.
+
+```sh
+src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/prolly_bench/configs/s_write_amp.toml
+src/tools/prolly_bench/prolly_bench table
+```
+
+Logical bytes are (rows inserted + rows updated) x the table's average row
+size, from `pg_stat_get_tuples_*()` for the workload's tables. Prolly's
+tables run heap's code, so the same counts cover both engines. Deletes
+count as rows, not bytes, and rows of aborted transactions count too.
+
+The collector's interval is wider than the window:
+
+- **Before the window** it waits for autovacuum workers to exit, then
+  checkpoints, so the warm-up's dirty pages aren't the window's. It
+  doesn't wait for clients: S6 and the V suite's background S1 connect
+  before the window.
+- **After the window** it waits for the clients and autovacuum workers to
+  exit. Autovacuum workers report their counts only when they exit. Then,
+  on prolly in the S suite, it runs `prolly_checkpoint()`, because a
+  plain SQL `COMMIT` writes no chunks and their bytes would otherwise go
+  uncounted (`write_amp_materialize`). It then reads the WAL, checkpoints
+  again so the window's dirty pages are written, and waits for
+  autovacuum once more.
+
+It reports each amount per unit, and as a ratio to the logical bytes:
+
+| Ratio | Bytes written (not synced) |
+|---|---|
+| `wa_wal` | WAL generated, by LSN difference, split by resource manager with pg_walinspect: rows, indexes, full-page images, prolly's `BlockMap` and `ProllyChunks` records, the rest |
+| `wa_pages` | relation pages written and extended by every backend type (`pg_stat_io`, the checkpointer's included), plus prolly's copy-on-write remaps (`wa.pages.bmap_store_bytes`) |
+| `wa_tree` | prolly only: the chunk store's journal, table files and metadata (`pg_stat_prolly`), including the copies collection and conjoining made |
+| `wa_server` | all three |
+
+Notes on the totals:
+
+- **Chunks are written twice.** Every chunk goes once into WAL
+  (`ProllyChunks`) and once into the journal.
+- **Extends and bulk writes.** The block map's extends for shared buffers
+  (`wa.pages.bmap_extend_bytes`) duplicate `pg_stat_io`'s extends, so
+  they aren't added. Its bulk writes (`wa.pages.bmap_bulk_bytes`: index
+  builds, copies) aren't added either, because heap's equivalent writes
+  count nowhere. Neither engine's `wa_pages` includes bulk writes.
+- **What isn't counted:** SLRU writes, and WAL's partial-page rewrites.
+- **Small intervals.** Ratios are omitted under 64 KiB of logical bytes,
+  and `table` says why for each n/a.
+- **Other instances.** A workload's other instances (`ctx.peers`: V4's
+  clone, which the clone, fetch and push write to) are measured like the
+  origin, and their bytes are added in. `wa.instances` says how many
+  instances were counted. Logical bytes are the origin's.
+
+Reports and run constraints:
+
+- **Reports.** `table` shows the ratios and a table of every component per
+  engine. Each result set's `README.md` shows that table too.
+- **No recovery.** `write_amp` and `recovery` can't share a run, because
+  after the second checkpoint recovery has nothing to replay.
+  `s_write_amp.toml` also leaves out `vacuum`, which would start just
+  after that checkpoint.
+- **WAL retention.** A replication slot keeps the window's WAL where
+  `wal_level` allows one. That WAL can be tens of GB on a long window.
+  The counter runs keep `minimal` and run with no slot. The config refuses
+  `minimal` unless `checkpoint_timeout` exceeds the window.
+- **The gate.** In a counter run, `scounters` gates the logical, WAL and
+  chunk-store totals. It doesn't gate the page totals: those sum every
+  backend type, and how they repeat depends on timing. `s_counters.toml`
+  requires `write_amp`, and the gate fails when any collector that ran in
+  the base didn't run in the candidate.
 
 ## Comparing builds
 
@@ -396,7 +472,7 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Workload` | S1-S10 and S13, V1-V4 and V6, C1-C4 | `pbench/workloads/` |
-| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
+| `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |
 
@@ -404,7 +480,9 @@ A workload creates its data in `prepare`, may warm up in `warmup`, and does
 the measured work inside the window it is given in `measure`, returning an
 `Outcome` (metrics, and a transaction count for per-transaction metrics).  A
 collector snapshots in `start`/`stop`, computes in `results`, and may act on
-the cluster in `post`.
+the cluster in `post`; `before_window` and `after_window` bracket every
+collector's `start` and `stop`, for one whose interval is wider than the
+window (`write_amp`).
 
 ## Tests
 

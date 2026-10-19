@@ -335,6 +335,8 @@ class V4(VWorkload):
         if ctx.make_cluster is None:
             raise NotImplementedByEngine("V4 needs a second instance, which this runner can't make")
         self._remote = ctx.make_cluster("v4-remote")
+        # (the runner destroys it, after the collectors have read its writes)
+        ctx.peers.append(self._remote)
         try:
             self._remote.sql(f"CREATE DATABASE {ctx.dbname}")
             # (the clone makes the versioned schema; its search path is the
@@ -349,11 +351,8 @@ class V4(VWorkload):
             self._check_moved(ctx)
             return outcome
         finally:
-            try:
-                self._save_log(ctx)
-            finally:
-                self._remote.destroy()
-                self._remote = None
+            self._save_log(ctx)
+            self._remote = None
 
     def _save_log(self, ctx):
         log = getattr(self._remote, "log_file", None)

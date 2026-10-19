@@ -15,6 +15,9 @@ CREATE TABLE cow.t (a int8, b int8);
 INSERT INTO cow.t SELECT g, g FROM generate_series(1, 1000) g;
 SELECT pg_relation_filenode('cow.t') AS src \gset
 SELECT pg_relation_size('cow.t') / 8192 AS nblocks \gset
+-- (and its change log's, which no copy holds)
+SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) / 8192
+	AS tlog \gset
 
 -- Nothing to do in a store whose counts are right.
 CHECKPOINT;
@@ -38,19 +41,21 @@ SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT count(test_bmap_unlink(copy)) FROM (SELECT copy FROM copies LIMIT 5) c;
 SELECT DISTINCT refs FROM test_bmap_map(:src);
 DROP TABLE cow.t;
-SELECT test_bmap_free_blocks() - :free_before = :nblocks AS freed_by_drop;
+SELECT test_bmap_free_blocks() - :free_before = :nblocks + :tlog AS freed_by_drop;
 
 -- Blocks whose holders all went while stuck stay allocated; the sweep
 -- frees them, and shortens the store.
 CREATE TABLE cow.u (a int8, b int8);
 INSERT INTO cow.u SELECT g, g FROM generate_series(1, 1000) g;
 SELECT pg_relation_filenode('cow.u') AS u \gset
+SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.u'::regclass::oid)::regclass) / 8192
+	AS ulog \gset
 CREATE TEMP TABLE ucopies AS
 SELECT test_bmap_share(:u) AS copy FROM generate_series(1, 260);
 SELECT count(test_bmap_unlink(copy)) FROM ucopies;
 SELECT test_bmap_free_blocks() AS free_before \gset
 DROP TABLE cow.u;
-SELECT test_bmap_free_blocks() = :free_before AS stuck_left_allocated;
+SELECT test_bmap_free_blocks() - :free_before = :ulog AS stuck_left_allocated;
 SELECT (pg_stat_file(format('base/%s/9421', :db))).size / 8192 AS store_before \gset
 CHECKPOINT;
 SELECT freed = :nblocks AS freed, truncated > 0 AS truncated FROM prolly_page_sweep();

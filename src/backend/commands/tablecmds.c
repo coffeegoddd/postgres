@@ -20,6 +20,7 @@
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/multixact.h"
+#include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
@@ -36,7 +37,6 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
-#include "access/prolly_config.h"
 #include "access/prolly_keying.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_attrdef.h"
@@ -2299,6 +2299,8 @@ ExecuteTruncateGuts(List *explicit_rels,
 							 &reindex_params);
 		}
 
+		/* (a prolly table's change log is told every row may have changed) */
+		prolly_note_change(rel, NULL, NULL);
 		pgstat_count_truncate(rel);
 	}
 
@@ -6095,6 +6097,12 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 RecentXmin,
 							 ReadNextMultiXactId(),
 							 persistence);
+
+			/*
+			 * (a table made a prolly table by SET ACCESS METHOD: its log,
+			 * made only now, as its TOAST table was made while it was heap)
+			 */
+			prolly_make_change_log(tab->relid, AccessExclusiveLock);
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}
@@ -17016,6 +17024,15 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 			ATExecChangeOwner(tuple_class->reltoastrelid, newOwnerId,
 							  true, lockmode);
 
+		/* ... and a prolly table's change log, as its TOAST table */
+		{
+			Oid			logid = prolly_change_log_relid(relationOid,
+														tuple_class->relam);
+
+			if (OidIsValid(logid))
+				ATExecChangeOwner(logid, newOwnerId, true, lockmode);
+		}
+
 		/* If it has dependent sequences, recurse to change them too */
 		change_owner_recurse_to_sequences(relationOid, newOwnerId, lockmode);
 	}
@@ -17583,6 +17600,7 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 {
 	Relation	rel;
 	Oid			reltoastrelid;
+	Oid			logid;
 	RelFileNumber newrelfilenumber;
 	RelFileLocator newrlocator;
 	List	   *reltoastidxids = NIL;
@@ -17603,6 +17621,7 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	}
 
 	reltoastrelid = rel->rd_rel->reltoastrelid;
+	logid = prolly_change_log_relid(tableOid, rel->rd_rel->relam);
 	/* Fetch the list of indexes on toast relation if necessary */
 	if (OidIsValid(reltoastrelid))
 	{
@@ -17657,6 +17676,9 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	/* Move associated toast relation and/or indexes, too */
 	if (OidIsValid(reltoastrelid))
 		ATExecSetTableSpace(reltoastrelid, newTableSpace, lockmode);
+	/* ... and a prolly table's change log */
+	if (OidIsValid(logid))
+		ATExecSetTableSpace(logid, newTableSpace, lockmode);
 	foreach(lc, reltoastidxids)
 		ATExecSetTableSpace(lfirst_oid(lc), newTableSpace, lockmode);
 
